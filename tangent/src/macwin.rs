@@ -1,4 +1,5 @@
-//! **Two AppKit facts winit does not surface, and one hook it does not install.**
+//! **Three AppKit facts winit does not surface, and one hook it does not
+//! install.**
 //!
 //! The app's layout is aspect-locked by construction: every band's height is a
 //! fixed fraction of the window's width, so there is exactly one height per
@@ -31,6 +32,45 @@
 //! `class_addMethod` returns false, the hook is reported as unavailable, and
 //! the app's own correction stays armed.
 //!
+//! # The third fact: "above the main window" and "above every other program
+//! on the machine" are one request to winit and two to AppKit
+//!
+//! 3. **`-[NSWindow addChildWindow:ordered:]`** is what AppKit has for "keep
+//!    this window above THAT one". winit has no word for it.
+//!
+//! A face — a plugin's editor, the IR wizard, a notice — has to stay in front
+//! of the window it belongs to, so `shell.rs` asks for
+//! `egui::WindowLevel::AlwaysOnTop` for every surface with `on_top`. winit
+//! answers that with `kCGFloatingWindowLevel`, and a window LEVEL is a fact
+//! about the whole machine, not about this app: level 3 sits above every
+//! level-0 window in every process. So the face stayed in front of the
+//! owner's terminal as well — and the main window, still at level 0, did not.
+//! The report, verbatim: "a the window pushes the MAIN window behind you
+//! while IT stays in front of you (you as in the one in the terminal
+//! window)". The requirement was only ever "in front of the MAIN window,
+//! without taking exclusivity over input"; outranking every other program was
+//! never asked for and is what a level buys.
+//!
+//! A CHILD window is the request that was actually meant. Ordered
+//! `NSWindowAbove`, AppKit keeps it above its parent, moves it with the
+//! parent, orders it out when the parent is hidden or minimised and brings it
+//! back with it — and none of that is a level, so the pair outranks nothing
+//! outside this process. Switch to the terminal and both Tangent windows go
+//! behind it together; switch back and both return together. Key status is
+//! untouched, so the "no exclusivity over input" half still holds: a single
+//! click into the main window still moves the dial under the cursor, and the
+//! face stays drawn on top, un-clicked.
+//!
+//! **Why the adoption happens HERE, from an enumeration, and not at a call
+//! site.** There is no call site to put it at. The faces are `egui` child
+//! viewports, made by winit inside `eframe`, and `tangent-ui` has nothing but
+//! `WindowLevel` to say. The VST3 editor windows are made by
+//! `tangent_host::editor` with AppKit directly, and that module's own docs
+//! record why it could not do this itself: "nothing hands this code the main
+//! window to be a child *of*". This module is handed the main window every
+//! frame, so it reaches both from the other side — `NSApp.windows` is the one
+//! list that has all of them on it.
+//!
 //! # Safety
 //!
 //! The callback runs inside AppKit's nested event-tracking run loop, on the
@@ -46,8 +86,11 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
 use objc2::{sel, ClassType};
-use objc2_app_kit::{NSEvent, NSView, NSWindow};
-use objc2_foundation::NSSize;
+use objc2_app_kit::{
+    NSApplication, NSEvent, NSFloatingWindowLevel, NSNormalWindowLevel, NSView, NSWindow,
+    NSWindowLevel, NSWindowOrderingMode,
+};
+use objc2_foundation::{MainThreadMarker, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// What the host can see, for [`tangent_ui::host::Gesture`] and the aspect lock.
@@ -209,6 +252,7 @@ pub fn publish(
     };
     refresh_curve(height_at, w_floor);
     let hooked = install(&window);
+    adopt_floating(&window);
     Facts {
         gesture: tangent_ui::host::Gesture {
             live_resize: window.inLiveResize(),
@@ -433,6 +477,446 @@ unsafe extern "C-unwind" fn will_resize(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Above the main window, and no higher
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Where a window sits in this app's own hierarchy, as [`adopt_floating`]
+/// finds it. Three states and not a `bool`, because "somebody else's child"
+/// and "nobody's child" are opposite answers: one is hands-off, the other is
+/// the whole job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Parentage {
+    /// `-[NSWindow parentWindow]` is nil.
+    Orphan,
+    /// The main window is its parent, so we adopted it on an earlier frame.
+    Ours,
+    /// Somebody else's child — a sheet's owner, a plugin's own panel.
+    Theirs,
+}
+
+/// What one window looks like to [`adopt_floating`], and everything the
+/// decision is allowed to depend on.
+///
+/// Split out from AppKit on purpose: the decision is the part that can be
+/// wrong in a way nobody notices, and it is the only part a test can reach
+/// without a window server. See [`verdict`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowFacts {
+    /// `-[NSWindow level]`.
+    level: NSWindowLevel,
+    /// `-[NSWindow parentWindow]`, read against the main window.
+    parent: Parentage,
+    /// `-[NSWindow isSheet]` or a non-nil `sheetParent`.
+    sheet: bool,
+    /// This IS the main window.
+    is_main: bool,
+    /// `-[NSWindow isVisible]`.
+    visible: bool,
+    /// This window has just BECOME `-[NSApplication keyWindow]`.
+    ///
+    /// **The arrival and not the state, which is the whole difference.** A
+    /// click is an event; "is key" is a condition that then holds for
+    /// minutes. Acting on the condition would mean re-seating the focused
+    /// face to the front on every frame after it, which would quietly undo
+    /// every promotion the app made in the meantime — the export window
+    /// coming back up a rung under a closing dialog, most of all. Acting on
+    /// the arrival puts a clicked window in front once and then leaves the
+    /// ordering to whoever asks for it next.
+    key_arrived: bool,
+    /// It is already the frontmost of the main window's children, so there is
+    /// nothing to bring forward. `childWindows` is back-to-front, so this is
+    /// its `lastObject`.
+    topmost_child: bool,
+}
+
+/// What to do with one window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Not ours to touch.
+    Leave,
+    /// Floating and unclaimed: adopt it, then put it down.
+    Adopt,
+    /// Ours already, and either floating AGAIN — `shell.rs` promoting it a
+    /// rung — or key while something else is in front of it, which is a click
+    /// AppKit did not act on. Either way: pull it out of the child list and
+    /// put it back at the top, which is the only thing that moves a child.
+    Reseat,
+}
+
+/// **Which windows this app is allowed to adopt, as a pure function.**
+///
+/// Everything here is an exclusion but the last line, and each exclusion is a
+/// way of getting it wrong that would not look like a bug in a screenshot.
+///
+/// **The native file panels are excluded by the LEVEL test, and the reason is
+/// not the one it is natural to assume.** `NSOpenPanel` and `NSSavePanel`
+/// look like they ought to run at `NSModalPanelWindowLevel` — they are
+/// `NSPanel`s and they are modal — and they do not. Measured on this machine
+/// with a twenty-line AppKit program that opens both and prints
+/// `-[NSWindow level]`: a fresh panel, a panel shown modeless (which is the
+/// path `rfd` takes, having no parent window to attach to) and a panel shown
+/// as a sheet are all at `NSNormalWindowLevel`, level 0. So they are below
+/// the floating level, not above it, and "exactly floating" passes over them
+/// either way — but the margin is one rung down rather than five up, which is
+/// worth knowing before somebody widens this to `> NSNormalWindowLevel` and
+/// silently adopts the owner's Open dialog into the main window.
+///
+/// **`Ours` and not floating is `Leave`, and that is the tier ladder.**
+/// `shell.rs` ranks its surfaces by putting the LOWER one DOWN to `Normal`
+/// and leaving the higher one floating — there being no fourth window level
+/// to promote into. So the top rung is the only rung that is ever floating,
+/// the only rung that is ever adopted, and a surface that has been stood down
+/// under a modal question is passed over here exactly as it was before any of
+/// this existed. When the question closes and the render is promoted back,
+/// that promotion is a level change this function CAN see, which is what
+/// [`Verdict::Reseat`] is for: the level command used to do the reordering by
+/// itself, and once the level is being taken away again it has to be done by
+/// hand.
+///
+/// **And the same for a click, because AppKit does not do it.** Measured:
+/// once two windows are children of one parent, their order relative to each
+/// other is frozen at the order they were adopted in. A click on the back one
+/// makes it the key window and leaves it exactly where it was;
+/// `makeKeyAndOrderFront:`, `orderFront:` and `orderWindow:relativeTo:` all
+/// return without moving it. That is a real behaviour lost to the child
+/// relationship — two floating siblings used to reorder on a click like any
+/// other pair of windows — so it is put back here: a child that is KEY and is
+/// not the frontmost child is a click AppKit declined to act on, and it gets
+/// re-seated.
+///
+/// The cost of that, stated plainly: a demoted surface can now be clicked
+/// back in front of the one that outranks it, which a window level would not
+/// have allowed. It takes a deliberate click ON the lower surface to do it,
+/// the higher one is one click from returning, and the app's own `raise`
+/// still comes through as a level change and re-seats. Weighed against a face
+/// that will not come forward when it is clicked, which happens every time
+/// two of them overlap, this is the better failure.
+fn verdict(w: WindowFacts) -> Verdict {
+    // The parent cannot be its own child. There is no other thing this could
+    // mean and AppKit is not the place to find out what it does with it.
+    if w.is_main {
+        return Verdict::Leave;
+    }
+    // A sheet is already bound to a window by a stronger relationship than
+    // this one, and AppKit positions and orders it itself.
+    if w.sheet {
+        return Verdict::Leave;
+    }
+    // Somebody else's child is somebody else's arrangement; re-parenting it
+    // would silently break whatever that arrangement was for.
+    if w.parent == Parentage::Theirs {
+        return Verdict::Leave;
+    }
+    // **Born hidden stays hidden.** `shell.rs` creates every surface
+    // invisible and reveals it a pass later, on purpose — a window that
+    // exists before anything has been drawn into it shows one frame of
+    // undefined back buffer. `addChildWindow:` orders the child IN, measured:
+    // a window that answered `isVisible` NO before the call answers YES
+    // after. So adopting one early would put that undrawn frame on the screen
+    // and undo the whole reason for the delay. It is visible next pass and
+    // adopted then.
+    if !w.visible {
+        return Verdict::Leave;
+    }
+    if w.level == NSFloatingWindowLevel {
+        return if w.parent == Parentage::Ours {
+            Verdict::Reseat
+        } else {
+            Verdict::Adopt
+        };
+    }
+    // Ours, just clicked, and still behind something: the click case above.
+    if w.parent == Parentage::Ours && w.key_arrived && !w.topmost_child {
+        return Verdict::Reseat;
+    }
+    // Not floating and not clicked: a window that never asked to be in front,
+    // one of ours that has been put down under a higher tier, or one of ours
+    // already sitting where it belongs. None of the three wants anything.
+    Verdict::Leave
+}
+
+/// Whether the adoption is armed. `TANGENT_CHILD_WINDOWS=0` disarms it.
+///
+/// The same escape hatch `IVORY_ASPECT_HOOK` is: this is AppKit behaviour on
+/// one person's machine and the honest position is that a rebuild should not
+/// be the only way to back it out. Cached rather than read per frame, because
+/// `std::env::var` allocates and this runs in the draw loop.
+fn adoption_armed() -> bool {
+    thread_local! {
+        static ARMED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    ARMED.with(|a| {
+        if let Some(known) = a.get() {
+            return known;
+        }
+        let armed = std::env::var("TANGENT_CHILD_WINDOWS").as_deref() != Ok("0");
+        a.set(Some(armed));
+        armed
+    })
+}
+
+/// **Make this app's floating windows children of the main window instead.**
+///
+/// Called once a frame from [`publish`], because the level is not something
+/// that is set once: `shell.rs` sends it again on every reveal, on every
+/// raise and on every change of rung, and each of those has to be caught and
+/// converted. Enumerating `NSApp.windows` is a handful of pointer reads on a
+/// list that is four or five long, which is why it can afford to be a sweep
+/// rather than a notification.
+///
+/// # The order of operations is the safety property
+///
+/// The risk in this whole change is a window that gets its level taken away
+/// and does NOT get the child relationship in exchange: that window falls
+/// behind the main window and cannot be got back, which is the exact bug the
+/// floating level was introduced to fix and is worse than the one being fixed
+/// here. So the adoption happens FIRST, its result is read back from AppKit
+/// rather than assumed, and the level is only lowered once `parentWindow` has
+/// actually come back as the main window. A failed adoption therefore leaves
+/// the window floating — today's behaviour, unchanged, in front of the
+/// terminal and all — rather than sinking it. The failure is impossible to
+/// make worse rather than merely unlikely, which is the property worth having
+/// because nobody is watching for it.
+///
+/// # Re-seating is remove-then-re-add, and nothing else works
+///
+/// Measured, because it is not what the API suggests. With two windows
+/// adopted into one parent, `orderFront:`, `makeKeyAndOrderFront:` and
+/// `orderWindow:NSWindowAbove relativeTo:0` all leave their order exactly as
+/// it was — a child's z-order relative to its siblings is fixed at the moment
+/// it is adopted. Re-adding it without removing it first does nothing either;
+/// AppKit sees a child it already has. `removeChildWindow:` followed by
+/// `addChildWindow:ordered:NSWindowAbove` is the one sequence that moves it,
+/// and it does not disturb key status.
+///
+/// The window is parentless for the width of those two calls, which is safe
+/// in a way worth naming: at that instant it is still at the floating level
+/// (that is what asked for the re-seat), so the gap is the pre-fix state, not
+/// a sunken window.
+///
+/// # What this changes that was not asked for
+///
+/// A surface that has been adopted and is LATER put down a rung by
+/// `shell.rs` stays a child, so it stays above the main window instead of
+/// being coverable by it. `shell.rs` records that coverability as a cost of
+/// the ladder ("a press on the main window can put it behind"), not as a
+/// goal, and the ladder's actual intent — the render never covers a question,
+/// an announcement never covers the render — is preserved by `Reseat` pulling
+/// each newly promoted surface back to the front of the sibling group.
+fn adopt_floating(main: &NSWindow) {
+    if !adoption_armed() {
+        return;
+    }
+    // SAFETY-adjacent: `MainThreadMarker::new` is the check, not an
+    // assertion. `publish` is only ever called from eframe's draw, which is
+    // the main thread, and if that ever stops being true this returns rather
+    // than touching AppKit from the wrong one.
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let main_ptr: *const NSWindow = main;
+    let is_main = |w: &NSWindow| std::ptr::eq(std::ptr::from_ref(w), main_ptr);
+    // **The key window as an EDGE.** Held as a bare address that is compared
+    // and never dereferenced, so a window released since the last frame is
+    // harmless: the worst an address reused by a different window can do is
+    // spend or skip one re-seat.
+    thread_local! {
+        static LAST_KEY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let key = app.keyWindow();
+    let key_addr = key
+        .as_ref()
+        .map_or(0, |k| objc2::rc::Retained::as_ptr(k) as usize);
+    let key_is_new = key_addr != 0 && key_addr != LAST_KEY.with(std::cell::Cell::get);
+    LAST_KEY.with(|k| k.set(key_addr));
+    // `childWindows` is back-to-front, so the LAST one is the frontmost.
+    let front_child = main.childWindows().and_then(|c| c.lastObject());
+    let windows = app.windows();
+    for i in 0..windows.count() {
+        let window = windows.objectAtIndex(i);
+        let parent = match window.parentWindow() {
+            None => Parentage::Orphan,
+            Some(p) if is_main(&p) => Parentage::Ours,
+            Some(_) => Parentage::Theirs,
+        };
+        let same = |other: &Option<objc2::rc::Retained<NSWindow>>| {
+            other
+                .as_ref()
+                .is_some_and(|o| std::ptr::eq(objc2::rc::Retained::as_ptr(o), &*window))
+        };
+        let facts = WindowFacts {
+            level: window.level(),
+            parent,
+            // Both, because they answer at different moments: `isSheet` is
+            // the style, `sheetParent` the live attachment.
+            sheet: window.isSheet() || window.sheetParent().is_some(),
+            is_main: is_main(&window),
+            visible: window.isVisible(),
+            key_arrived: key_is_new && same(&key),
+            topmost_child: same(&front_child),
+        };
+        match verdict(facts) {
+            Verdict::Leave => continue,
+            // The only thing that moves a child among its siblings. See the
+            // section above — every gentler ordering call was measured doing
+            // nothing at all.
+            Verdict::Reseat => main.removeChildWindow(&window),
+            Verdict::Adopt => {}
+        }
+        // SAFETY: two live `NSWindow`s on the main thread, neither of which
+        // is the other and neither of which is currently parented. objc2
+        // marks this unsafe for the cycle a window adopted into itself would
+        // make; `verdict` and the `removeChildWindow` above are what rule
+        // that out.
+        unsafe { main.addChildWindow_ordered(&window, NSWindowOrderingMode::Above) };
+        // **Read the answer back before spending the level on it.** This one
+        // line is the difference between a failed adoption leaving the window
+        // where it already was and a failed adoption sinking it behind the
+        // main window with no way back.
+        if window.parentWindow().is_some_and(|p| is_main(&p)) {
+            window.setLevel(NSNormalWindowLevel);
+        }
+    }
+}
+
+#[cfg(test)]
+mod adopt_tests {
+    use super::{verdict, Parentage, Verdict, WindowFacts};
+    use objc2_app_kit::{
+        NSFloatingWindowLevel, NSModalPanelWindowLevel, NSNormalWindowLevel, NSWindowLevel,
+    };
+
+    /// An ordinary visible window of this app at `level`, owned by nobody
+    /// and not holding the keyboard.
+    fn at(level: NSWindowLevel) -> WindowFacts {
+        WindowFacts {
+            level,
+            parent: Parentage::Orphan,
+            sheet: false,
+            is_main: false,
+            visible: true,
+            key_arrived: false,
+            topmost_child: false,
+        }
+    }
+
+    /// The case the whole filter exists for: a face that asked for
+    /// `AlwaysOnTop`, which winit spelt as the floating level.
+    #[test]
+    fn a_floating_face_is_adopted() {
+        assert_eq!(verdict(at(NSFloatingWindowLevel)), Verdict::Adopt);
+    }
+
+    /// **The file panel, which the owner explicitly keeps.** `rfd` shows it
+    /// with no parent to attach to, so it is a plain modeless window and the
+    /// LEVEL is the only thing that excludes it — measured at
+    /// `NSNormalWindowLevel`, not the modal panel level it looks like it
+    /// should be at. Widen the level test and this is what breaks.
+    #[test]
+    fn the_native_file_panel_is_left_alone() {
+        assert_eq!(verdict(at(NSNormalWindowLevel)), Verdict::Leave);
+        assert_eq!(verdict(at(NSModalPanelWindowLevel)), Verdict::Leave);
+    }
+
+    /// A window cannot be its own child, and the main window is the parent.
+    #[test]
+    fn the_main_window_is_never_adopted_into_itself() {
+        for level in [NSNormalWindowLevel, NSFloatingWindowLevel] {
+            let main = WindowFacts { is_main: true, ..at(level) };
+            assert_eq!(verdict(main), Verdict::Leave, "level {level}");
+        }
+    }
+
+    /// A sheet is bound to its window by a stronger relationship than this
+    /// one and AppKit orders it itself.
+    #[test]
+    fn a_sheet_keeps_its_own_owner() {
+        let sheet = WindowFacts { sheet: true, ..at(NSFloatingWindowLevel) };
+        assert_eq!(verdict(sheet), Verdict::Leave);
+    }
+
+    /// Somebody else's arrangement stays somebody else's.
+    #[test]
+    fn another_windows_child_is_not_re_parented() {
+        let theirs = WindowFacts { parent: Parentage::Theirs, ..at(NSFloatingWindowLevel) };
+        assert_eq!(verdict(theirs), Verdict::Leave);
+    }
+
+    /// The idempotence that lets this run every frame: once a window is ours
+    /// and down at the normal level there is nothing left to do to it.
+    #[test]
+    fn an_adopted_window_already_put_down_is_left_alone() {
+        let settled = WindowFacts { parent: Parentage::Ours, ..at(NSNormalWindowLevel) };
+        assert_eq!(verdict(settled), Verdict::Leave);
+    }
+
+    /// A surface `shell.rs` has promoted back up a rung — the export window
+    /// when the modal question above it closes, or any surface the app has
+    /// asked to `raise`. The level command is the only signal that it
+    /// happened, and it has to become a re-seat.
+    #[test]
+    fn an_adopted_window_floated_again_is_reseated() {
+        let promoted = WindowFacts { parent: Parentage::Ours, ..at(NSFloatingWindowLevel) };
+        assert_eq!(verdict(promoted), Verdict::Reseat);
+    }
+
+    /// **A click that AppKit will not act on.** Once two windows are children
+    /// of one parent their order is frozen at the order they were adopted in,
+    /// so clicking the back one makes it key and leaves it behind. Putting it
+    /// back is the only reason this predicate looks at key status at all.
+    #[test]
+    fn a_clicked_child_that_is_still_behind_is_reseated() {
+        let clicked = WindowFacts {
+            parent: Parentage::Ours,
+            key_arrived: true,
+            topmost_child: false,
+            ..at(NSNormalWindowLevel)
+        };
+        assert_eq!(verdict(clicked), Verdict::Reseat);
+    }
+
+    /// And the same child once it is where it belongs — otherwise this would
+    /// tear the child list apart and rebuild it on every single frame the
+    /// user had a face focused.
+    #[test]
+    fn a_clicked_child_already_in_front_is_left_alone() {
+        let settled = WindowFacts {
+            parent: Parentage::Ours,
+            key_arrived: true,
+            topmost_child: true,
+            ..at(NSNormalWindowLevel)
+        };
+        assert_eq!(verdict(settled), Verdict::Leave);
+    }
+
+    /// The key window that is NOT one of ours — the file panel, most of all.
+    /// Key status alone must never be enough to touch a window.
+    #[test]
+    fn a_key_window_we_do_not_own_is_left_alone() {
+        let panel = WindowFacts { key_arrived: true, ..at(NSNormalWindowLevel) };
+        assert_eq!(verdict(panel), Verdict::Leave);
+        let main = WindowFacts { key_arrived: true, is_main: true, ..at(NSNormalWindowLevel) };
+        assert_eq!(verdict(main), Verdict::Leave);
+    }
+
+    /// Born hidden, revealed a pass later. Adopting early would order it in
+    /// and put the undrawn frame on the screen.
+    #[test]
+    fn a_window_that_has_not_been_revealed_yet_waits() {
+        let unborn = WindowFacts { visible: false, ..at(NSFloatingWindowLevel) };
+        assert_eq!(verdict(unborn), Verdict::Leave);
+    }
+
+    /// winit puts a window at `CGShieldingWindowLevel() + 1` for exclusive
+    /// fullscreen. Far above floating, and not ours to argue with.
+    #[test]
+    fn a_fullscreen_shielding_level_is_not_floating() {
+        assert_eq!(verdict(at(NSWindowLevel::MAX)), Verdict::Leave);
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Borderless + maximised
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -476,8 +960,8 @@ pub fn cover_screen(frame: &eframe::Frame) -> bool {
     // SAFETY: `sharedApplication` on the main thread, which is the only
     // thread eframe draws from and therefore the only one that reaches here.
     unsafe {
-        if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
-            let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+        if let Some(mtm) = MainThreadMarker::new() {
+            let app = NSApplication::sharedApplication(mtm);
             app.setPresentationOptions(
                 objc2_app_kit::NSApplicationPresentationOptions::AutoHideDock
                     | objc2_app_kit::NSApplicationPresentationOptions::AutoHideMenuBar,
@@ -500,8 +984,8 @@ pub fn cover_screen(frame: &eframe::Frame) -> bool {
 pub fn uncover_screen() {
     // SAFETY: as `cover_screen`; main thread only.
     unsafe {
-        if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
-            let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+        if let Some(mtm) = MainThreadMarker::new() {
+            let app = NSApplication::sharedApplication(mtm);
             app.setPresentationOptions(
                 objc2_app_kit::NSApplicationPresentationOptions::Default,
             );
