@@ -17,11 +17,29 @@
 //! low end is where out-of-phase energy costs the most — a cutting lathe
 //! rejects it and a subwoofer sums it to cancellation — and every mastering
 //! chain wants it gone without touching the image above. **Ensemble**
-//! manufactures decorrelated side energy from what is already there, by a
-//! sparse velvet-noise convolution — width for material that has no side to
-//! widen, without a detuned pitch or a comb.
+//! manufactures decorrelated side energy out of the MID, by a sparse
+//! velvet-noise convolution — width for material that has no side to widen,
+//! without a detuned pitch or a comb.
+//!
+//! # Why the ensemble is fed the mid, which is the whole reason it works
+//!
+//! Most of what this unit is pointed at is one microphone. A mono source
+//! reaches the desk as `L == R` — `mix_channels` says so in as many words,
+//! "a mono input goes to both sides" — and a pair with `L == R` has a side of
+//! exactly zero. Width scaling zero is zero, the floor folding zero is zero,
+//! and an ensemble convolving zero is zero: on the commonest material in the
+//! app EVERY control here was arithmetically a wire, and the vectorscope drew
+//! the vertical line to prove it.
+//!
+//! So the decorrelator is fed the mid. The mid is the one thing present on
+//! every record, mono or wide, and building the side out of it costs the
+//! guarantee above nothing: the output is `M ± S'` whatever `S'` was made
+//! from, so inventing a side cannot move the fold. Feeding the velvet the
+//! side instead — the signal the control exists to CREATE — was a circular
+//! definition that happened to be non-zero only on material that did not need
+//! the control.
 
-use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_2, PI};
+use std::f32::consts::{FRAC_1_SQRT_2, PI};
 
 // ── what a person can change ────────────────────────────────────────────────
 
@@ -51,8 +69,12 @@ pub struct ImagerParams {
     /// Side gain across [`WIDTH_GAIN`]. 0.5 is unity — the shipped position,
     /// and a perfect null.
     pub width: f32,
-    /// Dry-to-decorrelated crossfade on the side. 0 is the record as it came;
-    /// 1 is all velvet. See [`VELVET_DENSITY_HZ`] for what the velvet is.
+    /// How much manufactured side to ADD to whatever the record already had.
+    /// 0 is the record as it came; 1 puts a decorrelated copy of the mid
+    /// alongside the mid at the mid's own level, which is a correlation of
+    /// zero — the widest a pair can be and still fold to mono untouched. The
+    /// dial in between is linear in that correlation reading, not in gain;
+    /// see [`ensemble_law`]. [`VELVET_DENSITY_HZ`] is what the velvet is.
     pub ensemble: f32,
     /// The mono floor: 0 is off, the rest sweeps the corner across
     /// [`MONO_BELOW_HZ`]. Below the corner the side is collapsed; the mid is
@@ -136,6 +158,27 @@ const VELVET_TAIL_DB: f64 = 24.0;
 /// speakers of an A/B never disagree about what "ensemble" means.
 const VELVET_SEED: u32 = 0x1DEA_5EED;
 
+/// The ensemble dial's taper: the gain on the manufactured side, given the
+/// knob.
+///
+/// **The dial is linear in the CORRELATION METER, not in gain**, because the
+/// correlation meter is the number the panel prints under the goniometer and
+/// a knob whose reading moves in equal steps is a knob somebody can aim. For
+/// a mid `M` and a manufactured side `kM` that is decorrelated from it, the
+/// meter reads `(1 − k²) / (1 + k²)`; asking that to equal `1 − e` and
+/// solving for `k` gives this. It lands where the ends have to land — nothing
+/// at 0, unity at 1 — and walks +1.00, +0.75, +0.50, +0.25, 0.00 across the
+/// quarters in between.
+///
+/// A quarter-sine would have been the equal-power crossfade this control used
+/// to be, and it is the wrong law now: there is no crossfade left to keep
+/// constant, and it overshoots the correlation it should be reading by 0.17
+/// in the middle of the travel.
+#[inline]
+fn ensemble_law(e: f32) -> f32 {
+    (e / (2.0 - e)).sqrt()
+}
+
 /// One sparse-FIR tap: where to read, and the signed, envelope-weighted gain.
 ///
 /// The sign rides inside the gain, so the per-sample work is exactly one
@@ -192,10 +235,17 @@ fn flush(x: f32) -> f32 {
 ///
 /// # The ensemble
 ///
-/// The side is convolved with the velvet kernel and crossfaded against the
-/// dry side with equal-POWER gains, because dry and velvet are decorrelated
-/// by design: their powers add, so a constant-voltage fade would dip 3 dB in
-/// the middle of the dial.
+/// The MID is convolved with the velvet kernel and the result is ADDED to
+/// whatever side the record already had, at [`ensemble_law`]'s gain. Two
+/// decisions there, and the module header argues the first at length: the
+/// velvet is fed the mid because a mono source has no side to feed it, and
+/// the manufactured side is added rather than crossfaded against the real one
+/// because a mastering widener may not throw away the image it was given.
+///
+/// The kernel's unit energy is what makes the top of the dial mean something:
+/// a decorrelated copy of the mid, at the mid's own power, is a correlation of
+/// exactly zero. Nothing about the mono fold changes on the way — the output
+/// is still `M ± S'` — so the widest setting is still free to fold.
 ///
 /// # Order of operations
 ///
@@ -205,8 +255,8 @@ fn flush(x: f32) -> f32 {
 /// the unit, velvet included, not just of what entered it.
 pub struct Imager {
     sample_rate: f32,
-    /// The velvet's view of the recent side signal. Written every sample,
-    /// read only while the ensemble is in circuit.
+    /// The velvet's view of the recent MID. Written every sample, read only
+    /// while the ensemble is in circuit.
     ring: Vec<f32>,
     at: usize,
     taps: [VelvetTap; VELVET_TAPS],
@@ -314,12 +364,7 @@ impl Imager {
         let s_gain = WIDTH_GAIN.0 + (WIDTH_GAIN.1 - WIDTH_GAIN.0) * p.width;
 
         let wet_on = p.ensemble >= OFF;
-        let (dry_g, wet_g) = if wet_on {
-            let a = p.ensemble * FRAC_PI_2;
-            (a.cos(), a.sin())
-        } else {
-            (1.0, 0.0)
-        };
+        let wet_g = if wet_on { ensemble_law(p.ensemble) } else { 0.0 };
 
         // The corner steps from "off" straight to 60 Hz, and that is fine: a
         // 60 Hz first-order fold is the smallest move this dial can make.
@@ -338,9 +383,12 @@ impl Imager {
             let m = 0.5 * (l + r);
             let s = 0.5 * (l - r);
 
-            // The ring is fed even while the ensemble is out of circuit, so
-            // the dial arrives on a warm kernel instead of a fade-in.
-            self.ring[self.at] = flush(s);
+            // **The MID goes on the ring, not the side.** See the module
+            // header: the side is what the ensemble is for MAKING, and on the
+            // mono program this unit mostly meets there is none to convolve.
+            // Fed even while the ensemble is out of circuit, so the dial
+            // arrives on a warm kernel instead of a fade-in.
+            self.ring[self.at] = flush(m);
 
             let mut side = s;
             if wet_on {
@@ -353,7 +401,10 @@ impl Imager {
                     };
                     velvet += t.gain * self.ring[i];
                 }
-                side = dry_g * s + wet_g * velvet;
+                // Added, not crossfaded: whatever image the record arrived
+                // with is the one the mix already approved, and a widener
+                // that swaps it for a synthetic one is a different unit.
+                side = s + wet_g * velvet;
             }
             if fold_on {
                 // TPT one-pole lowpass; the high band is the complement.
@@ -873,5 +924,179 @@ mod tests {
             "an old side tail came back after clear: {}",
             peak(&quiet)
         );
+    }
+
+    /// One microphone, arriving on both sides exactly as `mix_channels`
+    /// sends it — "a mono input goes to both sides". `L == R`, so `S` is
+    /// identically zero, which is the material this unit is most often
+    /// pointed at and the material it was silently a wire on.
+    fn one_microphone(seed: u32, frames: usize) -> Vec<f32> {
+        let mut s = seed;
+        (0..frames)
+            .flat_map(|_| {
+                let v = 1.6 * rand(&mut s);
+                [v, v]
+            })
+            .collect()
+    }
+
+    /// What the panel's meter would read of a finished buffer, through the
+    /// module's own meter rather than a second implementation.
+    fn correlation(buf: &[f32]) -> f32 {
+        let mut meter = CorrelationMeter::new(SR);
+        meter.feed(buf, buf.len() / 2, 2);
+        meter.read()
+    }
+
+    /// The side-to-mid amplitude ratio the goniometer draws as width.
+    fn side_over_mid(buf: &[f32]) -> f64 {
+        rms(&sides(buf)) / rms(&mids(buf)).max(1.0e-12)
+    }
+
+    /// **The fault a demo session found: on a single microphone every
+    /// control on this unit was a wire.**
+    ///
+    /// A mono source reaches the desk as `L == R`, so the side it carries is
+    /// exactly zero. Width scaled that zero, the floor folded it, and the
+    /// ensemble — the one control whose whole charter is "width for material
+    /// that has no side to widen" — was convolving the very signal it exists
+    /// to manufacture, so it too returned zero. Three dead knobs and a
+    /// vectorscope drawing a vertical line, from one arithmetic mistake.
+    ///
+    /// The claim: with the ensemble open the image widens, monotonely, and
+    /// the width knob then has something to scale.
+    #[test]
+    fn one_microphone_can_still_be_widened_and_the_meter_says_so() {
+        const FRAMES: usize = 48_000;
+        let input = one_microphone(0xB0A7_1DEA, FRAMES);
+        assert!(
+            rms(&sides(&input)) < 1.0e-12,
+            "the test's own source is not mono"
+        );
+
+        // The ensemble, quarter by quarter: side energy appears out of the
+        // mid and the correlation walks down from +1.
+        let mut last = (-1.0_f64, 2.0_f32);
+        for step in 0..=4 {
+            let ensemble = step as f32 / 4.0;
+            let mut out = input.clone();
+            Imager::new(SR).process(
+                &mut out,
+                FRAMES,
+                2,
+                &ImagerParams {
+                    ensemble,
+                    ..ImagerParams::default()
+                },
+            );
+            let (ratio, corr) = (side_over_mid(&out), correlation(&out));
+            assert!(
+                ratio > last.0 + 0.05 || step == 0,
+                "ensemble {ensemble} widened no further than the step below \
+                 it: {ratio:.3} after {:.3}",
+                last.0
+            );
+            assert!(
+                corr < last.1 - 0.05 || step == 0,
+                "ensemble {ensemble} left the correlation at {corr:.3}, \
+                 after {:.3}",
+                last.1
+            );
+            // The dial is linear in CORRELATION, which is the reading the
+            // panel prints: half the dial is half the way to zero.
+            assert!(
+                (corr - (1.0 - ensemble)).abs() < 0.06,
+                "ensemble {ensemble} read {corr:.3}, not {:.3}",
+                1.0 - ensemble
+            );
+            last = (ratio, corr);
+        }
+
+        // And now the width knob has something to scale. Full ensemble puts
+        // the manufactured side at the mid's own level, so the ratio walks
+        // 0, 1, 2 across the dial and the correlation follows it through
+        // zero and out the anti-phase side.
+        let mut last = (-1.0_f64, 2.0_f32);
+        for width in [0.0_f32, 0.5, 1.0] {
+            let mut out = input.clone();
+            Imager::new(SR).process(
+                &mut out,
+                FRAMES,
+                2,
+                &ImagerParams {
+                    width,
+                    ensemble: 1.0,
+                    ..ImagerParams::default()
+                },
+            );
+            let (ratio, corr) = (side_over_mid(&out), correlation(&out));
+            let want = 2.0 * f64::from(width);
+            assert!(
+                (ratio - want).abs() < 0.1,
+                "width {width} on a widened microphone read {ratio:.3}, \
+                 not {want:.3}"
+            );
+            assert!(
+                ratio > last.0 + 0.5 && corr < last.1 - 0.2,
+                "width {width} did not widen past the step below it: \
+                 ratio {ratio:.3} after {:.3}, correlation {corr:.3} after {:.3}",
+                last.0,
+                last.1
+            );
+            last = (ratio, corr);
+        }
+    }
+
+    /// The other end of the same sweep: an ANTI-correlated pair, which is
+    /// all side and no mid. Width is the only thing that can act on it, the
+    /// ratio is unbounded so the side's own level is what is measured, and
+    /// the mid must stay empty — a widener may not invent a centre.
+    #[test]
+    fn an_anti_correlated_pair_answers_the_width_knob_alone() {
+        const FRAMES: usize = 48_000;
+        let mut s = 0x5EED_1E55_u32;
+        let input: Vec<f32> = (0..FRAMES)
+            .flat_map(|_| {
+                let v = 1.6 * rand(&mut s);
+                [v, -v]
+            })
+            .collect();
+        let reference = rms(&sides(&input));
+
+        let mut last = -1.0_f64;
+        for width in [0.0_f32, 0.5, 1.0] {
+            let mut out = input.clone();
+            Imager::new(SR).process(
+                &mut out,
+                FRAMES,
+                2,
+                &ImagerParams {
+                    width,
+                    ..ImagerParams::default()
+                },
+            );
+            let level = rms(&sides(&out)) / reference;
+            let want = 2.0 * f64::from(width);
+            assert!(
+                (level - want).abs() < 1.0e-3,
+                "width {width} scaled a pure-side pair by {level:.4}, not {want}"
+            );
+            assert!(level >= last, "width {width} narrowed the image");
+            last = level;
+
+            assert!(
+                peak(&mids(&out)) < 1.0e-6,
+                "width {width} invented a centre on a pure-side pair"
+            );
+            // The meter agrees with the arithmetic at both ends: pure side
+            // is −1, and the collapsed end has no opinion because there is
+            // no signal left to have one about.
+            let corr = correlation(&out);
+            let want_corr = if width < OFF { 0.0 } else { -1.0 };
+            assert!(
+                (corr - want_corr).abs() < 1.0e-3,
+                "width {width} read {corr:.4}, not {want_corr}"
+            );
+        }
     }
 }

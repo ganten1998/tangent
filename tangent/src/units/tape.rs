@@ -54,7 +54,9 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TapeParams {
     /// Record level into the saturation, and with it how hard the
-    /// self-erasure leans on attacks. 0.5 is clean; see [`DRIVE_TANH`].
+    /// self-erasure leans on attacks. **0 is the wire** — a record level's
+    /// "off" is the bottom of its travel, not the middle of it — and the
+    /// shipped 0.6 is the machine at a healthy 0 VU. See [`DRIVE_TANH`].
     pub drive: f32,
     /// How much head bump. 0 is flat; see [`BUMP_DB`].
     pub bump: f32,
@@ -99,15 +101,39 @@ const DESIGN_RATE: f32 = 44_100.0;
 
 /// The tanh drive factor at each end of the knob, swept geometrically.
 ///
-/// **The knob's midpoint is the calibrated machine.** `tanh(d·x)/d` has
-/// small-signal gain of exactly one at any `d`, so `drive` never changes the
-/// level of quiet material — it moves where the rounding starts. At 0.5 the
-/// factor is ~0.63 and a full-scale peak loses under half a decibel; at 1.0
-/// it is 4 and the machine is being slammed. Bias is why the curve is a
-/// smooth tanh at all: an unbiased head has a dead zone at the origin and
-/// crossover fuzz, and the AC bias that every mastering engineer calibrated
-/// is precisely the linearisation that leaves only this compression behind.
-const DRIVE_TANH: (f32, f32) = (0.1, 4.0);
+/// **`d` is the record level, and it is easiest to read as where the tape
+/// saturates.** `tanh(d·x)/d` is exactly "gain up by `d`, into a fixed tape
+/// characteristic, and back down by `d`" — the record amplifier and the repro
+/// trim of a real machine, in one expression — so its small-signal gain is one
+/// at any setting and the knob never doubles as a volume control. The tape's
+/// shoulder sits at `x ≈ 1/d`: at the bottom of the travel that is +20 dBFS,
+/// which nothing can reach, and at the top it is −26 dBFS, which is under
+/// where a track's BODY sits. Bias is why the curve is a smooth tanh at all:
+/// an unbiased head has a dead zone at the origin and crossover fuzz, and the
+/// AC bias every mastering engineer calibrated is precisely the linearisation
+/// that leaves only this compression behind.
+///
+/// # Why the top is 20 and not 4
+///
+/// It was 4, and at 4 the knob was a control that measured live and sounded
+/// dead. A DAW track does not arrive at full scale; alignment puts 0 VU at
+/// −18 dBFS, so a healthy body is an amplitude near 0.126, and against that a
+/// factor of 4 is a shoulder the signal never reaches. Measured end to end on
+/// a −20 dBFS tone the old knob ran from 0.001 % distortion to 0.96 %, with
+/// three quarters of its travel under 0.15 %, and the self-erasure it is
+/// supposed to drive tilted 8 kHz against 200 Hz by 0.8 dB at the very top —
+/// measurably wired, audibly nothing, which is the worst of the three ways a
+/// control can be broken. Every test in this module drove the unit at −6 dBFS
+/// or hotter, where the knob DID work, so nothing here saw it.
+///
+/// The bottom of the travel is untouched, so "0 is a wire" still means what it
+/// said. The top now reaches the saturation the unit is named after at the
+/// level people actually record at: the same sweep runs to 17 % and tilts the
+/// band by 8 dB, the shipped position rounds a −6 dBFS peak by several percent
+/// and pulls its top to around 4 kHz while leaving the body alone, and full
+/// travel is a machine being slammed. Output level is what [`TRIM_DB`] is for,
+/// and the module header says as much.
+const DRIVE_TANH: (f32, f32) = (0.1, 20.0);
 
 /// How much of the flux the tape refused comes back at the next sample.
 ///
@@ -197,7 +223,7 @@ const SCRAPE_BAND_HZ: (f32, f32) = (800.0, 3_000.0);
 /// the knob's midpoint reproduces; full travel doubles it for effect.
 const BUMP_HZ: f64 = 70.0;
 const BUMP_Q: f64 = 1.1;
-const BUMP_DB: (f32, f32) = (0.0, 5.0);
+pub const BUMP_DB: (f32, f32) = (0.0, 5.0);
 
 /// The repro HF roll, as a one-pole corner swept geometrically.
 ///
@@ -205,7 +231,7 @@ const BUMP_DB: (f32, f32) = (0.0, 5.0);
 /// Zero is out of circuit; the default parks the corner just under 16 kHz,
 /// which is where this machine's own response quietly stops; full travel is
 /// a worn head that never saw a cotton swab.
-const ROLL_HZ: (f32, f32) = (20_000.0, 2_500.0);
+pub const ROLL_HZ: (f32, f32) = (20_000.0, 2_500.0);
 
 /// The hiss shaper: three one-pole corners in hertz and their injection
 /// gains, plus a direct white term.
@@ -235,7 +261,7 @@ const HISS_ATTACK_MS: f32 = 10.0;
 const HISS_RELEASE_MS: f32 = 300.0;
 
 /// Output trim, in dB across the knob. Midpoint is exactly unity.
-const TRIM_DB: (f32, f32) = (-12.0, 12.0);
+pub const TRIM_DB: (f32, f32) = (-12.0, 12.0);
 
 // ── small parts ─────────────────────────────────────────────────────────────
 
@@ -790,8 +816,13 @@ mod tests {
             })
             .collect();
         let input = to_stereo(&mono);
+        // **Drive at the BOTTOM, not the middle.** It is a record level, and
+        // a record level's off is the end of its travel — the same place
+        // every other knob here parks. This used to read 0.5 and pass only
+        // because the drive's top was too low to matter at 0.5; see
+        // [`DRIVE_TANH`].
         let p = TapeParams {
-            drive: 0.5,
+            drive: 0.0,
             bump: 0.0,
             roll: 0.0,
             wobble: 0.0,
@@ -832,8 +863,13 @@ mod tests {
             })
             .collect();
         let input = to_stereo(&mono);
+        // Half travel, on a −6 dBFS attack. The knob used to read 0.7 here
+        // and it is the SAME record level: [`DRIVE_TANH`]'s top moved from 4
+        // to 20, so the factor that used to sit at 0.7 now sits just under
+        // half. The claim being measured is about the erasure, not about the
+        // dial, so the operating point is what had to be preserved.
         let p = TapeParams {
-            drive: 0.7,
+            drive: 0.5,
             bump: 0.0,
             roll: 0.0,
             wobble: 0.0,
@@ -1171,5 +1207,181 @@ mod tests {
             spread < 0.4,
             "the roll moved by {spread:.2} dB across sample rates"
         );
+    }
+
+    /// Total harmonic distortion of a 220 Hz tone, as a fraction of the
+    /// fundamental. Harmonics 2 through 7; anything above that is under the
+    /// measurement's own noise.
+    fn thd(out: &[f32], sr: f32) -> f64 {
+        let f1 = band(out, sr.into(), 220.0);
+        let rest: f64 = (2..=7)
+            .map(|h| band(out, sr.into(), 220.0 * f64::from(h)).powi(2))
+            .sum();
+        rest.sqrt() / f1.max(1.0e-12)
+    }
+
+    /// **The knob that measured live and sounded dead.**
+    ///
+    /// Every test above drives this unit at −6 dBFS or hotter, and at those
+    /// levels the old drive knob worked. A DAW track is not at −6 dBFS: the
+    /// alignment every meter in this app is built around puts 0 VU at −18, so
+    /// the level to prove a saturator at is the one a person actually records.
+    /// Swept end to end against a −18 dBFS tone the old knob ran from 0.001 %
+    /// distortion to about 1.5 %, three quarters of that in the last eighth of
+    /// the travel, and barely moved the self-erasure corner at all —
+    /// measurably wired, audibly nothing, which is exactly what the owner
+    /// reported and what no existing test could see.
+    ///
+    /// So the claim is pinned where it can be heard: at a level people
+    /// record at, the bottom of the dial is a wire, the middle is a machine
+    /// running clean, and the top is saturating AND dulling — the two halves
+    /// of tape, both of them, at once.
+    #[test]
+    fn the_drive_knob_saturates_at_the_level_people_actually_record_at() {
+        let sr = 48_000.0_f32;
+        let frames = (sr * 1.0) as usize;
+        // −18 dBFS peak. Quiet, deliberately: if the knob works here it
+        // works on everything louder.
+        const NOMINAL: f32 = 0.126;
+        let clean = TapeParams {
+            bump: 0.0,
+            roll: 0.0,
+            wobble: 0.0,
+            hiss: 0.0,
+            trim: 0.5,
+            ..TapeParams::default()
+        };
+        let measure = |drive: f32| -> f64 {
+            let mono: Vec<f32> = (0..frames)
+                .map(|i| NOMINAL * (std::f32::consts::TAU * 220.0 * i as f32 / sr).sin())
+                .collect();
+            let out = left(&feed(
+                &mut Tape::new(sr),
+                &to_stereo(&mono),
+                &TapeParams { drive, ..clean },
+            ));
+            let (lo, hi) = ((sr * 0.3) as usize, (sr * 0.95) as usize);
+            thd(&out[lo..hi], sr)
+        };
+
+        let off = measure(0.0);
+        let noon = measure(0.5);
+        let slammed = measure(1.0);
+        assert!(
+            off < 1.0e-4,
+            "the bottom of the drive dial is not a wire: {:.4} % THD",
+            off * 100.0
+        );
+        assert!(
+            (5.0e-4..2.0e-2).contains(&noon),
+            "half travel reads {:.3} % THD — a clean machine is a few tenths \
+             of a percent, not silence and not fuzz",
+            noon * 100.0
+        );
+        assert!(
+            slammed > 0.05,
+            "full drive on a −18 dBFS track reads only {:.2} % THD — the knob \
+             does not reach the tape",
+            slammed * 100.0
+        );
+        assert!(
+            noon > off * 10.0 && slammed > noon * 10.0,
+            "the dial does not climb: {off:.6}, {noon:.6}, {slammed:.6}"
+        );
+
+        // And the other half of tape, at the same level: the top of the band
+        // goes before the bottom does. A gain element cannot do this, which
+        // is the whole argument of the module header.
+        let two_tone: Vec<f32> = (0..frames)
+            .map(|i| {
+                let t = i as f32 / sr;
+                NOMINAL * 0.5 * (std::f32::consts::TAU * 200.0 * t).sin()
+                    + NOMINAL * 0.5 * (std::f32::consts::TAU * 8_000.0 * t).sin()
+            })
+            .collect();
+        let tilt = |drive: f32| -> f64 {
+            let out = left(&feed(
+                &mut Tape::new(sr),
+                &to_stereo(&two_tone),
+                &TapeParams { drive, ..clean },
+            ));
+            let (lo, hi) = ((sr * 0.3) as usize, (sr * 0.95) as usize);
+            let at = |hz: f64| {
+                db(band(&out[lo..hi], sr.into(), hz) / band(&two_tone[lo..hi], sr.into(), hz))
+            };
+            at(8_000.0) - at(200.0)
+        };
+        assert!(
+            tilt(0.0).abs() < 0.5,
+            "the bottom of the dial already tilts the band by {:.2} dB",
+            tilt(0.0)
+        );
+        assert!(
+            tilt(1.0) < -3.0,
+            "full drive on a −18 dBFS track tilts 8 kHz against 200 Hz by \
+             only {:.2} dB — the self-erasure never leaves the ultrasonics",
+            tilt(1.0)
+        );
+    }
+
+    /// **No knob on this unit may be a decoration.**
+    ///
+    /// The generic net under the five specific tests above: sweep each
+    /// control from the shipped setting to each end of its travel and demand
+    /// that the OUTPUT moves — not that the parameter was stored, which is
+    /// what a field assignment proves and what a dead control also passes.
+    ///
+    /// The floors are measured, one per knob, a few decibels under what each
+    /// actually delivers, because "moves at all" is too weak a bar: a knob
+    /// that lost nine tenths of its authority to a mapping change would sail
+    /// through a shared threshold. They are difference energy against the
+    /// program, so a knob that only re-times the signal (wobble) scores as
+    /// loudly as one that changes its level.
+    #[test]
+    fn every_knob_changes_the_sound_and_by_how_much_is_pinned() {
+        let sr = 48_000.0_f32;
+        let frames = (sr * 1.5) as usize;
+        let mut seed = 0x2B1D_F00D_u32;
+        // Broadband at −12 dBFS: something for every knob to act on.
+        let mono: Vec<f32> = (0..frames).map(|_| 0.25 * white(&mut seed)).collect();
+        let input = to_stereo(&mono);
+
+        // symbol, what it does, and the floor in dB relative to the program.
+        let knobs: [(&str, fn(&mut TapeParams, f32), f64); 6] = [
+            ("drive", |p, v| p.drive = v, -6.0),
+            // A 70 Hz peak is a thin slice of broadband noise; the bump's
+            // own size is pinned in hertz by the sample-rate test.
+            ("bump", |p, v| p.bump = v, -30.0),
+            ("roll", |p, v| p.roll = v, -8.0),
+            ("wobble", |p, v| p.wobble = v, -3.0),
+            // Hiss is meant to sit under the music. Its shape and its
+            // ducking are pinned by their own test; this only says it is
+            // there.
+            ("hiss", |p, v| p.hiss = v, -42.0),
+            ("trim", |p, v| p.trim = v, 0.0),
+        ];
+
+        let shipped = feed(&mut Tape::new(sr), &input, &TapeParams::default());
+        let (lo, hi) = ((sr * 0.4) as usize * 2, (sr * 1.4) as usize * 2);
+        for (name, set, floor) in knobs {
+            let mut best = f64::MIN;
+            for end in [0.0_f32, 1.0] {
+                let mut p = TapeParams::default();
+                set(&mut p, end);
+                let moved = feed(&mut Tape::new(sr), &input, &p);
+                let diff: f64 = shipped[lo..hi]
+                    .iter()
+                    .zip(&moved[lo..hi])
+                    .map(|(a, b)| f64::from(*a - *b).powi(2))
+                    .sum();
+                let program: f64 = shipped[lo..hi].iter().map(|a| f64::from(*a).powi(2)).sum();
+                best = best.max(db((diff / program).sqrt()));
+            }
+            assert!(
+                best > floor,
+                "{name} moved the output by only {best:.2} dB from the shipped \
+                 setting — it is wired to nothing a person could hear"
+            );
+        }
     }
 }
