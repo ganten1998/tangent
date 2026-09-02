@@ -40412,3 +40412,49 @@ mod aspect_snap_tests {
         assert!(got.y > 0.0 && got.y.is_finite());
     }
 }
+
+#[cfg(test)]
+mod dirty_cost_probe {
+    use super::*;
+
+    /// Throwaway probe: what does one `project_dirty()` cost on a real-sized
+    /// session? Ignored by default; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn what_does_the_title_pay_every_frame() {
+        let ctx = egui::Context::default();
+        let mut app = TangentApp::new(&ctx, crate::settings::Settings::default(), crate::host::Caps::DESKTOP);
+        for lane in 0..8usize {
+            for c in 0..16usize {
+                let mut clip = crate::arrangement::ArrClip {
+                    lane,
+                    start_s: c as f64 * 4.0,
+                    len_s: 4.0,
+                    ..Default::default()
+                };
+                for n in 0..64u32 {
+                    clip.notes.push(crate::arrangement::ArrNote {
+                        at_s: f64::from(n) * 0.0625,
+                        dur_s: 0.05,
+                        key: 36 + (n % 36) as u8,
+                        vel: 100,
+                    });
+                }
+                app.arrangement.clips.push(clip);
+            }
+        }
+        let notes: usize = app.arrangement.clips.iter().map(|c| c.notes.len()).sum();
+        let t = std::time::Instant::now();
+        let n = 60;
+        for _ in 0..n {
+            std::hint::black_box(app.project_dirty());
+        }
+        let per = t.elapsed() / n;
+        println!(
+            "{} clips / {notes} notes -> project_dirty = {:?} per call, {:.1}% of a 16.6ms frame",
+            app.arrangement.clips.len(),
+            per,
+            per.as_secs_f64() / 0.0166 * 100.0
+        );
+    }
+}
