@@ -1175,6 +1175,25 @@ impl Instance {
         &self.audio_in
     }
 
+    /// The input bus a sidechain key belongs in, if this plugin has one: the
+    /// FIRST bus past the main whose metadata says aux with real channels.
+    ///
+    /// Consulted from [`Bus`] — `read_buses`' record — and not from the
+    /// scratch's `AudioBusBuffers`, which lost the aux flag; the
+    /// `channels > 0` guard is what excludes the `getBusInfo`-failed
+    /// placeholder, so an unreadable bus can never be fed somebody's key.
+    /// Bus 0 is skipped even if it claims aux, because `bind_inputs`
+    /// unconditionally feeds it the main signal: offering it as a key slot
+    /// would silently double-book it.
+    pub fn key_input_bus(&self) -> Option<usize> {
+        self.audio_in
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, b)| b.aux && b.channels > 0)
+            .map(|(i, _)| i)
+    }
+
     /// Run a block THROUGH the plugin: audio in, audio out.
     ///
     /// **The effect path, and the only one that fills `ProcessData::inputs`.**
@@ -1192,7 +1211,7 @@ impl Instance {
         frames: usize,
         out: &mut [Vec<f32>],
     ) -> Result<usize, String> {
-        self.process_through(&[], &[], &[], input, frames, out)
+        self.process_through(&[], &[], &[], input, &[], frames, out)
             .map(|r| r.frames)
     }
 
@@ -1208,7 +1227,28 @@ impl Instance {
         frames: usize,
         out: &mut [Vec<f32>],
     ) -> Result<usize, String> {
-        self.process_through(&[], &[], params, input, frames, out)
+        self.process_through(&[], &[], params, input, &[], frames, out)
+            .map(|r| r.frames)
+    }
+
+    /// The effect path with automation AND **a sidechain key for this
+    /// block** — one planar pair for the bus [`Instance::key_input_bus`]
+    /// names. A plugin without such a bus processes exactly as
+    /// [`Instance::process_effect_automated`] would: the key is simply
+    /// never bound anywhere.
+    ///
+    /// A separate entry, on `process_with_automation`'s own precedent: only
+    /// the one keyed rack call carries a key, and threading `&[]` through
+    /// every other caller is that many chances to feed the wrong one.
+    pub fn process_effect_keyed(
+        &mut self,
+        input: &[Vec<f32>],
+        params: &[ParamPoint],
+        frames: usize,
+        out: &mut [Vec<f32>],
+        key: &[Vec<f32>],
+    ) -> Result<usize, String> {
+        self.process_through(&[], &[], params, input, key, frames, out)
             .map(|r| r.frames)
     }
 
@@ -1463,7 +1503,7 @@ impl Instance {
         frames: usize,
         out: &mut [Vec<f32>],
     ) -> Result<Rendered, String> {
-        self.process_through(events, controls, &[], &[], frames, out)
+        self.process_through(events, controls, &[], &[], &[], frames, out)
     }
 
     /// The same, plus **parameter automation for this block**.
@@ -1479,7 +1519,7 @@ impl Instance {
         frames: usize,
         out: &mut [Vec<f32>],
     ) -> Result<Rendered, String> {
-        self.process_through(events, controls, params, &[], frames, out)
+        self.process_through(events, controls, params, &[], &[], frames, out)
     }
 
     /// The one `process` call. Notes, controls, audio in, audio out.
@@ -1494,6 +1534,12 @@ impl Instance {
         controls: &[Control],
         params: &[ParamPoint],
         input: &[Vec<f32>],
+        // The block's sidechain, or empty for the six callers that have
+        // none. An ARGUMENT and not a field set per call, deliberately: a
+        // field is state somebody forgets to clear, and a stale key feeding
+        // the next unkeyed block is exactly the silent class of bug the
+        // insert plumbing keeps having to unlearn.
+        key: &[Vec<f32>],
         frames: usize,
         out: &mut [Vec<f32>],
     ) -> Result<Rendered, String> {
@@ -1602,9 +1648,14 @@ impl Instance {
         // Last, deliberately: `bind` hands back a raw pointer into the scratch
         // and nothing may take `&mut self` between here and `process`.
         let (outputs, bus_count) = self.scratch.bind(channels, frames, out);
+        // Which bus the key lands in — resolved from the Bus metadata only
+        // when a key was actually handed over, so the six keyless callers
+        // never pay the scan. A key with no bus to take it is dropped here,
+        // silently and correctly: the plugin never asked for one.
+        let key_bus = if key.is_empty() { None } else { self.key_input_bus() };
         // **Bound after the outputs**, and both point into the same scratch:
         // nothing may take `&mut self` between here and `process`.
-        let (inputs, in_count) = self.scratch.bind_inputs(input, frames);
+        let (inputs, in_count) = self.scratch.bind_inputs(input, key, key_bus, frames);
 
         let mut data = ProcessData {
             processMode: ProcessModes_::kRealtime as i32,
@@ -2208,7 +2259,17 @@ impl Scratch {
     /// Allocates nothing and cannot panic: every index goes through `get`, and
     /// the scratch was sized from the bus layout before the audio thread ever
     /// saw this instance.
-    fn bind_inputs(&mut self, input: &[Vec<f32>], frames: usize) -> (*mut AudioBusBuffers, usize) {
+    fn bind_inputs(
+        &mut self,
+        input: &[Vec<f32>],
+        // The sidechain's planar pair, and which bus it belongs in — the
+        // caller resolved the bus from the `Bus` metadata (`key_input_bus`),
+        // because this scratch's `AudioBusBuffers` lost the aux flag at
+        // construction and cannot tell a second main from a side-chain.
+        key: &[Vec<f32>],
+        key_bus: Option<usize>,
+        frames: usize,
+    ) -> (*mut AudioBusBuffers, usize) {
         if self.in_buses.is_empty() {
             return (std::ptr::null_mut(), 0);
         }
@@ -2224,11 +2285,17 @@ impl Scratch {
                 // **The last channel repeats.** Mono into a stereo reverb is
                 // the ordinary case; the alternative is silence down one side,
                 // which sounds like a broken plugin rather than a mono source.
-                // Only the FIRST bus is fed at all — the others are side-chains
-                // and this app has nothing to put in one.
-                let src = (bus == 0)
-                    .then(|| input.get(c).or_else(|| input.last()))
-                    .flatten();
+                // The FIRST bus gets the caller's audio; the key bus, when
+                // one is armed, gets the key by the same repeat-last
+                // adaptation; every other bus keeps its silence.
+                let feed: Option<&[Vec<f32>]> = if bus == 0 {
+                    Some(input)
+                } else if Some(bus) == key_bus {
+                    Some(key)
+                } else {
+                    None
+                };
+                let src = feed.and_then(|b| b.get(c).or_else(|| b.last()));
                 match src {
                     Some(ch) => {
                         for (d, s) in dst.iter_mut().zip(ch.iter()) {
@@ -3305,7 +3372,7 @@ mod tests {
 
         // MONO in, stereo wanted: the one channel is copied to both sides.
         let mono = vec![vec![0.25_f32; 8]];
-        let (ptr, count) = scratch.bind_inputs(&mono, 8);
+        let (ptr, count) = scratch.bind_inputs(&mono, &[], None, 8);
         assert!(!ptr.is_null(), "an effect was handed no input at all");
         assert_eq!(count, 1, "one input bus");
         // SAFETY: the pointer is into `scratch`, which outlives this block, and
@@ -3325,7 +3392,7 @@ mod tests {
         // A SHORT channel leaves the tail silent rather than holding the last
         // sample, which would be a click repeated for the rest of the block.
         let short = vec![vec![1.0_f32; 3], vec![1.0_f32; 3]];
-        let (ptr, _) = scratch.bind_inputs(&short, 8);
+        let (ptr, _) = scratch.bind_inputs(&short, &[], None, 8);
         let bus = unsafe { &*ptr };
         let ch = unsafe { *bus.__field0.channelBuffers32 };
         let samples = unsafe { std::slice::from_raw_parts(ch, 8) };
@@ -3336,8 +3403,49 @@ mod tests {
         // `numInputs: 0` and a null array, which is what every VST3 host does
         // and what this one did unconditionally until now.
         let mut instrument = Scratch::new(64, &stereo_out, &[]).expect("scratch");
-        let (ptr, count) = instrument.bind_inputs(&mono, 8);
+        let (ptr, count) = instrument.bind_inputs(&mono, &[], None, 8);
         assert!(ptr.is_null() && count == 0, "an instrument was fed audio");
+    }
+
+    /// **The key lands in the bus the caller names, and only there.** The
+    /// main bus still carries the caller's audio, the aux bus carries the
+    /// key with the same repeat-last channel adaptation, and with no key bus
+    /// named the aux stays silent — which is every block before sidechain
+    /// existed, byte for byte.
+    #[test]
+    fn a_key_is_bound_into_the_named_aux_bus_and_nowhere_else() {
+        let buses = vec![
+            Bus { name: "in".into(), channels: 2, aux: false },
+            Bus { name: "sc".into(), channels: 2, aux: true },
+        ];
+        let stereo_out = vec![Bus { name: "out".into(), channels: 2, aux: false }];
+        let mut scratch = Scratch::new(64, &stereo_out, &buses).expect("build the scratch");
+
+        let main = vec![vec![0.25_f32; 8], vec![0.25_f32; 8]];
+        // A MONO key: the aux bus is stereo, so the one channel must repeat.
+        let key = vec![vec![0.5_f32; 8]];
+        let (ptr, count) = scratch.bind_inputs(&main, &key, Some(1), 8);
+        assert_eq!(count, 2, "two input buses");
+        // SAFETY: `count` buses, each pointing into `scratch`, which lives on.
+        let read = |bus: usize, c: usize| -> f32 {
+            let b = unsafe { &*ptr.add(bus) };
+            let ch = unsafe { *b.__field0.channelBuffers32.add(c) };
+            unsafe { *ch }
+        };
+        for c in 0..2 {
+            assert_eq!(read(0, c), 0.25, "the main bus lost its audio on {c}");
+            assert_eq!(read(1, c), 0.5, "the key did not reach aux channel {c}");
+        }
+
+        // No key bus named: the aux is explicit silence again.
+        let (ptr, _) = scratch.bind_inputs(&main, &key, None, 8);
+        let read = |bus: usize, c: usize| -> f32 {
+            let b = unsafe { &*ptr.add(bus) };
+            let ch = unsafe { *b.__field0.channelBuffers32.add(c) };
+            unsafe { *ch }
+        };
+        assert_eq!(read(1, 0), 0.0, "an unarmed aux bus carried a key");
+        assert_eq!(read(1, 1), 0.0, "an unarmed aux bus carried a key");
     }
 
     /// **A drum kit lives on the buses nobody was reading.**

@@ -2195,6 +2195,28 @@ struct Shared {
     /// precedent — and this one is uncontended by construction: after the
     /// build, no other thread takes it.
     insert_tap: Mutex<Option<InsertTapLane>>,
+
+    // ── the sidechain key table ─────────────────────────────────────────────
+    /// **Which channel keys each bay**, one [`pack_key`] word per
+    /// (seat, bay) — the `pack_route` idiom: bit 31 says the slot is
+    /// occupied, the low byte is the source CHANNEL, and a zeroed word can
+    /// never read as "keyed from channel 0". One word per bay is what makes
+    /// a torn table impossible per edge: an edge is exactly one atomic, so
+    /// the render loop sees each edge whole or absent, never half-written.
+    /// Sized for the whole seat space (~50 KB) so a comp on a pad, a
+    /// folder's second rack or the master asks the same question the same
+    /// way; read one relaxed load per effect bay, only on the passes that
+    /// feed keys at all.
+    insert_key: Vec<AtomicU32>,
+    /// How many words above are occupied — the routes' count protocol,
+    /// reused for its two jobs: it makes a desk with no keys pay one load
+    /// per chunk for the whole feature, and it is cleared FIRST and stored
+    /// LAST by [`Engine::set_insert_keys`], so a chunk that lands mid-publish
+    /// reads "no keys" and feeds nothing rather than a half-written table.
+    /// (A stale single word read anyway would only modulate a detector for
+    /// one block — a key never moves audio — but the count makes even that
+    /// window read as silence.)
+    insert_key_n: AtomicUsize,
 }
 
 impl Shared {
@@ -2326,6 +2348,8 @@ impl Shared {
             swaps: AtomicU64::new(0),
             insert_tap_route: AtomicU64::new(0),
             insert_tap: Mutex::new(None),
+            insert_key: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
+            insert_key_n: AtomicUsize::new(0),
         }
     }
 
@@ -2468,6 +2492,10 @@ struct Prepared {
     state_error: Option<String>,
     /// What to call the plugin in an error message.
     display_name: String,
+    /// Whether this tenant can take a sidechain key — decided the one moment
+    /// it is decidable, before the instance leaves this thread. See
+    /// [`Engine::insert_wants_key`].
+    wants_key: bool,
 }
 
 enum Backend {
@@ -2576,17 +2604,27 @@ impl Backend {
     }
 
     /// Render an effect: the channel in, the channel out.
+    ///
+    /// `key` is the block's sidechain, already de-interleaved to a planar
+    /// pair, or `None` on the passes that must not feed one — see
+    /// [`KeyFeed`] for the once-per-chunk rule the callers hold to.
     fn process_effect(
         &mut self,
         planar: &mut [Vec<f32>],
         params: &[tangent_host::ParamPoint],
         frames: usize,
         out: &mut [Vec<f32>],
+        key: Option<&[Vec<f32>]>,
     ) -> Result<(), String> {
         match self {
-            Backend::Vst3 { inst, .. } => inst
-                .process_effect_automated(planar, params, frames, out)
-                .map(|_| ()),
+            Backend::Vst3 { inst, .. } => match key {
+                Some(k) => inst
+                    .process_effect_keyed(planar, params, frames, out, k)
+                    .map(|_| ()),
+                None => inst
+                    .process_effect_automated(planar, params, frames, out)
+                    .map(|_| ()),
+            },
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             Backend::Lv2(inst) => {
                 // LV2 automation is a control port written before the block,
@@ -2598,6 +2636,11 @@ impl Backend {
                 for p in params {
                     let _ = inst.set_param(p.id as usize, p.value as f32);
                 }
+                // No key path exists in this host's LV2 plumbing yet, so an
+                // armed key is IGNORED here rather than half-fed: the UI
+                // greys the option per backend (`insert_wants_key` answers
+                // false), and dropping it silently at the one place the
+                // audio flows is the honest floor under that.
                 inst.process_planar(frames, planar, out)
             }
             Backend::Builtin(unit) => {
@@ -2605,7 +2648,7 @@ impl Backend {
                 // parameter is what the block runs at, and the unit's own
                 // slew keeps the boundary from clicking.
                 unit.apply(params);
-                unit.process(planar, frames, out);
+                unit.process_keyed(planar, frames, out, key);
                 Ok(())
             }
         }
@@ -3072,6 +3115,31 @@ fn param_slot(lane: usize, bay: usize) -> Option<(usize, usize)> {
     (lane < CHANNELS && bay < INSERTS).then_some((lane, bay))
 }
 
+/// The sidechain feed a caller hands [`run_rack`], on exactly ONE pass per
+/// seat per chunk.
+///
+/// **`Some` only at the lane pass in `mix_channels` and the three bus seats
+/// that run once per chunk** (the Fx bus and the master's two racks, via
+/// `run_insert_chain`); every other caller — the sends-pass second run, the
+/// monitor's, the pads', the click's, the fold's — passes `None`. A send
+/// destination's rack runs two or three times per chunk (SEND-BARGAIN), and
+/// feeding the key on each run would clock a keyed detector at twice real
+/// time; carrying the feed as an argument instead of a flag makes
+/// once-per-chunk structural rather than something a new caller has to
+/// remember to switch off.
+struct KeyFeed<'a> {
+    /// The last finished stems, interleaved exactly as `stem_scratch` is —
+    /// see `Renderer::key_prev` for why the snapshot and not the live buffer.
+    prev: &'a [f32],
+    /// Frames of `prev` that are real. A chunk longer than the previous one
+    /// (varispeed re-caps the chunk size mid-flight) must read silence past
+    /// this, not a stale tail — the "one block of itself buzzing" disease.
+    prev_frames: usize,
+    /// The planar pair the armed source is de-interleaved into, preallocated
+    /// at `Renderer` build like every other scratch.
+    io: &'a mut [Vec<f32>],
+}
+
 fn run_rack(
     rack: &mut Rack,
     planar: &mut [Vec<f32>],
@@ -3089,6 +3157,10 @@ fn run_rack(
     // polled from the main thread the way a VST3's is.
     shared: &Shared,
     seat: usize,
+    // **The key feed, or `None` on every pass that must not feed.** See
+    // [`KeyFeed`]. Disarmed cost is nothing at all: the table is only read
+    // when a feed was handed in.
+    mut key: Option<KeyFeed<'_>>,
 ) {
     // **The insert tap, aimed or not.** One relaxed load per rack call is
     // the entire disarmed cost; the seat comparison folds the armed-elsewhere
@@ -3108,6 +3180,45 @@ fn run_rack(
             continue;
         };
         let bay_params = params.get(bay).copied().unwrap_or(&[]);
+        // **This bay's key, de-interleaved on demand.** One relaxed load per
+        // effect bay, and only on a pass that carries a feed at all. The
+        // source is read out of the SNAPSHOT — post-rack, post-PDC,
+        // post-fader, post-pan, the app's stated tap doctrine ("Post-fader,
+        // like every other send here") — which means mute and solo silence
+        // the key BY DESIGN: soloing the bass un-ducks it, exactly as
+        // soloing it takes it off every send. Frames past `prev_frames` are
+        // written as silence, never left stale.
+        let keyed: Option<&[Vec<f32>]> = match (&mut key, p.voice) {
+            (Some(feed), false) => {
+                let word = shared
+                    .insert_key
+                    .get(seat * INSERTS + bay)
+                    .map_or(0, |c| c.load(Ordering::Relaxed));
+                match unpack_key(word) {
+                    Some(src) if src < CHANNELS => {
+                        let live = frames.min(feed.prev_frames);
+                        for c in 0..TAP_CHANNELS {
+                            let Some(dst) = feed.io.get_mut(c) else {
+                                continue;
+                            };
+                            for f in 0..live {
+                                dst[f] = feed
+                                    .prev
+                                    .get(f * CHANNELS * 2 + src * 2 + c.min(1))
+                                    .copied()
+                                    .unwrap_or(0.0);
+                            }
+                            for d in dst.iter_mut().take(frames).skip(live) {
+                                *d = 0.0;
+                            }
+                        }
+                        Some(&*feed.io)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         if p.voice {
             // **A voice renders into its OWN buffers and replaces the
             // channel.** Its own, because `fx_out` is TAP_CHANNELS wide and an
@@ -3127,7 +3238,7 @@ fn run_rack(
             }
         } else if p
             .backend
-            .process_effect(planar, bay_params, frames, out)
+            .process_effect(planar, bay_params, frames, out, keyed)
             .is_err()
         {
             // A refused block leaves the audio ALONE rather than replacing it
@@ -3697,6 +3808,38 @@ struct Renderer {
     pad_io: Vec<Vec<f32>>,
     /// `stems_on`, read once a block so the three mixers agree.
     stems_live: bool,
+    /// **The one stems-fill answer for this chunk**, computed once at the top
+    /// of `render_program` and read by every gate that used to spell out
+    /// `stems_live || route_n > 0 || has_folders` for itself. That condition
+    /// lived in FIVE places — the zeroing, the monitor, the clips, the pads
+    /// and the channel fold — and a customer added to four of them is a
+    /// source class that silently stems nothing. The keys are the fourth
+    /// customer, added here exactly once.
+    stems_wanted: bool,
+    /// Whether any key edge is armed this chunk — one count load, latched
+    /// with the routes. Off, the whole sidechain feature costs that load and
+    /// nothing else: no stems, no snapshot, no table reads.
+    keys_live: bool,
+    /// **Last chunk's finished stems** — `stem_scratch`'s exact interleaved
+    /// layout, copied once per chunk after the sends pass has written the
+    /// last stem. The key is read from HERE and not from the live buffer
+    /// because the lane racks run at fixed index order before clips, pads,
+    /// live input and sends have landed: a same-block key would be silently
+    /// incomplete for every source class but "a lower-numbered lane's own
+    /// instrument", and asymmetric freshness would make reordering tracks
+    /// audibly change a mix. One chunk of uniform lateness buys
+    /// reorder-invariance and determinism instead. (The Fx bus and the
+    /// master's two seats run AFTER the copy, so they key on the CURRENT
+    /// chunk — every stem is complete by then, and fresher is simply
+    /// better there.)
+    key_prev: Vec<f32>,
+    /// Frames of `key_prev` that are real — the previous chunk's length,
+    /// which under varispeed is not always this chunk's. Reads past it get
+    /// silence, never a stale tail.
+    key_prev_frames: usize,
+    /// The planar pair a bay's key is de-interleaved into — `send_io`'s
+    /// shape, bought at build like every other scratch.
+    key_io: Vec<Vec<f32>>,
 }
 
 impl Renderer {
@@ -3781,6 +3924,14 @@ impl Renderer {
             &params,
             &self.shared,
             at,
+            // The bus seats run ONCE per chunk, after the key snapshot was
+            // taken — so a keyed master or Fx-bus comp hears the CURRENT
+            // chunk's finished stems. See `KeyFeed` for the one-pass rule.
+            self.keys_live.then(|| KeyFeed {
+                prev: &self.key_prev,
+                prev_frames: self.key_prev_frames,
+                io: &mut self.key_io,
+            }),
         );
         let dst = if buf_is_aux {
             self.aux.get_mut(..n)
@@ -4331,13 +4482,23 @@ impl Renderer {
                 }
             }
             self.stems_live = self.shared.stems_on.load(Ordering::Relaxed);
+            // **Any keys armed?** One count load per chunk — the whole cost
+            // of the feature on an unkeyed desk. Acquire pairs with
+            // `set_insert_keys`' Release on the count, so a table seen
+            // as non-empty is a table whose words have landed.
+            self.keys_live = self.shared.insert_key_n.load(Ordering::Acquire) > 0;
             // **Hardware routes need the same per-channel audio stems need.**
             // One buffer, two customers: whichever asks, it is filled and
             // zeroed exactly once.
             // Groups are the third customer for the per-lane buffer: a
-            // folder sums its children out of it. One buffer, three
-            // customers, filled and zeroed exactly once.
-            if self.stems_live || self.route_n > 0 || self.has_folders {
+            // folder sums its children out of it. And the sidechain keys are
+            // the fourth: a key reads its source's stem out of the snapshot.
+            // One buffer, four customers, filled and zeroed exactly once —
+            // and ONE answer, computed here, read by every writer's gate, so
+            // a fifth customer is one line rather than a hunt through five.
+            self.stems_wanted =
+                self.stems_live || self.route_n > 0 || self.has_folders || self.keys_live;
+            if self.stems_wanted {
                 if let Some(st) = self.stem_scratch.get_mut(..n * CHANNELS * 2) {
                     st.fill(0.0);
                 }
@@ -4576,6 +4737,9 @@ impl Renderer {
                     &seat_params,
                         &self.shared,
                         Strip::Click.index(),
+                        // Not a key pass: the click is a cue, and nobody
+                        // keys a cue. See `KeyFeed`.
+                        None,
                     );
                 }
                 // Back into BOTH buffers, and the take's keeps its gate: a
@@ -4771,6 +4935,11 @@ impl Renderer {
                             &seat_params,
                             &self.shared,
                             dest,
+                            // NOT a key pass — this is the SEND-BARGAIN's
+                            // second run of a rack the lane pass already
+                            // fed; feeding it again would clock a keyed
+                            // detector at twice real time. See `KeyFeed`.
+                            None,
                         );
                     }
                     let g = self.lane_gain[dest];
@@ -4802,6 +4971,29 @@ impl Renderer {
                             *v += r;
                         }
                     }
+                }
+            }
+
+            // ── the key snapshot ───────────────────────────────────────────
+            //
+            // **The stems are finished; write them down for the keys.** The
+            // sends pass above was the last stem writer, so this is the
+            // first moment every source class — lane, clip, pad, live
+            // input, folder, send arrival — is in. Next chunk's lane racks
+            // read this copy (one chunk late, uniformly, which is what
+            // makes key freshness independent of track order); the Fx bus
+            // and the master's racks below read it THIS chunk, because for
+            // them every stem is already complete and fresher is simply
+            // better. Skipped entirely on an unkeyed desk — the routes'
+            // "nothing runs at all" property, kept.
+            if self.keys_live {
+                let want = n * CHANNELS * 2;
+                if let (Some(dst), Some(src)) = (
+                    self.key_prev.get_mut(..want),
+                    self.stem_scratch.get(..want),
+                ) {
+                    dst.copy_from_slice(src);
+                    self.key_prev_frames = n;
                 }
             }
 
@@ -5674,6 +5866,10 @@ impl Renderer {
                         &seat_params,
                         &self.shared,
                         strip.index(),
+                        // NOT a key pass: an input strip's seat is fed by
+                        // the lane pass in `mix_channels`; this is its
+                        // monitor run. See `KeyFeed`.
+                        None,
                     );
                 }
             }
@@ -5705,7 +5901,7 @@ impl Renderer {
                     }
                     // The stem tap hears the lane's LIVE input too — a
                     // bounced stem is everything the lane put on the bus.
-                    if self.stems_live || self.route_n > 0 || self.has_folders {
+                    if self.stems_wanted {
                         if let Some(sv) = self
                             .stem_scratch
                             .get_mut(i * CHANNELS * 2 + strip.index() * 2 + c.min(1))
@@ -6163,9 +6359,9 @@ impl Renderer {
             punch[lane] = self.shared.punch[lane].load(Ordering::Relaxed);
         }
         // Stems and ROUTING share this buffer: a send reads the
-        // lane's own audio out of it, so it is filled whenever either
-        // customer asks.
-        let stems = self.stems_live || self.route_n > 0 || self.has_folders;
+        // lane's own audio out of it, so it is filled whenever any
+        // customer asks — see `stems_wanted` for the one list of them.
+        let stems = self.stems_wanted;
         // Copied out before the buffers are borrowed: the fold below holds
         // `mix`/`aux`/`stem` mutably, and this has to be readable inside it.
         let direct = self.route_direct;
@@ -6722,6 +6918,9 @@ impl Renderer {
                 &seat_params,
                     &self.shared,
                     rack_at,
+                    // Not a key pass in v1: a pad seat is not reachable
+                    // from the key picker. See `KeyFeed`.
+                    None,
                 );
                 for c in 0..TAP_CHANNELS.min(2) {
                     let src = &self.pad_io[c];
@@ -6797,6 +6996,12 @@ impl Renderer {
                 &seat_params,
                 &self.shared,
                 bus_rack,
+                // NOT a key pass — for a non-drum lane this is the seat's
+                // second run per chunk (the sends pass's bargain), and a
+                // pure drum lane's rack runs only here, where v1 does not
+                // feed. Keying a comp ON a drum lane waits for the same
+                // second pass folders need. See `KeyFeed`.
+                None,
             );
         }
         // **The kit waits for the slowest chain, like every other source.**
@@ -6827,9 +7032,9 @@ impl Renderer {
         // every other strip does it.
         let want = frames * TAP_CHANNELS;
         // Stems and ROUTING share this buffer: a send reads the
-        // lane's own audio out of it, so it is filled whenever either
-        // customer asks.
-        let stems = self.stems_live || self.route_n > 0 || self.has_folders;
+        // lane's own audio out of it, so it is filled whenever any
+        // customer asks — see `stems_wanted` for the one list of them.
+        let stems = self.stems_wanted;
         let (Some(mix), Some(aux), Some(stem)) = (
             self.mix.get_mut(..want),
             self.aux.get_mut(..want),
@@ -7463,6 +7668,17 @@ impl Renderer {
                 &seat_params,
                     &self.shared,
                     ch,
+                    // **THE key pass for a channel's seat** — the one run
+                    // per chunk that carries the sidechain, reading LAST
+                    // chunk's snapshot (see `key_prev` for the proof that
+                    // same-block is structurally impossible here). Post-
+                    // fader by doctrine: a muted or un-soloed source keys
+                    // silence BY DESIGN.
+                    self.keys_live.then(|| KeyFeed {
+                        prev: &self.key_prev,
+                        prev_frames: self.key_prev_frames,
+                        io: &mut self.key_io,
+                    }),
                 );
             }
             // **And the lane waits for the slowest of its neighbours.**
@@ -7530,9 +7746,9 @@ impl Renderer {
             };
             let want = frames * TAP_CHANNELS;
             // Stems and ROUTING share this buffer: a send reads the
-            // lane's own audio out of it, so it is filled whenever either
-            // customer asks.
-            let stems = self.stems_live || self.route_n > 0 || self.has_folders;
+            // lane's own audio out of it, so it is filled whenever any
+            // customer asks — see `stems_wanted` for the one list of them.
+            let stems = self.stems_wanted;
             let direct = self.route_direct[ch];
             let (Some(mix), Some(aux), Some(stem)) = (
                 self.mix.get_mut(..want),
@@ -7676,6 +7892,11 @@ impl Renderer {
                     &seat_params,
                     &self.shared,
                     ch,
+                    // Not a key pass in v1: a folder's rack runs here, after
+                    // the chunk's snapshot customers were decided — keying a
+                    // bus comp IN a group is a second pass this feature does
+                    // not make yet. See `KeyFeed`.
+                    None,
                 );
             }
             // **THE-FOLD: the folder's SECOND rack** - bays 3..5, seated
@@ -7703,6 +7924,9 @@ impl Renderer {
                         &seat_params,
                         &self.shared,
                         extra,
+                        // Not a key pass in v1, exactly as the folder's
+                        // first rack above. See `KeyFeed`.
+                        None,
                     );
                 }
             }
@@ -8042,6 +8266,20 @@ fn unpack_route(w: u32) -> Option<(usize, usize, bool, bool)> {
     ))
 }
 
+// ── the sidechain key's machinery ───────────────────────────────────────────
+
+/// Pack one key edge into a word the audio thread can read atomically — the
+/// `pack_route` idiom. Only the source channel needs carrying: the WORD's
+/// index in `Shared::insert_key` already names the (seat, bay) it keys.
+fn pack_key(source: usize) -> u32 {
+    (source as u32 & 0xff) | (1 << 31)
+}
+
+/// The inverse of [`pack_key`]. `None` for an unkeyed bay.
+fn unpack_key(w: u32) -> Option<usize> {
+    (w & (1 << 31) != 0).then_some((w & 0xff) as usize)
+}
+
 // ── the insert tap's machinery ──────────────────────────────────────────────
 
 /// The insert tap's audio-thread half: the ring's write end, and the scratch
@@ -8208,6 +8446,11 @@ pub struct Engine {
     /// Heap, for the reason `Renderer::racks` gives: a seat per pad of
     /// every channel is too much to carry inline through a move.
     inserts_loaded: Vec<[Option<Loaded>; INSERTS]>,
+    /// Whether each bay's tenant can take a sidechain key — captured at load
+    /// time, because the one moment the answer is knowable for a VST3 is
+    /// before its instance crosses to the audio thread ([`Loaded`] carries no
+    /// bus layout, and there is no `&Instance` on this thread afterwards).
+    insert_keyable: Vec<[bool; INSERTS]>,
 
     tap: Option<RecorderTap>,
     fault: Arc<Mutex<Option<String>>>,
@@ -8808,6 +9051,11 @@ impl Engine {
             pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
             pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             stems_live: false,
+            stems_wanted: false,
+            keys_live: false,
+            key_prev: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            key_prev_frames: 0,
+            key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
         };
 
         let (stream, out_device_obj, offline_renderer) = match dev {
@@ -8881,6 +9129,7 @@ impl Engine {
             insert_tap_rx,
             reastream_rx: Some(reastream_rx),
             inserts_loaded: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
+            insert_keyable: (0..RACK_SEATS).map(|_| [false; INSERTS]).collect(),
             tap: Some(RecorderTap {
                 rx: tap_rx,
                 channels: TAP_CHANNELS,
@@ -9033,6 +9282,11 @@ impl Engine {
                 channels: u16::try_from(channels).unwrap_or(u16::MAX),
                 sample_rate: self.output.sample_rate,
             };
+        // Asked while the instance is still on this thread — the bus layout
+        // crosses to the audio side with it and is never reachable again. A
+        // voice is excluded: the effect path is the only one that carries a
+        // key, so an instrument with an aux input would grey honestly.
+        let wants_key = !voice && inst.key_input_bus().is_some();
         Ok(Prepared {
             display_name: class.name.clone(),
             backend: Backend::Vst3 { inst, module },
@@ -9047,6 +9301,7 @@ impl Engine {
             latency_handle,
             latency_now,
             state_error,
+            wants_key,
         })
     }
 
@@ -9162,6 +9417,9 @@ impl Engine {
             latency_handle: None,
             latency_now: 0,
             state_error,
+            // No LV2 key path exists — see `Backend::process_effect`'s LV2
+            // arm. False is what makes the menu grey instead of lying.
+            wants_key: false,
         })
     }
 
@@ -9218,6 +9476,9 @@ impl Engine {
             latency_handle: None,
             latency_now,
             state_error,
+            // Of the built-ins only the comp has a detector to key; its
+            // kernel took `key: Option<&[f32]>` from the day it was proven.
+            wants_key: path == crate::builtin_fx::COMP_PATH,
         })
     }
 
@@ -9294,6 +9555,15 @@ impl Engine {
             // the ring or the engine is torn down.
             let _ = self.hand_off_insert(strip, slot, PluginBox(None));
             self.inserts_loaded[strip][slot] = None;
+            // An emptied bay takes no key; a stale `true` would offer the
+            // menu row for a tenant that is gone.
+            if let Some(k) = self
+                .insert_keyable
+                .get_mut(strip)
+                .and_then(|r| r.get_mut(slot))
+            {
+                *k = false;
+            }
             if let Some(e) = self
                 .insert_state_errors
                 .get_mut(strip)
@@ -9353,6 +9623,7 @@ impl Engine {
             latency_now,
             state_error,
             display_name,
+            wants_key,
         } = prepared;
         // Whatever was in THIS bay is going away, so its window and then its
         // controller and state references go first — the lifetime rule from
@@ -9463,6 +9734,13 @@ impl Engine {
         }
         Rack::set_latency(&self.shared, strip, slot, latency_now);
         self.inserts_loaded[strip][slot] = Some(loaded.clone());
+        if let Some(k) = self
+            .insert_keyable
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *k = wants_key;
+        }
         if let Some(e) = self
             .insert_state_errors
             .get_mut(strip)
@@ -10015,6 +10293,7 @@ impl Engine {
             }
         }
         permute_rows(&mut self.inserts_loaded, order);
+        permute_rows(&mut self.insert_keyable, order);
         permute_rows(&mut self.insert_editors, order);
         permute_rows(&mut self.insert_builtin, order);
         permute_rows(&mut self.insert_state_handles, order);
@@ -10422,6 +10701,58 @@ impl Engine {
             self.shared.route_gain[i].store(r.gain.to_bits(), Ordering::Relaxed);
         }
         self.shared.route_count.store(n, Ordering::Release);
+    }
+
+    /// Publish the desk's sidechain-key table to the audio thread — the whole
+    /// table, every call, exactly as [`Engine::set_routes`] publishes routes:
+    /// an edge absent from `keys` is an edge cleared.
+    ///
+    /// Each tuple is `(seat, bay, source_channel)` in ENGINE terms — the seat
+    /// space `load_insert` speaks, the bay 0..[`INSERTS`], the source a desk
+    /// channel 0..[`CHANNELS`]. Out-of-range entries are dropped here, not
+    /// stored: the desk can shrink between the write and the read.
+    ///
+    /// **The count is stored LAST and cleared FIRST**, the routes' protocol.
+    /// A torn read is thereby impossible or harmless, in two layers: an edge
+    /// is ONE atomic word (`pack_key`), so no chunk can ever see half an
+    /// edge; and the render loop latches `keys_live` from the count once per
+    /// chunk, so a chunk that lands mid-publish reads "no keys" and feeds
+    /// nothing rather than a table with some edges old and some new. The
+    /// worst a racing chunk can do is feed one block of the OLD table or of
+    /// silence — and a key only modulates a detector, it moves no audio, so
+    /// one such block is a meter flicker and not a wrong sample.
+    pub fn set_insert_keys(&mut self, keys: &[(usize, usize, usize)]) {
+        self.shared.insert_key_n.store(0, Ordering::Release);
+        for cell in self.shared.insert_key.iter() {
+            cell.store(0, Ordering::Relaxed);
+        }
+        let mut n = 0usize;
+        for &(seat, bay, src) in keys {
+            if seat >= RACK_SEATS || bay >= INSERTS || src >= CHANNELS {
+                continue;
+            }
+            if let Some(cell) = self.shared.insert_key.get(seat * INSERTS + bay) {
+                cell.store(pack_key(src), Ordering::Relaxed);
+                n += 1;
+            }
+        }
+        self.shared.insert_key_n.store(n, Ordering::Release);
+    }
+
+    /// Whether the tenant of one bay can take a sidechain key at all — the
+    /// question the bay menu's "Sidechain from…" row greys on.
+    ///
+    /// True for the built-in comp and for a VST3 effect whose bus layout
+    /// reports an aux input with channels (the `getBusInfo`-failed
+    /// placeholder reports zero channels and is thereby excluded). False for
+    /// everything else — including LV2, whose feed path does not exist yet,
+    /// so greying here is what keeps an armed edge from lying on Linux.
+    pub fn insert_wants_key(&self, seat: usize, bay: usize) -> bool {
+        self.insert_keyable
+            .get(seat)
+            .and_then(|r| r.get(bay))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Take the hardware fast lane's write end, for `midi::MidiFastLane`.
@@ -13618,6 +13949,11 @@ mod tests {
             pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
             pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             stems_live: false,
+            stems_wanted: false,
+            keys_live: false,
+            key_prev: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            key_prev_frames: 0,
+            key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             racks,
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -15062,6 +15398,312 @@ mod tests {
             "after the catch-up the tap did not resume: {}",
             tap.len()
         );
+    }
+
+    // ── the sidechain keys ─────────────────────────────────────────────────
+
+    /// A comp state blob with the dials the key tests want: threshold at
+    /// −30 dB, 20 : 1, both clocks at their fastest — so one 512-frame block
+    /// is enough for the meter to speak and a handful are enough for it to
+    /// let go. Loaded as STATE rather than pushed as knob moves, so the
+    /// measured blocks never race the parameter ring.
+    fn fast_deep_comp_state() -> Vec<u8> {
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::COMP_PATH).unwrap();
+        let mut v = spec.defaults();
+        v[0] = 0.5; // threshold: −30 dB
+        v[1] = 1.0; // ratio: 20:1
+        v[2] = 0.0; // attack: 0.1 ms
+        v[3] = 0.0; // release: 20 ms
+        crate::builtin_fx::state_text(spec, &v).into_bytes()
+    }
+
+    /// One constant mono clip on one lane, a second long — the key tests'
+    /// signal, because a constant's level needs no window to agree on.
+    fn flat_clip(strip: usize, level: f32) -> Placed {
+        Placed {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: vec![level; 48_000],
+                rate: 48_000,
+                source: std::path::PathBuf::from("key.wav"),
+            }),
+            strip,
+            start: 0,
+            offset: 0,
+            len: 48_000,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+        }
+    }
+
+    /// The key tests' desk: fast-deep comps in bay 0 of `comps`, the key
+    /// table published, each `dumps` pair routing one lane into a channel
+    /// whose fader is closed (audible nowhere, stem intact — a key source
+    /// the master never hears), eight warm-up blocks so every hand-off ring
+    /// has drained AND the closed faders' slews have arrived, then the
+    /// clips seated and the transport rolled from zero. Each measured block
+    /// is one 512-frame chunk, so "a block" below means exactly one
+    /// snapshot generation.
+    fn key_engine(
+        clips: Vec<Placed>,
+        comps: &[usize],
+        keys: &[(usize, usize, usize)],
+        dumps: &[(usize, usize)],
+    ) -> Engine {
+        let state = fast_deep_comp_state();
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        for &seat in comps {
+            e.load_insert(
+                seat,
+                0,
+                Some(Path::new(crate::builtin_fx::COMP_PATH)),
+                Some(&state),
+            )
+            .expect("the comp loads")
+            .expect("the bay reports it");
+        }
+        e.set_insert_keys(keys);
+        if !dumps.is_empty() {
+            e.set_routes(&tangent_ui::routing::Routes(
+                dumps
+                    .iter()
+                    .map(|&(from, into)| tangent_ui::routing::Route {
+                        from,
+                        target: tangent_ui::routing::Target::Channel(into),
+                        gain: 1.0,
+                    })
+                    .collect(),
+            ));
+            for &(_, into) in dumps {
+                e.set_channel_gain(into, 0.0);
+            }
+        }
+        let mut out = vec![0.0f32; 512 * 2];
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        e.set_clips(clips);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        e
+    }
+
+    /// **A loud lane keys the master's comp and the quiet mix ducks — and
+    /// only when the edge is armed.** The loud lane is routed into a closed
+    /// fader so the master never hears it directly; its STEM still carries
+    /// it, which is exactly what the key reads. The unarmed control run is
+    /// the same desk with an empty key table, so the level difference and
+    /// the meter are the edge's doing and nobody else's.
+    #[test]
+    fn a_keyed_master_comp_ducks_the_mix_only_while_the_edge_is_armed() {
+        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let run = |keys: &[(usize, usize, usize)]| -> (f32, f32) {
+            // Lane 2 arrives only through lane 15, whose fader is closed.
+            let mut e = key_engine(
+                vec![flat_clip(2, 0.9), flat_clip(1, 0.01)],
+                &[seat],
+                keys,
+                &[(2, 15)],
+            );
+            let mut out = vec![0.0f32; 512 * 2];
+            // Twelve settling blocks first: a lane fader's slew only runs
+            // while the clips do, so the closed dump fader arrives a few
+            // blocks into the roll — an engine-wide smoothing trait, not the
+            // key's — and the comp needs a moment more to release what that
+            // transient squeezed. Identical in both runs; the measured six
+            // blocks answer only for the steady state.
+            for _ in 0..12 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                let _ = e.insert_gr_db(seat, 0);
+            }
+            let (mut peak, mut gr) = (0.0f32, 0.0f32);
+            for _ in 0..6 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+                gr = gr.max(e.insert_gr_db(seat, 0));
+            }
+            (peak, gr)
+        };
+        let (armed_peak, armed_gr) = run(&[(seat, 0, 2)]);
+        let (open_peak, open_gr) = run(&[]);
+        assert!(open_peak > 0.005, "the quiet mix is inaudible: {open_peak}");
+        assert!(
+            open_gr < 0.5,
+            "the comp squeezed {open_gr:.2} dB with no key armed"
+        );
+        assert!(
+            armed_gr > 6.0,
+            "the armed key only squeezed {armed_gr:.2} dB"
+        );
+        assert!(
+            armed_peak < open_peak * 0.5,
+            "the key did not duck the mix: {armed_peak} against {open_peak} open"
+        );
+    }
+
+    /// **A lane's key is exactly one chunk late, and no later.** The comp
+    /// sits on an empty lane so its meter answers to the key alone; the
+    /// loud clip starts at frame zero of block zero. Block zero's lane rack
+    /// runs before that block's snapshot is taken, so it must meter
+    /// nothing; block one reads block zero's finished stems and must
+    /// squeeze at once.
+    #[test]
+    fn the_key_reaches_a_lane_comp_exactly_one_chunk_late() {
+        let mut e = key_engine(vec![flat_clip(2, 0.9)], &[4], &[(4, 0, 2)], &[]);
+        let mut out = vec![0.0f32; 512 * 2];
+        e.render_offline(&mut out);
+        let first = e.insert_gr_db(4, 0);
+        assert_eq!(
+            first, 0.0,
+            "the comp heard the key in the SAME block it was made: {first:.2} dB"
+        );
+        out.fill(0.0);
+        e.render_offline(&mut out);
+        let second = e.insert_gr_db(4, 0);
+        assert!(
+            second > 3.0,
+            "one block after the hit the key still metered only {second:.2} dB"
+        );
+    }
+
+    /// **Swapping which lane is the source and which holds the comp changes
+    /// nothing** — the uniform one-chunk snapshot is what buys this, and it
+    /// is the property that keeps a reorder from audibly changing a mix.
+    /// Measured on the meter block by block, because the comp lane's own
+    /// output is silence in both runs.
+    #[test]
+    fn a_key_from_above_and_a_key_from_below_squeeze_identically() {
+        let run = |src: usize, dst: usize| -> Vec<f32> {
+            let mut e = key_engine(vec![flat_clip(src, 0.9)], &[dst], &[(dst, 0, src)], &[]);
+            let mut out = vec![0.0f32; 512 * 2];
+            (0..4)
+                .map(|_| {
+                    out.fill(0.0);
+                    e.render_offline(&mut out);
+                    e.insert_gr_db(dst, 0)
+                })
+                .collect()
+        };
+        let low_keys_high = run(2, 9);
+        let high_keys_low = run(9, 2);
+        assert!(
+            low_keys_high.iter().any(|g| *g > 3.0),
+            "the fixture never squeezed at all: {low_keys_high:?}"
+        );
+        for (i, (a, b)) in low_keys_high.iter().zip(&high_keys_low).enumerate() {
+            assert!(
+                (a - b).abs() < 1.0e-4,
+                "block {i}: {a:.4} dB with the source below, {b:.4} dB above"
+            );
+        }
+    }
+
+    /// **Clearing the table un-keys.** The whole-table publish means an
+    /// absent edge is a cleared edge; after the clear the detector follows
+    /// the (silent) main signal again and the fast release walks the gain
+    /// home. The loud clip is still playing the whole time, so a stale
+    /// table read anywhere would keep the meter pinned.
+    #[test]
+    fn an_edge_absent_from_the_published_table_stops_keying() {
+        let mut e = key_engine(vec![flat_clip(2, 0.9)], &[4], &[(4, 0, 2)], &[]);
+        let mut out = vec![0.0f32; 512 * 2];
+        let mut keyed = 0.0f32;
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            keyed = keyed.max(e.insert_gr_db(4, 0));
+        }
+        assert!(keyed > 3.0, "the fixture never keyed: {keyed:.2} dB");
+        e.set_insert_keys(&[]);
+        let mut last = f32::MAX;
+        for _ in 0..24 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            last = e.insert_gr_db(4, 0);
+        }
+        assert!(
+            last < 0.25,
+            "the cleared key still squeezed {last:.2} dB two dozen blocks on"
+        );
+    }
+
+    /// **An armed key on an empty bay, or on a tenant with no detector,
+    /// feeds nothing and breaks nothing.** The EQ takes the keyed path and
+    /// ignores the key by contract; the empty bay never reaches it. This is
+    /// also where `insert_wants_key` answers for the menu: comp yes, EQ no,
+    /// empty bay no.
+    #[test]
+    fn a_key_on_a_keyless_bay_is_harmless_and_the_menu_knows_the_difference() {
+        let mut e = key_engine(vec![flat_clip(2, 0.9)], &[7], &[], &[]);
+        e.load_insert(6, 0, Some(Path::new(crate::builtin_fx::EQ_PATH)), None)
+            .expect("the EQ loads")
+            .expect("the bay reports it");
+        // Keys onto the empty bay (5,1), the EQ, and a bay past the desk —
+        // the last is dropped at publish, the first two at feed time.
+        e.set_insert_keys(&[(5, 1, 2), (6, 0, 2), (usize::MAX, 0, 2)]);
+        let mut out = vec![0.0f32; 512 * 2];
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        assert!(
+            out.iter().all(|s| s.is_finite()),
+            "a keyless key produced non-finite audio"
+        );
+        assert!(e.insert_wants_key(7, 0), "the comp's bay refused a key");
+        assert!(!e.insert_wants_key(6, 0), "the EQ's bay offered a key");
+        assert!(!e.insert_wants_key(5, 1), "an empty bay offered a key");
+    }
+
+    /// **Mutual keys are bounded and finite.** A→B and B→A is two detectors
+    /// each reading the other's previous-chunk stem: no same-chunk data
+    /// dependency exists, the stems are zeroed every chunk so there is no
+    /// cross-block audio memory, and a compressor's transfer is contractive
+    /// — mutual ducking, not feedback. Four blocks prove the engine agrees.
+    #[test]
+    fn mutual_keys_render_bounded_and_finite() {
+        let mut e = key_engine(
+            vec![flat_clip(3, 0.5), flat_clip(4, 0.5)],
+            &[3, 4],
+            &[(3, 0, 4), (4, 0, 3)],
+            &[],
+        );
+        let mut out = vec![0.0f32; 512 * 2];
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            assert!(
+                out.iter().all(|s| s.is_finite() && s.abs() < 4.0),
+                "mutual keys blew up the mix"
+            );
+        }
+        let (a, b) = (e.insert_gr_db(3, 0), e.insert_gr_db(4, 0));
+        assert!(a.is_finite() && b.is_finite(), "a meter went non-finite: {a} {b}");
+    }
+
+    /// **The key scratches are bought at construction, in every
+    /// constructor.** The audio thread allocates nothing, so the snapshot,
+    /// its planar pair and the shared table must exist — at full size —
+    /// before the first callback, in the engine's renderer and the test
+    /// bench's alike.
+    #[test]
+    fn every_renderer_constructor_buys_the_key_scratches_up_front() {
+        let e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let r = e.offline.as_ref().expect("an offline engine holds its renderer");
+        assert_eq!(r.key_prev.len(), MAX_BLOCK as usize * CHANNELS * 2);
+        assert_eq!(r.key_prev_frames, 0, "a fresh snapshot claims frames it never wrote");
+        assert_eq!(r.key_io.len(), TAP_CHANNELS);
+        assert!(r.key_io.iter().all(|c| c.len() == MAX_BLOCK as usize));
+        assert_eq!(r.shared.insert_key.len(), RACK_SEATS * INSERTS);
+
+        let (tx, _rx) = RingBuffer::<f32>::new(64);
+        let t = test_renderer(Arc::new(Shared::new()), tx, 2);
+        assert_eq!(t.key_prev.len(), MAX_BLOCK as usize * CHANNELS * 2);
+        assert_eq!(t.key_io.len(), TAP_CHANNELS);
+        assert!(t.key_io.iter().all(|c| c.len() == MAX_BLOCK as usize));
     }
 
     /// **A folder inside a folder**, which the single descending fold has to

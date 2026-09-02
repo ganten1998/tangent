@@ -483,6 +483,23 @@ impl BuiltinUnit {
         }
     }
 
+    /// [`BuiltinUnit::process`] with the block's sidechain, when the desk
+    /// armed one. Only the comp has a detector to point at it; every other
+    /// unit ignores the key rather than erroring, because "this knob does
+    /// nothing here" is the desk's to grey, not the kernel's to refuse.
+    pub fn process_keyed(
+        &mut self,
+        input: &[Vec<f32>],
+        frames: usize,
+        out: &mut [Vec<f32>],
+        key: Option<&[Vec<f32>]>,
+    ) {
+        match (self, key) {
+            (BuiltinUnit::Comp(u), Some(k)) => u.process_keyed(input, frames, out, k),
+            (me, _) => me.process(input, frames, out),
+        }
+    }
+
     /// Drop whatever the unit remembers of the signal, the way every unit in
     /// `effects.rs` can. The trim remembers only where its slew is, and
     /// clearing that snaps the gain to its target.
@@ -713,6 +730,11 @@ pub struct CompUnit {
     kernel: crate::units::comp::Comp,
     params: crate::units::comp::CompParams,
     scratch: Vec<f32>,
+    /// The key's own interleave scratch, beside the main one: the kernel
+    /// wants both signals interleaved and aligned chunk for chunk, and
+    /// sharing one buffer would overwrite the audio with its own key.
+    /// Bought at build, on the UI thread, like every scratch here.
+    key_scratch: Vec<f32>,
 }
 
 impl CompUnit {
@@ -721,6 +743,7 @@ impl CompUnit {
             kernel: crate::units::comp::Comp::new(sample_rate),
             params: crate::units::comp::CompParams::default(),
             scratch: vec![0.0; SCRATCH_FRAMES * 2],
+            key_scratch: vec![0.0; SCRATCH_FRAMES * 2],
         }
     }
 
@@ -743,12 +766,70 @@ impl CompUnit {
     fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
         let (kernel, params) = (&mut self.kernel, &self.params);
         run_planar(&mut self.scratch, input, frames, out, |buf, n| {
-            // No side-chain yet: the kernel takes a key, the bay protocol
-            // does not carry one, and pretending otherwise here would be a
-            // lie in the signature. When cross-lane keying lands it arrives
-            // as a second planar argument, not a change to this call.
+            // No key on THIS call — the unkeyed passes (a send
+            // destination's second run, for one) come through here, and the
+            // detector honestly follows the main signal on them. The keyed
+            // path is `process_keyed` below.
             kernel.process(buf, n, 2, params, None);
         });
+    }
+
+    /// The keyed path: the same chunked interleave bridge as `process`, with
+    /// the key's planar pair interleaved beside the audio, chunk-aligned, so
+    /// the kernel's `k[2f]`/`k[2f+1]` indexing lines up with the frames it is
+    /// gaining. Mono keys repeat their one channel; a key channel shorter
+    /// than the block reads as silence past its end, never as a neighbour's
+    /// samples.
+    fn process_keyed(
+        &mut self,
+        input: &[Vec<f32>],
+        frames: usize,
+        out: &mut [Vec<f32>],
+        key: &[Vec<f32>],
+    ) {
+        // Fewer than two channels on either side is `run_planar`'s
+        // copy-through contract, restated because this bridge is its twin.
+        if input.len() < 2 || out.len() < 2 {
+            for (src, dst) in input.iter().zip(out.iter_mut()) {
+                let n = frames.min(src.len()).min(dst.len());
+                dst[..n].copy_from_slice(&src[..n]);
+            }
+            return;
+        }
+        let step = (self.scratch.len() / 2).max(1).min((self.key_scratch.len() / 2).max(1));
+        let mut done = 0usize;
+        while done < frames {
+            let n = step.min(frames - done);
+            for f in 0..n {
+                self.scratch[f * 2] = input[0].get(done + f).copied().unwrap_or(0.0);
+                self.scratch[f * 2 + 1] = input[1].get(done + f).copied().unwrap_or(0.0);
+                let kl = key.first().and_then(|k| k.get(done + f)).copied().unwrap_or(0.0);
+                let kr = key
+                    .get(1)
+                    .or_else(|| key.first())
+                    .and_then(|k| k.get(done + f))
+                    .copied()
+                    .unwrap_or(0.0);
+                self.key_scratch[f * 2] = kl;
+                self.key_scratch[f * 2 + 1] = kr;
+            }
+            self.kernel.process(
+                &mut self.scratch[..n * 2],
+                n,
+                2,
+                &self.params,
+                Some(&self.key_scratch[..n * 2]),
+            );
+            for f in 0..n {
+                if let Some(d) = out[0].get_mut(done + f) {
+                    *d = self.scratch[f * 2];
+                }
+                if let Some(d) = out[1].get_mut(done + f) {
+                    *d = self.scratch[f * 2 + 1];
+                }
+            }
+            done += n;
+        }
     }
 }
 
