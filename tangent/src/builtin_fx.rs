@@ -547,10 +547,30 @@ pub fn describe(path: &str, id: u32, value: f32) -> String {
         (PLATE_PATH, 1) => fmt_ms(lerp(crate::effects::PLATE_PREDELAY_MS)),
         (WAH_PATH, 1) => fmt_hz(sweep(crate::units::wah::WAH_BASE_HZ)),
         (IR_PATH, 1) => fmt_db(lerp(crate::units::convolver::CONV_TRIM_DB)),
-        // The tape speaks in percent on purpose: its knobs are character,
-        // not calibration, and a fake decibel is worse than an honest one.
-        // Every dial not named above — drive amount, depths, widths, mixes,
-        // the wah's damping — is percent for the same reason.
+        // **The three tape dials that have an honest number.** Their
+        // `ParamSpec`s promise dB, Hz and dB, and the automation lane prints
+        // that promise beside the curve; the face used to fall through to
+        // percent, so the lane said "dB" and the panel said "50 %" about the
+        // same knob. Which of the two was wrong is settled by the machine:
+        // the head bump is +2.5 dB at 70 Hz on the service data, the repro
+        // corner is a frequency, and a trim is decibels. The other three —
+        // drive, wobble, hiss — stay percent below, and their specs say so.
+        (TAPE_PATH, 1) => fmt_db(lerp(crate::units::tape::BUMP_DB)),
+        (TAPE_PATH, 2) => {
+            // Zero is the stage out of circuit, not a 20 kHz corner: naming
+            // a frequency for a filter that is not running is the lie the
+            // comp's key filter and the drive's level both refuse to tell.
+            if v <= 0.0 {
+                "off".to_owned()
+            } else {
+                fmt_hz(sweep(crate::units::tape::ROLL_HZ))
+            }
+        }
+        (TAPE_PATH, 5) => fmt_db(lerp(crate::units::tape::TRIM_DB)),
+        // The rest of the tape speaks in percent on purpose: those knobs are
+        // character, not calibration, and a fake decibel is worse than an
+        // honest one. Every dial not named above — drive amount, depths,
+        // widths, mixes, the wah's damping — is percent for the same reason.
         _ => fmt_pct(v),
     }
 }
@@ -2124,20 +2144,37 @@ mod tests {
             .collect();
         let input = vec![mono.clone(), mono];
         let spec = spec_for(TAPE_PATH).unwrap();
-        // drive 0.5 is the calibrated machine, trim 0.5 unity, every colour
-        // off — the kernel's own neutral recipe.
-        let mut unit = spec.create(sr, &[0.5, 0.0, 0.0, 0.0, 0.0, 0.5]);
-        let mut out = vec![vec![0.0f32; frames]; 2];
-        unit.process(&input, frames, &mut out);
         let rms = |v: &[f32]| {
             (v.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>() / v.len() as f64).sqrt()
         };
         // Steady state only: past the envelope settling and the line fill.
         let (lo, hi) = ((sr * 0.25) as usize, (sr * 1.15) as usize);
-        let delta = 20.0 * (rms(&out[0][lo..hi]) / rms(&input[0][lo..hi])).log10();
+        let at = |drive: f32| {
+            let mut unit = spec.create(sr, &[drive, 0.0, 0.0, 0.0, 0.0, 0.5]);
+            let mut out = vec![vec![0.0f32; frames]; 2];
+            unit.process(&input, frames, &mut out);
+            20.0 * (rms(&out[0][lo..hi]) / rms(&input[0][lo..hi])).log10()
+        };
+
+        // Drive at the bottom, trim 0.5 unity, every colour off — the
+        // kernel's own neutral recipe. The drive used to read 0.5 here and
+        // was only neutral by accident; it is a record level, and a record
+        // level's off is the end of its travel (`units::tape::DRIVE_TANH`).
+        let off = at(0.0);
         assert!(
-            delta.abs() < 0.1,
-            "neutral tape moved the broadband level by {delta:.3} dB through the adapter"
+            off.abs() < 0.1,
+            "neutral tape moved the broadband level by {off:.3} dB through the adapter"
+        );
+        // **And at the drive every new bay opens at.** Moving this guard to
+        // the bottom of the travel was right and it also left the SHIPPED
+        // position unwatched, which is how a record level that gave away
+        // 11.8 dB at the top of its travel reached the seat. See
+        // `units::tape::sat_makeup`.
+        let shipped = at(spec.defaults()[0]);
+        assert!(
+            shipped.abs() < 0.4,
+            "the shipped tape moved the broadband level by {shipped:.3} dB \
+             through the adapter"
         );
     }
 
@@ -2500,6 +2537,7 @@ mod tests {
     #[test]
     fn the_new_dials_read_in_their_own_units() {
         use crate::units::echo::ECHO_TIME_DEFAULT;
+        use tangent_ui::face::fmt_pct;
         assert_eq!(describe(ECHO_PATH, 0, ECHO_TIME_DEFAULT), "375 ms");
         assert_eq!(describe(PLATE_PATH, 0, 0.34), "2.20 s");
         assert_eq!(describe(PLATE_PATH, 1, 0.0), "0.0 ms");
@@ -2513,9 +2551,209 @@ mod tests {
         assert_eq!(describe(DRIVE_PATH, 2, 0.71), "+0.1 dB");
         assert_eq!(describe(DRIVE_PATH, 3, 0.0), "matched");
         assert_eq!(describe(IR_PATH, 1, 0.5), "+0.0 dB");
+        // The tape's three calibrated dials, at the positions it ships at:
+        // the bump's own +2.5 dB, the repro corner just under 16 kHz, unity
+        // trim. A face that printed "50 %" for any of these disagreed with
+        // the automation lane's declared unit about the same knob.
+        assert_eq!(describe(TAPE_PATH, 1, 0.5), "+2.5 dB");
+        assert_eq!(describe(TAPE_PATH, 2, 0.12), "15.6 kHz");
+        assert_eq!(describe(TAPE_PATH, 2, 0.0), "off");
+        assert_eq!(describe(TAPE_PATH, 5, 0.5), "+0.0 dB");
+        // And the three that are character rather than calibration keep
+        // saying so.
+        assert_eq!(describe(TAPE_PATH, 0, 0.6), fmt_pct(0.6));
+        assert_eq!(describe(TAPE_PATH, 3, 0.3), fmt_pct(0.3));
+        assert_eq!(describe(TAPE_PATH, 4, 0.25), fmt_pct(0.25));
         assert_eq!(choices(DENOISE_PATH, 0), vec!["Learn", "Listening"]);
         assert_eq!(choices(DRIVE_PATH, 3), vec!["matched", "uneven"]);
         assert_eq!(choices(AMP_PATH, 0), vec!["off", "on"]);
         assert!(choices(TREM_PATH, 0).is_empty(), "a continuous dial grew steps");
+    }
+
+    /// Two channels of independent noise: a record with a real image.
+    fn stereo_program(frames: usize) -> Vec<Vec<f32>> {
+        let mut a = 0x51DE_0001_u32;
+        let mut b = 0x51DE_0002_u32;
+        let step = |s: &mut u32| {
+            *s ^= *s << 13;
+            *s ^= *s >> 17;
+            *s ^= *s << 5;
+            0.5 * ((*s as f32 / u32::MAX as f32) * 2.0 - 1.0)
+        };
+        let l: Vec<f32> = (0..frames).map(|_| step(&mut a)).collect();
+        let r: Vec<f32> = (0..frames).map(|_| step(&mut b)).collect();
+        vec![l, r]
+    }
+
+    /// **One microphone.** `mix_channels` sends a mono input to both sides,
+    /// so this is what most of the desk's tracks look like by the time they
+    /// reach a bay — and a pair with `L == R` has a side of exactly zero,
+    /// which is the shape that made every control on the imager a wire.
+    fn microphone_program(frames: usize) -> Vec<Vec<f32>> {
+        let mut s = 0x51DE_0003_u32;
+        let mono: Vec<f32> = (0..frames)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                0.5 * ((s as f32 / u32::MAX as f32) * 2.0 - 1.0)
+            })
+            .collect();
+        vec![mono.clone(), mono]
+    }
+
+    /// How far apart two runs of the same program came out, in dB relative
+    /// to the program — the only question a dead-control test may ask.
+    fn divergence_db(a: &[Vec<f32>], b: &[Vec<f32>], skip: usize) -> f64 {
+        let mut diff = 0.0_f64;
+        let mut program = 0.0_f64;
+        for (x, y) in a.iter().zip(b) {
+            for (p, q) in x.iter().skip(skip).zip(y.iter().skip(skip)) {
+                diff += f64::from(*p - *q).powi(2);
+                program += f64::from(*p).powi(2);
+            }
+        }
+        10.0 * (diff / program.max(1.0e-30)).log10()
+    }
+
+    /// Run one unit at one value table over the planar road, from a fresh
+    /// instance, exactly as a bay would after a load.
+    fn through_seat(spec: &'static UnitSpec, values: &[f32], input: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let frames = input[0].len();
+        let mut unit = spec.create(48_000.0, values);
+        let mut out = vec![vec![0.0f32; frames]; 2];
+        unit.process(input, frames, &mut out);
+        out
+    }
+
+    /// **A control that does not move the OUTPUT is a decoration, whatever
+    /// the ledger says it is set to.**
+    ///
+    /// The existing tests here prove a unit is a NULL at rest, which is the
+    /// other half of the same question and the half that was already asked.
+    /// This asks the half that was not, at the seat rather than in the
+    /// kernel: the value goes in through `set_param` — the id decoding a
+    /// face actually drives — and what comes out the other end of the planar
+    /// road has to be a different sound.
+    ///
+    /// The floor is deliberately low. This test's job is "did the value
+    /// arrive"; whether the move is worth HEARING is pinned per knob in each
+    /// kernel's own module, where the right measurement for a bump is dB at
+    /// 70 Hz and the right one for a drive is harmonic content.
+    #[test]
+    fn every_imager_and_tape_control_moves_the_audio_through_the_seat() {
+        const FRAMES: usize = 24_000;
+        // Past the tape's line fill and envelope settling; the imager has
+        // no such warm-up but pays nothing for the skip.
+        const SKIP: usize = 4_800;
+        const FLOOR_DB: f64 = -50.0;
+        let program = stereo_program(FRAMES);
+
+        for path in [IMAGER_PATH, TAPE_PATH] {
+            let spec = spec_for(path).unwrap();
+            let rest = through_seat(spec, &spec.defaults(), &program);
+            for p in spec.params {
+                let mut best = f64::MIN;
+                for end in [0.0_f32, 1.0] {
+                    let mut values = spec.defaults();
+                    values[p.id as usize] = end;
+                    let moved = through_seat(spec, &values, &program);
+                    best = best.max(divergence_db(&rest, &moved, SKIP));
+                }
+                assert!(
+                    best > FLOOR_DB,
+                    "{path}: {} moved the output by {best:.1} dB — the knob is \
+                     wired to nothing",
+                    p.symbol
+                );
+            }
+        }
+    }
+
+    /// **The fault a demo session found, pinned at the seat.**
+    ///
+    /// On one microphone the imager did nothing at any setting of any
+    /// control, and the vectorscope — which reads the same post-bay audio —
+    /// drew the vertical line to match. Two of the three knobs are innocent:
+    /// width scales a side and a mono pair has none, so width doing nothing
+    /// there is arithmetic, and this test says so out loud rather than
+    /// leaving the next reader to rediscover it. The ensemble is the control
+    /// that owes this case an answer, and it was convolving the very signal
+    /// it exists to manufacture.
+    ///
+    /// So: the ensemble must widen a mono pair on its own, and once it has,
+    /// the other two must bite.
+    #[test]
+    fn one_microphone_through_the_imager_seat_answers_the_ensemble() {
+        use crate::units::imager::{ensemble_law, ensemble_trim};
+        const FRAMES: usize = 24_000;
+        const SKIP: usize = 2_400;
+        let program = microphone_program(FRAMES);
+        let spec = spec_for(IMAGER_PATH).unwrap();
+        let ids = |symbol: &str| {
+            spec.params
+                .iter()
+                .position(|p| p.symbol == symbol)
+                .expect("the imager lost a parameter")
+        };
+        let (width, ensemble, mono_below) = (ids("width"), ids("ensemble"), ids("mono_below"));
+
+        let rest = through_seat(spec, &spec.defaults(), &program);
+        // The honest part: with no side to scale, the side controls cannot
+        // and must not invent one.
+        for id in [width, mono_below] {
+            for end in [0.0_f32, 1.0] {
+                let mut values = spec.defaults();
+                values[id] = end;
+                let moved = through_seat(spec, &values, &program);
+                assert!(
+                    divergence_db(&rest, &moved, SKIP) < -100.0,
+                    "{} moved a mono pair with the ensemble shut — a widener \
+                     may not invent a side out of nothing",
+                    spec.params[id].symbol
+                );
+            }
+        }
+
+        // The part that was broken: the ensemble makes the side.
+        let mut open = spec.defaults();
+        open[ensemble] = 1.0;
+        let widened = through_seat(spec, &open, &program);
+        assert!(
+            divergence_db(&rest, &widened, SKIP) > -12.0,
+            "the ensemble left one microphone exactly where it found it: \
+             {:.1} dB",
+            divergence_db(&rest, &widened, SKIP)
+        );
+        // And what it made is genuine side, not a level change: the mono fold
+        // is the mid it was handed, times the one trim both channels took —
+        // and nothing else, to the bit. See `units::imager::ensemble_trim`:
+        // an ensemble adds decorrelated power and the trim takes that power
+        // back out of the pair, so the fold arrives scaled and never altered.
+        // A hole in the mono fold is the one failure this whole unit exists
+        // to make impossible, and a scalar cannot hide one.
+        let trim = ensemble_trim(ensemble_law(1.0));
+        for f in 0..FRAMES {
+            let before = 0.5 * (program[0][f] + program[1][f]) * trim;
+            let after = 0.5 * (widened[0][f] + widened[1][f]);
+            assert!(
+                (before - after).abs() < 1.0e-6,
+                "the ensemble put something other than the mid in the mono \
+                 fold at frame {f}: {before} -> {after}"
+            );
+        }
+
+        // And now the other two have something to act on.
+        for id in [width, mono_below] {
+            let mut values = open.clone();
+            values[id] = 1.0;
+            let moved = through_seat(spec, &values, &program);
+            assert!(
+                divergence_db(&widened, &moved, SKIP) > -30.0,
+                "{} still did nothing to a microphone the ensemble had \
+                 already widened",
+                spec.params[id].symbol
+            );
+        }
     }
 }

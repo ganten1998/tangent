@@ -48,6 +48,53 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **Mono's pressed keys are legible.** They were near-white on near-white keys,
   a highlight you could not see. Carbon retired to make room for Silverface;
   its palette indices stay frozen where saved desks expect them.
+- **Tangent Imager's Ensemble works on a single microphone, which is the whole
+  reason it exists.** It used to build its width out of the SIDE of the
+  record, and a mono track has no side, so on the commonest thing in the app
+  the knob did nothing whatsoever and the vectorscope drew the flat line to
+  agree. It builds width out of the MID now, which every record has, and what
+  it makes is ADDED to whatever image the record arrived with instead of
+  fading that image out, so a stereo mix keeps the picture it was mixed with.
+  The dial is calibrated in the correlation number printed under the
+  goniometer: half the travel is half the way to zero, and the top is the
+  widest a pair can be and still fold to mono untouched. And it holds your
+  level while it does it, to within a twentieth of a decibel across the whole
+  travel, so it is a knob you can A/B. Folding the output to mono still hands
+  back the middle of your mix and nothing else, which is the promise the unit
+  is built on and the one thing none of this was allowed to cost.
+- **Tangent Tape's Drive reaches the tape now.** Measured at the level people
+  actually record at, rather than the full scale nobody records at, the old
+  knob ran from a thousandth of a percent of distortion to about one and a
+  half percent, with three quarters of its travel doing nothing anybody could
+  hear. Its top is about fourteen decibels hotter, so full travel is a machine
+  being slammed: twenty-two percent, with the treble rounding that is the
+  point of the unit arriving alongside it. Two things came with that. The
+  record amplifier runs at four times the session rate, because a saturator
+  driven this hard folds the harmonics it makes back down into the music as
+  tuneless hash if it does not, and on a 7 kHz note at full drive that hash
+  was a third of the output; it is under two percent of it now. And the
+  playback side is lined up per record level, the way a real machine is lined
+  up with a tone, so the knob still is not a volume control where the music
+  sits: a quarter of a decibel at the shipped setting, under two at the very
+  top, and what the top does cost you is the top of the band rather than the
+  level, which is what a tape takes.
+- **Tape's Bump, Roll and Trim print decibels and hertz**, which is what their
+  automation lanes always said they were. The panel used to read all three as
+  a percentage, so the lane and the knob quoted two different numbers for the
+  same control.
+- **A Tape or Imager setting saved by an earlier development build will sound
+  different.** Both of those knobs kept their names and their stored numbers
+  while what the numbers MEAN changed underneath them, and nothing converts
+  them on the way in. A Tape Drive of 1.0 used to be a mild one and a half
+  percent of distortion and is twenty-two percent today; the old sound is at
+  0.7 now, so multiplying a stored Drive by 0.7 puts it back. An Imager
+  Ensemble has no conversion at all, because that control changed from fading
+  the record's own image out to adding to it, and no position of the new knob
+  reproduces the old one on a stereo source. This is written down rather than
+  migrated because neither unit has ever appeared in a released build: the
+  whole suite is still in this section, so the only sessions that can be
+  holding the old meaning are ones made while it was being built. The day it
+  ships, this stops being a note and becomes something the loader has to do.
 
 ### Fixed
 
