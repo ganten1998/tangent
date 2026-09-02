@@ -175,6 +175,22 @@ impl Eg {
         self.level
     }
 
+    /// Where the envelope is right now, in the same units as its targets.
+    fn level(&self) -> f32 {
+        self.level
+    }
+
+    /// This envelope, starting its first stage from `level` instead of from
+    /// silence. **What the hardware does when a voice is re-keyed**: the
+    /// DX7's envelope generator is given a new target and a new rate, and
+    /// it goes there from wherever it is — it has no way to jump. An attack
+    /// that started from silence on a voice that was still sounding is a
+    /// hole cut in the note, and the edges of the hole are the click.
+    fn from_level(mut self, level: f32) -> Self {
+        self.level = level.clamp(0.0, RANGE_DB);
+        self
+    }
+
     /// The key came up: run the fourth stage.
     fn release(&mut self) {
         self.stage = 3;
@@ -334,10 +350,26 @@ impl Dx7 {
         let hz = 440.0 * 2.0_f32.powf((sounding_pitch - 69.0) / 12.0);
         let vel = velocity.clamp(0.0, 1.0);
 
+        // **The slot is re-keyed, not replaced.** Whatever is in it — a
+        // repeat of this pitch under the pedal, a release tail, a stolen
+        // voice at another pitch — is still sounding, and this used to
+        // overwrite it wholesale: every envelope back to silence, every
+        // phase re-seeded, the feedback history zeroed. A ringing voice cut
+        // mid-waveform, audible as a pop on every consecutive strike and
+        // worst under the pedal, where the old note is always still loud.
+        // The rules below are the hardware's, which re-keys a voice by
+        // giving its generators new targets and letting them run on.
+        let old = self.notes[slot];
+        let silent = old.age == 0 || old.eg.iter().all(Eg::finished);
+
         let mut n = Note {
             on: true,
             pitch,
             age: self.clock.wrapping_add(1),
+            // The two samples of feedback history stay: the self-modulating
+            // operator keeps its own recent past, and zeroing it is a kink
+            // in whatever it was making.
+            fb: old.fb,
             ..Note::SILENT
         };
         self.clock = n.age;
@@ -347,19 +379,43 @@ impl Dx7 {
             // How fast this operator's envelope runs at this pitch.
             let rs =
                 f32::from(op.rate_scaling) / 7.0 * ((sounding_pitch - 21.0) / 87.0).clamp(0.0, 1.0);
-            n.eg[i] = Eg::new(op.rate, op.level, sr, rs);
+            // Each envelope starts its attack from where the OLD one is —
+            // from silence exactly when the slot was silent, which is the
+            // first strike as it always was.
+            let from = if silent { RANGE_DB } else { old.eg[i].level() };
+            n.eg[i] = Eg::new(op.rate, op.level, sr, rs).from_level(from);
             n.step[i] = std::f32::consts::TAU * op_hz(&op, hz) / sr;
             // A patch with oscillator sync starts every operator at zero, which
             // is what makes a percussive attack repeatable. Without it they run
             // free and each note is slightly different, which is what makes a
             // pad breathe.
-            n.phase[i] = if v.osc_sync { 0.0 } else { self.next_random() } * std::f32::consts::TAU;
+            //
+            // Both rules are for a voice starting from SILENCE, where the
+            // phase is inaudible until the envelope brings it up. A voice
+            // that is still sounding keeps its phase whatever the patch
+            // says: the sine runs on at the new step — continuous through a
+            // pitch change, which is a frequency step and not a click —
+            // where a reset to zero is a step of up to the whole waveform.
+            // The hardware never resets an audible oscillator on a repeat
+            // of the same key, because it gives the repeat a fresh silent
+            // voice; with one voice per pitch here, running on is the same
+            // sound. (It does reset one when it steals, and that is a
+            // known click of the instrument, not one to keep.)
+            n.phase[i] = if !silent {
+                old.phase[i]
+            } else if v.osc_sync {
+                0.0
+            } else {
+                self.next_random() * std::f32::consts::TAU
+            };
 
             let db = f32::from(op.output_level).min(99.0);
             let scaled = db + keyboard_scaling(&op, sounding_pitch) + velocity_offset(&op, vel);
             n.peak[i] = level_to_amp(scaled);
             n.am_depth[i] = f32::from(op.amp_mod_sens) / 3.0;
         }
+        // The pitch envelope restarts: its rest is the note as written, and
+        // a step in frequency is not a step in the waveform.
         n.pitch_eg = Eg::pitch(v.pitch_rate, v.pitch_level, sr);
 
         // The ledger counts occupied SLOTS. A retired slot is `Note::SILENT`,

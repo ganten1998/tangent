@@ -741,18 +741,60 @@ impl Mechanism {
 
     /// Become another instrument. Silences all four, because a tine ringing
     /// on under a piano would be the previous patch leaking into the new one.
+    ///
+    /// Silenced outright, not damped: a mechanism that is not the family
+    /// being ticked never runs its fade, so `damp` on it was a promise
+    /// nobody kept — the wave sat in the buffer until the next strike
+    /// cleared it. Now that a strike LANDS on a voice that is not finished
+    /// (see `strike`), a stale wave would be landed on, and the patch it
+    /// came from would speak through the new one.
     fn set_kind(&mut self, patch: Patch) {
         self.family = patch.family();
         self.patch = patch;
-        self.piano.damp();
-        self.ep.damp();
-        self.clav.damp();
-        self.wurli.damp();
+        self.silence();
+    }
+
+    /// Every mechanism to silence, now: what a voice must be before a first
+    /// strike, and what the frame makes of one it has faded out.
+    fn silence(&mut self) {
+        self.piano.silence();
+        self.ep.silence();
+        self.clav.silence();
+        self.wurli.silence();
+    }
+
+    /// Whether a strike of `pitch` with these knobs lands on what this
+    /// voice is ringing, or would have to replace it. The modal instruments
+    /// always land — a resonator takes new coefficients under its motion
+    /// without a step — and the waveguides land when the loop's design is
+    /// the one ringing; see `string::PianoVoice::lands`.
+    fn lands(&self, pitch: u8, params: &[f32; MAX_PARAMS]) -> bool {
+        match self.patch {
+            Patch::Piano1 => self.piano.lands(
+                pitch,
+                &PianoKnobs::from_params(params),
+                &string::PianoBase::JAZZ,
+            ),
+            Patch::Piano2 => self.piano.lands(
+                pitch,
+                &PianoKnobs::from_params(params),
+                &string::PianoBase::CONCERT,
+            ),
+            Patch::EpMk1 | Patch::EpSuitcase => !self.ep.finished(),
+            Patch::Clav => self.clav.lands(pitch, &ClavKnobs::from_params(params)),
+            Patch::ClavWah => self.clav.lands(pitch, &ClavKnobs::from_params_wah(params)),
+            Patch::Wurli200 | Patch::Wurli140 => !self.wurli.finished(),
+        }
     }
 
     /// Strike, with **the whole knob store** rather than one number: each
     /// mechanism maps the shared 0..1 values into its own units, because
     /// knob 4 is an unison on one instrument and a pickup on the other.
+    ///
+    /// On a voice that is still audible this LANDS — the hammer's energy
+    /// is added to what is ringing — when `lands` says it can, and starts
+    /// over from a cleared state when it cannot. The frame never lets the
+    /// second case happen to an audible voice; see `Keys::note_on`.
     fn strike(&mut self, pitch: u8, velocity: f32, params: &[f32; MAX_PARAMS]) {
         match self.patch {
             Patch::Piano1 => self.piano.strike_based(
@@ -849,7 +891,11 @@ impl Mechanism {
 }
 
 struct Note {
-    mech: Mechanism,
+    /// Boxed, so that moving a voice out of the pool — into a corpse slot,
+    /// see `Keys::bury` — is a pointer swap and not a copy of the four
+    /// mechanisms' hundred-odd kilobytes on the audio thread. Allocated in
+    /// `fill_pool`, once.
+    mech: Box<Mechanism>,
     /// Which key this is. `None` when the voice is free.
     pitch: Option<u8>,
     /// Whether the key is still down. A voice with the key up but the pedal
@@ -866,9 +912,41 @@ struct Note {
     age: u32,
 }
 
+/// A voice that had to leave the pool while it was still audible, finishing
+/// on its own: the mechanism, where it sat in the field, and how much of
+/// its fade is left.
+///
+/// **Why a voice cannot simply be restruck.** A strike LANDS on a voice of
+/// the same design — see `Mechanism::strike` — but a stolen voice is a
+/// different pitch, and nothing superposes across a pitch change; the loop
+/// has to start from silence, and clearing a loop that is still audible is
+/// a step, which is a pop. So the audible mechanism is swapped out here,
+/// faded to nothing over a few milliseconds, and the slot starts fresh on a
+/// mechanism that is silent — clearing silence pops nothing.
+struct Corpse {
+    mech: Box<Mechanism>,
+    pan: f32,
+    /// Samples of fade left. Zero is a free slot.
+    left: u32,
+    total: u32,
+}
+
+/// How many voices may be fading out at once. Stealing is rare on a pool
+/// of sixty-four, and a fade is four milliseconds; three is more than a
+/// hand can steal in that time. When it is not, the corpse nearest the end
+/// of its fade is cut — at a gain already close to zero.
+const CORPSES: usize = 3;
+
+/// How long a stolen voice takes to fade, in seconds. Long enough that the
+/// slope is not an edge at any pitch the instrument plays, short enough
+/// that the new note is not heard arriving under an old one.
+const CORPSE_FADE: f32 = 0.004;
+
 /// The instrument.
 pub struct Keys {
     notes: Vec<Note>,
+    /// Voices on their way out; see `Corpse`.
+    corpses: Vec<Corpse>,
     patch: Patch,
     rate: f32,
     /// **The panel's knobs, all of them, normalised 0..=1**, indexed by the
@@ -909,6 +987,7 @@ impl Keys {
         let rate = if sample_rate > 0.0 { sample_rate } else { 48_000.0 };
         let mut keys = Keys {
             notes: Vec::new(),
+            corpses: Vec::new(),
             patch: Patch::default(),
             rate,
             params: Patch::default().defaults(),
@@ -930,7 +1009,7 @@ impl Keys {
         self.notes.clear();
         self.notes.reserve_exact(VOICES);
         for _ in 0..VOICES {
-            let mut mech = Mechanism::new(self.rate);
+            let mut mech = Box::new(Mechanism::new(self.rate));
             mech.set_kind(self.patch);
             self.notes.push(Note {
                 mech,
@@ -938,6 +1017,18 @@ impl Keys {
                 held: false,
                 pan: 0.0,
                 age: 0,
+            });
+        }
+        self.corpses.clear();
+        self.corpses.reserve_exact(CORPSES);
+        for _ in 0..CORPSES {
+            let mut mech = Box::new(Mechanism::new(self.rate));
+            mech.set_kind(self.patch);
+            self.corpses.push(Corpse {
+                mech,
+                pan: 0.0,
+                left: 0,
+                total: 1,
             });
         }
         self.sounding = 0;
@@ -959,6 +1050,10 @@ impl Keys {
             n.pitch = None;
             n.held = false;
             n.mech.set_kind(patch);
+        }
+        for c in &mut self.corpses {
+            c.left = 0;
+            c.mech.set_kind(patch);
         }
         self.sounding = 0;
         self.body.set_patch(patch);
@@ -1039,14 +1134,35 @@ impl Keys {
         // held flag let a repeated note under the pedal allocate a fresh
         // voice every time until the pool ran dry. A real damper cannot do
         // that, because there is only one string.
-        let slot = self
-            .notes
-            .iter()
-            .position(|n| n.pitch == Some(pitch))
-            .or_else(|| self.free_slot())
-            .or_else(|| self.steal());
-        let Some(slot) = slot else {
-            return;
+        //
+        // **What the strike then does to that voice is the mechanism's
+        // business — a hammer LANDS on a string that is still moving — with
+        // one exception the frame has to handle: a voice that is audible
+        // and cannot be landed on.** Two cases. A stolen voice is another
+        // pitch, and nothing superposes across a pitch change. A re-struck
+        // key whose loop was re-designed under it — a knob moved the
+        // string's length between two strikes of one held note — is the
+        // rare case of the same thing. Both would need the loop cleared
+        // while it is audible, which is a pop, so both go to `bury`: the
+        // audible mechanism fades out on its own and the slot starts from
+        // silence.
+        let slot = match self.notes.iter().position(|n| n.pitch == Some(pitch)) {
+            Some(s) => {
+                if !self.notes[s].mech.finished() && !self.notes[s].mech.lands(pitch, &self.params) {
+                    self.bury(s);
+                }
+                s
+            }
+            None => match self.free_slot() {
+                Some(s) => s,
+                None => {
+                    let Some(s) = self.steal() else {
+                        return;
+                    };
+                    self.bury(s);
+                    s
+                }
+            },
         };
         self.strikes = self.strikes.wrapping_add(1);
         let age = self.strikes;
@@ -1067,6 +1183,27 @@ impl Keys {
         self.notes
             .iter()
             .position(|n| n.pitch.is_none() || n.mech.finished())
+    }
+
+    /// Move the voice in `slot` out to a corpse, fading, and leave the slot
+    /// holding a silent mechanism. See `Corpse` for why. Zero allocation:
+    /// the corpse pool was filled in `fill_pool`, and the mechanisms change
+    /// places by pointer.
+    fn bury(&mut self, slot: usize) {
+        // A free corpse, or failing that the one nearest the end of its
+        // fade: its gain is already closest to zero, so cutting it is the
+        // smallest cut on offer.
+        let Some(c) = (0..self.corpses.len()).min_by_key(|&i| self.corpses[i].left) else {
+            return;
+        };
+        let corpse = &mut self.corpses[c];
+        if corpse.left > 0 {
+            corpse.mech.silence();
+        }
+        std::mem::swap(&mut self.notes[slot].mech, &mut corpse.mech);
+        corpse.pan = self.notes[slot].pan;
+        corpse.total = ((CORPSE_FADE * self.rate) as u32).max(1);
+        corpse.left = corpse.total;
     }
 
     /// **Take the quietest thing that is already dying, never the loudest
@@ -1200,6 +1337,20 @@ impl Keys {
                 left += s * gl;
                 right += s * gr;
             }
+            // The voices on their way out: a straight line to zero, which
+            // at four milliseconds is a slope no pitch hears as an edge.
+            // They still drive the body — a fading string is a string.
+            for c in &mut self.corpses {
+                if c.left == 0 {
+                    continue;
+                }
+                let s = c.mech.tick() * (c.left as f32 / c.total as f32);
+                c.left -= 1;
+                drive += s;
+                let (gl, gr) = pan_gains(c.pan);
+                left += s * gl;
+                right += s * gr;
+            }
             // The soundboard/tonebar knob rides here rather than inside the
             // body, so the board's own decay is untouched and only how much
             // of it reaches the bus moves.
@@ -1294,6 +1445,17 @@ impl Keys {
                 n.held = false;
             } else if n.pitch.is_some() {
                 live += 1;
+            }
+        }
+        // A corpse that reached the end of its fade this block is silenced
+        // HERE, once — the clearing a strike used to do on every voice —
+        // so the next `bury` hands its slot a mechanism a first strike can
+        // land on as if from `new`.
+        for c in &mut self.corpses {
+            if c.left > 0 {
+                live += 1;
+            } else if !c.mech.finished() {
+                c.mech.silence();
             }
         }
         self.sounding = live;

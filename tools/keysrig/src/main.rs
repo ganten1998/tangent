@@ -7,6 +7,12 @@
 //!
 //!   cargo run --release -- <patch> <performance> <out.wav>
 //!   patches: piano piano2 ep suitcase clav clavwah wurli wurli140
+//!
+//!   cargo run --release -- restrike     the consecutive-strike report, every
+//!                                       patch and the DX7 (see `report_restrike`)
+//!   cargo run --release -- pin          one FNV per first-strike render, so a
+//!                                       change meant for restrikes can PROVE it
+//!                                       left a first strike alone
 
 // Relative to THIS FILE, which is how `#[path]` resolves: the bench lives
 // in tools/keysrig and reaches over to the one true copy of the DSP.
@@ -14,6 +20,8 @@
 mod keys;
 mod analyze;
 mod wav;
+
+mod dx7;
 
 use keys::{Keys, Patch};
 
@@ -422,8 +430,539 @@ fn report_partials(patch: Patch) {
     }
 }
 
+// ── consecutive strikes ─────────────────────────────────────────────────────
+//
+// The owner's report, verbatim: "the midi instruments all of them - don't
+// handle consecutive strikes very well - they audible pop which gets
+// noticeable degraded by any pedal activation". A pop is a discontinuity, and
+// a discontinuity is a number: the largest one-sample step in the output.
+// This report measures that step at the moment of a restrike and compares it
+// with the steepest step a FRESH strike of the same note makes, which is the
+// one edge the ear has already agreed to hear. A restrike that is no sharper
+// than a fresh strike laid over what was ringing is not a pop.
+
+/// The two instruments behind one set of calls, so every scenario below is
+/// written once and played on both.
+trait Rig {
+    fn on(&mut self, pitch: u8, vel: f32);
+    fn off(&mut self, pitch: u8);
+    fn pedal(&mut self, down: bool);
+    fn render(&mut self, out: &mut [f32], frames: usize, channels: usize);
+}
+
+impl Rig for Keys {
+    fn on(&mut self, pitch: u8, vel: f32) {
+        self.note_on(pitch, vel);
+    }
+    fn off(&mut self, pitch: u8) {
+        self.note_off(pitch);
+    }
+    fn pedal(&mut self, down: bool) {
+        self.set_pedal(down);
+    }
+    fn render(&mut self, out: &mut [f32], frames: usize, channels: usize) {
+        Keys::render(self, out, frames, channels);
+    }
+}
+
+impl Rig for dx7::synth::Dx7 {
+    fn on(&mut self, pitch: u8, vel: f32) {
+        self.note_on(pitch, vel);
+    }
+    fn off(&mut self, pitch: u8) {
+        self.note_off(pitch);
+    }
+    fn pedal(&mut self, down: bool) {
+        self.set_pedal(down);
+    }
+    fn render(&mut self, out: &mut [f32], frames: usize, channels: usize) {
+        dx7::synth::Dx7::render(self, out, frames, channels);
+    }
+}
+
+/// Every instrument the report plays, with a fresh instance per scenario so
+/// no scenario inherits another's ringing.
+fn rigs() -> Vec<(String, Box<dyn Fn() -> Box<dyn Rig>>)> {
+    let mut v: Vec<(String, Box<dyn Fn() -> Box<dyn Rig>>)> = Vec::new();
+    for &patch in &Patch::ALL {
+        v.push((
+            patch_label(patch).to_owned(),
+            Box::new(move || {
+                let mut k = Keys::new(RATE);
+                k.set_patch(patch);
+                Box::new(k)
+            }),
+        ));
+    }
+    for (name, voice) in dx7_patches() {
+        v.push((
+            format!("DX7 {name}"),
+            Box::new(move || {
+                let mut d = dx7::synth::Dx7::new(RATE);
+                d.set_voice(voice);
+                Box::new(d)
+            }),
+        ));
+    }
+    v
+}
+
+/// Three DX7 patches with nothing in common but the engine: the shipped
+/// electric piano (oscillator sync on, a modulator that dies in a fifth of a
+/// second), a percussive sync patch with feedback at the top of the stack,
+/// and a free-running pad that sustains. A restrike bug lives in the voice
+/// LIFECYCLE, so what matters is that the three take the three different
+/// paths through note-on: sync, feedback, and a held sustain stage.
+fn dx7_patches() -> Vec<(&'static str, dx7::voice::Voice)> {
+    use dx7::voice::Voice;
+    let ep = Voice::default();
+
+    let mut bell = Voice::default();
+    bell.osc_sync = true;
+    bell.feedback = 6;
+    for op in &mut bell.ops {
+        op.rate = [99, 72, 50, 80];
+        op.level = [99, 60, 0, 0];
+    }
+    bell.ops[1].coarse = 3;
+    bell.ops[1].fine = 50;
+    bell.ops[1].output_level = 86;
+    bell.ops[3].coarse = 7;
+    bell.ops[3].output_level = 70;
+    bell.ops[5].coarse = 11;
+    bell.ops[5].output_level = 75;
+    bell.set_name("SYNC BELL");
+
+    let mut pad = Voice::default();
+    pad.osc_sync = false;
+    pad.feedback = 0;
+    pad.lfo_amp_depth = 25;
+    pad.lfo_speed = 30;
+    for op in &mut pad.ops {
+        op.rate = [48, 60, 40, 55];
+        op.level = [99, 95, 90, 0];
+        op.amp_mod_sens = 1;
+    }
+    pad.ops[1].coarse = 2;
+    pad.ops[1].output_level = 62;
+    pad.ops[3].coarse = 1;
+    pad.ops[3].fine = 2;
+    pad.ops[3].output_level = 55;
+    pad.set_name("FREE PAD");
+
+    vec![("E.PIANO 1", ep), ("SYNC BELL", bell), ("FREE PAD", pad)]
+}
+
+/// Play `events` — (frame, event), frames on block boundaries so the moment
+/// is exact — for `frames` samples and return the mono sum. The block loop
+/// is the engine's, so a strike lands where the engine would land it.
+fn run(rig: &mut dyn Rig, events: &[(usize, Ev)], frames: usize) -> Vec<f32> {
+    let mut events = events.to_vec();
+    events.sort_by_key(|e| e.0);
+    let total = frames.div_ceil(BLOCK) * BLOCK;
+    let mut out = Vec::with_capacity(total);
+    let mut scratch = vec![0.0_f32; BLOCK * 2];
+    let mut next = 0usize;
+    let mut frame = 0usize;
+    while frame < total {
+        while next < events.len() && events[next].0 < frame + BLOCK {
+            match events[next].1 {
+                Ev::On(p, v) => rig.on(p, f32::from(v) / 127.0),
+                Ev::Off(p) => rig.off(p),
+                Ev::Pedal(d) => rig.pedal(d),
+            }
+            next += 1;
+        }
+        scratch.fill(0.0);
+        rig.render(&mut scratch, BLOCK, 2);
+        out.extend(scratch.chunks_exact(2).map(|f| (f[0] + f[1]) * 0.5));
+        frame += BLOCK;
+    }
+    out
+}
+
+/// Seconds to a block boundary at or before that instant — where `run`
+/// will actually apply an event, and therefore where a measurement window
+/// has to be centred.
+fn at(secs: f32) -> usize {
+    (secs * RATE) as usize / BLOCK * BLOCK
+}
+
+fn ms(m: f32) -> usize {
+    (m * 0.001 * RATE) as usize
+}
+
+/// Largest one-sample step in `x[a..b]`: the first difference, the plain
+/// measure of an edge.
+fn d1(x: &[f32], a: usize, b: usize) -> f32 {
+    let b = b.min(x.len());
+    let mut m = 0.0_f32;
+    for n in a.max(1)..b {
+        m = m.max((x[n] - x[n - 1]).abs());
+    }
+    m
+}
+
+/// Largest second difference in `x[a..b]`. A sinusoid's second difference is
+/// its first scaled by the tiny angle w, so a step — whose second difference
+/// is the whole step, twice — stands 30 dB clear of a loud low bed that the
+/// first difference alone would let it hide under. The chord tests need it.
+fn d2(x: &[f32], a: usize, b: usize) -> f32 {
+    let b = b.min(x.len());
+    let mut m = 0.0_f32;
+    for n in a.max(2)..b {
+        m = m.max((x[n] - 2.0 * x[n - 1] + x[n - 2]).abs());
+    }
+    m
+}
+
+fn rms_in(x: &[f32], a: usize, b: usize) -> f32 {
+    let b = b.min(x.len());
+    if b <= a {
+        return 0.0;
+    }
+    let e: f64 = x[a..b].iter().map(|s| f64::from(*s) * f64::from(*s)).sum();
+    (e / (b - a) as f64).sqrt() as f32
+}
+
+fn peak_in(x: &[f32], a: usize, b: usize) -> f32 {
+    analyze::peak(&x[a.min(x.len())..b.min(x.len())])
+}
+
+/// What a fresh strike of `pitch` looks like on this rig: the steepest first
+/// and second differences anywhere in the note — the attack, for everything
+/// struck; wherever the slope of a slow envelope peaks, for a pad whose
+/// first twenty milliseconds are silence — and its peak. These are the
+/// ceilings the restrikes are held to.
+struct Fresh {
+    d1: f32,
+    d2: f32,
+    peak: f32,
+}
+
+/// Where the fresh strike lands in its own render: after a few blocks of
+/// silence, so the step from nothing to its first sample is in the window
+/// — the first version struck at frame zero and the ceiling never saw the
+/// edge every restrike was then measured against.
+const FRESH_AT: f32 = 0.01;
+
+/// How far over the linear ceiling a restrike may sit before it is called
+/// a pop. The tine's magnet and the reed's plate are not linear: a hammer
+/// landing on metal already displaced toward the pickup makes a slightly
+/// steeper edge than the same hammer from rest, by the pickup's local gain
+/// — measured at 1.4 dB on the reed — and that is the instrument, not a
+/// fault. A cut loop is tens of decibels over.
+const EDGE_TOL_DB: f32 = 3.0;
+
+fn fresh(make: &dyn Fn() -> Box<dyn Rig>, pitch: u8, vel: u8, secs: f32) -> (Fresh, Vec<f32>) {
+    let mut rig = make();
+    let x = run(
+        rig.as_mut(),
+        &[(0, Ev::Pedal(true)), (at(FRESH_AT), Ev::On(pitch, vel))],
+        (secs * RATE) as usize,
+    );
+    let f = Fresh {
+        d1: d1(&x, 0, x.len()),
+        d2: d2(&x, 0, x.len()),
+        peak: analyze::peak(&x),
+    };
+    (f, x)
+}
+
+/// One restrike, measured. `onset` is where the event landed. The window
+/// runs from 2 ms before it — where a leaked step would already have to be
+/// absent — to 20 ms after, where the waveguide's delayed edge appears. The
+/// ceiling is the fresh strike's own edge PLUS the bed's edge in the 20 ms
+/// before: superposition can never exceed that sum, so a value over it is
+/// energy the strike did not put in.
+struct Edge {
+    d1: f32,
+    d2: f32,
+    over_d1: f32,
+    over_d2: f32,
+    /// The quietest four milliseconds — a period of the lowest note this
+    /// plays, so a level and not a phase — in the 12 ms after the strike,
+    /// against the four before it, in dB. A hole — a voice cut to silence
+    /// and re-attacked — reads as a deep negative here; a landing hammer
+    /// mostly adds. `None` when there was no bed to dip from: a bed under
+    /// -60 dBFS is a ratio of two noises.
+    dip_db: Option<f32>,
+}
+
+/// How far a restrike may sit under the bed it landed on and still be a
+/// hammer adding energy rather than a voice cut and re-attacked. A hammer
+/// landing against the motion takes energy out — a real string restruck
+/// in anti-phase gets quieter, and pianists know it — so this is not
+/// zero; a cut is tens of decibels.
+const DIP_FLOOR_DB: f32 = -6.0;
+
+fn edge(x: &[f32], onset: usize, f: &Fresh) -> Edge {
+    let bed1 = d1(x, onset.saturating_sub(ms(20.0)), onset);
+    let bed2 = d2(x, onset.saturating_sub(ms(20.0)), onset);
+    let e1 = d1(x, onset.saturating_sub(ms(2.0)), onset + ms(20.0));
+    let e2 = d2(x, onset.saturating_sub(ms(2.0)), onset + ms(20.0));
+    let before = rms_in(x, onset.saturating_sub(ms(4.0)), onset);
+    let mut worst = f32::MAX;
+    let mut a = onset;
+    while a + ms(4.0) <= onset + ms(12.0) {
+        worst = worst.min(rms_in(x, a, a + ms(4.0)));
+        a += ms(1.0);
+    }
+    Edge {
+        d1: e1,
+        d2: e2,
+        over_d1: analyze::db(e1 / (f.d1 + bed1).max(1e-12)),
+        over_d2: analyze::db(e2 / (f.d2 + bed2).max(1e-12)),
+        dip_db: (before > 1.0e-3).then(|| analyze::db(worst / before)),
+    }
+}
+
+impl Edge {
+    fn ok(&self) -> bool {
+        self.over_d1 <= EDGE_TOL_DB
+            && self.over_d2 <= EDGE_TOL_DB
+            && self.dip_db.is_none_or(|d| d >= DIP_FLOOR_DB)
+    }
+
+    /// The edges alone, for the scenarios where a dip is the physics: a
+    /// rapid repeat lands at whatever phase the note is in, and a landing
+    /// against the motion is quieter, not broken.
+    fn edges_ok(&self) -> bool {
+        self.over_d1 <= EDGE_TOL_DB && self.over_d2 <= EDGE_TOL_DB
+    }
+
+    fn dip(&self) -> String {
+        match self.dip_db {
+            Some(d) => format!("{d:+6.1} dB"),
+            None => "   (no bed)".to_owned(),
+        }
+    }
+}
+
+fn verdict(ok: bool) -> &'static str {
+    if ok {
+        "ok"
+    } else {
+        "POP"
+    }
+}
+
+/// **The consecutive-strike report.** For every patch and the DX7: a note
+/// restruck under the pedal, a voice stolen out of a full pool, and eight
+/// strikes at 60 ms. Prints the edge of each against the fresh ceiling and
+/// says which ones pop. Returns how many did, so a script can fail on it.
+fn report_restrike() -> usize {
+    const PITCH: u8 = 60;
+    const VEL: u8 = 102;
+    let mut pops = 0usize;
+    println!("consecutive strikes: edge at the restrike vs a fresh strike's own edge");
+    println!("  over = dB above (fresh + bed); positive is energy no hammer put in");
+    for (label, make) in rigs() {
+        let (f, _) = fresh(make.as_ref(), PITCH, VEL, 1.0);
+        println!("\n  {label}");
+        println!(
+            "    fresh      d1 {:8.5}  d2 {:8.5}  peak {:+6.1} dBFS",
+            f.d1,
+            f.d2,
+            analyze::db(f.peak)
+        );
+
+        // Restrike: key up at 0.25 s under the pedal, down again at 0.5 s.
+        let mut rig = make();
+        let onset = at(0.5);
+        let x = run(
+            rig.as_mut(),
+            &[
+                (0, Ev::Pedal(true)),
+                (0, Ev::On(PITCH, VEL)),
+                (at(0.25), Ev::Off(PITCH)),
+                (onset, Ev::On(PITCH, VEL)),
+            ],
+            (1.0 * RATE) as usize,
+        );
+        let e = edge(&x, onset, &f);
+        pops += usize::from(!e.ok());
+        println!(
+            "    restrike   d1 {:8.5}  d2 {:8.5}  over {:+5.1} {:+5.1} dB  dip {}  {}",
+            e.d1,
+            e.d2,
+            e.over_d1,
+            e.over_d2,
+            e.dip(),
+            verdict(e.ok())
+        );
+
+        // Steal: fill the pool with held keys, release ONE under the pedal
+        // (the stealing policy takes released voices first, so it is the
+        // one that goes, and it is still at full level), then a pitch the
+        // pool does not hold. On the DX7 the oldest keyed voice goes; the
+        // first note struck is the oldest, and it is the same pitch.
+        let is_dx7 = label.starts_with("DX7");
+        let pool = if is_dx7 { dx7::synth::VOICES } else { keys::VOICES };
+        let victim = 30u8;
+        let mut ev = vec![(0usize, Ev::Pedal(true))];
+        for i in 0..pool {
+            ev.push((0, Ev::On(24 + i as u8, VEL)));
+        }
+        ev.push((at(0.1), Ev::Off(victim)));
+        let newcomer = 100u8;
+        ev.push((onset, Ev::On(newcomer, VEL)));
+        let (fn_, _) = fresh(make.as_ref(), newcomer, VEL, 0.6);
+        let mut rig = make();
+        let x = run(rig.as_mut(), &ev, (0.8 * RATE) as usize);
+        let e = edge(&x, onset, &fn_);
+        pops += usize::from(!e.ok());
+        println!(
+            "    steal      d1 {:8.5}  d2 {:8.5}  over {:+5.1} {:+5.1} dB  dip {}  {}",
+            e.d1,
+            e.d2,
+            e.over_d1,
+            e.over_d2,
+            e.dip(),
+            verdict(e.ok())
+        );
+
+        // Rapid repeat: eight strikes 60 ms apart, key up 30 ms after each,
+        // pedal down throughout. Every restrike is held to the ceiling, and
+        // the whole thing to the fresh peak plus 3 dB — superposition that
+        // stacks into clipping is the other way to be wrong.
+        let mut ev = vec![(0usize, Ev::Pedal(true))];
+        let mut onsets = Vec::new();
+        for k in 0..8 {
+            let t = at(k as f32 * 0.060);
+            onsets.push(t);
+            ev.push((t, Ev::On(PITCH, VEL)));
+            ev.push((at(k as f32 * 0.060 + 0.030), Ev::Off(PITCH)));
+        }
+        let mut rig = make();
+        let x = run(rig.as_mut(), &ev, (1.0 * RATE) as usize);
+        let mut worst1 = f32::MIN;
+        let mut worst2 = f32::MIN;
+        let mut worst_dip = f32::MAX;
+        let mut edges_ok = true;
+        for &o in &onsets[1..] {
+            let e = edge(&x, o, &f);
+            worst1 = worst1.max(e.over_d1);
+            worst2 = worst2.max(e.over_d2);
+            worst_dip = worst_dip.min(e.dip_db.unwrap_or(0.0));
+            edges_ok &= e.ok();
+        }
+        let over_peak = analyze::db(peak_in(&x, 0, x.len()) / f.peak.max(1e-12));
+        let ok = edges_ok && over_peak <= 3.0;
+        pops += usize::from(!ok);
+        println!(
+            "    rapid x8   worst over {:+5.1} {:+5.1} dB  dip {:+6.1} dB  peak {:+5.1} dB vs fresh  {}",
+            worst1,
+            worst2,
+            worst_dip,
+            over_peak,
+            verdict(ok)
+        );
+    }
+    println!("\n  {pops} scenario(s) pop");
+    pops
+}
+
+/// **The first-strike pin.** One FNV hash per render of a first strike from
+/// silence — every patch at its defaults and at both ends of every knob, and
+/// the DX7 patches — so a change to restrikes can prove, by diff of two
+/// printouts, that it changed nothing a first strike does. A hash rather
+/// than a file: the point is a before/after that fits on one screen.
+fn report_pin() {
+    fn fnv(x: &[f32]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325_u64;
+        for s in x {
+            for b in s.to_bits().to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+    let ev = [(0usize, Ev::Pedal(true)), (0, Ev::On(60, 102)), (at(0.3), Ev::Off(60))];
+    let frames = (0.5 * RATE) as usize;
+    for &patch in &Patch::ALL {
+        let mut line = format!("  {:<12}", patch_label(patch));
+        for knob in 0..=keys::MAX_PARAMS {
+            for end in [0.0_f32, 1.0] {
+                if knob == keys::MAX_PARAMS && end > 0.0 {
+                    continue;
+                }
+                let mut k = Keys::new(RATE);
+                k.set_patch(patch);
+                if knob < keys::MAX_PARAMS {
+                    k.set_param(knob, end);
+                }
+                let x = run(&mut k, &ev, frames);
+                line.push_str(&format!(" {:016x}", fnv(&x)));
+            }
+        }
+        println!("{line}");
+    }
+    for (name, voice) in dx7_patches() {
+        let mut d = dx7::synth::Dx7::new(RATE);
+        d.set_voice(voice);
+        let x = run(&mut d, &ev, frames);
+        println!("  {:<12} {:016x}", format!("DX7 {name}"), fnv(&x));
+    }
+}
+
+/// Print the samples around a restrike, the bed alone, and their
+/// difference beside a fresh strike: what superposition SHOULD look like
+/// next to what the mechanism did. A debugging aid, kept because the next
+/// person to touch a strike path will want it.
+fn probe(which: &str) {
+    const PITCH: u8 = 60;
+    const VEL: u8 = 102;
+    let Some((label, make)) = rigs().into_iter().find(|(l, _)| l.starts_with(which)) else {
+        eprintln!("no rig starts with {which}");
+        return;
+    };
+    let onset = at(0.5);
+    let base = [
+        (0usize, Ev::Pedal(true)),
+        (0, Ev::On(PITCH, VEL)),
+        (at(0.25), Ev::Off(PITCH)),
+    ];
+    let mut with = base.to_vec();
+    with.push((onset, Ev::On(PITCH, VEL)));
+    let mut rig = make();
+    let bed = run(rig.as_mut(), &base, (0.6 * RATE) as usize);
+    let mut rig = make();
+    let re = run(rig.as_mut(), &with, (0.6 * RATE) as usize);
+    let (_, fr) = fresh(make.as_ref(), PITCH, VEL, 0.1);
+    println!("{label}: n   bed        restrike   diff       fresh");
+    for n in onset.saturating_sub(3)..onset + 24 {
+        let d = re[n] - bed[n];
+        let f = if n >= onset { fr[n - onset] } else { 0.0 };
+        println!(
+            "  {:>4}  {:+.6}  {:+.6}  {:+.6}  {:+.6}",
+            n as isize - onset as isize,
+            bed[n],
+            re[n],
+            d,
+            f
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let (Some("probe"), Some(which)) = (args.get(1).map(String::as_str), args.get(2)) {
+        probe(which);
+        return;
+    }
+    match args.get(1).map(String::as_str) {
+        Some("restrike") => {
+            let pops = report_restrike();
+            std::process::exit(i32::from(pops > 0));
+        }
+        Some("pin") => {
+            report_pin();
+            return;
+        }
+        _ => {}
+    }
     let patch = match args.get(1).map(String::as_str) {
         Some("ep") => Patch::EpMk1,
         Some("suitcase") => Patch::EpSuitcase,
