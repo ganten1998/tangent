@@ -1223,25 +1223,18 @@ fn push_fx_params(
     app.set_fx_params(strip, bays);
 }
 
-/// MERGE-ME(wave3-ui): stand-in for `Engine::insert_wants_key(seat, bay)`
-/// until the engine lane lands — replace the body with
-/// `engine.insert_wants_key(seat, bay)` and delete this comment. Answering
-/// `false` is the safe default: every VST3's "Sidechain" menu row stays
-/// hidden rather than offering a key input the engine cannot feed yet.
+/// Whether the bay's tenant can take a key — the engine's own answer, one
+/// thin seam kept so the UI lane and the engine lane could land apart.
 #[cfg(feature = "recorder")]
 fn engine_insert_wants_key(engine: &crate::instrument::Engine, seat: usize, bay: usize) -> bool {
-    let _ = (engine, seat, bay);
-    false
+    engine.insert_wants_key(seat, bay)
 }
 
-/// MERGE-ME(wave3-ui): stand-in for `Engine::set_insert_keys(keys)` until
-/// the engine lane lands — replace the body with
-/// `engine.set_insert_keys(keys)` and delete this comment. Entries are
-/// `(seat, bay, source_channel)`, the whole table each call, absent means
-/// cleared — the `set_routes` idiom.
+/// The whole key table onto the engine — `(seat, bay, source)`, absent
+/// means cleared, the `set_routes` idiom.
 #[cfg(feature = "recorder")]
 fn engine_set_insert_keys(engine: &crate::instrument::Engine, keys: &[(usize, usize, usize)]) {
-    let _ = (engine, keys);
+    engine.set_insert_keys(keys);
 }
 
 /// **Read one seat's bays and hand the app every built-in face on it** —
