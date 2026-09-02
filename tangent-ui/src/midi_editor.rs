@@ -531,6 +531,83 @@ pub fn velocity_hue(loud: Color32, quiet: Color32, face: Color32, vel: u8) -> Co
     out
 }
 
+/// **One bit per (pixel column, row, selected)**: has this cell been drawn
+/// into yet?
+///
+/// The roll and the velocity lane hit the same wall when a part is zoomed
+/// out, and it is the wall the arrangement's miniature hit first: far more
+/// marks than there are columns to put them in. Four minutes of sixteenths
+/// is fifteen thousand notes and the roll is a thousand points wide, so
+/// every mark was emitted, tessellated, and painted over the one before it.
+/// Nobody can see the difference, and the tessellator charged for all of it:
+/// 78,835 shapes and 64.8% of a 60 Hz frame for a programmed part
+/// (`editor_cost_probe`), of which the velocity lane was two thirds and
+/// every single circle.
+///
+/// A hundred and twenty-eight rows, because both callers have that many: a
+/// MIDI key, and a velocity shaft quantised to a band of the lane.
+///
+/// **Selected marks get their own plane.** A selection is drawn in a
+/// different ink for the express purpose of being seen, and letting an
+/// unselected mark that happens to sit in the same cell hide it would be the
+/// kind of silent-invisibility fault this app has learned to be afraid of.
+struct Coverage {
+    cols: usize,
+    /// Four words a column: two of a hundred and twenty-eight rows,
+    /// unselected then selected.
+    bits: Vec<u64>,
+}
+
+impl Coverage {
+    fn new(cols: usize) -> Self {
+        Self { cols, bits: vec![0u64; cols * 4] }
+    }
+
+    /// **Claims the cell `x` falls in**, and says whether it was free. A
+    /// caller draws when this is true and skips when it is false: the mark
+    /// it would have drawn is within a point of the one already there.
+    fn claim(&mut self, x: f32, left: f32, row: usize, selected: bool) -> bool {
+        let c = ((x - left).max(0.0) as usize).min(self.cols - 1);
+        let row = row & 127;
+        let w = c * 4 + usize::from(selected) * 2 + row / 64;
+        let b = 1u64 << (row % 64);
+        let free = self.bits[w] & b == 0;
+        self.bits[w] |= b;
+        free
+    }
+}
+
+/// A coverage grid for a surface `w` points wide holding `notes` notes, or
+/// nothing when there is room on it for every mark.
+///
+/// The test is O(1) on purpose. Asking the NOTES whether they are crowded is
+/// a walk over every one of them, paid every frame by exactly the parts that
+/// have the most and the least to gain — the arrangement learned that the
+/// expensive way. Columns are bounded by the screen; notes are not.
+fn coverage(w: f32, notes: usize) -> Option<Coverage> {
+    #[cfg(test)]
+    if !CULL.with(std::cell::Cell::get) {
+        return None;
+    }
+    let cols = w.ceil().max(1.0);
+    (notes > cols as usize && cols <= 16_384.0).then(|| Coverage::new(cols as usize))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// **The cull, switchable off** — for `mod tests` and the probe, never
+    /// for the app, which is why it compiles only under `cfg(test)`.
+    ///
+    /// The arrangement keeps its unculled drawing as a whole second
+    /// function, because its miniature is thirty lines. This one is four
+    /// hundred, and a copy of it would drift away from the original inside a
+    /// week and then be checking itself against a lie. So the picture the
+    /// cull has to reproduce is this same function with the grids withheld.
+    /// Thread-local because the test harness runs tests in parallel and a
+    /// global would have them switching each other's drawing.
+    pub(crate) static CULL: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
 pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     let l = Layout::new(rect);
     if !l.panel.is_positive() {
@@ -779,10 +856,31 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     // ── the notes ────────────────────────────────────────────────────────
     let vel_loud = Color32::from_rgb(view.vel_loud.0, view.vel_loud.1, view.vel_loud.2);
     let vel_quiet = Color32::from_rgb(view.vel_quiet.0, view.vel_quiet.1, view.vel_quiet.2);
+    // **One mark per column per key.** See [`Coverage`]: a note too narrow to
+    // show where it begins, in a column where that key is already drawn, IS
+    // the mark already drawn there. This panel was measured at 58-65% of a
+    // 60 Hz frame on a dense part — `editor_cost_probe` timed only the
+    // emitting for a while, and on that half of the bill reported a tenth of
+    // a frame and a verdict of "fine".
+    //
+    // `scale` is points per second, so a note's own width decides for it. A
+    // note wide enough to read as a span always draws — folding a held note
+    // into the column it starts in would delete it, which is the fault the
+    // arrangement's miniature shipped with and had to be corrected for.
+    let scale = f64::from(l.roll.width()) / view.view_len_s.max(1.0e-9);
+    let mut roll_seen = coverage(l.roll.width(), view.notes.len());
     for (i, n) in view.notes.iter().enumerate() {
         let r = note_rect(&l, view, n);
         if !r.is_positive() {
             continue;
+        }
+        let picked = view.selected.binary_search(&i).is_ok();
+        if let Some(seen) = roll_seen.as_mut() {
+            if n.dur_s.max(0.02) * scale < 1.0
+                && !seen.claim(r.left(), l.roll.left(), usize::from(n.key), picked)
+            {
+                continue;
+            }
         }
         // **The velocity is the colour, and it is the SAME colour the lane
         // downstairs draws.**
@@ -798,7 +896,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         painter.rect_stroke(
             r,
             2.0,
-            if view.selected.binary_search(&i).is_ok() {
+            if picked {
                 Stroke::new(2.0, ink)
             } else {
                 Stroke::new(1.0, Color32::from_black_alpha(140))
@@ -885,6 +983,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         let vel_loud = Color32::from_rgb(view.vel_loud.0, view.vel_loud.1, view.vel_loud.2);
         let vel_quiet =
             Color32::from_rgb(view.vel_quiet.0, view.vel_quiet.1, view.vel_quiet.2);
+        // **One shaft per column per band**, which is where two thirds of
+        // this panel's shapes were going and every one of its circles. A
+        // shaft is a fixed three points wide wherever the note starts, and a
+        // ring eight across sits on its head, so a part zoomed out stacked
+        // seventeen identical handles in every column: thirty thousand
+        // circles for a row of blobs. Duration has nothing to do with it —
+        // unlike the roll above, a mark here is the same size whatever the
+        // note's length, so crowding is the only question.
+        //
+        // A band is a POINT of the lane's height, or a hundred-and-twenty-
+        // eighth of it if the lane is taller than that, so the grid always
+        // has room for the lane it measures. Two shafts in one column that
+        // round to the same band draw the same bar to the same height with
+        // the same ring on it, in a colour that came from the same number.
+        let band = (l.vel.height() / 128.0).max(1.0);
+        let mut vel_seen = coverage(l.vel.width(), view.notes.len());
         for (i, n) in view.notes.iter().enumerate() {
             let t0 = view.clip_start_s + (n.at_s - view.offset_s);
             let x = x_of(&l, view, t0);
@@ -893,6 +1007,12 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             }
             let h = l.vel.height() * (f32::from(n.vel.min(127)) / 127.0);
             let selected = view.selected.binary_search(&i).is_ok();
+            if let Some(seen) = vel_seen.as_mut() {
+                let row = (h / band).round().max(0.0) as usize;
+                if !seen.claim(x, l.vel.left(), row, selected) {
+                    continue;
+                }
+            }
             // **The same colour the note upstairs wears**, from the same
             // function on the same number — see the note fill above. A
             // handle that disagreed with the thing it controls would be two
@@ -1775,6 +1895,187 @@ mod velocity_gradient_tests {
     }
 }
 
+
+#[cfg(test)]
+mod cull_tests {
+    use super::tests::{rect, view};
+    use super::*;
+
+    /// A dense part: `n` notes three voices deep over four minutes, cycling
+    /// through `keys` pitches and `vels` velocities. Far more marks than the
+    /// roll has columns at the zooms these tests use, which is the only
+    /// condition under which the cull runs at all.
+    fn dense(n: u32, keys: u32, vels: u32) -> Vec<ArrNote> {
+        (0..n)
+            .map(|i| ArrNote {
+                at_s: f64::from(i / 3) * 0.125,
+                dur_s: 0.1,
+                key: 48 + u8::try_from(i % keys.max(1)).unwrap_or(0),
+                vel: 40 + u8::try_from(i % vels.max(1)).unwrap_or(0) * 6,
+            })
+            .collect()
+    }
+
+    /// **How finely the coverage is sampled**: two cells to the point.
+    ///
+    /// The same reasoning as the arrangement's miniature — a mark two points
+    /// wide covers two whole pixels or three depending on the FRACTION it
+    /// starts at, so counting whole PIXELS measures sub-pixel phase and not
+    /// ink. Finer than the marks are wide is what it takes, and the
+    /// narrowest mark here is two points (`note_rect` floors it) where the
+    /// miniature's was one and a half.
+    const SUB: f32 = 2.0;
+
+    /// **The widest a MARK can be** at the zooms these tests use.
+    ///
+    /// The first version of this test sampled every shape the panel emitted
+    /// and compared 1,368,000 cells against 1,368,000 — a perfect score that
+    /// proved nothing, because the panel paints its own background, its key
+    /// rows, its veils and its lane wells across the whole surface and those
+    /// are identical whatever the notes do. Subtracting the chrome does not
+    /// work either: it lies UNDER the marks, so subtracting it subtracts them
+    /// as well. Width is what actually separates them — a note at these
+    /// zooms is two points and a velocity shaft is three, while every piece
+    /// of chrome spans the roll or the panel.
+    const MARK_W: f32 = 8.0;
+
+    /// **What the panel's MARKS light**, at [`SUB`] cells to the point:
+    /// every sample any of them covers. Circles by their bounding box, which
+    /// is generous in the direction that matters — it makes a mark that
+    /// APPEARED easier to catch, not harder.
+    fn lit(cull: bool, notes: &[ArrNote], selected: &[usize], len_s: f64) -> Vec<(i32, i32)> {
+        CULL.with(|c| c.set(cull));
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("cull-cover"));
+        let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+        let mut v = view(notes);
+        v.selected = selected;
+        v.clip_start_s = 0.0;
+        v.clip_len_s = 480.0;
+        v.view_start_s = 0.0;
+        v.view_len_s = len_s;
+        draw(&painter, rect(), &v);
+        CULL.with(|c| c.set(true));
+        let mut cells: Vec<(i32, i32)> = ctx.graphics(|g| {
+            g.get(layer)
+                .map(|list| {
+                    list.all_entries()
+                        .filter_map(|c| match &c.shape {
+                            egui::Shape::Rect(q) if q.rect.width() <= MARK_W => Some(q.rect),
+                            egui::Shape::Circle(c) => {
+                                Some(Rect::from_center_size(c.center, Vec2::splat(c.radius * 2.0)))
+                            }
+                            _ => None,
+                        })
+                        .flat_map(|q| {
+                            let s = |t: f32| (t * SUB).round() as i32;
+                            let (x0, x1) = (s(q.left()), s(q.right()));
+                            let (y0, y1) = (s(q.top()), s(q.bottom()));
+                            (x0..x1.max(x0 + 1))
+                                .flat_map(move |x| (y0..y1.max(y0 + 1)).map(move |y| (x, y)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        cells.sort_unstable();
+        cells.dedup();
+        cells
+    }
+
+    /// How far a cell is from the nearest cell of a sorted set.
+    fn near(set: &[(i32, i32)], cell: (i32, i32), reach: i32) -> bool {
+        (-reach..=reach).any(|dx| {
+            (-reach..=reach).any(|dy| set.binary_search(&(cell.0 + dx, cell.1 + dy)).is_ok())
+        })
+    }
+
+    /// **The culled roll draws the unculled one's picture**, at the zoom the
+    /// cull exists for, one where it half fires, and one where it does not
+    /// fire at all.
+    ///
+    /// One point of slack, which is the whole licence [`Coverage`] is given:
+    /// a mark narrower than a column is drawn at its column rather than at
+    /// its fraction of one, and nothing else moves. Nothing may appear where
+    /// nothing was drawn, and nothing drawn may go missing — the failure a
+    /// shape count would sail past.
+    #[test]
+    fn the_culled_roll_draws_the_same_picture_as_the_unculled_one() {
+        let notes = dense(2_500, 12, 9);
+        for len_s in [480.0, 120.0, 30.0] {
+            let want = lit(false, &notes, &[], len_s);
+            let got = lit(true, &notes, &[], len_s);
+            assert!(!want.is_empty(), "{len_s}s: the unculled panel drew nothing");
+            let reach = SUB as i32;
+            let lost = want.iter().filter(|c| !near(&got, **c, reach)).count();
+            let gained = got.iter().filter(|c| !near(&want, **c, reach)).count();
+            assert_eq!(lost, 0, "{len_s}s: {lost} of {} lit cells went missing", want.len());
+            assert_eq!(gained, 0, "{len_s}s: {gained} cells lit that were dark before");
+            // And the ink must not thin out: dropping every second mark
+            // would still be "within a point" and would still be a picture
+            // that changed. The worst of the three zooms is 0.08% lighter;
+            // three per cent is headroom for a platform whose floats round
+            // the other way.
+            let ratio = got.len() as f64 / want.len() as f64;
+            assert!(
+                (0.97..=1.03).contains(&ratio),
+                "{len_s}s: {} lit cells against {}, a ratio of {ratio:.3}",
+                got.len(),
+                want.len()
+            );
+        }
+    }
+
+    /// **A selected note is never hidden by an unselected one.**
+    ///
+    /// A selection is drawn in a different ink for the express purpose of
+    /// being seen. The cull keeps a separate plane for it — without that,
+    /// the first note to claim a cell wins, and on a part dense enough for
+    /// the cull to run at all that is almost never the selected one. This is
+    /// the silent-invisibility class of fault, so it gets a test that looks
+    /// for the ink rather than for a count.
+    #[test]
+    fn the_cull_never_hides_a_selection() {
+        let notes = dense(2_500, 12, 9);
+        // Notes scattered through the part, each of them sharing its column
+        // and key with plenty of unselected neighbours.
+        let picked: Vec<usize> = (0..40).map(|i| i * 61 + 7).collect();
+        let strokes = |cull: bool| -> usize {
+            CULL.with(|c| c.set(cull));
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+            let _ = ctx.run(Default::default(), |_| {});
+            let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("cull-pick"));
+            let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+            let mut v = view(&notes);
+            v.selected = &picked;
+            v.clip_start_s = 0.0;
+            v.clip_len_s = 480.0;
+            v.view_start_s = 0.0;
+            v.view_len_s = 480.0;
+            draw(&painter, rect(), &v);
+            CULL.with(|c| c.set(true));
+            ctx.graphics(|g| {
+                g.get(layer).map_or(0, |list| {
+                    list.all_entries()
+                        .filter(|c| match &c.shape {
+                            // The selection's own stroke: two points, where
+                            // an unselected note's is one.
+                            egui::Shape::Rect(q) => (q.stroke.width - 2.0).abs() < 0.01,
+                            _ => false,
+                        })
+                        .count()
+                })
+            })
+        };
+        let (want, got) = (strokes(false), strokes(true));
+        assert!(want > 0, "the unculled panel drew no selection to compare to");
+        assert_eq!(got, want, "the cull swallowed {} of {want} selected notes", want - got);
+    }
+}
+
 #[cfg(test)]
 mod editor_cost_probe {
     use super::tests::{rect, view};
@@ -1785,12 +2086,19 @@ mod editor_cost_probe {
     /// to be worth worrying about? Ignored by default; run with `--ignored
     /// --nocapture`, and in RELEASE.
     ///
-    /// Written to answer the same question that was asked of the
-    /// arrangement's miniature, where walking every note of every LOOP PASS
-    /// cost 43.7% of a frame. The editor has no passes: it draws the notes
-    /// it was handed, once each, so its cost is the note count and nothing
-    /// multiplies it. This measures that rather than assuming it — a dense
-    /// four-minute part, at the zoom that puts the most of it on screen.
+    /// **This probe reported the wrong answer once and it changed a
+    /// decision**, so what it does now is spelled out. It timed `draw` and
+    /// nothing else, divided by 16.6 ms, and said the roll was a tenth of a
+    /// frame; on that number the panel was left alone. Emitting a shape is
+    /// half the bill. The other half is turning it into triangles, and it is
+    /// the LARGER half here — a circle costs far more of it than a rect, and
+    /// the velocity lane draws two circles a note. Measured with the
+    /// tessellation the sibling probe in `arrangement_panel` had been
+    /// counting all along, the same picture was 58-65% of a frame.
+    ///
+    /// So: emit AND tessellate, both shapes of part, and the drawing with
+    /// the cull withheld against the drawing as it ships. A number that is
+    /// half a measurement is worse than no number, because it gets believed.
     #[test]
     #[ignore]
     fn what_does_the_piano_roll_pay_every_frame() {
@@ -1803,26 +2111,46 @@ mod editor_cost_probe {
         // Four minutes of sixteenths, four voices deep: 15,360 notes, which
         // is a busy orchestral part or a drum programme nobody would call
         // unreasonable.
-        let notes: Vec<ArrNote> = (0..15_360u32)
+        //
+        // Two shapes of it, because measuring one shape is how this probe
+        // went wrong the first time. The spiral never repeats a pitch inside
+        // a column and never repeats a velocity band either, which is the
+        // WORST case for a cull keyed on those — no music is that evenly
+        // spread. The kit is the other end: eight drums and four accents,
+        // which is what a programmed part actually looks like. A saving that
+        // only shows on one of them is a saving that was measured, not made.
+        let spiral: Vec<ArrNote> = (0..15_360u32)
             .map(|i| ArrNote {
                 at_s: f64::from(i / 4) * 0.125,
                 dur_s: 0.1,
                 key: 48 + u8::try_from((i * 7) % 36).unwrap_or(0),
-                vel: 100,
+                vel: 40 + u8::try_from((i * 11) % 88).unwrap_or(0),
+            })
+            .collect();
+        let kit: Vec<ArrNote> = (0..15_360u32)
+            .map(|i| ArrNote {
+                at_s: f64::from(i / 4) * 0.125,
+                dur_s: 0.1,
+                key: 48 + u8::try_from((i * 5) % 8).unwrap_or(0),
+                vel: if i % 8 == 0 { 118 } else { 64 + u8::try_from(i % 3).unwrap_or(0) * 12 },
             })
             .collect();
         let r = rect();
+        for (part, notes) in [("a part of no repeats", &spiral), ("a drum programme", &kit)] {
         for (what, start_s, len_s) in [
             ("the whole part", 0.0, 480.0),
             ("thirty seconds", 100.0, 30.0),
             ("four bars", 100.0, 8.0),
         ] {
-            let mut v = view(&notes);
+            let mut v = view(notes);
             v.clip_start_s = 0.0;
             v.clip_len_s = 480.0;
             v.view_start_s = start_s;
             v.view_len_s = len_s;
 
+            println!("{part}, {what} ({} notes):", notes.len());
+            for (which, cull) in [("unculled", false), ("as drawn now", true)] {
+            CULL.with(|c| c.set(cull));
             ctx.graphics_mut(|g| *g.entry(layer) = Default::default());
             draw(&painter, r, &v);
             let shapes = ctx.graphics(|g| g.get(layer).map_or(0, |l| l.all_entries().len()));
@@ -1837,12 +2165,39 @@ mod editor_cost_probe {
                 ctx.graphics_mut(|g| *g.entry(layer) = Default::default());
             }
             let per = total / n;
+
+            // **And what the tessellator then pays for them.** Emission is
+            // half the bill: a shape becomes triangles before the GPU sees
+            // it, and a circle becomes a great many more of them than a
+            // rect does. This probe timed only `draw` when it was written
+            // and reported a tenth of a frame for a picture that costs two
+            // thirds of one — the sibling probe in `arrangement_panel` had
+            // been counting both halves all along, and the two have to be
+            // read against each other.
+            draw(&painter, r, &v);
+            let mut tess = Duration::ZERO;
+            let m = 10;
+            for _ in 0..m {
+                let s: Vec<egui::epaint::ClippedShape> = ctx.graphics(|g| {
+                    g.get(layer).map(|l| l.all_entries().cloned().collect()).unwrap_or_default()
+                });
+                let t = Instant::now();
+                std::hint::black_box(ctx.tessellate(s, 1.0));
+                tess += t.elapsed();
+            }
+            let tess = tess / m;
+            ctx.graphics_mut(|g| *g.entry(layer) = Default::default());
+
             println!(
-                "{what}: {} notes, {shapes} shapes -> draw {:?} per frame, {:.1}% of a 16.6ms frame",
-                notes.len(),
+                "  {which:>14}: {shapes} shapes -> emit {:?} + tessellate {:?} = {:?}, {:.1}% of a 16.6ms frame",
                 per,
-                per.as_secs_f64() / 0.0166 * 100.0
+                tess,
+                per + tess,
+                (per + tess).as_secs_f64() / 0.0166 * 100.0
             );
+            }
+            CULL.with(|c| c.set(true));
+        }
         }
     }
 }
