@@ -48,6 +48,173 @@
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 
+/// **A document's structural fingerprint** — one `u64` standing in for the
+/// text [`Arrangement::to_json`] would write.
+///
+/// # Why this exists
+///
+/// "Is there anything unsaved?" is asked once a FRAME, and it used to be
+/// answered by cloning the document, serialising it and comparing two
+/// strings: 2.9 ms on a 128-clip session in a release build, a sixth of
+/// every frame spent on an asterisk in the title bar. This walks the same
+/// fields and mixes them into a number instead — no clone, no `Map`, no
+/// `String`, no allocation at all, and 86 µs for the same 8192 notes.
+///
+/// # The rule that keeps it honest
+///
+/// **Two documents that serialise to the same text must fingerprint the
+/// same.** Everything the accessors below are careful about follows from it:
+///
+/// * A key the writer OMITS collapses to one word here, however many
+///   different floats produce the omission — see [`Fingerprint::f64`].
+/// * A field written only outside a deadband — a clip's `stretch`, its
+///   `gain` — arrives through [`Fingerprint::maybe_f64`], so every value
+///   inside the deadband is one thing.
+/// * `-0.0` is NOT folded into `0.0`. ryu writes `-0.0`, so the two are
+///   different documents and the bit patterns are right to disagree.
+///
+/// The other direction — different text, the same number — is a COLLISION,
+/// and it is possible: sixty-four bits are not a document. What that costs
+/// decides where a fingerprint may be used and where the exact comparison
+/// has to stay; `TangentApp::project_dirty` writes that split down.
+pub struct Fingerprint(u64);
+
+impl Default for Fingerprint {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fingerprint {
+    /// A large odd seed, so a document whose first word is zero still moves.
+    pub fn new() -> Self {
+        Self(0x243f_6a88_85a3_08d3)
+    }
+
+    /// One word in. rustc's own FxHash step — rotate, mix, multiply by a
+    /// large odd constant.
+    ///
+    /// Not `DefaultHasher`: SipHash is the right default for a hash map
+    /// somebody may attack, and this is a private comparison of our own
+    /// bytes against our own bytes. Eight thousand notes is thirty thousand
+    /// words, and the difference between one multiply and a SipHash round
+    /// per word is the difference between a fingerprint that disappears
+    /// inside a frame's rounding error and one that does not.
+    pub fn u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    pub fn bool(&mut self, v: bool) {
+        self.u64(u64::from(v));
+    }
+
+    pub fn len(&mut self, v: usize) {
+        self.u64(v as u64);
+    }
+
+    /// One float, exactly as the writer treats it.
+    ///
+    /// `serde_json::Number::from_f64` refuses anything that is not finite,
+    /// and the writer then leaves the key out entirely (or, on the desk,
+    /// writes `null`) — so every NaN and both infinities are the SAME
+    /// document and have to be the same word here. `to_bits` alone would
+    /// tell two NaN payloads apart and report an edit nobody made.
+    ///
+    /// No finite double wears the quiet-NaN bits, so nothing real collides
+    /// with the stand-in.
+    pub fn f64(&mut self, v: f64) {
+        const OMITTED: u64 = 0x7ff8_0000_0000_0000;
+        self.u64(if v.is_finite() { v.to_bits() } else { OMITTED });
+    }
+
+    /// A float the writer only SOMETIMES emits. `None` means "no key at
+    /// all", which is the same document as a value it refuses to write.
+    pub fn maybe_f64(&mut self, v: Option<f64>) {
+        self.f64(v.unwrap_or(f64::NAN));
+    }
+
+    /// A string, eight bytes at a time. The length goes in first, or
+    /// `"ab" + "c"` and `"a" + "bc"` would be one document.
+    pub fn str(&mut self, s: &str) {
+        self.len(s.len());
+        let mut chunks = s.as_bytes().chunks_exact(8);
+        for c in &mut chunks {
+            self.u64(u64::from_le_bytes(c.try_into().unwrap_or([0; 8])));
+        }
+        let rest = chunks.remainder();
+        let mut tail = [0u8; 8];
+        tail[..rest.len()].copy_from_slice(rest);
+        self.u64(u64::from_le_bytes(tail));
+    }
+
+    /// A value a newer build wrote and this one only carries — see
+    /// [`ArrClip::extra`]. Hashed verbatim, ORDER included, because
+    /// `preserve_order` makes a map's order part of the document's text.
+    pub fn value(&mut self, v: &Value) {
+        match v {
+            Value::Null => self.u64(0),
+            Value::Bool(b) => {
+                self.u64(1);
+                self.bool(*b);
+            }
+            Value::Number(n) => {
+                // The shapes PRINT differently — `5` is not `5.0` — so which
+                // one a number is has to be part of the number.
+                if let Some(u) = n.as_u64() {
+                    self.u64(2);
+                    self.u64(u);
+                } else if let Some(i) = n.as_i64() {
+                    self.u64(3);
+                    self.u64(i as u64);
+                } else {
+                    self.u64(4);
+                    self.f64(n.as_f64().unwrap_or(f64::NAN));
+                }
+            }
+            Value::String(s) => {
+                self.u64(5);
+                self.str(s);
+            }
+            Value::Array(a) => {
+                self.u64(6);
+                self.len(a.len());
+                for x in a {
+                    self.value(x);
+                }
+            }
+            Value::Object(m) => {
+                self.u64(7);
+                self.map(m);
+            }
+        }
+    }
+
+    /// A bag of strangers' keys, in the order it holds them.
+    pub fn map(&mut self, m: &Map<String, Value>) {
+        self.len(m.len());
+        for (k, v) in m {
+            self.str(k);
+            self.value(v);
+        }
+    }
+
+    /// The number, avalanched.
+    ///
+    /// splitmix64's finaliser. The Fx step above leaves most of its entropy
+    /// in the high bits, and a fingerprint is compared whole — so the low
+    /// ones are stirred back in once, at the end, rather than thirty
+    /// thousand times on the way.
+    pub fn finish(self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^= x >> 31;
+        x
+    }
+}
+
 /// The document's schema version. Bump WITH a migration arm in
 /// [`Arrangement::from_map`], never without one.
 ///
@@ -522,6 +689,71 @@ impl DeskSnap {
         m.insert("in_folder".into(), bools(&self.in_folder));
         m.insert("folder_shut".into(), bools(&self.folder_shut));
         Value::Object(m)
+    }
+
+    /// The desk into a [`Fingerprint`], field for field with `to_value`.
+    ///
+    /// **The two walk together or the title bar goes blind.** A field added
+    /// to this struct and to `to_value` but not to here is a desk change no
+    /// cheap comparison can see — the asterisk stays off while a fader
+    /// stands somewhere new. `the_fingerprint_moves_when_the_document_moves`
+    /// is what catches that, and it catches it by MUTATING every field
+    /// rather than by reading this list.
+    fn hash_into(&self, f: &mut Fingerprint) {
+        f.len(self.kinds.len());
+        for k in &self.kinds {
+            f.u64(u64::from(*k));
+        }
+        f.len(self.icons.len());
+        for i in &self.icons {
+            f.u64(u64::from(*i));
+        }
+        f.len(self.names.len());
+        for n in &self.names {
+            f.str(n);
+        }
+        f.len(self.colors.len());
+        for c in &self.colors {
+            f.u64(*c as u64);
+        }
+        f.len(self.inserts.len());
+        for i in &self.inserts {
+            f.str(i);
+        }
+        f.len(self.sends.len());
+        for s in &self.sends {
+            f.f64(*s);
+        }
+        f.u64(self.muted);
+        f.u64(self.soloed);
+        f.len(self.gains.len());
+        for g in &self.gains {
+            f.f64(*g);
+        }
+        f.len(self.pans.len());
+        for p in &self.pans {
+            f.f64(*p);
+        }
+        f.len(self.inputs.len());
+        for i in &self.inputs {
+            f.str(i);
+        }
+        f.f64(self.drums_gain);
+        f.f64(self.drums_pan);
+        f.f64(self.metronome_gain);
+        f.f64(self.master_gain);
+        f.f64(self.fx_return);
+        f.f64(self.tempo_bpm);
+        f.u64(u64::from(self.sig_beats));
+        f.u64(u64::from(self.sig_unit));
+        f.bool(self.metronome_on);
+        f.u64(u64::from(self.tracks_added));
+        for v in [&self.is_folder, &self.in_folder, &self.folder_shut] {
+            f.len(v.len());
+            for b in v {
+                f.bool(*b);
+            }
+        }
     }
 
     fn from_value(v: &Value) -> Option<Self> {
@@ -1206,6 +1438,18 @@ impl Arrangement {
     }
 
     pub fn to_json(&self) -> String {
+        self.to_json_with_desk(self.desk.as_ref())
+    }
+
+    /// The same text with `desk` standing in for [`Arrangement::desk`].
+    ///
+    /// **Split out so undo need not CLONE the document to change one
+    /// field.** `undo_state` wants the live desk rather than the one the
+    /// document is carrying, and the only way to say so used to be
+    /// `self.arrangement.clone()` — eight thousand notes and every path
+    /// string copied, per committed edit and once per frame, to overwrite a
+    /// single `Option`.
+    pub fn to_json_with_desk(&self, desk: Option<&DeskSnap>) -> String {
         let mut map = Map::new();
         // The document's OWN version, not this build's constant. See
         // [`Arrangement::version`]: stamping 4 onto a file still carrying a
@@ -1238,7 +1482,7 @@ impl Arrangement {
                     .into(),
             ),
         );
-        if let Some(desk) = &self.desk {
+        if let Some(desk) = desk {
             map.insert("desk".into(), desk.to_value());
         }
         // Written only once true: older documents stay byte-identical.
@@ -1455,6 +1699,157 @@ impl Arrangement {
             map.entry(k.clone()).or_insert_with(|| v.clone());
         }
         serde_json::to_string_pretty(&Value::Object(map)).unwrap_or_else(|_| "{}".into())
+    }
+
+    /// **The document as one `u64`** — the same question `to_json` answers,
+    /// without building the answer.
+    ///
+    /// `desk` stands in for [`Arrangement::desk`], exactly as it does in
+    /// `to_json_with_desk`, so the two can be handed the same one.
+    pub fn fingerprint_with_desk(&self, desk: Option<&DeskSnap>) -> u64 {
+        let mut f = Fingerprint::new();
+        self.hash_into(desk, &mut f);
+        f.finish()
+    }
+
+    /// The document, desk and all, as it stands.
+    pub fn fingerprint(&self) -> u64 {
+        self.fingerprint_with_desk(self.desk.as_ref())
+    }
+
+    /// The document into somebody else's [`Fingerprint`], so a caller that
+    /// has more to mix in — the drum kits, which live in a sidecar — gets
+    /// ONE number for the pair rather than two to keep in step.
+    ///
+    /// **This walks beside `to_json_with_desk` and must keep walking beside
+    /// it.** Every conditional there is repeated here, because a key the
+    /// writer sometimes omits has to hash as one thing across every value
+    /// that produces the omission — otherwise a document nobody touched
+    /// fingerprints differently from itself.
+    ///
+    /// The two guards are `the_fingerprint_moves_when_the_document_moves`
+    /// and `the_fingerprint_stands_when_the_document_stands`. Between them
+    /// they take the writer as the ORACLE: sixty-odd edits, each asserting
+    /// that the fingerprint moved exactly when the text did. A field added
+    /// to the writer and forgotten here fails a test rather than shipping a
+    /// title bar that cannot see it.
+    pub fn hash_into(&self, desk: Option<&DeskSnap>, f: &mut Fingerprint) {
+        f.u64(self.version);
+        // The NORMALISED counter, the same expression the writer emits —
+        // see `to_json`'s note on why a document has to be a fixed point.
+        f.u64(
+            self.next_id
+                .max(self.clips.iter().map(|c| c.id + 1).max().unwrap_or(0))
+                .max(1),
+        );
+        match desk {
+            Some(d) => {
+                f.u64(1);
+                d.hash_into(f);
+            }
+            None => f.u64(0),
+        }
+        f.bool(self.named);
+        f.len(self.clips.len());
+        for c in &self.clips {
+            f.u64(match c.kind {
+                ClipKind::Audio => 0,
+                ClipKind::Midi => 1,
+            });
+            f.len(c.lane);
+            f.str(&c.path);
+            f.str(&c.name);
+            f.len(c.notes.len());
+            for n in &c.notes {
+                f.f64(n.at_s);
+                f.f64(n.dur_s);
+                f.u64(u64::from(n.key));
+                f.u64(u64::from(n.vel));
+            }
+            f.u64(c.id);
+            f.u64(match c.anchor {
+                Anchor::Time => 0,
+                Anchor::Beat => 1,
+            });
+            f.bool(c.follow_tempo);
+            // The writer's own deadbands: inside one, no key is written at
+            // all, so every ratio inside it is the same document.
+            f.maybe_f64(Some(c.stretch).filter(|s| (s - 1.0).abs() > 1.0e-9));
+            f.maybe_f64(Some(c.gain).filter(|g| (g - 1.0).abs() > 1.0e-9));
+            // `""` and `"auto"` write the same nothing.
+            f.str(if c.stretch_mode == "auto" { "" } else { &c.stretch_mode });
+            for v in [
+                c.start_s,
+                c.offset_s,
+                c.len_s,
+                c.fade_in_s,
+                c.fade_out_s,
+                c.loop_s,
+            ] {
+                f.f64(v);
+            }
+            f.map(&c.extra);
+        }
+        // **A constant map is not written, so its VALUE is not in the
+        // document.** One tempo all the way through lives on the desk
+        // snapshot instead — so hashing the point here would report a change
+        // the file cannot hold, and every undo would look like an edit.
+        if self.tempo.is_constant() {
+            f.u64(0);
+        } else {
+            f.u64(1);
+            f.len(self.tempo.points().len());
+            for p in self.tempo.points() {
+                f.f64(p.at_beat);
+                f.f64(p.bpm);
+                f.bool(p.ramp);
+            }
+        }
+        if self.automation.is_empty() {
+            f.u64(0);
+        } else {
+            f.u64(1);
+            f.len(self.automation.curves().len());
+            for c in self.automation.curves() {
+                f.len(c.lane);
+                // The VARIANT rather than `AutoParam::key`, which allocates a
+                // `String` per curve. The mapping is one-to-one with the
+                // spelling — that is what `from_key` round-tripping means —
+                // so the two tell exactly the same curves apart.
+                match c.param {
+                    crate::automation::AutoParam::Gain => f.u64(0),
+                    crate::automation::AutoParam::Pan => f.u64(1),
+                    crate::automation::AutoParam::Send => f.u64(2),
+                    crate::automation::AutoParam::Mute => f.u64(3),
+                    crate::automation::AutoParam::Plugin { bay, id } => {
+                        f.u64(4);
+                        f.u64(u64::from(bay));
+                        f.u64(u64::from(id));
+                    }
+                }
+                f.len(c.points().len());
+                for p in c.points() {
+                    f.f64(p.at_s);
+                    f.f64(p.value);
+                    f.u64(match p.shape {
+                        crate::automation::Shape::Linear => 0,
+                        crate::automation::Shape::Hold => 1,
+                    });
+                }
+            }
+        }
+        if self.meter.is_constant() {
+            f.u64(0);
+        } else {
+            f.u64(1);
+            f.len(self.meter.points().len());
+            for p in self.meter.points() {
+                f.u64(u64::from(p.at_bar));
+                f.u64(u64::from(p.sig.beats));
+                f.u64(u64::from(p.sig.unit));
+            }
+        }
+        f.map(&self.extra);
     }
 }
 
@@ -1999,4 +2394,423 @@ mod tests {
         assert_eq!(a.clips.len(), 1);
         assert_eq!(a.clips[0].start_s, 0.0);
     }
+
+    /// A document with something in every field this build writes — the
+    /// subject of the fingerprint tests below. Everything in it is inside
+    /// the ranges the READER accepts, so it is a fixed point of a save and a
+    /// load, which those tests lean on.
+    fn a_document_with_everything_in_it() -> Arrangement {
+        let mut a = Arrangement::default();
+        a.version = ARRANGEMENT_VERSION;
+        a.named = true;
+        a.desk = Some(DeskSnap {
+            kinds: vec![1, 2, 0],
+            icons: vec![0, 3],
+            names: vec!["drums".into(), String::new(), "gtr".into()],
+            colors: vec![3, 0, 11],
+            inserts: vec![String::new(), "reverb".into()],
+            sends: vec![0.0, 0.25],
+            muted: 0b0010,
+            soloed: 0b0100,
+            gains: vec![1.0, 0.5],
+            pans: vec![0.0, -0.5],
+            inputs: vec!["in 1".into(), String::new()],
+            drums_gain: 0.9,
+            drums_pan: 0.1,
+            metronome_gain: 0.7,
+            master_gain: 1.0,
+            fx_return: 0.8,
+            tempo_bpm: 96.0,
+            sig_beats: 3,
+            sig_unit: 4,
+            metronome_on: true,
+            tracks_added: 0b0111,
+            is_folder: vec![true, false],
+            in_folder: vec![false, true],
+            folder_shut: vec![false, false],
+        });
+        let mut extra = Map::new();
+        extra.insert("a_newer_builds_key".into(), Value::from("kept"));
+        a.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            notes: vec![
+                ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 },
+                ArrNote { at_s: 1.5, dur_s: 0.25, key: 64, vel: 33 },
+            ],
+            lane: 2,
+            path: String::new(),
+            start_s: 4.0,
+            offset_s: 0.5,
+            len_s: 8.0,
+            loop_s: 2.0,
+            fade_in_s: 0.1,
+            fade_out_s: 0.2,
+            name: "a part".into(),
+            id: 0,
+            anchor: Anchor::Beat,
+            follow_tempo: true,
+            stretch: 1.5,
+            stretch_mode: "tonal".into(),
+            gain: 0.75,
+            extra,
+        });
+        a.add_clip(ArrClip {
+            kind: ClipKind::Audio,
+            lane: 0,
+            path: "media/take 1.wav".into(),
+            name: "take 1".into(),
+            start_s: 0.0,
+            len_s: 12.0,
+            ..Default::default()
+        });
+        a.tempo = crate::tempo::TempoMap::sanitised(vec![
+            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 96.0, ramp: true },
+            crate::tempo::TempoPoint { at_beat: 16.0, bpm: 120.0, ramp: false },
+        ]);
+        a.meter = crate::tempo::MeterMap::sanitised(vec![
+            crate::tempo::MeterPoint {
+                at_bar: 0,
+                sig: crate::recorder::TimeSignature { beats: 3, unit: 4 },
+            },
+            crate::tempo::MeterPoint {
+                at_bar: 8,
+                sig: crate::recorder::TimeSignature { beats: 7, unit: 8 },
+            },
+        ]);
+        a.automation = crate::automation::Automation::from_curves(vec![
+            crate::automation::Curve::sanitised(
+                1,
+                crate::automation::AutoParam::Gain,
+                vec![
+                    crate::automation::Point {
+                        at_s: 0.0,
+                        value: 0.5,
+                        shape: crate::automation::Shape::Linear,
+                    },
+                    crate::automation::Point {
+                        at_s: 4.0,
+                        value: 1.0,
+                        shape: crate::automation::Shape::Hold,
+                    },
+                ],
+            ),
+            crate::automation::Curve::sanitised(
+                2,
+                crate::automation::AutoParam::Plugin { bay: 1, id: 77 },
+                vec![crate::automation::Point {
+                    at_s: 2.0,
+                    value: 0.25,
+                    shape: crate::automation::Shape::Linear,
+                }],
+            ),
+        ]);
+        a.extra.insert("song_of_the_future".into(), Value::from(9));
+        a
+    }
+
+    /// The edit moved the document, and the fingerprint saw it.
+    fn moves_both(name: &str, edit: impl Fn(&mut Arrangement)) {
+        let a = a_document_with_everything_in_it();
+        let (json, fp) = (a.to_json(), a.fingerprint());
+        let mut b = a;
+        edit(&mut b);
+        assert_ne!(b.to_json(), json, "`{name}` did not change the document at all");
+        assert_ne!(
+            b.fingerprint(),
+            fp,
+            "`{name}` changed the document and the fingerprint did not move"
+        );
+    }
+
+    /// The edit did NOT move the document, so the fingerprint must not move
+    /// either — a fingerprint that jumps where the file does not is an
+    /// asterisk over work nobody did, and an undo moment for it.
+    fn moves_neither(name: &str, base: Arrangement, edit: impl Fn(&mut Arrangement)) {
+        let (json, fp) = (base.to_json(), base.fingerprint());
+        let mut b = base;
+        edit(&mut b);
+        assert_eq!(b.to_json(), json, "`{name}` moved the document after all");
+        assert_eq!(
+            b.fingerprint(),
+            fp,
+            "`{name}` left the document alone and the fingerprint moved"
+        );
+    }
+
+    /// **Every meaningful change moves the fingerprint.**
+    ///
+    /// The list is one entry per thing `to_json` writes, because the
+    /// fingerprint is a hand-written mirror of that function and the only
+    /// thing stopping the two drifting apart is this test. A field added to
+    /// the writer and forgotten in `Arrangement::hash_into` fails here.
+    #[test]
+    fn the_fingerprint_moves_when_the_document_moves() {
+        moves_both("the version stamp", |a| a.version += 1);
+        moves_both("the id counter, above the clips", |a| a.next_id += 50);
+        moves_both("the desk going away", |a| a.desk = None);
+        moves_both("a channel kind", |a| a.desk.as_mut().unwrap().kinds[0] = 2);
+        moves_both("a channel badge", |a| a.desk.as_mut().unwrap().icons[1] = 5);
+        moves_both("a strip name", |a| {
+            a.desk.as_mut().unwrap().names[0] = "kit".into();
+        });
+        moves_both("a strip colour", |a| a.desk.as_mut().unwrap().colors[2] = 4);
+        moves_both("a plugin in a bay", |a| {
+            a.desk.as_mut().unwrap().inserts[0] = "eq".into();
+        });
+        moves_both("a send", |a| a.desk.as_mut().unwrap().sends[1] = 0.3);
+        moves_both("a mute", |a| a.desk.as_mut().unwrap().muted ^= 1);
+        moves_both("a solo", |a| a.desk.as_mut().unwrap().soloed ^= 1);
+        moves_both("a fader", |a| a.desk.as_mut().unwrap().gains[0] = 0.4);
+        moves_both("a pan", |a| a.desk.as_mut().unwrap().pans[0] = 0.2);
+        moves_both("an input", |a| {
+            a.desk.as_mut().unwrap().inputs[1] = "in 2".into();
+        });
+        moves_both("the drum bus", |a| a.desk.as_mut().unwrap().drums_gain = 0.5);
+        moves_both("the drum bus pan", |a| a.desk.as_mut().unwrap().drums_pan = -0.2);
+        moves_both("the click", |a| a.desk.as_mut().unwrap().metronome_gain = 0.2);
+        moves_both("the master", |a| a.desk.as_mut().unwrap().master_gain = 0.6);
+        moves_both("the effects return", |a| a.desk.as_mut().unwrap().fx_return = 0.3);
+        moves_both("the desk's tempo", |a| a.desk.as_mut().unwrap().tempo_bpm = 140.0);
+        moves_both("the signature", |a| a.desk.as_mut().unwrap().sig_beats = 5);
+        moves_both("the signature's unit", |a| a.desk.as_mut().unwrap().sig_unit = 8);
+        moves_both("the click switch", |a| {
+            a.desk.as_mut().unwrap().metronome_on = false;
+        });
+        moves_both("which rows exist", |a| a.desk.as_mut().unwrap().tracks_added = 1);
+        moves_both("a folder", |a| a.desk.as_mut().unwrap().is_folder[1] = true);
+        moves_both("what is inside a folder", |a| {
+            a.desk.as_mut().unwrap().in_folder[0] = true;
+        });
+        moves_both("a shut folder", |a| {
+            a.desk.as_mut().unwrap().folder_shut[0] = true;
+        });
+        moves_both("having been named", |a| a.named = false);
+        moves_both("a clip arriving", |a| {
+            a.add_clip(ArrClip { path: "media/x.wav".into(), ..Default::default() });
+        });
+        moves_both("a clip leaving", |a| {
+            a.clips.pop();
+        });
+        moves_both("a clip's kind", |a| a.clips[1].kind = ClipKind::Midi);
+        moves_both("a clip's LANE", |a| a.clips[0].lane = 5);
+        moves_both("a clip's file", |a| a.clips[1].path = "media/other.wav".into());
+        moves_both("a clip's name", |a| a.clips[0].name = "renamed".into());
+        moves_both("a NOTE MOVED", |a| a.clips[0].notes[1].at_s = 1.75);
+        moves_both("a note's length", |a| a.clips[0].notes[0].dur_s = 0.75);
+        moves_both("a note's pitch", |a| a.clips[0].notes[0].key = 61);
+        moves_both("a note's VELOCITY", |a| a.clips[0].notes[0].vel = 101);
+        moves_both("a note arriving", |a| {
+            a.clips[0].notes.push(ArrNote { at_s: 3.0, dur_s: 0.1, key: 48, vel: 90 });
+        });
+        moves_both("a note leaving", |a| {
+            a.clips[0].notes.pop();
+        });
+        moves_both("a clip's id", |a| a.clips[0].id += 100);
+        moves_both("a clip's anchor", |a| a.clips[1].anchor = Anchor::Beat);
+        moves_both("following the tempo", |a| a.clips[1].follow_tempo = true);
+        moves_both("a real stretch", |a| a.clips[1].stretch = 2.0);
+        moves_both("a clip's GAIN", |a| a.clips[1].gain = 0.5);
+        moves_both("the stretch algorithm", |a| {
+            a.clips[0].stretch_mode = "tape".into();
+        });
+        moves_both("a clip's START", |a| a.clips[0].start_s = 5.0);
+        moves_both("a clip's left trim", |a| a.clips[0].offset_s = 1.0);
+        moves_both("a clip's LENGTH", |a| a.clips[0].len_s = 9.0);
+        moves_both("a fade in", |a| a.clips[0].fade_in_s = 0.3);
+        moves_both("a fade out", |a| a.clips[0].fade_out_s = 0.4);
+        moves_both("a loop length", |a| a.clips[0].loop_s = 4.0);
+        moves_both("a stranger's key on a clip", |a| {
+            a.clips[1].extra.insert("from_tomorrow".into(), Value::from(1));
+        });
+        moves_both("a stranger's VALUE on a clip", |a| {
+            a.clips[0].extra.insert("a_newer_builds_key".into(), Value::from("changed"));
+        });
+        moves_both("a tempo", |a| {
+            let mut p = a.tempo.points().to_vec();
+            p[1].bpm = 132.0;
+            a.tempo = crate::tempo::TempoMap::sanitised(p);
+        });
+        moves_both("a ritardando", |a| {
+            let mut p = a.tempo.points().to_vec();
+            p[1].ramp = true;
+            a.tempo = crate::tempo::TempoMap::sanitised(p);
+        });
+        moves_both("a tempo point arriving", |a| {
+            let mut p = a.tempo.points().to_vec();
+            p.push(crate::tempo::TempoPoint { at_beat: 32.0, bpm: 60.0, ramp: false });
+            a.tempo = crate::tempo::TempoMap::sanitised(p);
+        });
+        moves_both("a signature change", |a| {
+            let mut p = a.meter.points().to_vec();
+            p[1].sig = crate::recorder::TimeSignature { beats: 5, unit: 4 };
+            a.meter = crate::tempo::MeterMap::sanitised(p);
+        });
+        moves_both("where a signature changes", |a| {
+            let mut p = a.meter.points().to_vec();
+            p[1].at_bar = 9;
+            a.meter = crate::tempo::MeterMap::sanitised(p);
+        });
+        moves_both("an automation point", |a| {
+            let c = &a.automation.curves()[0];
+            let mut p = c.points().to_vec();
+            p[0].value = 0.9;
+            let curve = crate::automation::Curve::sanitised(c.lane, c.param, p);
+            let mut all = a.automation.curves().to_vec();
+            all[0] = curve;
+            a.automation = crate::automation::Automation::from_curves(all);
+        });
+        moves_both("a point's shape", |a| {
+            let c = &a.automation.curves()[0];
+            let mut p = c.points().to_vec();
+            p[0].shape = crate::automation::Shape::Hold;
+            let curve = crate::automation::Curve::sanitised(c.lane, c.param, p);
+            let mut all = a.automation.curves().to_vec();
+            all[0] = curve;
+            a.automation = crate::automation::Automation::from_curves(all);
+        });
+        moves_both("which control a curve moves", |a| {
+            let c = &a.automation.curves()[0];
+            let curve = crate::automation::Curve::sanitised(
+                c.lane,
+                crate::automation::AutoParam::Pan,
+                c.points().to_vec(),
+            );
+            let mut all = a.automation.curves().to_vec();
+            all[0] = curve;
+            a.automation = crate::automation::Automation::from_curves(all);
+        });
+        moves_both("which BAY a curve moves", |a| {
+            let c = &a.automation.curves()[1];
+            let curve = crate::automation::Curve::sanitised(
+                c.lane,
+                crate::automation::AutoParam::Plugin { bay: 2, id: 77 },
+                c.points().to_vec(),
+            );
+            let mut all = a.automation.curves().to_vec();
+            all[1] = curve;
+            a.automation = crate::automation::Automation::from_curves(all);
+        });
+        moves_both("automation going away", |a| {
+            a.automation = crate::automation::Automation::default();
+        });
+        moves_both("a stranger's key on the document", |a| {
+            a.extra.insert("also_from_tomorrow".into(), Value::from(true));
+        });
+    }
+
+    /// **And nothing else does.**
+    ///
+    /// Every one of these is a struct that changed while the FILE did not,
+    /// and the fingerprint has to agree with the file. Each is a real trap
+    /// the writer sets: a normalised counter, two deadbands, a spelling with
+    /// two forms, and a map whose single point is not written down at all.
+    #[test]
+    fn the_fingerprint_stands_when_the_document_stands() {
+        moves_neither(
+            "an id counter behind its clips",
+            a_document_with_everything_in_it(),
+            |a| a.next_id = 0,
+        );
+        moves_neither(
+            "a stretch inside the writer's deadband",
+            a_document_with_everything_in_it(),
+            |a| a.clips[1].stretch = 1.0 + 1.0e-12,
+        );
+        moves_neither(
+            "a gain inside the writer's deadband",
+            a_document_with_everything_in_it(),
+            |a| a.clips[1].gain = 1.0 - 1.0e-12,
+        );
+        moves_neither(
+            "the two spellings of no stretch algorithm",
+            a_document_with_everything_in_it(),
+            |a| a.clips[1].stretch_mode = "auto".into(),
+        );
+        // A ONE-POINT tempo map is not written at all — the desk snapshot
+        // carries the song's single tempo instead. So its value cannot move
+        // the fingerprint, or every undo on a plain song would look like an
+        // edit.
+        let mut plain = a_document_with_everything_in_it();
+        plain.tempo = crate::tempo::TempoMap::constant(96.0);
+        plain.meter =
+            crate::tempo::MeterMap::constant(crate::recorder::TimeSignature::default());
+        moves_neither("a constant tempo's value", plain.clone(), |a| {
+            a.tempo = crate::tempo::TempoMap::constant(140.0);
+        });
+        moves_neither("a constant meter's value", plain, |a| {
+            a.meter = crate::tempo::MeterMap::constant(crate::recorder::TimeSignature {
+                beats: 7,
+                unit: 8,
+            });
+        });
+    }
+
+    /// **A save and a load do not move the fingerprint.**
+    ///
+    /// The comparison that decides "is there anything unsaved" runs against
+    /// a document that has been through the reader; if a round trip moved
+    /// the number, every freshly opened project would open dirty. The
+    /// document is asserted to be a fixed point first, because that is the
+    /// property the fingerprint is allowed to lean on.
+    #[test]
+    fn a_round_trip_keeps_the_fingerprint() {
+        let a = a_document_with_everything_in_it();
+        let json = a.to_json();
+        let back = Arrangement::from_json(&json);
+        assert_eq!(back.to_json(), json, "the document is not a fixed point");
+        assert_eq!(
+            back.fingerprint(),
+            a.fingerprint(),
+            "a save and a load moved the fingerprint"
+        );
+        // And through a real file, which is the road a project takes.
+        let dir = std::env::temp_dir().join(format!("tangent-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let doc = dir.join(DOC_NAME);
+        a.save_to(&doc);
+        assert_eq!(
+            Arrangement::load_from(&doc).fingerprint(),
+            a.fingerprint(),
+            "the file moved the fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The awkward floats hash the way the WRITER treats them.**
+    ///
+    /// `-0.0` is a different document (ryu writes `-0.0`), so it is a
+    /// different number. Every non-finite value is the SAME document — the
+    /// writer refuses them and leaves the key out — so they are all one
+    /// number, including two NaNs with different payloads, which `to_bits`
+    /// alone would have told apart and reported as an edit.
+    #[test]
+    fn minus_zero_and_the_nans_hash_the_way_the_writer_sees_them() {
+        let base = a_document_with_everything_in_it();
+        let plus = base.fingerprint();
+        assert_eq!(base.clips[1].start_s, 0.0, "the fixture moved");
+
+        let mut minus = base.clone();
+        minus.clips[1].start_s = -0.0;
+        assert_ne!(minus.to_json(), base.to_json(), "-0.0 is the same file after all");
+        assert_ne!(minus.fingerprint(), plus, "-0.0 did not move the fingerprint");
+
+        let quiet = f64::from_bits(0x7ff8_0000_0000_0001);
+        assert!(quiet.is_nan(), "the second NaN is not one");
+        let mut a = base.clone();
+        a.clips[0].notes[0].at_s = f64::NAN;
+        let mut b = base.clone();
+        b.clips[0].notes[0].at_s = quiet;
+        let mut c = base;
+        c.clips[0].notes[0].at_s = f64::INFINITY;
+        assert_eq!(a.to_json(), b.to_json(), "two NaNs wrote different files");
+        assert_eq!(a.to_json(), c.to_json(), "a NaN and an infinity wrote different files");
+        assert_eq!(a.fingerprint(), b.fingerprint(), "two NaNs fingerprinted apart");
+        assert_eq!(
+            a.fingerprint(),
+            c.fingerprint(),
+            "a NaN and an infinity fingerprinted apart"
+        );
+        assert_ne!(a.fingerprint(), plus, "an unwritable note time looked unchanged");
+    }
+
 }

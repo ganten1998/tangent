@@ -833,7 +833,7 @@ pub struct TangentApp {
     history: Vec<Moment>,
     /// The document as it was last written or opened — what `project_dirty`
     /// measures against. `None` until something has been saved or loaded.
-    saved_state: Option<Moment>,
+    saved_state: Option<SavedPoint>,
     /// **What to do once the unsaved changes are dealt with.**
     ///
     /// New, Open and Quit all have to ask the same question first, and all
@@ -1565,6 +1565,21 @@ struct Moment {
     /// Every non-empty lane kit, compactly — see `DrumpadDoc::compact_json`.
     /// A hundred moments of the full 128-pad form would be megabytes.
     kits: String,
+}
+
+/// **What "saved" means**: the moment that was written, and its fingerprint.
+///
+/// One value and not two fields, built by one constructor, because the whole
+/// point of the fingerprint is that it answers the SAME question as the
+/// moment — cheaply. Two fields assigned at two call sites is the shape that
+/// drifts, and a drifted pair here means the title bar and the quit prompt
+/// disagree about whether there is anything to lose.
+#[derive(Clone)]
+struct SavedPoint {
+    /// The exact bytes. What `project_dirty_exact` compares.
+    at: Moment,
+    /// The same bytes as one `u64`. What `project_dirty` compares.
+    mark: u64,
 }
 
 /// Everything a track is, held by value. See [`TangentApp::copy_track`].
@@ -7274,7 +7289,11 @@ impl TangentApp {
         // fourth implicit writer. Now: the annotation lands in memory, and
         // a project that was clean is re-marked clean around it; the length
         // is a cache the next explicit save carries to disk.
-        let was_clean = !self.project_dirty();
+        // **Exact**, because being wrong in one direction here CLEARS real
+        // dirt: a false "it was clean" re-marks the project saved over
+        // whatever was actually unsaved. Once per decoded file, not per
+        // frame. See `project_dirty`.
+        let was_clean = !self.project_dirty_exact();
         self.arrangement.clips[i].len_s = len_s;
         if was_clean {
             self.mark_project_saved();
@@ -10818,17 +10837,54 @@ impl TangentApp {
         self.undo_commit();
     }
 
-    /// **Is there anything unsaved?**
+    /// **Is there anything unsaved?** — the CHEAP answer, for the title bar.
     ///
     /// Asked rather than tracked: the document as it stands, against the
     /// document as it was written. A flag set by hand at forty-three edit
     /// sites is a flag one of them forgets, and the one it forgets is the
-    /// edit somebody loses.
+    /// edit somebody loses. That reasoning has not changed; what changed is
+    /// what asking costs.
     ///
-    /// `None` saved yet means anything at all counts as a change.
+    /// Asking used to mean cloning the document, serialising it and
+    /// comparing two strings. Measured by `dirty_cost_probe` on 128 clips
+    /// and 8192 notes: **2.9 ms every frame in a RELEASE build — a sixth of
+    /// a 16.6 ms frame spent on an asterisk** (40 ms, two and a half whole
+    /// frames, in the debug build the tests run in). Now it compares two
+    /// [`crate::arrangement::Fingerprint`]s over the same content: 86 µs,
+    /// half a percent of a frame, about thirty times cheaper.
+    ///
+    /// # THE SPLIT, AND WHY IT MUST NOT BE COLLAPSED BACK
+    ///
+    /// A fingerprint is sixty-four bits and a document is not, so two
+    /// different documents CAN land on one number. That will not happen, and
+    /// the design does not rest on it not happening — it rests on the cost
+    /// of it happening being different in different places:
+    ///
+    /// * **Here**, a collision means the asterisk in the title bar is
+    ///   briefly wrong. The next real edit moves the number and it corrects
+    ///   itself. Nobody loses anything.
+    /// * **`project_dirty_exact`** is the same question where a wrong answer
+    ///   means the app does not OFFER TO SAVE and somebody loses an
+    ///   afternoon: `ask_before` (New, Open and Quit all go through it),
+    ///   `new_is_noop`, `note_clip_len`, and the two project-switch
+    ///   save-backs in `desktop.rs`. Every one of those is event-driven and
+    ///   pays the full comparison once, not sixty times a second, so there
+    ///   is nothing to buy by making them cheap and everything to lose.
+    ///
+    /// A later reader looking at two functions that answer the same question
+    /// will want to delete one. Which one is deleted decides whether the
+    /// worst case is a wrong asterisk or a lost session.
     pub fn project_dirty(&self) -> bool {
+        self.saved_state.as_ref().map(|s| s.mark) != Some(self.undo_mark())
+    }
+
+    /// **Is there anything unsaved?** — the EXACT answer, byte for byte.
+    ///
+    /// For the callers where a wrong answer costs somebody their work. See
+    /// `project_dirty` for the split and for which callers those are.
+    pub fn project_dirty_exact(&self) -> bool {
         let now = self.undo_state();
-        self.saved_state.as_ref() != Some(&now)
+        self.saved_state.as_ref().map(|s| &s.at) != Some(&now)
     }
 
     /// **Whether New would hand back exactly what is already open** - an
@@ -10846,8 +10902,11 @@ impl TangentApp {
             .max(1)
     }
 
+    /// **The exact comparison, deliberately.** A wrong "nothing changed"
+    /// here means File > New silently throws the open session away instead
+    /// of asking — see `project_dirty` for the split.
     pub fn new_is_noop(&self) -> bool {
-        !self.arrangement.named && !self.project_dirty()
+        !self.arrangement.named && !self.project_dirty_exact()
     }
 
     /// **Ask before losing anything.** Returns whether the caller should
@@ -10858,7 +10917,11 @@ impl TangentApp {
     /// Open and Quit all go through it rather than each growing their own
     /// version of the question.
     fn ask_before(&mut self, next: AfterSave) -> bool {
-        if !self.project_dirty() {
+        // **The EXACT comparison, and it stays exact.** This is the one
+        // thing standing between an afternoon's work and a keystroke, and it
+        // runs once per New/Open/Quit — there is nothing to buy here by
+        // making it cheap. See `project_dirty`.
+        if !self.project_dirty_exact() {
             return false;
         }
         self.pending_after_save = Some(next.clone());
@@ -10939,22 +11002,70 @@ impl TangentApp {
     /// Remember what is on disk, so `project_dirty` has something to
     /// compare against. Called by every road that writes or opens one.
     fn mark_project_saved(&mut self) {
-        self.saved_state = Some(self.undo_state());
+        self.saved_state = Some(self.saved_point());
     }
 
     /// The document as UNDO stores it: clips with the desk baked in — one
     /// string, one moment.
+    ///
+    /// **No clone.** This used to copy the whole `Arrangement` — every clip,
+    /// every note, every path string — for the sole purpose of overwriting
+    /// its `desk` field with the live one before serialising. The desk goes
+    /// in through `to_json_with_desk` now, which exists for exactly this.
+    ///
+    /// **And its own honesty: the clone was not the cost.** Measured at
+    /// 8 µs of this function's 2.8 ms in release, a third of a percent —
+    /// the serialisation is where the time goes and always was. It is gone
+    /// because it was pure waste, not because removing it made anything
+    /// fast. What made the once-a-frame question cheap is `undo_mark`.
     fn undo_state(&self) -> Moment {
-        let mut arr = self.arrangement.clone();
-        arr.desk = Some(self.desk_snapshot());
         Moment {
-            doc: arr.to_json(),
+            doc: self
+                .arrangement
+                .to_json_with_desk(Some(&self.desk_snapshot())),
             kits: crate::drumpad::DrumpadDoc::compact_all(&self.drumpad_kits),
+        }
+    }
+
+    /// The same moment as one `u64` — see `project_dirty`.
+    ///
+    /// The arrangement and the kits go into ONE fingerprint rather than two,
+    /// so there is a single number to compare and no pair to keep in step.
+    fn undo_mark(&self) -> u64 {
+        let mut f = crate::arrangement::Fingerprint::new();
+        self.arrangement
+            .hash_into(Some(&self.desk_snapshot()), &mut f);
+        crate::drumpad::DrumpadDoc::hash_all_into(&self.drumpad_kits, &mut f);
+        f.finish()
+    }
+
+    /// The pair, taken together at one instant — the only way a `SavedPoint`
+    /// is ever built, so its two halves cannot describe different documents.
+    fn saved_point(&self) -> SavedPoint {
+        SavedPoint {
+            at: self.undo_state(),
+            mark: self.undo_mark(),
         }
     }
 
     /// A moment worth keeping: pushed unless it IS the standing moment.
     /// Anything ahead of NOW (the redo tail) dies — the timeline forked.
+    ///
+    /// # Why this does NOT take the fingerprint
+    ///
+    /// It was measured, and it was refused. A fingerprint here could only
+    /// help in one case — a commit where nothing changed, which today pays
+    /// the full 2.8 ms to find out and would pay 86 µs instead. Every
+    /// commit that DID change something has to serialise anyway, because
+    /// the serialisation is the moment being stored; there is nothing to
+    /// save on the path that matters.
+    ///
+    /// And the cheap answer's failure mode lands on the wrong side of
+    /// `project_dirty`'s split. A collision here does not misdraw an
+    /// asterisk: it decides an edit is not worth recording, and the next
+    /// Ctrl+Z then reaches past it and takes two edits away instead of one.
+    /// Event-driven, once per edit, work on the line — so it stays exact,
+    /// for the same reason `ask_before` does.
     fn undo_commit(&mut self) {
         let state = self.undo_state();
         if self
@@ -10980,7 +11091,7 @@ impl TangentApp {
         // A fresh line of time is also a fresh baseline for "unsaved": every
         // road into a document — open, save-as, new, launch — ends here, so
         // this is the one place that cannot be forgotten.
-        self.saved_state = Some(self.undo_state());
+        self.saved_state = Some(self.saved_point());
         self.history.clear();
         self.hist_at = 0;
         self.undo_commit();
@@ -39883,6 +39994,148 @@ mod folder_tests {
         app.set_in_folder(2, false);
         assert!(!app.desk().muted[2], "it stayed silent after leaving the folder");
     }
+
+    /// A session with real work in it, settled — a MIDI part on a lane and a
+    /// sample on a pad, then baselined, so an edit below is an edit to
+    /// something rather than the arrival of the first thing.
+    fn a_settled_session() -> TangentApp {
+        let mut a = app();
+        a.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            lane: 1,
+            len_s: 4.0,
+            notes: vec![
+                crate::arrangement::ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 },
+                crate::arrangement::ArrNote { at_s: 1.0, dur_s: 0.5, key: 64, vel: 80 },
+            ],
+            ..Default::default()
+        });
+        a.drumpad_kits[0].pads[0].path = "media/kick.wav".into();
+        a.undo_reset();
+        a
+    }
+
+    /// **The cheap answer and the exact one agree, on every kind of edit.**
+    ///
+    /// `project_dirty` compares fingerprints and `project_dirty_exact`
+    /// compares bytes. They answer the same question; only their cost and
+    /// their worst case differ, which is the whole basis for using one in
+    /// the title bar and the other in the quit prompt. The day they
+    /// disagree, the title bar and the prompt are telling somebody two
+    /// different stories about their afternoon — so every edit the app can
+    /// make is walked past both.
+    #[test]
+    fn the_cheap_dirty_answer_and_the_exact_one_agree() {
+        let edits: Vec<(&str, Box<dyn Fn(&mut TangentApp)>)> = vec![
+            ("a note moved", Box::new(|a: &mut TangentApp| {
+                a.arrangement.clips[0].notes[0].at_s = 0.25;
+            })),
+            ("a note's velocity", Box::new(|a: &mut TangentApp| {
+                a.arrangement.clips[0].notes[1].vel = 101;
+            })),
+            ("a note drawn", Box::new(|a: &mut TangentApp| {
+                a.arrangement.clips[0].notes.push(crate::arrangement::ArrNote {
+                    at_s: 2.0,
+                    dur_s: 0.25,
+                    key: 67,
+                    vel: 90,
+                });
+            })),
+            ("a note deleted", Box::new(|a: &mut TangentApp| {
+                a.arrangement.clips[0].notes.pop();
+            })),
+            ("a clip dragged to another lane", Box::new(|a: &mut TangentApp| {
+                a.arrangement.clips[0].lane = 3;
+            })),
+            ("a clip dragged along the timeline", Box::new(|a: &mut TangentApp| {
+                a.arrangement.clips[0].start_s = 8.0;
+            })),
+            ("a clip's edge dragged", Box::new(|a: &mut TangentApp| {
+                a.arrangement.clips[0].len_s = 6.0;
+            })),
+            ("a clip placed", Box::new(|a: &mut TangentApp| {
+                a.arrangement.add_clip(crate::arrangement::ArrClip {
+                    path: "media/take 2.wav".into(),
+                    len_s: 3.0,
+                    ..Default::default()
+                });
+            })),
+            ("a clip deleted", Box::new(|a: &mut TangentApp| {
+                a.arrangement.clips.clear();
+            })),
+            ("the master fader", Box::new(|a: &mut TangentApp| {
+                a.settings.master_gain = 0.3;
+            })),
+            ("a channel fader", Box::new(|a: &mut TangentApp| {
+                a.settings.channel_gains[1] = 0.42;
+            })),
+            ("a strip renamed", Box::new(|a: &mut TangentApp| {
+                // The fixture's names vector is empty, which is what an
+                // untouched desk looks like — naming a strip GROWS it.
+                a.settings.strip_names.push("the kit".into());
+            })),
+            ("a strip recoloured", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_colors[0] = 5;
+            })),
+            ("the click switched on", Box::new(|a: &mut TangentApp| {
+                a.settings.metronome_on = !a.settings.metronome_on;
+            })),
+            ("a pad's knob", Box::new(|a: &mut TangentApp| {
+                a.drumpad_kits[0].pads[0].params.gain = 0.5;
+            })),
+            ("a pad cleared", Box::new(|a: &mut TangentApp| {
+                a.drumpad_kits[0].pads[0].path = String::new();
+            })),
+            ("a kit loaded onto another lane", Box::new(|a: &mut TangentApp| {
+                a.drumpad_kits[2].pads[5].path = "media/hat.wav".into();
+            })),
+            ("a tempo map drawn", Box::new(|a: &mut TangentApp| {
+                a.arrangement.tempo = crate::tempo::TempoMap::sanitised(vec![
+                    crate::tempo::TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+                    crate::tempo::TempoPoint { at_beat: 8.0, bpm: 96.0, ramp: true },
+                ]);
+            })),
+            ("an automation curve drawn", Box::new(|a: &mut TangentApp| {
+                a.arrangement.automation =
+                    crate::automation::Automation::from_curves(vec![
+                        crate::automation::Curve::sanitised(
+                            1,
+                            crate::automation::AutoParam::Gain,
+                            vec![crate::automation::Point {
+                                at_s: 1.0,
+                                value: 0.25,
+                                shape: crate::automation::Shape::Linear,
+                            }],
+                        ),
+                    ]);
+            })),
+        ];
+        for (what, edit) in edits {
+            let mut a = a_settled_session();
+            assert!(!a.project_dirty(), "`{what}`: a settled session read dirty");
+            assert!(
+                !a.project_dirty_exact(),
+                "`{what}`: a settled session read dirty exactly"
+            );
+            edit(&mut a);
+            assert!(
+                a.project_dirty_exact(),
+                "`{what}` left the project looking saved — the edit reached nothing"
+            );
+            assert_eq!(
+                a.project_dirty(),
+                a.project_dirty_exact(),
+                "`{what}`: the title bar and the quit prompt disagree"
+            );
+            // And saving settles both again, from the one baseline.
+            a.mark_project_saved();
+            assert!(!a.project_dirty(), "`{what}`: a saved project still reads dirty");
+            assert!(
+                !a.project_dirty_exact(),
+                "`{what}`: a saved project still reads dirty exactly"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -40417,13 +40670,17 @@ mod aspect_snap_tests {
 mod dirty_cost_probe {
     use super::*;
 
-    /// Throwaway probe: what does one `project_dirty()` cost on a real-sized
-    /// session? Ignored by default; run with `--ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn what_does_the_title_pay_every_frame() {
+    /// A session of the size the owner actually works at: eight lanes, sixteen
+    /// MIDI clips each, sixty-four notes a clip. Marked saved, because the
+    /// CLEAN document is both the common case and the expensive one — that is
+    /// the comparison that has to read every byte before it can agree.
+    fn a_real_session() -> TangentApp {
         let ctx = egui::Context::default();
-        let mut app = TangentApp::new(&ctx, crate::settings::Settings::default(), crate::host::Caps::DESKTOP);
+        let mut app = TangentApp::new(
+            &ctx,
+            crate::settings::Settings::default(),
+            crate::host::Caps::DESKTOP,
+        );
         for lane in 0..8usize {
             for c in 0..16usize {
                 let mut clip = crate::arrangement::ArrClip {
@@ -40443,18 +40700,140 @@ mod dirty_cost_probe {
                 app.arrangement.clips.push(clip);
             }
         }
-        let notes: usize = app.arrangement.clips.iter().map(|c| c.notes.len()).sum();
+        app.mark_project_saved();
+        app
+    }
+
+    /// What `project_dirty` USED to do, kept here so the before and the after
+    /// are measured on one machine in one run rather than compared across two
+    /// builds: clone the document, bake the live desk into the copy,
+    /// serialise it, compact the kits, compare two strings.
+    fn the_old_way(app: &TangentApp) -> bool {
+        let mut arr = app.arrangement.clone();
+        arr.desk = Some(app.desk_snapshot());
+        let now = Moment {
+            doc: arr.to_json(),
+            kits: crate::drumpad::DrumpadDoc::compact_all(&app.drumpad_kits),
+        };
+        app.saved_state.as_ref().map(|s| &s.at) != Some(&now)
+    }
+
+    fn per_call(n: u32, mut f: impl FnMut()) -> std::time::Duration {
         let t = std::time::Instant::now();
-        let n = 60;
         for _ in 0..n {
-            std::hint::black_box(app.project_dirty());
+            f();
         }
-        let per = t.elapsed() / n;
+        t.elapsed() / n
+    }
+
+    fn say(what: &str, d: std::time::Duration) {
         println!(
-            "{} clips / {notes} notes -> project_dirty = {:?} per call, {:.1}% of a 16.6ms frame",
-            app.arrangement.clips.len(),
-            per,
-            per.as_secs_f64() / 0.0166 * 100.0
+            "  {what:<34} {:>10.3?}  {:>7.2}% of a 16.6ms frame",
+            d,
+            d.as_secs_f64() / 0.0166 * 100.0
         );
+    }
+
+    /// **What does the title bar pay every frame?** Ignored by default; run
+    /// with `--ignored --nocapture`.
+    ///
+    /// `desktop.rs` asks `project_dirty` once a frame to decide whether the
+    /// window title carries an asterisk. The answer used to cost a sixth of
+    /// every frame on a real session.
+    ///
+    /// **RUN IT BOTH WAYS.** `cargo test` is a debug build, and the numbers
+    /// it prints are debug numbers — about fifteen times the shipping cost,
+    /// which is why the line says which it is. `--release` is what a person
+    /// actually feels; debug is what the ordinary suite would pay if this
+    /// probe were not `#[ignore]`d.
+    #[test]
+    #[ignore]
+    fn what_does_the_title_pay_every_frame() {
+        let app = a_real_session();
+        let notes: usize = app.arrangement.clips.iter().map(|c| c.notes.len()).sum();
+        println!(
+            "{} clips / {notes} notes, marked saved (the clean case), {} build",
+            app.arrangement.clips.len(),
+            if cfg!(debug_assertions) { "DEBUG" } else { "release" }
+        );
+        // Both answers must be the same answer, or the numbers below are
+        // measuring two different questions.
+        assert!(!the_old_way(&app), "the old way called a clean project dirty");
+        assert!(!app.project_dirty(), "the fingerprint called a clean project dirty");
+
+        let before = per_call(20, || {
+            std::hint::black_box(the_old_way(&app));
+        });
+        let after = per_call(2000, || {
+            std::hint::black_box(app.project_dirty());
+        });
+        let exact = per_call(20, || {
+            std::hint::black_box(app.project_dirty_exact());
+        });
+        say("BEFORE project_dirty", before);
+        say("AFTER  project_dirty", after);
+        say("       project_dirty_exact", exact);
+        println!(
+            "  -> {:.0}x cheaper per frame",
+            before.as_secs_f64() / after.as_secs_f64()
+        );
+    }
+
+    /// **What does one committed edit pay?**
+    ///
+    /// `undo_commit` runs on every edit that reaches `arr_save_edits`, and it
+    /// has to serialise — that is the moment it stores. What it did NOT have
+    /// to do was clone the whole arrangement first, purely to overwrite one
+    /// `Option` before serialising the copy. `to_json_with_desk` removed
+    /// that, and this probe is what says how little it was worth: the clone
+    /// is a quarter of a percent of the call. It also prints `undo_mark`
+    /// beside it, which is the measurement `undo_commit`'s doc comment
+    /// leans on when it declines to use the fingerprint here.
+    #[test]
+    #[ignore]
+    fn what_does_a_committed_edit_pay() {
+        let mut app = a_real_session();
+        let notes: usize = app.arrangement.clips.iter().map(|c| c.notes.len()).sum();
+        println!(
+            "{} clips / {notes} notes, {} build",
+            app.arrangement.clips.len(),
+            if cfg!(debug_assertions) { "DEBUG" } else { "release" }
+        );
+
+        let with_clone = per_call(20, || {
+            let mut arr = app.arrangement.clone();
+            arr.desk = Some(app.desk_snapshot());
+            std::hint::black_box(Moment {
+                doc: arr.to_json(),
+                kits: crate::drumpad::DrumpadDoc::compact_all(&app.drumpad_kits),
+            });
+        });
+        let without = per_call(20, || {
+            std::hint::black_box(app.undo_state());
+        });
+        let clone_only = per_call(200, || {
+            std::hint::black_box(app.arrangement.clone());
+        });
+        let mark = per_call(2000, || {
+            std::hint::black_box(app.undo_mark());
+        });
+        let desk = per_call(2000, || {
+            std::hint::black_box(app.desk_snapshot());
+        });
+        say("BEFORE undo_state (with clone)", with_clone);
+        say("AFTER  undo_state", without);
+        say("  of which: the clone alone", clone_only);
+        say("  for scale: undo_mark", mark);
+        say("  of which: desk_snapshot", desk);
+
+        // And the whole call, end to end, on a document that really changed.
+        app.undo_reset();
+        let t = std::time::Instant::now();
+        let n = 20;
+        for i in 0..n {
+            app.arrangement.clips[0].notes[0].at_s = f64::from(i) * 0.001;
+            app.undo_commit();
+        }
+        say("AFTER  undo_commit (a real edit)", t.elapsed() / n);
     }
 }
