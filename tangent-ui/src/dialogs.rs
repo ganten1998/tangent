@@ -574,6 +574,101 @@ pub enum Dialog {
         /// ducking to the drum bus is the classic ask.
         channels: Vec<(usize, String)>,
     },
+    /// **The IR wizard**: capture a hardware unit's impulse response through
+    /// a physical loop — interface outs into the box, box outs back into the
+    /// interface. Staged, because the measurement has an order (patch, set
+    /// levels, sweep, judge), and boxed because the stages carry more state
+    /// than any other dialog holds. Appended at the enum's END, the
+    /// append-only law every parallel lane obeys.
+    IrWizard { state: Box<IrWizardState> },
+}
+
+/// Which page of the IR wizard is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrStage {
+    /// Pick the loop's jacks and patch the cables.
+    Io,
+    /// The test tone and the return meter — levels before sweeps.
+    Level,
+    /// Length, tail, the optional loop-only reference pass, and ARM.
+    Sweep,
+    /// The captured IR: picture, numbers, warnings, Save.
+    Result,
+}
+
+/// Everything the IR wizard holds between frames. The app snapshots the
+/// device's channel lists when it opens the dialog (the `AudioSetup`
+/// bargain: enumerating hardware is never a per-frame act) and refreshes
+/// `live` each frame from the host's push.
+pub struct IrWizardState {
+    pub stage: IrStage,
+    /// Stereo output pairs the open device offers, as zero-based firsts:
+    /// (0,1) is "Out 1/2". Snapshot from the routing plumbing's count.
+    pub out_pairs: Vec<(usize, usize)>,
+    /// Input pairs, likewise, from the input device's width.
+    pub in_pairs: Vec<(usize, usize)>,
+    pub out_sel: usize,
+    pub in_sel: usize,
+    /// The test tone / sweep level, dBFS. −18 first, then −12 — the two
+    /// alignment levels the references use; REW's own default is −12.
+    pub level_db: f32,
+    /// The stage-2 tone is sounding right now.
+    pub tone_on: bool,
+    /// Index into [`IR_SWEEP_CHOICES`].
+    pub sweep_choice: usize,
+    /// Post-sweep capture window, seconds — at least the tail expected.
+    pub tail_s: f64,
+    /// The host's per-frame push: levels, progress, result.
+    pub live: crate::ports::IrLive,
+    /// The Save field.
+    pub name: String,
+    /// Retry was pressed: the OLD result still rides the live push until a
+    /// new pass replaces it, and without this latch the auto-advance would
+    /// bounce the wizard straight back to the result page every frame.
+    pub retried: bool,
+}
+
+/// The offered sweep lengths, seconds. 15 is the default (Farina's own
+/// experiments; between Apple's 10 and 50); 5 for quick passes on short
+/// tails, 50 for the last few dB of noise floor.
+pub const IR_SWEEP_CHOICES: [f64; 3] = [5.0, 15.0, 50.0];
+
+impl Default for IrWizardState {
+    fn default() -> Self {
+        Self {
+            stage: IrStage::Io,
+            out_pairs: Vec::new(),
+            in_pairs: Vec::new(),
+            out_sel: 0,
+            in_sel: 0,
+            level_db: -18.0,
+            tone_on: false,
+            sweep_choice: 1,
+            tail_s: 10.0,
+            live: crate::ports::IrLive::default(),
+            name: String::new(),
+            retried: false,
+        }
+    }
+}
+
+impl IrWizardState {
+    /// The chosen device channels, resolved — the wizard's actions carry
+    /// these, so the app never re-derives a selection.
+    pub fn out_pair(&self) -> (usize, usize) {
+        self.out_pairs.get(self.out_sel).copied().unwrap_or((0, 1))
+    }
+
+    pub fn in_pair(&self) -> (usize, usize) {
+        self.in_pairs.get(self.in_sel).copied().unwrap_or((0, 1))
+    }
+
+    pub fn sweep_s(&self) -> f64 {
+        IR_SWEEP_CHOICES
+            .get(self.sweep_choice)
+            .copied()
+            .unwrap_or(15.0)
+    }
 }
 
 /// Snapshot of learned-re-ranker state for display.
@@ -919,6 +1014,33 @@ pub enum DialogAction {
     /// per-frame publish owns the `seat_bay` translation, so the edge
     /// survives every seat renumbering the desk migrations perform.
     SetInsertKeySource { strip: usize, slot: usize, from: Option<usize> },
+    // ── the IR wizard ───────────────────────────────────────────────────
+    // Appended at the enum's END, the append-only law. The wizard's five:
+    // a door in Setup, and the four asks the app maps onto requests.
+    /// Open the IR wizard — Setup's "Capture hardware IR..." door. The app
+    /// builds the channel lists when it opens the dialog.
+    OpenIrWizard,
+    /// The stage-2 test tone, on or off, on these device channels.
+    IrTone {
+        on: bool,
+        out: (usize, usize),
+        inp: (usize, usize),
+        level_db: f32,
+    },
+    /// Arm one sweep pass — `reference: true` is the loop-only bypass pass.
+    IrCapture {
+        out: (usize, usize),
+        inp: (usize, usize),
+        sweep_s: f64,
+        tail_s: f64,
+        level_db: f32,
+        reference: bool,
+    },
+    /// Stop whatever the IR road is doing. Also fired when the wizard
+    /// closes, so a tone can never outlive its meter.
+    IrCancel,
+    /// Write the finished capture as `IRs/<name>.wav` and refresh the shelf.
+    IrSave { name: String },
 }
 
 // ── the custom tuning editor ────────────────────────────────────────────────
@@ -3393,6 +3515,445 @@ pub fn show_notice(ctx: &egui::Context, placement: Placement, text: &str) -> boo
     closed || report.close
 }
 
+// ── the IR wizard's four pages ──────────────────────────────────────────────
+//
+// Free functions rather than arms of the big closure, because each page is a
+// small essay and the wizard arm would otherwise be four hundred lines deep
+// in one match. They speak through the same two channels every dialog does:
+// mutate the boxed state, and put at most one `DialogAction` in `action`.
+
+/// A channel pair the way an interface prints it: one-based, "1/2".
+fn ir_pair_label(prefix: &str, pair: (usize, usize)) -> String {
+    format!("{prefix} {}/{}", pair.0 + 1, pair.1 + 1)
+}
+
+fn draw_ir_io(ui: &mut egui::Ui, t: &DialogTheme, s: &mut IrWizardState) {
+    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+    ui.label(
+        RichText::new(
+            "Capture a hardware unit as an impulse response: a measurement \
+             sweep goes OUT of the interface, through the box, and back IN.",
+        )
+        .font(bold(10.5))
+        .color(t.text),
+    );
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(
+            "Patch the chosen outputs into the unit's inputs and the unit's \
+             outputs into the chosen inputs. Set the unit 100% WET - its \
+             dry/wet mix becomes part of the capture.",
+        )
+        .font(bold(10.0))
+        .color(t.faint),
+    );
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("SEND ON").font(bold(11.0)).color(t.text));
+        egui::ComboBox::from_id_salt("ir-out-pair")
+            .selected_text(
+                RichText::new(ir_pair_label("Out", s.out_pair()))
+                    .font(bold(11.0))
+                    .color(t.text),
+            )
+            .show_ui(ui, |ui| {
+                for (i, &pair) in s.out_pairs.iter().enumerate() {
+                    if ui
+                        .selectable_label(
+                            s.out_sel == i,
+                            ir_pair_label("Out", pair),
+                        )
+                        .clicked()
+                    {
+                        s.out_sel = i;
+                    }
+                }
+            });
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("RETURN ON").font(bold(11.0)).color(t.text));
+        egui::ComboBox::from_id_salt("ir-in-pair")
+            .selected_text(
+                RichText::new(ir_pair_label("In", s.in_pair()))
+                    .font(bold(11.0))
+                    .color(t.text),
+            )
+            .show_ui(ui, |ui| {
+                for (i, &pair) in s.in_pairs.iter().enumerate() {
+                    if ui
+                        .selectable_label(s.in_sel == i, ir_pair_label("In", pair))
+                        .clicked()
+                    {
+                        s.in_sel = i;
+                    }
+                }
+            });
+    });
+    if s.in_pairs.is_empty() {
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(
+                "No audio input is open - pick an input device first \
+                 (Setup, or the microphone picker).",
+            )
+            .font(bold(10.0))
+            .color(t.text),
+        );
+    }
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(
+            "Sending on the main monitor pair works but you will hear the \
+             sweep at full level - a spare pair of jacks is kinder.",
+        )
+        .font(bold(9.5))
+        .color(t.faint),
+    );
+}
+
+fn draw_ir_level(
+    ui: &mut egui::Ui,
+    t: &DialogTheme,
+    s: &mut IrWizardState,
+    action: &mut Option<DialogAction>,
+) {
+    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+    ui.label(
+        RichText::new(
+            "Play the alignment tone and set the unit's input level. \
+             Start at -18 dBFS, then confirm at -12.",
+        )
+        .font(bold(10.5))
+        .color(t.text),
+    );
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        for level in [-18.0f32, -12.0] {
+            let here = s.tone_on && (s.level_db - level).abs() < 0.5;
+            let label = if here {
+                format!("tone {level:.0} dBFS ■")
+            } else {
+                format!("tone {level:.0} dBFS")
+            };
+            if ui
+                .add(Button::new(RichText::new(label).font(bold(11.0)).color(t.text)))
+                .clicked()
+            {
+                // Press the sounding level to stop; press the other to move.
+                s.tone_on = !here;
+                s.level_db = level;
+                *action = Some(DialogAction::IrTone {
+                    on: s.tone_on,
+                    out: s.out_pair(),
+                    inp: s.in_pair(),
+                    level_db: s.level_db,
+                });
+            }
+        }
+    });
+    ui.add_space(10.0);
+    // The return meter: a bar on the field ground, RMS as the fill, peak as
+    // a tick, −60..0 dBFS. Drawn, not a widget, because it is a readout.
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 20.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 2.0, t.field_bg);
+    let frac = |db: f32| ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+    let (rms, peak) = (s.live.rms_db, s.live.peak_db);
+    if rms > -200.0 {
+        let w = rect.width() * frac(rms);
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min, Vec2::new(w, rect.height())),
+            2.0,
+            t.faint,
+        );
+    }
+    if peak > -200.0 {
+        let x = rect.left() + rect.width() * frac(peak);
+        ui.painter().line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(2.0, t.text),
+        );
+    }
+    ui.add_space(4.0);
+    let reading = if peak <= -200.0 {
+        "return: silence".to_owned()
+    } else {
+        format!("return: {rms:.1} dBFS rms   {peak:.1} peak")
+    };
+    ui.label(RichText::new(reading).font(bold(10.5)).color(t.text));
+    // The warnings, in the order they matter.
+    let warn = if peak > -0.5 {
+        Some("CLIPPING - bring the unit's output (or this tone) down.")
+    } else if peak > -6.0 {
+        Some("Under 6 dB of headroom - the sweep will hit harder than this tone.")
+    } else if s.tone_on && peak <= -200.0 {
+        Some("Nothing is coming back - check the loop's cables and the unit's bypass.")
+    } else {
+        None
+    };
+    if let Some(w) = warn {
+        ui.add_space(4.0);
+        ui.label(RichText::new(w).font(bold(10.5)).color(t.text));
+    }
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(
+            "Aim the return around -12 dBFS. Hardware often keeps less \
+             headroom on its wet path than its dry one, so set levels by \
+             the box's own meters, below its clip.",
+        )
+        .font(bold(9.5))
+        .color(t.faint),
+    );
+}
+
+fn draw_ir_sweep(
+    ui: &mut egui::Ui,
+    t: &DialogTheme,
+    s: &mut IrWizardState,
+    action: &mut Option<DialogAction>,
+) {
+    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("SWEEP").font(bold(11.0)).color(t.text));
+        for (i, secs) in IR_SWEEP_CHOICES.iter().enumerate() {
+            if ui
+                .selectable_label(
+                    s.sweep_choice == i,
+                    RichText::new(format!("{secs:.0} s")).font(bold(11.0)),
+                )
+                .clicked()
+            {
+                s.sweep_choice = i;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("TAIL").font(bold(11.0)).color(t.text));
+        for secs in [5.0f64, 10.0, 20.0] {
+            if ui
+                .selectable_label(
+                    (s.tail_s - secs).abs() < 0.5,
+                    RichText::new(format!("{secs:.0} s")).font(bold(11.0)),
+                )
+                .clicked()
+            {
+                s.tail_s = secs;
+            }
+        }
+        ui.label(
+            RichText::new("at least the decay you expect")
+                .font(bold(9.5))
+                .color(t.faint),
+        );
+    });
+    ui.add_space(10.0);
+    // The optional exact route: capture the LOOP alone once, and every
+    // later pass divides by it — interface, converters and latency cancel.
+    let ref_line = if s.live.has_reference {
+        "reference held - the next capture divides by it"
+    } else {
+        "no reference - the capture will use the inverse-filter route"
+    };
+    ui.label(RichText::new(ref_line).font(bold(10.0)).color(t.faint));
+    if !s.live.capturing
+        && ui
+            .add(Button::new(
+                RichText::new("Capture loop-only reference (recommended)")
+                    .font(bold(10.5))
+                    .color(t.text),
+            ))
+            .on_hover_text(
+                "Bypass the unit (or patch out straight to in), then run \
+                 this once. Same sweep, same levels.",
+            )
+            .clicked()
+    {
+        s.retried = false;
+        *action = Some(DialogAction::IrCapture {
+            out: s.out_pair(),
+            inp: s.in_pair(),
+            sweep_s: s.sweep_s(),
+            tail_s: s.tail_s,
+            level_db: s.level_db,
+            reference: true,
+        });
+    }
+    ui.add_space(6.0);
+    if !s.live.capturing
+        && ui
+            .add(Button::new(
+                RichText::new("ARM - capture through the unit")
+                    .font(bold(12.0))
+                    .color(t.text),
+            ))
+            .clicked()
+    {
+        s.retried = false;
+        *action = Some(DialogAction::IrCapture {
+            out: s.out_pair(),
+            inp: s.in_pair(),
+            sweep_s: s.sweep_s(),
+            tail_s: s.tail_s,
+            level_db: s.level_db,
+            reference: false,
+        });
+    }
+    if s.live.capturing {
+        ui.add_space(8.0);
+        let (rect, _) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), 16.0),
+            egui::Sense::hover(),
+        );
+        ui.painter().rect_filled(rect, 2.0, t.field_bg);
+        let w = rect.width() * s.live.progress.clamp(0.0, 1.0);
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min, Vec2::new(w, rect.height())),
+            2.0,
+            t.faint,
+        );
+        ui.add_space(4.0);
+        if ui
+            .add(Button::new(RichText::new("Stop").color(t.text)))
+            .clicked()
+        {
+            *action = Some(DialogAction::IrCancel);
+        }
+    }
+    if !s.live.phase.is_empty() {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(s.live.phase.as_str())
+                .font(bold(10.5))
+                .color(t.text),
+        );
+    }
+}
+
+fn draw_ir_result(
+    ui: &mut egui::Ui,
+    t: &DialogTheme,
+    st: &crate::face::FaceStyle,
+    s: &mut IrWizardState,
+    action: &mut Option<DialogAction>,
+) {
+    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+    let Some(r) = s.live.result.clone() else {
+        ui.label(
+            RichText::new("No capture yet - go back and arm one.")
+                .font(bold(10.5))
+                .color(t.text),
+        );
+        return;
+    };
+    // The picture: the IR's level over time in dB, on the kit's glass.
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 140.0),
+        egui::Sense::hover(),
+    );
+    crate::face::lcd_glass(ui.painter(), rect, st);
+    if r.envelope_db.len() > 1 {
+        let n = r.envelope_db.len();
+        let pts: Vec<Pos2> = r
+            .envelope_db
+            .iter()
+            .enumerate()
+            .map(|(i, &db)| {
+                let x = rect.left()
+                    + rect.width() * i as f32 / (n - 1) as f32;
+                let y = rect.top()
+                    + rect.height() * (1.0 - ((db + 100.0) / 100.0).clamp(0.0, 1.0));
+                Pos2::new(x, y)
+            })
+            .collect();
+        ui.painter().add(egui::Shape::line(
+            pts,
+            Stroke::new(1.5, crate::face::lcd_ink(st, crate::face::LcdTier::Primary)),
+        ));
+        // The measured floor, as a grid line the tail can be judged against.
+        let fy = rect.top()
+            + rect.height()
+                * (1.0 - ((r.noise_floor_db + 100.0) / 100.0).clamp(0.0, 1.0));
+        ui.painter().line_segment(
+            [Pos2::new(rect.left(), fy), Pos2::new(rect.right(), fy)],
+            Stroke::new(1.0, crate::face::lcd_ink(st, crate::face::LcdTier::Label)),
+        );
+    }
+    ui.add_space(6.0);
+    let route = if r.has_reference {
+        "reference-divided (exact)"
+    } else {
+        "inverse-filter route"
+    };
+    ui.label(
+        RichText::new(format!(
+            "{:.2} s captured   {:.2} s above the floor ({:.0} dBFS)   {route}",
+            r.seconds, r.usable_s, r.noise_floor_db
+        ))
+        .font(bold(10.5))
+        .color(t.text),
+    );
+    // The sweep's free distortion probe. −200 means the window fell off the
+    // buffer, which a short capture can do; say nothing rather than a lie.
+    if r.thd2_db > -200.0 {
+        ui.label(
+            RichText::new(format!(
+                "distortion: 2nd {:+.0} dB, 3rd {:+.0} dB against the linear response",
+                r.thd2_db, r.thd3_db
+            ))
+            .font(bold(10.0))
+            .color(t.faint),
+        );
+    }
+    ui.add_space(8.0);
+    // The caveats list — what an IR can NEVER carry, said before Save.
+    ui.label(
+        RichText::new(
+            "An IR keeps only the linear, time-invariant part of the sound.\n\
+             - Gated-reverb programs capture as the UNGATED reverb: the gate \
+             triggers on input level and cannot round-trip.\n\
+             - Chorus, flange, phaser, detune and rotary programs will not \
+             round-trip - the sweep smears against the moving delay.\n\
+             - Some reverbs modulate their tails (and some units default \
+             that ON): switch tail chorus off before capturing.\n\
+             - Reverse programs usually capture fine - A/B the result.",
+        )
+        .font(bold(9.5))
+        .color(t.faint),
+    );
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        let edit = egui::TextEdit::singleline(&mut s.name)
+            .hint_text("name the capture...")
+            .font(bold(11.0))
+            .desired_width(220.0);
+        ui.add(edit);
+        let can = !s.name.trim().is_empty();
+        if ui
+            .add_enabled(
+                can,
+                Button::new(RichText::new("Save IR").font(bold(11.0)).color(t.text)),
+            )
+            .clicked()
+        {
+            *action = Some(DialogAction::IrSave {
+                name: s.name.trim().to_owned(),
+            });
+        }
+    });
+    if !s.live.phase.is_empty() {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(s.live.phase.as_str())
+                .font(bold(10.0))
+                .color(t.faint),
+        );
+    }
+}
+
 pub fn show(
     ctx: &egui::Context,
     dialog_opt: &mut Option<Dialog>,
@@ -5501,6 +6062,21 @@ pub fn show(
                                 {
                                     result.close = true;
                                 }
+                                // The IR wizard's door, beside Close: it is
+                                // about the same subject as this panel — the
+                                // interface's ins and outs — and it needs
+                                // both halves open, which Setup is where you
+                                // check.
+                                if ui
+                                    .add(Button::new(
+                                        RichText::new("Capture hardware IR...")
+                                            .color(t.text),
+                                    ))
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::OpenIrWizard);
+                                    result.close = true;
+                                }
                             });
                         });
                 },
@@ -6998,6 +7574,148 @@ pub fn show(
                                     .add(Button::new(RichText::new("Close").color(t.text)))
                                     .clicked()
                                 {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+        Dialog::IrWizard { state } => {
+            let t = theme(face);
+            let (lcd, lcd_glass_c) = live_lcd(ctx);
+            let st = crate::face::FaceStyle::new(face, lcd, lcd_glass_c);
+            let s: &mut IrWizardState = state.as_mut();
+            // A finished capture pulls the wizard to its result page — the
+            // deconvolution ran on the host and pushed the outcome; nobody
+            // should have to click "next" to see what they just measured.
+            if s.live.result.is_some() && s.stage == IrStage::Sweep && !s.retried {
+                s.stage = IrStage::Result;
+            }
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "IR Wizard",
+                Vec2::new(540.0, 560.0),
+                Vec2::new(460.0, 430.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.field_bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(14))
+                        .show(ui, |ui| {
+                            let head = match s.stage {
+                                IrStage::Io => "1 / 4  THE LOOP",
+                                IrStage::Level => "2 / 4  LEVELS",
+                                IrStage::Sweep => "3 / 4  THE SWEEP",
+                                IrStage::Result => "4 / 4  THE CAPTURE",
+                            };
+                            ui.label(RichText::new(head).font(bold(12.0)).color(t.text));
+                            ui.add_space(8.0);
+                            match s.stage {
+                                IrStage::Io => draw_ir_io(ui, &t, s),
+                                IrStage::Level => {
+                                    draw_ir_level(ui, &t, s, &mut action)
+                                }
+                                IrStage::Sweep => {
+                                    draw_ir_sweep(ui, &t, s, &mut action)
+                                }
+                                IrStage::Result => {
+                                    draw_ir_result(ui, &t, &st, s, &mut action)
+                                }
+                            }
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                match s.stage {
+                                    IrStage::Io => {
+                                        if ui
+                                            .add(Button::new(
+                                                RichText::new("Next").color(t.text),
+                                            ))
+                                            .clicked()
+                                        {
+                                            s.stage = IrStage::Level;
+                                        }
+                                    }
+                                    IrStage::Level => {
+                                        if ui
+                                            .add(Button::new(
+                                                RichText::new("Next").color(t.text),
+                                            ))
+                                            .clicked()
+                                        {
+                                            // The tone must not outlive its
+                                            // meter.
+                                            if s.tone_on {
+                                                s.tone_on = false;
+                                                action = Some(DialogAction::IrTone {
+                                                    on: false,
+                                                    out: s.out_pair(),
+                                                    inp: s.in_pair(),
+                                                    level_db: s.level_db,
+                                                });
+                                            }
+                                            s.stage = IrStage::Sweep;
+                                        }
+                                        if ui
+                                            .add(Button::new(
+                                                RichText::new("Back").color(t.text),
+                                            ))
+                                            .clicked()
+                                        {
+                                            if s.tone_on {
+                                                s.tone_on = false;
+                                                action = Some(DialogAction::IrTone {
+                                                    on: false,
+                                                    out: s.out_pair(),
+                                                    inp: s.in_pair(),
+                                                    level_db: s.level_db,
+                                                });
+                                            }
+                                            s.stage = IrStage::Io;
+                                        }
+                                    }
+                                    IrStage::Sweep => {
+                                        if !s.live.capturing
+                                            && ui
+                                                .add(Button::new(
+                                                    RichText::new("Back").color(t.text),
+                                                ))
+                                                .clicked()
+                                        {
+                                            s.stage = IrStage::Level;
+                                        }
+                                    }
+                                    IrStage::Result => {
+                                        if ui
+                                            .add(Button::new(
+                                                RichText::new("Done").color(t.text),
+                                            ))
+                                            .clicked()
+                                        {
+                                            result.close = true;
+                                        }
+                                        if ui
+                                            .add(Button::new(
+                                                RichText::new("Retry").color(t.text),
+                                            ))
+                                            .clicked()
+                                        {
+                                            s.stage = IrStage::Sweep;
+                                            s.retried = true;
+                                        }
+                                    }
+                                }
+                                if s.stage != IrStage::Result
+                                    && ui
+                                        .add(Button::new(
+                                            RichText::new("Cancel").color(t.text),
+                                        ))
+                                        .clicked()
+                                {
+                                    action = Some(DialogAction::IrCancel);
                                     result.close = true;
                                 }
                             });
@@ -10648,5 +11366,35 @@ at: None,
             !fills.contains(&theme_of(FALLBACK_FACE).bg),
             "ivory is still painted somewhere in the export window"
         );
+    }
+
+    /// **The wizard's choices resolve to exactly what its actions will
+    /// carry** — pairs by index with a stale selection falling back rather
+    /// than panicking, and the sweep-length table answering in seconds.
+    /// This is the spec round-trip: what the combo shows IS what
+    /// `IrCapture` asks for.
+    #[test]
+    fn the_ir_wizards_choices_resolve_to_the_pairs_and_seconds_it_asks_for() {
+        let mut s = IrWizardState::default();
+        assert_eq!(s.stage, IrStage::Io, "a fresh wizard starts at the loop");
+        s.out_pairs = vec![(0, 1), (2, 3), (12, 13)];
+        s.in_pairs = vec![(0, 1)];
+        s.out_sel = 2;
+        assert_eq!(s.out_pair(), (12, 13));
+        assert_eq!(s.in_pair(), (0, 1));
+        // A selection the device no longer has falls back to the main pair.
+        s.in_sel = 7;
+        assert_eq!(s.in_pair(), (0, 1));
+        for (i, want) in IR_SWEEP_CHOICES.iter().enumerate() {
+            s.sweep_choice = i;
+            assert!((s.sweep_s() - want).abs() < f64::EPSILON);
+        }
+        s.sweep_choice = 99;
+        assert!((s.sweep_s() - 15.0).abs() < f64::EPSILON, "the fallback is the default");
+        // And the default levels are the recipe's: −18 first, 10 s of tail.
+        let fresh = IrWizardState::default();
+        assert!((fresh.level_db + 18.0).abs() < 0.01);
+        assert!((fresh.tail_s - 10.0).abs() < 0.01);
+        assert!((fresh.sweep_s() - 15.0).abs() < 0.01);
     }
 }

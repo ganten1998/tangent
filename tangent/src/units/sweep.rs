@@ -41,8 +41,9 @@
 //! realtime half of the story — playing a captured IR — lives next door in
 //! `convolver.rs`.
 
-// Nothing reaches this module yet: the IR-wizard lane wires it later, and
-// proving the math before any panel exists is the point.
+// The IR wizard wires this now — `desktop::process_ir_capture` is the road
+// — but a few pieces (`ess_with_fades`, the constants a caller might tune)
+// remain spare parts for the next capture mode, so the allow stays.
 #![allow(dead_code)]
 
 // ── the numbers, and why ────────────────────────────────────────────────────

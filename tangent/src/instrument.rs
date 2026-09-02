@@ -2217,6 +2217,28 @@ struct Shared {
     /// one block — a key never moves audio — but the count makes even that
     /// window read as silence.)
     insert_key_n: AtomicUsize,
+
+    // ── the IR wizard's capture road ────────────────────────────────────────
+    /// A one-shot capture job on its way IN — host to audio thread, the
+    /// `pending_monitor` handoff exactly: the host builds every buffer, the
+    /// callback `try_lock`s and takes, and nothing is ever allocated or
+    /// dropped on the audio thread.
+    pending_ir: std::sync::Mutex<Option<IrJob>>,
+    /// The finished (or cancelled) job on its way back OUT, buffers and all,
+    /// so their deallocation happens on the host's thread. `try_lock`ed by
+    /// the callback; drained by [`Engine::take_captured`].
+    finished_ir: std::sync::Mutex<Option<IrJob>>,
+    /// The host asked the road to stop. Read once per callback; the running
+    /// job is handed back through `finished_ir` however far it got.
+    ir_stop: AtomicBool,
+    /// Frames captured so far and the capture buffer's whole length, for the
+    /// wizard's progress bar. Zero/zero while idle or in tone mode.
+    ir_cap_pos: AtomicU32,
+    ir_cap_total: AtomicU32,
+    /// The chosen input pair's return level over the last block — RMS and
+    /// peak, linear, f32 bits. The wizard's stage-2 meter and its clip lamp.
+    ir_rms: AtomicU32,
+    ir_peak: AtomicU32,
 }
 
 impl Shared {
@@ -2350,6 +2372,13 @@ impl Shared {
             insert_tap: Mutex::new(None),
             insert_key: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             insert_key_n: AtomicUsize::new(0),
+            pending_ir: std::sync::Mutex::new(None),
+            finished_ir: std::sync::Mutex::new(None),
+            ir_stop: AtomicBool::new(false),
+            ir_cap_pos: AtomicU32::new(0),
+            ir_cap_total: AtomicU32::new(0),
+            ir_rms: AtomicU32::new(0),
+            ir_peak: AtomicU32::new(0),
         }
     }
 
@@ -3299,6 +3328,81 @@ fn run_rack(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// The IR wizard's capture road
+// ───────────────────────────────────────────────────────────────────────────
+//
+// A one-shot measurement mode OUTSIDE the transport: the wizard plays a test
+// tone or a prerendered sweep straight onto two device output channels — the
+// hardware-route idiom, added at the per-frame fold, after the meters, so the
+// probe never rides the master chain and the limiter never lies about its
+// level — and copies the RAW device input of two chosen channels into a
+// preallocated buffer, tapped off `mix_monitor`'s scratch before any fader,
+// pick binding or varispeed touches it. Everything heavy (sweep synthesis,
+// deconvolution, files) happens on the host; the callback adds, copies, and
+// counts.
+
+/// Everything one IR pass needs, built and allocated host-side.
+pub struct IrCaptureSpec {
+    /// Device OUTPUT channels the probe plays on, zero-based.
+    pub out_pair: (usize, usize),
+    /// Device INPUT channels the return is read from, zero-based.
+    pub in_pair: (usize, usize),
+    /// The prerendered exponential sweep, mono, at the engine's rate.
+    pub sweep: Vec<f32>,
+    /// Silence recorded BEFORE the sweep plays — the noise-floor read, and
+    /// enough of it that the loop's own latency never eats the sweep's head.
+    pub pre_silence_frames: usize,
+    /// Silence recorded after the sweep ends — at least the tail expected.
+    pub post_silence_frames: usize,
+    /// Linear playback gain applied to the sweep (the wizard's dBFS choice).
+    pub level: f32,
+}
+
+/// The job as the audio thread holds it: the spec's buffers plus the two
+/// positions and the resolved ring columns. Moved whole through `pending_ir`
+/// and back whole through `finished_ir`, so no allocator call ever happens
+/// on the callback.
+#[derive(Debug)]
+struct IrJob {
+    /// A test tone's frequency in Hz; `0.0` means sweep mode.
+    tone_hz: f64,
+    level: f32,
+    out_pair: (usize, usize),
+    in_pair: (usize, usize),
+    sweep: Vec<f32>,
+    /// Playback silence before the sweep, in frames (sweep mode).
+    pre: usize,
+    /// The capture, interleaved stereo, preallocated to its whole length.
+    /// Empty in tone mode: the tone road meters and never records.
+    capture: Vec<f32>,
+    /// Frames captured so far — input-driven, so a late interface stretches
+    /// the capture rather than tearing a hole in it.
+    cap_pos: usize,
+    /// Frames played so far — output-driven.
+    play_pos: usize,
+    /// `in_pair` resolved to the monitor ring's columns, once, on accept.
+    cols: (usize, usize),
+    cols_ready: bool,
+    /// The capture buffer is full; waiting to be handed back.
+    done: bool,
+}
+
+/// Which column of the monitor ring carries device input `want`.
+///
+/// The ring holds the PICKED channels, laid end to end, so a device index
+/// has to be looked up through the picks — the inverse of the strip loop's
+/// `dev_col`. Falls back to the identity (clamped) when no pick names it,
+/// which is exactly right for `Picks::EVERYTHING`.
+fn ir_ring_col(picks: &tangent_record::audio::Picks, want: usize, ch_in: usize) -> usize {
+    for k in 0..ch_in {
+        if picks.source(k, ch_in).unwrap_or(k) == want {
+            return k;
+        }
+    }
+    want.min(ch_in.saturating_sub(1))
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // The renderer: everything that runs on the audio thread
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -3840,6 +3944,12 @@ struct Renderer {
     /// The planar pair a bay's key is de-interleaved into — `send_io`'s
     /// shape, bought at build like every other scratch.
     key_io: Vec<Vec<f32>>,
+    /// The IR wizard's running job, if one is armed. Taken from
+    /// `Shared::pending_ir`, handed back through `Shared::finished_ir`.
+    ir: Option<IrJob>,
+    /// The test tone's phase, 0..1 of a cycle — the renderer's, not the
+    /// job's, so a job swap can never click mid-cycle.
+    ir_phase: f64,
 }
 
 impl Renderer {
@@ -4191,6 +4301,68 @@ impl Renderer {
     /// plugins, the click — is generated on demand and has no opinion about
     /// how fast it is being asked for; `render` is where the two clocks meet.
     /// See `crate::varispeed`.
+    /// The IR road's once-per-callback bookkeeping: accept a pending job,
+    /// hand a done (or stopped) one back, publish progress.
+    ///
+    /// Handing back MOVES the whole job — buffers included — into
+    /// `finished_ir`, so nothing is dropped here; if the host has not yet
+    /// drained the last one, the job simply waits a callback. A pending job
+    /// arriving while one runs replaces it the same way: old job out whole,
+    /// new job in, which is the click-clip-list protocol for Vecs.
+    fn take_ir_job(&mut self) {
+        let stop = self.shared.ir_stop.load(Ordering::Relaxed);
+        let finished = self
+            .ir
+            .as_ref()
+            .is_some_and(|j| j.done || stop);
+        let mut incoming = None;
+        if let Ok(mut pending) = self.shared.pending_ir.try_lock() {
+            incoming = pending.take();
+        }
+        if finished || (incoming.is_some() && self.ir.is_some()) {
+            if let Ok(mut out) = self.shared.finished_ir.try_lock() {
+                if out.is_none() {
+                    *out = self.ir.take();
+                    if incoming.is_none() {
+                        // Stopped or completed with nothing to follow: the
+                        // road is idle again and the meters say so.
+                        self.shared.ir_stop.store(false, Ordering::Relaxed);
+                        self.shared.ir_rms.store(0, Ordering::Relaxed);
+                        self.shared.ir_peak.store(0, Ordering::Relaxed);
+                        self.shared.ir_cap_pos.store(0, Ordering::Relaxed);
+                        self.shared.ir_cap_total.store(0, Ordering::Relaxed);
+                    }
+                } else if incoming.is_some() {
+                    // Nowhere to put the old job yet — park the new one back
+                    // and try again next callback rather than dropping either.
+                    if let Ok(mut pending) = self.shared.pending_ir.try_lock() {
+                        *pending = incoming.take();
+                    }
+                }
+            }
+        }
+        if let Some(job) = incoming {
+            if self.ir.is_none() {
+                self.ir_phase = 0.0;
+                self.shared.ir_stop.store(false, Ordering::Relaxed);
+                self.shared
+                    .ir_cap_total
+                    .store((job.capture.len() / 2).min(u32::MAX as usize) as u32, Ordering::Relaxed);
+                self.shared.ir_cap_pos.store(0, Ordering::Relaxed);
+                self.ir = Some(job);
+            } else if let Ok(mut pending) = self.shared.pending_ir.try_lock() {
+                // Still carrying the old one (the finished slot was full):
+                // park the new job for the next callback.
+                *pending = Some(job);
+            }
+        }
+        if let Some(job) = self.ir.as_ref() {
+            self.shared
+                .ir_cap_pos
+                .store(job.cap_pos.min(u32::MAX as usize) as u32, Ordering::Relaxed);
+        }
+    }
+
     fn render_program(
         &mut self,
         out: &mut [f32],
@@ -4203,6 +4375,9 @@ impl Renderer {
             .delay_ns
             .store(heard.saturating_sub(now), Ordering::Relaxed);
         self.swap_plugins();
+        // The IR wizard's job handoff — once per callback, like the plugin
+        // swap above, and before any chunk plays or captures a frame.
+        self.take_ir_job();
 
         // Every sample inside `frames` is written below, so this is only here
         // for a buffer whose length is not a whole number of frames: its tail
@@ -5272,6 +5447,39 @@ impl Renderer {
                         }
                     }
                 }
+                // **The IR wizard's probe, on its chosen jacks.** The
+                // hardware-route idiom exactly — ADDED to the device frame
+                // after the meters, so the tone and the sweep never ride the
+                // master chain (a limiter shaving a measurement sweep is a
+                // measurement of the limiter) and never move the clip lamp.
+                // Same sample on both jacks: the loop is one mono probe into
+                // a stereo return.
+                if let Some(job) = self.ir.as_mut() {
+                    if !job.done {
+                        let s = if job.tone_hz > 0.0 {
+                            self.ir_phase += job.tone_hz / self.rate;
+                            self.ir_phase -= self.ir_phase.floor();
+                            ((std::f64::consts::TAU * self.ir_phase).sin() as f32)
+                                * job.level
+                        } else {
+                            let p = job.play_pos;
+                            job.play_pos = p.saturating_add(1);
+                            match p.checked_sub(job.pre).and_then(|k| job.sweep.get(k)) {
+                                Some(&v) => v * job.level,
+                                None => 0.0,
+                            }
+                        };
+                        if s != 0.0 {
+                            let (a, b) = job.out_pair;
+                            if a < dev_ch {
+                                out[at + a] += s;
+                            }
+                            if b < dev_ch && b != a {
+                                out[at + b] += s;
+                            }
+                        }
+                    }
+                }
             }
             done += n;
         }
@@ -5636,6 +5844,51 @@ impl Renderer {
                 Err(_) => 0,
             }
         };
+        // **The IR wizard's capture tap — RAW device frames, right here.**
+        //
+        // Before the varispeed stretch, before pick-to-strip binding, before
+        // any fader: a measurement wants the signal at the jack, and this is
+        // the last place it still is. Input-driven on purpose — a late
+        // interface stretches the capture rather than tearing a hole in it —
+        // and bounded by the buffer the host preallocated: the callback
+        // copies and counts, nothing more.
+        if let Some(job) = self.ir.as_mut() {
+            if !job.cols_ready {
+                job.cols = (
+                    ir_ring_col(&self.monitor_picks, job.in_pair.0, ch_in),
+                    ir_ring_col(&self.monitor_picks, job.in_pair.1, ch_in),
+                );
+                job.cols_ready = true;
+            }
+            let raw_frames = got / ch_in;
+            let (c0, c1) = job.cols;
+            let mut sumsq = 0.0f64;
+            let mut peak = 0.0f32;
+            for f in 0..raw_frames {
+                let l = self.monitor_scratch[f * ch_in + c0];
+                let r = self.monitor_scratch[f * ch_in + c1];
+                sumsq += f64::from(l) * f64::from(l) + f64::from(r) * f64::from(r);
+                peak = peak.max(l.abs()).max(r.abs());
+                if job.tone_hz == 0.0 && !job.done {
+                    let at = job.cap_pos * 2;
+                    if at + 1 < job.capture.len() {
+                        job.capture[at] = l;
+                        job.capture[at + 1] = r;
+                        job.cap_pos += 1;
+                    }
+                    // Full is done — the host sized the buffer to the whole
+                    // measurement, so the last frame IS the finish line.
+                    if job.cap_pos * 2 >= job.capture.len() {
+                        job.done = true;
+                    }
+                }
+            }
+            if raw_frames > 0 {
+                let rms = (sumsq / (raw_frames as f64 * 2.0)).sqrt() as f32;
+                self.shared.ir_rms.store(rms.to_bits(), Ordering::Relaxed);
+                self.shared.ir_peak.store(peak.to_bits(), Ordering::Relaxed);
+            }
+        }
         // Stretched into the program's timeline, in place, so everything
         // below reads the same buffer it always did. `got` becomes the CHUNK
         // length: whatever arrived covers this chunk now.
@@ -9056,6 +9309,8 @@ impl Engine {
             key_prev: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             key_prev_frames: 0,
             key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            ir: None,
+            ir_phase: 0.0,
         };
 
         let (stream, out_device_obj, offline_renderer) = match dev {
@@ -11206,6 +11461,124 @@ impl Engine {
         while let Ok(v) = self.insert_tap_rx.pop() {
             out.push(v);
         }
+    }
+
+    // ── the IR wizard's capture road ────────────────────────────────────────
+
+    /// Play a level-setting sine on `out_pair` while metering `in_pair`'s
+    /// return — the wizard's stage-2 test tone. 1 kHz, the alignment-tone
+    /// convention every reference in the recipe uses. Runs until
+    /// [`Engine::stop_ir`]; read the return off [`Engine::ir_return_db`].
+    pub fn start_ir_tone(
+        &mut self,
+        out_pair: (usize, usize),
+        in_pair: (usize, usize),
+        level_db: f32,
+    ) {
+        self.push_ir_job(IrJob {
+            tone_hz: 1_000.0,
+            level: 10.0f32.powf(level_db.clamp(-80.0, 0.0) / 20.0),
+            out_pair,
+            in_pair,
+            sweep: Vec::new(),
+            pre: 0,
+            capture: Vec::new(),
+            cap_pos: 0,
+            play_pos: 0,
+            cols: (0, 0),
+            cols_ready: false,
+            done: false,
+        });
+    }
+
+    /// Arm one sweep capture. Everything is allocated HERE, on the caller's
+    /// thread — the sweep came prerendered and the capture buffer is sized
+    /// to the whole measurement — so the callback only adds, copies and
+    /// counts. Progress rides [`Engine::ir_progress`]; the finished (or
+    /// cancelled) buffer comes back through [`Engine::take_captured`].
+    pub fn start_ir_capture(&mut self, spec: IrCaptureSpec) {
+        let total = spec
+            .pre_silence_frames
+            .saturating_add(spec.sweep.len())
+            .saturating_add(spec.post_silence_frames);
+        self.push_ir_job(IrJob {
+            tone_hz: 0.0,
+            level: if spec.level.is_finite() {
+                spec.level.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+            out_pair: spec.out_pair,
+            in_pair: spec.in_pair,
+            sweep: spec.sweep,
+            pre: spec.pre_silence_frames,
+            capture: vec![0.0; total * 2],
+            cap_pos: 0,
+            play_pos: 0,
+            cols: (0, 0),
+            cols_ready: false,
+            done: false,
+        });
+    }
+
+    fn push_ir_job(&mut self, job: IrJob) {
+        self.shared.ir_stop.store(false, Ordering::Relaxed);
+        if let Ok(mut pending) = self.shared.pending_ir.lock() {
+            // A job still parked here was never accepted; replacing it drops
+            // it on THIS thread, which is exactly where Vecs may die.
+            *pending = Some(job);
+        }
+    }
+
+    /// Stop whatever the IR road is doing. The running job — tone, or a
+    /// capture however far it got — comes back through
+    /// [`Engine::take_captured`] so its buffers die on the host's thread.
+    pub fn stop_ir(&self) {
+        self.shared.ir_stop.store(true, Ordering::Relaxed);
+        // A job the callback never accepted has to be reclaimed here: with
+        // no engine running (or none yet), the flag alone would strand it.
+        if let Ok(mut pending) = self.shared.pending_ir.lock() {
+            if let Some(job) = pending.take() {
+                if let Ok(mut fin) = self.shared.finished_ir.lock() {
+                    if fin.is_none() {
+                        *fin = Some(job);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The finished capture, once the audio thread has handed it back:
+    /// the interleaved-stereo buffer and whether it is COMPLETE (a cancel
+    /// returns the partial fill, and the caller can tell). `None` until
+    /// then, which is the ordinary answer most frames.
+    pub fn take_captured(&mut self) -> Option<(Vec<f32>, bool)> {
+        let job = self.shared.finished_ir.lock().ok()?.take()?;
+        // The sweep Vec inside dies right here, host-side, with the job.
+        Some((job.capture, job.done))
+    }
+
+    /// Capture progress as (frames done, frames total). (0, 0) while idle
+    /// or while the tone runs.
+    pub fn ir_progress(&self) -> (u32, u32) {
+        (
+            self.shared.ir_cap_pos.load(Ordering::Relaxed),
+            self.shared.ir_cap_total.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The chosen input pair's return level over the last block: (rms, peak)
+    /// in dBFS, −200 for silence — the wizard's meter reads this per frame.
+    pub fn ir_return_db(&self) -> (f32, f32) {
+        let db = |cell: &AtomicU32| {
+            let v = f32::from_bits(cell.load(Ordering::Relaxed));
+            if v > 0.0 {
+                20.0 * v.log10()
+            } else {
+                -200.0
+            }
+        };
+        (db(&self.shared.ir_rms), db(&self.shared.ir_peak))
     }
 
     /// Put the playhead at `frames`, stamped with the host's generation.
@@ -13956,6 +14329,8 @@ mod tests {
             key_prev: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             key_prev_frames: 0,
             key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            ir: None,
+            ir_phase: 0.0,
             racks,
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -20191,6 +20566,160 @@ mod stack_budget {
         assert!(
             RACK_SEATS > 1000,
             "RACK_SEATS fell to {RACK_SEATS}: re-tighten the ceilings here"
+        );
+    }
+}
+
+// ── the IR wizard's capture road, proved offline ────────────────────────────
+#[cfg(test)]
+mod ir_road {
+    use super::*;
+
+    /// An offline engine wearing a monitor ring whose input IS its own
+    /// output — the hardware loop, simulated one block deep.
+    fn ir_loop_rig() -> (Engine, Producer<f32>) {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+        let (tx, rx) = RingBuffer::<f32>::new(48_000 * 2);
+        let mut widths = [0u8; INPUTS];
+        widths[0] = 2;
+        e.set_monitor(Some((
+            rx,
+            2,
+            widths,
+            1024,
+            tangent_record::audio::Picks::EVERYTHING,
+        )));
+        (e, tx)
+    }
+
+    /// One offline block through the loop: render, then feed the block back
+    /// as the next callback's device input.
+    fn ir_loop_block(e: &mut Engine, tx: &mut Producer<f32>, out: &mut [f32]) {
+        out.fill(0.0);
+        e.render_offline(out);
+        for &v in out.iter() {
+            let _ = tx.push(v);
+        }
+    }
+
+    /// **The capture road records exactly what the probe played.** A sweep
+    /// armed on an offline engine whose outs feed its ins comes back
+    /// complete: the pre-roll is silence, the sweep sits at its level after
+    /// the pre-roll sample for sample, and the buffer is the size the spec
+    /// named.
+    #[test]
+    fn an_armed_sweep_capture_records_the_loop_and_completes() {
+        let (mut e, mut tx) = ir_loop_rig();
+        let sr = 48_000.0f64;
+        let sweep = crate::units::sweep::ess(20.0, 20_000.0, 0.25, sr);
+        assert!(!sweep.is_empty());
+        let (pre, tail) = (4_800usize, 4_800usize);
+        let total = pre + sweep.len() + tail;
+        e.start_ir_capture(IrCaptureSpec {
+            out_pair: (0, 1),
+            in_pair: (0, 1),
+            sweep: sweep.clone(),
+            pre_silence_frames: pre,
+            post_silence_frames: tail,
+            level: 0.5,
+        });
+        let mut out = vec![0.0f32; 1024 * 2];
+        let mut got = None;
+        for _ in 0..80 {
+            ir_loop_block(&mut e, &mut tx, &mut out);
+            if let Some(back) = e.take_captured() {
+                got = Some(back);
+                break;
+            }
+        }
+        let (capture, complete) = got.expect("the capture never came back");
+        assert!(complete, "the road stopped short of the buffer");
+        assert_eq!(capture.len(), total * 2, "the buffer is not the spec's size");
+        // The pre-roll is honest silence.
+        let head = &capture[..pre * 2 - 2];
+        assert!(
+            head.iter().all(|v| v.abs() < 1.0e-6),
+            "the pre-roll carries signal"
+        );
+        // The sweep is where the spec put it, at its level, both channels.
+        let mut worst = 0.0f32;
+        for (t, &want) in sweep.iter().enumerate() {
+            let l = capture[(pre + t) * 2];
+            let r = capture[(pre + t) * 2 + 1];
+            worst = worst.max((l - want * 0.5).abs()).max((r - want * 0.5).abs());
+        }
+        assert!(worst < 1.0e-5, "the loop bent the sweep by {worst}");
+        // And the road is idle again: nothing further comes back.
+        ir_loop_block(&mut e, &mut tx, &mut out);
+        assert!(e.take_captured().is_none());
+    }
+
+    /// **Stopping a capture hands back the partial fill, marked partial.**
+    /// The buffers must come home either way — a cancel that leaked ten
+    /// megabytes per attempt would be a slow crash nobody ties to the
+    /// wizard.
+    #[test]
+    fn a_cancelled_capture_returns_its_partial_buffer() {
+        let (mut e, mut tx) = ir_loop_rig();
+        let sweep = crate::units::sweep::ess(20.0, 20_000.0, 2.0, 48_000.0);
+        e.start_ir_capture(IrCaptureSpec {
+            out_pair: (0, 1),
+            in_pair: (0, 1),
+            sweep,
+            pre_silence_frames: 4_800,
+            post_silence_frames: 48_000,
+            level: 0.25,
+        });
+        let mut out = vec![0.0f32; 1024 * 2];
+        for _ in 0..4 {
+            ir_loop_block(&mut e, &mut tx, &mut out);
+        }
+        let (done, total) = e.ir_progress();
+        assert!(total > 0 && done < total, "progress reads {done}/{total}");
+        e.stop_ir();
+        let mut got = None;
+        for _ in 0..4 {
+            ir_loop_block(&mut e, &mut tx, &mut out);
+            if let Some(back) = e.take_captured() {
+                got = Some(back);
+                break;
+            }
+        }
+        let (_, complete) = got.expect("the cancelled job never came home");
+        assert!(!complete, "a cancel claimed to be a finished capture");
+    }
+
+    /// **The tone road plays at its level and the meter reads the return.**
+    /// A −18 dBFS sine through the loop reads back near −18 peak (rms sits
+    /// 3 dB under it, as a sine does), and stopping the tone puts the meter
+    /// back to silence — the wizard's stage-2 contract end to end.
+    #[test]
+    fn the_test_tone_meters_its_own_return_and_stops_clean() {
+        let (mut e, mut tx) = ir_loop_rig();
+        e.start_ir_tone((0, 1), (0, 1), -18.0);
+        let mut out = vec![0.0f32; 1024 * 2];
+        for _ in 0..8 {
+            ir_loop_block(&mut e, &mut tx, &mut out);
+        }
+        let (rms, peak) = e.ir_return_db();
+        assert!(
+            (peak + 18.0).abs() < 1.0,
+            "the tone came back at {peak:.1} dBFS peak, wanted -18"
+        );
+        assert!(
+            (rms + 21.0).abs() < 1.5,
+            "the tone came back at {rms:.1} dBFS rms, wanted about -21"
+        );
+        e.stop_ir();
+        for _ in 0..4 {
+            ir_loop_block(&mut e, &mut tx, &mut out);
+            // The stopped tone's job comes home too; drain it.
+            let _ = e.take_captured();
+        }
+        let (rms, peak) = e.ir_return_db();
+        assert!(
+            rms <= -200.0 && peak <= -200.0,
+            "the meter still reads {rms:.1}/{peak:.1} after the stop"
         );
     }
 }
