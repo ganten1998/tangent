@@ -24,6 +24,10 @@ beside it, because equal luminance is not equal vividness.
     --emit       print the shipped runs as Rust, byte-identical to the file
     --legacy     the eight retired abstract palettes (pre theme-named runs)
     --gradients  the monotone-ramp model that was explored and never shipped
+    --dark       the factory themes designed in this file, held to the ported
+                 Rust sweeps (the dark two, and Silverface)
+    --silverface the Silverface run re-derived from its families and proved
+                 equal to the pinned bytes, plus the whole-desk gates
 """
 import colorsys
 import re
@@ -365,6 +369,14 @@ DEAD_ZONE_HAND = {11, 14, 17}
 
 # The dark batch's runs, pinned the same way SHIPPED is — frozen data the
 # Rust must match byte for byte. Designed by the `--dark` machinery above.
+#
+# **Carbon is RETIRED from the factory (2026-09-02, "a worse version of
+# Studio") and its bytes stay exactly where they are.** A palette's indices
+# are written into saved desks the moment anybody paints a track, so a
+# retired run is table history like the eight abstract palettes before it:
+# reachable by a saved colour, offered by no menu. It is in `RETIRED`, out of
+# `PALETTES`, and still verified byte for byte below — the day these rows
+# move is the day every desk that ever wore Carbon changes colour.
 DARK_RUNS = {
     "Carbon": dict(
         slots=[
@@ -563,6 +575,155 @@ EXT2_RUNS = {
     ],
 }
 
+# ── the Silverface run ─────────────────────────────────────────────────────
+#
+# **The twentieth run, and the first designed by machinery that survived.**
+# Silverface is the faceplate of the Dual Showman Reverb the DAW grew
+# (AA769): brushed aluminum, a black control panel, turquoise script, one red
+# jewel. Its desk is four families and nothing else — steel-blue, aluminum,
+# Fender turquoise, and one red lineage — no greens, no purples, by the
+# owner's word. The walk is `family`'s: four hues, all four tones, ordered so
+# neither hue nor tone repeats back to back, which is what buys 20 dE
+# between neighbours where the floor is 10.
+#
+# The aluminum is a warm neutral held to Mono's chroma ceiling, because at
+# the strips' ceiling a "neutral" at hue 38 is an ochre. That choice has a
+# cost the extensions pay: eight neutrals inside one ink-safe luminance band
+# cannot all be 8 dE apart (Mono's whole problem), so channel 26 sits ~4 dE
+# from channel 10, sixteen strips away. Neighbours never do.
+#
+# **The extensions sit on the HALF-tones.** The shipped extensions grew "two
+# tones away", which on a four-tone walk lands every new lane exactly on a
+# colour the first sixteen already wear (Nocturne's channel 17 is its
+# channel 9 to within a dE). Halfway between tones, with the hue nudged ten
+# degrees, is family without twinning. The top half-tone, 0.112, sits under
+# the 0.119 ceiling where the ivory ink runs out.
+#
+# The click is the control panel's own slate — a cool neutral, because the
+# warm-neutral family already owns every tone a warm click could take. The
+# master is the jewel: red, full stop, and among the reds that clear the
+# gates, the one the eighteen live masters leave the most room around.
+#
+# Everything below is re-derived and proved equal to the pins by
+# `--silverface`; `--check` holds the pins to the Rust like every other run.
+FACEPLATE = [
+    ("steel", 212, 0.72),
+    ("aluminum", 38, 0.26),
+    ("teal", 186, 0.74),
+    ("red", 8, 0.74),
+]
+HALF_TONES = [0.027, 0.053, 0.086, 0.112]
+
+
+def faceplate_run():
+    """Sixteen channels: `family`'s walk over the four faceplate families."""
+    out = []
+    for i in range(16):
+        _, hue, sat = FACEPLATE[i % 4]
+        out.append(make(hue, sat, (i // 4 + i) % 4))
+    return out
+
+
+def faceplate_ext(first, nudge):
+    """Eight channels seeded from run slots `first..first+8`: the seed's
+    family on the half-tone above the seed's tone, hue nudged `nudge`."""
+    out = []
+    for j in range(8):
+        i = first + j
+        _, hue, sat = FACEPLATE[i % 4]
+        out.append(make(hue + nudge, sat, None, lum=HALF_TONES[(i // 4 + i) % 4]))
+    return out
+
+
+def faceplate_click():
+    """The panel's slate: cool, quiet, on the third half-tone."""
+    return make(225, 0.20, None, lum=HALF_TONES[2])
+
+
+def jewel_master(slots, click, others):
+    """A RED master — the pilot lamp is red and nothing else will do — and
+    among the reds that clear `master_ok`, the one with the most room from
+    the live masters. `make_master` takes the first red that clears the 6 dE
+    floor, which put the jewel 7.2 dE from Porcelain's master: legal here,
+    and two tenths from the Rust floor."""
+    best = None
+    for dh in range(-16, 12, 2):
+        for tone in (3, 2):
+            for sat in (0.92, 0.85, 0.75):
+                c = make(dh, sat, tone, cmax=90.0)
+                if not master_ok(c, slots, click, others):
+                    continue
+                spread = min(de(c, m) for m in others)
+                own = min(de(c, s) for s in slots + [click])
+                if best is None or (spread, own) > best[0]:
+                    best = ((spread, own), c)
+    return best and best[1]
+
+
+def design_silverface(others):
+    slots = faceplate_run()
+    click = faceplate_click()
+    return dict(
+        slots=slots,
+        click=click,
+        master=jewel_master(slots, click, others),
+        ext=faceplate_ext(0, 10.0),
+        ext2=faceplate_ext(8, -10.0),
+    )
+
+
+# Runs appended WHOLE — channels, click, master, both extensions together at
+# the end of the table — because every earlier block was full the day it
+# shipped. Pinned like everything else; `--silverface` proves the pins are
+# what the machinery above still produces.
+APPENDED_RUNS = {
+    "Silverface": dict(
+        slots=[
+            (0x10, 0x23, 0x38), (0x3c, 0x37, 0x2d), (0x17, 0x51, 0x58), (0x94, 0x42, 0x35),
+            (0x19, 0x38, 0x5b), (0x50, 0x49, 0x3c), (0x1c, 0x64, 0x6b), (0x3c, 0x16, 0x10),
+            (0x22, 0x4b, 0x7a), (0x63, 0x5a, 0x49), (0x0b, 0x25, 0x28), (0x60, 0x23, 0x19),
+            (0x2a, 0x5c, 0x96), (0x25, 0x22, 0x1b), (0x11, 0x3d, 0x41), (0x7f, 0x30, 0x24),
+        ],
+        click=(0x4e, 0x52, 0x61),
+        master=(0xb3, 0x1b, 0x25),
+    ),
+}
+EXT_RUNS["Silverface"] = [
+    (0x19, 0x2b, 0x58), (0x45, 0x41, 0x33), (0x1d, 0x5a, 0x70), (0x92, 0x4a, 0x2c),
+    (0x23, 0x3e, 0x7d), (0x57, 0x53, 0x41), (0x21, 0x66, 0x7e), (0x49, 0x23, 0x13),
+]
+EXT2_RUNS["Silverface"] = [
+    (0x21, 0x57, 0x77), (0x6a, 0x5b, 0x4f), (0x0d, 0x33, 0x31), (0x76, 0x24, 0x26),
+    (0x26, 0x63, 0x87), (0x34, 0x2c, 0x26), (0x13, 0x48, 0x45), (0x8e, 0x36, 0x39),
+]
+
+# Every run in the table, in TABLE order — which is also `PALETTES` order
+# once the retired are skipped.
+ALL_RUNS = {**SHIPPED, **DARK_RUNS, **APPENDED_RUNS}
+RETIRED = {"Carbon"}
+
+# Where each run's four blocks sit. The first sixteen follow the original
+# formula; the dark batch was appended after the 300-block masters; the
+# extensions came as two blocks of their own; Silverface is the first run
+# appended whole. Explicit rather than a formula over the PALETTES index,
+# because Carbon's retirement shifted Nocturne and Phosphor up one in
+# `PALETTES` without moving a byte of theirs in the table — which is the
+# whole point of retiring by name.
+TABLE_AT = {}
+for _i, _n in enumerate(SHIPPED):
+    TABLE_AT[_n] = dict(base=28 + 17 * _i, master=300 + _i, ext=370 + 8 * _i, ext2=522 + 8 * _i)
+for _i, _n in enumerate(DARK_RUNS):
+    TABLE_AT[_n] = dict(base=316 + 17 * _i, master=367 + _i, ext=498 + 8 * _i, ext2=650 + 8 * _i)
+TABLE_AT["Silverface"] = dict(base=674, master=691, ext=692, ext2=700)
+TABLE_LEN = 708
+
+
+def live_masters():
+    """The masters a person can actually choose between — the spread gate's
+    `others`. A retired run's master is off the menu and off this list."""
+    return [p["master"] for n, p in ALL_RUNS.items() if n not in RETIRED]
+
+
 MIXER_RS = Path(__file__).resolve().parent.parent / "tangent-ui" / "src" / "mixer_panel.rs"
 
 
@@ -604,8 +765,24 @@ def run_lines(name, base, p):
     return lines
 
 
-def master_line(i, name, m):
-    return f"    (0x{m[0]:02x}, 0x{m[1]:02x}, 0x{m[2]:02x}), // {300 + i}  {name}"
+def master_line(at, name, m):
+    """One master, at its table index -- the 300 block for the sixteen, 367
+    on for the dark batch, wherever the appended runs put theirs."""
+    return f"    (0x{m[0]:02x}, 0x{m[1]:02x}, 0x{m[2]:02x}), // {at}  {name}"
+
+
+def ext_lines(name, label, lo, hi, base, run):
+    """One extension block (channels `lo..hi`), formatted as the file holds
+    it -- the same byte-for-byte claim `run_lines` makes."""
+    lines = [f"    // {name} {label}: channels {lo}..{hi} at {base}..{base + 7}"]
+    for i in range(0, 8, 4):
+        lines.append(
+            "    "
+            + " ".join(
+                f"(0x{r:02x}, 0x{g:02x}, 0x{b:02x})," for r, g, b in run[i : i + 4]
+            )
+        )
+    return lines
 
 
 def master_ok(c, slots, click, others):
@@ -643,48 +820,61 @@ def check(verbose=True):
     errs = []
     src, cols, pals = parse_rust()
 
-    # The SHAPE first: 316 entries, sixteen contiguous 17-entry runs from 28,
-    # masters appended at 300. Wrong shape means the regexes matched the
-    # wrong thing and every later answer would be about the wrong table.
-    if len(cols) != 674:
-        errs.append(f"STRIP_COLORS holds {len(cols)} entries, want 674")
-    if [n for n, _, _, _, _ in pals] != list(SHIPPED) + list(DARK_RUNS):
-        errs.append("palette names/order differ between Rust and SHIPPED+DARK_RUNS")
-    for i, (name, base, mat, ext, ext2) in enumerate(pals):
-        if ext != 370 + 8 * i:
-            errs.append(f"{name}: ext base {ext}, want {370 + 8 * i}")
-        if ext2 != 522 + 8 * i:
-            errs.append(f"{name}: ext2 base {ext2}, want {522 + 8 * i}")
-        # The first sixteen follow the original formula; the dark batch is
-        # APPENDED after the 300-block masters, so its runs start at 316 and
-        # its masters sit after the last run.
-        want_base = 28 + 17 * i if i < 16 else 316 + 17 * (i - 16)
-        want_mat = 300 + i if i < 16 else 367 + (i - 16)
-        if base != want_base or mat != want_mat:
-            errs.append(f"{name}: base {base}/master {mat}, want {want_base}/{want_mat}")
+    # The SHAPE first: TABLE_LEN entries, PALETTES in table order with the
+    # retired skipped, and every live run's four blocks exactly where
+    # TABLE_AT says. Wrong shape means the regexes matched the wrong thing
+    # and every later answer would be about the wrong table.
+    if len(cols) != TABLE_LEN:
+        errs.append(f"STRIP_COLORS holds {len(cols)} entries, want {TABLE_LEN}")
+    live = [n for n in ALL_RUNS if n not in RETIRED]
+    if [n for n, *_ in pals] != live:
+        errs.append("palette names/order differ between Rust and ALL_RUNS minus RETIRED")
+    for name, base, mat, ext, ext2 in pals:
+        want = TABLE_AT.get(name)
+        if want is None:
+            continue
+        got = dict(base=base, master=mat, ext=ext, ext2=ext2)
+        if got != want:
+            errs.append(f"{name}: Palette {got}, want {want}")
     if errs:
         for e in errs:
             say(f"  - {e}")
         say("CHECK FAILS (shape)")
         return len(errs)
 
-    # The embedded copy against the Rust, value by value and byte by byte.
+    # The embedded copy against the Rust, value by value and byte by byte --
+    # the retired included, because a run nobody can pick is still a run
+    # somebody's saved desk points at.
     if HAND != cols[:27]:
         errs.append("the hand grid here has drifted from the Rust")
     if MASTER_STRIP != cols[27]:
         errs.append("MASTER_STRIP has drifted from index 27")
     if MASTER != cols[27]:
         errs.append(f"make({MASTER_HUE}, 0.92, 3) no longer reproduces index 27")
-    for i, (name, p) in enumerate(SHIPPED.items()):
-        base = 28 + 17 * i
+    for name, p in ALL_RUNS.items():
+        at = TABLE_AT[name]
+        base = at["base"]
         if p["slots"] != cols[base : base + 16] or p["click"] != cols[base + 16]:
             errs.append(f"{name}: the embedded run has drifted from the Rust")
-        if p["master"] != cols[300 + i]:
+        if p["master"] != cols[at["master"]]:
             errs.append(f"{name}: the embedded master has drifted from the Rust")
         if "\n".join(run_lines(name, base, p)) not in src:
             errs.append(f"{name}: the emitted run is not byte-identical to the file")
-        if master_line(i, name, p["master"]) not in src:
+        if master_line(at["master"], name, p["master"]) not in src:
             errs.append(f"{name}: the emitted master line is not byte-identical")
+        cmax = CHROMA_MONO if name == "Mono" else CHROMA_MAX
+        for label, table, lo, hi in (("ext", EXT_RUNS, 17, 24), ("ext2", EXT2_RUNS, 25, 32)):
+            b0 = at[label]
+            e = table[name]
+            if e != cols[b0 : b0 + 8]:
+                errs.append(f"{name}: the embedded {label} run has drifted from the Rust")
+            if "\n".join(ext_lines(name, label, lo, hi, b0, e)) not in src:
+                errs.append(f"{name}: the emitted {label} block is not byte-identical")
+            for j, c in enumerate(e):
+                if not wants_light_ink(c) or ink_contrast(c) < INK_FLOOR:
+                    errs.append(f"{name} {label} {j} {hexs(c)} fails the ink gate")
+                if chroma(c) > cmax:
+                    errs.append(f"{name} {label} {j} {hexs(c)} chroma {chroma(c):.1f}")
 
     # The hand grid's dead-zone set, pinned. The Rust test
     # `every_swatch_carries_its_ink_once_the_dead_zone_guard_runs` holds the
@@ -693,33 +883,18 @@ def check(verbose=True):
     dead = {i for i, c in enumerate(cols[:27]) if ink_contrast(c) < INK_FLOOR}
     if dead != DEAD_ZONE_HAND:
         errs.append(f"hand-grid dead zone is {sorted(dead)}, expected {sorted(DEAD_ZONE_HAND)}")
+    # And nothing past the grid may need the guard: every palette colour is
+    # a surface the guard must leave alone, or a palette change on every
+    # saved desk went in through the back door.
+    for i, c in enumerate(cols[27:], 27):
+        if ink_contrast(c) < INK_FLOOR:
+            errs.append(f"swatch {i} {hexs(c)} is in the dead zone past the hand grid")
 
-    for i, name in enumerate(list(SHIPPED) + list(DARK_RUNS)):
-        for label, table, b0 in (("ext", EXT_RUNS, 370), ("ext2", EXT2_RUNS, 522)):
-            base = b0 + 8 * i
-            e = table[name]
-            if e != cols[base : base + 8]:
-                errs.append(f"{name}: the embedded {label} run has drifted from the Rust")
-            cmax = CHROMA_MONO if name == "Mono" else CHROMA_MAX
-            for j, c in enumerate(e):
-                if not wants_light_ink(c) or ink_contrast(c) < INK_FLOOR:
-                    errs.append(f"{name} {label} {j} {hexs(c)} fails the ink gate")
-                if chroma(c) > cmax:
-                    errs.append(f"{name} {label} {j} {hexs(c)} chroma {chroma(c):.1f}")
-
-    for i, (name, p) in enumerate(DARK_RUNS.items()):
-        base = 316 + 17 * i
-        if p["slots"] != cols[base : base + 16] or p["click"] != cols[base + 16]:
-            errs.append(f"{name}: the embedded dark run has drifted from the Rust")
-        if p["master"] != cols[367 + i]:
-            errs.append(f"{name}: the embedded dark master has drifted from the Rust")
-
-    # The gates, palette by palette — the dark batch held to the same bars.
-    masters = [p["master"] for p in SHIPPED.values()] + [
-        p["master"] for p in DARK_RUNS.values()
-    ]
-    everything = list(SHIPPED.items()) + list(DARK_RUNS.items())
-    for i, (name, p) in enumerate(everything):
+    # The gates, palette by palette -- the dark batch and the appended run
+    # held to the same bars. The spread is measured against the LIVE masters
+    # and not asked of a retired run at all: it exists so two palettes in
+    # the menu can be told apart, and a retired one is in no menu.
+    for name, p in ALL_RUNS.items():
         slots, click, master = p["slots"], p["click"], p["master"]
         perrs = []
         if len(set(slots)) != 16:
@@ -741,12 +916,14 @@ def check(verbose=True):
                 perrs.append(f"slots {j}/{j + 1} dE {d:.1f} < {floor}")
         if min(de(click, s) for s in slots) < CLICK_DE_MIN:
             perrs.append(f"click only dE {min(de(click, s) for s in slots):.1f} from a channel")
-        if not master_ok(master, slots, click, [m for m in masters if m != master]):
+        others = [] if name in RETIRED else [m for m in live_masters() if m != master]
+        if not master_ok(master, slots, click, others):
             perrs.append("master fails its gates (ink / own-run distance / spread)")
         say(
             f"{name:11s} {'FAIL' if perrs else 'ok':4s} "
             f"adj {min(ds):4.1f}+  ink {min(ink_contrast(c) for c in slots):.2f}:1+  "
             f"chroma {max(chroma(c) for c in slots):4.1f}-"
+            f"{'  (retired: bytes frozen, off the menu)' if name in RETIRED else ''}"
         )
         for e in perrs:
             say(f"            - {e}")
@@ -754,7 +931,7 @@ def check(verbose=True):
 
     if verbose:
         for e in errs:
-            if e.split(":")[0] not in SHIPPED:
+            if e.split(":")[0] not in ALL_RUNS:
                 say(f"  - {e}")
         say()
         say("ALL PASS" if not errs else f"CHECK FAILS ({len(errs)})")
@@ -762,14 +939,96 @@ def check(verbose=True):
 
 
 def emit_shipped():
-    """The sixteen runs and their masters as Rust -- what `--emit` prints,
-    and exactly what sits in the file today; `check` proves the identity."""
+    """Every run in the table as Rust, block by block in table order -- what
+    `--emit` prints, and exactly what sits in the file today, the prose
+    between blocks aside; `check` proves each block's identity."""
     out = []
-    for i, (name, p) in enumerate(SHIPPED.items()):
-        out.extend(run_lines(name, 28 + 17 * i, p))
-    for i, (name, p) in enumerate(SHIPPED.items()):
-        out.append(master_line(i, name, p["master"]))
+    for name, p in SHIPPED.items():
+        out.extend(run_lines(name, TABLE_AT[name]["base"], p))
+    for name, p in SHIPPED.items():
+        out.append(master_line(TABLE_AT[name]["master"], name, p["master"]))
+    for name, p in DARK_RUNS.items():
+        out.extend(run_lines(name, TABLE_AT[name]["base"], p))
+    for name, p in DARK_RUNS.items():
+        out.append(master_line(TABLE_AT[name]["master"], name, p["master"]))
+    for label, table, lo, hi in (("ext", EXT_RUNS, 17, 24), ("ext2", EXT2_RUNS, 25, 32)):
+        for name in list(SHIPPED) + list(DARK_RUNS):
+            out.extend(ext_lines(name, label, lo, hi, TABLE_AT[name][label], table[name]))
+    for name, p in APPENDED_RUNS.items():
+        at = TABLE_AT[name]
+        out.extend(run_lines(name, at["base"], p))
+        out.append(master_line(at["master"], name, p["master"]))
+        out.extend(ext_lines(name, "ext", 17, 24, at["ext"], EXT_RUNS[name]))
+        out.extend(ext_lines(name, "ext2", 25, 32, at["ext2"], EXT2_RUNS[name]))
     return "\n".join(out)
+
+
+def silverface_report():
+    """`--silverface`: the pins are what the machinery produces, and the
+    whole thirty-two-channel desk clears the gates the Rust holds every live
+    palette to -- adjacency across both seams, click and master off every
+    channel, the master off every live master by the Rust's own 7 dE."""
+    p = APPENDED_RUNS["Silverface"]
+    ext, ext2 = EXT_RUNS["Silverface"], EXT2_RUNS["Silverface"]
+    others = [m for m in live_masters() if m != p["master"]]
+    fresh = design_silverface(others)
+    errs = []
+    for k, pinned in (
+        ("slots", p["slots"]),
+        ("click", p["click"]),
+        ("master", p["master"]),
+        ("ext", ext),
+        ("ext2", ext2),
+    ):
+        if fresh[k] != pinned:
+            errs.append(f"{k}: the machinery no longer reproduces the pin")
+    desk = p["slots"] + ext + ext2
+    if len(set(desk)) != 32:
+        errs.append("the desk repeats a colour")
+    ds = [de(a, b) for a, b in zip(desk, desk[1:])]
+    for j, d in enumerate(ds):
+        if d < ADJ_FLOOR:
+            errs.append(f"channels {j + 1}/{j + 2} dE {d:.1f} < {ADJ_FLOOR}")
+    for j, c in enumerate(desk):
+        if not wants_light_ink(c) or ink_contrast(c) < INK_FLOOR:
+            errs.append(f"channel {j + 1} {hexs(c)} fails the ink gate")
+        if chroma(c) > CHROMA_MAX:
+            errs.append(f"channel {j + 1} {hexs(c)} chroma {chroma(c):.1f}")
+    for label, c in (("click", p["click"]), ("master", p["master"])):
+        near = min(de(c, s) for s in desk)
+        if near < CLICK_DE_MIN:
+            errs.append(f"{label} only dE {near:.1f} from a channel")
+    if de(p["click"], p["master"]) < 20.0:
+        errs.append("click and master too alike")
+    spread = min(de(p["master"], m) for m in others)
+    if spread < 7.0:
+        errs.append(f"master only {spread:.1f} dE from a live master (Rust floor 7)")
+
+    print(f"{'ch':>3s} {'hex':8s} {'lum':>6s} {'chroma':>6s} {'ink':>5s}  family")
+    for j, c in enumerate(desk):
+        fam = FACEPLATE[j % 4][0]
+        print(
+            f"{j + 1:3d} {hexs(c):8s} {luminance(c):6.3f} {chroma(c):6.1f} "
+            f"{ink_contrast(c):5.2f}  {fam}"
+        )
+    near = min(
+        (de(a, b), i + 1, j + 1)
+        for i, a in enumerate(desk)
+        for j, b in enumerate(desk)
+        if i < j
+    )
+    print()
+    print(f"click {hexs(p['click'])}  master {hexs(p['master'])}")
+    print(
+        f"adjacent {min(ds):.1f}+ dE (seams {ds[15]:.1f}, {ds[23]:.1f})  "
+        f"closest pair anywhere {near[0]:.1f} (channels {near[1]}, {near[2]})  "
+        f"master spread {spread:.1f}+"
+    )
+    for e in errs:
+        print(f"  - {e}")
+    print()
+    print("ALL PASS" if not errs else f"SILVERFACE FAILS ({len(errs)})")
+    return len(errs)
 
 
 # ── the retired abstract palettes ──────────────────────────────────────────
@@ -1068,23 +1327,33 @@ def emit_gradients():
         print(f"    ({click[0]:#04x}, {click[1]:#04x}, {click[2]:#04x}), // {name} click")
 
 
-# ── the dark factory themes (W51) ──────────────────────────────────────────
+# ── the factory themes designed here ────────────────────────────────────────
 #
 # **Designed here first, transcribed to Rust second** — the house law since
-# the theme batch. Three dark themes, each grown from values that already
-# live in the codebase rather than invented: Carbon is Default's own dark
-# mode promoted to a theme (the #1a1a1a ground and #0b0e0a meter well are
-# Default's dark constants), Nocturne is Navi's night side worn as the
+# the theme batch. The dark two grew from values that already live in the
+# codebase rather than invented: Nocturne is Navi's night side worn as the
 # light-mode dress (its ground IS Navi's black_key, its band Navi's band),
-# and Phosphor is the green console the scope always implied.
+# and Phosphor is the green console the scope always implied. Carbon —
+# Default's own dark mode promoted to a theme — was the third, and is
+# retired (2026-09-02, "a worse version of Studio"): its palette bytes stay
+# in the table under DARK_RUNS, its surfaces do not stay here.
+#
+# Silverface is the light one, and the first light theme designed in this
+# file: the Dual Showman Reverb's faceplate — aluminum ground, black control
+# panel, turquoise script, the red jewel as the master.
 #
 # The gates below are the PORT of the Rust acceptance tests in theme.rs —
 # `every_factory_theme_is_readable_on_its_own_background`,
 # `every_band_leaves_room_for_the_parts_derived_from_it`, the theory-ground
-# law — plus the two house rules the tests cannot see: no role that is ever
-# a SURFACE may sit in the ~0.12–0.22 dead zone where neither ink clears
-# 4.5:1, and surfaces obey the same chroma ceiling as the strips. `--dark`
-# must print ALL PASS before any of this is Rust.
+# law — and of the two keyboard sweeps in piano.rs, which are here because
+# Mono's grey and the first turquoise each failed them and nothing else: a
+# lit key is a SURFACE with a note name printed on it, so it must carry an
+# ink at 4.5:1 like any strip, and in dark mode the swapped keyboard must
+# still show against its own ground. Plus the two house rules the tests
+# cannot see: no role that is ever a SURFACE may sit in the ~0.12–0.22 dead
+# zone where neither ink clears 4.5:1, and surfaces obey the same chroma
+# ceiling as the strips. `--dark` must print ALL PASS before any of this is
+# Rust.
 
 # The roles that are painted as SURFACES (things with area, carrying parts
 # or ink), as opposed to marks drawn ON a surface.
@@ -1093,30 +1362,9 @@ SURFACE_ROLES = [
     "meter_bg", "fx_strip", "fretboard",
 ]
 
-DARK_THEMES = {
-    "Carbon": dict(
-        background=(0x1A, 0x1A, 0x1A),
-        white_key=(0x1A, 0x1A, 0x1A),
-        black_key=(0x0D, 0x0D, 0x0D),
-        key_active=(0xFF, 0x9D, 0x4D),
-        sustain=(0xD4, 0x70, 0x8C),
-        key_separator=(0x38, 0x34, 0x2C),
-        text=(0xE8, 0xDC, 0xC0),
-        theory_line=(0x56, 0x50, 0x44),
-        interval_text=(0xB8, 0xAC, 0x90),
-        recorder_bg=(0x4A, 0x35, 0x27),
-        fx_knob=(0xD0, 0x98, 0x5A),
-        master_knob=(0xFF, 0x3B, 0x5C),
-        varispeed=(0xE8, 0xDC, 0xC0),
-        velocity_loud=(0xFF, 0x70, 0x50),
-        velocity_quiet=(0x3A, 0xA8, 0xA0),
-        meter_bg=(0x0B, 0x0E, 0x0A),
-        scope_draw=(0xA3, 0xE0, 0x48),
-        fx_strip=(0x30, 0x24, 0x1B),
-        input_chip=(0x8A, 0xB0, 0x60),
-        fretboard=(0x0D, 0x0D, 0x0D),
-        string=(0x8A, 0x7F, 0x6A),
-    ),
+# `dark` is the theme's own dark set, the way the Rust `dark_of` writes it;
+# a light theme names only the ground and takes the keyboard swap.
+DESIGNED_THEMES = {
     "Nocturne": dict(
         background=(0x0A, 0x1C, 0x34),
         white_key=(0x0A, 0x1C, 0x34),
@@ -1139,6 +1387,11 @@ DARK_THEMES = {
         input_chip=(0x55, 0x78, 0xFF),
         fretboard=(0x06, 0x12, 0x24),
         string=(0x78, 0x98, 0xB8),
+        dark=dict(
+            background=(0x06, 0x12, 0x24),
+            white_key=(0x46, 0x59, 0x7A),
+            black_key=(0x1E, 0x33, 0x50),
+        ),
     ),
     "Phosphor": dict(
         background=(0x0B, 0x0E, 0x0A),
@@ -1162,6 +1415,42 @@ DARK_THEMES = {
         input_chip=(0x6F, 0xAE, 0x3F),
         fretboard=(0x05, 0x07, 0x05),
         string=(0x6A, 0x80, 0x60),
+        dark=dict(
+            background=(0x05, 0x07, 0x05),
+            white_key=(0x4E, 0x5A, 0x40),
+            black_key=(0x1E, 0x28, 0x17),
+        ),
+    ),
+    # The turquoise is not the panel's #18808f: that one sits at luminance
+    # 0.176, in the dead zone, and read 2.94:1 on the band and 3.75:1 under
+    # its own note name. Lifted to 0.24 — the lowest turquoise that clears
+    # the band at 3:1 and the dark ink at 4.5:1 — it keeps the most of what
+    # a lit key can have against aluminum naturals (2.25:1).
+    "Silverface": dict(
+        background=(0xC9, 0xCD, 0xD2),
+        white_key=(0xC9, 0xCD, 0xD2),
+        black_key=(0x1B, 0x1D, 0x20),
+        key_active=(0x1B, 0x94, 0xA6),
+        sustain=(0x3B, 0x5A, 0x8C),
+        key_separator=(0x3A, 0x3E, 0x44),
+        text=(0xD8, 0xDE, 0xE6),
+        theory_line=(0x8A, 0x90, 0x99),
+        interval_text=(0x9F, 0xB3, 0xC4),
+        recorder_bg=(0x2A, 0x2E, 0x33),
+        fx_knob=(0x3F, 0xB8, 0xC9),
+        master_knob=(0xE0, 0x48, 0x3A),
+        varispeed=(0xD8, 0xDE, 0xE6),
+        # velgen's solver against this roll, hot 12 / cool 190: the panel's
+        # own pair sat at 2.7:1 and 2.4:1 on the dark roll.
+        velocity_loud=(0xFF, 0x78, 0x57),
+        velocity_quiet=(0x1D, 0xAF, 0xCD),
+        meter_bg=(0x14, 0x16, 0x1A),
+        scope_draw=(0x64, 0xD8, 0xE8),
+        fx_strip=(0x1F, 0x22, 0x26),
+        input_chip=(0x8A, 0xA0, 0xB8),
+        fretboard=(0x14, 0x16, 0x1A),
+        string=(0x8A, 0x90, 0x99),
+        dark=dict(background=(0x1B, 0x1D, 0x20)),
     ),
 }
 
@@ -1197,9 +1486,13 @@ def theme_gates(name, t):
     )
     if contrast(well, field) < 1.12:
         errs.append(f"band well/field separate {contrast(well, field):.2f}:1 < 1.12")
-    # The theory-ground law: light ground IS the naturals.
+    # The theory-ground law, both halves: the light ground IS the naturals
+    # and the dark ground IS the sharps.
     if t["background"] != t["white_key"]:
         errs.append("background != white_key (the theory-ground law)")
+    dark = t.get("dark", {})
+    if dark.get("background") != t["black_key"]:
+        errs.append("dark.background != black_key (the theory-ground law)")
     # House rules the Rust tests cannot see.
     for role in SURFACE_ROLES:
         l = luminance(t[role])
@@ -1207,13 +1500,38 @@ def theme_gates(name, t):
             errs.append(f"{role} {hexs(t[role])} lum {l:.3f} in the dead zone")
         if chroma(t[role]) > CHROMA_MAX:
             errs.append(f"{role} {hexs(t[role])} chroma {chroma(t[role]):.1f} > {CHROMA_MAX}")
-    # Text and lines must actually read on the GROUND too.
-    if contrast(text, t["background"]) < 4.5:
-        errs.append(f"text on the ground {contrast(text, t['background']):.2f}:1 < 4.5")
-    if contrast(t["interval_text"], t["background"]) < 4.5:
-        errs.append(
-            f"interval_text on the ground {contrast(t['interval_text'], t['background']):.2f}:1 < 4.5"
-        )
+    # **The keyboard, both modes** — piano.rs's two sweeps. Every key fill is
+    # a surface with a note name on it: the idle pair as the mode paints
+    # them, the lit key and the held key in either mode. The one that fails
+    # is always a lit colour parked in the dead zone.
+    swapped = (
+        dark.get("white_key", t["black_key"]),
+        dark.get("black_key", t["white_key"]),
+    )
+    fills = [
+        ("natural idle", t["white_key"]), ("sharp idle", t["black_key"]),
+        ("natural idle (dark)", swapped[0]), ("sharp idle (dark)", swapped[1]),
+        ("lit key", t["key_active"]), ("held key", t["sustain"]),
+    ]
+    for what, c in fills:
+        if ink_contrast(c) < 4.5:
+            errs.append(f"note name on the {what} {hexs(c)} {ink_contrast(c):.2f}:1 < 4.5")
+    ground = dark.get("background", t["black_key"])
+    shows = max(contrast(swapped[0], ground), contrast(swapped[1], ground))
+    if shows < 2.0:
+        errs.append(f"dark keyboard {shows:.2f}:1 on its ground < 2")
+    if contrast(*swapped) < 1.25:
+        errs.append(f"dark keys {contrast(*swapped):.2f}:1 apart < 1.25")
+    # Text and lines on the GROUND. On a dark theme the band's ink is also
+    # the page's; a light theme's page takes measured ink instead, so only
+    # the line is asked of it (the theory view pushes it to 1.9 regardless).
+    if wants_light_ink(t["background"]):
+        if contrast(text, t["background"]) < 4.5:
+            errs.append(f"text on the ground {contrast(text, t['background']):.2f}:1 < 4.5")
+        if contrast(t["interval_text"], t["background"]) < 4.5:
+            errs.append(
+                f"interval_text on the ground {contrast(t['interval_text'], t['background']):.2f}:1 < 4.5"
+            )
     if contrast(t["theory_line"], t["background"]) < 1.7:
         errs.append(
             f"theory_line on the ground {contrast(t['theory_line'], t['background']):.2f}:1 < 1.7"
@@ -1223,14 +1541,14 @@ def theme_gates(name, t):
 
 def dark_report():
     bad = 0
-    for name, t in DARK_THEMES.items():
+    for name, t in DESIGNED_THEMES.items():
         errs = theme_gates(name, t)
         print(f"{name:10s} {'FAIL' if errs else 'ok'}")
         for e in errs:
             print(f"           - {e}")
         bad += len(errs)
     print()
-    print("ALL PASS" if not bad else f"DARK THEMES FAIL ({bad})")
+    print("ALL PASS" if not bad else f"DESIGNED THEMES FAIL ({bad})")
     return bad
 
 
@@ -1239,6 +1557,8 @@ if __name__ == "__main__":
 
     if "--dark" in sys.argv:
         raise SystemExit(1 if dark_report() else 0)
+    if "--silverface" in sys.argv:
+        raise SystemExit(1 if silverface_report() else 0)
     if "--gradients" in sys.argv:
         rc = report_gradients()
         if not rc:
