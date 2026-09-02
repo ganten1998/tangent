@@ -54,8 +54,12 @@ pub struct ClavVoice {
     comb_at: usize,
     comb_d: usize,
     comb_g: f32,
-    /// The tone rocker: one pole over the comb's output.
+    /// The tone rocker: two matched poles over the comb's output. Two, not
+    /// one — a clav's spectrum is over by 2 kHz, and one pole's 6 dB an
+    /// octave measured under 4 dB of change on anything that was actually
+    /// sounding. Twelve is a rocker you can hear land.
     tone_z: f32,
+    tone_z2: f32,
     tone_a: f32,
     /// The choke fade, and the spit that rides out through it.
     damp: f32,
@@ -88,6 +92,7 @@ impl ClavVoice {
             comb_d: 16,
             comb_g: 0.92,
             tone_z: 0.0,
+            tone_z2: 0.0,
             tone_a: 1.0,
             damp: 1.0,
             damp_to: 1.0,
@@ -131,7 +136,17 @@ impl ClavVoice {
         let rho2 = 10.0_f32.powf(-3.0 / (t60_h * f0));
         let (p, gain) = design_loss(w1, w2, rho1, rho2);
 
-        let disp_a = -(1.0 - (b * 1400.0).min(0.92)).sqrt() * 0.92;
+        // The same sqrt(B)-in-delay dispersion fit as the piano's — see
+        // string.rs for the design and for the inversion this replaced. It
+        // matters MORE here: the old map turned this string's small B into a
+        // huge coefficient, which parked a long-ringing upper series 25 to
+        // 122 cents sharp — an enharmonic bell on an instrument whose whole
+        // brightness is supposed to be combs over a harmonic series. With the
+        // fit the partials sit within a few cents of the stretched ideal at
+        // every velocity, and a test in mod.rs now pins that.
+        let disp_tau = (1.8625 * b.sqrt() * total)
+            .clamp(1.0, (0.14 * total).min(19.0).max(1.0));
+        let disp_a = (1.0 - disp_tau) / (1.0 + disp_tau);
         for d in &mut self.string.disp {
             d.a = disp_a;
         }
@@ -171,11 +186,17 @@ impl ClavVoice {
         self.comb.fill(0.0);
         self.comb_at = 0;
 
-        // The tone rockers, folded to one pole: brilliant leaves the wire
-        // alone, soft is the mellow switch pair down.
-        let corner = 1_500.0 * (14_000.0_f32 / 1_500.0).powf(k.tone.clamp(0.0, 1.0));
+        // The tone rockers: brilliant leaves the wire alone, soft is the
+        // mellow switch pair down. 8010 Hz is precisely where the old
+        // 1500..14000 sweep put the shipped 0.75 default, so an untouched
+        // strip keeps its corner to the hertz; the five-octave span around
+        // it reaches 600 Hz at the bottom — INTO the sounding series, where
+        // the old 1500 floor stopped a full octave above a spectrum that is
+        // over by 2 kHz — and an effectively-open 19 kHz at the top.
+        let corner = 8_010.0 * 2.0_f32.powf((k.tone.clamp(0.0, 1.0) - 0.75) * 5.0);
         self.tone_a = 1.0 - (-std::f32::consts::TAU * corner / self.rate).exp();
         self.tone_z = 0.0;
+        self.tone_z2 = 0.0;
 
         self.damp = 1.0;
         self.damp_to = 1.0;
@@ -252,11 +273,12 @@ impl ClavVoice {
         self.comb_at = (self.comb_at + 1) % COMB_MAX;
         let picked = raw - self.comb_g * behind;
 
-        // Tone rocker, then the choke.
+        // Tone rocker — both poles — then the choke.
         self.tone_z += self.tone_a * (picked - self.tone_z);
+        self.tone_z2 += self.tone_a * (self.tone_z - self.tone_z2);
         let coeff = 1.0 - (-1.0 / (self.damp_secs * self.rate)).exp();
         self.damp += (self.damp_to - self.damp) * coeff;
-        let out = self.tone_z * self.damp;
+        let out = self.tone_z2 * self.damp;
         let out = if out.is_finite() { out.clamp(-4.0, 4.0) } else { 0.0 };
 
         let a = out.abs();
@@ -266,6 +288,7 @@ impl ClavVoice {
             self.string.clear();
             self.comb.fill(0.0);
             self.tone_z = 0.0;
+            self.tone_z2 = 0.0;
         }
         out
     }

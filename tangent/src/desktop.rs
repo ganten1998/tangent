@@ -9968,14 +9968,6 @@ mod tests {
         }
     }
 
-    /// **The centre of every knob is the instrument the bench signed off.**
-    ///
-    /// Every mapping in `PianoKnobs`/`EpKnobs` passes through its own tuned
-    /// constant at the default, so a strip nobody has touched, a sound just
-    /// initialised, and the two-knob build that shipped first all make the
-    /// identical sound. A knob whose default multiplies by something other
-    /// than one is a silent retune of both patches.
-    #[test]
     /// **The suite's two tables are one list.** The UI's `SUITE_UNITS`
     /// routes faces and fills the picker; the engine's `UNITS` seats the
     /// sound. A path in one and not the other is a face over an empty bay
@@ -10011,6 +10003,17 @@ mod tests {
         }
     }
 
+    /// **The centre of every knob is the instrument the bench signed off.**
+    ///
+    /// Every mapping in `PianoKnobs`/`EpKnobs` passes through its own tuned
+    /// constant at the default, so a strip nobody has touched, a sound just
+    /// initialised, and the two-knob build that shipped first all make the
+    /// identical sound. A knob whose default multiplies by something other
+    /// than one is a silent retune of both patches.
+    ///
+    /// (The `#[test]` below was stranded on the NEXT function for a release
+    /// — this pin compiled, was green in review, and never ran.)
+    #[test]
     fn an_initialised_sound_is_the_bench_tuning() {
         let piano = crate::keys::PianoKnobs::from_params(&crate::keys::Patch::Piano1.defaults());
         assert!((piano.decay - 1.0).abs() < 1.0e-5, "decay {}", piano.decay);

@@ -2207,7 +2207,7 @@ pub const KEYS_PARAM_SPECS: [[(&str, &str, f32); KEYS_PARAMS]; KEYS_PATCHES] = [
         ("Bark", "how hard the tine leans on the pickup", 0.5),
         ("Chime", "where the bell partial sits above the note", 0.5),
         ("Release", "how fast the damper stops the tine", 0.5),
-        ("Tonebar", "the metal the tine is bolted to", 0.5),
+        ("Tonebar", "the bar the tine is bolted to: its ring and the slow beat", 0.5),
     ],
     [
         ("Voicing", "hammer felt: needled soft to lacquered bright", 0.5),
@@ -2235,7 +2235,7 @@ pub const KEYS_PARAM_SPECS: [[(&str, &str, f32); KEYS_PARAMS]; KEYS_PATCHES] = [
         ("Bark", "how hard the tine leans on the pickup", 0.5),
         ("Tremolo", "the stereo throb of the twin speakers", 0.45),
         ("Release", "how fast the damper stops the tine", 0.5),
-        ("Tonebar", "the metal the tine is bolted to", 0.5),
+        ("Tonebar", "the bar the tine is bolted to: its ring and the slow beat", 0.5),
     ],
     [
         ("Voicing", "tangent tip: worn soft to fresh hard", 0.5),

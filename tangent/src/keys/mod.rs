@@ -191,8 +191,11 @@ pub const P_VOICING: usize = 0;
 pub const P_WIDTH: usize = 1;
 /// The body knob — a soundboard on one instrument and a tonebar on the other,
 /// but the same slot and the same meaning: how much of the shared resonator
-/// reaches the bus. `render` reads it directly, which is why it is named here
-/// rather than left to the two knob-mapping structs.
+/// speaks under the note. `render` reads it directly for the pianos' board
+/// send, which is why it is named here rather than left to the two
+/// knob-mapping structs; the electric patches' tonebar takes it at the
+/// strike through `EpKnobs::body` instead, because their `Body` is a hard
+/// zero and the bar is per voice.
 pub const P_BODY: usize = 7;
 
 /// The stereo spread at the top of the WIDTH knob: a little wider than the
@@ -283,7 +286,7 @@ const EP_PARAMS: [ParamSpec; MAX_PARAMS] = [
     },
     ParamSpec {
         name: "Tonebar",
-        about: "the metal the tine is bolted to",
+        about: "the bar the tine is bolted to: its ring and the slow beat",
         default: 0.5,
     },
 ];
@@ -329,7 +332,7 @@ const EP_SUITCASE_PARAMS: [ParamSpec; MAX_PARAMS] = [
     },
     ParamSpec {
         name: "Tonebar",
-        about: "the metal the tine is bolted to",
+        about: "the bar the tine is bolted to: its ring and the slow beat",
         default: 0.5,
     },
 ];
@@ -591,6 +594,19 @@ impl EpKnobs {
             body: (p[7] * 2.0).clamp(0.0, 2.0),
         }
     }
+
+    /// The suitcase patch: index 5 belongs to the amp's TREMOLO, so the
+    /// chime holds at the tine as built — the same seat-swap discipline as
+    /// `ClavKnobs::from_params_wah`. Before this existed the suitcase went
+    /// through `from_params` and the tremolo depth leaked into the chime
+    /// mapping: turning the throb up retuned the bell partial nine
+    /// semitones at the strike, and the shipped 0.45 default meant the
+    /// suitcase's bell never even matched the Mk.1's.
+    pub fn from_params_suitcase(p: &[f32; MAX_PARAMS]) -> Self {
+        let mut k = Self::from_params(p);
+        k.chime = 0.0;
+        k
+    }
 }
 
 impl Default for EpKnobs {
@@ -751,10 +767,15 @@ impl Mechanism {
                 &PianoKnobs::from_params(params),
                 &string::PianoBase::CONCERT,
             ),
-            Patch::EpMk1 | Patch::EpSuitcase => {
+            Patch::EpMk1 => {
                 self.ep
                     .strike_knobs(pitch, velocity, &EpKnobs::from_params(params));
             }
+            Patch::EpSuitcase => self.ep.strike_knobs(
+                pitch,
+                velocity,
+                &EpKnobs::from_params_suitcase(params),
+            ),
             Patch::Clav => {
                 self.clav
                     .strike_knobs(pitch, velocity, &ClavKnobs::from_params(params));
@@ -1132,7 +1153,18 @@ impl Keys {
         let n = frames.min(out.len() / channels);
         // Once per block, not per sample: the knob cannot move inside a
         // block, and the mapping is a multiply the loop should not repeat.
-        let body_amt = (self.params[P_BODY] * 2.0).clamp(0.0, 2.0);
+        // CUBED, with the centre still exactly 1.0: the board is voiced to
+        // sit well under the strings, so a linear 0..2 could only whisper —
+        // the bench measured a tenth of a decibel of total RMS across the
+        // knob's whole travel. The cube leaves the shipped default
+        // bit-identical and gives the top of the knob a board you can hear
+        // open, 18 dB above the old ceiling, with a true zero at the bottom.
+        // This feeds `Body`, which the electric patches hard-zero — their
+        // knob 7 is the tonebar, applied at the strike in `EpKnobs`.
+        let body_amt = {
+            let b = (self.params[P_BODY] * 2.0).clamp(0.0, 2.0);
+            b * b * b
+        };
         // The amp side, block-constant. The tremolo and wah knobs are read
         // HERE rather than at the strike, because an amp's knobs act on
         // whatever is already ringing — turn the throb up under a held
@@ -1377,6 +1409,228 @@ mod tests {
             let d = patch.defaults();
             for (i, spec) in patch.params().iter().enumerate() {
                 assert_eq!(d[i], spec.default, "{patch:?} knob {i} ({})", spec.name);
+            }
+        }
+    }
+
+    /// Magnitude at one frequency through a Hann window — the bench's
+    /// measuring stick, duplicated here because the tests below pin SPECTRA
+    /// and a rectangular window's leakage floor would pin noise instead.
+    fn goertzel_hann(x: &[f32], freq: f32, rate: f32) -> f32 {
+        if x.is_empty() || freq <= 0.0 || freq >= rate * 0.5 {
+            return 0.0;
+        }
+        let w = std::f32::consts::TAU * freq / rate;
+        let c = 2.0 * w.cos();
+        let n = x.len() as f32;
+        let step = std::f32::consts::TAU / n;
+        let (mut s1, mut s2) = (0.0_f32, 0.0_f32);
+        for (i, &v) in x.iter().enumerate() {
+            let win = 0.5 - 0.5 * (step * i as f32).cos();
+            let s0 = v * win + c * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        (s1 * s1 + s2 * s2 - c * s1 * s2).max(0.0).sqrt() / (n * 0.25)
+    }
+
+    /// One voice of `mech`, struck once, ticked for `secs` — no pool, no
+    /// pan, no body: the mechanism alone, which is what the spectrum tests
+    /// are about.
+    fn run_voice(tick: &mut dyn FnMut() -> f32, secs: f32) -> Vec<f32> {
+        (0..(secs * 48_000.0) as usize).map(|_| tick()).collect()
+    }
+
+    /// **The clav has no bell.** Its brightness is combs over a stretched
+    /// HARMONIC series; for one release the shared dispersion map was
+    /// inverted against stiffness and parked a long-ringing upper series up
+    /// to 122 cents sharp — an enharmonic chime this instrument does not
+    /// own. Every component loud enough to matter, at every velocity, must
+    /// sit within a fraction of a semitone of the stretched ideal.
+    #[test]
+    fn the_clavs_ringing_partials_sit_on_the_stretched_string_series() {
+        let f0 = 261.6256_f32;
+        // The B schedule at C4, exactly as clav.rs computes it.
+        let b = 1.2e-4 * 2.0_f32.powf((60.0 - 52.0) / 26.0);
+        for vel in [0.3_f32, 0.7, 1.0] {
+            let mut v = clav::ClavVoice::new(48_000.0);
+            v.strike_knobs(60, vel, &ClavKnobs::default());
+            let out = run_voice(&mut || v.tick(), 0.85);
+            // Skip the strike transient: broadband by nature, innocent here.
+            let w = &out[(0.05 * 48_000.0) as usize..];
+            // Scan the whole region above the fundamental in 10-cent steps.
+            let mut mags = Vec::new();
+            let mut f = f0 * 1.5;
+            while f < f0 * 8.5 {
+                mags.push((f, goertzel_hann(w, f, 48_000.0)));
+                f *= 1.005_79; // ten cents
+            }
+            let top = mags.iter().fold(0.0_f32, |m, &(_, g)| m.max(g));
+            let floor = top * 0.031_6; // -30 dB: quieter than this is tail
+            for &(f, g) in &mags {
+                if g < floor {
+                    continue;
+                }
+                // Distance to the nearest stretched partial, in cents.
+                let nearest = (2..=9)
+                    .map(|n| {
+                        let ideal =
+                            n as f32 * f0 * (1.0 + b * (n * n) as f32).sqrt();
+                        (1_200.0 * (f / ideal).log2()).abs()
+                    })
+                    .fold(f32::MAX, f32::min);
+                assert!(
+                    nearest < 40.0,
+                    "clav at vel {vel}: {f:.0} Hz rings {nearest:.0} cents \
+                     off the stretched series — that is a bell"
+                );
+            }
+        }
+    }
+
+    /// **The two electric mechanisms may never converge.** The reed's upper
+    /// energy is the plate's GROWL — second and third harmonics, integer
+    /// ratios, with its one bar overtone buried — while the tine carries a
+    /// loud BELL far from any integer. One release shipped them swapped:
+    /// the reed's overtone sat half a semitone from the tine's bell, rang
+    /// into the sustain, and the reed out-Rhodesed the Rhodes. This pins
+    /// each mechanism to its own signature: what dominates the reed's top,
+    /// how far down its inharmonic content lies, and how loud and how
+    /// off-integer the tine's bell is.
+    #[test]
+    fn the_reed_speaks_harmonics_where_the_tine_speaks_a_bell() {
+        let f0 = 261.6256_f32;
+        let peak_near = |x: &[f32], around: f32| -> (f32, f32) {
+            let mut best = (0.0_f32, 0.0_f32);
+            let mut f = around * 0.95;
+            while f < around * 1.05 {
+                let g = goertzel_hann(x, f, 48_000.0);
+                if g > best.1 {
+                    best = (f, g);
+                }
+                f += around * 0.001;
+            }
+            best
+        };
+
+        let mut reed = reed::WurliVoice::new(48_000.0);
+        reed.strike_knobs(60, 1.0, &WurliKnobs::default(), &reed::WurliBase::TWO_HUNDRED);
+        let out = run_voice(&mut || reed.tick(), 0.25);
+        // The loudest thing above the fundamental must be a harmonic.
+        let mut best = (0.0_f32, 0.0_f32);
+        let mut f = f0 * 1.5;
+        while f < f0 * 8.2 {
+            let g = goertzel_hann(&out, f, 48_000.0);
+            if g > best.1 {
+                best = (f, g);
+            }
+            f *= 1.005_79; // ten cents
+        }
+        let r = best.0 / f0;
+        assert!(
+            (r - r.round()).abs() < 0.08 && (1.8..=3.2).contains(&r),
+            "the reed's loudest upper partial sits at {r:.2} x f0 — growl \
+             is harmonic, this is not"
+        );
+        // And its one inharmonic voice — the solder-dropped bar overtone —
+        // stays attack colour: well under the fundamental even in the
+        // attack window, where it is at its loudest.
+        let fund = goertzel_hann(&out, f0, 48_000.0).max(1.0e-12);
+        let drop = 1.0 - 0.06 * ((60.0_f32 - 33.0) / 40.0).clamp(0.0, 1.0);
+        let over1 = peak_near(&out, f0 * 4.4 * drop).1;
+        let over_db = 20.0 * (over1 / fund).max(1.0e-12).log10();
+        assert!(
+            over_db < -35.0,
+            "the reed's bar overtone reads {over_db:.0} dB under the \
+             fundamental; louder than -35 and it starts sounding like a bell"
+        );
+
+        let mut tine = tine::EpVoice::new(48_000.0);
+        tine.strike_knobs(60, 1.0, &EpKnobs::default());
+        let out = run_voice(&mut || tine.tick(), 0.25);
+        let fund = goertzel_hann(&out, f0, 48_000.0).max(1.0e-12);
+        // The bell mode as tine.rs places it at C4, chime centred.
+        let bell_ratio = 6.6 - 0.030 * (60.0 - 28.0);
+        let (bf, bg) = peak_near(&out, f0 * bell_ratio);
+        let bell_db = 20.0 * (bg / fund).max(1.0e-12).log10();
+        let t = bf / f0;
+        assert!(
+            bell_db > -30.0,
+            "the tine's bell reads {bell_db:.0} dB under the fundamental at \
+             fortissimo — that is the under-belled Rhodes coming back"
+        );
+        assert!(
+            (t - t.round()).abs() > 0.25,
+            "the tine's bell sits at {t:.2} x f0 — a bell lives OFF the \
+             harmonic series, this one converged onto it"
+        );
+    }
+
+    /// **STRETCH turns the way it says.** The inverted dispersion map made
+    /// knob zero the stiffest wire on the panel; this holds the direction:
+    /// more knob, sharper upper partials.
+    #[test]
+    fn the_stretch_knob_pulls_the_partials_sharper_not_flatter() {
+        let f0 = 261.6256_f32;
+        let n6_at = |stretch: f32| -> f32 {
+            let mut k = PianoKnobs::default();
+            k.stretch = stretch;
+            k.unison = 0.0; // measure the design, not the beat geometry
+            let mut v = string::PianoVoice::new(48_000.0);
+            v.strike_based(60, 0.7, &k, &string::PianoBase::JAZZ);
+            let out = run_voice(&mut || v.tick(), 1.0);
+            let mut best = (0.0_f32, 0.0_f32);
+            let mut f = 6.0 * f0 * 0.98;
+            while f < 6.0 * f0 * 1.10 {
+                let g = goertzel_hann(&out, f, 48_000.0);
+                if g > best.1 {
+                    best = (f, g);
+                }
+                f += f0 * 0.006;
+            }
+            best.0
+        };
+        let lo = n6_at(bipolar(0.0, 1.6));
+        let hi = n6_at(bipolar(1.0, 1.6));
+        let cents = 1_200.0 * (hi / lo).log2();
+        assert!(
+            cents > 20.0,
+            "full stretch travel moved n6 by {cents:.0} cents; it must pull \
+             clearly SHARP with the knob, not sit still or fall"
+        );
+    }
+
+    /// **The dispersion budget never detunes a short string.** The all-pass
+    /// cascade eats loop delay, and at the top of the keyboard there is
+    /// almost none to eat: the per-note cap must leave the fundamental on
+    /// pitch at both stretch extremes, or C8 plays flat and no test below
+    /// A5 would ever notice.
+    #[test]
+    fn the_treble_stays_on_pitch_at_either_stretch_extreme() {
+        for pitch in [105_u8, 108] {
+            let f0 = 440.0 * 2.0_f32.powf((f32::from(pitch) - 69.0) / 12.0);
+            for stretch in [bipolar(0.0, 1.6), bipolar(1.0, 1.6)] {
+                let mut k = PianoKnobs::default();
+                k.stretch = stretch;
+                k.unison = 0.0;
+                let mut v = string::PianoVoice::new(48_000.0);
+                v.strike_based(pitch, 0.7, &k, &string::PianoBase::JAZZ);
+                let out = run_voice(&mut || v.tick(), 0.4);
+                let mut best = (0.0_f32, 0.0_f32);
+                let mut f = f0 * 0.97;
+                while f < f0 * 1.03 {
+                    let g = goertzel_hann(&out, f, 48_000.0);
+                    if g > best.1 {
+                        best = (f, g);
+                    }
+                    f += f0 * 0.000_5;
+                }
+                let cents = 1_200.0 * (best.0 / f0).log2();
+                assert!(
+                    cents.abs() < 15.0,
+                    "pitch {pitch} at stretch {stretch:.2} sounds {cents:.0} \
+                     cents off — the dispersion cap failed to protect it"
+                );
             }
         }
     }
