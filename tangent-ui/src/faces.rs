@@ -158,7 +158,9 @@ fn row(ui: &mut egui::Ui, st: &FaceStyle, face: &BuiltinFace, id: u32) -> Option
 }
 
 /// One stepped parameter as a kit row: the button wears the current choice,
-/// stepping wraps.
+/// stepping wraps, and a double-click lands on the position the DSP calls
+/// home — `p.default`, pushed with the parameter, never a number spelled
+/// here.
 fn step_row(
     ui: &mut egui::Ui,
     st: &FaceStyle,
@@ -174,8 +176,13 @@ fn step_row(
         .get(at)
         .map(String::as_str)
         .unwrap_or(&p.reading);
-    stepped_row(ui, st, name_override.unwrap_or(&p.name), label).map(|delta| {
-        let next = (at as i32 + delta).rem_euclid(steps as i32) as usize;
+    stepped_row(ui, st, name_override.unwrap_or(&p.name), label).map(|ask| {
+        let next = match ask {
+            face::StepAsk::By(delta) => (at as i32 + delta).rem_euclid(steps as i32) as usize,
+            face::StepAsk::Home => {
+                ((p.default * (steps - 1) as f32).round() as usize).min(steps - 1)
+            }
+        };
         FaceAction::Set {
             id,
             value: next as f32 / (steps - 1) as f32,
@@ -275,18 +282,19 @@ pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fa
                 .map(|p| (p.id, p.steps >= 2))
                 .collect();
             for (id, stepped) in ids {
-                out = out.or_else(|| {
+                face::keep(
+                    &mut out,
                     if stepped {
                         step_row(ui, st, &live.face, id, None)
                     } else {
                         row(ui, st, &live.face, id)
-                    }
-                });
+                    },
+                );
             }
             out
         }
     };
-    action = action.or_else(|| preset_strip(ui, st, live));
+    face::keep(&mut action, preset_strip(ui, st, live));
     action
 }
 
@@ -300,7 +308,7 @@ fn draw_comp(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<F
     ui.add_space(6.0);
     let mut out = None;
     for id in 0..=6 {
-        out = out.or_else(|| row(ui, st, &live.face, id));
+        face::keep(&mut out, row(ui, st, &live.face, id));
     }
     out
 }
@@ -323,7 +331,7 @@ fn draw_imager(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option
     ui.add_space(6.0);
     let mut out = None;
     for id in 0..=2 {
-        out = out.or_else(|| row(ui, st, &live.face, id));
+        face::keep(&mut out, row(ui, st, &live.face, id));
     }
     out
 }
@@ -469,14 +477,19 @@ fn draw_eq(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
     // rows to say five things.
     let band = live.band.min(EQ_BANDS - 1);
     let base = band as u32 * EQ_KNOBS;
-    if stepped_row(ui, st, "Band", &format!("{}", band + 1)).is_some() {
-        live.band = (band + 1) % EQ_BANDS;
+    // The walker is a VIEW, not a parameter: it steps either way like any
+    // other stepped row, but there is no engine number behind it, so the
+    // reset gesture has nothing to ask for and means nothing here.
+    if let Some(face::StepAsk::By(delta)) =
+        stepped_row(ui, st, "Band", &format!("{}", band + 1))
+    {
+        live.band = (band as i32 + delta).rem_euclid(EQ_BANDS as i32) as usize;
     }
-    out = out.or_else(|| step_row(ui, st, &live.face, base, None));
-    out = out.or_else(|| step_row(ui, st, &live.face, base + 1, Some("Shape")));
-    out = out.or_else(|| row(ui, st, &live.face, base + 2));
-    out = out.or_else(|| row(ui, st, &live.face, base + 3));
-    out = out.or_else(|| row(ui, st, &live.face, base + 4));
+    face::keep(&mut out, step_row(ui, st, &live.face, base, None));
+    face::keep(&mut out, step_row(ui, st, &live.face, base + 1, Some("Shape")));
+    face::keep(&mut out, row(ui, st, &live.face, base + 2));
+    face::keep(&mut out, row(ui, st, &live.face, base + 3));
+    face::keep(&mut out, row(ui, st, &live.face, base + 4));
     out
 }
 
@@ -577,7 +590,7 @@ fn draw_ir(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
         });
     ui.add_space(6.0);
     for id in 0..=1 {
-        out = out.or_else(|| row(ui, st, &live.face, id));
+        face::keep(&mut out, row(ui, st, &live.face, id));
     }
     out
 }

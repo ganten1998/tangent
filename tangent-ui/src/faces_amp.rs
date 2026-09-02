@@ -18,7 +18,7 @@
 //! own seat (`recorder::amp_pedal_seat`), and the pedal's face then opens
 //! by the same road every insert's does.
 
-use crate::face::{slider_row, stepped_row, FaceStyle};
+use crate::face::{self, slider_row, stepped_row, FaceStyle, StepAsk};
 use crate::faces::{FaceAction, FaceLive};
 use crate::fonts;
 use crate::recorder::AMP_PEDALS;
@@ -70,9 +70,9 @@ pub fn draw_amp(
 
     // ── the top strip: bright, volume, the stack ────────────────────────────
     caption(ui, "CHANNEL");
-    out = out.or_else(|| toggle_row(ui, st, live, 0));
+    face::keep(&mut out, toggle_row(ui, st, live, 0));
     for id in 1..=4 {
-        out = out.or_else(|| param_row(ui, st, live, id));
+        face::keep(&mut out, param_row(ui, st, live, id));
     }
     ui.add_space(6.0);
 
@@ -80,9 +80,9 @@ pub fn draw_amp(
     // The panel word is the era's; that it is amplitude tremolo is the
     // module doc's to tell, not a knob's.
     caption(ui, "VIBRATO");
-    out = out.or_else(|| toggle_row(ui, st, live, 5));
+    face::keep(&mut out, toggle_row(ui, st, live, 5));
     for id in 6..=8 {
-        out = out.or_else(|| param_row(ui, st, live, id));
+        face::keep(&mut out, param_row(ui, st, live, id));
     }
     ui.add_space(8.0);
 
@@ -151,10 +151,20 @@ fn toggle_row(
         .get(usize::from(on))
         .map(String::as_str)
         .unwrap_or(if on { "on" } else { "off" });
-    stepped_row(ui, st, &p.name, label).map(|_| FaceAction::Set {
+    stepped_row(ui, st, &p.name, label).map(|ask| FaceAction::Set {
         id,
-        // A switch has two positions; either step is the other one.
-        value: if on { 0.0 } else { 1.0 },
+        value: match ask {
+            // A switch has two positions; either step is the other one.
+            StepAsk::By(_) => {
+                if on {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
+            // Home is the engine's own number, pushed with the parameter.
+            StepAsk::Home => p.default,
+        },
     })
 }
 

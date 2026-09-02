@@ -19,6 +19,15 @@
 //! resizes. A sweep test at the bottom dresses the kit in all sixteen
 //! factory themes, both modes, and fails the build on the first layer that
 //! cannot be read.
+//!
+//! **Two laws the first shipping build broke, written down here so the next
+//! face cannot break them again.** A face draws EVERY row it has, every
+//! frame, and folds their asks with [`keep`] — never `or_else`, which stops
+//! calling the rows once one of them has spoken and leaves the panel below
+//! the hand blinking in and out at pointer rate. And an adjustable is only
+//! double-clickable if its widget SENSES clicks: `egui::Slider` does not, so
+//! the reset gesture the hover text promises is arranged here, in one place,
+//! rather than re-derived by each panel that happens to want it.
 
 use egui::{Align2, Color32, FontId, Painter, Rect, Stroke, StrokeKind, Vec2};
 
@@ -167,6 +176,64 @@ pub fn fit_mono(r: Rect, widest: &str, nominal: f32) -> f32 {
 const LABEL_W: f32 = 0.34;
 const READING_W: f32 = 0.19;
 
+/// Keep the FIRST wish of the frame — having DRAWN every row that could have
+/// made one.
+///
+/// **Why this exists, and why `or_else` must never be used for it.** A face
+/// returns at most one ask per frame, because a hand only does one thing at a
+/// time and a queue of asks is a queue of bugs. The obvious spelling of that
+/// rule is `out = out.or_else(|| row(ui, ..))` — and it is a trap, because
+/// `or_else` does not CALL its closure once something is held. The moment one
+/// row acts, every row under it stops being drawn at all.
+///
+/// That is the whole of the reported "slider glitch". A dragged slider
+/// reports a change on the frames the pointer travels and none on the frames
+/// it rests, so the panel below the hand alternated between whole and
+/// one-row-tall at pointer rate — measured at 129pt and 18pt by
+/// `a_dragged_row_never_moves_the_rows_under_it`. It took the double-click
+/// with it: egui matches a second press to a first by widget id, and a widget
+/// that is absent every other frame never sees two.
+///
+/// So the argument is evaluated EAGERLY, which is the entire point: the row
+/// draws whether or not its wish is the one that gets kept.
+pub fn keep<T>(slot: &mut Option<T>, wish: Option<T>) {
+    if slot.is_none() {
+        *slot = wish;
+    }
+}
+
+/// Did the hand ask THIS control to go home?
+///
+/// **Why it is not simply `double_clicked`.** egui counts double-clicks on
+/// the CLOCK, not per widget: the second of two clicks a fifth of a second
+/// apart reads as a double on whichever widget took it, even when the first
+/// landed on something else entirely. Almost everywhere that is harmless — a
+/// list row opens the thing it was going to open anyway. On a face it would
+/// throw away a value the hand had just placed on the NEIGHBOURING row, which
+/// is the one mistake a reset gesture must never make. So the pair has to
+/// have landed on the same control, and the kit remembers which one in
+/// egui's own per-context scratch — never a static, because the plugin build
+/// runs several contexts in one process, and never `Settings`, because a
+/// widget that reads global state is a widget that cannot be tested.
+///
+/// A triple counts as well: a double refused for following a click elsewhere
+/// should land on the retry rather than making somebody pause first.
+///
+/// Crate-visible on purpose: the keys panel and the routing window each hold
+/// a copy of the same broken line (`resp.double_clicked()` straight off an
+/// `egui::Slider`), and when their lanes come to fix it the answer should be
+/// this function and not a third telling of the story. Hand it the response
+/// that senses clicks — `resp.interact(Sense::click())` — not the raw one.
+pub(crate) fn home_gesture(resp: &egui::Response) -> bool {
+    if !resp.clicked() {
+        return false;
+    }
+    let key = egui::Id::new("face-kit-last-clicked");
+    let previous: Option<egui::Id> = resp.ctx.data(|d| d.get_temp(key));
+    resp.ctx.data_mut(|d| d.insert_temp(key, resp.id));
+    previous == Some(resp.id) && (resp.double_clicked() || resp.triple_clicked())
+}
+
 /// One continuous parameter as a row: name, slider, reading. Returns the new
 /// value when the hand moved it. The kit's contract, in one place:
 /// double-click puts the knob back to `default` (never a UI constant — the
@@ -193,12 +260,30 @@ pub fn slider_row(
         let mut v = value;
         ui.spacing_mut().slider_width = w * (1.0 - LABEL_W - READING_W) - 16.0;
         let resp = ui.add(egui::Slider::new(&mut v, 0.0..=1.0).show_value(false));
-        if resp.double_clicked() {
+        // **A slider has to be TOLD to sense clicks before it can be
+        // double-clicked.** `egui::Slider` allocates itself with
+        // `Sense::drag()` alone, and `Response::double_clicked` is gated on
+        // the CLICKED flag, which egui only ever sets for a widget whose
+        // sense says it wants clicks. So the `resp.double_clicked()` this
+        // row used to ask — and the identical line the keys panel asks —
+        // could not be true on any frame, on any theme, on any unit: the
+        // hover text has been promising a gesture the widget was deaf to.
+        // Re-registering the SAME id with the click sense added is egui's
+        // own remedy for exactly this ("use `interact` to sense more things
+        // after adding a widget"), and it costs no extra id, so the rows
+        // below keep the ids they had.
+        //
+        // The two responses are not interchangeable: `changed` is a flag the
+        // slider stamps on the response object it returned, and the
+        // re-interacted one is a fresh object that never saw it. Read each
+        // from the one that knows.
+        let hand = resp.interact(egui::Sense::click());
+        if home_gesture(&hand) {
             out = Some(default);
         } else if resp.changed() {
             out = Some(v);
         }
-        resp.on_hover_text("double-click to reset");
+        hand.on_hover_text("drag to set; double-click to reset");
         let at_rest = (value - default).abs() < 0.5 / 100.0;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
@@ -211,16 +296,40 @@ pub fn slider_row(
     out
 }
 
+/// What a gesture on a stepped row asked for. The row names the WISH and the
+/// face maps it onto the parameter — [`CurveAction`]'s bargain, kept for the
+/// same reason: the kit knows nothing about ids, and it must know nothing
+/// about defaults either. A knob's home is a number the DSP owns and the host
+/// pushes, so only the face can spell it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StepAsk {
+    /// Walk the choices by this many, wrapping. +1 forward, -1 back.
+    By(i32),
+    /// Put it back where the DSP says it rests.
+    Home,
+}
+
 /// One stepped parameter as a row: name, a cycling button wearing the current
-/// choice, a step either way from its ends. Returns +1/-1 when stepped.
+/// choice, a step either way from its ends.
+///
 /// A click on the body cycles forward — the effect panels' own idiom for a
-/// mode: fewer targets, and the list is short enough to walk.
+/// mode: fewer targets, and the list is short enough to walk. A right-click
+/// steps back, which the hover text has always promised and no code has ever
+/// done until now. A double-click asks for home, the same gesture the sliders
+/// wear, because "how do I put this back" should have one answer on a panel
+/// and not two.
+///
+/// The double-click arrives one step late: egui reports the first release as
+/// an ordinary click before it can know a second is coming, so a
+/// double-click on the body cycles once and THEN homes. That lands on the
+/// right value either way, which is why it is left alone rather than bought
+/// back with a timer nobody would be able to tune.
 pub fn stepped_row(
     ui: &mut egui::Ui,
     st: &FaceStyle,
     name: &str,
     choice: &str,
-) -> Option<i32> {
+) -> Option<StepAsk> {
     let mut out = None;
     ui.horizontal(|ui| {
         let w = ui.available_width();
@@ -231,7 +340,7 @@ pub fn stepped_row(
                 egui::RichText::new(name).font(bold(11.0)).color(st.s.ink),
             ),
         );
-        if ui
+        let body = ui
             .add_sized(
                 Vec2::new(w * (1.0 - LABEL_W) - 40.0, 18.0),
                 egui::Button::new(
@@ -239,10 +348,15 @@ pub fn stepped_row(
                 )
                 .fill(st.s.raised),
             )
-            .on_hover_text("click to cycle; right-click steps back")
-            .clicked()
-        {
-            out = Some(1);
+            .on_hover_text(
+                "click to cycle; right-click steps back; double-click to reset",
+            );
+        if home_gesture(&body) {
+            out = Some(StepAsk::Home);
+        } else if body.secondary_clicked() {
+            out = Some(StepAsk::By(-1));
+        } else if body.clicked() {
+            out = Some(StepAsk::By(1));
         }
         let back = ui.add_sized(
             Vec2::new(22.0, 18.0),
@@ -251,8 +365,10 @@ pub fn stepped_row(
             )
             .fill(st.s.raised),
         );
-        if back.clicked() {
-            out = Some(-1);
+        if home_gesture(&back) {
+            out = Some(StepAsk::Home);
+        } else if back.clicked() {
+            out = Some(StepAsk::By(-1));
         }
     });
     out
@@ -483,6 +599,24 @@ const NODE_GRAB: f32 = 12.0;
 /// `CURVE_POINTS` log grid. `drag` is the caller's latch: which node the
 /// press took, cleared on release — held by the caller because the widget is
 /// immediate-mode and owns nothing between frames.
+///
+/// **On the two faults the rows had, and why this widget has neither.** Its
+/// id is spelled out (`ui.id().with("eq-curve")`) instead of drawn from the
+/// auto counter, so nothing above it in the panel can shift it — the handles
+/// were never at risk of the strobe that took the sliders' double-click, and
+/// the measurement is in `dragging_a_curve_node_never_moves_the_rows_under_it`.
+/// It senses clicks AND drags from the start, so its double-click has always
+/// worked. What it does NOT get is a reset: on the curve that gesture is
+/// spoken for — a double-click on a node takes the band out and one on empty
+/// glass adds a band, which is the control the brief was written around, and
+/// no third meaning fits on one gesture. Putting a band back is what the five
+/// rows under it are for.
+///
+/// One rough edge left standing: the first press of a double-click is
+/// reported as an ordinary click before egui can know a second is coming, so
+/// double-clicking a node cycles its shape once on the way to removing it.
+/// The band ends up off either way and the stray shape is invisible under it,
+/// which is a smaller price than a hand-tuned click delay.
 #[allow(clippy::too_many_arguments)]
 pub fn eq_curve(
     ui: &mut egui::Ui,
@@ -838,5 +972,575 @@ mod tests {
         assert_eq!(fmt_ms(2.5), "2.5 ms");
         assert_eq!(fmt_ms(120.0), "120 ms");
         assert_eq!(fmt_ms(1_200.0), "1.20 s");
+    }
+
+    // ── the hand on a row ───────────────────────────────────────────────
+
+    /// A face of `n` plain continuous rows: the shape `faces::draw` gives
+    /// any unit without a hand-built panel, which is most of the suite.
+    fn a_face_of(n: usize) -> crate::faces::FaceLive {
+        crate::faces::FaceLive {
+            face: crate::ports::BuiltinFace {
+                path: "@tangent-tape".to_owned(),
+                params: (0..n)
+                    .map(|i| crate::ports::BuiltinFaceParam {
+                        id: i as u32,
+                        symbol: format!("p{i}"),
+                        name: format!("KNOB {i}"),
+                        units: "%".to_owned(),
+                        default: 0.25,
+                        reading: "50%".to_owned(),
+                        choices: Vec::new(),
+                        steps: 0,
+                        value: 0.5,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn a_test_style() -> FaceStyle {
+        let set = crate::settings::Settings::default();
+        let p = crate::recorder_panel::palette(&set);
+        FaceStyle::new(p.bg, p.lcd, p.lcd_face)
+    }
+
+    /// **The panel under the hand is the SAME panel every frame.**
+    ///
+    /// The reported fault: drag any slider on a suite face and everything
+    /// from the next row down flashes. A face folds its rows with "keep the
+    /// first ask", and the obvious spelling of that skips the rows under
+    /// whichever one acted — so on the frames the hand moves they are not
+    /// drawn at all, and on the frames it rests they are. That strobe is
+    /// also why a double-click never landed: a widget that is absent every
+    /// other frame cannot see two presses.
+    ///
+    /// So: press a row, then travel-rest-travel the way a real drag does,
+    /// and demand that the ids the face consumes and the rect it fills come
+    /// out identical on every one of those frames.
+    #[test]
+    fn a_dragged_row_never_moves_the_rows_under_it() {
+        let ctx = a_test_ctx();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 420.0));
+        let st = a_test_style();
+        let mut live = a_face_of(5);
+        // Mid-track of the FIRST row's slider: the label column ends at
+        // 0.34 of the width and the reading column starts at 0.81.
+        let mut at = egui::pos2(200.0, 9.0);
+        // A gesture that never fired would make every frame agree and prove
+        // nothing at all, so the asks are counted as well.
+        let mut acted = 0_u32;
+
+        let mut frame =
+            |events: Vec<egui::Event>, live: &mut crate::faces::FaceLive| -> (u64, Rect) {
+                let mut seen = (0_u64, Rect::NOTHING);
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                // A scope so the face's own extent is a rect
+                                // somebody can read, and so the auto-id
+                                // counter can be sampled either side of it.
+                                let mut consumed = 0_u64;
+                                let drawn = ui.scope(|ui| {
+                                    let before = ui.next_auto_id().value();
+                                    let act = crate::faces::draw(ui, &st, live);
+                                    consumed =
+                                        ui.next_auto_id().value().wrapping_sub(before);
+                                    act
+                                });
+                                seen = (consumed, drawn.response.rect);
+                                // The app's optimistic mirror, which is what
+                                // makes a RESTING hand report no change.
+                                if let Some(crate::faces::FaceAction::Set { id, value }) =
+                                    drawn.inner
+                                {
+                                    acted += 1;
+                                    if let Some(p) =
+                                        live.face.params.iter_mut().find(|p| p.id == id)
+                                    {
+                                        p.value = value;
+                                    }
+                                }
+                            });
+                    },
+                );
+                seen
+            };
+
+        let _ = frame(Vec::new(), &mut live);
+        let _ = frame(
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut live,
+        );
+        let mut seen: Vec<(u64, Rect)> = Vec::new();
+        for step in 0..6 {
+            let events = if step % 2 == 0 {
+                at.x += 6.0;
+                vec![egui::Event::PointerMoved(at)]
+            } else {
+                Vec::new()
+            };
+            seen.push(frame(events, &mut live));
+        }
+        assert!(
+            acted >= 3,
+            "the slider was never actually dragged, so this proves nothing \
+             ({acted} asks over the gesture)"
+        );
+        let first = seen[0];
+        assert!(
+            seen.iter().all(|s| *s == first),
+            "the face is not the same face frame to frame while a slider is \
+             dragged - (auto ids consumed, content rect) per frame: {seen:#?}"
+        );
+    }
+
+    /// The fold's whole contract: the first wish of the frame is the one
+    /// that travels, and the arguments after it were already evaluated —
+    /// which is to say already DRAWN.
+    #[test]
+    fn the_first_wish_of_the_frame_is_the_one_kept() {
+        let mut slot = None;
+        let mut drawn = 0;
+        for wish in [None, Some("freq"), Some("gain")] {
+            keep(&mut slot, {
+                drawn += 1;
+                wish
+            });
+        }
+        assert_eq!(slot, Some("freq"), "the fold kept the wrong ask");
+        assert_eq!(drawn, 3, "a row went undrawn because an earlier one acted");
+    }
+
+    // ── the double-click, one control at a time ─────────────────────────
+
+    fn press_at(p: egui::Pos2, down: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: down,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// A ready `Context` with the panel fonts in it — the kit prints in
+    /// Courier and monospace, and an uninstalled family is a different
+    /// layout, so every gesture test dresses itself the same way.
+    fn a_test_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        ctx
+    }
+
+    /// **Double-click a slider row and it goes home.** The gesture the hover
+    /// text has advertised since the kit was written and which no unit has
+    /// ever performed: `egui::Slider` senses drags only, and egui refuses
+    /// the CLICKED flag — and therefore `double_clicked` — to a widget that
+    /// never asked for clicks. Five frames: settle, press, release, press,
+    /// release, which is a double-click as the input layer counts one.
+    #[test]
+    fn a_double_click_puts_a_slider_row_home() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 60.0));
+        // The knob is parked well away from the number the DSP calls home,
+        // so nothing but the reset could produce it.
+        const HOME: f32 = 0.25;
+        let at = egui::pos2(200.0, 9.0);
+
+        let frame = |events: Vec<egui::Event>| -> Option<f32> {
+            let mut out = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            out = slider_row(ui, &st, "DRIVE", "80%", 0.80, HOME);
+                        });
+                },
+            );
+            out
+        };
+
+        let _ = frame(vec![egui::Event::PointerMoved(at)]);
+        let _ = frame(vec![press_at(at, true)]);
+        let _ = frame(vec![press_at(at, false)]);
+        let _ = frame(vec![press_at(at, true)]);
+        assert_eq!(
+            frame(vec![press_at(at, false)]),
+            Some(HOME),
+            "a double-click on a slider row did not ask for the DSP's default"
+        );
+    }
+
+    /// **And the drag still owns the hand once it has left the track.**
+    /// Teaching the slider to sense clicks changes how egui decides a press
+    /// IS a drag — a widget that senses both waits until the pointer has
+    /// moved too far to be a click, where a drag-only one is dragging at
+    /// once. The latch that carries a drag off the widget is a different
+    /// thing again, and the gesture people actually make (grab the knob,
+    /// haul it past the end of the track, past the row) has to keep working
+    /// or the cure would be worse than the fault.
+    #[test]
+    fn a_drag_that_leaves_the_track_still_moves_the_knob() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 200.0));
+        let mut value = 0.50_f32;
+        let frame = |events: Vec<egui::Event>, value: &mut f32| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            if let Some(v) =
+                                slider_row(ui, &st, "DRIVE", "50%", *value, 0.25)
+                            {
+                                *value = v;
+                            }
+                        });
+                },
+            );
+        };
+
+        let at = egui::pos2(200.0, 9.0);
+        frame(vec![egui::Event::PointerMoved(at)], &mut value);
+        frame(vec![press_at(at, true)], &mut value);
+        // Off the right end of the track and well below the row: nowhere
+        // the widget's own rect reaches.
+        for p in [
+            egui::pos2(260.0, 20.0),
+            egui::pos2(340.0, 60.0),
+            egui::pos2(600.0, 150.0),
+        ] {
+            frame(vec![egui::Event::PointerMoved(p)], &mut value);
+        }
+        assert!(
+            value > 0.99,
+            "the drag was dropped when the hand left the track: {value}"
+        );
+    }
+
+    /// **Double-click a stepped row and it goes home too** — one gesture for
+    /// "put it back" across the whole panel. The row names the wish; only
+    /// the face knows which position home is.
+    #[test]
+    fn a_double_click_asks_a_stepped_row_for_home() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 60.0));
+        // Mid-body of the cycling button: the label column ends at 0.34 of
+        // the width and the back-step is the last 22pt.
+        let at = egui::pos2(250.0, 9.0);
+
+        let frame = |events: Vec<egui::Event>| -> Option<StepAsk> {
+            let mut out = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            out = stepped_row(ui, &st, "SHAPE", "bell");
+                        });
+                },
+            );
+            out
+        };
+
+        let _ = frame(vec![egui::Event::PointerMoved(at)]);
+        let _ = frame(vec![press_at(at, true)]);
+        assert_eq!(
+            frame(vec![press_at(at, false)]),
+            Some(StepAsk::By(1)),
+            "a single click no longer cycles the row forward"
+        );
+        let _ = frame(vec![press_at(at, true)]);
+        assert_eq!(
+            frame(vec![press_at(at, false)]),
+            Some(StepAsk::Home),
+            "a double-click on a stepped row did not ask for home"
+        );
+    }
+
+    /// **And it is the ENGINE's number that comes back, through the whole
+    /// path.** The kit is handed a default by the face, the face reads it
+    /// off the pushed parameter, and the parameter carries what the unit's
+    /// own spec says — so this drives `faces::draw` rather than the row, and
+    /// asserts on the ask the app would forward. Both control kinds, since
+    /// a stepped parameter's home is an index and a slider's is a number.
+    #[test]
+    fn the_reset_a_face_asks_for_is_the_pushed_default() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 200.0));
+        let mut live = a_face_of(2);
+        live.face.params[0].value = 0.80;
+        live.face.params[0].default = 0.25;
+        // The second row is a three-way whose home is the LAST position, so
+        // neither "the first choice" nor "the one it is on" could pass.
+        live.face.params[1].choices =
+            vec!["off".to_owned(), "half".to_owned(), "full".to_owned()];
+        live.face.params[1].steps = 3;
+        live.face.params[1].value = 0.0;
+        live.face.params[1].default = 1.0;
+
+        // egui dates its clicks, so the test has to hold the clock rather
+        // than let two unrelated gestures run into one double.
+        let mut clock = 0.0_f64;
+        let frame = |events: Vec<egui::Event>,
+                         at: f64,
+                         live: &mut crate::faces::FaceLive|
+         -> Option<(u32, f32)> {
+            let mut out = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(at),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            if let Some(crate::faces::FaceAction::Set { id, value }) =
+                                crate::faces::draw(ui, &st, live)
+                            {
+                                out = Some((id, value));
+                            }
+                        });
+                },
+            );
+            out
+        };
+
+        // Rows are 18pt tall on 3pt of spacing, so the second one's middle
+        // sits at 30.
+        for (what, at, want) in [
+            ("the slider row", egui::pos2(200.0, 9.0), (0_u32, 0.25_f32)),
+            ("the stepped row", egui::pos2(250.0, 30.0), (1, 1.0)),
+        ] {
+            // A clean second between the two gestures: each is a
+            // double-click of its own, not the tail of the last one.
+            clock += 1.0;
+            let mut tick = |events: Vec<egui::Event>,
+                            live: &mut crate::faces::FaceLive|
+             -> Option<(u32, f32)> {
+                clock += 1.0 / 60.0;
+                frame(events, clock, live)
+            };
+            let _ = tick(vec![egui::Event::PointerMoved(at)], &mut live);
+            let _ = tick(vec![press_at(at, true)], &mut live);
+            let _ = tick(vec![press_at(at, false)], &mut live);
+            let _ = tick(vec![press_at(at, true)], &mut live);
+            assert_eq!(
+                tick(vec![press_at(at, false)], &mut live),
+                Some(want),
+                "{what} did not come home to the pushed default"
+            );
+        }
+    }
+
+    /// **A reset never lands on the row the hand did NOT double-click.**
+    /// egui dates its double-clicks rather than owning them: two quick
+    /// single clicks on two different rows come back as a double on the
+    /// second. Everywhere else that is harmless; here it would silently
+    /// throw away the value just placed on a neighbour. So: click one row,
+    /// click the next one straight after, and the second must set what was
+    /// clicked, never its default.
+    #[test]
+    fn a_click_on_one_row_cannot_reset_the_next_one() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 200.0));
+        let mut live = a_face_of(2);
+        for p in live.face.params.iter_mut() {
+            p.value = 0.80;
+            p.default = 0.25;
+        }
+        let mut clock = 0.0_f64;
+        let mut frame = |events: Vec<egui::Event>,
+                         live: &mut crate::faces::FaceLive|
+         -> Option<(u32, f32)> {
+            clock += 1.0 / 60.0;
+            let mut out = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(clock),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            if let Some(crate::faces::FaceAction::Set { id, value }) =
+                                crate::faces::draw(ui, &st, live)
+                            {
+                                out = Some((id, value));
+                            }
+                        });
+                },
+            );
+            out
+        };
+
+        let first = egui::pos2(200.0, 9.0);
+        let second = egui::pos2(200.0, 30.0);
+        let _ = frame(vec![egui::Event::PointerMoved(first)], &mut live);
+        let _ = frame(vec![press_at(first, true)], &mut live);
+        let _ = frame(vec![press_at(first, false)], &mut live);
+        // The very next frames, well inside the double-click window.
+        let _ = frame(vec![egui::Event::PointerMoved(second)], &mut live);
+        let _ = frame(vec![press_at(second, true)], &mut live);
+        let landed = frame(vec![press_at(second, false)], &mut live);
+        assert!(
+            !matches!(landed, Some((1, v)) if (v - 0.25).abs() < 1.0e-6),
+            "clicking one row reset the NEXT one: {landed:?}"
+        );
+    }
+
+    /// **The curve is the other draggable, and it drags the same rows.**
+    /// The EQ's nodes take their id from [`eq_curve`]'s own explicit
+    /// `ui.id().with("eq-curve")` rather than the auto counter, so the
+    /// widget itself was never at risk of the strobe. The five rows UNDER
+    /// it were, and worse than the sliders': a held node reports a move on
+    /// every frame, not only the ones the hand travels, so the band's whole
+    /// control surface did not flicker — it was simply GONE for as long as
+    /// a node was held. That is why the measure here is the panel at REST,
+    /// carried through the drag: a gesture on the picture must not take the
+    /// rows away.
+    #[test]
+    fn dragging_a_curve_node_never_moves_the_rows_under_it() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(470.0, 470.0));
+        // Three bands of five: on, kind, freq, gain, q — the face's own
+        // band-major id plan.
+        let mut live = a_face_of(15);
+        live.face.path = "@tangent-eq".to_owned();
+        for band in 0..3 {
+            let base = band * 5;
+            live.face.params[base].value = 1.0;
+            live.face.params[base + 1].choices =
+                ["bell", "lo-shelf", "hi-shelf"].map(str::to_owned).to_vec();
+            live.face.params[base + 1].steps = 3;
+            for k in 1..5 {
+                live.face.params[base + k].value = 0.5;
+            }
+        }
+        // The first node: the middle of the log sweep at 0 dB, which the
+        // curve's own mapping puts at the middle of its inner rect.
+        // The curve fills the panel width, so 0.5 of the log sweep lands at
+        // the middle of its inner rect: (470 - 12) / 2 + 6.
+        let mut at = egui::pos2(235.0, 95.0);
+
+        // A gesture that never fired would make every frame agree and prove
+        // nothing at all, so the asks are counted as well.
+        let mut acted = 0_u32;
+        let mut frame =
+            |events: Vec<egui::Event>, live: &mut crate::faces::FaceLive| -> (u64, Rect) {
+                let mut seen = (0_u64, Rect::NOTHING);
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                let mut consumed = 0_u64;
+                                let drawn = ui.scope(|ui| {
+                                    let before = ui.next_auto_id().value();
+                                    let act = crate::faces::draw(ui, &st, live);
+                                    consumed =
+                                        ui.next_auto_id().value().wrapping_sub(before);
+                                    act
+                                });
+                                seen = (consumed, drawn.response.rect);
+                                if let Some(crate::faces::FaceAction::Set { id, value }) =
+                                    drawn.inner
+                                {
+                                    acted += 1;
+                                    if let Some(p) =
+                                        live.face.params.iter_mut().find(|p| p.id == id)
+                                    {
+                                        p.value = value;
+                                    }
+                                }
+                            });
+                    },
+                );
+                seen
+            };
+
+        let _ = frame(Vec::new(), &mut live);
+        // The panel with nobody touching it: the shape every later frame
+        // has to keep.
+        let at_rest = frame(Vec::new(), &mut live);
+        // The press, then a decisive first step: egui postpones the drag on
+        // a widget that senses clicks AND drags until the hand has moved
+        // too far to be a click, and the grab is only taken while the
+        // pointer is still within reach of the node.
+        let _ = frame(
+            vec![egui::Event::PointerMoved(at), press_at(at, true)],
+            &mut live,
+        );
+        let mut seen: Vec<(u64, Rect)> = vec![at_rest];
+        for step in 0..8 {
+            let events = if step % 2 == 0 {
+                at.y -= if step == 0 { 9.0 } else { 3.0 };
+                vec![egui::Event::PointerMoved(at)]
+            } else {
+                Vec::new()
+            };
+            seen.push(frame(events, &mut live));
+        }
+        assert!(
+            acted >= 2,
+            "the node was never actually dragged, so this proves nothing \
+             ({acted} asks over the gesture)"
+        );
+        assert!(
+            seen.iter().all(|s| *s == at_rest),
+            "the EQ face is not the face it was at rest while a node is \
+             dragged - (auto ids consumed, content rect) per frame: {seen:#?}"
+        );
     }
 }
