@@ -8154,6 +8154,15 @@ impl TangentApp {
                 );
                 self.settings.strip_inserts[dst * INSERTS + b] =
                     inserts[src * INSERTS + b].clone();
+                // And the pedalboard, seven seats per channel, same rule.
+                for p in 0..crate::recorder::AMP_PEDALS {
+                    let (dst, src) = (
+                        crate::recorder::amp_pedal_seat(n, p),
+                        crate::recorder::amp_pedal_seat(order[n], p),
+                    );
+                    self.settings.strip_inserts[dst * INSERTS + b] =
+                        inserts[src * INSERTS + b].clone();
+                }
             }
         }
 
@@ -8188,11 +8197,16 @@ impl TangentApp {
         if let Some((strip, _)) = self.open_insert_on_load.as_mut() {
             if *strip < CHANNELS {
                 *strip = inv[*strip];
+            } else if let Some((ch, p)) = crate::recorder::amp_pedal_of(*strip) {
+                // A pedal seat follows its channel, like its plugins did.
+                *strip = crate::recorder::amp_pedal_seat(inv[ch], p);
             }
         }
         if let Some((strip, _)) = self.picker_insert.as_mut() {
             if *strip < CHANNELS {
                 *strip = inv[*strip];
+            } else if let Some((ch, p)) = crate::recorder::amp_pedal_of(*strip) {
+                *strip = crate::recorder::amp_pedal_seat(inv[ch], p);
             }
         }
 
@@ -20669,8 +20683,10 @@ impl TangentApp {
     }
 
     pub fn set_insert(&mut self, strip: usize, slot: usize, path: Option<&str>) {
-        let need = (crate::recorder::STRIPS + 1 + crate::recorder::DRUM_PADS)
-            * crate::recorder::INSERTS;
+        // The WHOLE insert space, not the strips-plus-pads slice it once
+        // was: a write to a folder-extra or pedal seat on a vector still at
+        // the old length would fall silently past the end.
+        let need = crate::recorder::INSERT_SPACE;
         if self.settings.strip_inserts.len() < need {
             self.settings.strip_inserts.resize(need, String::new());
         }
@@ -22559,6 +22575,19 @@ impl TangentApp {
                 // One bay, one choice: the window answered its question.
                 // Unlike the routing dialog there is nothing else to add.
                 self.dialog = None;
+            }
+            DialogAction::OpenPedalPicker { strip, slot, pedal } => {
+                // The face speaks DESK terms; the pedal seat is the
+                // CHANNEL's, so resolve the seat first — an amp on the
+                // master or a folder's extra rack has no board and the chip
+                // row never drew, but a stale ask must still go nowhere.
+                // No new addressing road: `picker_insert` has always
+                // carried raw SEATS (its callers pass `seat_bay` output),
+                // so a pedal seat rides the existing picker unchanged.
+                let (seat, _) = recorder::seat_bay(strip, slot);
+                if seat < recorder::CHANNELS && pedal < recorder::AMP_PEDALS {
+                    self.open_insert_picker(recorder::amp_pedal_seat(seat, pedal), 0);
+                }
             }
             DialogAction::AcceptCheat => {
                 // The "...": for the keyless this is the unlock, real from
@@ -27048,6 +27077,18 @@ impl TangentApp {
             }
             live.gr_db = self.insert_gr(seat, bay);
             live.preset_rows = self.preset_rows(&live.face.path).to_vec();
+            // The amp face's pedal chips, refreshed from settings like the
+            // rest of the picture — and only for a CHANNEL's seat: the
+            // master, the buses and a folder's extra rack wear no board.
+            live.pedals = (live.face.path == crate::faces_amp::AMP_PATH
+                && seat < recorder::CHANNELS)
+                .then(|| {
+                    std::array::from_fn(|p| {
+                        self.insert(recorder::amp_pedal_seat(seat, p), 0)
+                            .map(crate::faces_amp::pedal_label)
+                            .unwrap_or_default()
+                    })
+                });
             match live.face.path.as_str() {
                 "@tangent-eq" => {
                     let dt = ctx.input(|i| i.stable_dt);

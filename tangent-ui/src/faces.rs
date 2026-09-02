@@ -19,7 +19,7 @@ use crate::ports::{BuiltinFace, BuiltinFaceParam, PresetRow};
 /// panel, and the line under it. The engine's `builtin_fx::UNITS` is the
 /// same list; the PATH is the contract between them, exactly as
 /// `KEYS_PATCH_NAMES` documents for the keyboard.
-pub const SUITE_UNITS: [(&str, &str, &str); 4] = [
+pub const SUITE_UNITS: [(&str, &str, &str); 5] = [
     ("@tangent-eq", "Tangent EQ", "three bands you can hold in your hand"),
     (
         "@tangent-imager",
@@ -35,6 +35,11 @@ pub const SUITE_UNITS: [(&str, &str, &str); 4] = [
         "@tangent-comp",
         "Tangent Comp",
         "dials, a needle, and nothing to hide behind",
+    ),
+    (
+        crate::faces_amp::AMP_PATH,
+        "Tangent Amp",
+        "warm and clean, with a pedalboard underfoot",
     ),
 ];
 
@@ -70,6 +75,12 @@ pub struct FaceLive {
     pub drag: Option<usize>,
     /// The EQ's band under the rows, chosen by the last gesture.
     pub band: usize,
+    /// The amp face's pedal chips: each pedal's short label, empty for an
+    /// empty pedal slot. `None` when the face's seat carries no pedalboard
+    /// — the amp on a folder's extra rack, the master or a bus. Filled by
+    /// the app each frame, like every other field here, because tenants
+    /// live in settings and a face reads only what it is pushed.
+    pub pedals: Option<[String; crate::recorder::AMP_PEDALS]>,
 }
 
 /// What a face asked for. `Set` speaks the unit's own stable ids; the
@@ -78,6 +89,9 @@ pub enum FaceAction {
     Set { id: u32, value: f32 },
     SavePreset { name: String },
     LoadPreset { path: String },
+    /// The amp face's pedal chip: open the picker over pedal `pedal`'s
+    /// seat. The face knows only the ordinal; the app owns the seat math.
+    OpenPedal { pedal: usize },
 }
 
 fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {
@@ -190,6 +204,7 @@ pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fa
         "@tangent-eq" => draw_eq(ui, st, live),
         "@tangent-imager" => draw_imager(ui, st, live),
         "@tangent-comp" => draw_comp(ui, st, live),
+        crate::faces_amp::AMP_PATH => crate::faces_amp::draw_amp(ui, st, live),
         // The tape, the trim, and anything the suite grows before its face
         // does: every continuous parameter as a row, in id order.
         _ => {
