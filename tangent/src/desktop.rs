@@ -612,6 +612,13 @@ pub struct DesktopApp {
     pad_cache: std::collections::HashMap<std::path::PathBuf, Arc<tangent_record::decode::Clip>>,
     /// The scope drain's reusable buffer.
     scope_buf: Vec<f32>,
+    /// The INSERT tap drain's reusable buffer, and where the tap is aimed —
+    /// `None` while no plugin face has it armed, which is also the gate on
+    /// draining it at all. Kept in ENGINE terms (seat, bay), translated once
+    /// where the request lands, so an engine rebuilt mid-session could be
+    /// re-armed from here without re-asking the UI.
+    tap_buf: Vec<f32>,
+    insert_tap_at: Option<(usize, usize)>,
 }
 
 /// How many columns the backing track's waveform is drawn from.
@@ -2144,6 +2151,19 @@ impl DesktopApp {
                 self.app.scope_feed(&self.scope_buf, dt, rate);
             }
         }
+        // **The INSERT tap, drained dry once a frame — but only while a face
+        // has it armed.** Disarmed, the engine pushes nothing and this skips
+        // even the empty pop-loop, so an idle session pays nothing at all.
+        if self.insert_tap_at.is_some() {
+            if let Some(e) = self.recorder.engine.as_mut() {
+                self.tap_buf.clear();
+                e.drain_insert_tap(&mut self.tap_buf);
+                let rate = e.output().sample_rate as f32;
+                if !self.tap_buf.is_empty() {
+                    self.app.insert_tap_feed(rate, &self.tap_buf);
+                }
+            }
+        }
         // **Read before the state is borrowed mutably.** Both are pure
         // functions of the settings, so hoisting them changes nothing but
         // the borrow.
@@ -3397,6 +3417,17 @@ impl DesktopApp {
                             self.recorder.engine_error =
                                 Some(format!("could not open the effect's window: {err}"));
                         }
+                    }
+                }
+                R::SetInsertTap { strip, slot, on } => {
+                    // The face speaks DESK terms; `seat_bay` is the one
+                    // translation into the rack's, exactly as its own note
+                    // demands — a call site that recomputes the master's
+                    // two-rack fold taps somebody else's plugin.
+                    let at = tangent_ui::recorder::seat_bay(strip, slot);
+                    self.insert_tap_at = on.then_some(at);
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        e.set_insert_tap(self.insert_tap_at);
                     }
                 }
             }
@@ -7750,6 +7781,8 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             pad_cache: std::collections::HashMap::new(),
             scope_buf: Vec::new(),
+            tap_buf: Vec::new(),
+            insert_tap_at: None,
         };
         // What the effects ship as, so the panel can draw a slider for a
         // parameter nobody has moved. See `ports::EffectDefaults`: the DSP owns

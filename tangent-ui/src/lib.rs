@@ -45,6 +45,7 @@ pub mod shell;
 pub mod routing;
 pub mod theme;
 pub mod theory_panel;
+pub mod tapring;
 
 /// The version the About box reports.
 ///

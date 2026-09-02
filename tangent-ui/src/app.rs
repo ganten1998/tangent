@@ -910,6 +910,10 @@ pub struct TangentApp {
     export_project_spec: crate::ports::ProjectExportSpec,
     /// The band's oscilloscope: the speakers' mix without the click.
     scope: crate::scope::Scope,
+    /// The INSERT tap's ring: the audio at whichever bay the one open
+    /// plugin face armed — the EQ's analyzer and the imager's vectorscope
+    /// both read it. Fed by the host through `insert_tap_feed`.
+    tapring: crate::tapring::TapRing,
     /// The TIME SELECTION, in song seconds: drawn over the lanes, offered
     /// to the export. A ruler click clears it.
     time_sel: Option<(f64, f64)>,
@@ -2303,6 +2307,7 @@ impl TangentApp {
             browsed_dir: None,
             export_project_spec: crate::ports::ProjectExportSpec::default(),
             scope: crate::scope::Scope::new(48_000.0),
+            tapring: crate::tapring::TapRing::new(48_000.0),
             time_sel: None,
             menu_rows_cache: None,
             menu_cache_key: (String::new(), 0),
@@ -20461,6 +20466,26 @@ impl TangentApp {
     pub fn scope_feed(&mut self, samples: &[f32], dt: f32, rate: f32) {
         self.scope.set_rate(rate);
         self.scope.tick(samples, dt);
+    }
+
+    /// The engine's INSERT tap, drained by the host once a frame while a
+    /// plugin face has it armed: interleaved stereo of whatever bay the tap
+    /// is pointed at. Lands in [`crate::tapring::TapRing`], where the EQ's
+    /// analyzer and the imager's vectorscope read it.
+    pub fn insert_tap_feed(&mut self, rate: f32, samples: &[f32]) {
+        self.tapring.set_rate(rate);
+        self.tapring.tick(samples);
+    }
+
+    /// The tap's ring, for the faces to read.
+    pub fn insert_tap(&self) -> &crate::tapring::TapRing {
+        &self.tapring
+    }
+
+    /// And mutably — a face that re-aims the tap clears the ring, so the
+    /// new bay's first frames are not painted onto the old bay's tail.
+    pub fn insert_tap_mut(&mut self) -> &mut crate::tapring::TapRing {
+        &mut self.tapring
     }
 
     /// The export destination the native chooser picked: into the OPEN

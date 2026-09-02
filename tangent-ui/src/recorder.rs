@@ -1782,6 +1782,19 @@ pub enum RecorderRequest {
     PreviewFile(std::path::PathBuf),
     /// Silence the preview — the explorer closed.
     PreviewStop,
+    /// **Aim the engine's ONE insert tap at a mixer slot, or take it off**
+    /// — the feed behind an EQ face's analyzer and an imager face's
+    /// vectorscope. `strip` and `slot` are DESK terms (`Strip::index` and
+    /// the strip's Nth slot); the host owns the `seat_bay` translation, the
+    /// same way it owns it for `OpenInsertEditor`.
+    ///
+    /// A request because the tap is the engine's: this crate cannot reach
+    /// `Engine::set_insert_tap` — the firewall is the whole point — so the
+    /// face says which bay it is looking at and the host arms the tap and
+    /// starts draining it into `TangentApp::insert_tap_feed`. Only one face
+    /// is ever open, so the LAST request wins and `on: false` from the
+    /// closing face disarms.
+    SetInsertTap { strip: usize, slot: usize, on: bool },
 }
 
 /// How hard an auditioned note is struck.
