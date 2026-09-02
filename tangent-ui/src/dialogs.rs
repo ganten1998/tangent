@@ -8623,9 +8623,15 @@ mod tests {
     fn no_effect_is_named_after_hardware_it_only_refers_to() {
         let marks = [
             "emt", "roland", "space echo", "re-201", "boss", "ce-1", "mxr",
-            "phase 90", "140",
+            "phase 90", "140", "fender", "ibanez", "screamer", "vox",
+            "cry baby", "cedar",
         ];
-        for (path, name, what) in super::FX_UNITS {
+        // Both shelves under the one rule: the fixed chain's rows and the
+        // suite's insert units, because the suite reuses three of the
+        // chain's names and the day someone renames one is the day the rule
+        // needs to be standing on both.
+        let rows = super::FX_UNITS.iter().chain(crate::faces::SUITE_UNITS.iter());
+        for (path, name, what) in rows.clone() {
             let lower = name.to_lowercase();
             for mark in marks {
                 assert!(
@@ -8644,6 +8650,33 @@ mod tests {
             for (other, other_name, _) in &super::FX_UNITS[i + 1..] {
                 assert_ne!(path, other, "two rows share the path {path}");
                 assert_ne!(name, other_name, "two rows share the name {name}");
+            }
+        }
+        // Within the suite the same uniqueness holds; ACROSS the two lists
+        // the chorus, echo and plate share on purpose — they are one effect
+        // each, reachable from two doors — so cross-list sharing must be
+        // exactly that set and no more.
+        for (i, (path, name, _)) in crate::faces::SUITE_UNITS.iter().enumerate() {
+            for (other, other_name, _) in &crate::faces::SUITE_UNITS[i + 1..] {
+                assert_ne!(path, other, "two suite rows share the path {path}");
+                assert_ne!(name, other_name, "two suite rows share the name {name}");
+            }
+        }
+        let shared_on_purpose = ["@tangent-chorus", "@tangent-echo", "@tangent-plate"];
+        for (path, name, _) in super::FX_UNITS {
+            let in_suite = crate::faces::SUITE_UNITS.iter().find(|(p, ..)| *p == path);
+            if shared_on_purpose.contains(&path) {
+                let (_, suite_name, _) =
+                    in_suite.expect("a declared-shared sentinel left the suite");
+                assert_eq!(
+                    *suite_name, name,
+                    "{path} wears two names, one per door"
+                );
+            } else {
+                assert!(
+                    in_suite.is_none(),
+                    "{path} appeared in both lists without being declared shared"
+                );
             }
         }
     }
@@ -10314,6 +10347,15 @@ at: None,
                         "Tangent Imager",
                         "Tangent Tape",
                         "Tangent Comp",
+                        "Tangent Denoise",
+                        "Tangent Amp",
+                        "Tangent Drive",
+                        "Tangent Trem",
+                        "Tangent Chorus",
+                        "Tangent Echo",
+                        "Tangent Plate",
+                        "Tangent Wah",
+                        "Tangent IR",
                         "analog lab v",
                         "the modelled piano",
                         "Vital"
@@ -10330,12 +10372,13 @@ at: None,
                     .iter()
                     .filter(|p| !is_builtin(&p.path))
                     .all(|p| p.vendor.is_empty()));
-                // Eight, not one: the house shelf took the first seven rows.
-                assert_eq!(*selected, Some(8), "it did not open on what is loaded");
+                // Seventeen, not one: the house shelf took the first sixteen
+                // rows — three instruments and the thirteen-unit suite.
+                assert_eq!(*selected, Some(17), "it did not open on what is loaded");
                 assert_eq!(current.as_deref(), Some(loaded.as_str()));
                 assert!(filter.is_empty() && *focus);
                 assert!(
-                    plugin_row(&plugins[8], Some(&loaded)).starts_with('\u{2022}'),
+                    plugin_row(&plugins[17], Some(&loaded)).starts_with('\u{2022}'),
                     "the loaded plugin is not marked"
                 );
                 assert!(
@@ -10344,7 +10387,7 @@ at: None,
                 );
                 // Every row is bare — the folder heading carries the vendor,
                 // the house shelf's included.
-                assert_eq!(plugin_row(&plugins[9], None), "  Vital");
+                assert_eq!(plugin_row(&plugins[18], None), "  Vital");
                 assert_eq!(plugin_row(&plugins[0], None), format!("  {BUILTIN_NAME}"));
                 // The vendor is a FOLDER heading now, never a row suffix —
                 // the owner's ruling. A scanned plugin's row is bare.

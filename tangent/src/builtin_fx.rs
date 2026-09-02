@@ -43,6 +43,22 @@ pub const IMAGER_PATH: &str = "@tangent-imager";
 pub const TAPE_PATH: &str = "@tangent-tape";
 pub const COMP_PATH: &str = "@tangent-comp";
 
+/// The rest of the shelf: the nine kernels registered after the first four
+/// proved the road. Three of these sentinels — the chorus, the echo and the
+/// plate — were declared in `dialogs::FX_UNITS` long before the units
+/// existed, waiting for exactly this registration, so those strings are
+/// reused rather than re-invented: they are the same effects the fixed
+/// chain ships, now seatable in any bay.
+pub const DENOISE_PATH: &str = "@tangent-denoise";
+pub const AMP_PATH: &str = "@tangent-amp";
+pub const DRIVE_PATH: &str = "@tangent-drive";
+pub const TREM_PATH: &str = "@tangent-trem";
+pub const CHORUS_PATH: &str = "@tangent-chorus";
+pub const ECHO_PATH: &str = "@tangent-echo";
+pub const PLATE_PATH: &str = "@tangent-plate";
+pub const WAH_PATH: &str = "@tangent-wah";
+pub const IR_PATH: &str = "@tangent-ir";
+
 /// One parameter a unit publishes: what the automation lane, the state blob
 /// and (one day) a knob panel all address it by.
 ///
@@ -164,6 +180,103 @@ const COMP_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 6, symbol: "key_hpf", name: "Key HPF", units: "Hz", default: 0.0, steps: 0 },
 ];
 
+/// One knob per `units::denoise::DenoiseParams` field. Defaults are the
+/// kernel's — nothing learned, a wire — and the defaults-pin test holds the
+/// two together. The 32 learned thresholds are NOT knobs: they persist as
+/// the extra-state symbols `t0..t31` (see [`is_extra_symbol`]), because a
+/// threshold is a measurement, not a dial an automation lane should sweep.
+const DENOISE_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "learn", name: "Learn", units: "", default: 0.0, steps: 2 },
+    ParamSpec { id: 1, symbol: "reduce", name: "Reduce", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 2, symbol: "smooth", name: "Smooth", units: ":1", default: 0.5, steps: 0 },
+    ParamSpec { id: 3, symbol: "release", name: "Release", units: "ms", default: 0.5, steps: 0 },
+    ParamSpec { id: 4, symbol: "sc_hpf", name: "Detector HPF", units: "Hz", default: 0.0, steps: 0 },
+    ParamSpec { id: 5, symbol: "lookahead", name: "Lookahead", units: "", default: 1.0, steps: 2 },
+];
+
+/// One knob per `units::amp::AmpParams` field, panel order. Defaults are the
+/// kernel's shipped warm-and-clean sound.
+const AMP_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "bright", name: "Bright", units: "", default: 0.0, steps: 2 },
+    ParamSpec { id: 1, symbol: "volume", name: "Volume", units: "%", default: 0.7, steps: 0 },
+    ParamSpec { id: 2, symbol: "treble", name: "Treble", units: "%", default: 0.5, steps: 0 },
+    ParamSpec { id: 3, symbol: "middle", name: "Middle", units: "%", default: 0.5, steps: 0 },
+    ParamSpec { id: 4, symbol: "bass", name: "Bass", units: "%", default: 0.5, steps: 0 },
+    ParamSpec { id: 5, symbol: "vib_speed", name: "Vib Speed", units: "Hz", default: 0.35, steps: 0 },
+    ParamSpec { id: 6, symbol: "vib_depth", name: "Vib Depth", units: "%", default: 0.0, steps: 0 },
+    ParamSpec { id: 7, symbol: "vib_stereo", name: "Vib Stereo", units: "%", default: 0.0, steps: 0 },
+];
+
+/// One knob per `units::drive::DriveParams` field: the pedal as it leaves
+/// the factory.
+const DRIVE_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "drive", name: "Drive", units: "%", default: 0.35, steps: 0 },
+    ParamSpec { id: 1, symbol: "tone", name: "Tone", units: "Hz", default: 0.5, steps: 0 },
+    ParamSpec { id: 2, symbol: "level", name: "Level", units: "dB", default: 0.71, steps: 0 },
+    ParamSpec { id: 3, symbol: "symmetry", name: "Symmetry", units: "", default: 0.0, steps: 2 },
+];
+
+/// One knob per `units::trem::TremParams` field: the amp circuit in a box,
+/// at the setting the reference amp spends its life on.
+const TREM_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "speed", name: "Speed", units: "Hz", default: 0.35, steps: 0 },
+    ParamSpec { id: 1, symbol: "depth", name: "Depth", units: "%", default: 0.6, steps: 0 },
+    ParamSpec { id: 2, symbol: "stereo", name: "Stereo", units: "%", default: 0.0, steps: 0 },
+];
+
+/// One knob per `units::chorus::ChorusParams` field — the fixed chain's
+/// voice with its send full up, per the extraction lane's mapping table.
+const CHORUS_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "rate", name: "Rate", units: "Hz", default: 0.28, steps: 0 },
+    ParamSpec { id: 1, symbol: "depth", name: "Depth", units: "%", default: 0.55, steps: 0 },
+    ParamSpec { id: 2, symbol: "width", name: "Width", units: "%", default: 0.85, steps: 0 },
+    ParamSpec { id: 3, symbol: "tone", name: "Tone", units: "Hz", default: 0.45, steps: 0 },
+    ParamSpec { id: 4, symbol: "mix", name: "Mix", units: "%", default: 1.0, steps: 0 },
+];
+
+/// One knob per `units::echo::EchoParams` field. `mix` is last ON PURPOSE
+/// and stays last: the kernel documents that a `sync` field will be
+/// APPENDED after it when the bay protocol carries a tempo, and this id
+/// space is as append-only as every other.
+const ECHO_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        id: 0,
+        symbol: "time",
+        name: "Time",
+        units: "ms",
+        default: crate::units::echo::ECHO_TIME_DEFAULT,
+        steps: 0,
+    },
+    ParamSpec { id: 1, symbol: "feedback", name: "Feedback", units: "%", default: 0.42, steps: 0 },
+    ParamSpec { id: 2, symbol: "tone", name: "Tone", units: "%", default: 0.55, steps: 0 },
+    ParamSpec { id: 3, symbol: "mix", name: "Mix", units: "%", default: 1.0, steps: 0 },
+];
+
+/// One knob per `units::plate::PlateParams` field: the fixed chain's
+/// 2.2-second plate with the send full up.
+const PLATE_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "decay", name: "Decay", units: "s", default: 0.34, steps: 0 },
+    ParamSpec { id: 1, symbol: "predelay", name: "Predelay", units: "ms", default: 0.0, steps: 0 },
+    ParamSpec { id: 2, symbol: "width", name: "Width", units: "%", default: 0.80, steps: 0 },
+    ParamSpec { id: 3, symbol: "mix", name: "Mix", units: "%", default: 1.0, steps: 0 },
+];
+
+/// One knob per `units::wah::WahParams` field: the clav patch's own pedal.
+const WAH_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "sens", name: "Sens", units: "%", default: 0.55, steps: 0 },
+    ParamSpec { id: 1, symbol: "base", name: "Base", units: "Hz", default: 0.5, steps: 0 },
+    ParamSpec { id: 2, symbol: "q", name: "Q", units: "%", default: 0.5, steps: 0 },
+    ParamSpec { id: 3, symbol: "mix", name: "Mix", units: "%", default: 1.0, steps: 0 },
+];
+
+/// One knob per `units::convolver::ConvolverParams` field. The IR itself is
+/// not a knob: it persists as the extra-state symbol `ir_path` and is read
+/// off disk at load time, host-side, like a plugin loading its own data.
+const IR_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "mix", name: "Mix", units: "%", default: 1.0, steps: 0 },
+    ParamSpec { id: 1, symbol: "trim", name: "Trim", units: "dB", default: 0.5, steps: 0 },
+];
+
 fn build_trim(sample_rate: f32) -> BuiltinUnit {
     BuiltinUnit::Trim(Trim::new(sample_rate))
 }
@@ -182,6 +295,42 @@ fn build_tape(sample_rate: f32) -> BuiltinUnit {
 
 fn build_comp(sample_rate: f32) -> BuiltinUnit {
     BuiltinUnit::Comp(CompUnit::new(sample_rate))
+}
+
+fn build_denoise(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Denoise(DenoiseUnit::new(sample_rate))
+}
+
+fn build_amp(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Amp(AmpUnit::new(sample_rate))
+}
+
+fn build_drive(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Drive(DriveUnit::new(sample_rate))
+}
+
+fn build_trem(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Trem(TremUnit::new(sample_rate))
+}
+
+fn build_chorus(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Chorus(ChorusUnit::new(sample_rate))
+}
+
+fn build_echo(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Echo(EchoUnit::new(sample_rate))
+}
+
+fn build_plate(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Plate(PlateUnit::new(sample_rate))
+}
+
+fn build_wah(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Wah(WahUnit::new(sample_rate))
+}
+
+fn build_ir(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Ir(IrUnit::new(sample_rate))
 }
 
 /// Every effect this build ships. Order is nothing; the path is the key.
@@ -215,6 +364,60 @@ pub const UNITS: &[UnitSpec] = &[
         class: "Tangent Comp",
         params: COMP_FACE_PARAMS,
         build: build_comp,
+    },
+    UnitSpec {
+        path: DENOISE_PATH,
+        class: "Tangent Denoise",
+        params: DENOISE_FACE_PARAMS,
+        build: build_denoise,
+    },
+    UnitSpec {
+        path: AMP_PATH,
+        class: "Tangent Amp",
+        params: AMP_FACE_PARAMS,
+        build: build_amp,
+    },
+    UnitSpec {
+        path: DRIVE_PATH,
+        class: "Tangent Drive",
+        params: DRIVE_FACE_PARAMS,
+        build: build_drive,
+    },
+    UnitSpec {
+        path: TREM_PATH,
+        class: "Tangent Trem",
+        params: TREM_FACE_PARAMS,
+        build: build_trem,
+    },
+    UnitSpec {
+        path: CHORUS_PATH,
+        class: "Tangent Chorus",
+        params: CHORUS_FACE_PARAMS,
+        build: build_chorus,
+    },
+    UnitSpec {
+        path: ECHO_PATH,
+        class: "Tangent Echo",
+        params: ECHO_FACE_PARAMS,
+        build: build_echo,
+    },
+    UnitSpec {
+        path: PLATE_PATH,
+        class: "Tangent Plate",
+        params: PLATE_FACE_PARAMS,
+        build: build_plate,
+    },
+    UnitSpec {
+        path: WAH_PATH,
+        class: "Tangent Wah",
+        params: WAH_FACE_PARAMS,
+        build: build_wah,
+    },
+    UnitSpec {
+        path: IR_PATH,
+        class: "Tangent IR",
+        params: IR_FACE_PARAMS,
+        build: build_ir,
     },
 ];
 
@@ -281,8 +484,67 @@ pub fn describe(path: &str, id: u32, value: f32) -> String {
                 }
             }
         }
+        (DENOISE_PATH, id) => {
+            use crate::units::denoise::*;
+            match id {
+                // The same words `choices` offers, so the stepped row and
+                // the reading can never disagree about what the button says.
+                0 => (if v >= 0.5 { "Listening" } else { "Learn" }).to_owned(),
+                // The cap on the CUT, so the sign says which way it goes.
+                1 => {
+                    if v <= 0.0 {
+                        "off".to_owned()
+                    } else {
+                        fmt_db(-(v * DENOISE_REDUCE_DB))
+                    }
+                }
+                2 => format!("{:.1}:1", sweep(DENOISE_RATIO)),
+                3 => fmt_ms(sweep(DENOISE_RELEASE_MS)),
+                4 => {
+                    if v <= 0.0 {
+                        "off".to_owned()
+                    } else {
+                        fmt_hz(sweep(DENOISE_SC_HPF_HZ))
+                    }
+                }
+                _ => {
+                    if v >= 0.5 {
+                        fmt_ms(DENOISE_LOOKAHEAD_MS)
+                    } else {
+                        "off".to_owned()
+                    }
+                }
+            }
+        }
+        (AMP_PATH, 0) => (if v >= 0.5 { "on" } else { "off" }).to_owned(),
+        // The vibrato speed rides the opto circuit's own geometric sweep;
+        // the pots read as pot travel — a tone stack has no honest Hz.
+        (AMP_PATH, 5) => fmt_hz(sweep(crate::units::trem::TREM_SPEED_HZ)),
+        (AMP_PATH, _) => fmt_pct(v),
+        (DRIVE_PATH, 1) => fmt_hz(sweep(crate::units::drive::DRIVE_TONE_HZ)),
+        (DRIVE_PATH, 2) => {
+            // Square-law across 0..DRIVE_LEVEL_MAX, printed as the dB it
+            // lands on — the shipped 0.71 reads as unity's +0.0.
+            use crate::units::drive::DRIVE_LEVEL_MAX;
+            if v <= 0.0 {
+                "off".to_owned()
+            } else {
+                fmt_db(20.0 * (v * v * DRIVE_LEVEL_MAX).log10())
+            }
+        }
+        (DRIVE_PATH, 3) => (if v >= 0.5 { "uneven" } else { "matched" }).to_owned(),
+        (TREM_PATH, 0) => fmt_hz(sweep(crate::units::trem::TREM_SPEED_HZ)),
+        (CHORUS_PATH, 0) => fmt_hz(lerp(crate::effects::CHORUS_RATE_HZ)),
+        (CHORUS_PATH, 3) => fmt_hz(lerp(crate::effects::CHORUS_LP_HZ)),
+        (ECHO_PATH, 0) => fmt_ms(sweep(crate::units::echo::ECHO_TIME_S) * 1_000.0),
+        (PLATE_PATH, 0) => fmt_ms(lerp(crate::effects::PLATE_DECAY_S) * 1_000.0),
+        (PLATE_PATH, 1) => fmt_ms(lerp(crate::effects::PLATE_PREDELAY_MS)),
+        (WAH_PATH, 1) => fmt_hz(sweep(crate::units::wah::WAH_BASE_HZ)),
+        (IR_PATH, 1) => fmt_db(lerp(crate::units::convolver::CONV_TRIM_DB)),
         // The tape speaks in percent on purpose: its knobs are character,
         // not calibration, and a fake decibel is worse than an honest one.
+        // Every dial not named above — drive amount, depths, widths, mixes,
+        // the wah's damping — is percent for the same reason.
         _ => fmt_pct(v),
     }
 }
@@ -298,6 +560,15 @@ pub fn choices(path: &str, id: u32) -> Vec<String> {
             .iter()
             .map(|k| k.label().to_owned())
             .collect(),
+        // The learn toggle's positions are the BUTTON's words, not on/off:
+        // at rest it offers the verb, engaged it reports the state.
+        (DENOISE_PATH, 0) => vec!["Learn".to_owned(), "Listening".to_owned()],
+        (DENOISE_PATH, 5) | (AMP_PATH, 0) => {
+            vec!["off".to_owned(), "on".to_owned()]
+        }
+        // One diode against one, or against two — what the toggle does to
+        // the harmonics, in the clipper's own terms.
+        (DRIVE_PATH, 3) => vec!["matched".to_owned(), "uneven".to_owned()],
         _ => Vec::new(),
     }
 }
@@ -341,6 +612,29 @@ pub struct BuiltinBay {
     pub spec: &'static UnitSpec,
     /// Current value per parameter, normalised, indexed as `spec.params`.
     pub values: Vec<f32>,
+    /// State lines BEYOND the parameters — `(symbol, value)` pairs a unit
+    /// claims through [`is_extra_symbol`]: the denoise's 32 learned
+    /// thresholds, the IR's file path. Same durable-truth rule as `values`:
+    /// what the host holds here IS what `save_insert_state` writes, refilled
+    /// from the blob at load and refreshed by the host when the engine
+    /// publishes new measurements (the learn snapshot road).
+    pub extra: Vec<(String, String)>,
+}
+
+/// Whether `symbol` is one of the EXTRA state lines `path`'s unit owns —
+/// state that is not a knob. These symbol spaces are append-only exactly as
+/// the param symbols are: `t0..t31` are the denoise's learned thresholds,
+/// `ir_path` is the convolver's impulse file.
+pub fn is_extra_symbol(path: &str, symbol: &str) -> bool {
+    match path {
+        DENOISE_PATH => symbol
+            .strip_prefix('t')
+            .and_then(|n| n.parse::<usize>().ok())
+            // "t07" must NOT alias t7 — one value per symbol, one spelling.
+            .is_some_and(|n| n < crate::units::denoise::DENOISE_BANDS && symbol == format!("t{n}")),
+        IR_PATH => symbol == "ir_path",
+        _ => false,
+    }
 }
 
 /// Write a unit's values as state text — the blob the insert-state sidecar
@@ -349,8 +643,9 @@ pub struct BuiltinBay {
 /// Keyed by SYMBOL, not position, for the reason `lv2::state_from_params`
 /// gives: a unit that grows a parameter must still read its old sessions, and
 /// a positional format moves every value one knob to the left the day that
-/// happens.
-pub fn state_text(spec: &UnitSpec, values: &[f32]) -> String {
+/// happens. `extra` lines ride after the params, in the same `symbol=value`
+/// grammar — a value may hold any text without newlines (a path, say).
+pub fn state_text(spec: &UnitSpec, values: &[f32], extra: &[(String, String)]) -> String {
     let mut out = String::from("tangentfx 1\n");
     for (p, v) in spec.params.iter().zip(values) {
         out.push_str(p.symbol);
@@ -358,7 +653,32 @@ pub fn state_text(spec: &UnitSpec, values: &[f32]) -> String {
         out.push_str(&v.to_string());
         out.push('\n');
     }
+    for (symbol, value) in extra {
+        out.push_str(symbol);
+        out.push('=');
+        out.push_str(value);
+        out.push('\n');
+    }
     out
+}
+
+/// Read a blob's EXTRA lines back — the ones [`is_extra_symbol`] claims for
+/// this unit. Forgiving like [`values_from_state`] and quieter still: a blob
+/// that is not this format at all answers empty, because the values reader
+/// already turned that case into the sentence the user sees.
+pub fn extra_from_state(spec: &UnitSpec, bytes: &[u8]) -> Vec<(String, String)> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some("tangentfx 1") {
+        return Vec::new();
+    }
+    lines
+        .filter_map(|line| line.split_once('='))
+        .filter(|(symbol, _)| is_extra_symbol(spec.path, symbol))
+        .map(|(s, v)| (s.to_owned(), v.to_owned()))
+        .collect()
 }
 
 /// Read a state blob back into a full value table.
@@ -403,6 +723,15 @@ pub enum BuiltinUnit {
     Imager(ImagerUnit),
     Tape(TapeUnit),
     Comp(CompUnit),
+    Denoise(DenoiseUnit),
+    Amp(AmpUnit),
+    Drive(DriveUnit),
+    Trem(TremUnit),
+    Chorus(ChorusUnit),
+    Echo(EchoUnit),
+    Plate(PlateUnit),
+    Wah(WahUnit),
+    Ir(IrUnit),
 }
 
 impl BuiltinUnit {
@@ -427,6 +756,33 @@ impl BuiltinUnit {
             BuiltinUnit::Tape(_) => 0,
             // Feed-forward with no lookahead window.
             BuiltinUnit::Comp(_) => 0,
+            // The one honest mover: 3 ms with the lookahead up, nothing with
+            // it down. The kernel answers for its current setting, and
+            // `Backend::reported_latency` re-reads this every block, so the
+            // toggle's change reaches the compensation graph on its own.
+            BuiltinUnit::Denoise(u) => u.kernel.latency(),
+            // Filters, saturators and modulators that read the sample they
+            // write, like the four above. The tape-echo/chorus/plate DELAYS
+            // are the effect, not a reporting debt — the dry half of each
+            // additive mix leaves on time.
+            BuiltinUnit::Amp(_)
+            | BuiltinUnit::Drive(_)
+            | BuiltinUnit::Trem(_)
+            | BuiltinUnit::Chorus(_)
+            | BuiltinUnit::Echo(_)
+            | BuiltinUnit::Plate(_)
+            | BuiltinUnit::Wah(_) => 0,
+            // One partition of FIFO priming — but only once an IR is in:
+            // with nothing loaded the kernel is a bit-exact wire, and
+            // claiming 512 frames for a wire would hold the mix late for
+            // nothing.
+            BuiltinUnit::Ir(u) => {
+                if u.has_ir {
+                    u.kernel.latency()
+                } else {
+                    0
+                }
+            }
         }
     }
 
@@ -444,6 +800,66 @@ impl BuiltinUnit {
             BuiltinUnit::Imager(u) => u.set_param(id, value),
             BuiltinUnit::Tape(u) => u.set_param(id, value),
             BuiltinUnit::Comp(u) => u.set_param(id, value),
+            BuiltinUnit::Denoise(u) => u.set_param(id, value),
+            BuiltinUnit::Amp(u) => u.set_param(id, value),
+            BuiltinUnit::Drive(u) => u.set_param(id, value),
+            BuiltinUnit::Trem(u) => u.set_param(id, value),
+            BuiltinUnit::Chorus(u) => u.set_param(id, value),
+            BuiltinUnit::Echo(u) => u.set_param(id, value),
+            BuiltinUnit::Plate(u) => u.set_param(id, value),
+            BuiltinUnit::Wah(u) => u.set_param(id, value),
+            BuiltinUnit::Ir(u) => u.set_param(id, value),
+        }
+    }
+
+    /// Apply a blob's EXTRA state — the lines beyond the knobs — to a fresh
+    /// instance, HOST-SIDE, before it crosses to the audio thread. This is
+    /// where the denoise gets its learned thresholds back and where the IR
+    /// unit reads its impulse file off disk (allocation and file IO, which
+    /// is exactly why it may never run on the audio thread; `Convolver::set_ir`
+    /// documents the same contract from below).
+    ///
+    /// `Some(sentence)` reports what did not restore, in the voice of a
+    /// failed plugin state: the unit still loads and runs — the IR with
+    /// nothing loaded is the kernel's own bit-exact wire — because a missing
+    /// file must cost the session one insert's colour, not the session.
+    pub fn apply_extra_state(&mut self, extra: &[(String, String)]) -> Option<String> {
+        match self {
+            BuiltinUnit::Denoise(u) => {
+                use crate::units::denoise::DENOISE_BANDS;
+                let mut thresholds = [0.0f32; DENOISE_BANDS];
+                let mut any = false;
+                for (symbol, value) in extra {
+                    let Some(k) = symbol
+                        .strip_prefix('t')
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .filter(|k| *k < DENOISE_BANDS)
+                    else {
+                        continue;
+                    };
+                    if let Ok(v) = value.parse::<f32>() {
+                        thresholds[k] = v;
+                        any = true;
+                    }
+                }
+                // Nothing learned in the blob leaves the fresh all-off state
+                // alone; `set_thresholds` itself washes non-finite to off.
+                if any {
+                    u.kernel.set_thresholds(&thresholds);
+                }
+                None
+            }
+            BuiltinUnit::Ir(u) => {
+                let path = extra
+                    .iter()
+                    .find(|(s, _)| s == "ir_path")
+                    .map(|(_, v)| v.as_str())?;
+                match crate::wavread::read(std::path::Path::new(path)) {
+                    Ok(wav) => u.load_ir(&wav),
+                    Err(e) => Some(format!("its impulse response did not load — {e}")),
+                }
+            }
+            _ => None,
         }
     }
 
@@ -480,6 +896,27 @@ impl BuiltinUnit {
             BuiltinUnit::Imager(u) => u.process(input, frames, out),
             BuiltinUnit::Tape(u) => u.process(input, frames, out),
             BuiltinUnit::Comp(u) => u.process(input, frames, out),
+            BuiltinUnit::Denoise(u) => u.process(input, frames, out),
+            BuiltinUnit::Amp(u) => u.process(input, frames, out),
+            BuiltinUnit::Drive(u) => u.process(input, frames, out),
+            BuiltinUnit::Trem(u) => u.process(input, frames, out),
+            BuiltinUnit::Chorus(u) => u.process(input, frames, out),
+            BuiltinUnit::Echo(u) => u.process(input, frames, out),
+            BuiltinUnit::Plate(u) => u.process(input, frames, out),
+            BuiltinUnit::Wah(u) => u.process(input, frames, out),
+            BuiltinUnit::Ir(u) => u.process(input, frames, out),
+        }
+    }
+
+    /// The denoise's learned thresholds, when this block may have moved them
+    /// — `Some` while the learn dial is up and for ONE block after it falls,
+    /// which is the block the kernel froze them on. The engine forwards the
+    /// snapshot into a shared cell the host adopts into its ledger; every
+    /// other unit answers `None`, the `gain_reduction_db` shape exactly.
+    pub fn learn_snapshot(&mut self) -> Option<[f32; crate::units::denoise::DENOISE_BANDS]> {
+        match self {
+            BuiltinUnit::Denoise(u) => u.publish.then(|| u.kernel.thresholds()),
+            _ => None,
         }
     }
 
@@ -510,6 +947,21 @@ impl BuiltinUnit {
             BuiltinUnit::Imager(u) => u.kernel.clear(),
             BuiltinUnit::Tape(u) => u.kernel.clear(),
             BuiltinUnit::Comp(u) => u.kernel.clear(),
+            // The denoise's clear keeps what was LEARNED — its kernel
+            // documents "forget what was playing, keep the thresholds",
+            // which is exactly what a restored preset needs from the
+            // `create`-then-`clear` load path.
+            BuiltinUnit::Denoise(u) => u.kernel.clear(),
+            BuiltinUnit::Amp(u) => u.kernel.clear(),
+            BuiltinUnit::Drive(u) => u.kernel.clear(),
+            BuiltinUnit::Trem(u) => u.kernel.clear(),
+            BuiltinUnit::Chorus(u) => u.kernel.clear(),
+            BuiltinUnit::Echo(u) => u.kernel.clear(),
+            BuiltinUnit::Plate(u) => u.kernel.clear(),
+            BuiltinUnit::Wah(u) => u.kernel.clear(),
+            // And the convolver's clear keeps the IR itself: tails go, the
+            // loaded filter stays, the same knowledge-vs-signal split.
+            BuiltinUnit::Ir(u) => u.kernel.clear(),
         }
     }
 }
@@ -833,6 +1285,414 @@ impl CompUnit {
     }
 }
 
+// ── Tangent Denoise, seated ─────────────────────────────────────────────────
+
+/// The learned expander bank behind its face. Beyond the shared shape it
+/// carries the learn edge-detector that feeds [`BuiltinUnit::learn_snapshot`]:
+/// the kernel freezes thresholds on the block AFTER the dial falls, so the
+/// snapshot must stay offered for exactly one block past the fall.
+pub struct DenoiseUnit {
+    kernel: crate::units::denoise::Denoise,
+    params: crate::units::denoise::DenoiseParams,
+    scratch: Vec<f32>,
+    /// Whether the LAST processed block ran with the learn dial up.
+    last_learn: bool,
+    /// Whether this block's thresholds are worth publishing — learn up, or
+    /// the falling-edge block that froze them.
+    publish: bool,
+}
+
+impl DenoiseUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::denoise::Denoise::new(sample_rate),
+            params: crate::units::denoise::DenoiseParams::default(),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+            last_learn: false,
+            publish: false,
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = DENOISE_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.learn = v,
+            1 => self.params.reduce = v,
+            2 => self.params.smooth = v,
+            3 => self.params.release = v,
+            4 => self.params.sc_hpf = v,
+            _ => self.params.lookahead = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let learn_now = self.params.learn >= 0.5;
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+        self.publish = learn_now || self.last_learn;
+        self.last_learn = learn_now;
+    }
+}
+
+// ── Tangent Amp, seated ─────────────────────────────────────────────────────
+
+pub struct AmpUnit {
+    kernel: crate::units::amp::Amp,
+    params: crate::units::amp::AmpParams,
+    scratch: Vec<f32>,
+}
+
+impl AmpUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::amp::Amp::new(sample_rate),
+            params: crate::units::amp::AmpParams::default(),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = AMP_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.bright = v,
+            1 => self.params.volume = v,
+            2 => self.params.treble = v,
+            3 => self.params.middle = v,
+            4 => self.params.bass = v,
+            5 => self.params.vib_speed = v,
+            6 => self.params.vib_depth = v,
+            _ => self.params.vib_stereo = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+    }
+}
+
+// ── Tangent Drive, seated ───────────────────────────────────────────────────
+
+pub struct DriveUnit {
+    kernel: crate::units::drive::Drive,
+    params: crate::units::drive::DriveParams,
+    scratch: Vec<f32>,
+}
+
+impl DriveUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::drive::Drive::new(sample_rate),
+            params: crate::units::drive::DriveParams::default(),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = DRIVE_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.drive = v,
+            1 => self.params.tone = v,
+            2 => self.params.level = v,
+            _ => self.params.symmetry = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+    }
+}
+
+// ── Tangent Trem, seated ────────────────────────────────────────────────────
+
+pub struct TremUnit {
+    kernel: crate::units::trem::Trem,
+    params: crate::units::trem::TremParams,
+    scratch: Vec<f32>,
+}
+
+impl TremUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::trem::Trem::new(sample_rate),
+            params: crate::units::trem::TremParams::default(),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = TREM_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.speed = v,
+            1 => self.params.depth = v,
+            _ => self.params.stereo = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+    }
+}
+
+// ── Tangent Chorus, seated ──────────────────────────────────────────────────
+
+pub struct ChorusUnit {
+    kernel: crate::units::chorus::Chorus,
+    params: crate::units::chorus::ChorusParams,
+    scratch: Vec<f32>,
+}
+
+impl ChorusUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::chorus::Chorus::new(sample_rate),
+            params: crate::units::chorus::ChorusParams::default(),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = CHORUS_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.rate = v,
+            1 => self.params.depth = v,
+            2 => self.params.width = v,
+            3 => self.params.tone = v,
+            _ => self.params.mix = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+    }
+}
+
+// ── Tangent Echo, seated ────────────────────────────────────────────────────
+
+pub struct EchoUnit {
+    kernel: crate::units::echo::Echo,
+    params: crate::units::echo::EchoParams,
+    scratch: Vec<f32>,
+}
+
+impl EchoUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::echo::Echo::new(sample_rate),
+            params: crate::units::echo::EchoParams::default(),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = ECHO_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.time = v,
+            1 => self.params.feedback = v,
+            2 => self.params.tone = v,
+            _ => self.params.mix = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+    }
+}
+
+// ── Tangent Plate, seated ───────────────────────────────────────────────────
+
+pub struct PlateUnit {
+    kernel: crate::units::plate::Plate,
+    params: crate::units::plate::PlateParams,
+    scratch: Vec<f32>,
+}
+
+impl PlateUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::plate::Plate::new(sample_rate),
+            params: crate::units::plate::PlateParams::default(),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = PLATE_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.decay = v,
+            1 => self.params.predelay = v,
+            2 => self.params.width = v,
+            _ => self.params.mix = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+    }
+}
+
+// ── Tangent Wah, seated ─────────────────────────────────────────────────────
+
+pub struct WahUnit {
+    kernel: crate::units::wah::Wah,
+    params: crate::units::wah::WahParams,
+    scratch: Vec<f32>,
+}
+
+impl WahUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::wah::Wah::new(sample_rate),
+            params: crate::units::wah::WahParams::default(),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = WAH_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.sens = v,
+            1 => self.params.base = v,
+            2 => self.params.q = v,
+            _ => self.params.mix = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+    }
+}
+
+// ── Tangent IR, seated ──────────────────────────────────────────────────────
+
+/// The convolver behind its two knobs. What makes it different from every
+/// other seat here is that its real state is a FILE: `ir_path` rides the
+/// extra-state road, and [`IrUnit::load_ir`] turns the decoded WAV into the
+/// kernel's spectra at load time, host-side, before the hand-off.
+pub struct IrUnit {
+    kernel: crate::units::convolver::Convolver,
+    params: crate::units::convolver::ConvolverParams,
+    scratch: Vec<f32>,
+    /// The engine rate this instance was built at, kept to notice a capture
+    /// made at some other rate — see [`IrUnit::load_ir`].
+    sample_rate: f32,
+    /// Whether an IR ever landed, which is what decides the honest latency:
+    /// the empty kernel is a wire and must not bill a partition for it.
+    has_ir: bool,
+}
+
+impl IrUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::convolver::Convolver::new(sample_rate),
+            params: crate::units::convolver::ConvolverParams::default(),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+            sample_rate,
+            has_ir: false,
+        }
+    }
+
+    /// Hand a decoded WAV to the kernel. A mono capture plays as the same
+    /// IR on both channels; a stereo capture plays as the pair; anything
+    /// wider is refused with a sentence, because guessing which four of six
+    /// channels form a true-stereo set is how somebody's Atmos bounce
+    /// becomes a mystery reverb.
+    ///
+    /// A rate mismatch LOADS ANYWAY and says so: the convolution is still
+    /// well-defined, just shifted in pitch and time by the ratio, and
+    /// hearing something wrong-but-reported beats silence. Resampling is
+    /// deliberately not attempted this pass.
+    fn load_ir(&mut self, wav: &crate::wavread::WavData) -> Option<String> {
+        use crate::units::convolver::IrLayout;
+        let irs: Vec<Vec<f32>> = match wav.channels.len() {
+            1 => vec![wav.channels[0].clone(), wav.channels[0].clone()],
+            2 => vec![wav.channels[0].clone(), wav.channels[1].clone()],
+            n => {
+                return Some(format!(
+                    "its impulse response has {n} channels; one or two are playable"
+                ))
+            }
+        };
+        if !self.kernel.set_ir(&irs, IrLayout::Stereo) {
+            return Some("its impulse response holds no samples".to_owned());
+        }
+        self.has_ir = true;
+        let engine = self.sample_rate.round() as u32;
+        if wav.rate != engine {
+            return Some(format!(
+                "its impulse response was captured at {} Hz and this session runs at \
+                 {engine} Hz — loaded as-is, so it plays shifted",
+                wav.rate
+            ));
+        }
+        None
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = IR_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.mix = v,
+            _ => self.params.trim = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+    }
+}
+
 // ── Tangent Trim ────────────────────────────────────────────────────────────
 
 /// Where the trim's one knob travels, in dB. 0.5 is exactly unity — the knob
@@ -1058,7 +1918,7 @@ mod tests {
     #[test]
     fn state_text_round_trips_and_forgives_what_it_should() {
         let spec = spec_for(TRIM_PATH).unwrap();
-        let text = state_text(spec, &[0.75]);
+        let text = state_text(spec, &[0.75], &[]);
         let back = values_from_state(spec, text.as_bytes()).expect("own text reads back");
         assert_eq!(back, vec![0.75]);
 
@@ -1123,6 +1983,48 @@ mod tests {
             crate::units::eq::NodeKind::ALL.len(),
             "the kind knob's step count drifted from NodeKind::ALL"
         );
+        // And the wave-4 nine, same disease, same cure.
+        let d = crate::units::denoise::DenoiseParams::default();
+        for (spec, want) in DENOISE_FACE_PARAMS.iter().zip([
+            d.learn, d.reduce, d.smooth, d.release, d.sc_hpf, d.lookahead,
+        ]) {
+            assert_eq!(spec.default, want, "{} drifted from DenoiseParams::default", spec.symbol);
+        }
+        let a = crate::units::amp::AmpParams::default();
+        for (spec, want) in AMP_FACE_PARAMS.iter().zip([
+            a.bright, a.volume, a.treble, a.middle, a.bass, a.vib_speed, a.vib_depth,
+            a.vib_stereo,
+        ]) {
+            assert_eq!(spec.default, want, "{} drifted from AmpParams::default", spec.symbol);
+        }
+        let dr = crate::units::drive::DriveParams::default();
+        for (spec, want) in DRIVE_FACE_PARAMS.iter().zip([dr.drive, dr.tone, dr.level, dr.symmetry]) {
+            assert_eq!(spec.default, want, "{} drifted from DriveParams::default", spec.symbol);
+        }
+        let tr = crate::units::trem::TremParams::default();
+        for (spec, want) in TREM_FACE_PARAMS.iter().zip([tr.speed, tr.depth, tr.stereo]) {
+            assert_eq!(spec.default, want, "{} drifted from TremParams::default", spec.symbol);
+        }
+        let ch = crate::units::chorus::ChorusParams::default();
+        for (spec, want) in CHORUS_FACE_PARAMS.iter().zip([ch.rate, ch.depth, ch.width, ch.tone, ch.mix]) {
+            assert_eq!(spec.default, want, "{} drifted from ChorusParams::default", spec.symbol);
+        }
+        let ec = crate::units::echo::EchoParams::default();
+        for (spec, want) in ECHO_FACE_PARAMS.iter().zip([ec.time, ec.feedback, ec.tone, ec.mix]) {
+            assert_eq!(spec.default, want, "{} drifted from EchoParams::default", spec.symbol);
+        }
+        let pl = crate::units::plate::PlateParams::default();
+        for (spec, want) in PLATE_FACE_PARAMS.iter().zip([pl.decay, pl.predelay, pl.width, pl.mix]) {
+            assert_eq!(spec.default, want, "{} drifted from PlateParams::default", spec.symbol);
+        }
+        let w = crate::units::wah::WahParams::default();
+        for (spec, want) in WAH_FACE_PARAMS.iter().zip([w.sens, w.base, w.q, w.mix]) {
+            assert_eq!(spec.default, want, "{} drifted from WahParams::default", spec.symbol);
+        }
+        let ir = crate::units::convolver::ConvolverParams::default();
+        for (spec, want) in IR_FACE_PARAMS.iter().zip([ir.mix, ir.trim]) {
+            assert_eq!(spec.default, want, "{} drifted from ConvolverParams::default", spec.symbol);
+        }
     }
 
     /// A planar in/out pair with awkward values in it — negative zero and a
@@ -1320,7 +2222,7 @@ mod tests {
             let unit = spec.create(48_000.0, &spec.defaults());
             // Latency answers something; the state round-trips at defaults.
             let _ = unit.latency();
-            let text = state_text(spec, &spec.defaults());
+            let text = state_text(spec, &spec.defaults(), &[]);
             assert_eq!(
                 values_from_state(spec, text.as_bytes()).unwrap(),
                 spec.defaults()
@@ -1332,7 +2234,262 @@ mod tests {
                     assert_ne!(a.id, b.id, "{} reuses id {}", spec.path, a.id);
                     assert_ne!(a.symbol, b.symbol, "{} reuses {}", spec.path, a.symbol);
                 }
+                // A knob symbol may never collide with the unit's EXTRA
+                // state space — one blob, one meaning per line.
+                assert!(
+                    !is_extra_symbol(spec.path, a.symbol),
+                    "{} names {} as both a knob and extra state",
+                    spec.path,
+                    a.symbol
+                );
             }
         }
+    }
+
+    /// **Every registered unit processes finite audio through the planar
+    /// road at its defaults** — the smallest liveness claim, walked over the
+    /// whole table so a kernel that panics on its first block (a bad map, a
+    /// zero-length ring) is caught at the registry rather than in a session.
+    #[test]
+    fn every_unit_in_the_table_processes_finite_audio() {
+        let frames = 2_048;
+        let input = tricky_planar(frames);
+        for spec in UNITS {
+            let mut unit = spec.create(48_000.0, &spec.defaults());
+            let mut out = vec![vec![7.0f32; frames]; 2];
+            for _ in 0..3 {
+                unit.process(&input, frames, &mut out);
+            }
+            for (c, ch) in out.iter().enumerate() {
+                for (f, s) in ch.iter().enumerate() {
+                    assert!(s.is_finite(), "{} channel {c} frame {f}: {s}", spec.path);
+                }
+            }
+        }
+    }
+
+    /// **Extra state lines ride the blob beside the knobs and stay out of
+    /// their space.** The values reader skips them, the extra reader claims
+    /// exactly its own, and the whole `symbol=value` grammar survives a
+    /// round trip — including a path with spaces, because `ir_path` is one.
+    #[test]
+    fn extra_state_lines_ride_the_blob_and_stay_out_of_the_knob_space() {
+        let spec = spec_for(DENOISE_PATH).unwrap();
+        let extra = vec![
+            ("t0".to_owned(), "0.25".to_owned()),
+            ("t31".to_owned(), "0.75".to_owned()),
+        ];
+        let text = state_text(spec, &spec.defaults(), &extra);
+        assert_eq!(
+            values_from_state(spec, text.as_bytes()).unwrap(),
+            spec.defaults(),
+            "a threshold line moved a knob"
+        );
+        assert_eq!(extra_from_state(spec, text.as_bytes()), extra);
+
+        // The claims are exact: the 32 bands and nothing that merely looks
+        // like one — "t32" is out of range, "t07" would alias t7's value
+        // under a second spelling, and another unit claims none of them.
+        assert!(is_extra_symbol(DENOISE_PATH, "t0"));
+        assert!(is_extra_symbol(DENOISE_PATH, "t31"));
+        assert!(!is_extra_symbol(DENOISE_PATH, "t32"));
+        assert!(!is_extra_symbol(DENOISE_PATH, "t07"));
+        assert!(!is_extra_symbol(DENOISE_PATH, "ir_path"));
+        assert!(is_extra_symbol(IR_PATH, "ir_path"));
+        assert!(!is_extra_symbol(IR_PATH, "t0"));
+        assert!(!is_extra_symbol(EQ_PATH, "t0"));
+
+        // A path with spaces and an equals sign in its tail survives: the
+        // split is on the FIRST `=`, so everything after it is the value.
+        let spec = spec_for(IR_PATH).unwrap();
+        let odd = vec![("ir_path".to_owned(), "/My IRs/room=big.wav".to_owned())];
+        let text = state_text(spec, &spec.defaults(), &odd);
+        assert_eq!(extra_from_state(spec, text.as_bytes()), odd);
+        // And a blob that is not ours answers empty rather than inventing.
+        assert!(extra_from_state(spec, b"vstpreset\x00junk").is_empty());
+    }
+
+    /// A deterministic broadband rattle for the learn pass — an LCG rather
+    /// than anything seeded from time, so the learned thresholds are the
+    /// same on every run of this test.
+    fn noise_planar(frames: usize, seed: &mut u32) -> Vec<Vec<f32>> {
+        let mut next = move || {
+            *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (*seed >> 8) as f32 / 16_777_216.0 - 0.5
+        };
+        let l: Vec<f32> = (0..frames).map(|_| next() * 0.2).collect();
+        let r: Vec<f32> = (0..frames).map(|_| next() * 0.2).collect();
+        vec![l, r]
+    }
+
+    /// **Learn, freeze, persist, restore: the denoise's whole threshold
+    /// story at the unit level.** The dial up is listening, the falling edge
+    /// freezes, the snapshot is offered for exactly the freeze block, and a
+    /// fresh instance fed the persisted lines opens with the same bank.
+    #[test]
+    fn the_denoise_learns_on_the_falling_edge_and_the_extra_state_restores_it() {
+        let spec = spec_for(DENOISE_PATH).unwrap();
+        let mut unit = spec.create(48_000.0, &spec.defaults());
+        assert!(
+            unit.learn_snapshot().is_none(),
+            "an idle denoise offered a snapshot"
+        );
+        let frames = 512;
+        let mut out = vec![vec![0.0f32; frames]; 2];
+        let mut seed = 7u32;
+        // Listening: ~160 ms of noise, far past the kernel's minimum pass.
+        unit.set_param(0, 1.0);
+        for _ in 0..15 {
+            let input = noise_planar(frames, &mut seed);
+            unit.process(&input, frames, &mut out);
+        }
+        // The falling edge: THIS block freezes, and the snapshot says so.
+        unit.set_param(0, 0.0);
+        let input = noise_planar(frames, &mut seed);
+        unit.process(&input, frames, &mut out);
+        let thr = unit
+            .learn_snapshot()
+            .expect("the freeze block must offer the thresholds");
+        assert!(
+            thr.iter().any(|t| *t > 0.05),
+            "a broadband learn froze an all-off bank: {thr:?}"
+        );
+        // One block later the offer is withdrawn — the ledger has it now.
+        let input = noise_planar(frames, &mut seed);
+        unit.process(&input, frames, &mut out);
+        assert!(
+            unit.learn_snapshot().is_none(),
+            "a settled denoise kept offering its snapshot"
+        );
+
+        // Persist exactly as the host does, restore into a fresh instance,
+        // and the bank matches to the text format's precision.
+        let extra: Vec<(String, String)> = thr
+            .iter()
+            .enumerate()
+            .map(|(k, t)| (format!("t{k}"), t.to_string()))
+            .collect();
+        let mut restored = spec.create(48_000.0, &spec.defaults());
+        assert!(restored.apply_extra_state(&extra).is_none());
+        let BuiltinUnit::Denoise(r) = &restored else {
+            panic!("the denoise path built something else");
+        };
+        for (k, (a, b)) in thr.iter().zip(r.kernel.thresholds()).enumerate() {
+            assert!((a - b).abs() < 1.0e-6, "band {k}: froze {a}, restored {b}");
+        }
+    }
+
+    /// Write a 32-bit float WAV the test owns byte for byte, so the IR road
+    /// is proven against a real file rather than a mocked reader.
+    fn write_float_wav(name: &str, rate: u32, channels: u16, samples: &[f32]) -> std::path::PathBuf {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&3u16.to_le_bytes());
+        v.extend_from_slice(&channels.to_le_bytes());
+        v.extend_from_slice(&rate.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v.extend_from_slice(&32u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&((samples.len() * 4) as u32).to_le_bytes());
+        for s in samples {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        let path = std::env::temp_dir().join(format!("tangent-ir-{}-{name}.wav", std::process::id()));
+        std::fs::write(&path, v).expect("the temp WAV writes");
+        path
+    }
+
+    /// **An impulse IR makes the convolver a 512-frame-late wire, and every
+    /// way the file can be wrong is a sentence, not a refusal to seat.**
+    #[test]
+    fn an_impulse_ir_convolves_as_a_delayed_wire_and_bad_files_read_as_sentences() {
+        use crate::units::convolver::CONV_PARTITION;
+        let mut impulse = vec![0.0f32; 2_048];
+        impulse[0] = 1.0; // interleaved stereo: frame 0 left only
+        impulse[1] = 1.0; // and right, so both channels carry the wire
+        let good = write_float_wav("good", 48_000, 2, &impulse);
+
+        let spec = spec_for(IR_PATH).unwrap();
+        let mut unit = spec.create(48_000.0, &spec.defaults());
+        assert_eq!(unit.latency(), 0, "an empty convolver billed a partition");
+        let extra = vec![("ir_path".to_owned(), good.display().to_string())];
+        assert_eq!(unit.apply_extra_state(&extra), None);
+        assert_eq!(unit.latency(), CONV_PARTITION as u32);
+
+        // Through the planar road: input against output, 512 frames apart.
+        // Long enough that the first-load fade (two partitions) is history.
+        let frames = 4_096;
+        let input = {
+            let mut seed = 99u32;
+            noise_planar(frames, &mut seed)
+        };
+        let mut out = vec![vec![0.0f32; frames]; 2];
+        unit.process(&input, frames, &mut out);
+        for c in 0..2 {
+            for f in CONV_PARTITION * 3..frames {
+                let (want, got) = (input[c][f - CONV_PARTITION], out[c][f]);
+                assert!(
+                    (want - got).abs() < 1.0e-3,
+                    "channel {c} frame {f}: sent {want}, heard {got}"
+                );
+            }
+        }
+
+        // A wrong-rate capture loads AND says so — the sentence names both
+        // rates, because "it sounds shifted" starts as "why".
+        let slow = write_float_wav("slow", 44_100, 1, &[1.0, 0.0, 0.0, 0.0]);
+        let mut unit = spec.create(48_000.0, &spec.defaults());
+        let extra = vec![("ir_path".to_owned(), slow.display().to_string())];
+        let note = unit.apply_extra_state(&extra).expect("a mismatch says so");
+        assert!(note.contains("44100") && note.contains("48000"), "{note}");
+        assert_eq!(unit.latency(), CONV_PARTITION as u32, "it still loaded");
+
+        // A missing file is a sentence and a wire: nothing loaded, nothing
+        // billed, audio untouched.
+        let mut unit = spec.create(48_000.0, &spec.defaults());
+        let extra = vec![("ir_path".to_owned(), "/nowhere/tangent-gone.wav".to_owned())];
+        assert!(unit.apply_extra_state(&extra).is_some());
+        assert_eq!(unit.latency(), 0);
+        let input = tricky_planar(64);
+        let mut out = vec![vec![7.0f32; 64]; 2];
+        unit.process(&input, 64, &mut out);
+        for (src, dst) in input.iter().zip(&out) {
+            for (s, d) in src.iter().zip(dst) {
+                assert_eq!(s.to_bits(), d.to_bits(), "an IR-less bay touched the audio");
+            }
+        }
+
+        let _ = std::fs::remove_file(good);
+        let _ = std::fs::remove_file(slow);
+    }
+
+    /// **The new dials read in their own units** — spot checks holding the
+    /// describe arms to the kernels' published mappings, one per mapping
+    /// family, so a describe arm quoting the wrong constant fails here and
+    /// not on somebody's panel.
+    #[test]
+    fn the_new_dials_read_in_their_own_units() {
+        use crate::units::echo::ECHO_TIME_DEFAULT;
+        assert_eq!(describe(ECHO_PATH, 0, ECHO_TIME_DEFAULT), "375 ms");
+        assert_eq!(describe(PLATE_PATH, 0, 0.34), "2.20 s");
+        assert_eq!(describe(PLATE_PATH, 1, 0.0), "0.0 ms");
+        assert_eq!(describe(WAH_PATH, 1, 0.5), "240 Hz");
+        assert_eq!(describe(DENOISE_PATH, 0, 0.0), "Learn");
+        assert_eq!(describe(DENOISE_PATH, 0, 1.0), "Listening");
+        assert_eq!(describe(DENOISE_PATH, 1, 0.5), "-12.0 dB");
+        assert_eq!(describe(DENOISE_PATH, 1, 0.0), "off");
+        assert_eq!(describe(DENOISE_PATH, 5, 1.0), "3.0 ms");
+        // The shipped level is unity to a tenth of a dB: 0.71² · 2 ≈ 1.008.
+        assert_eq!(describe(DRIVE_PATH, 2, 0.71), "+0.1 dB");
+        assert_eq!(describe(DRIVE_PATH, 3, 0.0), "matched");
+        assert_eq!(describe(IR_PATH, 1, 0.5), "+0.0 dB");
+        assert_eq!(choices(DENOISE_PATH, 0), vec!["Learn", "Listening"]);
+        assert_eq!(choices(DRIVE_PATH, 3), vec!["matched", "uneven"]);
+        assert_eq!(choices(AMP_PATH, 0), vec!["off", "on"]);
+        assert!(choices(TREM_PATH, 0).is_empty(), "a continuous dial grew steps");
     }
 }

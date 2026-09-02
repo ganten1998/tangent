@@ -2019,6 +2019,19 @@ struct Shared {
     /// [`Engine::insert_gr_db`] once a frame for the face's meter. Same row
     /// law as `seat_latency` above: `seat * INSERTS + bay`.
     seat_gr: Vec<AtomicU32>,
+    /// **The learn bay's threshold snapshot** — the denoise's 32 frozen
+    /// per-band thresholds as f32 bits, plus which flat seat (`seat *
+    /// INSERTS + bay`, `u32::MAX` for nobody) published them. ONE slot for
+    /// the whole desk, deliberately: learning is a hands-on act done with
+    /// the unit's face open, so a single learner at a time is the honest
+    /// model, and two denoises learning at once would race this cell — the
+    /// last writer wins, documented at [`Engine::adopt_learned_thresholds`].
+    /// The callback stores after every learning block AND the freeze block
+    /// ([`crate::builtin_fx::BuiltinUnit::learn_snapshot`]); the host swaps
+    /// the seat cell to `u32::MAX` as it adopts, so a settled learner costs
+    /// nothing once drained.
+    learn_thr: Vec<AtomicU32>,
+    learn_seat: AtomicU32,
     lane_latency: [AtomicU32; CHANNELS],
     /// **What everything is aligned TO** — the largest of the sixteen
     /// channel chains, and nothing else.
@@ -2291,6 +2304,10 @@ impl Shared {
             auto_suspend: AtomicU64::new(0),
             seat_latency: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             seat_gr: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
+            learn_thr: (0..crate::units::denoise::DENOISE_BANDS)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+            learn_seat: AtomicU32::new(u32::MAX),
             lane_latency: std::array::from_fn(|_| AtomicU32::new(0)),
             lufs: std::array::from_fn(|_| {
                 AtomicU32::new(crate::loudness::ABSOLUTE_GATE.to_bits())
@@ -3273,6 +3290,21 @@ fn run_rack(
                             cell.fetch_max(gr.to_bits(), Ordering::Relaxed);
                         }
                     }
+                }
+                // **And the learn bay's thresholds, while a denoise is
+                // learning** — plus the one block after, which is when the
+                // kernel froze them. Values first, seat second, so a reader
+                // that saw the seat sees values at least as new as it; the
+                // host adopts them into the durable ledger
+                // (`adopt_learned_thresholds`), because the instance is out
+                // here where nobody can ask it at save time.
+                if let Some(thr) = unit.learn_snapshot() {
+                    for (cell, t) in shared.learn_thr.iter().zip(thr) {
+                        cell.store(t.to_bits(), Ordering::Relaxed);
+                    }
+                    shared
+                        .learn_seat
+                        .store((seat * INSERTS + bay) as u32, Ordering::Relaxed);
                 }
             }
         }
@@ -9452,7 +9484,22 @@ impl Engine {
             },
             None => (spec.defaults(), None),
         };
-        let unit = spec.create(self.output.sample_rate as f32, &values);
+        // The lines beyond the knobs — the denoise's learned thresholds, the
+        // IR's file path — parsed off the same blob and applied HERE, on the
+        // loading thread, before the instance crosses to the audio thread:
+        // this is the one moment the convolver may read a file and allocate
+        // its spectra (`Convolver::set_ir`'s contract). A failure is worth a
+        // sentence in the same voice as a refused blob, and the unit still
+        // loads — an IR bay with nothing loaded is the kernel's own wire.
+        let extra = state
+            .map(|b| crate::builtin_fx::extra_from_state(spec, b))
+            .unwrap_or_default();
+        let mut unit = spec.create(self.output.sample_rate as f32, &values);
+        let state_error = state_error.or_else(|| {
+            unit.apply_extra_state(&extra)
+                .map(|e| format!("{} loaded, but {e}", spec.class))
+        });
+        // After the extra state: a loaded IR is what makes the latency 512.
         let latency_now = unit.latency();
         Ok(Prepared {
             display_name: spec.class.to_owned(),
@@ -9471,7 +9518,7 @@ impl Engine {
             editor_handle: None,
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             lv2_bay: None,
-            builtin_bay: Some(crate::builtin_fx::BuiltinBay { spec, values }),
+            builtin_bay: Some(crate::builtin_fx::BuiltinBay { spec, values, extra }),
             state_handle: None,
             latency_handle: None,
             latency_now,
@@ -10482,7 +10529,9 @@ impl Engine {
             .and_then(|r| r.get(slot))
             .and_then(Option::as_ref)
         {
-            return Some(crate::builtin_fx::state_text(bay.spec, &bay.values).into_bytes());
+            return Some(
+                crate::builtin_fx::state_text(bay.spec, &bay.values, &bay.extra).into_bytes(),
+            );
         }
         self.insert_state_handles
             .get(strip)?
@@ -10609,6 +10658,48 @@ impl Engine {
             return 0.0;
         };
         f32::from_bits(cell.swap(0, Ordering::Relaxed))
+    }
+
+    /// **Pull a denoise bay's freshly learned thresholds into the durable
+    /// ledger** — the host's half of the learn road. The audio thread
+    /// publishes the kernel's thresholds into one shared slot while a learn
+    /// runs and once more on the block that froze them; this drains that
+    /// slot into the named bay's extra state, which is exactly what
+    /// `save_insert_state` writes. Called once a frame by the desktop —
+    /// cheap when idle (one atomic swap says "nobody") — so by the time a
+    /// hand can reach Save, the ledger holds what the ears heard frozen.
+    ///
+    /// ONE learner at a time, by design: the slot is single and the last
+    /// writer wins. Learning is done with the unit's face open, so two
+    /// simultaneous learns would take two hands on two faces — if that day
+    /// comes, the slot grows a generation counter; today it would only
+    /// dress a race as a feature.
+    pub fn adopt_learned_thresholds(&mut self) {
+        let flat = self.shared.learn_seat.swap(u32::MAX, Ordering::Relaxed);
+        if flat == u32::MAX {
+            return;
+        }
+        let (strip, slot) = (flat as usize / INSERTS, flat as usize % INSERTS);
+        let Some(bay) = self
+            .insert_builtin
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+            .and_then(Option::as_mut)
+        else {
+            return;
+        };
+        // The seat could have been reloaded with something else between the
+        // callback's publish and this drain; a snapshot must never land in
+        // another unit's state.
+        if bay.spec.path != crate::builtin_fx::DENOISE_PATH {
+            return;
+        }
+        bay.extra
+            .retain(|(s, _)| !crate::builtin_fx::is_extra_symbol(bay.spec.path, s));
+        for (k, cell) in self.shared.learn_thr.iter().enumerate() {
+            let v = f32::from_bits(cell.load(Ordering::Relaxed));
+            bay.extra.push((format!("t{k}"), v.to_string()));
+        }
     }
 
     pub fn output(&self) -> &OutputInfo {
@@ -14983,7 +15074,7 @@ mod tests {
     #[test]
     fn a_trim_at_full_gain_lifts_the_mix_twenty_four_decibels() {
         let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).unwrap();
-        let state = crate::builtin_fx::state_text(spec, &[1.0]).into_bytes();
+        let state = crate::builtin_fx::state_text(spec, &[1.0], &[]).into_bytes();
         let flat = drums_through_master_bay(None);
         let loud = drums_through_master_bay(Some((crate::builtin_fx::TRIM_PATH, Some(state))));
         let peak = |v: &[f32]| v.iter().fold(0.0f32, |m, s| m.max(s.abs()));
@@ -15005,7 +15096,7 @@ mod tests {
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
         let mut out = vec![0.0f32; 512 * 2];
         let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).unwrap();
-        let sent = crate::builtin_fx::state_text(spec, &[0.75]).into_bytes();
+        let sent = crate::builtin_fx::state_text(spec, &[0.75], &[]).into_bytes();
         e.load_insert(3, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), Some(&sent))
             .expect("load")
             .expect("loaded");
@@ -15087,13 +15178,25 @@ mod tests {
     /// knobs and an automation menu with a hole in it.
     #[test]
     fn every_suite_unit_loads_into_a_bay_and_answers_its_lanes() {
-        use crate::builtin_fx::{COMP_PATH, EQ_PATH, IMAGER_PATH, TAPE_PATH};
+        use crate::builtin_fx::{
+            AMP_PATH, CHORUS_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, ECHO_PATH, EQ_PATH,
+            IMAGER_PATH, IR_PATH, PLATE_PATH, TAPE_PATH, TREM_PATH, WAH_PATH,
+        };
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
-        let cases: [(&str, &str, usize); 4] = [
+        let cases: [(&str, &str, usize); 13] = [
             (EQ_PATH, "Tangent EQ", 15),
             (IMAGER_PATH, "Tangent Imager", 3),
             (TAPE_PATH, "Tangent Tape", 6),
             (COMP_PATH, "Tangent Comp", 7),
+            (DENOISE_PATH, "Tangent Denoise", 6),
+            (AMP_PATH, "Tangent Amp", 8),
+            (DRIVE_PATH, "Tangent Drive", 4),
+            (TREM_PATH, "Tangent Trem", 3),
+            (CHORUS_PATH, "Tangent Chorus", 5),
+            (ECHO_PATH, "Tangent Echo", 4),
+            (PLATE_PATH, "Tangent Plate", 4),
+            (WAH_PATH, "Tangent Wah", 4),
+            (IR_PATH, "Tangent IR", 2),
         ];
         for (i, (path, class, lanes)) in cases.iter().enumerate() {
             // One per seat, bay 0 — four different racks holding the whole
@@ -15110,6 +15213,14 @@ mod tests {
             let (spec, values) = e.builtin_insert(seat, 0).expect("a face to push");
             assert_eq!(spec.path, *path);
             assert_eq!(values, spec.defaults(), "{path} did not open at its defaults");
+            // And the state road answers immediately: the fresh bay's blob
+            // reads back as the defaults it opened at.
+            let saved = e.save_insert_state(seat, 0).expect("a built-in bay answers");
+            assert_eq!(
+                crate::builtin_fx::values_from_state(spec, &saved).unwrap(),
+                spec.defaults(),
+                "{path}'s state does not round-trip at rest"
+            );
         }
         let mut out = vec![0.0f32; 512 * 2];
         e.render_offline(&mut out);
@@ -15152,7 +15263,7 @@ mod tests {
         let mut neutral = spec.defaults();
         neutral[0] = 1.0;
         neutral[1] = 0.0;
-        let state = crate::builtin_fx::state_text(spec, &neutral).into_bytes();
+        let state = crate::builtin_fx::state_text(spec, &neutral, &[]).into_bytes();
         e.load_insert(seat, 0, Some(Path::new(COMP_PATH)), Some(&state))
             .expect("the comp loads")
             .expect("the bay reports it");
@@ -15223,6 +15334,193 @@ mod tests {
         );
     }
 
+    /// **A learn pass reaches the saved session: listen, freeze, adopt,
+    /// save, reload.** The whole road in one walk — the dial turned through
+    /// the live ring, the kernel freezing engine-side, the callback
+    /// publishing into the shared slot, the host adopting it into the
+    /// ledger, and the sidecar carrying `t0..t31` back into a fresh load.
+    #[test]
+    fn a_denoise_learn_freezes_into_the_ledger_and_survives_a_reload() {
+        use crate::builtin_fx::DENOISE_PATH;
+        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let spec = crate::builtin_fx::spec_for(DENOISE_PATH).unwrap();
+
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_pad_kit(5, test_kit(&[0], 4_800, 0.5));
+        e.set_channel_gain(5, 1.0);
+        e.set_drum_strips(1 << 5);
+        // Loaded LISTENING — learn already up in the restored values, which
+        // is also the proof that a session saved mid-learn does no harm.
+        let mut listening = spec.defaults();
+        listening[0] = 1.0;
+        let state = crate::builtin_fx::state_text(spec, &listening, &[]).into_bytes();
+        e.load_insert(seat, 0, Some(Path::new(DENOISE_PATH)), Some(&state))
+            .expect("the denoise loads")
+            .expect("the bay reports it");
+
+        let mut out = vec![0.0f32; 1024 * 2];
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        // Something to learn: the drum fixture, struck and ringing.
+        e.set_midi_clips(vec![PlacedMidi {
+            strip: 5,
+            start: 0,
+            len: 48_000,
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+        }]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        // The falling edge, through the same live road a face uses; the
+        // next render is the block the kernel freezes and publishes on.
+        assert!(e.set_insert_param(seat, 0, 0, 0.0));
+        for _ in 0..2 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        // The desktop's once-a-frame drain, and then the save.
+        e.adopt_learned_thresholds();
+        let saved = e.save_insert_state(seat, 0).expect("a built-in bay answers");
+        let text = String::from_utf8(saved.clone()).expect("our state is text");
+        let learned: Vec<f32> = (0..crate::units::denoise::DENOISE_BANDS)
+            .map(|k| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(&format!("t{k}=")))
+                    .unwrap_or_else(|| panic!("the saved state lost t{k}:\n{text}"))
+                    .parse::<f32>()
+                    .expect("a threshold is a number")
+            })
+            .collect();
+        assert!(
+            learned.iter().any(|t| *t > 0.05),
+            "a learn pass over real drums froze an all-off bank: {learned:?}"
+        );
+
+        // And the round trip: a fresh load of that blob carries the bank in
+        // its ledger, so saving again writes the same thresholds.
+        e.load_insert(seat, 0, None, None).expect("unload");
+        e.render_offline(&mut out);
+        e.load_insert(seat, 0, Some(Path::new(DENOISE_PATH)), Some(&saved))
+            .expect("reload")
+            .expect("loaded");
+        assert!(e.insert_state_error(seat, 0).is_none());
+        let again = e.save_insert_state(seat, 0).expect("answers again");
+        assert_eq!(again, saved, "the reload changed the learned bank");
+    }
+
+    /// **An IR file named by the state loads through the bay and convolves**
+    /// — an impulse response that IS an impulse turns the master bay into a
+    /// wire one partition late, proven against the same fixture the trim's
+    /// null test uses; and the two honest failure modes (wrong rate, missing
+    /// file) each load with a sentence in the bay's error slot.
+    #[test]
+    fn an_ir_bay_loads_its_wav_and_convolves_the_mix() {
+        use crate::builtin_fx::IR_PATH;
+        use crate::units::convolver::CONV_PARTITION;
+        let spec = crate::builtin_fx::spec_for(IR_PATH).unwrap();
+
+        // A stereo unit impulse, written as real bytes on disk.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&3u16.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        wav.extend_from_slice(&0u16.to_le_bytes());
+        wav.extend_from_slice(&32u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        let mut frames = vec![0.0f32; 512 * 2];
+        frames[0] = 1.0;
+        frames[1] = 1.0;
+        wav.extend_from_slice(&((frames.len() * 4) as u32).to_le_bytes());
+        for s in &frames {
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tangent-ir-bay-{}.wav", std::process::id()));
+        std::fs::write(&path, &wav).expect("the temp WAV writes");
+
+        let state = crate::builtin_fx::state_text(
+            spec,
+            &spec.defaults(),
+            &[("ir_path".to_owned(), path.display().to_string())],
+        )
+        .into_bytes();
+        let flat = drums_through_master_bay(None);
+        let through = drums_through_master_bay(Some((IR_PATH, Some(state.clone()))));
+        assert!(flat.iter().any(|s| s.abs() > 0.001), "the fixture made no sound");
+        // Interleaved stereo: a 512-FRAME delay is 1024 samples. The head of
+        // `through` is the FIFO's priming silence; past it, the impulse IR
+        // is a wire to the convolution's precision.
+        let lag = CONV_PARTITION * 2;
+        let mut peak = 0.0f32;
+        for i in lag..flat.len() {
+            let (want, got) = (flat[i - lag], through[i]);
+            assert!(
+                (want - got).abs() < 1.0e-3,
+                "sample {i}: sent {want}, heard {got} a partition later"
+            );
+            peak = peak.max(got.abs());
+        }
+        assert!(peak > 0.001, "the delayed wire carried nothing");
+
+        // The bay reports the file in its state, so the session carries it.
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.load_insert(3, 0, Some(Path::new(IR_PATH)), Some(&state))
+            .expect("load")
+            .expect("loaded");
+        assert!(e.insert_state_error(3, 0).is_none(), "a clean IR raised an error");
+        let saved = e.save_insert_state(3, 0).expect("answers");
+        assert!(
+            String::from_utf8(saved).unwrap().contains(&format!("ir_path={}", path.display())),
+            "the saved state lost the IR's path"
+        );
+
+        // Wrong rate: loads, convolves, and the error slot says both rates.
+        let mut slow = wav.clone();
+        let rate_at = 12 + 8 + 4; // RIFF header, "fmt " id+size, format+channels
+        slow[rate_at..rate_at + 4].copy_from_slice(&44_100u32.to_le_bytes());
+        let slow_path = dir.join(format!("tangent-ir-slow-{}.wav", std::process::id()));
+        std::fs::write(&slow_path, &slow).expect("writes");
+        let state = crate::builtin_fx::state_text(
+            spec,
+            &spec.defaults(),
+            &[("ir_path".to_owned(), slow_path.display().to_string())],
+        )
+        .into_bytes();
+        e.load_insert(3, 1, Some(Path::new(IR_PATH)), Some(&state))
+            .expect("a mismatched rate must still load")
+            .expect("loaded");
+        let err = e.insert_state_error(3, 1).expect("and must say so");
+        assert!(err.contains("44100") && err.contains("48000"), "{err}");
+
+        // Missing file: loads as a wire, and the sentence names the path.
+        let state = crate::builtin_fx::state_text(
+            spec,
+            &spec.defaults(),
+            &[("ir_path".to_owned(), "/nowhere/tangent-gone.wav".to_owned())],
+        )
+        .into_bytes();
+        e.load_insert(3, 2, Some(Path::new(IR_PATH)), Some(&state))
+            .expect("a missing IR must still load")
+            .expect("loaded");
+        assert!(
+            e.insert_state_error(3, 2).is_some_and(|s| s.contains("tangent-gone")),
+            "the missing file's sentence went missing too"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&slow_path);
+    }
+
     /// The drum fixture with the INSERT tap in play. `arm` aims the tap in
     /// ENGINE terms; `trim_bay` seats a trim in that bay of the MASTER's
     /// rack at `trim_gain` of its travel (0.5 is unity, 1.0 is +24 dB),
@@ -15241,7 +15539,7 @@ mod tests {
         e.set_drum_strips(1 << 5);
         if let Some(bay) = trim_bay {
             let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).unwrap();
-            let state = crate::builtin_fx::state_text(spec, &[trim_gain]).into_bytes();
+            let state = crate::builtin_fx::state_text(spec, &[trim_gain], &[]).into_bytes();
             e.load_insert(
                 tangent_ui::recorder::MASTER_SEAT,
                 bay,
@@ -15416,7 +15714,7 @@ mod tests {
         v[1] = 1.0; // ratio: 20:1
         v[2] = 0.0; // attack: 0.1 ms
         v[3] = 0.0; // release: 20 ms
-        crate::builtin_fx::state_text(spec, &v).into_bytes()
+        crate::builtin_fx::state_text(spec, &v, &[]).into_bytes()
     }
 
     /// One constant mono clip on one lane, a second long — the key tests'
