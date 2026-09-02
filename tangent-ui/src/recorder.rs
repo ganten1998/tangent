@@ -248,6 +248,9 @@ pub struct RecorderView<'a> {
     pub export_dest: &'a str,
     /// The PRESET folder, likewise — the MEDIA tier's fourth row.
     pub preset_dest: &'a str,
+    /// The IR folder, likewise — the MEDIA tier's fifth row, where the IR
+    /// wizard saves and the convolver's shelf reads.
+    pub irs_dest: &'a str,
     /// The typed take name. May be empty — the timestamp guarantees uniqueness.
     pub take_name: &'a str,
     /// The name field has keyboard focus, so it draws a caret and the app's
@@ -375,6 +378,7 @@ impl RecorderView<'_> {
             project_dest: "",
             export_dest: "",
             preset_dest: "",
+            irs_dest: "",
             take_name: "",
             name_focused: false,
             editing: None,
@@ -1198,6 +1202,8 @@ pub struct RecorderState {
     pub export_dest: String,
     /// And the PRESET folder — the fourth standing folder.
     pub preset_dest: String,
+    /// And the IR folder — the fifth.
+    pub irs_dest: String,
     /// What the next take's folder will be called, from `tangent_record::take`.
     pub folder_preview: String,
     pub camera_name: Option<String>,
@@ -1239,6 +1245,7 @@ impl Default for RecorderState {
             project_dest: String::new(),
             export_dest: String::new(),
             preset_dest: String::new(),
+            irs_dest: String::new(),
             folder_preview: String::new(),
             camera_name: None,
             camera_missing: false,
@@ -1306,6 +1313,7 @@ impl RecorderState {
             project_dest: &self.project_dest,
             export_dest: &self.export_dest,
             preset_dest: &self.preset_dest,
+            irs_dest: &self.irs_dest,
             take_name,
             name_focused,
             editing,
@@ -1834,6 +1842,39 @@ pub enum RecorderRequest {
     /// outside the preset root — a delete is the one request here that
     /// must never follow user text anywhere it points.
     DeletePreset { path: String },
+    // ── the IR wizard's road ────────────────────────────────────────────
+    // Appended at the END, like the presets' three above: the enum is
+    // append-only across parallel lanes. All four are requests because the
+    // capture engine, the sweep math and the `IRs/` folder all live behind
+    // the firewall; the wizard says what it wants and reads the answers off
+    // the pushed `ports::IrLive`.
+    /// Play a level-setting sine on `out` while metering `inp`'s return —
+    /// the wizard's stage-2 test tone. `on: false` stops it. Channels are
+    /// device indices, zero-based; `level_db` is dBFS of the tone.
+    IrTone {
+        out: (usize, usize),
+        inp: (usize, usize),
+        level_db: f32,
+        on: bool,
+    },
+    /// Arm one sweep capture through the hardware loop: play an exponential
+    /// sweep of `sweep_s` seconds at `level_db` on `out`, record `inp` for
+    /// the sweep plus `tail_s` of silence, then deconvolve. `reference`
+    /// marks a loop-only (bypass) pass, kept to divide the next real pass.
+    IrCapture {
+        out: (usize, usize),
+        inp: (usize, usize),
+        sweep_s: f64,
+        tail_s: f64,
+        level_db: f32,
+        reference: bool,
+    },
+    /// Stop whatever the IR road is doing — tone or capture — and reclaim
+    /// its buffers. Also what closing the wizard sends.
+    IrCancel,
+    /// Write the last finished capture into `IRs/<name>.wav` (32-bit float
+    /// stereo) and re-push the shelf rows.
+    IrSave { name: String },
 }
 
 /// How hard an auditioned note is struck.

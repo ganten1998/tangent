@@ -718,6 +718,9 @@ pub enum DirPurpose {
     /// Where saved presets live — the fourth standing folder. Appended at
     /// the end, like every variant this enum gains.
     PresetRoot,
+    /// Where captured impulse responses live — the fifth standing folder.
+    /// Appended at the end, like every variant this enum gains.
+    IrsRoot,
 }
 
 // ── presets ─────────────────────────────────────────────────────────────────
@@ -848,6 +851,68 @@ pub struct BuiltinFace {
     /// click on the chip to the right face.
     pub path: String,
     pub params: Vec<BuiltinFaceParam>,
+}
+
+// ── the IR shelf and the wizard's live picture ──────────────────────────────
+// Appended as a section of its own, exactly as the faces' section above is:
+// sibling lanes edit this file in parallel worktrees, and a block at the end
+// merges where a mid-file insertion conflicts.
+
+/// One impulse response the host found under `IRs/`. Names and paths, never
+/// samples: the UI draws a list and hands the path back, the [`PresetRow`]
+/// bargain exactly.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IrRow {
+    /// The file's stem — an IR file has no name field of its own.
+    pub name: String,
+    /// The file, absolute, for a convolver picker to load by.
+    pub path: String,
+    /// How long the IR runs, read from the WAV header alone so a shelf of
+    /// fifty files costs fifty header reads and no decoding.
+    pub seconds: f32,
+}
+
+/// What one finished capture measured, pushed by the host for the wizard's
+/// result stage to draw. Plain data over the firewall: the samples stay on
+/// the host, which is where saving happens.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IrOutcome {
+    /// The IR's level over time in dB, both channels folded to the louder,
+    /// evenly spaced over `seconds` — the picture the result stage paints.
+    pub envelope_db: Vec<f32>,
+    /// Length of the processed IR.
+    pub seconds: f32,
+    /// Seconds of tail above the measured noise floor — the usable decay.
+    pub usable_s: f32,
+    /// The loop's own floor, read from the capture's pre-roll silence, dBFS.
+    pub noise_floor_db: f32,
+    /// 2nd/3rd-harmonic energy against the linear response, dB — the free
+    /// THD probe an exponential sweep carries (Farina).
+    pub thd2_db: f32,
+    pub thd3_db: f32,
+    /// Whether a loop-only reference pass divided out the interface.
+    pub has_reference: bool,
+}
+
+/// The wizard's live picture, pushed by the host once per frame while the
+/// IR road is doing anything: return levels during the tone and the sweep,
+/// capture progress, and the finished result when there is one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IrLive {
+    /// Return RMS of the chosen input pair, dBFS. −200 when silent/idle.
+    pub rms_db: f32,
+    /// Return peak of the chosen input pair, dBFS, per block.
+    pub peak_db: f32,
+    /// A capture is armed or running.
+    pub capturing: bool,
+    /// 0..=1 of the capture buffer filled.
+    pub progress: f32,
+    /// What the road is doing, in words: "capturing", "deconvolving", "".
+    pub phase: String,
+    /// A reference pass has been captured and will divide the next DUT pass.
+    pub has_reference: bool,
+    /// The last finished capture's measurements, until a new arm clears it.
+    pub result: Option<IrOutcome>,
 }
 
 #[cfg(test)]

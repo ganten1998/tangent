@@ -619,6 +619,10 @@ pub struct DesktopApp {
     /// re-armed from here without re-asking the UI.
     tap_buf: Vec<f32>,
     insert_tap_at: Option<(usize, usize)>,
+    /// The IR wizard's host-side road: what is armed, the reference pass on
+    /// hold, the worker chewing a finished capture, and the processed IRs
+    /// waiting for a Save. See the "IRs on disk" section.
+    ir: IrRoad,
 }
 
 /// How many columns the backing track's waveform is drawn from.
@@ -2286,12 +2290,21 @@ impl DesktopApp {
                 }
             }
         }
+        // The IR road's own frame work: levels while the wizard meters, a
+        // finished capture handed to the worker, the worker's answer landed
+        // — and, first time through, the shelf's launch scan.
+        if !self.ir.scanned {
+            self.ir.scanned = true;
+            self.push_ir_rows();
+        }
+        self.ir_tick();
         // **Read before the state is borrowed mutably.** Both are pure
         // functions of the settings, so hoisting them changes nothing but
         // the borrow.
         let project_dest = shorten_home(&self.app.project_root());
         let export_dest = shorten_home(&self.app.export_root());
         let preset_dest = shorten_home(&self.app.preset_root());
+        let irs_dest = shorten_home(&self.app.irs_root());
         let state = self.app.recorder_state_mut();
         state.preview = preview;
         state.camera_name = self
@@ -2398,6 +2411,7 @@ impl DesktopApp {
         state.project_dest = project_dest;
         state.export_dest = export_dest;
         state.preset_dest = preset_dest;
+        state.irs_dest = irs_dest;
         state.folder_preview = take::folder_name(
             &take::WallTime::now_utc(),
             name.as_deref().and_then(take::sanitise_slug).as_deref(),
@@ -3611,6 +3625,46 @@ impl DesktopApp {
                 R::DeletePreset { path } => {
                     self.delete_unit_preset(std::path::Path::new(&path));
                 }
+                // ── the IR wizard ───────────────────────────────────────
+                // The wizard's four asks. Requests because the capture
+                // engine, the sweep math and `IRs/` all live on this side;
+                // the answers ride back on the pushed `IrLive`.
+                R::IrTone { out, inp, level_db, on } => {
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        if on {
+                            e.start_ir_tone(out, inp, level_db);
+                        } else {
+                            e.stop_ir();
+                        }
+                    }
+                }
+                R::IrCapture { out, inp, sweep_s, tail_s, level_db, reference } => {
+                    self.start_ir_capture(out, inp, sweep_s, tail_s, level_db, reference);
+                }
+                R::IrCancel => {
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        e.stop_ir();
+                    }
+                    // The pending pass is dropped HERE, so the buffer the
+                    // engine hands back finds nobody waiting and dies
+                    // quietly — and the live picture says the road is at
+                    // rest, or the wizard would show a progress bar with
+                    // nothing behind it forever.
+                    self.ir.pending = None;
+                    self.ir.live.capturing = false;
+                    self.ir.live.progress = 0.0;
+                    self.ir.live.phase = String::new();
+                    self.app.set_ir_live(self.ir.live.clone());
+                    // A cancel keeps the reference and the finished result:
+                    // closing the wizard mid-thought must not cost the pass
+                    // somebody already captured. This is also the wizard's
+                    // Done, so the shelf is re-read on the way out — a save
+                    // that happened this session is on it for certain.
+                    self.push_ir_rows();
+                }
+                R::IrSave { name } => {
+                    self.save_ir(&name);
+                }
             }
             ctx.request_repaint();
         }
@@ -3756,6 +3810,230 @@ impl DesktopApp {
         if let Some(unit) = unit {
             self.push_preset_rows(&unit);
         }
+    }
+
+    // ── IRs on disk, and the wizard's host half ─────────────────────────────
+    //
+    // The preset road's shape, one shelf instead of one per unit: the host
+    // scans `IRs/` and pushes plain rows; the wizard asks through
+    // `RecorderRequest` and reads the answers off the pushed `IrLive`. The
+    // MEASUREMENT lives here too — the engine only plays and records; the
+    // sweep synthesis, the deconvolution and the file all happen on this
+    // side, with the heavy math on a worker thread so a fifty-second
+    // capture's FFTs never freeze a frame.
+
+    /// Scan `IRs/` and push the rows — see [`scan_ir_rows`], which is the
+    /// whole of it; this method only knows where the folder is and who
+    /// receives the answer.
+    fn push_ir_rows(&mut self) {
+        let rows = scan_ir_rows(&self.app.irs_root());
+        self.app.set_ir_rows(rows);
+    }
+
+    /// Arm one sweep pass — the wizard's stage-3 button, and its optional
+    /// loop-only reference pass. Everything the engine will touch is built
+    /// here: the sweep from the verified math in `units::sweep`, the level
+    /// from the stage the meter approved, a second of pre-roll so the noise
+    /// floor is measured and the loop's latency never eats the sweep's head.
+    fn start_ir_capture(
+        &mut self,
+        out: (usize, usize),
+        inp: (usize, usize),
+        sweep_s: f64,
+        tail_s: f64,
+        level_db: f32,
+        reference: bool,
+    ) {
+        let Some(e) = self.recorder.engine.as_mut() else {
+            self.ir.live.phase = "no audio engine is running".to_owned();
+            self.app.set_ir_live(self.ir.live.clone());
+            return;
+        };
+        let rate = f64::from(e.output().sample_rate.max(1));
+        // The recipe's band: from 10 Hz — "well below the lowest frequency
+        // of interest" (Muller) — up to 22 kHz or 95% of Nyquist, whichever
+        // the rate can carry.
+        let f1 = 10.0;
+        let f2 = 22_000.0f64.min(0.475 * rate);
+        let sweep_s = if sweep_s.is_finite() { sweep_s.clamp(1.0, 120.0) } else { 15.0 };
+        let tail_s = if tail_s.is_finite() { tail_s.clamp(1.0, 60.0) } else { 10.0 };
+        let sweep = crate::units::sweep::ess(f1, f2, sweep_s, rate);
+        if sweep.is_empty() {
+            self.ir.live.phase = "the sweep could not be generated at this rate".to_owned();
+            self.app.set_ir_live(self.ir.live.clone());
+            return;
+        }
+        let pre = rate.round() as usize;
+        let tail = (tail_s * rate).round() as usize;
+        let level = 10.0f32.powf(level_db.clamp(-60.0, 0.0) / 20.0);
+        e.start_ir_capture(crate::instrument::IrCaptureSpec {
+            out_pair: out,
+            in_pair: inp,
+            sweep: sweep.clone(),
+            pre_silence_frames: pre,
+            post_silence_frames: tail,
+            level,
+        });
+        let total = pre + sweep.len() + tail;
+        if reference {
+            // A fresh reference supersedes whatever was held.
+            self.ir.reference = None;
+            self.ir.live.has_reference = false;
+        } else if let Some(r) = &self.ir.reference {
+            // A held reference only divides a pass with ITS sweep: same
+            // length, same window — the IRU lock semantics. A mismatched
+            // one is quietly retired rather than silently misapplied.
+            if r.sweep_len != sweep.len() || r.total != total {
+                self.ir.reference = None;
+                self.ir.live.has_reference = false;
+            }
+        }
+        self.ir.pending = Some(IrPending {
+            reference,
+            sweep,
+            pre,
+            rate,
+            f1,
+            f2,
+            duration: sweep_s,
+            total,
+        });
+        self.ir.live.result = None;
+        self.ir.live.capturing = true;
+        self.ir.live.progress = 0.0;
+        self.ir.live.phase = if reference {
+            "capturing the loop-only reference".to_owned()
+        } else {
+            "capturing".to_owned()
+        };
+        self.app.set_ir_live(self.ir.live.clone());
+    }
+
+    /// The IR road's once-per-frame poll: return levels while the tone or a
+    /// capture runs, a finished capture handed off to the worker thread, the
+    /// worker's answer landed, and the whole picture pushed to the app.
+    fn ir_tick(&mut self) {
+        let mut busy = self.ir.pending.is_some() || self.ir.worker.is_some();
+        if let Some(e) = self.recorder.engine.as_mut() {
+            let (rms_db, peak_db) = e.ir_return_db();
+            let (done_f, total_f) = e.ir_progress();
+            if rms_db > -200.0 || total_f > 0 {
+                busy = true;
+            }
+            self.ir.live.rms_db = rms_db;
+            self.ir.live.peak_db = peak_db;
+            self.ir.live.progress = if total_f > 0 {
+                (done_f as f32 / total_f as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            if let Some((capture, complete)) = e.take_captured() {
+                busy = true;
+                if let Some(p) = self.ir.pending.take() {
+                    if !complete {
+                        self.ir.live.capturing = false;
+                        self.ir.live.phase = "cancelled".to_owned();
+                    } else if p.reference {
+                        self.ir.reference = Some(IrReference {
+                            capture,
+                            sweep_len: p.sweep.len(),
+                            total: p.total,
+                        });
+                        self.ir.live.capturing = false;
+                        self.ir.live.has_reference = true;
+                        self.ir.live.phase =
+                            "reference captured - now capture through the unit".to_owned();
+                    } else {
+                        // The heavy half, off this thread: a fifty-second
+                        // capture deconvolves through multi-million-point
+                        // FFTs, and a frozen frame would read as a hang.
+                        let reference =
+                            self.ir.reference.as_ref().map(|r| r.capture.clone());
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(process_ir_capture(
+                                &capture, &p.sweep, reference.as_deref(), p.pre, p.rate,
+                                p.f1, p.f2, p.duration,
+                            ));
+                        });
+                        self.ir.worker = Some(rx);
+                        self.ir.live.capturing = false;
+                        self.ir.live.phase = "deconvolving".to_owned();
+                    }
+                }
+                // With no pending pass this was a stopped tone (or a stale
+                // job): the buffers just died on this thread, as designed.
+            }
+        }
+        if let Some(rx) = self.ir.worker.take() {
+            match rx.try_recv() {
+                Ok((left, right, outcome)) => {
+                    self.ir.finished = Some(IrFinished {
+                        irs: [left, right],
+                        rate: self.recorder.engine.as_ref().map_or(48_000, |e| e.output().sample_rate),
+                    });
+                    self.ir.live.result = Some(outcome);
+                    self.ir.live.phase = String::new();
+                    busy = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.ir.worker = Some(rx);
+                    busy = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.ir.live.phase = "deconvolution failed".to_owned();
+                }
+            }
+        }
+        // Pushed while anything moves, and once more as the road settles, so
+        // the wizard's last frame shows the road at rest rather than stale.
+        if busy || self.ir.was_busy {
+            self.app.set_ir_live(self.ir.live.clone());
+        }
+        self.ir.was_busy = busy;
+    }
+
+    /// Write the processed pair as `IRs/<name>.wav` — 32-bit float stereo at
+    /// the capture's rate, the format every convolver reads — and re-push
+    /// the shelf.
+    fn save_ir(&mut self, name: &str) {
+        let Some(f) = self.ir.finished.as_ref() else {
+            self.ir.live.phase = "nothing captured to save yet".to_owned();
+            self.app.set_ir_live(self.ir.live.clone());
+            return;
+        };
+        let dir = self.app.irs_root();
+        if std::fs::create_dir_all(&dir).is_err() {
+            self.ir.live.phase = "the IRs folder could not be created".to_owned();
+            self.app.set_ir_live(self.ir.live.clone());
+            return;
+        }
+        let stem = sanitize_file_stem(name);
+        let path = dir.join(format!("{stem}.wav"));
+        let spec = tangent_record::wav::WavSpec {
+            sample_rate: f.rate,
+            channels: 2,
+            format: tangent_record::wav::SampleFormat::Float32,
+        };
+        let bext =
+            tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+        let frames = f.irs[0].len().max(f.irs[1].len());
+        let mut interleaved = vec![0.0f32; frames * 2];
+        for (i, fr) in interleaved.chunks_exact_mut(2).enumerate() {
+            fr[0] = f.irs[0].get(i).copied().unwrap_or(0.0);
+            fr[1] = f.irs[1].get(i).copied().unwrap_or(0.0);
+        }
+        let written = tangent_record::wav::WavWriter::create(&path, spec, &bext)
+            .and_then(|mut w| {
+                w.write_interleaved(&interleaved)?;
+                w.finish()
+            });
+        self.ir.live.phase = match written {
+            Ok(()) => format!("saved {stem}.wav"),
+            Err(e) => format!("save failed: {e}"),
+        };
+        self.app.set_ir_live(self.ir.live.clone());
+        self.push_ir_rows();
     }
 
     /// The patch the settings point at, if the cartridge has one there.
@@ -4150,6 +4428,12 @@ impl DesktopApp {
             tangent_ui::ports::DirPurpose::ProjectRoot => self.app.set_project_dir(dir),
             tangent_ui::ports::DirPurpose::ExportRoot => self.app.set_export_root(dir),
             tangent_ui::ports::DirPurpose::PresetRoot => self.app.set_preset_dir(dir),
+            tangent_ui::ports::DirPurpose::IrsRoot => {
+                self.app.set_irs_dir(dir);
+                // A moved shelf is a different shelf: rescan where the
+                // setting now points, so the rows match the folder shown.
+                self.push_ir_rows();
+            }
         }
     }
 
@@ -7778,6 +8062,285 @@ fn shorten_home(path: &std::path::Path) -> String {
     }
 }
 
+// ── the IR wizard's host-side state and math ────────────────────────────────
+
+/// Everything the host holds for the IR road between frames. One struct so
+/// the desktop grows one field however much the wizard learns to do.
+#[derive(Default)]
+struct IrRoad {
+    /// The pass the engine is capturing right now, with everything the
+    /// worker will need once the buffer comes back.
+    pending: Option<IrPending>,
+    /// The loop-only (bypass) pass, held to divide the next real pass — the
+    /// exact deconvolution route, which cancels the interface and its
+    /// latency in the quotient.
+    reference: Option<IrReference>,
+    /// The worker thread chewing a finished capture, if one is out.
+    worker: Option<std::sync::mpsc::Receiver<(Vec<f32>, Vec<f32>, tangent_ui::ports::IrOutcome)>>,
+    /// The processed pair, waiting for Save (or a retry to replace it).
+    finished: Option<IrFinished>,
+    /// The picture pushed to the app — see `ports::IrLive`.
+    live: tangent_ui::ports::IrLive,
+    /// The road moved last frame, so it gets one more push as it settles.
+    was_busy: bool,
+    /// The launch scan has run — once, on the first frame, when the app
+    /// exists to receive the rows.
+    scanned: bool,
+}
+
+/// What `start_ir_capture` remembers about the armed pass.
+struct IrPending {
+    reference: bool,
+    sweep: Vec<f32>,
+    /// Pre-roll silence frames — the noise-floor read.
+    pre: usize,
+    rate: f64,
+    f1: f64,
+    f2: f64,
+    /// Sweep length in seconds, for the harmonic-advance arithmetic.
+    duration: f64,
+    /// Whole capture length in frames, the reference-match key.
+    total: usize,
+}
+
+/// A held reference pass and the shape it was captured with. Only a pass
+/// with the SAME shape may be divided by it — the IRU lock semantics.
+struct IrReference {
+    capture: Vec<f32>,
+    sweep_len: usize,
+    total: usize,
+}
+
+/// The processed stereo pair, ready to be written.
+struct IrFinished {
+    irs: [Vec<f32>; 2],
+    rate: u32,
+}
+
+/// How many points the wizard's envelope picture carries. Finer than any
+/// panel is wide, coarse enough to push every frame without a thought.
+const IR_ENVELOPE_POINTS: usize = 360;
+
+/// The whole measurement, capture in, shippable IR out — every step is the
+/// verified recipe's, in its order, on `units::sweep`'s math.
+///
+/// The QC numbers ride the CLASSIC route (time-reversed-sweep convolution)
+/// because that is the route whose negative times hold the harmonic images
+/// where the probe reads them; the exported IR takes the REFERENCE division
+/// when a loop-only pass exists, because that route is exact — latency,
+/// converter ripple and interface coloration cancel in the quotient.
+#[allow(clippy::too_many_arguments)]
+fn process_ir_capture(
+    capture: &[f32],
+    sweep: &[f32],
+    reference: Option<&[f32]>,
+    pre: usize,
+    rate: f64,
+    f1: f64,
+    f2: f64,
+    duration: f64,
+) -> (Vec<f32>, Vec<f32>, tangent_ui::ports::IrOutcome) {
+    use crate::units::sweep as ess;
+    let frames = capture.len() / 2;
+    let mut left = Vec::with_capacity(frames);
+    let mut right = Vec::with_capacity(frames);
+    for fr in capture.chunks_exact(2) {
+        left.push(fr[0]);
+        right.push(fr[1]);
+    }
+    // The loop's floor, off the pre-roll — most of it, staying clear of the
+    // last stretch where the loop's latency may already carry sweep onset.
+    let floor_window = (pre * 4) / 5;
+    let floor_db = ess::noise_floor_db(&left[..floor_window.min(left.len())])
+        .max(ess::noise_floor_db(&right[..floor_window.min(right.len())]));
+
+    // The distortion probe, on the classic route: the order-N image sits
+    // dt_N ahead of the recorded response's own peak.
+    let inv = ess::inverse_filter(f1, f2, duration, rate);
+    let probe = ess::deconvolve_classic(&left, sweep, &inv);
+    let probe_peak = ess::linear_peak(&probe.ir);
+    let thd2 = ess::harmonic_level_db(&probe.ir, probe_peak, 2, duration, f1, f2, rate);
+    let thd3 = ess::harmonic_level_db(&probe.ir, probe_peak, 3, duration, f1, f2, rate);
+
+    // The IR itself: exact division when a reference exists, classic else.
+    let (mut l, mut r, has_reference) = match reference.filter(|r| r.len() == capture.len()) {
+        Some(refc) => {
+            let mut rl = Vec::with_capacity(frames);
+            let mut rr = Vec::with_capacity(frames);
+            for fr in refc.chunks_exact(2) {
+                rl.push(fr[0]);
+                rr.push(fr[1]);
+            }
+            let mut hl = ess::deconvolve_by_reference(&left, &rl, f1, f2, rate);
+            let mut hr = ess::deconvolve_by_reference(&right, &rr, f1, f2, rate);
+            // The division is circular: harmonic images and regularization
+            // ringing wrap to the END of the padded buffer. The buffer is at
+            // least twice the capture, so keeping one capture's worth chops
+            // the wrap off whole — Muller's windowing rule.
+            hl.truncate(frames);
+            hr.truncate(frames);
+            (hl, hr, true)
+        }
+        None => {
+            let dr = ess::deconvolve_classic(&right, sweep, &inv);
+            (probe.ir.clone(), dr.ir, false)
+        }
+    };
+    // One start for BOTH channels — the earlier foot — so the stereo pair
+    // stays sample-locked (the IRU rule: edits apply across all tracks).
+    let start = ess::find_onset(&l).min(ess::find_onset(&r));
+    ess::trim_leading(&mut l, start);
+    ess::trim_leading(&mut r, start);
+    ess::remove_dc(&mut l);
+    ess::remove_dc(&mut r);
+    ess::truncate_at_floor(&mut l, floor_db, rate);
+    ess::truncate_at_floor(&mut r, floor_db, rate);
+    // Tail lengths equalized by silence, so the pair interleaves cleanly;
+    // both ends were just faded to the floor, so the padding is inaudible.
+    let len = l.len().max(r.len()).max(1);
+    l.resize(len, 0.0);
+    r.resize(len, 0.0);
+    // One scale for the set: the level difference between the channels IS
+    // the stereo image (Voxengo's warning).
+    let mut set = [l, r];
+    ess::normalize_set(&mut set, ess::NORM_TARGET_DB);
+    let [l, r] = set;
+
+    let peak_at = ess::linear_peak(&l).min(ess::linear_peak(&r));
+    let seconds = (len as f64 / rate) as f32;
+    let usable_s = ((len.saturating_sub(peak_at)) as f64 / rate) as f32;
+    let outcome = tangent_ui::ports::IrOutcome {
+        envelope_db: ir_envelope_db(&l, &r),
+        seconds,
+        usable_s,
+        noise_floor_db: floor_db,
+        thd2_db: thd2,
+        thd3_db: thd3,
+        has_reference,
+    };
+    (l, r, outcome)
+}
+
+/// The result stage's picture: the pair's level over time in dB, folded to
+/// the louder channel, [`IR_ENVELOPE_POINTS`] buckets, floored at −100.
+fn ir_envelope_db(l: &[f32], r: &[f32]) -> Vec<f32> {
+    let len = l.len().max(r.len());
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(IR_ENVELOPE_POINTS);
+    for b in 0..IR_ENVELOPE_POINTS {
+        let from = b * len / IR_ENVELOPE_POINTS;
+        let to = ((b + 1) * len / IR_ENVELOPE_POINTS).max(from + 1).min(len);
+        let mut peak = 0.0f32;
+        for i in from..to {
+            peak = peak
+                .max(l.get(i).copied().unwrap_or(0.0).abs())
+                .max(r.get(i).copied().unwrap_or(0.0).abs());
+        }
+        out.push(if peak > 0.0 {
+            (20.0 * peak.log10()).max(-100.0)
+        } else {
+            -100.0
+        });
+    }
+    out
+}
+
+/// The shelf's scan: the folder itself plus ONE level of subfolders, so a
+/// library sorted into `Reverbs/` and `Cabs/` still shows whole. Duration
+/// comes off each WAV's header alone — a shelf of fifty files costs fifty
+/// header reads and no decoding — and junk is skipped without a word, the
+/// preset folder's own rule.
+fn scan_ir_rows(root: &std::path::Path) -> Vec<tangent_ui::ports::IrRow> {
+    let mut rows: Vec<tangent_ui::ports::IrRow> = Vec::new();
+    let wavs = |dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>| {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+                {
+                    out.push(p);
+                }
+            }
+        }
+    };
+    let mut paths = Vec::new();
+    wavs(root, &mut paths);
+    if let Ok(entries) = std::fs::read_dir(root) {
+        let mut subs: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .collect();
+        subs.sort();
+        for sub in subs {
+            wavs(&sub, &mut paths);
+        }
+    }
+    paths.sort();
+    for path in paths {
+        let Some(seconds) = wav_seconds(&path) else {
+            continue; // Not a WAV after all; a shelf skips junk quietly.
+        };
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        rows.push(tangent_ui::ports::IrRow {
+            name,
+            path: path.to_string_lossy().into_owned(),
+            seconds,
+        });
+    }
+    rows
+}
+
+/// A WAV's duration off its header alone — chunk walk, no decoding. `None`
+/// for anything that is not a WAV, which a shelf scan skips quietly.
+fn wav_seconds(path: &std::path::Path) -> Option<f32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hdr = [0u8; 12];
+    f.read_exact(&mut hdr).ok()?;
+    if &hdr[0..4] != b"RIFF" || &hdr[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut rate = 0u32;
+    let mut block_align = 0u32;
+    let mut data_bytes: Option<u64> = None;
+    let mut chunk = [0u8; 8];
+    while f.read_exact(&mut chunk).is_ok() {
+        let size = u64::from(u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]));
+        match &chunk[0..4] {
+            b"fmt " => {
+                let mut fmt = [0u8; 16];
+                if size < 16 || f.read_exact(&mut fmt).is_err() {
+                    return None;
+                }
+                rate = u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]);
+                block_align = u32::from(u16::from_le_bytes([fmt[12], fmt[13]]));
+                // Whatever the format appends past the common fields.
+                f.seek(SeekFrom::Current((size - 16) as i64)).ok()?;
+            }
+            b"data" => {
+                data_bytes = Some(size);
+                break; // Nothing after data changes the duration.
+            }
+            _ => {
+                // An odd chunk carries a RIFF pad byte its size omits.
+                f.seek(SeekFrom::Current((size + (size & 1)) as i64)).ok()?;
+            }
+        }
+    }
+    let data = data_bytes?;
+    if rate == 0 || block_align == 0 {
+        return None;
+    }
+    Some((data / u64::from(block_align)) as f32 / rate as f32)
+}
+
 impl DesktopApp {
     /// The pointer during a FILE DRAG, in window-local points — or `None`
     /// when nothing is being dragged and on platforms that are not asked.
@@ -8191,6 +8754,7 @@ impl DesktopApp {
             scope_buf: Vec::new(),
             tap_buf: Vec::new(),
             insert_tap_at: None,
+            ir: IrRoad::default(),
         };
         // What the effects ship as, so the panel can draw a slider for a
         // parameter nobody has moved. See `ports::EffectDefaults`: the DSP owns
@@ -9829,5 +10393,199 @@ mod tests {
         let peak = decoded.samples.iter().fold(0.0f32, |a, b| a.max(b.abs()));
         assert!(peak > 0.3 && peak < 0.8, "the sine came back at {peak}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── the IR wizard's host half ───────────────────────────────────────────
+
+    /// A synthetic "hardware loop" capture: pre-roll of near-silence, then
+    /// the sweep convolved through a little two-tap room, then tail — with a
+    /// −90 dB noise floor throughout, so the floor read and the truncation
+    /// both have something honest to find.
+    fn synthetic_ir_capture(
+        sweep: &[f32],
+        pre: usize,
+        tail: usize,
+        rate: f64,
+    ) -> (Vec<f32>, Vec<f32>) {
+        // The DUT: a direct arrival and one echo 30 ms later, decaying.
+        let mut ir = vec![0.0f32; (0.15 * rate) as usize];
+        ir[0] = 0.8;
+        let echo = (0.030 * rate) as usize;
+        for i in 0..(0.08 * rate) as usize {
+            let t = i as f64 / rate;
+            ir[echo + i] += (0.3 * (-t / 0.015).exp()) as f32
+                * ((std::f64::consts::TAU * 900.0 * t).cos() as f32);
+        }
+        let wet = crate::units::sweep::fft_convolve(sweep, &ir);
+        let frames = pre + sweep.len() + tail;
+        let mut noise_seed = 0x2468_ace0_1357_9bdfu64;
+        let mut noise = move || {
+            noise_seed = noise_seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((noise_seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0) * 3.0e-5
+        };
+        let mut capture = vec![0.0f32; frames * 2];
+        for f in 0..frames {
+            let dry = f
+                .checked_sub(pre)
+                .and_then(|k| wet.get(k))
+                .copied()
+                .unwrap_or(0.0);
+            capture[f * 2] = dry + noise();
+            capture[f * 2 + 1] = dry + noise();
+        }
+        (capture, ir)
+    }
+
+    /// **The whole measurement on synthetic loop data**, both routes: the
+    /// classic (no reference) pass recovers the room, reads its floor near
+    /// the −90 dB planted for it, trims the loop's lead-in so the direct
+    /// arrival sits at the front, and truncates the tail to a usable decay
+    /// shorter than the buffer — and a loop-only reference pass makes the
+    /// reference route say so.
+    #[test]
+    fn a_synthetic_capture_deconvolves_to_the_room_on_both_routes() {
+        let rate = 48_000.0f64;
+        let (f1, f2, dur) = (10.0, 22_000.0f64.min(0.475 * rate), 0.5);
+        let sweep = crate::units::sweep::ess(f1, f2, dur, rate);
+        let pre = 4_800usize;
+        let tail = 9_600usize;
+        let (capture, _room) = synthetic_ir_capture(&sweep, pre, tail, rate);
+
+        // The classic route.
+        let (l, r, out) =
+            super::process_ir_capture(&capture, &sweep, None, pre, rate, f1, f2, dur);
+        assert!(!out.has_reference);
+        assert_eq!(out.envelope_db.len(), super::IR_ENVELOPE_POINTS);
+        assert!(
+            (-100.0..=-85.0).contains(&out.noise_floor_db),
+            "the planted ~-95 dB floor read as {}",
+            out.noise_floor_db
+        );
+        // The direct arrival leads: the trim put the peak near the front.
+        let peak = crate::units::sweep::linear_peak(&l);
+        assert!(
+            (peak as f64) < 0.005 * rate,
+            "the direct arrival sits {peak} samples in"
+        );
+        // The echo survives where the room put it, on both channels.
+        let echo_at = (0.030 * rate) as usize;
+        let near_echo = |ch: &[f32]| {
+            ch[echo_at.saturating_sub(96)..(echo_at + 96).min(ch.len())]
+                .iter()
+                .fold(0.0f32, |a, &b| a.max(b.abs()))
+        };
+        assert!(
+            near_echo(&l) > 0.05 && near_echo(&r) > 0.05,
+            "the 30 ms echo went missing: {} / {}",
+            near_echo(&l),
+            near_echo(&r)
+        );
+        // Truncated to a decay, not the whole capture window.
+        assert!(
+            out.usable_s > 0.02 && out.usable_s < 0.30,
+            "usable decay reads {} s",
+            out.usable_s
+        );
+        // The set peaks at the norm target, channels locked.
+        let top = l
+            .iter()
+            .chain(r.iter())
+            .fold(0.0f32, |a, &b| a.max(b.abs()));
+        assert!((20.0 * top.log10() - (-0.2)).abs() < 0.1, "peak at {top}");
+        assert_eq!(l.len(), r.len(), "the pair came back different lengths");
+
+        // The reference route: a loop-only pass of the same shape.
+        let mut reference = vec![0.0f32; capture.len()];
+        for f in 0..capture.len() / 2 {
+            let v = f
+                .checked_sub(pre)
+                .and_then(|k| sweep.get(k))
+                .copied()
+                .unwrap_or(0.0);
+            reference[f * 2] = v;
+            reference[f * 2 + 1] = v;
+        }
+        let (l2, _r2, out2) = super::process_ir_capture(
+            &capture, &sweep, Some(&reference), pre, rate, f1, f2, dur,
+        );
+        assert!(out2.has_reference, "the reference pass was not used");
+        let peak2 = crate::units::sweep::linear_peak(&l2);
+        assert!(
+            (peak2 as f64) < 0.005 * rate,
+            "the reference route left the arrival {peak2} samples in"
+        );
+        assert!(
+            near_echo(&l2) > 0.05,
+            "the reference route lost the echo"
+        );
+    }
+
+    /// **A saved IR round-trips through the shelf**: written as 32-bit float
+    /// stereo, `wav_seconds` reads its length off the header alone,
+    /// `read_pcm` gets the samples back, and the scan lists it — from the
+    /// root and from one subfolder down — while junk is skipped without a
+    /// word.
+    #[test]
+    fn a_saved_ir_round_trips_through_the_shelf_scan() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-irs-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("Reverbs");
+        std::fs::create_dir_all(&sub).expect("irs dir");
+        let spec = tangent_record::wav::WavSpec {
+            sample_rate: 48_000,
+            channels: 2,
+            format: tangent_record::wav::SampleFormat::Float32,
+        };
+        let bext = tangent_record::wav::Bext::new(
+            tangent_record::wav::Wallclock::from_unix(1_786_804_327, 0),
+            spec,
+        );
+        // Half a second of decaying stereo, values past nothing special.
+        let frames = 24_000usize;
+        let samples: Vec<f32> = (0..frames)
+            .flat_map(|i| {
+                let v = 0.9 * (-(i as f32) / 4_800.0).exp();
+                [v, -v * 0.5]
+            })
+            .collect();
+        for path in [root.join("spring.wav"), sub.join("plate.wav")] {
+            let mut w = tangent_record::wav::WavWriter::create(&path, spec, &bext)
+                .expect("create");
+            w.write_interleaved(&samples).expect("write");
+            w.finish().expect("finish");
+        }
+        // Junk beside them: not WAVs, not listed, not fatal.
+        std::fs::write(root.join("notes.txt"), b"not audio").expect("junk");
+        std::fs::write(root.join("broken.wav"), b"RIFFxxxx").expect("junk wav");
+
+        let secs = super::wav_seconds(&root.join("spring.wav")).expect("header read");
+        assert!((secs - 0.5).abs() < 0.01, "header says {secs} s");
+        let bytes = std::fs::read(root.join("spring.wav")).expect("bytes");
+        let (back_spec, back) =
+            tangent_record::wav::read_pcm(&bytes).expect("read back");
+        assert_eq!(back_spec.channels, 2);
+        assert_eq!(back.len(), samples.len());
+        let worst = back
+            .iter()
+            .zip(&samples)
+            .fold(0.0f32, |a, (x, y)| a.max((x - y).abs()));
+        assert!(worst < 1.0e-6, "float samples moved by {worst}");
+
+        let rows = super::scan_ir_rows(&root);
+        // Path-sorted, subfolder capital before root lowercase — the scan's
+        // one ordering rule is "stable and boring".
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["plate", "spring"],
+            "the shelf lists {rows:?}"
+        );
+        assert!(rows.iter().all(|r| (r.seconds - 0.5).abs() < 0.01));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
