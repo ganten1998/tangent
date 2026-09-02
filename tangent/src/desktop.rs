@@ -1177,6 +1177,45 @@ fn is_instrument_sentinel(path: &str) -> bool {
     )
 }
 
+/// **The default pedalboard**, in chain order: dynamics first, then the
+/// filters and drive, modulation, time, and the room last — the order a
+/// player wires a real board, seeded so the amp arrives dressed rather
+/// than as seven pluses.
+#[cfg(feature = "recorder")]
+const AMP_DEFAULT_BOARD: [&str; tangent_ui::recorder::AMP_PEDALS] = [
+    "@tangent-comp",
+    "@tangent-wah",
+    "@tangent-drive",
+    "@tangent-chorus",
+    "@tangent-trem",
+    "@tangent-echo",
+    "@tangent-plate",
+];
+
+/// Whether the amp landing on channel `ch` should seed [`AMP_DEFAULT_BOARD`],
+/// asked with a lookup instead of the settings so the once-only rule can be
+/// tested as plain logic. `pedal_filled(pedal, bay)` answers whether that
+/// cell holds anything.
+///
+/// **"Any non-empty pedal cell" is the whole marker, deliberately** — the
+/// simpler of the two honest options (the other was a settings flag per
+/// channel, a key carried forever for a fact the slots already state). The
+/// seeded board itself trips it, so one amp load seeds exactly once; a
+/// player who empties all twenty-one cells by hand AND re-seats the amp
+/// gets a fresh board, which is the reading of that gesture we want.
+#[cfg(feature = "recorder")]
+fn amp_board_to_seed(
+    ch: usize,
+    pedal_filled: impl Fn(usize, usize) -> bool,
+) -> Option<[&'static str; tangent_ui::recorder::AMP_PEDALS]> {
+    if ch >= tangent_ui::recorder::CHANNELS {
+        return None;
+    }
+    let untouched = (0..tangent_ui::recorder::AMP_PEDALS)
+        .all(|p| (0..tangent_ui::recorder::INSERTS).all(|b| !pedal_filled(p, b)));
+    untouched.then_some(AMP_DEFAULT_BOARD)
+}
+
 /// **Read one strip's three bays and hand the app what they can automate.**
 ///
 /// A free function because it is called from two arms of the same match and
@@ -3041,6 +3080,30 @@ impl DesktopApp {
         {
             let want = want_at(i);
             self.recorder.inserts_loaded[i] = want.clone();
+            // **THE DEFAULT PEDALBOARD.** The amp landing in a CHANNEL bay
+            // whose pedal slots have never been touched seeds the classic
+            // board, comp to plate, through `set_insert` — the same
+            // settings road the track-paste above takes, so each pedal then
+            // loads through this very reconcile, one bay a frame. The
+            // decision and its once-only marker live in
+            // [`amp_board_to_seed`].
+            if want.as_deref() == Some(crate::builtin_fx::AMP_PATH) {
+                let ch = i / inserts;
+                let seed = amp_board_to_seed(ch, |pedal, bay| {
+                    self.app
+                        .insert(tangent_ui::recorder::amp_pedal_seat(ch, pedal), bay)
+                        .is_some()
+                });
+                if let Some(board) = seed {
+                    for (pedal, path) in board.iter().enumerate() {
+                        self.app.set_insert(
+                            tangent_ui::recorder::amp_pedal_seat(ch, pedal),
+                            0,
+                            Some(path),
+                        );
+                    }
+                }
+            }
             if let Some(e) = self.recorder.engine.as_mut() {
                 // **A built-in INSTRUMENT is not a bundle.** Its sentinel
                 // path rides in the bay like any plugin's — that is what lets
@@ -9489,6 +9552,35 @@ mod tests {
             (MASTER_EXTRA_SEAT + 1) * INSERTS <= INSERT_SPACE,
             "INSERT_SPACE does not cover the master's second rack"
         );
+    }
+
+    /// **The default pedalboard seeds exactly once, and only on a
+    /// channel.** The once-only marker is "any non-empty pedal cell" — the
+    /// seeded board itself trips it — so the decision is held here as the
+    /// plain logic it is, with the reconcile's write path left to write.
+    #[cfg(feature = "recorder")]
+    #[test]
+    fn the_default_pedalboard_seeds_once_and_only_on_channels() {
+        use tangent_ui::recorder::{AMP_PEDALS, CHANNELS};
+        let empty = |_p: usize, _b: usize| false;
+        let board = super::amp_board_to_seed(3, empty).expect("an untouched channel seeds");
+        assert_eq!(board.len(), AMP_PEDALS);
+        assert!(board.iter().all(|p| p.starts_with("@tangent-")));
+        assert_eq!(board[0], "@tangent-comp", "dynamics lead the chain");
+        assert_eq!(board[AMP_PEDALS - 1], "@tangent-plate", "the room comes last");
+        // ONE non-empty cell anywhere on the board — the seeded board
+        // itself included — blocks a second seeding, first and last cells
+        // both checked because the walk has two loops to get wrong.
+        assert!(super::amp_board_to_seed(3, |p, b| p == 0 && b == 0).is_none());
+        assert!(
+            super::amp_board_to_seed(3, |p, b| p == AMP_PEDALS - 1 && b == 2).is_none(),
+            "a tenant in the last pedal's last bay did not count as touched"
+        );
+        // Past the channels — the master's seat and everything after — no
+        // board: those amps play bare in v1, and seeding would land the
+        // pedals on seat math that means another channel's board.
+        assert!(super::amp_board_to_seed(CHANNELS, empty).is_none());
+        assert!(super::amp_board_to_seed(usize::MAX, empty).is_none());
     }
 
     /// **The export renders the STRETCHED audio, at the stretched length.**

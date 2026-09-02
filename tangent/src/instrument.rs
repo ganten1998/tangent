@@ -3298,6 +3298,21 @@ fn run_rack(
     }
 }
 
+/// Whether a rack seats the amp in any bay — the switch that arms a
+/// channel's pedal racks (see `recorder::AMP_PEDAL_SEATS`). Asked on the
+/// audio thread, so it is a match on the INSTANCE actually seated rather
+/// than a string compare or a second ledger that could drift from what the
+/// hand-off ring has delivered: between the bay being filled and the ring
+/// delivering, the pedals honestly stay silent, exactly as the amp does.
+fn rack_holds_amp(rack: &Rack) -> bool {
+    rack.slots.iter().any(|s| {
+        matches!(
+            &s.0,
+            Some(p) if matches!(p.backend, Backend::Builtin(crate::builtin_fx::BuiltinUnit::Amp(_)))
+        )
+    })
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // The renderer: everything that runs on the audio thread
 // ───────────────────────────────────────────────────────────────────────────
@@ -6232,6 +6247,19 @@ impl Renderer {
                     tangent_ui::recorder::folder_extra_seat(lane),
                 ));
             }
+            // An amp-bearing lane's chain includes its seven pedal racks —
+            // they run in series before the amp, so the lane's figure and
+            // the alignment target both carry their sum, or a lookahead
+            // pedal would leave the lane late by exactly what it looks
+            // ahead. Mirrors the wait in the lane pass; see THE PEDALBOARD.
+            if self.racks.get(lane).is_some_and(|r| rack_holds_amp(r)) {
+                for pedal in 0..tangent_ui::recorder::AMP_PEDALS {
+                    l = l.saturating_add(Rack::latency(
+                        &self.shared,
+                        tangent_ui::recorder::amp_pedal_seat(lane, pedal),
+                    ));
+                }
+            }
             self.shared.lane_latency[lane].store(l, Ordering::Relaxed);
             // **Plus every rack it is folded THROUGH.** A track in a group
             // with a lookahead limiter on the group pays that limiter, so
@@ -7643,6 +7671,55 @@ impl Renderer {
             }
             if rack_live && !is_folder {
                 let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
+                // ── THE PEDALBOARD ─────────────────────────────────────────
+                // **A channel bay holding the amp arms the channel's seven
+                // pedal racks** (`recorder::AMP_PEDAL_SEATS`), run here IN
+                // ORDER over `fx_in` — the signal as it stands before this
+                // channel's own rack, which is the amp's input in the
+                // seeded shape (the amp in bay 0; an amp moved to a later
+                // bay hears its pedals through whatever sits before it, a
+                // v1 simplification stated rather than hidden). Only HERE:
+                // the master, the buses, a folder's two racks and the
+                // send/monitor re-runs of this same seat all play bare in
+                // v1 — a pedal is a once-per-chunk stateful chain, and a
+                // second run per chunk would double-clock it.
+                if rack_holds_amp(&self.racks[ch]) {
+                    for pedal in 0..tangent_ui::recorder::AMP_PEDALS {
+                        let seat = tangent_ui::recorder::amp_pedal_seat(ch, pedal);
+                        // An empty pedal rack costs this one load and
+                        // nothing else — every channel's default state.
+                        if self.racks[seat].is_empty() {
+                            continue;
+                        }
+                        // The seat's own queue, taken before the rack is
+                        // borrowed mutably, as every caller does.
+                        let pedal_params: [&[tangent_host::ParamPoint]; INSERTS] =
+                            std::array::from_fn(|b| {
+                                self.auto_params
+                                    .get(seat * INSERTS + b)
+                                    .map_or(&[][..], Vec::as_slice)
+                            });
+                        // **NOT-A-CHANNEL:** a pedal seat lives past every
+                        // channel index and can never be handed a folder.
+                        // An effects pass — no notes; the hand's CONTROLS
+                        // still reach a pedal that listens for them.
+                        run_rack(
+                            &mut self.racks[seat],
+                            &mut self.fx_in,
+                            frames,
+                            &mut self.fx_out,
+                            &[],
+                            controls,
+                            &pedal_params,
+                            &self.shared,
+                            seat,
+                            // NOT a key pass: the lane's one feed per chunk
+                            // belongs to the channel's own rack below. See
+                            // `KeyFeed`.
+                            None,
+                        );
+                    }
+                }
                 // **This seat's own parameter queue, not the empty one.** Every rack
                 // outside the general channels used to be handed an empty queue,
                 // which was true while the only writer was an automation curve —
@@ -7658,6 +7735,8 @@ impl Renderer {
                             .get((ch) * INSERTS + b)
                             .map_or(&[][..], Vec::as_slice)
                     });
+                // Guarded by `!is_folder` at this block's head — a folder's
+                // rack belongs to the fold, per the checklist's rule.
                 run_rack(
                     &mut self.racks[ch],
                     &mut self.fx_in,
@@ -7714,6 +7793,18 @@ impl Renderer {
                         &self.shared,
                         tangent_ui::recorder::folder_extra_seat(ch),
                     ));
+                }
+                // An amp-bearing lane also pays its pedal racks on the way
+                // out, so the wait subtracts them too — `publish_latency`
+                // counts them into the target by the same rule, and the two
+                // must not drift or the lane waits for its own pedals.
+                if rack_holds_amp(&self.racks[ch]) {
+                    for pedal in 0..tangent_ui::recorder::AMP_PEDALS {
+                        own = own.saturating_add(Rack::latency(
+                            &self.shared,
+                            tangent_ui::recorder::amp_pedal_seat(ch, pedal),
+                        ));
+                    }
                 }
                 let want = usize::try_from(
                     pdc_max
@@ -14995,6 +15086,231 @@ mod tests {
             "full gain measured {:.3}x, not the +24 dB ({want:.3}x) the mapping promises",
             loud / flat
         );
+    }
+
+    /// The pedal tests' shared rig: a DX7 lane rolling one long note on a
+    /// channel with the amp in bay 0, rendered a few blocks; the two flags
+    /// choose where a +24 dB trim sits — pedal 0 (before the amp) or the
+    /// channel's bay 1 (after it). Returns the rolling peak.
+    fn dx7_through_amp(trim_in_pedal: bool, trim_in_bay: bool) -> f32 {
+        use std::sync::Arc;
+        const CH: usize = 2;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).unwrap();
+        let loud = crate::builtin_fx::state_text(spec, &[1.0]).into_bytes();
+        e.load_insert(CH, 0, Some(Path::new(crate::builtin_fx::AMP_PATH)), None)
+            .expect("the amp loads")
+            .expect("the bay reports it");
+        if trim_in_pedal {
+            e.load_insert(
+                tangent_ui::recorder::amp_pedal_seat(CH, 0),
+                0,
+                Some(Path::new(crate::builtin_fx::TRIM_PATH)),
+                Some(&loud),
+            )
+            .expect("a pedal seat admits a built-in")
+            .expect("the pedal bay reports it");
+        }
+        if trim_in_bay {
+            e.load_insert(CH, 1, Some(Path::new(crate::builtin_fx::TRIM_PATH)), Some(&loud))
+                .expect("bay 1 loads")
+                .expect("bay 1 reports it");
+        }
+        // Low fader so the loud case cannot brush anything downstream —
+        // the claim is about the RACK's internal order, read as a ratio.
+        e.set_channel_gain(CH, 0.02);
+        e.set_master_gain(1.0);
+        e.set_builtin_strips(1 << CH);
+        e.sync_instrument_lanes(1 << CH, 0);
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; 1024 * 2];
+        // Warm-up drains the hand-off rings, same count for every variant.
+        for _ in 0..3 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        e.set_midi_clips(vec![PlacedMidi {
+            strip: CH,
+            start: 0,
+            len: 96_000,
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 48_000, key: 48, vel: 127 }]),
+        }]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+        }
+        peak
+    }
+
+    /// **A pedal runs BEFORE the amp; the same effect in the next bay runs
+    /// after.** +24 dB ahead of the power stage saturates — the table's
+    /// ceiling eats most of it — while +24 dB after the amp keeps nearly
+    /// all of its gain. If the pedal racks ran after the amp (or not at
+    /// all), the two placements would read the same and this fails.
+    #[test]
+    fn a_pedal_trim_saturates_the_amp_where_a_bay_trim_rides_out_clean() {
+        let bare = dx7_through_amp(false, false);
+        assert!(bare > 1.0e-4, "the rig makes no sound at all: {bare}");
+        let before = dx7_through_amp(true, false);
+        let after = dx7_through_amp(false, true);
+        assert!(
+            before > bare,
+            "a +24 dB pedal into the amp got QUIETER: {before} against {bare} bare"
+        );
+        // Measured as GAIN over the bare take. The bay trim sits after the
+        // power stage, so its +24 dB rides out whole; the pedal trim sits
+        // before it, so the table's ceiling eats a real part of it. Same
+        // effect, same setting — only the placement differs, so a pedal
+        // walk that ran after the rack (or not at all) reads identical
+        // gains and fails here.
+        let full = 10f32.powf(24.0 / 20.0);
+        let (gain_before, gain_after) = (before / bare, after / bare);
+        assert!(
+            gain_after > full * 0.8,
+            "the bay trim's gain did not survive the amp: x{gain_after:.2} of x{full:.2}"
+        );
+        assert!(
+            gain_before < gain_after * 0.8,
+            "no saturation onset between the placements: pedal x{gain_before:.2} \
+             against bay x{gain_after:.2}"
+        );
+    }
+
+    /// **An emptied pedal rack leaves no fingerprint.** Two engines, block
+    /// for block: one never had a pedal, one seated a trim and unloaded it
+    /// before rolling. Same render count on both — the amp's tremolo LFO
+    /// and the DX7 advance per block — so any difference is the pedal
+    /// walk's, and there must be none, to the bit.
+    #[test]
+    fn an_unloaded_pedal_leaves_the_amp_lane_bit_identical() {
+        use std::sync::Arc;
+        const CH: usize = 1;
+        let rig = |pedal_then_unload: bool| -> Vec<f32> {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.load_insert(CH, 0, Some(Path::new(crate::builtin_fx::AMP_PATH)), None)
+                .expect("amp")
+                .expect("seated");
+            if pedal_then_unload {
+                e.load_insert(
+                    tangent_ui::recorder::amp_pedal_seat(CH, 4),
+                    0,
+                    Some(Path::new(crate::builtin_fx::TRIM_PATH)),
+                    None,
+                )
+                .expect("pedal")
+                .expect("seated");
+            }
+            e.set_builtin_strips(1 << CH);
+            e.sync_instrument_lanes(1 << CH, 0);
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 512 * 2];
+            e.render_offline(&mut out);
+            if pedal_then_unload {
+                e.load_insert(tangent_ui::recorder::amp_pedal_seat(CH, 4), 0, None, None)
+                    .expect("unload");
+            }
+            e.render_offline(&mut out);
+            e.set_midi_clips(vec![PlacedMidi {
+                strip: CH,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 24_000, key: 52, vel: 100 }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut heard = Vec::new();
+            for _ in 0..6 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                heard.extend_from_slice(&out);
+            }
+            heard
+        };
+        let never = rig(false);
+        let emptied = rig(true);
+        assert!(never.iter().any(|s| s.abs() > 1.0e-4), "the rig is silent");
+        assert_eq!(never.len(), emptied.len());
+        for (i, (a, b)) in never.iter().zip(&emptied).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "sample {i}: {a} became {b}");
+        }
+    }
+
+    /// **An idle desk pays nothing for the pedal machinery.** Every lane
+    /// disarmed, nothing feeding: a desk with the amp seated and its seven
+    /// pedal seats empty must cost what a bare desk costs — the appended
+    /// two-hundred-odd seats live only in the per-block swap walk and one
+    /// enum match, and this is the tripwire for someone making them do
+    /// real work per block. Min-of-runs against a 3x bound: coarse on
+    /// purpose, because CI clocks wobble and the real claim (the audio is
+    /// untouched) is the bit-exact test above.
+    #[test]
+    fn empty_pedals_cost_an_idle_desk_nothing_measurable() {
+        let cost = |amp: bool| -> std::time::Duration {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            if amp {
+                e.load_insert(3, 0, Some(Path::new(crate::builtin_fx::AMP_PATH)), None)
+                    .expect("amp")
+                    .expect("seated");
+            }
+            e.set_midi_off(u64::MAX);
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 512 * 2];
+            e.render_offline(&mut out);
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..7 {
+                let t = std::time::Instant::now();
+                for _ in 0..200 {
+                    out.fill(0.0);
+                    e.render_offline(&mut out);
+                }
+                best = best.min(t.elapsed());
+            }
+            best
+        };
+        let bare = cost(false);
+        let dressed = cost(true);
+        assert!(
+            dressed < bare * 3 + std::time::Duration::from_millis(30),
+            "an idle amp desk took {dressed:?} against {bare:?} bare"
+        );
+    }
+
+    /// **The alignment target carries an amp lane's pedals — and ONLY an
+    /// amp lane's.** Same arithmetic-through-the-published-figure shape as
+    /// the folder test above: an empty rack cannot really delay, so the
+    /// fixture states what the chain costs.
+    #[test]
+    fn the_alignment_target_counts_pedals_only_behind_an_amp() {
+        let render = |wire: &dyn Fn(&mut Engine)| -> u32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            wire(&mut e);
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 256 * 2];
+            // Two blocks: the first drains the amp's hand-off ring, the
+            // second publishes with the seat occupied.
+            e.render_offline(&mut out);
+            e.render_offline(&mut out);
+            e.published_max_latency_for_test()
+        };
+        let pedal_seat = tangent_ui::recorder::amp_pedal_seat(6, 3);
+        // A lookahead pedal behind a seated amp: the lane pays it.
+        let with_amp = render(&|e| {
+            e.load_insert(6, 0, Some(Path::new(crate::builtin_fx::AMP_PATH)), None)
+                .expect("amp")
+                .expect("seated");
+            e.set_seat_latency_for_test(pedal_seat, 0, 64);
+        });
+        assert_eq!(with_amp, 64, "an amp lane's pedal latency went uncounted");
+        // The same figure on the same seat with NO amp is a rack that
+        // never runs, and counting it would hold the whole desk late.
+        let without_amp = render(&|e| {
+            e.set_seat_latency_for_test(pedal_seat, 0, 64);
+        });
+        assert_eq!(without_amp, 0, "a bare lane waited for pedals that never run");
     }
 
     /// **A built-in bay's settings survive: state out, unload, state back in,

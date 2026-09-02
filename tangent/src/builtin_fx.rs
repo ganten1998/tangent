@@ -43,6 +43,12 @@ pub const IMAGER_PATH: &str = "@tangent-imager";
 pub const TAPE_PATH: &str = "@tangent-tape";
 pub const COMP_PATH: &str = "@tangent-comp";
 
+/// The amp's sentinel. Same law as the four above — and this one the engine
+/// also LOOKS FOR: a channel bay holding the amp is what arms that
+/// channel's seven pedal racks (see `recorder::AMP_PEDAL_SEATS` and the
+/// lane pass in `instrument.rs`).
+pub const AMP_PATH: &str = "@tangent-amp";
+
 /// One parameter a unit publishes: what the automation lane, the state blob
 /// and (one day) a knob panel all address it by.
 ///
@@ -164,8 +170,31 @@ const COMP_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 6, symbol: "key_hpf", name: "Key HPF", units: "Hz", default: 0.0, steps: 0 },
 ];
 
+/// One knob per panel control of `units::amp`. Ids 0..4 are the top strip
+/// (bright, volume, tone stack), 5..8 the vibrato group. Defaults are
+/// `AmpParams::default()` verbatim — warm and clean — except the VIB
+/// switch, which is the wrapper's own (the kernel spells "off" as depth 0;
+/// a panel wants a switch that remembers the intensity it will come back
+/// at, so the switch is a face parameter and the wrapper computes the
+/// depth). A test holds the two tables together.
+const AMP_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "bright", name: "Bright", units: "", default: 0.0, steps: 2 },
+    ParamSpec { id: 1, symbol: "volume", name: "Volume", units: "", default: 0.7, steps: 0 },
+    ParamSpec { id: 2, symbol: "treble", name: "Treble", units: "", default: 0.5, steps: 0 },
+    ParamSpec { id: 3, symbol: "middle", name: "Middle", units: "", default: 0.5, steps: 0 },
+    ParamSpec { id: 4, symbol: "bass", name: "Bass", units: "", default: 0.5, steps: 0 },
+    ParamSpec { id: 5, symbol: "vib_on", name: "Vibrato", units: "", default: 0.0, steps: 2 },
+    ParamSpec { id: 6, symbol: "vib_speed", name: "Speed", units: "Hz", default: 0.35, steps: 0 },
+    ParamSpec { id: 7, symbol: "vib_depth", name: "Intensity", units: "%", default: 0.0, steps: 0 },
+    ParamSpec { id: 8, symbol: "vib_stereo", name: "Stereo", units: "%", default: 0.0, steps: 0 },
+];
+
 fn build_trim(sample_rate: f32) -> BuiltinUnit {
     BuiltinUnit::Trim(Trim::new(sample_rate))
+}
+
+fn build_amp(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Amp(AmpUnit::new(sample_rate))
 }
 
 fn build_eq(sample_rate: f32) -> BuiltinUnit {
@@ -215,6 +244,12 @@ pub const UNITS: &[UnitSpec] = &[
         class: "Tangent Comp",
         params: COMP_FACE_PARAMS,
         build: build_comp,
+    },
+    UnitSpec {
+        path: AMP_PATH,
+        class: "Tangent Amp",
+        params: AMP_FACE_PARAMS,
+        build: build_amp,
     },
 ];
 
@@ -281,6 +316,21 @@ pub fn describe(path: &str, id: u32, value: f32) -> String {
                 }
             }
         }
+        (AMP_PATH, id) => match id {
+            // The switches say what they are.
+            0 | 5 => (if v >= 0.5 { "on" } else { "off" }).to_owned(),
+            // Speed is a real frequency, from the opto tremolo's measured
+            // range; the community's 2.5–10 Hz, swept like every Hz knob.
+            6 => {
+                use crate::units::trem::TREM_SPEED_HZ;
+                fmt_hz(sweep(TREM_SPEED_HZ))
+            }
+            7 | 8 => fmt_pct(v),
+            // Volume and the tone stack read as panel numbers, 0–10: the
+            // hardware's skirted dials are numbered, not calibrated, and a
+            // fake decibel would claim a precision the pot never had.
+            _ => format!("{:.1}", v * 10.0),
+        },
         // The tape speaks in percent on purpose: its knobs are character,
         // not calibration, and a fake decibel is worse than an honest one.
         _ => fmt_pct(v),
@@ -298,6 +348,7 @@ pub fn choices(path: &str, id: u32) -> Vec<String> {
             .iter()
             .map(|k| k.label().to_owned())
             .collect(),
+        (AMP_PATH, 0 | 5) => vec!["off".to_owned(), "on".to_owned()],
         _ => Vec::new(),
     }
 }
@@ -403,6 +454,11 @@ pub enum BuiltinUnit {
     Imager(ImagerUnit),
     Tape(TapeUnit),
     Comp(CompUnit),
+    /// The amp is also what ARMS a channel's pedal racks — the engine's
+    /// lane pass matches on this variant, which is the one honest "is the
+    /// amp in this bay" question the audio thread can ask without a string
+    /// compare or a second ledger.
+    Amp(AmpUnit),
 }
 
 impl BuiltinUnit {
@@ -427,6 +483,8 @@ impl BuiltinUnit {
             BuiltinUnit::Tape(_) => 0,
             // Feed-forward with no lookahead window.
             BuiltinUnit::Comp(_) => 0,
+            // Filters and a static table: nothing reads ahead.
+            BuiltinUnit::Amp(_) => 0,
         }
     }
 
@@ -444,6 +502,7 @@ impl BuiltinUnit {
             BuiltinUnit::Imager(u) => u.set_param(id, value),
             BuiltinUnit::Tape(u) => u.set_param(id, value),
             BuiltinUnit::Comp(u) => u.set_param(id, value),
+            BuiltinUnit::Amp(u) => u.set_param(id, value),
         }
     }
 
@@ -480,6 +539,7 @@ impl BuiltinUnit {
             BuiltinUnit::Imager(u) => u.process(input, frames, out),
             BuiltinUnit::Tape(u) => u.process(input, frames, out),
             BuiltinUnit::Comp(u) => u.process(input, frames, out),
+            BuiltinUnit::Amp(u) => u.process(input, frames, out),
         }
     }
 
@@ -510,6 +570,7 @@ impl BuiltinUnit {
             BuiltinUnit::Imager(u) => u.kernel.clear(),
             BuiltinUnit::Tape(u) => u.kernel.clear(),
             BuiltinUnit::Comp(u) => u.kernel.clear(),
+            BuiltinUnit::Amp(u) => u.kernel.clear(),
         }
     }
 }
@@ -833,6 +894,64 @@ impl CompUnit {
     }
 }
 
+// ── Tangent Amp, seated ─────────────────────────────────────────────────────
+
+/// The amp kernel behind its panel table.
+///
+/// The one wrinkle is the VIB switch: the kernel spells "vibrato off" as
+/// depth zero, but a panel switch that zeroed the intensity knob would
+/// forget where the player had it. So the switch and the intensity are two
+/// face parameters, both persisted, and the kernel's depth is their product
+/// — computed here, in the only place both are known.
+pub struct AmpUnit {
+    kernel: crate::units::amp::Amp,
+    params: crate::units::amp::AmpParams,
+    /// The VIB switch's own state; see the struct doc.
+    vib_on: bool,
+    /// Where the Intensity knob stands, kept apart from the depth the
+    /// kernel sees so the switch can come back to it.
+    intensity: f32,
+    scratch: Vec<f32>,
+}
+
+impl AmpUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::amp::Amp::new(sample_rate),
+            params: crate::units::amp::AmpParams::default(),
+            vib_on: false,
+            intensity: 0.0,
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = AMP_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.bright = v,
+            1 => self.params.volume = v,
+            2 => self.params.treble = v,
+            3 => self.params.middle = v,
+            4 => self.params.bass = v,
+            5 => self.vib_on = v >= 0.5,
+            6 => self.params.vib_speed = v,
+            7 => self.intensity = v,
+            _ => self.params.vib_stereo = v,
+        }
+        self.params.vib_depth = if self.vib_on { self.intensity } else { 0.0 };
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+    }
+}
+
 // ── Tangent Trim ────────────────────────────────────────────────────────────
 
 /// Where the trim's one knob travels, in dB. 0.5 is exactly unity — the knob
@@ -1105,6 +1224,16 @@ mod tests {
         ]) {
             assert_eq!(spec.default, want, "{} drifted from CompParams::default", spec.symbol);
         }
+        // The amp: kernel defaults for every dial; the VIB switch is the
+        // wrapper's own and ships off, which IS the kernel's depth-0 rest.
+        let a = crate::units::amp::AmpParams::default();
+        for (spec, want) in AMP_FACE_PARAMS.iter().zip([
+            a.bright, a.volume, a.treble, a.middle, a.bass, 0.0, a.vib_speed, a.vib_depth,
+            a.vib_stereo,
+        ]) {
+            assert_eq!(spec.default, want, "{} drifted from AmpParams::default", spec.symbol);
+        }
+        assert_eq!(a.vib_depth, 0.0, "the kernel no longer ships with the vibrato at rest");
         // The EQ: kernel defaults for everything except the parking spots,
         // which are the documented three-handle spread (see EQ_FACE_PARAMS).
         let n = crate::units::eq::NodeParams::default();

@@ -919,6 +919,12 @@ pub enum DialogAction {
     /// per-frame publish owns the `seat_bay` translation, so the edge
     /// survives every seat renumbering the desk migrations perform.
     SetInsertKeySource { strip: usize, slot: usize, from: Option<usize> },
+    /// The amp face's pedal chip: open the insert picker over pedal
+    /// `pedal` of the channel whose bay the face sits on. `strip`/`slot`
+    /// are the face's own DESK terms; the app resolves the channel through
+    /// `seat_bay` and the pedal through `amp_pedal_seat`, on its side of
+    /// the wall. Appended at the END, per this enum's law.
+    OpenPedalPicker { strip: usize, slot: usize, pedal: usize },
 }
 
 // ── the custom tuning editor ────────────────────────────────────────────────
@@ -3676,6 +3682,9 @@ pub fn show(
                 "@tangent-eq" => Vec2::new(470.0, 470.0),
                 "@tangent-imager" => Vec2::new(340.0, 480.0),
                 "@tangent-comp" => Vec2::new(400.0, 430.0),
+                // The amp: a 3:2 head, wide enough for the pedal row to
+                // wear seven readable chips.
+                crate::faces_amp::AMP_PATH => Vec2::new(540.0, 360.0),
                 _ => Vec2::new(400.0, 360.0),
             };
             show_dialog_viewport(
@@ -3714,6 +3723,9 @@ pub fn show(
                                             unit: unit.clone(),
                                             path,
                                         }
+                                    }
+                                    crate::faces::FaceAction::OpenPedal { pedal } => {
+                                        DialogAction::OpenPedalPicker { strip, slot, pedal }
                                     }
                                 });
                             }
@@ -10314,6 +10326,7 @@ at: None,
                         "Tangent Imager",
                         "Tangent Tape",
                         "Tangent Comp",
+                        "Tangent Amp",
                         "analog lab v",
                         "the modelled piano",
                         "Vital"
@@ -10330,12 +10343,12 @@ at: None,
                     .iter()
                     .filter(|p| !is_builtin(&p.path))
                     .all(|p| p.vendor.is_empty()));
-                // Eight, not one: the house shelf took the first seven rows.
-                assert_eq!(*selected, Some(8), "it did not open on what is loaded");
+                // Nine, not one: the house shelf took the first eight rows.
+                assert_eq!(*selected, Some(9), "it did not open on what is loaded");
                 assert_eq!(current.as_deref(), Some(loaded.as_str()));
                 assert!(filter.is_empty() && *focus);
                 assert!(
-                    plugin_row(&plugins[8], Some(&loaded)).starts_with('\u{2022}'),
+                    plugin_row(&plugins[9], Some(&loaded)).starts_with('\u{2022}'),
                     "the loaded plugin is not marked"
                 );
                 assert!(
@@ -10344,7 +10357,7 @@ at: None,
                 );
                 // Every row is bare — the folder heading carries the vendor,
                 // the house shelf's included.
-                assert_eq!(plugin_row(&plugins[9], None), "  Vital");
+                assert_eq!(plugin_row(&plugins[10], None), "  Vital");
                 assert_eq!(plugin_row(&plugins[0], None), format!("  {BUILTIN_NAME}"));
                 // The vendor is a FOLDER heading now, never a row suffix —
                 // the owner's ruling. A scanned plugin's row is bare.
