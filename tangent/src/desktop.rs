@@ -15,6 +15,11 @@ use crate::midi;
 use tangent_ui::app::TangentApp;
 use tangent_ui::host::Caps;
 use tangent_ui::midi_event::MidiEvent;
+// Named, not qualified: it appears beside three dozen messages and the
+// contract that introduced it spells it `Kind`. Gated with the messages
+// themselves — a Minimal build has nothing to say.
+#[cfg(feature = "recorder")]
+use tangent_ui::notify::Kind;
 use tangent_ui::ports::MidiPorts;
 use tangent_ui::settings::Settings;
 use std::sync::{mpsc, Arc};
@@ -244,16 +249,6 @@ struct Recorder {
     /// what knows: which inputs are open is a fact about the device and the
     /// selection, and `tangent-ui` can reach neither.
     input_names: [String; crate::instrument::INPUTS],
-    /// What the LAST take is worth saying about it, if anything.
-    ///
-    /// **Its own field, not `engine_error`.** The video path used to put this
-    /// in the audio engine's error slot, which nothing in the video path ever
-    /// cleared — so "frames were dropped" sat on the owner's screen for eight
-    /// minutes and across several takes, outliving the take it described by a
-    /// long way. This is cleared when a take starts and by the × on the status
-    /// row, and it is the last thing in the message chain because a live
-    /// problem always matters more than a finished one.
-    take_note: Option<String>,
     /// The newest camera frame, kept as RGBA for the compositor.
     ///
     /// A copy, and a deliberate one: the preview uploads its own texture and
@@ -389,6 +384,12 @@ struct OfflineBounce {
     /// position rather than appended, so a block that spans two columns fills
     /// both and a render that stalls leaves no gap.
     peaks: Vec<(f32, f32)>,
+    /// The render is over and the FORMAT pass is what is left.
+    ///
+    /// A phase and not a bool anybody reads for fun: it is what keeps the
+    /// per-frame tick out of the way while `write_export` owns the files.
+    /// See `tick_offline_bounce`, which is where the two are told apart.
+    writing: bool,
 }
 
 #[cfg(feature = "recorder")]
@@ -499,6 +500,51 @@ pub struct DesktopApp {
     recorder: Recorder,
     /// The launch splash, until it has been earned and faded. `None` after.
     splash: Option<Splash>,
+    /// The busy overlay: what the window says while the UI thread is gone.
+    ///
+    /// **The host holds it, and it has to.** `tangent_ui::busy` is a painter
+    /// over a rect that keeps only the two stamps its own `draw` can make
+    /// honestly, because the side that knows a stall is coming is the side
+    /// that owns the devices, the disk and somebody else's plugin
+    /// constructor — and that side is this one. The law the whole design is
+    /// bent around is stated in that module: a synchronous block produces no
+    /// frames, so the overlay is painted in frame N and the block happens in
+    /// frame N+1. [`Chore`] is how a call is suspended across that boundary.
+    busy: Option<tangent_ui::busy::Busy>,
+    /// Who raised it. See [`Busied`].
+    busied: Busied,
+    /// The announced work has finished, so the overlay may go as soon as it
+    /// has served its minimum. Never consulted while the work is still
+    /// running — an operation that is still going keeps its cover whatever
+    /// the clock says.
+    busy_done: bool,
+    /// What `Busy::draw` answered last frame: whether the desk is COVERED.
+    ///
+    /// Handed to the app beside the splash's own flag, because "something is
+    /// over the desk" is one question with one answer — the app must not
+    /// promote a card underneath either cover, and the frame's input is
+    /// swallowed on the strength of this too. See `update`.
+    busy_up: bool,
+    /// The blocking job announced last frame and run at the top of this one.
+    #[cfg(feature = "recorder")]
+    chore: Option<Chore>,
+    /// Files the next reload will need decoded, taken one a frame. See
+    /// `run_warm`.
+    #[cfg(feature = "recorder")]
+    warm: std::collections::VecDeque<Warm>,
+    /// What the decode warm-up's meter reads. See [`Counted`].
+    #[cfg(feature = "recorder")]
+    warm_count: Counted,
+    /// A clip or kit reload that is owed and is waiting on the warm-up.
+    #[cfg(feature = "recorder")]
+    clips_owed: bool,
+    #[cfg(feature = "recorder")]
+    pads_owed: bool,
+    /// What the insert loader's meter reads for the batch it is working
+    /// through. Zeroed between batches. See [`Counted`], which is where the
+    /// arithmetic and the reason for it live.
+    #[cfg(feature = "recorder")]
+    insert_batch: Counted,
     /// The MIDI port to open once the window is up: `Some(Some(name))` from
     /// `-p`, `Some(None)` for the priority chain, `None` once it has run.
     /// See where it is taken for why it is not done in the constructor.
@@ -2231,7 +2277,16 @@ impl DesktopApp {
             .or_else(|| self.muted_out_of_the_take())
             // And what the LAST take was worth saying, which is the only thing
             // here that is about the past — so it goes last.
-            .or_else(|| self.recorder.take_note.clone())
+            // **And what the LAST take had to say is not here either.**
+            //
+            // It was the last `or_else` in this chain, which is what made it
+            // a problem: a sentence about a finished take sat in a one-line
+            // strip competing with live errors, and stayed up until something
+            // else replaced it — eight minutes and several takes, once. It is
+            // a notification now, which ages out on its own, stacks rather
+            // than displaces, and is dismissed where it is drawn. What is
+            // left in this chain is the live conditions, which belong in the
+            // band precisely because they are true NOW.
             // **The take's report is not here any more.** It was the last
             // `or_else` in this chain, which meant it sat in a one-line strip
             // competing with live errors and stayed up until something else
@@ -2265,10 +2320,13 @@ impl DesktopApp {
                 // swallows every event until it is found and closed. See
                 // `Summary::is_problem`.
                 if silent {
-                    self.recorder.take_note = Some(
+                    // An ERROR by meaning and not by tone: "I recorded
+                    // silence" is the exact failure this recorder exists to
+                    // prevent, and it earns the longer life an error gets.
+                    self.app.notify(
+                        Kind::Error,
                         "that take is silent - check the input, and the mute \
-                         buttons in the mixer"
-                            .to_owned(),
+                         buttons in the mixer",
                     );
                 }
                 self.app.report_take(message, problem);
@@ -2843,7 +2901,7 @@ impl DesktopApp {
             self.app.set_browser(dir, entries, error);
         }
         if let Some((purpose, file)) = self.app.take_browsed_file() {
-            self.finish_file_choice(purpose, &file);
+            self.finish_file_choice(ctx, purpose, &file);
         }
         if let Some((purpose, dir)) = self.app.take_browsed_dir() {
             self.finish_dir_choice(purpose, dir);
@@ -2907,7 +2965,7 @@ impl DesktopApp {
         self.take_cartridge_request(ctx, frame);
         #[cfg(feature = "recorder")]
         self.take_save_panel(ctx, frame);
-        self.run_project_request();
+        self.take_project_request(ctx);
         #[cfg(feature = "recorder")]
         self.reconcile_reastream();
         #[cfg(feature = "recorder")]
@@ -2952,7 +3010,7 @@ impl DesktopApp {
                     report.vst2_seen
                 );
             }
-            self.recorder.take_note = Some(note);
+            self.app.notify(Kind::Info, note);
             self.app
                 .set_plugin_list(crate::plugin_catalog_from(report.found));
         }
@@ -3099,11 +3157,59 @@ impl DesktopApp {
             }
         }
         let inserts = tangent_ui::recorder::INSERTS;
-        let want_at = |i: usize| self.app.insert(i / inserts, i % inserts).map(str::to_owned);
-        if let Some(i) = (0..self.recorder.inserts_loaded.len())
-            .find(|i| want_at(*i) != self.recorder.inserts_loaded[*i])
-        {
-            let want = want_at(i);
+        // One walk, two answers — the next bay and the size of the wait.
+        // See `insert_walk`, which is where the reasoning lives.
+        let (next, outstanding) = insert_walk(
+            self.recorder.inserts_loaded.len(),
+            |i| {
+                self.app.insert(i / inserts, i % inserts)
+                    != self.recorder.inserts_loaded[i].as_deref()
+            },
+            |i| self.app.insert(i / inserts, i % inserts).is_some(),
+        );
+        // **Nothing can load without an engine**, so a desk waiting for a
+        // device is not waiting for plugins — the same exclusion
+        // `inserts_pending` makes for the splash, and for the same reason. A
+        // cover that said "Loading plugins" over a closed band would be
+        // naming work that is not happening.
+        let outstanding = if self.recorder.engine.is_some() {
+            outstanding
+        } else {
+            0
+        };
+        if outstanding == 0 {
+            // **The last bay lands as "8 of 8", not as "7 of 8".** The
+            // reading is taken from what is still outstanding, so the frame
+            // the work finishes on is the only one that can say it finished
+            // — and a meter whose final state is one short of full is a meter
+            // that looks like it gave up.
+            if !self.insert_batch.idle() && self.busied == Busied::Inserts {
+                let progress = self.insert_batch.saw(0).progress();
+                if let Some(busy) = self.busy.as_mut() {
+                    busy.detail = None;
+                    busy.progress = Some(progress);
+                }
+            }
+            self.insert_batch = Counted::default();
+            self.busy_chunk_done(Busied::Inserts);
+        } else {
+            self.insert_batch = self.insert_batch.saw(outstanding);
+            let progress = self.insert_batch.progress();
+            let name = next
+                .and_then(|i| self.app.insert(i / inserts, i % inserts))
+                .map(leaf_of);
+            if let Some(busy) = self.busy_chunk(Busied::Inserts, "Loading plugins") {
+                busy.detail = name;
+                busy.progress = Some(progress);
+            }
+            // A bay a frame only advances if frames arrive, and between the
+            // splash lifting and the user moving the mouse nothing else is
+            // asking for one. Asked only while real plugins are outstanding,
+            // so the long empty flush above does not spin the window.
+            ctx.request_repaint();
+        }
+        if let Some(i) = next {
+            let want = self.app.insert(i / inserts, i % inserts).map(str::to_owned);
             self.recorder.inserts_loaded[i] = want.clone();
             // **THE DEFAULT PEDALBOARD.** The amp landing in a CHANNEL bay
             // whose pedal slots have never been touched seeds the classic
@@ -3211,14 +3317,17 @@ impl DesktopApp {
         // `TangentApp::arr_waves_stale`, which is the threshold that keeps
         // this off the frame path during a drag.
         if self.app.take_clips_dirty() || self.app.arr_waves_stale() {
-            self.reload_clips();
+            self.clips_owed = true;
         }
 
         // **The drumpad's kit, on the same bargain**: a drop, a clear or a
         // project switch marks; this decodes and pushes the samples whole.
         if std::mem::take(&mut self.recorder.pads_retry) || self.app.take_drumpad_dirty() {
-            self.reload_pads();
+            self.pads_owed = true;
         }
+        // **And neither runs until its files are already decoded.** See
+        // `run_warm`, which is where both of those flags are answered.
+        self.run_warm(ctx);
 
         // **The click's sound, on the same bargain.** Decoded here, off the
         // audio thread, and handed over on the engine's own ring.
@@ -3273,8 +3382,8 @@ impl DesktopApp {
         // The automatic one, at most once per finished take. The marker is
         // updated whether or not the tick is on, so turning it on after a take
         // does not immediately open a window for a recording already made.
-        self.tick_bounce();
-        self.tick_offline_bounce();
+        self.tick_bounce(ctx);
+        self.tick_offline_bounce(ctx);
         // The arrangement's count-in reaching its downbeat: begin.
         if self.recorder.arr_rec_wait
             && self
@@ -3307,7 +3416,10 @@ impl DesktopApp {
         // The × on the status row. The message is the host's, so the host is
         // what puts it away — see `TangentApp::take_dismiss_message`.
         if self.app.take_dismiss_message() {
-            self.recorder.take_note = None;
+            // **The take's own line is not here any more.** It is a
+            // notification, and a notification is dismissed where it is drawn
+            // — the × on this row is for the LIVE problems below, which are
+            // conditions the band keeps showing until they stop being true.
             // **And the engine's error, which is what is usually showing.**
             // "Pro-R 2 is an effect, not an instrument" is a correct refusal
             // and a finished conversation — the user has read it and there is
@@ -3352,7 +3464,6 @@ impl DesktopApp {
                 // clips out; the take machinery does not stir. The capture —
                 // the cassette — is where the old take toggle lives now.
                 R::Toggle => {
-                    self.recorder.take_note = None;
                     if self.recorder.arr_rec_wait {
                         // Pressed again mid-count: the count stops, nothing
                         // records.
@@ -3383,8 +3494,10 @@ impl DesktopApp {
                     // **Whatever the last take had to say, it is not about
                     // this one.** Stale post-take advice that outlives the
                     // take it describes is how a line about dropped frames sat
-                    // on screen for eight minutes across several takes.
-                    self.recorder.take_note = None;
+                    // on screen for eight minutes across several takes —
+                    // and it is why the report is a notification now, which
+                    // ages out on its own rather than waiting to be replaced.
+                    //
                     // The click counts the take in, on the audio thread's own
                     // sample clock. Started here, at the press, so the first
                     // beat lands immediately rather than a frame later.
@@ -3640,13 +3753,30 @@ impl DesktopApp {
                 // instrument's: press it again and the window that is up goes
                 // away.
                 R::OpenInsertEditor(strip, slot) => {
-                    if let Some(e) = self.recorder.engine.as_mut() {
-                        if e.insert_editor_open(strip, slot) {
+                    let up = self
+                        .recorder
+                        .engine
+                        .as_ref()
+                        .is_some_and(|e| e.insert_editor_open(strip, slot));
+                    if up {
+                        if let Some(e) = self.recorder.engine.as_mut() {
                             e.close_insert_editor(strip, slot);
-                        } else if let Err(err) = e.open_insert_editor(strip, slot) {
-                            self.recorder.engine_error =
-                                Some(format!("could not open the effect's window: {err}"));
                         }
+                    } else if self.recorder.engine.is_some() {
+                        // **Opening one is not free and never was.** An LV2
+                        // re-parses the whole lilv world to find its UI, and
+                        // a JUCE or Qt view builds its whole tree on the
+                        // calling thread — the owner's "spinning wheel" on a
+                        // press that looks like it should just show a window.
+                        // There is no count to give: it is one call into
+                        // somebody else's code.
+                        let name = self.app.insert(strip, slot).map(leaf_of);
+                        self.announce(
+                            ctx,
+                            "Opening the plugin's window",
+                            name,
+                            Chore::InsertEditor(strip, slot),
+                        );
                     }
                 }
                 // A built-in face's knob, on its way to the sound. The app
@@ -3874,13 +4004,15 @@ impl DesktopApp {
         let p = match parsed {
             Ok(p) => p,
             Err(e) => {
-                self.recorder.take_note = Some(format!("preset: {e}"));
+                self.app.notify(Kind::Error, format!("preset: {e}"));
                 return;
             }
         };
         if !p.unit.is_empty() && p.unit != unit {
-            self.recorder.take_note =
-                Some(format!("preset: that file belongs to {}", p.unit));
+            self.app.notify(
+                Kind::Error,
+                format!("preset: that file belongs to {}", p.unit),
+            );
             return;
         }
         let name = if p.name.is_empty() {
@@ -4376,7 +4508,7 @@ impl DesktopApp {
             self.insert_media(lane, &files);
             return;
         }
-        self.finish_file_choice(purpose, &files[0]);
+        self.finish_file_choice(ctx, purpose, &files[0]);
     }
 
     /// Raise the SAVE panel the app asked for, and answer it.
@@ -4565,6 +4697,7 @@ impl DesktopApp {
     #[cfg(feature = "recorder")]
     fn finish_file_choice(
         &mut self,
+        ctx: &egui::Context,
         purpose: tangent_ui::ports::FilePurpose,
         file: &std::path::Path,
     ) {
@@ -4581,7 +4714,23 @@ impl DesktopApp {
             return;
         }
         if purpose == tangent_ui::ports::FilePurpose::Project {
-            self.switch_project(file);
+            // **The headline stall.** The outgoing session's plugin states
+            // are written, the incoming document parsed, every rack marked
+            // for reload and every clip decoded — up to a minute on a
+            // plugin-heavy desk. Announced by name, because "Opening
+            // Rehearsal 3" is the one thing somebody staring at a stopped
+            // window wants confirmed.
+            let name = file
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .or_else(|| file.file_name())
+                .map(|n| n.to_string_lossy().into_owned());
+            self.announce(
+                ctx,
+                "Opening project",
+                name,
+                Chore::OpenProject(file.to_path_buf()),
+            );
             return;
         }
         if purpose == tangent_ui::ports::FilePurpose::KitPreset {
@@ -4893,12 +5042,12 @@ impl DesktopApp {
             return;
         }
         let Some(e) = self.recorder.engine.as_ref() else {
-            self.recorder.take_note =
-                Some("Open the band to record — the audio path is closed.".to_owned());
+            self.app
+                .notify(Kind::Error, "Open the band to record — the audio path is closed.");
             return;
         };
         if self.app.project_doc().is_none() {
-            self.recorder.take_note = Some("No project is open.".to_owned());
+            self.app.notify(Kind::Error, "No project is open.");
             return;
         }
         // The armed lanes, split by what they record: a MIDI lane takes the
@@ -4959,13 +5108,15 @@ impl DesktopApp {
             }
         }
         if midi_lanes.is_empty() && audio.is_empty() {
-            self.recorder.take_note = Some(if armed_unbound {
-                "The armed channel has NO INPUT — its strip's input menu names \
-                 what it records."
-                    .to_owned()
-            } else {
-                "Nothing is armed — R on a channel is what records it.".to_owned()
-            });
+            self.app.notify(
+                Kind::Error,
+                if armed_unbound {
+                    "The armed channel has NO INPUT — its strip's input menu names \
+                     what it records."
+                } else {
+                    "Nothing is armed — R on a channel is what records it."
+                },
+            );
             return;
         }
         let rate = f64::from(e.output().sample_rate).max(1.0);
@@ -5053,11 +5204,14 @@ impl DesktopApp {
                     // and the old waveform pops back": no clip landed, no
                     // carve ran, and nothing said why.
                     if len_s >= 0.5 {
-                        self.recorder.take_note = Some(format!(
-                            "channel {}: the input delivered no audio for a {:.1}s take -                              nothing was kept and the old clips stand. See Audio Status.",
-                            lane + 1,
-                            len_s
-                        ));
+                        self.app.notify(
+                            Kind::Error,
+                            format!(
+                                "channel {}: the input delivered no audio for a {:.1}s take -                              nothing was kept and the old clips stand. See Audio Status.",
+                                lane + 1,
+                                len_s
+                            ),
+                        );
                     }
                     continue;
                 }
@@ -5090,7 +5244,8 @@ impl DesktopApp {
                         notes: Vec::new(),
                     }),
                     Err(e) => {
-                        self.recorder.take_note = Some(format!("could not write {name}: {e}"));
+                        self.app
+                            .notify(Kind::Error, format!("could not write {name}: {e}"));
                     }
                 }
             }
@@ -5104,24 +5259,39 @@ impl DesktopApp {
     /// the real engine — racks, limiter, master — into an audio-only take
     /// the finish copies into the project's `export/`.
     fn start_bounce(&mut self, stems: bool, span: Option<(f64, f64)>) {
+        // **A standing message stands until somebody lowers it.** The request
+        // raises `EXPORT_RUNNING` before it knows whether the pass can even
+        // start, which is right — the user pressed Export and deserves to see
+        // that something happened — but it makes every refusal below a road
+        // out that has to take it down again, or "Exporting…" sits on the
+        // desk for the rest of the session with nothing able to clear it.
+        // A lower on a key that is not raised is a no-op, so the direct
+        // Export Track / Export Stems rows pay nothing for this.
+        macro_rules! refuse {
+            () => {{
+                self.app.notify_lower(EXPORT_RUNNING);
+                return;
+            }};
+        }
         if self.recorder.bounce.is_some()
             || self.recorder.session.is_recording()
             || self.recorder.arr_rec.is_some()
         {
-            return;
+            refuse!();
         }
         if self.recorder.engine.is_none() {
-            self.recorder.take_note =
-                Some("Open the band to export — the audio path is closed.".to_owned());
-            return;
+            self.app
+                .notify(Kind::Error, "Open the band to export — the audio path is closed.");
+            refuse!();
         }
         let (from_s, until_s) = match span {
             Some((a, b)) if b > a => (a.max(0.0), b + 2.0),
             _ => (0.0, self.app.arr_span_s() + 2.0),
         };
         if until_s <= from_s + 2.0 && self.app.arr_span_s() <= 0.0 {
-            self.recorder.take_note = Some("Nothing to export — the timeline is empty.".to_owned());
-            return;
+            self.app
+                .notify(Kind::Error, "Nothing to export — the timeline is empty.");
+            refuse!();
         }
         let root = self.app.record_root();
         // From the span's head, rolling before the take opens — the same
@@ -5135,7 +5305,16 @@ impl DesktopApp {
             video: tangent_ui::recorder::VideoMode::None,
             ..self.app.export_spec()
         };
-        self.recorder.take_note = Some("Exporting — a real pass from the top…".to_owned());
+        // **A condition, not an event.** It is true from the press until
+        // the files land, so it is RAISED under a key and lowered when the
+        // pass reports — see the contract's `notify_raise`. Pushed as an
+        // event it would age out halfway through a five-minute song and leave
+        // the desk looking idle while it was still rendering.
+        self.app.notify_raise(
+            EXPORT_RUNNING,
+            Kind::Info,
+            "Exporting — a real pass from the top…",
+        );
         self.recorder.session.toggle(&root, Some("bounce"), 0, spec);
         // The stems: one writer per USED lane — clips on it, or a kind —
         // fed live from the engine's tap so nothing is buffered whole.
@@ -5223,7 +5402,7 @@ impl DesktopApp {
     }
 
     /// Drive a bounce: stop at the end, wait for the files, file the WAV.
-    fn tick_bounce(&mut self) {
+    fn tick_bounce(&mut self, ctx: &egui::Context) {
         self.drain_stem_tap();
         let Some(b) = self.recorder.bounce.as_mut() else {
             return;
@@ -5263,12 +5442,22 @@ impl DesktopApp {
                         wrote += 1;
                     }
                 }
-                self.finish_bounce(&folder, problem, stems);
-                if stems && wrote > 0 {
-                    self.recorder.take_note = Some(format!(
-                        "exported  export/track + {wrote} stems in export/stems/"
-                    ));
-                }
+                // **The same format pass the offline export runs**, and the
+                // same reason for holding it a frame: a copy per stem and an
+                // mp3 encode per file, all of it on this thread. The writers
+                // above are already closed, so nothing is left open across
+                // the wait.
+                self.announce(
+                    ctx,
+                    "Writing files",
+                    Some(folder.clone()),
+                    Chore::FinishBounce {
+                        folder,
+                        problem,
+                        stems,
+                        wrote,
+                    },
+                );
             }
         }
     }
@@ -5280,7 +5469,8 @@ impl DesktopApp {
         // bounce — the export note says where the real file went.
         self.recorder.seen_take = Some(folder.to_owned());
         if let Some(p) = problem {
-            self.recorder.take_note = Some(format!("export failed: {p}"));
+            self.app.notify_lower(EXPORT_RUNNING);
+            self.app.notify(Kind::Error, format!("export failed: {p}"));
             return;
         }
         let take_dir = self.app.record_root().join(folder);
@@ -5289,6 +5479,9 @@ impl DesktopApp {
             .project_doc()
             .and_then(|d| d.parent().map(|p| p.join("export")))
         else {
+            // Silent, but the standing message must not be: a pass that ends
+            // with nowhere to put the file still ended.
+            self.app.notify_lower(EXPORT_RUNNING);
             return;
         };
         let _ = std::fs::create_dir_all(&export_dir);
@@ -5298,7 +5491,9 @@ impl DesktopApp {
                 .find(|p| p.extension().is_some_and(|e| e == "wav"))
         });
         let Some(wav) = wav else {
-            self.recorder.take_note = Some("export: the take produced no audio file".to_owned());
+            self.app.notify_lower(EXPORT_RUNNING);
+            self.app
+                .notify(Kind::Error, "export: the take produced no audio file");
             return;
         };
         let mut n = 1usize;
@@ -5315,10 +5510,13 @@ impl DesktopApp {
         };
         match std::fs::copy(&wav, export_dir.join(&name)) {
             Ok(_) => {
-                self.recorder.take_note = Some(format!("exported  export/{name}"));
+                self.app.notify_lower(EXPORT_RUNNING);
+                self.app
+                    .notify(Kind::Success, format!("exported  export/{name}"));
             }
             Err(e) => {
-                self.recorder.take_note = Some(format!("export failed: {e}"));
+                self.app.notify_lower(EXPORT_RUNNING);
+                self.app.notify(Kind::Error, format!("export failed: {e}"));
             }
         }
         // A realtime EXPORT-dialog pass: deliver into the chosen folder in
@@ -5331,6 +5529,7 @@ impl DesktopApp {
                 .as_ref()
                 .map_or(spec.rate, |e| e.output().sample_rate);
             let Some(out_dir) = self.export_out_dir(&spec) else {
+                self.app.notify_lower(EXPORT_RUNNING);
                 return;
             };
             let _ = std::fs::create_dir_all(&out_dir);
@@ -5358,7 +5557,9 @@ impl DesktopApp {
             self.app.set_export_progress(None);
             match deliver_formats_inner(&paths, &spec, true) {
                 Ok(()) => {
-                    self.recorder.take_note = Some(format!("Exported  {}", out_dir.display()));
+                    self.app.notify_lower(EXPORT_RUNNING);
+                    self.app
+                        .notify(Kind::Success, format!("Exported  {}", out_dir.display()));
                     // A long export is a thing people walk away from; the
                     // first thing they want on returning is the file.
                     if spec.open_when_done {
@@ -5366,7 +5567,8 @@ impl DesktopApp {
                     }
                 }
                 Err(e) => {
-                    self.recorder.take_note = Some(format!("export: {e}"));
+                    self.app.notify_lower(EXPORT_RUNNING);
+                    self.app.notify(Kind::Error, format!("export: {e}"));
                 }
             }
         }
@@ -5408,12 +5610,20 @@ impl DesktopApp {
     /// out; nothing live reaches it.
     fn start_offline_bounce(&mut self, spec: tangent_ui::ports::ProjectExportSpec) {
         use tangent_ui::ports::ExportFormat;
+        // Every road out of here is a road out of a message that is already
+        // standing — see `start_bounce`, which says why.
+        macro_rules! refuse {
+            () => {{
+                self.app.notify_lower(EXPORT_RUNNING);
+                return;
+            }};
+        }
         if self.recorder.offline_bounce.is_some()
             || self.recorder.bounce.is_some()
             || self.recorder.session.is_recording()
             || self.recorder.arr_rec.is_some()
         {
-            return;
+            refuse!();
         }
         // The whole project, or the arrange view's TIME SELECTION.
         let (from_s, span) = match spec.span {
@@ -5421,24 +5631,25 @@ impl DesktopApp {
             _ => (0.0, self.app.arr_span_s()),
         };
         if span <= 0.0 {
-            self.recorder.take_note = Some("Nothing to export — the timeline is empty.".to_owned());
-            return;
+            self.app
+                .notify(Kind::Error, "Nothing to export — the timeline is empty.");
+            refuse!();
         }
         let Some(out_dir) = self.export_out_dir(&spec) else {
-            self.recorder.take_note = Some("export: no project open".to_owned());
-            return;
+            self.app.notify(Kind::Error, "export: no project open");
+            refuse!();
         };
         if let Err(e) = std::fs::create_dir_all(&out_dir) {
-            self.recorder.take_note = Some(format!("export: {e}"));
-            return;
+            self.app.notify(Kind::Error, format!("export: {e}"));
+            refuse!();
         }
         let rate = spec.rate.clamp(8_000, 192_000);
         let mut e =
             match crate::instrument::Engine::offline(rate, tangent_record::audio::Timebase::new()) {
                 Ok(e) => e,
                 Err(err) => {
-                    self.recorder.take_note = Some(format!("export: {err}"));
-                    return;
+                    self.app.notify(Kind::Error, format!("export: {err}"));
+                    refuse!();
                 }
             };
         // ── the desk, exactly as the live walk pushes it ──
@@ -5577,7 +5788,8 @@ impl DesktopApp {
                 Some(std::path::Path::new(path)),
                 state.as_deref(),
             ) {
-                self.recorder.take_note = Some(format!("export: a rack refused to load: {err}"));
+                self.app
+                    .notify(Kind::Error, format!("export: a rack refused to load: {err}"));
             }
         }
         // ── the clips, decoded at the EXPORT rate with a cache of their
@@ -5693,7 +5905,7 @@ impl DesktopApp {
             match tangent_record::wav::WavWriter::create(&path, wav_spec, &bext) {
                 Ok(w) => Some((path, w)),
                 Err(err) => {
-                    self.recorder.take_note = Some(format!("export: {err}"));
+                    self.app.notify(Kind::Error, format!("export: {err}"));
                     return;
                 }
             }
@@ -5704,7 +5916,8 @@ impl DesktopApp {
         if spec.stems {
             let dir = out_dir.join("stems");
             if let Err(e) = std::fs::create_dir_all(&dir) {
-                self.recorder.take_note = Some(format!("export: stems dir: {e}"));
+                self.app
+                    .notify(Kind::Error, format!("export: stems dir: {e}"));
             }
             let doc = self.app.arrangement().clone();
             for lane in 0..tangent_ui::recorder::CHANNELS {
@@ -5743,15 +5956,19 @@ impl DesktopApp {
         // somewhere.
         let ratio = f64::from(self.app.varispeed_ratio()).clamp(0.5, 2.0);
         let until = (((span + 2.0) / ratio) * f64::from(rate)).ceil() as u64;
-        self.recorder.take_note = Some(format!(
-            "Rendering at full speed… ({} stem writers)",
-            stems.len()
-        ));
+        // The render is a condition too, and this one really does run for
+        // minutes. Lowered wherever the pass ends — see `write_export`.
+        self.app.notify_raise(
+            EXPORT_RUNNING,
+            Kind::Info,
+            format!("Rendering at full speed… ({} stem writers)", stems.len()),
+        );
         self.recorder.offline_bounce = Some(OfflineBounce {
             e,
             spec,
             until,
             done: 0,
+            writing: false,
             block: vec![0.0; 1024 * 2],
             master,
             stems,
@@ -5763,10 +5980,17 @@ impl DesktopApp {
 
     /// Drive the full-speed export: as many blocks as ~80 ms allows, every
     /// UI frame, until the span (plus a two-second tail) has rendered.
-    fn tick_offline_bounce(&mut self) {
+    fn tick_offline_bounce(&mut self, ctx: &egui::Context) {
         let Some(mut b) = self.recorder.offline_bounce.take() else {
             return;
         };
+        // The format pass belongs to the chore now; it takes the bounce when
+        // it runs. Touching it from here as well would close the same files
+        // twice.
+        if b.writing {
+            self.recorder.offline_bounce = Some(b);
+            return;
+        }
         let budget = std::time::Instant::now();
         let wide = tangent_ui::recorder::CHANNELS * 2;
         let mut fold = Vec::new();
@@ -5839,15 +6063,47 @@ impl DesktopApp {
             self.recorder.offline_bounce = Some(b);
             return;
         }
-        // Rendering is done; the format pass still has to run, and on a long
-        // mp3 that is the part that used to look like a hang. Say so, and let
-        // the window paint this frame before it starts.
+        // **Rendering is done, and the format pass is the part that used to
+        // look like a hang.**
+        //
+        // This said so already — and then did the work in the SAME frame, so
+        // it said it to nobody: the label was set, `deliver_formats` blocked
+        // for tens of seconds on a long mp3, and the window never painted
+        // between the two. A comment claiming to "let the window paint this
+        // frame before it starts" sat directly above the code that made that
+        // impossible.
+        //
+        // So the two are a frame apart now, which is the only arrangement
+        // that works (`busy.rs` states the law), and the announcement goes on
+        // the cover as well as into the export window.
+        b.writing = true;
         self.app
             .set_export_progress(Some(tangent_ui::ports::ExportProgress {
                 fraction: 1.0,
                 label: "Writing files".to_owned(),
                 peaks: b.peaks.clone(),
             }));
+        // The second format is the slow one when there is one: a wav is
+        // written as it renders, an mp3 is a whole encode after the fact.
+        let detail = Some(match b.spec.secondary {
+            Some(f) => format!("{} and {}", b.spec.primary.ext(), f.ext()),
+            None => b.spec.primary.ext().to_owned(),
+        });
+        self.recorder.offline_bounce = Some(b);
+        self.announce(ctx, "Writing files", detail, Chore::WriteExport);
+    }
+
+    /// Close the render's files and run the format pass, with the
+    /// announcement already on the screen.
+    ///
+    /// Everything here blocks and none of it can report: an mp3 encode is one
+    /// call into LAME per file. What the overlay buys is that the frozen
+    /// frame underneath the window server's wheel SAYS "Writing files"
+    /// instead of showing a desk that has stopped.
+    fn write_export(&mut self) {
+        let Some(b) = self.recorder.offline_bounce.take() else {
+            return;
+        };
         // ── done: close the files, then the format pass ──
         let OfflineBounce {
             spec,
@@ -5872,7 +6128,8 @@ impl DesktopApp {
             stem_paths.push(path);
         }
         if let Some(p) = problem {
-            self.recorder.take_note = Some(format!("export failed: {p}"));
+            self.app.notify_lower(EXPORT_RUNNING);
+            self.app.notify(Kind::Error, format!("export failed: {p}"));
             self.app.set_export_progress(None);
             return;
         }
@@ -5881,11 +6138,14 @@ impl DesktopApp {
             paths.push(m);
         }
         if let Err(e) = deliver_formats(&paths, &spec) {
-            self.recorder.take_note = Some(format!("export: {e}"));
+            self.app.notify_lower(EXPORT_RUNNING);
+            self.app.notify(Kind::Error, format!("export: {e}"));
             self.app.set_export_progress(None);
             return;
         }
-        self.recorder.take_note = Some(format!("Exported  {}", out_dir.display()));
+        self.app.notify_lower(EXPORT_RUNNING);
+        self.app
+            .notify(Kind::Success, format!("Exported  {}", out_dir.display()));
         self.app.set_export_progress(None);
         if spec.open_when_done {
             reveal(&out_dir);
@@ -5897,12 +6157,61 @@ impl DesktopApp {
         self.app.project_root().join("Templates")
     }
 
-    /// Run whatever project action the app asked for this frame. The host
-    /// runs these whole because it owns the plugin states and the shelf.
-    fn run_project_request(&mut self) {
+    /// Take the project action the app asked for, and put its name on the
+    /// screen before doing it.
+    ///
+    /// **Every one of these blocks, and three of them block for a long
+    /// time**: a New adopts a template and marks every rack for reload, a
+    /// Template copies a whole session folder, an Export re-instantiates each
+    /// rack into a fresh offline engine at five seconds an instrument. Even
+    /// Save is a `getState` per loaded plugin. So the request is held for one
+    /// frame — see `announce` and the law it obeys — and run from the chore.
+    fn take_project_request(&mut self, ctx: &egui::Context) {
         let Some(req) = self.app.take_project_request() else {
             return;
         };
+        use tangent_ui::ports::ProjectRequest as Q;
+        let (label, detail) = match &req {
+            Q::Save => ("Saving project", None),
+            Q::Template(name) => ("Saving template", Some(name.clone())),
+            Q::New | Q::NewKeeping | Q::NewDiscarding => ("New project", None),
+            // The overlay names the SOURCES, because that is what decides how
+            // long this takes: stems re-instantiate the same racks and then
+            // write one file per lane.
+            Q::Export(spec) => (
+                "Preparing export",
+                Some(match (spec.master, spec.stems) {
+                    (true, false) => "master".to_owned(),
+                    (false, true) => "stems".to_owned(),
+                    _ => "master and stems".to_owned(),
+                }),
+            ),
+            Q::ExportTrack => ("Preparing export", Some("master".to_owned())),
+            Q::ExportStems => ("Preparing export", Some("stems".to_owned())),
+        };
+        // **Save is the one of these that is usually instant, and it is
+        // also the one pressed every few minutes.** An overlay that flashes
+        // on every Ctrl-S is worse than none — the whole appeal of a save is
+        // that it does not interrupt — and the delay-before-showing cannot
+        // help a single blocking call (see `Busy::deferred`). What makes a
+        // save slow is having plugins to ask for their state, which is a
+        // question this can answer before deciding.
+        if matches!(req, Q::Save) && !self.has_plugin_state() {
+            self.run_project_request(ctx, req);
+            return;
+        }
+        self.announce(ctx, label, detail, Chore::Project(req));
+    }
+
+    /// Whether anything on the desk will have to be ASKED for its state when
+    /// the session is written down. See `save_plugin_states`.
+    fn has_plugin_state(&self) -> bool {
+        self.recorder.inserts_loaded.iter().any(Option::is_some)
+    }
+
+    /// Run whatever project action the app asked for. The host runs these
+    /// whole because it owns the plugin states and the shelf.
+    fn run_project_request(&mut self, ctx: &egui::Context, req: tangent_ui::ports::ProjectRequest) {
         match req {
             tangent_ui::ports::ProjectRequest::Save => {
                 self.save_plugin_states();
@@ -5949,7 +6258,13 @@ impl DesktopApp {
                 }
             }
             tangent_ui::ports::ProjectRequest::Export(spec) => {
-                self.recorder.take_note = Some(format!(
+                // Raised, not pushed: from here until the files land this is
+                // a thing that is HAPPENING, and the render below can run for
+                // minutes. Both passes lower it when they report.
+                self.app.notify_raise(
+                    EXPORT_RUNNING,
+                    Kind::Info,
+                    format!(
                     "export: {} {} → {}…",
                     if spec.realtime {
                         "realtime"
@@ -5966,7 +6281,8 @@ impl DesktopApp {
                     } else {
                         spec.dir.trim()
                     },
-                ));
+                    ),
+                );
                 if spec.realtime {
                     // The realtime pass: the live engine, the live rate. The
                     // spec's shaping (name, dir, formats, mono) is applied
@@ -6106,8 +6422,12 @@ impl DesktopApp {
                 self.track_cache.clear();
                 self.stretch_cache.clear();
                 self.pad_cache.clear();
-                self.reload_clips();
-                self.reload_pads();
+                self.clips_owed = true;
+                self.pads_owed = true;
+                // Both are answered a file a frame from here; ask for the
+                // frames, since a fresh scratch is exactly the moment nobody
+                // is touching anything.
+                ctx.request_repaint();
             }
         }
     }
@@ -6242,6 +6562,134 @@ impl DesktopApp {
         if self.app.take_desk_reload() {
             self.copy_states_from_project();
             self.force_insert_reload();
+        }
+    }
+
+    /// Decode ONE file the next reload will need, and hold that reload back
+    /// until there are none left.
+    ///
+    /// **The only stall in this file that was turned into a chunked
+    /// operation rather than merely covered, and the reason is worth
+    /// writing down.** `reload_clips` and `reload_pads` are single blocking
+    /// calls whose whole cost is an ffmpeg child process per uncached file: a
+    /// project of takes opens with most of a minute of nothing, a sixteen-pad
+    /// kit lands with a second of it. An overlay in front of one indivisible
+    /// call can only ever be a frozen frame with a hatched bar on it — true,
+    /// and still a window that has stopped answering, beachball and all.
+    /// Warming the caches a file at a time leaves both reloads with nothing
+    /// to decode by the time they run, so the app keeps painting, the count
+    /// really advances, and the meter is a measurement instead of a picture
+    /// of one. That is the fix `busy.rs` says to prefer: "the only real fixes
+    /// for a long block are the two that keep frames coming".
+    ///
+    /// **It is a cover and an optimisation, never a precondition.** Both
+    /// reloads keep their own decode fallback, so a file that appears late,
+    /// or that fails here, is still tried in the place that actually needs
+    /// it — this cannot turn a working clip into a missing one.
+    fn run_warm(&mut self, ctx: &egui::Context) {
+        if !self.clips_owed && !self.pads_owed && self.warm.is_empty() {
+            return;
+        }
+        if self.warm.is_empty() {
+            self.queue_warm();
+        }
+        // Nothing to decode: the reload is free, so it happens THIS frame.
+        // Waiting a frame for an empty queue would put a frame of latency on
+        // every note anybody draws, since an edit marks the clips dirty.
+        let Some(item) = self.warm.pop_front() else {
+            // The same courtesy the insert meter gets: the frame the queue
+            // empties on is the only one that can read "12 of 12".
+            if !self.warm_count.idle() && self.busied == Busied::Decode {
+                let progress = self.warm_count.saw(0).progress();
+                if let Some(busy) = self.busy.as_mut() {
+                    busy.detail = None;
+                    busy.progress = Some(progress);
+                }
+            }
+            self.warm_count = Counted::default();
+            self.busy_chunk_done(Busied::Decode);
+            if std::mem::take(&mut self.clips_owed) {
+                self.reload_clips();
+            }
+            if std::mem::take(&mut self.pads_owed) {
+                self.reload_pads();
+            }
+            return;
+        };
+        // The one still in hand counts as outstanding: it is not decoded
+        // until the call below returns.
+        self.warm_count = self.warm_count.saw(self.warm.len() + 1);
+        let progress = self.warm_count.progress();
+        let (path, pads) = match &item {
+            Warm::Clip(p) => (p.clone(), false),
+            Warm::Pad(p) => (p.clone(), true),
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        if let Some(busy) = self.busy_chunk(Busied::Decode, "Loading audio") {
+            busy.detail = name;
+            busy.progress = Some(progress);
+        }
+        // The rate the reloads decode at, read the same way they read it —
+        // the caches are keyed to one rate and a mismatch here would be a
+        // decode neither of them can use.
+        let rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(48_000, |e| e.output().sample_rate);
+        if let Ok(c) = tangent_record::decode::decode(&path, rate) {
+            let c = Arc::new(c);
+            if pads {
+                self.pad_cache.insert(path, c);
+            } else {
+                self.track_cache.insert(path, c);
+            }
+        }
+        // A file a frame only advances if frames arrive.
+        ctx.request_repaint();
+    }
+
+    /// Fill the warm-up queue with everything the owed reloads would have to
+    /// decode, once, without duplicates.
+    ///
+    /// Asked only when a reload is owed and the queue is empty, because it
+    /// walks the document and every drum lane's hundred and twenty-eight pads
+    /// — cheap beside a decode, not cheap beside nothing.
+    fn queue_warm(&mut self) {
+        let mut seen: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        if self.clips_owed {
+            if let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) {
+                for clip in &self.app.arrangement().clips {
+                    // A MIDI item has no file: its notes are in the document.
+                    if clip.kind == tangent_ui::arrangement::ClipKind::Midi {
+                        continue;
+                    }
+                    let path =
+                        tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
+                    if self.track_cache.contains_key(&path) || !seen.insert(path.clone()) {
+                        continue;
+                    }
+                    self.warm.push_back(Warm::Clip(path));
+                }
+            }
+        }
+        if self.pads_owed {
+            // Every drum LANE, because each carries its own kit — the same
+            // walk `reload_pads` makes, and for the same reason.
+            let lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
+                .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+                .collect();
+            for lane in lanes {
+                for path in self.app.drumpad_paths_of(lane).into_iter().flatten() {
+                    if self.pad_cache.contains_key(&path) || !seen.insert(path.clone()) {
+                        continue;
+                    }
+                    self.warm.push_back(Warm::Pad(path));
+                }
+            }
         }
     }
 
@@ -6648,12 +7096,22 @@ impl DesktopApp {
                 .set_clip_gain(clip.id, f64::from(CEILING / peak));
             done += 1;
         }
-        self.recorder.take_note = Some(match (done, silent) {
-            (0, 0) => "Nothing to normalise.".to_owned(),
-            (0, n) => format!("{n} clip(s) are silent - nothing to bring up."),
-            (d, 0) => format!("Normalised {d} clip(s) to -1 dBFS."),
-            (d, n) => format!("Normalised {d} clip(s); {n} were silent."),
-        });
+        // A receipt when it did something, a refusal when it did not — the
+        // kind carries which, so the accent does not have to be read.
+        let kind = if done > 0 {
+            Kind::Success
+        } else {
+            Kind::Info
+        };
+        self.app.notify(
+            kind,
+            match (done, silent) {
+                (0, 0) => "Nothing to normalise.".to_owned(),
+                (0, n) => format!("{n} clip(s) are silent - nothing to bring up."),
+                (d, 0) => format!("Normalised {d} clip(s) to -1 dBFS."),
+                (d, n) => format!("Normalised {d} clip(s); {n} were silent."),
+            },
+        );
     }
 
     /// Copy one bay's effect to another channel's next free bay, with the
@@ -6679,10 +7137,9 @@ impl DesktopApp {
             // **Every bay full is a refusal with a reason.** Silently
             // replacing one would be throwing away an effect somebody dialled
             // in, from a gesture that says "copy".
-            self.recorder.take_note = Some(format!(
-                "{} has no free insert bay",
-                self.app.channel_display_name(to_strip)
-            ));
+            let where_to = self.app.channel_display_name(to_strip);
+            self.app
+                .notify(Kind::Error, format!("{where_to} has no free insert bay"));
             return;
         };
         // The state it is playing at, not the one on disk: a plugin somebody
@@ -6813,6 +7270,21 @@ impl DesktopApp {
     /// Every path that starts the engine goes through here, because a rule
     /// about ordering that only two of three callers follow is not a rule.
     fn open_audio_path(&mut self, ctx: &egui::Context) {
+        // **The refusal is asked here as well as below**, because a take that
+        // is running must not even put an overlay up: the answer is "not
+        // now", and `audio_path_deferred` is what remembers to come back.
+        if self.recorder.session.state().is_active() {
+            self.recorder.audio_path_deferred = true;
+            return;
+        }
+        // Everything below blocks: an output unit is built, a device is
+        // opened, and on a bad day CoreAudio's own timeouts are inside that.
+        // Announce it, and open on the next frame.
+        self.announce(ctx, "Starting the audio engine", None, Chore::AudioPath);
+    }
+
+    /// The audio path itself, with the announcement already on screen.
+    fn open_audio_path_now(&mut self, ctx: &egui::Context) {
         // **Refused outright while a take is running, because the ordering
         // above CANNOT be honoured then.**
         //
@@ -6997,11 +7469,20 @@ impl DesktopApp {
                 // — the device that just opened may run another.
                 self.track_cache.clear();
                 self.stretch_cache.clear();
-                self.reload_clips();
+                // **Owed, not done here.** Both caches were just emptied, so
+                // this is the single worst decode in the app — every clip in
+                // the session, at once, on the UI thread, from inside a
+                // device change. It goes through `run_warm` like every other
+                // reload: a file a frame, in front of a meter.
+                self.clips_owed = true;
                 // And the kit, on the same reasoning: the pad cache is
                 // keyed to a rate this device may not run.
                 self.pad_cache.clear();
-                self.reload_pads();
+                self.pads_owed = true;
+                // Both of those are answered a file a frame from here on, and
+                // between a device settling and the user touching something
+                // nothing else is asking for a frame.
+                ctx.request_repaint();
             }
             Err(e) => {
                 self.recorder.engine_error = Some(format!("no audio output: {e}"));
@@ -7480,6 +7961,21 @@ impl DesktopApp {
         // "starting the camera…" in order to turn one OFF would be silly.
         if wanted.is_some() && !self.recorder.camera_opening {
             self.recorder.camera_opening = true;
+            // **And it says so on the cover now, not only in the band's
+            // line.** `open_camera` blocks for 1.9 to 3.9 seconds on an
+            // external webcam — long past the point where the window server
+            // paints its wheel over a desk that looks half-drawn. This is the
+            // precedent the whole two-phase sequence was taken from, so it
+            // needs no chore: the bool below IS the announcement, and the
+            // overlay is raised beside it.
+            if let Some(busy) = self.busy_chunk(Busied::Camera, "Starting the camera") {
+                busy.detail = wanted.clone();
+                busy.progress = Some(tangent_ui::busy::Progress::Indeterminate);
+                // A device, not a chunked walk: it must be up before the call
+                // and cannot wait out a delay it will never be asked about
+                // again. See `Busy::deferred`, which says why.
+                busy.delay = std::time::Duration::ZERO;
+            }
             ctx.request_repaint();
             return;
         }
@@ -7501,6 +7997,7 @@ impl DesktopApp {
             name,
             self.recorder.session.camera_error().map(str::to_owned),
         );
+        self.busy_chunk_done(Busied::Camera);
     }
 
     /// Open the audio input the user asked for, if it is not already open.
@@ -8861,7 +9358,6 @@ impl DesktopApp {
                 transport: crate::transport::Transport::new(),
                 pending_monitor: None,
                 input_names: std::array::from_fn(|_| String::new()),
-                take_note: None,
                 arr_rec: None,
                 bounce: None,
                 offline_bounce: None,
@@ -8930,6 +9426,22 @@ impl DesktopApp {
                 since: std::time::Instant::now(),
                 done_at: None,
             }),
+            busy: None,
+            busied: Busied::Nothing,
+            busy_done: false,
+            busy_up: false,
+            #[cfg(feature = "recorder")]
+            chore: None,
+            #[cfg(feature = "recorder")]
+            warm: std::collections::VecDeque::new(),
+            #[cfg(feature = "recorder")]
+            warm_count: Counted::default(),
+            #[cfg(feature = "recorder")]
+            clips_owed: false,
+            #[cfg(feature = "recorder")]
+            pads_owed: false,
+            #[cfg(feature = "recorder")]
+            insert_batch: Counted::default(),
             #[cfg(feature = "recorder")]
             cartridge: None,
             #[cfg(feature = "recorder")]
@@ -9104,6 +9616,14 @@ impl eframe::App for DesktopApp {
     /// that opens a device, raises a native panel or creates a directory
     /// happens between those two lines.
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // **The announced block runs FIRST, before anything else asks for
+        // work.** The overlay it was announced under was painted at the
+        // bottom of the last frame and eframe presented when that `update`
+        // returned, so by here it really is on the screen — which is the
+        // whole of the two-phase sequence `busy.rs` describes, and the only
+        // moment at which a caller may honestly go ahead and block.
+        #[cfg(feature = "recorder")]
+        self.run_chore(ctx);
         #[cfg(feature = "recorder")]
         self.fill_recorder_state(ctx);
         // Before the frame, not after: the app decides whether to raise the
@@ -9125,7 +9645,11 @@ impl eframe::App for DesktopApp {
                 }
             }
         }
-        self.app.set_splash_up(self.splash.is_some());
+        // **"Something is over the desk" is one question.** The busy
+        // overlay covers as completely as the splash does, so the app must
+        // not promote its Welcome card underneath either — one flag, both
+        // covers, and the app never learns there are two.
+        self.app.set_splash_up(self.splash.is_some() || self.busy_up);
         // **Where the cursor is during a FILE DRAG.** Asked of the OS,
         // because the window toolkit will not say — see `drag_pointer`.
         self.app.set_drag_pointer(Self::drag_pointer(ctx));
@@ -9201,12 +9725,24 @@ impl eframe::App for DesktopApp {
             self.reader_seen = true;
             self.app.set_screen_reader(true);
         }
+        // **A covered desk takes no clicks**, which is the other duty
+        // `busy.rs` hands the host. During a CHUNKED operation frames really
+        // do arrive and a press really would land on whatever is under the
+        // pointer — a fader, a clip, the very menu row that started the load
+        // — while the window says it is busy. Read from what `draw` answered
+        // last frame rather than from `busy.is_some()`: the overlay that has
+        // not appeared yet (its delay is unspent, or the cap has released it)
+        // is covering nothing and must swallow nothing.
+        if self.busy_up {
+            ctx.input_mut(|i| i.events.clear());
+        }
         if self.painted_once {
             self.app.frame(ctx);
         }
         #[cfg(feature = "recorder")]
         self.after_frame(ctx, frame);
         self.paint_splash(ctx);
+        self.paint_busy(ctx);
         self.painted_once = true;
         // **The geometry probe.** `IVORY_GEOM_PROBE=1` prints, once the
         // window has settled, everything the app believes about where it is
@@ -9723,11 +10259,14 @@ impl DesktopApp {
                     .camera_rate_limited()
                     .filter(|r| r.actual_fps < f64::from(v.fps) * 0.9);
                 if let Some(r) = starved {
-                    self.recorder.take_note = Some(format!(
-                        "camera gave {:.0} fps of the {} this take wanted - it \
-                         needs more light",
-                        r.actual_fps, v.fps
-                    ));
+                    self.app.notify(
+                        Kind::Error,
+                        format!(
+                            "camera gave {:.0} fps of the {} this take wanted - it \
+                             needs more light",
+                            r.actual_fps, v.fps
+                        ),
+                    );
                 } else if dropped > 0 || v.padded > 0 {
                     // Both numbers, because they are different failures: a
                     // dropped frame is a hole, a padded one is a freeze —
@@ -9745,10 +10284,10 @@ impl DesktopApp {
                     // that says why the take is wrong drew NOTHING at all. And
                     // it sent the user to Take Settings, where the resolution
                     // is not: that is the Export dialog.
-                    self.recorder.take_note = Some(format!(
-                        "{} - lower the video size in Export",
-                        what.join(", ")
-                    ));
+                    self.app.notify(
+                        Kind::Error,
+                        format!("{} - lower the video size in Export", what.join(", ")),
+                    );
                 }
                 // The manifest was written at Stop, before this file existed;
                 // fold the finished video into it. §7's report: what the file
@@ -9953,8 +10492,730 @@ impl DesktopApp {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// MERGE-ME: the messages door, until the UI lane's own lands
+// ───────────────────────────────────────────────────────────────────────────
+//
+// **DELETE THIS WHOLE SECTION** the moment `TangentApp` carries its own
+// inherent `notify`, `notify_raise` and `notify_lower`. Nothing else has to
+// change when it goes: an inherent method wins over a trait one in Rust's
+// resolution, so every `self.app.notify(...)` below starts reaching the real
+// notification column the instant the real door exists, and this becomes
+// dead code rather than a conflict.
+//
+// **Why it exists at all.** The two halves of this work were built in
+// parallel lanes against one written contract: the GUI crate owns and
+// declares the three doors, the host only calls them, and neither lane may
+// edit the other's files. So the host lane can name the doors — the contract
+// fixes their spelling — but cannot yet reach them, and a lane that does not
+// compile cannot be tested.
+//
+// **It deliberately does not paint anything.** The obvious stopgap — put the
+// text back in the band's one-line notice slot — would keep the two faults
+// this work exists to remove: a receipt for a finished export competing with
+// a live device error in a strip that holds one sentence, and a floating
+// notice window that reveals one frame after the export's own progress window
+// and is therefore ordered on top of the waveform somebody is watching. So
+// the messages go to the log until the real column lands, and the slot they
+// used to fight over is gone.
+
+/// The three doors, spelled as the contract spells them.
+#[cfg(feature = "recorder")]
+trait Messages {
+    /// Raise a message in the top-left corner. The one door for anything the
+    /// app wants to SAY (as opposed to ASK).
+    fn notify(&mut self, kind: Kind, text: impl Into<String>);
+    /// A condition that is true until it stops being true. Re-raising an
+    /// already-standing key does nothing; a user dismissal sticks.
+    fn notify_raise(&mut self, key: &str, kind: Kind, text: impl Into<String>);
+    fn notify_lower(&mut self, key: &str);
+}
+
+#[cfg(feature = "recorder")]
+thread_local! {
+    /// The conditions standing, so re-raising one says nothing twice — the
+    /// half of `notify_raise` a plain push would lose, and the half a caller
+    /// here can get wrong (the export raises from two places). One window,
+    /// one UI thread, so a thread-local rather than a lock.
+    static RAISED: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        std::cell::RefCell::new(std::collections::BTreeSet::new());
+}
+
+#[cfg(feature = "recorder")]
+impl Messages for TangentApp {
+    fn notify(&mut self, kind: Kind, text: impl Into<String>) {
+        log::info!("{}: {}", kind.spoken(), text.into());
+    }
+
+    fn notify_raise(&mut self, key: &str, kind: Kind, text: impl Into<String>) {
+        if RAISED.with(|r| r.borrow_mut().insert(key.to_owned())) {
+            log::info!("{} [{key}]: {}", kind.spoken(), text.into());
+        }
+    }
+
+    fn notify_lower(&mut self, key: &str) {
+        RAISED.with(|r| r.borrow_mut().remove(key));
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The busy overlay
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Who raised the overlay.
+///
+/// One overlay and several drivers, two of which are CHUNKED: the insert
+/// loader takes a bay per frame and the decode warm-up takes a file per
+/// frame, and both rewrite their own `detail` and `progress` on every pass. A
+/// driver therefore has to be able to tell "mine, refresh it" from "somebody
+/// else's, leave it alone". Building a fresh `Busy` each frame instead would
+/// restart the delay and the minimum sixty times a second, so the overlay
+/// would never be due to appear and never be free to leave — the two timers
+/// `busy.rs` is mostly made of would become decoration.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// The Minimal build drives none of these — it has no engine to load a plugin
+// into, no camera and no decoder — so only `Nothing` is ever constructed
+// there. The enum itself still is: the overlay's own state is not gated.
+#[cfg_attr(not(feature = "recorder"), allow(dead_code))]
+enum Busied {
+    /// Nothing is up.
+    Nothing,
+    /// A single blocking call, announced through [`DesktopApp::announce`].
+    Chore,
+    /// The insert loader, one bay a frame.
+    Inserts,
+    /// A camera opening. Its own owner and not [`Busied::Chore`], because it
+    /// carries its own announcement (`camera_opening`) rather than a chore —
+    /// and clearing somebody else's chore flag would drop a block on the
+    /// floor before it was ever made.
+    Camera,
+    /// The decode warm-up, one file a frame.
+    Decode,
+}
+
+/// A blocking call that has been ANNOUNCED and not yet made.
+///
+/// **Why the work is a value here rather than a call.** The law in
+/// `tangent_ui::busy` is that a synchronous stall produces no frames, so the
+/// announcement has to reach the screen on the frame BEFORE the call — which
+/// means every covered block needs exactly one point where it can be
+/// suspended, and the only way to suspend a call across a frame boundary is
+/// to write down what it was going to be. `reconcile_camera` has done this
+/// for years with a single bool, because it only ever had one thing to
+/// announce; this is the same handshake with a name for each job.
+///
+/// Only the jobs that BLOCK are here. Anything that comes back between chunks
+/// drives the overlay directly and needs no suspending — it is already
+/// painting.
+#[cfg(feature = "recorder")]
+#[derive(Debug, Clone, PartialEq)]
+enum Chore {
+    /// A project action the app asked for. Held whole, because the host runs
+    /// these whole — see `run_project_request`.
+    Project(tangent_ui::ports::ProjectRequest),
+    /// Open a project file: the outgoing session written down, the incoming
+    /// one parsed, every rack marked for reload.
+    OpenProject(std::path::PathBuf),
+    /// Build the audio path: the output engine, then the input device.
+    AudioPath,
+    /// Somebody else's plugin editor. An LV2 re-parses the whole lilv world
+    /// to open one, and a heavy JUCE view is worse.
+    InsertEditor(usize, usize),
+    /// The offline render is finished: close the files and run the format
+    /// pass. See `tick_offline_bounce`.
+    WriteExport,
+    /// The realtime pass landed: copy it out, run the format pass, say where.
+    FinishBounce {
+        folder: String,
+        problem: Option<String>,
+        stems: bool,
+        wrote: usize,
+    },
+}
+
+/// One file the next reload will need, and which cache its decode belongs in.
+#[cfg(feature = "recorder")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Warm {
+    /// A clip on the timeline, into `track_cache`.
+    Clip(std::path::PathBuf),
+    /// A drum pad's sample, into `pad_cache`.
+    Pad(std::path::PathBuf),
+}
+
+/// The key the running export is raised under.
+///
+/// One constant because a raise and its lower are two call sites that have to
+/// agree on a string, and a typo in one of them leaves a message standing for
+/// the rest of the session with nothing able to take it down. See the
+/// contract's `notify_raise`.
+#[cfg(feature = "recorder")]
+const EXPORT_RUNNING: &str = "export-running";
+
+/// Whether an announced job may be run this frame.
+///
+/// The gate of the two-phase sequence, in one place so the reason survives:
+/// the job waits for its announcement to be ON SCREEN, and `None` — an
+/// overlay that was dropped, capped, or never had a window with any area to
+/// paint into — means there is nothing left to wait for. A job that never
+/// runs is a lost session where an uncovered stall is only a bad second.
+#[cfg(feature = "recorder")]
+fn chore_ready(busy: Option<&tangent_ui::busy::Busy>) -> bool {
+    busy.is_none_or(tangent_ui::busy::Busy::on_screen)
+}
+
+/// A chunked operation's meter, carried between frames.
+///
+/// **Neither driver knows how much it has DONE.** Both can only say what is
+/// still outstanding: the insert loader counts mismatched bays, the decode
+/// warm-up counts a queue. So the done-count has to be accumulated, and the
+/// obvious accumulation — a high-water mark of the outstanding count, with
+/// `done = high - left` — is wrong in the one case that actually happens: an
+/// amp landing in a bay SEEDS seven pedals into empty bays, so the work grows
+/// mid-batch, `left` jumps up, and the reading walks backwards from "2 of 8"
+/// to "0 of 14". A meter going backwards is the one thing it must never do,
+/// and it is exactly the moment somebody is watching it.
+///
+/// So `done` only ever rises and the TOTAL is what absorbs new work: the
+/// total is `done` plus whatever is outstanding, which is the honest reading
+/// of "how much is known about" at any moment, and it lands on `done ==
+/// total` on the frame the work finishes — because a meter whose last state
+/// is one short of full looks like one that gave up.
+#[cfg(feature = "recorder")]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Counted {
+    done: usize,
+    total: usize,
+}
+
+#[cfg(feature = "recorder")]
+impl Counted {
+    /// Fold in what is outstanding NOW.
+    fn saw(self, left: usize) -> Counted {
+        // What was outstanding last time, from the pair itself — carrying it
+        // as a third number would be a third thing to keep in step.
+        let was = self.total.saturating_sub(self.done);
+        // `saturating_sub` is the growth case: more outstanding than last
+        // frame means work appeared, not that work was undone.
+        let done = self.done + was.saturating_sub(left);
+        Counted {
+            done,
+            total: done + left,
+        }
+    }
+
+    /// Nothing has ever been counted, so there is nothing to read.
+    fn idle(self) -> bool {
+        self.total == 0
+    }
+
+    fn progress(self) -> tangent_ui::busy::Progress {
+        tangent_ui::busy::Progress::Steps {
+            done: self.done,
+            total: self.total,
+        }
+    }
+}
+
+/// One frame of the insert loader's walk: which bay to load next, and how
+/// many bays that hold a PLUGIN are still outstanding.
+///
+/// **Two closures rather than the tables themselves.** The real tables are
+/// thirteen thousand entries long and live on two different objects — what
+/// the desk wants is the app's, what the engine has is the host's — so
+/// handing them over would mean building a copy every frame of the most
+/// repeated loop in the app. The rule under test is which INDEX comes back
+/// and what the meter reads, and that rule is the same whatever answers the
+/// two questions.
+///
+/// **Only the filled bays are counted.** A reload marks the whole seat space,
+/// of which all but a handful are empty, and the loader then flushes those
+/// one a frame for minutes afterwards costing nothing and doing nothing.
+/// Counting them would put "3 of 13167" in front of somebody who is waiting
+/// for eight plugins, and would hold the cover up long after the wait was
+/// over.
+#[cfg(feature = "recorder")]
+fn insert_walk(
+    len: usize,
+    mismatch: impl Fn(usize) -> bool,
+    filled: impl Fn(usize) -> bool,
+) -> (Option<usize>, usize) {
+    let mut next: Option<usize> = None;
+    let mut outstanding = 0usize;
+    for i in 0..len {
+        if !mismatch(i) {
+            continue;
+        }
+        if next.is_none() {
+            next = Some(i);
+        }
+        if filled(i) {
+            outstanding += 1;
+        }
+    }
+    (next, outstanding)
+}
+
+/// The last path segment of a bundle or file name, for the overlay's detail
+/// row. A full path is not what somebody waiting wants to read, and `busy.rs`
+/// would only cut it in the middle anyway.
+#[cfg(feature = "recorder")]
+fn leaf_of(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or(path)
+        .to_owned()
+}
+
+impl DesktopApp {
+    /// Announce a stall, and hand the work to the next frame.
+    ///
+    /// The one door for anything that BLOCKS. What comes back between chunks
+    /// uses [`DesktopApp::busy_chunk`] instead and never passes through here.
+    ///
+    /// **The splash short-circuits it**, because during a launch there is
+    /// nothing to wait for: the splash is already covering the desk, this
+    /// overlay stands down under it (see [`DesktopApp::paint_busy`]), and a
+    /// caller that waited for a paint which is never going to happen would
+    /// hang the launch outright rather than merely go uncovered.
+    #[cfg(feature = "recorder")]
+    fn announce(
+        &mut self,
+        ctx: &egui::Context,
+        label: &str,
+        detail: Option<String>,
+        chore: Chore,
+    ) {
+        if self.splash.is_some() {
+            self.run_chore_now(ctx, chore);
+            return;
+        }
+        // A second announcement while one is still owed would drop the first
+        // one's work on the floor, which is the one outcome worse than an
+        // uncovered stall. There is normally never more than one: each caller
+        // here is reached from a request the app makes at most once a frame.
+        if let Some(owed) = self.chore.take() {
+            self.run_chore_now(ctx, owed);
+        }
+        let mut busy = tangent_ui::busy::Busy::new(label);
+        busy.detail = detail;
+        // Indeterminate rather than nothing: a block cannot report and must
+        // not pretend to, and a hatched track with no leading edge is what
+        // says so standing still. See `Progress::Indeterminate`.
+        busy.progress = Some(tangent_ui::busy::Progress::Indeterminate);
+        self.busy = Some(busy);
+        self.busied = Busied::Chore;
+        self.busy_done = false;
+        self.chore = Some(chore);
+        // Nothing else is asking for frames, and the announcement is worth
+        // nothing until one goes out.
+        ctx.request_repaint();
+    }
+
+    /// Run the job the overlay announced, once that announcement is really on
+    /// the screen.
+    ///
+    /// The top of `update`, before anything else asks for work — which is the
+    /// half of the handshake `Busy::on_screen` documents: `draw` runs at the
+    /// bottom of a frame, eframe presents when `update` returns, so a caller
+    /// asking here is asking about a frame that has reached the screen.
+    #[cfg(feature = "recorder")]
+    fn run_chore(&mut self, ctx: &egui::Context) {
+        // **An overlay that has gone must not take the work with it.** The
+        // gate is the announcement being ON SCREEN, but an overlay can also
+        // stop existing — dropped by the cap, or never able to paint at all
+        // because the window has no area — and a job that never runs is a
+        // lost session where an uncovered stall is only a bad second.
+        if !chore_ready(self.busy.as_ref()) {
+            return;
+        }
+        let Some(chore) = self.chore.take() else {
+            return;
+        };
+        self.run_chore_now(ctx, chore);
+        // Its job is done; the overlay goes as soon as it has served its
+        // minimum, which `paint_busy` asks about at the bottom of the frame.
+        if self.busied == Busied::Chore {
+            self.busy_done = true;
+        }
+    }
+
+    /// The jobs themselves, with nothing left to wait for.
+    #[cfg(feature = "recorder")]
+    fn run_chore_now(&mut self, ctx: &egui::Context, chore: Chore) {
+        match chore {
+            Chore::Project(req) => self.run_project_request(ctx, req),
+            Chore::OpenProject(path) => self.switch_project(&path),
+            Chore::AudioPath => self.open_audio_path_now(ctx),
+            Chore::InsertEditor(strip, slot) => {
+                if let Some(e) = self.recorder.engine.as_mut() {
+                    if let Err(err) = e.open_insert_editor(strip, slot) {
+                        self.recorder.engine_error =
+                            Some(format!("could not open the effect's window: {err}"));
+                    }
+                }
+            }
+            Chore::WriteExport => self.write_export(),
+            Chore::FinishBounce {
+                folder,
+                problem,
+                stems,
+                wrote,
+            } => {
+                self.finish_bounce(&folder, problem, stems);
+                if stems && wrote > 0 {
+                    self.app.notify(
+                        Kind::Success,
+                        format!("exported  export/track + {wrote} stems in export/stems/"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The overlay for a CHUNKED operation: made on the first frame it is
+    /// wanted, refreshed on every frame after.
+    ///
+    /// **`None` when the overlay already belongs to somebody else**, and
+    /// that refusal is what keeps two drivers from destroying each other.
+    ///
+    /// Opening a project runs BOTH chunked operations at once — plugins load
+    /// a bay a frame while clips decode a file a frame — and the two are
+    /// asked in that order every frame. Without this, each would replace the
+    /// other's `Busy` on every pass, and since a fresh one restarts the delay
+    /// the cover would never become due: two loads, sixty replacements a
+    /// second, and a window that says nothing for the whole minute. So the
+    /// overlay is held until its owner is finished with it, and the other
+    /// driver simply goes uncovered for a few hundred milliseconds — which it
+    /// can afford, because it is coming back between items. An announced
+    /// BLOCK cannot afford that, which is why `announce` takes the overlay
+    /// outright instead of asking here.
+    #[cfg(feature = "recorder")]
+    fn busy_chunk(&mut self, who: Busied, label: &str) -> Option<&mut tangent_ui::busy::Busy> {
+        if self.busy.is_some() && self.busied != who {
+            return None;
+        }
+        if self.busy.is_none() {
+            // `deferred`, not `new`: this is the operation the delay exists
+            // for. Frames really do arrive, so the wall clock really does
+            // advance, so a load that is over in eighty milliseconds shows
+            // nobody anything. See `busy::SHOW_AFTER`.
+            self.busy = Some(tangent_ui::busy::Busy::deferred(label));
+            self.busied = who;
+            self.busy_done = false;
+        }
+        self.busy.as_mut()
+    }
+
+    /// A chunked operation has run out of work: let its overlay go.
+    #[cfg(feature = "recorder")]
+    fn busy_chunk_done(&mut self, who: Busied) {
+        if self.busied == who {
+            self.busy_done = true;
+        }
+    }
+
+    /// Paint the overlay, and decide when it goes. The bottom of the frame,
+    /// beside `paint_splash`, for the reason `Busy::on_screen` gives.
+    ///
+    /// **The splash wins while both could be up, and there is nothing to
+    /// arbitrate.** The splash is opaque and drawn on the same Foreground
+    /// layer, so a card underneath it would be invisible and would then snap
+    /// into view the instant the splash faded — a worse picture than either
+    /// alone. The two also say the same thing at launch, since the splash
+    /// already waits on `inserts_pending`, and `splash.rs` decided on purpose
+    /// that the wordmark carries no status line. So this stands down entirely
+    /// while the splash is up; `announce` runs its work immediately rather
+    /// than waiting for a paint that will not come, and the chunked drivers
+    /// go on counting behind it so the overlay is already correct if the
+    /// splash lifts mid-load.
+    fn paint_busy(&mut self, ctx: &egui::Context) {
+        if self.splash.is_some() || self.busy.is_none() {
+            self.busy_up = false;
+            return;
+        }
+        // **Asked BEFORE the draw, because the draw is what would stamp it as
+        // shown.** An operation that finished before its overlay was due owes
+        // the screen nothing, and must not appear now in order to serve a
+        // minimum it never started — which is exactly what a launch does to
+        // the camera's cover, finished behind the splash and then free to
+        // flash up the moment the splash faded.
+        if self.busy_done
+            && self
+                .busy
+                .as_ref()
+                .is_some_and(tangent_ui::busy::Busy::may_close)
+        {
+            self.busy = None;
+            self.busied = Busied::Nothing;
+            self.busy_up = false;
+            return;
+        }
+        // The desk's own face, which is what every floating surface in this
+        // app is derived from — see `Dress::of`, which measures each of its
+        // colours on the thing that colour lands on.
+        let face = self.app.panel_face();
+        let time = ctx.input(|i| i.time);
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("tangent-busy"),
+        ));
+        let rect = ctx.screen_rect();
+        let Some(busy) = self.busy.as_mut() else {
+            return;
+        };
+        self.busy_up = busy.draw(&painter, rect, face, time);
+        // While it is up the window must keep repainting: a chunked operation
+        // only advances on a frame, and nothing else in the app is asking for
+        // one while the desk is covered. The close is decided at the top of
+        // the next pass, above.
+        ctx.request_repaint();
+    }
+}
+
 #[cfg(all(test, feature = "recorder"))]
 mod tests {
+    use tangent_ui::busy::{Busy, Progress};
+
+    /// One frame of the host's own loop, in the order `update` runs it: the
+    /// desk draws, then the overlay draws, then eframe presents.
+    ///
+    /// The order is the whole point — see `Busy::on_screen`, which is only
+    /// honest if `draw` happens at the BOTTOM of the frame it is asked about.
+    fn present(ctx: &egui::Context, busy: &mut Busy) -> bool {
+        let mut up = false;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                up = busy.draw(
+                    ui.painter(),
+                    egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::Vec2::new(900.0, 600.0),
+                    ),
+                    egui::Color32::from_rgb(0x2a, 0x2c, 0x30),
+                    0.0,
+                );
+            });
+        });
+        up
+    }
+
+    fn ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        tangent_ui::fonts::install(&ctx, tangent_ui::fonts::FontChoice::default(), None);
+        ctx
+    }
+
+    /// **The announcement reaches the screen BEFORE the block runs.**
+    ///
+    /// The whole two-phase sequence in one assertion, and the failure it
+    /// guards is the one the export's format pass shipped with for months: a
+    /// label set and the blocking call made in the same frame, so the words
+    /// were true and nobody ever saw them. `chore_ready` is the gate, and it
+    /// must answer NO on the frame the work is announced on and YES on the
+    /// one after.
+    #[test]
+    fn an_announced_block_waits_for_its_own_frame() {
+        let ctx = ctx();
+        let mut busy = Busy::new("Writing files").with_detail("wav and mp3");
+        // Frame N: announced, nothing painted yet. Blocking here would be the
+        // bug.
+        assert!(
+            !super::chore_ready(Some(&busy)),
+            "the work must not run on the frame it was announced on"
+        );
+        assert!(present(&ctx, &mut busy), "the overlay paints at once");
+        // Frame N+1, at the top: the announcement is out.
+        assert!(
+            super::chore_ready(Some(&busy)),
+            "the work must run once its announcement has been presented"
+        );
+        // And an overlay that is GONE never holds the work hostage: a window
+        // with no area, or a cap that has fired, must not cost a session.
+        assert!(super::chore_ready(None));
+    }
+
+    /// **A fast chunked operation shows nobody anything.**
+    ///
+    /// `Busy::deferred` is what the insert loader and the decode warm-up
+    /// raise, and both are usually over before anybody notices. The overlay
+    /// must not paint inside the delay, and — this is the part that is the
+    /// host's own rule rather than `busy.rs`'s — one that finished before it
+    /// ever appeared must be dropped WITHOUT appearing, which is why
+    /// `paint_busy` asks `may_close` before it draws rather than after. Asked
+    /// the other way round, a load that beat the delay still flashed a card
+    /// for the four hundred milliseconds of its minimum.
+    #[test]
+    fn a_chunked_operation_that_beats_the_delay_never_appears() {
+        let ctx = ctx();
+        let mut busy = Busy::deferred("Loading plugins");
+        busy.progress = Some(Progress::Steps { done: 0, total: 3 });
+        assert!(!present(&ctx, &mut busy), "nothing inside the delay");
+        assert!(!busy.on_screen());
+        // The work finished. `paint_busy`'s order: close first, draw second.
+        assert!(
+            busy.may_close(),
+            "an overlay nobody saw owes the screen nothing"
+        );
+    }
+
+    /// **An operation that never answers gives the desk back.**
+    ///
+    /// `MAX_SILENT` measured on silence, not on total time — a render that is
+    /// counting up may take all afternoon, a constructor that has said
+    /// nothing for twenty seconds is not coming back. Driven here with a cap
+    /// of a few milliseconds so the test does not.
+    #[test]
+    fn an_overlay_that_goes_quiet_releases_the_window() {
+        let ctx = ctx();
+        let mut busy = Busy::new("Loading Serum").with_cap(std::time::Duration::from_millis(30));
+        assert!(present(&ctx, &mut busy), "up while it is still saying so");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(
+            !present(&ctx, &mut busy),
+            "past the cap the desk comes back whatever the operation is doing"
+        );
+    }
+
+    /// **The meter counts up, survives the work growing, and ends full.**
+    ///
+    /// Three rules in one walk, all of them things a real load does. It
+    /// counts up as bays land; the total RISES when an amp seeds seven pedals
+    /// into empty bays mid-batch, and the reading never walks backwards
+    /// through that; and the frame the work finishes on reads "15 of 15",
+    /// because a meter whose last state is one short of full looks like one
+    /// that gave up.
+    #[test]
+    fn a_chunked_meter_counts_up_and_ends_full() {
+        // Eight plugins to load; two land, and then an amp seeds seven pedals
+        // into empty bays, so the work GROWS from under the meter.
+        let outstanding = [8usize, 7, 6, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
+        let mut count = super::Counted::default();
+        let mut last = (0usize, 0usize);
+        for (frame, left) in outstanding.into_iter().enumerate() {
+            count = count.saw(left);
+            let Progress::Steps { done, total } = count.progress() else {
+                panic!("a counted operation reports steps");
+            };
+            assert!(done <= total, "frame {frame}: {done} of {total} is a lie");
+            assert!(
+                done >= last.0 && total >= last.1,
+                "frame {frame}: the meter walked backwards, {last:?} -> {:?}",
+                (done, total)
+            );
+            last = (done, total);
+        }
+        // Two were done when the seven arrived, so fifteen were ever known
+        // about — and the last frame is the one that says so.
+        assert_eq!(
+            last,
+            (15, 15),
+            "the frame the work finishes on is the only one that can read full"
+        );
+        assert_eq!(
+            Progress::Steps {
+                done: 15,
+                total: 15
+            }
+            .reading()
+            .as_deref(),
+            Some("15 of 15")
+        );
+        // And the growth really was absorbed by the TOTAL and not by undoing
+        // work: the reading right after the amp landed still says two done.
+        let grown = super::Counted::default().saw(8).saw(7).saw(6).saw(13);
+        assert_eq!((grown.done, grown.total), (2, 15));
+    }
+
+    /// **The loader takes the first gap and counts only the FULL bays.**
+    ///
+    /// A reload marks the whole seat space, so the walk starts among
+    /// thousands of empty bays that flush for nothing. The next index has to
+    /// be the first mismatch whatever is in it — that is what makes the flush
+    /// finish — while the meter's "n" counts only the bays that will cost
+    /// somebody a wait.
+    #[test]
+    fn the_loader_takes_the_first_gap_and_counts_only_the_full_bays() {
+        // Bays 0..40 all mismatch; three of them hold a plugin.
+        let filled = [7usize, 19, 33];
+        let (next, outstanding) = super::insert_walk(
+            40,
+            |_| true,
+            |i| filled.contains(&i),
+        );
+        assert_eq!(next, Some(0), "the flush starts at the first gap");
+        assert_eq!(outstanding, 3, "empty bays are not a wait");
+        // Settled: nothing mismatches, so there is nothing to say.
+        let (next, outstanding) = super::insert_walk(40, |_| false, |_| true);
+        assert_eq!((next, outstanding), (None, 0));
+        // And a lone plugin high up is still found.
+        let (next, outstanding) = super::insert_walk(40, |i| i == 33, |_| true);
+        assert_eq!((next, outstanding), (Some(33), 1));
+    }
+
+    /// **Every message leaves through the notify door.**
+    ///
+    /// The band's one-line notice slot is gone: `take_note` was an
+    /// `Option<String>` at the end of a priority chain, so a receipt for a
+    /// finished export sat in the same strip as a live device error and
+    /// stayed there until something else replaced it — eight minutes and
+    /// several takes, once. A source scan because `DesktopApp` cannot be
+    /// built in a test (the precedent is
+    /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`
+    /// below); what it stops is somebody reintroducing the slot rather than
+    /// adding a notification.
+    #[test]
+    fn every_message_leaves_through_the_notify_door() {
+        let src = include_str!("desktop.rs");
+        // This test names it, so look at everything above the test module.
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        assert!(
+            !body.contains("take_note"),
+            "the one-line notice slot is gone; say it with self.app.notify"
+        );
+        assert!(
+            body.matches(".notify(Kind::").count() >= 20,
+            "the thirty-odd retired notices should all be notify calls now"
+        );
+        // A running export is a CONDITION, so it is raised and lowered under
+        // one key rather than pushed as an event that ages out mid-render —
+        // and every road out of a pass has to take it back down, refusals
+        // included, or "Exporting…" stands for the rest of the session.
+        assert!(
+            body.matches("notify_raise(").count() >= 3,
+            "both passes and the request itself raise the running export"
+        );
+        assert!(
+            body.matches("notify_lower(EXPORT_RUNNING)").count() >= 10,
+            "every way an export can end has to take its message down"
+        );
+    }
+
+    /// **The format pass is a frame after the label that announces it.**
+    ///
+    /// The specific fault this work was pointed at: `tick_offline_bounce`
+    /// set "Writing files" into the export window and then ran
+    /// `deliver_formats` in the SAME frame, so a pass that takes tens of
+    /// seconds on a long mp3 showed nothing at all. The render loop and the
+    /// format pass are two functions now, with an announcement between them.
+    #[test]
+    fn the_format_pass_is_a_frame_after_it_says_so() {
+        let src = include_str!("desktop.rs");
+        let tick = src
+            .find("fn tick_offline_bounce")
+            .expect("the render tick");
+        let write = src.find("fn write_export").expect("the format pass");
+        assert!(tick < write, "the tick announces, the writer acts");
+        let tick_body = &src[tick..write];
+        assert!(
+            !tick_body.contains("deliver_formats("),
+            "the format pass must not run in the frame that announces it"
+        );
+        assert!(
+            tick_body.contains("Chore::WriteExport"),
+            "the tick hands the format pass to the next frame"
+        );
+    }
 
     /// **A unit's preset drawer is spelled the way its chip is.** The
     /// built-ins come off the loader's own table, so the folder and the bay
