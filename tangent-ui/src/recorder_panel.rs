@@ -2436,6 +2436,11 @@ pub enum Hit {
     /// opened, including the twenty minutes of silence before you pressed
     /// play.
     ResetLufs,
+    /// The MEDIA tier's fifth folder row: where captured impulse responses
+    /// live. Appended at the enum's END, like every variant this enum
+    /// gains across parallel lanes.
+    ChooseIrFolder,
+    RevealIrFolder,
 }
 
 impl Hit {
@@ -2477,7 +2482,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 39] = [
+    pub const ALL: [Hit; 41] = [
         Hit::Play,
         Hit::Record,
         Hit::Stop,
@@ -2517,6 +2522,8 @@ impl Hit {
         Hit::SetVarispeed(Hit::MIDWAY),
         Hit::CycleLufs,
         Hit::ResetLufs,
+        Hit::ChooseIrFolder,
+        Hit::RevealIrFolder,
     ];
 
     pub fn label(self) -> &'static str {
@@ -2544,6 +2551,8 @@ impl Hit {
             Hit::RevealExportFolder => "Show the export folder",
             Hit::ChoosePresetFolder => "Choose the preset folder",
             Hit::RevealPresetFolder => "Show the preset folder",
+            Hit::ChooseIrFolder => "Choose the impulse-response folder",
+            Hit::RevealIrFolder => "Show the impulse-response folder",
             Hit::ToggleOpenWhenDone => "Show the take when it is finished",
             Hit::NameField => "Take name",
             Hit::PickCamera => "Camera",
@@ -3055,6 +3064,12 @@ fn name_for(
             }
             Hit::RevealPresetFolder => {
                 Node::button(id("preset-reveal"), r, "Show the preset folder")
+            }
+            Hit::ChooseIrFolder => {
+                Node::button(id("irs-dest"), r, "Choose the impulse-response folder")
+            }
+            Hit::RevealIrFolder => {
+                Node::button(id("irs-reveal"), r, "Show the impulse-response folder")
             }
             Hit::PickCamera => Node::button(id("camera"), r, "Choose a camera"),
             Hit::PickAudio => Node::button(id("audio"), r, "Choose an audio input"),
@@ -8135,7 +8150,8 @@ mod tests {
         );
         assert!(
             l.proj_dest.bottom() <= l.take_head.top()
-                && l.export_dest.bottom() <= l.take_head.top(),
+                && l.export_dest.bottom() <= l.take_head.top()
+                && l.irs_dest.bottom() <= l.take_head.top(),
             "the MEDIA tier does not end before TAKE begins"
         );
         assert!(
@@ -9468,7 +9484,7 @@ mod tests {
                 // `PickAudio` joined when the microphone icon left with the
                 // input fader: the desk's audio channels pick their inputs
                 // now, and the menu keeps the row for the interface itself.
-                const IN_THE_MENU: [Hit; 15] = [
+                const IN_THE_MENU: [Hit; 17] = [
                     Hit::ChooseFolder,
                     Hit::RevealFolder,
                     // The PROJECT tier's six, which live in the cog and
@@ -9480,6 +9496,8 @@ mod tests {
                     Hit::RevealExportFolder,
                     Hit::ChoosePresetFolder,
                     Hit::RevealPresetFolder,
+                    Hit::ChooseIrFolder,
+                    Hit::RevealIrFolder,
                     Hit::ToggleOpenWhenDone,
                     Hit::CycleCountIn,
                     Hit::Export,
@@ -10185,6 +10203,7 @@ mod tests {
                                 project_dest: "",
                                 export_dest: "",
                                 preset_dest: "",
+                                irs_dest: "",
                                 position_s: 0.0,
                                 playing: false,
                                 arr_recording: false,
@@ -10691,7 +10710,7 @@ const SETUP_ASPECT: f32 = 1.16;
 /// row, and it is the one row here that is not about a take.
 /// (Kept as the unit the row pitch is derived from; the three section
 /// headers take about half a row each on top of these.)
-const SETUP_ROWS: usize = 10;
+const SETUP_ROWS: usize = 11;
 
 /// Every rectangle in the popup.
 struct SetupLayout {
@@ -10741,6 +10760,8 @@ struct SetupLayout {
     export_reveal: Rect,
     preset_dest: Rect,
     preset_reveal: Rect,
+    irs_dest: Rect,
+    irs_reveal: Rect,
 }
 
 impl SetupLayout {
@@ -10771,6 +10792,8 @@ impl SetupLayout {
         export_reveal: Rect::NOTHING,
         preset_dest: Rect::NOTHING,
         preset_reveal: Rect::NOTHING,
+        irs_dest: Rect::NOTHING,
+        irs_reveal: Rect::NOTHING,
         audio_count_in: Rect::NOTHING,
         audio_sig: Rect::NOTHING,
         project_row: Rect::NOTHING,
@@ -10858,6 +10881,7 @@ impl SetupLayout {
         let rp1 = band(1.0);
         let rp2 = band(1.0);
         let rp3 = band(1.0);
+        let rp4 = band(1.0);
         let take_head = band(HEAD);
         let r0 = band(1.0);
         let r1 = band(1.0);
@@ -10932,11 +10956,13 @@ impl SetupLayout {
             export_reveal: slice_h(rp2, 0.82, 1.00),
             preset_dest: slice_h(rp3, 0.00, 0.79),
             preset_reveal: slice_h(rp3, 0.82, 1.00),
+            irs_dest: slice_h(rp4, 0.00, 0.79),
+            irs_reveal: slice_h(rp4, 0.82, 1.00),
         }
     }
 
     /// Every clickable region and what it means. The popup's [`Layout::targets`].
-    fn targets(&self) -> [(Rect, Hit); 23] {
+    fn targets(&self) -> [(Rect, Hit); 25] {
         [
             (self.audio_count_in, Hit::CycleCountIn),
             (self.audio_sig, Hit::EditTimeSignature),
@@ -10954,6 +10980,8 @@ impl SetupLayout {
             (self.export_reveal, Hit::RevealExportFolder),
             (self.preset_dest, Hit::ChoosePresetFolder),
             (self.preset_reveal, Hit::RevealPresetFolder),
+            (self.irs_dest, Hit::ChooseIrFolder),
+            (self.irs_reveal, Hit::RevealIrFolder),
             (self.count_in, Hit::CycleCountIn),
             (self.time_sig, Hit::EditTimeSignature),
             (self.export, Hit::Export),
@@ -12445,6 +12473,7 @@ pub fn draw_setup(
         (l.proj_dest, l.proj_reveal, "PROJECTS", view.project_dest),
         (l.export_dest, l.export_reveal, "EXPORTS", view.export_dest),
         (l.preset_dest, l.preset_reveal, "PRESETS", view.preset_dest),
+        (l.irs_dest, l.irs_reveal, "IRS", view.irs_dest),
     ] {
         control(painter, box_, &p);
         if box_.is_positive() {

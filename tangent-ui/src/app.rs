@@ -977,6 +977,14 @@ pub struct TangentApp {
     /// A preset the host has read back for a face to apply, latched until
     /// [`TangentApp::take_preset_loaded`] drains it.
     preset_loaded: Option<crate::ports::PresetLoaded>,
+    /// The host's scan of the IRs shelf — every capture under `IRs/`, one
+    /// level deep. Pushed like the preset rows; the app never opens the
+    /// folder itself.
+    ir_rows: Vec<crate::ports::IrRow>,
+    /// The IR road's live picture, pushed by the host while the wizard
+    /// meters, captures or deconvolves. Copied into the open wizard each
+    /// frame, the `InsertFace` live-refresh bargain.
+    ir_live: crate::ports::IrLive,
     /// The host has been asked to look for plugins again.
     plugin_rescan: bool,
     /// A folder the app has asked the host to show in the file manager.
@@ -2336,6 +2344,8 @@ impl TangentApp {
             cartridge: crate::ports::CartridgeInfo::default(),
             preset_rows: std::collections::HashMap::new(),
             preset_loaded: None,
+            ir_rows: Vec::new(),
+            ir_live: crate::ports::IrLive::default(),
             plugin_rescan: false,
             reveal_request: None,
             export_override: None,
@@ -19165,6 +19175,54 @@ impl TangentApp {
         self.preset_loaded.take()
     }
 
+    // ── the IR shelf and the wizard ─────────────────────────────────────────
+    //
+    // The preset road's shape, one shelf instead of one per unit: the host
+    // scans `IRs/` and pushes rows; the wizard reads its live picture off
+    // the same push channel; every ask goes back through `RecorderRequest`.
+
+    /// The host's scan of `IRs/` — replaces the shelf whole, exactly as the
+    /// preset rows do, so what any picker shows is what the disk holds.
+    pub fn set_ir_rows(&mut self, rows: Vec<crate::ports::IrRow>) {
+        self.ir_rows = rows;
+    }
+
+    /// What the host last found under `IRs/`. Empty until it has pushed —
+    /// the convolver's picker and anything else that lists IRs reads this.
+    pub fn ir_rows(&self) -> &[crate::ports::IrRow] {
+        &self.ir_rows
+    }
+
+    /// The IR road's live picture, pushed by the host per frame while the
+    /// road does anything. Held here and copied into the open wizard, so
+    /// the dialog stays a picture of pushed data like every face.
+    pub fn set_ir_live(&mut self, live: crate::ports::IrLive) {
+        self.ir_live = live;
+    }
+
+    /// Open the IR wizard with the device lists snapshotted NOW — the
+    /// `AudioSetup` bargain: channel counts come from the stored widths the
+    /// host pushed, never from a per-frame enumeration.
+    fn open_ir_wizard(&mut self) {
+        let mut state = dialogs::IrWizardState::default();
+        state.out_pairs = Self::ir_channel_pairs(self.device_outs);
+        state.in_pairs = Self::ir_channel_pairs(usize::from(self.input_width));
+        state.live = self.ir_live.clone();
+        self.dialog = Some(dialogs::Dialog::IrWizard {
+            state: Box::new(state),
+        });
+    }
+
+    /// A device's width as selectable stereo pairs: (0,1), (2,3)… A
+    /// one-channel device offers its channel twice — a mono loop is still a
+    /// loop, and refusing it would make the wizard a two-jack luxury.
+    fn ir_channel_pairs(width: usize) -> Vec<(usize, usize)> {
+        if width == 1 {
+            return vec![(0, 0)];
+        }
+        (0..width / 2).map(|i| (2 * i, 2 * i + 1)).collect()
+    }
+
     /// Show what is in a bay: a VST3's own editor, or the built-in's patches.
     ///
     /// **The built-in has no window to open.** Same gesture either way, and it
@@ -20031,6 +20089,10 @@ impl TangentApp {
                 self.ask_for_a_media_folder(crate::ports::DirPurpose::PresetRoot);
             }
             Hit::RevealPresetFolder => self.reveal_folder(self.settings.preset_root(), true),
+            Hit::ChooseIrFolder => {
+                self.ask_for_a_media_folder(crate::ports::DirPurpose::IrsRoot);
+            }
+            Hit::RevealIrFolder => self.reveal_folder(self.settings.irs_root(), true),
             Hit::ToggleOpenWhenDone => {
                 self.settings.record_open_when_done = !self.settings.record_open_when_done;
                 self.save_settings();
@@ -20337,6 +20399,12 @@ impl TangentApp {
     /// it; this crate only names it.
     pub fn preset_root(&self) -> std::path::PathBuf {
         self.settings.preset_root()
+    }
+
+    /// Where captured IMPULSE RESPONSES live, resolved — the wizard's Save
+    /// and the shelf's scan both go through the host, which asks here.
+    pub fn irs_root(&self) -> std::path::PathBuf {
+        self.settings.irs_root()
     }
 
     /// The typed take name, if any.
@@ -20809,6 +20877,12 @@ impl TangentApp {
     /// Where PRESETS live from now on.
     pub fn set_preset_dir(&mut self, dir: std::path::PathBuf) {
         self.settings.preset_dir = Some(dir.to_string_lossy().into_owned());
+        self.save_settings();
+    }
+
+    /// Where IRs live from now on.
+    pub fn set_irs_dir(&mut self, dir: std::path::PathBuf) {
+        self.settings.irs_dir = Some(dir.to_string_lossy().into_owned());
         self.save_settings();
     }
 
@@ -21322,6 +21396,10 @@ impl TangentApp {
             P::PresetRoot => (
                 self.settings.preset_root(),
                 "Where should Tangent keep your presets?",
+            ),
+            P::IrsRoot => (
+                self.settings.irs_root(),
+                "Where should Tangent keep your impulse responses?",
             ),
             _ => {
                 if !self.caps.capture_devices {
@@ -22588,6 +22666,34 @@ impl TangentApp {
                 if seat < recorder::CHANNELS && pedal < recorder::AMP_PEDALS {
                     self.open_insert_picker(recorder::amp_pedal_seat(seat, pedal), 0);
                 }
+            }
+            // ── the IR wizard ────────────────────────────────────────────
+            // Four asks mapped one-to-one onto requests: the engine, the
+            // math and the folder all live behind the firewall.
+            DialogAction::OpenIrWizard => self.open_ir_wizard(),
+            DialogAction::IrTone { on, out, inp, level_db } => {
+                self.request_recorder(recorder::RecorderRequest::IrTone {
+                    out,
+                    inp,
+                    level_db,
+                    on,
+                });
+            }
+            DialogAction::IrCapture { out, inp, sweep_s, tail_s, level_db, reference } => {
+                self.request_recorder(recorder::RecorderRequest::IrCapture {
+                    out,
+                    inp,
+                    sweep_s,
+                    tail_s,
+                    level_db,
+                    reference,
+                });
+            }
+            DialogAction::IrCancel => {
+                self.request_recorder(recorder::RecorderRequest::IrCancel);
+            }
+            DialogAction::IrSave { name } => {
+                self.request_recorder(recorder::RecorderRequest::IrSave { name });
             }
             DialogAction::AcceptCheat => {
                 // The "...": for the keyless this is the unlock, real from
@@ -27060,6 +27166,15 @@ impl TangentApp {
             Some(dialogs::Dialog::InsertFace { strip, slot, .. }) => Some((strip, slot)),
             _ => None,
         };
+        // **The IR wizard is live the same way.** Its meter, its progress
+        // bar and its finished result are all pushed by the host; the open
+        // dialog gets this frame's copy before it draws, and the repaint
+        // keeps the needle moving while the hand is still.
+        let ir_watch = matches!(self.dialog, Some(dialogs::Dialog::IrWizard { .. }));
+        if let Some(dialogs::Dialog::IrWizard { state }) = self.dialog.as_mut() {
+            state.live = self.ir_live.clone();
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
         // Take-and-put-back ONLY when it is a face: an unconditional
         // `take()` here would quietly destroy every other dialog each frame.
         let is_face = matches!(self.dialog, Some(dialogs::Dialog::InsertFace { .. }));
@@ -27143,6 +27258,12 @@ impl TangentApp {
                     on: false,
                 });
             }
+        }
+        // The wizard closed this frame: whatever the IR road was doing —
+        // the tone above all — stops with it. A tone that outlives its
+        // meter is a signal generator nobody can find the switch for.
+        if ir_watch && !matches!(self.dialog, Some(dialogs::Dialog::IrWizard { .. })) {
+            self.request_recorder(recorder::RecorderRequest::IrCancel);
         }
         // **The party, over everything.** A dim veil and the rainbow, drawn
         // on the Foreground layer so it covers the whole canvas (and sits
@@ -29553,7 +29674,7 @@ mod tests {
         );
     }
 
-    /// **The four media folders exist after the host asks for them**, and
+    /// **The five media folders exist after the host asks for them**, and
     /// the SHOW buttons therefore have somewhere to open.
     ///
     /// On a fresh install nothing created them: they appeared when the first
@@ -29572,10 +29693,11 @@ mod tests {
         settings.project_dir = Some(root.join("p").to_string_lossy().into_owned());
         settings.export_dir = Some(root.join("e").to_string_lossy().into_owned());
         settings.preset_dir = Some(root.join("s").to_string_lossy().into_owned());
+        settings.irs_dir = Some(root.join("i").to_string_lossy().into_owned());
         let (_, app) = headless_with(Caps::DESKTOP, settings);
 
         let roots = app.settings.media_roots();
-        assert_eq!(roots.len(), 4, "the four folders are not all named");
+        assert_eq!(roots.len(), 5, "the five folders are not all named");
         for r in &roots {
             assert!(!r.exists(), "{} was there before anything made it", r.display());
         }
@@ -38018,6 +38140,89 @@ mod folder_tests {
             from: None,
         });
         assert_eq!(a.settings.insert_keys.get(0, 1), None);
+    }
+
+    /// **The IR wizard opens on the device the host pushed, and its four
+    /// asks cross the firewall verbatim.** The pairs come from the stored
+    /// widths — sixteen outs is eight pairs, four ins is two — and every
+    /// dialog action maps one-to-one onto its request, values untouched:
+    /// what the wizard shows is exactly what the engine will be asked.
+    #[test]
+    fn the_ir_wizard_opens_on_the_device_and_its_asks_become_requests() {
+        let mut a = app();
+        a.set_device_outs(16);
+        a.set_input_width(4);
+        a.apply_dialog_action(dialogs::DialogAction::OpenIrWizard);
+        match a.dialog.as_ref() {
+            Some(dialogs::Dialog::IrWizard { state }) => {
+                assert_eq!(state.out_pairs.len(), 8, "sixteen outs is eight pairs");
+                assert_eq!(state.in_pairs.len(), 2, "four ins is two pairs");
+                assert_eq!(state.out_pairs[6], (12, 13));
+            }
+            other => panic!("the wizard did not open: {:?}", other.is_some()),
+        }
+
+        use recorder::RecorderRequest as R;
+        a.apply_dialog_action(dialogs::DialogAction::IrTone {
+            on: true,
+            out: (12, 13),
+            inp: (2, 3),
+            level_db: -18.0,
+        });
+        assert_eq!(
+            a.take_recorder_request(),
+            Some(R::IrTone { out: (12, 13), inp: (2, 3), level_db: -18.0, on: true })
+        );
+        a.apply_dialog_action(dialogs::DialogAction::IrCapture {
+            out: (12, 13),
+            inp: (2, 3),
+            sweep_s: 15.0,
+            tail_s: 10.0,
+            level_db: -12.0,
+            reference: true,
+        });
+        assert_eq!(
+            a.take_recorder_request(),
+            Some(R::IrCapture {
+                out: (12, 13),
+                inp: (2, 3),
+                sweep_s: 15.0,
+                tail_s: 10.0,
+                level_db: -12.0,
+                reference: true,
+            })
+        );
+        a.apply_dialog_action(dialogs::DialogAction::IrCancel);
+        assert_eq!(a.take_recorder_request(), Some(R::IrCancel));
+        a.apply_dialog_action(dialogs::DialogAction::IrSave {
+            name: "QV plate".to_owned(),
+        });
+        assert_eq!(
+            a.take_recorder_request(),
+            Some(R::IrSave { name: "QV plate".to_owned() })
+        );
+        assert!(a.take_recorder_request().is_none(), "an ask was queued twice");
+
+        // The shelf and the live picture are plain pushed data, like the
+        // preset rows beside them.
+        a.set_ir_rows(vec![crate::ports::IrRow {
+            name: "spring".to_owned(),
+            path: "/somewhere/spring.wav".to_owned(),
+            seconds: 2.5,
+        }]);
+        assert_eq!(a.ir_rows().len(), 1);
+        assert_eq!(a.ir_rows()[0].name, "spring");
+        let mut live = crate::ports::IrLive::default();
+        live.capturing = true;
+        live.progress = 0.5;
+        a.set_ir_live(live);
+        // The open wizard reads this frame's copy in the frame path; here
+        // the latch itself is the contract.
+        assert!(a.ir_live.capturing);
+
+        // A mono input device still offers a loop.
+        assert_eq!(TangentApp::ir_channel_pairs(1), vec![(0, 0)]);
+        assert!(TangentApp::ir_channel_pairs(0).is_empty());
     }
 
     #[test]
