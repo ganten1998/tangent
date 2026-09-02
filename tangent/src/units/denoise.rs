@@ -857,6 +857,23 @@ struct Spectral {
     /// How many frames the current learn pass has thrown away for being
     /// only partly full of the material being learned.
     warm: usize,
+    /// Per bin: the tracked noise power, the smoothed speech-presence
+    /// probability behind the stagnation cap, this frame's instantaneous
+    /// probability, and the one-way floor and ceiling the learned profile
+    /// puts around the estimate.
+    lambda: Vec<f32>,
+    ph1mean: Vec<f32>,
+    ph1: Vec<f32>,
+    floor: Vec<f32>,
+    ceil: Vec<f32>,
+    /// Per band: last frame's estimated SIGNAL power, which is what the
+    /// decision-directed recursion feeds on.
+    s_prev: [f32; DENOISE_BANDS],
+    /// The two fixed smoothers' per-frame coefficients, derived from the
+    /// hop at the running rate. Derived, never stored as constants — that
+    /// is what makes 1024 points at 48 kHz and 2048 at 96 behave alike.
+    a_ph1: f32,
+    a_psd: f32,
 }
 
 impl Spectral {
@@ -889,6 +906,14 @@ impl Spectral {
             ln_sum: [0.0; DENOISE_BANDS],
             ln_n: 0.0,
             warm: 0,
+            lambda: vec![0.0; max_n / 2 + 1],
+            ph1mean: vec![0.5; max_n / 2 + 1],
+            ph1: vec![0.0; max_n / 2 + 1],
+            floor: vec![0.0; max_n / 2 + 1],
+            ceil: vec![0.0; max_n / 2 + 1],
+            s_prev: [0.0; DENOISE_BANDS],
+            a_ph1: 0.0,
+            a_psd: 0.0,
         }
     }
 
@@ -916,6 +941,11 @@ impl Spectral {
             *w = (std::f32::consts::PI * (i as f32 + 0.5) / n as f32).sin();
         }
         self.lay_out_bands(sr);
+        // TIME constants into per-frame coefficients, at the frame rate
+        // this length gives at this sample rate.
+        let frame_ms = 1_000.0 * self.hop as f32 / sr;
+        self.a_ph1 = (-frame_ms / TAU_PH1MEAN_MS).exp();
+        self.a_psd = (-frame_ms / TAU_LAMBDA_MS).exp();
         self.reset();
     }
 
@@ -932,6 +962,9 @@ impl Spectral {
         self.ap = 0;
         self.out_head = 0;
         self.out_len = self.hop;
+        self.ph1mean.fill(0.5);
+        self.ph1.fill(0.0);
+        self.s_prev = [0.0; DENOISE_BANDS];
         self.restart_learn();
     }
 
@@ -1331,7 +1364,7 @@ impl Denoise {
         let mut sp = Spectral::new(studio_n);
         sp.retune(studio_n, sample_rate);
 
-        Self {
+        let mut dn = Self {
             sample_rate,
             design,
             band: [Band::IDLE; DENOISE_BANDS],
@@ -1356,7 +1389,12 @@ impl Denoise {
             studio_n,
             live_n: studio_n / 2,
             min_learn_ticks: f64::from(MIN_LEARN_MS) / (tick_s * 1_000.0),
-        }
+        };
+        // Nothing is learned yet, so this lays a floor of nothing — but it
+        // is the one place the per-bin arrays get their shape, and a unit
+        // whose tracker has never been floored would clamp against zeroes.
+        dn.refloor();
+        dn
     }
 
     /// The frame length this kernel wants at this rate; the bank has none.
@@ -1390,6 +1428,7 @@ impl Denoise {
         } else {
             self.sp.retune(n, self.sample_rate);
         }
+        self.refloor();
     }
 
     /// Band `k`'s centre frequency, in Hz — the geometry the whole file is
@@ -1420,6 +1459,7 @@ impl Denoise {
             b.thr_db = DENOISE_THR_DB.0 + (DENOISE_THR_DB.1 - DENOISE_THR_DB.0) * norm;
         }
         self.recount();
+        self.refloor();
     }
 
     /// The honest latency, in samples, for the current settings — what a
@@ -1498,6 +1538,7 @@ impl Denoise {
         }
         self.sp.restart_learn();
         self.recount();
+        self.refloor();
     }
 
     /// The spectral falling edge: freeze each band at the GEOMETRIC mean of
@@ -1547,6 +1588,7 @@ impl Denoise {
         }
         self.sp.restart_learn();
         self.recount();
+        self.refloor();
     }
 
     /// Design one bell for a cut of `depth_db`. RBJ peaking with the fixed
@@ -1992,8 +2034,263 @@ impl Denoise {
             self.sp.gain[..self.sp.n].fill(1.0);
             return;
         }
-        self.sp.gain[..self.sp.n].fill(1.0);
+        if self.live == 0 {
+            // Nothing learned is a wire, here as everywhere: the frame
+            // machinery still owes its delay, but no bin is touched.
+            self.sp.gain[..self.sp.n].fill(1.0);
+            return;
+        }
+        self.spectral_suppress(plan);
     }
+
+    /// Track the noise in every bin, decide how much of each band is
+    /// signal, and write the gain the frame will be multiplied by.
+    ///
+    /// # The noise estimate: MMSE with a speech-presence probability
+    ///
+    /// Per BIN, Gerkmann & Hendriks. Each bin's a-posteriori SNR
+    /// `γ = |Y|²/λ` is turned into a generalised likelihood ratio against a
+    /// fixed a-priori SNR of 15 dB ([`SPP_XI_H1`], with [`LOG_GLR_FACT`]
+    /// and [`GLR_EXP`] its two precomputed pieces), and that ratio becomes
+    /// a probability that this bin holds signal. The noise estimate then
+    /// updates toward `p·λ + (1−p)·|Y|²` — that is, toward the observation
+    /// only in proportion to how sure we are it is NOT signal. This is why
+    /// a sustained note does not slowly get absorbed into the noise floor
+    /// the way a minimum-statistics tracker's does.
+    ///
+    /// [`SPP_STAGNATION_CAP`] is not decoration. Once a bin's smoothed
+    /// probability has sat at 1 for a while its estimate stops updating
+    /// forever — frozen by its own confidence — and the failure is silent:
+    /// the unit simply stops working on sustained material. Capping the
+    /// instantaneous probability leaves 1 % of every frame flowing in,
+    /// which is enough to unstick it.
+    ///
+    /// The estimate is FLOORED at the learned profile and ceilinged 12 dB
+    /// above it. The floor is one-way and it is the whole point of having
+    /// asked the user to teach the unit: a tracker that may fall below what
+    /// it was taught will, on a quiet passage, decide the room is quieter
+    /// than it is and stop cutting. The ceiling is the other side — an
+    /// estimate 12 dB above the print is tracking the programme.
+    ///
+    /// # The gain: decision-directed, then mixed against the dial
+    ///
+    /// Per BAND. The a-priori SNR ξ comes from the classical
+    /// decision-directed recursion, mixing the PREVIOUS frame's estimated
+    /// signal power with this frame's raw excess `max(γ − 1, 0)`. Using the
+    /// previous estimated SIGNAL power (gain² × energy) rather than the
+    /// previous ξ is what makes the estimator self-quenching in noise: a
+    /// small gain feeds back a small power, which keeps ξ small, and the
+    /// recursion settles at [`XI_MIN_DB`] instead of at the ~−4 dB the raw
+    /// excess alone would hold it at. The weight is expressed as a time
+    /// constant that slides from [`TAU_DD_NOISE_MS`] to
+    /// [`TAU_DD_SIGNAL_MS`] with `q²`, so a noise-only band forgets over a
+    /// quarter second and a band with a note in it forgets in 8 ms — which
+    /// is what keeps transients from smearing without paying for it in
+    /// musical noise everywhere else.
+    ///
+    /// Then the line this whole rewrite exists for:
+    ///
+    /// ```text
+    ///     g_dB[b] = p[b]·20log10(g_H1[b]) + (1 − p[b])·C_dB
+    /// ```
+    ///
+    /// with `C_dB = −(reduce · 24)`, the dialled floor, and `p[b]` the
+    /// band's speech-presence probability — which costs nothing extra,
+    /// because the per-bin probabilities the noise tracker already computed
+    /// aggregate through the SAME triangular weights the energies do. No
+    /// second detector.
+    ///
+    /// In a noise-only frame ξ has bottomed out at [`XI_MIN_DB`], so
+    /// `g_H1` is −40.1 dB — below the deepest the dial can ask for — and
+    /// the mixture therefore lands at or under `C_dB` in every band
+    /// whatever `p` happens to be. The clamp puts it exactly ON `C_dB`:
+    /// flat, and equal to the dial, in every band and every octave. That
+    /// clamp is the REDUCE dial's own meaning (a CAP on the cut, exactly
+    /// the bank's `wanted.min(cap_db)`), not a fudge to make a test pass.
+    ///
+    /// `p[b]` is the weighted SUM of the bin probabilities, clamped into
+    /// 0..=1 — a detection statistic that saturates, not an average. The
+    /// distinction is the whole difference between this working and not,
+    /// and it was measured: averaged instead, a −20 dBFS tone at 1 kHz
+    /// came back 4.3 dB down, because a tone fills two bins of a
+    /// three-and-a-half-bin band and an average therefore reports 60 %
+    /// confidence about a band that plainly contains a note. The question
+    /// the mixture is asking is "is there signal here", and one bin's worth
+    /// of certainty is a yes.
+    ///
+    /// One thing the specification says about `p` is not quite true and it
+    /// does not matter: `p` does NOT go to zero on noise. The bins' own
+    /// probabilities sit near 0.03–0.12 rather than at 0, so a narrow band
+    /// reads about 0.24 and a wide one saturates at 1. The dial's exactness
+    /// comes from the CAP, not from `p` vanishing — with `g_H1` pinned at
+    /// −40.1 dB by [`XI_MIN_DB`], the mixture is at or under `C_dB` for
+    /// every `p` in 0..=1, so the clamp lands it on the dial either way.
+    fn spectral_suppress(&mut self, plan: &SpectralPlan) {
+        let n = self.sp.n;
+        let bins = n / 2;
+
+        // ── the per-bin noise tracker ───────────────────────────────────
+        let (a_ph1, a_psd) = (self.sp.a_ph1, self.sp.a_psd);
+        for k in 0..=bins {
+            let lam = self.sp.lambda[k];
+            let p = self.sp.pow[k];
+            let snr_post = p / lam;
+            // The likelihood ratio's LOGARITHM, clamped, and then the
+            // probability by the logistic identity
+            // `glr/(1+glr) = 1/(1 + e^−log glr)` rather than by
+            // exponentiating and dividing.
+            //
+            // This is not a style preference, it is the difference between
+            // working and not. In f64 `exp(200)` is a large finite number
+            // and the textbook form is fine; in f32 it is INFINITY, and
+            // `inf/(1+inf)` is NaN — one NaN gain poisons a bin, the
+            // inverse transform spreads it across the whole frame, and the
+            // overlap-add spreads that across the whole buffer. It takes a
+            // band whose profile is OFF (floor ~1e−7) with real signal in
+            // it to reach the clamp at all, which is exactly the case the
+            // noise-only acceptance tests cannot produce and a tone over
+            // band-limited noise produces immediately.
+            let log_glr = (LOG_GLR_FACT + GLR_EXP * snr_post).min(GLR_CLAMP);
+            let mut ph1 = 1.0 / (1.0 + (-log_glr).exp());
+            let mean = a_ph1 * self.sp.ph1mean[k] + (1.0 - a_ph1) * ph1;
+            self.sp.ph1mean[k] = mean;
+            if mean > SPP_STAGNATION_CAP {
+                ph1 = ph1.min(SPP_STAGNATION_CAP);
+            }
+            let est = ph1 * lam + (1.0 - ph1) * p;
+            let next = a_psd * lam + (1.0 - a_psd) * est;
+            self.sp.lambda[k] = next.clamp(self.sp.floor[k], self.sp.ceil[k]);
+            self.sp.ph1[k] = ph1;
+        }
+
+        // ── band aggregates, through the same weights as the energy ─────
+        let mut lam_b = [0.0_f32; DENOISE_BANDS];
+        let mut pres = [0.0_f32; DENOISE_BANDS];
+        for k in 0..=bins {
+            let (b, frac) = (self.sp.map_lo[k] as usize, self.sp.map_frac[k]);
+            let (lam, ph1) = (self.sp.lambda[k], self.sp.ph1[k]);
+            lam_b[b] += (1.0 - frac) * lam;
+            pres[b] += (1.0 - frac) * ph1;
+            if b + 1 < DENOISE_BANDS {
+                lam_b[b + 1] += frac * lam;
+                pres[b + 1] += frac * ph1;
+            }
+        }
+
+        // ── the decision-directed a-priori SNR ──────────────────────────
+        let frame_ms = 1_000.0 * self.sp.hop as f32 / self.sample_rate;
+        let xi_min = 10.0_f32.powf(XI_MIN_DB / 20.0).powi(2);
+        let mut xi = [0.0_f32; DENOISE_BANDS];
+        for b in 0..DENOISE_BANDS {
+            let lam = lam_b[b].max(1.0e-30);
+            let gamma = (self.sp.e[b] / lam).clamp(1.0e-6, 1_000.0);
+            let s = self.sp.s_prev[b];
+            let q = s / (s + lam);
+            let tau = TAU_DD_NOISE_MS + (TAU_DD_SIGNAL_MS - TAU_DD_NOISE_MS) * q * q;
+            let a = (-frame_ms / tau).exp();
+            xi[b] = (a * (s / lam) + (1.0 - a) * (gamma - 1.0).max(0.0)).max(xi_min);
+        }
+
+        // Cross-band smoothing, [0.25, 0.5, 0.25], on the ESTIMATE and
+        // never on the output. Smoothing the GAIN would be the bank's
+        // mistake in a new costume — a constraint applied after the fact to
+        // the thing the ear hears. Smoothing the estimate instead means a
+        // band's neighbours vote on how much signal it has, which halves
+        // the variance a two-bin band's energy carries, and the weights sum
+        // to one so a flat estimate stays exactly flat.
+        //
+        // LINEAR, not logarithmic, and that was measured rather than
+        // assumed. ξ spans orders of magnitude, which is the usual argument
+        // for smoothing its logarithm — but a geometric mean of one loud
+        // band and two quiet ones is dominated by the quiet ones, and a
+        // −20 dBFS tone sitting on a band centre came back 2.4 dB down
+        // because its own neighbours voted it away. The arithmetic mean
+        // biases the other way, toward keeping signal, which is the right
+        // direction to be wrong in; and where it matters for the dial —
+        // every band bottomed out at [`XI_MIN_DB`] — the two agree exactly,
+        // because a mean of equal numbers is that number in either domain.
+        let mut sm = [0.0_f32; DENOISE_BANDS];
+        for b in 0..DENOISE_BANDS {
+            let lo = xi[b.saturating_sub(1)];
+            let hi = xi[(b + 1).min(DENOISE_BANDS - 1)];
+            sm[b] = 0.25 * lo + 0.5 * xi[b] + 0.25 * hi;
+        }
+
+        // ── the gain ────────────────────────────────────────────────────
+        let mut g_lin = [1.0_f32; DENOISE_BANDS];
+        for b in 0..DENOISE_BANDS {
+            let off = self.band[b].thr_norm < DENOISE_OFF;
+            let g_h1 = sm[b] / (1.0 + sm[b]);
+            // Next frame's decision-directed history: the SPEECH estimate,
+            // which is the H1 gain's work and not the floored output's —
+            // the floor is a cosmetic minimum, not a belief about signal.
+            self.sp.s_prev[b] = g_h1 * g_h1 * self.sp.e[b];
+            if off {
+                // A band with nothing learned in it never reduces. Same
+                // contract the bank keeps, and the reason `thresholds` can
+                // be all zeroes and mean "this unit is a wire".
+                g_lin[b] = 1.0;
+                self.band[b].depth_db = 0.0;
+                continue;
+            }
+            let p = pres[b].clamp(0.0, 1.0);
+            let h1_db = 20.0 * g_h1.max(1.0e-6).log10();
+            let db = (p * h1_db + (1.0 - p) * plan.floor_db).clamp(plan.floor_db, 0.0);
+            g_lin[b] = 10.0_f32.powf(db / 20.0);
+            // The meter reads the same number the audio gets, per band,
+            // whichever kernel is running.
+            self.band[b].depth_db = -db;
+        }
+
+        // ── back onto the bins, and mirrored ────────────────────────────
+        for k in 0..=bins {
+            let (b, frac) = (self.sp.map_lo[k] as usize, self.sp.map_frac[k]);
+            let hi = if b + 1 < DENOISE_BANDS { g_lin[b + 1] } else { g_lin[b] };
+            self.sp.gain[k] = (1.0 - frac) * g_lin[b] + frac * hi;
+        }
+        // The gain is real AND conjugate-symmetric, which is what makes it
+        // one filter applied to both packed channels rather than two.
+        for k in bins + 1..n {
+            self.sp.gain[k] = self.sp.gain[n - k];
+        }
+    }
+
+    /// Re-derive the per-bin noise floor and ceiling from the learned
+    /// profile, and start the tracker from the floor.
+    ///
+    /// The profile is stored per BAND as a level — the mean power per bin,
+    /// normalised by n, so it means the same at any frame length (see
+    /// `Spectral::band_level`). Coming back the other way multiplies by the
+    /// CURRENT n, which is what lets a profile learned at Studio's 1024
+    /// points be read at Live's 512 without lying about how loud the room
+    /// was. Interpolating it onto bins uses the same partition-of-unity
+    /// weights as everything else, so a flat profile lands as a flat floor.
+    fn refloor(&mut self) {
+        let n = self.sp.n;
+        if n == 0 {
+            return;
+        }
+        let bins = n / 2;
+        let ceil_mul = 10.0_f32.powf(NOISE_CEIL_DB / 10.0);
+        let mut per_band = [0.0_f32; DENOISE_BANDS];
+        for (p, b) in per_band.iter_mut().zip(self.band.iter()) {
+            *p = 10.0_f32.powf(b.thr_db / 10.0) * n as f32;
+        }
+        for k in 0..=bins {
+            let (b, frac) = (self.sp.map_lo[k] as usize, self.sp.map_frac[k]);
+            let hi = if b + 1 < DENOISE_BANDS { per_band[b + 1] } else { per_band[b] };
+            let floor = ((1.0 - frac) * per_band[b] + frac * hi).max(1.0e-30);
+            self.sp.floor[k] = floor;
+            self.sp.ceil[k] = floor * ceil_mul;
+            // The tracker starts AT the print rather than at zero: it may
+            // only ever climb away from what it was taught, so opening
+            // below the floor would just be one clamp's worth of nothing.
+            self.sp.lambda[k] = floor;
+            self.sp.ph1mean[k] = 0.5;
+        }
+        self.sp.s_prev = [0.0; DENOISE_BANDS];
+    }
+
 
     /// The spectral path: stage the block into the frame machinery a hop at
     /// a time, firing a frame whenever one is full.
@@ -2069,6 +2366,7 @@ impl Denoise {
         self.phase = 0;
         self.hp_lp = 0.0;
         self.sp.reset();
+        self.refloor();
     }
 }
 
@@ -2228,6 +2526,28 @@ mod tests {
         }
         let amp = 2.0 * (re * re + im * im).sqrt() / wsum;
         (20.0 * amp.max(1.0e-12).log10()) as f32
+    }
+
+    /// The PHASE of the same Hann-windowed correlation [`tone_db`] takes
+    /// the magnitude of, in radians, over `[from, from+len)` frames of the
+    /// left channel.
+    ///
+    /// It exists because the owner's first symptom is a phase symptom, and
+    /// an argument about phase settled with a magnitude measurement is not
+    /// settled. Correlating rather than differencing waveforms means the
+    /// noise the tone is buried in averages away, and taking the phase from
+    /// the same correlation the level comes from means the two numbers
+    /// cannot disagree about which frequency they are describing.
+    fn tone_phase(buf: &[f32], hz: f32, sr: f32, from: usize, len: usize) -> f32 {
+        let (mut re, mut im) = (0.0_f64, 0.0_f64);
+        for n in 0..len {
+            let x = f64::from(buf[(from + n) * 2]);
+            let w = 0.5 - 0.5 * (std::f64::consts::TAU * n as f64 / len as f64).cos();
+            let ph = std::f64::consts::TAU * f64::from(hz) * n as f64 / f64::from(sr);
+            re += x * w * ph.cos();
+            im += x * w * ph.sin();
+        }
+        im.atan2(re) as f32
     }
 
     /// Test-only measurement tools. Nothing here is compiled into the
@@ -2406,6 +2726,55 @@ mod tests {
                     (mag_db(k) * (1.0 - t) + mag_db(k + 1) * t) as f32
                 })
                 .collect()
+        }
+
+        /// The composite magnitude response, in dB of GAIN (so a cut is
+        /// negative), of the SPECTRAL kernel exactly as it stands right
+        /// now, sampled at each frequency in `hz`.
+        ///
+        /// The spectral twin of [`settled_response_db`], and simpler for a
+        /// reason worth naming: there is no filter to excite and no
+        /// transform to take, because the kernel's response IS an array of
+        /// per-bin gains. It reads them out of the unit without disturbing
+        /// anything, which is the same discipline the bank version keeps
+        /// with its fresh copy of the cascade.
+        ///
+        /// Bins are interpolated linearly in dB. The mask is smooth on the
+        /// scale of a bin by construction — it is a triangular
+        /// interpolation across bands hundreds of hertz wide, which is
+        /// exactly the property the band structure exists to buy — so the
+        /// interpolation is not where any error in these numbers comes
+        /// from.
+        pub(super) fn spectral_response_db(dn: &Denoise, hz: &[f32], sr: f32) -> Vec<f32> {
+            let n = dn.sp.n;
+            let bins = n / 2;
+            let bin_hz = f64::from(sr) / n as f64;
+            let db = |k: usize| 20.0 * f64::from(dn.sp.gain[k]).max(1.0e-12).log10();
+            hz.iter()
+                .map(|&f| {
+                    let x = (f64::from(f) / bin_hz).clamp(0.0, bins as f64);
+                    let k = x.floor() as usize;
+                    let t = x - k as f64;
+                    (db(k) * (1.0 - t) + db(k.min(bins - 1) + 1) * t) as f32
+                })
+                .collect()
+        }
+
+        /// The cut at one frequency in dB, taken from the AUDIO: the drop
+        /// in power between a dry and a wet spectrum inside a narrow slice
+        /// around `hz`.
+        ///
+        /// A twelfth of an octave either side — wide enough at 11.7 Hz per
+        /// bin to hold a real number of bins at 1 kHz (about fourteen) and
+        /// narrow enough at 14 kHz not to average two different answers
+        /// together. It exists to keep [`spectral_response_db`] honest:
+        /// reading a gain array and reporting the gain array proves nothing
+        /// on its own, and everything this unit's rewrite is argued from
+        /// wants a second opinion arrived at a completely different way.
+        pub(super) fn psd_cut_at(dry: &[f64], wet: &[f64], sr: f32, hz: f32) -> f32 {
+            let edge = 2.0_f32.powf(1.0 / 24.0);
+            band_power_db(dry, sr, hz / edge, hz * edge)
+                - band_power_db(wet, sr, hz / edge, hz * edge)
         }
 
         /// The composite cut at ONE frequency, in positive dB, measured by
@@ -2712,18 +3081,21 @@ mod tests {
     /// quieter broadband, at the shipped default settings.
     #[test]
     fn learned_noise_comes_back_at_least_8_db_quieter() {
-        let mut dn = learned(DenoiseKernel::Bank, 0xBAD5EED, 0.05, SR, 1.0);
-        let frames = SR as usize;
-        let mut noise = Noise::new(0xBAD5EED, 0.05, SR);
-        let mut buf = noise.frames(frames);
-        let in_db = rms_db(&buf, frames / 2);
-        dn.process(&mut buf, frames, 2, &on(DenoiseKernel::Bank));
-        let out_db = rms_db(&buf, frames / 2);
-        assert!(
-            in_db - out_db >= 8.0,
-            "the learned noise only dropped {:.1} dB ({in_db:.1} -> {out_db:.1})",
-            in_db - out_db
-        );
+        for kernel in DenoiseKernel::ALL {
+            let mut dn = learned(kernel, 0xBAD5EED, 0.05, SR, 1.0);
+            let frames = SR as usize;
+            let mut noise = Noise::new(0xBAD5EED, 0.05, SR);
+            let mut buf = noise.frames(frames);
+            let in_db = rms_db(&buf, frames / 2);
+            dn.process(&mut buf, frames, 2, &on(kernel));
+            let out_db = rms_db(&buf, frames / 2);
+            assert!(
+                in_db - out_db >= 8.0,
+                "{}: the learned noise only dropped {:.1} dB ({in_db:.1} -> {out_db:.1})",
+                kernel.label(),
+                in_db - out_db
+            );
+        }
     }
 
     /// **The signal survives the suppression that kills the noise**: a
@@ -2735,27 +3107,206 @@ mod tests {
     fn a_tone_survives_the_suppression_that_kills_the_noise() {
         let sr = SR;
         let frames = 2 * sr as usize;
-        let (from, len) = (frames / 2, sr as usize / 2);
         let amp = 10.0_f32.powf(-20.0 / 20.0);
 
         let clean = sine(1_000.0, amp, frames, sr);
-        let clean_db = tone_db(&clean, 1_000.0, sr, from, len);
 
-        let mut dn = learned(DenoiseKernel::Bank, 0xBAD5EED, 0.05, sr, 1.0);
-        let mut buf = sine(1_000.0, amp, frames, sr);
-        add(&mut buf, &Noise::new(0xBAD5EED, 0.05, sr).frames(frames));
-        dn.process(&mut buf, frames, 2, &on(DenoiseKernel::Bank));
-        let got_db = tone_db(&buf, 1_000.0, sr, from, len);
+        for kernel in DenoiseKernel::ALL {
+            let mut dn = learned(kernel, 0xBAD5EED, 0.05, sr, 1.0);
+            let mut buf = sine(1_000.0, amp, frames, sr);
+            add(&mut buf, &Noise::new(0xBAD5EED, 0.05, sr).frames(frames));
+            dn.process(&mut buf, frames, 2, &on(kernel));
+            // Aligned to the kernel's own latency, so the correlation
+            // windows describe the same half-second of programme whichever
+            // engine is running.
+            let lat = dn.latency() as usize;
+            let (from, len) = (frames / 2, sr as usize / 2);
+            let clean_db = tone_db(&clean, 1_000.0, sr, from - lat, len);
+            let got_db = tone_db(&buf, 1_000.0, sr, from, len);
 
+            assert!(
+                (got_db - clean_db).abs() <= 1.5,
+                "{}: the tone moved from {clean_db:.2} to {got_db:.2} dB under suppression",
+                kernel.label()
+            );
+            // And the suppression was real while the tone played: bands
+            // far from 1 kHz were still cutting. Without this the test
+            // would pass on a wire.
+            let depth = dn.depth_db();
+            let far = depth[..8]
+                .iter()
+                .chain(depth[26..].iter())
+                .cloned()
+                .fold(0.0_f32, f32::max);
+            assert!(
+                far > 3.0,
+                "{}: no band far from the tone was cutting ({far:.1} dB) — the test proves nothing",
+                kernel.label()
+            );
+        }
+    }
+
+    /// **The spectral kernel is not a flat attenuator wearing a denoiser's
+    /// name.** The two acceptance tests above feed it nothing but noise,
+    /// where the honest answer and the answer a plain volume knob would
+    /// give are the SAME number — so on their own they would pass on a
+    /// fader. This is the test that separates them: a −20 dBFS tone over
+    /// the learned noise, and the signal-to-noise ratio has to improve by
+    /// the dial. The tone stays put, the floor around it drops by what was
+    /// asked for, and the difference between those two facts is the whole
+    /// product.
+    #[test]
+    fn the_spectral_kernel_improves_the_signal_to_noise_and_not_just_the_level() {
+        let sr = SR;
+        let frames = 2 * sr as usize;
+        let amp = 10.0_f32.powf(-20.0 / 20.0);
+        for kernel in [DenoiseKernel::SpectralStudio, DenoiseKernel::SpectralLive] {
+            for reduce in [0.5_f32, 1.0] {
+                let dial = reduce * DENOISE_REDUCE_DB;
+                let mut dn = learned_full_band(kernel, 0x5A11, 0.02, sr, 1.0);
+                let p = DenoiseParams {
+                    reduce,
+                    ..on(kernel)
+                };
+                let mut dry = sine(1_000.0, amp, frames, sr);
+                add(&mut dry, &FullBandNoise::new(0x5A11, 0.02).frames(frames));
+                let mut wet = dry.clone();
+                dn.process(&mut wet, frames, 2, &p);
+                let lat = dn.latency() as usize;
+
+                let (from, len) = (frames / 2, sr as usize / 2);
+                let tone_in = tone_db(&dry, 1_000.0, sr, from - lat, len);
+                let tone_out = tone_db(&wet, 1_000.0, sr, from, len);
+                // The floor, measured well away from the tone so none of
+                // its skirt is in the slice.
+                let psd_dry = analysis::power_spectrum(&dry, from - lat, len);
+                let psd_wet = analysis::power_spectrum(&wet, from, len);
+                let floor_cut = analysis::band_power_db(&psd_dry, sr, 4_000.0, 16_000.0)
+                    - analysis::band_power_db(&psd_wet, sr, 4_000.0, 16_000.0);
+
+                assert!(
+                    (tone_out - tone_in).abs() <= 1.5,
+                    "{} at {dial:.0} dB: the tone moved {:.2} dB ({tone_in:.2} -> {tone_out:.2})",
+                    kernel.label(),
+                    tone_out - tone_in
+                );
+                assert!(
+                    (floor_cut - dial).abs() <= 1.5,
+                    "{} at {dial:.0} dB: the floor around the tone dropped {floor_cut:.2} dB, \
+                     not the dial",
+                    kernel.label()
+                );
+                // Said once more as the thing a listener hears: the tone
+                // sits that much further above the floor than it did.
+                let gained = (tone_out - tone_in) + floor_cut;
+                assert!(
+                    gained >= dial - 1.5,
+                    "{} at {dial:.0} dB: the signal-to-noise only improved {gained:.2} dB",
+                    kernel.label()
+                );
+            }
+        }
+    }
+
+    /// **A real gain on a bin leaves phase alone; a moving bell cannot.**
+    /// The owner's first symptom, measured rather than argued.
+    ///
+    /// The same experiment on all three engines: learned noise with a quiet
+    /// 1 kHz probe under it, so the band around the probe is cutting hard,
+    /// and the probe's PHASE at the output compared against the input
+    /// delayed by the kernel's own reported latency. Multiplying a bin by a
+    /// real non-negative scalar multiplies its real and imaginary parts by
+    /// the same number, so the argument is an identity — the spectral
+    /// kernels come back inside a degree. A minimum-phase peaking cut has
+    /// its phase tied to its magnitude by the Hilbert relation and cannot:
+    /// the bank rotates the same probe by tens of degrees for the same
+    /// depth of cut.
+    ///
+    /// The bank's number is asserted too, as a FLOOR rather than a ceiling.
+    /// A phase test that cannot see phase would pass on all three engines
+    /// and prove nothing about any of them.
+    #[test]
+    fn a_real_bin_gain_leaves_phase_alone_and_a_moving_bell_does_not() {
+        let sr = SR;
+        let frames = 3 * sr as usize;
+        let probe = 1_000.0_f32;
+        // Quiet enough to be a probe rather than a signal: the band must
+        // still be cutting while it is being measured.
+        let amp = 10.0_f32.powf(-45.0 / 20.0);
+
+        let mut worst = [0.0_f32; 3];
+        let mut cut = [0.0_f32; 3];
+        for (i, kernel) in DenoiseKernel::ALL.iter().enumerate() {
+            let mut dn = learned_full_band(*kernel, 0xB0A5, 0.05, sr, 1.0);
+            let p = DenoiseParams {
+                reduce: 1.0,
+                ..on(*kernel)
+            };
+            let mut dry = sine(probe, amp, frames, sr);
+            add(&mut dry, &FullBandNoise::new(0xB0A5, 0.05).frames(frames));
+            let mut wet = dry.clone();
+            dn.process(&mut wet, frames, 2, &p);
+            let lat = dn.latency() as usize;
+
+            // Several windows across the settled second half, because the
+            // claim is that phase does not MOVE — one window could catch an
+            // excursion at either end of its travel and call it zero.
+            let len = sr as usize / 4;
+            for w in 0..6 {
+                let from = frames / 2 + w * len / 2;
+                if from + len > frames {
+                    break;
+                }
+                let a = tone_phase(&dry, probe, sr, from - lat, len);
+                let b = tone_phase(&wet, probe, sr, from, len);
+                let mut d = (b - a).to_degrees();
+                while d > 180.0 {
+                    d -= 360.0;
+                }
+                while d < -180.0 {
+                    d += 360.0;
+                }
+                worst[i] = worst[i].max(d.abs());
+                cut[i] = cut[i].max(
+                    tone_db(&dry, probe, sr, from - lat, len) - tone_db(&wet, probe, sr, from, len),
+                );
+            }
+        }
+
+        let table = DenoiseKernel::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                format!(
+                    "  {:<16} {:>6.2} deg at {:>5.1} dB of cut",
+                    k.label(),
+                    worst[i],
+                    cut[i]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("phase excursion on a 1 kHz probe:\n{table}");
+
+        // All three are cutting hard, so all three are being asked the
+        // same question.
+        for (i, k) in DenoiseKernel::ALL.iter().enumerate() {
+            assert!(
+                cut[i] > 8.0,
+                "{} only cut {:.1} dB at the probe, so its phase figure describes \
+                 nothing:\n{table}",
+                k.label(),
+                cut[i]
+            );
+        }
+        for w in worst.iter().skip(1) {
+            assert!(*w < 1.0, "a real bin gain moved the probe's phase:\n{table}");
+        }
         assert!(
-            (got_db - clean_db).abs() <= 1.5,
-            "the tone moved from {clean_db:.2} to {got_db:.2} dB under suppression"
+            worst[0] > 10.0,
+            "the bank did not move phase either, so this test cannot see phase and \
+             proves nothing about the kernels that pass it:\n{table}"
         );
-        // And the suppression was real while the tone played: bands far
-        // from 1 kHz were still cutting.
-        let depth = dn.depth_db();
-        let far = depth[..8].iter().chain(depth[26..].iter()).cloned().fold(0.0_f32, f32::max);
-        assert!(far > 3.0, "no band far from the tone was cutting ({far:.1} dB) — the test proves nothing");
     }
 
     /// **One hot band between two cold ones is reined to the slope**: with
@@ -3321,14 +3872,25 @@ mod tests {
         }
     }
 
-    // ── the target ──────────────────────────────────────────────────────────
+    // ── the target, met ─────────────────────────────────────────────────────
     //
-    // The two tests below assert what this unit is SUPPOSED to do, not what
-    // it does, and they therefore fail. They are `#[ignore]`d so the suite
-    // stays green while the DSP work happens, and every assertion message
-    // carries both the live measurement and the figure recorded when they
-    // were written, so the gap — and any movement in it — is visible from
-    // the failure text alone without anyone reading this file.
+    // The two tests below assert what this unit is SUPPOSED to do. They were
+    // written first, against the bank, where they failed and carried
+    // `#[ignore]`; the numbers they measured then are kept below as
+    // [`BASE_A`] and [`BASE_B`] and quoted in every failure message, so a
+    // later regression is legible as a distance travelled BACKWARD rather
+    // than as a bare number nobody can place. The assertions have not been
+    // touched — the bounds are the ones the failing versions carried, and
+    // the spectral kernel meets them with room to spare.
+    //
+    // What they measure between them is one claim from two ends: the first
+    // reads the COEFFICIENTS the kernel is applying, the second reads the
+    // AUDIO that came out. Neither is enough alone. And neither is enough
+    // even together — both feed the unit nothing but noise, where a flat
+    // fader and an honest denoiser give the same answer — which is why
+    // `the_spectral_kernel_improves_the_signal_to_noise_and_not_just_the_level`
+    // sits above them and is the test to read first if this unit is ever
+    // suspected of having become a volume knob.
 
     /// The four REDUCE settings both target tests span the dial with: a
     /// quarter, half, three quarters and all of it, so 6, 12, 18 and 24 dB
@@ -3336,15 +3898,16 @@ mod tests {
     const REDUCE_SPAN: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
 
     /// What [`noise_only_gain_is_flat_and_equals_the_dial`] measured on
-    /// 2026-09-02, one row per [`REDUCE_SPAN`] entry: (dialled reduction,
-    /// mean cut, peak-to-peak spread) in dB across 100 Hz to 16 kHz. The
-    /// target is a mean equal to the dial and a spread of 0.00. Quoted in
-    /// the failure text so the gap, and any later movement in it, is
-    /// legible without opening this file.
+    /// THE BANK on 2026-09-02, one row per [`REDUCE_SPAN`] entry: (dialled
+    /// reduction, mean cut, peak-to-peak spread) in dB across 100 Hz to
+    /// 16 kHz. The target is a mean equal to the dial and a spread of 0.00.
+    /// Quoted in the failure text so a regression reads as a distance
+    /// travelled rather than as a bare number.
     ///
     /// The middle column is never the first. At the shipped default the
-    /// bank cuts 18.06 dB on average when it was asked for 12, and the
-    /// cut ranges over 15 dB from one probe frequency to the next.
+    /// bank cut 18.06 dB on average when it was asked for 12, and the cut
+    /// ranged over 15 dB from one probe frequency to the next. The spectral
+    /// kernel returns the dial to two decimal places with a spread of 0.00.
     const BASE_A: [(f32, f32, f32); 4] = [
         (6.0, 8.63, 6.67),
         (12.0, 18.06, 15.03),
@@ -3352,16 +3915,17 @@ mod tests {
         (24.0, 29.37, 32.52),
     ];
 
-    /// What [`the_dial_tells_the_truth_in_every_octave`] measured on
-    /// 2026-09-02, one row per [`REDUCE_SPAN`] entry: the drop in dB
-    /// broadband, below 500 Hz, across 500 Hz to 4 kHz, and above 8 kHz.
-    /// The target is the dial in all four columns.
+    /// What [`the_dial_tells_the_truth_in_every_octave`] measured on THE
+    /// BANK on 2026-09-02, one row per [`REDUCE_SPAN`] entry: the drop in
+    /// dB broadband, below 500 Hz, across 500 Hz to 4 kHz, and above
+    /// 8 kHz. The target is the dial in all four columns.
     ///
     /// Read the last column down. It is 5.53, 9.83, 10.05, 10.06 — above
-    /// 8 kHz the unit saturates at about 10 dB and then stops responding
-    /// to the dial ENTIRELY: turning REDUCE from 18 dB to 24 dB buys
-    /// one hundredth of a decibel up there. That is the owner's "I still
-    /// hear white noise when I push it hard", written down.
+    /// 8 kHz the bank saturated at about 10 dB and then stopped responding
+    /// to the dial ENTIRELY: turning REDUCE from 18 dB to 24 dB bought one
+    /// hundredth of a decibel up there. That is the owner's "I still hear
+    /// white noise when I push it hard", written down. The same column on
+    /// the spectral kernel is 6.00, 12.00, 18.00, 24.00.
     const BASE_B: [[f32; 4]; 4] = [
         [6.32, 8.49, 8.95, 5.53],
         [11.24, 16.71, 18.70, 9.83],
@@ -3369,55 +3933,49 @@ mod tests {
         [11.71, 24.31, 29.27, 10.06],
     ];
 
-    /// **The dial is a promise about the SPECTRUM, and the bank does not
-    /// keep it.** With nothing but learned noise going in, every band
-    /// should close, every bell should reach the cap, and the composite
-    /// response of the cascade should be a flat shelf of exactly the
-    /// dialled reduction from 100 Hz to 16 kHz. It is neither flat nor
-    /// equal to the dial.
+    /// **The dial is a promise about the SPECTRUM, and it is kept.** With
+    /// nothing but learned noise going in, every band should close, and the
+    /// composite gain the kernel is applying should be a flat shelf of
+    /// exactly the dialled reduction from 100 Hz to 16 kHz.
     ///
-    /// The mechanism is the geometry. The bells are peaking cuts at Q 5.5
-    /// on a 0.26-octave grid, so their skirts overlap: in the dense middle
-    /// of the bank a probe frequency sits under three or four cuts at once
-    /// and receives their SUM, well past what was asked for, while in the
-    /// top octave the grid runs out at 15.5 kHz and a lone shelf is left
-    /// holding the region — so the same dial delivers far less. Hand every
-    /// band a uniform ask and measure the composite with
-    /// [`analysis::settled_response_db`] and the shape is unmistakable:
-    /// a 12 dB ask lands at −21.2 dB at 100 Hz, −18.6 at 1 kHz, −15.1 at
-    /// 8 kHz, −9.2 at 14 kHz and −7.9 at 16 kHz. Worse, the error is not
-    /// a fixed offset that could be trimmed out once — it GROWS with the
-    /// dial, because it is a sum of overlapping cuts and every one of them
-    /// gets deeper together: the same measurement at a 24 dB ask reads
-    /// −50.0 dB at 100 Hz against −17.4 at 16 kHz. Both reported symptoms
-    /// fall out of that one fact — the reduction is not what the user
-    /// asked for, the error is worst exactly where hiss lives, and pushing
-    /// the dial makes the imbalance worse rather than better.
+    /// The bank could not do this and no tuning would have let it. Its
+    /// sections are peaking cuts at Q 5.5 on a 0.26-octave grid, so their
+    /// skirts overlap and a probe frequency in the dense middle receives
+    /// their SUM while the top octave is left to a lone shelf: measured, a
+    /// 12 dB ask landed at −21.2 dB at 100 Hz, −18.6 at 1 kHz, −15.1 at
+    /// 8 kHz and −7.9 at 16 kHz, and the error GREW with the dial because
+    /// every overlapping cut deepened together — the same measurement at
+    /// 24 dB read −50.0 against −17.4. [`BASE_A`] is that row of numbers,
+    /// quoted in the failure text so the distance travelled stays legible.
     ///
-    /// EXPECTED FAILURE. It is waiting for a bank whose COMPOSITE gain is
-    /// the design target — per-band depths solved against the summed
-    /// response rather than each set independently to the dial, or a
-    /// filter geometry whose sections do not overlap in the first place.
-    /// It is not waiting on the fixture, the detector or the dynamics:
-    /// [`analysis::gain_trajectory`] is read here first and the assertion
-    /// message reports the bank's DRIFT over the last second, so "it had
-    /// not settled yet" can be ruled out from the failure text without
-    /// anyone re-running anything.
+    /// The spectral kernel keeps the promise by construction, and it is
+    /// worth being precise about which construction, because it is two
+    /// facts and not one:
     ///
-    /// One caveat to read honestly, because it is a second defect wearing
-    /// the first one's coat: at the two upper settings the drift does not
-    /// go to zero and does not shrink when the run is lengthened — 1.07
-    /// and 1.64 dB over the last second at three seconds, and the same
-    /// again at six. Below 18 dB the bank arrives (0.00 and 0.13 dB) and
-    /// stays. Above it the bank never stops travelling, which means bells
-    /// whose gain never stops moving, which means phase that never stops
-    /// moving — a candidate for the reported artefacts in its own right,
-    /// and not something a fix to the summation alone will settle.
+    /// * The band weights are a PARTITION of every bin (pinned separately
+    ///   in `the_band_weights_partition_every_bin_exactly`), so a bank of
+    ///   equal band gains reconstructs to exactly that gain at every bin
+    ///   rather than to a sum of skirts.
+    /// * In a noise-only frame every band's decision-directed ξ has
+    ///   bottomed out at [`XI_MIN_DB`], which puts the speech-present gain
+    ///   at −40.1 dB — deeper than the deepest the dial can ask for — so
+    ///   the mixture `p·g_H1 + (1−p)·C` lands at or under `C` whatever `p`
+    ///   is, and the REDUCE cap clamps it exactly onto `C`. The bands come
+    ///   out EQUAL, which is the precondition the first fact needs.
+    ///
+    /// Read like the bank version: the composite is measured from the
+    /// coefficients the kernel is actually applying, and
+    /// [`analysis::gain_trajectory`] is read FIRST so the assertion message
+    /// can report the bank's drift over the last second and rule out "it
+    /// had not settled yet" from the failure text alone. The last column is
+    /// the two-routes guard — the same cut measured from the AUDIO, by
+    /// comparing the dry and wet power spectra in a narrow slice around the
+    /// probe — because a measurement of a gain array by reading the gain
+    /// array proves nothing on its own.
     #[test]
-    #[ignore = "expected failure: the composite response is neither flat nor equal to the dial"]
     fn noise_only_gain_is_flat_and_equals_the_dial() {
         // 100 Hz to 16 kHz, log-spaced: the range the unit claims to
-        // cover, sampled finely enough to catch a dip between two bells.
+        // cover, sampled finely enough to catch a dip between two bands.
         let probes: Vec<f32> = (0..96)
             .map(|i| 100.0 * (16_000.0_f32 / 100.0).powf(i as f32 / 95.0))
             .collect();
@@ -3425,19 +3983,21 @@ mod tests {
         let mut rows = Vec::new();
         for &reduce in REDUCE_SPAN.iter() {
             let cap = reduce * DENOISE_REDUCE_DB;
-            let mut dn = learned_full_band(DenoiseKernel::SpectralStudio, 0xD1A1, 0.05, SR, 1.0);
+            let kernel = DenoiseKernel::SpectralStudio;
+            let mut dn = learned_full_band(kernel, 0xD1A1, 0.05, SR, 1.0);
             let p = DenoiseParams {
                 reduce,
-                ..DenoiseParams::default()
+                ..on(kernel)
             };
-            // Six seconds of the same noise: long against the 219 ms
-            // default release, so the bank has arrived.
+            // Six seconds of the same noise: long against every time
+            // constant in the detector, so the kernel has arrived.
             let frames = 6 * SR as usize;
-            let mut buf = FullBandNoise::new(0xD1A1, 0.05).frames(frames);
+            let dry = FullBandNoise::new(0xD1A1, 0.05).frames(frames);
+            let mut buf = dry.clone();
             let traj = analysis::gain_trajectory(&mut dn, &mut buf, frames, 512, &p);
             // DRIFT, not jitter. Each band's mean depth over the last
             // tenth of the run against its mean over the tenth before
-            // that: a bank still travelling shows up here, whereas the
+            // that: a kernel still travelling shows up here, whereas the
             // sample-to-sample wobble of a depth riding a noise envelope
             // averages out — and that wobble is real and never reaches
             // zero, so comparing two adjacent snapshots would answer the
@@ -3452,7 +4012,7 @@ mod tests {
                 m.max((mean_over(last, k) - mean_over(prev, k)).abs())
             });
 
-            let cut: Vec<f32> = analysis::settled_response_db(&dn, &probes, SR)
+            let cut: Vec<f32> = analysis::spectral_response_db(&dn, &probes, SR)
                 .iter()
                 .map(|g| -g)
                 .collect();
@@ -3460,15 +4020,18 @@ mod tests {
             let hi = cut.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mean = cut.iter().sum::<f32>() / cut.len() as f32;
 
-            // The tools check each other. A tone through the same settled
-            // cascade, correlated back out, against the transform of that
-            // cascade's impulse — one number, one probe low in the grid
-            // and one in the top octave where the disagreement would
-            // matter most. If this column is not near zero, the argument
-            // above it is about a measurement bug, not about the bank.
+            // The tools check each other. What the coefficients say against
+            // what the AUDIO did, at one probe low in the grid and one in
+            // the top octave where a disagreement would matter most. If
+            // this column is not near zero the argument above it is about a
+            // measurement bug, not about the kernel.
+            let (from, len) = (frames / 2, frames / 2);
+            let psd_dry = analysis::power_spectrum(&dry, from, len);
+            let psd_wet = analysis::power_spectrum(&buf, from, len);
             let check = [1_000.0_f32, 14_000.0].iter().fold(0.0_f32, |m, &hz| {
-                let by_fft = -analysis::settled_response_db(&dn, &[hz], SR)[0];
-                m.max((by_fft - analysis::composite_cut_at(&dn, hz, SR)).abs())
+                let by_coef = -analysis::spectral_response_db(&dn, &[hz], SR)[0];
+                let by_audio = analysis::psd_cut_at(&psd_dry, &psd_wet, SR, hz);
+                m.max((by_coef - by_audio).abs())
             });
             rows.push((reduce, cap, mean, lo, hi, hi - lo, drift, check));
         }
@@ -3480,14 +4043,23 @@ mod tests {
                 format!(
                     "  reduce {:.2} (dial {:>4.1} dB): mean cut {:>6.2} dB, \
                      {:>6.2}..{:>6.2}, peak-to-peak {:>5.2} dB \
-                     (drift over the last second {:.3} dB, FFT vs tone \
-                     {:.3} dB) [at commit: mean {:.2}, p-p {:.2}]",
+                     (drift over the last second {:.3} dB, coefficients vs \
+                     audio {:.3} dB) [bank: mean {:.2}, p-p {:.2}]",
                     r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, c.1, c.2
                 )
             })
             .collect::<Vec<_>>()
             .join("\n");
 
+        // Printed as well as asserted: `--nocapture` gives the table this
+        // unit's later commits get judged against, without anyone having
+        // to make a test fail on purpose to read it.
+        println!("noise-only composite gain, Spectral Studio:\n{table}");
+        assert!(
+            rows.iter().all(|r| r.7 < 1.0),
+            "the coefficients and the audio disagree, so nothing below this \
+             line means anything:\n{table}"
+        );
         assert!(
             rows.iter().all(|r| r.5 < 1.0),
             "the settled composite gain is not flat across 100 Hz..16 kHz \
@@ -3500,31 +4072,33 @@ mod tests {
         );
     }
 
-    /// **The dial must tell the truth in every octave, not on average.**
-    /// The measurement a listener would make: learned noise in, how much
-    /// energy actually left — broadband, and separately below 500 Hz,
-    /// across 500 Hz to 4 kHz, and above 8 kHz. Each should land within
-    /// 1.5 dB of the dial. Today the low slice overshoots and the high
-    /// slice undershoots, which is precisely what "I still hear white
-    /// noise when I push it" sounds like: the top octave keeps most of its
-    /// hiss whatever the dial says, and pushing the dial harder mostly
-    /// buys more over-cutting further down.
+    /// **The dial tells the truth in every octave, not on average.** The
+    /// measurement a listener would make: learned noise in, how much energy
+    /// actually left — broadband, and separately below 500 Hz, across
+    /// 500 Hz to 4 kHz, and above 8 kHz. Each lands within 1.5 dB of the
+    /// dial.
     ///
-    /// This is the same defect as
+    /// This is the same claim as
     /// [`noise_only_gain_is_flat_and_equals_the_dial`] seen from the other
     /// end. That test reads the coefficients; this one reads the audio, so
-    /// it also catches anything the dynamics do that the settled response
-    /// cannot show — bands that never close, a cap the expander cannot
-    /// reach, a profile that learned nothing up top. Two independent
-    /// routes to the same number is what makes a later fix believable.
+    /// it also catches anything the dynamics do that a settled response
+    /// cannot show — bands that never close, a floor the estimator cannot
+    /// reach, a profile that learned nothing up top. Two independent routes
+    /// to the same number is what makes the fix believable.
     ///
-    /// EXPECTED FAILURE, waiting on the same work. Note that the top
-    /// setting asks for 24 dB and is worth reading separately: if the
-    /// slices are short of the dial by roughly the same amount everywhere,
-    /// that is the expander running out of range under its threshold
-    /// rather than the bank's summation error, and it is a different fix.
+    /// [`BASE_B`] is what the bank measured. Read its last column down:
+    /// 5.53, 9.83, 10.05, 10.06 — above 8 kHz the bank saturated at about
+    /// 10 dB and then stopped responding to the dial ENTIRELY, so turning
+    /// REDUCE from 18 dB to 24 dB bought one hundredth of a decibel up
+    /// there. That was the owner's "I still hear white noise when I push it
+    /// hard", written down, and it is the column to check first if this
+    /// test ever goes red again.
+    ///
+    /// Both spectral frame lengths, because Live is not Studio with a
+    /// smaller number in it: half the frame is half the frequency
+    /// resolution, its bands sit on the 2-bin floor further up the
+    /// spectrum, and the whole flatness argument has to survive that.
     #[test]
-    #[ignore = "expected failure: the reduction is octave-dependent and does not equal the dial"]
     fn the_dial_tells_the_truth_in_every_octave() {
         let slices: [(&str, f32, f32); 4] = [
             ("broadband", 20.0, SR / 2.0),
@@ -3533,61 +4107,65 @@ mod tests {
             ("above 8 kHz", 8_000.0, SR / 2.0),
         ];
 
-        let mut rows = Vec::new();
-        for &reduce in REDUCE_SPAN.iter() {
-            let cap = reduce * DENOISE_REDUCE_DB;
-            let mut dn = learned_full_band(DenoiseKernel::SpectralStudio, 0x0C7A, 0.05, SR, 1.0);
-            let p = DenoiseParams {
-                reduce,
-                ..DenoiseParams::default()
-            };
-            let frames = 2 * SR as usize;
-            let dry = FullBandNoise::new(0x0C7A, 0.05).frames(frames);
-            let mut wet = dry.clone();
-            dn.process(&mut wet, frames, 2, &p);
+        for kernel in [DenoiseKernel::SpectralStudio, DenoiseKernel::SpectralLive] {
+            let mut rows = Vec::new();
+            for &reduce in REDUCE_SPAN.iter() {
+                let cap = reduce * DENOISE_REDUCE_DB;
+                let mut dn = learned_full_band(kernel, 0x0C7A, 0.05, SR, 1.0);
+                let p = DenoiseParams {
+                    reduce,
+                    ..on(kernel)
+                };
+                let frames = 2 * SR as usize;
+                let dry = FullBandNoise::new(0x0C7A, 0.05).frames(frames);
+                let mut wet = dry.clone();
+                dn.process(&mut wet, frames, 2, &p);
 
-            // The second half only: the first second is the bank arriving,
-            // and the 3 ms lookahead splice lives at the very front.
-            let (from, len) = (frames / 2, frames / 2);
-            let psd_dry = analysis::power_spectrum(&dry, from, len);
-            let psd_wet = analysis::power_spectrum(&wet, from, len);
-            let drops: Vec<f32> = slices
+                // The second half only: the first second is the kernel
+                // arriving, and the frame of latency lives at the front.
+                let (from, len) = (frames / 2, frames / 2);
+                let psd_dry = analysis::power_spectrum(&dry, from, len);
+                let psd_wet = analysis::power_spectrum(&wet, from, len);
+                let drops: Vec<f32> = slices
+                    .iter()
+                    .map(|&(_, lo, hi)| {
+                        analysis::band_power_db(&psd_dry, SR, lo, hi)
+                            - analysis::band_power_db(&psd_wet, SR, lo, hi)
+                    })
+                    .collect();
+                rows.push((reduce, cap, drops));
+            }
+
+            let table = rows
                 .iter()
-                .map(|&(_, lo, hi)| {
-                    analysis::band_power_db(&psd_dry, SR, lo, hi)
-                        - analysis::band_power_db(&psd_wet, SR, lo, hi)
+                .zip(BASE_B.iter())
+                .map(|(r, base)| {
+                    let (reduce, cap, drops) = r;
+                    let live = drops
+                        .iter()
+                        .zip(slices.iter())
+                        .map(|(d, s)| format!("{} {:>6.2}", s.0, d))
+                        .collect::<Vec<_>>()
+                        .join("   ");
+                    let was = base
+                        .iter()
+                        .map(|d| format!("{d:.2}"))
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    format!("  reduce {reduce:.2} (dial {cap:>4.1} dB): {live}  [bank: {was}]")
                 })
-                .collect();
-            rows.push((reduce, cap, drops));
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            println!("energy actually removed, {}:\n{table}", kernel.label());
+            assert!(
+                rows.iter()
+                    .all(|r| r.2.iter().all(|d| (d - r.1).abs() <= 1.5)),
+                "{}: the reduction the audio actually received is not the \
+                 dialled reduction in every slice (each must be within \
+                 1.5 dB of the dial):\n{table}",
+                kernel.label()
+            );
         }
-
-        let table = rows
-            .iter()
-            .zip(BASE_B.iter())
-            .map(|(r, base)| {
-                let (reduce, cap, drops) = r;
-                let live = drops
-                    .iter()
-                    .zip(slices.iter())
-                    .map(|(d, s)| format!("{} {:>6.2}", s.0, d))
-                    .collect::<Vec<_>>()
-                    .join("   ");
-                let was = base
-                    .iter()
-                    .map(|d| format!("{d:.2}"))
-                    .collect::<Vec<_>>()
-                    .join("/");
-                format!("  reduce {reduce:.2} (dial {cap:>4.1} dB): {live}  [at commit: {was}]")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(
-            rows.iter()
-                .all(|r| r.2.iter().all(|d| (d - r.1).abs() <= 1.5)),
-            "the reduction the audio actually received is not the dialled \
-             reduction in every slice (each must be within 1.5 dB of the \
-             dial):\n{table}"
-        );
     }
 }
