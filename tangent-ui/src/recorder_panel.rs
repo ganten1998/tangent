@@ -234,32 +234,32 @@ pub fn band_height(w: f32) -> f32 {
 /// a darker red does not.
 pub const REC_RED: Color32 = Color32::from_rgb(0xE8, 0x3A, 0x4E);
 
-struct Palette {
+pub(crate) struct Palette {
     /// Also the letterbox bars. See [`fit_preview`].
-    bg: Color32,
+    pub(crate) bg: Color32,
     /// Recessed fills: the preview well, the meter troughs and the fader
     /// tracks. A fader has to look like a slot with something in it, which is
     /// the same picture as a meter and gets the same colour.
-    well: Color32,
+    pub(crate) well: Color32,
     /// Control fills, so a thing you can click looks unlike a thing you read.
-    field: Color32,
-    ink: Color32,
-    faint: Color32,
-    line: Color32,
+    pub(crate) field: Color32,
+    pub(crate) ink: Color32,
+    pub(crate) faint: Color32,
+    pub(crate) line: Color32,
     /// The meter and the fader fills. Whatever a held key looks like on the
     /// piano — the user chose that colour once and this is the same "sound is
     /// happening" signal.
-    accent: Color32,
-    rec: Color32,
+    pub(crate) accent: Color32,
+    pub(crate) rec: Color32,
     /// The cluster's glass: the timecode digits and the scope trace, and the
     /// face they sit on. Theme roles — see `crate::theme`.
-    lcd: Color32,
-    lcd_face: Color32,
+    pub(crate) lcd: Color32,
+    pub(crate) lcd_face: Color32,
     /// The eight effect dials, and the master, which is its own colour.
-    fx_knob: Color32,
-    master: Color32,
+    pub(crate) fx_knob: Color32,
+    pub(crate) master: Color32,
     /// The varispeed dial's face. Its own role — see `Settings`.
-    varispeed: Color32,
+    pub(crate) varispeed: Color32,
 }
 
 /// The two inks the band can wear.
@@ -319,6 +319,7 @@ pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
 /// panel made of that face: a ground that can carry its own ink, the ink, a
 /// quieter ink for secondary rows, a raised shade for buttons and the
 /// highlighted row, a hover a step beyond that, and a well for typed fields.
+#[derive(Clone, Copy)]
 pub struct Surface {
     pub bg: Color32,
     pub ink: Color32,
@@ -734,7 +735,7 @@ pub fn band_face(s: &Settings) -> Color32 {
     palette(s).bg
 }
 
-fn palette(s: &Settings) -> Palette {
+pub(crate) fn palette(s: &Settings) -> Palette {
     // The BAND's own background, and its own choice. It used to borrow the
     // piano's, so the recorder read as another band of the same window — which
     // is right until you want to tell a set of controls apart from an
