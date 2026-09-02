@@ -1359,6 +1359,7 @@ fn push_builtin_faces(
                 } else {
                     Vec::new()
                 },
+                extra: engine.builtin_extra(strip, slot).to_vec(),
             },
             None => tangent_ui::ports::BuiltinFace {
                 strip,
@@ -3657,6 +3658,14 @@ impl DesktopApp {
                 R::SetInsertParam { strip, slot, id, value } => {
                     if let Some(e) = self.recorder.engine.as_mut() {
                         e.set_insert_param(strip, slot, id, value);
+                        // **Push the face back, NOW.** The readings are
+                        // host-printed strings and the EQ's curve is
+                        // host-computed; a push that only happened at load
+                        // time froze every readout at its birth values and
+                        // let a stale frame yank a dragged slider backward.
+                        // One strip, one frame behind the finger - the lag a
+                        // reading can wear, where "never" could not.
+                        push_builtin_faces(&mut self.app, e, strip);
                     }
                 }
                 R::SetInsertTap { strip, slot, on } => {
@@ -3734,6 +3743,31 @@ impl DesktopApp {
                     // Done, so the shelf is re-read on the way out — a save
                     // that happened this session is on it for certain.
                     self.push_ir_rows();
+                }
+                R::SetInsertIr { strip, slot, path } => {
+                    // A swap IS a reload: the IR is bound before the
+                    // instance crosses threads, so rewrite the sidecar
+                    // with the new path and the bay's own current knobs,
+                    // then mark the reload sentinel - the reconcile does
+                    // the rest, state and all.
+                    if let Some(e) = self.recorder.engine.as_ref() {
+                        if let Some((spec, values)) = e.builtin_insert(strip, slot) {
+                            if spec.path == crate::builtin_fx::IR_PATH {
+                                let mut extra = e.builtin_extra(strip, slot).to_vec();
+                                extra.retain(|(k, _)| k != "ir_path");
+                                extra.push(("ir_path".to_owned(), path));
+                                let blob = crate::builtin_fx::state_text(spec, values, &extra)
+                                    .into_bytes();
+                                write_insert_state(strip, slot, spec.path, &blob);
+                                let bays = tangent_ui::recorder::INSERTS;
+                                if let Some(cell) =
+                                    self.recorder.inserts_loaded.get_mut(strip * bays + slot)
+                                {
+                                    *cell = Some("\u{1f}reload".to_owned());
+                                }
+                            }
+                        }
+                    }
                 }
                 R::IrSave { name } => {
                     self.save_ir(&name);

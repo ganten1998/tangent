@@ -380,6 +380,13 @@ pub struct TangentApp {
     /// Pushed by the host on load/change ([`Self::set_builtin_face`]),
     /// mirrored optimistically by a local drag ([`Self::set_insert_param`]).
     builtin_faces: std::collections::HashMap<(usize, usize), crate::ports::BuiltinFace>,
+    /// Knob edits the host has not echoed back yet: (seat, bay, id) →
+    /// (value, frames left). During a drag the push is one frame behind
+    /// the finger, and letting it win yanked the slider backward every
+    /// other frame — the "flashing" a beta hand caught in minutes. A
+    /// pending value shields its param until the echo matches or a grace
+    /// period passes (a refused edit must not shield forever).
+    pending_inserts: std::collections::HashMap<(usize, usize, u32), (f32, u8)>,
     /// Per (SEAT, bay), the built-in compressor's gain-reduction meter in
     /// positive dB — forwarded each frame by the host for open faces.
     insert_gr: std::collections::HashMap<(usize, usize), f32>,
@@ -2405,6 +2412,7 @@ impl TangentApp {
             arr_auto_bypassed: std::collections::HashSet::new(),
             fx_params: std::collections::HashMap::new(),
             builtin_faces: std::collections::HashMap::new(),
+            pending_inserts: std::collections::HashMap::new(),
             insert_gr: std::collections::HashMap::new(),
             arr_auto_params: std::collections::HashMap::new(),
             arr_auto_hot: None,
@@ -18248,12 +18256,29 @@ impl TangentApp {
     /// change of tenant — the `set_fx_params` precedent with values. An
     /// empty face (no path, no params) CLEARS the entry: the bay unloaded,
     /// or holds a plugin whose window is the engine's business.
-    pub fn set_builtin_face(&mut self, face: crate::ports::BuiltinFace) {
+    pub fn set_builtin_face(&mut self, mut face: crate::ports::BuiltinFace) {
         let key = (face.strip, face.slot);
         if face.path.is_empty() && face.params.is_empty() {
             self.builtin_faces.remove(&key);
             self.insert_gr.remove(&key);
+            self.pending_inserts.retain(|k, _| (k.0, k.1) != key);
         } else {
+            // A pending edit shields its param from an older echo; the
+            // echo that MATCHES retires the shield, and a shield left
+            // standing (a refused edit) ages out so the truth returns.
+            for p in face.params.iter_mut() {
+                let pk = (key.0, key.1, p.id);
+                if let Some((want, ttl)) = self.pending_inserts.get_mut(&pk) {
+                    if (p.value - *want).abs() < 1.0e-4 {
+                        self.pending_inserts.remove(&pk);
+                    } else if *ttl == 0 {
+                        self.pending_inserts.remove(&pk);
+                    } else {
+                        *ttl -= 1;
+                        p.value = *want;
+                    }
+                }
+            }
             self.builtin_faces.insert(key, face);
         }
     }
@@ -18278,6 +18303,7 @@ impl TangentApp {
                 p.value = value;
             }
         }
+        self.pending_inserts.insert((strip, slot, id), (value, 30));
         self.request_recorder(crate::recorder::RecorderRequest::SetInsertParam {
             strip,
             slot,
@@ -22642,6 +22668,14 @@ impl TangentApp {
             }
             DialogAction::FaceLoadPreset { unit, path } => {
                 self.request_recorder(recorder::RecorderRequest::LoadPreset { unit, path });
+            }
+            DialogAction::SetInsertIr { strip, slot, path } => {
+                let (seat, bay) = recorder::seat_bay(strip, slot);
+                self.request_recorder(recorder::RecorderRequest::SetInsertIr {
+                    strip: seat,
+                    slot: bay,
+                    path,
+                });
             }
             DialogAction::SetInsertKeySource { strip, slot, from } => {
                 // A settings write and nothing else — the `SetRouteGain`
@@ -27192,6 +27226,9 @@ impl TangentApp {
             }
             live.gr_db = self.insert_gr(seat, bay);
             live.preset_rows = self.preset_rows(&live.face.path).to_vec();
+            if live.face.path == "@tangent-ir" {
+                live.irs = self.ir_rows().to_vec();
+            }
             // The amp face's pedal chips, refreshed from settings like the
             // rest of the picture — and only for a CHANNEL's seat: the
             // master, the buses and a folder's extra rack wear no board.
