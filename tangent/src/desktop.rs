@@ -2229,6 +2229,7 @@ impl DesktopApp {
         // the borrow.
         let project_dest = shorten_home(&self.app.project_root());
         let export_dest = shorten_home(&self.app.export_root());
+        let preset_dest = shorten_home(&self.app.preset_root());
         let state = self.app.recorder_state_mut();
         state.preview = preview;
         state.camera_name = self
@@ -2334,6 +2335,7 @@ impl DesktopApp {
         // box is a path nobody can read the end of.
         state.project_dest = project_dest;
         state.export_dest = export_dest;
+        state.preset_dest = preset_dest;
         state.folder_preview = take::folder_name(
             &take::WallTime::now_utc(),
             name.as_deref().and_then(take::sanitise_slug).as_deref(),
@@ -3519,8 +3521,166 @@ impl DesktopApp {
                         e.set_insert_tap(self.insert_tap_at);
                     }
                 }
+                // ── presets ─────────────────────────────────────────────
+                // The preset road's disk half. Every arm ends by re-scanning
+                // the unit's folder and re-pushing the rows, so what a panel
+                // shows is what the disk holds — the rule the request enum
+                // promises.
+                R::SavePreset { unit, name, values } => {
+                    self.save_unit_preset(&unit, &name, &values);
+                    self.push_preset_rows(&unit);
+                }
+                R::LoadPreset { unit, path } => {
+                    self.load_unit_preset(&unit, std::path::Path::new(&path));
+                    self.push_preset_rows(&unit);
+                }
+                R::DeletePreset { path } => {
+                    self.delete_unit_preset(std::path::Path::new(&path));
+                }
             }
             ctx.request_repaint();
+        }
+    }
+
+    // ── presets on disk ─────────────────────────────────────────────────────
+    //
+    // The host's half of the preset system: `tangent-ui` holds the format
+    // (`preset.rs`, pure data) and asks through `RecorderRequest`; everything
+    // that touches `Presets/` is below. One folder per unit under
+    // `Settings::preset_root`, made lazily on the first save.
+
+    /// Where one unit's presets live, under the preset root.
+    fn unit_preset_dir(&self, unit: &str) -> std::path::PathBuf {
+        self.app.preset_root().join(preset_subfolder(unit))
+    }
+
+    /// Scan a unit's folder and push what is there as plain rows — the
+    /// cartridge-list pattern. Files that do not parse as presets are
+    /// skipped without a word (a preset folder is somewhere people put
+    /// junk, the user-themes rule), and so is a preset that does not name
+    /// THIS unit: it cannot be loaded from this list, so a row for it would
+    /// be a button that refuses — and requiring the match here is what lets
+    /// a delete know, from the file alone, whose list to refresh.
+    fn push_preset_rows(&mut self, unit: &str) {
+        let dir = self.unit_preset_dir(unit);
+        let mut rows: Vec<tangent_ui::ports::PresetRow> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut paths: Vec<std::path::PathBuf> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                        e.eq_ignore_ascii_case(tangent_ui::preset::PRESET_EXT)
+                    })
+                })
+                .collect();
+            paths.sort();
+            for path in paths {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(p) = tangent_ui::preset::Preset::from_json(&text) else {
+                    continue;
+                };
+                if p.unit != unit {
+                    continue;
+                }
+                // The file's own name when it says, the stem when it does
+                // not — the same fallback a renamed theme gets.
+                let name = if p.name.trim().is_empty() {
+                    path.file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                } else {
+                    p.name
+                };
+                rows.push(tangent_ui::ports::PresetRow {
+                    name,
+                    path: path.to_string_lossy().into_owned(),
+                });
+            }
+        }
+        self.app.set_preset_rows(unit.to_owned(), rows);
+    }
+
+    /// Write `values` as a named preset for `unit`, atomically — the
+    /// `Settings::save_to` model: whole file beside, then rename, so a
+    /// crash mid-write costs a `.tmp` and never a preset.
+    ///
+    /// The filename is the SANITIZED name; the typed name goes inside the
+    /// file. Same name, same unit, same file: saving "Warm Bus" twice is an
+    /// update, not a "Warm Bus (2)".
+    fn save_unit_preset(&mut self, unit: &str, name: &str, values: &[(String, f64)]) {
+        let dir = self.unit_preset_dir(unit);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let stem = tangent_ui::preset::safe_stem(name);
+        let path = dir.join(format!("{stem}.{}", tangent_ui::preset::PRESET_EXT));
+        let preset = tangent_ui::preset::Preset {
+            version: tangent_ui::preset::PRESET_VERSION,
+            unit: unit.to_owned(),
+            name: name.trim().to_owned(),
+            values: values.to_vec(),
+            extra: Default::default(),
+        };
+        let tmp = path.with_extension("tangentpreset.tmp");
+        if std::fs::write(&tmp, preset.to_json()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Read a preset back and hand it to the app as plain data. The unit
+    /// check is the owner rule `write_insert_state` keeps for plugin state:
+    /// a file that names a different unit moves nothing, out loud.
+    fn load_unit_preset(&mut self, unit: &str, path: &std::path::Path) {
+        let parsed = std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| tangent_ui::preset::Preset::from_json(&text));
+        let p = match parsed {
+            Ok(p) => p,
+            Err(e) => {
+                self.recorder.take_note = Some(format!("preset: {e}"));
+                return;
+            }
+        };
+        if !p.unit.is_empty() && p.unit != unit {
+            self.recorder.take_note =
+                Some(format!("preset: that file belongs to {}", p.unit));
+            return;
+        }
+        let name = if p.name.is_empty() {
+            path.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            p.name
+        };
+        self.app.set_preset_loaded(tangent_ui::ports::PresetLoaded {
+            unit: unit.to_owned(),
+            name,
+            values: p.values,
+        });
+    }
+
+    /// Delete one preset file, then re-push the list it came off.
+    ///
+    /// **The one request that must never follow user text anywhere it
+    /// points.** The path is resolved and has to land inside the preset
+    /// root wearing our extension, or nothing happens — a request built
+    /// from a stale row, a moved root or a hostile string deletes nothing.
+    fn delete_unit_preset(&mut self, path: &std::path::Path) {
+        let Some(canon) = preset_delete_target(&self.app.preset_root(), path) else {
+            return;
+        };
+        // Whose list to refresh, read from the file before it goes.
+        let unit = std::fs::read_to_string(&canon)
+            .ok()
+            .and_then(|text| tangent_ui::preset::Preset::from_json(&text).ok())
+            .map(|p| p.unit)
+            .filter(|u| !u.is_empty());
+        let _ = std::fs::remove_file(&canon);
+        if let Some(unit) = unit {
+            self.push_preset_rows(&unit);
         }
     }
 
@@ -3812,12 +3972,25 @@ impl DesktopApp {
             self.app.native_panel_closed();
             return;
         }
+        // **Start where the thing being saved LIVES**, and let the panel
+        // wander anywhere from there: the Projects folder for the project
+        // purposes — the owner's word — and the drum kits' own preset
+        // drawer for a kit. The drawer is made here, on the way in, because
+        // this is the first save's lazy moment and a default directory that
+        // does not exist is a panel that opens somewhere arbitrary. The
+        // answered path is still honoured whole either way.
+        let start = match request.purpose {
+            tangent_ui::ports::SavePurpose::KitPreset => {
+                let dir = self.app.preset_root().join(DRUM_PRESET_FOLDER);
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            }
+            _ => self.app.project_root(),
+        };
         let mut dialog = rfd::FileDialog::new()
             .set_title(&request.title)
             .set_file_name(&request.suggested)
-            // **Start in the Projects folder** — the owner's word — and
-            // let the panel wander anywhere from there.
-            .set_directory(self.app.project_root());
+            .set_directory(start);
         dialog = dialog.set_parent(frame);
         let file = dialog.save_file();
         self.app.native_panel_closed();
@@ -3902,6 +4075,7 @@ impl DesktopApp {
             tangent_ui::ports::DirPurpose::PluginFolder => self.app.add_plugin_folder(dir),
             tangent_ui::ports::DirPurpose::ProjectRoot => self.app.set_project_dir(dir),
             tangent_ui::ports::DirPurpose::ExportRoot => self.app.set_export_root(dir),
+            tangent_ui::ports::DirPurpose::PresetRoot => self.app.set_preset_dir(dir),
         }
     }
 
@@ -7287,6 +7461,59 @@ fn insert_state_path(strip: usize, bay: usize) -> std::path::PathBuf {
     dir.join(format!("insert-state-{strip}-{bay}.bin"))
 }
 
+/// The preset drawer drum KITS live in, under `Presets/`. Kits keep their
+/// own full-path save road (`SavePurpose::KitPreset` honours the whole
+/// path), so this is only the drawer the save panel OPENS on — named here
+/// beside [`preset_subfolder`] so the two spellings cannot drift apart.
+#[cfg(feature = "recorder")]
+const DRUM_PRESET_FOLDER: &str = "Tangent Drums";
+
+/// The folder one unit's presets live in, under `Presets/`.
+///
+/// Derived from the unit's IDENTITY, human-readable on purpose — these are
+/// folders people browse in a file manager. A Keys patch ("keys:2") files
+/// under one shared drawer because the patches are one instrument's eight
+/// sounds; a built-in effect files under its class name ("@tangent-eq" →
+/// "Tangent EQ") via the table the loader already reads, so the folder is
+/// spelled exactly as the bay's chip is. A sentinel this build has no row
+/// for — a newer build's unit — still gets a stable folder of its own: the
+/// sanitized identity, `@` shed. Never raw user text: everything joined
+/// onto the root here has been through a table lookup or the sanitizer.
+#[cfg(feature = "recorder")]
+fn preset_subfolder(unit: &str) -> String {
+    if unit == "keys" || unit.starts_with("keys:") {
+        return "Tangent Keys".to_owned();
+    }
+    if let Some(spec) = crate::builtin_fx::spec_for(unit) {
+        return spec.class.to_owned();
+    }
+    tangent_ui::preset::safe_stem(unit.trim_start_matches('@'))
+}
+
+/// What `DeletePreset` may actually remove: `path`, resolved, IF it lands
+/// inside the preset `root` wearing our extension — `None` for everything
+/// else. Its own function so the one guard between a request string and
+/// `remove_file` is the thing a test holds, not a private method on the
+/// whole app.
+#[cfg(feature = "recorder")]
+fn preset_delete_target(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    // Canonicalized on BOTH sides, so `..` segments and symlinks in the
+    // request cannot walk out of a root that compares equal as a string.
+    let root = root.canonicalize().ok()?;
+    let canon = path.canonicalize().ok()?;
+    if !canon.starts_with(&root) {
+        return None;
+    }
+    canon
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(tangent_ui::preset::PRESET_EXT))
+        .then_some(canon)
+}
+
 #[cfg(feature = "recorder")]
 /// A file stem the filesystem will take: separators out, trimmed, never
 /// empty.
@@ -8861,6 +9088,79 @@ impl DesktopApp {
 
 #[cfg(all(test, feature = "recorder"))]
 mod tests {
+
+    /// **A unit's preset drawer is spelled the way its chip is.** The
+    /// built-ins come off the loader's own table, so the folder and the bay
+    /// label cannot drift; every Keys patch shares one drawer; and an
+    /// identity this build has no row for still gets a stable,
+    /// separator-free folder rather than a panic or a path.
+    #[test]
+    fn every_unit_identity_files_under_a_readable_safe_folder() {
+        assert_eq!(super::preset_subfolder("keys"), "Tangent Keys");
+        assert_eq!(super::preset_subfolder("keys:0"), "Tangent Keys");
+        assert_eq!(super::preset_subfolder("keys:7"), "Tangent Keys");
+        // The table row the trim proved the road with.
+        assert_eq!(
+            super::preset_subfolder(crate::builtin_fx::TRIM_PATH),
+            "Tangent Trim"
+        );
+        // And every row the table will ever hold, by construction.
+        for spec in crate::builtin_fx::UNITS {
+            assert_eq!(super::preset_subfolder(spec.path), spec.class);
+        }
+        // A newer build's sentinel: sanitized identity, `@` shed.
+        assert_eq!(super::preset_subfolder("@tangent-shine"), "tangent-shine");
+        for hostile in ["../evil", "@a/b", ""] {
+            let folder = super::preset_subfolder(hostile);
+            assert!(!folder.contains('/') && !folder.contains('\\'));
+            assert!(!folder.starts_with('.'), "{hostile:?} → {folder:?}");
+            assert!(!folder.is_empty());
+        }
+    }
+
+    /// **A delete request only ever lands inside the preset root, on one of
+    /// our own files.** The request carries a path the UI got from a row the
+    /// host pushed — but rows go stale, roots get moved, and a string is a
+    /// string, so the guard is what stands between `DeletePreset` and
+    /// `remove_file`.
+    #[test]
+    fn a_delete_request_cannot_reach_outside_the_preset_root() {
+        let scratch = std::env::temp_dir().join(format!(
+            "tangent-preset-delete-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let root = scratch.join("Presets");
+        let drawer = root.join("Tangent EQ");
+        std::fs::create_dir_all(&drawer).expect("drawer");
+        let inside = drawer.join("warm.tangentpreset");
+        std::fs::write(&inside, "{}").expect("inside");
+        let beside = scratch.join("victim.tangentpreset");
+        std::fs::write(&beside, "{}").expect("beside");
+        let wrong_kind = drawer.join("notes.txt");
+        std::fs::write(&wrong_kind, "keep me").expect("wrong kind");
+
+        // The one legal target answers, resolved.
+        assert_eq!(
+            super::preset_delete_target(&root, &inside).as_deref(),
+            Some(inside.canonicalize().expect("canon").as_path())
+        );
+        // A file OUTSIDE the root is refused even though it wears our
+        // extension — and a traversal that names it through the root is
+        // refused too, because the check runs on the resolved path.
+        assert_eq!(super::preset_delete_target(&root, &beside), None);
+        let sneaky = drawer.join("..").join("..").join("victim.tangentpreset");
+        assert_eq!(super::preset_delete_target(&root, &sneaky), None);
+        // A file inside the root that is not a preset is refused.
+        assert_eq!(super::preset_delete_target(&root, &wrong_kind), None);
+        // A root that does not exist deletes nothing rather than resolving
+        // relative to whatever the process's directory happens to be.
+        assert_eq!(
+            super::preset_delete_target(&scratch.join("gone"), &inside),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 
     /// **The engine's knob table and the panel's are the same table.**
     ///

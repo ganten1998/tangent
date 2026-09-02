@@ -2354,6 +2354,10 @@ pub enum Hit {
     /// And where an export lands when the export dialog names no folder.
     ChooseExportFolder,
     RevealExportFolder,
+    /// And where saved PRESETS live — kits, built-in effect settings, Keys
+    /// patches. The MEDIA tier's fourth row.
+    ChoosePresetFolder,
+    RevealPresetFolder,
     /// Show the destination folder in the file manager.
     RevealFolder,
     /// Show the take's folder as soon as the take is finished.
@@ -2473,7 +2477,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 37] = [
+    pub const ALL: [Hit; 39] = [
         Hit::Play,
         Hit::Record,
         Hit::Stop,
@@ -2488,6 +2492,8 @@ impl Hit {
         Hit::RevealProjectFolder,
         Hit::ChooseExportFolder,
         Hit::RevealExportFolder,
+        Hit::ChoosePresetFolder,
+        Hit::RevealPresetFolder,
         Hit::ToggleOpenWhenDone,
         Hit::NameField,
         Hit::PickCamera,
@@ -2536,6 +2542,8 @@ impl Hit {
             Hit::RevealProjectFolder => "Show the project folder",
             Hit::ChooseExportFolder => "Choose the export folder",
             Hit::RevealExportFolder => "Show the export folder",
+            Hit::ChoosePresetFolder => "Choose the preset folder",
+            Hit::RevealPresetFolder => "Show the preset folder",
             Hit::ToggleOpenWhenDone => "Show the take when it is finished",
             Hit::NameField => "Take name",
             Hit::PickCamera => "Camera",
@@ -3041,6 +3049,12 @@ fn name_for(
             }
             Hit::RevealExportFolder => {
                 Node::button(id("exp-reveal"), r, "Show the export folder")
+            }
+            Hit::ChoosePresetFolder => {
+                Node::button(id("preset-dest"), r, "Choose the preset folder")
+            }
+            Hit::RevealPresetFolder => {
+                Node::button(id("preset-reveal"), r, "Show the preset folder")
             }
             Hit::PickCamera => Node::button(id("camera"), r, "Choose a camera"),
             Hit::PickAudio => Node::button(id("audio"), r, "Choose an audio input"),
@@ -9454,16 +9468,18 @@ mod tests {
                 // `PickAudio` joined when the microphone icon left with the
                 // input fader: the desk's audio channels pick their inputs
                 // now, and the menu keeps the row for the interface itself.
-                const IN_THE_MENU: [Hit; 13] = [
+                const IN_THE_MENU: [Hit; 15] = [
                     Hit::ChooseFolder,
                     Hit::RevealFolder,
-                    // The PROJECT tier's four, which live in the cog and
+                    // The PROJECT tier's six, which live in the cog and
                     // nowhere in the band — the same as the take folder's
                     // two above them.
                     Hit::ChooseProjectFolder,
                     Hit::RevealProjectFolder,
                     Hit::ChooseExportFolder,
                     Hit::RevealExportFolder,
+                    Hit::ChoosePresetFolder,
+                    Hit::RevealPresetFolder,
                     Hit::ToggleOpenWhenDone,
                     Hit::CycleCountIn,
                     Hit::Export,
@@ -10168,6 +10184,7 @@ mod tests {
                                 scope: RecorderView::empty().scope,
                                 project_dest: "",
                                 export_dest: "",
+                                preset_dest: "",
                                 position_s: 0.0,
                                 playing: false,
                                 arr_recording: false,
@@ -10674,7 +10691,7 @@ const SETUP_ASPECT: f32 = 1.16;
 /// row, and it is the one row here that is not about a take.
 /// (Kept as the unit the row pitch is derived from; the three section
 /// headers take about half a row each on top of these.)
-const SETUP_ROWS: usize = 9;
+const SETUP_ROWS: usize = 10;
 
 /// Every rectangle in the popup.
 struct SetupLayout {
@@ -10716,12 +10733,14 @@ struct SetupLayout {
     /// The STREAM door, on the count-in row's free half — the ReaStream send
     /// settings, moved here from the Project menu by the owner's word.
     stream_row: Rect,
-    /// The third tier's heading, and its two folder rows.
+    /// The third tier's heading, and its three folder rows.
     project_head: Rect,
     proj_dest: Rect,
     proj_reveal: Rect,
     export_dest: Rect,
     export_reveal: Rect,
+    preset_dest: Rect,
+    preset_reveal: Rect,
 }
 
 impl SetupLayout {
@@ -10750,6 +10769,8 @@ impl SetupLayout {
         proj_reveal: Rect::NOTHING,
         export_dest: Rect::NOTHING,
         export_reveal: Rect::NOTHING,
+        preset_dest: Rect::NOTHING,
+        preset_reveal: Rect::NOTHING,
         audio_count_in: Rect::NOTHING,
         audio_sig: Rect::NOTHING,
         project_row: Rect::NOTHING,
@@ -10836,6 +10857,7 @@ impl SetupLayout {
         let project_head = band(HEAD);
         let rp1 = band(1.0);
         let rp2 = band(1.0);
+        let rp3 = band(1.0);
         let take_head = band(HEAD);
         let r0 = band(1.0);
         let r1 = band(1.0);
@@ -10908,11 +10930,13 @@ impl SetupLayout {
             proj_reveal: slice_h(rp1, 0.82, 1.00),
             export_dest: slice_h(rp2, 0.00, 0.79),
             export_reveal: slice_h(rp2, 0.82, 1.00),
+            preset_dest: slice_h(rp3, 0.00, 0.79),
+            preset_reveal: slice_h(rp3, 0.82, 1.00),
         }
     }
 
     /// Every clickable region and what it means. The popup's [`Layout::targets`].
-    fn targets(&self) -> [(Rect, Hit); 21] {
+    fn targets(&self) -> [(Rect, Hit); 23] {
         [
             (self.audio_count_in, Hit::CycleCountIn),
             (self.audio_sig, Hit::EditTimeSignature),
@@ -10928,6 +10952,8 @@ impl SetupLayout {
             (self.proj_reveal, Hit::RevealProjectFolder),
             (self.export_dest, Hit::ChooseExportFolder),
             (self.export_reveal, Hit::RevealExportFolder),
+            (self.preset_dest, Hit::ChoosePresetFolder),
+            (self.preset_reveal, Hit::RevealPresetFolder),
             (self.count_in, Hit::CycleCountIn),
             (self.time_sig, Hit::EditTimeSignature),
             (self.export, Hit::Export),
@@ -12411,13 +12437,14 @@ pub fn draw_setup(
     // is opened, a folder is shown.
     draw_word_button(painter, l.reveal, &["SHOW FOLDER", "SHOW"], &p);
 
-    // **The PROJECT tier's two folders**, drawn exactly as the take's is —
+    // **The PROJECT tier's three folders**, drawn exactly as the take's is —
     // a box carrying the word and the path, with a Choose... at its right
-    // and a SHOW beside it. Three answers to one question, so they read as
-    // a set rather than as three different controls.
+    // and a SHOW beside it. Four answers to one question, so they read as
+    // a set rather than as four different controls.
     for (box_, show, word, path) in [
         (l.proj_dest, l.proj_reveal, "PROJECTS", view.project_dest),
         (l.export_dest, l.export_reveal, "EXPORTS", view.export_dest),
+        (l.preset_dest, l.preset_reveal, "PRESETS", view.preset_dest),
     ] {
         control(painter, box_, &p);
         if box_.is_positive() {

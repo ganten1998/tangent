@@ -709,6 +709,47 @@ pub enum DirPurpose {
     /// Where an export lands when the export dialog names no folder. The
     /// standing default; [`DirPurpose::ExportDir`] is this one export.
     ExportRoot,
+    /// Where saved presets live — the fourth standing folder. Appended at
+    /// the end, like every variant this enum gains.
+    PresetRoot,
+}
+
+// ── presets ─────────────────────────────────────────────────────────────────
+//
+// The preset road, end to end: the host scans `Presets/<unit's folder>/` and
+// pushes rows of plain data (the cartridge-list pattern); a panel asks for a
+// save, a load or a delete through `RecorderRequest`; the host does the disk
+// work and answers a load with [`PresetLoaded`]. `tangent-ui` never touches
+// the files — see `crate::preset` for the file format itself, which lives in
+// this crate only as data and serialization.
+
+/// One saved preset the host found for a unit. Names and paths, never file
+/// contents: the UI draws a list and hands the path back, exactly as the
+/// plugin picker holds bundle paths rather than modules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PresetRow {
+    /// What the preset calls itself — the file's own `name`, or its stem
+    /// when the file does not say.
+    pub name: String,
+    /// The file, absolute, for a later `LoadPreset`/`DeletePreset` to name.
+    pub path: String,
+}
+
+/// A preset the host has read back, for the app to apply to `unit`.
+///
+/// The values are `(symbol, value)` pairs rather than a struct per unit:
+/// symbols are the append-only address space every built-in already persists
+/// by (see `builtin_fx`'s `ParamSpec` in the binary), so a preset from a
+/// newer build carries symbols this build skips and one from an older build
+/// simply leaves the missing knobs at their defaults.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PresetLoaded {
+    /// The unit the FILE says it belongs to — "@tangent-eq", "keys:2". The
+    /// applying side compares this against the unit it asked for, so a file
+    /// moved into the wrong folder moves nothing.
+    pub unit: String,
+    pub name: String,
+    pub values: Vec<(String, f64)>,
 }
 
 /// A source of MIDI the app picks for itself.

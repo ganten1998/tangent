@@ -210,7 +210,7 @@ pub enum Hit {
     MediaRow(usize),
     /// Clear the selected pad.
     Clear,
-    /// **SAVE**: write this lane's kit out as a `.tgkit` preset.
+    /// **SAVE**: write this lane's kit out as a `.kit` preset.
     SaveKit,
     /// **LOAD**: put a saved preset on this lane.
     LoadKit,

@@ -246,6 +246,8 @@ pub struct RecorderView<'a> {
     /// Empty strings are legal and read as "the default".
     pub project_dest: &'a str,
     pub export_dest: &'a str,
+    /// The PRESET folder, likewise — the MEDIA tier's fourth row.
+    pub preset_dest: &'a str,
     /// The typed take name. May be empty — the timestamp guarantees uniqueness.
     pub take_name: &'a str,
     /// The name field has keyboard focus, so it draws a caret and the app's
@@ -372,6 +374,7 @@ impl RecorderView<'_> {
             dest: "",
             project_dest: "",
             export_dest: "",
+            preset_dest: "",
             take_name: "",
             name_focused: false,
             editing: None,
@@ -1193,6 +1196,8 @@ pub struct RecorderState {
     /// [`RecorderView`].
     pub project_dest: String,
     pub export_dest: String,
+    /// And the PRESET folder — the fourth standing folder.
+    pub preset_dest: String,
     /// What the next take's folder will be called, from `tangent_record::take`.
     pub folder_preview: String,
     pub camera_name: Option<String>,
@@ -1233,6 +1238,7 @@ impl Default for RecorderState {
             dest: String::new(),
             project_dest: String::new(),
             export_dest: String::new(),
+            preset_dest: String::new(),
             folder_preview: String::new(),
             camera_name: None,
             camera_missing: false,
@@ -1299,6 +1305,7 @@ impl RecorderState {
             dest: &self.dest,
             project_dest: &self.project_dest,
             export_dest: &self.export_dest,
+            preset_dest: &self.preset_dest,
             take_name,
             name_focused,
             editing,
@@ -1804,6 +1811,29 @@ pub enum RecorderRequest {
     /// is ever open, so the LAST request wins and `on: false` from the
     /// closing face disarms.
     SetInsertTap { strip: usize, slot: usize, on: bool },
+    // ── presets ─────────────────────────────────────────────────────────
+    // The preset road's three requests, at the END because the enum is
+    // append-only across parallel lanes. All three are requests for the
+    // same reason the folder picker is: the files live behind the firewall,
+    // and every one of them re-scans the unit's folder and re-pushes the
+    // row list so what a panel shows is what the disk holds.
+    /// Write `values` as a named preset for `unit` — "@tangent-eq",
+    /// "keys:2" — under `Presets/<the unit's folder>/`. The host sanitizes
+    /// `name` into the filename and keeps the typed form inside the file.
+    SavePreset {
+        unit: String,
+        name: String,
+        values: Vec<(String, f64)>,
+    },
+    /// Read the preset at `path` and answer with
+    /// [`crate::ports::PresetLoaded`] via `TangentApp::set_preset_loaded`.
+    /// `unit` is who is asking, so a file that names a different unit is
+    /// refused rather than applied to the wrong knobs.
+    LoadPreset { unit: String, path: String },
+    /// Remove the preset at `path`. The host refuses paths that resolve
+    /// outside the preset root — a delete is the one request here that
+    /// must never follow user text anywhere it points.
+    DeletePreset { path: String },
 }
 
 /// How hard an auditioned note is struck.
