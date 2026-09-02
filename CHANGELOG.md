@@ -12,6 +12,69 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **Nothing waits in silence any more.** Every operation that used to freeze
+  the window with no explanation now says what it is doing. A survey traced
+  seventy-six of them. The ones that can be counted show a real meter —
+  loading a project counts its plugins, a pasted track counts its bays, an
+  export counts its racks — and the ones that cannot name what they are
+  waiting on instead, by the plugin's own name where there is one. The overlay
+  obeys the rule the frozen frame forces on it: it is painted on the frame
+  BEFORE the blocking call, because a call that blocks produces no frames to
+  paint in. It waits a moment before appearing, so an operation that turns out
+  to be quick never flashes anything, and it holds a minimum time so a fast one
+  does not blink. It also gives up on an operation that never returns, rather
+  than owning the screen forever.
+- **Messages moved to the top-left corner and stopped interrupting.** A themed
+  notification that lasts three to five seconds and can be clicked away.
+  Messages that are *conditions* — a missing MIDI port, a device that
+  disappeared — stand until the condition clears rather than expiring, and a
+  dismissal sticks without silencing the next genuine occurrence.
+- **Silverface**, the nineteenth theme: the faceplate of the Dual Showman
+  Reverb, with the red jewel pilot lamp as the master.
+
+### Changed
+
+- **Nine dialogs that asked nothing stopped stopping you.** The take report,
+  the MIDI errors, the startup notices, the no-free-channel refusal and the
+  "Tangent" notice window are notifications now. Everything that asks a real
+  question — save before closing, flatten the tempo, the three destructive
+  confirmations — is untouched, as are the file and folder pickers and the
+  three native boxes that fire when there is no window left to draw into.
+- **The render is the biggest thing on screen while it runs**, sized from the
+  monitor rather than a fixed 520 by 210, and nothing that merely *announces*
+  can cover it any more. A dialog that *asks* still comes forward, because a
+  question hidden behind a progress window is an app that has stopped for no
+  visible reason.
+- **Mono's pressed keys are legible.** They were near-white on near-white keys,
+  a highlight you could not see. Carbon retired to make room for Silverface;
+  its palette indices stay frozen where saved desks expect them.
+
+### Fixed
+
+- **The window title was costing a sixth of every frame.** It asked whether the
+  project was dirty once per frame, and asking meant serialising the entire
+  document to JSON — 2.6 ms on a modest session. It is a structural fingerprint
+  now, about thirty times cheaper, with the exact comparison kept everywhere a
+  wrong answer could lose work.
+- **The piano roll drew two circles per note in its velocity lane**, seventeen
+  of them stacked in a column a fifth of a point wide. With the marks culled to
+  what can actually be seen, a drum programme went from sixty-five percent of a
+  frame to nineteen.
+- **Opening a project made twenty-six thousand filesystem calls, twice**, walking
+  every one of 4,389 seats when two of them held anything.
+- **Consecutive strikes popped on every MIDI instrument**, worst under the
+  pedal, because a re-struck key reused its voice and then reset it — clearing
+  a ringing waveguide mid-cycle, reseeding modal banks, overwriting a DX7 slot.
+  A hammer adds energy to a string rather than silencing it, and restrikes now
+  superpose. Underneath it was a slot leak: a percussive DX7 patch held by the
+  pedal decayed to silence and never gave its voice back.
+- **Every Keys knob does what its label says.** Two were wired to nothing and
+  six lied about what they did. The dispersion map ran backwards, which is what
+  put a bell tone in the Clavinet and made the concert grand more metallic than
+  the jazz one.
+- **The trackpad stopped being a slot machine.** Zoom gestures stepped once per
+  scroll event, and a trackpad flick is thirty events plus an inertial tail.
+
 - **Tangent Keys: a piano and an electric piano, computed rather than
   recorded.** A third built-in instrument beside the DX7 and the drumpad, on
   the sentinel `@tangent-keys`, containing no samples at all. **Piano 1** is a
