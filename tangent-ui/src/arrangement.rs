@@ -437,6 +437,28 @@ pub struct DeskSnap {
     /// rather than assuming an empty desk — a v4 document that says nothing
     /// about its rows still knows which ones it described.
     pub tracks_added: u32,
+    /// **The folder skeleton** — `strip_is_folder` per channel, as the
+    /// settings spell it.
+    ///
+    /// Appended, and absent in every document before this. The three
+    /// folder vectors lived only in the shared settings file, which made a
+    /// folder a property of the MACHINE rather than of the song: opening
+    /// any project (or File > New) wore the previous session's folder
+    /// shape over a desk that never had one, and undo restored every
+    /// other per-channel fact while the folder flags kept their
+    /// post-gesture values. Carried here they ride the same snapshot
+    /// everything else rides — the document, the template, and every undo
+    /// moment. Absent reads as FLAT, never as "keep whatever is live":
+    /// a document that says nothing about folders has none, and
+    /// preserving the live flags instead is exactly the bleed these
+    /// fields end.
+    pub is_folder: Vec<bool>,
+    /// `strip_in_folder` per channel — see `is_folder`.
+    pub in_folder: Vec<bool>,
+    /// `strip_folder_shut` per channel — see `is_folder`. A stale shut
+    /// flag is the worst of the three: it HIDES the next project's real
+    /// lanes, not just indents its empty ones.
+    pub folder_shut: Vec<bool>,
 }
 
 impl DeskSnap {
@@ -491,6 +513,14 @@ impl DeskSnap {
         // Appended, at the END — the settings file's own rule, and this
         // struct answers to it for the same reason.
         m.insert("tracks_added".into(), Value::Number(u64::from(self.tracks_added).into()));
+        // Always written, all-false included: like the icons above, a flat
+        // desk is an OPINION, and omitting it would let the previous
+        // session's folders bleed into a document that carries none.
+        let bools =
+            |v: &[bool]| Value::Array(v.iter().map(|b| Value::Bool(*b)).collect());
+        m.insert("is_folder".into(), bools(&self.is_folder));
+        m.insert("in_folder".into(), bools(&self.in_folder));
+        m.insert("folder_shut".into(), bools(&self.folder_shut));
         Value::Object(m)
     }
 
@@ -511,6 +541,15 @@ impl DeskSnap {
             m.get(k)
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_f64).collect())
+                .unwrap_or_default()
+        };
+        // Absent in every document before the folder fields — and absent
+        // means FLAT (see the struct), so the default is the empty vec
+        // that `apply_desk_snapshot` reads as all-false.
+        let bools = |k: &str| -> Vec<bool> {
+            m.get(k)
+                .and_then(Value::as_array)
+                .map(|a| a.iter().map(|x| x.as_bool().unwrap_or(false)).collect())
                 .unwrap_or_default()
         };
         // Hoisted for the `tracks_added` fallback below, which reconstructs
@@ -597,6 +636,9 @@ impl DeskSnap {
                     },
                     |v| v as u32,
                 ),
+            is_folder: bools("is_folder"),
+            in_folder: bools("in_folder"),
+            folder_shut: bools("folder_shut"),
         })
     }
 }

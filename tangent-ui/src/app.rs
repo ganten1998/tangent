@@ -7239,6 +7239,9 @@ impl TangentApp {
             sig_unit: sig.unit,
             metronome_on: s.metronome_on,
             tracks_added: s.tracks_added as u32,
+            is_folder: s.strip_is_folder.clone(),
+            in_folder: s.strip_in_folder.clone(),
+            folder_shut: s.strip_folder_shut.clone(),
         }
     }
 
@@ -7424,6 +7427,31 @@ impl TangentApp {
         // be loaded and if something is silently overwriting it, that's a
         // huge problem."
         self.settings.tracks_added = i64::from(d.tracks_added);
+        // **The folder skeleton comes from the document too.** The three
+        // vectors used to live ONLY in the shared settings file, so every
+        // project opened wearing the previous session's folders — the
+        // mixer indented slots this document never grouped — and undo
+        // restored the whole desk around flags it could not see. A row
+        // the document says nothing about reads FLAT, not "whatever the
+        // last session left": that silence-means-keep was the bleed.
+        for (dst, src) in [
+            (&mut self.settings.strip_is_folder, &d.is_folder),
+            (&mut self.settings.strip_in_folder, &d.in_folder),
+            (&mut self.settings.strip_folder_shut, &d.folder_shut),
+        ] {
+            for (i, slot) in dst.iter_mut().enumerate() {
+                *slot = src.get(i).copied().unwrap_or(false);
+            }
+        }
+        // A group is not a send destination — `set_is_folder` enforces
+        // that at the gesture, but a document's folder arrives here, and
+        // the routes it must displace live in settings, not in the
+        // document. Same invariant, second doorway.
+        for ch in 0..crate::recorder::CHANNELS {
+            if self.settings.strip_is_folder.get(ch).copied().unwrap_or(false) {
+                let _ = self.settings.routes.drop_into(ch);
+            }
+        }
         self.save_settings();
         self.desk_reload = true;
     }
@@ -38261,6 +38289,61 @@ mod folder_tests {
         assert!(!a.settings.strip_to_theory[3], "T was left behind");
         assert!(a.is_folder(0), "the folder flag did not follow");
         assert!(!a.is_folder(3));
+    }
+
+    /// **A project's folders are the PROJECT's.** The three folder vectors
+    /// ride the desk snapshot like every other per-channel fact: a folder
+    /// round-trips through the document, opening a document replaces the
+    /// live shape instead of wearing it, and a document from before the
+    /// fields — which says nothing about folders — opens FLAT. They used
+    /// to live only in the shared settings file, so every project opened
+    /// under the previous session's folder skeleton (empty indented slots
+    /// the document never grouped; hidden lanes a stale shut flag ate).
+    #[test]
+    fn a_documents_folders_arrive_and_its_silence_reads_flat() {
+        let mut a = app();
+        a.toggle_folder(1);
+        a.set_in_folder(2, true);
+        a.set_in_folder(3, true);
+        a.toggle_folder_shut(1);
+        let snap = a.desk_snapshot();
+
+        // Through the document's own JSON and back, intact.
+        let mut arr = crate::arrangement::Arrangement::default();
+        arr.desk = Some(snap.clone());
+        let back = crate::arrangement::Arrangement::from_json(&arr.to_json());
+        assert_eq!(
+            back.desk.as_ref().unwrap(),
+            &snap,
+            "the folders did not survive the document"
+        );
+
+        // A second session, folded differently: the document's shape
+        // arrives whole and the session's own shape does not survive it.
+        let mut b = app();
+        b.toggle_folder(5);
+        b.set_in_folder(6, true);
+        b.apply_desk_snapshot(&snap);
+        assert!(
+            b.is_folder(1) && b.in_folder(2) && b.in_folder(3) && b.folder_shut(1),
+            "the document's folder did not arrive"
+        );
+        assert!(
+            !b.is_folder(5) && !b.in_folder(6),
+            "the last session's folder survived the open"
+        );
+
+        // A document written before the folder fields opens flat rather
+        // than keeping whatever the live desk had.
+        let mut old = snap.clone();
+        old.is_folder = Vec::new();
+        old.in_folder = Vec::new();
+        old.folder_shut = Vec::new();
+        b.apply_desk_snapshot(&old);
+        assert!(
+            !b.is_folder(1) && !b.in_folder(2) && !b.in_folder(3),
+            "an old document's silence kept the live folders"
+        );
     }
 
     /// **A child's header steps right and a folder's does not.** The indent
