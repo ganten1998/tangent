@@ -75,7 +75,74 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Kits saved before this still open: they name paths, and those paths are
   still tried.
 
+- **Tangent Keys grew from two sounds to eight.** The keyboard now carries
+  two grands, two tine pianos, two clavs and two reed pianos, every one a
+  physical model with its own eight-knob rack, chosen per strip:
+
+  *Piano 1* is the jazz grand as it was, with two things it always needed:
+  a unison whose three strings no longer die together - the fast first
+  breath and the slow singing tail a real course has - and the knock of
+  the action itself, a fixed wooden thud under the note that scales with
+  how hard the key is put down. *Piano 2* is the concert instrument:
+  longer wire, a third more ring, sweeter treble for its pitch, a wider
+  dynamic sweep and a quieter action.
+
+  *EP Mk.1* keeps its bench tuning and gains the two smallest loudest
+  things: the damper pad now audibly LANDS when a key is let go, and the
+  pickup finally rolls off like a passive coil into a real lead instead
+  of handing the bus raw arithmetic. *EP Suitcase* is the same tines
+  through their own amplifier - the stereo throb, five cycles a second,
+  the two speakers trading the note - with the tremolo on a knob that
+  works mid-note, because an amp's knobs act on whatever is ringing.
+
+  *Clav* is a new mechanism, and the app's namesake in miniature: a
+  string struck and HELD by a tangent, read by a pickup whose position is
+  a knob - slide it and the comb moves, which is where the funk lives.
+  Letting a key up chokes the string on yarn and spits the little clack
+  every clav record is made of; there is a MUTE slider for the staccato
+  the originals were famous for. *Clav Wah* is the same strings through
+  an envelope filter that chases your touch - the pedal this instrument
+  spent the seventies plugged into, with one knob for how hard it listens.
+
+  *Reed 200* is a reed piano: hollow and woody played gently, and when it
+  is leaned on the pickup plate hands the note a growing second harmonic
+  and the tone GROWLS - measured on the bench riding from nothing at a
+  feather to full snarl flat out, exactly the curve the real amp draws.
+  Its tremolo throbs the level in mono, as that amp did. *Reed 140* is
+  the earlier tube instrument: darker, dirtier, never entirely clean even
+  at rest, with the growl arriving like a dimmer rather than a switch.
+
+  Every sound keeps its knobs per strip and per patch, so switching away
+  and back finds the instrument as it was left; sessions from before the
+  new sounds open with their two pianos exactly where they were.
+
+- **Every slider now knows its way home.** Double-click was already how a
+  band knob, a mixer fader, a drum knob and a keyboard knob reset; the
+  effect panels' parameter rows and the routing dialog's level were the
+  two that could not. A double-click on an effect row now clears the
+  stored value so the row lands back on the DSP's own default - the same
+  rule the panel's RESET button uses, never a number the UI made up - and
+  the route level snaps back to unity. The rule from here on: if it
+  slides, a double-click puts it back.
+
 ### Fixed
+
+- **A project's folders now belong to the project.** The folder layout -
+  which channel is a group, which sit inside it, which are collapsed - was
+  kept only in the shared settings file, never in the project document. So
+  every project opened wearing the PREVIOUS session's folder shape: a mixer
+  that indented empty slots the project never grouped, and in the worst
+  case a stale collapsed group that hid the next project's real tracks.
+  Undo had the matching half of the disease - it restored every other fact
+  about the desk while the folder flags kept whatever a gesture had just
+  set. The three folder facts now travel in the document's desk snapshot
+  like everything else: saving writes them, opening applies them, New
+  starts flat, and undo puts them back. A document from before this - which
+  says nothing about folders - opens flat rather than inheriting whichever
+  skeleton the last session left behind; refold once, save, and it sticks
+  to the project from then on. (Deleting a track inside a folder still
+  leaves an indented empty slot on purpose - that hole is where a re-added
+  track rejoins the group, and clearing it would sever every member below.)
 
 - **The window no longer opens bigger than the screen it opens on.** Every
   band's height in Tangent is a fixed fraction of the window's width, so the
