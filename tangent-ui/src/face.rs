@@ -202,7 +202,25 @@ pub fn keep<T>(slot: &mut Option<T>, wish: Option<T>) {
     }
 }
 
-/// Did the hand ask THIS control to go home?
+/// Remember which control the hand has just clicked, and hand back the one
+/// it clicked before this. Kept in egui's own per-context scratch — never a
+/// static, because the plugin build runs several contexts in one process,
+/// and never `Settings`, because a widget that reads global state is a widget
+/// that cannot be tested.
+///
+/// EVERY click a face row takes has to pass through here, whether or not the
+/// row itself cares about the answer, because the answer is "what did the
+/// hand touch last" and a click nobody reported would leave the NEXT row
+/// believing the pair before it were its own.
+fn note_click(resp: &egui::Response) -> Option<egui::Id> {
+    let key = egui::Id::new("face-kit-last-clicked");
+    let previous: Option<egui::Id> = resp.ctx.data(|d| d.get_temp(key));
+    resp.ctx.data_mut(|d| d.insert_temp(key, resp.id));
+    previous
+}
+
+/// Did the hand ask THIS control to go home? For a control the hand DRAGS —
+/// a slider, a knob, a fader — where clicking twice can mean nothing else.
 ///
 /// **Why it is not simply `double_clicked`.** egui counts double-clicks on
 /// the CLOCK, not per widget: the second of two clicks a fifth of a second
@@ -211,13 +229,25 @@ pub fn keep<T>(slot: &mut Option<T>, wish: Option<T>) {
 /// list row opens the thing it was going to open anyway. On a face it would
 /// throw away a value the hand had just placed on the NEIGHBOURING row, which
 /// is the one mistake a reset gesture must never make. So the pair has to
-/// have landed on the same control, and the kit remembers which one in
-/// egui's own per-context scratch — never a static, because the plugin build
-/// runs several contexts in one process, and never `Settings`, because a
-/// widget that reads global state is a widget that cannot be tested.
+/// have landed on the same control, which is what [`note_click`] is for.
 ///
 /// A triple counts as well: a double refused for following a click elsewhere
 /// should land on the retry rather than making somebody pause first.
+///
+/// **And why only a control the hand drags may wear it.** egui's counter
+/// LATCHES. Read it in `InputState`: a release is a double when it lands
+/// within `max_double_click_delay` (0.3 s) of the last one, and a TRIPLE
+/// when it lands within twice that of the one BEFORE the last — and in a
+/// sustained stream both windows keep sliding forward, so from the third
+/// release onward every single one is a triple, for as long as the hand
+/// keeps going. Above about 3.3 clicks a second this function is therefore
+/// true on every click. That is harmless on a slider, which nobody clicks
+/// repeatedly, and fatal on anything whose ordinary use IS repeated
+/// clicking — those take [`alt_home_gesture`] instead.
+///
+/// Alt-click is accepted here as well, so that the answer to "how do I put
+/// this back" is one gesture for the whole panel and not one per kind of
+/// control.
 ///
 /// Crate-visible on purpose: the keys panel and the routing window each hold
 /// a copy of the same broken line (`resp.double_clicked()` straight off an
@@ -228,10 +258,31 @@ pub(crate) fn home_gesture(resp: &egui::Response) -> bool {
     if !resp.clicked() {
         return false;
     }
-    let key = egui::Id::new("face-kit-last-clicked");
-    let previous: Option<egui::Id> = resp.ctx.data(|d| d.get_temp(key));
-    resp.ctx.data_mut(|d| d.insert_temp(key, resp.id));
-    previous == Some(resp.id) && (resp.double_clicked() || resp.triple_clicked())
+    let same = note_click(resp) == Some(resp.id);
+    resp.ctx.input(|i| i.modifiers.alt)
+        || (same && (resp.double_clicked() || resp.triple_clicked()))
+}
+
+/// The same ask, for a control whose PRIMARY gesture is the click itself.
+///
+/// A stepped row is WALKED by clicking it, so there is no second click to
+/// spare for a second meaning: see [`home_gesture`] for the arithmetic that
+/// turns a brisk walk into an endless triple. A modifier cannot collide with
+/// a walk, because the hand has to reach for it deliberately, and alt is the
+/// modifier this app already spends on "undo what is here": the key legend
+/// teaches `A-CLK` as emptying an insert bay and removing an automation
+/// node, so a hand that knows the rack already knows this one.
+///
+/// Note it does not ask whether the pair landed on the same control, because
+/// there is no pair: one click carries the whole gesture. It still reports
+/// the click, so that a slider clicked after it cannot mistake the hand's
+/// detour for a double of its own.
+pub(crate) fn alt_home_gesture(resp: &egui::Response) -> bool {
+    if !resp.clicked() {
+        return false;
+    }
+    note_click(resp);
+    resp.ctx.input(|i| i.modifiers.alt)
 }
 
 /// One continuous parameter as a row: name, slider, reading. Returns the new
@@ -283,7 +334,7 @@ pub fn slider_row(
         } else if resp.changed() {
             out = Some(v);
         }
-        hand.on_hover_text("drag to set; double-click to reset");
+        hand.on_hover_text("drag to set; double-click or alt-click to reset");
         let at_rest = (value - default).abs() < 0.5 / 100.0;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
@@ -315,15 +366,18 @@ pub enum StepAsk {
 /// A click on the body cycles forward — the effect panels' own idiom for a
 /// mode: fewer targets, and the list is short enough to walk. A right-click
 /// steps back, which the hover text has always promised and no code has ever
-/// done until now. A double-click asks for home, the same gesture the sliders
-/// wear, because "how do I put this back" should have one answer on a panel
-/// and not two.
+/// done until now. An ALT-click asks for home.
 ///
-/// The double-click arrives one step late: egui reports the first release as
-/// an ordinary click before it can know a second is coming, so a
-/// double-click on the body cycles once and THEN homes. That lands on the
-/// right value either way, which is why it is left alone rather than bought
-/// back with a timer nobody would be able to tune.
+/// **Why alt here, and a double-click on the sliders.** This row's primary
+/// gesture is repeated clicking, and egui's click counter is a clock that
+/// latches: past about 3.3 clicks a second every release reads as a triple
+/// ([`home_gesture`] holds the arithmetic). A row that took a double or a
+/// triple for "go home" would therefore reset itself in the middle of being
+/// walked — the reset and the walk would be the SAME gesture, which is no
+/// gesture at all. A modifier is the one spelling a fast hand cannot produce
+/// by accident. The sliders keep their double-click, since a slider has no
+/// repeat-click idiom to collide with, and they answer to alt as well, so
+/// "put it back" is still one thing to know for the whole panel.
 pub fn stepped_row(
     ui: &mut egui::Ui,
     st: &FaceStyle,
@@ -349,9 +403,9 @@ pub fn stepped_row(
                 .fill(st.s.raised),
             )
             .on_hover_text(
-                "click to cycle; right-click steps back; double-click to reset",
+                "click to cycle; right-click steps back; alt-click resets",
             );
-        if home_gesture(&body) {
+        if alt_home_gesture(&body) {
             out = Some(StepAsk::Home);
         } else if body.secondary_clicked() {
             out = Some(StepAsk::By(-1));
@@ -365,7 +419,7 @@ pub fn stepped_row(
             )
             .fill(st.s.raised),
         );
-        if home_gesture(&back) {
+        if alt_home_gesture(&back) {
             out = Some(StepAsk::Home);
         } else if back.clicked() {
             out = Some(StepAsk::By(-1));
@@ -1129,14 +1183,22 @@ mod tests {
         assert_eq!(drawn, 3, "a row went undrawn because an earlier one acted");
     }
 
-    // ── the double-click, one control at a time ─────────────────────────
+    // ── the home gesture, one control at a time ─────────────────────────
 
     fn press_at(p: egui::Pos2, down: bool) -> egui::Event {
+        press_with(p, down, egui::Modifiers::NONE)
+    }
+
+    /// The same press with a modifier held. egui reads the modifier state
+    /// off the frame's `RawInput` rather than off the event, so a test that
+    /// wants an alt-click has to hold it in BOTH places — which is exactly
+    /// what a real backend does.
+    fn press_with(p: egui::Pos2, down: bool, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::PointerButton {
             pos: p,
             button: egui::PointerButton::Primary,
             pressed: down,
-            modifiers: egui::Modifiers::NONE,
+            modifiers,
         }
     }
 
@@ -1196,6 +1258,55 @@ mod tests {
         );
     }
 
+    /// **And one alt-click does the same thing** — the gesture the stepped
+    /// rows had to take instead of the double, tried here so that "put it
+    /// back" is one thing to know for the whole panel and the hover text is
+    /// telling the truth on both kinds of row. It has to beat the slider's
+    /// own click, too: a click anywhere on the track jumps the knob there,
+    /// so an alt-click that merely reset AFTER moving would be no reset.
+    #[test]
+    fn an_alt_click_puts_a_slider_row_home_as_well() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 60.0));
+        const HOME: f32 = 0.25;
+        // Well down the track from where the knob sits (the label column
+        // takes the first 0.34 of the width and the knob is at 0.80), so the
+        // click has somewhere wrong to put it.
+        let at = egui::pos2(180.0, 9.0);
+        let alt = egui::Modifiers::ALT;
+
+        let frame = |events: Vec<egui::Event>,
+                     modifiers: egui::Modifiers|
+         -> Option<f32> {
+            let mut out = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    modifiers,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            out = slider_row(ui, &st, "DRIVE", "80%", 0.80, HOME);
+                        });
+                },
+            );
+            out
+        };
+
+        let _ = frame(vec![egui::Event::PointerMoved(at)], egui::Modifiers::NONE);
+        let _ = frame(vec![press_with(at, true, alt)], alt);
+        assert_eq!(
+            frame(vec![press_with(at, false, alt)], alt),
+            Some(HOME),
+            "an alt-click on a slider row did not ask for the DSP's default"
+        );
+    }
+
     /// **And the drag still owns the hand once it has left the track.**
     /// Teaching the slider to sense clicks changes how egui decides a press
     /// IS a drag — a widget that senses both waits until the pointer has
@@ -1249,23 +1360,28 @@ mod tests {
         );
     }
 
-    /// **Double-click a stepped row and it goes home too** — one gesture for
-    /// "put it back" across the whole panel. The row names the wish; only
-    /// the face knows which position home is.
+    /// **Alt-click a stepped row and it goes home** — and a plain second
+    /// click keeps walking, because on this row the click is the walk. The
+    /// row names the wish; only the face knows which position home is. Both
+    /// halves of the row wear the gesture, since both are clicked.
     #[test]
-    fn a_double_click_asks_a_stepped_row_for_home() {
+    fn an_alt_click_asks_a_stepped_row_for_home() {
         let ctx = a_test_ctx();
         let st = a_test_style();
         let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 60.0));
         // Mid-body of the cycling button: the label column ends at 0.34 of
         // the width and the back-step is the last 22pt.
-        let at = egui::pos2(250.0, 9.0);
+        let body = egui::pos2(250.0, 9.0);
+        let back = egui::pos2(385.0, 9.0);
 
-        let frame = |events: Vec<egui::Event>| -> Option<StepAsk> {
+        let frame = |events: Vec<egui::Event>,
+                     modifiers: egui::Modifiers|
+         -> Option<StepAsk> {
             let mut out = None;
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(screen),
+                    modifiers,
                     events,
                     ..Default::default()
                 },
@@ -1279,19 +1395,189 @@ mod tests {
             );
             out
         };
+        let none = egui::Modifiers::NONE;
+        let alt = egui::Modifiers::ALT;
 
-        let _ = frame(vec![egui::Event::PointerMoved(at)]);
-        let _ = frame(vec![press_at(at, true)]);
+        let _ = frame(vec![egui::Event::PointerMoved(body)], none);
+        let _ = frame(vec![press_at(body, true)], none);
         assert_eq!(
-            frame(vec![press_at(at, false)]),
+            frame(vec![press_at(body, false)], none),
             Some(StepAsk::By(1)),
             "a single click no longer cycles the row forward"
         );
-        let _ = frame(vec![press_at(at, true)]);
+        // The very next click, well inside the double-click window: the row
+        // must go on WALKING, which is the fault this gesture was moved for.
+        let _ = frame(vec![press_at(body, true)], none);
         assert_eq!(
-            frame(vec![press_at(at, false)]),
+            frame(vec![press_at(body, false)], none),
+            Some(StepAsk::By(1)),
+            "a double-click on a stepped row stopped walking it"
+        );
+        let _ = frame(vec![press_with(body, true, alt)], alt);
+        assert_eq!(
+            frame(vec![press_with(body, false, alt)], alt),
             Some(StepAsk::Home),
-            "a double-click on a stepped row did not ask for home"
+            "an alt-click on a stepped row did not ask for home"
+        );
+        let _ = frame(vec![egui::Event::PointerMoved(back)], none);
+        let _ = frame(vec![press_with(back, true, alt)], alt);
+        assert_eq!(
+            frame(vec![press_with(back, false, alt)], alt),
+            Some(StepAsk::Home),
+            "an alt-click on the back arrow did not ask for home"
+        );
+    }
+
+    /// **Six clicks in a row still walk six places.** The regression this
+    /// pins, and the reason a stepped row cannot wear a click-counted
+    /// reset: egui's counter is a clock, and it latches. A release inside
+    /// 0.3 s of the last is a double; a release inside 0.6 s of the one
+    /// before THAT is a triple; in a sustained stream both stay true, so
+    /// the second click is already a double and every click from the third
+    /// is a triple, for as long as the hand keeps going. Five clicks a
+    /// second is not fast — it is somebody looking for the fifth entry in a
+    /// list of seven — and a row that read either as "go home" spent the
+    /// whole stream resetting itself instead of walking.
+    ///
+    /// Three surfaces, because all three are walked by clicking: the
+    /// cycling body, the back arrow, and the EQ's band walker, which is the
+    /// same row with no engine number behind it. Measured against the code
+    /// that wore the gesture: six clicks on the body landed on home (3)
+    /// rather than 6, six on the back arrow the same, and the walker — which
+    /// drops a `Home` on the floor, having no engine number to go back to —
+    /// did not reset but simply STOPPED, frozen on band 2 from its first
+    /// click for the whole stream.
+    #[test]
+    fn a_stepped_row_can_still_be_walked_at_speed() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(470.0, 470.0));
+        // A row 470 wide: the label takes 0.34 of it, the body runs from
+        // there to 40pt short of the end, and the back arrow is the last
+        // 22pt of that — so 250 is the body and 457 the arrow.
+        let body = egui::pos2(250.0, 9.0);
+        let back = egui::pos2(457.0, 9.0);
+
+        let frame = |t: f64,
+                     events: Vec<egui::Event>,
+                     modifiers: egui::Modifiers,
+                     live: &mut crate::faces::FaceLive| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(t),
+                    modifiers,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            if let Some(crate::faces::FaceAction::Set { id, value }) =
+                                crate::faces::draw(ui, &st, live)
+                            {
+                                if let Some(p) =
+                                    live.face.params.iter_mut().find(|p| p.id == id)
+                                {
+                                    p.value = value;
+                                }
+                            }
+                        });
+                },
+            );
+        };
+
+        // A fifth of a second between RELEASES, which is what egui dates a
+        // click by; the press is the frame before it.
+        let stream = |t0: f64,
+                      at: egui::Pos2,
+                      clicks: usize,
+                      live: &mut crate::faces::FaceLive,
+                      after: &mut dyn FnMut(&crate::faces::FaceLive)| {
+            let none = egui::Modifiers::NONE;
+            frame(t0, vec![egui::Event::PointerMoved(at)], none, live);
+            for i in 0..clicks {
+                let release = t0 + 0.2 * (i + 1) as f64;
+                frame(release - 1.0 / 60.0, vec![press_at(at, true)], none, live);
+                frame(release, vec![press_at(at, false)], none, live);
+                after(live);
+            }
+        };
+
+        // A seven-position row whose home is the MIDDLE choice, so a reset
+        // can never be mistaken for a walk that happened to arrive there.
+        let a_seven_way = |start: usize| {
+            let mut live = a_face_of(1);
+            let p = &mut live.face.params[0];
+            p.choices = (0..7).map(|i| format!("s{i}")).collect();
+            p.steps = 7;
+            p.default = 0.5;
+            p.value = start as f32 / 6.0;
+            live
+        };
+        let at_index = |live: &crate::faces::FaceLive| {
+            (live.face.params[0].value * 6.0).round() as usize
+        };
+
+        for (k, (what, at, start, want)) in [
+            ("the cycling body", body, 0_usize, 6_usize),
+            ("the back arrow", back, 6, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut live = a_seven_way(start);
+            // Whole seconds apart, so one block's last click cannot be read
+            // as the first of the next.
+            stream(10.0 * (k + 1) as f64, at, 6, &mut live, &mut |_| {});
+            assert_eq!(
+                at_index(&live),
+                want,
+                "six clicks on {what} did not walk six places (home is 3)"
+            );
+        }
+
+        // The EQ's walker: three bands, so six clicks is two laps.
+        let mut live = a_face_of(15);
+        live.face.path = "@tangent-eq".to_owned();
+        for band in 0..3 {
+            let base = band * 5;
+            live.face.params[base].value = 1.0;
+            live.face.params[base + 1].choices =
+                ["bell", "lo-shelf", "hi-shelf"].map(str::to_owned).to_vec();
+            live.face.params[base + 1].steps = 3;
+            for k in 1..5 {
+                live.face.params[base + k].value = 0.5;
+            }
+        }
+        // The curve takes the first 190pt and 6 more are spent under it, so
+        // the walker's row (18pt on 3pt of spacing) has its middle at 208.
+        let walker = egui::pos2(250.0, 208.0);
+        let mut walked: Vec<usize> = Vec::new();
+        stream(40.0, walker, 6, &mut live, &mut |live| {
+            walked.push(live.band + 1);
+        });
+        assert_eq!(
+            walked,
+            vec![2, 3, 1, 2, 3, 1],
+            "the EQ band walker stopped walking under a fast hand"
+        );
+
+        // And the walker still owes the tooltip an answer. It is the one
+        // stepped row with no engine number behind it, so its home is the
+        // first band rather than a pushed default — walk one step off it,
+        // then ask.
+        let alt = egui::Modifiers::ALT;
+        let none = egui::Modifiers::NONE;
+        frame(50.0, vec![press_at(walker, true)], none, &mut live);
+        frame(50.1, vec![press_at(walker, false)], none, &mut live);
+        assert_eq!(live.band, 1, "the walker did not step off band 1");
+        frame(52.0, vec![press_with(walker, true, alt)], alt, &mut live);
+        frame(52.1, vec![press_with(walker, false, alt)], alt, &mut live);
+        assert_eq!(
+            live.band, 0,
+            "an alt-click on the band walker did not come home to band 1"
         );
     }
 
@@ -1299,8 +1585,10 @@ mod tests {
     /// path.** The kit is handed a default by the face, the face reads it
     /// off the pushed parameter, and the parameter carries what the unit's
     /// own spec says — so this drives `faces::draw` rather than the row, and
-    /// asserts on the ask the app would forward. Both control kinds, since
-    /// a stepped parameter's home is an index and a slider's is a number.
+    /// asserts on the ask the app would forward. Both control kinds, each
+    /// with the gesture it actually wears — a double-click on the slider, an
+    /// alt-click on the stepped row — since a stepped parameter's home is an
+    /// index and a slider's is a number.
     #[test]
     fn the_reset_a_face_asks_for_is_the_pushed_default() {
         let ctx = a_test_ctx();
@@ -1322,6 +1610,7 @@ mod tests {
         let mut clock = 0.0_f64;
         let frame = |events: Vec<egui::Event>,
                          at: f64,
+                         modifiers: egui::Modifiers,
                          live: &mut crate::faces::FaceLive|
          -> Option<(u32, f32)> {
             let mut out = None;
@@ -1329,6 +1618,7 @@ mod tests {
                 egui::RawInput {
                     screen_rect: Some(screen),
                     time: Some(at),
+                    modifiers,
                     events,
                     ..Default::default()
                 },
@@ -1349,25 +1639,32 @@ mod tests {
 
         // Rows are 18pt tall on 3pt of spacing, so the second one's middle
         // sits at 30.
-        for (what, at, want) in [
-            ("the slider row", egui::pos2(200.0, 9.0), (0_u32, 0.25_f32)),
-            ("the stepped row", egui::pos2(250.0, 30.0), (1, 1.0)),
+        let none = egui::Modifiers::NONE;
+        let alt = egui::Modifiers::ALT;
+        for (what, at, held, want) in [
+            ("the slider row", egui::pos2(200.0, 9.0), none, (0_u32, 0.25_f32)),
+            ("the stepped row", egui::pos2(250.0, 30.0), alt, (1, 1.0)),
         ] {
-            // A clean second between the two gestures: each is a
-            // double-click of its own, not the tail of the last one.
+            // A clean second between the two gestures: each is a gesture of
+            // its own, not the tail of the last one.
             clock += 1.0;
             let mut tick = |events: Vec<egui::Event>,
+                            modifiers: egui::Modifiers,
                             live: &mut crate::faces::FaceLive|
              -> Option<(u32, f32)> {
                 clock += 1.0 / 60.0;
-                frame(events, clock, live)
+                frame(events, clock, modifiers, live)
             };
-            let _ = tick(vec![egui::Event::PointerMoved(at)], &mut live);
-            let _ = tick(vec![press_at(at, true)], &mut live);
-            let _ = tick(vec![press_at(at, false)], &mut live);
-            let _ = tick(vec![press_at(at, true)], &mut live);
+            let _ = tick(vec![egui::Event::PointerMoved(at)], none, &mut live);
+            // The slider wants two clicks and the stepped row one, so the
+            // first pair is a plain click either way: on the slider it is
+            // the half of a double that does nothing, on the stepped row it
+            // is one step forward that the alt-click then undoes.
+            let _ = tick(vec![press_at(at, true)], none, &mut live);
+            let _ = tick(vec![press_at(at, false)], none, &mut live);
+            let _ = tick(vec![press_with(at, true, held)], held, &mut live);
             assert_eq!(
-                tick(vec![press_at(at, false)], &mut live),
+                tick(vec![press_with(at, false, held)], held, &mut live),
                 Some(want),
                 "{what} did not come home to the pushed default"
             );
