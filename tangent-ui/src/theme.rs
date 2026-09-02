@@ -990,6 +990,24 @@ pub fn factory() -> Vec<Theme> {
         // Designed and gated by `scripts/palgen.py --dark` BEFORE this Rust
         // existed; the factory-loop tests below are the second lock.
         //
+        // **These three NAME their own dark keyboard, and they are the only
+        // themes that must.** In dark mode `piano::idle_colors` SWAPS the
+        // keys — naturals take the sharps' colour and sharps the naturals' —
+        // so a light theme's ivory white key becomes the bright sharp that
+        // carries the keyboard against the near-black ground (the naturals
+        // themselves equal that ground, by the theory-ground rule). These
+        // themes are ALREADY dark: their light `white_key` is a near-black,
+        // so the swap made the sharps near-black too and BOTH idle key
+        // colours collapsed into the ground at ~1.1:1 — the whole piano band
+        // read as one flat mask, only in dark mode, which is exactly what the
+        // owner photographed. So each names `dark.white_key`/`dark.black_key`
+        // outright: a keyboard that stays legible against its own dark ground
+        // (naturals ~2.6:1 on the ground, the two key colours ~2:1 apart)
+        // instead of inheriting a swap written for the light sixteen. The
+        // sweep `every_theme_keeps_a_legible_keyboard_in_dark_mode` is the
+        // lock. `dark.background` still equals `black_key`, the theory-ground
+        // rule the sweep beside it checks.
+        //
         // ── Carbon: Default inverted. Warm near-black, bone ink, embers.
         Theme {
             name: "Carbon".to_owned(),
@@ -1017,7 +1035,13 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x0d, 0x0d, 0x0d),
             string: c(0x8a, 0x7f, 0x6a),
             channel_palette: Some(16),
-            dark: dark_of(&[("background", (0x0d, 0x0d, 0x0d))]),
+            // A warm dark keyboard that survives the dark-mode swap: naturals
+            // a warm graphite legible on the 0x0d ground, sharps a step down.
+            dark: dark_of(&[
+                ("background", (0x0d, 0x0d, 0x0d)),
+                ("white_key", (0x58, 0x53, 0x4a)),
+                ("black_key", (0x2c, 0x28, 0x23)),
+            ]),
         },
         // ── Nocturne: Navi's night side, worn as the light-mode dress. The
         // periwinkle and cyan are the same values the Navi theme carries,
@@ -1046,7 +1070,13 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x06, 0x12, 0x24),
             string: c(0x78, 0x98, 0xb8),
             channel_palette: Some(17),
-            dark: dark_of(&[("background", (0x06, 0x12, 0x24))]),
+            // Navy naturals bright enough to read on the 0x06 ground, sharps
+            // a deeper blue below them.
+            dark: dark_of(&[
+                ("background", (0x06, 0x12, 0x24)),
+                ("white_key", (0x46, 0x59, 0x7a)),
+                ("black_key", (0x1e, 0x33, 0x50)),
+            ]),
         },
         // ── Phosphor: the green console. Scope-green actives, one warm
         // amber for the held state, and a warning red-orange master.
@@ -1074,7 +1104,13 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x05, 0x07, 0x05),
             string: c(0x6a, 0x80, 0x60),
             channel_palette: Some(18),
-            dark: dark_of(&[("background", (0x05, 0x07, 0x05))]),
+            // Phosphor-green naturals lifted off the 0x05 ground, sharps a
+            // darker green below them.
+            dark: dark_of(&[
+                ("background", (0x05, 0x07, 0x05)),
+                ("white_key", (0x4e, 0x5a, 0x40)),
+                ("black_key", (0x1e, 0x28, 0x17)),
+            ]),
         },
     ]
 }
