@@ -100,14 +100,41 @@
 //! compliant window manager honours and a bare one ignores — best-effort, and
 //! documented as such per platform.
 //!
-//! **A parent/child window relationship was the other candidate and is not used:
-//! nothing hands this code the main window to be a child *of*.** `open_handle`
-//! takes a controller handle and a title, no parent — reaching for the app's
-//! main window from inside here to adopt the editor into it would couple every
-//! editor to whatever happened to be frontmost (including another open editor),
-//! and closing a parent orders its children out from under a caller that still
-//! believes its window is up. A floating level needs no parent, keeps two open
-//! editors independent, and is undone by nothing but teardown.
+//! **A parent/child window relationship was the other candidate and is not
+//! reachable from here: nothing hands this code the main window to be a child
+//! *of*.** `open_handle` takes a controller handle and a title, no parent —
+//! reaching for the app's main window from inside here to adopt the editor
+//! into it would couple every editor to whatever happened to be frontmost
+//! (including another open editor), and closing a parent orders its children
+//! out from under a caller that still believes its window is up. A floating
+//! level needs no parent, keeps two open editors independent, and is undone by
+//! nothing but teardown.
+//!
+//! **What that argument got wrong, and where it is now answered.** "Above
+//! ordinary windows" is a level, and a level is a fact about the whole
+//! machine: an editor at `NSFloatingWindowLevel` sits above the user's
+//! terminal too, while Tangent's main window at level 0 does not — so opening
+//! an editor left the main window stranded behind whatever else was on the
+//! screen while the editor floated in front of it. The report: "the window
+//! pushes the MAIN window behind you while IT stays in front of you".
+//!
+//! The child relationship IS the right one; only this file cannot form it.
+//! `tangent::macwin` can, and does: it holds the desktop app's main window
+//! every frame, finds every window in the process sitting at exactly the
+//! floating level, adopts each into the main window ordered above, and only
+//! then takes the level away. It reaches these windows through `NSApp.windows`
+//! rather than through this API, so nothing here has to be handed a parent and
+//! the objection above still stands — and because it always uses the MAIN
+//! window and never the frontmost one, the coupling that argument feared
+//! cannot happen either.
+//!
+//! So the level set below is the STARTING state, and it is the whole story
+//! only where there is no `macwin`: the examples, `tangent --plugin-test`, and
+//! every non-macOS platform. Inside the desktop app on macOS the editor ends
+//! up a child of the main window at the normal level, which keeps every
+//! promise this section makes — in front of the main window, key status
+//! untouched, below sheets and menus — and stops making the one nobody asked
+//! for.
 
 use std::cell::Cell;
 use std::time::Duration;
@@ -486,6 +513,14 @@ mod mac {
     /// is a different and wrong promise. A function rather than a `const`
     /// because the AppKit level names are `static`s, not `const`s; the test at
     /// the foot of this module reads the same one this sets.
+    ///
+    /// **Inside the desktop app this is where the window STARTS, not where it
+    /// stays.** `tangent::macwin::adopt_floating` matches on exactly this
+    /// level, makes the window a child of Tangent's main window, and puts the
+    /// level back to normal — which keeps the editor above the main window
+    /// without keeping it above every other program on the machine. The level
+    /// is what that sweep looks for, so it is load-bearing in a second way now
+    /// and must stay exactly `NSFloatingWindowLevel`.
     fn editor_window_level() -> NSWindowLevel {
         NSFloatingWindowLevel
     }

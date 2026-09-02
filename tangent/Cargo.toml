@@ -278,6 +278,13 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     # features pull nothing but objc2-foundation sub-features already here.
     "NSAccessibility",
     "NSWorkspace",
+    # `-[NSWindow addChildWindow:ordered:]` and `orderWindow:relativeTo:` both
+    # take an `NSWindowOrderingMode`, which lives in the NSGraphics module —
+    # so keeping a face above the MAIN window rather than above every program
+    # on the machine takes this feature. See `macwin::adopt_floating`. Costs
+    # nothing but compile time: it pulls only objc2-foundation sub-features
+    # already in the tree.
+    "NSGraphics",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
