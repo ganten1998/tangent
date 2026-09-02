@@ -478,12 +478,18 @@ fn draw_eq(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
     let band = live.band.min(EQ_BANDS - 1);
     let base = band as u32 * EQ_KNOBS;
     // The walker is a VIEW, not a parameter: it steps either way like any
-    // other stepped row, but there is no engine number behind it, so the
-    // reset gesture has nothing to ask for and means nothing here.
-    if let Some(face::StepAsk::By(delta)) =
-        stepped_row(ui, st, "Band", &format!("{}", band + 1))
-    {
-        live.band = (band as i32 + delta).rem_euclid(EQ_BANDS as i32) as usize;
+    // other stepped row, but there is no engine number behind it. Home
+    // therefore cannot mean "what the DSP says" — it means the first band,
+    // which is a real answer and the one the row's hover text is promising.
+    // A row that silently dropped the gesture would be a row whose tooltip
+    // lied, and this walker is the only stepped row in the suite with
+    // nobody behind it to catch the ask.
+    match stepped_row(ui, st, "Band", &format!("{}", band + 1)) {
+        Some(face::StepAsk::By(delta)) => {
+            live.band = (band as i32 + delta).rem_euclid(EQ_BANDS as i32) as usize;
+        }
+        Some(face::StepAsk::Home) => live.band = 0,
+        None => {}
     }
     face::keep(&mut out, step_row(ui, st, &live.face, base, None));
     face::keep(&mut out, step_row(ui, st, &live.face, base + 1, Some("Shape")));
