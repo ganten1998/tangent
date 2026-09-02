@@ -2042,23 +2042,31 @@ fn visible_passes(
 /// Time maps onto the full span; each bar is then clipped to what shows.
 ///
 /// **Two things keep a looped clip off the frame budget.** Measured on
-/// eight lanes each carrying a one-bar, 64-note loop dragged over two
-/// hundred bars, the plain walk emitted 102,048 marks and cost 7.4 ms a
-/// frame — forty-five per cent of a 60 Hz budget spent on dashes a fifth of
-/// a pixel wide, before the grid, the headers or the waves are drawn. So:
+/// eight lanes each carrying a one-bar part of music dragged over two
+/// hundred bars, the plain walk emitted 108,440 marks and cost 8.0 ms a
+/// frame — forty-eight per cent of a 60 Hz budget spent on dashes a fifth
+/// of a pixel wide, before the grid, the headers or the waves are drawn. So:
 ///
 /// * only the passes that reach the window are walked ([`visible_passes`]),
 ///   which is exact — the same marks, minus the ones that were computed
 ///   solely to be thrown away;
-/// * and when the longest note is too narrow to show where it begins, the
-///   marks that share a pixel column are merged into one bar per run of
-///   TOUCHING pitches. A miniature is an impression, not a score, and at
-///   that width the marks already overlap each other: the merge draws the
-///   union it was going to paint anyway.
+/// * and a mark too narrow to show where it begins is merged with the other
+///   marks in its pixel column into one bar per run of TOUCHING pitches. A
+///   miniature is an impression, not a score, and at that width the marks
+///   already overlap each other: the merge draws the union it was going to
+///   paint anyway.
+///
+/// **Each mark decides that for itself.** The first version of this asked
+/// the clip's LONGEST note and merged nothing if that one was wide, which
+/// looked right against a probe whose notes were all the same length and was
+/// worthless against music: one held note — a pad, a bass note, a whole-bar
+/// chord — sent every other note in the clip down the plain path and gave
+/// the whole saving back. A held note is drawn as the span it is; the
+/// sub-pixel notes around it still merge.
 ///
 /// The merge is the only place the picture moves, and it moves by less than
 /// a pixel. `mod tests` keeps the plain walk as the drawing this one has to
-/// agree with, cell by cell, at every zoom.
+/// agree with, cell by cell, at every zoom, with and without a held note.
 fn draw_note_miniature(
     painter: &Painter,
     r: Rect,
@@ -2078,18 +2086,26 @@ fn draw_note_miniature(
         1
     };
     let (mut lo, mut hi) = (127u8, 0u8);
-    // The notes' own span, and the longest of them, found in the SAME walk
-    // that finds the pitch range: a pass is placed from the span and the
-    // merge is decided by the longest, and a second walk over the notes is
-    // exactly the cost this function exists to stop paying.
-    let (mut first_s, mut last_s, mut longest_s) = (f64::INFINITY, f64::NEG_INFINITY, 0.0f64);
-    for n in clip.notes {
-        lo = lo.min(n.key);
-        hi = hi.max(n.key);
-        let dur = n.dur_s.max(0.02);
-        first_s = first_s.min(n.at_s);
-        last_s = last_s.max(n.at_s + dur);
-        longest_s = longest_s.max(dur);
+    // The notes' own span, which places a pass — and which ONLY
+    // [`visible_passes`] reads, and which it does not read at all on a clip
+    // holding one pass. So a clip that does not loop does not walk for it.
+    // That is not a rounding error dressed up: the clips carrying the most
+    // notes are the long recorded ones, and a recorded clip is exactly the
+    // kind that has no loop to skip, so the span would be a walk over
+    // thousands of notes bought and thrown away every frame.
+    let (mut first_s, mut last_s) = (f64::INFINITY, f64::NEG_INFINITY);
+    if passes > 1 {
+        for n in clip.notes {
+            lo = lo.min(n.key);
+            hi = hi.max(n.key);
+            first_s = first_s.min(n.at_s);
+            last_s = last_s.max(n.at_s + n.dur_s.max(0.02));
+        }
+    } else {
+        for n in clip.notes {
+            lo = lo.min(n.key);
+            hi = hi.max(n.key);
+        }
     }
     if lo > hi {
         return;
@@ -2154,37 +2170,68 @@ fn draw_note_miniature(
             ink.gamma_multiply(0.8),
         );
     };
+    // One mark drawn where it actually falls, over the span it actually
+    // covers. This is the plain walk's own drawing, kept as a closure so
+    // that the merged path can reach for it note by note.
+    let span_bar = |x0: f32, x1: f32, k: u8| {
+        let y = y_of(usize::from(k));
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1.max(x0 + 1.5), y + bar_h)),
+            1.0,
+            ink.gamma_multiply(0.8),
+        );
+    };
     // One column of the merge grid per point of width, and a ceiling on it.
     // The rect handed in has already been cut to the viewport, so this is a
     // few thousand columns on any real screen; the ceiling is there so that
     // a window nobody has drops back to the plain walk rather than folding
     // an entire clip into one column and calling it a picture.
     let cols = inner.width().ceil().max(1.0);
-    // **Wide enough to read as separate notes**: draw them separately. The
-    // merge below would only round their edges to the pixel grid, and at
-    // this width that is a picture the eye can tell apart from the one it
-    // asked for.
-    if f64::from(fw) * (longest_s / len) >= 1.0 || cols > 16_384.0 {
-        for (pass, n) in seen.flat_map(|k| clip.notes.iter().map(move |n| (k, n))) {
-            if let Some((x0, x1, k)) = mark(pass, n) {
-                let y = y_of(usize::from(k));
-                painter.rect_filled(
-                    Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1.max(x0 + 1.5), y + bar_h)),
-                    1.0,
-                    ink.gamma_multiply(0.8),
-                );
+    // **The grid is built only when some mark could land inside another's
+    // column**, and the question is asked as cheaply as it can be asked.
+    //
+    // It used to be asked of the clip's LONGEST note, and that was the whole
+    // fault: one held note anywhere in the bar — a pad, a bass note, a
+    // whole-bar chord, which is to say ordinary music — made the longest
+    // wide and vetoed the merge for every other note in the clip. The width
+    // that matters is each MARK's own, so each mark decides for itself
+    // below; all this decides is whether to allocate a grid at all.
+    //
+    // `scale` is points per source second, and every note draws at least
+    // 0.02 s long (`dur_s.max(0.02)`) — so when even that would be a point
+    // wide, nothing in this clip can merge, and NO NOTE IS LOOKED AT to
+    // learn it. That matters more than the arithmetic makes it sound: this
+    // question is asked of every clip every frame, and asking it of the
+    // notes is a per-note cost paid by exactly the clips that have the most
+    // of them and the least to gain — a long recorded part, zoomed in, where
+    // every mark is already wider than a point. The decision is O(columns)
+    // and the columns are bounded by the screen.
+    //
+    // The price of guessing wrong the other way is an empty grid: a few
+    // kilobytes and a sweep over columns that hold nothing, which does not
+    // grow with the part.
+    let scale = f64::from(fw) / len;
+    let mut lit: Vec<u64> = if cols > 16_384.0 || 0.02 * scale >= 1.0 {
+        Vec::new()
+    } else {
+        vec![0u64; cols as usize * 2]
+    };
+    let cols = cols as usize;
+    for (pass, n) in seen.flat_map(|k| clip.notes.iter().map(move |n| (k, n))) {
+        if let Some((x0, x1, k)) = mark(pass, n) {
+            // **Wide enough to show where it begins**: draw it as the span
+            // it is. A held note crosses many columns and reads as a line;
+            // folding it into the column it starts in would delete it.
+            if lit.is_empty() || x1 - x0 >= 1.0 {
+                span_bar(x0, x1, k);
+            } else {
+                let c = (((x0 - inner.left()).max(0.0)) as usize).min(cols - 1);
+                lit[c * 2 + usize::from(k) / 64] |= 1u64 << (usize::from(k) % 64);
             }
         }
-        return;
     }
-    // One bit per pitch per column, 128 pitches to two words.
-    let cols = cols as usize;
-    let mut lit = vec![0u64; cols * 2];
-    for (pass, n) in seen.flat_map(|k| clip.notes.iter().map(move |n| (k, n))) {
-        if let Some((x0, _, k)) = mark(pass, n) {
-            let c = (((x0 - inner.left()).max(0.0)) as usize).min(cols - 1);
-            lit[c * 2 + usize::from(k) / 64] |= 1u64 << (usize::from(k) % 64);
-        }
+    if lit.is_empty() {
+        return;
     }
     for c in 0..cols {
         let words = [lit[c * 2], lit[c * 2 + 1]];
@@ -7649,6 +7696,24 @@ selected: false,
             .collect()
     }
 
+    /// **The same bar with a note held across it**, which is what almost all
+    /// real music has and what the merge used to be vetoed by.
+    ///
+    /// A bass note under the part, sounding the whole bar. The merge was
+    /// first gated on the clip's LONGEST note, so this one note used to send
+    /// every other note in the clip down the plain path — and the probe that
+    /// said the merge was worth 2x had no bar like this in it.
+    pub(super) fn a_bar_with_a_held_note(bar_s: f64) -> Vec<crate::arrangement::ArrNote> {
+        let mut notes = a_looped_bar(bar_s);
+        notes.push(crate::arrangement::ArrNote {
+            at_s: 0.0,
+            dur_s: bar_s,
+            key: 36,
+            vel: 100,
+        });
+        notes
+    }
+
     /// A looped MIDI clip `bars` bars long, built from a one-bar loop.
     pub(super) fn a_looped_clip<'a>(
         notes: &'a [crate::arrangement::ArrNote],
@@ -7743,6 +7808,41 @@ selected: false,
         )
     }
 
+    /// Both drawings of one clip in one view, as the rects they emitted —
+    /// what `both_miniatures` gives as coverage, given as marks instead, for
+    /// the checks that are about a mark's WIDTH rather than about ink.
+    fn both_rects(clip: &ClipView<'_>, view: &ArrangeView<'_>, area: Rect) -> (Vec<Rect>, Vec<Rect>) {
+        let r = clip_rect(area, view, clip);
+        let full_x = (
+            x_of(area, view, clip.start_s),
+            x_of(area, view, clip.start_s + clip.len_s),
+        );
+        let go = |f: &dyn Fn(&Painter, Rect, (f32, f32), &ClipView<'_>)| {
+            let ctx = egui::Context::default();
+            let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("mini-rects"));
+            let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+            if r.is_positive() {
+                f(&painter, r, full_x, clip);
+            }
+            ctx.graphics(|g| {
+                g.get(layer)
+                    .map(|list| {
+                        list.all_entries()
+                            .filter_map(|c| match &c.shape {
+                                egui::Shape::Rect(q) => Some(q.rect),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+        };
+        (
+            go(&reference_miniature),
+            go(&|p, r, fx, c| draw_note_miniature(p, r, fx, c, Color32::WHITE)),
+        )
+    }
+
     /// How far a cell is from the nearest cell of a sorted set, in the
     /// square sense — 0 when the set holds it.
     fn is_near(set: &[(i32, i32)], cell: (i32, i32), reach: i32) -> bool {
@@ -7811,6 +7911,63 @@ selected: false,
                 want.len()
             );
         }
+    }
+
+    /// **A held note does not veto the merge, and is not folded into it.**
+    ///
+    /// This is the case the first version of the fix got wrong, and it got it
+    /// wrong because the probe it was measured against had no example of it:
+    /// with every note the same length, a merge gated on the LONGEST note is
+    /// a merge gated on nothing, and the 2x it reported was an artifact of
+    /// its own notes. One held note is ordinary music, and it used to send
+    /// the whole clip down the plain path.
+    ///
+    /// Two halves, and both are needed. The picture still has to be the plain
+    /// walk's — a held note crossing a hundred columns must be drawn as the
+    /// line it is and not folded into the column it starts in, which is the
+    /// obvious way to make this fast and wrong. And the saving has to
+    /// survive: the sub-pixel notes around it still merge.
+    #[test]
+    fn a_held_note_is_drawn_as_a_span_and_the_notes_around_it_still_merge() {
+        let bar_s = 2.0;
+        let notes = a_bar_with_a_held_note(bar_s);
+        for offset_s in [0.0, bar_s * 0.375] {
+            let clips = [ClipView { offset_s, ..a_looped_clip(&notes, bar_s, 60.0) }];
+            the_two_miniatures_agree(&clips, offset_s);
+        }
+        // Zoomed right out over two hundred bars, which is the shape the
+        // probe measures and the shape the complaint was about: every short
+        // note a fifth of a point wide, the held one several points, and
+        // twelve marks fighting for every column.
+        let clips = [a_looped_clip(&notes, bar_s, 200.0)];
+        let mut v = a_view(&clips);
+        v.view_start_s = 0.0;
+        v.view_len_s = bar_s * 200.0;
+        v.song_s = bar_s * 200.0;
+        let (want, got) = both_rects(&clips[0], &v, rect());
+        // The saving: the merge must still be doing its work, not sitting
+        // vetoed by the one long note. The plain walk draws every note of
+        // every pass; the gate this replaced would have made these equal.
+        assert!(
+            got.len() * 4 < want.len() * 3,
+            "one held note gave the merge back: {} marks against the plain walk's {}",
+            got.len(),
+            want.len()
+        );
+        // And the held note is still a LINE. The widest mark the plain walk
+        // draws is the held note's span; the drawing has to have one about
+        // that wide, or it folded a bar-long note into a stub.
+        let widest = |v: &[Rect]| v.iter().map(|q| q.width()).fold(0.0f32, f32::max);
+        let (wide_want, wide_got) = (widest(&want), widest(&got));
+        assert!(
+            wide_want > 4.0,
+            "the plain walk's widest mark is {wide_want}, so this zoom proves nothing"
+        );
+        assert!(
+            wide_got >= wide_want - 1.0,
+            "the held note came out {wide_got} wide against the plain walk's {wide_want} \
+             — a bar-long note folded into the column it starts in"
+        );
     }
 
     /// **A clip whose notes all land in one column still draws something.**
@@ -7964,15 +8121,59 @@ mod miniature_cost_probe {
     use crate::arrangement::ArrNote;
     use std::time::{Duration, Instant};
 
-    /// One bar of the kind of part that actually gets looped: sixteen
-    /// sixteenths, four voices deep, so 64 notes over 36 semitones.
-    fn a_bar(bar_s: f64) -> Vec<ArrNote> {
+    /// One bar of nothing but short notes: sixteen sixteenths, four voices
+    /// deep, so 64 notes over 36 semitones, every one of them a thirty-second
+    /// long.
+    ///
+    /// This is the shape the first version of the fix was measured against,
+    /// and it flattered it: with every note the same length, a merge gated on
+    /// the LONGEST note is a merge gated on nothing. Kept so the two shapes
+    /// can be read side by side.
+    fn a_bar_of_short_notes(bar_s: f64) -> Vec<ArrNote> {
         (0..64u32)
             .map(|i| ArrNote {
                 at_s: f64::from(i / 4) * (bar_s / 16.0),
                 dur_s: bar_s / 32.0,
                 key: 48 + u8::try_from((i * 7) % 36).unwrap_or(0),
                 vel: 100,
+            })
+            .collect()
+    }
+
+    /// **One bar of music**, which is the same part with the notes a player
+    /// would actually hold held.
+    ///
+    /// Every fourth beat carries a note that sounds through to the end of
+    /// the bar — a bass note, a pad, a chord let ring. That is not an exotic
+    /// case, it is what a bar of almost anything looks like, and it is the
+    /// case the first probe had no example of. Measure only the bar above and
+    /// a merge vetoed by one long note reports a win it does not have.
+    fn a_bar(bar_s: f64) -> Vec<ArrNote> {
+        let mut notes = a_bar_of_short_notes(bar_s);
+        for (i, held) in [(0u32, 36u8), (16, 43), (32, 48), (48, 55)] {
+            notes.push(ArrNote {
+                at_s: f64::from(i / 4) * (bar_s / 16.0),
+                dur_s: bar_s - f64::from(i / 4) * (bar_s / 16.0),
+                key: held,
+                vel: 100,
+            });
+        }
+        notes
+    }
+
+    /// The same music laid out FLAT over `bars` bars instead of looped: one
+    /// clip holding every note it plays, which is what a recorded part is.
+    ///
+    /// The pass skip does nothing here — one pass is all there is — so this
+    /// isolates what the merge and the pre-pass cost and buy on their own.
+    fn a_flat_part(bar_s: f64, bars: usize) -> Vec<ArrNote> {
+        let one = a_bar(bar_s);
+        (0..bars)
+            .flat_map(|b| {
+                one.iter().map(move |n| ArrNote {
+                    at_s: n.at_s + b as f64 * bar_s,
+                    ..*n
+                })
             })
             .collect()
     }
@@ -8018,12 +8219,20 @@ mod miniature_cost_probe {
     /// `--ignored --nocapture`, and in RELEASE — a debug build reports about
     /// ten times the truth and the app ships optimised.
     ///
-    /// The document is the survey's: eight lanes each carrying a one-bar,
-    /// 64-note loop stretched over 200 bars — a part written once and
-    /// dragged out, which is how looped MIDI is actually used. The notes are
-    /// scattered over three octaves on purpose: that is the WORST case for
-    /// the column merge, because marks at neighbouring pitches are what it
-    /// gets to fold together.
+    /// The document is the survey's: eight lanes each carrying the same part
+    /// stretched over 200 bars. The notes are scattered over three octaves
+    /// on purpose — that is the WORST case for the column merge, because
+    /// marks at neighbouring pitches are what it gets to fold together.
+    ///
+    /// **Three shapes of clip, because one of them was hiding two faults.**
+    /// The first version of this probe measured a single looped bar whose
+    /// notes were all the same short length, and on that one shape a merge
+    /// gated on the clip's LONGEST note is a merge gated on nothing: it
+    /// reported a 2x that one held note anywhere in the bar would have taken
+    /// straight back. And it never drew a clip that does NOT loop, so a
+    /// pre-pass added for the benefit of looped clips went unmeasured on the
+    /// clips that could not use it. A bar of music and a flat recorded part
+    /// are here now, and the numbers are read across all three.
     ///
     /// Two suspects this ruled out before the fix was written, recorded so
     /// nobody pays to find out twice. The 1-point corner radius on a mark
@@ -8043,7 +8252,22 @@ mod miniature_cost_probe {
         // 120 bpm, 4/4: a bar is two seconds, 200 bars is 400.
         let bar_s = 2.0;
         let song_s = bar_s * 200.0;
-        let notes = a_bar(bar_s);
+        let r = rect();
+
+        // Three clips, because one of them was hiding two faults. The bar of
+        // music is the case that matters; the bar of short notes is what the
+        // first measurement used, kept so the difference is visible; and the
+        // flat part is the one nothing here ever measured — a clip with no
+        // loop, which the pass skip cannot help and which therefore has to be
+        // shown paying nothing for it.
+        let looped_music = a_bar(bar_s);
+        let looped_short = a_bar_of_short_notes(bar_s);
+        let flat = a_flat_part(bar_s, 200);
+        for (part, notes, loop_s) in [
+            ("a looped clip of music", &looped_music, bar_s),
+            ("a looped clip of sub-pixel notes", &looped_short, bar_s),
+            ("a clip that does not loop", &flat, 0.0),
+        ] {
         let clips: Vec<ClipView<'_>> = (0..VISIBLE_LANES)
             .map(|lane| ClipView {
                 id: lane as u64 + 1,
@@ -8057,8 +8281,8 @@ mod miniature_cost_probe {
                 wave: &[],
                 wave_from_s: 0.0,
                 wave_span_s: 0.0,
-                notes: &notes,
-                loop_s: bar_s,
+                notes,
+                loop_s,
                 offset_s: 0.0,
                 selected: false,
                 midi: true,
@@ -8066,7 +8290,6 @@ mod miniature_cost_probe {
             })
             .collect();
 
-        let r = rect();
         // The whole song, sixteen bars, and four bars: zoomed out is the
         // worst case for how much is drawn, zoomed in is the case an owner
         // actually spends the day in.
@@ -8102,7 +8325,7 @@ mod miniature_cost_probe {
                 }
             };
 
-            println!("{what}:");
+            println!("{part}, {what} ({} notes a clip):", notes.len());
             for (which, plain) in [("the plain walk", true), ("as drawn now", false)] {
                 shed(&ctx, layer);
                 sweep(&painter, plain);
@@ -8150,6 +8373,7 @@ mod miniature_cost_probe {
                     (per + tess).as_secs_f64() / 0.0166 * 100.0
                 );
             }
+        }
         }
     }
 }
