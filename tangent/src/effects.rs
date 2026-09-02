@@ -816,11 +816,11 @@ const PLATE_MOD_HZ: f32 = 0.9;
 /// Voiced against [`PLATE_TRIM_AT`], and scaled by the tank's energy so the
 /// decay control changes how LONG and not how loud. See the comment on
 /// [`Plate::process`] for the arithmetic and for why it is a square root.
-const PLATE_TRIM: f32 = 0.34;
+pub(crate) const PLATE_TRIM: f32 = 0.34;
 
 /// The decay position the trim above was voiced at, as a fraction of
 /// [`PLATE_DECAY_S`]. 0.4 of 0.5..5.5 is 2.5 seconds — a plate.
-const PLATE_TRIM_AT: f32 = 0.4;
+pub(crate) const PLATE_TRIM_AT: f32 = 0.4;
 
 /// A plain delay line with a fixed length, read at the write point.
 struct Line {
@@ -1006,7 +1006,10 @@ impl Pole {
 }
 
 /// The plate.
-struct Plate {
+// `pub(crate)` — visibility only, no behaviour change: `units/plate.rs` embeds
+// this struct as the engine of the per-lane insert form. Same for the trim
+// consts above and for `Chorus`/`TapeEcho` below.
+pub(crate) struct Plate {
     /// Predelay, allocated for the longest [`PLATE_PREDELAY_MS`] can ask.
     pre: [Vec<f32>; 2],
     pre_at: usize,
@@ -1041,7 +1044,7 @@ struct Plate {
 }
 
 impl Plate {
-    fn new(sample_rate: f32) -> Self {
+    pub(crate) fn new(sample_rate: f32) -> Self {
         let sr = sample_rate.max(8_000.0);
         let scale = |n: usize| ((n as f32) * sr / DESIGN_RATE).max(1.0);
         let pre_cap = (sr * PLATE_PREDELAY_MS.1 / 1_000.0) as usize + 2;
@@ -1128,20 +1131,20 @@ impl Plate {
     /// little under the requested one, more so as the tone control comes down.
     /// That is the plate behaving like a plate — the panel absorbs — and not
     /// an error in the solution.
-    fn feedback(&self, t60: f32) -> f32 {
+    pub(crate) fn feedback(&self, t60: f32) -> f32 {
         let loop_secs = PLATE_LOOP / DESIGN_RATE;
         let t = t60.max(0.05);
         10f32.powf(-1.5 * loop_secs / t)
     }
 
     /// Seconds of decay at this position of the control.
-    fn decay_secs(size: f32) -> f32 {
+    pub(crate) fn decay_secs(size: f32) -> f32 {
         PLATE_DECAY_S.0 + (PLATE_DECAY_S.1 - PLATE_DECAY_S.0) * size.clamp(0.0, 1.0)
     }
 
     /// One stereo frame in, the plate's output out. Wet only; the caller mixes.
     #[inline]
-    fn process(&mut self, input: [f32; 2], p: &Params, predelay: f32) -> [f32; 2] {
+    pub(crate) fn process(&mut self, input: [f32; 2], p: &Params, predelay: f32) -> [f32; 2] {
         // ── the input path ──────────────────────────────────────────────
         //
         // Predelay first, because it is meant to be silence in front of the
@@ -1280,7 +1283,7 @@ impl Plate {
         [mid + (out[0] - mid) * w, mid + (out[1] - mid) * w]
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         for b in &mut self.pre {
             b.fill(0.0);
         }
@@ -1693,7 +1696,8 @@ impl Spring {
 }
 
 /// A three-head tape echo whose first head follows the session tempo.
-struct TapeEcho {
+// `pub(crate)`: embedded by `units/echo.rs`. See the note on [`Plate`].
+pub(crate) struct TapeEcho {
     /// The tape itself. **One loop, mono**, because that is what is in the
     /// machine: the three heads read the same magnetisation at three points.
     tape: Vec<f32>,
@@ -1716,7 +1720,7 @@ struct TapeEcho {
 }
 
 impl TapeEcho {
-    fn new(sample_rate: f32) -> Self {
+    pub(crate) fn new(sample_rate: f32) -> Self {
         let cap = (sample_rate * MAX_TAPE_SECS) as usize + 2;
         Self {
             tape: vec![0.0; cap],
@@ -1755,7 +1759,7 @@ impl TapeEcho {
     /// record head — so the two are summed on the way in and the heads are
     /// spread across the pair on the way out.
     #[inline]
-    fn process(&mut self, input: [f32; 2], target: f32, p: &Params) -> [f32; 2] {
+    pub(crate) fn process(&mut self, input: [f32; 2], target: f32, p: &Params) -> [f32; 2] {
         let mode = p.echo_mode;
         let heads = mode.heads();
         let feedback =
@@ -1871,7 +1875,7 @@ impl TapeEcho {
         wet
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.tape.fill(0.0);
         self.loss = 0.0;
         self.bump = 0.0;
@@ -1967,7 +1971,8 @@ const CHORUS_LP_HZ: (f32, f32) = (2_600.0, 9_000.0);
 /// Triangle, not sine. The CE-1's LFO is a charging capacitor and the sweep
 /// is close to linear between its turning points, which is why the pitch shift
 /// sits at a steady value and then reverses rather than easing continuously.
-struct Chorus {
+// `pub(crate)`: embedded by `units/chorus.rs`. See the note on [`Plate`].
+pub(crate) struct Chorus {
     buf: [Vec<f32>; 2],
     at: usize,
     /// The LFO's position, 0..1, wrapping.
@@ -1985,7 +1990,7 @@ struct Chorus {
 }
 
 impl Chorus {
-    fn new(sample_rate: f32) -> Self {
+    pub(crate) fn new(sample_rate: f32) -> Self {
         // Room for the longest delay the depth can reach, and a little over.
         let longest = CHORUS_FLOOR_MS + CHORUS_SPAN_MS.1;
         let cap = (sample_rate * longest * 2.0 / 1000.0) as usize + 4;
@@ -2023,7 +2028,7 @@ impl Chorus {
     }
 
     #[inline]
-    fn process(&mut self, input: [f32; 2], p: &Params) -> [f32; 2] {
+    pub(crate) fn process(&mut self, input: [f32; 2], p: &Params) -> [f32; 2] {
         let rate = CHORUS_RATE_HZ.0 + (CHORUS_RATE_HZ.1 - CHORUS_RATE_HZ.0) * p.chorus_rate;
         self.phase = (self.phase + rate / self.sample_rate).fract();
 
@@ -2079,7 +2084,7 @@ impl Chorus {
         [wet[0], wet[1] * right_sign]
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         for b in &mut self.buf {
             b.fill(0.0);
         }
