@@ -1326,7 +1326,7 @@ mod tests {
 
     use super::*;
 
-    fn view<'a>(notes: &'a [ArrNote]) -> MidiEditView<'a> {
+    pub(super) fn view<'a>(notes: &'a [ArrNote]) -> MidiEditView<'a> {
         MidiEditView {
             draw_mode: true,
             fx_strip: (0xE3, 0xD9, 0xBD),
@@ -1365,7 +1365,7 @@ mod tests {
         }
     }
 
-    fn rect() -> Rect {
+    pub(super) fn rect() -> Rect {
         Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(900.0, 380.0))
     }
 
@@ -1770,6 +1770,78 @@ mod velocity_gradient_tests {
                 contrast_ratio(out, face) >= FLOOR,
                 "velocity {v} stayed invisible at {:?}",
                 out
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod editor_cost_probe {
+    use super::tests::{rect, view};
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Probe: what does the piano roll cost per frame on a clip dense enough
+    /// to be worth worrying about? Ignored by default; run with `--ignored
+    /// --nocapture`, and in RELEASE.
+    ///
+    /// Written to answer the same question that was asked of the
+    /// arrangement's miniature, where walking every note of every LOOP PASS
+    /// cost 43.7% of a frame. The editor has no passes: it draws the notes
+    /// it was handed, once each, so its cost is the note count and nothing
+    /// multiplies it. This measures that rather than assuming it — a dense
+    /// four-minute part, at the zoom that puts the most of it on screen.
+    #[test]
+    #[ignore]
+    fn what_does_the_piano_roll_pay_every_frame() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("roll-probe"));
+        let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+
+        // Four minutes of sixteenths, four voices deep: 15,360 notes, which
+        // is a busy orchestral part or a drum programme nobody would call
+        // unreasonable.
+        let notes: Vec<ArrNote> = (0..15_360u32)
+            .map(|i| ArrNote {
+                at_s: f64::from(i / 4) * 0.125,
+                dur_s: 0.1,
+                key: 48 + u8::try_from((i * 7) % 36).unwrap_or(0),
+                vel: 100,
+            })
+            .collect();
+        let r = rect();
+        for (what, start_s, len_s) in [
+            ("the whole part", 0.0, 480.0),
+            ("thirty seconds", 100.0, 30.0),
+            ("four bars", 100.0, 8.0),
+        ] {
+            let mut v = view(&notes);
+            v.clip_start_s = 0.0;
+            v.clip_len_s = 480.0;
+            v.view_start_s = start_s;
+            v.view_len_s = len_s;
+
+            ctx.graphics_mut(|g| *g.entry(layer) = Default::default());
+            draw(&painter, r, &v);
+            let shapes = ctx.graphics(|g| g.get(layer).map_or(0, |l| l.all_entries().len()));
+            ctx.graphics_mut(|g| *g.entry(layer) = Default::default());
+
+            let n = 20;
+            let mut total = Duration::ZERO;
+            for _ in 0..n {
+                let t = Instant::now();
+                draw(&painter, r, &v);
+                total += t.elapsed();
+                ctx.graphics_mut(|g| *g.entry(layer) = Default::default());
+            }
+            let per = total / n;
+            println!(
+                "{what}: {} notes, {shapes} shapes -> draw {:?} per frame, {:.1}% of a 16.6ms frame",
+                notes.len(),
+                per,
+                per.as_secs_f64() / 0.0166 * 100.0
             );
         }
     }
