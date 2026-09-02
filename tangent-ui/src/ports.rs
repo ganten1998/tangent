@@ -516,6 +516,12 @@ pub struct FxParams {
     /// The plugin's short name, for the menu row the parameters hang under.
     pub name: String,
     pub params: Vec<FxParam>,
+    /// Whether the tenant can take a sidechain key — a VST3 reporting an aux
+    /// input bus with channels. Pushed by the host because only it can read
+    /// the plugin's bus list; the UI uses it to gate the bay menu's
+    /// "Sidechain" row. Appended, defaulting false, so every other
+    /// construction site keeps meaning what it meant.
+    pub has_sidechain: bool,
 }
 
 /// One editable parameter of a patch.

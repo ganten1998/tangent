@@ -557,6 +557,23 @@ pub enum Dialog {
         slot: usize,
         live: Box<crate::faces::FaceLive>,
     },
+    /// Pick which channel keys one insert bay's sidechain — the routing
+    /// window's sibling, one step instead of two because there is only one
+    /// kind of source. `strip`/`slot` are DESK terms (`Strip::index` and
+    /// the strip's visible slot), like `InsertFace`'s.
+    InsertKeySource {
+        strip: usize,
+        slot: usize,
+        /// What the bay listens to now, so the picker can grey it and the
+        /// "No sidechain" row can say whether it is already the state.
+        current: Option<usize>,
+        /// Channels worth keying from: index and name. Used channels only —
+        /// an empty channel is a key that never ducks — and never the
+        /// destination itself. Folders ARE offered, unlike the routing
+        /// picker's list: a group's stem holds the group's whole mix, and
+        /// ducking to the drum bus is the classic ask.
+        channels: Vec<(usize, String)>,
+    },
 }
 
 /// Snapshot of learned-re-ranker state for display.
@@ -897,6 +914,11 @@ pub enum DialogAction {
     FaceSavePreset { strip: usize, slot: usize, name: String },
     /// Load a preset file into whatever the open face controls.
     FaceLoadPreset { unit: String, path: String },
+    /// Point one bay's sidechain key at a channel, or take it off with
+    /// `None`. DESK terms like the dialog that fires it; the desktop's
+    /// per-frame publish owns the `seat_bay` translation, so the edge
+    /// survives every seat renumbering the desk migrations perform.
+    SetInsertKeySource { strip: usize, slot: usize, from: Option<usize> },
 }
 
 // ── the custom tuning editor ────────────────────────────────────────────────
@@ -6877,6 +6899,106 @@ pub fn show(
                                         .clicked()
                                 {
                                     action = Some(DialogAction::OpenRouting(ch));
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
+        Dialog::InsertKeySource { strip, slot, current, channels } => {
+            let t = theme(face);
+            let dim = t.text.gamma_multiply(0.62);
+            let (at, bay, now) = (*strip, *slot, *current);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Sidechain",
+                Vec2::new(420.0, 420.0),
+                Vec2::new(360.0, 300.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.field_bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            // The routing picker's row, verbatim: a full-width
+                            // button, greyed when it is not a choice.
+                            let row = |ui: &mut egui::Ui, label: &str, on: bool| -> bool {
+                                let clicked = ui
+                                    .add_enabled(
+                                        on,
+                                        Button::new(
+                                            RichText::new(label).font(bold(12.0)).color(t.text),
+                                        )
+                                        .min_size(Vec2::new(ui.available_width(), 24.0)),
+                                    )
+                                    .clicked();
+                                ui.add_space(4.0);
+                                clicked
+                            };
+                            ui.label(
+                                RichText::new("Key this effect from:")
+                                    .font(bold(11.0))
+                                    .color(t.text),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "A copy of the chosen channel feeds the effect's \
+                                     sidechain input. It does not move any audio.",
+                                )
+                                .font(bold(9.0))
+                                .color(dim),
+                            );
+                            ui.add_space(8.0);
+                            egui::ScrollArea::vertical()
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                )
+                                .max_height(ui.available_height() - 40.0)
+                                .show(ui, |ui| {
+                                    // The way off first, greyed when it is
+                                    // already the state — the picker must
+                                    // never look like a question with no
+                                    // no-thanks answer.
+                                    if row(ui, "No sidechain", now.is_some()) {
+                                        action = Some(DialogAction::SetInsertKeySource {
+                                            strip: at,
+                                            slot: bay,
+                                            from: None,
+                                        });
+                                    }
+                                    for (idx, name) in channels.iter() {
+                                        let label =
+                                            crate::routing::Target::Channel(*idx).label();
+                                        let shown = if name.is_empty() {
+                                            label
+                                        } else {
+                                            format!("{label} - {name}")
+                                        };
+                                        // The current source is greyed, the
+                                        // routing picker's no-duplicates
+                                        // grammar: saying "already this" before
+                                        // the click beats a click that does
+                                        // nothing.
+                                        if row(ui, &shown, now != Some(*idx)) {
+                                            action = Some(DialogAction::SetInsertKeySource {
+                                                strip: at,
+                                                slot: bay,
+                                                from: Some(*idx),
+                                            });
+                                        }
+                                    }
+                                });
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(Button::new(RichText::new("Close").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
                                 }
                             });
                         });
