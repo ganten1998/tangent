@@ -1214,9 +1214,34 @@ fn push_fx_params(
             tangent_ui::ports::FxParams {
                 name: app.insert_short_name(strip, bay),
                 params,
+                // Read here, once, with the parameters it travels with:
+                // whether the tenant reports an aux input bus a key could
+                // feed. The UI gates the bay menu's "Sidechain" row on it.
+                has_sidechain: engine_insert_wants_key(engine, strip, bay),
             }
         });
     app.set_fx_params(strip, bays);
+}
+
+/// MERGE-ME(wave3-ui): stand-in for `Engine::insert_wants_key(seat, bay)`
+/// until the engine lane lands — replace the body with
+/// `engine.insert_wants_key(seat, bay)` and delete this comment. Answering
+/// `false` is the safe default: every VST3's "Sidechain" menu row stays
+/// hidden rather than offering a key input the engine cannot feed yet.
+#[cfg(feature = "recorder")]
+fn engine_insert_wants_key(engine: &crate::instrument::Engine, seat: usize, bay: usize) -> bool {
+    let _ = (engine, seat, bay);
+    false
+}
+
+/// MERGE-ME(wave3-ui): stand-in for `Engine::set_insert_keys(keys)` until
+/// the engine lane lands — replace the body with
+/// `engine.set_insert_keys(keys)` and delete this comment. Entries are
+/// `(seat, bay, source_channel)`, the whole table each call, absent means
+/// cleared — the `set_routes` idiom.
+#[cfg(feature = "recorder")]
+fn engine_set_insert_keys(engine: &crate::instrument::Engine, keys: &[(usize, usize, usize)]) {
+    let _ = (engine, keys);
 }
 
 /// **Read one seat's bays and hand the app every built-in face on it** —
@@ -6640,6 +6665,24 @@ impl DesktopApp {
         let mut routes = self.app.routes().clone();
         routes.prune(outs, tangent_ui::recorder::CHANNELS);
         e.set_routes(&routes);
+        // **The sidechain key table rides beside the routes**, whole each
+        // frame on the same bargain: absent means cleared, so the engine
+        // never keeps an edge the desk no longer has. The desk speaks
+        // (strip, slot) so saved edges survive seat renumbering; the engine
+        // speaks (seat, bay), and THIS is the one place the translation
+        // happens — through `seat_bay`, like every other slot address.
+        let keys: Vec<(usize, usize, usize)> = self
+            .app
+            .insert_keys()
+            .0
+            .iter()
+            .filter(|k| k.from < tangent_ui::recorder::CHANNELS)
+            .map(|k| {
+                let (seat, bay) = tangent_ui::recorder::seat_bay(k.strip, k.slot);
+                (seat, bay, k.from)
+            })
+            .collect();
+        engine_set_insert_keys(e, &keys);
     }
 
     fn push_monitor_settings(&mut self) {

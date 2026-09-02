@@ -4041,6 +4041,12 @@ impl TangentApp {
                         let (seat, bay) = self.slot_seat(i, n);
                         self.open_insert_picker(seat, bay);
                     }
+                    crate::mixer_panel::FxAction::Sidechain => {
+                        // DESK terms, not the seat: the picker's action is
+                        // stored by (strip, slot) so it survives seat
+                        // renumbering, and `desk_index` is that address.
+                        self.open_key_picker(i.desk_index(), n);
+                    }
                     crate::mixer_panel::FxAction::Dismiss => {}
                 }
                 return;
@@ -4220,6 +4226,11 @@ impl TangentApp {
             self.arrangement.clips.retain(|c| c.lane != n);
             self.arr_save_edits();
         }
+        // And the sidechain key edges, at BOTH ends: an edge keyed BY this
+        // track would go on ducking to whatever slides into its index, and
+        // an edge ON this track's bays names effects that just unloaded.
+        // `Routes::prune`'s discipline, one call.
+        let _ = self.settings.insert_keys.drop_channel(n);
         // The bays last, through `set_insert` so the host's reconcile unloads
         // whatever was running in them - the folder-extra seat's included,
         // or a removed folder's second rack stayed loaded invisibly and
@@ -4712,6 +4723,11 @@ impl TangentApp {
                     let (seat, bay) = crate::recorder::seat_bay(i, n);
                     self.insert(seat, bay).map_or("", plugin_display_name)
                 }),
+                // The dot on a keyed chip. By SLOT, matching `inserts`; the
+                // key table speaks slot too, so no translation here.
+                keyed: std::array::from_fn(|n| {
+                    self.settings.insert_keys.get(i, n).is_some()
+                }),
                 kind,
                 icon,
                 empty,
@@ -4810,6 +4826,14 @@ impl TangentApp {
                     soloed: false,
                     removable: false,
                     armed: false,
+                    // The master keys like any strip; its desk index is the
+                    // stable seat past the channels.
+                    keyed: std::array::from_fn(|n| {
+                        self.settings
+                            .insert_keys
+                            .get(crate::recorder::MASTER_SEAT, n)
+                            .is_some()
+                    }),
                 },
             }),
             any_solo: desk.any_solo(),
@@ -4819,6 +4843,11 @@ impl TangentApp {
             selected: self.selected_channel,
             selected_tracks: &self.selected_tracks,
             fx_menu: self.mixer_fx_menu,
+            // Whether the open menu's bay can take a key, asked once here
+            // so the hit test and the painter agree by construction.
+            fx_menu_key: self
+                .mixer_fx_menu
+                .is_some_and(|(at, bay)| self.bay_offers_key(at, bay)),
             typing: self
                 .mixer_typing
                 .as_ref()
@@ -8239,6 +8268,13 @@ impl TangentApp {
         // doing something else.
         self.arr_auto_nodes.clear();
         self.arr_auto_sel = None;
+
+        // **The sidechain key edges, both ends.** They name channels the
+        // same way the kits and the curves do, and an edge left behind is
+        // the same disease: a compressor ducking to whichever track moved
+        // into its source's old row. Bus and master destinations sit past
+        // the channels and hold still, which `remap_channels` knows.
+        self.settings.insert_keys.remap_channels(&inv);
 
         self.desk_state_perm = Some(order.to_vec());
         self.save_settings();
@@ -17878,6 +17914,42 @@ impl TangentApp {
         }
     }
 
+    /// Open the sidechain source picker on one bay, in DESK terms —
+    /// `Strip::index` and the strip's visible slot, the same address the
+    /// bay menu that calls this stands on.
+    pub fn open_key_picker(&mut self, strip: usize, slot: usize) {
+        self.dialog = Some(self.key_picker_dialog(strip, slot));
+    }
+
+    /// Build the source picker: the routing dialog's sibling, with two
+    /// deliberate differences in its list. Folders are OFFERED — a key is a
+    /// copy read from the group's finished stem, so the fold-before-sends
+    /// ordering that makes a folder a dead SEND destination does not apply —
+    /// and there is no hardware page, because a jack cannot duck anything.
+    /// Still excluded: the destination itself (a bay keying off its own
+    /// channel is not a thing anyone means) and unused channels (a key that
+    /// never sounds is a compressor that never ducks, silently).
+    fn key_picker_dialog(&self, strip: usize, slot: usize) -> dialogs::Dialog {
+        let channels = (0..crate::recorder::CHANNELS)
+            .filter(|n| *n != strip && self.channel_used(*n))
+            .map(|n| {
+                let name = self
+                    .settings
+                    .strip_names
+                    .get(n)
+                    .cloned()
+                    .unwrap_or_default();
+                (n, name)
+            })
+            .collect();
+        dialogs::Dialog::InsertKeySource {
+            strip,
+            slot,
+            current: self.settings.insert_keys.get(strip, slot),
+            channels,
+        }
+    }
+
     pub fn set_effect_defaults(&mut self, defaults: crate::ports::EffectDefaults) {
         self.fx_defaults = defaults;
     }
@@ -19428,6 +19500,12 @@ impl TangentApp {
         &self.settings.routes
     }
 
+    /// The desk's sidechain key edges, for the host to translate through
+    /// `seat_bay` and hand to the engine beside the routes.
+    pub fn insert_keys(&self) -> &crate::routing::KeyEdges {
+        &self.settings.insert_keys
+    }
+
     /// Whether the master out is being streamed over ReaStream.
     pub fn reastream_enabled(&self) -> bool {
         self.settings.reastream_enabled
@@ -20473,6 +20551,23 @@ impl TangentApp {
     /// loop, the pads) never call it and are unaffected.
     fn slot_seat(&self, col: crate::recorder::Column, n: usize) -> (usize, usize) {
         crate::recorder::seat_bay(col.desk_index(), n)
+    }
+
+    /// Whether one bay's tenant can take a sidechain key, which is what
+    /// earns its menu the "Sidechain..." row.
+    ///
+    /// The built-in compressor answers by NAME, because it always can and
+    /// the host pushes no `FxParams` for a unit whose face is ours. A VST3
+    /// answers through the `has_sidechain` the host read off its bus list —
+    /// pushed once on load, like the parameters it travels with, so a
+    /// plugin with no aux bus never grows a row that feeds it silence.
+    fn bay_offers_key(&self, col: crate::recorder::Column, slot: usize) -> bool {
+        let (seat, bay) = self.slot_seat(col, slot);
+        // The sentinel, spelled the way the picker spells it.
+        if self.insert(seat, bay) == Some("@tangent-comp") {
+            return true;
+        }
+        self.fx_params(seat, bay).is_some_and(|fx| fx.has_sidechain)
     }
 
     pub fn insert(&self, strip: usize, slot: usize) -> Option<&str> {
@@ -22453,6 +22548,17 @@ impl TangentApp {
             }
             DialogAction::FaceLoadPreset { unit, path } => {
                 self.request_recorder(recorder::RecorderRequest::LoadPreset { unit, path });
+            }
+            DialogAction::SetInsertKeySource { strip, slot, from } => {
+                // A settings write and nothing else — the `SetRouteGain`
+                // pattern, not a request: the desktop publishes the whole
+                // key table beside the routes every frame, so the engine
+                // hears about it the same way it hears about a fader.
+                self.settings.insert_keys.set(strip, slot, from);
+                self.save_settings();
+                // One bay, one choice: the window answered its question.
+                // Unlike the routing dialog there is nothing else to add.
+                self.dialog = None;
             }
             DialogAction::AcceptCheat => {
                 // The "...": for the keyless this is the unlock, real from
@@ -37770,6 +37876,107 @@ mod folder_tests {
         assert!(!a.arr_auto_is_open(3, AutoParam::Gain), "the row stayed behind");
         // Which the engine agrees with.
         assert_eq!(a.folder_parents().len(), crate::recorder::CHANNELS);
+    }
+
+    /// **A reorder carries both ends of a sidechain key edge; a delete takes
+    /// its edges at both ends.**
+    ///
+    /// The kit-and-curves disease over again: an edge that names channels by
+    /// index and stays behind on a reorder is a compressor ducking to
+    /// whichever track slid into its source's old row — and after a delete,
+    /// to a track that does not exist yet.
+    #[test]
+    fn key_edges_follow_a_reorder_and_die_with_their_track() {
+        let mut a = app();
+        for n in [1usize, 2, 3] {
+            a.add_bare_track(n);
+        }
+        // Track 3's bay 0 is keyed by track 1; the master's slot 4 by track 3.
+        a.settings.insert_keys.set(3, 0, Some(1));
+        a.settings.insert_keys.set(crate::recorder::MASTER_SEAT, 4, Some(3));
+
+        // Move 3 up to 1: order[new] = old — the kit test's move.
+        let mut order: Vec<usize> = (0..crate::recorder::CHANNELS).collect();
+        order.remove(3);
+        order.insert(1, 3);
+        a.reorder_channels(&order);
+
+        // The channel edge moved at BOTH ends: 3 became 1 and 1 became 2.
+        assert_eq!(
+            a.settings.insert_keys.get(1, 0),
+            Some(2),
+            "the edge did not follow both of its tracks"
+        );
+        // The master held still while its source moved.
+        assert_eq!(
+            a.settings.insert_keys.get(crate::recorder::MASTER_SEAT, 4),
+            Some(1),
+            "the master's edge lost its source in the reorder"
+        );
+
+        // And deleting the destination track takes its edge with it, while
+        // the master's — now keyed by the SAME track — dies as a source.
+        a.remove_channel(1);
+        assert_eq!(a.settings.insert_keys.get(1, 0), None, "a deleted track kept a key");
+        assert_eq!(
+            a.settings.insert_keys.get(crate::recorder::MASTER_SEAT, 4),
+            None,
+            "an edge keyed BY the deleted track survived it"
+        );
+        assert!(a.settings.insert_keys.0.is_empty());
+    }
+
+    /// **The source picker lists what a key can honestly listen to.**
+    ///
+    /// The routing dialog's list minus one rule: folders ARE offered — a
+    /// key reads the group's finished stem, so the fold-before-sends
+    /// ordering that starves a folder SEND does not apply. Still never the
+    /// destination itself, never an unused channel; and choosing writes the
+    /// edge while "No sidechain" takes it off.
+    #[test]
+    fn the_key_picker_offers_folders_but_not_self_and_its_choice_lands() {
+        let mut a = app();
+        for n in [0usize, 1, 2, 3] {
+            a.add_bare_track(n);
+        }
+        a.set_is_folder(2, true);
+
+        let offered = |a: &TangentApp| -> Vec<usize> {
+            match a.key_picker_dialog(0, 1) {
+                dialogs::Dialog::InsertKeySource { channels, .. } => {
+                    channels.into_iter().map(|(n, _)| n).collect()
+                }
+                _ => panic!("not the key picker"),
+            }
+        };
+        let list = offered(&a);
+        assert!(list.contains(&2), "a folder was refused as a key source");
+        assert!(!list.contains(&0), "the destination was offered its own key");
+        assert!(!list.contains(&7), "an unused channel was offered");
+
+        // The choice lands in settings — and only closes the window.
+        a.open_key_picker(0, 1);
+        a.apply_dialog_action(dialogs::DialogAction::SetInsertKeySource {
+            strip: 0,
+            slot: 1,
+            from: Some(2),
+        });
+        assert_eq!(a.settings.insert_keys.get(0, 1), Some(2));
+        assert!(a.dialog.is_none(), "the picker answered and stayed open");
+        // The picker reopened on that bay greys what is current.
+        match a.key_picker_dialog(0, 1) {
+            dialogs::Dialog::InsertKeySource { current, .. } => {
+                assert_eq!(current, Some(2));
+            }
+            _ => panic!("not the key picker"),
+        }
+        // And "No sidechain" is the way off.
+        a.apply_dialog_action(dialogs::DialogAction::SetInsertKeySource {
+            strip: 0,
+            slot: 1,
+            from: None,
+        });
+        assert_eq!(a.settings.insert_keys.get(0, 1), None);
     }
 
     #[test]

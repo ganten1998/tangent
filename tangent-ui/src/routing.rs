@@ -288,6 +288,133 @@ pub fn hardware_targets(device_outs: usize) -> Vec<Target> {
     out
 }
 
+/// One sidechain key edge: the effect in `strip`'s `slot` ducks to what
+/// channel `from` is doing.
+///
+/// Desk topology, not plugin state: which channel keys a compressor is the
+/// desk's fact, exactly as which channel a route leaves from is — so it lives
+/// beside [`Routes`] in the settings file rather than inside the plugin's own
+/// preset blob, and it survives the plugin being swapped for another build of
+/// itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyEdge {
+    /// The DESTINATION strip in `Strip::index` space — the strip whose bay
+    /// holds the keyed effect. Channel indices move with a reorder; the
+    /// buses and the master sit past the channels and hold still.
+    pub strip: usize,
+    /// The strip's visible slot, `0..bays_of` — six on the master and on a
+    /// folder. Stored as the SLOT and translated to a rack (seat, bay) only
+    /// at publish time through `recorder::seat_bay`, because seats renumber
+    /// under migrations and desk indices do not.
+    pub slot: usize,
+    /// The SOURCE channel, in the same desk space `Route::from` uses.
+    pub from: usize,
+}
+
+/// Every sidechain key on the desk — the [`Routes`] idiom: one flat sparse
+/// list, serialised as one array, filtered rather than looked up.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyEdges(pub Vec<KeyEdge>);
+
+impl KeyEdges {
+    /// Point one bay's key at `from`, or take it off with `None`.
+    ///
+    /// Replace-or-remove by (strip, slot), because a bay listens to at most
+    /// one channel: a compressor has one key input, and keeping two edges
+    /// for one bay would leave the engine to pick a winner silently.
+    pub fn set(&mut self, strip: usize, slot: usize, from: Option<usize>) {
+        self.0.retain(|k| !(k.strip == strip && k.slot == slot));
+        if let Some(from) = from {
+            self.0.push(KeyEdge { strip, slot, from });
+        }
+    }
+
+    /// Which channel keys this bay, when one does.
+    pub fn get(&self, strip: usize, slot: usize) -> Option<usize> {
+        self.0
+            .iter()
+            .find(|k| k.strip == strip && k.slot == slot)
+            .map(|k| k.from)
+    }
+
+    /// Drop every edge touching a deleted channel — as its source, or as the
+    /// channel strip whose bay was keyed.
+    ///
+    /// [`Routes::prune`]'s job for keys, called from the same track-delete
+    /// path: an edge left standing would key the bass from whatever track
+    /// slides into the kick's old index, which is this codebase's oldest
+    /// scar. Returns how many went, so a caller can tell somebody.
+    pub fn drop_channel(&mut self, channel: usize) -> usize {
+        let before = self.0.len();
+        self.0.retain(|k| k.from != channel && k.strip != channel);
+        before - self.0.len()
+    }
+
+    /// Follow a channel reorder: both ends of an edge move through `inv`
+    /// (`inv[old] = new`).
+    ///
+    /// Only the channel strips move — a destination at or past the channels
+    /// is a bus or the master, whose index a reorder never touches — which
+    /// is the same rule the seat permutation (`recorder::seat_order`) wrote
+    /// down for the racks themselves.
+    pub fn remap_channels(&mut self, inv: &[usize]) {
+        for k in &mut self.0 {
+            if let Some(n) = inv.get(k.strip) {
+                k.strip = *n;
+            }
+            if let Some(n) = inv.get(k.from) {
+                k.from = *n;
+            }
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        Value::Array(
+            self.0
+                .iter()
+                .map(|k| {
+                    let mut m = Map::new();
+                    m.insert("strip".into(), Value::from(k.strip as i64));
+                    m.insert("slot".into(), Value::from(k.slot as i64));
+                    m.insert("from".into(), Value::from(k.from as i64));
+                    Value::Object(m)
+                })
+                .collect(),
+        )
+    }
+
+    /// Read the keys back. A malformed entry is skipped rather than failing
+    /// the list — the same forgiveness `Routes::from_json` extends — and a
+    /// bay named twice keeps its FIRST edge, because two sources on one key
+    /// input is a hand-edited file's mistake, not a thing to publish.
+    pub fn from_json(v: &Value) -> Self {
+        let Value::Array(items) = v else {
+            return Self::default();
+        };
+        let mut out = Self::default();
+        for it in items {
+            let Value::Object(m) = it else { continue };
+            // `as_u64`, not `as_i64`: a negative index is malformed, and
+            // clamping it to zero would key some real channel by accident.
+            let (Some(strip), Some(slot), Some(from)) = (
+                m.get("strip").and_then(Value::as_u64),
+                m.get("slot").and_then(Value::as_u64),
+                m.get("from").and_then(Value::as_u64),
+            ) else {
+                continue;
+            };
+            if out.get(strip as usize, slot as usize).is_none() {
+                out.0.push(KeyEdge {
+                    strip: strip as usize,
+                    slot: slot as usize,
+                    from: from as usize,
+                });
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +556,69 @@ mod tests {
         assert!((r.0[0].gain - 1.0).abs() < 1e-6);
         r.set_gain(0, -3.0);
         assert!(r.0[0].gain.abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_key_edge_survives_the_json_round_trip() {
+        let mut k = KeyEdges::default();
+        k.set(3, 1, Some(7));
+        k.set(35, 5, Some(0)); // the master's second rack keys off channel 1
+        let back = KeyEdges::from_json(&k.to_json());
+        assert_eq!(back, k);
+        assert_eq!(back.get(3, 1), Some(7));
+        assert_eq!(back.get(35, 5), Some(0));
+    }
+
+    #[test]
+    fn setting_a_bays_key_replaces_it_and_none_takes_it_off() {
+        let mut k = KeyEdges::default();
+        k.set(2, 0, Some(5));
+        k.set(2, 0, Some(9));
+        assert_eq!(k.get(2, 0), Some(9), "a bay listens to one channel");
+        assert_eq!(k.0.len(), 1, "the replaced edge did not linger");
+        k.set(2, 0, None);
+        assert_eq!(k.get(2, 0), None);
+        assert!(k.0.is_empty());
+    }
+
+    #[test]
+    fn malformed_key_rows_are_skipped_and_a_doubled_bay_keeps_its_first() {
+        let v: Value = serde_json::from_str(
+            r#"[
+                {"strip": 4, "slot": 1, "from": 2},
+                {"strip": 4, "slot": 1, "from": 9},
+                {"strip": -1, "slot": 0, "from": 3},
+                {"strip": 5, "from": 3},
+                "not even an object"
+            ]"#,
+        )
+        .unwrap();
+        let k = KeyEdges::from_json(&v);
+        assert_eq!(k.0.len(), 1, "only the first well-formed row survives");
+        assert_eq!(k.get(4, 1), Some(2), "the doubled bay kept its first edge");
+    }
+
+    #[test]
+    fn deleting_a_channel_takes_its_key_edges_at_both_ends() {
+        let mut k = KeyEdges::default();
+        k.set(2, 0, Some(5)); // 2's bay keyed by the deleted channel
+        k.set(5, 1, Some(0)); // the deleted channel's own bay is keyed
+        k.set(3, 2, Some(1)); // untouched, to prove it is not a sweep
+        assert_eq!(k.drop_channel(5), 2);
+        assert_eq!(k.0, vec![KeyEdge { strip: 3, slot: 2, from: 1 }]);
+    }
+
+    #[test]
+    fn a_reorder_carries_both_ends_of_a_key_edge() {
+        let mut k = KeyEdges::default();
+        k.set(0, 1, Some(2));
+        k.set(35, 0, Some(0)); // the master strip holds still
+        // Channels 0 and 2 swap: inv[old] = new.
+        let mut inv: Vec<usize> = (0..32).collect();
+        inv[0] = 2;
+        inv[2] = 0;
+        k.remap_channels(&inv);
+        assert_eq!(k.get(2, 1), Some(0), "the edge followed both its tracks");
+        assert_eq!(k.get(35, 0), Some(2), "the master end held while its source moved");
     }
 }
