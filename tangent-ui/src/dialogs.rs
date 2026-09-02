@@ -24,7 +24,8 @@ use crate::recorder::{
     MIN_BPM,
 };
 use egui::{
-    Align, Button, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Stroke, Vec2,
+    Align, Align2, Button, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Stroke,
+    Vec2,
 };
 use tangent_core::fretboard::{self, Tuning, TuningError, MAX_STRINGS};
 use tangent_core::patterns::{NOTE_NAMES, NOTE_NAMES_FLAT};
@@ -3481,6 +3482,213 @@ fn shorten_middle(s: &str, max: usize) -> String {
     format!("{head}\u{2026}{tail}")
 }
 
+// ── the export window ───────────────────────────────────────────────────────
+
+/// The export window's own identity, apart from [`DIALOG_ID`].
+///
+/// **It used to share the dialog's window, and that cost it twice.**
+///
+/// A dialog opened during a render drew INTO THE SAME WINDOW, alternately
+/// with the waveform: two `show_viewport_immediate` calls under one
+/// `ViewportId` in one frame are one window asked to be two things.
+///
+/// And the export window was never brought to the front. Taking over from
+/// the Export dialog's own window, `shell::surface` saw a surface that
+/// already existed — `existing = true`, so no reveal — and emitted only
+/// patch commands: a Title, an InnerSize, a re-centre. Never a
+/// `Visible(true)`, which is the one command that reaches
+/// `makeKeyAndOrderFront:`. The window that is the entire reason to watch a
+/// render was the one window that never came forward, and anything born
+/// after it — the band's "Rendering at full speed…" notice, chief among
+/// them — landed straight on top.
+///
+/// An id of its own gives it its own birth, its own reveal and its own
+/// remembered geometry. Nothing else keyed off `DIALOG_ID` on its behalf:
+/// `pointer_over_dialog` and `dialog_drawn_inline` are both gated on a
+/// `Dialog` being open, which an export is not.
+const EXPORT_ID: &str = "ivory-export";
+
+/// **How much of the screen the export window takes.**
+///
+/// A share rather than a count of points, for the reason `app::main_width`
+/// gives about the main window: 520 by 210 is a reasonable window on the
+/// display this app was written on and a postage stamp on a 5K, so the
+/// percentage was a percentage of nothing in particular. The waveform is
+/// the whole point of this window — it is what somebody watches for the
+/// minutes a render takes — so it is sized to the room the machine has.
+///
+/// Wider than it is tall because the wave runs across time, and under half
+/// the screen in both directions because the desk behind it is still worth
+/// seeing.
+const EXPORT_SHARE: Vec2 = Vec2::new(0.46, 0.40);
+
+/// **The floor.** Below this the wave stops being worth watching, which is
+/// the only reason the window exists — and it is already well over twice
+/// the area of the 520 by 210 this window opened at for years.
+const EXPORT_MIN: Vec2 = Vec2::new(560.0, 300.0);
+
+/// **The ceiling.** A share with no cap is a window that eats a 6K display
+/// to draw one waveform; past about this size the wave gains resolution
+/// nobody is reading and the desk loses the room it is being rendered from.
+const EXPORT_MAX: Vec2 = Vec2::new(1200.0, 620.0);
+
+/// The export window's size on this display — see [`EXPORT_SHARE`].
+///
+/// `monitor` is whatever [`Placement`] was handed: the screen on the
+/// desktop, the plugin editor's own canvas inline, and the same share is
+/// the right answer to both. With nothing known it falls back to the floor,
+/// because a guess about a screen that has never been measured is worse
+/// than the smallest size the layout is designed for.
+pub fn export_window_size(monitor: Option<Vec2>) -> Vec2 {
+    let Some(m) = monitor.filter(|m| m.x > 0.0 && m.y > 0.0) else {
+        return EXPORT_MIN;
+    };
+    let want = Vec2::new(
+        (m.x * EXPORT_SHARE.x).clamp(EXPORT_MIN.x, EXPORT_MAX.x),
+        (m.y * EXPORT_SHARE.y).clamp(EXPORT_MIN.y, EXPORT_MAX.y),
+    );
+    // The floor can outgrow a small display, and a window bigger than the
+    // screen it opens on is the bug the 5.0 demo session found in the main
+    // window. Same clamp, same reason.
+    crate::settings::clamp_size_to_monitor(want, Some(m))
+}
+
+/// The smallest the window may be dragged to, which is the floor — except
+/// on a display too small to hold even that, where a minimum larger than
+/// the size we just asked for would be a window that cannot be placed.
+fn export_min_size(size: Vec2) -> Vec2 {
+    EXPORT_MIN.min(size)
+}
+
+/// The window's margin, the label's line, the bar's thickness, and the air
+/// between them: everything the wave does NOT get. See [`export_layout`].
+const EXPORT_PAD: f32 = 14.0;
+const EXPORT_LABEL_H: f32 = 18.0;
+const EXPORT_BAR_H: f32 = 12.0;
+const EXPORT_GAP: f32 = 10.0;
+
+/// **Where the export window's parts are.**
+///
+/// One function for the whole window, so a size that now follows the
+/// monitor cannot drift the wave off the bar or the playhead off the wave.
+/// The parts were three `allocate_exact_size` calls in a layout that only
+/// happened to agree with itself at one window size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExportLayout {
+    /// The line of words: what is happening, and how far in.
+    pub label: Rect,
+    /// **The point of the window**, and everything left over once the
+    /// furniture above has been paid for.
+    pub wave: Rect,
+    /// The progress bar under the wave.
+    pub bar: Rect,
+}
+
+impl ExportLayout {
+    /// The playhead's x at `fraction`.
+    ///
+    /// Measured on the WAVE, which is the only rect it may ever be measured
+    /// on: the peak columns behind it are indexed across the same width, so
+    /// a playhead taken from anything else drifts away from the sample it
+    /// claims to be pointing at.
+    pub fn playhead(&self, fraction: f32) -> f32 {
+        self.wave.left() + self.wave.width() * fraction.clamp(0.0, 1.0)
+    }
+}
+
+/// The window's parts, from the one rect it is handed.
+///
+/// **The furniture is paid first and the wave gets the rest.** That is the
+/// order that makes the window worth growing: every point the window gains
+/// goes to the waveform, and the label and the bar stay the size a label
+/// and a bar should be. Each part is floored at nothing so a window
+/// squeezed under its own minimum degrades instead of inverting.
+pub fn export_layout(rect: Rect) -> ExportLayout {
+    let inner = rect.shrink(EXPORT_PAD);
+    let w = inner.width().max(0.0);
+    let h = inner.height().max(0.0);
+    let label_h = EXPORT_LABEL_H.min(h);
+    let bar_h = EXPORT_BAR_H.min(h - label_h);
+    let gaps = (2.0 * EXPORT_GAP).min(h - label_h - bar_h);
+    let wave_h = (h - label_h - bar_h - gaps).max(0.0);
+    let gap = gaps * 0.5;
+    let label = Rect::from_min_size(inner.min, Vec2::new(w, label_h));
+    let wave = Rect::from_min_size(
+        Pos2::new(inner.left(), label.bottom() + gap),
+        Vec2::new(w, wave_h),
+    );
+    let bar = Rect::from_min_size(
+        Pos2::new(inner.left(), wave.bottom() + gap),
+        Vec2::new(w, bar_h),
+    );
+    ExportLayout { label, wave, bar }
+}
+
+/// **The playhead's red, kept findable on the well it is drawn on.**
+///
+/// `#E83A4E` has a relative luminance of 0.207 — inside the 0.12–0.22 dead
+/// zone this app has learned about from a screenshot seven times, the band
+/// where neither ink wins. Measured across the nineteen themes it comes out
+/// under 3:1 on five of the thirty-eight dressings and as low as 2.43:1 on
+/// Sandstone's pale well: a red line on a cream ground that the eye has to
+/// hunt for. That was survivable while the wave was 96 points tall in the
+/// corner of a small window. It is not now that the wave IS the window.
+///
+/// So the red is walked toward whichever ink the well can carry until it
+/// clears 3:1 — the non-text floor, because this is a one-point MARKER and
+/// not a word, and dragging a line this thin to 4.5:1 would take the red
+/// out of the red. In practice the walk moves nothing on thirty-three of
+/// the thirty-eight and lands on `#C93546` at its furthest, so the playhead
+/// stays plainly red and is findable everywhere. Measured on the well,
+/// never assumed from the role: the surface is what decides.
+fn playhead_ink(well: Color32) -> Color32 {
+    const RED: Color32 = Color32::from_rgb(0xE8, 0x3A, 0x4E);
+    const FLOOR: f32 = 3.0;
+    // The well is the panel ground moved AWAY from its ink, so this ink
+    // clears 4.5:1 on it by construction and the walk always converges.
+    let toward = if crate::recorder_panel::wants_light_ink(well) {
+        crate::recorder_panel::INK_LIGHT
+    } else {
+        crate::recorder_panel::INK_DARK
+    };
+    let mut out = RED;
+    let mut t = 0.0_f32;
+    while crate::recorder_panel::contrast_ratio(out, well) < FLOOR && t < 1.0 {
+        t += 0.05;
+        let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
+        out = Color32::from_rgb(
+            lerp(RED.r(), toward.r()),
+            lerp(RED.g(), toward.g()),
+            lerp(RED.b(), toward.b()),
+        );
+    }
+    out
+}
+
+/// **Where the export window opens — decided once, then left alone.**
+///
+/// [`Placement::position_for`] is recomputed from the parent's rect every
+/// frame, and a `pos` that changes is a `ViewportCommand::OuterPosition`:
+/// this window walked back to the middle of the main window every time the
+/// main window moved, and could not be dragged aside at all. It is up for
+/// the length of a render, which is exactly long enough to want it
+/// somewhere else.
+///
+/// So the answer is taken on the frame it opens and held until it closes —
+/// and dropped when it does, by the same one-pass liveness `shell::surface`
+/// uses, so the next export centres again rather than reopening wherever
+/// the last one was left.
+fn export_pos(ctx: &egui::Context, placement: Placement, size: Vec2) -> Option<Pos2> {
+    let id = egui::Id::new((EXPORT_ID, "pos"));
+    let pass = ctx.cumulative_pass_nr();
+    let held = ctx
+        .memory(|m| m.data.get_temp::<(u64, Option<Pos2>)>(id))
+        .filter(|(p, _)| pass.saturating_sub(*p) <= 1);
+    let pos = held.map_or_else(|| placement.position_for(size), |(_, p)| p);
+    ctx.memory_mut(|m| m.data.insert_temp(id, (pass, pos)));
+    pos
+}
+
 /// The export window: a wave that draws itself while the render walks the
 /// timeline, and a bar under it.
 ///
@@ -3489,6 +3697,12 @@ fn shorten_middle(s: &str, max: usize) -> String {
 /// over the main window because that is where an eye already is, and because
 /// an export is the one thing in this app that can run long enough for a
 /// person to wonder whether it is running at all.
+///
+/// **And nothing of this app's may cover it while it is up**
+/// ([`crate::shell::SurfaceTier::Uncovered`]). It was losing the reveal race
+/// to every sibling — see [`EXPORT_ID`] for why it was losing it worse than
+/// anything else — and a progress window you cannot see is a progress window
+/// that does not exist.
 pub fn show_export_progress(
     ctx: &egui::Context,
     p: &crate::ports::ExportProgress,
@@ -3501,83 +3715,124 @@ pub fn show_export_progress(
     // stretch. See `remember_face`.
     let t = theme(live_face(ctx));
     let bold = |size: f32| FontId::new(size, fonts::courier_bold());
-    show_dialog_viewport(
-        ctx,
-        placement,
-        "Exporting",
-        Vec2::new(520.0, 210.0),
-        Vec2::new(420.0, 180.0),
-        |ui, _result| {
-            apply_theme(ui.style_mut(), &t);
-            ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
-            egui::Frame::NONE
-                .inner_margin(egui::Margin::same(12))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!("{}  {:.0}%", p.label, p.fraction * 100.0))
-                            .font(bold(12.0))
-                            .color(t.text),
-                    );
-                    ui.add_space(8.0);
-                    // ── the wave ──────────────────────────────────────────
-                    let w = ui.available_width();
-                    let (rect, _) = ui.allocate_exact_size(
-                        Vec2::new(w, 96.0),
-                        egui::Sense::hover(),
-                    );
-                    let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, 2.0, t.field_bg);
-                    let mid = rect.center().y;
-                    // The zero line, so a silent passage still reads as
-                    // rendered rather than as nothing drawn yet.
-                    painter.line_segment(
-                        [
-                            Pos2::new(rect.left(), mid),
-                            Pos2::new(rect.right(), mid),
-                        ],
-                        Stroke::new(1.0_f32, t.text.gamma_multiply(0.25)),
-                    );
-                    let cols = p.peaks.len().max(1);
-                    let half = rect.height() * 0.5 - 2.0;
-                    for (i, (lo, hi)) in p.peaks.iter().enumerate() {
-                        if *lo == 0.0 && *hi == 0.0 {
-                            continue;
-                        }
-                        let x = rect.left() + rect.width() * (i as f32 + 0.5) / cols as f32;
-                        let top = mid - hi.clamp(-1.0, 1.0) * half;
-                        let bot = mid - lo.clamp(-1.0, 1.0) * half;
-                        painter.line_segment(
-                            [Pos2::new(x, top), Pos2::new(x, bot.max(top + 1.0))],
-                            Stroke::new(1.0_f32, t.text),
-                        );
-                    }
-                    // The playhead: where the render has got to.
-                    let x = rect.left() + rect.width() * p.fraction.clamp(0.0, 1.0);
-                    painter.line_segment(
-                        [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-                        Stroke::new(1.0_f32, Color32::from_rgb(0xE8, 0x3A, 0x4E)),
-                    );
-                    ui.add_space(8.0);
-                    // ── the bar ───────────────────────────────────────────
-                    let (bar, _) = ui.allocate_exact_size(
-                        Vec2::new(w, 10.0),
-                        egui::Sense::hover(),
-                    );
-                    let painter = ui.painter_at(bar);
-                    painter.rect_filled(bar, 1.0, t.field_bg);
-                    let filled = Rect::from_min_max(
-                        bar.min,
-                        Pos2::new(
-                            bar.left() + bar.width() * p.fraction.clamp(0.0, 1.0),
-                            bar.bottom(),
-                        ),
-                    );
-                    if filled.width() > 0.5 {
-                        painter.rect_filled(filled, 1.0, t.text);
-                    }
-                });
-        },
-    );
+    let inline = !placement.caps.child_windows;
+    let size = export_window_size(placement.monitor);
+    let spec = crate::shell::SurfaceSpec {
+        id: EXPORT_ID,
+        title: "Exporting",
+        size,
+        min_size: export_min_size(size),
+        pos: export_pos(ctx, placement, size),
+        decorated: true,
+        resizable: true,
+        // It comes forward when it opens, because it opens the instant the
+        // Export dialog it replaces goes away and the eye is already there.
+        takes_focus: true,
+        // **Not modal.** It blocks nothing and dims nothing: the desk stays
+        // live under a render, which is the whole reason this is not a
+        // `Dialog`. It went through `show_dialog_viewport` before, which
+        // decides modality from `chrome` and therefore made it modal inline
+        // — a plugin canvas greyed out behind a window that was reporting,
+        // not asking.
+        modal: false,
+        // Down for as long as the OS's own panel is up, like every other
+        // surface here. See `SurfaceSpec::on_top`.
+        on_top: !placement.native_panel_up,
+        tier: crate::shell::SurfaceTier::Uncovered,
+        // A tiling WM would otherwise TILE it into the layout, which for a
+        // window whose only job is to be looked at is the same failure as
+        // being covered.
+        window_type: Some(egui::X11WindowType::Dialog),
+        ..Default::default()
+    };
+    // **The report is dropped on purpose.** Escape, the title bar's cross
+    // and a click outside all arrive here, and none of them may take this
+    // window down: it goes when the export goes, and an export that is
+    // still running with nothing on screen saying so is exactly what this
+    // window exists to prevent. That was its contract before and it is its
+    // contract now.
+    let _ = crate::shell::surface(ctx, placement.caps, &spec, &mut |ui, _want_close| {
+        apply_theme(ui.style_mut(), &t);
+        let rect = ui.max_rect();
+        let painter = ui.painter_at(rect);
+        // Rounded inline, where there is no window edge to tell the surface
+        // apart from the app behind it; square in a window of its own.
+        painter.rect_filled(rect, if inline { 4.0 } else { 0.0 }, t.bg);
+        let l = export_layout(rect);
+        painter.text(
+            l.label.left_center(),
+            Align2::LEFT_CENTER,
+            format!("{}  {:.0}%", p.label, p.fraction * 100.0),
+            bold(13.0),
+            t.text,
+        );
+        // ── the wave ──────────────────────────────────────────────────────
+        let wave = painter.with_clip_rect(l.wave);
+        wave.rect_filled(l.wave, 2.0, t.field_bg);
+        // **A hairline round the well**, because on three of the nineteen
+        // themes the well and the window's ground are within 1.1:1 of each
+        // other (Porcelain light, Phosphor dark, Silverface dark) and the
+        // waveform was floating in a rectangle with no findable edge. The
+        // surface cannot move — it is the ground the wave is measured
+        // against — so the box gets a line instead, in the theme's own edge
+        // shade. See `every_theme_dresses_the_export_window`.
+        wave.rect_stroke(
+            l.wave,
+            2.0,
+            Stroke::new(1.0_f32, t.button_border),
+            egui::StrokeKind::Inside,
+        );
+        let mid = l.wave.center().y;
+        // The zero line, so a silent passage still reads as rendered rather
+        // than as nothing drawn yet.
+        wave.line_segment(
+            [
+                Pos2::new(l.wave.left(), mid),
+                Pos2::new(l.wave.right(), mid),
+            ],
+            Stroke::new(1.0_f32, t.text.gamma_multiply(0.25)),
+        );
+        let cols = p.peaks.len().max(1);
+        let half = l.wave.height() * 0.5 - 2.0;
+        // **A column is as wide as its share of the wave**, not one point.
+        // The feed is a fixed 480 columns (`ports::EXPORT_PEAKS`), which was
+        // about one point each in the 496-point wave this window used to
+        // have; across a wave three times that wide, one-point strokes draw
+        // a comb with two points of ground showing between every pair of
+        // samples. Floored at a point so a narrow window still draws
+        // something rather than hairlines with gaps.
+        let col_w = (l.wave.width() / cols as f32).max(1.0);
+        for (i, (lo, hi)) in p.peaks.iter().enumerate() {
+            if *lo == 0.0 && *hi == 0.0 {
+                continue;
+            }
+            let x = l.wave.left() + l.wave.width() * (i as f32 + 0.5) / cols as f32;
+            let top = mid - hi.clamp(-1.0, 1.0) * half;
+            let bot = mid - lo.clamp(-1.0, 1.0) * half;
+            wave.line_segment(
+                [Pos2::new(x, top), Pos2::new(x, bot.max(top + 1.0))],
+                Stroke::new(col_w, t.text),
+            );
+        }
+        // The playhead: where the render has got to.
+        let x = l.playhead(p.fraction);
+        wave.line_segment(
+            [Pos2::new(x, l.wave.top()), Pos2::new(x, l.wave.bottom())],
+            Stroke::new(1.0_f32, playhead_ink(t.field_bg)),
+        );
+        // ── the bar ───────────────────────────────────────────────────────
+        // Filled to the SAME x the playhead stands at — the bar and the wave
+        // share a left edge and a width, so the two read as one measurement
+        // rather than two that nearly agree.
+        painter.rect_filled(l.bar, 1.0, t.field_bg);
+        let filled = Rect::from_min_max(
+            l.bar.min,
+            Pos2::new(l.playhead(p.fraction), l.bar.bottom()),
+        );
+        if filled.width() > 0.5 {
+            painter.rect_filled(filled, 1.0, t.text);
+        }
+    });
 }
 
 /// The band's message, as its own window. Returns true when the user closed it.
@@ -11498,6 +11753,305 @@ at: None,
             walk(&c.shape, &mut out);
         }
         out
+    }
+
+    // ── the export window ───────────────────────────────────────────────────
+
+    /// The size this window opened at for years, kept here as the thing the
+    /// new one is measured against rather than as anything that still runs.
+    const OLD_EXPORT_SIZE: Vec2 = Vec2::new(520.0, 210.0);
+
+    /// **The window is a share of the screen, with a floor and a ceiling.**
+    ///
+    /// 520 by 210 was a percentage of nothing in particular: comfortable on
+    /// the display this app was written on, a postage stamp on a 5K. This is
+    /// `main_width`'s rule applied to the one window whose whole content is
+    /// a picture — the same share of a laptop and of a 6K, and never bigger
+    /// than the screen it opens on.
+    #[test]
+    fn the_export_window_is_a_share_of_the_screen_between_a_floor_and_a_ceiling() {
+        // Nothing measured yet — the first frames on a new machine. The
+        // floor, because a guess about an unseen screen is worse.
+        assert_eq!(export_window_size(None), EXPORT_MIN);
+        assert_eq!(export_window_size(Some(Vec2::ZERO)), EXPORT_MIN);
+
+        let screens = [
+            ("a 13-inch laptop", Vec2::new(1280.0, 800.0)),
+            ("a 1080p desk", Vec2::new(1920.0, 1080.0)),
+            ("the reference display", Vec2::new(2560.0, 1400.0)),
+            ("a 5K", Vec2::new(2560.0, 1440.0)),
+            ("a 6K XDR", Vec2::new(3008.0, 1692.0)),
+        ];
+        let mut last = Vec2::ZERO;
+        for (name, mon) in screens {
+            let size = export_window_size(Some(mon));
+            assert!(
+                size.x >= EXPORT_MIN.x && size.y >= EXPORT_MIN.y,
+                "{name}: {size:?} is under the floor {EXPORT_MIN:?}"
+            );
+            assert!(
+                size.x <= EXPORT_MAX.x && size.y <= EXPORT_MAX.y,
+                "{name}: {size:?} is over the ceiling {EXPORT_MAX:?}"
+            );
+            assert!(
+                size.x <= mon.x && size.y <= mon.y,
+                "{name}: a {size:?} window does not fit a {mon:?} screen"
+            );
+            // The point of the whole exercise, measured where the owner
+            // asked for it: bigger than the fixed window it replaces in both
+            // directions, and a WAVE more than twice the 96 points it used
+            // to get. A 13-inch laptop is the tight case — the window there
+            // is only 1.7 times the area, and the waveform is still two and
+            // a half times as tall, because the growth went where it was
+            // wanted rather than into furniture.
+            assert!(
+                size.x >= OLD_EXPORT_SIZE.x && size.y >= OLD_EXPORT_SIZE.y,
+                "{name}: {size:?} is not bigger than {OLD_EXPORT_SIZE:?}"
+            );
+            let wave = export_layout(Rect::from_min_size(Pos2::ZERO, size)).wave;
+            assert!(
+                wave.height() >= 2.0 * 96.0,
+                "{name}: the wave is {:.0} points, against the 96 it had",
+                wave.height()
+            );
+            // A bigger screen never gets a smaller window.
+            assert!(
+                size.x >= last.x && size.y >= last.y,
+                "{name}: {size:?} is smaller than the screen below it got ({last:?})"
+            );
+            last = size;
+        }
+
+        // Both limits have to actually BITE somewhere, or they are decoration
+        // and the next change to the share will sail past them unnoticed.
+        assert_eq!(
+            export_window_size(Some(Vec2::new(3008.0, 1692.0))),
+            EXPORT_MAX,
+            "the ceiling never engages"
+        );
+        assert_eq!(
+            export_window_size(Some(Vec2::new(900.0, 600.0))),
+            EXPORT_MIN,
+            "the floor never engages"
+        );
+
+        // And a canvas too small even for the floor — a plugin editor, where
+        // `monitor` is the editor's own pane. The window comes down to fit,
+        // and the minimum it may be dragged to comes down with it, because a
+        // minimum larger than the size just asked for is a window that
+        // cannot be placed.
+        let tiny = Vec2::new(400.0, 300.0);
+        let size = export_window_size(Some(tiny));
+        assert!(size.x < EXPORT_MIN.x && size.y < EXPORT_MIN.y, "{size:?}");
+        assert!(size.x <= tiny.x && size.y <= tiny.y, "{size:?} escapes {tiny:?}");
+        let least = export_min_size(size);
+        assert!(
+            least.x <= size.x && least.y <= size.y,
+            "the minimum {least:?} is bigger than the size {size:?}"
+        );
+        // On every real screen the minimum IS the floor.
+        assert_eq!(export_min_size(export_window_size(Some(Vec2::new(1920.0, 1080.0)))), EXPORT_MIN);
+    }
+
+    /// **One layout, every part — and the wave gets the lion's share.**
+    ///
+    /// The parts used to be three `allocate_exact_size` calls with a
+    /// hard-coded 96-point wave in a 210-point window, which only agreed
+    /// with itself at that one size. Now the window follows the monitor, so
+    /// the arithmetic has to hold at every size the derivation can produce:
+    /// nothing escapes the window, nothing overlaps, the order down the
+    /// window is label, wave, bar, and every point the window gains goes to
+    /// the wave.
+    #[test]
+    fn the_export_windows_parts_come_from_one_layout() {
+        let sizes = [
+            export_window_size(None),
+            export_window_size(Some(Vec2::new(1280.0, 800.0))),
+            export_window_size(Some(Vec2::new(2560.0, 1400.0))),
+            export_window_size(Some(Vec2::new(3008.0, 1692.0))),
+            export_window_size(Some(Vec2::new(400.0, 300.0))),
+        ];
+        for size in sizes {
+            // Placed away from the origin on purpose: a layout that only
+            // works at (0, 0) is one that has confused a size for a rect.
+            let rect = Rect::from_min_size(Pos2::new(37.0, 19.0), size);
+            let l = export_layout(rect);
+            for (what, r) in [("label", l.label), ("wave", l.wave), ("bar", l.bar)] {
+                assert!(
+                    rect.expand(0.01).contains_rect(r),
+                    "{size:?}: the {what} {r:?} escapes the window {rect:?}"
+                );
+                assert!(r.width() >= 0.0 && r.height() >= 0.0, "{what} inverted: {r:?}");
+            }
+            // Down the window in reading order, sharing nothing.
+            assert!(
+                l.label.bottom() <= l.wave.top() + 0.01,
+                "{size:?}: the label runs into the wave"
+            );
+            assert!(
+                l.wave.bottom() <= l.bar.top() + 0.01,
+                "{size:?}: the wave runs into the bar"
+            );
+            // One left edge and one width for all three, which is what lets
+            // the bar's fill and the playhead be the same measurement.
+            assert!(
+                (l.label.left() - l.wave.left()).abs() < 0.01
+                    && (l.bar.left() - l.wave.left()).abs() < 0.01
+                    && (l.label.width() - l.wave.width()).abs() < 0.01
+                    && (l.bar.width() - l.wave.width()).abs() < 0.01,
+                "{size:?}: the parts do not share a column"
+            );
+            // **The wave is the window.** Two thirds is the floor at the
+            // smallest size the layout is ever handed; on a real screen it
+            // is well over four fifths.
+            assert!(
+                l.wave.height() >= rect.height() * 2.0 / 3.0,
+                "{size:?}: the wave got {:.0} of {:.0} points — the furniture is \
+                 taking the room the waveform is the point of",
+                l.wave.height(),
+                rect.height()
+            );
+            // And more than twice the 96 points it used to get, on every
+            // screen big enough to hold the floor.
+            if size.y >= EXPORT_MIN.y {
+                assert!(
+                    l.wave.height() >= 2.0 * 96.0,
+                    "{size:?}: the wave is {:.0} points, no bigger than it was",
+                    l.wave.height()
+                );
+            }
+            // The playhead is measured on the WAVE and clamped, because a
+            // fraction outside 0..=1 is a rounding error at the end of a
+            // render and not a reason to draw off the window.
+            assert!((l.playhead(0.0) - l.wave.left()).abs() < 0.01);
+            assert!((l.playhead(1.0) - l.wave.right()).abs() < 0.01);
+            assert!((l.playhead(0.5) - l.wave.center().x).abs() < 0.01);
+            assert!((l.playhead(-3.0) - l.wave.left()).abs() < 0.01);
+            assert!((l.playhead(9.0) - l.wave.right()).abs() < 0.01);
+        }
+
+        // Squeezed under its own minimum — which the inline shell can do on a
+        // very short plugin editor. Nothing inverts and nothing escapes.
+        for h in [90.0_f32, 40.0, 10.0, 0.0] {
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, h));
+            let l = export_layout(rect);
+            for (what, r) in [("label", l.label), ("wave", l.wave), ("bar", l.bar)] {
+                assert!(
+                    r.height() >= -0.01 && r.width() >= -0.01,
+                    "at {h} points the {what} inverted: {r:?}"
+                );
+            }
+            assert!(l.label.bottom() <= l.wave.top() + 0.01, "at {h} points");
+            assert!(l.wave.bottom() <= l.bar.top() + 0.01, "at {h} points");
+        }
+    }
+
+    /// **The export window is readable on every theme, in both modes, or the
+    /// build fails.**
+    ///
+    /// The sweep `shell.rs` runs on the chrome, on the one window that is on
+    /// screen for minutes at a time and has just become the biggest thing
+    /// this app floats. Every colour is measured on the surface it lands on:
+    /// the label on the window's ground, the wave's ink on the WELL it is
+    /// drawn in and not on the ground beside it, and the playhead — the one
+    /// colour here with an identity of its own, and a luminance of 0.21,
+    /// which is inside the dead zone.
+    ///
+    /// The zero line is deliberately absent: it is `t.text` at a quarter
+    /// alpha, a guide rather than ink, and measuring a translucent colour as
+    /// though it were opaque would be measuring the wrong thing.
+    #[test]
+    fn every_theme_dresses_the_export_window() {
+        use crate::recorder_panel::contrast_ratio;
+        let themes = crate::theme::factory();
+        assert!(
+            themes.len() >= 19,
+            "the sweep expects the nineteen factory themes, found {}",
+            themes.len()
+        );
+        let mut bad: Vec<String> = Vec::new();
+        let mut swept = 0;
+        let mut reds = std::collections::HashSet::new();
+        for theme in &themes {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                set.dark_mode = dark;
+                // The two faces `show` can have remembered when the export
+                // window reads one: the desk's strip and the band's ground.
+                let strip = if dark {
+                    set.dark_role("fx_strip").map_or_else(
+                        || crate::mixer_panel::shade_face(set.fx_strip_color.to_color32(), 0.88),
+                        |c| c.to_color32(),
+                    )
+                } else {
+                    set.fx_strip_color.to_color32()
+                };
+                let band = crate::recorder_panel::palette(&set).bg;
+                let mode = if dark { "dark" } else { "light" };
+                for (which, face) in [("strip", strip), ("band", band)] {
+                    let t = theme_of(face);
+                    let head = playhead_ink(t.field_bg);
+                    let mut check = |what: &str, r: f32, floor: f32| {
+                        if r < floor {
+                            bad.push(format!(
+                                "{} {mode} ({which}): {what} {r:.2}:1",
+                                theme.name
+                            ));
+                        }
+                    };
+                    check("the label on the ground", contrast_ratio(t.text, t.bg), 4.5);
+                    check(
+                        "the wave on the well",
+                        contrast_ratio(t.text, t.field_bg),
+                        4.5,
+                    );
+                    // The wave's box has to be FINDABLE, or the waveform
+                    // floats in an unbounded rectangle. The well alone is
+                    // not enough — on Porcelain light, Phosphor dark and
+                    // Silverface dark it lands within 1.1:1 of the window's
+                    // own ground — so the box is drawn with a hairline and
+                    // it is the hairline that is measured, from both sides.
+                    check(
+                        "the wave's edge against the ground",
+                        contrast_ratio(t.button_border, t.bg),
+                        1.5,
+                    );
+                    check(
+                        "the wave's edge against the well",
+                        contrast_ratio(t.button_border, t.field_bg),
+                        1.5,
+                    );
+                    // The non-text floor: this is a one-point marker, not a
+                    // word. See `playhead_ink`.
+                    check("the playhead on the well", contrast_ratio(head, t.field_bg), 3.0);
+                    reds.insert((head.r(), head.g(), head.b()));
+                    swept += 1;
+                }
+            }
+        }
+        assert!(swept >= 19 * 2 * 2, "the sweep covered {swept} dressings");
+        assert!(
+            bad.is_empty(),
+            "the export window is unreadable:\n  {}",
+            bad.join("\n  ")
+        );
+        // **And it is still a RED playhead.** A walk that ran to the end
+        // would leave the marker as the body ink, and nobody would ever see
+        // a playhead again — so every answer has to read as red, and the
+        // shipped red itself has to survive untouched on the themes that can
+        // carry it (it does on thirty-three of the thirty-eight).
+        assert!(
+            reds.contains(&(0xE8, 0x3A, 0x4E)),
+            "the walk moved the playhead on every theme; it is no longer the \
+             colour it was designed as"
+        );
+        for (r, g, b) in &reds {
+            assert!(
+                *r > *g + 40 && *r > *b + 20,
+                "the playhead came out #{r:02X}{g:02X}{b:02X}, which is not red"
+            );
+        }
     }
 
     /// The export window wears the desk's face, not the retired ivory.

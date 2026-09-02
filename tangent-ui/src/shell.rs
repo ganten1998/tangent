@@ -253,6 +253,108 @@ pub fn inline_rect(ctx: &egui::Context, id: &str) -> Option<Rect> {
         .map(|(_, r)| r)
 }
 
+// ── how high a surface sits ─────────────────────────────────────────────────
+
+/// **How high a surface sits among this app's OWN windows.**
+///
+/// Every child surface here asks to float, and inside one window level the
+/// order is by most-recent order-front — `makeKeyAndOrderFront:` on macOS,
+/// `SetWindowPos` on Windows, a map request on X11. So whichever surface is
+/// revealed or focused LAST is the one in front, and a window that has to
+/// stay visible for the length of a render cannot win a race it re-runs
+/// every time anything else opens. The export window was losing it to the
+/// band's own "Rendering at full speed…" notice, which is born on the same
+/// frame and reveals on the next.
+///
+/// **There is no fourth level to promote into.** `winit` exposes exactly
+/// three (`AlwaysOnBottom`, `Normal`, `AlwaysOnTop`) and `egui` passes them
+/// straight through, so "put this one higher" is not a thing that can be
+/// said. The tier is therefore expressed from the other end: the surface
+/// that must not be covered keeps the floating level, and every OTHER
+/// surface of this app is put DOWN to `Normal` for as long as that claim is
+/// held. All three window managers order strictly by level first and
+/// front-to-back only WITHIN a level, so a sibling revealed later cannot
+/// come out in front however loudly it orders itself forward. It is a rule
+/// rather than a race, which is the whole difference: re-asserting the
+/// export window's own level on every sibling reveal would be the same race
+/// run once more, and `-[NSWindow setLevel:]` with the level it already has
+/// is not documented to reorder anything.
+///
+/// **What it costs.** A demoted surface shares the main window's level, so a
+/// press on the main window can put it behind — which is exactly the case
+/// [`SurfaceSpec::raise`] already exists to answer, and the app already asks
+/// for a raise on that press. On Windows the two levels are `HWND_TOPMOST`
+/// and `HWND_NOTOPMOST` and behave the same way. On X11 the level is
+/// `_NET_WM_STATE_ABOVE`, which a window manager MAY ignore: there a demoted
+/// surface can still land in front, and the `_NET_WM_WINDOW_TYPE` hint is
+/// the only other lever. That is a WM already ignoring the float every
+/// dialog in this app asks for, so it is not a new failure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SurfaceTier {
+    /// An ordinary floating surface: dialogs, menus, notices, the suite's
+    /// plugin windows. What everything here was before there was a tier.
+    #[default]
+    Floating,
+    /// **Nothing of this app's may cover it while it is up.**
+    ///
+    /// One customer: the export window, which reports on a render that can
+    /// run for minutes and is worth nothing the moment something lands on
+    /// top of it.
+    Uncovered,
+}
+
+impl SurfaceTier {
+    /// The inline equivalent. A layer has no window level, so the tier is
+    /// egui's own paint order: [`egui::Order::Tooltip`] is the band above
+    /// the `Foreground` every menu and dialog here uses, and unlike a
+    /// window level it is absolute — a later `Area` cannot get in front of
+    /// one in a higher order, so inline the claim needs no bookkeeping at
+    /// all.
+    fn inline_order(self, asked: egui::Order) -> egui::Order {
+        match self {
+            Self::Floating => asked,
+            Self::Uncovered => egui::Order::Tooltip,
+        }
+    }
+}
+
+fn tier_claim_id() -> egui::Id {
+    egui::Id::new("surface-uncovered-claim")
+}
+
+/// Who holds the [`SurfaceTier::Uncovered`] claim, if anyone.
+///
+/// One slot, because the claim is a statement about ALL of this app's
+/// surfaces and two of them cannot both be the one nothing may cover.
+///
+/// **Accepted one pass stale, on purpose.** The surfaces of a frame are
+/// drawn in whatever order the app happens to call them, and the export
+/// window is drawn LAST — after the dialogs, after the notice. A claim good
+/// only on the pass it was written would never be seen by the very surfaces
+/// it exists to hold down. One frame late is the right answer instead: the
+/// claim appears a frame after the export window opens and lapses a frame
+/// after it closes, and this window repaints at 30 Hz.
+fn uncovered_claim(ctx: &egui::Context, pass: u64) -> Option<egui::Id> {
+    ctx.memory(|m| m.data.get_temp::<(u64, egui::Id)>(tier_claim_id()))
+        .filter(|(p, _)| pass.saturating_sub(*p) <= 1)
+        .map(|(_, who)| who)
+}
+
+/// **The window level a surface asks for**, given what it wants and whether
+/// somebody else is holding the no-cover claim. See [`SurfaceTier`].
+///
+/// A pure table so the decision can be read and tested without a window
+/// manager: everything about the tier that can be checked headlessly is
+/// checked here, and the ordering it produces on a real screen is not
+/// something a unit test may claim to have proved.
+fn level_for(on_top: bool, tier: SurfaceTier, held_by_other: bool) -> egui::WindowLevel {
+    if on_top && (tier == SurfaceTier::Uncovered || !held_by_other) {
+        egui::WindowLevel::AlwaysOnTop
+    } else {
+        egui::WindowLevel::Normal
+    }
+}
+
 /// A pane that is an OS window on the desktop and a floating layer in a plugin.
 ///
 /// The fields are exactly the union of what the real callers set on a
@@ -314,6 +416,11 @@ pub struct SurfaceSpec<'a> {
     /// the desktop window borderless and draws the same bar on both paths,
     /// so they cannot drift; `None` is every surface that was here before.
     pub chrome: Option<Chrome>,
+    /// **How high this one sits among the app's own surfaces** — see
+    /// [`SurfaceTier`]. Distinct from `on_top`, which is a yes/no about
+    /// floating at all: this is which of two floating surfaces wins, and
+    /// `on_top: false` still beats any tier.
+    pub tier: SurfaceTier,
 }
 
 impl Default for SurfaceSpec<'_> {
@@ -333,6 +440,7 @@ impl Default for SurfaceSpec<'_> {
             order: egui::Order::Foreground,
             window_type: None,
             chrome: None,
+            tier: SurfaceTier::Floating,
         }
     }
 }
@@ -394,6 +502,22 @@ pub fn surface(
     let mut report = SurfaceReport::default();
     let mut body_wants_close = false;
     let chrome_id = egui::Id::new((spec.id, "chrome"));
+    // **The tier, settled once for both paths.** Read before anything is
+    // drawn, because the answer decides the level this surface is BORN at as
+    // well as the one it is told to hold — and because the claim has to be
+    // stamped whether this surface ends up a window or a layer, or a plugin
+    // editor would leave a stale claim holding every desktop dialog down.
+    let pass = ctx.cumulative_pass_nr();
+    let me = egui::Id::new(spec.id);
+    let held_by_other = uncovered_claim(ctx, pass).is_some_and(|who| who != me);
+    let want_level = level_for(spec.on_top, spec.tier, held_by_other);
+    // Claimed only while the claim is worth anything. A surface that has
+    // stood down for the OS's file panel (`on_top: false`) is not above
+    // anything, and holding the rest of the app at `Normal` on its behalf
+    // would cost them their float for no one's benefit.
+    if spec.tier == SurfaceTier::Uncovered && want_level == egui::WindowLevel::AlwaysOnTop {
+        ctx.memory_mut(|m| m.data.insert_temp(tier_claim_id(), (pass, me)));
+    }
     // **`size` is the BODY's size.** Every caller designed its panel to the
     // points it asked for; a bar of ours on top must be added to the
     // window, not taken out of the panel — taken out, every plugin window
@@ -421,7 +545,6 @@ pub fn surface(
         // Consecutive calls differ by exactly one pass — not drawing a surface
         // is what destroys it — so the gap is a reliable "this is new".
         let life = egui::Id::new(("surface-life", spec.id));
-        let pass = ctx.cumulative_pass_nr();
         // `(the pass it was born on, the last pass it was drawn on)`. Drawn on
         // the previous pass means the window is still there; a gap means this
         // one is brand new, because not drawing a surface is what destroys it.
@@ -443,11 +566,7 @@ pub fn surface(
             // A bar of ours under the OS's would be two title bars.
             .with_decorations(spec.decorated && spec.chrome.is_none())
             .with_resizable(spec.resizable)
-            .with_window_level(if spec.on_top {
-                egui::WindowLevel::AlwaysOnTop
-            } else {
-                egui::WindowLevel::Normal
-            })
+            .with_window_level(want_level)
             .with_active(spec.takes_focus)
             .with_visible(existing)
             .with_inner_size(outer(spec.size))
@@ -493,10 +612,22 @@ pub fn surface(
                 // under the Setup window it was reporting on, and under the
                 // desktop's own panels. The owner saw a device-change message
                 // appear below the panel he had just changed the device in.
-                if spec.on_top && (revealing || spec.raise) {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                        egui::WindowLevel::AlwaysOnTop,
-                    ));
+                //
+                // **And asked for again whenever the answer CHANGES**, which
+                // is what a tier needs: a surface that was floating and has
+                // been put down under a [`SurfaceTier::Uncovered`] claim must
+                // be told so on a frame that is neither its reveal nor a
+                // raise. Remembering the last level sent keeps that to one
+                // command per transition rather than one every frame.
+                let level_id = egui::Id::new((spec.id, "surface-level"));
+                let sent = ui
+                    .ctx()
+                    .memory(|m| m.data.get_temp::<egui::WindowLevel>(level_id));
+                if revealing || spec.raise || sent != Some(want_level) {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::WindowLevel(want_level));
+                    ui.ctx()
+                        .memory_mut(|m| m.data.insert_temp(level_id, want_level));
                 }
                 // **Focus, separately, and only for surfaces that want it.**
                 // `with_active` is creation-time and an invisible window is not
@@ -549,7 +680,6 @@ pub fn surface(
     let screen = ctx.content_rect();
     // What the bar and the grip did to this layer on earlier frames — only
     // a chrome surface has either, so only a chrome surface remembers.
-    let pass = ctx.cumulative_pass_nr();
     let state_id = egui::Id::new((spec.id, "inline-chrome"));
     let mut state = spec.chrome.map(|_| {
         ctx.memory(|m| m.data.get_temp::<InlineChromeState>(state_id))
@@ -603,7 +733,10 @@ pub fn surface(
     }
 
     egui::Area::new(egui::Id::new(spec.id))
-        .order(spec.order)
+        // The tier, inline: a layer's height is its paint order, and
+        // `Order` is absolute in a way a window level is not. See
+        // [`SurfaceTier::inline_order`].
+        .order(spec.tier.inline_order(spec.order))
         .fixed_pos(rect.min)
         .show(ctx, |ui| {
             ui.set_clip_rect(rect);
@@ -909,6 +1042,140 @@ mod tests {
             },
         );
         assert!(report.close, "the body asked to close and was ignored");
+    }
+
+
+    // ── how high a surface sits ─────────────────────────────────────────────
+
+    /// **The tier's whole rule, as a table.**
+    ///
+    /// One surface may say "nothing of ours covers me"; everything else goes
+    /// down to the ordinary level while it does. The two ways to get this
+    /// wrong are to leave a sibling floating (the bug: the notice landing on
+    /// the export waveform) and to put the claimant itself down along with
+    /// the rest.
+    ///
+    /// A unit test on a level is NOT a proof that the windows stack that way
+    /// on a screen — the window manager has the last word and no headless
+    /// test can ask it. What it does prove is that the right level is asked
+    /// for in every combination, which is the half of this that lives in
+    /// this crate.
+    #[test]
+    fn the_uncovered_tier_puts_every_other_surface_down_and_never_itself() {
+        use egui::WindowLevel::{AlwaysOnTop, Normal};
+        // Nobody claiming: every floating surface floats, exactly as before
+        // the tier existed.
+        assert_eq!(level_for(true, SurfaceTier::Floating, false), AlwaysOnTop);
+        assert_eq!(level_for(true, SurfaceTier::Uncovered, false), AlwaysOnTop);
+        // Somebody else claiming: the ordinary surfaces go down...
+        assert_eq!(level_for(true, SurfaceTier::Floating, true), Normal);
+        // ...and the claimant does not, which is the point. Two claimants at
+        // once is not a state this app can reach, but neither of them may be
+        // put down by the other's claim if it ever does.
+        assert_eq!(level_for(true, SurfaceTier::Uncovered, true), AlwaysOnTop);
+        // `on_top: false` still wins over any tier. It is the one moment a
+        // surface must NOT float — the OS's own file panel is up, parented
+        // to the main window, and nothing else can get in front of it.
+        for tier in [SurfaceTier::Floating, SurfaceTier::Uncovered] {
+            for held in [false, true] {
+                assert_eq!(
+                    level_for(false, tier, held),
+                    Normal,
+                    "{tier:?} floated over a native panel (claim held: {held})"
+                );
+            }
+        }
+        // Inline the tier is a paint order, and Tooltip really is above the
+        // Foreground every menu and dialog here uses.
+        assert_eq!(
+            SurfaceTier::Floating.inline_order(egui::Order::Foreground),
+            egui::Order::Foreground
+        );
+        assert_eq!(
+            SurfaceTier::Uncovered.inline_order(egui::Order::Foreground),
+            egui::Order::Tooltip
+        );
+        assert!(
+            egui::Order::Tooltip > egui::Order::Foreground,
+            "the inline tier does not actually paint above the dialogs"
+        );
+        // A floating surface keeps whatever order it asked for — the submenu
+        // sits above the menu by asking, and the tier must not flatten that.
+        assert_eq!(
+            SurfaceTier::Floating.inline_order(egui::Order::Middle),
+            egui::Order::Middle
+        );
+    }
+
+    /// **The claim reaches the sibling, and it lapses.**
+    ///
+    /// The end-to-end half: run `surface` the way the app does and read the
+    /// level it actually asks the host for. The order matters — the app
+    /// draws its dialogs and its notice BEFORE the export window, so a
+    /// sibling reads a claim written on the previous pass, which is why
+    /// `uncovered_claim` accepts one that is a pass old.
+    ///
+    /// It has to lapse too, or an export that finished would hold every
+    /// dialog in the app at the ordinary level for the rest of the session.
+    #[test]
+    fn a_no_cover_claim_reaches_the_next_frames_siblings_and_then_lapses() {
+        use egui::WindowLevel::{AlwaysOnTop, Normal};
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
+        let top = SurfaceSpec {
+            id: "test-uncovered",
+            size: Vec2::new(600.0, 400.0),
+            tier: SurfaceTier::Uncovered,
+            ..Default::default()
+        };
+        let sibling = SurfaceSpec {
+            id: "test-sibling",
+            size: Vec2::new(300.0, 200.0),
+            ..Default::default()
+        };
+        // What level was asked for on this frame. `Caps::DESKTOP` takes the
+        // window path; with no viewport renderer attached egui runs the body
+        // inline and the commands land on the root's output, which is
+        // exactly the list eframe would hand to winit.
+        let run = |spec: &SurfaceSpec<'_>| -> Vec<egui::WindowLevel> {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    surface(ctx, Caps::DESKTOP, spec, &mut |_ui, _close| {});
+                },
+            );
+            out.viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|vp| {
+                    vp.commands
+                        .iter()
+                        .filter_map(|c| match c {
+                            egui::ViewportCommand::WindowLevel(l) => Some(*l),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        // The claimant asks to float, and stamps the claim.
+        assert_eq!(run(&top), vec![AlwaysOnTop], "the claimant did not float");
+        // The very next frame, a sibling that asked to float is put down.
+        // This is the notice that used to land on the waveform.
+        assert_eq!(
+            run(&sibling),
+            vec![Normal],
+            "a sibling still floated over a surface nothing may cover"
+        );
+        // And with the claimant gone a frame, it comes back up on its own.
+        assert_eq!(
+            run(&sibling),
+            vec![AlwaysOnTop],
+            "the claim outlived the surface that made it"
+        );
     }
 
     // ── the in-house chrome ─────────────────────────────────────────────────
