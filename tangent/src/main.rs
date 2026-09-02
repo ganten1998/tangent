@@ -79,6 +79,14 @@ mod record;
 /// which a Minimal build has.
 #[cfg(feature = "recorder")]
 mod transport;
+/// Standalone DSP kernels for the coming plugin suite. Deliberately not yet
+/// reachable from any UI: each kernel is proven by its own tests first and
+/// wired into a product second, so nothing in there may assume an engine, a
+/// window or a settings file. Ungated, because it links nothing a Minimal
+/// build lacks — and compiling it there keeps that true. The allow covers
+/// exactly the proven-but-unwired gap, nothing else.
+#[allow(dead_code)]
+mod units;
 
 /// Every plugin the picker should offer: VST3 bundles, and LV2 where there is
 /// an LV2 world to ask.
