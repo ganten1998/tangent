@@ -41,8 +41,8 @@ pub struct StripView<'a> {
     /// What feeds a general channel, for its icon. `None` on everything else
     /// and on an unused channel.
     pub kind: Option<crate::recorder::ChannelKind>,
-    /// The channel's CHOSEN badge: 0 follows the kind; the rest name rows
-    /// of `recorder_panel::ICONS` — the Track menu's picker, 25 wide.
+    /// The channel's CHOSEN badge: 0 draws whatever [`auto_icon`] says the
+    /// strip is worth; the rest name rows of `recorder_panel::ICONS`.
     pub icon: u8,
     /// Index into [`STRIP_COLORS`]. Zero is the desk's own wood.
     pub color: usize,
@@ -2089,6 +2089,34 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
     }
 }
 
+/// **What a strip draws when nobody has chosen a badge for it.**
+///
+/// A pure function of what the strip IS, so the answer can be pinned by a
+/// test rather than inferred from a painter. It was a `match` inside the
+/// painting code, and what it matched on was the channel's KIND: a keyboard
+/// for MIDI, a microphone for audio, a waveform for a clip lane with nothing
+/// live on it. The owner's call is that the split is gone. Every track draws
+/// the WAVE whatever it carries - a track that is MIDI today and audio
+/// tomorrow should not change its picture underneath you, and the badge is
+/// there to be chosen if a user wants it to say more than "track".
+///
+/// The two buses keep pictures of their own, because they are not tracks and
+/// there is nothing to choose for them: the drum bus wears the kit and the
+/// click wears the metronome. A FOLDER answers `None` on purpose - the
+/// owner's "leave the main icon empty for users to choose" - and so does
+/// anything with no source at all, the master included.
+pub(crate) fn auto_icon(strip: Option<Strip>, is_folder: bool) -> Option<crate::icons::Icon> {
+    if is_folder {
+        return None;
+    }
+    match strip {
+        Some(Strip::Channel(_)) => Some(crate::recorder_panel::DEFAULT_TRACK_ICON),
+        Some(Strip::Drums) => Some(crate::icons::Icon::Drumset),
+        Some(Strip::Click) => Some(crate::icons::Icon::Metronome),
+        _ => None,
+    }
+}
+
 fn strip(
     painter: &Painter,
     l: &StripStrip,
@@ -2267,45 +2295,26 @@ fn strip(
             p.engrave,
         );
     }
-    // A chosen badge beats the kind's own icon on a channel strip. An
-    // unknown code (a NEWER install's desk) falls through to the kind
-    // rather than drawing nothing.
+    // A chosen badge beats the strip's own picture, and only a CHANNEL can
+    // wear one - the buses always draw for themselves. A code this build has
+    // no drawing for (a NEWER install's desk) falls through to `auto_icon`
+    // rather than leaving the spot blank.
     let badge = v.icon != 0
         && matches!(v.strip, Some(Strip::Channel(_)))
         && crate::recorder_panel::draw_badge(painter, l.icon, ink, face, v.icon);
     let named = if badge {
         true
-    } else if v.is_folder {
-        // A folder with no chosen badge keeps its icon spot EMPTY - the
-        // owner's "leave the main icon empty for users to choose". The
-        // picker still answers a press there.
-        true
     } else {
-        match (v.strip, v.kind) {
-        // A general channel's icon IS its kind, which is why clicking it
-        // cycles: the keyboard says MIDI, the microphone says AUDIO.
-        (Some(Strip::Channel(_)), Some(crate::recorder::ChannelKind::Midi)) => {
-            crate::recorder_panel::draw_instrument_icon(painter, l.icon, ink);
-            true
-        }
-        (Some(Strip::Channel(_)), Some(crate::recorder::ChannelKind::Audio)) => {
-            crate::recorder_panel::draw_microphone(painter, l.icon, ink);
-            true
-        }
-        (Some(Strip::Drums), _) => {
-            crate::recorder_panel::draw_drum(painter, l.icon, ink, face);
-            true
-        }
-        (Some(Strip::Click), _) => {
-            crate::recorder_panel::draw_metronome_on(painter, l.icon, ink, face);
-            true
-        }
-        // A CLIP lane: used, no live source — the waveform is what is on it.
-        (Some(Strip::Channel(_)), None) => {
-            crate::recorder_panel::draw_waveform_icon(painter, l.icon, ink);
-            true
-        }
-        _ => false,
+        match auto_icon(v.strip, v.is_folder) {
+            Some(icon) => {
+                crate::icons::draw(painter, l.icon, ink, icon);
+                true
+            }
+            // A folder with no chosen badge keeps its icon spot EMPTY - the
+            // owner's "leave the main icon empty for users to choose". The
+            // picker still answers a press there. So does the master, which
+            // has no icon rect at all.
+            None => v.is_folder,
         }
     };
     let _ = named;
@@ -3418,6 +3427,146 @@ mod tests {
 
     fn rect() -> Rect {
         Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1300.0, 420.0))
+    }
+
+    /// **WAVE is the default badge, for a MIDI track and an audio one alike.**
+    ///
+    /// This is the behaviour the owner asked for and the one a later edit is
+    /// most likely to undo, because undoing it looks like a fix: the strip
+    /// KNOWS whether a channel is MIDI or audio, so branching on it is the
+    /// obvious thing to write, and the app did exactly that until now - a
+    /// keyboard for MIDI, a microphone for audio, a waveform for a clip lane
+    /// with nothing live on it. Three pictures for one thing. Both kinds are
+    /// named here so that restoring the split fails on the case that made the
+    /// owner ask, rather than on some abstract invariant.
+    #[test]
+    fn a_track_with_no_chosen_badge_draws_the_wave_whatever_it_carries() {
+        use crate::icons::Icon;
+        for kind in [
+            Some(crate::recorder::ChannelKind::Midi),
+            Some(crate::recorder::ChannelKind::Audio),
+            // A CLIP lane: used, and with no live source at all.
+            None,
+        ] {
+            let mut v = a_strip(Some(Strip::Channel(0)), false);
+            v.kind = kind;
+            assert_eq!(
+                auto_icon(v.strip, v.is_folder),
+                Some(Icon::Wave),
+                "a {kind:?} track drew something other than the wave"
+            );
+        }
+        // The two buses keep pictures of their own, and a folder stays empty.
+        assert_eq!(auto_icon(Some(Strip::Drums), false), Some(Icon::Drumset));
+        assert_eq!(auto_icon(Some(Strip::Click), false), Some(Icon::Metronome));
+        assert_eq!(auto_icon(Some(Strip::Channel(0)), true), None, "a folder drew a badge");
+        assert_eq!(auto_icon(None, false), None, "the master drew a badge");
+        // And the default is spelt in ONE place, which is what the strip and
+        // the arrangement both read.
+        assert_eq!(crate::recorder_panel::DEFAULT_TRACK_ICON, Icon::Wave);
+    }
+
+    /// **The badge fills its seat and still clears everything around it.**
+    ///
+    /// The owner's acceptance criterion is "big enough to see, and nothing
+    /// cut off", and the new drawings are trimmed to their own bounds - they
+    /// use their whole seat, where every vector badge they replace inset
+    /// itself by a tenth. So the clearances that were comfortable by accident
+    /// have to be measured rather than assumed.
+    ///
+    /// The one that looked alarming and is not: the badge's seat reaches
+    /// about a point PAST the band it was laid out in, at every window
+    /// height. On a channel that is still points clear of the input chip
+    /// below it. On the two buses the seat overlaps the detail row outright -
+    /// and the detail row of a bus is empty (`app.rs` gives DRUM BUS and
+    /// CLICK no second line), so nothing is drawn there to collide with. If
+    /// a bus is ever given a second line, this test is what fails.
+    #[test]
+    fn the_strip_badge_clears_the_name_above_it_and_the_chip_below() {
+        let mut worst = f32::MAX;
+        for h in [340.0_f32, 420.0, 520.0, 640.0, 780.0, 1000.0, 1400.0] {
+            let v = a_view();
+            let l = Layout::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, h)), &v);
+            for (i, s) in l.strips.iter().enumerate() {
+                if !s.icon.is_positive() {
+                    continue;
+                }
+                // What is actually PAINTED, letterboxing and the clear margin
+                // the assets carry included - not the seat it was handed.
+                let seat = crate::icons::fitted(s.icon);
+                let pad = seat.height() * 8.0 / 192.0;
+                let ink = seat.shrink(pad);
+                assert!(
+                    s.icon.contains_rect(seat),
+                    "h={h}: strip {i} paints outside its seat"
+                );
+                assert!(
+                    ink.top() > s.name.bottom(),
+                    "h={h}: strip {i} badge overlaps its own name"
+                );
+                // A bus draws nothing in its detail row, so only a strip with
+                // a real chip under it has something to collide with.
+                if s.input_chip.is_positive() {
+                    let gap = s.input_chip.top() - ink.bottom();
+                    assert!(gap > 0.0, "h={h}: strip {i} badge overlaps the input chip by {:.2}", -gap);
+                    worst = worst.min(gap);
+                }
+                // And it is not a speck: the seat takes most of the band it
+                // was given, which is what "big enough to see" means here.
+                let band = s.icon.width().min(s.icon.height());
+                assert!(band >= 11.0, "h={h}: strip {i} badge is only {band:.1}pt");
+            }
+        }
+        assert!(
+            worst.is_finite() && worst > 1.0,
+            "the tightest badge-to-chip gap is {worst:.2}pt"
+        );
+    }
+
+    /// **A tinted icon is legible on the strip it lands on, every theme,
+    /// both modes.**
+    ///
+    /// The badge takes the same ink the strip's own labels take, and the
+    /// ground it lands on is the CHANNEL's colour, not the theme's face - a
+    /// desk somebody painted, run through the dead-zone guard. That pairing
+    /// is the one this file has got wrong before (the icon and the decibel
+    /// readout went dark on dark when the desk got colours), and a mask has
+    /// no colour of its own to fall back on, so if the ink disappears the
+    /// icon disappears completely rather than becoming hard to read.
+    ///
+    /// 3.0 rather than 4.5: a badge is a picture, and the floor the rest of
+    /// this app holds its graphic marks to is 3.0. Failures are collected so
+    /// a run names every theme that is wrong rather than the first.
+    #[test]
+    fn every_theme_tints_a_badge_legibly_on_every_colour_a_strip_can_be() {
+        let mut bad: Vec<String> = Vec::new();
+        let themes = crate::theme::factory();
+        assert!(themes.len() >= 16, "only {} themes to sweep", themes.len());
+        for t in &themes {
+            let Some(strip) = t.fx_strip else { continue };
+            let mut v = a_view();
+            v.fx_strip = strip.to_color32();
+            for dark in [false, true] {
+                v.dark_mode = dark;
+                let p = ink(&v);
+                let mode = if dark { "dark" } else { "light" };
+                for colour in 0..MANUAL_COLORS {
+                    // Exactly what `strip` does with a painted channel.
+                    let face = if colour == 0 {
+                        p.face
+                    } else {
+                        let (r, g, b) = STRIP_COLORS[colour];
+                        crate::recorder_panel::legible_surface(Color32::from_rgb(r, g, b))
+                    };
+                    let solid = flatten(face, p.wood);
+                    let c = crate::recorder_panel::contrast_ratio(print_on(solid, &p), solid);
+                    if c < 3.0 {
+                        bad.push(format!("{} {mode} colour {colour}: {c:.2}:1", t.name));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "a badge is invisible on {} pairings:\n{}", bad.len(), bad.join("\n"));
     }
 
     /// **Every control on the desk has words, and they name their strip.**

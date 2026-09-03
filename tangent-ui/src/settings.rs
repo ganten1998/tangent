@@ -1164,10 +1164,12 @@ pub struct Settings {
     /// `recorder::ChannelKind` — kept as bytes so a hand-edited file cannot
     /// hold a kind this build has no picture for.
     pub channel_kinds: [u8; crate::recorder::CHANNELS],
-    /// Each channel's chosen BADGE: 0 follows the kind (instrument, mic,
-    /// waveform); every other code names a row of
-    /// `recorder_panel::ICONS` - twenty-five badges now, drum to line-in -
-    /// and the Track menu's picker writes it.
+    /// Each channel's chosen BADGE: 0 is "not chosen", and a track with 0
+    /// draws the wave whatever it carries; every other code names a row of
+    /// `recorder_panel::ICONS`, and the Track menu's picker writes it.
+    ///
+    /// Clamped to `ICON_MAX` on load, so a file written by a newer build
+    /// lands on a badge this one can draw rather than on nothing.
     pub channel_icons: [u8; crate::recorder::CHANNELS],
     /// The three effect knobs, 0..=1. All off by default: a first launch has to
     /// sound like the instrument, not like a room.

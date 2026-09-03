@@ -24,6 +24,8 @@ pub mod drumpad_panel;
 pub mod fonts;
 pub mod fretboard_panel;
 pub mod host;
+/// The instrument icon set: raw coverage, tinted by the caller.
+pub mod icons;
 pub mod keys;
 pub mod menu;
 pub mod midi_event;
