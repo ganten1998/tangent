@@ -9097,25 +9097,27 @@ impl TangentApp {
     /// so it is the same desk on every machine and every launch — and so
     /// that seeding the template can never capture a session.
     pub fn template_desk() -> crate::arrangement::DeskSnap {
-        use crate::recorder::{Strip, INSERTS};
+        use crate::recorder::INSERTS;
         let mut s = Settings::default();
         let need = (crate::recorder::STRIPS + 1 + crate::recorder::DRUM_PADS) * INSERTS;
         if s.strip_inserts.len() < need {
             s.strip_inserts.resize(need, String::new());
         }
-        let put = |s: &mut Settings, ch: usize, path: &str| {
-            let at = Strip::Channel(ch).index() * INSERTS;
-            if let Some(slot) = s.strip_inserts.get_mut(at) {
-                *slot = path.to_owned();
-            }
-            if let Some(k) = s.channel_kinds.get_mut(ch) {
-                *k = crate::recorder::ChannelKind::as_u8(Some(
-                    crate::recorder::ChannelKind::Midi,
-                ));
-            }
-        };
-        put(&mut s, 0, crate::dialogs::BUILTIN_PATH);
-        put(&mut s, 1, crate::dialogs::DRUMPAD_PATH);
+        // **The two instruments are NOT placed again here.**
+        //
+        // They used to be — `BUILTIN_PATH` onto channel 0 and `DRUMPAD_PATH`
+        // onto channel 1, right after the `Settings::default()` that had
+        // already put them somewhere. Two copies of one fact, and the day the
+        // owner asked for the kit to come first the copies disagreed: the
+        // settings said drums-then-DX7 and this said the reverse, so the
+        // template overwrote the default on the first launch and wrote itself
+        // back to disk. What that looked like was a desk whose drum BADGE sat
+        // on the row holding the DX7 — the badge is derived from where the
+        // drumpad is and had believed the settings.
+        //
+        // This function's own doc already said it is built from
+        // `Settings::default()`. It is, now, and the test beside it holds the
+        // two together.
         let mut d = Self::desk_snapshot_of(&s);
         // Two rows, and only two.
         d.tracks_added = 0b11;
@@ -41586,13 +41588,35 @@ mod folder_tests {
     fn the_template_desk_is_the_shipped_one_whatever_is_on_screen() {
         use crate::recorder::{Strip, CHANNELS, INSERTS};
         let d = TangentApp::template_desk();
-        // Two rows, and only two: the built-in on one, the drums on two.
+        // Two rows, and only two: the drums on one, the built-in on two.
         assert_eq!(d.tracks_added, 0b11, "the template is not two tracks");
         let bay = |ch: usize| d.inserts[Strip::Channel(ch).index() * INSERTS].as_str();
-        assert_eq!(bay(0), crate::dialogs::BUILTIN_PATH, "channel 1 is not the DX7");
-        assert_eq!(bay(1), crate::dialogs::DRUMPAD_PATH, "channel 2 is not the drums");
+        assert_eq!(bay(0), crate::dialogs::DRUMPAD_PATH, "channel 1 is not the drums");
+        assert_eq!(bay(1), crate::dialogs::BUILTIN_PATH, "channel 2 is not the DX7");
         for ch in 2..CHANNELS {
             assert!(bay(ch).is_empty(), "channel {} came with a plugin", ch + 1);
+        }
+
+        // **And it is the SETTINGS' desk, not a second copy of it.** It was a
+        // second copy — this function placed both instruments again after
+        // `Settings::default()` had — and the day the shipped order changed,
+        // the copy did not. What shipped was a template that overwrote the
+        // default on first launch and put the drum badge on the row holding
+        // the DX7. Held together here so the two cannot drift again.
+        let shipped = crate::settings::Settings::default();
+        for ch in 0..CHANNELS {
+            let at = Strip::Channel(ch).index() * INSERTS;
+            assert_eq!(
+                bay(ch),
+                shipped.strip_inserts.get(at).map_or("", String::as_str),
+                "channel {} differs between the template and the shipped desk",
+                ch + 1
+            );
+            assert_eq!(
+                d.kinds[ch], shipped.channel_kinds[ch],
+                "channel {}'s KIND differs between the template and the shipped desk",
+                ch + 1
+            );
         }
 
         // **And it does not move with the session.** A desk with eight
