@@ -849,6 +849,19 @@ pub struct TangentApp {
     clips_dirty: bool,
     /// A file the app wants the host to raise a SAVE panel for.
     save_request: Option<crate::ports::SaveRequest>,
+    /// The clip ids a raised `SavePurpose::ExportMidi` panel is standing for.
+    ///
+    /// **Frozen when the row is pressed, not re-read when the panel answers.**
+    /// The panel is asynchronous — the host raises it out in `after_frame`,
+    /// several frames after the request is parked, and it blocks for as long
+    /// as somebody takes to name a file. The selection is live the whole
+    /// time: a click on the timeline behind the panel, or a project loaded
+    /// while it stands, and `arr_multi` is a different set by the time
+    /// `finish_save_choice` runs. Exporting whatever happens to be selected
+    /// THEN would write a file that has nothing to do with the menu row the
+    /// user pressed. The same reason `cartridge_pick_strip` exists one field
+    /// road along, and stated again because this one carries a list.
+    midi_export: Vec<u64>,
     /// A press landed on the timeline and the button is still down: the
     /// locate follows the hand. See `recorder_panel::timeline_fraction`.
     timeline_scrub: bool,
@@ -1651,6 +1664,29 @@ struct Grab {
 ///
 /// A slot holds a PATH, and a bundle path under a channel is the sort of detail
 /// that makes an app look like it is showing you its insides.
+/// What one row of the clip menu means.
+///
+/// **The menu's rows are conditional and its dispatch was positional**, which
+/// is a fault waiting for its first new row: `rows[0]` was Delete and
+/// `rows[1]` was Copy, hard-coded two hundred lines from the function that
+/// built the labels, with no test anywhere on the pairing. Insert a row
+/// anywhere but the end and Delete quietly becomes Copy — and the row that
+/// was about to be inserted is offered only sometimes, so it would have been
+/// right on a MIDI clip and wrong on an audio one.
+///
+/// So the label and the meaning travel together now, out of
+/// [`TangentApp::clip_menu_rows_for`], and the painter and the press handler
+/// read the same list. There is no index left to get wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipMenuAction {
+    Delete,
+    Copy,
+    CycleStretch,
+    ResetStretch,
+    /// Write the acting set's MIDI clips out, one `.mid` per track.
+    ExportMidi,
+}
+
 /// A gesture in flight on the arrangement. What the press grabbed, and the
 /// figures the drag needs to stay relative — the band's own rule: a press
 /// never makes the thing jump to the pointer.
@@ -2167,6 +2203,67 @@ fn default_armed(settings: &crate::settings::Settings) -> u32 {
         .map_or(0, |n| 1 << n)
 }
 
+/// The name at the end of a path, for a message. Empty when there is none.
+fn leaf(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// `path`, guaranteed to end in `.mid`.
+///
+/// **Appended rather than replaced**, which matters for a name with a dot in
+/// it: `set_file_name` on "Take 2.1" would turn it into "Take 2.mid" and lose
+/// the part somebody typed. A name that already ends in `.mid` is left alone,
+/// case-insensitively, because a save panel on Windows may well hand back
+/// `.MID`. Anything else — no extension, or `.midi`, or `.1` — gets `.mid`
+/// added, so the file the user meant to keep is still identifiable and the OS
+/// still knows what it is.
+fn with_mid_extension(path: &std::path::Path) -> std::path::PathBuf {
+    let already = path
+        .extension()
+        .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("mid"));
+    if already {
+        return path.to_path_buf();
+    }
+    let mut name = path.file_name().map(std::ffi::OsString::from).unwrap_or_default();
+    name.push(".mid");
+    path.with_file_name(name)
+}
+
+/// `dir/<stem>.mid` if nothing is there, else `dir/<stem> 2.mid`,
+/// `<stem> 3.mid`…
+///
+/// **The Finder's own suffix**, the same one `desktop::unique_ir_stem`
+/// chooses, so a file this app declines to overwrite reads like something a
+/// person named rather than something a program mangled.
+///
+/// This is the SIBLING path, and it does not overwrite for a reason the
+/// single-file path does not share: the save panel confirmed exactly one
+/// name, and every other file this export writes was never shown to anybody.
+/// Silently replacing one of those is silently destroying a file the user has
+/// not been asked about. The stems export DOES clobber — `remove_file` before
+/// every WAV — and that is right there and wrong here: a stems folder is the
+/// app's own, an export folder is the user's.
+///
+/// Consulted, never locked, and it gives up at a hundred, both exactly as the
+/// IR namer does: two processes racing for one name is not a situation this
+/// app can be in, and a hundred files called the same thing is somebody who
+/// wants the overwrite.
+fn unused_mid(dir: &std::path::Path, stem: &str) -> std::path::PathBuf {
+    let first = dir.join(format!("{stem}.mid"));
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..100u32 {
+        let candidate = dir.join(format!("{stem} {n}.mid"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
 fn plugin_display_name(path: &str) -> &str {
     if path == dialogs::BUILTIN_PATH {
         return "TANGENT DX7";
@@ -2600,6 +2697,7 @@ impl TangentApp {
             project_doc: std::path::PathBuf::new(),
             clips_dirty: false,
             save_request: None,
+            midi_export: Vec::new(),
             timeline_scrub: false,
             viewport_pan: None,
             arrangement_open: false,
@@ -8937,6 +9035,23 @@ impl TangentApp {
                 && lane < crate::recorder::CHANNELS
                 && self.track_on_clipboard(),
             icon: self.settings.channel_icons.get(lane).copied().unwrap_or(0),
+            // Counted here rather than tested in the dialog, because the
+            // dialog has no arrangement to look at — and counted at OPEN
+            // rather than per frame, which is what makes it a plain number
+            // this window can hold. The guard on `native_file_dialogs` is the
+            // one `arr_export_midi` states: no OS panel, no export, so no row
+            // about one.
+            midi_clips: if self.caps.native_file_dialogs {
+                self.arrangement
+                    .clips
+                    .iter()
+                    .filter(|c| {
+                        c.lane == lane && c.kind == crate::arrangement::ClipKind::Midi
+                    })
+                    .count()
+            } else {
+                0
+            },
         });
     }
 
@@ -11699,31 +11814,19 @@ impl TangentApp {
         // Every note, at its place on the TIMELINE, with each clip's own
         // loop already spelled out — gluing a repeating clip has to keep the
         // repeats, or the sound changes.
+        //
+        // **The expansion itself moved out**, to
+        // `arrangement::clip_notes_in_song_time`, which is where its argument
+        // now lives: this was one of three copies of the same schedule, and
+        // the MIDI export was about to be a fourth. What stays here is the
+        // one thing that is glue's and not the export's — the rebase to
+        // `start`, because a glued clip's notes are measured from the clip
+        // and an exported file's are measured from 0:00.
         let mut notes: Vec<crate::arrangement::ArrNote> = Vec::new();
         for c in &picked {
-            let passes: usize = if c.loop_s > 1.0e-6 {
-                ((c.len_s / c.loop_s).ceil() as usize).clamp(1, 4_096)
-            } else {
-                1
-            };
-            for pass in 0..passes {
-                let shift = c.loop_s * pass as f64;
-                for n in &c.notes {
-                    let at = n.at_s - c.offset_s + shift;
-                    if at < -1.0e-9 {
-                        continue;
-                    }
-                    if c.loop_s > 1.0e-6 && at >= c.len_s - 1.0e-9 {
-                        continue;
-                    }
-                    notes.push(crate::arrangement::ArrNote {
-                        at_s: c.start_s + at - start,
-                        dur_s: n.dur_s,
-                        key: n.key,
-                        vel: n.vel,
-                    });
-                }
-            }
+            notes.extend(crate::arrangement::clip_notes_in_song_time(c).into_iter().map(
+                |n| crate::arrangement::ArrNote { at_s: n.at_s - start, ..n },
+            ));
         }
         notes.sort_by(|a, b| {
             a.at_s.partial_cmp(&b.at_s).unwrap_or(std::cmp::Ordering::Equal)
@@ -11811,26 +11914,104 @@ impl TangentApp {
         }
     }
 
-    /// What the clip menu offers for `id`.
+    /// What the clip menu offers for `id`: each row's label, and what it
+    /// DOES.
     ///
-    /// **Two rows for anything, four for a stretched audio clip.** The two
-    /// stretch rows are not offered on a clip nobody has stretched: a menu
-    /// that lists an algorithm for a clip playing at its own speed is a menu
-    /// asking a question that has no answer.
-    fn clip_menu_labels(&self, id: u64) -> Vec<String> {
-        let mut out = vec!["Delete take".to_owned(), "Copy take".to_owned()];
+    /// **Two rows for anything, two more on a stretched audio clip, and one
+    /// more again when the set holds MIDI.** The stretch rows are not offered
+    /// on a clip nobody has stretched: a menu that lists an algorithm for a
+    /// clip playing at its own speed is a menu asking a question that has no
+    /// answer. Export is not offered on a set with no MIDI in it, for the
+    /// same reason.
+    ///
+    /// **The action travels WITH the label, and that is the point of this
+    /// function.** It used to return `Vec<String>` and the press handler
+    /// matched on `rows[0]`, `rows[1]`, `rows.get(2)`, `rows.get(3)` — a
+    /// positional contract between two functions two hundred lines apart,
+    /// with not one test on it anywhere. Every row here is conditional on
+    /// something, so inserting a row in the middle silently re-points Delete
+    /// onto Copy: the most destructive row in the app, aimed by an index.
+    /// Adding Export was the change that would have done it. Now the painter
+    /// and the hit test read the same list and the two cannot disagree —
+    /// which is exactly the argument [`Self::clip_menu_rows`] already makes
+    /// for the geometry, applied to the meaning.
+    ///
+    /// Export goes LAST on purpose, under the separator's business end:
+    /// Delete and Copy are the rows the hand already knows where to find,
+    /// and a row that comes and goes must not move them.
+    fn clip_menu_rows_for(&self, id: u64) -> Vec<(String, ClipMenuAction)> {
+        let mut out = vec![
+            ("Delete take".to_owned(), ClipMenuAction::Delete),
+            ("Copy take".to_owned(), ClipMenuAction::Copy),
+        ];
         let stretched = self.arrangement.clips.iter().find(|c| {
             c.id == id
                 && c.kind == crate::arrangement::ClipKind::Audio
                 && (c.stretch - 1.0).abs() > 1.0e-9
         });
         if let Some(c) = stretched {
-            out.push(
+            out.push((
                 crate::arrangement::stretch_mode_label(&c.stretch_mode).to_owned(),
-            );
-            out.push(format!("Reset stretch ({:.0}%)", c.stretch * 100.0));
+                ClipMenuAction::CycleStretch,
+            ));
+            out.push((
+                format!("Reset stretch ({:.0}%)", c.stretch * 100.0),
+                ClipMenuAction::ResetStretch,
+            ));
+        }
+        // The SET, the rule every row in this menu follows: a marquee over
+        // eight takes and a menu on one of them means all eight.
+        if self.caps.native_file_dialogs {
+            let acting = self.arr_acting_on(id);
+            let mut lanes: Vec<usize> = self
+                .arrangement
+                .clips
+                .iter()
+                .filter(|c| {
+                    c.kind == crate::arrangement::ClipKind::Midi
+                        && acting.contains(&c.id)
+                })
+                .map(|c| c.lane)
+                .collect();
+            lanes.sort_unstable();
+            lanes.dedup();
+            // **The count is on the label when it is more than one**, because
+            // this is the one row in the menu whose result is a NUMBER of
+            // files, and the save panel that follows can only show one name.
+            // "Export MIDI (2 tracks)" measures about 145 points at 11pt
+            // Courier bold against the menu's 168, so it fits with the eight
+            // points of left inset to spare.
+            match lanes.len() {
+                0 => {}
+                1 => out.push(("Export MIDI".to_owned(), ClipMenuAction::ExportMidi)),
+                n => out.push((
+                    format!("Export MIDI ({n} tracks)"),
+                    ClipMenuAction::ExportMidi,
+                )),
+            }
         }
         out
+    }
+
+    /// Which row of the clip menu a pointer is on, as an ACTION.
+    ///
+    /// The hit test the press handler runs, and the only one: the geometry
+    /// comes from [`Self::clip_menu_rows`] and the meanings from
+    /// [`Self::clip_menu_rows_for`], which is the same list
+    /// [`Self::draw_clip_menu`] paints. `None` is a press outside every row,
+    /// which is a dismissal.
+    ///
+    /// Split out from the press handler so that it can be MEASURED. The old
+    /// index dispatch could not be — it was four `contains` calls inlined in
+    /// a match arm, reachable only by driving a whole frame of pointer input
+    /// — which is a large part of why a menu this destructive had no test on
+    /// it at all.
+    fn clip_menu_hit(&self, id: u64, at: Pos2, pointer: Option<Pos2>) -> Option<ClipMenuAction> {
+        let p = pointer?;
+        let rows = self.clip_menu_rows_for(id);
+        let rects = Self::clip_menu_rows(at, rows.len());
+        let i = rects.iter().position(|r| r.contains(p))?;
+        rows.get(i).map(|(_, action)| *action)
     }
 
     /// Let go of a carried insert bay over `to`, if anything.
@@ -12046,9 +12227,19 @@ impl TangentApp {
     }
 
     /// Draw the clip menu — or the bay's FX menu — over the arrangement.
+    ///
+    /// The labels come off [`Self::clip_menu_rows_for`], which is the same
+    /// list the press handler hit-tests against, so a row cannot be painted
+    /// with one meaning and pressed with another.
     fn draw_clip_menu(&self, painter: &egui::Painter) {
         let (at, labels) = if let Some((id, at)) = self.arr_clip_menu {
-            (at, self.clip_menu_labels(id))
+            (
+                at,
+                self.clip_menu_rows_for(id)
+                    .into_iter()
+                    .map(|(label, _)| label)
+                    .collect::<Vec<String>>(),
+            )
         } else if let Some((.., at)) = self.arr_fx_menu {
             (at, vec!["Delete FX".to_owned(), "Replace FX".to_owned()])
         } else {
@@ -12079,13 +12270,23 @@ impl TangentApp {
                 egui::Color32::from_rgb(0x24, 0x20, 0x1A),
             );
         }
-        painter.line_segment(
-            [
-                Pos2::new(frame.left() + 4.0, rows[1].top()),
-                Pos2::new(frame.right() - 4.0, rows[1].top()),
-            ],
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x24, 0x20, 0x1A).gamma_multiply(0.25)),
-        );
+        // The hairline under Delete, which is the only row here worth
+        // separating from the rest. Indexed rather than asked of the action
+        // list because it is about the DRAWING and not about the meaning —
+        // and reached through `get` because this painter serves the FX menu
+        // too, whose list this function does not build.
+        if let Some(second) = rows.get(1) {
+            painter.line_segment(
+                [
+                    Pos2::new(frame.left() + 4.0, second.top()),
+                    Pos2::new(frame.right() - 4.0, second.top()),
+                ],
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgb(0x24, 0x20, 0x1A).gamma_multiply(0.25),
+                ),
+            );
+        }
     }
 
     fn arr_copy(&mut self) {
@@ -16190,21 +16391,26 @@ impl TangentApp {
             });
             if pressed || sec {
                 self.arr_clip_menu = None;
-                let rows = Self::clip_menu_rows(at, self.clip_menu_labels(id).len());
-                match pointer {
+                // **The row's ACTION, not its index.** One list answers what
+                // was painted and what was pressed, so a conditional row
+                // cannot re-point the rows above it — see
+                // [`Self::clip_menu_rows_for`], which is where the four
+                // hard-coded indices this used to carry went.
+                let hit = self.clip_menu_hit(id, at, pointer.filter(|_| pressed));
+                match hit {
                     // **A menu on a member of the selected set acts on the
                     // SET** — the same rule as grabbing a clip body. The
                     // clear-first version threw away a marquee'd group and
                     // copied or deleted one clip: the owner's "pasting the
                     // first of the selected group".
-                    Some(p) if pressed && rows[0].contains(p) => {
+                    Some(ClipMenuAction::Delete) => {
                         if !self.arr_multi.contains(&id) {
                             self.arr_multi.clear();
                         }
                         self.arr_selected = Some(id);
                         self.arr_delete_selected();
                     }
-                    Some(p) if pressed && rows[1].contains(p) => {
+                    Some(ClipMenuAction::Copy) => {
                         if !self.arr_multi.contains(&id) {
                             self.arr_multi.clear();
                         }
@@ -16214,16 +16420,23 @@ impl TangentApp {
                     // **The algorithm, cycled.** One press, one step — the
                     // gridbox's and the clef's gesture, and there is no room
                     // in a menu row for four of them.
-                    Some(p) if pressed && rows.get(2).is_some_and(|r| r.contains(p)) => {
+                    Some(ClipMenuAction::CycleStretch) => {
                         self.arr_cycle_stretch_mode(id);
                     }
                     // ...and the way back to unstretched, which is the one
                     // thing a dragged edge cannot reach: the ratio compounds,
                     // so dragging back is a second stretch and not an undo.
-                    Some(p) if pressed && rows.get(3).is_some_and(|r| r.contains(p)) => {
+                    Some(ClipMenuAction::ResetStretch) => {
                         self.arr_reset_stretch(id);
                     }
-                    _ => {
+                    // **The whole acting set**, not the clip the menu is on:
+                    // a marquee over three clips on two tracks exports two
+                    // files, which is the verb.
+                    Some(ClipMenuAction::ExportMidi) => {
+                        let ids = self.arr_acting_on(id);
+                        self.arr_export_midi(ids);
+                    }
+                    None => {
                         // Dismissed: the press is SPENT, the same rule as
                         // every overlay — it must not land underneath.
                         self.menu_ate_press = true;
@@ -18326,6 +18539,7 @@ impl TangentApp {
                 }
             }
             crate::ports::SavePurpose::KitPreset => self.write_kit_preset(path),
+            crate::ports::SavePurpose::ExportMidi => self.write_midi_export(path),
         }
     }
 
@@ -18374,6 +18588,239 @@ impl TangentApp {
         match preset.save(path) {
             Ok(_) => self.track.error.clear(),
             Err(e) => self.track.error = format!("could not save the kit: {e}"),
+        }
+    }
+
+    /// **Ask where to put the selected MIDI clips.** One `.mid` per TRACK.
+    ///
+    /// The verb the clip menu and the track menu both reach. Its shape is
+    /// [`Self::save_kit_preset`]'s — park a request, let the host raise the
+    /// panel, write the file when the answer comes back — with one addition:
+    /// the clip ids are frozen into `midi_export` here, because by the time
+    /// the panel is answered the selection may be a different set entirely.
+    /// See that field.
+    ///
+    /// **A track's clips merge, glued or not.** That is the whole reason this
+    /// is per-track rather than per-clip: two consecutive clips on one lane
+    /// are one part played in two takes, and a part is a file. The silence
+    /// between them and after the last of them survives, exactly as
+    /// [`Self::arr_glue_selection`] keeps it and for the same reason — a file
+    /// whose gaps had been closed would no longer line up with the song it
+    /// came out of, or with the OTHER file this same export just wrote.
+    ///
+    /// **Audio clips in the set are dropped without comment**, which is
+    /// [`Self::arr_normalize_selection`]'s rule in the other direction: a
+    /// marquee over a busy passage catches whatever it catches, and a verb
+    /// that narrated everything it skipped would be a verb nobody could use
+    /// on a real selection. It speaks only when NOTHING qualifies, because
+    /// then it is about to do nothing at all.
+    ///
+    /// **Capability-gated on `native_file_dialogs`**, the same guard
+    /// [`Self::ask_for_a_media_folder`] states: that flag is what says this
+    /// host may raise an OS panel, and a plugin editor may not. Without it
+    /// the request would be parked in a host that never drains it —
+    /// `desktop::take_save_panel` is the only drain there is — leaving
+    /// `native_panel_up` stuck true for the rest of the session and a stale
+    /// id list behind it. The menu rows are hidden on the same test, so this
+    /// is the second lock on a door that should already be shut.
+    ///
+    /// The row is still a no-op on a Linux box with no portal and no zenity,
+    /// where `take_save_panel` bails because the in-app browser can only pick
+    /// files that already EXIST. That is not this verb's to fix — Duplicate
+    /// Project As and Save Kit stand in the same place — and it is recorded
+    /// here so the next person to see "Export MIDI does nothing" knows where
+    /// to look.
+    fn arr_export_midi(&mut self, ids: Vec<u64>) {
+        if !self.caps.native_file_dialogs {
+            return;
+        }
+        // MIDI only, and in the document's own order rather than the
+        // selection's: the ids arrive from a marquee or a menu and carry
+        // whatever order the hand made them in.
+        let picked: Vec<(u64, usize)> = self
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| {
+                c.kind == crate::arrangement::ClipKind::Midi && ids.contains(&c.id)
+            })
+            .map(|c| (c.id, c.lane))
+            .collect();
+        if picked.is_empty() {
+            // **Not `report_take`**, for the reason `arr_glue_selection`
+            // spells out one screen up: a refusal is neither a take nor a
+            // success, and the take report is switched off by a setting that
+            // has nothing to do with this.
+            self.notify(
+                crate::notify::Kind::Info,
+                "Nothing to export - select a MIDI clip first.",
+            );
+            return;
+        }
+        let mut lanes: Vec<usize> = picked.iter().map(|(_, lane)| *lane).collect();
+        lanes.sort_unstable();
+        lanes.dedup();
+        // **The panel tells the truth before the click.** With one track the
+        // answered path is written whole; with several it is only a stem, so
+        // the title has to say how many files are coming or the export looks
+        // like a bug the first time it writes something other than what was
+        // typed. See `SavePurpose::ExportMidi`.
+        let (title, suggested) = match lanes.as_slice() {
+            [only] => ("Export MIDI".to_owned(), self.midi_export_stem(*only)),
+            many => {
+                let name = self.project_name();
+                let name = if name.trim().is_empty() {
+                    "MIDI".to_owned()
+                } else {
+                    name
+                };
+                (format!("Export MIDI - {} tracks", many.len()), name)
+            }
+        };
+        self.midi_export = picked.into_iter().map(|(id, _)| id).collect();
+        self.native_panel_up = true;
+        self.save_request = Some(crate::ports::SaveRequest {
+            title,
+            suggested: format!("{suggested}.mid"),
+            purpose: crate::ports::SavePurpose::ExportMidi,
+        });
+    }
+
+    /// A lane's name as a FILENAME: the display name with path separators
+    /// mapped to '-', trimmed, and never empty.
+    ///
+    /// The scrub is the stems export's, character for character
+    /// (`desktop.rs`, where a lane becomes `01-Drums.wav`), so the two
+    /// exports cannot disagree about what a track called "Gtr/Bass" is called
+    /// on disk. Empty falls back to the lane number, because a nameless lane
+    /// still has to produce a file somebody can tell apart from the others.
+    fn midi_export_stem(&self, lane: usize) -> String {
+        let name: String = self
+            .channel_display_name(lane)
+            .chars()
+            .map(|c| if std::path::is_separator(c) { '-' } else { c })
+            .collect();
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            format!("Track {}", lane + 1)
+        } else {
+            name
+        }
+    }
+
+    /// Write the export the panel just answered for, and say what happened.
+    ///
+    /// The twin of [`Self::write_kit_preset`]: `tangent-ui` writing files with
+    /// `std::fs` is normal here — the arrangement document and the drum kits
+    /// both do it — and every failure comes back as a sentence rather than as
+    /// a silence.
+    ///
+    /// **Grouped by lane through a `BTreeMap`**, so the files come out in
+    /// lane order and the same selection always produces the same names in
+    /// the same sequence. A `HashMap` would have been a set of files whose
+    /// numbering wandered between runs.
+    ///
+    /// `end_s` per lane is the furthest `start_s + len_s` of that lane's
+    /// clips, NOT the last note: two clips a bar apart with a bar of tail
+    /// after them are three bars of music, and an export that stopped at the
+    /// last note would silently crop the third. `smf_write::write` puts the
+    /// `EndOfTrack` there.
+    ///
+    /// The naming contract — one track honours the path, several extend it,
+    /// and no sibling is ever clobbered — is stated on
+    /// `SavePurpose::ExportMidi` and implemented here.
+    ///
+    /// **"Several" is counted again HERE, not carried from the request.** The
+    /// panel's title was written from the lanes that were selected when the
+    /// row was pressed, and a clip can be gone by the time it is answered.
+    /// Counting again means the file lands where the surviving material says
+    /// it should: a set that has shrunk to one track writes one file at the
+    /// name that was typed, which is better than a lone `song-02-Keys.mid`
+    /// beside a title that promised two.
+    fn write_midi_export(&mut self, path: &std::path::Path) {
+        let ids = std::mem::take(&mut self.midi_export);
+        let tempo = self.live_tempo_map();
+        let meter = self.live_meter_map();
+        let mut by_lane: std::collections::BTreeMap<
+            usize,
+            (Vec<crate::arrangement::ArrNote>, f64),
+        > = std::collections::BTreeMap::new();
+        for c in self
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| c.kind == crate::arrangement::ClipKind::Midi && ids.contains(&c.id))
+        {
+            let entry = by_lane.entry(c.lane).or_insert_with(|| (Vec::new(), 0.0));
+            entry.0.extend(crate::arrangement::clip_notes_in_song_time(c));
+            entry.1 = entry.1.max(c.start_s + c.len_s);
+        }
+        if by_lane.is_empty() {
+            // The selection went away between the row and the answer — a
+            // project loaded behind the panel, or the clips deleted. Nothing
+            // to write, and saying so beats an empty file.
+            self.notify(
+                crate::notify::Kind::Error,
+                "Those MIDI clips are no longer there to export.",
+            );
+            return;
+        }
+        let several = by_lane.len() > 1;
+        let dir = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut written = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        for (lane, (mut notes, end_s)) in by_lane {
+            notes.sort_by(|a, b| {
+                a.at_s.partial_cmp(&b.at_s).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let name = self.midi_export_stem(lane);
+            let bytes = crate::smf_write::write(&name, &notes, end_s, &tempo, &meter);
+            let at = if several {
+                // A stem for all of them, the first included, and never over
+                // a file that is already there.
+                unused_mid(&dir, &format!("{stem}-{:02}-{name}", lane + 1))
+            } else {
+                // The one name the panel itself confirmed, so this is the
+                // only path here allowed to overwrite.
+                with_mid_extension(path)
+            };
+            match std::fs::write(&at, &bytes) {
+                Ok(()) => written += 1,
+                Err(e) => failed.push(format!("{}: {e}", leaf(&at))),
+            }
+        }
+        if let Some(first) = failed.first() {
+            // The first by name and the count, the export's own house style
+            // for a batch that partly failed: one name is worth more than
+            // four, and the count is what says more went wrong than the
+            // reader can see.
+            self.notify(
+                crate::notify::Kind::Error,
+                match failed.len() {
+                    1 => format!("Could not write the MIDI file - {first}"),
+                    n => format!("Could not write {n} MIDI files, starting with {first}"),
+                },
+            );
+        }
+        if written == 0 {
+            return;
+        }
+        self.notify(
+            crate::notify::Kind::Success,
+            match written {
+                1 => "Exported 1 MIDI file.".to_owned(),
+                n => format!("Exported {n} MIDI files."),
+            },
+        );
+        // And show them, which is what somebody who just exported wants next.
+        // `reveal_folder` is capability-gated itself and makes nothing here —
+        // the folder is the one the panel was standing in, so it exists.
+        if !dir.as_os_str().is_empty() {
+            self.reveal_folder(dir, false);
         }
     }
 
@@ -24008,6 +24455,24 @@ impl TangentApp {
                 self.dialog = None;
                 self.paste_track(lane);
             }
+            // **The whole lane**, which is the argument on the variant: the
+            // door that was opened was the track's. The dialog closes first,
+            // because what follows it is a native save panel and one of those
+            // opening behind an always-on-top dialog is the fault
+            // `take_save_panel`'s two settle frames exist to prevent.
+            DialogAction::ExportMidi(lane) => {
+                self.dialog = None;
+                let ids: Vec<u64> = self
+                    .arrangement
+                    .clips
+                    .iter()
+                    .filter(|c| {
+                        c.lane == lane && c.kind == crate::arrangement::ClipKind::Midi
+                    })
+                    .map(|c| c.id)
+                    .collect();
+                self.arr_export_midi(ids);
+            }
             // **The badge and the paint reach the whole selection.**
             //
             // Remove already did (`remove_selected_channels`) and the four
@@ -25719,6 +26184,12 @@ impl TangentApp {
                 palette_auto: self.settings.palette_auto,
                 serial: 1,
                 can_paste: false,
+                // The shot this exists to take is of the colour grid and the
+                // palette list, and a row that appears only on a lane with
+                // MIDI on it would make the picture depend on what happened
+                // to be open. Zero keeps the demo's dialog the same height
+                // every time it is photographed.
+                midi_clips: 0,
             });
         }
         // **Audio Setup**, which is now where the interface's short name is
@@ -33990,6 +34461,595 @@ mod tests {
             2,
             "clips on two tracks were welded into one"
         );
+    }
+
+    // ── Export MIDI ─────────────────────────────────────────────────────
+    //
+    // The verb: right-click a MIDI clip, a selection of them, or a track,
+    // and get one `.mid` PER TRACK. The tests below are grouped because
+    // they share a scratch folder helper and because between them they hold
+    // the whole contract — the grouping, the merge, the naming, the
+    // refusal, and the menu row that reaches it.
+
+    /// A scratch folder of this test's own, emptied on the way in.
+    ///
+    /// Per-NAME rather than per-process, because these tests run in
+    /// parallel in one process and a shared folder would have them counting
+    /// each other's files.
+    fn export_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("tangent-midiexport-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch folder");
+        dir
+    }
+
+    /// Every `.mid` in `dir`, by name, sorted.
+    fn mids(dir: &std::path::Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(dir)
+            .expect("the scratch folder")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".mid"))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Two consecutive MIDI clips on one lane and one on another, each with
+    /// a note at its own head, plus names for the two lanes.
+    fn three_clips_on_two_lanes(app: &mut TangentApp) {
+        use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+        app.settings.strip_names =
+            vec![String::new(), "Keys".to_owned(), "Bass".to_owned()];
+        let mut mk = |id: u64, lane: usize, at: f64| {
+            app.arrangement.clips.push(ArrClip {
+                id,
+                lane,
+                kind: ClipKind::Midi,
+                start_s: at,
+                len_s: 1.0,
+                notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100 }],
+                ..Default::default()
+            });
+        };
+        // Lane 1: two clips back to back, NOT glued.
+        mk(1, 1, 0.0);
+        mk(2, 1, 1.0);
+        // Lane 2: one clip.
+        mk(3, 2, 0.0);
+    }
+
+    /// **The owner's case, end to end.** Track one has two consecutive MIDI
+    /// clips, track two has one; select all three and export, and TWO files
+    /// come out — track one's two clips merged into a single file even
+    /// though they were never glued, and track two's clip as its own.
+    ///
+    /// This is the whole verb in one test, so it asserts all four halves:
+    /// that the panel is asked for and says how many tracks are coming,
+    /// that exactly two files land, that they are named for their lanes,
+    /// and that the LANE-ONE file holds BOTH clips' notes at their song
+    /// positions. Collapse the grouping to one file, split it per clip, or
+    /// rebase either clip to its own start, and one of those fails.
+    #[test]
+    fn a_cross_track_selection_exports_one_file_per_track() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        three_clips_on_two_lanes(&mut app);
+        app.arr_multi = vec![1, 2, 3];
+
+        app.arr_export_midi(vec![1, 2, 3]);
+        let req = app.take_save_request().expect("no save panel was asked for");
+        assert_eq!(req.purpose, crate::ports::SavePurpose::ExportMidi);
+        // The panel must say the answered name will be extended, BEFORE the
+        // click. See `SavePurpose::ExportMidi`.
+        assert!(
+            req.title.contains("2 tracks"),
+            "the panel did not say two files were coming: {}",
+            req.title
+        );
+
+        let dir = export_dir("cross-track");
+        app.finish_save_choice(
+            crate::ports::SavePurpose::ExportMidi,
+            &dir.join("song.mid"),
+        );
+
+        assert_eq!(
+            mids(&dir),
+            vec!["song-02-Keys.mid".to_owned(), "song-03-Bass.mid".to_owned()],
+            "one file per TRACK, named stem-NN-track"
+        );
+
+        // Lane one's file holds BOTH clips, a second apart — the merge, and
+        // the proof that the second clip was not rebased to its own start.
+        let keys = std::fs::read(dir.join("song-02-Keys.mid")).expect("lane one's file");
+        let got = crate::smf_read::read(&keys).expect("lane one's file is not an SMF");
+        assert_eq!(got.notes.len(), 2, "the two clips did not merge: {:?}", got.notes);
+        assert!((got.notes[0].at_s - 0.0).abs() < 5.0e-3, "{:?}", got.notes);
+        assert!(
+            (got.notes[1].at_s - 1.0).abs() < 5.0e-3,
+            "the second clip was rebased instead of kept in song time: {:?}",
+            got.notes
+        );
+
+        // Lane two's is its own file with its own one note, and NOT the
+        // other lane's notes as well.
+        let bass = std::fs::read(dir.join("song-03-Bass.mid")).expect("lane two's file");
+        let got = crate::smf_read::read(&bass).expect("lane two's file is not an SMF");
+        assert_eq!(got.notes.len(), 1, "the lanes ran together: {:?}", got.notes);
+    }
+
+    /// **The silence between two clips, and after the last of them,
+    /// survives the export.**
+    ///
+    /// The mirror of `glue_welds_clips_on_one_track_and_keeps_the_silence`,
+    /// and it exists for the same reason: a file whose gaps had been closed
+    /// would no longer line up with the song it came out of, or with the
+    /// other file the same export just wrote.
+    ///
+    /// Both halves are measured. The notes come back through `smf_read`,
+    /// which fails if the export rebases per clip. The file's END comes back
+    /// through `smf_write::end_of_track_ticks`, because `smf_read` reports
+    /// the last thing that made a SOUND and would happily agree with a file
+    /// trimmed to its last note — which is the mistake this half is here to
+    /// catch.
+    #[test]
+    fn the_exported_mid_keeps_the_silence_between_two_clips() {
+        use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+        let (_, mut app) = headless(Caps::DESKTOP);
+        for (id, at) in [(1u64, 0.0f64), (2, 2.0)] {
+            app.arrangement.clips.push(ArrClip {
+                id,
+                lane: 3,
+                kind: ClipKind::Midi,
+                start_s: at,
+                len_s: 1.0,
+                notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100 }],
+                ..Default::default()
+            });
+        }
+        app.arr_multi = vec![1, 2];
+        app.arr_export_midi(vec![1, 2]);
+        let _ = app.take_save_request().expect("no save panel was asked for");
+        let dir = export_dir("silence");
+        let path = dir.join("part.mid");
+        app.finish_save_choice(crate::ports::SavePurpose::ExportMidi, &path);
+
+        let bytes =
+            std::fs::read(&path).expect("one track, one file, at the answered path");
+        let got = crate::smf_read::read(&bytes).expect("not an SMF");
+        assert_eq!(got.notes.len(), 2, "{:?}", got.notes);
+        assert!((got.notes[0].at_s - 0.0).abs() < 5.0e-3, "{:?}", got.notes);
+        assert!(
+            (got.notes[1].at_s - 2.0).abs() < 5.0e-3,
+            "the gap between the clips was closed: {:?}",
+            got.notes
+        );
+        // The material runs to 3.0 s — the second clip starts at 2.0 and is
+        // a second long — which at the default 120 bpm is six quarters. A
+        // file that stopped at the last note would end at 2.25 s.
+        let ends = crate::smf_write::end_of_track_ticks(&bytes);
+        let want = 6 * u64::from(crate::smf_write::PPQ);
+        assert!(
+            ends.iter().all(|e| *e == want),
+            "the tail after the last clip was cropped: {ends:?} should be {want}"
+        );
+    }
+
+    /// **The clip menu's rows keep their meanings when Export MIDI appears.**
+    ///
+    /// The guard that did not exist. This menu's dispatch was POSITIONAL —
+    /// `rows[0]` deleted and `rows[1]` copied, hard-coded two hundred lines
+    /// from the function that built the labels, with no test anywhere on the
+    /// pairing — and every row in it is conditional on something. Adding a
+    /// row anywhere but the end would have made Delete mean Copy, silently,
+    /// on exactly the clips the new row appears for.
+    ///
+    /// So this asserts three things: what the rows ARE on each kind of clip,
+    /// that the hit test at each row's rectangle answers that row's own
+    /// action, and — the half that is about behaviour rather than about a
+    /// list — that a real press on a real row through a real frame does the
+    /// thing the row says. Pressing row zero on a MIDI clip must DELETE it;
+    /// under an index dispatch with Export inserted first it would export it.
+    #[test]
+    fn the_clip_menus_rows_keep_their_actions_when_export_midi_appears() {
+        use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.arrangement.clips.push(ArrClip {
+            id: 1,
+            lane: 1,
+            kind: ClipKind::Midi,
+            start_s: 0.0,
+            len_s: 1.0,
+            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100 }],
+            ..Default::default()
+        });
+        // A STRETCHED AUDIO clip: the four rows, and no Export — the stretch
+        // rows must not be pushed around by a row that is not there.
+        app.arrangement.clips.push(ArrClip {
+            id: 2,
+            lane: 2,
+            kind: ClipKind::Audio,
+            start_s: 0.0,
+            len_s: 1.0,
+            stretch: 1.5,
+            ..Default::default()
+        });
+
+        let audio: Vec<ClipMenuAction> =
+            app.clip_menu_rows_for(2).into_iter().map(|(_, a)| a).collect();
+        assert_eq!(
+            audio,
+            vec![
+                ClipMenuAction::Delete,
+                ClipMenuAction::Copy,
+                ClipMenuAction::CycleStretch,
+                ClipMenuAction::ResetStretch,
+            ],
+            "a stretched audio clip must not be offered a MIDI export"
+        );
+
+        let midi: Vec<ClipMenuAction> =
+            app.clip_menu_rows_for(1).into_iter().map(|(_, a)| a).collect();
+        assert_eq!(
+            midi,
+            vec![
+                ClipMenuAction::Delete,
+                ClipMenuAction::Copy,
+                ClipMenuAction::ExportMidi
+            ],
+            "Export must be LAST, under the rows the hand already knows"
+        );
+
+        // The hit test at every row's own rectangle answers that row.
+        let at = Pos2::new(120.0, 300.0);
+        for (id, rows) in [(1u64, &midi), (2, &audio)] {
+            let rects = TangentApp::clip_menu_rows(at, rows.len());
+            for (i, want) in rows.iter().enumerate() {
+                assert_eq!(
+                    app.clip_menu_hit(id, at, Some(rects[i].center())),
+                    Some(*want),
+                    "row {i} of clip {id} hit-tested to the wrong action"
+                );
+            }
+            // Off the bottom of the list is a dismissal, not the last row.
+            let below = Pos2::new(at.x + 4.0, rects[rows.len() - 1].bottom() + 6.0);
+            assert_eq!(app.clip_menu_hit(id, at, Some(below)), None);
+        }
+
+        // ── and now the same rows, PRESSED ──
+        //
+        // A press driven through a whole frame, because the contract this
+        // test exists for is between the press handler and the row list, and
+        // asserting on the list alone would leave the handler free to go on
+        // using indices.
+        let rects = TangentApp::clip_menu_rows(at, 3);
+        app.arr_clip_menu = Some((1, at));
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(rects[2].center()),
+                egui::Event::PointerButton {
+                    pos: rects[2].center(),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            app.take_save_request().is_some(),
+            "the LAST row did not reach the export"
+        );
+        assert!(app.arr_clip_menu.is_none(), "the menu stayed up");
+
+        // Row ZERO is still Delete on a clip whose menu has three rows.
+        app.arr_clip_menu = Some((1, at));
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(rects[0].center()),
+                egui::Event::PointerButton {
+                    pos: rects[0].center(),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            !app.arrangement.clips.iter().any(|c| c.id == 1),
+            "the top row did not delete the clip it was pressed on"
+        );
+        assert!(
+            app.take_save_request().is_none(),
+            "the top row exported instead of deleting"
+        );
+    }
+
+    /// **A selection with no MIDI in it says so, and asks for nothing.**
+    ///
+    /// Modelled on the refusal half of
+    /// `normalise_takes_the_audio_selection_and_leaves_midi_alone`, and for
+    /// the same reason it is not `report_take`: a refusal is neither a take
+    /// nor a success, and the take report is switched off by a setting that
+    /// has nothing to do with this.
+    ///
+    /// The other half of the rule is here too: a MIXED selection is not
+    /// narrated. Audio clips are dropped silently, exactly as the normalise
+    /// verb drops MIDI ones — a marquee over a busy passage catches whatever
+    /// it catches, and a verb that listed everything it skipped would be
+    /// unusable on a real selection.
+    #[test]
+    fn exporting_a_selection_with_no_midi_says_so() {
+        use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+        let (_, mut app) = headless(Caps::DESKTOP);
+        fn mk(app: &mut TangentApp, id: u64, kind: ClipKind) {
+            app.arrangement.clips.push(ArrClip {
+                id,
+                lane: 1,
+                kind,
+                start_s: 0.0,
+                len_s: 1.0,
+                notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100 }],
+                ..Default::default()
+            });
+        }
+        mk(&mut app, 1, ClipKind::Audio);
+        mk(&mut app, 2, ClipKind::Audio);
+
+        app.arr_export_midi(vec![1, 2]);
+        assert!(
+            app.take_save_request().is_none(),
+            "a panel was raised for a selection with nothing to write"
+        );
+        let said = app.said().notes();
+        assert_eq!(said.len(), 1, "it went quiet on an empty selection");
+        assert_eq!(said[0].kind, crate::notify::Kind::Info);
+        assert!(said[0].text.contains("MIDI clip"), "{}", said[0].text);
+
+        // Put one MIDI clip in the set and the refusal goes away WITHOUT the
+        // audio clips being mentioned.
+        mk(&mut app, 3, ClipKind::Midi);
+        app.messages.clear();
+        app.arr_export_midi(vec![1, 2, 3]);
+        assert!(app.take_save_request().is_some(), "a valid set was refused");
+        assert!(
+            app.said().notes().is_empty(),
+            "the skipped audio clips were narrated: {:?}",
+            app.said().notes().iter().map(|n| &n.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// **The track menu offers Export MIDI only on a lane that has MIDI on
+    /// it, and exports the WHOLE lane when it does.**
+    ///
+    /// One test for four doors: `open_track_dialog` is the single
+    /// constructor for this dialog — the arrangement header, both mixer
+    /// press paths and the keyboard all go through it — so the field it
+    /// fills is the field every door shows.
+    ///
+    /// The second half is the decision on the variant: the door that was
+    /// opened was the TRACK's, so the row takes the whole lane and not the
+    /// selection. A selection of ONE of the lane's two clips is standing
+    /// while the row is pressed, and both clips have to come out.
+    #[test]
+    fn the_track_menu_offers_export_midi_only_on_a_lane_with_midi_clips() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        three_clips_on_two_lanes(&mut app);
+
+        app.open_track_dialog(1, true);
+        let Some(dialogs::Dialog::Track { midi_clips, .. }) = app.dialog else {
+            panic!("the track dialog did not open");
+        };
+        assert_eq!(midi_clips, 2, "lane one's two MIDI clips were not counted");
+
+        // A lane with nothing on it offers no row at all — hidden, not
+        // greyed: Export is not what a lane is FOR.
+        app.open_track_dialog(7, true);
+        let Some(dialogs::Dialog::Track { midi_clips, .. }) = app.dialog else {
+            panic!("the track dialog did not open");
+        };
+        assert_eq!(midi_clips, 0, "an empty lane was offered a MIDI export");
+
+        // The row takes the whole lane, selection or no selection.
+        app.arr_multi = vec![2];
+        app.arr_selected = Some(2);
+        app.open_track_dialog(1, true);
+        app.apply_dialog_action(dialogs::DialogAction::ExportMidi(1));
+        assert!(app.dialog.is_none(), "the dialog stayed up in front of the panel");
+        let req = app.take_save_request().expect("the row asked for no panel");
+        assert_eq!(req.title, "Export MIDI", "one track, so one file");
+
+        let dir = export_dir("track-menu");
+        let path = dir.join("keys.mid");
+        app.finish_save_choice(crate::ports::SavePurpose::ExportMidi, &path);
+        let got = crate::smf_read::read(&std::fs::read(&path).expect("the file"))
+            .expect("not an SMF");
+        assert_eq!(
+            got.notes.len(),
+            2,
+            "the track's door honoured the clip selection instead of the track: {:?}",
+            got.notes
+        );
+    }
+
+    /// **One track honours the answered path; several extend it.**
+    ///
+    /// The naming contract, which is stated on `SavePurpose::ExportMidi` and
+    /// is the decision this item had to make: a save panel answers ONE path
+    /// and the export may write several files. One track writes exactly
+    /// where it was told. Several treat the answer as a stem and write
+    /// beside it — ALL of them suffixed, the first included, so the result
+    /// reads as a set rather than as one odd file plus siblings.
+    #[test]
+    fn one_track_honours_the_answered_path_and_several_extend_it() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        three_clips_on_two_lanes(&mut app);
+
+        // One lane: the answered path, exactly.
+        let dir = export_dir("one-track");
+        app.arr_export_midi(vec![1, 2]);
+        let _ = app.take_save_request();
+        let answered = dir.join("just these.mid");
+        app.finish_save_choice(crate::ports::SavePurpose::ExportMidi, &answered);
+        assert_eq!(mids(&dir), vec!["just these.mid".to_owned()]);
+
+        // ...and an answer with no extension on it still gets `.mid`,
+        // because the OS has to know what the file is.
+        let dir = export_dir("one-track-bare");
+        app.arr_export_midi(vec![1, 2]);
+        let _ = app.take_save_request();
+        app.finish_save_choice(crate::ports::SavePurpose::ExportMidi, &dir.join("bare"));
+        assert_eq!(mids(&dir), vec!["bare.mid".to_owned()]);
+
+        // Two lanes: the answer is a STEM and nothing is written at it.
+        let dir = export_dir("two-tracks");
+        app.arr_export_midi(vec![1, 2, 3]);
+        let _ = app.take_save_request();
+        app.finish_save_choice(
+            crate::ports::SavePurpose::ExportMidi,
+            &dir.join("song.mid"),
+        );
+        assert_eq!(
+            mids(&dir),
+            vec!["song-02-Keys.mid".to_owned(), "song-03-Bass.mid".to_owned()],
+            "the stem was not extended for every file"
+        );
+        assert!(
+            !dir.join("song.mid").exists(),
+            "the answered path was written literally as well as extended"
+        );
+    }
+
+    /// **A sibling that is already there is not clobbered.**
+    ///
+    /// The save panel confirmed one name; every other file this export
+    /// writes was never shown to anybody, so replacing one is destroying a
+    /// file the user was not asked about. The stems export DOES overwrite,
+    /// and that is right there and wrong here: a stems folder is the app's
+    /// own, an export folder is the user's.
+    #[test]
+    fn an_existing_sibling_is_not_clobbered() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        three_clips_on_two_lanes(&mut app);
+        let dir = export_dir("sibling");
+        let standing = dir.join("song-02-Keys.mid");
+        std::fs::write(&standing, b"somebody else's work").expect("the decoy");
+
+        app.arr_export_midi(vec![1, 2, 3]);
+        let _ = app.take_save_request();
+        app.finish_save_choice(
+            crate::ports::SavePurpose::ExportMidi,
+            &dir.join("song.mid"),
+        );
+
+        assert_eq!(
+            std::fs::read(&standing).expect("the standing file"),
+            b"somebody else's work",
+            "the export overwrote a file the panel never confirmed"
+        );
+        assert_eq!(
+            mids(&dir),
+            vec![
+                "song-02-Keys 2.mid".to_owned(),
+                "song-02-Keys.mid".to_owned(),
+                "song-03-Bass.mid".to_owned(),
+            ],
+            "the file that could not have its name went missing instead"
+        );
+    }
+
+    /// **A plugin editor is offered no MIDI export at all**, on either door.
+    ///
+    /// The honest degradation for the risk this verb carries into a plugin:
+    /// `take_save_request` is drained in exactly one place — the desktop
+    /// host's `take_save_panel` — so a request parked inside a DAW is never
+    /// answered, `native_panel_up` stays true for the rest of the session,
+    /// and a frozen list of clip ids sits behind it forever. `ports.rs` does
+    /// bless a host refusing by never draining, but a row that appears to do
+    /// something and then wedges a flag is not a refusal, it is a fault.
+    ///
+    /// So the gate is `Caps::native_file_dialogs` — the flag
+    /// `ask_for_a_media_folder` already documents as "this host may raise an
+    /// OS panel at all" — and it is checked in all three places: the clip
+    /// menu's row, the track menu's row, and the verb itself, so that a
+    /// fourth door added later cannot get in behind them.
+    #[test]
+    fn a_plugin_editor_is_offered_no_midi_export() {
+        let (_, mut app) = headless(Caps::PLUGIN);
+        three_clips_on_two_lanes(&mut app);
+        app.arr_multi = vec![1, 2, 3];
+
+        let rows: Vec<ClipMenuAction> =
+            app.clip_menu_rows_for(1).into_iter().map(|(_, a)| a).collect();
+        assert!(
+            !rows.contains(&ClipMenuAction::ExportMidi),
+            "the clip menu offered an export a plugin cannot answer: {rows:?}"
+        );
+
+        app.open_track_dialog(1, true);
+        let Some(dialogs::Dialog::Track { midi_clips, .. }) = app.dialog else {
+            panic!("the track dialog did not open");
+        };
+        assert_eq!(midi_clips, 0, "the track menu offered the row in a plugin");
+
+        // And the verb itself refuses, so a door added later cannot get in
+        // behind the two that are gated.
+        app.arr_export_midi(vec![1, 2, 3]);
+        assert!(
+            app.take_save_request().is_none(),
+            "a save panel was parked in a host that never drains one"
+        );
+        assert!(!app.native_panel_up(), "the panel flag was left standing");
+    }
+
+    /// **A looping MIDI clip exports its repeats, not one pass.**
+    ///
+    /// The reason the loop expansion moved out of `arr_glue_selection` into
+    /// `arrangement::clip_notes_in_song_time`: the schedule was written
+    /// three times — once in frames for playback and the bounce, once in
+    /// seconds for glue, and the export would have been a fourth. Two of
+    /// them can share and now do.
+    ///
+    /// **Which means this is the only test of the loop half of that helper**,
+    /// and it is worth saying so. Measured: collapsing `passes` to one turns
+    /// this red and leaves `glue_welds_clips_on_one_track_and_keeps_the_silence`
+    /// green, because that test's clips do not loop. Glue guards the rebase
+    /// and the gaps; this guards the repeats. Neither covers the other.
+    #[test]
+    fn an_exported_loop_carries_its_repeats() {
+        use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+        let (_, mut app) = headless(Caps::DESKTOP);
+        // A half-second loop dragged out to two seconds: four passes.
+        app.arrangement.clips.push(ArrClip {
+            id: 1,
+            lane: 1,
+            kind: ClipKind::Midi,
+            start_s: 0.0,
+            len_s: 2.0,
+            loop_s: 0.5,
+            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.2, key: 60, vel: 100 }],
+            ..Default::default()
+        });
+        app.arr_export_midi(vec![1]);
+        let _ = app.take_save_request().expect("no panel");
+        let dir = export_dir("loop");
+        let path = dir.join("loop.mid");
+        app.finish_save_choice(crate::ports::SavePurpose::ExportMidi, &path);
+        let got = crate::smf_read::read(&std::fs::read(&path).expect("the file"))
+            .expect("not an SMF");
+        assert_eq!(got.notes.len(), 4, "the loop went out as one pass: {:?}", got.notes);
+        for (i, n) in got.notes.iter().enumerate() {
+            let want = 0.5 * i as f64;
+            assert!(
+                (n.at_s - want).abs() < 5.0e-3,
+                "pass {i} landed at {} instead of {want}",
+                n.at_s
+            );
+        }
     }
 
     /// **Selecting a clip selects the track it is on**, and several clips

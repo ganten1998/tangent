@@ -42,6 +42,11 @@ pub mod mixer_panel;
 pub mod recorder_panel;
 pub mod arrangement;
 pub mod smf_read;
+/// Writing arrangement notes back out as a `.mid`. The mirror of
+/// [`smf_read`], hand-rolled behind the same firewall and for the same
+/// reason — see its header for why `tangent-record`'s writer is unreachable
+/// and would be the wrong shape even if it were not.
+pub mod smf_write;
 pub mod arrangement_panel;
 pub mod midi_editor;
 pub mod settings;
