@@ -600,20 +600,20 @@ const MARGIN: f32 = 16.0;
 /// The card's nominal width, and the narrowest it may be squeezed to before
 /// the overlay gives up and shows the scrim alone. A plugin editor is a small
 /// window and this has to be sane inside one.
-const CARD_W: f32 = 354.0;
+const CARD_W: f32 = 440.0;
 const CARD_MIN_W: f32 = 160.0;
 /// The card's inner margin.
-const PAD: f32 = 21.0;
+const PAD: f32 = 24.0;
 /// The lattice band's height, the gap under it, and the two text rows.
-const MARK_H: f32 = 45.0;
-const GAP: f32 = 14.0;
-const LABEL_H: f32 = 24.0;
+const MARK_H: f32 = 68.0;
+const GAP: f32 = 16.0;
+const LABEL_H: f32 = 28.0;
 const DETAIL_GAP: f32 = 5.0;
-const DETAIL_H: f32 = 19.0;
+const DETAIL_H: f32 = 21.0;
 /// The meter row: tall enough for the reading beside the bar, with the bar
 /// itself centred in it.
-const METER_ROW_H: f32 = 17.0;
-const METER_H: f32 = 12.0;
+const METER_ROW_H: f32 = 19.0;
+const METER_H: f32 = 13.0;
 /// The card's corner, and the meter's.
 const CARD_R: f32 = 4.0;
 
@@ -826,7 +826,7 @@ fn paint(painter: &Painter, rect: Rect, face: Color32, busy: &Busy, time: f64) {
         draw_mark(&p, mark, d.ink, d.lattice, d.card);
     }
 
-    let label_font = FontId::new(16.5, fonts::courier_bold());
+    let label_font = FontId::new(19.0, fonts::courier_bold());
     p.with_clip_rect(l.label).text(
         l.label.center(),
         Align2::CENTER_CENTER,
@@ -835,7 +835,7 @@ fn paint(painter: &Painter, rect: Rect, face: Color32, busy: &Busy, time: f64) {
         d.ink,
     );
     if let (Some(r), Some(text)) = (l.detail, busy.detail.as_deref()) {
-        let font = FontId::new(13.0, fonts::courier());
+        let font = FontId::new(14.5, fonts::courier());
         p.with_clip_rect(r).text(
             r.center(),
             Align2::CENTER_CENTER,
@@ -862,7 +862,19 @@ fn draw_mark(painter: &Painter, rect: Rect, ink: Color32, lattice: Color32, card
     if !rect.is_positive() {
         return;
     }
-    let a = (rect.height() * 0.66).min(rect.width() * 0.30);
+    // **Sized from the whole drawing, stubs included, not from the triangle.**
+    //
+    // The lattice lines run PAST the nodes: a stub reaches `STUB` of a
+    // spacing beyond the node it leaves, in six directions. So the mark is
+    // wider and taller than the triangle that names it - about 2.24 spacings
+    // across (half a spacing to a base node, plus a whole one along the
+    // horizontal stub) and about 1.94 down (the apex's upward stub to the
+    // base's downward one). Sizing `a` from the triangle alone asked for 45
+    // points of height and drew 58, and `with_clip_rect` below took the
+    // difference off the top and both sides - which is what the owner saw.
+    const SPAN_W: f32 = 2.24;
+    const SPAN_H: f32 = 1.94;
+    let a = (rect.height() / SPAN_H).min(rect.width() / SPAN_W);
     if a < 8.0 {
         return;
     }
