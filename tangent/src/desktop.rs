@@ -9533,15 +9533,65 @@ fn process_ir_capture(
     let thd2 = ess::harmonic_level_db(&probe.ir, probe_peak, 2, duration, f1, f2, rate);
     let thd3 = ess::harmonic_level_db(&probe.ir, probe_peak, 3, duration, f1, f2, rate);
 
-    // The IR itself: exact division when a reference exists, classic else.
-    let (mut l, mut r, has_reference) = match reference.filter(|r| r.len() == capture.len()) {
-        Some(refc) => {
+    // **A reference channel with no sweep in it is not a reference, and the
+    // division must not be handed one.**
+    //
+    // The reference pass is a stereo recording of a loop that half the world
+    // patches with one cable. When a return jack brings nothing back, that
+    // channel of the reference is silence or hiss, and
+    // `deconvolve_by_reference` divides by it anyway: silence bails out to a
+    // buffer of zeros, and hiss divides a real return by a noise floor and
+    // comes back about a hundred dB above the side that holds the
+    // measurement. Both were measured on the road, and both are what the
+    // report "the capture is focused on the left channel when the loop-only
+    // reference is used" sounds like — one side deleted, or one side
+    // normalized into inaudibility by the other side's garbage, depending on
+    // which jack was live.
+    //
+    // Neither is the division's fault. The engine plays the SAME sample on
+    // both output jacks — the loop is one mono probe into a stereo return —
+    // so a reference that came back on one jack is a perfectly good
+    // reference for both channels, and this borrows it. What is lost by
+    // borrowing is the dead jack's own converter coloration, which was never
+    // knowable from a jack that recorded nothing.
+    //
+    // `sweep::reference_range_db` is the measurement and
+    // `sweep::TRUSTWORTHY_RANGE_DB` is the line, the same 30 dB the wizard
+    // judges the capture itself by: below it a recording is not a
+    // measurement, and that is as true of a reference pass as of the pass it
+    // divides. When NEITHER channel clears it the reference is dropped
+    // altogether and the classic route runs, which is honest — the result
+    // stage's "reference" flag then reads false, and a wrong IR is worse
+    // than a slightly less exact one.
+    let usable = reference
+        .filter(|r| r.len() == capture.len())
+        .and_then(|refc| {
             let mut rl = Vec::with_capacity(frames);
             let mut rr = Vec::with_capacity(frames);
             for fr in refc.chunks_exact(2) {
                 rl.push(fr[0]);
                 rr.push(fr[1]);
             }
+            let live = |c: &[f32]| {
+                ess::reference_range_db(c, pre, sweep.len()) >= ess::TRUSTWORTHY_RANGE_DB
+            };
+            match (live(&rl), live(&rr)) {
+                (true, true) => Some((rl, rr)),
+                (true, false) => {
+                    rr.clone_from(&rl);
+                    Some((rl, rr))
+                }
+                (false, true) => {
+                    rl.clone_from(&rr);
+                    Some((rl, rr))
+                }
+                (false, false) => None,
+            }
+        });
+
+    // The IR itself: exact division when a reference exists, classic else.
+    let (mut l, mut r, has_reference) = match usable {
+        Some((rl, rr)) => {
             let mut hl = ess::deconvolve_by_reference(&left, &rl, f1, f2, rate);
             let mut hr = ess::deconvolve_by_reference(&right, &rr, f1, f2, rate);
             // The division is circular: harmonic images and regularization
@@ -9578,15 +9628,28 @@ fn process_ir_capture(
     // does the translation from the one quantity that survives a division,
     // the capture's own signal-to-noise ratio.
     //
-    // ONE threshold for the pair, from the SET's peak, and — since the
-    // bench found what the other half costs — ONE CUT as well, made by
-    // `sweep::truncate_set_at_floor`. Both for the reason `normalize_set`
-    // uses one scale: the pair is one measurement. A per-channel threshold
-    // would cut the quieter side early and skew the image; per-channel CUTS
-    // let a dead return, whose deconvolved hiss never sinks to any
-    // threshold, keep the full window and drag the good channel out to
+    // **What comes out of that translation is a BOUND, not the answer**, and
+    // believing it was the answer is the long-IR bug on the other side of the
+    // same coin. It is derived from the capture; the buffer it judges is the
+    // deconvolution's, and the deconvolution has a noise floor of its own —
+    // it redistributes the loop's noise across the whole buffer and adds its
+    // regularization ringing on top. When the IR's own floor sits ABOVE the
+    // derived line, no sliding window ever reaches the threshold, the
+    // truncator declines to cut, and the IR comes back the full length of the
+    // recorded tail: 10.000 s for a 10 s TAIL row, whatever was in the loop.
+    // `sweep::truncate_set_at_floor` now reads each channel's floor off that
+    // channel's own end and takes the higher of the two numbers, so the cut
+    // lands where the decay meets whichever limit it meets first.
+    //
+    // ONE CUT for the pair, made by `sweep::truncate_set_at_floor`, for the
+    // reason `normalize_set` uses one scale: the pair is one measurement.
+    // Per-channel CUTS let a dead return, whose deconvolved hiss never sinks
+    // to any threshold, keep the full window and drag the good channel out to
     // match it through the resize below — measured at 10.000 s against the
-    // 1.494 s the same capture gave with a live right return.
+    // 1.494 s the same capture gave with a live right return. The THRESHOLD
+    // is per channel, which is not the same thing and is the fix above: a
+    // threshold measured under the SET's peak is a threshold one channel's
+    // scale can poison for the other.
     //
     // **And no IR is longer than the silence recorded after the sweep.**
     //
@@ -14026,6 +14089,359 @@ mod tests {
         }
     }
 
+    /// [`synth_plate`] with the seed handed in, so a stereo fixture can be
+    /// built out of two decays that are provably not the same signal — a
+    /// swapped channel or a duplicated one then shows up as content, not
+    /// just as a level.
+    fn synth_plate_seeded(rt60: f64, secs: f64, rate: f64, mut seed: u64) -> Vec<f32> {
+        let n = (secs * rate) as usize;
+        let mut lp = 0.0f64;
+        let mut hp = 0.0f64;
+        let mut out = vec![0.0f32; n];
+        for (i, v) in out.iter_mut().enumerate() {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let w = ((seed >> 33) as f64 / (1u64 << 31) as f64) - 1.0;
+            lp += 0.35 * (w - lp);
+            hp += 0.004 * (lp - hp);
+            let t = i as f64 / rate;
+            *v = ((lp - hp) * 10.0f64.powf(-3.0 * t / rt60)) as f32;
+        }
+        out[0] = 1.0;
+        out
+    }
+
+    /// **A TRUE-STEREO loop pass**: the sweep through a different box on
+    /// each side, with the right side trimmed, and a matching loop-only
+    /// reference.
+    ///
+    /// [`loop_through`] puts the identical signal on both channels, which is
+    /// the right fixture for the mono-probe questions it was built for and
+    /// is blind to every stereo one: a channel swap, a duplicated channel
+    /// and a correct answer are the same buffer. Two different decays at two
+    /// different levels tell all three apart at a glance.
+    #[allow(clippy::too_many_arguments)]
+    fn stereo_loop_through(
+        dut_l: &[f32],
+        dut_r: &[f32],
+        sweep: &[f32],
+        pre: usize,
+        tail: usize,
+        send_db: f32,
+        right_trim_db: f32,
+        floor_db: f32,
+        latency: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let frames = pre + sweep.len() + tail;
+        let wl = crate::units::sweep::fft_convolve(sweep, dut_l);
+        let wr = crate::units::sweep::fft_convolve(sweep, dut_r);
+        // ONE gain for both sides, off the louder of them, so the trim below
+        // is the only thing that separates the channels' levels.
+        let peak = wl
+            .iter()
+            .chain(wr.iter())
+            .fold(0.0f32, |a, &b| a.max(b.abs()))
+            .max(1e-12);
+        let g = 10.0f32.powf(send_db / 20.0) / peak;
+        let gr = g * 10.0f32.powf(right_trim_db / 20.0);
+        let send = 10.0f32.powf(send_db / 20.0);
+        let amp = 10.0f32.powf(floor_db / 20.0) * 3.0f32.sqrt();
+        let mut seed = 0xfeed_beef_dead_c0deu64;
+        let mut noise = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0) * amp
+        };
+        let mut capture = vec![0.0f32; frames * 2];
+        let mut reference = vec![0.0f32; frames * 2];
+        for f in 0..frames {
+            let at = f.checked_sub(pre + latency);
+            let l = at.and_then(|k| wl.get(k)).copied().unwrap_or(0.0) * g;
+            let r = at.and_then(|k| wr.get(k)).copied().unwrap_or(0.0) * gr;
+            // The reference is the loop with the box out of it, so it
+            // carries the sweep at the send level on both jacks.
+            let s = at.and_then(|k| sweep.get(k)).copied().unwrap_or(0.0) * send;
+            capture[f * 2] = l + noise();
+            capture[f * 2 + 1] = r + noise();
+            reference[f * 2] = s + noise();
+            reference[f * 2 + 1] = s + noise();
+        }
+        (capture, reference)
+    }
+
+    /// **A true-stereo capture comes back true stereo on the reference
+    /// road, and a reference jack that brought nothing back does not
+    /// collapse it onto one side.**
+    ///
+    /// The regression for "and be focused on the left channel when the
+    /// capture loop only reference is used". The reference pass is a stereo
+    /// recording of a loop that half the world patches with one cable, and
+    /// `sweep::deconvolve_by_reference` divided by whatever it was handed.
+    /// Both ways that ends were measured on this fixture, and neither says
+    /// anything on screen:
+    ///
+    /// * **A silent jack divides to silence.** An input the interface hands
+    ///   back as true zeros makes the reference spectrum's power peak zero,
+    ///   the division bails, and that channel of the IR is a buffer of
+    ///   zeros: peak 0.00000 against the other side's 0.97724, a stereo file
+    ///   with one channel deleted.
+    /// * **A hissing jack divides to garbage and takes the good side with
+    ///   it.** The quotient is a real return over a noise floor, so it came
+    ///   back **+99.97 dB** above the side that held the box; `normalize_set`
+    ///   scales the pair by ONE peak, so the measurement was normalized down
+    ///   to −124.8 dB of energy. And the garbage became the SET's peak,
+    ///   which is what every threshold on the road is measured under, so the
+    ///   truncation stopped working as well: **6.000 s of a 6 s window**,
+    ///   the whole TAIL row, on a 2.5 s plate.
+    ///
+    /// So both of the owner's sentences were one fault. What is pinned here
+    /// is that the four references — a healthy stereo pass and each of the
+    /// three ways a jack comes back empty — all give the SAME IR, to within
+    /// a hair: each channel its own decay, the right side its own 6 dB trim,
+    /// one length, and a length that is the box rather than the window.
+    ///
+    /// The fixture is two DIFFERENT plates on purpose. With
+    /// [`loop_through`]'s identical channels, a swap, a duplication and a
+    /// correct answer are the same buffer; with a 2.5 s decay on the left
+    /// and a 0.8 s one on the right, each channel's own RT60 names which
+    /// side of the box it came from.
+    #[test]
+    fn a_true_stereo_capture_survives_a_reference_jack_that_brought_nothing_back() {
+        let rate = 48_000.0f64;
+        let (f1, f2, dur) = (10.0, 22_000.0f64.min(0.475 * rate), 5.0);
+        let sweep = crate::units::sweep::ess(f1, f2, dur, rate);
+        let pre = rate as usize;
+        let tail_s = 6.0f64;
+        let tail = (tail_s * rate) as usize;
+        let (want_l, want_r, trim_db) = (2.5f64, 0.8f64, -6.0f32);
+        let dut_l = synth_plate_seeded(want_l, 8.0, rate, 0x1111_2222_3333_4444);
+        let dut_r = synth_plate_seeded(want_r, 8.0, rate, 0x5555_6666_7777_8888);
+        let (capture, stereo_ref) = stereo_loop_through(
+            &dut_l, &dut_r, &sweep, pre, tail, -6.0, trim_db, -90.0, 512,
+        );
+        let frames = capture.len() / 2;
+
+        // The three ways a jack comes back with nothing on it, against the
+        // healthy pass they all have to match.
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut hiss = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0)
+                * 10.0f32.powf(-90.0 / 20.0)
+                * 3.0f32.sqrt()
+        };
+        let mut refs: Vec<(String, Vec<f32>)> =
+            vec![("a stereo loop".to_owned(), stereo_ref.clone())];
+        for (side, name) in [(1usize, "right"), (0, "left")] {
+            let mut silent = stereo_ref.clone();
+            let mut hissing = stereo_ref.clone();
+            for f in 0..frames {
+                silent[f * 2 + side] = 0.0;
+                hissing[f * 2 + side] = hiss();
+            }
+            refs.push((format!("digital silence on the {name} jack"), silent));
+            refs.push((format!("only hiss on the {name} jack"), hissing));
+        }
+
+        for (what, refc) in &refs {
+            let (l, r, out) = super::process_ir_capture(
+                &capture, &sweep, Some(&refc[..]), pre, rate, f1, f2, dur,
+            );
+            assert!(out.has_reference, "{what}: the reference road was not taken");
+            assert_eq!(l.len(), r.len(), "{what}: the pair came back uneven");
+
+            // **Each channel has its own content.** The decay names the side
+            // it came from, so a swap or a duplication cannot pass.
+            let got_l = rt60_of(&l, rate);
+            let got_r = rt60_of(&r, rate);
+            assert!(
+                (got_l - want_l).abs() / want_l < 0.12,
+                "{what}: the left channel recovered RT60 {got_l:.3} s against \
+                 the left box's {want_l}"
+            );
+            assert!(
+                (got_r - want_r).abs() / want_r < 0.12,
+                "{what}: the right channel recovered RT60 {got_r:.3} s against \
+                 the right box's {want_r}"
+            );
+
+            // **And its own level.** The trim between the sides IS the
+            // stereo image; one peak normalizes the pair, so it has to
+            // survive to the file.
+            let peak = |c: &[f32]| c.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            let (pl, pr) = (peak(&l), peak(&r));
+            assert!(
+                pl > 0.0 && pr > 0.0,
+                "{what}: a channel came back silent — L {pl}, R {pr}"
+            );
+            let image_db = 20.0 * (pr / pl).log10();
+            assert!(
+                (image_db - trim_db).abs() < 1.5,
+                "{what}: the right side came back {image_db:.2} dB against the \
+                 left, where the loop put it {trim_db} dB down"
+            );
+
+            // **Not one channel twice.** Two different plates through one
+            // sweep are barely correlated; a duplicated or summed channel
+            // reads near 1.
+            let n = l.len().min(r.len());
+            let (mut num, mut sl, mut sr) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 0..n {
+                num += f64::from(l[i]) * f64::from(r[i]);
+                sl += f64::from(l[i]) * f64::from(l[i]);
+                sr += f64::from(r[i]) * f64::from(r[i]);
+            }
+            let corr = num / (sl.sqrt() * sr.sqrt()).max(1e-30);
+            assert!(
+                corr.abs() < 0.5,
+                "{what}: the channels correlate at {corr:.3} — this is one \
+                 channel copied, not a stereo pair"
+            );
+
+            // **And the length is the box, not the TAIL row.** The garbage
+            // channel used to become the set's peak and with it the
+            // threshold every channel was judged by, and the pair came back
+            // the whole 6 s window.
+            assert!(
+                f64::from(out.seconds) < 0.7 * tail_s,
+                "{what}: {} s of a {tail_s} s window",
+                out.seconds
+            );
+            assert!(
+                f64::from(out.seconds) > want_l * 0.8,
+                "{what}: {} s is shorter than the left box's {want_l} s decay",
+                out.seconds
+            );
+        }
+
+        // A reference pass with NEITHER jack live is not a reference at all:
+        // the classic route runs and the result stage says so, rather than
+        // the wizard dividing by two channels of hiss and calling the answer
+        // exact.
+        let mut dead = stereo_ref.clone();
+        for v in dead.iter_mut() {
+            *v = hiss();
+        }
+        let (l, r, out) =
+            super::process_ir_capture(&capture, &sweep, Some(&dead), pre, rate, f1, f2, dur);
+        assert!(
+            !out.has_reference,
+            "a reference pass with nothing on either jack was used as a reference"
+        );
+        assert_eq!(l.len(), r.len(), "the classic fallback came back uneven");
+        assert!(
+            (rt60_of(&l, rate) - want_l).abs() / want_l < 0.12,
+            "the classic fallback lost the left box: RT60 {:.3} s",
+            rt60_of(&l, rate)
+        );
+    }
+
+    /// **A box that only hisses while it is WORKING does not ship its whole
+    /// tail window.**
+    ///
+    /// The regression for "is every IR supposed to end up as 10 seconds at
+    /// the end with those settings", on the road, with the wizard's own
+    /// defaults: a 15 s sweep and a 10 s tail.
+    ///
+    /// The truncation threshold was `ir_peak_db − snr`, where the snr is the
+    /// CAPTURE's — and the buffer it judges is the deconvolution's, whose
+    /// noise floor is its own affair. Note the sign, because it is what kept
+    /// this hidden for so long: the cleaner the capture, the LOWER the
+    /// threshold, and the lower the threshold the harder it is for any
+    /// window to reach it. So the failure arrives on GOOD captures, and it
+    /// arrives as an IR the exact length of whatever the TAIL row said.
+    ///
+    /// The fixture is the ordinary behaviour of a digital box, not an edge
+    /// case: an idle Quadraverb-era output stage is quiet, and a working one
+    /// is not — dither and truncation noise only exist while there is signal
+    /// to truncate. The pre-roll therefore reads −120 dBFS, the wizard
+    /// scores the capture at its full 80 dB of range, and the threshold goes
+    /// 77 dB under the IR's peak, while the recovered IR's own floor sits
+    /// nowhere near that far down. Measured on this fixture before the fix:
+    /// **10.000 s of a 10 s window, on both routes**, of a 2.5 s plate.
+    /// After: 2.174 s classic, 2.113 s reference, with the recovered RT60
+    /// still 2.50 s.
+    ///
+    /// The second case is the control. A flat floor never had the fault, and
+    /// it must not acquire one: the same plate through a −85 dBFS loop kept
+    /// 2.507 s before and keeps it after.
+    #[test]
+    fn a_box_that_only_hisses_while_it_works_does_not_ship_its_whole_tail_window() {
+        let rate = 48_000.0f64;
+        let (f1, f2) = (10.0, 22_000.0f64.min(0.475 * rate));
+        // The wizard's defaults, because they are what the report was made
+        // with and the length that comes back is the whole complaint.
+        let dur = 15.0f64;
+        let sweep = crate::units::sweep::ess(f1, f2, dur, rate);
+        let pre = rate as usize;
+        let tail_s = 10.0f64;
+        let tail = (tail_s * rate) as usize;
+        let want = 2.5f64;
+        let plate = synth_plate(want, 8.0, rate);
+        for (what, idle_db, working_db) in [
+            ("quiet idle, hissy under signal", -120.0f32, -60.0f32),
+            ("a flat floor", -85.0, -85.0),
+        ] {
+            let frames = pre + sweep.len() + tail;
+            let wet = crate::units::sweep::fft_convolve(&sweep, &plate);
+            let wet_peak = wet.iter().fold(0.0f32, |a, &b| a.max(b.abs())).max(1e-12);
+            let g = 10.0f32.powf(-6.0 / 20.0) / wet_peak;
+            let send = 10.0f32.powf(-6.0 / 20.0);
+            let mut seed = 0xfeed_beef_dead_c0deu64;
+            let mut u = move || {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+            };
+            let idle = 10.0f32.powf(idle_db / 20.0) * 3.0f32.sqrt();
+            let working = 10.0f32.powf(working_db / 20.0) * 3.0f32.sqrt();
+            let mut capture = vec![0.0f32; frames * 2];
+            let mut reference = vec![0.0f32; frames * 2];
+            for f in 0..frames {
+                let at = f.checked_sub(pre + 512);
+                // The box is idle through the pre-roll and working from the
+                // moment the sweep reaches it, which is exactly what the
+                // floor read at the front of the road cannot see.
+                let amp = if f < pre { idle } else { working };
+                let w = at.and_then(|k| wet.get(k)).copied().unwrap_or(0.0) * g;
+                let s = at.and_then(|k| sweep.get(k)).copied().unwrap_or(0.0) * send;
+                capture[f * 2] = w + u() * amp;
+                capture[f * 2 + 1] = w + u() * amp;
+                reference[f * 2] = s + u() * idle;
+                reference[f * 2 + 1] = s + u() * idle;
+            }
+            for (route, refc) in [("classic", None), ("reference", Some(&reference[..]))] {
+                let (l, r, out) = super::process_ir_capture(
+                    &capture, &sweep, refc, pre, rate, f1, f2, dur,
+                );
+                assert!(
+                    f64::from(out.seconds) < 0.5 * tail_s,
+                    "{route}, {what}: {} s came back for a {tail_s} s tail \
+                     setting - the truncation never reached its threshold",
+                    out.seconds
+                );
+                // Short is not the answer either: the decay that comes back
+                // is still the plate's.
+                let got = rt60_of(&l, rate);
+                assert!(
+                    (got - want).abs() / want < 0.10,
+                    "{route}, {what}: recovered RT60 {got:.3} s against the \
+                     plate's {want}"
+                );
+                assert!(
+                    f64::from(out.seconds) > want * 0.7,
+                    "{route}, {what}: {} s of a {want} s plate",
+                    out.seconds
+                );
+                assert_eq!(l.len(), r.len(), "{route}, {what}: the pair came back uneven");
+            }
+        }
+    }
 
     // ── the IR wizard's host half ───────────────────────────────────────────
 
