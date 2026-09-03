@@ -15,9 +15,19 @@
 //! tremolo — and the pedalboard underfoot as a row of seven chips, each
 //! wearing its tenant's short name or a plus.
 //!
-//! A chip is a doorway, not an editor: clicking one asks the app to open
-//! the picker over that pedal's own seat (`recorder::amp_pedal_seat`), and
-//! the pedal's face then opens by the same road every insert's does.
+//! **A chip is a doorway, and it is the SAME doorway a rack bay is.**
+//! Clicking one opens that pedal's own window STACKED over this one — the
+//! picker if the seat is empty, the suite unit's face if it is one of ours,
+//! the plugin's native editor if it is a bundle — and Alt empties the seat
+//! and Shift bypasses it, exactly as they do on a bay, because one function
+//! (`App::bay_gesture`) decides both and neither surface can disagree with
+//! it. The modifiers are read from THIS window's own input rather than from
+//! the desk's latched pair; see `FaceAction::PedalGesture` for why that is
+//! not a detail.
+//!
+//! The pedal's window stands ABOVE this one and closing it comes back here:
+//! the amp is never put away to show a pedal, and both windows stay
+//! turnable wherever they are not covered.
 //!
 //! **Whose board this is comes from `recorder::pedal_owner`, not from the
 //! seat.** A group wears six bays across two seats, and an amp in the second
@@ -201,10 +211,28 @@ pub fn draw_amp(
                     let chip = chip.on_hover_text(if empty {
                         format!("pedal {}: choose an effect", pedal + 1)
                     } else {
-                        format!("pedal {}: {tenant} - click to swap", pedal + 1)
+                        format!(
+                            "pedal {}: {tenant} - click to open, \
+                             shift to bypass, alt to remove",
+                            pedal + 1
+                        )
                     });
                     if chip.clicked() && out.is_none() {
-                        out = Some(FaceAction::OpenPedal { pedal });
+                        // **Read from THIS window's input, not from the
+                        // desk's.** The app latches `alt_down`/`shift_down`
+                        // once a frame off the main window's context, and on
+                        // the desktop this panel is a window of its own with
+                        // a keyboard of its own — so a chip that leaned on
+                        // the latched pair would answer about whatever the
+                        // desk happened to be holding, which is nothing,
+                        // because the hand is over here. See
+                        // `FaceAction::PedalGesture`.
+                        let m = ui.input(|i| i.modifiers);
+                        out = Some(FaceAction::PedalGesture {
+                            pedal,
+                            alt: m.alt,
+                            shift: m.shift,
+                        });
                     }
                 }
             });
