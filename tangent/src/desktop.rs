@@ -1337,6 +1337,13 @@ fn engine_set_insert_keys(engine: &crate::instrument::Engine, keys: &[(usize, us
     engine.set_insert_keys(keys);
 }
 
+/// The whole bypass table onto the engine - `(seat, bay)`, absent means in
+/// circuit, the `set_routes` idiom.
+#[cfg(feature = "recorder")]
+fn engine_set_insert_bypass(engine: &crate::instrument::Engine, bays: &[(usize, usize)]) {
+    engine.set_insert_bypass(bays);
+}
+
 /// **Read one seat's bays and hand the app every built-in face on it** —
 /// the `push_fx_params` precedent with the values included, called from the
 /// same place for the same reason: the reconcile is the only spot a bay's
@@ -7933,6 +7940,11 @@ impl DesktopApp {
             })
             .collect();
         engine_set_insert_keys(e, &keys);
+        // **And the bypassed bays**, whole each frame on the same bargain:
+        // absent means in circuit. Already in SEAT terms - a bypass is stored
+        // at the plugin's own address - so unlike the keys above there is no
+        // `seat_bay` translation here to get wrong.
+        engine_set_insert_bypass(e, self.app.insert_bypass());
     }
 
     fn push_monitor_settings(&mut self) {

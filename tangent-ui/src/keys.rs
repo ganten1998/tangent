@@ -528,6 +528,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("2-CLK", "rename a channel · reset a fader"),
             ("S-ARM", "shift+arm: this lane alone - every other arm stands down"),
             ("A-CLK", "alt-click an insert: empty the bay"),
+            ("S-CLK", "shift-click an insert: bypass it - the plugin stays"),
             ("DEL", "remove the selected channel"),
             ("C-T", "ctrl+T: a new track"),
             ("C-F", "ctrl+F: group the selection into a folder"),
@@ -551,7 +552,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             // lane" and "a node" rather than naming the two surfaces. The
             // ramp toggle is the one thing a tempo point has that an
             // automation node does not, so it alone gets a row of its own.
-            ("S-CLK", "shift-click a lane: drop a node · a node: add it to the selection"),
+            ("S-CLK", "shift-click a lane: drop a node · a node: add it · an insert bay: bypass it"),
             ("S-PT", "shift-click a tempo point: ramp or step"),
             ("DIAL", "an automation row's dial: the lane's base · 2-click resets"),
             ("2-CLK", "double-click a MIDI item: open its editor"),
