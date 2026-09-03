@@ -54,6 +54,11 @@ pub struct LaneView<'a> {
     /// extra rack, `recorder::folder_extra_seat`), everybody else the first
     /// three and blanks.
     pub inserts: [&'a str; crate::recorder::INSERTS * 2],
+    /// **Which of those bays are BYPASSED** — kept, loaded, editable, and
+    /// not applied, the `AutoView::bypassed` bargain one layer down. Indexed
+    /// like `inserts`, so a FOLDER's slots 3..5 answer for its extra rack;
+    /// the app resolves that through `recorder::seat_bay` before it asks.
+    pub bypassed: [bool; crate::recorder::INSERTS * 2],
     /// How many routes leave this lane, for the ROUTING chip.
     pub route_count: usize,
     /// Polarity inverted — see `mixer_panel::StripView::phase`.
@@ -358,6 +363,9 @@ pub struct ArrangeView<'a> {
     /// in which is `recorder::seat_bay`'s business and not this panel's, so
     /// what arrives here is already in strip order, top to bottom.
     pub master_inserts: [&'a str; crate::recorder::INSERTS * 2],
+    /// Which of the master's six are bypassed — `LaneView::bypassed` for the
+    /// master row, in the same strip order as `master_inserts`.
+    pub master_bypassed: [bool; crate::recorder::INSERTS * 2],
     /// The first lane shown — the arrangement has more lanes than fit, so a
     /// window of them shows and this says which. Clamped by the app.
     pub lane_scroll: usize,
@@ -2834,11 +2842,19 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
             ),
             Hit::HdrBay(i, bay) => {
                 let what = view.lanes.get(i).map_or("", |l| l.inserts[bay]);
+                // Bypassed said in the VALUE, the mixer's wording exactly:
+                // the amber bar and the quieted word are the whole visual
+                // answer and a reader gets neither.
+                let off = view.lanes.get(i).is_some_and(|l| l.bypassed[bay]);
                 Node::readout(
                     id,
                     r,
                     format!("{} insert {}", who(i), bay + 1),
-                    if what.is_empty() { "empty".to_owned() } else { what.to_owned() },
+                    match (what.is_empty(), off) {
+                        (true, _) => "empty".to_owned(),
+                        (false, true) => format!("{what}, bypassed"),
+                        (false, false) => what.to_owned(),
+                    },
                 )
             }
             Hit::HdrRouting(i) => Node::button(id, r, format!("{} routing", who(i))),
@@ -2846,13 +2862,16 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
             // so it reads in the desk's own words.
             Hit::BusBay(_, slot) => {
                 let word = view.master_inserts.get(slot).copied().unwrap_or("");
+                let off = view.master_bypassed.get(slot).copied().unwrap_or(false);
                 Node::button(
                     id,
                     r,
-                    if word.is_empty() {
-                        format!("Master insert {}, empty", slot + 1)
-                    } else {
-                        format!("Master insert {}, {word}", slot + 1)
+                    match (word.is_empty(), off) {
+                        (true, _) => format!("Master insert {}, empty", slot + 1),
+                        (false, true) => {
+                            format!("Master insert {}, {word}, bypassed", slot + 1)
+                        }
+                        (false, false) => format!("Master insert {}, {word}", slot + 1),
                     },
                 )
             }
@@ -2997,7 +3016,12 @@ struct Ink {
 /// A free function rather than a closure inside the header loop, because the
 /// MASTER row grew a rack of its own and two racks drawn by two pieces of code
 /// is two racks that drift apart.
-fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, p: &Ink) {
+/// `bypassed` is the bay's tenant being kept and not applied — see
+/// `settings::BypassBays`. It shows the way the MIXER's rack shows it, and
+/// deliberately so: these chips already wear the mixer's own strip face
+/// (`hdr_face`), and a hand that has learned "amber bar, grey word" on one
+/// desk has learned it on both.
+fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, bypassed: bool, p: &Ink) {
     if !r.is_positive() {
         return;
     }
@@ -3010,13 +3034,44 @@ fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, p: &Ink) {
         Stroke::new(1.0, ink.gamma_multiply(0.4)),
         egui::StrokeKind::Inside,
     );
+    // **The amber bar down the left edge, on a bypassed bay only.**
+    //
+    // The mixer's rack has a tab there always — blue for loaded, amber for
+    // bypassed — while this chip has never had one, so an unbypassed chip is
+    // left exactly as it was drawn yesterday and only the new state grows a
+    // new mark. Through `lit_on`, because a fixed amber on a themed face is
+    // a mark that disappears on the warm themes; the all-theme sweep in this
+    // file's tests holds it to a floor.
+    let text_left = if bypassed && has {
+        let tab = crate::recorder_panel::lit_on(p.mute, bone);
+        painter.rect_filled(
+            Rect::from_min_max(r.min, Pos2::new(r.left() + 3.0, r.bottom())),
+            2.0,
+            tab,
+        );
+        4.0
+    } else {
+        0.0
+    };
     let font = FontId::new((r.height() * 0.62).clamp(7.0, 10.0), crate::fonts::courier());
+    // **And the word goes as quiet as a bypassed automation row's does** —
+    // 0.45, the figure two hundred lines down where the same state is drawn
+    // on a lane. `quiet` re-measures against this chip's own ground and
+    // stops at 4.5:1, so "quieter" never becomes "gone" on a dark theme.
+    let dim = if bypassed && has {
+        0.45
+    } else if has {
+        0.08
+    } else {
+        0.34
+    };
+    let inner = Rect::from_min_max(Pos2::new(r.left() + text_left, r.top()), r.max);
     painter.text(
-        r.center(),
+        inner.center(),
         Align2::CENTER_CENTER,
-        cut_to(painter, r.width() - 4.0, word, &font),
+        cut_to(painter, inner.width() - 4.0, word, &font),
         font,
-        quiet(ink, bone, if has { 0.08 } else { 0.34 }),
+        quiet(ink, bone, dim),
     );
 }
 
@@ -3145,7 +3200,12 @@ fn on_ink(bg: Color32) -> Color32 {
     }
 }
 
-fn quiet(ink: Color32, bg: Color32, t: f32) -> Color32 {
+/// `pub(crate)` because the MIXER's rack needs it too, for the bypassed bay
+/// label: one contrast-guarded dim for the whole app rather than a second
+/// copy in the other panel that could be given a different floor by somebody
+/// who never saw this one. It lives here because this is where it was
+/// written and where every other caller of it still is.
+pub(crate) fn quiet(ink: Color32, bg: Color32, t: f32) -> Color32 {
     // **Quieter, but never quiet enough to stop being words.** How far `t`
     // can go depends on the ground: on the pale themes a third of the way
     // toward a near-white panel is already a grey nobody reads, which is what
@@ -4742,6 +4802,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     *cell,
                     if word.is_empty() { "+" } else { word },
                     !word.is_empty(),
+                    view.master_bypassed.get(b).copied().unwrap_or(false),
                     &p,
                 );
             }
@@ -4902,8 +4963,12 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // The input chip draws on EVERY lane — binding an input is how a
         // bare lane becomes a track — in bone whatever the theme, so the
         // words read on a painted header and on the grey field alike.
-        let chip =
-            |painter: &Painter, r: Rect, word: &str, has: bool| bay_chip(painter, r, word, has, &p);
+        // Not bypassable, these two: the input chip and the ROUTING button
+        // borrow the bay's LOOK and are not bays, so they pass `false` and
+        // the bays below call `bay_chip` themselves with their own flag.
+        let chip = |painter: &Painter, r: Rect, word: &str, has: bool| {
+            bay_chip(painter, r, word, has, false, &p);
+        };
         if !lane.used {
             if row.add.is_positive() {
                 let c = row.add.center();
@@ -4981,11 +5046,15 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 continue;
             }
             let bay_word = lane.inserts.get(b).copied().unwrap_or("");
-            chip(
+            // Not through `chip`: a BAY is the one of these three that can
+            // be taken out of circuit, so it carries its own flag.
+            bay_chip(
                 painter,
                 *r,
                 if bay_word.is_empty() { "+" } else { bay_word },
                 !bay_word.is_empty(),
+                lane.bypassed.get(b).copied().unwrap_or(false),
+                &p,
             );
         }
         // ROUTING, under the dials: the same door the mixer's button opens,
@@ -5551,6 +5620,7 @@ LaneView {
             route_count: 0,
             stereo: true,
             inserts: [""; crate::recorder::INSERTS * 2],
+            bypassed: [false; crate::recorder::INSERTS * 2],
             name: "KEYS",
             input: String::new(),
             color: 0,
@@ -5619,6 +5689,7 @@ ArrangeView {
             accent: (0x6C, 0x9B, 0xD2),
             show_master_row: true,
             master_inserts: [""; crate::recorder::INSERTS * 2],
+            master_bypassed: [false; crate::recorder::INSERTS * 2],
             show_tempo_lane: false,
             tempo_hot: None,
             meter_edit: None,
@@ -6472,6 +6543,27 @@ ArrangeView {
                     quiet(p.engrave, p.hdr_face, 0.08),
                     p.hdr_face,
                     4.5,
+                );
+                // **And the BYPASSED one**, which is the same chip with its
+                // word pulled twice as far toward the ground and an amber
+                // bar down its left edge. Quieter is a matter of weight: a
+                // plugin whose name has gone unreadable is a plugin you
+                // cannot identify to put back, so it answers the full 4.5.
+                check(
+                    "bypassed bay chip",
+                    quiet(p.engrave, p.hdr_face, 0.45),
+                    p.hdr_face,
+                    4.5,
+                );
+                // The bar is a graphic mark and takes the graphic floor —
+                // through `lit_on`, because a fixed amber on a themed face
+                // is exactly the fault this whole audit exists to catch, and
+                // a warm theme is where it would have hidden.
+                check(
+                    "bypassed bay bar",
+                    crate::recorder_panel::lit_on(p.mute, p.hdr_face),
+                    p.hdr_face,
+                    3.0,
                 );
                 check("ruler seconds", quiet(on_ink(p.ruler), p.ruler, 0.18), p.ruler, 4.0);
                 check(
