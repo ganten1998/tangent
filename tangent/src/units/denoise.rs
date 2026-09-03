@@ -84,7 +84,7 @@
 //! several times faster, because the hit masked the noise and the gap behind
 //! it should not hiss.
 //!
-//! Then, every control tick, the depths are smoothed ACROSS the bank:
+//! Then, every control tick, the TARGETS are smoothed ACROSS the bank:
 //! adjacent bands may not differ by more than 6 dB. Two bells at very
 //! different depths beat against each other in the overlap region between
 //! their centres; CEDAR-style designs constrain the slope of the gain curve
@@ -99,9 +99,13 @@
 //! isolated noise. On the falling edge each band's threshold freezes at
 //! mean + 2σ of its log energy, NOT at the mean: a short noise sample's
 //! mean underestimates its excursions, and a threshold at the mean would
-//! leave half the noise poking through. The thresholds are ordinary state —
-//! [`Denoise::thresholds`] and [`Denoise::set_thresholds`] move all 32 as
-//! normalized values so a session can persist them as symbols.
+//! leave half the noise poking through. (The SPECTRAL kernels freeze a
+//! GEOMETRIC mean into the same slots instead — see
+//! [`Denoise::freeze_spectral_thresholds`] — which is the other half of why
+//! a profile belongs to the kernel that learned it.) The thresholds are
+//! ordinary state — [`Denoise::thresholds`] and [`Denoise::set_thresholds`]
+//! move all 32 as normalized values so a session can persist them as
+//! symbols.
 //!
 //! # Lookahead
 //!
@@ -248,7 +252,9 @@ const DENOISE_TICK_MS: f32 = 0.667;
 /// onset is seen inside the lookahead window) and falls over ~12 ms; that
 /// asymmetry makes it ride the TOPS of the band's level distribution —
 /// which errs toward opening, exactly right for protecting signal. The
-/// LEVEL envelope is symmetric at ~12 ms: an unbiased estimate of the same
+/// LEVEL envelope is symmetric and PER BAND, from 12 ms at the top of the
+/// grid to 400 ms at the bottom (see [`LEVEL_BW_MS_HZ`] for why it has to
+/// vary): an unbiased estimate of the same
 /// statistic the learn pass measured, which is what the expander curve
 /// must compare against the threshold — feed the curve the peak-riding
 /// gate envelope instead and the learn margin (mean + 2σ) cancels out to
@@ -256,6 +262,40 @@ const DENOISE_TICK_MS: f32 = 0.667;
 const ENV_RISE_MS: f32 = 1.5;
 const ENV_FALL_MS: f32 = 12.0;
 const LEVEL_MS: f32 = 12.0;
+
+/// The LEVEL envelope's time constant is per band, and this is what sets
+/// it: `LEVEL_BW_MS_HZ / bandwidth`, floored at [`LEVEL_MS`] and capped at
+/// [`LEVEL_MAX_MS`].
+///
+/// A band's energy estimate is a chi-square with about `2·B·τ` degrees of
+/// freedom, so a FIXED τ gives the top band (12.9 kHz of detector
+/// bandwidth) a quarter of a decibel of scatter and the bottom one (50 Hz)
+/// several decibels of it. That scatter is not cosmetic: the expander's
+/// slope multiplies it by ratio − 1, and the depth smoother is asymmetric
+/// (2 ms toward less cut, the dialled release toward more), so it
+/// RECTIFIES the scatter into a slow random walk. Measured on twelve
+/// seconds of stationary noise at the top of the dial, band 0's
+/// second-by-second mean wandered over 3.3 dB and never settled, while
+/// band 16 and above sat still — the bank "never arriving" was always a
+/// low-band statistics problem wearing a dynamics problem's clothes.
+///
+/// 20 s·Hz is about forty degrees of freedom, so every band's level
+/// estimate carries roughly a decibel of scatter instead of a quarter of
+/// one at the top and several at the bottom. It puts the 60 Hz band on the
+/// 400 ms cap, band 8 at 159 ms, band 16 at 45 ms and everything above
+/// about 1.7 kHz back on the fixed 12 ms — which is where the scatter was
+/// already small and where nothing needed changing.
+///
+/// Only the statistic the STATIC CURVE reads is slowed. The gate envelope
+/// that decides open-or-closed and protects transients is untouched, so
+/// nothing about how fast a band opens for signal changes; what is slower
+/// is only how fast a band that is already closed adjusts the DEPTH of its
+/// cut, and a bass noise floor that moves faster than a third of a second
+/// is not a noise floor. Going further has little left to buy: 40 s·Hz and
+/// an 800 ms cap took the same measurement from 0.898 dB only to 0.813,
+/// for twice the sluggishness.
+const LEVEL_BW_MS_HZ: f32 = 20_000.0;
+const LEVEL_MAX_MS: f32 = 400.0;
 
 /// The slow reference the transient detector compares against, and how far
 /// above it the envelope must jump to count as a transient.
@@ -553,6 +593,10 @@ struct BandDesign {
     /// only reachable at absurdly low sample rates; the band then never
     /// cuts.
     inert: bool,
+    /// This band's LEVEL smoothing coefficient — per band, because the
+    /// confidence of an energy estimate depends on the bandwidth it was
+    /// taken over. See [`LEVEL_BW_MS_HZ`].
+    a_level: f32,
 }
 
 /// One bell's audio-rate coefficients. f32, per the house split: design
@@ -1305,6 +1349,7 @@ impl Denoise {
             g: 0.0,
             inert: true,
             shelf: 0,
+            a_level: 0.0,
         }; DENOISE_BANDS];
         for (k, d) in design.iter_mut().enumerate() {
             let hz = f64::from(Self::center_hz(k));
@@ -1327,6 +1372,8 @@ impl Denoise {
                 pi: (r * w0.sin()) as f32,
                 g: (1.0 - r) as f32,
                 inert: false,
+                // Filled in below, once the tick length is known.
+                a_level: 0.0,
                 shelf: if k == 0 {
                     -1
                 } else if k == DENOISE_BANDS - 1 {
@@ -1344,6 +1391,20 @@ impl Denoise {
         let tick_len = ((sr * f64::from(DENOISE_TICK_MS) / 1_000.0).round() as u32).max(8);
         let tick_s = f64::from(tick_len) / sr;
         let a_of = |ms: f32| (1.0 - (-tick_s * 1_000.0 / f64::from(ms)).exp()) as f32;
+
+        // The per-band LEVEL coefficient needs the tick length, which is
+        // only known now; the bandwidth each one derives from is the same
+        // `hz / det_q` the resonator above was built with.
+        for (k, d) in design.iter_mut().enumerate() {
+            if d.inert {
+                continue;
+            }
+            let hz = Self::center_hz(k);
+            let edge = k == 0 || k == DENOISE_BANDS - 1;
+            let bw = hz / if edge { 1.2 } else { DENOISE_DETECTOR_Q };
+            let ms = (LEVEL_BW_MS_HZ / bw).clamp(LEVEL_MS, LEVEL_MAX_MS);
+            d.a_level = a_of(ms);
+        }
 
         let la_len = ((sr * f64::from(DENOISE_LOOKAHEAD_MS) / 1_000.0).round() as usize).max(1);
 
@@ -1669,7 +1730,7 @@ impl Denoise {
                 self.a_fall
             };
             b.env_db += a * (level_db - b.env_db);
-            b.level_db += self.a_level * (level_db - b.level_db);
+            b.level_db += self.design[k].a_level * (level_db - b.level_db);
 
             // The transient flag: envelope far above its slow reference
             // means a hit just landed; the release runs faster for the
@@ -1739,24 +1800,11 @@ impl Denoise {
                 }
             };
 
-            // Depth smoothing, dB domain. Toward LESS cut is the fast fixed
-            // opening; toward MORE cut is the release, interpolated toward
-            // its after-a-transient speed by the boost flag.
-            let a = if target < b.depth_db {
-                self.a_open
-            } else {
-                plan.a_rel_slow + (plan.a_rel_fast - plan.a_rel_slow) * b.boost
-            };
-            b.depth_db += a * (target - b.depth_db);
-            // Flush the decaying tail to a true zero — but ONLY while the
-            // target is zero. A rising depth starts each tick a fraction
-            // of a dB above nothing, well inside any epsilon; flush that
-            // and no cut can ever climb out of zero (the stale-clamp
-            // disease, met before and it cost an afternoon).
-            if target <= 0.0 && b.depth_db < DEPTH_EPS_DB {
-                b.depth_db = 0.0;
-            }
-            depth[k] = b.depth_db;
+            // The TARGET, unsmoothed. The smoothing happens in a second
+            // pass, after the cross-band constraint has had its say — see
+            // the constraint's own comment for why that ordering is the
+            // whole fix for the depth jump.
+            depth[k] = target;
         }
 
         // The cross-band slope constraint, MASKING-EXEMPT: one pass up,
@@ -1771,6 +1819,20 @@ impl Denoise {
         // open band's own edge: the signal that opened it masks the noise
         // it admits, and its neighbours' floors staying PINNED is what
         // makes the break-through crisp.
+        //
+        // **It runs on the TARGET, before the smoother, and that ordering
+        // is load-bearing.** It used to run on the smoothed depth, after —
+        // a hard `min` applied to the number the bell was about to be
+        // designed from. The `open` flags are booleans, so the moment a
+        // neighbour stops being masking-exempt the constraint arrives all
+        // at once and the depth moved as much as 5.55 dB in a single
+        // 0.667 ms tick. A minimum-phase bell whose coefficients jump is
+        // the definition of the artefact this unit was reported for: its
+        // phase is tied to its magnitude, so a discontinuous gain is a
+        // discontinuous phase. Constraining the target instead puts every
+        // such transition through the same 2 ms opening envelope that every
+        // other gain move already uses, and the bell stops being asked to
+        // teleport.
         let open: [bool; DENOISE_BANDS] = {
             let mut o = [false; DENOISE_BANDS];
             for (k, b) in self.band.iter().enumerate() {
@@ -1790,7 +1852,25 @@ impl Denoise {
         }
 
         for (k, b) in self.band.iter_mut().enumerate() {
-            b.depth_db = depth[k];
+            // Depth smoothing, dB domain, on the CONSTRAINED target.
+            // Toward LESS cut is the fast fixed opening; toward MORE cut is
+            // the release, interpolated toward its after-a-transient speed
+            // by the boost flag.
+            let target = depth[k];
+            let a = if target < b.depth_db {
+                self.a_open
+            } else {
+                plan.a_rel_slow + (plan.a_rel_fast - plan.a_rel_slow) * b.boost
+            };
+            b.depth_db += a * (target - b.depth_db);
+            // Flush the decaying tail to a true zero — but ONLY while the
+            // target is zero. A rising depth starts each tick a fraction
+            // of a dB above nothing, well inside any epsilon; flush that
+            // and no cut can ever climb out of zero (the stale-clamp
+            // disease, met before and it cost an afternoon).
+            if target <= 0.0 && b.depth_db < DEPTH_EPS_DB {
+                b.depth_db = 0.0;
+            }
             if b.depth_db < DEPTH_EPS_DB {
                 // Skipped entirely: this is the bit-transparent state. The
                 // delay registers keep whatever tail was ringing; by the
@@ -3870,6 +3950,153 @@ mod tests {
                 kernel.label()
             );
         }
+    }
+
+    /// **The bank arrives, and stays.** Twelve seconds of stationary noise
+    /// at the top of the dial: no band's second-by-second mean depth may
+    /// move more than 1.5 dB from one second to the next.
+    ///
+    /// It used to move 3.34 dB, in the LOW bands only, and it did not
+    /// shrink when the run was made longer — which is what "the bank never
+    /// settles" meant. A bell whose gain never stops moving is a bell whose
+    /// PHASE never stops moving, because a minimum-phase section ties the
+    /// two together, so this was a candidate for the reported artefacts in
+    /// its own right.
+    ///
+    /// The cause was statistics, not dynamics. A band's energy estimate is
+    /// a chi-square with about `2·B·τ` degrees of freedom, so at a fixed
+    /// τ the 50 Hz-wide bottom band carried several decibels of scatter
+    /// where the 12.9 kHz-wide top band carried a quarter of one; the
+    /// expander's slope multiplied that scatter by ratio − 1, and the
+    /// asymmetric depth smoother — fast toward less cut, slow toward more —
+    /// RECTIFIED it into a slow random walk. Giving each band a level
+    /// window inversely proportional to its bandwidth
+    /// ([`LEVEL_BW_MS_HZ`]) equalises the confidence and the walk stops.
+    ///
+    /// Measured per band rather than in aggregate, and over twelve windows
+    /// rather than two, because a walk that happens to be near its old
+    /// value at both ends of a short run reads as zero.
+    #[test]
+    fn the_bank_settles_and_stops_travelling() {
+        let p = DenoiseParams {
+            reduce: 1.0,
+            ..on(DenoiseKernel::Bank)
+        };
+        let mut dn = learned_full_band(DenoiseKernel::Bank, 0xD1A1, 0.05, SR, 1.0);
+        let frames = 12 * SR as usize;
+        let mut buf = FullBandNoise::new(0xD1A1, 0.05).frames(frames);
+        let traj = analysis::gain_trajectory(&mut dn, &mut buf, frames, 512, &p);
+        let per_sec = traj.len() / 12;
+        let mean = |seg: &[[f32; DENOISE_BANDS]], k: usize| {
+            seg.iter().map(|s| s[k]).sum::<f32>() / seg.len() as f32
+        };
+
+        // The first two seconds are the bank arriving, which is allowed.
+        let (mut worst, mut at) = (0.0_f32, (0, 0));
+        for w in 3..12 {
+            let seg = &traj[w * per_sec..(w + 1) * per_sec];
+            let prev = &traj[(w - 1) * per_sec..w * per_sec];
+            for k in 0..DENOISE_BANDS {
+                let d = (mean(seg, k) - mean(prev, k)).abs();
+                if d > worst {
+                    worst = d;
+                    at = (w, k);
+                }
+            }
+        }
+        assert!(
+            worst < 1.5,
+            "band {} moved {worst:.2} dB between second {} and the one before \
+             it — the bank is still travelling (it was 3.34 dB before the \
+             per-band level window)",
+            at.1,
+            at.0
+        );
+    }
+
+    /// **A band that stays closed does not jump when its neighbour opens.**
+    ///
+    /// The cross-band slope rule is masking-exempt: a band that is open
+    /// because signal lives in it does not export its zero sideways. The
+    /// flags are booleans, so the moment a neighbour stops being exempt the
+    /// constraint arrives all at once — and it used to arrive at the
+    /// SMOOTHED depth, as a hard `min` on the number the bell was about to
+    /// be designed from. Measured on a tone gated on and off over learned
+    /// noise, a band that never opened at all had its applied depth move
+    /// 3.41 dB in one 0.667 ms tick. A minimum-phase bell whose
+    /// coefficients jump is precisely the artefact this unit was reported
+    /// for.
+    ///
+    /// Constraining the TARGET instead puts the transition through the same
+    /// 2 ms opening envelope every other gain move already uses, and the
+    /// same measurement reads 0.80 dB — no longer a discontinuity, just a
+    /// gain move like any other. The bound here is 1.5 dB: comfortably
+    /// under the old behaviour, comfortably over the new one, and set where
+    /// it is because the honest claim is "no faster than an ordinary open",
+    /// not "arbitrarily slow".
+    #[test]
+    fn a_closed_band_does_not_jump_when_its_neighbour_stops_being_exempt() {
+        let p = DenoiseParams {
+            reduce: 1.0,
+            ..on(DenoiseKernel::Bank)
+        };
+        let mut dn = learned_full_band(DenoiseKernel::Bank, 0x0C7A, 0.05, SR, 1.0);
+        let frames = 4 * SR as usize;
+        let noise = FullBandNoise::new(0x0C7A, 0.05).frames(frames);
+        let mut buf = sine(1_000.0, 0.3, frames, SR);
+        add(&mut buf, &noise);
+        // A quarter second of tone-over-noise, a quarter second of noise
+        // alone, repeatedly: bands around 1 kHz open and close, and their
+        // neighbours enter and leave the exemption with them.
+        for (i, f) in buf.chunks_exact_mut(2).enumerate() {
+            if (i / (SR as usize / 4)) % 2 != 0 {
+                f[0] = noise[i * 2];
+                f[1] = noise[i * 2 + 1];
+            }
+        }
+
+        // One control tick at a time, so a "one-tick move" is what it says.
+        let tick = dn.tick_len as usize;
+        let mut prev_depth = dn.depth_db();
+        let mut prev_open = [false; DENOISE_BANDS];
+        let (mut worst, mut at) = (0.0_f32, 0);
+        let mut done = 0usize;
+        let mut moved = false;
+        while done < frames {
+            let n = tick.min(frames - done);
+            dn.process(&mut buf[done * 2..(done + n) * 2], n, 2, &p);
+            let depth = dn.depth_db();
+            let mut open = [false; DENOISE_BANDS];
+            for (k, b) in dn.band.iter().enumerate() {
+                open[k] = b.open;
+            }
+            for k in 0..DENOISE_BANDS {
+                // Only bands that were closed for BOTH ticks: a band that
+                // opened is allowed to move fast, that is its whole job.
+                if !open[k] && !prev_open[k] {
+                    let d = (depth[k] - prev_depth[k]).abs();
+                    if d > worst {
+                        worst = d;
+                        at = k;
+                    }
+                }
+                moved |= open[k] != prev_open[k];
+            }
+            prev_depth = depth;
+            prev_open = open;
+            done += n;
+        }
+        assert!(
+            moved,
+            "no band ever changed its open flag, so the exemption was never \
+             crossed and this test proves nothing"
+        );
+        assert!(
+            worst < 1.5,
+            "band {at}'s applied depth moved {worst:.2} dB in one tick while \
+             it was closed throughout — the cross-band constraint is jumping \
+             the smoother again (it was 3.41 dB before the reorder)"
+        );
     }
 
     // ── the target, met ─────────────────────────────────────────────────────
