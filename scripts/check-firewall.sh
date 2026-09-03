@@ -35,8 +35,17 @@ for crate in tangent-ui tangent-core; do
   # reason to name them here is that the list is literal crate names rather than
   # a category, so nothing else would stop them.
   # vst3/clack-host/tangent-host: the plugin host, for the same reason.
+  # midly: the SMF parser INSIDE tangent-record, and the one name on this list
+  # that is not a native dependency. It is here because the list is literal
+  # crate names rather than a category, so forbidding `tangent-record` did
+  # nothing to stop somebody adding `midly = "0.5"` to tangent-ui directly and
+  # passing this check — and the whole reason `smf_read.rs` and `smf_write.rs`
+  # are hand-rolled is that the wall is meant to be mechanical rather than a
+  # thing review has to remember. Two hundred lines of SMF walking is the price
+  # of the wall, and it is a price already paid twice; the check is what stops
+  # the third person deciding it was not worth it.
   for dep in eframe midir rfd fd-lock winit \
-             cpal nokhwa objc2 windows tangent-record \
+             cpal nokhwa objc2 windows tangent-record midly \
              vst3 clack-host tangent-host; do
     # Match the crate NAME field of a cargo-tree line, without trying to
     # describe cargo's box-drawing prefix in a regex.

@@ -74,6 +74,22 @@ pub enum Dialog {
         /// can offer to receive it — greyed rather than hidden when it is
         /// not, so the row always says what the slot is for.
         can_paste: bool,
+        /// How many MIDI clips stand on this lane, and therefore whether
+        /// Export MIDI has anything to write. Appended at the END, this
+        /// struct's law.
+        ///
+        /// A COUNT rather than a bool, because the row says it: "Export MIDI
+        /// (3 clips)" is what tells somebody the whole track is going out and
+        /// not just the one they had selected — which is the difference
+        /// between this door and the clip menu's, and the sort of thing that
+        /// is only obvious to the person who wrote it.
+        ///
+        /// Filled by `TangentApp::open_track_dialog`, which is the ONE
+        /// constructor for this dialog and says why: adding it there gives
+        /// the row to the arrangement header, both mixer press paths and the
+        /// keyboard at once, rather than to whichever of the four somebody
+        /// remembered.
+        midi_clips: usize,
     },
     /// The project export: sources, rate, shape, formats, speed — and the
     /// arrange view's time selection, if one stands.
@@ -1116,6 +1132,36 @@ pub struct LearningStatus {
 /// `TrackPalette` with this means "follow the theme" rather than naming one.
 pub const PALETTE_AUTO: i64 = -1;
 
+/// The track menu's height with every row it always has.
+///
+/// A constant rather than a literal because it is now one term of a sum —
+/// see [`track_export_row_h`] — and a magic number that is added to is a
+/// magic number somebody will change in one place.
+const TRACK_DIALOG_H: f32 = 648.0;
+
+/// The Export MIDI row's button height, and the gap under it.
+///
+/// Named rather than written twice. That menu has no scroll area on purpose
+/// — see the argument at its `show_dialog_viewport` call — so a row whose
+/// height the WINDOW does not know about is a row that pushes the icon table
+/// off the bottom with nothing on screen to say so. The window's height and
+/// the row itself are both computed from these two numbers, which is the
+/// same bargain `TangentApp::clip_menu_rows` makes for the clip menu: one
+/// piece of arithmetic serving both the drawing and the space reserved for
+/// it, so the two cannot drift.
+const TRACK_EXPORT_ROW_H: f32 = 22.0;
+const TRACK_EXPORT_ROW_GAP: f32 = 6.0;
+
+/// What the Export MIDI row costs the track menu in height, or nothing when
+/// the lane has no MIDI on it.
+fn track_export_row_h(midi_clips: usize) -> f32 {
+    if midi_clips > 0 {
+        TRACK_EXPORT_ROW_H + TRACK_EXPORT_ROW_GAP
+    } else {
+        0.0
+    }
+}
+
 /// How wide each of `count` cells may be to fit `available` with `gap`
 /// between them.
 ///
@@ -1506,6 +1552,17 @@ pub enum DialogAction {
     /// key, so the dialog carries it back and the app cycles exactly as it
     /// would from its own keymap. Appended at the END, the law.
     CycleTheme,
+    /// **Write this lane's MIDI clips out as a `.mid`.** Appended at the
+    /// END, the law.
+    ///
+    /// The WHOLE lane, not the selection, and that is the decision this
+    /// variant exists to record: the door that was opened was the TRACK's.
+    /// A menu raised on a track header is asking about the track, and the
+    /// clip menu one gesture away is where a selection is honoured — a track
+    /// menu that quietly exported three of a lane's nine clips because they
+    /// happened to be selected would be a row that does something other than
+    /// what it says.
+    ExportMidi(usize),
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -8637,10 +8694,20 @@ pub fn show(
                 },
             )
         }
-        Dialog::Track { lane, removable, icon, palette, palette_auto, serial, can_paste } => {
+        Dialog::Track {
+            lane,
+            removable,
+            icon,
+            palette,
+            palette_auto,
+            serial,
+            can_paste,
+            midi_clips,
+        } => {
             let t = theme(face);
             let lane = *lane;
             let removable = *removable;
+            let midi_clips = *midi_clips;
             // An EMPTY slot's menu is a different, much smaller thing: there
             // is no track here to remove, recolour or badge. `removable` is
             // what says a track exists — it is false for the buses too, which
@@ -8665,8 +8732,19 @@ pub fn show(
                 // up halfway down somebody else's strip. The content is a
                 // handful of rows; the honest fix is a window that fits it.
                 // Widened for the icon table's two rows of thirteen.
-                Vec2::new(520.0, 648.0),
-                Vec2::new(520.0, 648.0),
+                //
+                // **And a row that comes and goes has to be PAID FOR in
+                // height**, which is the whole cost of that decision. There
+                // is no scroll area left to absorb an extra row, so Export
+                // MIDI's twenty-two points and the six of spacing under it
+                // are added to the window exactly when the row is there. A
+                // fixed 676 would have left twenty-eight points of empty
+                // band under every audio track's menu, which is the more
+                // visible of the two faults; growing only when the row does
+                // keeps the window sized for what it actually holds, which
+                // is what the paragraph above already promises.
+                Vec2::new(520.0, TRACK_DIALOG_H + track_export_row_h(midi_clips)),
+                Vec2::new(520.0, TRACK_DIALOG_H + track_export_row_h(midi_clips)),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
@@ -8728,6 +8806,46 @@ pub fn show(
                                     action = Some(DialogAction::TrackCopy(lane));
                                 }
                                 ui.add_space(6.0);
+                                // **Export MIDI, and HIDDEN when the lane has
+                                // no MIDI on it** — not greyed, which is the
+                                // opposite of the choice Paste Track makes
+                                // two rows up and is deliberate. Paste is
+                                // greyed because an empty slot's menu exists
+                                // largely IN ORDER to offer it: the row is
+                                // what tells somebody the slot can receive a
+                                // track. Export is not what a lane is for. A
+                                // permanently dead row on every audio track
+                                // in the desk would be a row that teaches
+                                // people to stop reading this menu.
+                                //
+                                // The count is on the label because this door
+                                // takes the WHOLE lane: somebody who had two
+                                // of nine clips selected needs to see that
+                                // nine are going out. See
+                                // `DialogAction::ExportMidi`.
+                                if midi_clips > 0 {
+                                    let label = match midi_clips {
+                                        1 => "Export MIDI (1 clip)".to_owned(),
+                                        n => format!("Export MIDI ({n} clips)"),
+                                    };
+                                    if ui
+                                        .add_sized(
+                                            Vec2::new(
+                                                ui.available_width(),
+                                                TRACK_EXPORT_ROW_H,
+                                            ),
+                                            Button::new(
+                                                RichText::new(label)
+                                                    .font(plain(11.0))
+                                                    .color(t.text),
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some(DialogAction::ExportMidi(lane));
+                                    }
+                                    ui.add_space(TRACK_EXPORT_ROW_GAP);
+                                }
                             }
                             // **And an EMPTY slot can receive one.** Greyed
                             // rather than hidden when nothing is held, so the

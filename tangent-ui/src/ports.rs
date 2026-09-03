@@ -646,6 +646,42 @@ pub enum SavePurpose {
     /// the whole path is honoured — a kit is a file you keep wherever you
     /// keep files.
     KitPreset,
+    /// **Write the selected MIDI clips out as `.mid` files, one per TRACK.**
+    /// Appended at the END, this enum's law.
+    ///
+    /// A track's selected clips merge into a single file whether or not they
+    /// are glued — that is the whole verb: a track is a part, and a part is a
+    /// file. So one save panel can answer for several files, and the naming
+    /// contract has to say which.
+    ///
+    /// # The naming contract
+    ///
+    /// **One track: the answered path is honoured whole**, exactly as
+    /// [`Self::KitPreset`] is, with `.mid` appended if the user typed no
+    /// extension. That is the name the panel confirmed, so it is also the one
+    /// case allowed to overwrite.
+    ///
+    /// **Several tracks: the answered path is a STEM.** Every file is written
+    /// beside it as `<stem>-<NN>-<track name>.mid`, `NN` being the lane
+    /// number as `{:02}` — the same shape the stems export gives its WAVs
+    /// (`01-Drums.wav`), so the two exports name their per-track files alike
+    /// and a folder holding both reads as one set. ALL of them get the
+    /// suffix, the first included: `song.mid` sitting beside `song-05-Bass.mid`
+    /// reads as one odd file plus some siblings rather than as a set.
+    ///
+    /// So the answered path is not literally written when several tracks go
+    /// out. That is a small lie unless it is told BEFORE the click, which is
+    /// why the request's title says "Export MIDI - N tracks" in that case;
+    /// [`Self::Template`] is the precedent for a purpose that honours only
+    /// part of the answer, and it is documented here for the same reason.
+    ///
+    /// **Siblings are never clobbered.** The panel confirmed one name, not
+    /// the others, so an existing sibling makes the new file `<name> 2` —
+    /// the Finder's own suffix, and the same rule `desktop::unique_ir_stem`
+    /// follows. The stems export overwrites instead, and deliberately is not
+    /// copied here: a stems folder is the app's own and an export folder is
+    /// the user's.
+    ExportMidi,
 }
 
 /// A project action the HOST must run whole — it owns the plugin states
