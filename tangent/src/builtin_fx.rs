@@ -2587,6 +2587,11 @@ mod tests {
         assert_eq!(describe(DENOISE_PATH, 1, 0.5), "-12.0 dB");
         assert_eq!(describe(DENOISE_PATH, 1, 0.0), "off");
         assert_eq!(describe(DENOISE_PATH, 5, 1.0), "3.0 ms");
+        // The kernel selector reads as the engine, in the words the
+        // cycling row offers, at each of its three positions.
+        assert_eq!(describe(DENOISE_PATH, 6, 0.0), "Bank");
+        assert_eq!(describe(DENOISE_PATH, 6, 0.5), "Spectral Studio");
+        assert_eq!(describe(DENOISE_PATH, 6, 1.0), "Spectral Live");
         // The shipped level is unity to a tenth of a dB: 0.71² · 2 ≈ 1.008.
         assert_eq!(describe(DRIVE_PATH, 2, 0.71), "+0.1 dB");
         assert_eq!(describe(DRIVE_PATH, 3, 0.0), "matched");
@@ -2605,6 +2610,10 @@ mod tests {
         assert_eq!(describe(TAPE_PATH, 3, 0.3), fmt_pct(0.3));
         assert_eq!(describe(TAPE_PATH, 4, 0.25), fmt_pct(0.25));
         assert_eq!(choices(DENOISE_PATH, 0), vec!["Learn", "Listening"]);
+        assert_eq!(
+            choices(DENOISE_PATH, 6),
+            vec!["Bank", "Spectral Studio", "Spectral Live"]
+        );
         assert_eq!(choices(DRIVE_PATH, 3), vec!["matched", "uneven"]);
         assert_eq!(choices(AMP_PATH, 0), vec!["off", "on"]);
         assert!(choices(TREM_PATH, 0).is_empty(), "a continuous dial grew steps");

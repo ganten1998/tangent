@@ -2433,6 +2433,31 @@ impl Denoise {
         }
     }
 
+    /// Every byte of Vec capacity in the unit, for the tests' proof that
+    /// `process` never allocates: equal before and after means no internal
+    /// buffer so much as considered growing. The same accessor the
+    /// convolver keeps, for the same contract.
+    #[cfg(test)]
+    fn footprint(&self) -> usize {
+        let v = |x: &Vec<f32>| x.capacity() * std::mem::size_of::<f32>();
+        self.ring.capacity() * std::mem::size_of::<f32>()
+            + v(&self.sp.win)
+            + v(&self.sp.in_ring)
+            + v(&self.sp.acc)
+            + v(&self.sp.fifo)
+            + v(&self.sp.re)
+            + v(&self.sp.im)
+            + v(&self.sp.gain)
+            + v(&self.sp.pow)
+            + v(&self.sp.lambda)
+            + v(&self.sp.ph1mean)
+            + v(&self.sp.ph1)
+            + v(&self.sp.floor)
+            + v(&self.sp.ceil)
+            + v(&self.sp.map_frac)
+            + self.sp.map_lo.capacity() * std::mem::size_of::<u16>()
+    }
+
     /// Drop every trace of what was playing: bells, resonators, envelopes,
     /// depths, the lookahead line, the frame machinery, any half-done learn
     /// statistics. The learned THRESHOLDS stay — they are settings, not
@@ -3457,21 +3482,34 @@ mod tests {
             }
             10.0 * ((acc / n.max(1) as f64).max(1e-30)).log10() as f32
         };
-        let drop_at = |sr: f32| {
-            let mut dn = learned(DenoiseKernel::Bank, 0xABCD, 0.05, sr, 1.0);
+        let drop_at = |kernel: DenoiseKernel, sr: f32| {
+            let mut dn = learned(kernel, 0xABCD, 0.05, sr, 1.0);
             let frames = sr as usize;
             let mut noise = Noise::new(0xABCD, 0.05, sr);
             let mut buf = noise.frames(frames);
             let in_db = lp15(&buf, frames / 2, sr);
-            dn.process(&mut buf, frames, 2, &on(DenoiseKernel::Bank));
+            dn.process(&mut buf, frames, 2, &on(kernel));
             in_db - lp15(&buf, frames / 2, sr)
         };
-        let (a, b, c) = (drop_at(44_100.0), drop_at(48_000.0), drop_at(96_000.0));
-        for (x, y) in [(a, b), (b, c), (a, c)] {
-            assert!(
-                (x - y).abs() < 1.5,
-                "suppression across rates disagrees: {a:.2} / {b:.2} / {c:.2} dB"
+        // Every engine. The spectral kernels earn this the hard way: their
+        // frame LENGTH changes with the rate (1024 points at 48 kHz, 2048
+        // at 96) precisely so the frame DURATION does not, and every time
+        // constant in the detector is derived from that duration rather
+        // than stored as a per-frame coefficient. If any of that were
+        // wrong, 96 kHz would answer differently here.
+        for kernel in DenoiseKernel::ALL {
+            let (a, b, c) = (
+                drop_at(kernel, 44_100.0),
+                drop_at(kernel, 48_000.0),
+                drop_at(kernel, 96_000.0),
             );
+            for (x, y) in [(a, b), (b, c), (a, c)] {
+                assert!(
+                    (x - y).abs() < 1.5,
+                    "{}: suppression across rates disagrees: {a:.2} / {b:.2} / {c:.2} dB",
+                    kernel.label()
+                );
+            }
         }
     }
 
@@ -3541,26 +3579,33 @@ mod tests {
     /// passes through a working stereo pair untouched.
     #[test]
     fn a_mono_buffer_and_a_third_channel_are_left_alone() {
-        let mut dn = learned(DenoiseKernel::Bank, 0x9, 0.05, SR, 1.0);
-        let mut mono: Vec<f32> = (0..256).map(|i| (i as f32 * 0.02).sin()).collect();
-        let before = mono.clone();
-        dn.process(&mut mono, 256, 1, &on(DenoiseKernel::Bank));
-        assert_eq!(mono, before, "a mono buffer was written to");
+        for kernel in DenoiseKernel::ALL {
+            let mut dn = learned(kernel, 0x9, 0.05, SR, 1.0);
+            let mut mono: Vec<f32> = (0..256).map(|i| (i as f32 * 0.02).sin()).collect();
+            let before = mono.clone();
+            dn.process(&mut mono, 256, 1, &on(kernel));
+            assert_eq!(mono, before, "{}: a mono buffer was written to", kernel.label());
 
-        let frames = 4_800;
-        let mut dn = learned(DenoiseKernel::Bank, 0x9, 0.05, SR, 1.0);
-        let mut buf = vec![0.0_f32; frames * 3];
-        let mut noise = Noise::new(0x9, 0.05, SR);
-        for (i, f) in buf.chunks_exact_mut(3).enumerate() {
-            let v = noise.next();
-            f[0] = v;
-            f[1] = v;
-            f[2] = (i as f32 * 0.01).sin();
+            let frames = 4_800;
+            let mut dn = learned(kernel, 0x9, 0.05, SR, 1.0);
+            let mut buf = vec![0.0_f32; frames * 3];
+            let mut noise = Noise::new(0x9, 0.05, SR);
+            for (i, f) in buf.chunks_exact_mut(3).enumerate() {
+                let v = noise.next();
+                f[0] = v;
+                f[1] = v;
+                f[2] = (i as f32 * 0.01).sin();
+            }
+            let third: Vec<f32> = buf.chunks_exact(3).map(|f| f[2]).collect();
+            dn.process(&mut buf, frames, 3, &on(kernel));
+            let third_after: Vec<f32> = buf.chunks_exact(3).map(|f| f[2]).collect();
+            assert_eq!(
+                third_after,
+                third,
+                "{}: the third channel was touched",
+                kernel.label()
+            );
         }
-        let third: Vec<f32> = buf.chunks_exact(3).map(|f| f[2]).collect();
-        dn.process(&mut buf, frames, 3, &on(DenoiseKernel::Bank));
-        let third_after: Vec<f32> = buf.chunks_exact(3).map(|f| f[2]).collect();
-        assert_eq!(third_after, third, "the third channel was touched");
     }
 
     /// **While learning, no reduction is applied**: the learn pass itself
@@ -4096,6 +4141,69 @@ mod tests {
             "band {at}'s applied depth moved {worst:.2} dB in one tick while \
              it was closed throughout — the cross-band constraint is jumping \
              the smoother again (it was 3.41 dB before the reorder)"
+        );
+    }
+
+    /// **Nothing on the audio thread allocates, including a kernel
+    /// change.** Every Vec capacity in the unit is byte-identical before
+    /// and after ten seconds of audio that flips the selector, the
+    /// lookahead and the learn toggle underneath it — the arrangement the
+    /// convolver's own contract test uses, for the same reason: a `resize`
+    /// nobody noticed is a malloc on the audio callback, and a malloc on
+    /// the audio callback is a dropout on somebody else's machine.
+    ///
+    /// The kernel change is the interesting half. Switching between
+    /// Spectral Studio and Spectral Live moves the frame from 1024 points
+    /// to 512, which is exactly the kind of change that invites a `vec!` —
+    /// every buffer is cut in `new` to the LONGEST frame this rate can ask
+    /// for and the switch only re-derives the window, the band layout and
+    /// the per-frame coefficients in place.
+    ///
+    /// The timing is printed as well, because a kernel that cannot run in
+    /// realtime is not allocation-free, it is just differently unusable.
+    #[test]
+    fn nothing_on_the_audio_thread_allocates_not_even_a_kernel_change() {
+        let seconds = 10.0_f32;
+        let frames = (SR * seconds) as usize;
+        let mut dn = learned_full_band(DenoiseKernel::SpectralStudio, 0xA110C, 0.05, SR, 1.0);
+        let mut buf = FullBandNoise::new(0xA110C, 0.05).frames(frames);
+        let before = dn.footprint();
+
+        let start = std::time::Instant::now();
+        let mut pos = 0usize;
+        let mut step = 0usize;
+        while pos < frames {
+            // Deliberately awkward block sizes, and every dial that can
+            // move machinery moving between them.
+            let n = [480_usize, 512, 1, 333, 1_024][step % 5].min(frames - pos);
+            let p = DenoiseParams {
+                learn: if step % 17 == 0 { 1.0 } else { 0.0 },
+                lookahead: if step % 3 == 0 { 0.0 } else { 1.0 },
+                reduce: (step % 5) as f32 / 4.0,
+                ..on(DenoiseKernel::ALL[step % 3])
+            };
+            dn.process(&mut buf[pos * 2..(pos + n) * 2], n, 2, &p);
+            pos += n;
+            step += 1;
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+
+        assert_eq!(
+            dn.footprint(),
+            before,
+            "process grew a buffer somewhere — the allocation contract is broken"
+        );
+        assert!(
+            buf.iter().all(|s| s.is_finite()),
+            "ten seconds of dial-flipping produced a non-finite sample"
+        );
+        let factor = f64::from(seconds) / elapsed;
+        println!("denoise: {factor:.0}x realtime across all three kernels");
+        #[cfg(not(debug_assertions))]
+        assert!(
+            factor > 20.0,
+            "only {factor:.1}x realtime in release — this unit is meant to \
+             sit on every strip"
         );
     }
 
