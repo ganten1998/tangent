@@ -693,6 +693,125 @@ pub const PRESET_EXT: &str = "tgkit";
 /// [`KitPreset::from_bytes`] still reads it.
 const MAGIC: &[u8] = b"TGKIT2\n";
 
+/// **How much audio one kit may carry inside it: 256 MiB.**
+///
+/// Version 1 was a manifest and nothing else, and a ceiling on it would have
+/// been a ceiling on a few kilobytes of JSON. Version 2 puts the samples in
+/// the file, and nobody went back and asked what the biggest one could be —
+/// so today the answer is "as much as the pads point at", and the cost of
+/// that is paid three times over on the UI thread with no window to say so:
+/// [`KitPreset::from_kit`] holds every blob, [`KitPreset::to_bytes`]
+/// allocates a second buffer the size of all of them plus the manifest, and
+/// [`KitPreset::save`] hands that whole thing to one synchronous
+/// `fs::write`. A 500 MB kit therefore peaks near a gigabyte, and a Rust
+/// allocation that cannot be served does not return an error — it aborts the
+/// process. The session goes with it.
+///
+/// So the ceiling is not a policy about what a kit ought to be. It is the
+/// line between "a sentence in the status strip" and "Tangent quit and the
+/// last hour is gone".
+///
+/// **It never refuses the save.** Past the ceiling the remaining pads keep
+/// their absolute source paths and no blob, which is exactly the shape of a
+/// version 1 kit — a form every reader in this module already handles — and
+/// the count comes back in [`KitEmbedReport`] so the writing end can say out
+/// loud that this kit will not travel. Refusing would be the one behaviour
+/// that destroys work somebody thought they had saved.
+///
+/// 256 MiB because a drum kit is one-shots: a hundred and twenty-eight pads
+/// of 24-bit stereo 48 kHz one-shots at two seconds each is about 74 MB, so
+/// the ceiling is more than three times the fattest kit anyone would build
+/// pad by pad, while still bounding the peak at half a gigabyte on a machine
+/// that is already running a DAW.
+pub const MAX_KIT_BYTES: usize = 256 * 1024 * 1024;
+
+/// **How large a kit FILE may be before it is read at all: 512 MiB.**
+///
+/// The mirror of [`MAX_KIT_BYTES`], and it has to be a separate, larger
+/// number rather than the same one. [`KitPreset::load`] reads the whole file
+/// and then [`KitPreset::from_bytes`] copies each blob out of it, so opening
+/// a kit peaks at twice the file — and a kit written by a build from before
+/// the ceiling existed can be any size at all. Set the two equal and Tangent
+/// would refuse to reopen files it wrote itself last week, which is a worse
+/// failure than the one being prevented.
+///
+/// Twice the write ceiling leaves room for the manifest and for every kit
+/// this build can produce, and still turns a two-gigabyte file — a truncated
+/// download, a rename of something that was never a kit, a hostile file —
+/// into a sentence instead of four gigabytes of allocation.
+///
+/// Note what does NOT need a ceiling: a manifest that LIES about its blob
+/// lengths cannot make `from_bytes` allocate anything, because every copy is
+/// bounded by `body.len()` before it is taken and a length that runs past the
+/// end stops the table. The hazard is only ever the real size of the file on
+/// the disk, which is why the guard is a `metadata` call before the read.
+pub const MAX_KIT_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// **Does this file look like a kit rather than a sample?**
+///
+/// Asked on the drop road, where a `.tgkit` a user downloaded and dragged
+/// onto the pads was being copied into `media/` as though it were audio —
+/// leaving a pad pointing at a container the decoder cannot read, which is a
+/// dead pad and no message.
+///
+/// The extension answers first because it is free and because it is what the
+/// save panel forces. The magic sniff is the second answer, for the file that
+/// came out of a zip with its extension eaten or was renamed on the way: the
+/// header is ASCII on purpose (see [`KitPreset::to_bytes`]), so recognising it
+/// costs one open and seven bytes.
+///
+/// A version 1 kit — bare JSON, no magic — is caught by its extension alone.
+/// That is the whole of what can be done for it: sniffing JSON would mean
+/// parsing every dropped file to find out whether it was audio, and a WAV
+/// whose first bytes happen to parse is not a risk worth inventing.
+pub fn looks_like_a_kit(path: &std::path::Path) -> bool {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(PRESET_EXT))
+    {
+        return true;
+    }
+    use std::io::Read as _;
+    let mut head = [0u8; MAGIC.len()];
+    std::fs::File::open(path).is_ok_and(|mut f| f.read_exact(&mut head).is_ok()) && head == *MAGIC
+}
+
+/// **What a snapshot could not put inside the kit file.**
+///
+/// [`KitPreset::from_kit`] degrades rather than fails — a pad whose sample
+/// cannot be embedded keeps its absolute path and no blob — and until this
+/// existed the degrade was completely silent. The save reported plain
+/// success, and the user learned that the kit was not portable when somebody
+/// else opened it and got a hundred and twenty-eight empty pads.
+///
+/// Counted per DISTINCT SOURCE FILE, not per pad: a kit with the same
+/// unreadable hat on four pads has lost one sample, and saying "4" would
+/// overstate what went wrong.
+///
+/// **Fields are append-only** — nothing here is serialized today, but this is
+/// the report a future save dialog would render, and a renumbering would be a
+/// silent lie rather than a compile error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KitEmbedReport {
+    /// Source files the snapshot could not read at all: deleted, on an
+    /// unmounted volume, or not ours to read.
+    pub unreadable: usize,
+    /// Source files left out because the kit had already reached
+    /// [`MAX_KIT_BYTES`]. Readable, and deliberately not taken.
+    pub over_ceiling: usize,
+    /// Source files whose bytes are really in the file. The denominator for
+    /// anything the caller wants to say about the other two.
+    pub embedded: usize,
+}
+
+impl KitEmbedReport {
+    /// Whether this kit is whole — every sample it names is inside it.
+    pub fn is_complete(&self) -> bool {
+        self.unreadable == 0 && self.over_ceiling == 0
+    }
+}
+
 /// **A kit as a THING you can keep**, independent of the project it was
 /// built in.
 ///
@@ -765,28 +884,89 @@ impl KitPreset {
     /// is a record of the layout, and a sample that is missing today may be
     /// on the disk the preset is carried to. Loading reports what it could
     /// not find rather than refusing the whole kit.
+    ///
+    /// **The bytes it could not take are counted** — see
+    /// [`Self::from_kit_within`], which this is the plain form of. Callers
+    /// that write the file to disk should use that one and say what came
+    /// back; a degrade nobody is told about is indistinguishable, from the
+    /// chair, from a kit that works.
     pub fn from_kit(name: &str, kit: &DrumpadDoc, doc: &std::path::Path) -> Self {
+        Self::from_kit_within(name, kit, doc, MAX_KIT_BYTES).0
+    }
+
+    /// The same snapshot, with the embedding ceiling named and the shortfall
+    /// reported.
+    ///
+    /// **Why the ceiling is a parameter and not just [`MAX_KIT_BYTES`]:** the
+    /// only way to prove a 256 MiB ceiling with the constant baked in is to
+    /// write a quarter of a gigabyte of temporary files, and a test that does
+    /// that is a test that gets marked `#[ignore]` within a month and then
+    /// stops being a guard at all. The seam costs one argument and lets
+    /// `a_kit_past_the_ceiling_keeps_the_layout_and_drops_the_audio` prove the
+    /// real branch with two five-hundred-byte files. Every shipping caller
+    /// passes `MAX_KIT_BYTES`.
+    ///
+    /// **The ceiling is checked before the bytes are added, never after.** A
+    /// sample that would carry the total past the line is not embedded at
+    /// all — it is not truncated, and it does not push the total over and get
+    /// caught next time around. A half sample in the file would parse, land in
+    /// `media/`, and play as a click.
+    ///
+    /// A file that fails to read and a file that is past the ceiling both
+    /// leave `blob: None`, which is the version 1 shape and needs no new
+    /// handling anywhere downstream. They are counted separately because they
+    /// deserve different sentences: one is "your sample moved", the other is
+    /// "this kit is too big to carry itself".
+    pub fn from_kit_within(
+        name: &str,
+        kit: &DrumpadDoc,
+        doc: &std::path::Path,
+        ceiling: usize,
+    ) -> (Self, KitEmbedReport) {
         let mut media: Vec<KitBlob> = Vec::new();
-        let mut seen: Vec<std::path::PathBuf> = Vec::new();
+        // **One entry per distinct file, and it remembers the ANSWER.** A kit
+        // with the same hat on two pads at different tunings is one sample,
+        // and a preset that wrote it twice would be twice the size for
+        // nothing. Holding `Option<usize>` rather than only the paths that
+        // worked means a file that could not be read is not read again once
+        // per pad that names it, and the counts below stay per-file rather
+        // than per-pad.
+        let mut seen: Vec<(std::path::PathBuf, Option<usize>)> = Vec::new();
         let mut pads = Vec::new();
+        let mut report = KitEmbedReport::default();
+        let mut carried = 0usize;
         for (key, p) in kit.pads.iter().enumerate() {
             if p.path.is_empty() {
                 continue;
             }
             let file = resolve(doc, &p.path);
-            // **One blob per distinct file.** A kit with the same hat on two
-            // pads at different tunings is one sample, and a preset that
-            // wrote it twice would be twice the size for nothing.
-            let blob = seen.iter().position(|s| *s == file).or_else(|| {
-                let bytes = std::fs::read(&file).ok()?;
-                let label = file
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| format!("pad-{key}.wav"));
-                seen.push(file.clone());
-                media.push(KitBlob { name: label, bytes });
-                Some(media.len() - 1)
-            });
+            let blob = match seen.iter().find(|(s, _)| *s == file) {
+                Some((_, at)) => *at,
+                None => {
+                    let at = match std::fs::read(&file) {
+                        Err(_) => {
+                            report.unreadable += 1;
+                            None
+                        }
+                        Ok(bytes) if carried.saturating_add(bytes.len()) > ceiling => {
+                            report.over_ceiling += 1;
+                            None
+                        }
+                        Ok(bytes) => {
+                            carried += bytes.len();
+                            report.embedded += 1;
+                            let label = file
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| format!("pad-{key}.wav"));
+                            media.push(KitBlob { name: label, bytes });
+                            Some(media.len() - 1)
+                        }
+                    };
+                    seen.push((file.clone(), at));
+                    at
+                }
+            };
             pads.push(KitPad {
                 key,
                 file,
@@ -795,12 +975,15 @@ impl KitPreset {
                 blob,
             });
         }
-        Self {
-            name: name.to_owned(),
-            master: kit.master,
-            pads,
-            media,
-        }
+        (
+            Self {
+                name: name.to_owned(),
+                master: kit.master,
+                pads,
+                media,
+            },
+            report,
+        )
     }
 
     pub fn to_json(&self) -> String {
@@ -1046,7 +1229,35 @@ impl KitPreset {
         Ok(out)
     }
 
+    /// Read a kit from disk, refusing an absurd file **before** it is read.
+    ///
+    /// See [`MAX_KIT_FILE_BYTES`] for the number and the argument. The short
+    /// version: opening a kit costs twice the file in RAM, on the UI thread,
+    /// and an allocation that cannot be served aborts the process rather than
+    /// returning something this `Result` could carry. A `metadata` call is the
+    /// only place a two-gigabyte file can still be turned into a sentence.
+    ///
+    /// A file whose size cannot be read at all is let through: that is a
+    /// permissions or race question, and `fs::read` below is about to give a
+    /// far better message about it than a guess here would.
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        Self::load_within(path, MAX_KIT_FILE_BYTES)
+    }
+
+    /// [`Self::load`] with the ceiling named, for the same reason
+    /// [`Self::from_kit_within`] takes one: proving a 512 MiB guard with the
+    /// constant baked in would mean writing half a gigabyte in a unit test.
+    /// Every shipping caller passes [`MAX_KIT_FILE_BYTES`].
+    pub fn load_within(path: &std::path::Path, max_file: u64) -> Result<Self, String> {
+        if let Ok(len) = std::fs::metadata(path).map(|m| m.len()) {
+            if len > max_file {
+                return Err(format!(
+                    "that file is {} MB — too big to be a kit, and reading it \
+                     would take twice that in memory",
+                    len / (1024 * 1024)
+                ));
+            }
+        }
         let raw = std::fs::read(path).map_err(|e| e.to_string())?;
         let mut out = Self::from_bytes(&raw)?;
         if out.name.is_empty() {
@@ -1239,5 +1450,154 @@ mod preset_tests {
         assert_eq!(back.pads.len(), 1, "the layout was lost with the audio");
         assert!(back.media.is_empty(), "half a sample was kept");
         assert_eq!(back.pads[0].blob, None, "a pad points at audio that is not there");
+    }
+
+    /// **Past the ceiling the kit keeps its layout and gives up the audio,
+    /// and it never refuses to save.**
+    ///
+    /// The whole point of the ceiling is that the failure it prevents — a
+    /// synchronous allocation of twice a very large kit on the UI thread,
+    /// which aborts the process rather than returning an error — costs the
+    /// user the session, while the failure it introduces costs them a
+    /// sentence. So this asserts BOTH halves: the pad past the line is still
+    /// in the preset, still holds its absolute source path, and is still
+    /// pointed at by nothing; and the count comes back so somebody can be
+    /// told.
+    ///
+    /// Six hundred bytes of ceiling rather than 256 MiB, through
+    /// `from_kit_within` — the argument for that seam is on the function.
+    #[test]
+    fn a_kit_past_the_ceiling_keeps_the_layout_and_drops_the_audio() {
+        let dir = tmp("ceiling");
+        let doc = dir.join("project.tangent");
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).expect("media");
+        std::fs::write(media.join("kick.wav"), vec![1u8; 500]).expect("kick");
+        std::fs::write(media.join("snare.wav"), vec![2u8; 500]).expect("snare");
+
+        let mut kit = DrumpadDoc::default();
+        kit.pads[36] = PadSlot { path: "media/kick.wav".to_owned(), ..Default::default() };
+        kit.pads[38] = PadSlot { path: "media/snare.wav".to_owned(), ..Default::default() };
+
+        let (preset, report) = KitPreset::from_kit_within("Fat", &kit, &doc, 600);
+        assert_eq!(preset.pads.len(), 2, "the ceiling ate a pad off the layout");
+        assert_eq!(preset.media.len(), 1, "the ceiling did not stop the embedding");
+        assert_eq!(preset.pads[0].blob, Some(0), "the first sample fitted and is not here");
+        assert_eq!(preset.pads[1].blob, None, "a sample past the ceiling was embedded anyway");
+        assert_eq!(
+            preset.pads[1].file,
+            media.join("snare.wav"),
+            "the pad past the ceiling lost the path it has to fall back to"
+        );
+        assert_eq!(report.embedded, 1);
+        assert_eq!(report.over_ceiling, 1, "the shortfall was not counted");
+        assert_eq!(report.unreadable, 0, "a readable file was called unreadable");
+        assert!(!report.is_complete(), "a kit missing a sample called itself whole");
+
+        // And it still WRITES. A ceiling that refused the save would destroy
+        // work the user believed they had.
+        let at = dir.join("Fat.tgkit");
+        let written = preset.save(&at).expect("the ceiling refused the save");
+        assert!(written.is_file(), "nothing was written");
+        let back = KitPreset::load(&written).expect("load");
+        assert_eq!(back.pads.len(), 2, "the written kit lost the layout");
+        assert_eq!(back.media.len(), 1);
+    }
+
+    /// **A sample that cannot be read is counted, not swallowed.**
+    ///
+    /// `from_kit` degrades to path-only for an unreadable file, which is
+    /// right — and used to be completely silent, so the only way to discover
+    /// that a kit was not portable was to hand it to somebody. The count is
+    /// per DISTINCT FILE: the same missing hat on two pads has lost one
+    /// sample, and this asserts that rather than the pad count, because the
+    /// tempting implementation counts pads and overstates every failure.
+    #[test]
+    fn a_kit_counts_the_samples_it_could_not_read() {
+        let dir = tmp("unreadable");
+        let doc = dir.join("project.tangent");
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).expect("media");
+        std::fs::write(media.join("kick.wav"), vec![1u8; 40]).expect("kick");
+
+        let mut kit = DrumpadDoc::default();
+        kit.pads[36] = PadSlot { path: "media/kick.wav".to_owned(), ..Default::default() };
+        // One missing file, on two pads.
+        kit.pads[38] = PadSlot { path: "media/gone.wav".to_owned(), ..Default::default() };
+        kit.pads[40] = PadSlot { path: "media/gone.wav".to_owned(), ..Default::default() };
+
+        let (preset, report) = KitPreset::from_kit_within("Holey", &kit, &doc, MAX_KIT_BYTES);
+        assert_eq!(preset.pads.len(), 3, "a pad was dropped from the layout");
+        assert_eq!(report.unreadable, 1, "one missing FILE was counted as {}", report.unreadable);
+        assert_eq!(report.embedded, 1);
+        assert_eq!(report.over_ceiling, 0);
+        assert!(!report.is_complete());
+        assert_eq!(preset.pads[1].blob, None);
+        assert_eq!(preset.pads[2].blob, None);
+    }
+
+    /// **A file too large to be a kit is refused before it is read.**
+    ///
+    /// The guard has to sit on `metadata`, not on the bytes: by the time
+    /// `from_bytes` has a slice the whole file is already in memory and the
+    /// hazard has happened. Proved with a tiny ceiling for the reason
+    /// `load_within` argues — half a gigabyte of temp file is not a unit
+    /// test.
+    #[test]
+    fn a_file_too_large_to_be_a_kit_is_refused_before_it_is_read() {
+        let dir = tmp("toobig");
+        let doc = dir.join("project.tangent");
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).expect("media");
+        std::fs::write(media.join("kick.wav"), vec![3u8; 4096]).expect("kick");
+        let mut kit = DrumpadDoc::default();
+        kit.pads[36] = PadSlot { path: "media/kick.wav".to_owned(), ..Default::default() };
+        let at = KitPreset::from_kit("Big", &kit, &doc)
+            .save(&dir.join("Big.tgkit"))
+            .expect("write");
+
+        let err = KitPreset::load_within(&at, 1024).expect_err("a huge file was read anyway");
+        assert!(
+            err.contains("too big to be a kit"),
+            "the refusal does not say what happened: {err}"
+        );
+        // **The same file, under a ceiling it fits.** A real kit, so this
+        // also proves the guard is a size test and not a refusal that
+        // happens to be worded like one — the very same bytes come back as
+        // the kit they are.
+        let back = KitPreset::load_within(&at, 1024 * 1024)
+            .expect("a kit inside the ceiling was refused");
+        assert_eq!(back.pads.len(), 1, "the kit under the ceiling did not load");
+        assert_eq!(back.media.len(), 1);
+        assert_eq!(back.media[0].bytes.len(), 4096);
+    }
+
+    /// **A kit is recognised by extension or by its magic**, which is what
+    /// keeps a dropped `.tgkit` off the drop road that copies samples into
+    /// `media/`.
+    ///
+    /// Both answers are asserted separately because they cover different
+    /// files: the extension is what the save panel forces, and the sniff is
+    /// for the one that came out of an archive with its name mangled. And a
+    /// WAV is asserted NOT to be a kit, because a predicate that says yes to
+    /// everything would make every dropped sample clear the lane.
+    #[test]
+    fn a_kit_is_known_by_its_extension_or_its_first_seven_bytes() {
+        let dir = tmp("sniff");
+        let by_ext = dir.join("Room.tgkit");
+        std::fs::write(&by_ext, b"not even a kit").expect("write");
+        assert!(looks_like_a_kit(&by_ext), "the extension was not enough");
+
+        let renamed = dir.join("mystery.bin");
+        std::fs::write(&renamed, KitPreset::default().to_bytes()).expect("write");
+        assert!(looks_like_a_kit(&renamed), "the magic was not sniffed");
+
+        let wav = dir.join("kick.wav");
+        std::fs::write(&wav, b"RIFF....WAVEfmt ").expect("write");
+        assert!(!looks_like_a_kit(&wav), "a sample was called a kit");
+
+        // A file that is not there is not a kit either, and asking must not
+        // panic — the drop road asks about every path the OS hands it.
+        assert!(!looks_like_a_kit(&dir.join("nothing at all")));
     }
 }
