@@ -689,10 +689,17 @@ fn adoption_armed() -> bool {
 /// `addChildWindow:ordered:NSWindowAbove` is the one sequence that moves it,
 /// and it does not disturb key status.
 ///
-/// The window is parentless for the width of those two calls, which is safe
-/// in a way worth naming: at that instant it is still at the floating level
-/// (that is what asked for the re-seat), so the gap is the pre-fix state, not
-/// a sunken window.
+/// The window is parentless for the width of those two calls, and the two
+/// re-seats are in different states while it is. A window re-seated because
+/// it floated AGAIN is still at the floating level in the gap, so that gap is
+/// the pre-fix state and not a sunken window. A window re-seated because it
+/// was CLICKED was put down to `NSNormalWindowLevel` when it was adopted, so
+/// for those two calls it is an ordinary orphan that the main window could
+/// cover — an earlier draft of this paragraph claimed the floating level for
+/// both cases, and it was only ever true of one. What makes the second safe
+/// is not the level but the gap: both calls happen inside one turn of the
+/// main thread with no run-loop iteration between them, so there is no moment
+/// at which anything can be ordered into it.
 ///
 /// # What this changes that was not asked for
 ///
@@ -913,6 +920,80 @@ mod adopt_tests {
     #[test]
     fn a_fullscreen_shielding_level_is_not_floating() {
         assert_eq!(verdict(at(NSWindowLevel::MAX)), Verdict::Leave);
+    }
+
+    /// **A child AppKit has ordered out is left where AppKit put it.**
+    ///
+    /// This is the `visible` test doing a second job, and it is worth a name
+    /// of its own because the case is not the one the test above covers. That
+    /// one is a window not yet born; this one is a face that has been open for
+    /// half an hour and has gone off screen WITH its parent — the app hidden,
+    /// or the user away on another Space. `addChildWindow:` orders a hidden
+    /// child in, measured, so a sweep that touched one now would drag it back
+    /// onto a screen its parent is not on.
+    ///
+    /// It matters more than it did, because AppKit is now the ONLY thing
+    /// positioning these windows: `dialogs::held_geometry` stopped the app
+    /// re-asserting an absolute position on every frame, and a face's place
+    /// is whatever the parent-relative arrangement says it is. Two things
+    /// moving one window was the whole disease.
+    #[test]
+    fn a_child_ordered_out_with_its_parent_is_left_alone() {
+        for level in [NSNormalWindowLevel, NSFloatingWindowLevel] {
+            let away = WindowFacts {
+                parent: Parentage::Ours,
+                visible: false,
+                ..at(level)
+            };
+            assert_eq!(verdict(away), Verdict::Leave, "level {level}");
+            // And the same window on the frame the app comes back, before
+            // AppKit has finished ordering things in: a key arrival is not a
+            // reason to touch a window that is not on the screen yet.
+            let arriving = WindowFacts { key_arrived: true, ..away };
+            assert_eq!(verdict(arriving), Verdict::Leave, "level {level}, arriving");
+        }
+    }
+
+    /// **The tab-away-and-back sequence, as the predicate sees it.**
+    ///
+    /// The owner's report was a face that walked to the bottom-right corner
+    /// on exactly this sequence. The corner was the app's own doing and is
+    /// fixed in `dialogs.rs`; what this pins is the other half of the story —
+    /// that the sweep does NOTHING across the whole sequence, so a face's
+    /// position is AppKit's parent-relative arrangement from the moment it is
+    /// adopted until it closes.
+    ///
+    /// A frame in the middle of this that came back `Adopt` or `Reseat` would
+    /// be `removeChildWindow:` and `addChildWindow:` on a settled window, and
+    /// re-adoption is the one operation in this module that can reorder a
+    /// window a user has arranged. This is the numbered by-hand checklist
+    /// written down as facts.
+    #[test]
+    fn a_face_is_not_touched_across_a_tab_away_and_back() {
+        // Adopted and put down, sitting in front of the desk as the only
+        // child, holding the keyboard.
+        let settled = WindowFacts {
+            parent: Parentage::Ours,
+            topmost_child: true,
+            ..at(NSNormalWindowLevel)
+        };
+        let sequence = [
+            ("open and settled", settled),
+            // Tab away: the app resigns active and `keyWindow` goes nil, so
+            // nothing arrives. The window is still on screen behind the
+            // other program.
+            ("tabbed away", settled),
+            // A Space change or Cmd-H orders parent and child out together.
+            ("ordered out with the parent", WindowFacts { visible: false, ..settled }),
+            // Back: AppKit orders them in and hands the keyboard to whichever
+            // window had it, which is this one — and it is already the front
+            // child, so there is nothing to bring forward.
+            ("back, and key again", WindowFacts { key_arrived: true, ..settled }),
+            ("settled again", settled),
+        ];
+        for (when, facts) in sequence {
+            assert_eq!(verdict(facts), Verdict::Leave, "{when}");
+        }
     }
 }
 
