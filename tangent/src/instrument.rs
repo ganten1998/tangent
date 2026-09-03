@@ -2287,6 +2287,24 @@ struct Shared {
     /// the sweep, while there is still a cable to move.
     ir_peak_l: AtomicU32,
     ir_peak_r: AtomicU32,
+    /// **APPENDED — the stem tap is running DRY.**
+    ///
+    /// A mode on `stems_on`, not a second tap switch: with `stems_on` off
+    /// this says nothing and costs a bool load. On, it decides WHICH of the
+    /// two per-lane buffers the ring is fed from — the wet one every other
+    /// customer already reads, or the dry one written beside it.
+    ///
+    /// **A dry stem is that strip's OWN inserts taken out, and nothing
+    /// else's.** One sentence, applied identically at every writer: a
+    /// channel's dry stem is its clip, instrument or input before its
+    /// pedalboard and its rack; a kit's is its voices before the pad bays
+    /// and the kit's bus rack; a group's is the sum of its children —
+    /// exactly as those children reach the mix — before the group's own two
+    /// bus racks; a routed arrival's is what was sent before the
+    /// destination's rack ran over it. Nothing upstream of the strip is
+    /// undone, because a stem that undid its sources would not be a stem of
+    /// anything in this mix.
+    stems_dry: AtomicBool,
 }
 
 impl Shared {
@@ -2434,6 +2452,7 @@ impl Shared {
             ir_peak: AtomicU32::new(0),
             ir_peak_l: AtomicU32::new(0),
             ir_peak_r: AtomicU32::new(0),
+            stems_dry: AtomicBool::new(false),
         }
     }
 
@@ -2848,10 +2867,17 @@ unsafe impl Send for PluginBox {}
 #[derive(Clone)]
 pub struct Placed {
     pub clip: Arc<tangent_record::decode::Clip>,
-    /// Which general channel — which LANE — the clip plays through: its
-    /// fader, its mute and solo, its send. Not its rack yet: a rack also
-    /// runs for the lane's LIVE input, and one rack must run once per block,
-    /// which is the unification a later phase owes.
+    /// Which general channel — which LANE — the clip plays through:
+    /// **everything the strip is.** Its rack, its pedalboard, its
+    /// compensation, its fader, its pan, its mute and solo, its send, its
+    /// meter.
+    ///
+    /// This used to end at "its send", with a note owing a later phase the
+    /// unification of the clip path and the rack path. The debt was not
+    /// academic: until it was paid, an insert dropped into an audio track's
+    /// bay was furniture — it did not process the track, it did not process
+    /// silence, it did not run. `mix_clips` carries the argument and
+    /// `a_clip_runs_through_its_lanes_insert_rack` holds the guard.
     pub strip: usize,
     /// The timeline frame where the clip begins.
     pub start: u64,
@@ -4199,6 +4225,65 @@ struct Renderer {
     /// The test tone's phase, 0..1 of a cycle — the renderer's, not the
     /// job's, so a job swap can never click mid-cycle.
     ir_phase: f64,
+    /// **APPENDED — the timeline's audio, laid out per lane, pre-fader and
+    /// pre-rack.** `CHANNELS * 2` interleaved floats per frame, exactly
+    /// `stem_scratch`'s layout, so the two can be read with the same index
+    /// arithmetic and nobody has to hold two shapes in their head.
+    ///
+    /// This buffer is why an insert on an audio track finally does
+    /// something. `mix_clips` writes the clip here instead of folding it
+    /// onto the bus, and the channel walk seeds its rack input from it — so
+    /// the clip takes the same road as the lane's live input and its
+    /// instrument, through the same rack, on the same delay line, into the
+    /// same fold. Bought whole at construction like every other scratch:
+    /// the audio thread allocates nothing. About a megabyte at
+    /// `MAX_BLOCK` × 32 lanes × stereo.
+    clip_lane: Vec<f32>,
+    /// **APPENDED — which lanes have audio standing on them anywhere on the
+    /// timeline**, one bit per channel. Recomputed once a block from the
+    /// clip list rather than asked per lane, because the channel walk asks
+    /// thirty-two times and the list can be long. See `mix_clips` for why
+    /// the answer is deliberately whole-timeline rather than
+    /// under-the-playhead.
+    clip_lanes: u32,
+    /// **APPENDED — the DRY stem block**, `stem_scratch`'s exact layout and
+    /// its exact indexing, filled only while a dry stems pass is running.
+    ///
+    /// A SECOND buffer rather than a mode on the first one, and that is not
+    /// a convenience. `stem_scratch` has four customers — the tap, hardware
+    /// routing, the folder fold and the sidechain keys (see `stems_wanted`)
+    /// — and three of them are part of the MIX. Writing dry audio into it
+    /// would have made "export dry stems" quietly change what a group sums,
+    /// what a send carries and what a keyed compressor hears. A hundred and
+    /// twenty-eight kilobytes buys the guarantee that the mode switch
+    /// cannot reach the master at all.
+    dry_scratch: Vec<f32>,
+    /// **APPENDED — one strip's pre-rack audio**, planar, `fx_in`'s shape.
+    /// Reused strip by strip the way `fx_in` itself is: the channel walk
+    /// fills it, folds it and moves on before the next lane touches it.
+    dry_io: Vec<Vec<f32>>,
+    /// **APPENDED — the dry tap's own compensation, one line per channel.**
+    ///
+    /// Separate from `pdc` for the reason `pad_pdc` is separate from it: one
+    /// ring carries one signal, and running a ring twice in a block is what
+    /// made a grouped track buzz. It is needed at all because the dry copy
+    /// skips the lane's rack and therefore does not pay the `own` frames of
+    /// real delay the wet copy pays — so where the wet waits
+    /// `max - own - folded`, the dry waits `max - folded`, and the two land
+    /// together. Without it, a lane carrying a lookahead limiter would come
+    /// out of a dry stems export up to a hundred and seventy milliseconds
+    /// ahead of every other lane: a flam nobody would think to blame on the
+    /// export mode.
+    dry_pdc: Vec<DelayLine>,
+    /// **APPENDED — the same, for the kits.** `pad_pdc`'s sibling, by the
+    /// same argument and for the same signal: a kit's dry copy skips the
+    /// bus rack the wet copy pays for.
+    pad_dry_pdc: Vec<DelayLine>,
+    /// **APPENDED — `stems_dry`, read once a block** so every writer agrees
+    /// about which buffer this chunk belongs to. Latched beside
+    /// `stems_live`, and only ever acted on together with it: a desk not
+    /// exporting stems does not fill the dry buffer at all.
+    stems_dry: bool,
 }
 
 impl Renderer {
@@ -4908,6 +4993,13 @@ impl Renderer {
                 }
             }
             self.stems_live = self.shared.stems_on.load(Ordering::Relaxed);
+            // **Dry only counts while stems are being taken.** The four
+            // other customers of the per-lane buffer are the mix's own, and
+            // none of them may see the dry copy — so the flag is latched
+            // ANDed with `stems_live` here, once, rather than at five
+            // writers that could each get the conjunction wrong.
+            self.stems_dry =
+                self.stems_live && self.shared.stems_dry.load(Ordering::Relaxed);
             // **Any keys armed?** One count load per chunk — the whole cost
             // of the feature on an unkeyed desk. Acquire pairs with
             // `set_insert_keys`' Release on the count, so a table seen
@@ -4929,6 +5021,28 @@ impl Renderer {
                     st.fill(0.0);
                 }
             }
+            if self.stems_dry {
+                if let Some(st) = self.dry_scratch.get_mut(..n * CHANNELS * 2) {
+                    st.fill(0.0);
+                }
+            }
+            // **The timeline is laid out BEFORE the channel walk, because the
+            // channel walk is what plays it now.**
+            //
+            // `mix_clips` used to sit below with the other folds and put the
+            // clip straight on the bus. It writes `clip_lane` instead, and
+            // `mix_channels` seeds each lane's rack input from it — so this
+            // call has to have run before the walk reaches lane 0 or every
+            // audio track renders one block of silence and then catches up
+            // for ever.
+            //
+            // Nothing about the FOLD's position changed: `fold_folders` is
+            // still the last thing to run, after the channel walk, the
+            // monitor and the pads have all written their stems. That
+            // ordering is load-bearing for a different reason — see the note
+            // on the fold — and moving the clips above the walk does not
+            // touch it.
+            self.mix_clips(at, rolling, n, muted, soloed);
             self.mix_channels(n, muted, soloed, at, rolling, flush, wrap_from);
 
             // A parameter change, if one is waiting and the lock is free this
@@ -4985,7 +5099,6 @@ impl Renderer {
             // and to the bus in one pass. Both were downstream of the effects
             // before and reached neither.
             //
-            self.mix_clips(at, rolling, n, muted, soloed);
             self.mix_monitor(n, muted, soloed);
             self.mix_preview(n);
             // The drumpad, upstream of the bus return, the room split and
@@ -4996,10 +5109,12 @@ impl Renderer {
             //
             // A folder sums its children out of the per-lane buffer, and
             // three separate passes fill that buffer: the channel racks in
-            // `mix_channels`, the timeline in `mix_clips`, and the drum kits
-            // in `mix_pads`. Folding at the end of the first of them read a
-            // buffer two thirds empty and summed silence — a group with a
-            // drum track in it was simply gone. Here, everything is in.
+            // `mix_channels` — which is where the timeline's own audio now
+            // arrives too — the live input in `mix_monitor`, and the drum
+            // kits in `mix_pads`. Folding at the end of the first of them
+            // read a buffer two thirds empty and summed silence — a group
+            // with a drum track in it was simply gone. Here, everything is
+            // in.
             //
             // Before the stem push below, deliberately: a folder REPLACES
             // its own slot with its output, so a bounced group stem is the
@@ -5014,7 +5129,17 @@ impl Renderer {
                 let room = (self.stem_tx.slots() / (CHANNELS * 2)) * (CHANNELS * 2);
                 let take = want.min(room);
                 if take > 0 {
-                    let _ = self.stem_tx.push_entire_slice(&self.stem_scratch[..take]);
+                    // **One ring, two buffers, and the mode picks.** The
+                    // host drains the same tap either way, so nothing
+                    // downstream of here — the writers, the de-interleave,
+                    // the mono fold, the WAV — has to learn that dry stems
+                    // exist. Only the fill point moved.
+                    let from = if self.stems_dry {
+                        &self.dry_scratch
+                    } else {
+                        &self.stem_scratch
+                    };
+                    let _ = self.stem_tx.push_entire_slice(&from[..take]);
                 }
             }
             // ── the click, and what it sends ───────────────────────────
@@ -6406,6 +6531,21 @@ impl Renderer {
                     }
                 }
             }
+            // The live input's dry copy, before its rack — the same
+            // instant the channel walk takes its own. No compensation line
+            // in this pass at all (a monitor path is not delay-compensated;
+            // it is what the player is hearing), so the dry copy needs none
+            // either.
+            if self.stems_dry {
+                let (dry, fx) = (&mut self.dry_io, &self.fx_in);
+                for c in 0..TAP_CHANNELS {
+                    let (Some(dst), Some(sr)) = (dry.get_mut(c), fx.get(c)) else {
+                        continue;
+                    };
+                    let m = n.min(dst.len()).min(sr.len());
+                    dst[..m].copy_from_slice(&sr[..m]);
+                }
+            }
             {
                 // An input channel's rack can hold a voice too — the desk is
                 // about to stop distinguishing — and the gate is the same one.
@@ -6481,6 +6621,18 @@ impl Renderer {
                             .get_mut(i * CHANNELS * 2 + strip.index() * 2 + c.min(1))
                         {
                             *sv += src;
+                        }
+                    }
+                    // And the dry tap hears it before its rack. Same pan,
+                    // same lane, the strip's own bays left out.
+                    if self.stems_dry {
+                        let dsrc = self.dry_io.get(c).map_or(0.0, |b| b[i])
+                            * if c == 0 { pan_l } else { pan_r };
+                        if let Some(sv) = self
+                            .dry_scratch
+                            .get_mut(i * CHANNELS * 2 + strip.index() * 2 + c.min(1))
+                        {
+                            *sv += dsrc;
                         }
                     }
                     // The room's subtrahend, ADDED to rather than written:
@@ -6901,12 +7053,41 @@ impl Renderer {
         (at, rolling, flush, wrap_from)
     }
 
-    /// Add the backing track to the bus, if one is loaded and the transport is
-    /// rolling.
+    /// **Lay the timeline's audio out per LANE, pre-fader and pre-rack.**
     ///
     /// The clip is stereo at the device's rate — `decode` guarantees both — so
     /// there is no resampling and no channel mapping here, which is the whole
     /// reason it is guaranteed there.
+    ///
+    /// **This used to fold the clip straight onto the bus, and that is the
+    /// bug this function was rewritten to kill.** A clip carried its lane's
+    /// fader, pan, mute, solo and send out of here and went to the master
+    /// having passed through no insert rack anywhere in the engine — the
+    /// header used to say so in as many words and call the unification "a
+    /// later phase's". What that cost is not subtle: a compressor dropped
+    /// into an audio track's bay reduced nothing, changed nothing, and
+    /// metered zero, in the speakers AND in the exported file. Measured on
+    /// the desk `the_master_mix_hears_a_clip_lanes_inserts` builds — a
+    /// constant clip thirty decibels over a 20 : 1 compressor's threshold on
+    /// the same lane as the compressor — the master peaked at 0.8999999 with
+    /// the plugin loaded and 0.8999999 without it. Bit for bit. The bay was
+    /// furniture.
+    ///
+    /// So the clip now goes where every other source class already went: it
+    /// is written into `clip_lane`, raw except for its own trim and fades,
+    /// and `mix_channels` picks it up as the lane's SOURCE, runs the lane's
+    /// pedals and rack over it, waits the lane's own wait and folds it with
+    /// the lane's fader, pan, send and meter. One rack per lane per block,
+    /// which is the constraint that stopped this being done in place here.
+    ///
+    /// **And the clips' own arithmetic compensation died with it.** There
+    /// used to be a per-lane `hold[]` here, subtracting each lane's downstream
+    /// racks from the published maximum so a clip that paid no latency still
+    /// arrived with everything else. A clip now pays the same wait as the
+    /// lane's live input and its instrument, on the same delay line, by the
+    /// same formula — so the second formula, and the two-way drift between
+    /// them that a grouped or amp-bearing lane could open up, is gone rather
+    /// than kept in step by hand.
     fn mix_clips(&mut self, at: u64, rolling: bool, frames: usize, muted: u64, soloed: u64) {
         // A clip LIST arriving — and the displaced one going BACK, by the
         // racks' own protocol: no room to return it, no swap this block.
@@ -6918,21 +7099,47 @@ impl Renderer {
                 let _ = self.track_retiring.push(old);
             }
         }
+        // **Which lanes have audio standing on them ANYWHERE on the
+        // timeline** — not "under the playhead this block", and not "while
+        // rolling".
+        //
+        // This is the bit `mix_channels` reads to decide a lane renders at
+        // all, and it is deliberately the same shape as `lane_has_clips`,
+        // which has always answered for MIDI clips the same whole-timeline
+        // way. A per-block answer would switch a lane's rack off between two
+        // clips and cut a reverb tail in half at every gap; a rolling-only
+        // answer would cut every tail the moment the transport stopped.
+        // The cost of the coarse answer is that an audio track's plugins run
+        // over silence while the song is parked, which is exactly what a
+        // MIDI track's have always done.
+        let mut lanes = 0u32;
+        for placed in &self.clips {
+            lanes |= 1u32 << placed.strip.min(CHANNELS - 1);
+        }
+        self.clip_lanes = lanes;
+        if lanes != 0 {
+            if let Some(cl) = self.clip_lane.get_mut(..frames * CHANNELS * 2) {
+                cl.fill(0.0);
+            }
+        }
         // **Stopped means silent, exactly as it always has.** Without this the
         // parked position is re-read every callback and the clips buzz one
         // block of themselves under a readout that says nothing is moving.
         if !rolling || self.clips.is_empty() {
             return;
         }
-        // **Per LANE: the clip plays through its channel.** Its fader, its
-        // mute and solo, its post-fader send — the strip's own facts, read
-        // the way every other source reads them. Not its rack yet: the rack
-        // also runs for the lane's live input, one rack must run once per
-        // block, and that unification is a later phase's.
+        // **The per-lane fader's own smoothing state, advanced here and read
+        // by the SENDS pass.**
+        //
+        // `lane_gain[]` is no longer what a clip is multiplied by — the
+        // channel fold's `channel_gain[]` is, along with everything else on
+        // the strip — but it is still the gain a routed bus is folded at
+        // (see the destination fold in the sends pass), and this is the only
+        // writer it has ever had. Advancing it was interleaved with the clip
+        // walk frame by frame; it never depended on the frame, so it is one
+        // loop now and the arithmetic is unchanged.
         let coeff = self.gain_coeff;
         let mut target = [0.0f32; CHANNELS];
-        let mut send = [0.0f32; CHANNELS];
-        let mut pan = [(1.0f32, 1.0f32); CHANNELS];
         let mut punch = [u64::MAX; CHANNELS];
         for lane in 0..CHANNELS {
             let strip = Strip::Channel(lane);
@@ -6941,97 +7148,34 @@ impl Renderer {
             } else {
                 0.0
             };
-            send[lane] = self.lane_send(strip.index());
-            pan[lane] = pan_gains(self.lane_pan(lane));
             punch[lane] = self.shared.punch[lane].load(Ordering::Relaxed);
         }
-        // Stems and ROUTING share this buffer: a send reads the
-        // lane's own audio out of it, so it is filled whenever any
-        // customer asks — see `stems_wanted` for the one list of them.
-        let stems = self.stems_wanted;
-        // Copied out before the buffers are borrowed: the fold below holds
-        // `mix`/`aux`/`stem` mutably, and this has to be readable inside it.
-        let direct = self.route_direct;
-        let (Some(mix), Some(aux), Some(stem)) = (
-            self.mix.get_mut(..frames * TAP_CHANNELS),
-            self.aux.get_mut(..frames * TAP_CHANNELS),
-            self.stem_scratch.get_mut(..frames * CHANNELS * 2),
-        ) else {
-            return;
-        };
-        // How far the whole graph is behind, which is what the clips must
-        // wait for. Read once per block: it changes when a plugin is loaded,
-        // not within a buffer.
-        let pdc = self.shared.max_latency.load(Ordering::Relaxed);
-        // **And how much of that each LANE pays for itself.**
-        //
-        // A clip bypasses its channel's rack, so what it does not pay is the
-        // whole of the maximum — unless the lane is in a group, where every
-        // rack it is folded through runs over it after this, or IS a group,
-        // where the folder's own rack does. A single figure for all sixteen
-        // held a grouped clip back for a delay it was about to pay again,
-        // and the group came out late by exactly its bus's lookahead.
-        let hold: [u64; CHANNELS] = std::array::from_fn(|ch| {
-            let after = self.folder_lat[ch].saturating_add(if self.folder_is[ch] {
-                // BOTH the folder's racks run over its own row at the fold.
-                Rack::latency(&self.shared, ch).saturating_add(Rack::latency(
-                    &self.shared,
-                    tangent_ui::recorder::folder_extra_seat(ch),
-                ))
-            } else {
-                0
-            });
-            u64::from(pdc.saturating_sub(after))
-        });
-        let mut peak = [[0.0f32; 2]; CHANNELS];
-        for f in 0..frames {
+        for _ in 0..frames {
             for lane in 0..CHANNELS {
                 self.lane_gain[lane] += (target[lane] - self.lane_gain[lane]) * coeff;
             }
+        }
+        // Disjoint fields, so the borrows are disjoint: the clip list is read
+        // while the per-lane buffer is written.
+        let (clips, dst) = (&self.clips, &mut self.clip_lane);
+        let stride = CHANNELS * 2;
+        for f in 0..frames {
             // Project frame. The u64 compares come BEFORE any cast, because
             // `p` grows without bound; before a clip and past its end are
             // both silence, and both are ordinary.
-            // **The clips' own compensation, and it is arithmetic rather
-            // than a buffer.**
             //
-            // An audio clip does not pass through its channel's insert rack
-            // — see the note in this function's header — so it arrives with
-            // no latency at all, while a MIDI lane carrying a lookahead
-            // plugin arrives `L` frames late. Aligning them means holding
-            // the clips back by the graph's own maximum.
-            //
-            // `mix_clips` derives everything from the absolute frame, which
-            // is what makes locate, loop and offline export correct for
-            // free. Reading `p - delay` keeps that property exactly: there
-            // is no cursor to rewind on a flush, nothing to reset on a loop
-            // wrap, and a seek lands in the right place because it always
-            // did. A delay LINE here would have needed all three.
-            //
-            // **`checked_sub`, not `saturating_sub`.** Saturating pins `p` at
-            // zero for the first `pdc` frames — which is precisely the window
-            // compensation exists for — so a clip starting at 0:00 emitted
-            // its first sample over and over while the plugin lane's own
-            // delay line was correctly putting out silence. A DC step
-            // followed by a discontinuity, on every play-from-zero with a
-            // lookahead plugin loaded.
-            //
-            // Before the compensated zero there is no project frame, and the
-            // honest answer is the same one the clip loop gives for any
-            // other position a clip does not cover: nothing. The per-lane
-            // gain smoothing above has already run, so the fader still
-            // settles across these frames.
-            //
-            // **Per LANE, so a grouped clip is held back only by what it has
-            // not already paid.** The subtraction moved inside the clip loop
-            // for that: it is one `u64` per clip per frame, beside work that
-            // already reads the clip's own fields.
+            // **No compensation subtracted here any more.** It used to be
+            // `now - hold[lane]`, with a `checked_sub` standing in for the
+            // silence a delay line puts out before it has been fed — the
+            // note that lived here explained at length why saturating would
+            // have repeated the first sample for the first `pdc` frames.
+            // The lane's delay line does that job now, and does it with an
+            // actual ring, so there is nothing left to reason about: the
+            // clip reads its own frame and the wait happens downstream.
             let now = at + f as u64;
-            for placed in &self.clips {
+            for placed in clips {
                 let lane = placed.strip.min(CHANNELS - 1);
-                let Some(p) = now.checked_sub(hold[lane]) else {
-                    continue;
-                };
-                let Some(k) = p.checked_sub(placed.start) else {
+                let Some(k) = now.checked_sub(placed.start) else {
                     continue;
                 };
                 if k >= placed.len {
@@ -7040,7 +7184,7 @@ impl Renderer {
                 // **Being recorded over, right now**: from the punch frame
                 // on, this lane's clips are the material the take is
                 // replacing, and the take must not be heard against them.
-                if p >= punch[placed.strip.min(CHANNELS - 1)] {
+                if now >= punch[lane] {
                     continue;
                 }
                 let i = match usize::try_from(placed.offset + k) {
@@ -7067,41 +7211,24 @@ impl Renderer {
                 if placed.fade_out > 0 && left <= placed.fade_out {
                     env *= (left - 1) as f32 / placed.fade_out as f32;
                 }
-                let lane = placed.strip.min(CHANNELS - 1);
-                // **The clip's own level, before the lane's.** Sanitised
+                // **The clip's own level, and nothing else's.** Sanitised
                 // here rather than trusted: this multiplies into somebody's
                 // monitors, and the rule the gains follow everywhere else.
+                // The lane's fader, pan, mute, solo and send are the channel
+                // fold's, one strip's worth applied once — which is what
+                // stopped a clip on a folder needing a special case in this
+                // loop: `mix_channels` already knows a folder's row carries
+                // no fader of its own.
                 let clip_g = if placed.gain.is_finite() {
                     placed.gain.clamp(0.0, 64.0)
                 } else {
                     1.0
                 };
-                // A clip standing on a FOLDER goes into the bus raw — only
-                // its own clip gain — for the reason the channel loop
-                // gives: the strip's fader, pan and send belong to the fold.
-                let folded = self.folder_is[lane];
-                let g = if folded { clip_g } else { self.lane_gain[lane] * clip_g };
-                let (pl, pr) = if folded { (1.0, 1.0) } else { pan[lane] };
-                let (l, r) = (cl * env * g * pl, cr * env * g * pr);
-                peak[lane][0] = peak[lane][0].max(l.abs());
-                peak[lane][1] = peak[lane][1].max(r.abs());
-                // The METER and the STEM still see the whole lane; only the
-                // path to the master closes when the lane feeds a bus.
-                mix[f * TAP_CHANNELS] += l * direct[lane];
-                mix[f * TAP_CHANNELS + 1] += r * direct[lane];
-                let s_lane = if folded { 0.0 } else { send[lane] };
-                aux[f * TAP_CHANNELS] += l * s_lane;
-                aux[f * TAP_CHANNELS + 1] += r * s_lane;
-                if stems {
-                    stem[f * CHANNELS * 2 + lane * 2] += l;
-                    stem[f * CHANNELS * 2 + lane * 2 + 1] += r;
+                if let Some(v) = dst.get_mut(f * stride + lane * 2) {
+                    *v += cl * env * clip_g;
                 }
-            }
-        }
-        for (lane, pk) in peak.iter().enumerate() {
-            if pk[0] > 0.0 || pk[1] > 0.0 {
-                if !self.folder_is[lane] {
-                    self.shared.note_strip_peak(Strip::Channel(lane), *pk);
+                if let Some(v) = dst.get_mut(f * stride + lane * 2 + 1) {
+                    *v += cr * env * clip_g;
                 }
             }
         }
@@ -7209,9 +7336,9 @@ impl Renderer {
         // per block, forever. It made the app measurably laggier the moment
         // a drumpad was assigned.
         //
-        // And the tail does not need it: the lane's own pass in `mix_clips`
-        // runs that same rack every block regardless, so whatever is ringing
-        // in it keeps ringing there.
+        // And the tail does not need it: the lane's own pass in
+        // `mix_channels` runs that same rack every block regardless, so
+        // whatever is ringing in it keeps ringing there.
         // **Cached, not walked.** With a pad block per channel this is two
         // thousand seats, and asking every block — when the answer changes
         // only on a plugin load — is the audio thread doing a full scan of
@@ -7385,6 +7512,19 @@ impl Renderer {
                 dst[..frames].fill(0.0);
             }
         }
+        // The kit's DRY sum, beside the wet one and zeroed with it. See
+        // `Shared::stems_dry`: a kit's dry stem is its voices before the pad
+        // bays and before the kit's bus rack, which means this buffer takes
+        // the raw voice on BOTH branches of the pad walk below while the wet
+        // one takes whichever the pad's own bay produced.
+        if self.stems_dry {
+            for c in 0..TAP_CHANNELS {
+                if let Some(dst) = self.dry_io.get_mut(c) {
+                    let n = frames.min(dst.len());
+                    dst[..n].fill(0.0);
+                }
+            }
+        }
         if let Some(po) = self.pad_out.get_mut(..frames * PADS * 2) {
             po.fill(0.0);
         }
@@ -7526,6 +7666,20 @@ impl Renderer {
                     }
                 }
             }
+            // The dry sum takes the voice as it left the sampler, whether or
+            // not this pad has a bay. Written here rather than as a copy of
+            // `fx_in` before the walk, because the pad racks run INSIDE the
+            // walk: there is no single instant at which the summed kit
+            // exists un-processed.
+            if self.stems_dry {
+                for c in 0..TAP_CHANNELS.min(2) {
+                    if let Some(dst) = self.dry_io.get_mut(c) {
+                        for f in 0..frames.min(dst.len()) {
+                            dst[f] += self.pad_out[(f * PADS + i) * 2 + c];
+                        }
+                    }
+                }
+            }
         }
         for (i, pk) in peak.iter().enumerate() {
             if *pk > 0.0 {
@@ -7614,6 +7768,20 @@ impl Renderer {
             if let Some(line) = self.pad_pdc.get_mut(ch) {
                 line.run(&mut self.fx_in, frames, wait);
             }
+            // The dry copy skipped `own`, so its ring is `own` longer — the
+            // same correction the channel walk makes, argued at `dry_pdc`.
+            if self.stems_dry {
+                let dry_wait = usize::try_from(
+                    self.shared
+                        .max_latency
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(folded),
+                )
+                .unwrap_or(0);
+                if let Some(line) = self.pad_dry_pdc.get_mut(ch) {
+                    line.run(&mut self.dry_io, frames, dry_wait);
+                }
+            }
         }
         // The fold: the DRUMS strip's fader, pan, send and peak, exactly as
         // every other strip does it.
@@ -7622,6 +7790,7 @@ impl Renderer {
         // lane's own audio out of it, so it is filled whenever any
         // customer asks — see `stems_wanted` for the one list of them.
         let stems = self.stems_wanted;
+        let dry_on = self.stems_dry;
         let (Some(mix), Some(aux), Some(stem)) = (
             self.mix.get_mut(..want),
             self.aux.get_mut(..want),
@@ -7662,15 +7831,33 @@ impl Renderer {
                     stem[f * CHANNELS * 2 + ch * 2 + 1] += r;
                 }
             }
+            // Same fader, same pan, same lane — the kit's inserts out. See
+            // the channel fold for why the balance is deliberately kept.
+            if dry_on {
+                if let Some(ch) = drum_lane {
+                    let dl = self.dry_io.first().map_or(0.0, |b| b[f]) * g * bus_l;
+                    let dr = self.dry_io.get(1).map_or(0.0, |b| b[f]) * g * bus_r;
+                    if let Some(d) = self.dry_scratch.get_mut(..frames * CHANNELS * 2) {
+                        d[f * CHANNELS * 2 + ch * 2] += dl;
+                        d[f * CHANNELS * 2 + ch * 2 + 1] += dr;
+                    }
+                }
+            }
         }
         if !is_folder {
             self.shared.note_strip_peak(bus_strip, bus_peak);
         }
     }
 
-    /// The eight general channels: the built-in, the bay voices, and their
-    /// effect bays — everything except AUDIO channels, whose racks run where
-    /// their input arrives (see `mix_monitor`).
+    /// The eight general channels: the built-in, the bay voices, the
+    /// TIMELINE's audio, and their effect bays.
+    ///
+    /// The header used to end "everything except AUDIO channels, whose racks
+    /// run where their input arrives" — which was true of a lane's LIVE
+    /// input and quietly false of its clips, whose racks ran nowhere at all.
+    /// A clip's audio is seeded into `fx_in` here, from `clip_lane`, and
+    /// takes this walk exactly as an instrument's does. A lane's live input
+    /// still has its own monitor pass in `mix_monitor`.
     ///
     /// Replaces `render_builtin`, and generalises exactly what that function
     /// already did for one synth: render into a private buffer, run the
@@ -8153,8 +8340,19 @@ impl Renderer {
             let is_folder = self.folder_is[ch];
             // A lane renders when something can SOUND on it: its own live
             // arm, or clips standing on it — through the built-in or a rack.
-            let feeds = armed || lane_has_clips || !lane_notes.is_empty();
-            if !feeds || (!is_builtin && !is_keys && !rack_live) {
+            //
+            // **`lane_has_clips` only ever counted MIDI clips**, and that is
+            // the whole of why a plugin on an audio track did nothing: a
+            // lane holding nothing but audio failed this gate, took the
+            // `continue` below, and never reached the rack call at all. Its
+            // compressor did not process silence — it did not run. So audio
+            // is a second term here, and a second escape from the clause
+            // beneath: a lane with a clip on it and an EMPTY bay still has
+            // to walk the fold, or the timeline goes silent the moment the
+            // last plugin is pulled out of the strip.
+            let has_audio = self.clip_lanes & (1u32 << ch.min(CHANNELS - 1)) != 0;
+            let feeds = armed || lane_has_clips || has_audio || !lane_notes.is_empty();
+            if !feeds || (!is_builtin && !is_keys && !rack_live && !has_audio) {
                 // **The gain is advanced whether or not anything renders.** A
                 // fader moved during a rest has to have arrived by the next
                 // note, or it comes in at the old level and slides.
@@ -8174,9 +8372,47 @@ impl Renderer {
                 }
                 continue;
             }
-            // The channel's own signal, planar for the rack. One scratch
-            // serves every lane of an instrument kind: this lane renders,
-            // copies out, and only then does the walk reach the next.
+            // **The lane's SOURCE, planar for the rack — the timeline's
+            // audio first.**
+            //
+            // This used to be three branches that each FILLED `fx_in`: the
+            // DX7 wrote its render over it, the keyboard wrote its render
+            // over it, and everything else wrote silence. The timeline was
+            // nowhere in the list, because the timeline folded itself onto
+            // the bus somewhere else entirely.
+            //
+            // Seeding first and ADDING after is what lets both live on one
+            // lane. The two instrument scratches are zeroed and then
+            // rendered into — the instruments ADD, which is why the scratch
+            // exists at all — so `+=` here is the same arithmetic the old
+            // `=` was over a buffer that had just been filled with silence,
+            // and it is the only shape in which a lane can carry an
+            // instrument AND a clip without one of them being quietly
+            // discarded.
+            {
+                // Disjoint fields borrow disjointly, which is the only
+                // reason this can be written as a copy rather than a
+                // per-sample method call.
+                let (fx, clip) = (&mut self.fx_in, &self.clip_lane);
+                for c in 0..TAP_CHANNELS {
+                    let Some(dst) = fx.get_mut(c) else {
+                        continue;
+                    };
+                    if has_audio {
+                        for f in 0..frames {
+                            dst[f] = clip
+                                .get(f * CHANNELS * 2 + ch * 2 + c)
+                                .copied()
+                                .unwrap_or(0.0);
+                        }
+                    } else {
+                        let n = frames.min(dst.len());
+                        dst[..n].fill(0.0);
+                    }
+                }
+            }
+            // One scratch serves every lane of an instrument kind: this lane
+            // renders, copies out, and only then does the walk reach the next.
             if is_builtin && self.dx7s[ch].as_ref().is_some_and(|d| d.active()) {
                 let want = frames * TAP_CHANNELS;
                 let Some(scratch) = self.builtin_scratch.get_mut(..want) else {
@@ -8191,7 +8427,7 @@ impl Renderer {
                         continue;
                     };
                     for f in 0..frames {
-                        dst[f] = scratch[f * TAP_CHANNELS + c];
+                        dst[f] += scratch[f * TAP_CHANNELS + c];
                     }
                 }
             } else if is_keys && self.keys_lanes[ch].as_ref().is_some_and(|k| k.active()) {
@@ -8213,19 +8449,34 @@ impl Renderer {
                         continue;
                     };
                     for f in 0..frames {
-                        dst[f] = scratch[f * TAP_CHANNELS + c];
+                        dst[f] += scratch[f * TAP_CHANNELS + c];
                     }
                 }
-            } else {
-                // Silence in: a bay-1 voice REPLACES it, an effect transforms
-                // it, and a rack of effects over silence is silence.
+            } else if !rack_live && !has_audio {
+                // Nothing to play and nothing to play it through: an
+                // inactive instrument on a bare lane. The seed above has
+                // already left `fx_in` silent, so there is nothing to undo.
+                continue;
+            }
+            // **The dry copy, taken here: after the source is assembled and
+            // before one plugin has seen it.**
+            //
+            // This is the only moment in the block at which a channel's own
+            // audio exists WITHOUT its own processing: the clip and the
+            // instrument have just finished being summed into `fx_in`, and
+            // the pedalboard a few lines below has not run yet. Copied
+            // rather than recomputed, because recomputing would mean a
+            // second walk of the clip list and a second render of the
+            // instrument — and the second render of a stateful instrument is
+            // not the same sound as the first.
+            if self.stems_dry {
+                let (dry, fx) = (&mut self.dry_io, &self.fx_in);
                 for c in 0..TAP_CHANNELS {
-                    if let Some(dst) = self.fx_in.get_mut(c) {
-                        dst[..frames].fill(0.0);
-                    }
-                }
-                if !rack_live {
-                    continue;
+                    let (Some(dst), Some(src)) = (dry.get_mut(c), fx.get(c)) else {
+                        continue;
+                    };
+                    let n = frames.min(dst.len()).min(src.len());
+                    dst[..n].copy_from_slice(&src[..n]);
                 }
             }
             if rack_live && !is_folder {
@@ -8325,8 +8576,17 @@ impl Renderer {
             // place a channel's own audio exists as a separate buffer. A
             // chain that delays by `L` needs `max - L` more to arrive with
             // everything else; the chain with the most latency waits for
-            // nothing, and the clips — which pass through no rack at all —
-            // wait for the whole of `max` in `mix_clips`.
+            // nothing.
+            //
+            // **And the clips wait HERE now**, on this line, by this
+            // formula. They used to wait in `mix_clips`, by a second
+            // arithmetic formula written for a signal that passed through no
+            // rack — one that had to reconstruct, per lane, everything this
+            // one subtracts. The two agreed for a loose channel and were
+            // kept in step by hand for a grouped one; nothing kept them in
+            // step for an AMP-bearing one, where this formula subtracts
+            // seven pedal seats and the clips' never did. There is one
+            // formula now and no way for them to drift.
             //
             // Runs whether or not the rack is live, so switching the last
             // plugin off does not leave the lane early by its own latency
@@ -8374,6 +8634,28 @@ impl Renderer {
                 if let Some(line) = self.pdc.get_mut(ch) {
                     line.run(&mut self.fx_in, frames, want);
                 }
+                // **And the dry copy waits `own` frames LONGER**, on a line
+                // of its own, because it is the one signal here that did not
+                // pay the rack.
+                //
+                // The wet copy's total is `own` of real plugin delay plus
+                // `max - own - folded` of ring: `max - folded`. The dry copy
+                // has no plugin delay at all, so its ring is the whole
+                // `max - folded` and the two come out of the fold on the
+                // same frame. Get this wrong in the obvious way — reuse
+                // `want` — and a dry stems export is correct on every lane
+                // whose plugins report zero latency and silently early on
+                // the one lane carrying the linear-phase EQ, which is the
+                // worst possible distribution of a bug.
+                if self.stems_dry {
+                    let dry_want = usize::try_from(
+                        pdc_max.saturating_sub(self.folder_lat[ch]),
+                    )
+                    .unwrap_or(0);
+                    if let Some(line) = self.dry_pdc.get_mut(ch) {
+                        line.run(&mut self.dry_io, frames, dry_want);
+                    }
+                }
             }
             // The fold: fader, send, peak — the channel's own, exactly as
             // every other strip does it.
@@ -8399,6 +8681,7 @@ impl Renderer {
             // lane's own audio out of it, so it is filled whenever any
             // customer asks — see `stems_wanted` for the one list of them.
             let stems = self.stems_wanted;
+            let dry_on = self.stems_dry;
             let direct = self.route_direct[ch];
             let (Some(mix), Some(aux), Some(stem)) = (
                 self.mix.get_mut(..want),
@@ -8430,6 +8713,23 @@ impl Renderer {
                 if stems {
                     stem[f * CHANNELS * 2 + ch * 2] += l;
                     stem[f * CHANNELS * 2 + ch * 2 + 1] += r;
+                }
+                // **The same fader, the same pan, the same gate — a
+                // different signal.** A dry stem is the strip's inserts
+                // removed and NOT its balance: the set still sums to the
+                // mix's own arrangement of levels and positions, which is
+                // the only thing that makes a stem set reimportable. So the
+                // dry write is deliberately a copy of the line above with
+                // `dry_io` in place of `fx_in`, sharing `g`, `pan_l` and
+                // `pan_r` rather than recomputing them, so the two cannot
+                // drift apart when somebody changes one of them.
+                if dry_on {
+                    let dl = self.dry_io.first().map_or(0.0, |b| b[f]) * g * pan_l;
+                    let dr = self.dry_io.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
+                    if let Some(d) = self.dry_scratch.get_mut(..frames * CHANNELS * 2) {
+                        d[f * CHANNELS * 2 + ch * 2] += dl;
+                        d[f * CHANNELS * 2 + ch * 2 + 1] += dr;
+                    }
                 }
             }
             // The folder's meter is the GROUP's, and the fold reports it.
@@ -8506,6 +8806,33 @@ impl Renderer {
                             .copied()
                             .unwrap_or(0.0);
                     }
+                }
+            }
+            // **The group's DRY stem is exactly this sum.**
+            //
+            // Taken here, one line above the first of the folder's two
+            // racks, and NOT rebuilt out of the children's dry stems.
+            // `Shared::stems_dry` sets the rule: a dry stem is that strip's
+            // own inserts removed and nothing else's. A group's own inserts
+            // are its two bus racks; its children reach it exactly as they
+            // reach the mix. Summing the dry children instead would have
+            // produced a group stem of a mix nobody had ever heard, and
+            // would have needed a second gather of a buffer that is also the
+            // routing bus and the key snapshot.
+            //
+            // No compensation line here, deliberately: the fold has none
+            // either — see the note below on what a folder's own rack leaves
+            // uncompensated — so the dry copy and the wet copy differ by
+            // exactly that same known, published amount and by nothing this
+            // mode introduced.
+            if self.stems_dry {
+                let (dry, fx) = (&mut self.dry_io, &self.fx_in);
+                for c in 0..TAP_CHANNELS {
+                    let (Some(dst), Some(sr)) = (dry.get_mut(c), fx.get(c)) else {
+                        continue;
+                    };
+                    let n = frames.min(dst.len()).min(sr.len());
+                    dst[..n].copy_from_slice(&sr[..n]);
                 }
             }
             // **THE-FOLD:** the one place a folder's rack runs.
@@ -8623,6 +8950,17 @@ impl Renderer {
                 if let Some(st) = self.stem_scratch.get_mut(..frames * stride) {
                     st[f * stride + ch * 2] = l;
                     st[f * stride + ch * 2 + 1] = r;
+                }
+                // The dry slot is REPLACED too, for the same reason: it held
+                // this folder's own raw row and the group is what belongs
+                // there. Same fader, same pan, the bus racks left out.
+                if self.stems_dry {
+                    let dl = self.dry_io.first().map_or(0.0, |b| b[f]) * g * pan_l;
+                    let dr = self.dry_io.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
+                    if let Some(d) = self.dry_scratch.get_mut(..frames * stride) {
+                        d[f * stride + ch * 2] = dl;
+                        d[f * stride + ch * 2 + 1] = dr;
+                    }
                 }
                 if to_master {
                     if let Some(mix) = self.mix.get_mut(..want) {
@@ -9708,6 +10046,13 @@ impl Engine {
             key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             ir: None,
             ir_phase: 0.0,
+            clip_lane: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            clip_lanes: 0,
+            dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            dry_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            dry_pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
+            pad_dry_pdc: (0..=CHANNELS).map(|_| DelayLine::new()).collect(),
+            stems_dry: false,
         };
 
         let (stream, out_device_obj, offline_renderer) = match dev {
@@ -11932,6 +12277,20 @@ impl Engine {
     /// The stem tap's switch: on for an export pass, off after.
     pub fn set_stems(&self, on: bool) {
         self.shared.stems_on.store(on, Ordering::Relaxed);
+    }
+
+    /// **Take the stems DRY: every strip's own inserts out of the tap.**
+    ///
+    /// A mode on `set_stems`, not a replacement for it — a pass still has to
+    /// arm the tap, and this only decides which of the two per-lane buffers
+    /// the ring is fed from. Off is the mode the desk sounds like, which is
+    /// why it is the default and why `an_offline_engine_taps_stems_too` did
+    /// not have to learn about it.
+    ///
+    /// See `Shared::stems_dry` for what "dry" is defined to mean and why it
+    /// is defined that way rather than as "before everything".
+    pub fn set_stems_dry(&self, on: bool) {
+        self.shared.stems_dry.store(on, Ordering::Relaxed);
     }
 
     /// Drain the stem tap — interleaved `CHANNELS * 2` floats per frame —
@@ -14877,6 +15236,13 @@ mod tests {
             key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             ir: None,
             ir_phase: 0.0,
+            clip_lane: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            clip_lanes: 0,
+            dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            dry_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            dry_pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
+            pad_dry_pdc: (0..=CHANNELS).map(|_| DelayLine::new()).collect(),
+            stems_dry: false,
             racks,
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -17018,6 +17384,16 @@ mod tests {
     /// dependency exists, the stems are zeroed every chunk so there is no
     /// cross-block audio memory, and a compressor's transfer is contractive
     /// — mutual ducking, not feedback. Four blocks prove the engine agrees.
+    ///
+    /// **And it only started proving it today.** The two comps sit in the
+    /// bays of lanes 3 and 4 and the two clips stand on lanes 3 and 4 — but
+    /// until a clip reached its lane's rack, each comp's MAIN input was
+    /// silence and only its key carried anything. A contractive loop over
+    /// two silent signals is not much of a test of a loop. Both comps now
+    /// process a half-amplitude constant thirty decibels over their
+    /// thresholds while keying each other, which is the shape the reasoning
+    /// above was written for, and the bound still holds. The assertions are
+    /// unchanged; what changed is that they are now being asked something.
     #[test]
     fn mutual_keys_render_bounded_and_finite() {
         let mut e = key_engine(
@@ -17077,15 +17453,22 @@ mod tests {
     /// what leaves the bay is what would have left it had the plugin never
     /// been loaded at all.
     ///
-    /// **On the MASTER's rack**, not a track's, and only because of where
-    /// audio can be got into a rack today: `mix_clips` says in as many words
-    /// that a clip does not yet run through its lane's own insert chain
-    /// ("Not its rack yet… that unification is a later phase's"), so a
-    /// comp on channel 2 would process silence and both runs would match for
-    /// the wrong reason. `run_rack` is one function and the skip is in it,
-    /// so what this proves about the master's seat is what happens at every
-    /// seat; that the right SEAT is addressed is the desk's half, and the
-    /// UI's `shift_clicking_a_bay_bypasses_it_in_both_views_on_tracks_and_folders`
+    /// **On the MASTER's rack**, not a track's — and the reason it is
+    /// sited there has EXPIRED, which is worth saying rather than quietly
+    /// leaving a stale argument standing.
+    ///
+    /// It was sited here because a clip did not reach its lane's insert
+    /// chain at all: a comp on channel 2 would have processed silence, all
+    /// three runs would have come out identical, and the first assertion
+    /// would have passed for the wrong reason. That gap is closed — see
+    /// `mix_clips` — so channel 2 would work now. It STAYS on the master
+    /// because the master's seat has one property a track's does not: it is
+    /// downstream of everything, so a bypass failure there cannot be masked
+    /// by a lane that happened to be silent. `run_rack` is one function and
+    /// the skip is in it, so what this proves about the master's seat is
+    /// what happens at every seat; that the right SEAT is addressed is the
+    /// desk's half, and the UI's
+    /// `shift_clicking_a_bay_bypasses_it_in_both_views_on_tracks_and_folders`
     /// holds that end.
     #[test]
     fn a_bypassed_bay_passes_the_audio_through_bit_for_bit() {
@@ -17149,6 +17532,421 @@ mod tests {
         assert_eq!(
             bypassed, bare,
             "a bypassed bay altered the audio it was supposed to walk past"
+        );
+    }
+
+    // ── the clip and its lane's rack ───────────────────────────────────────
+
+    /// **An insert on an audio track processes the track's audio.**
+    ///
+    /// The one assertion this whole item stands on. `key_engine` seats a
+    /// fast, deep compressor in bay 0 of channel 2 and stands a constant
+    /// 0.9 clip on lane 2 — a signal thirty decibels over that
+    /// compressor's threshold. If the clip reaches the rack, the gain
+    /// reduction meter cannot stay at zero; if it does not, the meter is
+    /// the proof, because a compressor fed silence reduces nothing.
+    ///
+    /// The METER rather than the audio, deliberately. A level comparison
+    /// would also move if the fader, the pan or the clip gain changed, and
+    /// this test exists to say one thing: the rack ran, and it ran over
+    /// THIS lane's clip. `the_master_mix_hears_a_clip_lanes_inserts` below
+    /// holds the audio's end of it.
+    #[test]
+    fn a_clip_runs_through_its_lanes_insert_rack() {
+        let mut e = key_engine(vec![flat_clip(2, 0.9)], &[2], &[], &[]);
+        let mut out = vec![0.0f32; 512 * 2];
+        for _ in 0..6 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let gr = e.insert_gr_db(2, 0);
+        assert!(
+            gr > 3.0,
+            "a compressor in channel 2's bay 0 reduced {gr} dB over a 0.9 \
+             constant clip on lane 2 — the clip never reached the rack"
+        );
+    }
+
+    /// **And the MASTER hears it, not merely the stem tap.**
+    ///
+    /// The mix-changing half, named out loud so nobody can later mistake
+    /// the stems work for a stems-only change. Two renders of one desk, the
+    /// only difference being whether channel 2's bay holds the compressor;
+    /// the master output has to differ. The comp is fast and deep and the
+    /// clip is a constant thirty decibels over its threshold, so "differ"
+    /// here means "quieter by a lot", which is asserted rather than merely
+    /// "not equal" — a not-equal would also pass on a dither-sized wobble.
+    #[test]
+    fn the_master_mix_hears_a_clip_lanes_inserts() {
+        let run = |comps: &[usize]| -> f32 {
+            let mut e = key_engine(vec![flat_clip(2, 0.9)], comps, &[], &[]);
+            let mut out = vec![0.0f32; 512 * 2];
+            // Six settling blocks, then six measured: the lane fader's slew
+            // runs only while the clips do, and the comp needs a moment to
+            // reach its steady state over a constant. Identical in both
+            // runs, so nothing here can favour one of them.
+            for _ in 0..6 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            let mut peak = 0.0f32;
+            for _ in 0..6 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+            }
+            peak
+        };
+        let bare = run(&[]);
+        assert!(bare > 0.5, "the clip never reached the master at all: {bare}");
+        let comped = run(&[2]);
+        assert!(
+            comped < bare * 0.5,
+            "the master came out at {comped} with a deep compressor on the \
+             clip's own lane and {bare} without it — the bay is not in the mix"
+        );
+    }
+
+    /// **A clip is delay-compensated like every other source, and PER LANE.**
+    ///
+    /// The clips used to carry a compensation formula of their own — a
+    /// `hold[]` array in `mix_clips` that reconstructed, per lane, how much
+    /// of the published maximum that lane would pay downstream. It is gone:
+    /// a clip now waits on the lane's own delay line, by the lane's own
+    /// formula, because it now takes the lane's own road. This is the guard
+    /// on that deletion, and it is written per lane on purpose — one figure
+    /// for all thirty-two is exactly the mistake the old array existed to
+    /// avoid, and it comes out as a group arriving late by its bus
+    /// compressor's lookahead.
+    ///
+    /// The desk: a group whose BUS holds the one built-in that reports an
+    /// honest lookahead, a clip inside that group, and a clip on a loose
+    /// lane with nothing on it at all. Neither measured lane carries a
+    /// plugin, so what is measured is arrival and not tone.
+    ///
+    /// The loose lane has paid nothing and waits for the whole published
+    /// maximum. The child has paid nothing YET but is about to be folded
+    /// through the group's rack, so it waits for nothing here — and the
+    /// group's own stem, written a moment later by the fold, comes out on
+    /// the same frame the loose lane does. That is the alignment the
+    /// deleted array was protecting.
+    #[test]
+    fn a_grouped_clip_and_a_loose_one_each_wait_only_for_what_they_have_not_paid() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let mut parents = [-1i32; CHANNELS];
+        parents[6] = 5;
+        assert!(e.set_folders(parents), "the tree was refused");
+        e.load_insert(5, 0, Some(Path::new(crate::builtin_fx::DENOISE_PATH)), None)
+            .expect("the denoise loads")
+            .expect("the bay reports it");
+        let mut out = vec![0.0f32; 512 * 2];
+        // The hand-off rings drain on the callback, and the latency figures
+        // are published from there, so the plugin is not really seated —
+        // and `max_latency` not really raised — until some blocks have run.
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let pdc = usize::try_from(e.published_max_latency_for_test()).unwrap_or(0);
+        assert!(
+            pdc > 0,
+            "the fixture publishes no latency, so nothing below means anything"
+        );
+        // Armed only now, so the ring holds no silence from the warm-up and
+        // frame zero of the drain is frame zero of the roll.
+        e.set_stems(true);
+        e.set_clips(vec![flat_clip(2, 0.9), flat_clip(6, 0.9)]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut drained: Vec<f32> = Vec::new();
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            e.drain_stems(&mut drained);
+        }
+        let wide = CHANNELS * 2;
+        let frames = drained.len() / wide;
+        assert!(frames > pdc + 512, "too little drained to see the wait: {frames}");
+        let first = |lane: usize| -> Option<usize> {
+            (0..frames).find(|f| drained[f * wide + lane * 2].abs() > 0.01)
+        };
+        assert_eq!(
+            first(2),
+            Some(pdc),
+            "the loose lane's clip did not wait for the group's bus plugin"
+        );
+        assert_eq!(
+            first(6),
+            Some(0),
+            "the grouped clip waited here as well as at the fold, so the \
+             group comes out late by its bus plugin's lookahead"
+        );
+    }
+
+    // ── dry stems and processed stems ──────────────────────────────────────
+
+    /// **The two stem modes are two different files.**
+    ///
+    /// The failure this item most risks shipping is a pair of labels that
+    /// render the same audio, so this is written as a comparison and not as
+    /// a property of either mode alone. One desk — the key suite's, a
+    /// twenty-to-one compressor in channel 2's bay and a constant clip on
+    /// lane 2 thirty decibels over its threshold — rendered twice, and lane
+    /// 2's stem read out of the tap both times.
+    ///
+    /// Dry has to come back at the clip's own level, because a dry stem is
+    /// the strip's inserts removed and NOT its fader: the set still sums to
+    /// the mix's balance, which is the only thing that makes a stem set
+    /// worth reimporting. Processed has to come back squeezed. Equal peaks
+    /// mean the switch is decorative.
+    #[test]
+    fn a_processed_stem_carries_the_lane_rack_and_a_dry_stem_does_not() {
+        let run = |dry: bool| -> f32 {
+            let mut e = key_engine(vec![flat_clip(2, 0.9)], &[2], &[], &[]);
+            e.set_stems(true);
+            e.set_stems_dry(dry);
+            let mut out = vec![0.0f32; 512 * 2];
+            let mut drained: Vec<f32> = Vec::new();
+            // Six settling blocks THROWN AWAY, then six measured. A
+            // compressor's attack transient is louder than its steady
+            // state, so a peak over the whole roll would report the moment
+            // before the plugin had squeezed anything and make the two modes
+            // look far closer than they are. Identical in both runs.
+            for _ in 0..6 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                e.drain_stems(&mut drained);
+            }
+            drained.clear();
+            for _ in 0..6 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                e.drain_stems(&mut drained);
+            }
+            let wide = CHANNELS * 2;
+            (0..drained.len() / wide)
+                .map(|f| drained[f * wide + 2 * 2].abs())
+                .fold(0.0f32, f32::max)
+        };
+        let dry = run(true);
+        let processed = run(false);
+        assert!(
+            dry > 0.8,
+            "the dry stem is not the clip as it left the fader: {dry}"
+        );
+        assert!(
+            processed < dry * 0.5,
+            "the processed stem peaked at {processed} and the dry one at \
+             {dry} — the mode switch renders the same audio twice"
+        );
+    }
+
+    /// **Choosing dry stems may not move one sample of the mix.**
+    ///
+    /// This is the reason the dry audio lives in a buffer of its own instead
+    /// of being written into `stem_scratch` under a flag. That buffer is not
+    /// only the export tap: it is what a group sums out of, what a hardware
+    /// send gathers from, and what a keyed compressor listens to. Writing
+    /// dry audio into it would have made an EXPORT OPTION quietly change
+    /// what the record sounds like — the worst class of bug this file knows,
+    /// because the file that came out would be internally consistent and
+    /// simply wrong.
+    ///
+    /// So the desk here is deliberately one where `stem_scratch` reaches the
+    /// master: a clip inside a GROUP, so the fold gathers the child out of
+    /// that buffer and folds it into the mix. Bit-for-bit equality, not
+    /// approximate — there is no mechanism by which an export switch should
+    /// alter the master by a little.
+    ///
+    /// **And the compressor is on the CHILD, which is what makes this test
+    /// bite at all.** It was written first with the comp on the group's bus
+    /// and the child bare — and a leak of dry audio into `stem_scratch` was
+    /// then invisible, because a bare lane's dry copy and its wet copy are
+    /// the same samples and the fold summed the same numbers either way. The
+    /// leak has to be given something to change: with the comp on the child,
+    /// its dry copy is thirty decibels louder than its wet one, and a fold
+    /// that gathered the wrong buffer would put that straight on the master.
+    /// The group here is only the road from the buffer to the mix.
+    ///
+    /// It stands for the other two readers of that buffer as well — a
+    /// hardware send gathers from it and a keyed compressor listens to it —
+    /// because all three read the one array and one leak would reach all of
+    /// them.
+    #[test]
+    fn taking_the_stems_dry_leaves_the_mix_alone() {
+        let state = fast_deep_comp_state();
+        let run = |dry: bool| -> Vec<f32> {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            let mut parents = [-1i32; CHANNELS];
+            parents[6] = 5;
+            assert!(e.set_folders(parents), "the tree was refused");
+            e.load_insert(
+                6,
+                0,
+                Some(Path::new(crate::builtin_fx::COMP_PATH)),
+                Some(&state),
+            )
+            .expect("the comp loads")
+            .expect("the bay reports it");
+            let mut out = vec![0.0f32; 512 * 2];
+            for _ in 0..8 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_stems(true);
+            e.set_stems_dry(dry);
+            e.set_clips(vec![flat_clip(6, 0.9)]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut got = Vec::new();
+            for _ in 0..8 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                got.extend_from_slice(&out);
+            }
+            got
+        };
+        let processed = run(false);
+        assert!(
+            processed.iter().any(|s| s.abs() > 0.01),
+            "the fixture never made a sound, so nothing below means anything"
+        );
+        assert_eq!(
+            run(true),
+            processed,
+            "asking for DRY stems changed the master mix"
+        );
+    }
+
+    /// **A group's dry stem is the group before its own bus rack — and the
+    /// children in it are as they are in the mix.**
+    ///
+    /// The definition matters more than the number here, so this test pins
+    /// it from both ends. The desk is a group holding one clip lane, with a
+    /// deep compressor on the group's bus and NOTHING on the child. Dry has
+    /// to come back at the clip's level (the bus comp is the group's own
+    /// insert and is taken out); processed has to come back squeezed by it.
+    ///
+    /// Rebuilding a group's dry stem out of its children's dry stems was the
+    /// other option and it was rejected: it would have produced a stem of a
+    /// mix nobody had ever heard, and it would have needed a second gather
+    /// of the one buffer that is also the routing bus and the key snapshot.
+    #[test]
+    fn a_groups_dry_stem_leaves_its_bus_rack_out() {
+        let state = fast_deep_comp_state();
+        let run = |dry: bool| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            let mut parents = [-1i32; CHANNELS];
+            parents[6] = 5;
+            assert!(e.set_folders(parents), "the tree was refused");
+            e.load_insert(
+                5,
+                0,
+                Some(Path::new(crate::builtin_fx::COMP_PATH)),
+                Some(&state),
+            )
+            .expect("the comp loads")
+            .expect("the bay reports it");
+            let mut out = vec![0.0f32; 512 * 2];
+            for _ in 0..8 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_stems(true);
+            e.set_stems_dry(dry);
+            e.set_clips(vec![flat_clip(6, 0.9)]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut drained: Vec<f32> = Vec::new();
+            // Settled first, then measured — the bus compressor's attack is
+            // louder than what it settles to. See the sibling test.
+            for _ in 0..6 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                e.drain_stems(&mut drained);
+            }
+            drained.clear();
+            for _ in 0..6 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                e.drain_stems(&mut drained);
+            }
+            let wide = CHANNELS * 2;
+            // Lane 5 is the FOLDER's slot, which the fold replaces with the
+            // group's own output — that is the group's stem.
+            (0..drained.len() / wide)
+                .map(|f| drained[f * wide + 5 * 2].abs())
+                .fold(0.0f32, f32::max)
+        };
+        let dry = run(true);
+        let processed = run(false);
+        assert!(dry > 0.8, "the group's dry stem is not the clip: {dry}");
+        assert!(
+            processed < dry * 0.5,
+            "the group's stem peaked at {processed} processed and {dry} dry \
+             — the fold writes the same audio into both buffers"
+        );
+    }
+
+    /// **A dry stem waits for the rack it did NOT pass through.**
+    ///
+    /// The one thing about the dry tap that could ruin the files it exists
+    /// to make, and the one thing nothing else here would notice. The dry
+    /// copy is taken before the lane's pedalboard and rack, so it does not
+    /// pay the `own` frames of real delay those cost — while the wet copy
+    /// does. Hand both the same ring length, which is the obvious and wrong
+    /// thing to do, and a dry stems export comes out perfectly aligned on
+    /// every lane whose plugins report zero latency and silently early on
+    /// the one lane carrying the linear-phase EQ. That distribution is
+    /// worse than being wrong everywhere: it survives every casual test.
+    ///
+    /// The desk is a clip on lane 2 and the one built-in that reports an
+    /// honest lookahead in lane 2's own bay. Nothing else on the desk
+    /// reports anything, so the published maximum IS that lookahead — and
+    /// the dry stem, which is the raw clip with the plugin left out, still
+    /// has to appear `pdc` frames in. Without the correction it appears on
+    /// frame zero.
+    ///
+    /// Measured on the dry stem alone and never on the plugin's output, so
+    /// what the denoise does to a constant cannot decide whether this test
+    /// passes.
+    #[test]
+    fn a_dry_stem_waits_for_the_rack_it_did_not_pass_through() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.load_insert(2, 0, Some(Path::new(crate::builtin_fx::DENOISE_PATH)), None)
+            .expect("the denoise loads")
+            .expect("the bay reports it");
+        let mut out = vec![0.0f32; 512 * 2];
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let pdc = usize::try_from(e.published_max_latency_for_test()).unwrap_or(0);
+        assert!(
+            pdc > 0,
+            "the fixture publishes no latency, so nothing below means anything"
+        );
+        e.set_stems(true);
+        e.set_stems_dry(true);
+        e.set_clips(vec![flat_clip(2, 0.9)]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut drained: Vec<f32> = Vec::new();
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            e.drain_stems(&mut drained);
+        }
+        let wide = CHANNELS * 2;
+        let frames = drained.len() / wide;
+        assert!(frames > pdc + 512, "too little drained to see the wait: {frames}");
+        let first = (0..frames).find(|f| drained[f * wide + 2 * 2].abs() > 0.01);
+        assert_eq!(
+            first,
+            Some(pdc),
+            "the dry stem arrived on its own schedule: the lane publishes \
+             {pdc} frames of compensation and the dry copy skipped the rack \
+             that earns them"
         );
     }
 
