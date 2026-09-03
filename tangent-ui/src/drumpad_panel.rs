@@ -1031,7 +1031,11 @@ fn draw_with(painter: &Painter, rect: Rect, view: &DrumpadView<'_>, face: Color3
 }
 
 /// `text`, cut with an ellipsis to fit `width`.
-fn cut_text(painter: &Painter, width: f32, text: &str, f: &FontId) -> String {
+///
+/// Shared out of the panel rather than copied: the amp's pedal chips and the
+/// IR browser's rows have the same problem this solves, and a second copy of
+/// "measure, then walk back a character" is a second thing to get wrong.
+pub(crate) fn cut_text(painter: &Painter, width: f32, text: &str, f: &FontId) -> String {
     let measure = |t: &str| {
         painter
             .layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE)

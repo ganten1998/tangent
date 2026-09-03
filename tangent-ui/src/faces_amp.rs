@@ -93,14 +93,39 @@ pub fn draw_amp(
             ui.add_space(2.0);
             let gap = ui.spacing().item_spacing.x;
             let w = crate::dialogs::cells_across(ui.available_width(), AMP_PEDALS, gap);
-            ui.horizontal(|ui| {
+            // **A chip is only as narrow as its own text lets it be.**
+            // `cells_across` divides the row honestly, and then `add_sized`
+            // hands the button a size it is free to ignore: egui sizes a
+            // button from its galley plus the theme's padding, and takes the
+            // LARGER of that and what it was asked for. Seven ten-character
+            // labels therefore need about four hundred and eighty points
+            // whatever the panel is, so the board ran off the right-hand
+            // edge of any amp window narrower than that — which is every amp
+            // window the moment it is dragged in, and the amp half of the
+            // owner's "cut off on the right". Cutting the WORD to the room
+            // is the fix; the full name is on the hover, where it already
+            // was. `horizontal_wrapped` is the floor under that: if the room
+            // is too small even for an ellipsis, the board takes a second
+            // line rather than running off the end.
+            let room = (w - ui.spacing().button_padding.x * 2.0 - 2.0).max(0.0);
+            let cut: Vec<String> = pedals
+                .iter()
+                .map(|t| {
+                    crate::drumpad_panel::cut_text(
+                        ui.painter(),
+                        room,
+                        if t.is_empty() { "+" } else { t.as_str() },
+                        &bold(9.0),
+                    )
+                })
+                .collect();
+            ui.horizontal_wrapped(|ui| {
                 for (pedal, tenant) in pedals.iter().enumerate() {
                     let empty = tenant.is_empty();
-                    let label = if empty { "+" } else { tenant.as_str() };
                     let chip = ui.add_sized(
                         egui::Vec2::new(w, 30.0),
                         egui::Button::new(
-                            egui::RichText::new(label)
+                            egui::RichText::new(&cut[pedal])
                                 .font(bold(9.0))
                                 .color(if empty { st.s.faint } else { st.s.ink }),
                         )
@@ -182,6 +207,97 @@ mod tests {
         let long = pedal_label("/x/FabFilter Saturn 2 Deluxe.vst3");
         assert!(long.chars().count() <= 10, "{long}");
         assert!(long.ends_with('…'), "{long}");
+    }
+
+    /// **The pedalboard fits the panel, at every width the panel can be.**
+    ///
+    /// The owner's report was "menus that are cut off in them (cut off on
+    /// the right side): Imager, Amp", and this is the amp's half of it.
+    /// `cells_across` divided the row honestly all along; what nobody
+    /// noticed is that `add_sized` only ASKS. egui sizes a button from its
+    /// own galley plus the theme's padding and takes the larger of that and
+    /// the size it was handed, so seven ten-character labels claimed about
+    /// four hundred and eighty points however narrow the window was, and the
+    /// last chips were quietly clipped away. The word is cut to the room
+    /// now, so the row's width follows the panel's.
+    ///
+    /// The widths swept start at the narrowest a dialog can be dragged to —
+    /// the 320-point floor, less the plugin margin either side.
+    #[test]
+    fn the_pedalboard_fits_the_panel_at_every_width() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let set = crate::settings::Settings::default();
+        let p = crate::recorder_panel::palette(&set);
+        let st = FaceStyle::new(p.bg, p.lcd, p.lcd_face);
+        let mut bad: Vec<String> = Vec::new();
+        for w in [296.0f32, 316.0, 400.0, 516.0, 700.0, 1200.0] {
+            let mut live = FaceLive {
+                face: crate::ports::BuiltinFace {
+                    path: AMP_PATH.to_owned(),
+                    params: (0..9)
+                        .map(|i| crate::ports::BuiltinFaceParam {
+                            id: i,
+                            symbol: format!("p{i}"),
+                            name: format!("KNOB {i}"),
+                            units: "%".to_owned(),
+                            default: 0.5,
+                            reading: "50%".to_owned(),
+                            choices: vec!["off".to_owned(), "on".to_owned()],
+                            steps: 0,
+                            value: 0.5,
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                // The longest a chip can ever wear: `pedal_label` cuts at
+                // ten characters, so this is the worst case by construction.
+                pedals: Some(std::array::from_fn(|_| "compresso\u{2026}".to_owned())),
+                ..Default::default()
+            };
+            let screen =
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::Vec2::new(w, 900.0));
+            let mut took = f32::MIN;
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            took = ui
+                                .scope(|ui| {
+                                    let _ = draw_amp(ui, &st, &mut live);
+                                })
+                                .response
+                                .rect
+                                .right();
+                        });
+                },
+            );
+            // The allocation is one question and what got PAINTED is the
+            // other: egui clips the second kind away, which is exactly why
+            // this shipped unseen.
+            let mut painted = f32::MIN;
+            for cs in &out.shapes {
+                let b = cs.shape.visual_bounding_rect();
+                if b.is_positive() && b.right().is_finite() {
+                    painted = painted.max(b.right());
+                }
+            }
+            // A point of slack for the fractional widths egui justifies to;
+            // the fault this pins ran to a hundred and sixty.
+            if took > w + 1.0 {
+                bad.push(format!("at {w}: took {took:.1}"));
+            }
+            if painted > w + 1.0 {
+                bad.push(format!("at {w}: painted to {painted:.1}"));
+            }
+        }
+        assert!(bad.is_empty(), "the amp overflows:\n  {}", bad.join("\n  "));
     }
 
     /// The face's path const matches the suite table row that routes to it —
