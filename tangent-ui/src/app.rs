@@ -40958,20 +40958,34 @@ mod tests {
         r.center()
     }
 
-    /// **A clip dragged past the right edge takes the window with it — and the
-    /// two agree to the second.**
+    /// **A clip dragged past the right edge takes the window with it, and stays
+    /// under the hand the whole way.**
     ///
-    /// This is the ORDERING guard as much as the scroll one. The pointer's
-    /// meaning (`t_at`) is read against the window, so the scroll has to happen
-    /// FIRST; move it after and the window advances this frame while the clip
-    /// only catches up on the next, which on screen is a clip that
-    /// rubber-bands against the grid for as long as the hold lasts. With the
-    /// scroll first the two deltas are the same number, because the pointer's
-    /// x never moved.
+    /// The second half is the ORDERING guard, and it has to ask about WHERE THE
+    /// CLIP IS DRAWN rather than about how far it travelled. The pointer's
+    /// meaning (`t_at`) is read against the window, so the scroll has to run
+    /// first; move it after and every frame places the clip using the PREVIOUS
+    /// frame's window, which on screen is a clip sitting a fixed distance
+    /// behind the hand for as long as the hold lasts.
+    ///
+    /// The first version of this compared the window's travel against the
+    /// clip's, and it stayed GREEN through exactly that revert — a constant
+    /// one-frame lag cancels out of a difference of two deltas taken over the
+    /// same number of frames. The gap between the hand and the clip's left edge
+    /// does not cancel, because it IS the lag, so that is what is measured, in
+    /// points, off the same `clip_rect` the painter draws with.
     #[test]
     fn a_clip_dragged_past_the_right_edge_takes_the_window_with_it() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
         let (rect, id) = arrangement_with_a_clip(&ctx, &mut app);
+        let clip_left = |app: &TangentApp| {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let c = clips.iter().find(|c| c.id == id).expect("the clip has a view");
+            let r = crate::arrangement_panel::clip_rect(rect, &view, c);
+            assert!(r.is_positive(), "the clip drew nowhere");
+            r.left()
+        };
         let grab = arr_clip_centre(&app, rect, id);
         press(&ctx, &mut app, grab);
         assert!(
@@ -40979,16 +40993,16 @@ mod tests {
             "the press did not grab the clip: {:?}",
             app.arr_drag
         );
+        // How far into the clip the hand took hold. Whatever the view does
+        // afterwards, the clip has to keep riding under that same point.
+        let held_at = grab.x - clip_left(&app);
         let lanes = {
             let clips = app.arr_clip_views();
             let view = app.arrange_view(&clips);
             crate::arrangement_panel::Layout::new(rect, &view).lanes_area
         };
-        move_to(&ctx, &mut app, Pos2::new(lanes.right() - 2.0, lanes.center().y));
-        eprintln!(
-            "DBG pps = {:?}",
-            edge_scroll_pps(lanes, Pos2::new(lanes.right() - 2.0, lanes.center().y))
-        );
+        let at = Pos2::new(lanes.right() - 2.0, lanes.center().y);
+        move_to(&ctx, &mut app, at);
         let win0 = app.arr_window_now().0;
         let clip0 = app.arrangement.clips[0].start_s;
         for _ in 0..10 {
@@ -40997,11 +41011,13 @@ mod tests {
         let win_d = app.arr_window_now().0 - win0;
         let clip_d = app.arrangement.clips[0].start_s - clip0;
         assert!(win_d > 0.5, "the window only moved {win_d} s");
+        assert!(clip_d > 0.5, "the window ran off and left the clip behind");
+        let now = at.x - clip_left(&app);
         assert!(
-            (win_d - clip_d).abs() < 1.0e-6,
-            "the window moved {win_d} s and the clip {clip_d} s — the clip is \
-             lagging the view by a frame, which means the scroll is running \
-             after the pointer has been read"
+            (now - held_at).abs() < 1.0,
+            "the clip is drawn {now} points into the hand instead of \
+             {held_at} — it is lagging the view, which means the scroll is \
+             running after the pointer has been read"
         );
     }
 
