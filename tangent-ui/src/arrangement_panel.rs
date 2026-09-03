@@ -3360,7 +3360,10 @@ pub fn grid_quarters(exp: i8, beats: u8, unit: u8) -> f64 {
     v
 }
 
-/// **What the box prints, derived from what the magnet actually does.**
+/// **What the box prints, derived from what the magnet actually does** —
+/// in the spelling that keeps the note glyph at the quarter, which is now
+/// the MIDI EDITOR's chip and nothing else. The arrange gridbox takes
+/// [`grid_label_text`]; the argument for the split is written out there.
 ///
 /// It used to be a formula of its own, written for the ladder somebody
 /// expected rather than the one [`grid_quarters`] walks — so from the second
@@ -3373,16 +3376,75 @@ pub fn grid_quarters(exp: i8, beats: u8, unit: u8) -> f64 {
 /// Reading the value back out is what makes that impossible to reintroduce:
 /// there is now one source of truth and the label is a rendering of it.
 ///
-/// The glyph is kept for the quarter note alone, which is what makes it the
-/// single 1/4 state. It stays `\u{266a}` — the character already on screen
-/// and known to render in the panel's font; a "more correct" `\u{2669}` that
-/// the font lacks would draw a hollow box, which is worse than approximate.
+/// **The glyph is not what enforces that**, and the comment this replaces
+/// said it was — "kept for the quarter note alone, which is what makes it
+/// the single 1/4 state". That was true of the code it was written beside
+/// and false about the mechanism. The duplicate 1/4 was a symptom of the
+/// label being a SECOND OPINION about the division; deriving it from
+/// `grid_quarters` is what killed the duplicate, and once the derivation is
+/// the rule only one exponent can ever come back as one quarter, whatever
+/// character that rung is drawn in. The glyph was standing guard over a hole
+/// that had already been filled — so removing it from the arrange box costs
+/// nothing the ruling was protecting, and
+/// `only_one_rung_of_the_arrange_ladder_is_a_quarter` now holds that
+/// property as a test rather than as a character.
+///
+/// What is left is a spelling, and this spelling stays HERE because the
+/// editor's chip is not what the owner asked about. It stays `\u{266a}`
+/// rather than the "more correct" `\u{2669}`, though not for the reason the
+/// old note gave — it said U+266A was "known to render in the panel's font",
+/// and reading the cmap of both weights shipped in `assets/fonts` says
+/// Courier Prime carries NEITHER (it does carry the U+00B7 the dotted rungs
+/// wear, and Δ). Both come off egui's appended fallback face, so the choice
+/// is which character that face is likeliest to have: U+266A, the one that
+/// has been drawing on every platform this ships to. A hollow box is worse
+/// than approximate, and it is worth knowing this rung depends on a fallback
+/// at all — the arrange box's numerals are ASCII and depend on nothing.
 pub fn grid_label(exp: i8, beats: u8, unit: u8) -> String {
+    grid_label_with(exp, beats, unit, true)
+}
+
+/// **The same ladder, spelled in numerals the whole way down** — what the
+/// ARRANGE gridbox prints.
+///
+/// The owner, on that box: "it's easier to spot at a glance for a beginner
+/// and realize that's what that button does." In 4/4 the ladder reads 1,
+/// 1/2, ♪, 1/8, 1/16 — the glyph is the ONE rung not written the way the
+/// rungs on either side of it are, and it sits at the division a beginner is
+/// most likely to be hunting for, because a quarter note is the first thing
+/// anyone is taught to count. `tool_grid` is at most 48 points wide and the
+/// label is drawn between 8 and 11 points, so ♪ arrives as a stem and a blob
+/// that has to be recognised before it can be read; "1/4" arrives as a
+/// fraction the two rungs under it have already taught the eye to parse.
+///
+/// This supersedes the earlier ruling quoted on [`grid_label`], and only its
+/// second half: "there should exist a single state of that button that
+/// produces 1/4th" is still the law here and still holds — it is the
+/// derivation from `grid_quarters` that holds it — while "and that's the
+/// glyph" is the part being overruled. Anyone reading 629955e's commit
+/// message and reaching for the glyph again should read that paragraph
+/// first.
+///
+/// Two functions rather than one with a flag in the caller's hands, because
+/// the callers are two panels and neither should have to know the other's
+/// taste to get its own label. Both are one line over the same
+/// `grid_quarters`/`note_label` pair, so the two spellings cannot drift
+/// apart in the ARITHMETIC — the only place a drift would be a bug rather
+/// than a preference.
+pub fn grid_label_text(exp: i8, beats: u8, unit: u8) -> String {
+    grid_label_with(exp, beats, unit, false)
+}
+
+/// The one ladder both public labels walk. Kept private and shared so the
+/// bar branch — the half of the label that has nothing to do with note
+/// glyphs — exists once; two copies of `1u32 << exp` is exactly the kind of
+/// duplicate that let the label disagree with the magnet in the first place.
+fn grid_label_with(exp: i8, beats: u8, unit: u8, quarter_glyph: bool) -> String {
     if exp > 0 {
         // Multiples of a BAR, and it says so by counting them.
         return format!("{}", 1u32 << exp.min(6) as u32);
     }
-    note_label(grid_quarters(exp, beats, unit))
+    note_label(grid_quarters(exp, beats, unit), quarter_glyph)
 }
 
 /// A length in quarter notes, as a note value.
@@ -3390,12 +3452,27 @@ pub fn grid_label(exp: i8, beats: u8, unit: u8) -> String {
 /// Whole = 4 quarters, half = 2, quarter = 1, and so on down. A dotted value
 /// is one and a half of the next one up and wears a dot; 6/8's second rung is
 /// a dotted quarter and there is no other honest way to write it.
-fn note_label(q: f64) -> String {
+///
+/// **`quarter_glyph` decides one rung and one rung only**: whether q == 1
+/// comes back as `\u{266a}` or falls through into the plain-fraction branch,
+/// which already spells that same rung "1/4" out of the division rather than
+/// out of a second table of its own. Every other string — the whole, the
+/// plain fractions, the dotted values, the unnameable fallback — is identical
+/// on both paths, so the two panels' labels differ in exactly the one way
+/// they were asked to differ and in no other.
+///
+/// The DOTTED branch in particular is deliberately outside the flag's reach.
+/// 6/8's second rung is "1/4·" under both spellings and has to be: let the
+/// flag reach it and the numeral ladder would carry two things called 1/4
+/// again — plain and dotted, at two different divisions — which is precisely
+/// the fault the derivation above was written to end.
+fn note_label(q: f64, quarter_glyph: bool) -> String {
     if !q.is_finite() || q <= 0.0 {
         return "1".to_owned();
     }
-    // The glyph IS the quarter note, and only the quarter note.
-    if (q - 1.0).abs() < 1.0e-9 {
+    // The glyph IS the quarter note, and only the quarter note — for the
+    // caller that wants a glyph at all.
+    if quarter_glyph && (q - 1.0).abs() < 1.0e-9 {
         return "\u{266a}".to_owned();
     }
     let denom = 4.0 / q;
@@ -3445,9 +3522,19 @@ fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
     let q = grid_quarters(exp, beats, unit);
     // Spoken in words rather than in the box's shorthand: a reader saying
     // "one slash eight" has not said "an eighth note".
-    let label = note_label(q);
+    //
+    // **Off the TEXT spelling**, because this is the ARRANGE box's readout
+    // and the arrange box prints numerals now. It is not a free choice:
+    // leave it on `grid_label`'s spelling and the quarter rung arrives as
+    // `\u{266a}`, which no arm below names, so it drops into the catch-all
+    // and a reader is told "♪ of a bar" — a character read aloud instead of
+    // a note named, and wrong arithmetic on top of it, since in 6/8 a
+    // quarter note is a THIRD of the bar. That is the box, the reader and
+    // the magnet disagreeing again, which is what this function was
+    // rewritten to end. `the_grid_box_can_be_stepped_both_ways` is the guard.
+    let label = note_label(q, false);
     match label.as_str() {
-        "\u{266a}" => "quarter note".to_owned(),
+        "1/4" => "quarter note".to_owned(),
         "1/2" => "half note".to_owned(),
         "1/8" => "eighth note".to_owned(),
         "1/16" => "sixteenth note".to_owned(),
@@ -5393,10 +5480,19 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // matters. `sig_at_bar` is the same lookup the grid lines use.
     let sig_now = view.meter.sig_at_bar(bar_of(view, view.view_start_s));
     if tool(painter, l.tool_grid, true).is_some() {
+        // **Numerals, so `grid_label_text` and not `grid_label`.** This box
+        // is the one somebody meets on their first afternoon, and one rung
+        // of its ladder used to be a picture instead of a fraction — the
+        // owner wants "1/4" here because it is what a beginner can spot at a
+        // glance. The whole argument is on `grid_label_text`; what matters
+        // at this call site is that the two names are not interchangeable.
+        // The MIDI editor's chip still calls `grid_label` and still shows
+        // the glyph, so pointing this line back at `grid_label` would not
+        // undo one decision, it would move two surfaces at once.
         painter.text(
             l.tool_grid.center(),
             Align2::CENTER_CENTER,
-            grid_label(view.grid_exp, sig_now.beats, sig_now.unit),
+            grid_label_text(view.grid_exp, sig_now.beats, sig_now.unit),
             FontId::new(
                 (l.tool_grid.height() * 0.55).clamp(8.0, 11.0),
                 crate::fonts::courier_bold(),
@@ -6379,6 +6475,15 @@ ArrangeView {
 
     /// The grid box is a slider so both arrows reach it, and it reads the
     /// grid the box PRINTS.
+    ///
+    /// The printed spelling changed under this test — the quarter rung reads
+    /// "1/4" rather than `\u{266a}` now — and the SPOKEN assertion below did
+    /// not, deliberately. It is the guard on `grid_spoken` having followed
+    /// the box across: point that function at the glyph spelling while the
+    /// box prints numerals, or leave its match arm on `\u{266a}`, and the
+    /// quarter rung falls through to the "of a bar" catch-all. This line
+    /// then says "1/4 of a bar" and goes red, which is the whole point of
+    /// keeping it worded as a note.
     #[test]
     fn the_grid_box_can_be_stepped_both_ways() {
         let cs: Vec<ClipView<'_>> = Vec::new();
@@ -6390,11 +6495,11 @@ ArrangeView {
         // They used to give three different answers — see `grid_label`.
         // exp -2 in 4/4 is the quarter note: bar, half, quarter.
         assert_eq!(g.value.as_deref(), Some("quarter note"));
-        assert_eq!(grid_label(-2, 4, 4), "\u{266a}");
+        assert_eq!(grid_label_text(-2, 4, 4), "1/4");
         assert!((grid_quarters(-2, 4, 4) - 1.0).abs() < 1e-9);
         // 6/8 cannot halve its bar twice without landing between beats, so
         // the second rung is the beat itself: an eighth.
-        assert_eq!(grid_label(-2, 6, 8), "1/8");
+        assert_eq!(grid_label_text(-2, 6, 8), "1/8");
         assert!((grid_quarters(-2, 6, 8) - 0.5).abs() < 1e-9);
         let t = g.travel.expect("the grid box cannot be nudged");
         assert!((t.norm - 3.0 / 8.0).abs() < 1e-6, "{}", t.norm);
@@ -7680,14 +7785,148 @@ selected: false,
         assert!(row.knob_readout.is_positive(), "the volume lost its readout");
         assert!(row.send_readout.is_positive(), "the send lost its readout");
         // **The ladder the owner asked for, in the meter he works in.**
-        // Going finer: 1, 1/2, the glyph, 1/8, 1/16 — one 1/4 state, and it
-        // is the glyph, sitting exactly between 1/8 and 1/2.
-        assert_eq!(grid_label(0, 4, 4), "1");
-        assert_eq!(grid_label(3, 4, 4), "8");
-        assert_eq!(grid_label(-1, 4, 4), "1/2");
-        assert_eq!(grid_label(-2, 4, 4), "\u{266a}");
-        assert_eq!(grid_label(-3, 4, 4), "1/8");
-        assert_eq!(grid_label(-4, 4, 4), "1/16");
+        // Going finer: 1, 1/2, 1/4, 1/8, 1/16 — one 1/4 state, sitting
+        // exactly between 1/8 and 1/2, and now written the way the rungs
+        // either side of it are written. The middle rung used to assert
+        // `\u{266a}`; the owner asked for the fraction back because "it's
+        // easier to spot at a glance for a beginner and realize that's what
+        // that button does", and the single-1/4-state property that the
+        // glyph used to stand in for is asserted on its own terms by
+        // `only_one_rung_of_the_arrange_ladder_is_a_quarter`, so nothing was
+        // weakened by respelling it here.
+        assert_eq!(grid_label_text(0, 4, 4), "1");
+        assert_eq!(grid_label_text(3, 4, 4), "8");
+        assert_eq!(grid_label_text(-1, 4, 4), "1/2");
+        assert_eq!(grid_label_text(-2, 4, 4), "1/4");
+        assert_eq!(grid_label_text(-3, 4, 4), "1/8");
+        assert_eq!(grid_label_text(-4, 4, 4), "1/16");
+        // And nowhere on the arrange ladder, at either end of the range the
+        // wheel, the arrows and the saved setting can between them reach.
+        // The rung at -2 is the one anybody would edit; a sweep is what
+        // catches a "fix" applied to the wrong branch of `note_label`.
+        for e in -7i8..=6 {
+            for (beats, unit) in [(4u8, 4u8), (6, 8), (3, 4), (7, 8)] {
+                let w = grid_label_text(e, beats, unit);
+                assert!(
+                    !w.contains('\u{266a}'),
+                    "exp {e} in {beats}/{unit} still prints a glyph: {w}"
+                );
+            }
+        }
+    }
+
+    /// **What the ARRANGE gridbox actually PAINTS**, harvested off the frame
+    /// rather than asked of the helper that feeds it.
+    ///
+    /// Every assertion above would stay green if somebody pointed the draw
+    /// call at `grid_label` again: the text ladder would go on spelling
+    /// "1/4" for anyone who called it, and the button on screen would go on
+    /// showing a note glyph. That is the shape of mistake this panel has
+    /// been caught by twice — a test that measures a function the painter
+    /// happens to call is not a test of the picture. So this one runs the
+    /// real `draw` into a real context, keeps the `Shape::Text` that lands
+    /// inside `tool_grid`, and reads the box the way the owner does.
+    ///
+    /// The neighbouring rungs are checked too, so a failure here says which
+    /// thing broke: all three wrong means the box stopped drawing or the
+    /// harvest is aimed at the wrong rectangle; only the middle one wrong
+    /// means the quarter's spelling is what moved.
+    #[test]
+    fn the_arrange_gridbox_paints_its_quarter_as_a_fraction() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let r = rect();
+        let printed = |exp: i8| -> Vec<String> {
+            let cs: Vec<ClipView<'_>> = Vec::new();
+            let mut v = a_view(&cs);
+            v.grid_exp = exp;
+            let cell = Layout::new(r, &v).tool_grid;
+            let out = ctx.run(
+                egui::RawInput { screen_rect: Some(r), ..Default::default() },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.set_clip_rect(r);
+                        draw(ui.painter(), r, &v);
+                    });
+                },
+            );
+            out.shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if cell.intersects(t.visual_bounding_rect()) => {
+                        Some(t.galley.text().to_owned())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        // exp -2 in 4/4 is the quarter note, and the quarter note is the one
+        // rung this item is about.
+        let quarter = printed(-2);
+        assert!(
+            quarter.iter().any(|t| t == "1/4"),
+            "the gridbox did not print 1/4: {quarter:?}"
+        );
+        assert!(
+            !quarter.iter().any(|t| t.contains('\u{266a}')),
+            "the gridbox is still painting the glyph: {quarter:?}"
+        );
+        assert!(
+            printed(-1).iter().any(|t| t == "1/2"),
+            "the rung above the quarter stopped printing"
+        );
+        assert!(
+            printed(-3).iter().any(|t| t == "1/8"),
+            "the rung below the quarter stopped printing"
+        );
+    }
+
+    /// **Exactly one rung of the arrange ladder is a quarter**, and no two
+    /// rungs anywhere on it print the same thing.
+    ///
+    /// This is the property the glyph was believed to be holding up. The old
+    /// note on `grid_label` said the glyph was "what makes it the single 1/4
+    /// state", which read a fixed bug as a live one: "1/4" appeared twice on
+    /// the way down because the label was a second opinion about the
+    /// division, and it stopped appearing twice when the label began reading
+    /// `grid_quarters` back out. The character was never what enforced it.
+    ///
+    /// The argument was prose, though, and prose does not fail a build — so
+    /// respelling the rung as text is only safe if something else holds the
+    /// line. This does. Give the label a formula of its own again, or let
+    /// `note_label`'s `quarter_glyph` flag reach the DOTTED branch, and two
+    /// rungs start answering to the same string in some meter here.
+    #[test]
+    fn only_one_rung_of_the_arrange_ladder_is_a_quarter() {
+        // Every meter the app's clamps and the ladder's own doc mention,
+        // plus the odd ones where a bar is not a power of two of its beat —
+        // those are where a second label formula would first disagree.
+        for (beats, unit) in [(4u8, 4u8), (2, 2), (3, 4), (5, 4), (6, 8), (7, 8), (9, 8), (12, 8)] {
+            let mut seen: Vec<(i8, String)> = Vec::new();
+            for e in -7i8..=6 {
+                let w = grid_label_text(e, beats, unit);
+                if let Some((prev, _)) = seen.iter().find(|(_, s)| *s == w) {
+                    panic!("{beats}/{unit}: exp {prev} and exp {e} both print {w:?}");
+                }
+                seen.push((e, w));
+            }
+        }
+        // In 4/4 there is one 1/4 state and it is the one the magnet snaps
+        // to a whole quarter note on — the box and the maths naming the same
+        // division, which is the entire reason the label is derived rather
+        // than computed twice.
+        let quarters: Vec<i8> =
+            (-7i8..=6).filter(|e| grid_label_text(*e, 4, 4) == "1/4").collect();
+        assert_eq!(quarters, vec![-2], "the 4/4 ladder's 1/4 states: {quarters:?}");
+        assert!((grid_quarters(-2, 4, 4) - 1.0).abs() < 1e-9);
+        // And 6/8 has no plain quarter rung at all: a quarter note is a
+        // THIRD of that bar, so the ladder steps dotted quarter, eighth. The
+        // dot is what keeps that rung distinct from the one above, and it is
+        // why the glyph flag must never reach the dotted branch.
+        assert!(!(-7i8..=6).any(|e| grid_label_text(e, 6, 8) == "1/4"));
+        assert_eq!(grid_label_text(-1, 6, 8), "1/4\u{00b7}");
+        assert_eq!(grid_label(-1, 6, 8), "1/4\u{00b7}");
     }
 
     /// It survives a rect far too small to be useful, and clips off-window
