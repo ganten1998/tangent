@@ -4356,6 +4356,13 @@ impl DesktopApp {
     /// worker's answer landed, and the whole picture pushed to the app.
     fn ir_tick(&mut self) {
         let mut busy = self.ir.pending.is_some() || self.ir.worker.is_some();
+        // Said through the notification queue rather than the wizard's phase
+        // line, and collected here because the engine is borrowed below.
+        // The phase line is where the road narrates itself and is gone the
+        // moment the road moves on; a capture that was refused, or one whose
+        // numbers say it should not be trusted, has to survive that.
+        let mut refused: Option<String> = None;
+        let mut warned: Option<String> = None;
         if let Some(e) = self.recorder.engine.as_mut() {
             let (rms_db, peak_db) = e.ir_return_db();
             let (done_f, total_f) = e.ir_progress();
@@ -4369,12 +4376,45 @@ impl DesktopApp {
             } else {
                 0.0
             };
-            if let Some((capture, complete)) = e.take_captured() {
+            if let Some((capture, complete, slipped)) = e.take_captured() {
                 busy = true;
                 if let Some(p) = self.ir.pending.take() {
                     if !complete {
                         self.ir.live.capturing = false;
                         self.ir.live.phase = "cancelled".to_owned();
+                    } else if slipped > 0 {
+                        // **A spliced sweep is not a measurement, and it is
+                        // the one fault on this road that LOOKS like the
+                        // deconvolution ringing.**
+                        //
+                        // The capture tap reads the monitor ring downstream
+                        // of that ring's backlog trim, so a surplus is not
+                        // late audio the sweep can absorb — those frames are
+                        // gone out of its middle and everything after them
+                        // sits early. The deconvolution then correlates a
+                        // sweep against a copy of itself with a step in its
+                        // time base, and what comes back is comb ripple
+                        // across the whole band: measured on the bench, 32
+                        // frames — two thirds of a millisecond — take a pure
+                        // delay from 0.14 dB of in-band ripple to 16.7 dB.
+                        // That is "it rings and it has artifacts", exactly,
+                        // and no amount of staring at the IR distinguishes it
+                        // from the deconvolution being wrong.
+                        //
+                        // So it is REFUSED rather than shipped with a
+                        // caveat. Everything else the wizard can be unhappy
+                        // about leaves a usable IR and a number on screen
+                        // explaining it; this leaves a plausible-looking file
+                        // that poisons every mix it is loaded into.
+                        self.ir.reference = None;
+                        self.ir.live.has_reference = false;
+                        self.ir.live.capturing = false;
+                        self.ir.live.phase = "capture dropped — try again".to_owned();
+                        refused = Some(format!(
+                            "IR capture: the interface dropped {slipped} frames mid-sweep, \
+                             which smears the result — nothing was kept. Try a larger audio \
+                             buffer, or use the same device for input and output."
+                        ));
                     } else if p.reference {
                         self.ir.reference = Some(IrReference {
                             capture,
@@ -4410,6 +4450,36 @@ impl DesktopApp {
         if let Some(rx) = self.ir.worker.take() {
             match rx.try_recv() {
                 Ok((left, right, outcome)) => {
+                    // **A capture below the trustworthy range gets said out
+                    // loud, and the wizard's own numbers are what say it.**
+                    //
+                    // The peak minus the loop's floor is all the range there
+                    // was to find a decay in, and under about 30 dB of it the
+                    // truncator stops cutting hiss off the end of the decay
+                    // and starts cutting inside it: measured on a 1.5 s
+                    // plate, 39 dB of range keeps 0.49 s and still reads the
+                    // box's RT60 within a third, 29 dB keeps 0.24 s and reads
+                    // 0.363 s, which is not the box at all. See
+                    // `sweep::TRUSTWORTHY_RANGE_DB`.
+                    //
+                    // It is a WARNING and not a refusal on purpose. A short
+                    // honest IR of a quiet box is worth having, the result
+                    // stage draws its envelope and prints the three numbers,
+                    // and the user is the one who knows whether the box is
+                    // quiet or the send level was wrong. What must not
+                    // happen — what did happen — is handing back a fraction
+                    // of the box in silence and calling it a capture.
+                    if outcome.tail_range_db < crate::units::sweep::TRUSTWORTHY_RANGE_DB {
+                        warned = Some(format!(
+                            "IR capture: only {:.0} dB between the return's peak \
+                             ({:.0} dBFS) and the loop's floor ({:.0} dBFS) — the tail \
+                             is cut inside the decay, so this IR is shorter than the \
+                             box. Raise the send level, or the unit's output.",
+                            outcome.tail_range_db,
+                            outcome.capture_peak_db,
+                            outcome.noise_floor_db,
+                        ));
+                    }
                     self.ir.finished = Some(IrFinished {
                         irs: [left, right],
                         rate: self.recorder.engine.as_ref().map_or(48_000, |e| e.output().sample_rate),
@@ -4426,6 +4496,12 @@ impl DesktopApp {
                     self.ir.live.phase = "deconvolution failed".to_owned();
                 }
             }
+        }
+        if let Some(said) = refused {
+            self.app.notify(Kind::Error, said);
+        }
+        if let Some(said) = warned {
+            self.app.notify(Kind::Info, said);
         }
         // Pushed while anything moves, and once more as the road settles, so
         // the wizard's last frame shows the road at rest rather than stale.
@@ -13244,7 +13320,8 @@ mod tests {
     //
     //   pure delay  in-band ripple      classic 0.14 dB pp   reference 0.05
     //   pure delay  pre-impulse energy  classic −14.2 dB     reference −300
-    //   pure delay  final sample        −599.8 dB under the peak, both routes
+    //   pure delay  faded tail energy   0.20x the stretch before it (classic)
+    //   spliced capture, 32 frames      16.7 dB pp — the road's worst fault
     //   plate       RT60                1.507 s recovered against 1.507 true
     //
     // The classic route's −14.2 dB of energy ahead of the peak is the LEFT
@@ -13264,6 +13341,22 @@ mod tests {
     // over the same window is −122 × its peak against the recovery's +6.5,
     // so forcing the IR's mean to zero would be inventing a null the box
     // does not have; the whole disagreement lives below 5 Hz).
+    //
+    // **AND WHAT WAS FOUND ONCE THE MATHS WAS CLEARED, which is the point of
+    // clearing it: the ringing was never in the deconvolution, it was in the
+    // RECORDING.** The capture tap reads the monitor ring downstream of that
+    // ring's backlog trim, so a surplus in the ring is not late audio the
+    // sweep absorbs — those frames are dropped, out of the middle of a
+    // recording sweep, with everything after them early. Thirty-two of them
+    // is 16.7 dB of comb ripple against the clean 0.14, and two AudioUnits
+    // on two crystals produce a surplus from drift alone, never mind one late
+    // output callback. `instrument::IrJob::slipped` counts it and
+    // `Host::ir_tick` refuses the pass;
+    // `a_spliced_capture_rings_and_a_drifting_clock_only_bends_the_classic_route`
+    // is the measurement. Steady drift with no drops is the gentler cousin
+    // of the same two clocks — 1.9 dB of ripple at 100 ppm on the classic
+    // route, and NOTHING at all on the reference route, where the stretch
+    // sits in both halves of the quotient and cancels.
 
     /// A pure delay: an IR that is exactly one spike, so the recovered
     /// magnitude response has a known answer — flat.
@@ -13319,17 +13412,9 @@ mod tests {
         10.0 * (e(&ir[..p]).max(1e-30) / total).log10()
     }
 
-    /// The step the IR ends on: its last sample against its own peak, in dB.
-    /// A hard cut leaves this near 0; a faded one takes it to nothing.
-    fn end_step_db(ir: &[f32]) -> f64 {
-        let peak = ir.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-        if peak <= 0.0 || ir.is_empty() {
-            return -200.0;
-        }
-        20.0 * (f64::from(ir[ir.len() - 1].abs()).max(1e-30) / f64::from(peak)).log10()
-    }
 
-    /// **A pure delay comes back flat, at the front, and faded to nothing.**
+    /// **A pure delay comes back flat, at the front, and faded to nothing —
+    /// and a dead return does not change one number of that.**
     ///
     /// The bench's headline. A DUT whose impulse response is one spike can
     /// only come back as a bandpassed Dirac, so its recovered magnitude
@@ -13340,6 +13425,25 @@ mod tests {
     /// route, 0.05 dB on the reference route. The bounds are set an order of
     /// magnitude wide because this is a ringing test, not a flatness one:
     /// anything that rings audibly moves these by dB, not by hundredths.
+    ///
+    /// **The second fixture is why this test now indicts anything.** As
+    /// first written it measured only a healthy stereo capture, and every
+    /// reading it took was one the pre-fix code already gave — a bench
+    /// headline that was green on the code it was written to accuse, which
+    /// proves nothing about either. So the same pure delay is measured again
+    /// with the right return unplugged, which is half of hardware and which
+    /// the road handled by stretching the IR to the whole recorded window:
+    /// **144,000 samples against the 1,459 the same capture gives with both
+    /// returns live**, measured at the parent commit. One measurement, one
+    /// cut — see `sweep::cut_set_with_fade` — makes the two fixtures give the
+    /// same answer to the sample, which is what is pinned.
+    ///
+    /// And the fade assertion is a real one now. `end_step_db` reads the
+    /// LAST sample, and the half-cosine's final multiplier is exactly zero,
+    /// so any faded cut passes it and so does an IR that merely decayed —
+    /// it could not fail. The reading that can is the one the window test
+    /// next door uses: the energy in the faded stretch against the energy in
+    /// the stretch before it.
     #[test]
     fn a_pure_delay_comes_back_flat_and_faded_to_nothing() {
         let rate = 48_000.0f64;
@@ -13348,51 +13452,360 @@ mod tests {
         let sweep = crate::units::sweep::ess(f1, f2, dur, rate);
         let pre = rate as usize;
         let tail = (3.0 * rate) as usize;
-        let (capture, reference) =
-            loop_through(&one_spike(), &sweep, pre, tail, -6.0, -90.0, 512);
-        for (route, refc) in [("classic", None), ("reference", Some(&reference[..]))] {
-            let (l, r, _out) =
-                super::process_ir_capture(&capture, &sweep, refc, pre, rate, f1, f2, dur);
-            let pp = ripple_pp_db(&mag_curve_db(&l, rate, 100.0, 10_000.0));
-            assert!(
-                pp < 1.5,
-                "{route}: a pure delay came back with {pp:.2} dB of in-band \
-                 ripple - something on the road is ringing"
-            );
-            // The band edges are allowed to be softer than the middle, but
-            // not by the many dB a badly regularized division would show.
-            let wide = ripple_pp_db(&mag_curve_db(&l, rate, 20.0, 20_000.0));
-            assert!(
-                wide < 6.0,
-                "{route}: {wide:.2} dB peak to peak across 20 Hz - 20 kHz"
-            );
-            // The direct arrival leads. The loop's 512 frames of latency
-            // are the trim's whole job here.
-            let peak = crate::units::sweep::linear_peak(&l);
-            assert!(
-                (peak as f64) < 0.002 * rate,
-                "{route}: the impulse sits {peak} samples into the IR"
-            );
-            // Almost nothing ahead of it: a bandpassed Dirac's own
-            // symmetric ringing on the classic route, and not one bit of
-            // harmonic pre-response, which the trim is there to drop.
-            let pre_db = pre_impulse_db(&l);
-            assert!(
-                pre_db < -10.0,
-                "{route}: {pre_db:.2} dB of the IR's energy sits ahead of \
-                 its own impulse"
-            );
-            // And it ends on nothing, whichever cut got there first.
-            for (side, ch) in [("L", &l), ("R", &r)] {
-                let step = end_step_db(ch);
+        let fade = (crate::units::sweep::TAIL_FADE_S * rate) as usize;
+        // The healthy answer per route, filled on the first pass and held to
+        // on the second: the two routes legitimately differ from each other
+        // (the reference route lands its impulse at index 0 by construction)
+        // and neither may differ from itself over a dead return.
+        let mut healthy: Vec<(usize, f64)> = Vec::new();
+        for fixture in ["both returns live", "right return unplugged"] {
+            let (mut capture, mut reference) =
+                loop_through(&one_spike(), &sweep, pre, tail, -6.0, -90.0, 512);
+            if fixture.starts_with("right") {
+                let mut seed = 0xabcd_ef01_2345_6789u64;
+                let mut hiss = move || {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0) * 3.16e-5
+                };
+                for f in 0..capture.len() / 2 {
+                    capture[f * 2 + 1] = hiss();
+                    reference[f * 2 + 1] = hiss();
+                }
+            }
+            for (i, (route, refc)) in [("classic", None), ("reference", Some(&reference[..]))]
+                .into_iter()
+                .enumerate()
+            {
+                let (l, r, _out) =
+                    super::process_ir_capture(&capture, &sweep, refc, pre, rate, f1, f2, dur);
+                let pp = ripple_pp_db(&mag_curve_db(&l, rate, 100.0, 10_000.0));
                 assert!(
-                    step < -40.0,
-                    "{route} {side}: the IR ends {step:.1} dB under its peak \
-                     - the tail was cut without a fade"
+                    pp < 1.5,
+                    "{route}, {fixture}: a pure delay came back with {pp:.2} dB of \
+                     in-band ripple - something on the road is ringing"
+                );
+                // The band edges are allowed to be softer than the middle, but
+                // not by the many dB a badly regularized division would show.
+                let wide = ripple_pp_db(&mag_curve_db(&l, rate, 20.0, 20_000.0));
+                assert!(
+                    wide < 6.0,
+                    "{route}, {fixture}: {wide:.2} dB peak to peak across \
+                     20 Hz - 20 kHz"
+                );
+                // The direct arrival leads. The loop's 512 frames of latency
+                // are the trim's whole job here.
+                let peak = crate::units::sweep::linear_peak(&l);
+                assert!(
+                    (peak as f64) < 0.002 * rate,
+                    "{route}, {fixture}: the impulse sits {peak} samples into the IR"
+                );
+                // Almost nothing ahead of it: a bandpassed Dirac's own
+                // symmetric ringing on the classic route, and not one bit of
+                // harmonic pre-response, which the trim is there to drop.
+                let pre_db = pre_impulse_db(&l);
+                assert!(
+                    pre_db < -10.0,
+                    "{route}, {fixture}: {pre_db:.2} dB of the IR's energy sits \
+                     ahead of its own impulse"
+                );
+                // **The cut is FADED, not stopped dead.** The half-cosine's
+                // mean square is 3/8 of what it fades, so the last fade-length
+                // has to sit clearly under the stretch before it. Reading the
+                // last sample instead proves nothing: the fade's final
+                // multiplier is exactly zero, so it passes whatever happened.
+                let ms = |w: &[f32]| {
+                    w.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>()
+                        / w.len().max(1) as f64
+                };
+                assert!(
+                    l.len() >= 2 * fade,
+                    "{route}, {fixture}: {} samples is too short to read a fade in",
+                    l.len()
+                );
+                let faded = ms(&l[l.len() - fade..]);
+                let before = ms(&l[l.len() - 2 * fade..l.len() - fade]);
+                assert!(
+                    faded < 0.6 * before,
+                    "{route}, {fixture}: the last {fade} samples read {faded:.3e} \
+                     against {before:.3e} before them - the cut was not faded"
+                );
+                assert_eq!(l.len(), r.len(), "{route}, {fixture}: the pair came back uneven");
+                // **And the dead return changes nothing.** Same length to the
+                // sample, same ripple to a hundredth of a dB.
+                if fixture.starts_with("both") {
+                    healthy.push((l.len(), pp));
+                } else {
+                    let (want_len, want_pp) = healthy[i];
+                    assert_eq!(
+                        l.len(),
+                        want_len,
+                        "{route}: a dead right return made the IR {} samples \
+                         against the {want_len} the same capture gives with both \
+                         returns live",
+                        l.len()
+                    );
+                    assert!(
+                        (pp - want_pp).abs() < 0.05,
+                        "{route}: a dead right return moved the bench's ripple \
+                         reading from {want_pp:.2} dB to {pp:.2} dB"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **What a spliced capture costs, and what a drifting clock costs — the
+    /// two numbers behind refusing a pass the monitor ring trimmed under.**
+    ///
+    /// A CHARACTERISATION, not a regression guard, and labelled that way on
+    /// purpose: nothing in the tree can be reverted to make it red, because
+    /// what it measures is what a deconvolution does to a corrupted recording
+    /// rather than a decision this code makes. It is here because the
+    /// decision it justifies — throwing away a capture the user waited
+    /// fifteen seconds for — should not rest on a number nobody can re-run.
+    ///
+    /// **The splice.** `instrument::IrJob::slipped` explains how frames go
+    /// missing from the middle of a recording sweep; this is what it does to
+    /// the answer. A pure delay through a clean loop comes back with 0.14 dB
+    /// of in-band ripple. Excise 32 frames — two thirds of a millisecond,
+    /// one small ring surplus — and it comes back with **16.7 dB**. There is
+    /// no gentle region: the smallest drop measured is already the worst,
+    /// because what it does is put a step in the sweep's time base and every
+    /// frequency past it correlates against the wrong phase.
+    ///
+    /// **The drift.** The same two clocks, without any drop: the record clock
+    /// running fast by a few hundred parts per million. That one is far
+    /// gentler and it is asymmetric between the routes, which is worth
+    /// knowing. An ESS resampled by (1+eps) is an ESS of duration
+    /// `dur*(1+eps)`, so the drift is modelled here exactly rather than by
+    /// interpolation. On the CLASSIC route the ripple goes 0.14 → 0.25 dB at
+    /// 20 ppm, 1.9 dB at 100 ppm, and the impulse walks off its own front
+    /// (sample 10 → 101 at 500 ppm). On the REFERENCE route it is unmoved at
+    /// every drift measured, to the hundredth of a dB: the reference pass
+    /// rides the same two crystals, so the stretch is in both halves of the
+    /// quotient and cancels. Capturing the loop-only pass is worth doing for
+    /// that reason alone, and this is the evidence for saying so.
+    #[test]
+    fn a_spliced_capture_rings_and_a_drifting_clock_only_bends_the_classic_route() {
+        let rate = 48_000.0f64;
+        let (f1, f2, dur) = (10.0, 22_000.0f64.min(0.475 * rate), 5.0);
+        let sweep = crate::units::sweep::ess(f1, f2, dur, rate);
+        let pre = rate as usize;
+        let tail = (3.0 * rate) as usize;
+        let ripple_of = |cap: &[f32], refc: Option<&[f32]>| {
+            let (l, _r, _o) =
+                super::process_ir_capture(cap, &sweep, refc, pre, rate, f1, f2, dur);
+            (
+                ripple_pp_db(&mag_curve_db(&l, rate, 100.0, 10_000.0)),
+                crate::units::sweep::linear_peak(&l),
+            )
+        };
+
+        // ── the splice ──────────────────────────────────────────────────
+        let (clean, clean_ref) = loop_through(&one_spike(), &sweep, pre, tail, -6.0, -90.0, 512);
+        let (control, _) = ripple_of(&clean, None);
+        assert!(
+            control < 1.5,
+            "the control is not clean: {control:.2} dB of in-band ripple"
+        );
+        // 32 frames out of the middle of the sweep, and the tail shifted up
+        // to fill: one small ring surplus, in both passes.
+        let drop = 32usize;
+        let cut_at = pre + sweep.len() / 2;
+        let frames = clean.len() / 2;
+        let mut spliced = Vec::with_capacity(clean.len());
+        for f in (0..frames).filter(|&f| !(cut_at..cut_at + drop).contains(&f)) {
+            spliced.push(clean[f * 2]);
+            spliced.push(clean[f * 2 + 1]);
+        }
+        spliced.resize(clean.len(), 0.0);
+        let (torn, _) = ripple_of(&spliced, None);
+        assert!(
+            torn > 5.0,
+            "{drop} frames gone from the middle of the sweep left only \
+             {torn:.2} dB of ripple against the clean {control:.2} - if that \
+             is really the cost, `ir_tick` is throwing away captures for \
+             nothing and should stop"
+        );
+
+        // ── the drift ───────────────────────────────────────────────────
+        // 200 ppm: two ordinary crystals, no drops at all.
+        let eps = 200.0e-6;
+        let played = crate::units::sweep::ess(f1, f2, dur * (1.0 + eps), rate);
+        let wet = crate::units::sweep::fft_convolve(&played, &one_spike());
+        let wet_peak = wet.iter().fold(0.0f32, |a, &b| a.max(b.abs())).max(1e-12);
+        let g = 10.0f32.powf(-6.0 / 20.0) / wet_peak;
+        let send = 10.0f32.powf(-6.0 / 20.0);
+        let amp = 10.0f32.powf(-90.0 / 20.0) * 3.0f32.sqrt();
+        let mut seed = 0xfeed_beef_dead_c0deu64;
+        let mut noise = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0) * amp
+        };
+        let mut drifted = vec![0.0f32; frames * 2];
+        let mut drifted_ref = vec![0.0f32; frames * 2];
+        for f in 0..frames {
+            let at = f.checked_sub(pre + 512);
+            let w = at.and_then(|k| wet.get(k)).copied().unwrap_or(0.0) * g;
+            let s = at.and_then(|k| played.get(k)).copied().unwrap_or(0.0) * send;
+            drifted[f * 2] = w + noise();
+            drifted[f * 2 + 1] = w + noise();
+            drifted_ref[f * 2] = s + noise();
+            drifted_ref[f * 2 + 1] = s + noise();
+        }
+        let (classic_drift, classic_peak) = ripple_of(&drifted, None);
+        let (control_peak_ref, _) = ripple_of(&clean, Some(&clean_ref[..]));
+        let (reference_drift, _) = ripple_of(&drifted, Some(&drifted_ref[..]));
+        // The classic route feels it — in the ripple, and in the impulse
+        // walking off the front of its own IR.
+        assert!(
+            classic_drift > control * 3.0 || classic_peak > 30,
+            "200 ppm of clock drift left the classic route at \
+             {classic_drift:.2} dB of ripple (clean {control:.2}) with its \
+             impulse at sample {classic_peak} - if drift is free, the wizard \
+             does not need to care which device it uses"
+        );
+        // The reference route does not, because the drift is in both halves
+        // of the quotient.
+        assert!(
+            (reference_drift - control_peak_ref).abs() < 0.05,
+            "200 ppm of clock drift moved the reference route from \
+             {control_peak_ref:.2} dB of ripple to {reference_drift:.2} - the \
+             quotient is supposed to cancel a stretch that is in both passes"
+        );
+    }
+
+    /// **A return quieter than the loop's floor comes back as an IR, not as
+    /// its own impulse.**
+    ///
+    /// The regression for a stub the truncation shipped. `truncate_set_at_floor`
+    /// searches from `peak + 1 + fade`, and that is also the earliest cut
+    /// `cut_set_with_fade` will accept — so when the level was ALREADY at or
+    /// under the derived floor at the first window, the search answered with
+    /// the very index it started at, the clamp had nothing to refuse, and the
+    /// whole stereo pair came back **481 samples: 10.0 ms** of a 3 s window,
+    /// on both routes, reported to the user as a successful capture.
+    ///
+    /// A capture with 21 dB between its peak and the loop's floor is not a
+    /// good capture and nothing here pretends otherwise — the tail it keeps
+    /// is bounded by the recorded window and the wizard says so through
+    /// `sweep::TRUSTWORTHY_RANGE_DB`. What it must not be is DELETED, which
+    /// is a different thing and looks identical on the result stage.
+    ///
+    /// Two ways in, because they are two different mistakes a person makes:
+    /// a send level far too low for the box, and a box whose own output is
+    /// simply quiet. Both land the capture peak near the loop's floor and
+    /// both used to produce the stub.
+    #[test]
+    fn a_quiet_return_is_not_truncated_down_to_its_own_impulse() {
+        let rate = 48_000.0f64;
+        let (f1, f2, dur) = (10.0, 22_000.0f64.min(0.475 * rate), 5.0);
+        let sweep = crate::units::sweep::ess(f1, f2, dur, rate);
+        let pre = rate as usize;
+        let tail_s = 3.0f64;
+        let tail = (tail_s * rate) as usize;
+        let fade = (crate::units::sweep::TAIL_FADE_S * rate) as usize;
+        let plate = synth_plate(1.5, 3.0, rate);
+        for (what, dut, send, floor) in [
+            ("a quiet box", &plate[..], -60.0f32, -80.0f32),
+            ("the send left down", &plate[..], -70.0, -80.0),
+            ("a quiet delay line", &one_spike()[..], -70.0, -90.0),
+        ] {
+            let (capture, reference) = loop_through(dut, &sweep, pre, tail, send, floor, 512);
+            for (route, refc) in [("classic", None), ("reference", Some(&reference[..]))] {
+                let (l, r, out) =
+                    super::process_ir_capture(&capture, &sweep, refc, pre, rate, f1, f2, dur);
+                // The clamp is where the collapse landed: the direct impulse,
+                // one sample, and the fade that follows it. Nothing may come
+                // back at or under that.
+                let clamp = crate::units::sweep::linear_peak(&l) + 1 + fade;
+                assert!(
+                    l.len() > clamp,
+                    "{route}, {what}: the IR came back {} samples - the earliest \
+                     legal cut is {clamp}, so the measurement was deleted rather \
+                     than truncated",
+                    l.len()
+                );
+                // And it is still a bounded, even pair: the window is the
+                // backstop when there is no decay to find.
+                assert_eq!(l.len(), r.len(), "{route}, {what}: the pair came back uneven");
+                assert!(
+                    f64::from(out.seconds) <= tail_s + 0.001,
+                    "{route}, {what}: {} s out of a {tail_s} s window",
+                    out.seconds
+                );
+                // The capture's own numbers still ride out with it, and they
+                // are what the app warns on.
+                assert!(
+                    out.tail_range_db < crate::units::sweep::TRUSTWORTHY_RANGE_DB,
+                    "{route}, {what}: {} dB of range - this fixture is supposed \
+                     to be a capture the wizard warns about",
+                    out.tail_range_db
                 );
             }
-            assert_eq!(l.len(), r.len(), "{route}: the pair came back uneven");
         }
+    }
+
+    /// **The wizard SAYS the two things a capture can be wrong about, in the
+    /// queue that outlives the frame it happened on.**
+    ///
+    /// Both are rules about a function that cannot be run here — `ir_tick`
+    /// needs a live engine, an audio callback and a window — so they are read
+    /// off the source, the way `a_restarted_engine_is_told_the_tempo_map_again`
+    /// reads its rule. Narrow on purpose: this notices the reporting being
+    /// REMOVED, not a third condition being added without one.
+    ///
+    /// What is being protected, and why neither may go back to the phase
+    /// line: the phase line is where the road narrates itself and it is gone
+    /// the moment the road moves on, so a capture the user walked away from
+    /// tells them nothing when they come back.
+    ///
+    /// * **A slipped capture is REFUSED**, not shipped. The monitor ring's
+    ///   backlog trim throws frames out of the middle of a recording sweep
+    ///   (`instrument::IrJob::slipped`), and the result is comb ripple across
+    ///   the whole band that looks exactly like the deconvolution ringing —
+    ///   0.14 dB to 16.7 dB from 32 frames, measured. It is the one fault
+    ///   here that leaves a plausible file rather than a visibly poor one.
+    /// * **A capture under `sweep::TRUSTWORTHY_RANGE_DB` is warned about.**
+    ///   That one is kept, because a short honest IR of a quiet box is worth
+    ///   having; what it may not do is arrive in silence.
+    #[test]
+    fn a_refused_capture_and_an_untrustworthy_one_both_reach_the_message_queue() {
+        let src = include_str!("desktop.rs");
+        let start = src.find("fn ir_tick").expect("the IR poll is still called that");
+        let end = src[start..]
+            .find("fn save_ir")
+            .expect("`save_ir` still follows `ir_tick`");
+        let body = &src[start..start + end];
+        assert!(
+            body.contains("slipped > 0"),
+            "`ir_tick` no longer looks at the frames the monitor ring threw \
+             away under the capture, so a spliced sweep ships as an IR"
+        );
+        assert!(
+            body.contains("TRUSTWORTHY_RANGE_DB"),
+            "`ir_tick` no longer compares the capture's range against the \
+             level below which it is not a measurement"
+        );
+        // And both go to the queue rather than the phase line.
+        let refused = body
+            .find("refused = Some(")
+            .expect("the slip verdict no longer sets a message");
+        let warned = body
+            .find("warned = Some(")
+            .expect("the range verdict no longer sets a message");
+        assert!(
+            body[refused..].contains("self.app.notify(Kind::Error"),
+            "the refusal is set but never pushed to the message queue"
+        );
+        assert!(
+            body[warned..].contains("self.app.notify(Kind::Info"),
+            "the warning is set but never pushed to the message queue"
+        );
     }
 
     /// **A dead return neither moves the impulse nor stretches the IR.**
@@ -13418,10 +13831,30 @@ mod tests {
     /// 480,000 samples — the whole 10 s window — where the same capture with
     /// a live right return gave 71,690. Both cuts are set-wide now.
     ///
-    /// Three hiss levels, because the failure was a function of how loud the
+    /// Five hiss levels, because the failure was a function of how loud the
     /// dead side is: −90 dBFS is a quiet interface, −40 dBFS is an open
-    /// input with the gain up, and the middle is the one that used to sit on
-    /// the boundary.
+    /// input with the gain up, and the two loudest are past the point where
+    /// the capture is a measurement at all.
+    ///
+    /// **The guarantee CHANGES at `sweep::TRUSTWORTHY_RANGE_DB`, and saying
+    /// where is the point of the last two levels.** A dead input hissing
+    /// louder than the loop raises the floor the whole pair is judged
+    /// against, so it costs range, and range is the only thing there is to
+    /// find a decay in. Down to about 30 dB of it the tail that comes back
+    /// is short but is still the box; below that it is not:
+    ///
+    ///   −40 dBFS hiss → 38.8 dB range → 0.49 s, RT60 1.011 s of a 1.5 s plate
+    ///   −30 dBFS hiss → 28.8 dB range → 0.24 s, RT60 0.363 s — not the box
+    ///   −20 dBFS hiss → 18.8 dB range → the level threshold finds no decay
+    ///
+    /// The old sweep stopped at −40 and so pinned a decay guarantee only
+    /// where it happened to hold. What is pinned below the line instead is
+    /// everything that must still be true when the decay cannot be: the
+    /// impulse is at the front, the pair is even, the IR is bounded by the
+    /// recorded window, **it is not collapsed down to the impulse and its
+    /// fade**, and the capture's own numbers say it is untrustworthy so the
+    /// wizard can say so out loud. That last one is the honest version of a
+    /// promise this road cannot keep.
     #[test]
     fn a_dead_return_neither_moves_the_impulse_nor_stretches_the_ir() {
         let rate = 48_000.0f64;
@@ -13453,7 +13886,7 @@ mod tests {
             healthy_route.push((crate::units::sweep::linear_peak(&hl), hl.len()));
         }
 
-        for &hiss_db in &[-90.0f32, -60.0, -40.0] {
+        for &hiss_db in &[-90.0f32, -60.0, -40.0, -30.0, -20.0] {
             let (mut capture, mut reference) =
                 loop_through(&plate, &sweep, pre, tail, -6.0, -90.0, 512);
             let amp = 10.0f32.powf(hiss_db / 20.0);
@@ -13499,6 +13932,8 @@ mod tests {
                 // happen is the decay coming back as a fraction of itself
                 // because the TRIM went wrong, which is what this fixture
                 // caught: 0.037 s of a 2 s plate, measured, before the fix.
+                let trusted =
+                    out.tail_range_db >= crate::units::sweep::TRUSTWORTHY_RANGE_DB;
                 let got = rt60_of(&l, rate);
                 if out.tail_range_db > 50.0 {
                     assert!(
@@ -13508,7 +13943,7 @@ mod tests {
                          {} dB of range to do it in",
                         out.tail_range_db
                     );
-                } else {
+                } else if trusted {
                     assert!(
                         got > 0.6 * want,
                         "{route}, dead side at {hiss_db} dBFS: recovered RT60 \
@@ -13516,33 +13951,75 @@ mod tests {
                          costs tail, it does not destroy the decay"
                     );
                 }
-                // And the dead side buys no length. The bound is generous
-                // against the healthy answer because a louder dead input
-                // genuinely raises the measured floor and costs tail; what
-                // it must not do is win the whole window.
-                assert!(
-                    l.len() <= 2 * healthy_len,
-                    "{route}, dead side at {hiss_db} dBFS: {} samples against \
-                     the {healthy_len} the same capture gives with both \
-                     returns live",
-                    l.len()
-                );
-                assert!(
-                    f64::from(out.seconds) < 0.5 * tail_s,
-                    "{route}, dead side at {hiss_db} dBFS: {} s of a {tail_s} s \
-                     window",
-                    out.seconds
-                );
-                // Both channels end faded, including the one that is only
-                // noise - a hard stop there is a step the convolver rings
-                // into everything it touches, in one ear.
-                assert_eq!(l.len(), r.len(), "{route}: the pair came back uneven");
-                for (side, ch) in [("L", &l), ("R", &r)] {
-                    let step = end_step_db(ch);
+                if trusted {
+                    // And the dead side buys no length. The bound is generous
+                    // against the healthy answer because a louder dead input
+                    // genuinely raises the measured floor and costs tail; what
+                    // it must not do is win the whole window.
                     assert!(
-                        step < -40.0,
-                        "{route}, dead side at {hiss_db} dBFS, {side}: the IR \
-                         ends {step:.1} dB under its peak - un-faded"
+                        l.len() <= 2 * healthy_len,
+                        "{route}, dead side at {hiss_db} dBFS: {} samples against \
+                         the {healthy_len} the same capture gives with both \
+                         returns live",
+                        l.len()
+                    );
+                    assert!(
+                        f64::from(out.seconds) < 0.5 * tail_s,
+                        "{route}, dead side at {hiss_db} dBFS: {} s of a {tail_s} s \
+                         window",
+                        out.seconds
+                    );
+                } else {
+                    // **Below the line the decay is gone and this is what is
+                    // left to promise.** Not a stub — the collapse to the
+                    // impulse and its fade is the failure
+                    // `a_quiet_return_is_not_truncated_down_to_its_own_impulse`
+                    // pins, and a loud dead return is the other road to it —
+                    // bounded by what was actually recorded, and honest on
+                    // screen about being untrustworthy.
+                    let clamp = peak + 1 + (crate::units::sweep::TAIL_FADE_S * rate) as usize;
+                    assert!(
+                        l.len() > clamp,
+                        "{route}, dead side at {hiss_db} dBFS: {} samples against \
+                         an earliest legal cut of {clamp} — the measurement was \
+                         deleted, not truncated",
+                        l.len()
+                    );
+                    assert!(
+                        f64::from(out.seconds) <= tail_s + 0.001,
+                        "{route}, dead side at {hiss_db} dBFS: {} s out of a \
+                         {tail_s} s window",
+                        out.seconds
+                    );
+                }
+                // Both channels end FADED, including the one that is only
+                // noise - a hard stop there is a step the convolver rings
+                // into everything it touches, in one ear. Read as energy
+                // rather than as the last sample: the half-cosine's final
+                // multiplier is exactly zero, so a last-sample reading passes
+                // whatever happened and cannot fail. On stationary hiss the
+                // difference is the whole assertion — an un-faded noise
+                // channel ends at the same level it ran at.
+                assert_eq!(l.len(), r.len(), "{route}: the pair came back uneven");
+                let fade = (crate::units::sweep::TAIL_FADE_S * rate) as usize;
+                let ms = |w: &[f32]| {
+                    w.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>()
+                        / w.len().max(1) as f64
+                };
+                for (side, ch) in [("L", &l), ("R", &r)] {
+                    assert!(
+                        ch.len() >= 2 * fade,
+                        "{route}, dead side at {hiss_db} dBFS, {side}: {} samples \
+                         is too short to read a fade in",
+                        ch.len()
+                    );
+                    let faded = ms(&ch[ch.len() - fade..]);
+                    let before = ms(&ch[ch.len() - 2 * fade..ch.len() - fade]);
+                    assert!(
+                        faded < 0.6 * before,
+                        "{route}, dead side at {hiss_db} dBFS, {side}: the last \
+                         {fade} samples read {faded:.3e} against {before:.3e} \
+                         before them - the cut was not faded"
                     );
                 }
             }
