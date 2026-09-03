@@ -1262,6 +1262,10 @@ fn is_instrument_sentinel(path: &str) -> bool {
 /// filters and drive, modulation, time, and the room last — the order a
 /// player wires a real board, seeded so the amp arrives dressed rather
 /// than as seven pluses.
+///
+/// **Dressed and switched OFF.** Every one of these lands BYPASSED — see
+/// [`seed_amp_board`], which is the other half of this table and the only
+/// place that writes it.
 #[cfg(feature = "recorder")]
 const AMP_DEFAULT_BOARD: [&str; tangent_ui::recorder::AMP_PEDALS] = [
     "@tangent-comp",
@@ -1304,6 +1308,60 @@ fn amp_board_to_seed(
     let untouched = (0..tangent_ui::recorder::AMP_PEDALS)
         .all(|p| (0..tangent_ui::recorder::INSERTS).all(|b| !pedal_filled(p, b)));
     untouched.then_some((ch, AMP_DEFAULT_BOARD))
+}
+
+/// **Seed the board an amp landing in `seat` should wear — and switch every
+/// pedal of it OFF.**
+///
+/// A free function on the app rather than a block inside the reconcile, for
+/// the reason [`amp_board_to_seed`] is a lookup rather than a settings read:
+/// the decision was already testable as plain logic and the WRITES were not,
+/// and the writes are where the interesting half now lives. A test can drive
+/// this against a headless `TangentApp` and read back both what landed and
+/// what state it landed in; nothing could drive the reconcile, which needs an
+/// engine, a device and a frame.
+///
+/// **The board arrives dressed, and it arrives silent.** Seven pedals in
+/// series is a sound nobody asked for on an amp somebody has only just
+/// loaded — a compressor, a wah, a drive, a chorus, a tremolo, a delay and a
+/// plate, all at their defaults, between a guitar and the first note played
+/// through it. The owner's words on the shipped build: they "should be off
+/// by default for beta testing".
+///
+/// Off means BYPASSED and not absent, which is the whole reason the seed is
+/// worth keeping: every pedal is loaded, named on its chip, openable in its
+/// own window and one shift-click from being in circuit. That is only honest
+/// because the state can be SEEN — `faces_amp` draws a bypassed chip on the
+/// well, struck through, and the pedal's own face carries a BYPASS button —
+/// and shipping it bypassed without those two would be a board that
+/// mysteriously does nothing, which is worse than the loudness it avoids.
+///
+/// **The bypass is written AFTER the tenant, and that ordering is
+/// load-bearing.** `TangentApp::set_insert` drops a bay's bypass whenever the
+/// tenant really changes, precisely so a flag cannot be left behind to
+/// silence the NEXT plugin to land there — so a flag written first would be
+/// wiped by the very write that puts the pedal in the seat.
+#[cfg(feature = "recorder")]
+fn seed_amp_board(app: &mut tangent_ui::app::TangentApp, seat: usize) {
+    // The SEAT the amp landed in, which for a group's bays 3..5 is not its
+    // channel — `amp_board_to_seed` is the one place that translates, and it
+    // hands back the channel it decided on so the cells written below cannot
+    // drift from the cells that were counted.
+    let owner = tangent_ui::recorder::pedal_owner(seat);
+    let seed = amp_board_to_seed(seat, |pedal, bay| {
+        owner.is_some_and(|ch| {
+            app.insert(tangent_ui::recorder::amp_pedal_seat(ch, pedal), bay)
+                .is_some()
+        })
+    });
+    let Some((ch, board)) = seed else {
+        return;
+    };
+    for (pedal, path) in board.iter().enumerate() {
+        let pedal_seat = tangent_ui::recorder::amp_pedal_seat(ch, pedal);
+        app.set_insert(pedal_seat, 0, Some(path));
+        app.set_insert_bypass(pedal_seat, 0, true);
+    }
 }
 
 /// **Read one strip's three bays and hand the app what they can automate.**
@@ -3299,31 +3357,10 @@ impl DesktopApp {
             // settings road the track-paste above takes, so each pedal then
             // loads through this very reconcile, one bay a frame. The
             // decision and its once-only marker live in
-            // [`amp_board_to_seed`].
+            // [`amp_board_to_seed`]; the WRITES live in [`seed_amp_board`],
+            // one call away from here so they can be driven by a test.
             if want.as_deref() == Some(crate::builtin_fx::AMP_PATH) {
-                // The SEAT the amp landed in, which for a group's bays 3..5
-                // is not its channel — `amp_board_to_seed` is the one place
-                // that translates, and it hands back the channel it decided
-                // on so the cells written below cannot drift from the cells
-                // that were counted.
-                let seat = i / inserts;
-                let owner = tangent_ui::recorder::pedal_owner(seat);
-                let seed = amp_board_to_seed(seat, |pedal, bay| {
-                    owner.is_some_and(|ch| {
-                        self.app
-                            .insert(tangent_ui::recorder::amp_pedal_seat(ch, pedal), bay)
-                            .is_some()
-                    })
-                });
-                if let Some((ch, board)) = seed {
-                    for (pedal, path) in board.iter().enumerate() {
-                        self.app.set_insert(
-                            tangent_ui::recorder::amp_pedal_seat(ch, pedal),
-                            0,
-                            Some(path),
-                        );
-                    }
-                }
+                seed_amp_board(&mut self.app, i / inserts);
             }
             if let Some(e) = self.recorder.engine.as_mut() {
                 // **A built-in INSTRUMENT is not a bundle.** Its sentinel
@@ -14315,6 +14352,78 @@ mod tests {
             "the seat just past the folder block claimed a board"
         );
         assert!(super::amp_board_to_seed(usize::MAX, empty).is_none());
+    }
+
+    /// **The seeded board arrives loaded, named — and switched OFF.**
+    ///
+    /// The owner, on the freshly installed build: the pedals make no sound
+    /// difference, "which should be off by default for beta testing". Seven
+    /// units in series between a guitar and its amp, all at their defaults,
+    /// is a sound nobody asked for on an amp somebody has only just loaded.
+    ///
+    /// So the seed writes both halves and this reads both back: the tenant
+    /// is in the seat AND the seat is bypassed. Off means loaded and not
+    /// applied, never absent, because a seat somebody can see, open and
+    /// shift-click back into circuit is the whole reason to seed a board at
+    /// all — and `faces_amp::a_bypassed_pedal_chip_does_not_look_like_a_live_one`
+    /// is the other half of that promise, on the glass.
+    ///
+    /// Driven through [`super::seed_amp_board`] against a headless app,
+    /// which is what lifting the writes out of the per-frame reconcile
+    /// bought: deleting the `set_insert_bypass` line makes this red, and
+    /// swapping the two lines makes it red too — `set_insert` drops a bay's
+    /// bypass whenever the tenant changes, so the flag has to be written
+    /// second.
+    #[cfg(feature = "recorder")]
+    #[test]
+    fn the_seeded_pedalboard_arrives_switched_off() {
+        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS};
+        for amp_seat in [3usize, folder_extra_seat(5)] {
+            let ch = tangent_ui::recorder::pedal_owner(amp_seat).expect("the seat owns a board");
+            let ctx = egui::Context::default();
+            // **`PLUGIN`, and that is not an arbitrary pick.** `Caps::DESKTOP`
+            // sets `persist_global_settings`, and `set_insert` saves on every
+            // write — so a sweep run under it would put a seeded pedalboard
+            // into whoever ran the tests' own `~/.config/tangent/settings.json`.
+            // Nothing here needs a desktop's capabilities; the two writes this
+            // is about are plain settings writes.
+            let mut app = tangent_ui::app::TangentApp::new(
+                &ctx,
+                tangent_ui::settings::Settings::default(),
+                tangent_ui::host::Caps::PLUGIN,
+            );
+            for pedal in 0..AMP_PEDALS {
+                assert_eq!(
+                    app.insert(amp_pedal_seat(ch, pedal), 0),
+                    None,
+                    "the board was dressed before the amp landed"
+                );
+            }
+            super::seed_amp_board(&mut app, amp_seat);
+            for pedal in 0..AMP_PEDALS {
+                let seat = amp_pedal_seat(ch, pedal);
+                assert_eq!(
+                    app.insert(seat, 0),
+                    Some(super::AMP_DEFAULT_BOARD[pedal]),
+                    "pedal {pedal} of the seeded board is not the one the chain names"
+                );
+                assert!(
+                    app.insert_bypassed(seat, 0),
+                    "pedal {pedal} of the seeded board arrived IN circuit, which is \
+                     seven effects nobody asked for between a guitar and its amp"
+                );
+            }
+            // And the once-only rule still holds with the flags standing: a
+            // second amp on the same channel finds a board that has been
+            // touched and writes nothing — including nothing that would
+            // switch a pedal somebody had put back into circuit off again.
+            app.set_insert_bypass(amp_pedal_seat(ch, 2), 0, false);
+            super::seed_amp_board(&mut app, amp_seat);
+            assert!(
+                !app.insert_bypassed(amp_pedal_seat(ch, 2), 0),
+                "a second amp re-seeded the board and switched a pedal back off"
+            );
+        }
     }
 
     /// **The export renders the STRETCHED audio, at the stretched length.**

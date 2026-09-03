@@ -15,6 +15,13 @@
 //! tremolo — and the pedalboard underfoot as a row of seven chips, each
 //! wearing its tenant's short name or a plus.
 //!
+//! **A chip has THREE looks, because a seat has three states.** Empty is the
+//! plus in the quiet ink; in circuit is the name on the raised surface; and
+//! BYPASSED is the name struck through, in the quiet ink, on the well. The
+//! third one arrived with the seeded board, which ships switched off — seven
+//! chips that look like working pedals and make no sound is a worse fault
+//! than the loudness shipping them in circuit would have been.
+//!
 //! **A chip is a doorway, and it is the SAME doorway a rack bay is.**
 //! Clicking one opens that pedal's own window STACKED over this one — the
 //! picker if the seat is empty, the suite unit's face if it is one of ours,
@@ -23,7 +30,9 @@
 //! (`App::bay_gesture`) decides both and neither surface can disagree with
 //! it. The modifiers are read from THIS window's own input rather than from
 //! the desk's latched pair; see `FaceAction::PedalGesture` for why that is
-//! not a detail.
+//! not a detail. Shift has worked since the day the chip learned to carry
+//! its own modifiers; what it did not have until the third look above was
+//! anything on screen to answer with.
 //!
 //! The pedal's window stands ABOVE this one and closing it comes back here:
 //! the amp is never put away to show a pedal, and both windows stay
@@ -155,6 +164,10 @@ pub fn draw_amp(
     ui.add_space(board_air);
 
     // ── the pedalboard ──────────────────────────────────────────────────────
+    // Copied out before the board's own field is borrowed: it is seven
+    // bools, and taking it here is what lets the chip row read the words and
+    // their states in one pass without the two borrows meeting.
+    let live_off = live.pedals_off;
     match &live.pedals {
         Some(pedals) => {
             caption(ui, "PEDALS - in order, before the amp");
@@ -190,26 +203,56 @@ pub fn draw_amp(
             ui.horizontal_wrapped(|ui| {
                 for (pedal, tenant) in pedals.iter().enumerate() {
                     let empty = tenant.is_empty();
+                    // **A THIRD look, because there is a third state.**
+                    //
+                    // A chip had two — empty and filled — and the seeded
+                    // board now ships switched OFF, so seven filled chips
+                    // would have been seven pedals that look exactly like
+                    // pedals and make no sound. That is a worse fault than
+                    // the loudness shipping them in circuit would have been,
+                    // and it is the reason this exists at all.
+                    //
+                    // A bypassed chip sits in the WELL rather than on the
+                    // raised surface — the kit's own recessed ground, which
+                    // is what "not standing in the chain" looks like
+                    // everywhere else in this app — wears the quiet ink
+                    // measured against that well, and is struck through.
+                    // Three signals rather than one on purpose: the ground
+                    // and the ink are a theme's to derive and a theme with
+                    // a flat palette could bring them close, while a
+                    // strikethrough is the same mark on all sixteen. An
+                    // EMPTY seat is left exactly as it was, because empty
+                    // and bypassed are different answers and the quiet ink
+                    // alone was already carrying empty.
+                    let off = !empty && live_off.get(pedal).copied().unwrap_or(false);
+                    let ground = if off { st.s.well } else { st.s.raised };
+                    let mut word = egui::RichText::new(&cut[pedal])
+                        .font(bold(9.0))
+                        // An empty seat wears the quiet ink, and a
+                        // chip is RAISED, so that ink is measured
+                        // against the chip and not against the
+                        // panel — `faint` on `raised` is under the
+                        // caption floor on three shipping themes.
+                        .color(if empty || off {
+                            face::quiet_ink(st, ground)
+                        } else {
+                            st.s.ink
+                        });
+                    if off {
+                        word = word.strikethrough();
+                    }
                     let chip = ui.add_sized(
                         egui::Vec2::new(w, chip_h),
-                        egui::Button::new(
-                            egui::RichText::new(&cut[pedal])
-                                .font(bold(9.0))
-                                // An empty seat wears the quiet ink, and a
-                                // chip is RAISED, so that ink is measured
-                                // against the chip and not against the
-                                // panel — `faint` on `raised` is under the
-                                // caption floor on three shipping themes.
-                                .color(if empty {
-                                    face::quiet_ink(st, st.s.raised)
-                                } else {
-                                    st.s.ink
-                                }),
-                        )
-                        .fill(st.s.raised),
+                        egui::Button::new(word).fill(ground),
                     );
                     let chip = chip.on_hover_text(if empty {
                         format!("pedal {}: choose an effect", pedal + 1)
+                    } else if off {
+                        format!(
+                            "pedal {}: {tenant} - BYPASSED. click to open, \
+                             shift to put it back in circuit, alt to remove",
+                            pedal + 1
+                        )
                     } else {
                         format!(
                             "pedal {}: {tenant} - click to open, \
@@ -361,6 +404,195 @@ mod tests {
         let long = pedal_label("/x/FabFilter Saturn 2 Deluxe.vst3");
         assert!(long.chars().count() <= 10, "{long}");
         assert!(long.ends_with('…'), "{long}");
+    }
+
+    /// One chip's whole appearance, off the painted frame: the ink its word
+    /// was laid out in, the last opaque rectangle painted under that word,
+    /// and whether the word is struck through.
+    ///
+    /// **Read off the galley's own sections, not off `fallback_color`.**
+    /// `TextShape::fallback_color` is what egui uses when a section declines
+    /// to say — and every word this panel paints says, through
+    /// `RichText::color` — so a test that read the fallback would be
+    /// comparing one constant with itself and passing for ever. The
+    /// strikethrough is in the same place, on the section's own
+    /// `TextFormat`, because that is where `RichText::strikethrough` puts
+    /// it.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct ChipLook {
+        ink: egui::Color32,
+        ground: egui::Color32,
+        struck: bool,
+    }
+
+    /// Every word one frame of the amp painted, with the look above.
+    fn chip_looks(live: &mut FaceLive, st: &FaceStyle, w: f32) -> Vec<(String, ChipLook)> {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::Vec2::new(w, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        face::fit::dress(ui.style_mut(), &st.s);
+                        let _ = draw_amp(ui, st, live);
+                    });
+            },
+        );
+        let mut surfaces: Vec<(egui::Rect, egui::Color32)> = Vec::new();
+        let mut words: Vec<(String, ChipLook)> = Vec::new();
+        fn walk(
+            shape: &egui::Shape,
+            surfaces: &mut Vec<(egui::Rect, egui::Color32)>,
+            words: &mut Vec<(String, ChipLook)>,
+        ) {
+            match shape {
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, surfaces, words);
+                    }
+                }
+                egui::Shape::Rect(r) => {
+                    if r.fill.a() == 255 && r.rect.is_positive() && r.rect.max.is_finite() {
+                        surfaces.push((r.rect, r.fill));
+                    }
+                }
+                egui::Shape::Text(t) => {
+                    let box_ = egui::Rect::from_min_size(t.pos, t.galley.rect.size());
+                    // Paint order decides the ground: the LAST opaque
+                    // rectangle that contains the word is the surface it
+                    // landed on, whatever the drawing code believed.
+                    let ground = surfaces
+                        .iter()
+                        .rev()
+                        .find(|(r, _)| r.contains_rect(box_))
+                        .map_or(egui::Color32::TRANSPARENT, |&(_, c)| c);
+                    let section = t.galley.job.sections.first();
+                    let ink = section
+                        .map(|s| s.format.color)
+                        .filter(|c| *c != egui::Color32::PLACEHOLDER)
+                        .unwrap_or(t.fallback_color);
+                    let struck = section.is_some_and(|s| s.format.strikethrough.width > 0.0);
+                    words.push((
+                        t.galley.text().to_owned(),
+                        ChipLook { ink, ground, struck },
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for cs in &out.shapes {
+            walk(&cs.shape, &mut surfaces, &mut words);
+        }
+        words
+    }
+
+    /// **A bypassed pedal chip does not look like a live one — or like an
+    /// empty one.**
+    ///
+    /// The seeded board ships switched OFF, which the owner asked for
+    /// ("which should be off by default for beta testing"), and shipping it
+    /// off is only honest if it can be SEEN: seven chips wearing seven names
+    /// and making no sound is a worse fault than the loudness it avoids.
+    /// A chip had exactly two looks, empty and filled, so there was nothing
+    /// for the third state to be drawn as — and the shift-click that toggles
+    /// it (`App::bay_gesture`, the same door a rack bay's gesture comes
+    /// through) had worked all along with nothing on screen answering.
+    ///
+    /// Measured on the painted frame rather than on the flag: the ink is
+    /// read out of the galley's own section, because
+    /// `TextShape::fallback_color` is not the colour a `RichText` was
+    /// coloured with, and the ground is the last opaque rectangle painted
+    /// under the word, because that is the only way to ask what a word
+    /// actually landed on.
+    ///
+    /// Three claims, and the third is the one a single-signal design would
+    /// fail: a bypassed chip differs from a live one in ground AND in ink
+    /// AND by being struck through, so a theme whose well and raised
+    /// surfaces sit close together still says which pedals are out. Give the
+    /// bypassed chip back the live chip's fill and ink — or drop the
+    /// strikethrough — and this goes red.
+    #[test]
+    fn a_bypassed_pedal_chip_does_not_look_like_a_live_one() {
+        let set = crate::settings::Settings::default();
+        let p = crate::recorder_panel::palette(&set);
+        let st = FaceStyle::new(p.bg, p.lcd, p.lcd_face);
+        let mut live = FaceLive {
+            face: crate::ports::BuiltinFace {
+                path: AMP_PATH.to_owned(),
+                ..Default::default()
+            },
+            // Six tenants and one empty seat, so all three looks are in the
+            // one frame and can be compared against each other rather than
+            // against a colour spelled here.
+            pedals: Some([
+                "comp".to_owned(),
+                "wah".to_owned(),
+                "drive".to_owned(),
+                "chorus".to_owned(),
+                "trem".to_owned(),
+                "echo".to_owned(),
+                String::new(),
+            ]),
+            pedals_off: [false, true, false, false, false, false, false],
+            ..Default::default()
+        };
+        let words = chip_looks(&mut live, &st, 700.0);
+        let look = |word: &str| {
+            words
+                .iter()
+                .find(|(s, _)| s == word)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "nothing on the board says {word:?}; it says {:?}",
+                        words.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>()
+                    )
+                })
+                .1
+        };
+        let live_chip = look("comp");
+        let off_chip = look("wah");
+        let empty_chip = look("+");
+        assert!(
+            !live_chip.struck && !empty_chip.struck,
+            "a chip that is in circuit is struck through: live {live_chip:?}, \
+             empty {empty_chip:?}"
+        );
+        assert!(
+            off_chip.struck,
+            "a bypassed chip is not struck through: {off_chip:?}"
+        );
+        assert_ne!(
+            off_chip.ground, live_chip.ground,
+            "a bypassed chip stands on the same surface as a live one"
+        );
+        assert_ne!(
+            off_chip.ink, live_chip.ink,
+            "a bypassed chip wears the same ink as a live one"
+        );
+        assert_ne!(
+            (off_chip.ground, off_chip.struck),
+            (empty_chip.ground, empty_chip.struck),
+            "a bypassed chip is indistinguishable from an EMPTY seat, which is \
+             a different answer: one has a pedal in it"
+        );
+        // And the ink a bypassed chip does wear is legible on the surface it
+        // landed on — `quiet_ink` climbs until it is, and this is the frame
+        // saying it climbed against the right surface.
+        let got = crate::recorder_panel::contrast_ratio(off_chip.ink, off_chip.ground);
+        assert!(
+            got >= 3.0,
+            "a bypassed chip's word is {got:.2}:1 on what it landed on, which \
+             is under the quiet floor"
+        );
     }
 
     /// **The pedalboard fits the panel, at every width the panel can be.**

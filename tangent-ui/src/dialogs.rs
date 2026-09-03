@@ -16220,6 +16220,111 @@ at: None,
         }
     }
 
+
+    /// One suite unit's face over channel 0's first bay, switched in or out
+    /// of circuit — a pedal's own stacked window, as the amp's chip opens
+    /// it.
+    fn a_unit_face(path: &str, bypassed: bool) -> Dialog {
+        let mut live = crate::faces::FaceLive {
+            bypassed,
+            ..Default::default()
+        };
+        live.face.path = path.to_owned();
+        Dialog::InsertFace {
+            strip: 0,
+            slot: 0,
+            live: Box::new(live),
+        }
+    }
+
+    /// **A pedal's own window can switch it out of circuit, and say that it
+    /// is.**
+    ///
+    /// The owner asked for the keybind and for the switch in one breath —
+    /// the seven seeded pedals ship BYPASSED, so a board somebody cannot see
+    /// the state of, or change from the panel in front of them, is a board
+    /// that mysteriously does nothing. Shift-clicking a chip already worked;
+    /// nothing on a pedal's own face did. `draw_ir` grew the first one of
+    /// these and it stayed the only one: the comp had no switch on its
+    /// panel, and the wah, drive, chorus, tremolo, echo and plate — six of
+    /// the seven seeded pedals — go through the generic rows, which had no
+    /// switch either.
+    ///
+    /// Swept over every unit the shelf can open, so a face added later
+    /// arrives with the switch rather than without it. The two exemptions
+    /// are named in `faces::draws_its_own_bypass` and asserted here from the
+    /// other end: the IR panel has its own button in its own layout (so the
+    /// word is on screen either way), and the AMP has one point of headroom
+    /// at its own window and gets none — its bypass is the bay's, where it
+    /// has always been.
+    ///
+    /// The word itself is the state: lit and reading BYPASSED when the unit
+    /// is out. Pressing it asks for the OTHER position, which is what makes
+    /// this a door onto the mixer's one flag rather than a second flag —
+    /// `DialogAction::SetInsertBypass` carries the seat the face was opened
+    /// over.
+    #[test]
+    fn a_pedals_own_window_can_switch_it_out_of_circuit() {
+        // Every unit the amp's board can be seeded with, plus the two the
+        // sweep is really about at either end of the exemption.
+        for path in [
+            "@tangent-comp",
+            "@tangent-wah",
+            "@tangent-drive",
+            "@tangent-chorus",
+            "@tangent-trem",
+            "@tangent-echo",
+            "@tangent-plate",
+            "@tangent-eq",
+            "@tangent-imager",
+            "@tangent-tape",
+            "@tangent-ir",
+        ] {
+            for (was, word) in [(false, "BYPASS"), (true, "BYPASSED")] {
+                let mut slot = Slot::new(a_unit_face(path, was));
+                assert!(
+                    slot.says(word),
+                    "{path} switched {was} says nothing about being in circuit"
+                );
+                match slot.click(word) {
+                    Some(DialogAction::SetInsertBypass { strip, slot: bay, on }) => {
+                        assert_eq!(
+                            (strip, bay),
+                            (0, 0),
+                            "{path}'s switch named the wrong seat"
+                        );
+                        assert_eq!(
+                            on, !was,
+                            "{path}'s switch asked for the position it was already in"
+                        );
+                    }
+                    other => panic!(
+                        "{path}'s bypass button asked for {:?} instead",
+                        other.is_some()
+                    ),
+                }
+            }
+        }
+    }
+
+    /// **The amp keeps its footer for the preset strip.** The other half of
+    /// the exemption above, and the reason it is one: the amp's panel is a
+    /// measured budget with a single point of headroom at the 540 by 360
+    /// window it opens at, so a bypass row there would push the save strip
+    /// off the bottom of a window with no scroll area under it —
+    /// `face::tests::every_face_fits_the_window_it_opens_at` is the sweep
+    /// that would catch it, and this is the reason written where somebody
+    /// adding the row would look.
+    #[test]
+    fn the_amp_face_leaves_its_bypass_to_the_bay() {
+        let mut slot = Slot::new(a_unit_face(crate::faces_amp::AMP_PATH, false));
+        assert!(
+            !slot.says("BYPASS"),
+            "the amp grew a bypass row; its window has one point of room and \
+             the preset strip is standing in it"
+        );
+    }
+
     /// An IR panel with one folder of impulses in it, standing at home.
     fn an_ir_panel(strip: usize, slot: usize, loaded: &str) -> Dialog {
         let mut live = crate::faces::FaceLive {
