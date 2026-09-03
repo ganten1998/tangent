@@ -1803,24 +1803,27 @@ impl Default for Settings {
             auto_palette: true,
             palette_choice: 0,
             palette_auto: true,
-            // **Channel 0 ships as the DX7, channel 1 as the DRUMPAD.** The
+            // **Channel 0 ships as the DRUMPAD, channel 1 as the DX7.** The
             // two built-in instruments sit side by side in the first two
             // slots — so a fresh install makes a sound, has a kit the editor
-            // can write for, and the desk shows both. The drumpad used to
-            // sit on channel 7 (the last of eight); with sixteen channels
-            // there is no sense stranding it in the middle, so it moves up
-            // to the second slot.
+            // can write for, and the desk shows both.
+            //
+            // The DRUMS come first by the owner's ruling: a desk is read top
+            // down, and the kit is what a song is built on top of rather than
+            // what sits under the melody. It also puts the one ARMED channel
+            // (the DX7 — see `app::default_armed`) second, where the record
+            // light is not the first thing the eye lands on.
             channel_kinds: {
                 let mut k = [0u8; crate::recorder::CHANNELS];
                 k[0] = 1;
                 k[1] = 1;
                 k
             },
-            // The drumpad on channel 1 wears the drum out of the box;
+            // The drumpad on channel 0 wears the drum out of the box;
             // everything else follows its kind.
             channel_icons: {
                 let mut c = [0u8; crate::recorder::CHANNELS];
-                c[1] = 1;
+                c[0] = 1;
                 c
             },
             reverb_mix: 0.0,
@@ -1859,20 +1862,21 @@ impl Default for Settings {
             // Every instrument slot sends everything; nothing else sends
             // anything. See `recorder::Desk::default`.
             strip_sends: std::array::from_fn(|i| {
-                // Only the shipped DX7 (strip 0) arrives wired to the
-                // reverb — the owner's ruling. Every other row, the drum
-                // track included, rests DRY until somebody turns it up.
-                if i == 0 { 1.0 } else { 0.0 }
+                // Only the shipped DX7 arrives wired to the reverb — the
+                // owner's ruling. It rides with the INSTRUMENT rather than
+                // with the seat, so it followed the DX7 to channel 1 when the
+                // two default tracks changed places. Every other row, the
+                // drum track included, rests DRY until somebody turns it up.
+                if i == 1 { 1.0 } else { 0.0 }
             }),
             strip_names: Vec::new(),
-            // Channel 0's bay 1 holds the built-in — the pre-added DX7 that
-            // is a fresh install's sound. See `channel_kinds` above.
+            // Channel 0's first bay holds the DRUMPAD, and channel 1's holds
+            // the built-in DX7 that is a fresh install's sound. See
+            // `channel_kinds` above for the order.
             strip_inserts: {
                 let mut v = vec![String::new(); crate::recorder::INSERT_SPACE];
-                v[0] = crate::dialogs::BUILTIN_PATH.to_owned();
-                // And channel 1's bay 0 is the drumpad — see `channel_kinds`.
-                v[1 * crate::recorder::INSERTS] =
-                    crate::dialogs::DRUMPAD_PATH.to_owned();
+                v[0] = crate::dialogs::DRUMPAD_PATH.to_owned();
+                v[crate::recorder::INSERTS] = crate::dialogs::BUILTIN_PATH.to_owned();
                 v
             },
             input_alias: String::new(),
@@ -1884,9 +1888,13 @@ impl Default for Settings {
             project_path: String::new(),
             arr_snap: true,
             arr_tempo_lane: false,
+            // **The one T on the desk, on the channel that plays notes.**
+            // It rides with the DX7 for the reason the send does: the theory
+            // surfaces are about what somebody is PLAYING, and on a fresh
+            // install that is the keyboard rather than the kit.
             strip_to_theory: {
                 let mut v = vec![false; crate::recorder::CHANNELS];
-                v[0] = true;
+                v[1] = true;
                 v
             },
             strip_is_folder: vec![false; crate::recorder::CHANNELS],
@@ -4274,11 +4282,12 @@ impl Settings {
         // Written only when it differs from the shipped set, so an untouched
         // file keeps its shape.
         {
-            let fresh = {
-                let mut v = vec![false; crate::recorder::CHANNELS];
-                v[0] = true;
-                v
-            };
+            // **Read off the default rather than spelled again here.** This
+            // was a second copy of `Settings::default`'s own vector, and the
+            // day the shipped desk changed — the kit taking the first row and
+            // the DX7 the second — the copy still said channel 0 and a fresh
+            // file started writing a key it had never written before.
+            let fresh = Self::default().strip_to_theory;
             if self.strip_to_theory != fresh {
                 map.insert(
                     "strip_to_theory".into(),
@@ -6305,7 +6314,16 @@ mod tests {
         );
         // And what came up is usable rather than a half-empty window.
         assert!(s.show_recorder && s.show_fretboard);
-        assert_eq!(s.strip_inserts.first().map(String::as_str), Some(crate::dialogs::BUILTIN_PATH));
+        // The default desk: the kit in channel 0's first bay, the DX7 in
+        // channel 1's. See `Settings::default`.
+        assert_eq!(
+            s.strip_inserts.first().map(String::as_str),
+            Some(crate::dialogs::DRUMPAD_PATH)
+        );
+        assert_eq!(
+            s.strip_inserts.get(crate::recorder::INSERTS).map(String::as_str),
+            Some(crate::dialogs::BUILTIN_PATH)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6580,7 +6598,16 @@ mod tests {
 
         assert!(!dir.join("settings.json.unreadable").exists());
         assert!(s.show_recorder);
-        assert_eq!(s.strip_inserts.first().map(String::as_str), Some(crate::dialogs::BUILTIN_PATH));
+        // The default desk: the kit in channel 0's first bay, the DX7 in
+        // channel 1's. See `Settings::default`.
+        assert_eq!(
+            s.strip_inserts.first().map(String::as_str),
+            Some(crate::dialogs::DRUMPAD_PATH)
+        );
+        assert_eq!(
+            s.strip_inserts.get(crate::recorder::INSERTS).map(String::as_str),
+            Some(crate::dialogs::BUILTIN_PATH)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6818,12 +6845,17 @@ mod tests {
             first.show_recorder,
             "the recorder is invisible on a fresh install"
         );
-        // **The built-in is loaded, and that is visibility too.** The default
-        // desk carries it in channel 1's first bay, and a first launch keeps
-        // that: the patch picker and the patch editor are reached by clicking
-        // the bay it is in.
+        // **Both built-ins are loaded, and that is visibility too.** The
+        // default desk carries the kit in channel 0's first bay and the DX7
+        // in channel 1's, and a first launch keeps that: the patch picker and
+        // the patch editor are reached by clicking the bay it is in.
         assert_eq!(
             first.strip_inserts.first().map(String::as_str),
+            Some(crate::dialogs::DRUMPAD_PATH),
+            "a fresh install has no kit on the desk"
+        );
+        assert_eq!(
+            first.strip_inserts.get(crate::recorder::INSERTS).map(String::as_str),
             Some(crate::dialogs::BUILTIN_PATH),
             "a fresh install has no instrument on the desk"
         );

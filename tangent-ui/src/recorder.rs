@@ -1929,6 +1929,29 @@ pub enum RecorderRequest {
     /// to an instance before it crosses to the audio thread - a swap IS a
     /// reload, honestly.
     SetInsertIr { strip: usize, slot: usize, path: String },
+    /// **Exchange two loaded insert bays, settings and all.** Appended at
+    /// the END, this enum's law. Both addresses are SEATS, like every other
+    /// bay-shaped request here.
+    ///
+    /// The owner: "dragging occupied fx slot x to any other occupied slot
+    /// should swap them." The carry gesture already existed and already had
+    /// a landing — but the landing only knew which CHANNEL was under the
+    /// hand, so a drop was a copy into the target's next free bay and a drop
+    /// onto a full rack was a refusal. Aimed at a bay it is a different verb,
+    /// and the useful one: a rack is an ORDER, and re-ordering it by dragging
+    /// is the gesture every desk has.
+    ///
+    /// A request rather than two settings writes for [`Self::CopyInsert`]'s
+    /// reason, doubled: what has to move is the state each plugin is playing
+    /// at right now, and only the host can ask a live instance for it. Two
+    /// bare paths exchanged in the settings would swap the units and hand
+    /// each of them the other's factory defaults.
+    SwapInserts {
+        a_strip: usize,
+        a_bay: usize,
+        b_strip: usize,
+        b_bay: usize,
+    },
 }
 
 /// How hard an auditioned note is struck.
