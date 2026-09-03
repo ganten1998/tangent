@@ -5874,7 +5874,19 @@ impl DesktopApp {
     /// Start an export: the whole arrangement, played from the top through
     /// the real engine — racks, limiter, master — into an audio-only take
     /// the finish copies into the project's `export/`.
-    fn start_bounce(&mut self, stems: bool, span: Option<(f64, f64)>) {
+    ///
+    /// `stems_dry` is read only when `stems` is on and says which of the two
+    /// per-lane taps the pass takes: every strip's own inserts left out, or
+    /// left in. Two bools rather than a mode enum because the offline twin
+    /// carries the same pair off `ProjectExportSpec`, and one shape for the
+    /// two paths is what stops them drifting.
+    ///
+    /// The pass does NOT store the mode: the folder it writes into and the
+    /// folder `finish_bounce` copies out of are both named by
+    /// `ports::stems_folder_name`, and the spec the finish reads is the same
+    /// object this pair was taken from a line earlier. A third copy of the
+    /// answer would be a third thing that can disagree.
+    fn start_bounce(&mut self, stems: bool, stems_dry: bool, span: Option<(f64, f64)>) {
         // **A standing message stands until somebody lowers it.** The request
         // raises `EXPORT_RUNNING` before it knows whether the pass can even
         // start, which is right — the user pressed Export and deserves to see
@@ -5940,7 +5952,15 @@ impl DesktopApp {
                 self.recorder.engine.as_ref(),
                 self.app
                     .project_doc()
-                    .and_then(|d| d.parent().map(|p| p.join("export").join("stems"))),
+                    .and_then(|d| {
+                        d.parent().map(|p| {
+                            // Named for what is in it, by the one namer the
+                            // finish's copy also calls through the spec —
+                            // see `ports::stems_folder_name`.
+                            p.join("export")
+                                .join(tangent_ui::ports::stems_folder_name(stems_dry))
+                        })
+                    }),
             ) {
                 let _ = std::fs::create_dir_all(&dir);
                 let rate = e.output().sample_rate;
@@ -5974,6 +5994,7 @@ impl DesktopApp {
                     }
                 }
                 e.set_stems(true);
+                e.set_stems_dry(stems_dry);
             }
         }
         self.recorder.bounce = Some(Bounce {
@@ -6192,8 +6213,8 @@ impl DesktopApp {
                 }
             }
             if spec.stems {
-                let src = export_dir.join("stems");
-                let dst_dir = out_dir.join("stems");
+                let src = export_dir.join(spec.stems_folder());
+                let dst_dir = out_dir.join(spec.stems_folder());
                 let _ = std::fs::create_dir_all(&dst_dir);
                 if let Ok(rd) = std::fs::read_dir(&src) {
                     for f in rd.flatten() {
@@ -6557,6 +6578,11 @@ impl DesktopApp {
             }
         }
         e.set_stems(spec.stems);
+        // Only meaningful with the tap armed, and the engine ANDs it with
+        // the tap again on its own side — but stated here too, so a spec
+        // carrying the unreachable fourth state (dry with no stems) cannot
+        // arm a mode for a pass that takes no stems.
+        e.set_stems_dry(spec.stems && spec.stems_dry);
         e.set_transport(1, (from_s * f64::from(rate)).round() as u64);
         e.set_rolling(true);
         // ── the files ──
@@ -6586,7 +6612,7 @@ impl DesktopApp {
         };
         let mut stems = Vec::new();
         if spec.stems {
-            let dir = out_dir.join("stems");
+            let dir = out_dir.join(spec.stems_folder());
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 self.app
                     .notify(Kind::Error, format!("export: stems dir: {e}"));
@@ -6916,14 +6942,11 @@ impl DesktopApp {
             // The overlay names the SOURCES, because that is what decides how
             // long this takes: stems re-instantiate the same racks and then
             // write one file per lane.
-            Q::Export(spec) => (
-                "Preparing export",
-                Some(match (spec.master, spec.stems) {
-                    (true, false) => "master".to_owned(),
-                    (false, true) => "stems".to_owned(),
-                    _ => "master and stems".to_owned(),
-                }),
-            ),
+            // One label, from the spec, for both this overlay and the
+            // running notification below — see
+            // `ProjectExportSpec::source_label` for why the two inline
+            // matches that used to be here were merged.
+            Q::Export(spec) => ("Preparing export", Some(spec.source_label().to_owned())),
             Q::ExportTrack => ("Preparing export", Some("master".to_owned())),
             Q::ExportStems => ("Preparing export", Some("stems".to_owned())),
         };
@@ -7009,11 +7032,7 @@ impl DesktopApp {
                     } else {
                         "full-speed"
                     },
-                    match (spec.master, spec.stems) {
-                        (true, false) => "master",
-                        (false, true) => "stems",
-                        _ => "master+stems",
-                    },
+                    spec.source_label(),
                     if spec.dir.trim().is_empty() {
                         "project/export"
                     } else {
@@ -7026,13 +7045,19 @@ impl DesktopApp {
                     // spec's shaping (name, dir, formats, mono) is applied
                     // when the pass lands — see `finish_bounce`.
                     self.recorder.pending_delivery = Some(spec.clone());
-                    self.start_bounce(spec.stems, spec.span);
+                    self.start_bounce(spec.stems, spec.stems_dry, spec.span);
                 } else {
                     self.start_offline_bounce(spec);
                 }
             }
-            tangent_ui::ports::ProjectRequest::ExportTrack => self.start_bounce(false, None),
-            tangent_ui::ports::ProjectRequest::ExportStems => self.start_bounce(true, None),
+            tangent_ui::ports::ProjectRequest::ExportTrack => {
+                self.start_bounce(false, false, None)
+            }
+            // Processed, like the dialog's own default: the files sum to the
+            // record, which is what a bare "export stems" row means.
+            tangent_ui::ports::ProjectRequest::ExportStems => {
+                self.start_bounce(true, false, None)
+            }
             tangent_ui::ports::ProjectRequest::New
             | tangent_ui::ports::ProjectRequest::NewKeeping
             | tangent_ui::ports::ProjectRequest::NewDiscarding => {
