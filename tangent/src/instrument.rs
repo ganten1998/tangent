@@ -417,6 +417,37 @@ pub struct OutputInfo {
     /// with a four-period ring and a JACK path with none, and the panel is
     /// read by somebody debugging dropouts on one of them.
     pub buffer_ring: Option<u32>,
+    /// **What the DEVICE's own nominal rate was at the moment this engine
+    /// opened**, which is not always `sample_rate` above.
+    ///
+    /// Appended, at the end, because that is where fields go here.
+    ///
+    /// The two differ whenever the engine is CONVERTING, and on macOS that is
+    /// the ordinary case for any chosen rate: cpal's CoreAudio output builder
+    /// sets the audio unit's stream format and lets CoreAudio convert — it
+    /// never touches `kAudioDevicePropertyNominalSampleRate`, unlike the input
+    /// builder, which sets it and blocks until the hardware confirms
+    /// (`vendor/cpal/src/host/coreaudio/macos/mod.rs`,
+    /// `build_input_stream_raw`). So pick 96000 on an interface sitting at
+    /// 48000, with no input open on it, and the engine really is rendering at
+    /// 96000 while the device really is still at 48000. Nothing is wrong: the
+    /// conversion is CoreAudio's job and it does it.
+    ///
+    /// It was wrong for `desktop::RateWatch`, which compared the
+    /// device's live rate against `sample_rate` and read that permanent,
+    /// legitimate difference as the interface having wandered off — reopening
+    /// the whole audio path, and reloading every plugin in the desk, every
+    /// three seconds for the rest of the session. Its doc claimed that could
+    /// not happen, and the claim held only for a rate the device CANNOT
+    /// reach: there the narrowing below fails, `sample_rate` falls back to
+    /// the device's own, and the two agree for ever. A rate the device CAN
+    /// reach but nothing moved it to was the hole.
+    ///
+    /// So the watch is given the rate the device was found at as well, and
+    /// only fires when the live answer is neither of the two rates Tangent
+    /// already knows about. Zero where there is no device at all — an offline
+    /// engine — which is a case the watch never runs against.
+    pub device_rate: u32,
 }
 
 impl OutputInfo {
@@ -9775,6 +9806,15 @@ impl Engine {
             Some((device, name, supported, host_rule))
         };
         let channels = dev.as_ref().map_or(2, |(_, _, c, _)| c.channels());
+        // **What the device was FOUND at, read before the narrowing below
+        // replaces it with what was asked for.** This is
+        // `default_output_config`'s rate — the same property
+        // [`Engine::default_output_rate`] polls — taken from the device object
+        // already in hand rather than by asking the platform again a moment
+        // later, which would be a second answer to one question. See
+        // [`OutputInfo::device_rate`] for the three-second reopen loop that
+        // not carrying it produced.
+        let device_rate = dev.as_ref().map_or(0, |(_, _, s, _)| s.sample_rate().0);
         // **The rate is asked for, not imposed.** Setup offers only what the
         // INPUT device supports, and this is the output — a different device
         // with its own ranges — so the request is honoured when this device can
@@ -10201,6 +10241,7 @@ impl Engine {
                 sample_rate: rate,
                 buffer_frames,
                 buffer_ring,
+                device_rate,
             },
             shared: Arc::clone(&shared),
             timebase,
@@ -22327,6 +22368,92 @@ mod tests {
         assert_eq!(sane_gain(-1.0), 0.0);
         assert_eq!(sane_gain(100.0), 8.0);
         assert_eq!(sane_gain(0.5), 0.5);
+    }
+
+    /// **One device, one buffer — both halves of the path ask for the same
+    /// number, for every setting the panel offers.**
+    ///
+    /// The fault this locks out is the owner's, measured on his own 18i20
+    /// with `--device-watch`, with the input open, which is how the app runs:
+    ///
+    /// ```text
+    ///     setting  device -> callback  64
+    ///     setting     256 -> callback  64
+    ///     setting     512 -> callback 128
+    ///     setting    1024 -> callback 256
+    ///     setting    2048 -> callback 512
+    /// ```
+    ///
+    /// A quarter, every time. `open_input`'s macOS arm deliberately asked for
+    /// a quarter of the chosen buffer, on the documented reasoning that the
+    /// capture callback only copies into a ring and can therefore afford to
+    /// run short. The reasoning assumes the two sizes are independent, and on
+    /// one CoreAudio device they are ONE property —
+    /// `kAudioDevicePropertyBufferFrameSize` belongs to the device, and cpal's
+    /// macOS builders both write it. Tangent opens the engine first and the
+    /// input second, so the quarter landed on top of the already-running
+    /// output and the whole DSP graph — every plugin, the entire mix — ran at
+    /// a quarter of the size the user picked, at four times the dropout
+    /// exposure, while the Setup panel blamed the device for it.
+    ///
+    /// Both halves are asked here in the same function on purpose: the output
+    /// through `pick_buffer`, the input through
+    /// `tangent_record::audio::input_ask_frames`, which is the arithmetic
+    /// `open_input` runs. A test of either alone would have passed all along.
+    ///
+    /// Revert-check: make `input_ask_frames` ignore its `separate_device`
+    /// argument — the bare `(want / 4).max(64)` it used to be — and every
+    /// iteration of the first loop goes red.
+    #[test]
+    fn one_device_gets_one_buffer_from_both_halves_of_the_path() {
+        use tangent_record::audio::{input_ask_frames, is_second_device, INPUT_DEFAULT_FRAMES};
+        // A roomy interface, so that nothing below is a clamp in disguise.
+        let dev = cpal::SupportedBufferSize::Range { min: 16, max: 8192 };
+        // `Ring` because that is `BufferRule::for_host` on CoreAudio, which is
+        // the stack the quarter lived on. ASIO's `Period` arm has its own
+        // equality test above, and it is an equality of REQUESTS rather than
+        // of sizes because a driver with one buffer set must be asked
+        // identically from both directions.
+        for choice in std::iter::once(None)
+            .chain(tangent_ui::recorder::BUFFER_CHOICES.into_iter().map(Some))
+        {
+            let plan = pick_buffer(&dev, choice, BufferRule::Ring);
+            // What the OUTPUT will be running: the plan's period, which is the
+            // number `Chrome::input_buffer` hands the input.
+            let out = plan.period.unwrap_or(INPUT_DEFAULT_FRAMES);
+            let inp = input_ask_frames(plan.period, false);
+            assert_eq!(
+                inp, out,
+                "with the setting at {choice:?} the output runs {out} frames \
+                 and the input asks the same device for {inp}"
+            );
+            // And "Device" is a size on both sides rather than a shrug: the
+            // un-picked case was `BufferSize::Default` once, which was 512 on
+            // Sonoma and counted as 1024 by the in-flight math.
+            assert!(inp >= 64, "the input asked for {inp} frames");
+        }
+
+        // **The quarter survives where its own reasoning does.** A microphone
+        // in a genuinely different box has a genuinely different property, and
+        // the 18.7 ms against 6.6 ms that bought the optimisation was measured
+        // on exactly that machine. Deleting it silently would be throwing away
+        // a measurement; this is what says it is still here.
+        assert_eq!(input_ask_frames(Some(1024), true), 256);
+        assert_eq!(input_ask_frames(Some(256), true), 64);
+        // Floored at 64. A quarter of 64 is 16, which no interface serves.
+        assert_eq!(input_ask_frames(Some(64), true), 64);
+
+        // Which case an open is in, is decided by NAME — the only thing both
+        // sides can be asked for, since cpal's `Device` is not comparable and
+        // the caller holds a selection key rather than a device.
+        assert!(is_second_device("MacBook Pro Microphone", Some("Scarlett 18i20 USB")));
+        assert!(!is_second_device("Scarlett 18i20 USB", Some("Scarlett 18i20 USB")));
+        // No output to compare against is NOT proof of a second box, and the
+        // cautious answer is the one that cannot drag a running output down.
+        assert!(
+            !is_second_device("Scarlett 18i20 USB", None),
+            "an unknown output was read as a second box"
+        );
     }
 
     #[test]

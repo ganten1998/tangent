@@ -2964,6 +2964,98 @@ impl InputStream {
     }
 }
 
+/// **The size the input asks for when nobody has chosen one.**
+///
+/// The same number the OUTPUT asks for with no choice made
+/// (`instrument::WANT_BUFFER_FRAMES`), so that the two directions of the
+/// setting called "Device" mean one thing. Kept here rather than imported
+/// because that constant lives in the binary crate and this is a library, and
+/// the pair must move together — it used to be declared TWICE inside
+/// [`open_input`], once per side of a `cfg`, which is two things to forget
+/// instead of one.
+pub const INPUT_DEFAULT_FRAMES: u32 = 256;
+
+/// **Whether the microphone is a genuinely SECOND box, or the same interface
+/// the output is playing through.**
+///
+/// Asked by name, and by name deliberately. cpal's `Device` is not comparable
+/// — no `PartialEq`, no exposed id — and the caller cannot answer this either:
+/// it holds a saved SELECTION key, and which box that resolves to is only
+/// known here, after `resolve`. The name is what both sides can be asked for.
+///
+/// Two identical interfaces of the same model report the same name and would
+/// be read as one device. That error is the SAFE direction and that is why
+/// this shape is acceptable: reading two boxes as one costs the input leg a
+/// few milliseconds of latency it could have saved, while reading one box as
+/// two is the fault this function exists to end — see [`input_ask_frames`].
+///
+/// `None` — no output open to compare against — is likewise "not proven
+/// separate". With no engine there is no output stream whose buffer could be
+/// dragged, so the cautious answer costs nothing, and the engine that starts
+/// a moment later would have been on the same device as often as not.
+pub fn is_second_device(input_name: &str, output_name: Option<&str>) -> bool {
+    output_name.is_some_and(|out| out != input_name)
+}
+
+/// **The frames the input asks the host for**, given the size the whole audio
+/// path is opening at and whether the microphone is a second box.
+///
+/// **On macOS the input used to run SMALLER than the output, on purpose, and
+/// the purpose did not survive contact with a single interface.**
+///
+/// The original argument is still written down and still worth reading: two
+/// AudioUnits stand between the microphone and the speaker, so the round trip
+/// pays the input buffer, the output buffer, AND whatever sits in the monitor
+/// ring between them — a duplex host like Live pays two buffers, which is the
+/// whole of the tester's 18.7 ms against 6.6 ms. The one term this side can
+/// shrink is the INPUT, because its callback only copies into a ring and does
+/// no DSP, so a quarter of the chosen buffer earns no dropouts and the ring's
+/// in-flight allowance shrinks with it (`in_block` follows this very value).
+///
+/// That argument assumes the two buffer sizes are INDEPENDENT. On one
+/// CoreAudio device they are not: `kAudioDevicePropertyBufferFrameSize` is a
+/// property of the DEVICE, and cpal's macOS builders both write it — the input
+/// one at `macos/mod.rs` in `build_input_stream_raw`, the output one in
+/// `build_output_stream_raw`, the same property, the same scope. Tangent opens
+/// the engine first and the input second (`Chrome::open_audio_path_now`), so
+/// the input's quarter landed on top of the already-running output and took it
+/// with it. Measured against the owner's 18i20 with the input open, which is
+/// how the app actually runs:
+///
+/// ```text
+///     setting  device -> callback  64
+///     setting     256 -> callback  64
+///     setting     512 -> callback 128
+///     setting    1024 -> callback 256
+///     setting    2048 -> callback 512
+/// ```
+///
+/// A quarter, every time, for the whole DSP graph — every plugin, the entire
+/// mix — at four times the dropout exposure of the size the user picked, while
+/// the Setup panel blamed the device for it. The optimisation was buying three
+/// quarters of one buffer of input latency by paying three quarters of the
+/// output buffer's headroom, on the side where all the work happens.
+///
+/// So the quarter survives only where its own reasoning does: a genuinely
+/// separate box, where the property really is two properties — a laptop's
+/// built-in microphone against an external output, which is the machine the
+/// 18.7-vs-6.6 measurement was taken on. On one interface both halves ask for
+/// the same number, which is what `Audio::open` has claimed in its doc comment
+/// all along ("Both streams get the same one: they are two halves of one path")
+/// and what this arm quietly made false.
+///
+/// macOS only at the call site: WASAPI's `Fixed` is the TOTAL shared-mode
+/// buffer (see `BUFFER_PERIODS`), ASIO ties both sides to one driver setting,
+/// and small ALSA periods overrun — those never had a quarter to lose.
+pub fn input_ask_frames(path_frames: Option<u32>, separate_device: bool) -> u32 {
+    let want = path_frames.unwrap_or(INPUT_DEFAULT_FRAMES).max(1);
+    if separate_device {
+        (want / 4).max(64)
+    } else {
+        want
+    }
+}
+
 /// Open an input device and start it.
 ///
 /// Per RECORDER-PLAN §3, this is called when the Recorder band *opens*, not when
@@ -3028,34 +3120,34 @@ pub fn open_input(
         }
     })?;
 
-    // **On macOS the input runs SMALLER than the output, on purpose.**
+    // **The same buffer as the output, unless the microphone is a second
+    // box.** The whole of that decision, with the measurement behind it, is
+    // in [`input_ask_frames`]; what is decided HERE is only which case this
+    // open is in, because the input's real device name exists only after
+    // `resolve` and the caller never sees it.
     //
-    // Two AudioUnits stand between the microphone and the speaker here, so
-    // the round trip pays the input buffer, the output buffer, AND whatever
-    // sits in the monitor ring between them — a duplex host like Live pays
-    // two buffers, which is the whole of the tester's 18.7 ms vs 6.6 ms.
-    // The one term this side can shrink is the INPUT: its callback only
-    // copies into a ring — no DSP — so it runs at a QUARTER of the chosen
-    // buffer (floor 64, clamped to what the device will admit to) without
-    // earning dropouts, and the ring's in-flight allowance shrinks with it
-    // (`in_block` follows this very value). The un-picked case used to open
-    // at `BufferSize::Default` — 512 on Sonoma, and counted as 1024 by the
-    // in-flight math — which is why "no choice" was the worst choice.
-    //
-    // macOS only: WASAPI's `Fixed` is the TOTAL shared-mode buffer (see
-    // BUFFER_PERIODS) and ASIO ties both sides to one driver setting, and
-    // small ALSA periods overrun — those keep the symmetric mapping below.
+    // Against `duplex_with` — the ENGINE's own output device — rather than
+    // the ASIO-filtered `duplex` above: the object-sharing question and the
+    // one-buffer question have different answers on macOS, where cpal shares
+    // no object and the device shares the property anyway. The un-picked case
+    // still asks for a number (see [`INPUT_DEFAULT_FRAMES`]) rather than
+    // `BufferSize::Default`, which was 512 on Sonoma and counted as 1024 by
+    // the in-flight math — the reason "no choice" used to be the worst
+    // choice.
     #[cfg(target_os = "macos")]
     let buffer_size = {
-        const INPUT_DEFAULT_FRAMES: u32 = 256;
-        let quarter = (wish.buffer_frames.unwrap_or(INPUT_DEFAULT_FRAMES) / 4).max(64);
+        let out_name = duplex_with.and_then(|d| d.name().ok());
+        let ask = input_ask_frames(
+            wish.buffer_frames,
+            is_second_device(&device_name, out_name.as_deref()),
+        );
         match chosen.buffer_size() {
             cpal::SupportedBufferSize::Range { min, max } => {
-                BufferSize::Fixed(quarter.clamp(*min, (*max).max(*min)))
+                BufferSize::Fixed(ask.clamp(*min, (*max).max(*min)))
             }
-            // A device that will not even name a range: the quarter wish,
-            // unclamped, beats gambling on a 512-frame Default.
-            cpal::SupportedBufferSize::Unknown => BufferSize::Fixed(quarter),
+            // A device that will not even name a range: the ask, unclamped,
+            // beats gambling on a 512-frame Default.
+            cpal::SupportedBufferSize::Unknown => BufferSize::Fixed(ask),
         }
     };
     #[cfg(not(target_os = "macos"))]
@@ -3106,11 +3198,11 @@ pub fn open_input(
         None if system().as_deref() == Some("ASIO") => BufferSize::Default,
         None => {
             // The same number the output asks for with no choice made, so the
-            // two directions of "Device" mean one thing. Kept here rather than
-            // imported because `WANT_BUFFER_FRAMES` lives in the binary crate
-            // and this is a library — the macOS arm above duplicates it for the
-            // same reason, and the pair must move together.
-            const INPUT_DEFAULT_FRAMES: u32 = 256;
+            // two directions of "Device" mean one thing. See
+            // [`INPUT_DEFAULT_FRAMES`], which the macOS arm above now reaches
+            // through [`input_ask_frames`] — it used to be declared twice,
+            // once per side of the `cfg`, and two declarations of one number
+            // are two places to change it.
             match chosen.buffer_size() {
                 cpal::SupportedBufferSize::Range { min, max } if *min <= *max => {
                     BufferSize::Fixed(INPUT_DEFAULT_FRAMES.clamp(*min, *max))
