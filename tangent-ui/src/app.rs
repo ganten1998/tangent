@@ -1598,6 +1598,56 @@ pub struct TangentApp {
     gesture_until: Option<Instant>,
     /// How many `InnerSize` commands have gone out. Probe only.
     inner_size_sends: u64,
+    /// **The window standing over the amp face: one pedal's own editor.**
+    /// Appended at the END, this struct's law. Session state; nothing here
+    /// is serialised, because a window that reopened itself on launch is a
+    /// window nobody asked for.
+    ///
+    /// See [`PedalStack`] for the invariant that makes a second dialog slot
+    /// safe in an app that writes the first one in seventy places.
+    pedal_stack: Option<PedalStack>,
+}
+
+/// **One pedal's window, and the amp face it is standing on.**
+///
+/// The stack is TWO facts and not one, and that is the whole safety
+/// argument. `self.dialog` is assigned in seventy places in this file — a
+/// picker landing, a menu row, a key, a device change, the export road — and
+/// every one of them is free to replace the amp face without knowing this
+/// window exists. If the stack were a lone `Option<Dialog>`, any of those
+/// would leave a pedal window floating over a dialog that has nothing to do
+/// with it: an ORPHAN, and one that goes on writing to a pedal seat whose
+/// board is no longer on screen.
+///
+/// So the stack remembers WHICH face it was opened over, and
+/// `App::settle_pedal_stack` drops it at the top of every frame unless
+/// `self.dialog` is still exactly that face. Nothing has to be audited and
+/// no writer has to be taught: an orphan is not unlikely here, it is
+/// unrepresentable for longer than the frame it was created in. Closing the
+/// amp therefore takes its pedal with it, and closing the pedal leaves the
+/// amp standing — by construction, rather than by a `becomes` trail somebody
+/// has to keep in step.
+///
+/// `over` is in the terms `Dialog::InsertFace` carries, which for every seat
+/// but the master is the seat itself; it is compared, never dereferenced, so
+/// the ambiguity `Dialog::InsertFace`'s own doc records cannot bite here.
+struct PedalStack {
+    /// The `(strip, slot)` of the amp face this window was opened over.
+    over: (usize, usize),
+    /// The pedal SEAT the window is about — what the picker's landing reads
+    /// to know it is filling a board and not a bay, so the chosen unit's
+    /// face opens HERE rather than in the desk's one dialog slot.
+    ///
+    /// It is deliberately not remapped by a channel reorder: `reorder_channels`
+    /// closes this window instead, and the argument for that is written where
+    /// it happens.
+    seat: usize,
+    /// The window itself.
+    ///
+    /// An `Option` only because `dialogs::show_stacked` empties the slot it
+    /// is handed to say the window closed; between frames it is always
+    /// `Some`, and the frame tail drops the whole stack when it is not.
+    dialog: Option<Dialog>,
 }
 
 /// Pixels of wheel intent, spent in whole STEPS - the arrange lane
@@ -3155,6 +3205,7 @@ impl TangentApp {
             snap_refusals: 0,
             gesture_until: None,
             inner_size_sends: 0,
+            pedal_stack: None,
         };
         // The panels draw from the rendered labels, so a session that loads
         // with routes has to arrive with them already rendered — otherwise
@@ -8996,6 +9047,27 @@ impl TangentApp {
                 *strip = crate::recorder::amp_pedal_seat(inv[ch], p);
             }
         }
+        // **And the OPEN pedal window goes DOWN**, rather than being carried.
+        //
+        // Remapping its seat is the move that looks right and is worse than
+        // doing nothing. The window it is standing on is an open
+        // `Dialog::InsertFace`, and this function does not remap THAT — the
+        // face goes on naming desk row 0's bay 0 whoever is in row 0 now,
+        // which is a pre-existing rough edge and not this lane's to smooth.
+        // Move only the pedal and the two windows stop describing the same
+        // strip: the amp shows whatever landed in that row while the pedal
+        // above it shows the board of the track that left, with no way for
+        // anybody looking at them to tell. Leaving both stale keeps them in
+        // agreement but leaves `picker_insert` — which IS remapped, three
+        // lines up — aimed at a seat the stack no longer claims, so a pick
+        // made across a reorder would land its face in the desk's slot and
+        // put the amp away.
+        //
+        // Closing it is the one answer with no disagreement in it. A reorder
+        // moves the ground under both windows; the second one is the one
+        // that can be put down cheaply, and a window that vanishes when you
+        // drag a track is a thing a person can see and understand.
+        self.pedal_stack = None;
 
         // ── everything else keyed by CHANNEL ─────────────────────────────
         //
@@ -20243,11 +20315,35 @@ impl TangentApp {
         if self.overlay_owns_pointer(ctx) {
             return true;
         }
+        // **A question raised BY the stacked window is still a question.**
+        //
+        // The pedal window is an ordinary plugin window and leaves the desk
+        // live, like the amp under it — but it has one road to a modal, the
+        // IR panel's delete confirmation, which `dialogs::show` hands into
+        // the same slot through `becomes`. Read only off `self.dialog`, that
+        // confirmation would dim the desk and swallow presses at egui's hit
+        // test while every handler that reads `i.pointer` straight off the
+        // input went on operating the mixer through the scrim. Obscure — it
+        // takes an impulse loader in a pedal seat to reach — and one line to
+        // make impossible rather than merely unlikely.
+        //
+        // It also cannot collide on the surface ladder: a stacked modal
+        // stands at `SurfaceTier::Asking` and the window underneath is
+        // always an `InsertFace`, which is never modal, so `shell::surface`'s
+        // two-on-one-rung assert has nothing to fire about.
+        if self.stacked_dialog().is_some_and(Dialog::is_modal) {
+            return true;
+        }
         match &self.dialog {
             None => false,
             Some(d) if d.is_modal() => true,
             Some(_) => dialogs::pointer_over_dialog(ctx),
         }
+    }
+
+    /// The window standing over the amp face, when one is.
+    fn stacked_dialog(&self) -> Option<&Dialog> {
+        self.pedal_stack.as_ref().and_then(|st| st.dialog.as_ref())
     }
 
     /// Whether one of the two TRANSIENT layers over the desk owns the pointer
@@ -20354,6 +20450,15 @@ impl TangentApp {
     /// is not, which is also what the OS delivers, made explicit so the
     /// theme key can never cycle twice.
     fn dialog_blocks_keys(&self, ctx: &egui::Context) -> bool {
+        // A question raised by the stacked window, for
+        // `dialog_blocks_pointer`'s reason. Everything else about the stack
+        // is already covered here: it only ever stands over an open
+        // `InsertFace`, so `self.dialog` is `Some` whenever it is up and the
+        // non-modal arm below is already answering for both windows —
+        // `dialog_drawn_inline` asks about the pair.
+        if self.stacked_dialog().is_some_and(Dialog::is_modal) {
+            return true;
+        }
         match &self.dialog {
             None => false,
             Some(d) if d.is_modal() => true,
@@ -21300,16 +21405,61 @@ impl TangentApp {
     }
 
     pub fn open_insert_face(&mut self, strip: usize, bay: usize) {
+        // The desk's latched pair, which is the right keyboard for every
+        // caller here: a press on a rack bay happens in the MAIN window.
+        // The amp's pedal chips are the one gesture that does not, and they
+        // come in through `bay_gesture` with their own — see
+        // `open_pedal_window`.
+        if self.bay_gesture(strip, bay, self.alt_down, self.shift_down) {
+            return;
+        }
+        match self.insert(strip, bay) {
+            Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
+            // The drumpad's face is the drumpad: pads, kit and browser in
+            // one window, same as its key opens.
+            Some(dialogs::DRUMPAD_PATH) => self.open_drumpad_for(strip),
+            // The modelled keyboard's face is its two patches.
+            Some(dialogs::KEYS_PATH) => self.open_keys_picker(strip),
+            // A suite unit's face is the kit-drawn panel.
+            Some(path) if crate::faces::suite_unit(path).is_some() => {
+                self.open_unit_face(strip, bay);
+            }
+            Some(_) => {
+                self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(strip, bay));
+            }
+            None => self.open_insert_picker(strip, bay),
+        }
+    }
+
+    /// **What Alt and Shift mean on an insert bay, decided once.** Answers
+    /// whether the gesture was spent here, so the caller knows not to open
+    /// anything.
+    ///
+    /// Split out of [`Self::open_insert_face`] when the amp's pedal chips
+    /// needed the same two gestures, and split rather than copied for the
+    /// reason that function's own comment already makes: one door means the
+    /// gesture reaches every surface at once and no surface can disagree
+    /// with another about what it means. A chip that grew its own eraser
+    /// would drift from the rack's the first time either was touched, and
+    /// the drift would show as "Alt does something different in the amp
+    /// window", which is not a bug anybody reports as one.
+    ///
+    /// The modifiers are ARGUMENTS rather than reads of `self.alt_down`,
+    /// which is the other half of the same point: those are latched from the
+    /// MAIN window's context once a frame, and a face on the desktop is a
+    /// window with a keyboard of its own. A chip that read the latched pair
+    /// would be answering about a keyboard nobody was typing on.
+    fn bay_gesture(&mut self, strip: usize, bay: usize, alt: bool, shift: bool) -> bool {
         // **Alt+click EMPTIES the bay.** One gesture, both views (and the
         // pads' chips, which come through this same door): the loaded
         // insert leaves and the slot is free — the FX menu's Delete without
         // the menu. An empty bay under Alt does nothing at all: an eraser
         // that opened pickers would be worse than no eraser.
-        if self.alt_down {
+        if alt {
             if self.insert(strip, bay).is_some() {
                 self.set_insert(strip, bay, None);
             }
-            return;
+            return true;
         }
         // **Shift+click BYPASSES the bay**, and clicking again puts it back.
         //
@@ -21339,28 +21489,13 @@ impl TangentApp {
         // An EMPTY bay is left alone, for `alt_down`'s reason: there is
         // nothing to take out of circuit, and a bypass flag sitting on an
         // empty bay would be waiting to silence whatever lands there next.
-        if self.shift_down {
+        if shift {
             if self.insert(strip, bay).is_some() {
                 self.toggle_insert_bypass(strip, bay);
             }
-            return;
+            return true;
         }
-        match self.insert(strip, bay) {
-            Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
-            // The drumpad's face is the drumpad: pads, kit and browser in
-            // one window, same as its key opens.
-            Some(dialogs::DRUMPAD_PATH) => self.open_drumpad_for(strip),
-            // The modelled keyboard's face is its two patches.
-            Some(dialogs::KEYS_PATH) => self.open_keys_picker(strip),
-            // A suite unit's face is the kit-drawn panel.
-            Some(path) if crate::faces::suite_unit(path).is_some() => {
-                self.open_unit_face(strip, bay);
-            }
-            Some(_) => {
-                self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(strip, bay));
-            }
-            None => self.open_insert_picker(strip, bay),
-        }
+        false
     }
 
     /// Open a suite unit's face over a bay, and aim the engine's tap at it
@@ -21377,6 +21512,250 @@ impl TangentApp {
             slot,
             on: true,
         });
+    }
+
+    /// **A pedal chip's whole answer**, in the amp face's own terms.
+    ///
+    /// `over` is the face that was clicked in, `pedal` the ordinal on its
+    /// chip row, and `alt`/`shift` what THAT window's keyboard was holding.
+    ///
+    /// **Nothing here is a new addressing road, and that is worth saying
+    /// once so nobody invents one.** `recorder::seat_bay` is the IDENTITY on
+    /// a pedal seat — it is past the master and past every folder-extra seat,
+    /// so it falls through to the final arm — which means
+    /// `Dialog::InsertFace { strip: amp_pedal_seat(ch, p), slot: 0 }` and
+    /// every action it can raise (`SetInsertParam`, `FaceSavePreset`,
+    /// `SetInsertIr`, `SetInsertBypass`, `OpenInsertEditor`) already resolve
+    /// to the right rack with no translation at all. The stack is a WINDOW
+    /// problem, not a routing one.
+    ///
+    /// The five arms are the bay's five, because a pedal seat is an ordinary
+    /// rack: alt empties, shift bypasses, an empty seat offers the picker, a
+    /// suite unit gets its kit-drawn face, and a bundle gets its OWN native
+    /// window — which needs no slot of ours at all, and so is the one arm
+    /// that leaves both of these windows exactly where they are.
+    ///
+    /// The three INSTRUMENT sentinels are deliberately not among them. A
+    /// drumpad or a modelled keyboard in a pedal seat is already silent —
+    /// the engine renders built-in instruments in `mix_channels`, never in a
+    /// rack — and both of those "faces" are whole panels the app draws in
+    /// its own way, not something that can stand in a small stacked window.
+    /// So they fall through to the picker, which is the honest offer: the
+    /// only useful thing to do with one is to replace it.
+    fn open_pedal_window(
+        &mut self,
+        over: (usize, usize),
+        ch: usize,
+        pedal: usize,
+        alt: bool,
+        shift: bool,
+    ) {
+        if pedal >= recorder::AMP_PEDALS || ch >= recorder::CHANNELS {
+            return;
+        }
+        let seat = recorder::amp_pedal_seat(ch, pedal);
+        // The rack's own two gestures, through the rack's own function.
+        if self.bay_gesture(seat, 0, alt, shift) {
+            return;
+        }
+        let dialog = match self.insert(seat, 0) {
+            Some(path) if crate::faces::suite_unit(path).is_some() => {
+                self.request_recorder(recorder::RecorderRequest::SetInsertTap {
+                    strip: seat,
+                    slot: 0,
+                    on: true,
+                });
+                Some(dialogs::Dialog::InsertFace {
+                    strip: seat,
+                    slot: 0,
+                    live: Box::default(),
+                })
+            }
+            // A bundle's editor is the plugin's own window, made by the
+            // host. It floats on its own and owes nothing to either of
+            // ours, so the stack is left alone rather than opened empty.
+            Some(p)
+                if p != dialogs::BUILTIN_PATH
+                    && p != dialogs::DRUMPAD_PATH
+                    && p != dialogs::KEYS_PATH =>
+            {
+                self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(seat, 0));
+                None
+            }
+            _ => self.build_insert_picker(seat, 0),
+        };
+        if let Some(dialog) = dialog {
+            self.pedal_stack = Some(PedalStack {
+                over,
+                seat,
+                dialog: Some(dialog),
+            });
+        }
+    }
+
+    /// Whether the stacked window is open over a pedal of the board `seat`
+    /// belongs to — the question the picker's landing asks before it decides
+    /// which slot the new tenant's face belongs in.
+    ///
+    /// Structural rather than a mode flag: it reads the seat that is being
+    /// filled and the stack that is standing, and both of those are facts on
+    /// the app. A `while I am applying the stacked window's action` flag
+    /// would have been the other option and it is the kind of state that
+    /// survives one early return and then lies for the rest of the frame.
+    fn pedal_stack_covers(&self, seat: usize) -> bool {
+        self.pedal_stack.as_ref().is_some_and(|st| st.seat == seat)
+    }
+
+    /// The stacked slot's `open_unit_face`: the same pairing of a panel with
+    /// an armed tap, written into the window standing over the amp.
+    ///
+    /// Only ever reached with the stack already up over this very seat (see
+    /// [`Self::pedal_stack_covers`]), so it replaces the picker that was in
+    /// it rather than creating a stack out of nothing — which is what keeps
+    /// `over` pointing at the amp face it has pointed at all along.
+    fn open_stacked_unit_face(&mut self, strip: usize, slot: usize) {
+        if let Some(st) = self.pedal_stack.as_mut() {
+            st.dialog = Some(dialogs::Dialog::InsertFace {
+                strip,
+                slot,
+                live: Box::default(),
+            });
+        }
+        self.request_recorder(recorder::RecorderRequest::SetInsertTap {
+            strip,
+            slot,
+            on: true,
+        });
+    }
+
+    /// **One frame's live facts, pushed into an open insert face.**
+    ///
+    /// Takes the dialog by value and hands it back, which is not a style
+    /// choice: everything below reads the app (`builtin_face`, `insert_gr`,
+    /// `preset_rows`, the tap ring, the settings' bypass) while the face is
+    /// being written, and a `&mut self.dialog` held across those calls
+    /// borrows the whole app twice. Take-and-put-back is what the inline
+    /// version already did; this only gives it a name.
+    ///
+    /// **And a name is what it needed, because there are two faces now.**
+    /// The stacked pedal window is an `InsertFace` like any other, and every
+    /// line here is what makes one live — its knobs, its gain-reduction
+    /// needle, its preset shelf, its IR browser, its analyzer. Left inline,
+    /// the pedal's window would have drawn once and then sat frozen with an
+    /// empty preset shelf, which is the shape of bug that gets reported as
+    /// "the second window does not work" a month after it ships.
+    ///
+    /// Anything that is not a face passes straight through, so no caller has
+    /// to test first — an unconditional `take()` at the call site is what
+    /// would quietly destroy every other dialog each frame.
+    fn refreshed_face(&mut self, ctx: &egui::Context, open: Option<Dialog>) -> Option<Dialog> {
+        let Some(dialogs::Dialog::InsertFace { strip, slot, mut live }) = open else {
+            return open;
+        };
+        let (seat, bay) = recorder::seat_bay(strip, slot);
+        if let Some(f) = self.builtin_face(seat, bay) {
+            // The push is the truth; the optimistic mirror already rode
+            // it, so this is a copy, never a fight.
+            live.face = f.clone();
+        }
+        live.gr_db = self.insert_gr(seat, bay);
+        live.preset_rows = self.preset_rows(&live.face.path).to_vec();
+        if live.face.path == "@tangent-ir" {
+            // The face used to be handed the whole shelf and drew it
+            // flat. It walks folders now, so what it needs is a listing
+            // of ONE of them; the host's shelf stays where it is, as the
+            // place the durations in that listing are read from.
+            self.refresh_ir_browser(&mut live);
+        }
+        // **The amp face's pedal chips, indexed by the OWNING channel
+        // rather than by the seat the amp happens to sit in.**
+        //
+        // This used to read `seat < recorder::CHANNELS`, which is the
+        // same test spelled four times across this app and wrong in the
+        // same way each time. A FOLDER wears six bays; the last three
+        // are seated past every pad block (`folder_extra_seat`), so an
+        // amp dropped into a group's slot 4 answered that test with
+        // "no", drew "PEDALS - on channel strips only", and the owner
+        // had a pedalboard that vanished when he moved the amp one bay
+        // down. `pedal_owner` asks the question the row actually wants —
+        // whose board is this — and a folder's two racks share the one
+        // board its channel owns, which is exactly what the engine now
+        // runs at the top of the fold.
+        //
+        // The master, the buses, the pads and the pedal seats themselves
+        // still answer `None`, and the caption under the board says so.
+        live.pedals = recorder::pedal_owner(seat)
+            .filter(|_| live.face.path == crate::faces_amp::AMP_PATH)
+            .map(|ch| {
+                std::array::from_fn(|p| {
+                    self.insert(recorder::amp_pedal_seat(ch, p), 0)
+                        .map(crate::faces_amp::pedal_label)
+                        .unwrap_or_default()
+                })
+            });
+        match live.face.path.as_str() {
+            "@tangent-eq" => {
+                let dt = ctx.input(|i| i.stable_dt);
+                crate::faces::analyzer_tick(&self.tapring, &mut live.analyzer_db, dt);
+            }
+            "@tangent-imager" => {
+                let n = self.tapring.frames().min(1024);
+                live.scope.clear();
+                let mut peak = 0.0f32;
+                for i in (0..n).rev() {
+                    let [l, r] = self.tapring.stereo_back(i);
+                    peak = peak.max(l.abs()).max(r.abs());
+                    live.scope.push((l, r));
+                }
+                // Normalised into the circle with a little headroom;
+                // silence holds the last gain rather than zooming into
+                // noise.
+                if peak > 1.0e-3 {
+                    live.scope_gain = (0.9 / peak).min(30.0);
+                }
+                live.correlation = self.tapring.correlation();
+            }
+            _ => {}
+        }
+        // The bay's bypass, pushed like every other fact the face draws.
+        {
+            let (seat, bay) = crate::recorder::seat_bay(strip, slot);
+            live.bypassed = self.insert_bypassed(seat, bay);
+        }
+        // The meters breathe even when the hand is still.
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        Some(dialogs::Dialog::InsertFace { strip, slot, live })
+    }
+
+    /// **Drop the stacked window unless the face it was opened over is still
+    /// the one in the dialog slot.**
+    ///
+    /// Run at the top of every frame, before either window draws. This is
+    /// the whole of the orphan rule and it is deliberately a SWEEP rather
+    /// than a set of hooks: `self.dialog` is written in seventy places in
+    /// this file, forty-nine of them `Some` and twenty-one `None`, and
+    /// asking each of them to remember a second slot is asking for the one
+    /// that forgets. Sweeping instead means a pedal window can outlive its
+    /// amp by at most the remainder of the frame it was orphaned in, during
+    /// which nothing has drawn.
+    ///
+    /// Both halves of the owner's requirement fall out of it. Closing the
+    /// amp takes its pedal with it, because the slot no longer holds that
+    /// face. Closing the pedal leaves the amp standing, because the pedal
+    /// lives in a different field and nothing on this road touches the
+    /// first one.
+    fn settle_pedal_stack(&mut self) {
+        let over = match &self.dialog {
+            Some(dialogs::Dialog::InsertFace { strip, slot, .. }) => Some((*strip, *slot)),
+            _ => None,
+        };
+        let keep = self
+            .pedal_stack
+            .as_ref()
+            .is_some_and(|st| st.dialog.is_some() && Some(st.over) == over);
+        if !keep {
+            self.pedal_stack = None;
+        }
     }
 
     /// Whether THIS bay's editor should open now that its plugin has loaded.
@@ -23091,6 +23470,22 @@ impl TangentApp {
     /// insert and `usize::MAX` meant "the bus", which stops being expressible
     /// the moment there are thirty-nine of them.
     fn open_insert_picker(&mut self, strip: usize, slot: usize) {
+        if let Some(d) = self.build_insert_picker(strip, slot) {
+            self.dialog = Some(d);
+        }
+    }
+
+    /// The picker itself, and the bookkeeping that goes with aiming one —
+    /// `picker_insert`, which is what the landing reads, and the one-time
+    /// introduction to the house folder.
+    ///
+    /// Returns the dialog instead of hanging it, because there are two slots
+    /// to hang it in now: the desk's, and the one standing over the amp
+    /// face. Everything that decides WHAT the picker is stays here, so the
+    /// stacked door cannot end up offering a different list or forgetting to
+    /// aim `picker_insert` — which would leave a chosen plugin landing in
+    /// whatever bay the last picker was about.
+    fn build_insert_picker(&mut self, strip: usize, slot: usize) -> Option<Dialog> {
         // **Bounded by the INSERT SPACE, not by the strip count.**
         //
         // The master's second rack is seated past the drum pads — see
@@ -23106,7 +23501,7 @@ impl TangentApp {
             || slot >= recorder::INSERTS
             || strip * recorder::INSERTS + slot >= recorder::INSERT_SPACE
         {
-            return;
+            return None;
         }
         self.picker_insert = Some((strip, slot));
         // The house folder opens itself exactly once — the first picker a
@@ -23117,11 +23512,11 @@ impl TangentApp {
             self.settings.labs_folder_seen = true;
             self.save_settings_soon();
         }
-        self.dialog = Some(Dialog::plugin_picker(
+        Some(Dialog::plugin_picker(
             &self.plugin_list,
             self.insert(strip, slot).map(str::to_owned),
             first_visit,
-        ));
+        ))
     }
 
     fn open_export_dialog(&mut self) {
@@ -24828,17 +25223,32 @@ impl TangentApp {
                 // Unlike the routing dialog there is nothing else to add.
                 self.dialog = None;
             }
+            DialogAction::OpenPedalFace { strip, slot, pedal, alt, shift } => {
+                // The face speaks DESK terms and the board belongs to the
+                // OWNING channel, which for a group's bays 3..5 is not the
+                // seat the amp sits in. Resolve both before anything is
+                // opened; a stale ask from a strip with no board goes
+                // nowhere rather than somewhere wrong.
+                let (seat, _) = recorder::seat_bay(strip, slot);
+                if let Some(ch) = recorder::pedal_owner(seat) {
+                    self.open_pedal_window((strip, slot), ch, pedal, alt, shift);
+                }
+            }
             DialogAction::OpenPedalPicker { strip, slot, pedal } => {
-                // The face speaks DESK terms; the pedal seat is the
-                // CHANNEL's, so resolve the seat first — an amp on the
-                // master or a folder's extra rack has no board and the chip
-                // row never drew, but a stale ask must still go nowhere.
+                // The face speaks DESK terms; the pedal seat is the OWNING
+                // CHANNEL's, so resolve the seat and then ask whose board it
+                // is — an amp on the master or a bus has none and the chip
+                // row never drew, but a stale ask must still go nowhere. A
+                // FOLDER's extra rack does have one, its channel's, which is
+                // why this is `pedal_owner` and no longer `seat < CHANNELS`.
                 // No new addressing road: `picker_insert` has always
                 // carried raw SEATS (its callers pass `seat_bay` output),
                 // so a pedal seat rides the existing picker unchanged.
                 let (seat, _) = recorder::seat_bay(strip, slot);
-                if seat < recorder::CHANNELS && pedal < recorder::AMP_PEDALS {
-                    self.open_insert_picker(recorder::amp_pedal_seat(seat, pedal), 0);
+                if let Some(ch) = recorder::pedal_owner(seat).filter(|_| {
+                    pedal < recorder::AMP_PEDALS
+                }) {
+                    self.open_insert_picker(recorder::amp_pedal_seat(ch, pedal), 0);
                 }
             }
             // ── the IR wizard ────────────────────────────────────────────
@@ -25360,7 +25770,20 @@ impl TangentApp {
                         // to wait for and no reason to make the hand knock
                         // twice.
                         Some(p) if crate::faces::suite_unit(p).is_some() => {
-                            self.open_unit_face(strip, at);
+                            // **Back into the window the picker was in.**
+                            // A pedal chose from the STACKED picker, so its
+                            // face belongs in the stacked slot — landing it
+                            // in the desk's would put the amp away to show
+                            // the pedal that was just chosen for it, which
+                            // is precisely the swap this feature exists to
+                            // avoid. Asked of the SEAT rather than of a
+                            // "which picker was that" flag: the seat is a
+                            // fact and the flag would be a mode.
+                            if self.pedal_stack_covers(strip) {
+                                self.open_stacked_unit_face(strip, at);
+                            } else {
+                                self.open_unit_face(strip, at);
+                            }
                         }
                         Some(_) => self.open_insert_on_load = Some((strip, at)),
                         None => {}
@@ -29545,6 +29968,9 @@ impl TangentApp {
             raise: std::mem::take(&mut self.raise_dialog),
             // `dialogs::show` fills this from the dialog's own kind.
             chrome: None,
+            // The desk's own dialog surface. `dialogs::show_stacked` stamps
+            // its own; nothing here has to know either id.
+            surface: None,
             // The rect the layout was actually DRAWN into, which is centred in
             // the pane and is not the same as one anchored at its corner. With
             // a band turned off, the two differ by half the slack and dialogs
@@ -29573,12 +29999,42 @@ impl TangentApp {
             },
             monitor: self.surface_frame().1,
         };
+        // **The orphan rule, before anything is refreshed or drawn.** See
+        // [`Self::settle_pedal_stack`]: the pedal window survives only while
+        // the amp face it was opened over is still in the dialog slot, so
+        // any of the seventy writers of `self.dialog` takes it down without
+        // having to know it exists.
+        self.settle_pedal_stack();
         // **The suite faces are LIVE.** Refresh the open one's picture from
         // the pushed data and the tap ring before it draws; land a loaded
         // preset on it as a run of ordinary knob asks; and remember which
         // bay it watched, so closing it can take the tap down.
         if let Some(loaded) = self.take_preset_loaded() {
-            if let Some(dialogs::Dialog::InsertFace { strip, slot, .. }) = self.dialog {
+            // **The preset lands on the face that ASKED**, which with two
+            // faces open is a question worth answering out loud. The file
+            // names the unit it belongs to, and the pedal's window is the
+            // one being worked in while it is up — so it gets first refusal
+            // and only a file that is not its unit falls through to the amp
+            // underneath. Without this, loading a preset into a pedal would
+            // have turned the amp's own knobs.
+            let asked = self
+                .pedal_stack
+                .as_ref()
+                .and_then(|st| match &st.dialog {
+                    Some(dialogs::Dialog::InsertFace { strip, slot, live })
+                        if live.face.path == loaded.unit =>
+                    {
+                        Some((*strip, *slot))
+                    }
+                    _ => None,
+                })
+                .or(match self.dialog {
+                    Some(dialogs::Dialog::InsertFace { strip, slot, .. }) => {
+                        Some((strip, slot))
+                    }
+                    _ => None,
+                });
+            if let Some((strip, slot)) = asked {
                 let (seat, bay) = recorder::seat_bay(strip, slot);
                 let asks: Vec<(u32, f32)> = self
                     .builtin_face(seat, bay)
@@ -29613,76 +30069,41 @@ impl TangentApp {
             state.live = self.ir_live.clone();
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
-        // Take-and-put-back ONLY when it is a face: an unconditional
-        // `take()` here would quietly destroy every other dialog each frame.
-        let is_face = matches!(self.dialog, Some(dialogs::Dialog::InsertFace { .. }));
-        if is_face {
-            let Some(dialogs::Dialog::InsertFace { strip, slot, mut live }) =
-                self.dialog.take()
-            else {
-                unreachable!("matched a face one line up");
-            };
-            let (seat, bay) = recorder::seat_bay(strip, slot);
-            if let Some(f) = self.builtin_face(seat, bay) {
-                // The push is the truth; the optimistic mirror already rode
-                // it, so this is a copy, never a fight.
-                live.face = f.clone();
-            }
-            live.gr_db = self.insert_gr(seat, bay);
-            live.preset_rows = self.preset_rows(&live.face.path).to_vec();
-            if live.face.path == "@tangent-ir" {
-                // The face used to be handed the whole shelf and drew it
-                // flat. It walks folders now, so what it needs is a listing
-                // of ONE of them; the host's shelf stays where it is, as the
-                // place the durations in that listing are read from.
-                self.refresh_ir_browser(&mut live);
-            }
-            // The amp face's pedal chips, refreshed from settings like the
-            // rest of the picture — and only for a CHANNEL's seat: the
-            // master, the buses and a folder's extra rack wear no board.
-            live.pedals = (live.face.path == crate::faces_amp::AMP_PATH
-                && seat < recorder::CHANNELS)
-                .then(|| {
-                    std::array::from_fn(|p| {
-                        self.insert(recorder::amp_pedal_seat(seat, p), 0)
-                            .map(crate::faces_amp::pedal_label)
-                            .unwrap_or_default()
-                    })
-                });
-            match live.face.path.as_str() {
-                "@tangent-eq" => {
-                    let dt = ctx.input(|i| i.stable_dt);
-                    crate::faces::analyzer_tick(&self.tapring, &mut live.analyzer_db, dt);
-                }
-                "@tangent-imager" => {
-                    let n = self.tapring.frames().min(1024);
-                    live.scope.clear();
-                    let mut peak = 0.0f32;
-                    for i in (0..n).rev() {
-                        let [l, r] = self.tapring.stereo_back(i);
-                        peak = peak.max(l.abs()).max(r.abs());
-                        live.scope.push((l, r));
-                    }
-                    // Normalised into the circle with a little headroom;
-                    // silence holds the last gain rather than zooming into
-                    // noise.
-                    if peak > 1.0e-3 {
-                        live.scope_gain = (0.9 / peak).min(30.0);
-                    }
-                    live.correlation = self.tapring.correlation();
-                }
-                _ => {}
-            }
-            // The bay's bypass, pushed like every other fact the face draws.
-            {
-                let (seat, bay) = crate::recorder::seat_bay(strip, slot);
-                live.bypassed = self.insert_bypassed(seat, bay);
-            }
-            self.dialog = Some(dialogs::Dialog::InsertFace { strip, slot, live });
-            // The meters breathe even when the hand is still.
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        // **The suite faces are LIVE**, and there may be two of them: the
+        // one in the dialog slot, and the pedal's window standing over it.
+        // Both go through the one refresh — see [`Self::refreshed_face`].
+        let open = self.dialog.take();
+        self.dialog = self.refreshed_face(&ctx, open);
+        if let Some(mut st) = self.pedal_stack.take() {
+            st.dialog = self.refreshed_face(&ctx, st.dialog);
+            self.pedal_stack = Some(st);
         }
 
+        // **The top window owns Escape, and inline it has to TAKE it.**
+        //
+        // On the desktop these are two OS windows with two keyboards and
+        // whichever is focused hears the key — nothing to arrange. Inline
+        // they are two `Area`s over one input, `shell::surface` turns
+        // Escape into a close for every surface that reads it, and both
+        // would read the same press: one key, both windows gone, with the
+        // amp taken down by a gesture aimed at the pedal standing on it.
+        //
+        // So the key is consumed here, before the desk's window is shown,
+        // and spent on the stacked one afterwards. Consuming is the lever
+        // that exists: `key_pressed` removes nothing, and the two surfaces
+        // are drawn by one function that cannot be told which is on top.
+        let esc_for_stack = self.pedal_stack.is_some()
+            && dialogs::dialog_drawn_inline(&ctx)
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        // Which bay the STACKED face is watching, read before it draws, for
+        // the same reason `face_watch` is: closing it has to take its tap
+        // down and hand the amp's back.
+        let stack_watch = match self.pedal_stack.as_ref().map(|st| &st.dialog) {
+            Some(Some(dialogs::Dialog::InsertFace { strip, slot, .. })) => {
+                Some((*strip, *slot))
+            }
+            _ => None,
+        };
         if let Some(action) =
             {
                 // Read BEFORE the dialog is borrowed mutably.
@@ -29705,6 +30126,74 @@ impl TangentApp {
                 ctx.request_repaint();
             }
             self.apply_dialog_action(action);
+        }
+        // **The pedal's window, over the amp's.**
+        //
+        // Drawn AFTER the desk's dialog in both worlds: inline, two `Area`s
+        // in one `Order` stack in the order they are drawn, so later is on
+        // top; on the desktop it is a viewport of its own. Both are
+        // `SurfaceTier::Ordinary` and neither is modal, which is what leaves
+        // the desk live underneath — the owner's second requirement, that a
+        // knob you can SEE is a knob you can turn, is a property of there
+        // being no scrim rather than of anything arranged here.
+        if let Some(mut st) = self.pedal_stack.take() {
+            let face = self.panel_face();
+            let action = dialogs::show_stacked(&ctx, &mut st.dialog, face, placement);
+            if esc_for_stack {
+                st.dialog = None;
+            }
+            // **Put the stack back BEFORE the action lands.** An action from
+            // this window can refill its own slot — the picker's pick is
+            // exactly that, opening the chosen unit's face where the picker
+            // was — and `pedal_stack_covers` has to be able to answer while
+            // that happens. A window that closed and left the slot empty is
+            // dropped a few lines down, once everything it had to say has
+            // been said.
+            self.pedal_stack = Some(st);
+            if let Some(action) = action {
+                if matches!(action, DialogAction::CycleTheme) {
+                    ctx.request_repaint();
+                }
+                // A stacked window that reaches for `self.dialog` — the IR
+                // wizard is the one road that does — replaces the amp face
+                // underneath, and the sweep at the top of the next frame
+                // takes this window down with it. That is a SWAP and not an
+                // orphan: it is the honest outcome for a road that was never
+                // going to fit in a stacked pane, and it cannot leave a
+                // window standing over a dialog it has nothing to do with.
+                self.apply_dialog_action(action);
+            }
+            if self.pedal_stack.as_ref().is_some_and(|st| st.dialog.is_none()) {
+                self.pedal_stack = None;
+            }
+        }
+        // **The tap follows the window being worked in.** One tap, two
+        // faces: `open_pedal_window` points it at the pedal when its window
+        // opens, and when that window closes the amp underneath is still up
+        // and wants it back. Without the hand-back the analyzer, the
+        // goniometer and the preset shelf would go on answering for a bay
+        // whose window is gone.
+        if let Some((strip, slot)) = stack_watch {
+            let still = match self.pedal_stack.as_ref().map(|st| &st.dialog) {
+                Some(Some(dialogs::Dialog::InsertFace { strip, slot, .. })) => {
+                    Some((*strip, *slot))
+                }
+                _ => None,
+            };
+            if still != Some((strip, slot)) {
+                self.request_recorder(recorder::RecorderRequest::SetInsertTap {
+                    strip,
+                    slot,
+                    on: false,
+                });
+                if let Some(dialogs::Dialog::InsertFace { strip, slot, .. }) = self.dialog {
+                    self.request_recorder(recorder::RecorderRequest::SetInsertTap {
+                        strip,
+                        slot,
+                        on: true,
+                    });
+                }
+            }
         }
         // The face closed this frame: take the tap down with it.
         if let Some((strip, slot)) = face_watch {
@@ -41975,6 +42464,681 @@ mod tests {
             "the face did not open"
         );
         (ctx, app)
+    }
+
+    /// The amp seated in one rack bay with its face open over it, and one
+    /// pedal loaded on channel `board_ch`'s board, so the caller can read
+    /// what the chip row was handed.
+    ///
+    /// Five tracks and channel 1 folded, because the interesting seat only
+    /// exists on a folder: a group wears six bays and its last three live in
+    /// `folder_extra_seat`.
+    fn app_with_an_amp_face(seat: usize, bay: usize) -> (egui::Context, TangentApp) {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        for n in 0..5 {
+            app.add_bare_track(n);
+        }
+        app.toggle_folder(1);
+        app.set_insert(seat, bay, Some(crate::faces_amp::AMP_PATH));
+        app.set_builtin_face(crate::ports::BuiltinFace {
+            strip: seat,
+            slot: bay,
+            path: crate::faces_amp::AMP_PATH.to_owned(),
+            params: Vec::new(),
+            curve_db: Vec::new(),
+            extra: Vec::new(),
+        });
+        // One recognisable tenant on channel 1's board, and another on
+        // channel 2's, so a face that read the WRONG channel's board would
+        // draw a name rather than an empty chip and be caught saying so.
+        app.set_insert(recorder::amp_pedal_seat(1, 3), 0, Some("/x/Fuzz.vst3"));
+        app.set_insert(recorder::amp_pedal_seat(2, 3), 0, Some("/x/Flanger.vst3"));
+        app.mixer_open = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        app.open_insert_face(seat, bay);
+        pointer_frame(&ctx, &mut app, Vec::new());
+        (ctx, app)
+    }
+
+    /// What the amp face's chip row was handed this frame, or `None` when
+    /// the panel is drawing its "no board here" caption instead.
+    fn board_on_the_face(app: &TangentApp) -> Option<[String; recorder::AMP_PEDALS]> {
+        match &app.dialog {
+            Some(dialogs::Dialog::InsertFace { live, .. }) => live.pedals.clone(),
+            other => panic!("no amp face is open: {}", other.is_some()),
+        }
+    }
+
+    /// **A GROUP's amp wears the group's pedalboard — from either of its
+    /// two racks.**
+    ///
+    /// This is the owner's "pedals must work on folder tracks", asserted
+    /// where the fault actually was. The panel's "on channel strips only"
+    /// caption was never a gate; the gate was `seat < recorder::CHANNELS` on
+    /// the seat the face is open over, and a folder's slots 3..5 are bays of
+    /// `folder_extra_seat`, which is past every channel index and past every
+    /// drum pad. So an amp in a group's bay 0 drew a board and an amp in the
+    /// same group's bay 3 drew a caption — one plugin, one strip, two
+    /// answers, and no rule anybody could have guessed.
+    ///
+    /// The row must also name the OWNING channel's tenants, which is the
+    /// half a looser assertion would miss: `amp_pedal_seat` takes a channel,
+    /// and handing it the raw seat would index far past the board space and
+    /// come back empty, or — worse, on a smaller seat map — land on somebody
+    /// else's board. Channel 2 wears a differently named pedal in the same
+    /// position for exactly that reason.
+    ///
+    /// Reverting the gate to `seat < recorder::CHANNELS` makes the folder's
+    /// second-rack case red while the first-rack case stays green.
+    #[test]
+    fn the_amp_face_on_a_group_wears_the_groups_board() {
+        // A plain track: unchanged, and the control for everything below.
+        let (_ctx, app) = app_with_an_amp_face(3, 0);
+        assert_eq!(
+            board_on_the_face(&app),
+            Some(std::array::from_fn(|_| String::new())),
+            "a bare track's board came back dressed"
+        );
+
+        // The group's FIRST rack — bays 0..2, its own seat.
+        let (_ctx, app) = app_with_an_amp_face(1, 0);
+        let board = board_on_the_face(&app).expect("a group's first rack drew no board");
+        assert_eq!(board[3], "Fuzz", "the group's own board was not the one drawn");
+
+        // The group's SECOND rack — slot 4, which is bay 1 of
+        // `folder_extra_seat(1)`. Same board, because a channel owns one.
+        let (_ctx, app) = app_with_an_amp_face(recorder::folder_extra_seat(1), 1);
+        let board = board_on_the_face(&app)
+            .expect("an amp in a group's bays 3..5 still drew no board");
+        assert_eq!(
+            board[3], "Fuzz",
+            "the group's second rack wore somebody else's board"
+        );
+        assert!(
+            board.iter().enumerate().all(|(p, t)| p == 3 || t.is_empty()),
+            "the board came back with tenants nobody loaded: {board:?}"
+        );
+
+        // And everything with no board of its own still says so: the master
+        // wears none, in either of ITS two racks.
+        for bay in [0usize, 1] {
+            let (_ctx, app) = app_with_an_amp_face(recorder::MASTER_SEAT, bay);
+            assert_eq!(
+                board_on_the_face(&app),
+                None,
+                "the master's bay {bay} grew a pedalboard"
+            );
+        }
+        let (_ctx, app) = app_with_an_amp_face(recorder::MASTER_EXTRA_SEAT, 0);
+        assert_eq!(
+            board_on_the_face(&app),
+            None,
+            "the master's extra rack grew a pedalboard"
+        );
+    }
+
+    // ── the pedal window standing on the amp ────────────────────────────
+
+    /// **The shape this feature has to be tested in: ONE canvas.**
+    ///
+    /// `child_windows: false` is a plugin editor, where both plugin windows
+    /// are `Area`s over the desk and a test can press either of them and the
+    /// desk between them. `capture_devices` stays on because the picker — an
+    /// empty chip's whole answer — is gated on it. On the desktop these are
+    /// two OS viewports, which a headless context never presents, so the
+    /// inline path is not a lesser version of the test: it is the only one
+    /// there is, and it is the build where the two windows and the desk
+    /// genuinely share a pointer and a keyboard.
+    fn a_desk_with_an_amp_face() -> (egui::Context, TangentApp) {
+        let caps = Caps { child_windows: false, ..Caps::DESKTOP };
+        let (ctx, mut app) = headless(caps);
+        app.set_insert(0, 0, Some(crate::faces_amp::AMP_PATH));
+        app.set_builtin_face(crate::ports::BuiltinFace {
+            strip: 0,
+            slot: 0,
+            path: crate::faces_amp::AMP_PATH.to_owned(),
+            params: Vec::new(),
+            curve_db: Vec::new(),
+            extra: Vec::new(),
+        });
+        // Pedal 2 dressed, so its chip wears a word a test can find. A suite
+        // unit rather than a bundle: a bundle's editor is the host's own
+        // window and opens no slot of ours at all.
+        app.set_insert(recorder::amp_pedal_seat(0, 2), 0, Some("@tangent-drive"));
+        app.mixer_open = true;
+        app.open_insert_face(0, 0);
+        for _ in 0..3 {
+            pointer_frame(&ctx, &mut app, Vec::new());
+        }
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::InsertFace { .. })),
+            "the amp face did not open"
+        );
+        (ctx, app)
+    }
+
+    /// One frame with these events and this keyboard, and every word it
+    /// painted. Words rather than coordinates, for the reason the dialog
+    /// harness gives: the amp panel's layout is derived from the room it is
+    /// given, and a test that re-derived a rectangle would be a copy of the
+    /// thing under test.
+    fn frame_words(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+        mods: egui::Modifiers,
+        events: Vec<egui::Event>,
+    ) -> Vec<(Rect, String)> {
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                modifiers: mods,
+                events,
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        let mut words = Vec::new();
+        fn walk(shape: &egui::epaint::Shape, words: &mut Vec<(Rect, String)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => words.push((
+                    Rect::from_min_size(t.pos, t.galley.rect.size()),
+                    t.galley.text().to_owned(),
+                )),
+                egui::epaint::Shape::Vec(v) => {
+                    for sh in v {
+                        walk(sh, words);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            walk(&c.shape, &mut words);
+        }
+        words
+    }
+
+    /// Where the word is on screen, or a panic naming everything that IS —
+    /// the failure worth having, since a test that pressed nothing passes.
+    fn word_at(ctx: &egui::Context, app: &mut TangentApp, word: &str) -> Pos2 {
+        let words = frame_words(ctx, app, egui::Modifiers::NONE, Vec::new());
+        words
+            .iter()
+            .find(|(_, s)| s == word)
+            .unwrap_or_else(|| {
+                panic!(
+                    "nothing on screen says {word:?}; it says {:?}",
+                    words.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>()
+                )
+            })
+            .0
+            .center()
+    }
+
+    /// A whole press on the word, with `mods` held throughout — the way
+    /// `click_with` does it for the desk, here for a word inside a window.
+    fn click_word(ctx: &egui::Context, app: &mut TangentApp, word: &str, mods: egui::Modifiers) {
+        let at = word_at(ctx, app, word);
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: mods,
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![button(true)],
+            vec![button(false)],
+        ] {
+            let _ = frame_words(ctx, app, mods, events);
+        }
+        // One more, so a window the answer opened has drawn before it is read.
+        let _ = frame_words(ctx, app, mods, Vec::new());
+    }
+
+    /// The seat and bay the stacked window is about, if one is standing.
+    fn stacked_face(app: &TangentApp) -> Option<(usize, usize)> {
+        match app.pedal_stack.as_ref().map(|st| &st.dialog) {
+            Some(Some(dialogs::Dialog::InsertFace { strip, slot, .. })) => Some((*strip, *slot)),
+            _ => None,
+        }
+    }
+
+    /// **A pedal's window opens ABOVE the amp's, and the amp stays open.**
+    ///
+    /// The owner's ask, and the thing the one-dialog-slot architecture made
+    /// hard: `dialogs::show` is a match over a single `&mut Option<Dialog>`,
+    /// so every road anybody had for this — the picker the chip used to
+    /// open, the `becomes` hand-off the IR panel uses — SWAPS one window for
+    /// another. A swap puts the amp away, which is the one thing this was
+    /// not allowed to do.
+    ///
+    /// Asserted on the painted frame rather than on the slots alone: both
+    /// surfaces have to have a rectangle in the canvas, and they have to be
+    /// different rectangles, or "stacked" would be one window drawn twice.
+    #[test]
+    fn a_pedal_opens_its_own_window_over_the_amps() {
+        let (ctx, mut app) = a_desk_with_an_amp_face();
+        assert!(app.pedal_stack.is_none(), "a pedal window was up before anything was pressed");
+        click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
+
+        // The amp is still where it was — not swapped, not closed.
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::InsertFace { strip: 0, slot: 0, .. })),
+            "the amp face was replaced by the pedal it opened"
+        );
+        // And the pedal's own face is standing over it, on its own seat.
+        assert_eq!(
+            stacked_face(&app),
+            Some((recorder::amp_pedal_seat(0, 2), 0)),
+            "the chip opened the wrong window, or none"
+        );
+
+        // Two surfaces, two rectangles, both drawn this pass.
+        let amp = dialogs::inline_dialog_rect(&ctx).expect("the amp window left no rect");
+        let pedal = dialogs::inline_stacked_rect(&ctx).expect("the pedal window left no rect");
+        assert!(amp.is_positive() && pedal.is_positive());
+        assert_ne!(
+            amp.min, pedal.min,
+            "both windows opened in the same place, so one of them cannot be reached"
+        );
+    }
+
+    /// **Closing the pedal leaves the amp standing; closing the amp takes
+    /// the pedal with it.** The two halves of the orphan rule, which is the
+    /// whole safety argument for a second dialog slot in a file that writes
+    /// the first one in seventy places.
+    ///
+    /// The second half is driven the way the danger actually arrives: not by
+    /// closing the amp politely, but by ANOTHER writer taking the slot — a
+    /// menu row opening About is one of the seventy, and it has never heard
+    /// of a pedal window. Deleting `settle_pedal_stack`'s sweep leaves that
+    /// window floating over a dialog it has nothing to do with, still
+    /// writing to a pedal seat whose board is no longer on screen.
+    #[test]
+    fn closing_a_pedal_leaves_the_amp_standing_and_closing_the_amp_takes_it() {
+        let (ctx, mut app) = a_desk_with_an_amp_face();
+        click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
+        assert!(app.pedal_stack.is_some(), "no pedal window to close");
+
+        // Escape, which inline is one key both windows can hear. The top one
+        // takes it: the pedal goes, the amp stays.
+        let esc = |pressed| egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = frame_words(&ctx, &mut app, egui::Modifiers::NONE, vec![esc(true), esc(false)]);
+        assert!(
+            app.pedal_stack.is_none(),
+            "Escape did not close the pedal window"
+        );
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::InsertFace { strip: 0, slot: 0, .. })),
+            "Escape aimed at the pedal took the amp down with it"
+        );
+
+        // Now the other half. Open it again, then let one of the seventy
+        // writers of `self.dialog` have the slot.
+        click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
+        assert!(app.pedal_stack.is_some(), "the pedal window did not reopen");
+        app.dialog = Some(dialogs::Dialog::About);
+        let _ = frame_words(&ctx, &mut app, egui::Modifiers::NONE, Vec::new());
+        assert!(
+            app.pedal_stack.is_none(),
+            "a pedal window outlived the amp face it was standing on"
+        );
+        assert!(
+            dialogs::inline_stacked_rect(&ctx).is_none(),
+            "the orphaned window was still being painted"
+        );
+    }
+
+    /// **Neither plugin window puts the desk down.** The owner's second
+    /// requirement, measured as the fader that moves rather than as the flag
+    /// that says it should.
+    ///
+    /// Both windows are non-modal and both stand on `SurfaceTier::Ordinary`,
+    /// so there is no scrim over the desk and no rung either of them has
+    /// taken. What blocks a press is COVERAGE and nothing else — the app's
+    /// raw-pointer handlers ask `dialogs::pointer_over_dialog`, which has to
+    /// answer for BOTH surfaces or the stacked one is a hole and a press on
+    /// the pedal's own face plays the piano underneath it.
+    #[test]
+    fn neither_plugin_window_puts_the_desk_down() {
+        let (ctx, mut app) = a_desk_with_an_amp_face();
+        click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
+        assert!(
+            app.dialog.as_ref().is_some_and(|d| !d.is_modal()),
+            "the amp window went modal"
+        );
+        assert!(
+            app.pedal_stack
+                .as_ref()
+                .and_then(|st| st.dialog.as_ref())
+                .is_some_and(|d| !d.is_modal()),
+            "the pedal window went modal"
+        );
+        let amp = dialogs::inline_dialog_rect(&ctx).expect("no amp rect");
+        let pedal = dialogs::inline_stacked_rect(&ctx).expect("no pedal rect");
+
+        // A fader the two windows do not cover — checked, not assumed, or
+        // this test would pass by being blocked for the right reason.
+        let rect = app.mixer_rect.expect("the mixer is not up");
+        let v = app.mixer_view();
+        let fader = crate::mixer_panel::Layout::new(rect, &v).strips[0].fader;
+        assert!(
+            !amp.intersects(fader) && !pedal.intersects(fader),
+            "the windows cover the fader this test drives: {fader:?} under {amp:?} / {pedal:?}"
+        );
+        let (before, after) = pull_the_first_fader(&ctx, &mut app);
+        assert!(
+            after > before,
+            "the desk froze under two plugin windows: {before} -> {after}"
+        );
+        // ...and both windows still standing after the desk was driven.
+        assert!(app.pedal_stack.is_some(), "driving the desk closed the pedal window");
+
+        // The other side of the same rule: a point on either window's face
+        // belongs to that window, so the handlers that read `i.pointer`
+        // straight off the input leave the desk alone there.
+        //
+        // **Probed where only ONE of them covers**, which is the difference
+        // between a test and a test that bites. The two windows overlap by
+        // design — the stacked one cascades off the amp's centre — so the
+        // middle of either rectangle is usually inside both, and a test
+        // aimed there goes on passing with the stacked window left out of
+        // `pointer_over_dialog` entirely. That omission is a HOLE: a press
+        // on the part of the pedal's face that hangs past the amp would
+        // reach straight through to the desk and play the piano under it,
+        // which is the exact bug the export window's own hit test was added
+        // to fix.
+        let only_pedal = Pos2::new(pedal.max.x - 6.0, pedal.max.y - 6.0);
+        let only_amp = Pos2::new(amp.min.x + 6.0, amp.min.y + 6.0);
+        assert!(
+            pedal.contains(only_pedal) && !amp.contains(only_pedal),
+            "the probe point {only_pedal:?} is not pedal-only against {amp:?}"
+        );
+        assert!(
+            amp.contains(only_amp) && !pedal.contains(only_amp),
+            "the probe point {only_amp:?} is not amp-only against {pedal:?}"
+        );
+        for (what, at) in [("the amp", only_amp), ("the pedal", only_pedal)] {
+            move_to(&ctx, &mut app, at);
+            assert!(
+                app.dialog_blocks_pointer(&ctx),
+                "a press on {what}'s own face would have reached the desk through it"
+            );
+        }
+        // And a point on neither does not.
+        move_to(&ctx, &mut app, fader.center());
+        assert!(
+            !app.dialog_blocks_pointer(&ctx),
+            "the windows blocked a point neither of them covers"
+        );
+    }
+
+    /// **The engine's one insert tap follows the window being worked in.**
+    ///
+    /// There is exactly one tap — the feed behind an EQ face's analyzer and
+    /// an imager face's vectorscope — and until now `RecorderRequest`'s own
+    /// doc could say "only one face is ever open, so the LAST request wins".
+    /// Two faces make that a rule somebody has to keep: the pedal takes it
+    /// when its window opens, and the amp underneath is still up and wants
+    /// it back when that window closes. Left un-handed-back, the amp's face
+    /// goes on holding whatever picture the pedal's last block drew, and the
+    /// host stops re-scanning the preset shelf for the panel that is
+    /// actually on screen.
+    ///
+    /// Asserted on the requests that cross the firewall, because that is the
+    /// whole of what this app can do about the tap: the engine is on the
+    /// other side of it.
+    #[test]
+    fn the_insert_tap_goes_to_the_pedal_and_comes_back_to_the_amp() {
+        let (ctx, mut app) = a_desk_with_an_amp_face();
+        let seat = recorder::amp_pedal_seat(0, 2);
+        while app.take_recorder_request().is_some() {}
+        click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
+        let mut armed_pedal = false;
+        while let Some(r) = app.take_recorder_request() {
+            armed_pedal |= r
+                == recorder::RecorderRequest::SetInsertTap { strip: seat, slot: 0, on: true };
+        }
+        assert!(armed_pedal, "the pedal's window opened without taking the tap");
+
+        // Escape closes it; the amp underneath gets the tap back.
+        let esc = |pressed| egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = frame_words(&ctx, &mut app, egui::Modifiers::NONE, vec![esc(true), esc(false)]);
+        let (mut off, mut back) = (false, false);
+        while let Some(r) = app.take_recorder_request() {
+            off |= r
+                == recorder::RecorderRequest::SetInsertTap { strip: seat, slot: 0, on: false };
+            back |= r
+                == recorder::RecorderRequest::SetInsertTap { strip: 0, slot: 0, on: true };
+        }
+        assert!(off, "the closed pedal window left the tap pointed at its bay");
+        assert!(back, "the amp did not get the tap back when the pedal closed");
+    }
+
+    /// **A question raised BY the pedal window freezes the desk, like any
+    /// other question.**
+    ///
+    /// The pedal window has one road to a modal: an impulse loader in a
+    /// pedal seat, whose browser raises a delete confirmation over itself.
+    /// `dialogs::show` puts that confirmation into the slot it was handed —
+    /// the stacked one — through `becomes`, which is what this test stands
+    /// in for, because driving the whole IR browser to get there would be a
+    /// test about the IR browser.
+    ///
+    /// Read only off `self.dialog`, that confirmation dims the desk and
+    /// blocks at egui's hit test while every handler that reads `i.pointer`
+    /// straight off the input goes on operating the mixer THROUGH the
+    /// scrim — a question that looks like it has frozen the app and has
+    /// not. Measured as the fader that must not move, which is the same
+    /// control `a_face_leaves_the_mixer_fader_live_and_a_question_does_not`
+    /// uses for the opposite claim.
+    #[test]
+    fn a_question_raised_by_the_pedal_window_still_freezes_the_desk() {
+        let (ctx, mut app) = a_desk_with_an_amp_face();
+        click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
+        // The control first: an ordinary pedal window leaves the desk live.
+        let (before, after) = pull_the_first_fader(&ctx, &mut app);
+        assert!(after > before, "the plain pedal window froze the desk");
+
+        // Now the shape `becomes` leaves in that slot.
+        let st = app.pedal_stack.as_mut().expect("the pedal window closed");
+        st.dialog = Some(dialogs::Dialog::Confirm {
+            title: "Delete this impulse?".to_owned(),
+            body: "It goes from the folder.".to_owned(),
+            kept: String::new(),
+            choices: vec![dialogs::ConfirmChoice::new(
+                "Delete",
+                dialogs::DialogAction::CycleTheme,
+                true,
+            )],
+            warn: egui::Color32::RED,
+        });
+        assert!(
+            app.stacked_dialog().is_some_and(dialogs::Dialog::is_modal),
+            "the fixture did not build a question"
+        );
+        let (before, after) = pull_the_first_fader(&ctx, &mut app);
+        assert!(
+            (after - before).abs() < 1e-9,
+            "a question in the pedal window let the desk be driven through it: \
+             {before} -> {after}"
+        );
+    }
+
+    /// **A channel reorder closes the pedal window rather than carrying
+    /// it.**
+    ///
+    /// The board travels with its channel (`recorder::seat_order` moves all
+    /// seven seats) and so does `picker_insert`, but the OPEN amp face does
+    /// not: `Dialog::InsertFace` goes on naming desk row 0's bay 0 whoever
+    /// is in row 0 afterwards. That is a pre-existing rough edge, and a
+    /// second window is exactly the wrong place to build on top of it —
+    /// carrying the pedal alone would leave the two windows describing
+    /// different tracks with nothing on screen saying so.
+    ///
+    /// So it goes down. Asserted here because "it goes down" is a decision
+    /// and not an accident: somebody adding the remap that looks obviously
+    /// missing will see this test and the argument attached to it.
+    #[test]
+    fn a_channel_reorder_takes_the_pedal_window_down() {
+        let (ctx, mut app) = a_desk_with_an_amp_face();
+        for n in 1..4 {
+            app.add_bare_track(n);
+        }
+        click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
+        assert!(app.pedal_stack.is_some(), "no pedal window to reorder under");
+        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
+        order.remove(0);
+        order.insert(2, 0);
+        app.reorder_channels(&order);
+        assert!(
+            app.pedal_stack.is_none(),
+            "a pedal window rode a reorder and now names another track's board"
+        );
+    }
+
+    /// **An empty chip offers the picker IN THE STACK, and what is chosen
+    /// opens there too.**
+    ///
+    /// The road with the sharpest edge on it. The picker's landing
+    /// (`DialogAction::LoadPlugin`) opens the chosen unit's face, and it has
+    /// always opened it in the desk's one dialog slot — which here would put
+    /// the amp away to show the pedal that was just chosen FOR the amp,
+    /// which is the swap this whole feature exists to avoid, arriving one
+    /// gesture later than anybody would look for it.
+    ///
+    /// The landing asks the SEAT rather than remembering which picker it
+    /// was: `pedal_stack_covers` is a fact about the app, and the "which
+    /// window am I answering for" flag it replaces is the kind of state that
+    /// survives one early return and then lies for the rest of the frame.
+    #[test]
+    fn a_pedal_picked_from_the_stack_opens_in_the_stack() {
+        let (ctx, mut app) = a_desk_with_an_amp_face();
+        // Pedal 5 is empty in the fixture, so its chip wears a plus.
+        let seat = recorder::amp_pedal_seat(0, 5);
+        assert_eq!(app.insert(seat, 0), None, "the fixture dressed pedal 5");
+        app.apply_dialog_action(dialogs::DialogAction::OpenPedalFace {
+            strip: 0,
+            slot: 0,
+            pedal: 5,
+            alt: false,
+            shift: false,
+        });
+        assert!(
+            matches!(
+                app.pedal_stack.as_ref().and_then(|st| st.dialog.as_ref()),
+                Some(dialogs::Dialog::PluginPicker { .. })
+            ),
+            "an empty chip did not offer the picker in the stacked window"
+        );
+        assert_eq!(
+            app.picker_insert,
+            Some((seat, 0)),
+            "the picker was not aimed at the pedal's own seat"
+        );
+        let _ = frame_words(&ctx, &mut app, egui::Modifiers::NONE, Vec::new());
+
+        // What the picker asks for when a row is chosen.
+        app.apply_dialog_action(dialogs::DialogAction::LoadPlugin {
+            path: Some("@tangent-echo".to_owned()),
+        });
+        assert_eq!(
+            app.insert(seat, 0),
+            Some("@tangent-echo"),
+            "the pick did not land in the pedal's seat"
+        );
+        assert_eq!(
+            stacked_face(&app),
+            Some((seat, 0)),
+            "the chosen pedal's face did not open in the stacked window"
+        );
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::InsertFace { strip: 0, slot: 0, .. })),
+            "choosing a pedal put the amp away"
+        );
+        // And the stack still points at the amp face it started over, so the
+        // orphan sweep goes on recognising it.
+        let _ = frame_words(&ctx, &mut app, egui::Modifiers::NONE, Vec::new());
+        assert!(app.pedal_stack.is_some(), "the sweep dropped the window it had just filled");
+    }
+
+    /// **Alt and Shift on a pedal chip do what they do on a rack bay.**
+    ///
+    /// One function decides both — `bay_gesture`, which the mixer's rack,
+    /// the arrangement's header chips, a folder's second rack, the master's
+    /// and the pads' all come through — so a chip cannot drift from a bay
+    /// about what a modifier means.
+    ///
+    /// Driven through `apply_dialog_action` with the desk's own latched pair
+    /// left FALSE, which is the point and not a shortcut: the claim is that
+    /// the modifier the chip carried is the one that is applied, and inline
+    /// the face and the desk share one keyboard, so a test that pressed the
+    /// key would prove nothing about which of the two was read. That the
+    /// chip carries the right pair in the first place is
+    /// `dialogs::tests::a_pedal_chip_carries_its_own_windows_modifiers`,
+    /// driven through the real window; between them the road is covered end
+    /// to end.
+    #[test]
+    fn alt_and_shift_on_a_pedal_chip_do_what_they_do_on_a_bay() {
+        let seat = recorder::amp_pedal_seat(0, 2);
+        // Alt empties the seat, exactly as it empties a bay.
+        let (_ctx, mut app) = a_desk_with_an_amp_face();
+        assert!(!app.alt_down && !app.shift_down, "the desk was holding a key");
+        app.apply_dialog_action(dialogs::DialogAction::OpenPedalFace {
+            strip: 0,
+            slot: 0,
+            pedal: 2,
+            alt: true,
+            shift: false,
+        });
+        assert_eq!(app.insert(seat, 0), None, "alt on a chip did not empty the seat");
+        assert!(app.pedal_stack.is_none(), "the eraser opened a window as well");
+
+        // Shift takes it out of circuit and puts it back, and opens nothing.
+        let (_ctx, mut app) = a_desk_with_an_amp_face();
+        let shift = || dialogs::DialogAction::OpenPedalFace {
+            strip: 0,
+            slot: 0,
+            pedal: 2,
+            alt: false,
+            shift: true,
+        };
+        app.apply_dialog_action(shift());
+        assert!(app.insert_bypassed(seat, 0), "shift on a chip did not bypass the seat");
+        assert!(app.pedal_stack.is_none(), "the bypass opened a window as well");
+        app.apply_dialog_action(shift());
+        assert!(!app.insert_bypassed(seat, 0), "shift again did not put it back");
+        assert_eq!(
+            app.insert(seat, 0),
+            Some("@tangent-drive"),
+            "a bypass removed the plugin"
+        );
+
+        // An EMPTY seat under alt is left alone — the bay's rule, which is
+        // that an eraser that opened pickers would be worse than no eraser.
+        let (_ctx, mut app) = a_desk_with_an_amp_face();
+        app.set_insert(seat, 0, None);
+        app.apply_dialog_action(dialogs::DialogAction::OpenPedalFace {
+            strip: 0,
+            slot: 0,
+            pedal: 2,
+            alt: true,
+            shift: false,
+        });
+        assert!(app.pedal_stack.is_none(), "alt on an empty chip opened something");
     }
 
     /// Press on channel 0's fader, pull it up fifty points, let go — as a
