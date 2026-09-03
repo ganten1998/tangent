@@ -41283,6 +41283,54 @@ mod tests {
         );
     }
 
+    /// **The desk has no up and down, and does not burn frames pretending it
+    /// has.**
+    ///
+    /// A strip's name plate sits at the TOP of its column, so a hand carrying a
+    /// strip is very often within a couple of dozen points of the scrolling
+    /// region's top rail — for the whole gesture, not as a corner case. A zone
+    /// that answered on both axes there would return a velocity every frame
+    /// that nothing can spend (the desk scrolls sideways and only sideways) and
+    /// would ask for a 60 Hz frame to spend it, for as long as the hand was
+    /// held. That is the reason `EdgeAxes` exists rather than the zone simply
+    /// always being both.
+    #[test]
+    fn a_carry_near_the_desks_top_edge_neither_scrolls_nor_asks_for_frames() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.mixer_open = true;
+        app.settings.mixer_visible = 4;
+        for n in 0..10 {
+            app.add_bare_track(n);
+        }
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.mixer_rect.expect("the mixer drew nowhere");
+        let (grab, region) = {
+            let view = app.mixer_view();
+            let l = crate::mixer_panel::Layout::new(rect, &view);
+            (l.strips[0].name.center(), l.region)
+        };
+        press(&ctx, &mut app, grab);
+        assert!(app.mixer_reorder.is_some(), "the press did not arm a carry");
+        // Hard against the top rail, and nowhere near either side.
+        let at = Pos2::new(region.center().x, region.top() + 1.0);
+        move_to(&ctx, &mut app, at);
+        assert!(
+            edge_scroll_pps(region, at).y != 0.0,
+            "the fixture is not actually in the vertical zone, so this proves \
+             nothing"
+        );
+        let was = app.mixer_scroll_px;
+        hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        let delay = hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        assert_eq!(app.mixer_scroll_px, was, "the desk moved sideways for a hand \
+             held against its TOP edge");
+        assert!(
+            delay > Duration::from_millis(5),
+            "a carry held against an edge the desk cannot travel along pinned \
+             the app at {delay:?}"
+        );
+    }
+
     /// **A carried bay scrolls the desk too.** It is a second branch on the
     /// same condition, and a bay dropped on a plugin slot has the identical
     /// reach problem: `strip_at` and `hit_test` both only answer about drawn
