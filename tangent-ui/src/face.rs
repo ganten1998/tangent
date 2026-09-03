@@ -1349,14 +1349,16 @@ pub(crate) mod fit {
         ("@tangent-ir", 2, &[], false, Vec2::new(600.0, 400.0), Vec2::new(1160.0, 620.0)),
     ];
 
-    /// The smallest a face may be DRAGGED to — `dialogs::face_min_size`,
-    /// which answers a flat 320 by 300 for every face but the IR browser.
+    /// The smallest a face may be DRAGGED to, asked of the production
+    /// function itself rather than restated here.
+    ///
+    /// It used to be a copy - a flat 320 by 300 for every face but the IR -
+    /// and a copy is how a test goes on certifying a number the app has
+    /// stopped using. `face_min_size` now answers with each face's own floor,
+    /// and this asks it, so the two cannot drift again. The infinity is the
+    /// "no window to be smaller than" argument: what comes back is the floor.
     pub fn drag_minimum(path: &str) -> Vec2 {
-        if path == "@tangent-ir" {
-            Vec2::new(640.0, 400.0)
-        } else {
-            Vec2::new(320.0, 300.0)
-        }
+        crate::dialogs::face_min_size(path, Vec2::splat(f32::INFINITY))
     }
 
     /// A context with one of the three fonts a person can choose installed.
@@ -2384,21 +2386,20 @@ mod tests {
     /// folds rather than losing its Save button, and the amp's chips cut their
     /// word rather than pushing the board off the edge.
     ///
-    /// Downwards it is not true and never was. At 320 by 300 the EQ's fifteen
-    /// rows want between 114 and 129 points more than the window holds
-    /// depending on the font, the Imager's goniometer 97 to 99 and the amp's
-    /// board 65 to 94 — drawn, clipped, and unreachable, because the desktop
-    /// path puts no scroll area under a face. That is one number in one
-    /// function in `dialogs`, and it belongs to whoever owns that file; what
-    /// this test is for is that the list cannot grow behind anybody's back. A
-    /// face that starts overflowing joins it and fails; a face that stops
-    /// overflowing — because the minimum was finally made a property of the
-    /// layout rather than a constant — also fails, and the fix is to strike it
-    /// from the list, which is the day this test wants to be looked at.
+    /// **Downwards it is true now, and it was not.** Against a flat 320 by 300
+    /// the EQ's fifteen rows wanted between 114 and 129 points more than the
+    /// window held depending on the font, the Imager's goniometer 97 to 99 and
+    /// the amp's board 65 to 94 — drawn, clipped and unreachable, because the
+    /// desktop path puts no scroll area under a face. `face_min_size` now
+    /// answers with each face's OWN floor, the size its rows were laid out in,
+    /// so the list below is empty and a face that overflows at its minimum is
+    /// a face whose layout outgrew its floor. Do not add it back to the list:
+    /// raise that face's floor in `FACE_SIZES`, which is the number the list
+    /// used to be standing in for.
     #[test]
     fn the_smallest_a_face_can_be_dragged_to_holds_it_sideways() {
-        /// The three whose layout is taller than `face_min_size` promises.
-        const TOO_TALL: [&str; 3] = ["@tangent-eq", "@tangent-imager", "@tangent-amp"];
+        /// Empty, and it should stay that way: see the note above.
+        const TOO_TALL: [&str; 0] = [];
         let set = crate::settings::Settings::default();
         let p = crate::recorder_panel::palette(&set);
         let st = FaceStyle::new(p.bg, p.lcd, p.lcd_face);
