@@ -200,6 +200,62 @@ fn wm_overrode_size(observed: Vec2, requested: Vec2) -> bool {
         || (observed.y - requested.y).abs() > WM_SIZE_TOLERANCE
 }
 
+/// **Does this window effectively fill the monitor it is on?**
+///
+/// Measured rather than asked, because the question has three different
+/// answers depending on who is asking the OS and none of them is reliable: a
+/// tiler that fills the screen sets no flag at all, macOS calls a hand-dragged
+/// screen-filling window "zoomed" whether or not anybody pressed the green
+/// button, and a manager's gaps mean the numbers rarely match exactly.
+///
+/// The slack is what turns three answers into one. Vertically it absorbs a
+/// menu bar and a title bar together; horizontally, a tiler's outer gap. Both
+/// are deliberately generous: the cost of saying yes to a window that is
+/// merely nearly the screen is a layout that shows the whole desk, and the
+/// cost of saying no to one that is the screen is eight giant strips on a
+/// 2560-wide display.
+///
+/// **`None` is "cannot say", and it is not "no".** A platform that reports no
+/// monitor, or a frame before the window has a size, has told us nothing —
+/// and the caller that holds a flag to this measurement must not treat
+/// silence as a contradiction, or a real maximize would be argued out of
+/// existence everywhere the monitor cannot be enumerated.
+fn covers_monitor(pane: Option<Vec2>, monitor: Option<Vec2>) -> Option<bool> {
+    let (p, m) = (pane?, monitor?);
+    Some(p.y + 96.0 >= m.y && p.x + 40.0 >= m.x)
+}
+
+/// **The `maximized` flag, with the lie macOS tells taken out of it.**
+///
+/// `egui-winit` reads `window.is_maximized()` exactly ONCE on macOS — on the
+/// frame the window is created, guarded by its own `is_init` because asking
+/// AppKit at runtime deadlocks (emilk/egui#3494). Every frame after that the
+/// field is simply left at whatever it was, so on macOS `viewport().maximized`
+/// is not a fact about the window NOW: it is a fact about the window's BIRTH,
+/// frozen for the life of the process. Nothing but the app sending
+/// `ViewportCommand::Maximized` ever moves it again.
+///
+/// That is not a curiosity. winit answers `is_maximized` with AppKit's
+/// `-[NSWindow isZoomed]`, which is true whenever the frame equals the
+/// screen's visible frame — however it got there. So a window REOPENED at a
+/// remembered screen-filling size is born "maximized" and stays so all
+/// session, and the owner's did: his settings held 2560x1378 at (0, 30), which
+/// is exactly the visible frame of his 2560x1440 display, measured. Everything
+/// gated on "not maximized" was then off for the whole run — the size presets
+/// silently did nothing, the too-tall-for-this-screen rescue never fired, and
+/// the minimum window size was never applied.
+///
+/// A frozen flag cannot be trusted, but it can be CONTRADICTED. A window that
+/// does not fill its monitor is not maximized, whatever it once was, so a
+/// measurement that disagrees wins. The flag is still believed when it agrees
+/// — a real maximize on Windows and Linux always covers — and believed when
+/// there is nothing to measure against, because only an actual `Some(false)`
+/// is evidence. So this only ever clears a claim the window itself has
+/// already been seen to outgrow.
+fn maximized_truthfully(flag: bool, covers_monitor: Option<bool>) -> bool {
+    flag && covers_monitor != Some(false)
+}
+
 /// How long the size must sit still before the hand counts as let go.
 ///
 /// **Wall-clock, not a frame count.** It was two frames, which is a duration
@@ -216,6 +272,90 @@ const SETTLE_QUIET: Duration = Duration::from_millis(90);
 /// clamp at a screen edge on an ordinary desktop, and most people are on an
 /// ordinary desktop. A tiler refuses every time and reaches two at once.
 const SNAP_REFUSALS_TO_LATCH: u8 = 2;
+
+/// What a size the USER asked for has to do this frame.
+///
+/// See [`size_request_step`] for why a request needs steps at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SizeStep {
+    /// No request, or one already under way and still waiting on the OS.
+    Hold,
+    /// Come out of fullscreen first. The size follows once the OS has finished
+    /// animating, which is not this frame and may not be the next one.
+    LeaveFullscreen,
+    /// Come off the zoomed frame first — and, on macOS, correct `egui-winit`'s
+    /// frozen record of the flag while doing it, which is the only thing that
+    /// can. See `maximized_truthfully`.
+    LeaveMaximized,
+    /// Send the size.
+    Resize,
+}
+
+/// How long a request waits for the window to come off the screen before it
+/// gives up waiting and asks for the size anyway.
+///
+/// A request must always RESOLVE. Waiting on a state change that never
+/// arrives — a manager that refuses to un-zoom, a fullscreen exit that is
+/// swallowed — would leave the size pending and then spring it on the owner
+/// minutes later, at whatever moment the state happened to clear. Generous
+/// enough for macOS's fullscreen animation, which is the slowest of these by
+/// an order of magnitude, and short enough that a refusal is over before
+/// anybody reaches for the menu a second time.
+const UNCOVER_GRACE: Duration = Duration::from_millis(1200);
+
+/// **A size the user asked for, and the one thing that has to happen first.**
+///
+/// The fault this replaces was not that the window refused the size. It was
+/// that the size was never sent: the `InnerSize` lived inside the branch that
+/// runs only while the window is neither fullscreen nor maximized, and on
+/// macOS a window reopened at a screen-filling size is maximized from birth
+/// and stays so all session (`maximized_truthfully`). The owner's report is
+/// exactly what that looks like from outside — "It's there, but doesn't do
+/// anything" — and the frame it produced sent no commands at all.
+///
+/// **What a covering window does with a size request, measured rather than
+/// assumed.** On macOS `-[NSWindow setFrame:display:]` — which is what winit
+/// calls — IS honoured on a zoomed window, and the window simply stops being
+/// zoomed: asked for 1600x1040 while zoomed to a 2560x1440 display it lands on
+/// 1600x1040 with `isZoomed` false. So the bare send would have worked there.
+/// It would NOT have worked everywhere: a fullscreen window has no frame of
+/// its own to change on any platform, and Windows keeps a maximized window
+/// maximized until it is restored. Leaving the state first is the answer that
+/// is right on all three, and on macOS it buys a second thing for free —
+/// `ViewportCommand::Maximized(false)` is the only lever that corrects
+/// `egui-winit`'s frozen record of the flag, so the app stops believing a
+/// window it has just moved is still filling the screen.
+///
+/// So the request is a two-step where it needs to be: leave the covering
+/// state, then take the size. Once each, never a loop — the un-cover goes out
+/// on the frame the request arrives and the resize on the frame the state has
+/// cleared, and `UNCOVER_GRACE` puts a floor under how long that can take.
+/// Fullscreen wins when both are set, because it is the outer state and
+/// leaving it is what clears the inner one.
+fn size_request_step(
+    pending: bool,
+    fullscreen: bool,
+    maximized: bool,
+    uncover_age: Option<Duration>,
+) -> SizeStep {
+    if !pending {
+        return SizeStep::Hold;
+    }
+    if !fullscreen && !maximized {
+        return SizeStep::Resize;
+    }
+    match uncover_age {
+        None if fullscreen => SizeStep::LeaveFullscreen,
+        None => SizeStep::LeaveMaximized,
+        // Asked, and the window has not come off the screen yet. Asking again
+        // is how an app fights a window manager; waiting is how it does not.
+        Some(age) if age < UNCOVER_GRACE => SizeStep::Hold,
+        // Long enough. Ask for the size and let the OS answer as it likes:
+        // an unanswerable request is still better than one that arrives
+        // unannounced a minute from now.
+        Some(_) => SizeStep::Resize,
+    }
+}
 
 /// How long a size we asked for has to be honoured before silence is refusal.
 ///
@@ -1386,6 +1526,14 @@ pub struct TangentApp {
     /// desktop's, and it exists because the window is no longer pinned, so
     /// "make it the right size" is now a request rather than a standing fact.
     pending_window_size: Option<Vec2>,
+    /// When the un-cover for the pending request went out, and nothing else.
+    ///
+    /// A request made while the window covers the screen cannot be answered
+    /// until it stops covering it, so it is sent in two steps and this is what
+    /// makes the first of them happen exactly once — see [`size_request_step`]
+    /// and `UNCOVER_GRACE`. `None` whenever `pending_window_size` is `None`;
+    /// the two are set and cleared together.
+    uncover_asked_at: Option<Instant>,
     decorations_sent: Option<bool>,
     /// While set, the size triple re-sends every frame — the decoration
     /// nudge. On X11 under a tiling WM (the owner's i3), toggling
@@ -2606,6 +2754,7 @@ impl TangentApp {
             // so the grace runs from launch.
             size_asked_at: Some(Instant::now()),
             pending_window_size: None,
+            uncover_asked_at: None,
             decorations_sent: None,
             decor_nudge_until: None,
             decor_keep_content: None,
@@ -19744,6 +19893,17 @@ impl TangentApp {
         aspect_width_floor(&self.settings)
     }
 
+    /// **Is the main window maximized — the honest answer, not the flag.**
+    ///
+    /// The host has to ask through here rather than reading the viewport
+    /// itself, because on macOS the viewport's `maximized` is frozen at the
+    /// window's birth and a window REOPENED at a screen-filling size is born
+    /// with it set. See `maximized_truthfully`. The app has already held the
+    /// flag to a measurement by the time anyone can call this.
+    pub fn maximized_now(&self) -> bool {
+        self.maximized_now
+    }
+
     /// How many window-size commands have gone out. For `IVORY_PACE_PROBE`.
     pub fn debug_inner_size_sends(&self) -> u64 {
         self.inner_size_sends
@@ -25950,10 +26110,15 @@ impl TangentApp {
         // in hand, and remembered for the view builders — which are called
         // from inside `arrange_view` and `mixer_view` and have no context to
         // ask with. See `mixer_visible` and `arr_visible`.
-        let (full, monitor) = ui.ctx().input(|i| {
+        //
+        // The pane is what the window is; the flags are what it says it is.
+        // Both are read here so `covers_monitor` can hold the second to the
+        // first — see `maximized_truthfully` for the lie that makes necessary.
+        let (fullscreen_flag, maximized_flag, monitor) = ui.ctx().input(|i| {
             let v = i.viewport();
             (
-                v.fullscreen.unwrap_or(false) || v.maximized.unwrap_or(false),
+                v.fullscreen.unwrap_or(false),
+                v.maximized.unwrap_or(false),
                 v.monitor_size,
             )
         });
@@ -25966,6 +26131,19 @@ impl TangentApp {
         // because the tiler leaves a menu bar and a gap and the question is
         // "is this effectively the whole screen", not "is a flag set".
         let pane_now = self.main_live_size;
+        let covers = covers_monitor(pane_now, monitor);
+        // Fullscreen and maximized, read separately. The mixer's 16-over-16
+        // fold answers to EITHER — the owner widened the ruling from
+        // fullscreen-only — while dialog placement and the borderless
+        // re-maximize below each answer to exactly one of them.
+        //
+        // **And `maximized` is held to the measurement**, because on macOS it
+        // is a fact about the window's BIRTH and nothing else — see
+        // `maximized_truthfully`. Fullscreen is asked afresh every frame by
+        // egui-winit on every platform, so it is taken as given.
+        self.fullscreen_now = fullscreen_flag;
+        self.maximized_now = maximized_truthfully(maximized_flag, covers);
+        let full = self.fullscreen_now || self.maximized_now;
         // **Measured, never gated on WHO sized it.** This used to demand the
         // wm-managed latch as well, so only a detected tiler could unlock the
         // full desk — a green-button zoom (which macOS never reports as
@@ -25974,18 +26152,7 @@ impl TangentApp {
         // is "does the window effectively fill the monitor", and the window
         // and the monitor are both right there to measure. The slack absorbs
         // the menu bar, a title bar, and a tiler's gaps.
-        self.screen_sized = self.caps.window_sizing
-            && (full
-                || match (pane_now, monitor) {
-                    (Some(p), Some(m)) => p.y + 96.0 >= m.y && p.x + 40.0 >= m.x,
-                    _ => false,
-                });
-        // Fullscreen and maximized, read separately. The mixer's 16-over-16
-        // fold answers to EITHER — the owner widened the ruling from
-        // fullscreen-only — while dialog placement and the borderless
-        // re-maximize below each answer to exactly one of them.
-        self.fullscreen_now = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-        self.maximized_now = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        self.screen_sized = self.caps.window_sizing && (full || covers == Some(true));
         // **This window's own frame, measured rather than assumed.** A title
         // bar is a different height on every platform, theme and scale, and a
         // borderless window has none — so the one honest number is the
@@ -26113,10 +26280,14 @@ impl TangentApp {
         // would hold itself shut. The flags are the right question for this
         // one, and a manager that resizes without setting them is not fighting
         // a pin in the first place, because it does not ask permission.
-        let wants_to_grow = ui.ctx().input(|i| {
-            let v = i.viewport();
-            v.fullscreen.unwrap_or(false) || v.maximized.unwrap_or(false)
-        });
+        //
+        // **Asked of the honest pair, not of the viewport again.** A second
+        // raw read here would bring back the frozen macOS `maximized` that
+        // `maximized_truthfully` has just taken out, and this branch is the
+        // expensive place to believe it: while it is taken the minimum window
+        // size is never applied at all, so the floor `MIN_WINDOW` exists to
+        // set was missing for every session that opened screen-filling.
+        let wants_to_grow = self.fullscreen_now || self.maximized_now;
         if self.caps.window_sizing && wants_to_grow {
             if self.fullscreen_sent != Some(true) {
                 // Let it grow. Sent once on the way in rather than every frame,
@@ -26216,26 +26387,70 @@ impl TangentApp {
                 // The presets ask for exactly this size, so the request has
                 // already been answered by the pin above.
                 self.pending_window_size = None;
+                self.uncover_asked_at = None;
             }
-            // A size the app itself asked for — a percentage preset, or a
-            // band appearing in a window that has never been dragged. Never
-            // per-frame: `pending_window_size` is set by the thing that
-            // wants it and cleared here.
-            if let Some(want) = self.pending_window_size.take() {
-                // **A size the USER asked for gets one honest attempt**, even
-                // if a window manager has been overruling us. Clearing the
-                // latch here is what stops "tiled once" meaning "the size
-                // menu does nothing for the rest of the session"; recording
-                // the request means `aspect_snap`'s verifier re-latches within
-                // `SNAP_ANSWER_WINDOW` if the tiler overrules this one too.
-                // So a user request costs exactly one correction, never a
-                // cycle.
-                self.main_wm_managed = false;
-                self.snap_asked = Some((want, Instant::now()));
-                self.inner_size_sends += 1;
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(want));
-                self.last_sent_size = Some(want);
-                self.size_asked_at = Some(Instant::now());
+        }
+        // A size the app itself asked for — a percentage preset, or a band
+        // appearing in a window that has never been dragged. Never per-frame:
+        // `pending_window_size` is set by the thing that wants it and cleared
+        // here.
+        //
+        // **OUTSIDE the resizable branch, which is the whole bug.** This used
+        // to sit in the `else` above, so it ran only while the window was
+        // neither fullscreen nor maximized — and a window that opens at a
+        // remembered screen-filling size is maximized from birth on macOS and
+        // stays so all session (`maximized_truthfully`). The preset wrote the
+        // percentage, saved it, recorded the request, and then the one line
+        // that sends it was in a branch that never ran. "It's there, but
+        // doesn't do anything."
+        //
+        // A size the user asked for is not something to yield on, so it is
+        // answered wherever the window happens to be; `size_request_step`
+        // decides what that costs.
+        if self.caps.window_sizing {
+            let want = self.pending_window_size;
+            match size_request_step(
+                want.is_some(),
+                self.fullscreen_now,
+                self.maximized_now,
+                self.uncover_asked_at.map(|at| at.elapsed()),
+            ) {
+                SizeStep::Hold => {}
+                SizeStep::LeaveFullscreen => {
+                    self.uncover_asked_at = Some(Instant::now());
+                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+                }
+                SizeStep::LeaveMaximized => {
+                    self.uncover_asked_at = Some(Instant::now());
+                    ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+                }
+                SizeStep::Resize => {
+                    // Both cleared together: the request is spent, and so is
+                    // the un-cover that cleared the way for it.
+                    self.pending_window_size = None;
+                    self.uncover_asked_at = None;
+                    // `Resize` is only ever returned for a request that
+                    // exists, and the size is still taken out of the option
+                    // rather than asserted out of it: sending an
+                    // `InnerSize(0, 0)` is not a thing to risk on a proof.
+                    if let Some(want) = want {
+                        // **A size the USER asked for gets one honest
+                        // attempt**, even if a window manager has been
+                        // overruling us. Clearing the latch here is what stops
+                        // "tiled once" meaning "the size menu does nothing for
+                        // the rest of the session"; recording the request
+                        // means `aspect_snap`'s verifier re-latches within
+                        // `SNAP_ANSWER_WINDOW` if the tiler overrules this one
+                        // too. So a user request costs exactly one correction,
+                        // never a cycle.
+                        self.main_wm_managed = false;
+                        self.snap_asked = Some((want, Instant::now()));
+                        self.inner_size_sends += 1;
+                        ctx.send_viewport_cmd(ViewportCommand::InnerSize(want));
+                        self.last_sent_size = Some(want);
+                        self.size_asked_at = Some(Instant::now());
+                    }
+                }
             }
         }
         // ── the borderless toggle under a MAXIMIZED window ──
@@ -38971,6 +39186,257 @@ mod tests {
             after.iter().any(|c| c.starts_with("InnerSize")),
             "a size preset did not resize the window; saw {after:?}"
         );
+    }
+
+    /// One frame with a viewport that says what the OS would say about a
+    /// window of this size on a monitor of that size.
+    ///
+    /// The plain `run_one_frame` sends a bare `screen_rect`, which leaves
+    /// every viewport flag at its default — and the whole of this fault lived
+    /// in flags, so a harness that cannot set them cannot see it.
+    fn run_one_frame_on_monitor(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+        size: Vec2,
+        monitor: Vec2,
+        maximized: bool,
+    ) -> Vec<String> {
+        let rect = Rect::from_min_size(Pos2::ZERO, size);
+        let info = egui::ViewportInfo {
+            inner_rect: Some(rect),
+            outer_rect: Some(rect),
+            monitor_size: Some(monitor),
+            maximized: Some(maximized),
+            fullscreen: Some(false),
+            native_pixels_per_point: Some(1.0),
+            ..Default::default()
+        };
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(egui::ViewportId::ROOT, info);
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                viewports,
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        out.viewport_output
+            .values()
+            .flat_map(|v| v.commands.iter())
+            .map(|c| format!("{c:?}"))
+            .collect()
+    }
+
+    /// **The owner's window, and the fault it found.** Verbatim: "did we
+    /// unwire the window setting (100 125 etc) from the right click menu? It's
+    /// there, but doesn't do anything, and it starts maximized windowed
+    /// everytime even though it's floated here."
+    ///
+    /// Nothing was unwired. His settings held 2560x1378 at (0, 30) on a
+    /// 2560x1440 display — measured, that is exactly the screen's visible
+    /// frame — so the window was REOPENED filling the screen and AppKit's
+    /// `isZoomed` was true the moment it was born. `egui-winit` reads
+    /// `maximized` once on macOS and never again, so the flag was true for the
+    /// whole session, and the one line that sends a preset's size sat in the
+    /// branch that only runs while the window is NOT maximized. The percentage
+    /// was written to the settings file and the window never heard about it.
+    ///
+    /// So: a screen-filling window, a preset, and a resize must come out.
+    #[test]
+    fn a_size_preset_moves_a_window_that_opened_filling_the_screen() {
+        let mut settings = Settings::default();
+        settings.show_welcome = false;
+        settings.monitor_width = 2560;
+        settings.monitor_usable_h = 1378;
+        settings.window_size_percent = 100;
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, settings);
+        let screen = Vec2::new(2560.0, 1378.0);
+        let monitor = Vec2::new(2560.0, 1440.0);
+
+        // Settle: the window is up, filling the screen, and the OS calls it
+        // maximized because it fills the screen.
+        for _ in 0..4 {
+            run_one_frame_on_monitor(&ctx, &mut app, screen, monitor, true);
+        }
+        assert!(
+            app.screen_sized,
+            "a window the size of the screen did not read as screen-sized"
+        );
+
+        app.apply_menu_action(&ctx, MenuAction::SetSizePercent(125));
+        assert_eq!(app.settings.window_size_percent, 125, "the preset was not recorded");
+
+        // The window is covering, so the first frame has to get it off the
+        // screen; the size follows once it is off.
+        let first = run_one_frame_on_monitor(&ctx, &mut app, screen, monitor, true);
+        assert!(
+            first.iter().any(|c| c.starts_with("Maximized(false)")),
+            "nothing tried to leave the zoomed frame; saw {first:?}"
+        );
+        assert!(
+            !first.iter().any(|c| c.starts_with("InnerSize")),
+            "the size went out before the window was off the screen; saw {first:?}"
+        );
+
+        // `Maximized(false)` is what corrects `egui-winit`'s frozen record as
+        // well as the window, so the next frame sees a window that is free.
+        let want = initial_window_size(&app.settings);
+        let second = run_one_frame_on_monitor(&ctx, &mut app, screen, monitor, false);
+        assert!(
+            second.iter().any(|c| c.starts_with("InnerSize")
+                && c.contains(&format!("{}", want.x))
+                && c.contains(&format!("{}", want.y))),
+            "the preset never reached the window; wanted {want:?}, saw {second:?}"
+        );
+
+        // **Exactly once.** A preset that re-sends is a window fighting
+        // whatever placed it, which is the fault this file has already been
+        // through once — see `wm_overrode_size`.
+        let third = run_one_frame_on_monitor(&ctx, &mut app, want, monitor, false);
+        assert!(
+            !third.iter().any(|c| c.starts_with("InnerSize")),
+            "the preset asked twice; saw {third:?}"
+        );
+    }
+
+    /// A user request must clear the latch that would otherwise swallow it.
+    ///
+    /// `main_wm_managed` means "a window manager is placing this window, so
+    /// stop arguing" — right for the aspect snap, wrong for a size a person
+    /// just chose from a menu. The owner runs AeroSpace; if the latch could
+    /// eat a preset, tiling once would mean the menu was dead for the session.
+    #[test]
+    fn a_size_preset_outranks_the_window_manager_latch() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        let pane = Vec2::new(1300.0, 632.0);
+        let monitor = Vec2::new(2560.0, 1440.0);
+        run_one_frame_on_monitor(&ctx, &mut app, pane, monitor, false);
+        app.main_wm_managed = true;
+
+        app.apply_menu_action(&ctx, MenuAction::SetSizePercent(150));
+        let sent = run_one_frame_on_monitor(&ctx, &mut app, pane, monitor, false);
+        assert!(
+            sent.iter().any(|c| c.starts_with("InnerSize")),
+            "the wm latch swallowed a size the user chose; saw {sent:?}"
+        );
+        assert!(
+            !app.main_wm_managed,
+            "the latch survived a size the user chose, so the next one dies too"
+        );
+    }
+
+    /// **A flag about a window's birth is not a fact about the window.**
+    ///
+    /// The macOS reading of `maximized` never refreshes, so it has to be held
+    /// to a measurement — otherwise a window dragged down to a quarter of the
+    /// screen still claims to be maximized, and everything gated on "not
+    /// maximized" stays off: the too-tall rescue, the minimum size, and the
+    /// layout, which would go on drawing the whole desk in a small window.
+    #[test]
+    fn a_maximized_flag_does_not_outlive_the_window_that_earned_it() {
+        let monitor = Some(Vec2::new(2560.0, 1440.0));
+        // The owner's reopened window: 2560x1378 IS his screen, slack and all.
+        let filling = Some(Vec2::new(2560.0, 1378.0));
+        assert_eq!(
+            covers_monitor(filling, monitor),
+            Some(true),
+            "the owner's window did not read as covering"
+        );
+        assert!(maximized_truthfully(true, covers_monitor(filling, monitor)));
+
+        // The same window after a preset moved it. The flag is still set —
+        // macOS will never clear it — and it is no longer true.
+        let moved = Some(Vec2::new(1600.0, 1040.0));
+        assert_eq!(
+            covers_monitor(moved, monitor),
+            Some(false),
+            "1600x1040 read as the whole screen"
+        );
+        assert!(
+            !maximized_truthfully(true, covers_monitor(moved, monitor)),
+            "a stale flag outlived the window it described"
+        );
+
+        // A flag that was never set stays unset however big the window is: the
+        // measurement CONTRADICTS, it never invents.
+        assert!(!maximized_truthfully(false, covers_monitor(filling, monitor)));
+
+        // Nothing measured means nothing to contradict with, so the flag
+        // stands — a platform that reports no monitor is not evidence, and
+        // neither is a frame before the window has a size.
+        assert_eq!(covers_monitor(filling, None), None);
+        assert_eq!(covers_monitor(None, monitor), None);
+        assert!(maximized_truthfully(true, None), "silence was read as a contradiction");
+    }
+
+    /// The whole decision, as a table, without a window to run it against.
+    #[test]
+    fn a_size_request_leaves_a_covering_window_once_and_then_resizes() {
+        use SizeStep::{Hold, LeaveFullscreen, LeaveMaximized, Resize};
+        let never = None;
+        let just_now = Some(Duration::from_millis(0));
+        let stale = Some(UNCOVER_GRACE + Duration::from_millis(1));
+
+        // Nothing pending is nothing to do, whatever the window is doing.
+        for (f, m) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(size_request_step(false, f, m, never), Hold);
+        }
+        // A free window takes the size straight away.
+        assert_eq!(size_request_step(true, false, false, never), Resize);
+        // A covering window is uncovered first, and fullscreen is the outer
+        // state so it wins when both are set.
+        assert_eq!(size_request_step(true, false, true, never), LeaveMaximized);
+        assert_eq!(size_request_step(true, true, false, never), LeaveFullscreen);
+        assert_eq!(size_request_step(true, true, true, never), LeaveFullscreen);
+        // Asked, and not answered yet: WAIT. Asking again every frame is how a
+        // window fights a manager.
+        assert_eq!(size_request_step(true, false, true, just_now), Hold);
+        assert_eq!(size_request_step(true, true, false, just_now), Hold);
+        // The state cleared, so take the size.
+        assert_eq!(size_request_step(true, false, false, just_now), Resize);
+        // **And a request always resolves.** A window that never comes off the
+        // screen must not leave the size pending to spring on somebody later.
+        assert_eq!(size_request_step(true, true, true, stale), Resize);
+    }
+
+    /// The ladder the percentages actually make, on the owner's display.
+    ///
+    /// Monotone and strictly increasing, because a preset that gives back the
+    /// same window as the one below it reads as a menu that does nothing —
+    /// which is the report this whole change came from, and it was worth being
+    /// sure the arithmetic was not a second cause of it. It is not: the ladder
+    /// climbs cleanly, and the fault was entirely in the delivery.
+    ///
+    /// Run with his bands as well as with none, because the height is a
+    /// function of what is showing. Nothing is asserted about `MIN_WINDOW`
+    /// here: with few bands on, this layout is genuinely shorter than the
+    /// floor and is letterboxed by the OS clamp on purpose — see
+    /// `aspect_width_floor`, which declines to raise the floor for exactly
+    /// that case.
+    #[test]
+    fn the_size_ladder_climbs_on_the_owners_display() {
+        for bands in [false, true] {
+            let mut s = Settings::default();
+            s.monitor_width = 2560;
+            s.monitor_usable_h = 1378;
+            if bands {
+                // What his settings file actually has showing.
+                s.show_recorder = true;
+                s.show_fretboard = true;
+                s.theory_order = "circle+tonnetz+triangles+staff".to_owned();
+            }
+            let mut last = Vec2::ZERO;
+            for pct in [50, 75, 100, 125, 150] {
+                s.window_size_percent = pct;
+                let got = initial_window_size(&s);
+                assert!(
+                    got.x > last.x && got.y > last.y,
+                    "with bands={bands}, {pct}% gave {got:?}, not bigger than {last:?}"
+                );
+                last = got;
+            }
+        }
     }
 
     /// A plugin shares `~/.config/tangent/settings.json` with the standalone and
