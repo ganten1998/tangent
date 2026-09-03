@@ -444,12 +444,58 @@ pub const UNITS: &[UnitSpec] = &[
 /// know — which the loader reports rather than swallows, because a session
 /// from a NEWER build naming a unit this one lacks deserves a sentence, not a
 /// silently empty bay.
+/// Whether the denoiser's bay is on the engine that reads the gate knobs.
+///
+/// The kernel is the LAST parameter and it is last for the reason its own doc
+/// gives — it was appended, and appended things stay appended — so this finds
+/// it by SYMBOL through the spec rather than by position, and answers "Bank"
+/// for a bay whose values have not arrived yet. Unknown reads as Bank because
+/// Bank is the only engine for which these knobs are live, and a face that
+/// briefly printed a real number for a live knob is a smaller wrong than one
+/// that printed "Bank only" over a knob that works.
+fn denoise_reads_the_gate(siblings: &[f32]) -> bool {
+    let Some(spec) = spec_for(DENOISE_PATH) else {
+        return true;
+    };
+    let Some(at) = spec.params.iter().position(|p| p.symbol == "kernel") else {
+        return true;
+    };
+    siblings.get(at).is_none_or(|v| {
+        crate::units::denoise::DenoiseKernel::from_dial(*v)
+            == crate::units::denoise::DenoiseKernel::Bank
+    })
+}
+
 /// The value as the face should PRINT it — the kernel's own mapping
 /// constants turned into the band's reading formats, in one place, so the
 /// panel and the sound can never quote two different numbers for one knob.
 /// The formatters are the face kit's; this crate links the UI crate, so
 /// reuse is free and the firewall is untouched (data flows outward only).
-pub fn describe(path: &str, id: u32, value: f32) -> String {
+///
+/// **`siblings` is the whole of that bay's values, and it is here because a
+/// knob can be INERT.**
+///
+/// The denoiser has three engines behind one face and they do not read the
+/// same knobs: `process` sends everything but Bank to `process_spectral` and
+/// returns, and SMOOTH and RELEASE are read below that line. So on Spectral
+/// Studio — which is what the unit SHIPS on — two of the five continuous
+/// controls did nothing at all, and the face printed a confident "2.8:1" and
+/// "219 ms" under both. Measured rather than read: the same take rendered at
+/// smooth 0.0 and 1.0 and at release 0.0 and 1.0 comes back byte for byte
+/// identical, all four hashes equal to the untouched render.
+///
+/// A knob that does nothing is worse than a knob that is not there, because
+/// the first thing anybody does with a denoiser that sounds wrong is reach
+/// for the smoothing. Making them WORK on the spectral path was the other
+/// answer and it is not free — a release envelope on the band gain was built
+/// and measured during this same pass and made the residual worse — so the
+/// face says so instead, and says it where the reading is composed rather
+/// than in a second table somebody has to keep in step.
+///
+/// The whole slice rather than the one sibling it needs: the caller has it,
+/// every other arm ignores it, and the day a second unit has a mode that
+/// parks a control this asks no new question.
+pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
     use tangent_ui::face::{fmt_db, fmt_hz, fmt_ms, fmt_pct};
     let v = value.clamp(0.0, 1.0);
     let lerp = |r: (f32, f32)| r.0 + (r.1 - r.0) * v;
@@ -517,6 +563,10 @@ pub fn describe(path: &str, id: u32, value: f32) -> String {
                         fmt_db(-(v * DENOISE_REDUCE_DB))
                     }
                 }
+                // SMOOTH and RELEASE belong to the Bank alone. See this
+                // function's own doc for the measurement, and for why the
+                // answer is a word rather than a working knob.
+                2 | 3 if !denoise_reads_the_gate(siblings) => "Bank only".to_owned(),
                 2 => format!("{:.1}:1", sweep(DENOISE_RATIO)),
                 3 => fmt_ms(sweep(DENOISE_RELEASE_MS)),
                 4 => {
@@ -2667,37 +2717,37 @@ mod tests {
     fn the_new_dials_read_in_their_own_units() {
         use crate::units::echo::ECHO_TIME_DEFAULT;
         use tangent_ui::face::fmt_pct;
-        assert_eq!(describe(ECHO_PATH, 0, ECHO_TIME_DEFAULT), "375 ms");
-        assert_eq!(describe(PLATE_PATH, 0, 0.34), "2.20 s");
-        assert_eq!(describe(PLATE_PATH, 1, 0.0), "0.0 ms");
-        assert_eq!(describe(WAH_PATH, 1, 0.5), "240 Hz");
-        assert_eq!(describe(DENOISE_PATH, 0, 0.0), "Learn");
-        assert_eq!(describe(DENOISE_PATH, 0, 1.0), "Listening");
-        assert_eq!(describe(DENOISE_PATH, 1, 0.5), "-12.0 dB");
-        assert_eq!(describe(DENOISE_PATH, 1, 0.0), "off");
-        assert_eq!(describe(DENOISE_PATH, 5, 1.0), "3.0 ms");
+        assert_eq!(describe(ECHO_PATH, 0, ECHO_TIME_DEFAULT, &[]), "375 ms");
+        assert_eq!(describe(PLATE_PATH, 0, 0.34, &[]), "2.20 s");
+        assert_eq!(describe(PLATE_PATH, 1, 0.0, &[]), "0.0 ms");
+        assert_eq!(describe(WAH_PATH, 1, 0.5, &[]), "240 Hz");
+        assert_eq!(describe(DENOISE_PATH, 0, 0.0, &[]), "Learn");
+        assert_eq!(describe(DENOISE_PATH, 0, 1.0, &[]), "Listening");
+        assert_eq!(describe(DENOISE_PATH, 1, 0.5, &[]), "-12.0 dB");
+        assert_eq!(describe(DENOISE_PATH, 1, 0.0, &[]), "off");
+        assert_eq!(describe(DENOISE_PATH, 5, 1.0, &[]), "3.0 ms");
         // The kernel selector reads as the engine, in the words the
         // cycling row offers, at each of its three positions.
-        assert_eq!(describe(DENOISE_PATH, 6, 0.0), "Bank");
-        assert_eq!(describe(DENOISE_PATH, 6, 0.5), "Spectral Studio");
-        assert_eq!(describe(DENOISE_PATH, 6, 1.0), "Spectral Live");
+        assert_eq!(describe(DENOISE_PATH, 6, 0.0, &[]), "Bank");
+        assert_eq!(describe(DENOISE_PATH, 6, 0.5, &[]), "Spectral Studio");
+        assert_eq!(describe(DENOISE_PATH, 6, 1.0, &[]), "Spectral Live");
         // The shipped level is unity to a tenth of a dB: 0.71² · 2 ≈ 1.008.
-        assert_eq!(describe(DRIVE_PATH, 2, 0.71), "+0.1 dB");
-        assert_eq!(describe(DRIVE_PATH, 3, 0.0), "matched");
-        assert_eq!(describe(IR_PATH, 1, 0.5), "+0.0 dB");
+        assert_eq!(describe(DRIVE_PATH, 2, 0.71, &[]), "+0.1 dB");
+        assert_eq!(describe(DRIVE_PATH, 3, 0.0, &[]), "matched");
+        assert_eq!(describe(IR_PATH, 1, 0.5, &[]), "+0.0 dB");
         // The tape's three calibrated dials, at the positions it ships at:
         // the bump's own +2.5 dB, the repro corner just under 16 kHz, unity
         // trim. A face that printed "50 %" for any of these disagreed with
         // the automation lane's declared unit about the same knob.
-        assert_eq!(describe(TAPE_PATH, 1, 0.5), "+2.5 dB");
-        assert_eq!(describe(TAPE_PATH, 2, 0.12), "15.6 kHz");
-        assert_eq!(describe(TAPE_PATH, 2, 0.0), "off");
-        assert_eq!(describe(TAPE_PATH, 5, 0.5), "+0.0 dB");
+        assert_eq!(describe(TAPE_PATH, 1, 0.5, &[]), "+2.5 dB");
+        assert_eq!(describe(TAPE_PATH, 2, 0.12, &[]), "15.6 kHz");
+        assert_eq!(describe(TAPE_PATH, 2, 0.0, &[]), "off");
+        assert_eq!(describe(TAPE_PATH, 5, 0.5, &[]), "+0.0 dB");
         // And the three that are character rather than calibration keep
         // saying so.
-        assert_eq!(describe(TAPE_PATH, 0, 0.6), fmt_pct(0.6));
-        assert_eq!(describe(TAPE_PATH, 3, 0.3), fmt_pct(0.3));
-        assert_eq!(describe(TAPE_PATH, 4, 0.25), fmt_pct(0.25));
+        assert_eq!(describe(TAPE_PATH, 0, 0.6, &[]), fmt_pct(0.6));
+        assert_eq!(describe(TAPE_PATH, 3, 0.3, &[]), fmt_pct(0.3));
+        assert_eq!(describe(TAPE_PATH, 4, 0.25, &[]), fmt_pct(0.25));
         assert_eq!(choices(DENOISE_PATH, 0), vec!["Learn", "Listening"]);
         assert_eq!(
             choices(DENOISE_PATH, 6),
@@ -2706,6 +2756,69 @@ mod tests {
         assert_eq!(choices(DRIVE_PATH, 3), vec!["matched", "uneven"]);
         assert_eq!(choices(AMP_PATH, 0), vec!["off", "on"]);
         assert!(choices(TREM_PATH, 0).is_empty(), "a continuous dial grew steps");
+    }
+
+    /// **A knob that does nothing must not print a number.**
+    ///
+    /// `Denoise::process` sends every kernel but the Bank to
+    /// `process_spectral` and returns; `params.smooth` and `params.release`
+    /// are read below that line. So on Spectral Studio — the unit's SHIPPED
+    /// kernel — those two dials are inert, and the face used to print a
+    /// confident "2.8:1" and "219 ms" under both of them. Measured, not
+    /// inferred: the same take rendered at smooth 0.0 and 1.0 and at release
+    /// 0.0 and 1.0 comes back byte for byte identical, all four hashes equal
+    /// to the untouched render.
+    ///
+    /// Revert-check: delete the `2 | 3 if !denoise_reads_the_gate(..)` arm in
+    /// `describe` and the two spectral halves of this go red with the name of
+    /// the knob that lied.
+    #[test]
+    fn the_denoiser_says_which_of_its_knobs_the_running_kernel_ignores() {
+        use crate::units::denoise::DenoiseKernel;
+        let spec = spec_for(DENOISE_PATH).expect("the denoiser has a spec");
+        let at = spec
+            .params
+            .iter()
+            .position(|p| p.symbol == "kernel")
+            .expect("the denoiser has a kernel knob");
+        // A whole bay's worth of values, with the kernel where the spec puts
+        // it rather than where this test guesses.
+        let bay = |k: DenoiseKernel| {
+            let mut v: Vec<f32> = spec.params.iter().map(|p| p.default).collect();
+            v[at] = k.dial();
+            v
+        };
+
+        // The Bank reads both, so both print their own mapping.
+        let bank = bay(DenoiseKernel::Bank);
+        assert_eq!(describe(DENOISE_PATH, 2, 0.5, &bank), "2.8:1");
+        assert_eq!(describe(DENOISE_PATH, 3, 0.5, &bank), "219 ms");
+
+        // Neither spectral kernel does, and the face says so rather than
+        // quoting a number that changes nothing.
+        for k in [DenoiseKernel::SpectralStudio, DenoiseKernel::SpectralLive] {
+            let v = bay(k);
+            assert_eq!(
+                describe(DENOISE_PATH, 2, 0.5, &v),
+                "Bank only",
+                "SMOOTH printed a live reading on {}",
+                k.label()
+            );
+            assert_eq!(
+                describe(DENOISE_PATH, 3, 0.5, &v),
+                "Bank only",
+                "RELEASE printed a live reading on {}",
+                k.label()
+            );
+            // Everything else on that face IS read by the spectral path and
+            // must keep its own reading.
+            assert_eq!(describe(DENOISE_PATH, 1, 0.5, &v), "-12.0 dB");
+        }
+
+        // An empty slice is a bay whose values have not arrived. It reads as
+        // Bank, because printing "Bank only" over a knob that works is the
+        // worse of the two wrongs.
+        assert_eq!(describe(DENOISE_PATH, 2, 0.5, &[]), "2.8:1");
     }
 
     /// Two channels of independent noise: a record with a real image.
