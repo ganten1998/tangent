@@ -41128,6 +41128,98 @@ mod tests {
         }
     }
 
+    /// A twelve-track arrangement whose stack is taller than its window, one
+    /// frame drawn. Returns the panel's rectangle and which header rows were
+    /// on screen at that moment.
+    fn arrangement_with_a_tall_stack(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+    ) -> (Rect, Vec<usize>) {
+        app.arrangement_open = true;
+        app.settings.arr_visible = 4;
+        for n in 0..12 {
+            app.add_bare_track(n);
+        }
+        let _ = run_frame(ctx, app);
+        let rect = app.arrangement_rect.expect("the arrangement drew nowhere");
+        let drawn = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            (0..crate::recorder::CHANNELS)
+                .filter(|&i| l.header_rows[i].panel.is_positive())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            drawn.len() < 12,
+            "the fixture drew every header row, so there is nothing to scroll to"
+        );
+        (rect, drawn)
+    }
+
+    /// **A track carried down the header column walks the stack.**
+    ///
+    /// The mixer's reach problem stood upright. `header_rows` exists only for
+    /// the lanes that are DRAWN, so a carried track could not be dropped on the
+    /// ninth row: the row it wanted was not laid out and `arr_row_under`
+    /// answered None. Vertical only — the header has no horizontal extent for a
+    /// name to travel along.
+    #[test]
+    fn a_track_carried_down_the_header_walks_the_stack() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, drawn_at_press) = arrangement_with_a_tall_stack(&ctx, &mut app);
+        let (grab, header) = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            (l.header_rows[0].name.center(), l.header)
+        };
+        press(&ctx, &mut app, grab);
+        assert!(
+            matches!(app.arr_drag, Some(ArrDrag::ReorderLane { from: 0, .. })),
+            "the press on the name plate did not arm a track carry: {:?}",
+            app.arr_drag
+        );
+        let at = Pos2::new(header.center().x, header.bottom() - 2.0);
+        move_to(&ctx, &mut app, at);
+        for _ in 0..30 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        assert!(app.arr_lane_scroll > 0, "the carried track did not move the stack");
+        let under = app.arr_row_under(rect, at).map(|(n, _)| n);
+        assert!(
+            under.is_some_and(|n| !drawn_at_press.contains(&n)),
+            "the hand ended over row {under:?}, which was already on screen"
+        );
+    }
+
+    /// **A carried bay walks the stack too**, on the arrangement's header as on
+    /// the mixer's desk — the header carries the same three chips, and a plugin
+    /// that cannot be dropped on the ninth track is the same gap.
+    #[test]
+    fn a_carried_bay_walks_the_arrangement_header_too() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.set_insert(crate::recorder::Strip::Channel(0).index(), 0, Some("/x/Comp.vst3"));
+        let (rect, _) = arrangement_with_a_tall_stack(&ctx, &mut app);
+        let (grab, header) = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            (l.header_rows[0].bays[0].center(), l.header)
+        };
+        press(&ctx, &mut app, grab);
+        assert!(app.bay_carry.is_some(), "the press on the chip did not arm a carry");
+        move_to(
+            &ctx,
+            &mut app,
+            Pos2::new(header.center().x, header.bottom() - 2.0),
+        );
+        for _ in 0..30 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        assert!(app.arr_lane_scroll > 0, "the carried bay did not move the stack");
+    }
+
     /// **A carried strip scrolls the desk, and lands on a column that was not
     /// there when it was picked up.**
     ///
@@ -41267,7 +41359,8 @@ mod tests {
         );
     }
 
-    /// **The wheel and the edge spend the same pixels.**
+    /// **The wheel and the edge spend the same pixels, and stop at the same
+    /// rails.**
     ///
     /// Both surfaces' scrolls were lifted out of their wheel branches on
     /// purpose: the CLAMPS are the shared thing. The lane stack's accumulator
@@ -41275,8 +41368,16 @@ mod tests {
     /// is the layout's own arithmetic — an edge path that grew its own copy of
     /// either would be free to disagree about where the end is, and the
     /// disagreement would show up as dead notches after a long hold. So: drive
-    /// the real wheel with a budget of pixels, drive the shared function with
+    /// the REAL wheel with a budget of pixels, drive the shared function with
     /// the same budget, and demand the same state.
+    ///
+    /// **The budget deliberately overshoots the rail and then comes back.** A
+    /// first version spent a polite twelve hundred points and never reached
+    /// either end, so it compared two copies of the same unclamped
+    /// multiplication and stayed green when the wheel was given a ceiling half
+    /// the size of the shared one. Everything interesting about a clamp is at
+    /// the rail, so both runs are driven hard against it and then walked back,
+    /// which is also the shape that exposes banked intent.
     #[test]
     fn the_wheel_and_the_edge_spend_the_same_pixels() {
         let wheel = |app: &mut TangentApp, ctx: &egui::Context, at: Pos2, dy: f32| {
@@ -41293,6 +41394,11 @@ mod tests {
                 ],
             );
         };
+        // Down hard past the end, then a little way back up.
+        let budget: Vec<f32> = std::iter::repeat_n(220.0_f32, 30)
+            .chain(std::iter::repeat_n(-220.0_f32, 4))
+            .collect();
+
         // ── the lane stack ──
         let lanes = |by_hand: bool| -> (usize, f32) {
             let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
@@ -41306,21 +41412,23 @@ mod tests {
                 let view = app.arrange_view(&clips);
                 crate::arrangement_panel::Layout::new(rect, &view).header
             };
-            for _ in 0..40 {
+            for d in &budget {
                 if by_hand {
                     let lane_h = app.arr_lane_h(rect);
-                    app.arr_scroll_lanes_by_px(30.0, lane_h);
+                    app.arr_scroll_lanes_by_px(*d, lane_h);
                 } else {
-                    wheel(&mut app, &ctx, header.center(), -30.0);
+                    wheel(&mut app, &ctx, header.center(), -*d);
                 }
             }
             (app.arr_lane_scroll, app.arr_scroll_acc)
         };
+        let (by_wheel, by_hand) = (lanes(false), lanes(true));
+        assert!(by_wheel.0 > 0, "the wheel never reached the lane stack at all");
         assert_eq!(
-            lanes(false),
-            lanes(true),
+            by_wheel, by_hand,
             "the wheel and the shared lane scroll parted company"
         );
+
         // ── the desk ──
         let desk = |by_hand: bool| -> f32 {
             let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
@@ -41331,20 +41439,21 @@ mod tests {
             }
             let _ = run_frame(&ctx, &mut app);
             let rect = app.mixer_rect.expect("the mixer drew nowhere");
-            for _ in 0..40 {
+            for d in &budget {
                 if by_hand {
-                    app.mixer_scroll_by_px(30.0, rect);
+                    app.mixer_scroll_by_px(*d, rect);
                 } else {
-                    wheel(&mut app, &ctx, rect.center(), -30.0);
+                    wheel(&mut app, &ctx, rect.center(), -*d);
                 }
             }
             app.mixer_scroll_px
         };
+        let (by_wheel, by_hand) = (desk(false), desk(true));
+        assert!(by_wheel > 0.0, "the wheel never reached the desk at all");
         assert!(
-            (desk(false) - desk(true)).abs() < 1.0e-3,
-            "the wheel left the desk at {} and the shared scroll at {}",
-            desk(false),
-            desk(true)
+            (by_wheel - by_hand).abs() < 1.0e-3,
+            "the wheel left the desk at {by_wheel} and the shared scroll at \
+             {by_hand}"
         );
     }
 }
