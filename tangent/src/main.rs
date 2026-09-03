@@ -222,6 +222,14 @@ fn parse_cli() -> CliArgs {
                 desktop::ir_test(args.next());
                 std::process::exit(0);
             }
+            // And the denoiser, whose faults are a matter of measurement and
+            // whose quality is a matter of taste — a file in, a file out, and
+            // the dials named. See `desktop::denoise_test`.
+            #[cfg(feature = "recorder")]
+            "--denoise-test" => {
+                desktop::denoise_test(args.next());
+                std::process::exit(0);
+            }
             "-h" | "--help" => print_usage_and_exit(0),
             "-p" | "--port" => match args.next() {
                 Some(value) => port = Some(value),
