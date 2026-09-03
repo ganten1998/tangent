@@ -4315,6 +4315,46 @@ struct Renderer {
     /// `stems_live`, and only ever acted on together with it: a desk not
     /// exporting stems does not fill the dry buffer at all.
     stems_dry: bool,
+    /// **APPENDED — whose pedalboard has already been clocked this chunk**,
+    /// one bit per channel, cleared at the top of every chunk.
+    ///
+    /// A pedal is a stateful chain — a delay, a tremolo, a plate — and the
+    /// board is seven of them in series, so a second run in one chunk
+    /// advances every one of them at twice real time. `run_pedalboard`'s own
+    /// doc has called that "unfixable-sounding noise" since the day it was
+    /// lifted out of the lane pass, and while there were two callers the
+    /// rule held by construction: the lane pass skipped folders and the fold
+    /// only visited them, so the two partitioned the channels.
+    ///
+    /// The live input is a THIRD caller and it does not partition. A lane
+    /// carrying a recorded take and a guitar plugged into the same channel
+    /// is one channel two passes both want the board for, in the same chunk
+    /// — so the partition became a CLAIM: whoever gets there first takes it,
+    /// and everybody after is refused. See [`Renderer::board_live`] for who
+    /// is meant to get there first, and `run_pedalboard` for the two rules
+    /// in one place.
+    board_ran: u32,
+    /// **APPENDED — whose board the ROOM owned last chunk**, one bit per
+    /// channel, written by `mix_monitor` and read by the lane pass.
+    ///
+    /// **Written by the pass that knows, rather than worked out again.** The
+    /// question "does this channel have a live input in the room" is settled
+    /// inside `mix_monitor`'s walk of the interface — the widths, the picks,
+    /// the arm, the mute — and a second spelling of that walk somewhere else
+    /// is exactly the shape `amp_board_arms` exists to avoid. So the monitor
+    /// records what it did and the lane pass believes it.
+    ///
+    /// **One chunk late, on purpose.** `mix_channels` runs before
+    /// `mix_monitor`, so what the lane pass reads is the previous chunk's
+    /// answer. On the first chunk after a guitar is plugged in the lane pass
+    /// still claims the board and the room's first five milliseconds go into
+    /// the amp dry — through an input whose own fade-in has barely started,
+    /// so it is inaudible, and it is why the CLAIM above exists rather than
+    /// this mask alone. The alternative was to walk the interface a second
+    /// time at the top of the chunk to get an exact answer, which buys five
+    /// milliseconds of a fading-in signal at the price of the duplication
+    /// this app has been bitten by three times.
+    board_live: u32,
 }
 
 impl Renderer {
@@ -5073,6 +5113,14 @@ impl Renderer {
             // ordering is load-bearing for a different reason — see the note
             // on the fold — and moving the clips above the walk does not
             // touch it.
+            // **Nobody has clocked a pedalboard yet this chunk.**
+            //
+            // Cleared HERE, at the head of the chunk, because the claim it
+            // opens has to span every pass that can run a board — the lane
+            // walk below, the room in `mix_monitor`, and the fold at the
+            // foot — and a claim reset inside any one of them would be a
+            // claim the other two could not see. See `Renderer::board_ran`.
+            self.board_ran = 0;
             self.mix_clips(at, rolling, n, muted, soloed);
             self.mix_channels(n, muted, soloed, at, rolling, flush, wrap_from);
 
@@ -6121,6 +6169,15 @@ impl Renderer {
         // Cleared first, so every path out of here that adds nothing to the
         // mix also leaves the room equal to the take.
         self.room_live = false;
+        // **And no channel's board belongs to the room until this pass says
+        // so.** Cleared here rather than beside `board_ran` at the head of
+        // the chunk, because this is the only writer: an interface that is
+        // unplugged, an input that is un-armed, a pick that is re-bound —
+        // every one of those leaves through some path out of this function,
+        // and a mask cleared anywhere else would go on telling the lane pass
+        // to stand aside for a guitar that is no longer there. See
+        // `Renderer::board_live`.
+        self.board_live = 0;
         // A ring arriving, or being taken away. `try_lock`, never `lock`.
         // **A layout change for the ring already held.** Read before the
         // ring handoff so a frame where both arrive takes the new ring's own
@@ -6540,13 +6597,21 @@ impl Renderer {
                 pan_gains(lane_pan_of(&self.auto, &self.shared, lane))
             };
             let mut peak = [0.0f32; 2];
-            // **This strip's own audio first, then its rack, then the fold.**
+            // **This strip's own audio first, then its BOARD, then its rack,
+            // then the fold.**
             //
             // It used to go straight into the mix a sample at a time, which is
             // cheaper and leaves nowhere for an insert to stand. The values
             // are identical — this is the same arithmetic through a buffer —
             // and what it buys is a channel that can carry an amp sim like
             // every other channel can.
+            //
+            // The board was the missing link in that sentence for as long as
+            // the amp has existed: an amp sim reached this rack and its
+            // pedals reached nothing, because `run_pedalboard` was called
+            // only from the lane pass and the fold. It runs below now,
+            // between the dry copy and the rack, on exactly the contract the
+            // other two callers keep.
             //
             // A mono input goes to both sides; a stereo one keeps its sides.
             // Anything wider is folded down by taking the first two, which is
@@ -6577,12 +6642,46 @@ impl Renderer {
                     dst[..m].copy_from_slice(&sr[..m]);
                 }
             }
+            // An input channel's rack can hold a voice too — the desk is
+            // about to stop distinguishing — and the gate is the same one.
+            // Hoisted above the board because the board wants it too: a wah
+            // or a tremolo listening for a controller is listening on the
+            // same terms its channel's rack is.
+            let armed =
+                self.shared.midi_off.load(Ordering::Relaxed) & (1 << strip.index().min(63)) == 0;
+            // ── THE PEDALBOARD, on the signal somebody is PLAYING ─────────
+            //
+            // **This is where a guitar meets its pedals**, and until this
+            // line it did not. `run_pedalboard` had exactly two callers —
+            // the lane pass and the fold — and neither is on the live-input
+            // path, so an armed audio channel with an amp in its bay and
+            // seven pedals loaded behind it made no pedal sound at all: the
+            // owner's "twist dials all you want, no sound difference baked
+            // in from any of the 7". The amp itself sounded, because the
+            // amp is in the channel's own rack and the rack runs below.
+            // What confirmed the diagnosis is that the same amp on a GROUP
+            // did hear its board, because a folder's live input reaches
+            // `fold_folders`, which does run it.
+            //
+            // Over `fx_in`, above the rack: the same contract the other two
+            // callers keep — the board is the amp's INPUT, so it runs over
+            // the signal as it stands before this channel's own bays.
+            //
+            // **After the fade-out early-out above, deliberately.** An input
+            // that is neither heard nor still fading has already taken the
+            // `continue`, so a disarmed channel neither runs its board nor
+            // claims it, and the lane pass keeps the board it has always
+            // had. A folder is left out for the same reason its rack is: a
+            // live input standing on a group goes into the bus raw and the
+            // group's board runs once, over the sum, in the fold.
+            //
+            // `live: true` marks this as the room's claim, which is what
+            // makes the lane pass stand aside for it next chunk.
+            if !is_folder && self.amp_board_arms(lane) {
+                self.board_live |= 1u32 << lane.min(CHANNELS - 1);
+                self.run_pedalboard(lane, n, armed, true);
+            }
             {
-                // An input channel's rack can hold a voice too — the desk is
-                // about to stop distinguishing — and the gate is the same one.
-                let armed = self.shared.midi_off.load(Ordering::Relaxed)
-                    & (1 << strip.index().min(63))
-                    == 0;
                 let notes: &[tangent_host::Note] = if armed { &self.notes } else { &[] };
                 let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
                 // **This seat's own parameter queue, not the empty one.** Every rack
@@ -8512,12 +8611,19 @@ impl Renderer {
                 // this channel's own rack, which is the amp's input in the
                 // seeded shape. A LOOSE lane's board runs here; a folder's
                 // runs over the summed group in `fold_folders`, because
-                // that is where a group's audio exists. Once per chunk
-                // either way, which is the whole rule: a pedal is a
-                // stateful chain and a second run per chunk double-clocks
-                // it. See [`Instrument::run_pedalboard`].
+                // that is where a group's audio exists; and a channel with a
+                // guitar plugged into it runs its board in `mix_monitor`,
+                // over the input, because that is where the signal being
+                // PLAYED exists. Once per chunk whichever of the three it
+                // is, which is the whole rule: a pedal is a stateful chain
+                // and a second run per chunk double-clocks it.
+                //
+                // `live: false` — this pass is the timeline's, so it stands
+                // aside for a channel the room owned last chunk. Both rules
+                // live inside [`Instrument::run_pedalboard`] rather than
+                // here, so no call site can hold a different opinion.
                 if self.amp_board_arms(ch) {
-                    self.run_pedalboard(ch, frames, armed);
+                    self.run_pedalboard(ch, frames, armed, false);
                 }
                 // Taken AFTER the board rather than at the head of the
                 // block, and not for tidiness: `&self.controls` is an
@@ -8755,9 +8861,12 @@ impl Renderer {
     /// a FOLDER, the extra rack its bays 3..5 live in
     /// (`recorder::folder_extra_seat`).
     ///
-    /// One function because three places have to agree and used to be three
+    /// One function because four places have to agree and used to be three
     /// spellings of `rack_holds_amp(&self.racks[ch])`: the lane pass, the
-    /// lane's alignment wait, and `publish_latency`. A group's second rack
+    /// room's pass in `mix_monitor`, the lane's alignment wait, and
+    /// `publish_latency`. (The room was the fourth to arrive and asked
+    /// nothing at all, which is the whole of why a live guitar heard no
+    /// pedals; it asks this now, like everybody else.) A group's second rack
     /// was invisible to all three, so an amp dropped into a group's bay 4
     /// wore a board that never ran — and, worse, the two latency sites
     /// counted the board's delay for a group whose board was silent, which
@@ -8786,6 +8895,18 @@ impl Renderer {
     /// cannot disagree about whether a board is in circuit. Zero when it is
     /// not armed, which is the honest answer: the racks are loaded but
     /// nothing is running them.
+    ///
+    /// **The ROOM's run of the board is not in this figure, and must not
+    /// be.** Both sites are about the TIMELINE's alignment — where a lane's
+    /// audio has to be held so it lands with every other lane — and
+    /// `mix_monitor` is not on that clock at all: it pays no compensation
+    /// for the channel rack it already runs, because a monitor path is what
+    /// the player is hearing and holding it back is the one thing nobody
+    /// wants. So the board's delay is paid in the room, undeclared, exactly
+    /// as the rack's is; what these two sites count is the same board on the
+    /// same channel when the lane pass or the fold is the one running it,
+    /// which is the case they were written for. `amp_board_arms` is still
+    /// the single arming question, so the two cannot drift.
     fn pedal_latency(&self, ch: usize) -> u32 {
         if !self.amp_board_arms(ch) {
             return 0;
@@ -8815,20 +8936,55 @@ impl Renderer {
     /// this takes a CHANNEL rather than a seat: the board belongs to the
     /// channel, and a folder's two racks share the one board.
     ///
-    /// Called exactly once per chunk per channel. The lane pass skips
-    /// folders entirely (`!is_folder`) and the fold only ever visits
-    /// folders, so the two callers partition the channels rather than
-    /// overlapping — a second run in one chunk would clock a delay, a
-    /// tremolo and a plate twice, which is the unfixable-sounding noise the
-    /// original comment warned about.
+    /// **Called at most once per chunk per channel, and this function is
+    /// what makes that true.** It used to be true by construction, and it
+    /// said so here: the lane pass skipped folders (`!is_folder`) and the
+    /// fold only ever visited folders, so the two callers partitioned the
+    /// channels and could not overlap.
+    ///
+    /// The ROOM is a third caller and it partitions nothing. An armed audio
+    /// channel with a take already on it is one channel that the lane pass
+    /// and `mix_monitor` both reach in the same chunk — the lane because
+    /// `clip_lanes` is a whole-timeline answer and a lane with any audio
+    /// anywhere on it renders every block, the room because that is where a
+    /// guitar coming off the interface meets its amp. Two runs would clock
+    /// the delay, the tremolo and the plate twice, which is the
+    /// unfixable-sounding noise the original comment warned about.
+    ///
+    /// So the partition became two rules, both here rather than at three
+    /// call sites:
+    ///
+    /// 1. **The claim.** A channel whose board has already run this chunk is
+    ///    refused. See [`Renderer::board_ran`].
+    /// 2. **The room goes first.** A caller that is not the live input
+    ///    stands aside for a channel the room owned last chunk, because the
+    ///    board is the amp's input and the signal somebody is PLAYING is the
+    ///    one that wants it. Without this the lane pass would take the board
+    ///    every block for any track with a take on it, and the guitar in
+    ///    somebody's hands would arrive at the amp dry — which is a worse
+    ///    reading of the same rule, not a safer one. See
+    ///    [`Renderer::board_live`].
+    ///
+    /// `live` says which kind of caller this is: the room passes `true`, the
+    /// lane pass and the fold `false`.
+    ///
     /// **`armed` rather than the slice itself**, which is a borrow-checker
     /// fact worth writing down because the obvious signature does not
     /// compile: `&self.controls` taken at the call site is an immutable
     /// borrow of the whole of `self`, and this method needs `&mut self` for
     /// the racks. Resolved INSIDE, the two are disjoint fields and the
-    /// borrows never meet. The lane pass passes the transport's own arming;
-    /// the fold passes `false`, because a bus is not played.
-    fn run_pedalboard(&mut self, ch: usize, frames: usize, armed: bool) {
+    /// borrows never meet. The lane pass passes the transport's own arming
+    /// and the room passes its strip's; the fold passes `false`, because a
+    /// bus is not played.
+    fn run_pedalboard(&mut self, ch: usize, frames: usize, armed: bool, live: bool) {
+        // Rule 1 and rule 2, in the order they are argued above. The mask
+        // is `u32` and `CHANNELS` is 32, so the clamp is a bounds check and
+        // never a fold of one channel onto another.
+        let bit = 1u32 << ch.min(CHANNELS - 1);
+        if self.board_ran & bit != 0 || (!live && self.board_live & bit != 0) {
+            return;
+        }
+        self.board_ran |= bit;
         let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
         for pedal in 0..tangent_ui::recorder::AMP_PEDALS {
             let seat = tangent_ui::recorder::amp_pedal_seat(ch, pedal);
@@ -8971,9 +9127,13 @@ impl Renderer {
             //
             // `amp_board_arms` asks both racks, so an amp in bays 3..5 arms
             // the board exactly as one in bay 0 does. Empty controls: a
-            // folder is a bus, and a bus is not played.
+            // folder is a bus, and a bus is not played — and `live: false`
+            // for the same reason, though no folder is ever in `board_live`:
+            // `mix_monitor` puts a live input on a group into the bus raw
+            // and runs neither its rack nor its board, so the fold is the
+            // only pass that can claim a folder's.
             if self.amp_board_arms(ch) {
-                self.run_pedalboard(ch, frames, false);
+                self.run_pedalboard(ch, frames, false, false);
             }
             // **THE-FOLD:** the one place a folder's rack runs.
             //
@@ -10202,6 +10362,8 @@ impl Engine {
             dry_pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
             pad_dry_pdc: (0..=CHANNELS).map(|_| DelayLine::new()).collect(),
             stems_dry: false,
+            board_ran: 0,
+            board_live: 0,
         };
 
         let (stream, out_device_obj, offline_renderer) = match dev {
@@ -15393,6 +15555,8 @@ mod tests {
             dry_pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
             pad_dry_pdc: (0..=CHANNELS).map(|_| DelayLine::new()).collect(),
             stems_dry: false,
+            board_ran: 0,
+            board_live: 0,
             racks,
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -16673,6 +16837,255 @@ mod tests {
             grouped > loose * 0.5 && grouped < loose * 2.0,
             "a group's board did not run the way a loose lane's does: \
              x{grouped:.3} against x{loose:.3}"
+        );
+    }
+
+
+    /// What is standing in the amp's first pedal seat, for the live-input
+    /// rig below. `Bypassed` is the same plugin with the mixer's own
+    /// `insert_bypass` flag set on it, because "off" in this app means a
+    /// tenant that is loaded, drawn, named on its chip and not applied.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Pedal {
+        None,
+        Loaded,
+        Bypassed,
+    }
+
+    /// **The owner's rig: a guitar in an interface, an armed AUDIO channel,
+    /// an amp in its first bay and one pedal in front of it.**
+    ///
+    /// Built the way the HOST builds it rather than the way a lane test
+    /// does, because the difference is the whole fault. The channel's live
+    /// MIDI is off, as `recorder::live_midi_off` leaves every audio lane's;
+    /// the arm bit is set, which is what puts an input in the room; the pick
+    /// is bound to the channel; and the ring arrives through `set_monitor`
+    /// exactly as opening the input stream delivers it. Nothing here reaches
+    /// `mix_channels`' lane walk at all — which is why an amp on a track
+    /// made pedal-less noise while the same amp on a GROUP sounded right.
+    ///
+    /// `take` puts an audio clip on the same lane, silent and with the
+    /// transport parked. That is not a detail either: `clip_lanes` is a
+    /// whole-timeline answer (see `mix_clips`), so a lane with any audio
+    /// anywhere on it renders its rack and its board every block for ever
+    /// after — the moment somebody records one take, the lane pass and the
+    /// room both want that channel's board in the same chunk. This is the
+    /// collision, reproduced.
+    ///
+    /// Answers the master's peak for each 512-frame chunk in order — one
+    /// `render_offline` of a 512-frame buffer is exactly one chunk — so a
+    /// caller can look at the chunk the interface arrived in separately from
+    /// the ones after it.
+    fn a_guitar_through_an_amp(pedal: Pedal, take: bool, blocks: usize) -> Vec<f32> {
+        const CH: usize = 3;
+        const FRAMES: usize = 512;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).unwrap();
+        let loud = crate::builtin_fx::state_text(spec, &[1.0], &[]).into_bytes();
+        e.load_insert(CH, 0, Some(Path::new(crate::builtin_fx::AMP_PATH)), None)
+            .expect("the amp loads")
+            .expect("the bay reports it");
+        let seat = tangent_ui::recorder::amp_pedal_seat(CH, 0);
+        if pedal != Pedal::None {
+            e.load_insert(seat, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), Some(&loud))
+                .expect("a pedal seat admits a built-in")
+                .expect("the pedal bay reports it");
+        }
+        if pedal == Pedal::Bypassed {
+            e.set_insert_bypass(&[(seat, 0)]);
+        }
+        if take {
+            // Silent, and parked: the point is the LANE bit it sets, not
+            // anything it plays.
+            e.set_clips(vec![flat_clip(CH, 0.0)]);
+        }
+        // `dx7_through_amp`'s fader, for `dx7_through_amp`'s reason: the
+        // claim is a ratio inside one channel and a loud case must not
+        // brush anything downstream.
+        e.set_channel_gain(CH, 0.02);
+        e.set_master_gain(1.0);
+        // An AUDIO lane: no live MIDI, and armed to the room.
+        e.set_midi_off(1 << CH);
+        e.set_armed(1 << CH);
+        e.set_pick_strips([Some(CH), None, None, None]);
+        e.set_monitor_on(true);
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; FRAMES * 2];
+        // Warm-up drains the insert hand-off rings and lands the clip list,
+        // the same count for every variant — and it happens BEFORE the
+        // interface opens, so the first measured chunk is the chunk the
+        // ring is handed over in.
+        for _ in 0..6 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let (mut jack, ring) = RingBuffer::<f32>::new(1 << 15);
+        e.set_monitor(Some((
+            ring,
+            1,
+            [1, 0, 0, 0],
+            FRAMES as u32,
+            tangent_record::audio::Picks::EVERYTHING,
+        )));
+        // A 440 Hz note rather than a constant: an amp is a chain of
+        // filters and a DC offset is the one signal it is entitled to throw
+        // away.
+        let mut phase = 0.0f64;
+        let mut peaks = Vec::with_capacity(blocks);
+        for _ in 0..blocks {
+            // Topped up one chunk at a time, as an input callback tops it
+            // up — a ring filled to the brim would be a backlog the monitor
+            // is right to drop.
+            for _ in 0..FRAMES {
+                let _ = jack.push((phase.sin() * 0.02) as f32);
+                phase += std::f64::consts::TAU * 440.0 / 48_000.0;
+            }
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            peaks.push(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+        }
+        peaks
+    }
+
+    /// The loudest the master got after the input's own fade-in has
+    /// arrived. The room and the input both slew over about ten
+    /// milliseconds, so the first few chunks are a ramp and say nothing
+    /// about a pedal.
+    fn settled(peaks: &[f32]) -> f32 {
+        peaks.iter().skip(4).fold(0.0f32, |a, v| a.max(*v))
+    }
+
+    /// **A live guitar hears the pedals in front of its amp.** THE fault the
+    /// owner reported: "twist dials all you want, no sound difference baked
+    /// in from any of the 7".
+    ///
+    /// `run_pedalboard` had exactly two callers — the lane pass in
+    /// `mix_channels` and `fold_folders` — and neither of them is on the
+    /// live-input path. An armed audio channel's own rack, and therefore its
+    /// amp, runs in `mix_monitor`, which called no pedals at all; and the
+    /// lane pass could not stand in for it, because an audio channel is
+    /// permanently unarmed there (`live_midi_off` clears bits for MIDI lanes
+    /// only) and a lane with no clip on it takes the `continue` long before
+    /// the board. So the amp sounded, the seven racks really were loaded,
+    /// their knobs really did reach the engine, and the chain simply never
+    /// ran on the signal he was playing. The giveaway that confirmed it: the
+    /// same amp on a GROUP did hear its board, because a folder's live input
+    /// reaches the fold, which runs it.
+    ///
+    /// Deleting the `run_pedalboard` call from `mix_monitor` makes this red:
+    /// with no board in front of the amp, +24 dB of pedal is worth nothing.
+    #[test]
+    fn a_live_guitar_hears_the_pedals_in_front_of_its_amp() {
+        let bare = settled(&a_guitar_through_an_amp(Pedal::None, false, 24));
+        assert!(
+            bare > 1.0e-5,
+            "the rig makes no sound at all, so nothing below is evidence: {bare}"
+        );
+        let pedalled = settled(&a_guitar_through_an_amp(Pedal::Loaded, false, 24));
+        assert!(
+            pedalled > bare * 1.5,
+            "a +24 dB pedal in front of a live guitar's amp changed nothing: \
+             {pedalled} against {bare} bare"
+        );
+    }
+
+    /// **A bypassed pedal is out of the live chain, and the rest of the
+    /// board is not.** The other half of shipping the seeded board switched
+    /// off: a default that cannot be heard to be a default is a default
+    /// nobody can trust.
+    ///
+    /// Same rig, same plugin, same +24 dB, and the only difference is the
+    /// mixer's own `insert_bypass` flag on that seat — the flag a shift
+    /// click on the chip toggles. Bypassed it must read as the bare rig; in
+    /// circuit it must read as the pedalled one. `run_rack` reads the flag
+    /// for the pedal racks exactly as it does for a channel's own bays, so
+    /// deleting that read makes this red from the bypassed side.
+    #[test]
+    fn a_bypassed_pedal_leaves_a_live_guitars_chain() {
+        let bare = settled(&a_guitar_through_an_amp(Pedal::None, false, 24));
+        let pedalled = settled(&a_guitar_through_an_amp(Pedal::Loaded, false, 24));
+        let off = settled(&a_guitar_through_an_amp(Pedal::Bypassed, false, 24));
+        assert!(
+            pedalled > bare * 1.5,
+            "the reference has no pedal gain to switch off: {pedalled} against {bare}"
+        );
+        assert!(
+            (off - bare).abs() <= bare * 0.02,
+            "a bypassed pedal is still doing something: {off} against {bare} \
+             with the seat empty"
+        );
+    }
+
+    /// **A lane that already holds a take gives its board to the guitar
+    /// somebody is playing.**
+    ///
+    /// The precedence rule, and it is not academic: `clip_lanes` is a
+    /// whole-timeline answer, so the moment one take is recorded on a track
+    /// the lane pass reaches that channel's board every block for ever —
+    /// including every block of the next overdub. First-come would then hand
+    /// the board to a lane playing nothing (the transport is parked) and
+    /// leave the guitar going into the amp dry, which is the original fault
+    /// wearing a fresh face.
+    ///
+    /// So the room's claim is remembered and the lane pass stands aside for
+    /// it. Deleting the `board_live` clause from `run_pedalboard` makes this
+    /// red: the lane takes the board back, and the pedal stops being audible
+    /// on a track that has anything recorded on it.
+    #[test]
+    fn a_lane_that_holds_a_take_gives_its_board_to_the_guitar() {
+        let bare = settled(&a_guitar_through_an_amp(Pedal::None, true, 24));
+        assert!(
+            bare > 1.0e-5,
+            "the rig makes no sound at all, so nothing below is evidence: {bare}"
+        );
+        let pedalled = settled(&a_guitar_through_an_amp(Pedal::Loaded, true, 24));
+        assert!(
+            pedalled > bare * 1.5,
+            "a lane with a take on it kept its guitar's board to itself: \
+             {pedalled} against {bare} bare"
+        );
+    }
+
+    /// **The board is clocked ONCE in the chunk the lane pass and the room
+    /// both reach it.**
+    ///
+    /// `board_live` is written by `mix_monitor` and read by `mix_channels`,
+    /// which runs first — so on the chunk an interface is handed over the
+    /// mask is still empty and the lane pass claims the board before the
+    /// room can. That chunk is the one place both passes arrive, and the
+    /// claim is what stops the second run: a pedal is a stateful chain and
+    /// seven of them in series clocked twice in a block is the
+    /// unfixable-sounding noise `run_pedalboard` has warned about since it
+    /// was lifted out of the lane walk.
+    ///
+    /// Measured on the FIRST chunk after the ring arrives, against the same
+    /// rig with the seat empty. The lane pass runs the board over its own
+    /// silence there, so with the claim in place that first chunk is
+    /// identical either way — the guitar goes into the amp dry for five
+    /// milliseconds, through an input whose fade-in has barely started, and
+    /// from the next chunk the room owns the board (the test above). Delete
+    /// the `board_ran` check and the room runs the board a second time in
+    /// that chunk, the guitar arrives +24 dB, and the two stop matching.
+    #[test]
+    fn the_board_is_clocked_once_in_the_chunk_a_lane_and_the_room_both_reach_it() {
+        let bare = a_guitar_through_an_amp(Pedal::None, true, 24);
+        let pedalled = a_guitar_through_an_amp(Pedal::Loaded, true, 24);
+        let (a, b) = (bare[0], pedalled[0]);
+        assert!(
+            (a - b).abs() <= a.max(b) * 0.02 + 1.0e-9,
+            "the pedalboard ran twice in the chunk the interface arrived in: \
+             {b} against {a} with the seat empty"
+        );
+        // And the rig is the one the claim is about: by the settled chunks
+        // the room owns the board and the pedal is plainly audible, so a
+        // first chunk that matches is a claim held rather than a pedal that
+        // never worked.
+        assert!(
+            settled(&pedalled) > settled(&bare) * 1.5,
+            "the rig never heard the pedal at all, so the first chunk agreeing \
+             says nothing: {} against {}",
+            settled(&pedalled),
+            settled(&bare)
         );
     }
 
