@@ -1269,10 +1269,10 @@ const AMP_DEFAULT_BOARD: [&str; tangent_ui::recorder::AMP_PEDALS] = [
     "@tangent-plate",
 ];
 
-/// Whether the amp landing on channel `ch` should seed [`AMP_DEFAULT_BOARD`],
-/// asked with a lookup instead of the settings so the once-only rule can be
-/// tested as plain logic. `pedal_filled(pedal, bay)` answers whether that
-/// cell holds anything.
+/// Which channel's board an amp landing in rack `seat` should seed, and
+/// with what — asked with a lookup instead of the settings so the once-only
+/// rule can be tested as plain logic. `pedal_filled(pedal, bay)` answers
+/// whether that cell of the OWNING channel's board holds anything.
 ///
 /// **"Any non-empty pedal cell" is the whole marker, deliberately** — the
 /// simpler of the two honest options (the other was a settings flag per
@@ -1280,17 +1280,26 @@ const AMP_DEFAULT_BOARD: [&str; tangent_ui::recorder::AMP_PEDALS] = [
 /// seeded board itself trips it, so one amp load seeds exactly once; a
 /// player who empties all twenty-one cells by hand AND re-seats the amp
 /// gets a fresh board, which is the reading of that gesture we want.
+///
+/// **It takes a SEAT and answers with a CHANNEL, and that is the fix.** It
+/// used to take `ch` and refuse anything at or past `CHANNELS`, which reads
+/// as "only real tracks get a board" and behaves as something else entirely:
+/// a folder's bays 3..5 live in an appended seat far past the channels
+/// (`folder_extra_seat`), so an amp dropped there seeded nothing at all
+/// while the same amp one bay up seeded the full board. Two amps in one
+/// group, two different behaviours, no rule anybody could have guessed.
+/// Routing through `pedal_owner` gives both racks the same answer — the
+/// channel's one board — and the once-only marker keeps its meaning without
+/// change, because the two racks share the cells it counts.
 #[cfg(feature = "recorder")]
 fn amp_board_to_seed(
-    ch: usize,
+    seat: usize,
     pedal_filled: impl Fn(usize, usize) -> bool,
-) -> Option<[&'static str; tangent_ui::recorder::AMP_PEDALS]> {
-    if ch >= tangent_ui::recorder::CHANNELS {
-        return None;
-    }
+) -> Option<(usize, [&'static str; tangent_ui::recorder::AMP_PEDALS])> {
+    let ch = tangent_ui::recorder::pedal_owner(seat)?;
     let untouched = (0..tangent_ui::recorder::AMP_PEDALS)
         .all(|p| (0..tangent_ui::recorder::INSERTS).all(|b| !pedal_filled(p, b)));
-    untouched.then_some(AMP_DEFAULT_BOARD)
+    untouched.then_some((ch, AMP_DEFAULT_BOARD))
 }
 
 /// **Read one strip's three bays and hand the app what they can automate.**
@@ -3198,13 +3207,21 @@ impl DesktopApp {
             // decision and its once-only marker live in
             // [`amp_board_to_seed`].
             if want.as_deref() == Some(crate::builtin_fx::AMP_PATH) {
-                let ch = i / inserts;
-                let seed = amp_board_to_seed(ch, |pedal, bay| {
-                    self.app
-                        .insert(tangent_ui::recorder::amp_pedal_seat(ch, pedal), bay)
-                        .is_some()
+                // The SEAT the amp landed in, which for a group's bays 3..5
+                // is not its channel — `amp_board_to_seed` is the one place
+                // that translates, and it hands back the channel it decided
+                // on so the cells written below cannot drift from the cells
+                // that were counted.
+                let seat = i / inserts;
+                let owner = tangent_ui::recorder::pedal_owner(seat);
+                let seed = amp_board_to_seed(seat, |pedal, bay| {
+                    owner.is_some_and(|ch| {
+                        self.app
+                            .insert(tangent_ui::recorder::amp_pedal_seat(ch, pedal), bay)
+                            .is_some()
+                    })
                 });
-                if let Some(board) = seed {
+                if let Some((ch, board)) = seed {
                     for (pedal, path) in board.iter().enumerate() {
                         self.app.set_insert(
                             tangent_ui::recorder::amp_pedal_seat(ch, pedal),
@@ -13638,16 +13655,26 @@ mod tests {
         );
     }
 
-    /// **The default pedalboard seeds exactly once, and only on a
-    /// channel.** The once-only marker is "any non-empty pedal cell" — the
-    /// seeded board itself trips it — so the decision is held here as the
-    /// plain logic it is, with the reconcile's write path left to write.
+    /// **The default pedalboard seeds exactly once, on a track or a group,
+    /// and onto the board its CHANNEL owns.** The once-only marker is "any
+    /// non-empty pedal cell" — the seeded board itself trips it — so the
+    /// decision is held here as the plain logic it is, with the reconcile's
+    /// write path left to write.
+    ///
+    /// The signature changed under this test and the doc says why rather
+    /// than the test being quietly re-pointed: it took a channel and now
+    /// takes a SEAT, because an amp landing in a group's bay 4 lands in the
+    /// appended `folder_extra_seat`, which is past `CHANNELS` and used to
+    /// seed nothing. Two amps in one group behaving differently was the bug;
+    /// the new assertions below are that pair.
     #[cfg(feature = "recorder")]
     #[test]
     fn the_default_pedalboard_seeds_once_and_only_on_channels() {
-        use tangent_ui::recorder::{AMP_PEDALS, CHANNELS};
+        use tangent_ui::recorder::{folder_extra_seat, AMP_PEDALS, CHANNELS, MASTER_SEAT};
         let empty = |_p: usize, _b: usize| false;
-        let board = super::amp_board_to_seed(3, empty).expect("an untouched channel seeds");
+        let (ch, board) =
+            super::amp_board_to_seed(3, empty).expect("an untouched channel seeds");
+        assert_eq!(ch, 3, "a channel seeds its own board");
         assert_eq!(board.len(), AMP_PEDALS);
         assert!(board.iter().all(|p| p.starts_with("@tangent-")));
         assert_eq!(board[0], "@tangent-comp", "dynamics lead the chain");
@@ -13660,10 +13687,30 @@ mod tests {
             super::amp_board_to_seed(3, |p, b| p == AMP_PEDALS - 1 && b == 2).is_none(),
             "a tenant in the last pedal's last bay did not count as touched"
         );
-        // Past the channels — the master's seat and everything after — no
-        // board: those amps play bare in v1, and seeding would land the
-        // pedals on seat math that means another channel's board.
+        // **A GROUP's second rack seeds the group's own board.** Bays 3..5
+        // of a folder are `folder_extra_seat(ch)`, which is past every pad
+        // block; before `pedal_owner` this arm answered None and an amp
+        // dropped there arrived as seven pluses.
+        let (ch, board) = super::amp_board_to_seed(folder_extra_seat(5), empty)
+            .expect("a group's extra rack seeds");
+        assert_eq!(ch, 5, "the extra rack seeded somebody else's board");
+        assert_eq!(board, super::AMP_DEFAULT_BOARD, "a different board on the extra rack");
+        // ...and once, across BOTH racks, because they share the one board.
+        // A cell filled by the first rack's seeding stops the second's.
+        assert!(
+            super::amp_board_to_seed(folder_extra_seat(5), |p, b| p == 0 && b == 0).is_none(),
+            "a group's two racks each seeded the shared board"
+        );
+        // Everything with no board of its own — the master, the buses, the
+        // pads, a pedal seat itself — still seeds nothing: those amps play
+        // bare in v1, and seeding would land the pedals on seat math that
+        // means another channel's board.
+        assert!(super::amp_board_to_seed(MASTER_SEAT, empty).is_none());
         assert!(super::amp_board_to_seed(CHANNELS, empty).is_none());
+        assert!(
+            super::amp_board_to_seed(folder_extra_seat(CHANNELS - 1) + 1, empty).is_none(),
+            "the seat just past the folder block claimed a board"
+        );
         assert!(super::amp_board_to_seed(usize::MAX, empty).is_none());
     }
 

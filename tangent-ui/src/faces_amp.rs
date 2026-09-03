@@ -13,10 +13,16 @@
 //! group beside them — the panel word is "Vibrato" because that is what the
 //! era's panels said, and the tooltip tells the truth that it is amplitude
 //! tremolo — and the pedalboard underfoot as a row of seven chips, each
-//! wearing its tenant's short name or a plus. A chip is a doorway, not a
-//! editor: clicking one asks the app to open the picker over that pedal's
-//! own seat (`recorder::amp_pedal_seat`), and the pedal's face then opens
-//! by the same road every insert's does.
+//! wearing its tenant's short name or a plus.
+//!
+//! A chip is a doorway, not an editor: clicking one asks the app to open
+//! the picker over that pedal's own seat (`recorder::amp_pedal_seat`), and
+//! the pedal's face then opens by the same road every insert's does.
+//!
+//! **Whose board this is comes from `recorder::pedal_owner`, not from the
+//! seat.** A group wears six bays across two seats, and an amp in the second
+//! of them wears the same board as one in the first — one board per channel,
+//! run once over the summed group.
 
 use crate::face::{self, slider_row, stepped_row, FaceStyle, StepAsk};
 use crate::faces::{FaceAction, FaceLive};
@@ -203,10 +209,17 @@ pub fn draw_amp(
                 }
             });
         }
-        // The amp is on the master, a bus or a folder's extra rack: no
-        // pedalboard there in v1, and the panel says so rather than
-        // drawing seven chips that go nowhere.
-        None => caption(ui, "PEDALS - on channel strips only"),
+        // The amp is on the master, on a bus, or in a drum pad's own rack:
+        // no board there in v1, and the panel says so rather than drawing
+        // seven chips that go nowhere.
+        //
+        // A GROUP is no longer in that list, and the wording changed with
+        // it. A folder's six bays are two seats — its own and an appended
+        // one — and until `pedal_owner` existed the second of them fell into
+        // this arm, so an amp moved from a group's bay 0 to its bay 3 lost
+        // its pedalboard on screen and in the engine. A folder is a track
+        // with a bus in it; its amp wears its channel's board like anybody's.
+        None => caption(ui, "PEDALS - on tracks and groups only"),
     }
     out
 }

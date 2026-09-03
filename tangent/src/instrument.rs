@@ -6810,15 +6810,10 @@ impl Renderer {
             // they run in series before the amp, so the lane's figure and
             // the alignment target both carry their sum, or a lookahead
             // pedal would leave the lane late by exactly what it looks
-            // ahead. Mirrors the wait in the lane pass; see THE PEDALBOARD.
-            if self.racks.get(lane).is_some_and(|r| rack_holds_amp(r)) {
-                for pedal in 0..tangent_ui::recorder::AMP_PEDALS {
-                    l = l.saturating_add(Rack::latency(
-                        &self.shared,
-                        tangent_ui::recorder::amp_pedal_seat(lane, pedal),
-                    ));
-                }
-            }
+            // ahead. Mirrors the wait in the lane pass, through the one
+            // function both ask, so a group's second rack cannot be visible
+            // to one of them and not the other. See `pedal_latency`.
+            l = l.saturating_add(self.pedal_latency(lane));
             self.shared.lane_latency[lane].store(l, Ordering::Relaxed);
             // **Plus every rack it is folded THROUGH.** A track in a group
             // with a lookahead limiter on the group pays that limiter, so
@@ -8229,56 +8224,25 @@ impl Renderer {
                 }
             }
             if rack_live && !is_folder {
-                let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
                 // ── THE PEDALBOARD ─────────────────────────────────────────
-                // **A channel bay holding the amp arms the channel's seven
-                // pedal racks** (`recorder::AMP_PEDAL_SEATS`), run here IN
-                // ORDER over `fx_in` — the signal as it stands before this
-                // channel's own rack, which is the amp's input in the
-                // seeded shape (the amp in bay 0; an amp moved to a later
-                // bay hears its pedals through whatever sits before it, a
-                // v1 simplification stated rather than hidden). Only HERE:
-                // the master, the buses, a folder's two racks and the
-                // send/monitor re-runs of this same seat all play bare in
-                // v1 — a pedal is a once-per-chunk stateful chain, and a
-                // second run per chunk would double-clock it.
-                if rack_holds_amp(&self.racks[ch]) {
-                    for pedal in 0..tangent_ui::recorder::AMP_PEDALS {
-                        let seat = tangent_ui::recorder::amp_pedal_seat(ch, pedal);
-                        // An empty pedal rack costs this one load and
-                        // nothing else — every channel's default state.
-                        if self.racks[seat].is_empty() {
-                            continue;
-                        }
-                        // The seat's own queue, taken before the rack is
-                        // borrowed mutably, as every caller does.
-                        let pedal_params: [&[tangent_host::ParamPoint]; INSERTS] =
-                            std::array::from_fn(|b| {
-                                self.auto_params
-                                    .get(seat * INSERTS + b)
-                                    .map_or(&[][..], Vec::as_slice)
-                            });
-                        // **NOT-A-CHANNEL:** a pedal seat lives past every
-                        // channel index and can never be handed a folder.
-                        // An effects pass — no notes; the hand's CONTROLS
-                        // still reach a pedal that listens for them.
-                        run_rack(
-                            &mut self.racks[seat],
-                            &mut self.fx_in,
-                            frames,
-                            &mut self.fx_out,
-                            &[],
-                            controls,
-                            &pedal_params,
-                            &self.shared,
-                            seat,
-                            // NOT a key pass: the lane's one feed per chunk
-                            // belongs to the channel's own rack below. See
-                            // `KeyFeed`.
-                            None,
-                        );
-                    }
+                // **A bay holding the amp arms the channel's seven pedal
+                // racks**, run over `fx_in` — the signal as it stands before
+                // this channel's own rack, which is the amp's input in the
+                // seeded shape. A LOOSE lane's board runs here; a folder's
+                // runs over the summed group in `fold_folders`, because
+                // that is where a group's audio exists. Once per chunk
+                // either way, which is the whole rule: a pedal is a
+                // stateful chain and a second run per chunk double-clocks
+                // it. See [`Instrument::run_pedalboard`].
+                if self.amp_board_arms(ch) {
+                    self.run_pedalboard(ch, frames, armed);
                 }
+                // Taken AFTER the board rather than at the head of the
+                // block, and not for tidiness: `&self.controls` is an
+                // immutable borrow of the whole of `self`, and the board
+                // above needs `&mut self` for the racks. Hoisted, it made
+                // the one call this refactor exists for uncompilable.
+                let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
                 // **This seat's own parameter queue, not the empty one.** Every rack
                 // outside the general channels used to be handed an empty queue,
                 // which was true while the only writer was an automation curve —
@@ -8357,14 +8321,15 @@ impl Renderer {
                 // out, so the wait subtracts them too — `publish_latency`
                 // counts them into the target by the same rule, and the two
                 // must not drift or the lane waits for its own pedals.
-                if rack_holds_amp(&self.racks[ch]) {
-                    for pedal in 0..tangent_ui::recorder::AMP_PEDALS {
-                        own = own.saturating_add(Rack::latency(
-                            &self.shared,
-                            tangent_ui::recorder::amp_pedal_seat(ch, pedal),
-                        ));
-                    }
-                }
+                //
+                // A FOLDER's board is armed by either of its racks and runs
+                // at the fold, which is still on this lane's way out, so the
+                // one figure covers both. It used to be `rack_holds_amp` on
+                // this lane's own rack alone, and that was wrong in both
+                // directions at once for a group: an amp in bays 3..5 paid
+                // nothing for a board it wore, and an amp in bay 0 paid for
+                // a board that was not running. See `pedal_latency`.
+                own = own.saturating_add(self.pedal_latency(ch));
                 let want = usize::try_from(
                     pdc_max
                         .saturating_sub(own)
@@ -8454,6 +8419,122 @@ impl Renderer {
     /// here processes the summed children, so a compressor in a folder's bay
     /// is a bus compressor, and the peak reported is the group's, so the
     /// meter finally moves.
+    /// **Whether channel `ch`'s pedalboard is armed this chunk**, asked of
+    /// the racks that can hold the amp for that channel — its own, and, for
+    /// a FOLDER, the extra rack its bays 3..5 live in
+    /// (`recorder::folder_extra_seat`).
+    ///
+    /// One function because three places have to agree and used to be three
+    /// spellings of `rack_holds_amp(&self.racks[ch])`: the lane pass, the
+    /// lane's alignment wait, and `publish_latency`. A group's second rack
+    /// was invisible to all three, so an amp dropped into a group's bay 4
+    /// wore a board that never ran — and, worse, the two latency sites
+    /// counted the board's delay for a group whose board was silent, which
+    /// left that group early by exactly the lookahead of a pedal nobody was
+    /// hearing. Extending one site and not the other moves that error rather
+    /// than removing it, which is precisely why it is one function.
+    ///
+    /// A channel owns ONE board and a folder has two racks; both racks
+    /// therefore share it. See `recorder::pedal_owner`, where that decision
+    /// is written down, and `run_pedalboard`, which runs it once.
+    fn amp_board_arms(&self, ch: usize) -> bool {
+        if self.racks.get(ch).is_some_and(rack_holds_amp) {
+            return true;
+        }
+        self.folder_is.get(ch).copied().unwrap_or(false)
+            && self
+                .racks
+                .get(tangent_ui::recorder::folder_extra_seat(ch))
+                .is_some_and(rack_holds_amp)
+    }
+
+    /// What channel `ch`'s pedal racks add to its chain, in frames.
+    ///
+    /// Read by both latency sites — the published figure and the lane's own
+    /// wait — off the same arming question the audio path asks, so the two
+    /// cannot disagree about whether a board is in circuit. Zero when it is
+    /// not armed, which is the honest answer: the racks are loaded but
+    /// nothing is running them.
+    fn pedal_latency(&self, ch: usize) -> u32 {
+        if !self.amp_board_arms(ch) {
+            return 0;
+        }
+        (0..tangent_ui::recorder::AMP_PEDALS).fold(0u32, |acc, pedal| {
+            acc.saturating_add(Rack::latency(
+                &self.shared,
+                tangent_ui::recorder::amp_pedal_seat(ch, pedal),
+            ))
+        })
+    }
+
+    /// **The seven pedal racks, in order, over whatever is in `fx_in`.**
+    ///
+    /// Lifted out of the lane pass so the fold can run the very same code.
+    /// It was written inline, and the day a group needed a board that was
+    /// the whole problem: the alternative to lifting it was a second copy in
+    /// `fold_folders`, and two copies of a stateful chain's driver is how
+    /// one of them quietly stops passing the automation queue, or the
+    /// controls, or the empty-rack skip. Nothing here is new; the only thing
+    /// that changed is that it has a name and two callers.
+    ///
+    /// **`fx_in` is the contract, and it means different audio at each
+    /// caller.** In the lane pass it is one channel's own signal before its
+    /// rack; in the fold it is the whole group summed. Both are "the amp's
+    /// input", which is the only thing the board cares about — and it is why
+    /// this takes a CHANNEL rather than a seat: the board belongs to the
+    /// channel, and a folder's two racks share the one board.
+    ///
+    /// Called exactly once per chunk per channel. The lane pass skips
+    /// folders entirely (`!is_folder`) and the fold only ever visits
+    /// folders, so the two callers partition the channels rather than
+    /// overlapping — a second run in one chunk would clock a delay, a
+    /// tremolo and a plate twice, which is the unfixable-sounding noise the
+    /// original comment warned about.
+    /// **`armed` rather than the slice itself**, which is a borrow-checker
+    /// fact worth writing down because the obvious signature does not
+    /// compile: `&self.controls` taken at the call site is an immutable
+    /// borrow of the whole of `self`, and this method needs `&mut self` for
+    /// the racks. Resolved INSIDE, the two are disjoint fields and the
+    /// borrows never meet. The lane pass passes the transport's own arming;
+    /// the fold passes `false`, because a bus is not played.
+    fn run_pedalboard(&mut self, ch: usize, frames: usize, armed: bool) {
+        let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
+        for pedal in 0..tangent_ui::recorder::AMP_PEDALS {
+            let seat = tangent_ui::recorder::amp_pedal_seat(ch, pedal);
+            // An empty pedal rack costs this one load and nothing else —
+            // every channel's default state.
+            if self.racks[seat].is_empty() {
+                continue;
+            }
+            // The seat's own queue, taken before the rack is borrowed
+            // mutably, as every caller does.
+            let pedal_params: [&[tangent_host::ParamPoint]; INSERTS] =
+                std::array::from_fn(|b| {
+                    self.auto_params
+                        .get(seat * INSERTS + b)
+                        .map_or(&[][..], Vec::as_slice)
+                });
+            // **NOT-A-CHANNEL:** a pedal seat lives past every channel index
+            // and can never be handed a folder. An effects pass — no notes;
+            // the hand's CONTROLS still reach a pedal that listens for them,
+            // and the fold hands an empty set because a bus is not played.
+            run_rack(
+                &mut self.racks[seat],
+                &mut self.fx_in,
+                frames,
+                &mut self.fx_out,
+                &[],
+                controls,
+                &pedal_params,
+                &self.shared,
+                seat,
+                // NOT a key pass: the lane's one feed per chunk belongs to
+                // the channel's own rack. See `KeyFeed`.
+                None,
+            );
+        }
+    }
+
     fn fold_folders(
         &mut self,
         frames: usize,
@@ -8507,6 +8588,26 @@ impl Renderer {
                             .unwrap_or(0.0);
                     }
                 }
+            }
+            // **THE-FOLD: the group's PEDALBOARD, before either rack.**
+            //
+            // An amp in a group's bays wears the group's board, and this is
+            // the only moment at which the group's audio exists as one
+            // buffer — the same reason the racks below run here rather than
+            // in the lane pass. Before the first rack, deliberately and for
+            // both racks: a channel owns one board, a folder has two racks,
+            // and running it once at the top of the fold is the v1 answer to
+            // "which one does it belong to". It matches the loose-lane
+            // reading of the same simplification already written on
+            // `run_pedalboard` — the board is the amp's INPUT, and an amp
+            // moved down the chain hears its pedals through whatever sits
+            // above it.
+            //
+            // `amp_board_arms` asks both racks, so an amp in bays 3..5 arms
+            // the board exactly as one in bay 0 does. Empty controls: a
+            // folder is a bus, and a bus is not played.
+            if self.amp_board_arms(ch) {
+                self.run_pedalboard(ch, frames, false);
             }
             // **THE-FOLD:** the one place a folder's rack runs.
             //
@@ -16010,6 +16111,156 @@ mod tests {
         );
     }
 
+    /// **A GROUP's amp hears the group's pedalboard**, and it hears it from
+    /// either of the group's two racks.
+    ///
+    /// The rig is `dx7_through_amp`'s, folded: the DX7 plays on a child, the
+    /// amp sits in the GROUP's rack, and a +24 dB trim sits in one of the
+    /// group's pedal seats. `where_amp` chooses which of the folder's two
+    /// racks the amp goes in — its own seat (bays 0..2) or the appended
+    /// `folder_extra_seat` (bays 3..5) — because those were two different
+    /// bugs wearing one face: the first rack drew a board that made no
+    /// sound, and the second drew no board at all.
+    ///
+    /// Returns the rolling peak, so a board that never ran and a board that
+    /// ran are separated by the trim's own +24 dB.
+    fn dx7_through_a_folders_amp(extra_rack: bool, trim_in_pedal: bool) -> f32 {
+        use std::sync::Arc;
+        const KID: usize = 4;
+        const GROUP: usize = 1;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).unwrap();
+        let loud = crate::builtin_fx::state_text(spec, &[1.0], &[]).into_bytes();
+        let amp_seat = if extra_rack {
+            tangent_ui::recorder::folder_extra_seat(GROUP)
+        } else {
+            GROUP
+        };
+        e.load_insert(amp_seat, 0, Some(Path::new(crate::builtin_fx::AMP_PATH)), None)
+            .expect("the amp loads")
+            .expect("the bay reports it");
+        if trim_in_pedal {
+            e.load_insert(
+                tangent_ui::recorder::amp_pedal_seat(GROUP, 2),
+                0,
+                Some(Path::new(crate::builtin_fx::TRIM_PATH)),
+                Some(&loud),
+            )
+            .expect("a pedal seat admits a built-in")
+            .expect("the pedal bay reports it");
+        }
+        let mut parents = [-1i32; CHANNELS];
+        parents[KID] = GROUP as i32;
+        assert!(e.set_folders(parents), "the tree was refused");
+        // Low on the GROUP for `dx7_through_amp`'s reason: the claim is
+        // about what happens inside the group, read as a ratio, and a loud
+        // case must not brush anything downstream.
+        e.set_channel_gain(GROUP, 0.02);
+        e.set_channel_gain(KID, 1.0);
+        e.set_master_gain(1.0);
+        e.set_builtin_strips(1 << KID);
+        e.sync_instrument_lanes(1 << KID, 0);
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; 1024 * 2];
+        // Warm-up drains the hand-off rings, same count for every variant.
+        for _ in 0..3 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        e.set_midi_clips(vec![PlacedMidi {
+            strip: KID,
+            start: 0,
+            len: 96_000,
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 48_000, key: 48, vel: 127 }]),
+        }]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+        }
+        peak
+    }
+
+    /// **A folder's amp hears its pedalboard.** The owner's ask, and the
+    /// half of it the engine was refusing: the chips drew, the picker
+    /// worked, the default board even seeded — and `fold_folders` ran no
+    /// pedals at all, because the only pedal walk in the engine lived in the
+    /// lane pass behind `!is_folder`. A group with a drive on its board was
+    /// a group with a drive that did nothing.
+    ///
+    /// Deleting the `run_pedalboard` call from THE-FOLD makes this red: with
+    /// no board the two takes are the same take.
+    #[test]
+    fn a_folders_amp_hears_its_pedalboard() {
+        let bare = dx7_through_a_folders_amp(false, false);
+        assert!(bare > 1.0e-6, "the grouped rig makes no sound at all: {bare}");
+        let pedalled = dx7_through_a_folders_amp(false, true);
+        assert!(
+            pedalled > bare * 1.5,
+            "a +24 dB pedal on a GROUP changed nothing: {pedalled} against {bare} bare"
+        );
+    }
+
+    /// **An amp in a group's SECOND rack still wears the board.**
+    ///
+    /// A folder's bays 3..5 are seated past every pad block
+    /// (`recorder::folder_extra_seat`), so every question anyone asked about
+    /// the board — does the face draw it, does the host seed it, does the
+    /// engine run it — was asked as `seat < CHANNELS` and answered "no" for
+    /// exactly those three bays. One amp, moved one bay down, lost its
+    /// pedalboard on screen and in the sound. `amp_board_arms` asks both
+    /// racks now; dropping its second clause makes this red while the test
+    /// above stays green, which is the point of having both.
+    #[test]
+    fn an_amp_in_a_folders_second_rack_still_wears_the_board() {
+        let bare = dx7_through_a_folders_amp(true, false);
+        assert!(bare > 1.0e-6, "the grouped rig makes no sound at all: {bare}");
+        let pedalled = dx7_through_a_folders_amp(true, true);
+        assert!(
+            pedalled > bare * 1.5,
+            "a +24 dB pedal ahead of an amp in a group's bays 3..5 changed \
+             nothing: {pedalled} against {bare} bare"
+        );
+    }
+
+    /// **A group's board runs ONCE a chunk, exactly as a loose lane's
+    /// does.** The audible half of the `!is_folder` rule.
+    ///
+    /// A pedal is a stateful chain and the seven of them are in series; a
+    /// second call site per chunk clocks the delay, the tremolo and the
+    /// plate twice, which is the noise the original comment called
+    /// unfixable-sounding. The lane pass and the fold PARTITION the channels
+    /// — the lane pass skips folders, the fold only visits them — and this
+    /// measures that partition rather than trusting it.
+    ///
+    /// Measured as a RATIO against the same rig with the pedal seat empty,
+    /// on a group and on a loose track, with the same amp and the same
+    /// +24 dB trim. The two ratios have to agree: a board that never runs
+    /// reads 1.0 on the group, and a board that runs twice puts a second
+    /// +24 dB into the same power stage and reads well clear of the loose
+    /// lane's figure. The tolerance is wide (half an order of magnitude
+    /// either way) because the two rigs are not the same signal path — one
+    /// has a fader and a fold in it — and the claim is about a factor of
+    /// fifteen, not about the third decimal place.
+    #[test]
+    fn a_folders_pedalboard_runs_once_a_chunk() {
+        let loose = dx7_through_amp(true, false) / dx7_through_amp(false, false);
+        let grouped =
+            dx7_through_a_folders_amp(false, true) / dx7_through_a_folders_amp(false, false);
+        assert!(
+            loose > 1.5,
+            "the loose reference has no pedal gain to compare against: x{loose:.3}"
+        );
+        assert!(
+            grouped > loose * 0.5 && grouped < loose * 2.0,
+            "a group's board did not run the way a loose lane's does: \
+             x{grouped:.3} against x{loose:.3}"
+        );
+    }
+
     /// **An emptied pedal rack leaves no fingerprint.** Two engines, block
     /// for block: one never had a pedal, one seated a trim and unloaded it
     /// before rolling. Same render count on both — the amp's tremolo LFO
@@ -16113,6 +16364,18 @@ mod tests {
     /// amp lane's.** Same arithmetic-through-the-published-figure shape as
     /// the folder test above: an empty rack cannot really delay, so the
     /// fixture states what the chain costs.
+    ///
+    /// **The GROUP cases at the bottom are the ones that were wrong in both
+    /// directions at once.** Both latency sites used to ask
+    /// `rack_holds_amp(&self.racks[lane])` and nothing else, while the
+    /// pedals themselves ran only in the lane pass, which a folder never
+    /// reaches. So a group with an amp in bay 0 counted a lookahead pedal
+    /// that was not running — leaving the whole desk waiting for a delay
+    /// nobody paid, which is a group EARLY by exactly that much — and a
+    /// group with the amp in bays 3..5 counted nothing while, once the fold
+    /// learned to run the board, it paid everything. `amp_board_arms` is now
+    /// the one question the audio path and both latency sites ask, so they
+    /// cannot answer it differently.
     #[test]
     fn the_alignment_target_counts_pedals_only_behind_an_amp() {
         let render = |wire: &dyn Fn(&mut Engine)| -> u32 {
@@ -16141,6 +16404,54 @@ mod tests {
             e.set_seat_latency_for_test(pedal_seat, 0, 64);
         });
         assert_eq!(without_amp, 0, "a bare lane waited for pedals that never run");
+
+        // ── the same three questions, on a GROUP ────────────────────────
+        // Channel 6 is the folder in every case below; 9 is a child under
+        // it, which is what makes `folder_is[6]` true.
+        let grouped = |wire: &dyn Fn(&mut Engine)| -> u32 {
+            render(&|e: &mut Engine| {
+                wire(e);
+                let mut parents = [-1i32; CHANNELS];
+                parents[9] = 6;
+                assert!(e.set_folders(parents), "the tree was refused");
+            })
+        };
+        // An amp in the group's OWN rack: the board runs at the fold, which
+        // is on this lane's way out, so the lane pays it.
+        let group_first = grouped(&|e| {
+            e.load_insert(6, 0, Some(Path::new(crate::builtin_fx::AMP_PATH)), None)
+                .expect("amp")
+                .expect("seated");
+            e.set_seat_latency_for_test(pedal_seat, 0, 64);
+        });
+        assert_eq!(group_first, 64, "a group's board went uncounted");
+        // An amp in the group's SECOND rack — bays 3..5, seated past every
+        // pad block — arms the same board and costs the same.
+        let group_extra = grouped(&|e| {
+            e.load_insert(
+                tangent_ui::recorder::folder_extra_seat(6),
+                0,
+                Some(Path::new(crate::builtin_fx::AMP_PATH)),
+                None,
+            )
+            .expect("amp")
+            .expect("seated");
+            e.set_seat_latency_for_test(pedal_seat, 0, 64);
+        });
+        assert_eq!(
+            group_extra, 64,
+            "an amp in a group's bays 3..5 paid nothing for the board it wears"
+        );
+        // And a group with NO amp in either rack pays nothing, exactly as a
+        // bare lane does — this is the direction the old code got wrong the
+        // other way round, holding the desk late for a silent board.
+        let group_bare = grouped(&|e| {
+            e.set_seat_latency_for_test(pedal_seat, 0, 64);
+        });
+        assert_eq!(
+            group_bare, 0,
+            "a group with no amp waited for pedals that never run"
+        );
     }
 
     /// **A built-in bay's settings survive: state out, unload, state back in,
