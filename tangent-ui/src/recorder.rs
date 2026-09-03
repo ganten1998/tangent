@@ -743,6 +743,24 @@ pub const fn folder_extra_seat(ch: usize) -> usize {
     FOLDER_EXTRA_SEATS + ch
 }
 
+/// The inverse: which channel's extra rack a seat is, or `None` for a seat
+/// outside the folder-extra block.
+///
+/// It did not exist while nothing needed to travel BACK. `folder_extra_seat`
+/// is a one-way street — every reader either knew the channel already or was
+/// content to ask about a seat it had just built — and the price of that was
+/// the pedalboard: a folder wears six bays, three of them seated past every
+/// pad block, and the board that arms behind an amp is the CHANNEL's. With no
+/// way home from the seat, the amp face in a folder's slots 3..5 could only
+/// say "on channel strips only", and the engine could only run the board for
+/// a lane whose own rack held the amp. Both were answering a question about
+/// the seat when the question was about the channel. See [`pedal_owner`],
+/// which is the question they should have been asking.
+pub fn folder_extra_of(seat: usize) -> Option<usize> {
+    seat.checked_sub(FOLDER_EXTRA_SEATS)
+        .filter(|ch| *ch < CHANNELS)
+}
+
 /// How many pedal seats each channel owns for the amp's pedalboard.
 ///
 /// Seven, the owner's board: comp, wah, drive, chorus, trem, echo, plate —
@@ -783,6 +801,40 @@ pub fn amp_pedal_of(seat: usize) -> Option<(usize, usize)> {
     let at = seat - AMP_PEDAL_SEATS;
     let ch = at / AMP_PEDALS;
     (ch < CHANNELS).then_some((ch, at % AMP_PEDALS))
+}
+
+/// **Whose pedalboard a rack seat wears** — the one question every part of
+/// the amp's board should be asking, and the one none of them used to.
+///
+/// A channel answers itself. A folder's EXTRA seat answers the channel that
+/// owns it, because a folder is a channel with six bays and a channel has
+/// exactly one board (`AMP_PEDALS` seats, appended once per channel). The
+/// master, the buses, the pads and the pedal seats themselves answer `None`:
+/// there is no board there and never was.
+///
+/// **Why one function rather than the test each caller was making.** Three
+/// places asked `seat < CHANNELS` and meant "does this seat get a board" —
+/// the amp face's chip row, the picker the chips open, and the host's
+/// default-board seeding — and the engine asked a fourth version of it by
+/// running the board only in the lane pass, which a folder never reaches.
+/// All four agreed, and all four were wrong the same way: an amp dropped
+/// into a folder's second rack drew no board, and an amp in a folder's FIRST
+/// rack drew a board that made no sound. Answering it in one place is the
+/// argument `pad_rack_index` and `amp_pedal_seat` already make on this
+/// module — a call site that recomputes the seat map edits somebody else's
+/// plugin — with the sharper version for this map: a call site that
+/// recomputes it here does not edit the wrong plugin, it silently declines
+/// to run the right one.
+///
+/// A folder's two racks therefore SHARE one board. That is the v1 answer to
+/// "a channel owns one board and a folder wants it twice", and it is written
+/// here rather than left to the caller: the board runs once, at the top of
+/// the fold, over the summed group — see the engine's `run_pedalboard`.
+pub fn pedal_owner(seat: usize) -> Option<usize> {
+    if seat < CHANNELS {
+        return Some(seat);
+    }
+    folder_extra_of(seat)
 }
 
 /// Every rack seat: strips, master, the first pad block, the master's
@@ -1863,9 +1915,18 @@ pub enum RecorderRequest {
     /// A request because the tap is the engine's: this crate cannot reach
     /// `Engine::set_insert_tap` — the firewall is the whole point — so the
     /// face says which bay it is looking at and the host arms the tap and
-    /// starts draining it into `TangentApp::insert_tap_feed`. Only one face
-    /// is ever open, so the LAST request wins and `on: false` from the
-    /// closing face disarms.
+    /// starts draining it into `TangentApp::insert_tap_feed`. The LAST
+    /// request wins and `on: false` from the closing face disarms.
+    ///
+    /// **There can be TWO faces open now**, and this comment used to say
+    /// there could not: the amp's pedal chips open the pedal's own window
+    /// stacked over the amp's. There is still ONE tap, and the rule the app
+    /// keeps is that it belongs to the window being worked in — the stacked
+    /// one while it is up, handed back to the face underneath when it
+    /// closes. Two windows sharing a tap means the top one's analyzer is
+    /// live and the one below it is holding its last picture, which is the
+    /// right answer for a needle nobody is looking at and much better than
+    /// the alternative of a second tap nothing in the engine has.
     SetInsertTap { strip: usize, slot: usize, on: bool },
     // ── presets ─────────────────────────────────────────────────────────
     // The preset road's three requests, at the END because the enum is
@@ -3671,6 +3732,73 @@ mod tests {
         let lifted = seat_order(&pads);
         assert_eq!(lifted[a], b, "the pad swap was dropped");
         assert_eq!(lifted[b], a, "the pad swap was dropped");
+    }
+
+    /// **A folder-extra seat names its own channel, and nothing else does.**
+    ///
+    /// The pedalboard's whole fault was a seat that could not say whose it
+    /// was. `folder_extra_seat` had no inverse, so four separate call sites
+    /// asked `seat < CHANNELS` and read the answer as "does this seat get a
+    /// board" — which is true of a channel's own seat, false of a folder's
+    /// extra seat, and WRONG both times, because a folder's extra seat is a
+    /// channel's. This pins the road back: every seat in the folder-extra
+    /// block round-trips, every seat outside it answers `None`, and
+    /// `pedal_owner` sends a channel to itself, a folder's extra rack to the
+    /// channel that owns it and everything else nowhere.
+    ///
+    /// The exhaustive sweep is the point rather than a few spot checks. The
+    /// three appended blocks (pads, folder-extras, pedals) sit next to each
+    /// other, and an off-by-one at either end of the middle one would hand a
+    /// folder's board to a drum pad or to another channel's pedal — a fault
+    /// that makes sound in somebody else's track and looks like nothing at
+    /// all in a spot check.
+    #[test]
+    fn a_folder_extra_seat_names_its_own_channel_and_nothing_else() {
+        use super::{
+            amp_pedal_seat, folder_extra_of, folder_extra_seat, pedal_owner, AMP_PEDALS,
+            CHANNELS, MASTER_EXTRA_SEAT, MASTER_SEAT, TOTAL_SEATS,
+        };
+        for ch in 0..CHANNELS {
+            assert_eq!(
+                folder_extra_of(folder_extra_seat(ch)),
+                Some(ch),
+                "channel {ch}'s extra seat forgot whose it was"
+            );
+            assert_eq!(pedal_owner(folder_extra_seat(ch)), Some(ch));
+            assert_eq!(pedal_owner(ch), Some(ch), "a channel is its own owner");
+        }
+        // Every seat in the whole space, one sweep: exactly the channels and
+        // the folder-extra block answer, and each answers its own channel.
+        for seat in 0..TOTAL_SEATS {
+            let want = if seat < CHANNELS {
+                Some(seat)
+            } else {
+                folder_extra_of(seat)
+            };
+            assert_eq!(
+                pedal_owner(seat),
+                want,
+                "seat {seat} disagreed with the block it is in"
+            );
+        }
+        // The named neighbours, spelled out because these are the ones a
+        // reader will want to see: no board on the master, either rack, none
+        // on a pad, none on a pedal seat itself.
+        assert_eq!(folder_extra_of(0), None, "a channel is not an extra seat");
+        assert_eq!(pedal_owner(MASTER_SEAT), None);
+        assert_eq!(pedal_owner(MASTER_EXTRA_SEAT), None);
+        assert_eq!(pedal_owner(folder_extra_seat(CHANNELS - 1) + 1), None);
+        for ch in [0usize, CHANNELS - 1] {
+            for pedal in 0..AMP_PEDALS {
+                assert_eq!(
+                    pedal_owner(amp_pedal_seat(ch, pedal)),
+                    None,
+                    "a pedal seat claimed a board of its own"
+                );
+            }
+        }
+        assert_eq!(pedal_owner(TOTAL_SEATS), None, "a seat past the end answered");
+        assert_eq!(pedal_owner(usize::MAX), None);
     }
 
     /// **The ladder is a stereo pair, and the two bars are the CHANNELS.**

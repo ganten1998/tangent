@@ -1563,6 +1563,26 @@ pub enum DialogAction {
     /// happened to be selected would be a row that does something other than
     /// what it says.
     ExportMidi(usize),
+    /// **A pedal chip was pressed, with whatever was held down.** Appended
+    /// at the END, this enum's law — `OpenPedalPicker` above is left exactly
+    /// as it was rather than widened, for the same reason.
+    ///
+    /// `strip`/`slot` are the amp face's own DESK terms and `pedal` is the
+    /// ordinal; the app resolves the owning channel through `seat_bay` and
+    /// `pedal_owner`, and the seat through `amp_pedal_seat`, on its side of
+    /// the wall. `alt` and `shift` are read from the FACE's own input, not
+    /// from the desk's latched pair: on the desktop a face is a separate OS
+    /// window with a keyboard of its own, so a chip that asked the main
+    /// window what was held would be answering about a keyboard nobody was
+    /// typing on. That is the whole reason they travel in the action rather
+    /// than being read where it lands.
+    OpenPedalFace {
+        strip: usize,
+        slot: usize,
+        pedal: usize,
+        alt: bool,
+        shift: bool,
+    },
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -3694,6 +3714,30 @@ fn visible_patches(voices: &[String], filter: &str) -> Vec<usize> {
 /// one id serves them all and the window keeps its place between dialogs.
 const DIALOG_ID: &str = "ivory-dialog";
 
+/// **The STACKED window's identity** — the amp's pedal, opened over the amp.
+///
+/// A second id and not a second copy of anything: [`show_stacked`] runs the
+/// very same match over a second slot, and the only thing it changes is
+/// which surface the window is drawn on. That is the whole architectural
+/// cost of the stack, and it is one string, because everything else a pedal
+/// needs already resolves — `recorder::seat_bay` is the IDENTITY on a pedal
+/// seat, so `Dialog::InsertFace { strip: amp_pedal_seat(ch, p), slot: 0 }`,
+/// `SetInsertParam`, `FaceSavePreset`, `SetInsertIr` and `OpenInsertEditor`
+/// all already mean the right rack. Nobody needs to invent a second
+/// addressing road; there is only a second WINDOW.
+///
+/// **Why an id of its own rather than the `becomes` handoff.** `becomes`
+/// (see [`show`]) swaps one window for another in one slot, which is the
+/// IR panel's road to its delete confirmation and back. It cannot be this,
+/// because the requirement is that the amp stay standing and stay TURNABLE
+/// underneath — a swap puts the amp away. And it cannot be the same id
+/// either: two `show_viewport_immediate` calls under one `ViewportId` in
+/// one frame are one window asked to be two things, which is the export
+/// window's own recorded scar ([`EXPORT_ID`]), and [`held_geometry`] keyed
+/// on one id with two titles takes its "two windows share a name" arm and
+/// re-places both every frame.
+const PEDAL_ID: &str = "ivory-dialog-pedal";
+
 pub fn color_pick_title(target: ColorTarget) -> &'static str {
     match target {
         ColorTarget::WhiteIdle => "Choose White Key Color",
@@ -4089,6 +4133,24 @@ pub struct Placement {
     /// classification — so no arm of the big match ever has to say which
     /// kind of window it is drawing. Callers leave it `None`.
     pub chrome: Option<crate::shell::Chrome>,
+    /// **Which surface this window is drawn on**, or `None` for the one
+    /// dialog slot's own. Appended at the END, this struct's law.
+    ///
+    /// It rides on the placement rather than being a parameter of
+    /// [`show_dialog_viewport`] for a reason worth stating: that function is
+    /// called from thirty-two arms of one match, and threading a
+    /// thirty-third argument through all of them would be thirty-two edits
+    /// to arms this change has no other business in — every one of them a
+    /// chance to hand the wrong id to one window. The placement is ALREADY
+    /// threaded to every arm and already carries the other facts that are
+    /// decided once for the whole match ([`Self::chrome`] is exactly this
+    /// shape), so [`show_stacked`] stamps it once at the top and no arm
+    /// knows or can disagree.
+    ///
+    /// `None` rather than a defaulted string because `Default` for `&str`
+    /// is the empty one, and an empty surface id is a window egui would
+    /// happily give its own identity to.
+    pub surface: Option<&'static str>,
 }
 
 impl Placement {
@@ -4462,9 +4524,13 @@ fn show_dialog_viewport(
     // [`held_geometry`], which is where the whole argument lives. The size
     // comes back through the same door because a position is only ever a
     // position for a size.
-    let (size, pos) = held_geometry(ctx, DIALOG_ID, title, placement, size);
+    // The one place either id is spelled. `surface` is `None` for every
+    // window but the stacked one; see [`Placement::surface`] for why it
+    // arrives this way and not as an argument.
+    let id = placement.surface.unwrap_or(DIALOG_ID);
+    let (size, pos) = held_geometry(ctx, id, title, placement, size);
     let spec = crate::shell::SurfaceSpec {
-        id: DIALOG_ID,
+        id,
         title,
         size,
         // Never larger than the window we just asked for. The arms name a
@@ -4534,10 +4600,40 @@ fn show_dialog_viewport(
 /// that reads `i.pointer` directly sees straight through an `Area`. On the
 /// desktop the dialog is another window and this is always false — its
 /// presses never reach the main window's input at all.
+/// **Both surfaces, and that is not cosmetic.** `App::dialog_blocks_pointer`
+/// reads this one function, so a stacked window left out of it is a HOLE: a
+/// press on the pedal's own face would also play the piano underneath, which
+/// is the exact bug the export window's `pointer_over_export` was added to
+/// fix. Answering for the pair here rather than adding a second question is
+/// what stops the app growing a third road it can forget about next time.
 pub fn pointer_over_dialog(ctx: &egui::Context) -> bool {
+    let over = |r: Option<Rect>| {
+        r.zip(ctx.pointer_interact_pos())
+            .is_some_and(|(r, p)| r.contains(p))
+    };
+    over(inline_dialog_rect(ctx)) || over(inline_stacked_rect(ctx))
+}
+
+/// Where the DESK's dialog was drawn in the canvas last pass, or `None` on
+/// the desktop, where it is a window of its own.
+///
+/// **The one place that knows the dialog's id**, which is why this is public
+/// rather than the id being — the same argument [`inline_export_rect`] makes
+/// for the export window, and the reason there are now two of these rather
+/// than two spellings of one string somewhere else.
+pub fn inline_dialog_rect(ctx: &egui::Context) -> Option<Rect> {
     crate::shell::inline_rect(ctx, DIALOG_ID)
-        .zip(ctx.pointer_interact_pos())
-        .is_some_and(|(r, p)| r.contains(p))
+}
+
+/// Where the STACKED window was drawn in the canvas last pass, or `None` on
+/// the desktop and whenever no pedal window is up.
+///
+/// Public for the same reason `inline_export_rect` is: the app has to be
+/// able to ask about this window, and a caller that reached for
+/// `shell::inline_rect` with an id of its own spelling would go on answering
+/// `None` for ever the day this one changed.
+pub fn inline_stacked_rect(ctx: &egui::Context) -> Option<Rect> {
+    crate::shell::inline_rect(ctx, PEDAL_ID)
 }
 
 /// The same question about the EXPORT window, which is not a dialog and so
@@ -4573,7 +4669,7 @@ pub fn inline_export_rect(ctx: &egui::Context) -> Option<Rect> {
 /// top; on the desktop each window hears only its own keys, so this is
 /// false and focus decides.
 pub fn dialog_drawn_inline(ctx: &egui::Context) -> bool {
-    crate::shell::inline_rect(ctx, DIALOG_ID).is_some()
+    inline_dialog_rect(ctx).is_some() || inline_stacked_rect(ctx).is_some()
 }
 
 /// Render the active dialog. Returns an action for the app to apply;
@@ -5993,7 +6089,72 @@ fn confirm_ir_delete(strip: usize, slot: usize, path: &str, loaded: bool) -> Dia
     }
 }
 
+/// **The desk's own dialog window**, in the one slot the app has always had.
+///
+/// A thin wrapper since the amp grew a stacked pedal window: `show_on` below
+/// is the whole of what both windows are, and the only thing that separates
+/// them is the surface they are drawn on. Kept as its own name rather than
+/// giving every caller an id to pass, because there is exactly ONE caller
+/// that means the desk's dialog and it should not have to know that a second
+/// surface exists at all. See [`show_stacked`].
 pub fn show(
+    ctx: &egui::Context,
+    dialog_opt: &mut Option<Dialog>,
+    // The desk's face, resolved for the mode the app is in.
+    face: Color32,
+    placement: Placement,
+) -> Option<DialogAction> {
+    show_on(ctx, dialog_opt, face, placement)
+}
+
+/// **The same window machinery, drawn on the STACKED surface** — one pedal's
+/// own editor, standing over the amp face that opened it.
+///
+/// Everything a pedal window can be is already a `Dialog`: the picker over
+/// an empty chip, an insert face over one of the suite's units, and (through
+/// the app, not through here) a bundle's own native editor. So this is
+/// `show` with one field stamped, and the whole ~5,500-line match is reused
+/// rather than copied. A second copy of it is the version of this feature
+/// that would have rotted: the pedal's face would have kept working and the
+/// pedal's PRESET SHELF, or its IR browser, or its bypass, would silently
+/// have stopped a release later.
+///
+/// **What makes it safe is the slot, not this function.** The app holds the
+/// stacked window in a second `Option<Dialog>` that is bound to the amp face
+/// beneath it and dropped the moment that face is not the one it was opened
+/// over — see `App::pedal_stack`. `self.dialog` is written in seventy places
+/// in `app.rs`, and none of them has to know this window exists.
+///
+/// Positioned down and right of the desk's centre rather than centred, so it
+/// cascades off the amp instead of landing squarely on top of it: the owner's
+/// second requirement is that the surface not visibly covered stays
+/// turnable, and a window that opens exactly over the one below it makes
+/// that true only in principle. A hand can move either window afterwards and
+/// `held_geometry` remembers where, per id.
+pub fn show_stacked(
+    ctx: &egui::Context,
+    dialog_opt: &mut Option<Dialog>,
+    face: Color32,
+    placement: Placement,
+) -> Option<DialogAction> {
+    let at = placement
+        .at
+        .or_else(|| placement.believable_parent().map(|p| (p.size() * 0.5).to_pos2()));
+    show_on(
+        ctx,
+        dialog_opt,
+        face,
+        Placement {
+            surface: Some(PEDAL_ID),
+            at,
+            ..placement
+        },
+    )
+}
+
+/// Every dialog this app has, drawn on whichever surface the placement
+/// names. Neither entry point above adds anything but that name.
+fn show_on(
     ctx: &egui::Context,
     dialog_opt: &mut Option<Dialog>,
     // The desk's face, resolved for the mode the app is in.
@@ -6324,6 +6485,17 @@ pub fn show(
                                     crate::faces::FaceAction::OpenPedal { pedal } => {
                                         Some(DialogAction::OpenPedalPicker { strip, slot, pedal })
                                     }
+                                    crate::faces::FaceAction::PedalGesture {
+                                        pedal,
+                                        alt,
+                                        shift,
+                                    } => Some(DialogAction::OpenPedalFace {
+                                        strip,
+                                        slot,
+                                        pedal,
+                                        alt,
+                                        shift,
+                                    }),
                                     crate::faces::FaceAction::OpenWizard => {
                                         // **Leave a way back before the wand
                                         // takes the slot.** The wizard adopts
@@ -11953,6 +12125,7 @@ mod tests {
             monitor,
             caps: crate::host::Caps::DESKTOP,
             chrome: None,
+            surface: None,
         }
         .position_for(size)
         .expect("a known monitor is enough to place a dialog");
@@ -11970,6 +12143,7 @@ mod tests {
                 monitor: None,
                 caps: crate::host::Caps::DESKTOP,
                 chrome: None,
+                surface: None,
             }
             .position_for(size),
             None
@@ -11985,6 +12159,7 @@ mod tests {
             monitor,
             caps: crate::host::Caps::DESKTOP,
             chrome: None,
+            surface: None,
         }
         .position_for(size)
         .expect("a known parent must yield a position");
@@ -12011,6 +12186,7 @@ mod tests {
             monitor,
             caps: crate::host::Caps::DESKTOP,
             chrome: None,
+            surface: None,
         }
         .position_for(size)
         .unwrap();
@@ -12053,6 +12229,7 @@ mod tests {
                 monitor,
                 caps: crate::host::Caps::DESKTOP,
                 chrome: None,
+                surface: None,
             }
             .position_for(size)
             .unwrap()
@@ -12127,6 +12304,7 @@ mod tests {
             monitor: Some(m),
             caps: crate::host::Caps::DESKTOP,
             chrome: None,
+            surface: None,
         };
         // A window on each of five displays: the primary, and one out in
         // each direction. Each window is well inside its own screen.
@@ -12563,6 +12741,7 @@ at: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
             chrome: None,
+            surface: None,
         };
         let mut action = None;
         let _ = ctx.run(
@@ -13189,6 +13368,7 @@ at: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
             chrome: None,
+            surface: None,
         };
         let mut action = None;
         let _ = ctx.run(
@@ -13294,6 +13474,7 @@ at: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
             chrome: None,
+            surface: None,
         };
         let mut action = None;
         let mut painted = String::new();
@@ -13618,6 +13799,7 @@ at: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
             chrome: None,
+            surface: None,
         };
         let held_enter = || egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 520.0))),
@@ -14226,6 +14408,7 @@ at: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
             chrome: None,
+            surface: None,
         };
         let p = crate::ports::ExportProgress {
             fraction: 0.5,
@@ -14279,6 +14462,7 @@ at: None,
             monitor: Some(monitor),
             caps: crate::host::Caps::DESKTOP,
             chrome: None,
+            surface: None,
         };
         let big = Vec2::new(2560.0, 1400.0);
         let small = Vec2::new(1280.0, 800.0);
@@ -14376,6 +14560,7 @@ at: None,
             monitor: Some(monitor),
             caps: crate::host::Caps::DESKTOP,
             chrome: None,
+            surface: None,
         };
         let olive = Color32::from_rgb(0x6B, 0x71, 0x3E);
         let frame = |dialog: &mut Option<Dialog>, parent: Rect| {
@@ -14482,6 +14667,7 @@ at: None,
             monitor: None,
             caps: crate::host::Caps::DESKTOP,
             chrome: None,
+            surface: None,
         };
         let mut welcome = Some(Dialog::Welcome {
             dont_show_again: false,
@@ -14539,6 +14725,7 @@ at: None,
             monitor: Some(monitor),
             caps: crate::host::Caps::DESKTOP,
             chrome: None,
+            surface: None,
         };
         let olive = Color32::from_rgb(0x6B, 0x71, 0x3E);
         let frame = |dialog: &mut Option<Dialog>| {
@@ -14612,6 +14799,7 @@ at: None,
             monitor,
             caps: crate::host::Caps::DESKTOP,
             chrome: None,
+            surface: None,
         };
         let olive = Color32::from_rgb(0x6B, 0x71, 0x3E);
         let frame = |dialog: &mut Option<Dialog>, monitor: Option<Vec2>| {
@@ -14827,6 +15015,7 @@ at: None,
             monitor: Some(screen.size()),
             caps: crate::host::Caps::DESKTOP,
             chrome: None,
+            surface: None,
         };
         let p = crate::ports::ExportProgress {
             fraction: 0.5,
@@ -14921,6 +15110,7 @@ at: None,
             monitor: Some(screen.size()),
             caps: crate::host::Caps::PLUGIN,
             chrome: None,
+            surface: None,
         };
         let p = crate::ports::ExportProgress {
             fraction: 0.5,
@@ -15376,6 +15566,7 @@ at: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
             chrome: None,
+            surface: None,
         };
         let mut fills = Vec::new();
         let mut texts = Vec::new();
@@ -15448,6 +15639,12 @@ at: None,
         dialog: Option<Dialog>,
         face: Color32,
         clock: f64,
+        /// **What the window's own keyboard is holding.** On
+        /// `RawInput::modifiers`, which is where `InputState::modifiers`
+        /// comes from and therefore what a widget inside the window reads —
+        /// a modifier decorating the pointer EVENT alone would be invisible
+        /// to `ui.input(|i| i.modifiers)` and would test nothing.
+        mods: egui::Modifiers,
     }
 
     impl Slot {
@@ -15460,6 +15657,7 @@ at: None,
                 dialog: Some(dialog),
                 face: Color32::from_rgb(0xE3, 0xD9, 0xBD),
                 clock: 0.0,
+                mods: egui::Modifiers::NONE,
             }
         }
 
@@ -15474,6 +15672,7 @@ at: None,
                 // context never presents.
                 caps: crate::host::Caps::PLUGIN,
                 chrome: None,
+                surface: None,
             }
         }
 
@@ -15489,6 +15688,7 @@ at: None,
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0))),
                     time: Some(self.clock),
+                    modifiers: self.mods,
                     events,
                     ..Default::default()
                 },
@@ -15568,13 +15768,13 @@ at: None,
                     pos: at,
                     button,
                     pressed: true,
-                    modifiers: Default::default(),
+                    modifiers: self.mods,
                 }],
                 vec![egui::Event::PointerButton {
                     pos: at,
                     button,
                     pressed: false,
-                    modifiers: Default::default(),
+                    modifiers: self.mods,
                 }],
             ] {
                 if let (Some(a), _) = self.frame(events) {
@@ -15593,6 +15793,75 @@ at: None,
         fn click(&mut self, word: &str) -> Option<DialogAction> {
             let at = self.word_at(word);
             self.press_at(at, egui::PointerButton::Primary)
+        }
+    }
+
+    /// The amp's face over channel 0's first bay, with one pedal dressed
+    /// so its chip wears a word a test can press.
+    fn an_amp_face(pedal: usize, tenant: &str) -> Dialog {
+        let mut live = crate::faces::FaceLive::default();
+        live.face.path = crate::faces_amp::AMP_PATH.to_owned();
+        live.pedals = Some(std::array::from_fn(|p| {
+            if p == pedal {
+                crate::faces_amp::pedal_label(tenant)
+            } else {
+                String::new()
+            }
+        }));
+        Dialog::InsertFace {
+            strip: 0,
+            slot: 0,
+            live: Box::new(live),
+        }
+    }
+
+    /// **A pedal chip carries the modifiers ITS OWN window was holding.**
+    ///
+    /// The half of the keybinds that can only be proved here. On the desktop
+    /// an amp face is a separate OS window with its own input stream, while
+    /// `App::alt_down` and `App::shift_down` are latched once a frame off the
+    /// MAIN window's context — so a chip that read the latched pair would be
+    /// reporting on a keyboard nobody was typing on: Alt-clicking a chip in
+    /// the amp's window would do nothing, and Alt-clicking it with the desk
+    /// focused would empty a seat you could not see.
+    ///
+    /// Driven through the real window with the modifier on
+    /// `RawInput::modifiers`, which is where a widget's `i.modifiers` comes
+    /// from — decorating the pointer event alone would leave `ui.input`
+    /// answering NONE and the test passing against a chip that read nothing.
+    ///
+    /// The other half — that the app applies the CARRIED modifier rather
+    /// than its own latched pair — is
+    /// `app::tests::alt_and_shift_on_a_pedal_chip_do_what_they_do_on_a_bay`,
+    /// because inline the two are one keyboard and no test in this file
+    /// could tell them apart.
+    #[test]
+    fn a_pedal_chip_carries_its_own_windows_modifiers() {
+        for (mods, alt, shift) in [
+            (egui::Modifiers::NONE, false, false),
+            (egui::Modifiers::ALT, true, false),
+            (egui::Modifiers::SHIFT, false, true),
+        ] {
+            let mut slot = Slot::new(an_amp_face(2, "@tangent-drive"));
+            slot.mods = mods;
+            let asked = slot.click("drive");
+            match asked {
+                Some(DialogAction::OpenPedalFace {
+                    strip,
+                    slot: bay,
+                    pedal,
+                    alt: a,
+                    shift: sh,
+                }) => {
+                    assert_eq!((strip, bay, pedal), (0, 0, 2), "the chip named the wrong seat");
+                    assert_eq!(
+                        (a, sh),
+                        (alt, shift),
+                        "the chip reported {a}/{sh} for a window holding {alt}/{shift}"
+                    );
+                }
+                other => panic!("a pedal chip asked for {:?}", other.is_some()),
+            }
         }
     }
 
@@ -16492,6 +16761,7 @@ at: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
             chrome: None,
+            surface: None,
         };
         let face = Color32::from_rgb(0xE3, 0xD9, 0xBD);
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
