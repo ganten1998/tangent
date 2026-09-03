@@ -4396,6 +4396,14 @@ impl DesktopApp {
             pre_silence_frames: pre,
             post_silence_frames: tail,
             level,
+            // **Wait for the loop to go quiet, up to the tail the user
+            // themselves said the box needs.** The TAIL row is a statement
+            // about how long this box rings; nothing else on the page knows
+            // that number, and a wait longer than it would be waiting for
+            // something the user has already said will not happen. The wait
+            // ends early the moment the return stops falling, so a dry loop
+            // pays nothing. See `IrCaptureSpec::settle_frames`.
+            settle_frames: tail,
         });
         let total = pre + sweep.len() + tail;
         if reference {
@@ -4451,17 +4459,33 @@ impl DesktopApp {
         let mut warned: Option<String> = None;
         if let Some(e) = self.recorder.engine.as_mut() {
             let (rms_db, peak_db) = e.ir_return_db();
+            let (peak_l_db, peak_r_db) = e.ir_return_sides_db();
             let (done_f, total_f) = e.ir_progress();
             if rms_db > -200.0 || total_f > 0 {
                 busy = true;
             }
             self.ir.live.rms_db = rms_db;
             self.ir.live.peak_db = peak_db;
+            self.ir.live.peak_l_db = peak_l_db;
+            self.ir.live.peak_r_db = peak_r_db;
             self.ir.live.progress = if total_f > 0 {
                 (done_f as f32 / total_f as f32).clamp(0.0, 1.0)
             } else {
                 0.0
             };
+            // **The settle narrates itself.** A pass waits for the loop to go
+            // quiet before it records anything, so a capture of a long reverb
+            // sits at zero frames for a few seconds first — and a progress
+            // bar that does not move is how somebody decides the button did
+            // not work. `total_f` is set the moment the job is accepted and
+            // `done_f` only moves once the recording starts, so the two
+            // together say exactly which phase this is. See
+            // `instrument::IrCaptureSpec::settle_frames`.
+            if total_f > 0 && done_f == 0 && self.ir.pending.is_some() {
+                self.ir.live.phase =
+                    "waiting for the loop to go quiet \u{2014} the noise floor is                      measured before the sweep"
+                        .to_owned();
+            }
             if let Some((capture, complete, slipped)) = e.take_captured() {
                 busy = true;
                 if let Some(p) = self.ir.pending.take() {
@@ -9852,11 +9876,62 @@ fn process_ir_capture(
         left.push(fr[0]);
         right.push(fr[1]);
     }
-    // The loop's floor, off the pre-roll — most of it, staying clear of the
-    // last stretch where the loop's latency may already carry sweep onset.
-    let floor_window = (pre * 4) / 5;
-    let floor_db = ess::noise_floor_db(&left[..floor_window.min(left.len())])
-        .max(ess::noise_floor_db(&right[..floor_window.min(right.len())]));
+    // **The loop's floor, off the pre-roll — read as the QUIETEST stretch of
+    // it and not as its average.**
+    //
+    // Every threshold downstream comes from this one number, and a pre-roll
+    // that is not actually silent poisons all of them. `Engine`'s settle
+    // (`instrument::IrCaptureSpec::settle_frames`) is what makes it silent,
+    // and it is the real fix — but it is capped, so a box that never goes
+    // quiet inside the tail it was given still arrives here ringing. One
+    // mean-square over the whole stretch is then dominated by its loudest
+    // moment: measured on a Quadraverb plate three tenths of a second after a
+    // tone, the pre-roll fell from −20.5 dBFS to −43.4 across its second and
+    // averaged to −27, against a settled floor of −87.5. Sixty dB of error,
+    // in the direction that makes every IR come back the full window.
+    //
+    // Read in tenths and take the quietest, which for anything decaying is
+    // the last of them: still wrong on a contaminated pre-roll, but wrong by
+    // the decay's last tenth rather than by its first, and right the moment
+    // the settle has done its job.
+    //
+    // Most of the stretch, not all: the loop's own latency can already carry
+    // the sweep's onset in the last fifth of it.
+    let floor_window = ((pre * 4) / 5).min(left.len()).min(right.len());
+    let quietest = |c: &[f32]| {
+        let n = c.len().min(floor_window);
+        if n == 0 {
+            return -200.0;
+        }
+        let slices = 10.min(n);
+        (0..slices)
+            .map(|k| {
+                let a = k * n / slices;
+                let b = ((k + 1) * n / slices).max(a + 1).min(n);
+                ess::noise_floor_db(&c[a..b])
+            })
+            .fold(f32::INFINITY, f32::min)
+    };
+    let floor_db = quietest(&left).max(quietest(&right));
+    // **And whether that pre-roll was actually SILENT**, which is a separate
+    // question from how quiet its quietest tenth was. A stretch that falls
+    // across itself is a decay, not a floor — the same discrimination
+    // `sweep::tail_floor_db` makes at the other end of the buffer — and a
+    // capture whose floor was read off a decay is a capture whose every
+    // threshold is derived from a number nobody measured. The result page
+    // says so rather than printing a length as if it meant something.
+    let settled = {
+        let span = |c: &[f32]| {
+            let n = c.len().min(floor_window);
+            if n < 20 {
+                return 0.0;
+            }
+            let first = ess::noise_floor_db(&c[..n / 10]);
+            let last = ess::noise_floor_db(&c[n - n / 10..n]);
+            f64::from(first - last)
+        };
+        span(&left).max(span(&right)) <= PRE_ROLL_FLAT_DB
+    };
 
     // The distortion probe, on the classic route: the order-N image sits
     // dt_N ahead of the recorded response's own peak.
@@ -10044,7 +10119,11 @@ fn process_ir_capture(
         .flat_map(|c| c.iter())
         .fold(0.0f32, |m, &v| m.max(v.abs()));
     let ir_floor_db = ess::recovered_floor_db(ir_peak, capture_peak, floor_db);
-    ess::truncate_set_at_floor(&mut set, ir_floor_db, rate);
+    // **Which cut decided the length, remembered.** The window cut above
+    // always bites; this one is the one that produces an IR the length of the
+    // reverb rather than the length of the TAIL row, and when it declines the
+    // wizard has to say so. See `ports::IrLengthCut`.
+    let cut_at_floor = ess::truncate_set_at_floor(&mut set, ir_floor_db, rate);
     // Both cuts are set-wide, so the pair already comes back the same
     // length; the equalizing resize stays as the backstop for a pair the
     // deconvolution handed over uneven, and pads with silence after a fade,
@@ -10071,6 +10150,49 @@ fn process_ir_capture(
     } else {
         -200.0
     };
+    // **The stereo image, as two numbers and not as a listen.**
+    //
+    // `normalize_set` scales the pair by ONE peak because the level
+    // difference between the channels IS the image; that makes the difference
+    // real and also makes it invisible, because nothing reported it. A side
+    // 30 dB down is a capture with one jack barely returning, and it looks
+    // exactly like a capture of a box that happens to be narrow.
+    // Against the FINISHED pair's peak, not the one measured before the
+    // truncation and the normalise — that peak belongs to a different buffer
+    // and made the louder side read +42 dB, which is not a thing a side can
+    // be. The louder side is 0.0 by construction.
+    let final_peak = l
+        .iter()
+        .chain(r.iter())
+        .fold(0.0f32, |m, &v| m.max(v.abs()));
+    let side_of = |c: &[f32]| {
+        let p = c.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        if p > 0.0 && final_peak > 0.0 {
+            20.0 * (p / final_peak).log10()
+        } else {
+            -200.0
+        }
+    };
+    // And how ALIKE they are, over the first half second — the part heard as
+    // the room's width. Negative means the sides are inverses and cancel when
+    // summed, which is a patching fault wearing a reverb's clothes; see
+    // `ports::IrOutcome::correlation`.
+    let correlation = {
+        let n = ((rate * 0.5) as usize).min(l.len()).min(r.len());
+        let (mut num, mut dl, mut dr) = (0.0f64, 0.0f64, 0.0f64);
+        for i in 0..n {
+            let (a, b) = (f64::from(l[i]), f64::from(r[i]));
+            num += a * b;
+            dl += a * a;
+            dr += b * b;
+        }
+        let den = (dl * dr).sqrt();
+        if den > 0.0 {
+            (num / den) as f32
+        } else {
+            0.0
+        }
+    };
     let outcome = tangent_ui::ports::IrOutcome {
         envelope_db: ir_envelope_db(&l, &r),
         seconds,
@@ -10083,9 +10205,458 @@ fn process_ir_capture(
         tail_range_db: (capture_peak_db - floor_db)
             .clamp(0.0, ess::TAIL_RANGE_MAX_DB as f32),
         reference: reference_use,
+        length_cut: if cut_at_floor {
+            tangent_ui::ports::IrLengthCut::Floor
+        } else {
+            tangent_ui::ports::IrLengthCut::Window
+        },
+        side_l_db: side_of(&l),
+        side_r_db: side_of(&r),
+        correlation,
+        floor_settled: settled,
     };
     (l, r, outcome)
 }
+
+
+/// **The IR road against REAL hardware, with no GUI and no wizard.**
+///
+/// The third of this file's undocumented developer probes, and the same idea
+/// as `record_test` and `plugin_test`: play the sweep out of two device jacks,
+/// record two more, run the very deconvolution the wizard runs, and print
+/// every number the result page could have shown plus the ones it cannot.
+/// No unit test can do this — the whole question is what a converter, a cable
+/// and a box actually did — and the owner's report ("every single IR recorded
+/// is pinned to the tail time … left channel having most of the information,
+/// right channel audible but mostly cancelled") is exactly the kind that is
+/// diagnosed by numbers off the real loop or not at all.
+///
+/// `--ir-test out,in,sweep,tail,level,device,settle,ref` — everything past
+/// the first two optional, jacks ONE-BASED so they read like the panel on the
+/// interface. `--ir-test 13,13` plays on outputs 13/14 and records inputs
+/// 13/14 at the wizard's own defaults; `--ir-test 13,13,15,10,-18,,0.3,1`
+/// takes a dry reference first and waits only three tenths of a second after
+/// the level tone, which is how the contaminated-pre-roll fault was
+/// reproduced and then confirmed fixed.
+///
+/// `settle` is this probe's own wait between the tone and the capture, not
+/// the engine's — the engine's is `IrCaptureSpec::settle_frames` and is
+/// always on. Setting this short is how you put a ringing box under the
+/// capture on purpose.
+#[cfg(feature = "recorder")]
+pub fn ir_test(arg: Option<String>) {
+    use crate::units::sweep as ess;
+    let parts: Vec<String> = arg
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .collect();
+    let num = |i: usize, d: f64| -> f64 {
+        parts.get(i).and_then(|s| s.parse::<f64>().ok()).unwrap_or(d)
+    };
+    // One-based on the way in, zero-based everywhere after: the jack is what
+    // is silk-screened on the box.
+    let out0 = (num(0, 1.0).max(1.0) as usize) - 1;
+    let in0 = (num(1, 1.0).max(1.0) as usize) - 1;
+    let sweep_s = num(2, 15.0).clamp(1.0, 120.0);
+    let tail_s = num(3, 10.0).clamp(1.0, 60.0);
+    let level_db = num(4, -18.0).clamp(-60.0, 0.0) as f32;
+    let device: Option<&str> = parts
+        .get(5)
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+
+    println!("== Tangent IR probe ==");
+    println!(
+        "jacks:    out {}/{}   in {}/{}",
+        out0 + 1,
+        out0 + 2,
+        in0 + 1,
+        in0 + 2
+    );
+    println!("sweep:    {sweep_s} s   tail {tail_s} s   send {level_db} dBFS");
+    let db = |v: f32| if v > 0.0 { 20.0 * v.log10() } else { -200.0 };
+
+    let mut engine = match crate::instrument::Engine::start(device) {
+        Ok(e) => e,
+        Err(why) => {
+            eprintln!("could not open an audio output: {why}");
+            std::process::exit(1);
+        }
+    };
+    let rate = f64::from(engine.output().sample_rate.max(1));
+    println!(
+        "output:   {} ({} ch, {} Hz)",
+        engine.output().device,
+        engine.output().channels,
+        engine.output().sample_rate
+    );
+    if out0 + 1 >= usize::from(engine.output().channels) {
+        eprintln!(
+            "output jack {} is past this device's {} channels",
+            out0 + 2,
+            engine.output().channels
+        );
+        std::process::exit(1);
+    }
+
+    // The input half, on the SAME device where the backend allows it — the
+    // desktop's own duplex rule, and the only way a single-client driver
+    // gives you both directions at once.
+    let timebase = tangent_record::audio::Timebase::new();
+    let tap = std::sync::Arc::new(crate::midi::RawMidiTap::new(1_024));
+    let mut session = crate::record::Session::new(std::sync::Arc::clone(&tap), timebase);
+    let duplex = engine.output_device();
+    // **The input is CHOSEN, not defaulted.** The first run of this probe
+    // opened "Virtual Mic" while playing the sweep out of a Scarlett, which
+    // reads as a dead loop and is really two different boxes. `duplex_with`
+    // is an ASIO affordance and does nothing on CoreAudio, so the device has
+    // to be named on this side too — by the same substring that picked the
+    // output, or by the output device's own name when none was given.
+    let want = device
+        .map(str::to_owned)
+        .unwrap_or_else(|| engine.output().device.clone());
+    let needle = want.to_lowercase();
+    let selection = match tangent_record::audio::input_devices() {
+        Ok(devices) => {
+            let hit = devices
+                .iter()
+                .find(|d| d.key.to_string().to_lowercase().contains(&needle));
+            match hit {
+                Some(d) => {
+                    println!(
+                        "input pick: {} ({} ch)",
+                        d.key,
+                        d.channels.map_or_else(|| "?".into(), |c| c.to_string())
+                    );
+                    tangent_record::audio::InputSelection::Key(d.key.clone())
+                }
+                None => {
+                    println!("inputs seen:");
+                    for d in &devices {
+                        println!("  {}", d.key);
+                    }
+                    eprintln!("no input device matching {want:?}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("could not enumerate audio inputs: {e}");
+            std::process::exit(1);
+        }
+    };
+    session.open_input(
+        &selection,
+        tangent_record::audio::Picks::EVERYTHING,
+        None,
+        Some(engine.output().sample_rate),
+        duplex.as_deref(),
+    );
+    match (session.audio_device_name(), session.audio_error()) {
+        (Some(name), _) => println!("input:    {name}"),
+        (None, Some(e)) => {
+            eprintln!("could not open an input: {e}");
+            std::process::exit(1);
+        }
+        (None, None) => {
+            eprintln!("no input opened and no error reported - that is a bug");
+            std::process::exit(1);
+        }
+    }
+    match session.take_monitor() {
+        Some(t) => engine.set_monitor(Some(t)),
+        None => {
+            eprintln!("the input opened but handed over no monitor ring - that is a bug");
+            std::process::exit(1);
+        }
+    }
+    // The ring only fills while monitoring is on; the capture tap reads it.
+    engine.set_monitor_on(true);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // ── the level check, which is the half the owner cannot see ──────────
+    //
+    // Per JACK, because the pair's peak is the larger of the two and a loop
+    // returning on one cable meters like a healthy one.
+    let sweep = ess::ess(10.0, 22_000.0f64.min(0.475 * rate), sweep_s, rate);
+    let pre = rate.round() as usize;
+    let tail = (tail_s * rate).round() as usize;
+    let level = 10.0f32.powf(level_db / 20.0);
+    println!("\ntone (2 s at the send level) - the return, per jack:");
+    engine.start_ir_tone((out0, out0 + 1), (in0, in0 + 1), level);
+    for _ in 0..8 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let (rms, peak) = engine.ir_return_db();
+        let (l, r) = engine.ir_return_sides_db();
+        println!("  peak {peak:7.2}  rms {rms:7.2}   left {l:7.2}  right {r:7.2}  dBFS");
+    }
+    engine.stop_ir();
+    // **Long enough for the box to stop ringing.** A 100% wet reverb is still
+    // decaying seconds after the tone stops, and the capture's pre-roll is
+    // where the loop's NOISE FLOOR is read — so a capture armed too soon
+    // measures the previous sound as its own noise, scores the loop as having
+    // almost no usable range, and the truncation then has no floor to find.
+    // The wizard has the same hazard between its level page and its sweep
+    // page; this probe waits four seconds so the number it prints is the
+    // loop's and not the tone's.
+    let settle_s = num(6, 4.0).clamp(0.0, 30.0);
+    println!("settling {settle_s} s before the capture");
+    std::thread::sleep(std::time::Duration::from_secs_f64(settle_s));
+    // **The tone's own job comes back and has to be thrown away**, or the
+    // loop below takes it instead of the sweep's and reports a capture of
+    // zero frames — which is exactly what the first run of this probe did.
+    while engine.take_captured().is_some() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // ── an optional DRY REFERENCE pass ───────────────────────────────────
+    //
+    // Arg 8 (`,1`) runs the sweep once more before the real capture and hands
+    // the result in as the reference, which is the exact route the owner's
+    // channel report named. On a loop normalled through a 100% wet box there
+    // is no dry path to record, so what this proves there is the PLUMBING —
+    // both jacks live, each channel divided by its own reference, no side
+    // deleted and no side a hundred dB up — rather than a physically
+    // meaningful measurement.
+    let want_ref = num(7, 0.0) > 0.5;
+    let total = pre + sweep.len() + tail;
+    let mut reference: Option<Vec<f32>> = None;
+    if want_ref {
+        println!("\ndry reference pass first ({:.1} s)", total as f64 / rate);
+        engine.start_ir_capture(crate::instrument::IrCaptureSpec {
+            out_pair: (out0, out0 + 1),
+            in_pair: (in0, in0 + 1),
+            sweep: sweep.clone(),
+            pre_silence_frames: pre,
+            post_silence_frames: tail,
+            level,
+            settle_frames: tail,
+        });
+        let by = std::time::Instant::now()
+            + std::time::Duration::from_secs_f64(total as f64 / rate + tail_s + 30.0);
+        loop {
+            if let Some((buf, done, _)) = engine.take_captured() {
+                if !done {
+                    eprintln!("the reference pass came back incomplete");
+                    std::process::exit(1);
+                }
+                let (mut a, mut b) = (0.0f32, 0.0f32);
+                for fr in buf.chunks_exact(2) {
+                    a = a.max(fr[0].abs());
+                    b = b.max(fr[1].abs());
+                }
+                println!(
+                    "reference peaks:  left {:.2} dBFS   right {:.2} dBFS",
+                    db(a),
+                    db(b)
+                );
+                let rl: Vec<f32> = buf.chunks_exact(2).map(|f| f[0]).collect();
+                let rr: Vec<f32> = buf.chunks_exact(2).map(|f| f[1]).collect();
+                println!(
+                    "reference range:  left {:.2} dB   right {:.2} dB   (the line is {:.0})",
+                    ess::reference_range_db(&rl, pre, sweep.len()),
+                    ess::reference_range_db(&rr, pre, sweep.len()),
+                    ess::TRUSTWORTHY_RANGE_DB
+                );
+                reference = Some(buf);
+                break;
+            }
+            if std::time::Instant::now() > by {
+                eprintln!("the reference pass never came back");
+                std::process::exit(1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    // ── the capture ──────────────────────────────────────────────────────
+    println!(
+        "\ncapturing {:.1} s ({} frames) - the sweep is audible on those jacks",
+        total as f64 / rate,
+        total
+    );
+    engine.start_ir_capture(crate::instrument::IrCaptureSpec {
+        out_pair: (out0, out0 + 1),
+        in_pair: (in0, in0 + 1),
+        sweep: sweep.clone(),
+        pre_silence_frames: pre,
+        post_silence_frames: tail,
+        level,
+        settle_frames: tail,
+    });
+    // The settle waits up to the tail before recording starts, so the wall
+    // clock has to allow for it as well as for the measurement itself.
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs_f64(total as f64 / rate + tail_s + 30.0);
+    let mut said = 0u32;
+    let captured = loop {
+        if let Some(got) = engine.take_captured() {
+            break Some(got);
+        }
+        if std::time::Instant::now() > deadline {
+            break None;
+        }
+        let (done_f, total_f) = engine.ir_progress();
+        if said % 20 == 0 {
+            println!(
+                "  ... {:.1}s recorded of {:.1}s",
+                f64::from(done_f) / rate,
+                f64::from(total_f) / rate
+            );
+        }
+        said += 1;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let Some((capture, done, slipped)) = captured else {
+        eprintln!("the capture never came back");
+        std::process::exit(1);
+    };
+    println!("returned: {} frames, complete={done}, slipped={slipped}", capture.len() / 2);
+    if slipped > 0 {
+        println!(
+            "  !! {slipped} input frames were dropped underneath the capture - the \\n\
+             \\x20    recorded sweep has a hole in it and is not a measurement"
+        );
+    }
+
+    // ── what the recording itself holds, before any maths ────────────────
+    let (mut pl, mut pr) = (0.0f32, 0.0f32);
+    for fr in capture.chunks_exact(2) {
+        pl = pl.max(fr[0].abs());
+        pr = pr.max(fr[1].abs());
+    }
+    println!(
+        "\nrecording peaks:  left {:.2} dBFS   right {:.2} dBFS",
+        db(pl),
+        db(pr)
+    );
+    let floor_window = (pre * 4) / 5;
+    let fl: Vec<f32> = capture.chunks_exact(2).take(floor_window).map(|f| f[0]).collect();
+    let fr: Vec<f32> = capture.chunks_exact(2).take(floor_window).map(|f| f[1]).collect();
+    println!(
+        "pre-roll floor:   left {:.2} dBFS   right {:.2} dBFS   (as the road reads it)",
+        ess::noise_floor_db(&fl),
+        ess::noise_floor_db(&fr)
+    );
+    // **The pre-roll's SHAPE, in tenths.** The road reads one mean-square
+    // over the first four fifths of it, which a decaying tail dominates — so
+    // what the loop is actually doing across that second is the thing to
+    // look at before choosing a different read.
+    println!("pre-roll, per 100 ms slice (dBFS):");
+    let slices = (pre / (rate as usize / 10)).max(1);
+    for k in 0..slices {
+        let a = k * pre / slices;
+        let b = ((k + 1) * pre / slices).min(pre);
+        let sl: Vec<f32> = capture[a * 2..b * 2].chunks_exact(2).map(|f| f[0]).collect();
+        let sr: Vec<f32> = capture[a * 2..b * 2].chunks_exact(2).map(|f| f[1]).collect();
+        println!(
+            "  {:5.2}-{:5.2} s   L {:7.2}   R {:7.2}",
+            a as f64 / rate,
+            b as f64 / rate,
+            ess::noise_floor_db(&sl),
+            ess::noise_floor_db(&sr)
+        );
+    }
+
+    // ── and what the wizard's own maths makes of it ──────────────────────
+    let (l, r, out) = process_ir_capture(
+        &capture,
+        &sweep,
+        reference.as_deref(),
+        pre,
+        rate,
+        10.0,
+        22_000.0f64.min(0.475 * rate),
+        sweep_s,
+    );
+    println!("\n== what the wizard would show ==");
+    println!("length:        {:.3} s  ({} samples)", out.seconds, l.len());
+    println!("after peak:    {:.3} s", out.usable_s);
+    println!(
+        "length cut by: {}",
+        match out.length_cut {
+            tangent_ui::ports::IrLengthCut::Floor => "the decay meeting its own floor",
+            tangent_ui::ports::IrLengthCut::Window =>
+                "NOTHING - this is the whole recorded window",
+        }
+    );
+    println!("capture peak:  {:.2} dBFS", out.capture_peak_db);
+    println!("loop floor:    {:.2} dBFS", out.noise_floor_db);
+    println!("usable range:  {:.1} dB", out.tail_range_db);
+    println!("THD2 / THD3:   {:.1} / {:.1} dB", out.thd2_db, out.thd3_db);
+    println!(
+        "channels:      left {:.2} dB   right {:.2} dB   correlation {:+.3}",
+        out.side_l_db, out.side_r_db, out.correlation
+    );
+    println!("reference:     {:?}", out.reference);
+
+    // The decay itself, which is the number the owner is actually asking
+    // about: how long IS the plate?
+    let rt60 = |ir: &[f32]| -> f64 {
+        let n = ir.len();
+        let mut tailsum = vec![0.0f64; n + 1];
+        for i in (0..n).rev() {
+            tailsum[i] = tailsum[i + 1] + f64::from(ir[i]) * f64::from(ir[i]);
+        }
+        let total = tailsum[0];
+        if total <= 0.0 {
+            return 0.0;
+        }
+        let d = |i: usize| 10.0 * (tailsum[i] / total).max(1e-30).log10();
+        let a = (0..n).find(|&i| d(i) <= -5.0);
+        let b = (0..n).find(|&i| d(i) <= -25.0);
+        match (a, b) {
+            (Some(a), Some(b)) if b > a => (b - a) as f64 / rate * 3.0,
+            _ => 0.0,
+        }
+    };
+    println!(
+        "\nrecovered RT60: left {:.3} s   right {:.3} s",
+        rt60(&l),
+        rt60(&r)
+    );
+    // Where the energy actually is, decade by decade, so a tail that never
+    // decays and a tail that decays and then sits on a floor look different.
+    println!("\nenvelope (dB under peak, every 10% of the file):");
+    let peak = l
+        .iter()
+        .chain(r.iter())
+        .fold(0.0f32, |m, &v| m.max(v.abs()))
+        .max(1e-30);
+    for k in 0..10 {
+        let a = k * l.len() / 10;
+        let b = ((k + 1) * l.len() / 10).max(a + 1).min(l.len());
+        let el = l[a..b].iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let er = r[a..b].iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        println!(
+            "  {:5.2}-{:5.2} s   L {:7.2}   R {:7.2}",
+            a as f64 / rate,
+            b as f64 / rate,
+            20.0 * (el / peak).max(1e-30).log10(),
+            20.0 * (er / peak).max(1e-30).log10()
+        );
+    }
+    engine.stop_ir();
+}
+
+/// **How much a pre-roll may fall across itself and still count as SILENCE**,
+/// in dB.
+///
+/// The pre-roll is the loop's noise-floor read, and a noise floor is
+/// stationary: its first tenth and its last read the same. A box still
+/// ringing from the last sound is not — measured on a Quadraverb plate, the
+/// pre-roll fell from −20.5 dBFS to −43.4 dBFS across one second, which is
+/// twenty-three dB of "silence".
+///
+/// Six dB is generous on purpose. The reading is a mean square over a tenth
+/// of a second and bounces three or four dB either way on real converter
+/// noise, so a tighter bar would call an honest floor a decay; anything
+/// actually decaying falls far more than this. It is a verdict for the
+/// RESULT page rather than a gate — the capture still happens, it is just no
+/// longer reported as if its numbers were measurements.
+#[cfg(feature = "recorder")]
+const PRE_ROLL_FLAT_DB: f64 = 6.0;
 
 /// The result stage's picture: the pair's level over time in dB, folded to
 /// the louder channel, [`IR_ENVELOPE_POINTS`] buckets, floored at −100.
@@ -14928,6 +15499,108 @@ mod tests {
         assert!(!irs.join("vanished.wav").exists(), "an empty file was created");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    /// **A pre-roll that is still decaying is not a noise floor, and the road
+    /// says so instead of believing it.**
+    ///
+    /// The engine waits for the loop to go quiet before it records
+    /// (`instrument::IrCaptureSpec::settle_frames`) and that is the real
+    /// cure. This is what happens when the wait runs out anyway — a box that
+    /// does not settle inside the tail it was given — and it is two separate
+    /// promises.
+    ///
+    /// The FLOOR is read as the quietest tenth of the pre-roll rather than as
+    /// one mean square over the whole of it. On the owner's Quadraverb, three
+    /// tenths of a second after the level tone, the pre-roll fell from
+    /// −20.5 dBFS to −43.4 across its second: the average was −27 and the
+    /// quietest tenth −43.4, against a settled floor of −87.5. Both are
+    /// wrong; one is wrong by the decay's last tenth and the other by its
+    /// first, and every threshold on the road is derived from this number.
+    ///
+    /// And the VERDICT says the number is not the loop's. A stretch that
+    /// falls across itself is a decay — the same discrimination
+    /// `sweep::tail_floor_db` makes at the other end of the buffer — so
+    /// `floor_settled` comes back false and the result page stops printing a
+    /// length as though it had measured one.
+    #[test]
+    fn a_pre_roll_that_is_still_ringing_is_not_reported_as_a_floor() {
+        let rate = 48_000.0f64;
+        let (f1, f2) = (10.0, 22_000.0f64.min(0.475 * rate));
+        let dur = 1.0f64;
+        let sweep = crate::units::sweep::ess(f1, f2, dur, rate);
+        let pre = rate as usize;
+        let tail = (2.0 * rate) as usize;
+        let frames = pre + sweep.len() + tail;
+        let plate = synth_plate(0.6, 3.0, rate);
+        let wet = crate::units::sweep::fft_convolve(&sweep, &plate);
+        let wet_peak = wet.iter().fold(0.0f32, |a, &b| a.max(b.abs())).max(1e-12);
+        let g = 10.0f32.powf(-6.0 / 20.0) / wet_peak;
+        let mut seed = 0x1357_9bdf_2468_ace0u64;
+        let mut noise = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        // Two captures off one fixture: the same measurement under a flat
+        // −90 dBFS floor, and the same one with a decaying tail laid over its
+        // pre-roll — twenty-five dB down across the second, which is what a
+        // plate three tenths of a second after a tone actually looks like.
+        let build = |ring: bool, noise: &mut dyn FnMut() -> f32| {
+            let floor = 10.0f32.powf(-90.0 / 20.0) * 3.0f32.sqrt();
+            let mut capture = vec![0.0f32; frames * 2];
+            for f in 0..frames {
+                let at = f.checked_sub(pre + 256);
+                let w = at.and_then(|k| wet.get(k)).copied().unwrap_or(0.0) * g;
+                let mut v = w + noise() * floor;
+                if ring && f < pre {
+                    let t = f as f32 / rate as f32;
+                    v += noise() * 10.0f32.powf(-20.0 / 20.0) * 10.0f32.powf(-25.0 * t / 20.0);
+                }
+                capture[f * 2] = v;
+                capture[f * 2 + 1] = v;
+            }
+            capture
+        };
+
+        let clean = build(false, &mut noise);
+        let (_, _, out) =
+            super::process_ir_capture(&clean, &sweep, None, pre, rate, f1, f2, dur);
+        assert!(
+            out.floor_settled,
+            "a flat pre-roll was called a decay: floor {:.1} dBFS",
+            out.noise_floor_db
+        );
+        assert!(
+            (out.noise_floor_db + 90.0).abs() < 4.0,
+            "a −90 dBFS floor read {:.1}",
+            out.noise_floor_db
+        );
+        let clean_floor = out.noise_floor_db;
+
+        let ringing = build(true, &mut noise);
+        let (_, _, out) =
+            super::process_ir_capture(&ringing, &sweep, None, pre, rate, f1, f2, dur);
+        assert!(
+            !out.floor_settled,
+            "a pre-roll falling twenty-five dB across itself was reported as the \
+             loop's own noise floor"
+        );
+        // And the number it did come back with is the quietest tenth, which
+        // is far below the average of that decay. The average of a −20 dBFS
+        // start is about −27; the last tenth is about −45.
+        assert!(
+            out.noise_floor_db < -38.0,
+            "the floor was read as the AVERAGE of a decay ({:.1} dBFS), not as its \
+             quietest stretch",
+            out.noise_floor_db
+        );
+        assert!(
+            out.noise_floor_db > clean_floor + 10.0,
+            "the ringing pre-roll somehow read as clean as the flat one"
+        );
     }
 
     /// **A box that only hisses while it is WORKING does not ship its whole

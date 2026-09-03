@@ -212,6 +212,16 @@ fn parse_cli() -> CliArgs {
                 instrument::plugin_test(args.next());
                 std::process::exit(0);
             }
+            // And the same for the IR road, which is the one measurement in
+            // this app whose correctness cannot be argued from a test: the
+            // question is what a converter, a cable and a box actually did.
+            // `--ir-test 13,13` plays the sweep on outputs 13/14 and records
+            // inputs 13/14. See `desktop::ir_test`.
+            #[cfg(feature = "recorder")]
+            "--ir-test" => {
+                desktop::ir_test(args.next());
+                std::process::exit(0);
+            }
             "-h" | "--help" => print_usage_and_exit(0),
             "-p" | "--port" => match args.next() {
                 Some(value) => port = Some(value),

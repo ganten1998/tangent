@@ -2276,6 +2276,17 @@ struct Shared {
     /// peak, linear, f32 bits. The wizard's stage-2 meter and its clip lamp.
     ir_rms: AtomicU32,
     ir_peak: AtomicU32,
+    /// **And each jack on its own**, peak, linear, f32 bits.
+    ///
+    /// The pair's peak is the max of the two, so a return with one dead jack
+    /// meters exactly like a healthy one — which is how somebody sets levels,
+    /// runs a sweep and only finds out at the result page that half the
+    /// capture was never there. The owner found it that way: "the left
+    /// channel having most of the information there and right channel
+    /// audible but mostly cancelled". These two say it at stage 2, before
+    /// the sweep, while there is still a cable to move.
+    ir_peak_l: AtomicU32,
+    ir_peak_r: AtomicU32,
 }
 
 impl Shared {
@@ -2421,6 +2432,8 @@ impl Shared {
             ir_cap_total: AtomicU32::new(0),
             ir_rms: AtomicU32::new(0),
             ir_peak: AtomicU32::new(0),
+            ir_peak_l: AtomicU32::new(0),
+            ir_peak_r: AtomicU32::new(0),
         }
     }
 
@@ -3484,6 +3497,29 @@ pub struct IrCaptureSpec {
     pub post_silence_frames: usize,
     /// Linear playback gain applied to the sweep (the wizard's dBFS choice).
     pub level: f32,
+    /// **The longest this pass will wait for the loop to go QUIET before it
+    /// starts recording**, in frames. Zero records at once.
+    ///
+    /// The pre-roll is where the loop's noise floor is measured, and every
+    /// threshold downstream is derived from that one number. A box that is
+    /// still ringing when the recording starts puts its own decay in there
+    /// instead, and the floor comes back tens of dB too high.
+    ///
+    /// Measured on the owner's rig — a Quadraverb on a 100% wet plate,
+    /// outputs 13/14 normalled to inputs 13/14 — three tenths of a second
+    /// after the level tone stopped: the pre-roll read −20.5 dBFS in its
+    /// first hundred milliseconds and was still falling at −43.4 in its last,
+    /// against a settled floor of −87.5. The road averaged that to −27, which
+    /// left the truncation a threshold 13 dB under the IR's peak instead of
+    /// 74, so nothing ever crossed it and the capture shipped as the whole
+    /// recorded window. Ten captures in a row, each one contaminated by the
+    /// last, is what that looks like from the far side: "every single IR
+    /// recorded is pinned to the tail time".
+    ///
+    /// So the pass waits, and it waits by LISTENING rather than by counting:
+    /// a dry box is ready at once and a long plate takes the seconds it takes.
+    /// See `IrJob::settle`.
+    pub settle_frames: usize,
 }
 
 /// The job as the audio thread holds it: the spec's buffers plus the two
@@ -3508,6 +3544,27 @@ struct IrJob {
     cap_pos: usize,
     /// Frames played so far — output-driven.
     play_pos: usize,
+    /// **Frames of settling left before the recording may start.** Counted
+    /// down on the input side like `cap_pos`; zero means recording.
+    ///
+    /// The wait ENDS EARLY when the return stops falling, which is what makes
+    /// it cost nothing on a dry loop. The comparison is between WINDOWS a
+    /// quarter of a second long, not between blocks: a plate falls about
+    /// 0.03 dB in a 10 ms block, which is under any threshold that is not
+    /// itself noise, so a block-to-block test declares a ringing box settled
+    /// almost at once — measured, on the first version of this, which left
+    /// the pre-roll exactly as contaminated as it had been. Over 250 ms the
+    /// same plate falls nearly 6 dB and a real floor falls nothing, and the
+    /// two are then trivially apart. See `IrCaptureSpec::settle_frames`.
+    settle: usize,
+    /// Sum of squares and frames in the window being accumulated.
+    settle_sum: f64,
+    settle_win: usize,
+    /// The last [`SETTLE_SPAN`] windows' mean squares, oldest at
+    /// `settle_at` — a ring, so the comparison is against a second ago
+    /// rather than a quarter of one.
+    settle_hist: [f32; SETTLE_SPAN],
+    settle_at: usize,
     /// **Input frames the monitor path threw away while this pass was
     /// recording** — frames torn OUT of the middle of the sweep.
     ///
@@ -3546,6 +3603,38 @@ struct IrJob {
     /// The capture buffer is full; waiting to be handed back.
     done: bool,
 }
+
+/// **How long a stretch the settle compares against the one before it**, in
+/// seconds.
+///
+/// A quarter of a second, and the length is the whole of why the test works.
+/// A decay falls 60/RT60 dB per second — about 23 dB/s on the plate this was
+/// measured against — so over 250 ms it falls nearly 6 dB while a noise floor
+/// falls nothing. Over one ~10 ms block the same plate falls 0.03 dB, which
+/// is under any threshold that is not itself noise; the first version of this
+/// compared blocks and declared a ringing box settled at once, leaving the
+/// pre-roll exactly as contaminated as it had been.
+const SETTLE_WINDOW_S: f64 = 0.25;
+
+/// How many [`SETTLE_WINDOW_S`] windows apart the settle's two readings are —
+/// four, so the comparison spans a whole second.
+///
+/// One 250 ms pair is too noisy to decide on: on the plate this was measured
+/// against, consecutive tenths bounce three and four dB either way while
+/// falling steadily, so a single pair that happens not to fall ends the wait
+/// with the box still 35 dB above its floor. Over a second the same decay
+/// falls fourteen dB and the bounce is unchanged.
+const SETTLE_SPAN: usize = 4;
+
+/// **How much quieter one settle window has to be than the one a
+/// [`SETTLE_SPAN`] before it to count as still decaying**, as a POWER
+/// ratio — 1.5 dB, which is `10^(-1.5/10)`.
+///
+/// Across a second, a decay anywhere under about RT60 400 s clears this and a
+/// floor never does. It is the same 1.5 dB the tail truncator uses to tell a
+/// floor from a decay (`sweep::TAIL_FLOOR_FLAT_DB`), for the same reason and
+/// against the same two things.
+const SETTLE_FALL_RATIO: f32 = 0.708;
 
 /// Which column of the monitor ring carries device input `want`.
 ///
@@ -4489,6 +4578,8 @@ impl Renderer {
                         self.shared.ir_stop.store(false, Ordering::Relaxed);
                         self.shared.ir_rms.store(0, Ordering::Relaxed);
                         self.shared.ir_peak.store(0, Ordering::Relaxed);
+                        self.shared.ir_peak_l.store(0, Ordering::Relaxed);
+                        self.shared.ir_peak_r.store(0, Ordering::Relaxed);
                         self.shared.ir_cap_pos.store(0, Ordering::Relaxed);
                         self.shared.ir_cap_total.store(0, Ordering::Relaxed);
                     }
@@ -5615,7 +5706,11 @@ impl Renderer {
                 // Same sample on both jacks: the loop is one mono probe into
                 // a stereo return.
                 if let Some(job) = self.ir.as_mut() {
-                    if !job.done {
+                    // Nothing is played while the pass is still listening for
+                    // the loop to go quiet — playing the sweep into a box
+                    // that has not finished the last sound is the very thing
+                    // the wait exists to prevent.
+                    if !job.done && job.settle == 0 {
                         let s = if job.tone_hz > 0.0 {
                             self.ir_phase += job.tone_hz / self.rate;
                             self.ir_phase -= self.ir_phase.floor();
@@ -6025,6 +6120,7 @@ impl Renderer {
         // interface stretches the capture rather than tearing a hole in it —
         // and bounded by the buffer the host preallocated: the callback
         // copies and counts, nothing more.
+        let ir_rate = self.rate;
         if let Some(job) = self.ir.as_mut() {
             if !job.cols_ready {
                 job.cols = (
@@ -6037,12 +6133,16 @@ impl Renderer {
             let (c0, c1) = job.cols;
             let mut sumsq = 0.0f64;
             let mut peak = 0.0f32;
+            let mut peak_l = 0.0f32;
+            let mut peak_r = 0.0f32;
             for f in 0..raw_frames {
                 let l = self.monitor_scratch[f * ch_in + c0];
                 let r = self.monitor_scratch[f * ch_in + c1];
                 sumsq += f64::from(l) * f64::from(l) + f64::from(r) * f64::from(r);
+                peak_l = peak_l.max(l.abs());
+                peak_r = peak_r.max(r.abs());
                 peak = peak.max(l.abs()).max(r.abs());
-                if job.tone_hz == 0.0 && !job.done {
+                if job.tone_hz == 0.0 && !job.done && job.settle == 0 {
                     let at = job.cap_pos * 2;
                     if at + 1 < job.capture.len() {
                         job.capture[at] = l;
@@ -6060,6 +6160,54 @@ impl Renderer {
                 let rms = (sumsq / (raw_frames as f64 * 2.0)).sqrt() as f32;
                 self.shared.ir_rms.store(rms.to_bits(), Ordering::Relaxed);
                 self.shared.ir_peak.store(peak.to_bits(), Ordering::Relaxed);
+                self.shared.ir_peak_l.store(peak_l.to_bits(), Ordering::Relaxed);
+                self.shared.ir_peak_r.store(peak_r.to_bits(), Ordering::Relaxed);
+                // **The settle, decided on the level and not on a clock.**
+                //
+                // While `settle` is non-zero the pass records nothing and
+                // plays nothing; it only listens. Each block is compared with
+                // the last, and a block that has not fallen by at least
+                // `SETTLE_FALL_DB` is a level that has stopped decaying. Two
+                // in a row ends the wait — one could be a gap between two
+                // reflections — and so does running the clock out, because a
+                // wait that never ends is worse than a floor read a few dB
+                // high. See `IrCaptureSpec::settle_frames`.
+                if job.settle > 0 {
+                    job.settle = job.settle.saturating_sub(raw_frames);
+                    job.settle_sum += sumsq;
+                    job.settle_win += raw_frames;
+                    let span = ((ir_rate * SETTLE_WINDOW_S) as usize).max(1);
+                    if job.settle_win >= span {
+                        let ms = (job.settle_sum / (job.settle_win as f64 * 2.0)) as f32;
+                        // **Against the window a whole second back**, not the
+                        // one just gone. A single 250 ms pair is a noisy
+                        // estimate — measured on the owner's plate, the
+                        // per-tenth readings bounce three and four dB either
+                        // way while falling steadily — so one pair that
+                        // happens not to fall ends the wait with the box
+                        // still 35 dB above its floor, and the capture then
+                        // comes back far too SHORT rather than too long. Over
+                        // a second the same decay falls fourteen dB and the
+                        // bounce is unchanged. The same lever-arm argument as
+                        // `sweep::TAIL_FLOOR_SPAN_S`, against the same two
+                        // things.
+                        let then = job.settle_hist[job.settle_at];
+                        if then > 0.0 && ms >= then * SETTLE_FALL_RATIO {
+                            job.settle = 0;
+                        }
+                        // A loop that is digitally silent settles as soon as
+                        // the ring has been round once: a dry patch pays the
+                        // span and nothing more.
+                        if then == 0.0 && ms == 0.0 && job.settle_hist.iter().all(|v| *v == 0.0)
+                        {
+                            job.settle = 0;
+                        }
+                        job.settle_hist[job.settle_at] = ms;
+                        job.settle_at = (job.settle_at + 1) % SETTLE_SPAN;
+                        job.settle_sum = 0.0;
+                        job.settle_win = 0;
+                    }
+                }
             }
         }
         // Stretched into the program's timeline, in place, so everything
@@ -11850,6 +11998,12 @@ impl Engine {
             capture: Vec::new(),
             cap_pos: 0,
             play_pos: 0,
+            // The tone records nothing, so it has nothing to settle for.
+            settle: 0,
+            settle_sum: 0.0,
+            settle_win: 0,
+            settle_hist: [0.0; SETTLE_SPAN],
+            settle_at: 0,
             slipped: 0,
             cols: (0, 0),
             cols_ready: false,
@@ -11881,6 +12035,11 @@ impl Engine {
             capture: vec![0.0; total * 2],
             cap_pos: 0,
             play_pos: 0,
+            settle: spec.settle_frames,
+            settle_sum: 0.0,
+            settle_win: 0,
+            settle_hist: [0.0; SETTLE_SPAN],
+            settle_at: 0,
             slipped: 0,
             cols: (0, 0),
             cols_ready: false,
@@ -11952,6 +12111,20 @@ impl Engine {
             }
         };
         (db(&self.shared.ir_rms), db(&self.shared.ir_peak))
+    }
+
+    /// The two jacks' peaks on their own, dBFS, −200 for silence. See
+    /// [`Shared::ir_peak_l`] for why the pair's number is not enough.
+    pub fn ir_return_sides_db(&self) -> (f32, f32) {
+        let db = |cell: &AtomicU32| {
+            let v = f32::from_bits(cell.load(Ordering::Relaxed));
+            if v > 0.0 {
+                20.0 * v.log10()
+            } else {
+                -200.0
+            }
+        };
+        (db(&self.shared.ir_peak_l), db(&self.shared.ir_peak_r))
     }
 
     /// Put the playhead at `frames`, stamped with the host's generation.
@@ -21589,6 +21762,182 @@ mod ir_road {
         }
     }
 
+
+    /// One offline block that renders (and throws the output away) and feeds
+    /// `feed` back as the next callback's device input — the loop with
+    /// something already ringing in it.
+    fn ir_loop_block_feeding(
+        e: &mut Engine,
+        tx: &mut Producer<f32>,
+        out: &mut [f32],
+        feed: &mut dyn FnMut(usize) -> f32,
+    ) {
+        out.fill(0.0);
+        e.render_offline(out);
+        for i in 0..out.len() {
+            let _ = tx.push(out[i] + feed(i / 2));
+        }
+    }
+
+    /// **A capture waits for the loop to go quiet before it records
+    /// anything.**
+    ///
+    /// The pre-roll is the loop's noise-floor read and every threshold on the
+    /// road is derived from it, so a box still ringing from the last sound
+    /// gets its own decay measured as "silence". Found on the owner's rig — a
+    /// Quadraverb on a 100% wet plate, outputs 13/14 normalled to inputs
+    /// 13/14 — three tenths of a second after the level tone stopped: the
+    /// pre-roll read −20.5 dBFS in its first tenth and was still falling at
+    /// −43.4 in its last, against a settled floor of −87.5. The road averaged
+    /// that to −27 dBFS, which left the truncation a threshold 13 dB under
+    /// the IR's peak instead of 74; nothing crossed it and the capture
+    /// shipped as the whole recorded window. Every capture, because each
+    /// one's tail contaminated the next: "every single IR recorded is pinned
+    /// to the tail time … captured 10 times now and still is a 10s reverb".
+    ///
+    /// Measured again on the same rig after this: the pre-roll comes back
+    /// flat at −88.8 dBFS across all ten of its tenths and the same plate
+    /// cuts at 7.06 s, which is what a manual four-second wait also gives.
+    ///
+    /// The wait is on the LEVEL, not on a clock, so a dry loop pays a fifth
+    /// of a second and a long plate pays what it needs. Both halves are
+    /// pinned here: a decaying feed records nothing, and the moment it goes
+    /// quiet the recording starts.
+    #[test]
+    fn a_capture_waits_for_the_loop_to_stop_ringing() {
+        let (mut e, mut tx) = ir_loop_rig();
+        let sr = 48_000.0f64;
+        let sweep = crate::units::sweep::ess(20.0, 20_000.0, 0.05, sr);
+        let (pre, tail) = (2_400usize, 2_400usize);
+        e.start_ir_capture(IrCaptureSpec {
+            out_pair: (0, 1),
+            in_pair: (0, 1),
+            sweep: sweep.clone(),
+            pre_silence_frames: pre,
+            post_silence_frames: tail,
+            level: 0.5,
+            // Generous, so what ends the wait is the level and not the cap.
+            settle_frames: (sr * 6.0) as usize,
+        });
+        let mut out = vec![0.0f32; 512 * 2];
+        // ── a decay in the loop ──────────────────────────────────────────
+        //
+        // Twelve dB a second — a five-second RT60, the gentlest thing this has
+        // to catch — WITH a slow wobble on top, and the wobble is the part
+        // that matters. A real tail is a sum of discrete reflections, so its
+        // short-window level does not fall smoothly: on the owner's plate the
+        // per-tenth readings bounced three and four dB either way while
+        // falling steadily. A quarter-second comparison catches a rising
+        // phase of that and lets go with the box still tens of dB above its
+        // floor, which is why the settle compares across a whole second. A
+        // smooth synthetic decay would pass either way and prove neither.
+        let mut n = 0usize;
+        let mut ring = |_i: usize| -> f32 {
+            n += 1;
+            let t = n as f32 / 48_000.0;
+            let fall = 10.0f32.powf(-12.0 * t / 20.0);
+            // One cycle a second, six dB either way: a quarter-second window
+            // lands inside a rising quarter of it and reads a level that has
+            // gone UP, while a whole second spans the cycle and sees only the
+            // decay. That is the discrimination `SETTLE_SPAN` is for, and a
+            // wobble much faster than the window averages out and proves
+            // nothing.
+            let wobble = 10.0f32
+                .powf(6.0 * (std::f32::consts::TAU * 1.0 * t).sin() / 20.0);
+            0.3 * fall * wobble
+        };
+        for _ in 0..280 {
+            ir_loop_block_feeding(&mut e, &mut tx, &mut out, &mut ring);
+            // Polled every block: the claim is that the pass does not RECORD
+            // while the loop is ringing, and a pass that finished has plainly
+            // recorded. Checked here rather than after the loop, where a
+            // completed capture has already reset the progress counters and
+            // the failure reads as "the job was never accepted".
+            assert!(
+                e.take_captured().is_none(),
+                "the pass recorded and finished while the loop was still ringing - \
+                 its pre-roll is that decay, and every threshold on the road is \
+                 derived from it"
+            );
+        }
+        let (done, total) = e.ir_progress();
+        assert!(total > 0, "the job was never accepted");
+        assert_eq!(
+            done, 0,
+            "the capture recorded {done} frames while the loop was still ringing"
+        );
+
+        // ── and the moment it goes quiet, it records ─────────────────────
+        let mut silence = |_i: usize| 0.0f32;
+        let mut got = None;
+        for _ in 0..400 {
+            ir_loop_block_feeding(&mut e, &mut tx, &mut out, &mut silence);
+            if let Some(back) = e.take_captured() {
+                got = Some(back);
+                break;
+            }
+        }
+        let (capture, complete, _) = got.expect("the capture never came back once quiet");
+        assert!(complete, "the road stopped short of the buffer");
+        // And what it recorded is a real pre-roll: the decay is gone, so the
+        // silence before the sweep is silence.
+        let head = &capture[..pre * 2 - 2];
+        let worst = head.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        assert!(
+            worst < 1.0e-4,
+            "the pre-roll still carries the decay at {worst} - the wait let go early"
+        );
+    }
+
+    /// **A loop that is already quiet is not made to wait.**
+    ///
+    /// The other half of the settle, and the half that keeps it from being a
+    /// tax on every capture: the wait is on the level, so a dry patch pays
+    /// only the span the comparison needs and then records.
+    #[test]
+    fn a_quiet_loop_does_not_wait_out_its_settle() {
+        let (mut e, mut tx) = ir_loop_rig();
+        let sr = 48_000.0f64;
+        let sweep = crate::units::sweep::ess(20.0, 20_000.0, 0.05, sr);
+        let (pre, tail) = (2_400usize, 2_400usize);
+        // Thirty seconds of allowance, none of which should be spent.
+        e.start_ir_capture(IrCaptureSpec {
+            out_pair: (0, 1),
+            in_pair: (0, 1),
+            sweep: sweep.clone(),
+            pre_silence_frames: pre,
+            post_silence_frames: tail,
+            level: 0.5,
+            settle_frames: (sr * 30.0) as usize,
+        });
+        let mut out = vec![0.0f32; 512 * 2];
+        let mut got = None;
+        // **Quiet, not digitally silent.** A real loop sits on its
+        // converters' noise, and that is the case the level comparison has to
+        // answer: a buffer of exact zeros can be recognised as silence by
+        // inspection, so a fixture made of zeros would pass on a settle that
+        // had stopped listening altogether.
+        let mut seed = 0x51ED_C0DEu32;
+        let mut hiss = move |_i: usize| -> f32 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0) * 1.0e-4
+        };
+        // The whole measurement is 0.1 s; two seconds of blocks is room for
+        // the settle's own span and the recording, and nothing like thirty.
+        for _ in 0..190 {
+            ir_loop_block_feeding(&mut e, &mut tx, &mut out, &mut hiss);
+            if let Some(back) = e.take_captured() {
+                got = Some(back);
+                break;
+            }
+        }
+        let (_, complete, _) = got.expect(
+            "a silent loop was still waiting out its settle after two seconds - the \
+             wait is counting rather than listening",
+        );
+        assert!(complete);
+    }
+
     /// **The capture road records exactly what the probe played.** A sweep
     /// armed on an offline engine whose outs feed its ins comes back
     /// complete: the pre-roll is silence, the sweep sits at its level after
@@ -21609,6 +21958,9 @@ mod ir_road {
             pre_silence_frames: pre,
             post_silence_frames: tail,
             level: 0.5,
+            // These rigs feed silence until the sweep plays, so there is
+            // nothing to settle for; the settle has its own test above.
+            settle_frames: 0,
         });
         let mut out = vec![0.0f32; 1024 * 2];
         let mut got = None;
@@ -21680,6 +22032,9 @@ mod ir_road {
             pre_silence_frames: pre,
             post_silence_frames: tail,
             level: 0.5,
+            // These rigs feed silence until the sweep plays, so there is
+            // nothing to settle for; the settle has its own test above.
+            settle_frames: 0,
         });
         let mut out = vec![0.0f32; 1024 * 2];
         let mut got = None;
@@ -21738,6 +22093,9 @@ mod ir_road {
             pre_silence_frames: 4_800,
             post_silence_frames: 48_000,
             level: 0.25,
+            // These rigs feed silence until the sweep plays, so there is
+            // nothing to settle for; the settle has its own test above.
+            settle_frames: 0,
         });
         let mut out = vec![0.0f32; 1024 * 2];
         for _ in 0..4 {

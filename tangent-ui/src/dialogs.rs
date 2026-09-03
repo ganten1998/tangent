@@ -5186,6 +5186,16 @@ fn draw_ir_level(
     // 3 dB under its peak by arithmetic, which is what made a −18 dBFS tone
     // read "−21" and look like a wall. Both numbers are here; only one of
     // them is the one to set levels by, and it now says so.
+    //
+    // **A steady number under a steady tone is the tone, not a compressor.**
+    // The owner read this meter pinned and wondered whether something was
+    // limiting: nothing is, and the reason is worth writing down because the
+    // suspicion is a reasonable one. A 1 kHz sine has one amplitude, so its
+    // peak does not move; the probe is added to the device frame AFTER the
+    // meters and never touches the master chain, precisely so a limiter
+    // cannot shave a measurement (`instrument.rs`, the IR probe block); and
+    // this reading is taken off the RAW input ring before any fader. What
+    // moves under a tone is the last digit of the RMS and nothing else.
     let reading = if peak <= -200.0 {
         "return: silence".to_owned()
     } else {
@@ -5195,6 +5205,28 @@ fn draw_ir_level(
         )
     };
     ui.label(RichText::new(reading).font(bold(10.5)).color(t.text));
+    // **And each jack on its own.**
+    //
+    // The line above is the PAIR's peak — the larger of the two — so a loop
+    // returning on one jack meters exactly like a loop returning on both, and
+    // the wizard says "levels are good" about a capture that is already half
+    // missing. The owner found that out at the end of ten sweeps: "the left
+    // channel having most of the information there and right channel audible
+    // but mostly cancelled". This is the last page where that is still a
+    // cable and not a ruined afternoon.
+    let (pl, pr) = (s.live.peak_l_db, s.live.peak_r_db);
+    let side = |db: f32| {
+        if db <= -200.0 {
+            "silent".to_owned()
+        } else {
+            format!("{db:.1}")
+        }
+    };
+    ui.label(
+        RichText::new(format!("  left {}   right {}", side(pl), side(pr)))
+            .font(bold(10.0))
+            .color(t.faint),
+    );
     // The warnings, in the order they matter.
     let warn = if peak > -0.5 {
         Some("CLIPPING - bring the unit's output (or the send) down.")
@@ -5202,6 +5234,22 @@ fn draw_ir_level(
         Some("Under 6 dB of headroom - the sweep will hit harder than this tone.")
     } else if s.tone_on && peak <= -200.0 {
         Some("Nothing is coming back - check the loop's cables and the unit's bypass.")
+    } else if s.tone_on && pl > -200.0 && pr <= -200.0 {
+        Some(
+            "Only the LEFT jack is returning. Check the right return cable - \
+             a capture made now is half a measurement.",
+        )
+    } else if s.tone_on && pr > -200.0 && pl <= -200.0 {
+        Some(
+            "Only the RIGHT jack is returning. Check the left return cable - \
+             a capture made now is half a measurement.",
+        )
+    } else if s.tone_on && pl > -200.0 && pr > -200.0 && (pl - pr).abs() > 12.0 {
+        Some(
+            "The two returns are more than 12 dB apart. That is the stereo \
+             image the capture will keep - check it is the box and not a \
+             cable or a trim.",
+        )
     } else if s.tone_on && peak < -30.0 {
         // The case the owner hit from the other side: a quiet return is a
         // quiet capture is a short IR, and nothing else in this wizard says
@@ -5281,22 +5329,34 @@ fn draw_ir_sweep(
     ui.add_space(10.0);
     // The optional exact route: capture the LOOP alone once, and every
     // later pass divides by it — interface, converters and latency cancel.
+    //
+    // **The two buttons are named for what you DO, not for what the maths
+    // calls it.** They were "Capture loop-only reference (recommended)" and
+    // "ARM - capture through the unit", and the owner's reading of that pair
+    // was the right one: "it's confusing to a newbie the two options". One
+    // named a signal path and the other named a state a tape machine goes
+    // into, and neither said which one takes the picture. DRY and IR are the
+    // words for the two recordings — everybody who has patched a loop knows
+    // which is which — and the order on screen is the order they happen in.
     let ref_line = if s.live.has_reference {
-        "reference held - the next capture divides by it"
+        "dry reference held - the capture will divide by it"
     } else {
-        "no reference - the capture will use the inverse-filter route"
+        "no dry reference - the capture will use the inverse-filter route"
     };
     ui.label(RichText::new(ref_line).font(bold(10.0)).color(t.faint));
     if !s.live.capturing
         && ui
             .add(Button::new(
-                RichText::new("Capture loop-only reference (recommended)")
+                RichText::new("Capture dry reference")
                     .font(bold(10.5))
                     .color(t.text),
             ))
             .on_hover_text(
-                "Bypass the unit (or patch out straight to in), then run \
-                 this once. Same sweep, same levels.",
+                "First. Bypass the unit (or patch the send straight back to \
+                 the return) and run this once: it records the loop with \
+                 nothing in it, so the interface, the converters and their \
+                 latency divide out of the capture that follows. Same sweep, \
+                 same levels.",
             )
             .clicked()
     {
@@ -5316,10 +5376,15 @@ fn draw_ir_sweep(
     if !s.live.capturing
         && ui
             .add(Button::new(
-                RichText::new("ARM - capture through the unit")
+                RichText::new("Capture IR")
                     .font(bold(12.0))
                     .color(t.text),
             ))
+            .on_hover_text(
+                "Second. Put the unit back in the loop and run this: the \
+                 sweep goes through the box and what comes back is the \
+                 impulse response.",
+            )
             .clicked()
     {
         // THIS is the pass whose result may move the wizard on, and what
@@ -5464,6 +5529,107 @@ fn draw_ir_result(
                 // is a note, and lives with the other quiet lines.
                 .color(if loud { IR_DANGER } else { t.faint }),
         );
+    }
+    // **Why the file is the length it is**, when the length is not a
+    // measurement.
+    //
+    // The wizard makes two cuts: to the recorded window, which is the TAIL
+    // row and is the edge of what was ever observed, and to the level where
+    // the decay meets its own noise floor. Only the second produces an IR the
+    // length of the reverb. When it declines, the first stands and the file
+    // comes back exactly as long as the row said — and the wizard used to
+    // print that number as if it had measured it. The owner captured a plate
+    // ten times and got ten 10.000-second files, with nothing on this page
+    // saying which of its two cuts had made them. See `ports::IrLengthCut`.
+    if r.length_cut == crate::ports::IrLengthCut::Window {
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(format!(
+                "This is the whole {:.2} s window, not a measured decay - the tail \
+                 never sank to its own noise floor inside it.",
+                r.seconds
+            ))
+            .font(bold(10.0))
+            .color(IR_DANGER),
+        );
+        ui.label(
+            RichText::new(
+                "Either the box outlasts the TAIL setting - take it again with a \
+                 longer tail - or the capture is too close to the noise for a decay \
+                 to be told from the floor, which the range figure below answers.",
+            )
+            .font(bold(9.5))
+            .color(t.faint),
+        );
+    }
+    // **And whether the floor under all of those numbers was measured at
+    // all.**
+    //
+    // Every threshold on this road is derived from the loop's noise floor,
+    // read from the silence before the sweep. A box still ringing from the
+    // last sound puts its own decay in there instead: measured on a
+    // Quadraverb plate three tenths of a second after the level tone, the
+    // "silence" fell from −20.5 dBFS to −43.4 across its second and averaged
+    // to −27, against a settled floor of −87.5. Sixty dB of error, all of it
+    // in the direction that makes the truncation give up and ship the whole
+    // window — which is what ten captures of one plate all measuring exactly
+    // the tail setting looked like.
+    //
+    // The engine waits for the loop to go quiet before it records, so this
+    // should be rare; when it is not, the length below is not a measurement
+    // and this says so instead of leaving it to be discovered.
+    if !r.floor_settled {
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(
+                "The silence before the sweep was still DECAYING, so the noise floor \
+                 below - and every number derived from it - is not the loop's. Leave \
+                 the box quiet for a few seconds and take it again.",
+            )
+            .font(bold(10.0))
+            .color(IR_DANGER),
+        );
+    }
+    // **The stereo image, as numbers.** One scale normalises the pair
+    // because the level difference between the channels IS the image; that
+    // makes the difference real and, until this line, invisible. A side far
+    // down is a jack that barely returned, and it looks exactly like a box
+    // that happens to be narrow.
+    let side = |db: f32| {
+        if db <= -200.0 {
+            "silent".to_owned()
+        } else {
+            format!("{db:.1} dB")
+        }
+    };
+    ui.label(
+        RichText::new(format!(
+            "channels: left {}   right {}   correlation {:+.2}",
+            side(r.side_l_db),
+            side(r.side_r_db),
+            r.correlation
+        ))
+        .font(bold(10.0))
+        .color(t.faint),
+    );
+    // And the two readings of that pair that are faults rather than pictures.
+    let sides = if r.side_l_db <= -200.0 || r.side_r_db <= -200.0 {
+        Some("One channel is SILENT - the capture is half a measurement.")
+    } else if (r.side_l_db - r.side_r_db).abs() > 20.0 {
+        Some(
+            "The two channels are more than 20 dB apart. That is a return jack \
+             that barely came back, not a stereo image.",
+        )
+    } else if r.correlation < -0.3 {
+        Some(
+            "The two channels are INVERSES of each other - summed to mono they \
+             cancel. Check the return cabling and the unit's phase.",
+        )
+    } else {
+        None
+    };
+    if let Some(said) = sides {
+        ui.label(RichText::new(said).font(bold(10.0)).color(IR_DANGER));
     }
     // **How the capture ran, next to how long it came out.** The truncation
     // keeps the tail down to about `tail_range_db` under the IR's own peak
@@ -9485,15 +9651,30 @@ pub fn show(
                                         // hand already trained on Done nor
                                         // one trained on Record another has
                                         // to find its button somewhere new.
+                                        //
+                                        // **Named for where it goes.** It said
+                                        // "Back to IR Panel", and the owner
+                                        // asked for the thing it already did:
+                                        // "why no Presets setting in 4/4 to go
+                                        // BACK to the presets menu and not
+                                        // close the window?" The panel it
+                                        // returns to IS that menu — the
+                                        // browser and the preset shelf are its
+                                        // two halves — so the button now wears
+                                        // the word somebody is looking for.
                                         if back_to.is_some() {
                                             if ui
                                                 .add(Button::new(
-                                                    RichText::new("Back to IR Panel")
-                                                        .color(t.text),
+                                                    RichText::new(
+                                                        "\u{2190} Presets & browser",
+                                                    )
+                                                    .color(t.text),
                                                 ))
                                                 .on_hover_text(
-                                                    "back to the impulse browser \u{2014} \
-                                                     this capture loaded and waiting",
+                                                    "back to the IR panel \u{2014} its \
+                                                     presets and its impulse browser, \
+                                                     with this capture loaded and \
+                                                     scrolled to",
                                                 )
                                                 .clicked()
                                             {
@@ -15144,6 +15325,54 @@ at: None,
         Dialog::InsertFace { strip, slot, live: Box::new(live) }
     }
 
+    /// **The two capture buttons say what you DO.**
+    ///
+    /// The owner, on the pair they replaced: "it's confusing to a newbie the
+    /// two options of 'Capture loop only reference' and 'Arm' — change them
+    /// to 'Capture dry reference' and 'Capture IR' instead." One of those
+    /// named a signal path and the other named a state a tape machine goes
+    /// into, and neither said which one takes the picture.
+    ///
+    /// Read off the painted frame, so a revert to either old word is caught
+    /// rather than argued about — and the ORDER is pinned with them, because
+    /// the dry reference is the one that has to happen first.
+    #[test]
+    fn the_sweep_page_names_the_two_recordings_it_makes() {
+        let mut slot = Slot::new(Dialog::IrWizard {
+            state: Box::new(IrWizardState {
+                stage: IrStage::Sweep,
+                ..Default::default()
+            }),
+        });
+        let words = slot.settle();
+        let text: Vec<&str> = words.iter().map(|(_, _, s)| s.as_str()).collect();
+        for want in ["Capture dry reference", "Capture IR"] {
+            assert!(
+                text.contains(&want),
+                "the sweep page does not say {want:?}; it says {text:?}"
+            );
+        }
+        for gone in [
+            "Capture loop-only reference (recommended)",
+            "ARM - capture through the unit",
+        ] {
+            assert!(!text.contains(&gone), "the old wording is back: {gone:?}");
+        }
+        // The dry reference is offered ABOVE the capture, because it is the
+        // recording that has to be made first for the other one to divide by.
+        let y = |want: &str| {
+            words
+                .iter()
+                .find(|(_, _, s)| s == want)
+                .map(|(r, _, _)| r.top())
+                .unwrap_or(f32::NAN)
+        };
+        assert!(
+            y("Capture dry reference") < y("Capture IR"),
+            "the capture is offered above the reference it divides by"
+        );
+    }
+
     /// **The dialog slot is handed from one window in this file to another,
     /// and every road that does it is driven here.**
     ///
@@ -15291,7 +15520,7 @@ at: None,
         if let Some(Dialog::IrWizard { state }) = slot.dialog.as_mut() {
             state.live.saves += 1;
         }
-        let asked = slot.click("Back to IR Panel");
+        let asked = slot.click("\u{2190} Presets & browser");
         match asked {
             Some(DialogAction::SetInsertIr { strip, slot: bay, path }) => {
                 assert_eq!((strip, bay), (5, 2));
@@ -15319,7 +15548,7 @@ at: None,
         });
         let words = slot.settle();
         assert!(
-            !words.iter().any(|(_, _, s)| s == "Back to IR Panel"),
+            !words.iter().any(|(_, _, s)| s == "\u{2190} Presets & browser"),
             "a wizard opened from Setup offered a way back to a panel that is not there"
         );
         assert!(
