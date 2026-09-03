@@ -24829,16 +24829,20 @@ impl TangentApp {
                 self.dialog = None;
             }
             DialogAction::OpenPedalPicker { strip, slot, pedal } => {
-                // The face speaks DESK terms; the pedal seat is the
-                // CHANNEL's, so resolve the seat first — an amp on the
-                // master or a folder's extra rack has no board and the chip
-                // row never drew, but a stale ask must still go nowhere.
+                // The face speaks DESK terms; the pedal seat is the OWNING
+                // CHANNEL's, so resolve the seat and then ask whose board it
+                // is — an amp on the master or a bus has none and the chip
+                // row never drew, but a stale ask must still go nowhere. A
+                // FOLDER's extra rack does have one, its channel's, which is
+                // why this is `pedal_owner` and no longer `seat < CHANNELS`.
                 // No new addressing road: `picker_insert` has always
                 // carried raw SEATS (its callers pass `seat_bay` output),
                 // so a pedal seat rides the existing picker unchanged.
                 let (seat, _) = recorder::seat_bay(strip, slot);
-                if seat < recorder::CHANNELS && pedal < recorder::AMP_PEDALS {
-                    self.open_insert_picker(recorder::amp_pedal_seat(seat, pedal), 0);
+                if let Some(ch) = recorder::pedal_owner(seat).filter(|_| {
+                    pedal < recorder::AMP_PEDALS
+                }) {
+                    self.open_insert_picker(recorder::amp_pedal_seat(ch, pedal), 0);
                 }
             }
             // ── the IR wizard ────────────────────────────────────────────
@@ -29637,14 +29641,28 @@ impl TangentApp {
                 // place the durations in that listing are read from.
                 self.refresh_ir_browser(&mut live);
             }
-            // The amp face's pedal chips, refreshed from settings like the
-            // rest of the picture — and only for a CHANNEL's seat: the
-            // master, the buses and a folder's extra rack wear no board.
-            live.pedals = (live.face.path == crate::faces_amp::AMP_PATH
-                && seat < recorder::CHANNELS)
-                .then(|| {
+            // **The amp face's pedal chips, indexed by the OWNING channel
+            // rather than by the seat the amp happens to sit in.**
+            //
+            // This used to read `seat < recorder::CHANNELS`, which is the
+            // same test spelled four times across this app and wrong in the
+            // same way each time. A FOLDER wears six bays; the last three
+            // are seated past every pad block (`folder_extra_seat`), so an
+            // amp dropped into a group's slot 4 answered that test with
+            // "no", drew "PEDALS - on channel strips only", and the owner
+            // had a pedalboard that vanished when he moved the amp one bay
+            // down. `pedal_owner` asks the question the row actually wants —
+            // whose board is this — and a folder's two racks share the one
+            // board its channel owns, which is exactly what the engine now
+            // runs at the top of the fold.
+            //
+            // The master, the buses, the pads and the pedal seats themselves
+            // still answer `None`, and the caption under the board says so.
+            live.pedals = recorder::pedal_owner(seat)
+                .filter(|_| live.face.path == crate::faces_amp::AMP_PATH)
+                .map(|ch| {
                     std::array::from_fn(|p| {
-                        self.insert(recorder::amp_pedal_seat(seat, p), 0)
+                        self.insert(recorder::amp_pedal_seat(ch, p), 0)
                             .map(crate::faces_amp::pedal_label)
                             .unwrap_or_default()
                     })
@@ -41975,6 +41993,117 @@ mod tests {
             "the face did not open"
         );
         (ctx, app)
+    }
+
+    /// The amp seated in one rack bay with its face open over it, and one
+    /// pedal loaded on channel `board_ch`'s board, so the caller can read
+    /// what the chip row was handed.
+    ///
+    /// Five tracks and channel 1 folded, because the interesting seat only
+    /// exists on a folder: a group wears six bays and its last three live in
+    /// `folder_extra_seat`.
+    fn app_with_an_amp_face(seat: usize, bay: usize) -> (egui::Context, TangentApp) {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        for n in 0..5 {
+            app.add_bare_track(n);
+        }
+        app.toggle_folder(1);
+        app.set_insert(seat, bay, Some(crate::faces_amp::AMP_PATH));
+        app.set_builtin_face(crate::ports::BuiltinFace {
+            strip: seat,
+            slot: bay,
+            path: crate::faces_amp::AMP_PATH.to_owned(),
+            params: Vec::new(),
+            curve_db: Vec::new(),
+            extra: Vec::new(),
+        });
+        // One recognisable tenant on channel 1's board, and another on
+        // channel 2's, so a face that read the WRONG channel's board would
+        // draw a name rather than an empty chip and be caught saying so.
+        app.set_insert(recorder::amp_pedal_seat(1, 3), 0, Some("/x/Fuzz.vst3"));
+        app.set_insert(recorder::amp_pedal_seat(2, 3), 0, Some("/x/Flanger.vst3"));
+        app.mixer_open = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        app.open_insert_face(seat, bay);
+        pointer_frame(&ctx, &mut app, Vec::new());
+        (ctx, app)
+    }
+
+    /// What the amp face's chip row was handed this frame, or `None` when
+    /// the panel is drawing its "no board here" caption instead.
+    fn board_on_the_face(app: &TangentApp) -> Option<[String; recorder::AMP_PEDALS]> {
+        match &app.dialog {
+            Some(dialogs::Dialog::InsertFace { live, .. }) => live.pedals.clone(),
+            other => panic!("no amp face is open: {}", other.is_some()),
+        }
+    }
+
+    /// **A GROUP's amp wears the group's pedalboard — from either of its
+    /// two racks.**
+    ///
+    /// This is the owner's "pedals must work on folder tracks", asserted
+    /// where the fault actually was. The panel's "on channel strips only"
+    /// caption was never a gate; the gate was `seat < recorder::CHANNELS` on
+    /// the seat the face is open over, and a folder's slots 3..5 are bays of
+    /// `folder_extra_seat`, which is past every channel index and past every
+    /// drum pad. So an amp in a group's bay 0 drew a board and an amp in the
+    /// same group's bay 3 drew a caption — one plugin, one strip, two
+    /// answers, and no rule anybody could have guessed.
+    ///
+    /// The row must also name the OWNING channel's tenants, which is the
+    /// half a looser assertion would miss: `amp_pedal_seat` takes a channel,
+    /// and handing it the raw seat would index far past the board space and
+    /// come back empty, or — worse, on a smaller seat map — land on somebody
+    /// else's board. Channel 2 wears a differently named pedal in the same
+    /// position for exactly that reason.
+    ///
+    /// Reverting the gate to `seat < recorder::CHANNELS` makes the folder's
+    /// second-rack case red while the first-rack case stays green.
+    #[test]
+    fn the_amp_face_on_a_group_wears_the_groups_board() {
+        // A plain track: unchanged, and the control for everything below.
+        let (_ctx, app) = app_with_an_amp_face(3, 0);
+        assert_eq!(
+            board_on_the_face(&app),
+            Some(std::array::from_fn(|_| String::new())),
+            "a bare track's board came back dressed"
+        );
+
+        // The group's FIRST rack — bays 0..2, its own seat.
+        let (_ctx, app) = app_with_an_amp_face(1, 0);
+        let board = board_on_the_face(&app).expect("a group's first rack drew no board");
+        assert_eq!(board[3], "Fuzz", "the group's own board was not the one drawn");
+
+        // The group's SECOND rack — slot 4, which is bay 1 of
+        // `folder_extra_seat(1)`. Same board, because a channel owns one.
+        let (_ctx, app) = app_with_an_amp_face(recorder::folder_extra_seat(1), 1);
+        let board = board_on_the_face(&app)
+            .expect("an amp in a group's bays 3..5 still drew no board");
+        assert_eq!(
+            board[3], "Fuzz",
+            "the group's second rack wore somebody else's board"
+        );
+        assert!(
+            board.iter().enumerate().all(|(p, t)| p == 3 || t.is_empty()),
+            "the board came back with tenants nobody loaded: {board:?}"
+        );
+
+        // And everything with no board of its own still says so: the master
+        // wears none, in either of ITS two racks.
+        for bay in [0usize, 1] {
+            let (_ctx, app) = app_with_an_amp_face(recorder::MASTER_SEAT, bay);
+            assert_eq!(
+                board_on_the_face(&app),
+                None,
+                "the master's bay {bay} grew a pedalboard"
+            );
+        }
+        let (_ctx, app) = app_with_an_amp_face(recorder::MASTER_EXTRA_SEAT, 0);
+        assert_eq!(
+            board_on_the_face(&app),
+            None,
+            "the master's extra rack grew a pedalboard"
+        );
     }
 
     /// Press on channel 0's fader, pull it up fifty points, let go — as a
