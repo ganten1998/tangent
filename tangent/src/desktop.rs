@@ -10937,6 +10937,234 @@ pub fn ir_test(arg: Option<String>) {
 #[cfg(feature = "recorder")]
 const PRE_ROLL_FLAT_DB: f64 = 6.0;
 
+
+/// **What the DEVICE says its rate and buffer are, once a second, while you
+/// change them somewhere else.**
+///
+/// The fourth developer probe, and the one that answers a question no unit
+/// test can: whether this app is holding an interface's sample rate against
+/// its owner. The owner's report was that Focusrite Control 2 cannot move his
+/// Scarlett off 48 kHz while Tangent is running, and can the moment it quits.
+///
+/// `--device-watch [seconds][,open]` — with `open`, it starts the engine the
+/// way the app does before watching, so the two runs differ in exactly one
+/// thing: whether Tangent has a stream on the device.
+#[cfg(feature = "recorder")]
+pub fn device_watch(arg: Option<String>) {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let parts: Vec<String> = arg
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .collect();
+    let secs: f64 = parts
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30.0_f64)
+        .clamp(1.0, 600.0);
+    let open = parts.iter().any(|s| s == "open");
+    // Which rate the engine ASKS for — the probe's own way of moving the
+    // device, since the thing under test is whether asking moves it.
+    // `device` in the arg list means ASK FOR NOTHING — the case the Setup
+    // screen calls "Device", and the one under test.
+    let want_rate: Option<u32> = if parts.iter().any(|p| p == "device") {
+        None
+    } else {
+        Some(
+            parts
+                .iter()
+                .find_map(|s| s.parse::<u32>().ok().filter(|r| *r >= 8_000))
+                .unwrap_or(48_000),
+        )
+    };
+
+    let host = cpal::default_host();
+    let dev = match host.default_output_device() {
+        Some(d) => d,
+        None => {
+            eprintln!("no default output device");
+            std::process::exit(1);
+        }
+    };
+    let name = dev.name().unwrap_or_else(|_| "<unnamed>".to_owned());
+    println!("device:   {name}");
+    println!("watching: {secs} s   engine open: {open}");
+
+    // **The device is looked up FRESH every poll.** A `cpal::Device` is a
+    // handle, and asking one that was obtained before the change is how a
+    // probe reports that nothing happened when something did. This costs an
+    // enumeration per second and buys an instrument that can be trusted.
+    let read = || -> (String, String) {
+        let host = cpal::default_host();
+        let Some(d) = host.default_output_device() else {
+            return ("<no device>".to_owned(), String::new());
+        };
+        let rate = d
+            .default_output_config()
+            .map(|c| c.sample_rate().0.to_string())
+            .unwrap_or_else(|e| format!("<{e}>"));
+        let buf = d
+            .default_output_config()
+            .map(|c| match c.buffer_size() {
+                cpal::SupportedBufferSize::Range { min, max } => format!("{min}..{max}"),
+                cpal::SupportedBufferSize::Unknown => "unknown".to_owned(),
+            })
+            .unwrap_or_else(|_| "?".to_owned());
+        (rate, buf)
+    };
+
+    let mut engine = None;
+    // Held for the life of the watch: dropping the session closes the input
+    // and the ring stops being fed.
+    let mut session_hold: Option<crate::record::Session> = None;
+    if open {
+        // Exactly what `desktop::start_engine` does: the resolved rate and
+        // the chosen buffer, both handed to cpal.
+        match crate::instrument::Engine::start_sized(
+            None,
+            tangent_record::audio::Timebase::new(),
+            Some(256),
+            want_rate,
+        ) {
+            Ok(mut e) => {
+                println!(
+                    "engine:   opened at {} Hz, {} ch  (asked {want_rate:?} / 256 frames)",
+                    e.output().sample_rate,
+                    e.output().channels
+                );
+                // **The INPUT too, or the clock measurement reads zero.** The
+                // capture tap counts frames out of the MONITOR RING, and the
+                // ring is fed by the input session — an output-only probe
+                // waits forever for frames nothing is producing, which is what
+                // the first version of this did.
+                let tap = std::sync::Arc::new(crate::midi::RawMidiTap::new(1_024));
+                let mut sess = crate::record::Session::new(
+                    std::sync::Arc::clone(&tap),
+                    tangent_record::audio::Timebase::new(),
+                );
+                let duplex = e.output_device();
+                let want = e.output().device.clone();
+                let needle = want.to_lowercase();
+                let sel = tangent_record::audio::input_devices()
+                    .ok()
+                    .and_then(|ds| {
+                        ds.into_iter()
+                            .find(|d| d.key.to_string().to_lowercase().contains(&needle))
+                    })
+                    .map_or(tangent_record::audio::InputSelection::Default, |d| {
+                        tangent_record::audio::InputSelection::Key(d.key)
+                    });
+                sess.open_input(
+                    &sel,
+                    tangent_record::audio::Picks::EVERYTHING,
+                    None,
+                    Some(e.output().sample_rate),
+                    duplex.as_deref(),
+                );
+                if let Some(t) = sess.take_monitor() {
+                    e.set_monitor(Some(t));
+                }
+                e.set_monitor_on(true);
+                println!(
+                    "input:    {}",
+                    sess.audio_device_name().unwrap_or("<none>")
+                );
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                session_hold = Some(sess);
+                engine = Some(e);
+            }
+            Err(why) => {
+                eprintln!("engine would not open: {why}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // **The decisive measurement: frames per WALL-CLOCK second.**
+    //
+    // Two readings already say the device stayed put while the engine
+    // reported the rate it asked for, and those two facts have very different
+    // consequences. If the engine's rate is a FICTION — it believes 88200
+    // while the hardware runs 44100 — then everything derived from that
+    // number (the sweep, the tempo, the latency arithmetic, the IR wizard's
+    // whole measurement) is wrong by the ratio between them.
+    //
+    // The capture buffer fills from the input callback, one frame per frame
+    // the DEVICE delivers. So a buffer the engine sizes as two seconds of its
+    // own rate takes two seconds only if that rate is real: at half of it, it
+    // takes four. No belief can bend a wall clock.
+    //
+    // A tone is not used and could not be: the job model holds ONE job, so
+    // arming a capture stops the tone and the capture would be of silence.
+    // That is what the first version of this measured.
+    if let Some(e) = engine.as_mut() {
+        if parts.iter().any(|s| s == "clock") {
+            let believes = f64::from(e.output().sample_rate.max(1));
+            let want_frames = (believes * 2.0) as usize;
+            println!(
+                "\nthe engine believes {believes} Hz, so it sizes two seconds as \
+                 {want_frames} frames. Timing how long they take to arrive."
+            );
+            while e.take_captured().is_some() {}
+            e.start_ir_capture(crate::instrument::IrCaptureSpec {
+                out_pair: (12, 13),
+                in_pair: (12, 13),
+                sweep: vec![0.0; want_frames],
+                pre_silence_frames: 0,
+                post_silence_frames: 0,
+                level: 0.0,
+                settle_frames: 0,
+            });
+            let began = std::time::Instant::now();
+            let mut got = None;
+            while began.elapsed().as_secs_f64() < 30.0 {
+                if let Some(back) = e.take_captured() {
+                    got = Some(back);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let secs = began.elapsed().as_secs_f64();
+            match got {
+                Some((buf, done, _)) => {
+                    let frames = buf.len() / 2;
+                    let real = frames as f64 / secs.max(1e-9);
+                    println!("  {frames} frames in {secs:.3} s   complete={done}");
+                    println!("  the device is really running at about {real:7.0} Hz");
+                    println!(
+                        "  the engine believes                    {believes:7.0} Hz   \
+                         ratio {:.3}",
+                        believes / real.max(1.0)
+                    );
+                }
+                None => println!("  the capture never came back in 30 s"),
+            }
+        }
+    }
+    println!("\n  t     device rate   buffer range");
+    let start = std::time::Instant::now();
+    let mut last = String::new();
+    while start.elapsed().as_secs_f64() < secs {
+        let (rate, buf) = read();
+        let line = format!("{rate:>11}   {buf}");
+        if line != last {
+            println!("  {:5.1}  {line}   <- CHANGED", start.elapsed().as_secs_f64());
+            last = line;
+        } else {
+            println!("  {:5.1}  {line}", start.elapsed().as_secs_f64());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1_000));
+    }
+    drop(engine);
+    drop(session_hold);
+    println!("\nengine dropped; watching five seconds more");
+    for _ in 0..5 {
+        std::thread::sleep(std::time::Duration::from_millis(1_000));
+        let (rate, buf) = read();
+        println!("  after  {rate:>11}   {buf}");
+    }
+}
+
 /// The result stage's picture: the pair's level over time in dB, folded to
 /// the louder channel, [`IR_ENVELOPE_POINTS`] buckets, floored at −100.
 fn ir_envelope_db(l: &[f32], r: &[f32]) -> Vec<f32> {
