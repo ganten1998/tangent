@@ -43,8 +43,10 @@
 //! self.busy = Some(Busy::new("Loading project").with_detail(name));
 //! ctx.request_repaint();
 //!
-//! // Frame N+1, at the top — the announcement is on screen, so act.
-//! if self.busy.as_ref().is_some_and(Busy::on_screen) {
+//! // Frame N+2, at the top — the announcement is on screen AND a frame has
+//! // gone out that no longer carries whatever asked. See
+//! // `Busy::outlived_the_asking_frame`, which is why this is not N+1.
+//! if self.busy.as_ref().is_some_and(Busy::outlived_the_asking_frame) {
 //!     self.open_project(&path);          // the block, in front of the user
 //!     self.busy_done = true;
 //! }
@@ -111,6 +113,70 @@ use crate::recorder_panel::{
 };
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
 use std::time::{Duration, Instant};
+
+// ── which band a cover paints in ────────────────────────────────────────────
+
+/// **The band every COVER of this app paints in, and the one place it is
+/// decided.**
+///
+/// A cover is a drawing that says the app is working: this overlay, and
+/// `splash.rs`'s wordmark at launch. Both used to name their own layer at
+/// their own call site in `desktop.rs` — `LayerId::new(Order::Foreground,
+/// Id::new("tangent-busy"))`, and the same line again with "tangent-splash" —
+/// and both call sites carried a comment claiming the drawing therefore
+/// covered "everything including any dialog that opened underneath it". It
+/// did not, and the owner found it: "the export loading bar comes up behind
+/// the export menu itself".
+///
+/// **What is above `Foreground`, which is what that claim missed.** egui's
+/// bands are `Background < Middle < Foreground < Tooltip < Debug`, and paint
+/// order is absolute across them. This app puts surfaces in three of them.
+/// `shell::SurfaceTier::inline_order` is the table: a modal dialog and a
+/// plugin window take `Foreground`, a modal's scrim takes `Middle`, and the
+/// **export render window takes `Tooltip`** — one band ABOVE a cover, on
+/// purpose, because nothing that merely announces may hide a render. `menu.rs`
+/// opens its submenu panel in `Tooltip` for the same reason, and egui's own
+/// hover text lands there whether we ask or not.
+///
+/// So a cover on `Foreground` was under the render window outright, and above
+/// a dialog only by accident: a layer that is not an `Area` is missing from
+/// `Areas::order`, and `GraphicLayers::drain` sweeps those up after the ones
+/// that are — a branch egui itself annotates "we don't think we end up here in
+/// normal situations", and one that iterates a hash map, so two covers would
+/// have come out in whichever order the hasher felt like. An accident that
+/// holds today is not a rule.
+///
+/// **Which windows have to be under it, and why the rule is here.** Every
+/// surface this app can have open while it works: the export dialog and every
+/// other modal question, a plugin's own face, the pedal window, the menu and
+/// its submenu, the notification column (`notify` draws in `Foreground`
+/// inside the main window), and the export render window that is up for the
+/// whole of a bounce — `announce("Writing files", …)` is raised while that
+/// window is still on screen, which is the pairing the owner was looking at.
+/// A cover is the last thing painted before the UI thread stops answering, so
+/// it is the one drawing in the app that must be above all of them; it is not
+/// a question and nothing is waiting on it, so nothing is lost by it being
+/// there. `Debug` is the only band above `Tooltip`, and the app paints nothing
+/// else in it — egui's own debug drawing lands there only with the debug style
+/// options on, which is a developer looking at a diagnostic and welcome to it.
+///
+/// The rule lives in `busy.rs` rather than at the call sites because that is
+/// what "stated once" means: a host asks for a layer by name and cannot spell
+/// a band at all, and `desktop.rs`'s own `a_cover_takes_its_band_from_one_place`
+/// holds it to that. `shell.rs`'s
+/// `a_cover_is_painted_above_every_surface_this_app_can_open` reads the answer
+/// straight off `SurfaceTier`, so a fourth tier added there with a higher band
+/// fails on the next `cargo test` rather than on somebody's screen.
+pub const COVER_ORDER: egui::Order = egui::Order::Debug;
+
+/// The layer a cover paints on, named for which cover it is.
+///
+/// `name` is the layer's identity and nothing else — `"tangent-busy"`,
+/// `"tangent-splash"`. The BAND is [`COVER_ORDER`]'s to decide, which is the
+/// whole point of asking through here.
+pub fn cover_layer(name: &str) -> egui::LayerId {
+    egui::LayerId::new(COVER_ORDER, egui::Id::new(name))
+}
 
 // ── what is being waited on ─────────────────────────────────────────────────
 
@@ -266,6 +332,11 @@ pub struct Busy {
     /// When [`Busy::draw`] first painted it, which is the only moment anybody
     /// can say it was on screen.
     shown: Option<Instant>,
+    /// How many frames have actually carried it. See
+    /// [`Busy::outlived_the_asking_frame`], which is the only reader and
+    /// where the reason lives. Counted rather than timed, for the reason the
+    /// module header gives about clocks during a stall.
+    paints: u32,
     /// When it last said something new, and what that was — the cap measures
     /// the gap since.
     spoke_at: Option<Instant>,
@@ -288,6 +359,7 @@ impl Busy {
             cap: MAX_SILENT,
             started: Instant::now(),
             shown: None,
+            paints: 0,
             spoke_at: None,
             spoke_progress: None,
             spoke_detail: None,
@@ -344,8 +416,11 @@ impl Busy {
 
     /// **Is the announcement actually on the screen?**
     ///
-    /// The gate of the two-phase sequence, and the one thing a caller with a
-    /// blocking call has to wait for.
+    /// The first half of the two-phase gate. A caller with a blocking call
+    /// waits for [`Busy::outlived_the_asking_frame`], which is this and one
+    /// frame more; this one on its own answers the narrower question — has
+    /// anything of this overlay ever been presented — which is what the cap,
+    /// the minimum and the host's own "did it appear at all" branches ask.
     ///
     /// It goes true the moment [`Busy::draw`] paints, which is why WHERE the
     /// two are called from matters: `draw` belongs at the bottom of the frame,
@@ -360,6 +435,42 @@ impl Busy {
     /// frame and lets the overlay appear when it is due.
     pub fn on_screen(&self) -> bool {
         self.shown.is_some()
+    }
+
+    /// **Has a frame gone out that no longer carries whatever ASKED for the
+    /// work?**
+    ///
+    /// [`Busy::on_screen`] is true one frame too early for a blocking call,
+    /// and the owner found the gap: "the export loading bar comes up behind
+    /// the export menu itself". The Export dialog is a window of its own on
+    /// the desktop, and the frame that announces the render is the same frame
+    /// that dialog was last drawn in — the app closes it while that frame is
+    /// being built, but a viewport is destroyed by NOT being drawn, which can
+    /// only happen on the next pass. Block on the next pass instead and that
+    /// pass never finishes, so the window is never destroyed, and the frozen
+    /// picture the user stares at for the length of the render is the cover
+    /// with the dialog still sitting on top of it.
+    ///
+    /// No layer can fix that: on the desktop the two are different OS
+    /// windows, and [`COVER_ORDER`] only orders what is inside one of them.
+    /// What fixes it is one more PRESENTED frame — the first one that is the
+    /// cover and no longer the thing that asked — and this is the count of
+    /// them. Two paints, because the first is by definition the announcing
+    /// frame; nothing is timed, for the reason the module header gives about
+    /// clocks during a stall.
+    ///
+    /// It costs one frame, once, in front of an operation that is about to
+    /// take seconds — the whole reason a cover exists.
+    ///
+    /// **It cannot hang.** The host paints every frame the overlay is up and
+    /// asks for the next one, so the second paint is the very next pass; the
+    /// silence cap is measured in tens of seconds and cannot fire between
+    /// two consecutive frames. The one case that stalls this — a window with
+    /// no area at all, where nothing ever paints — stalls
+    /// [`Busy::on_screen`] identically and is what `chore_ready`'s `None`
+    /// arm is for.
+    pub fn outlived_the_asking_frame(&self) -> bool {
+        self.paints >= 2
     }
 
     /// How long it has been on screen, or `None` if it never has.
@@ -787,6 +898,10 @@ impl Busy {
             return false;
         }
         let now = Instant::now();
+        // Counted before anything can return early below, because this is the
+        // number `outlived_the_asking_frame` reads and a paint that happened
+        // is a paint that happened.
+        self.paints = self.paints.saturating_add(1);
         if self.shown.is_none() {
             self.shown = Some(now);
             self.spoke_at = Some(now);
@@ -1320,11 +1435,20 @@ mod tests {
     /// **The handshake: painted first, blocked second.**
     ///
     /// The law the module is built on, as a test. A caller with one blocking
-    /// call announces on frame N and acts on frame N+1, and the only honest
-    /// signal that frame N happened is that the overlay was PAINTED — a wall
-    /// clock cannot say so, because during the block there is no clock being
-    /// read. `desktop.rs` keeps the same handshake around `open_camera` and
-    /// the same first-frame gate in `painted_once`.
+    /// call announces on frame N and acts two frames later, and the only
+    /// honest signal that those frames happened is that the overlay was
+    /// PAINTED — a wall clock cannot say so, because during the block there
+    /// is no clock being read. `desktop.rs` keeps the same handshake around
+    /// `open_camera` and the same first-frame gate in `painted_once`.
+    ///
+    /// **Why two and not one**, which is the half the owner reported: the
+    /// announcing frame still carries whatever asked for the work, and on the
+    /// desktop that is a window of its own which is destroyed by not being
+    /// drawn — on the pass that blocks. See
+    /// [`Busy::outlived_the_asking_frame`].
+    ///
+    /// Revert-check: make that method answer `self.paints >= 1` and the
+    /// second assertion below goes red.
     #[test]
     fn the_block_waits_for_the_frame_that_announces_it() {
         let ctx = ctx();
@@ -1334,7 +1458,18 @@ mod tests {
         assert!(!busy.on_screen(), "nothing has been painted, so nothing may block");
         assert!(busy.shown_for().is_none() && busy.silent_for().is_none());
         assert!(paint_once(&ctx, &mut busy, rect), "a known block paints at once");
-        assert!(busy.on_screen(), "the announcement is up; now the block may run");
+        assert!(busy.on_screen(), "the announcement is up");
+        assert!(
+            !busy.outlived_the_asking_frame(),
+            "the frame that announced the block also carried the window that \
+             asked for it, so the block may not run yet"
+        );
+        assert!(paint_once(&ctx, &mut busy, rect), "still up on the next frame");
+        assert!(
+            busy.outlived_the_asking_frame(),
+            "a frame has gone out that is the cover and nothing else; now the \
+             block may run"
+        );
         assert!(
             !busy.may_close(),
             "an operation that turned out to be instant still owes its minimum"
@@ -1346,6 +1481,7 @@ mod tests {
         let mut later = Busy::deferred("Exporting");
         assert!(!paint_once(&ctx, &mut later, rect));
         assert!(!later.on_screen());
+        assert!(!later.outlived_the_asking_frame());
         assert!(later.may_close());
     }
 
