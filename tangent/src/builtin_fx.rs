@@ -997,7 +997,12 @@ impl BuiltinUnit {
             // The denoise's clear keeps what was LEARNED — its kernel
             // documents "forget what was playing, keep the thresholds",
             // which is exactly what a restored preset needs from the
-            // `create`-then-`clear` load path.
+            // `create`-then-`clear` load path. Seating the ENGINE is
+            // `DenoiseUnit::set_param`'s job and is deliberately not
+            // duplicated here: `create` writes every parameter through
+            // `set_param` before it calls this, `set_param` primes on every
+            // write, and a second call would be a guard no revert could
+            // turn red.
             BuiltinUnit::Denoise(u) => u.kernel.clear(),
             BuiltinUnit::Amp(u) => u.kernel.clear(),
             BuiltinUnit::Drive(u) => u.kernel.clear(),
@@ -1374,6 +1379,18 @@ impl DenoiseUnit {
             5 => self.params.lookahead = v,
             _ => self.params.kernel = v,
         }
+        // **The selector and the lookahead toggle move LATENCY, and the
+        // kernel answers about them from its own fields, not from these.**
+        // Those fields were only ever written inside `process`, so a unit
+        // built from a blob answered with the CONSTRUCTOR's engine until it
+        // had seen a block: `UnitSpec::create` sets the parameters and
+        // `prepare_builtin` reads `latency()` the next line, so a bay
+        // restored on Bank reported the spectral frame instead of zero, and
+        // for a bay restored BYPASSED it kept reporting it — the block loop
+        // is the only correction road and it is skipped for a bypassed bay
+        // by design. `prime` runs the same two edges `process` runs, in the
+        // same order, allocation-free, so it is safe from here.
+        self.kernel.prime(&self.params);
     }
 
     fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
@@ -2419,6 +2436,78 @@ mod tests {
         let l: Vec<f32> = (0..frames).map(|_| next() * 0.2).collect();
         let r: Vec<f32> = (0..frames).map(|_| next() * 0.2).collect();
         vec![l, r]
+    }
+
+    /// **A denoise seated from a saved blob reports its latency BEFORE it
+    /// has seen a block.**
+    ///
+    /// `Denoise::latency` answers from the kernel's own `kernel` and
+    /// `la_on` fields, and those were only ever written inside `process`.
+    /// `UnitSpec::create` sets the parameters and `instrument`'s
+    /// `prepare_builtin` reads `latency()` on the very next line, so a bay
+    /// restored on Bank claimed the SPECTRAL frame — 1024 samples at 48 kHz
+    /// — and a bay restored on Spectral Live claimed 1024 instead of 512.
+    /// Built-ins carry no latency handle, so the only correction road is
+    /// `Backend::reported_latency` in the block loop, and that call is
+    /// skipped for a BYPASSED bay by design: a project reopened with this
+    /// bay bypassed held a phantom 1024 frames in that cell for the whole
+    /// session, and `publish_latency` aligned every other lane behind it.
+    ///
+    /// Read through the real load path — `state_text`, `values_from_state`,
+    /// `create` — because the fault lives in the seam between them and a
+    /// test that called `set_param` by hand would have walked past it.
+    #[test]
+    fn a_denoise_seated_from_a_blob_reports_its_latency_before_the_first_block() {
+        use crate::units::denoise::{DenoiseKernel, DenoiseParams, DENOISE_LOOKAHEAD_MS};
+        let spec = spec_for(DENOISE_PATH).unwrap();
+        let la = (48_000.0 * DENOISE_LOOKAHEAD_MS / 1_000.0).round() as u32;
+        for (kernel, lookahead, want) in [
+            (DenoiseKernel::Bank, 1.0_f32, la),
+            (DenoiseKernel::Bank, 0.0, 0),
+            (DenoiseKernel::SpectralStudio, 1.0, 1_024),
+            (DenoiseKernel::SpectralLive, 1.0, 512),
+            (DenoiseKernel::SpectralLive, 0.0, 512),
+        ] {
+            let p = DenoiseParams {
+                lookahead,
+                kernel: kernel.dial(),
+                ..DenoiseParams::default()
+            };
+            let values = vec![p.learn, p.reduce, p.smooth, p.release, p.sc_hpf, p.lookahead, p.kernel];
+            let text = state_text(spec, &values, &[]);
+            let back = values_from_state(spec, text.as_bytes()).expect("own text reads back");
+            let unit = spec.create(48_000.0, &back);
+            assert_eq!(
+                unit.latency(),
+                want,
+                "{} with lookahead {lookahead} reported {} frames before its first block",
+                kernel.label(),
+                unit.latency()
+            );
+        }
+
+        // And the disclosure this unit's Kernel selector owes every blob
+        // written before it existed: a state block with no `kernel=` line
+        // reads as the spec default, which is Spectral Studio, so it opens
+        // on the spectral engine and reports the frame rather than the
+        // bank's zero. That is deliberate — the enum's own doc argues for
+        // it and the CHANGELOG says so out loud — and it is written down
+        // here so that changing it is a decision rather than a drift. The
+        // profile such a blob carries was learned by the BANK, and a
+        // profile belongs to the kernel that learned it.
+        let old_blob = b"tangentfx 1\nlearn=0\nreduce=0.5\nsmooth=0.5\nrelease=0.5\nsc_hpf=0\nlookahead=1\n";
+        let back = values_from_state(spec, old_blob).expect("a pre-kernel blob still reads");
+        assert_eq!(
+            back[6],
+            DenoiseKernel::SpectralStudio.dial(),
+            "a blob written before the Kernel parameter no longer reads as Spectral Studio"
+        );
+        let unit = spec.create(48_000.0, &back);
+        assert_eq!(
+            unit.latency(),
+            1_024,
+            "a pre-kernel blob's bay does not report the spectral frame it will actually cost"
+        );
     }
 
     /// **Learn, freeze, persist, restore: the denoise's whole threshold

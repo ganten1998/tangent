@@ -334,6 +334,20 @@ fn flush(x: f32) -> f32 {
     }
 }
 
+/// Zero anything that is not a number at all. A NaN or an infinity arriving
+/// from upstream is not a quiet sample and not a loud one — it is the end of
+/// every recursion it touches, in both kernels — so it becomes silence at
+/// the door. See the call site in [`Denoise::process`] for why it is spent
+/// there and not in one pass over the block.
+#[inline]
+fn flush_bad(x: f32) -> f32 {
+    if x.is_finite() {
+        x
+    } else {
+        0.0
+    }
+}
+
 // ── which kernel is in the circuit ──────────────────────────────────────────
 
 /// How many positions the KERNEL selector has. Spelled as a literal so the
@@ -444,6 +458,51 @@ const SPECTRAL_MAX_BLOCK: usize = 512;
 /// has somewhere to land.
 const SPECTRAL_TOP_HZ: f64 = 20_000.0;
 
+/// The narrowest a band may be, in BINS — the floor under the ERB walk in
+/// [`Spectral::lay_out_bands`], and the number the two properties the band
+/// structure exists to buy actually depend on.
+///
+/// It was 2, and 2 was not enough. Measured at 48 kHz: the bottom SEVEN
+/// spacings of Spectral Studio and the bottom TEN of Spectral Live came out
+/// at exactly two bins, which is where three things went wrong at once.
+///
+/// * **The band energy is a chi-square with about `2·B` degrees of freedom
+///   per frame.** A two-bin band is worth about 1.5 bins of weight, so its
+///   γ scatters over several dB, a hot frame pushes `(γ−1)` through the
+///   decision-directed recursion, and the band briefly stops answering the
+///   dial. Measured per frame over the settled half of an eight-second run
+///   at the top of the dial, band 0's peak-to-peak was **13.02 dB** at
+///   Studio and 5.26 dB at Live, with 0.117 % of Studio band-frames more
+///   than 1 dB short of what REDUCE promised. The settled snapshot the
+///   acceptance test reads was flat to 0.00 dB the whole time, because a
+///   snapshot cannot see a frame it did not land on.
+/// * **The realised mask was not slope-limited down there.** The doc below
+///   argues that interpolating across triangles constrains how fast the
+///   mask can change with frequency; across two bins it constrains almost
+///   nothing. With signal present the biggest bin-to-bin step measured
+///   13.27 dB (Studio) and 10.33 dB (Live) — free per-bin behaviour, in the
+///   region the argument is about.
+/// * **The aliasing figure was not one number.** The same measurement of
+///   the realised mask's circular impulse response read −23.5 dB at Studio
+///   and −16.1 dB at Live: a 7.4 dB spread between two frame lengths that
+///   are supposed to differ only in resolution.
+///
+/// At four bins all three read differently: band 0's per-frame
+/// peak-to-peak is 1.05 dB at Studio and 0.00 at Live (0.00 at both once
+/// [`DD_BW_MS_HZ`] is in), the worst bin-to-bin step is 6.57 and 5.44 dB,
+/// and the aliasing is −30.6 and −33.4 dB — better at both lengths and
+/// within 2.8 dB of each other. The cost is resolution at the bottom: band
+/// 1's centre moves from 94 Hz to 188 Hz at Studio and from 188 to 375 at
+/// Live. That is the honest trade, and it is the right way round — a band
+/// too narrow to measure is not resolution, it is noise with a centre
+/// frequency.
+///
+/// Bins, not hertz, deliberately. The scatter, the slope limit and the
+/// aliasing all scale with the frame, so a fixed BIN count gives the two
+/// kernels the same behaviour; a fixed frequency would give Live half the
+/// degrees of freedom and twice the aliasing.
+const MIN_BAND_BINS: f64 = 4.0;
+
 /// The a-priori SNR the speech-presence test is tuned for, as a power
 /// ratio: 15 dB. Gerkmann & Hendriks' fixed ξ_H1, and the two constants
 /// below are algebraic consequences of it, precomputed so the hot loop
@@ -462,6 +521,15 @@ const GLR_EXP: f32 = 0.9693;
 /// where the probability has saturated at 1 and comfortably inside f32's
 /// range; without it one enormous bin overflows to infinity and the
 /// probability comes back NaN.
+///
+/// **The clamp is applied with a branch, not with `f32::min`, and that
+/// sentence is load-bearing.** `f32::min` returns THE OTHER OPERAND when
+/// one side is NaN — `NAN.min(200.0)` is `200.0`, measured — so the obvious
+/// spelling of this clamp does the exact opposite of what the paragraph
+/// above claims: handed a NaN it answers 200, 200 gives `ph1 == 1.0`
+/// exactly, and `(1.0 − ph1) · p` is then `0.0 · inf`, which is a NaN
+/// stored into the noise estimate for the life of the session. That was the
+/// shipped fault. See the call site in [`Denoise::spectral_suppress`].
 const GLR_CLAMP: f32 = 200.0;
 
 /// The stagnation cap. Once the smoothed probability of speech in a bin has
@@ -491,6 +559,48 @@ const TAU_LAMBDA_MS: f32 = 71.7;
 const TAU_DD_NOISE_MS: f32 = 250.0;
 const TAU_DD_SIGNAL_MS: f32 = 8.0;
 
+/// The NOISE-side time constant is PER BAND, and this is what sets it:
+/// `DD_BW_MS_HZ / bandwidth`, floored at [`TAU_DD_NOISE_MS`] and capped at
+/// [`TAU_DD_NOISE_MAX_MS`]. The bank's [`LEVEL_BW_MS_HZ`] is the same
+/// argument in the other engine, and it is here for the same reason.
+///
+/// A band's energy estimate is a chi-square with about `2·B·τ` degrees of
+/// freedom, so a FIXED τ hands the bottom bands — the narrowest ones, even
+/// with [`MIN_BAND_BINS`] under them — several times the scatter the top
+/// bands carry. The decision-directed recursion then RECTIFIES that
+/// scatter: `(γ−1)` is clamped at zero from below and not from above, so a
+/// hot frame raises ξ and a cold one cannot lower it past the floor, and
+/// the band spends the next few frames believing it has signal in it. That
+/// is the whole of band 0's per-frame wobble; see [`MIN_BAND_BINS`] for the
+/// numbers. 120 s·Hz puts Studio's band 0 on the 1 s cap, Live's band 0 at
+/// 512 ms and everything above about 480 Hz of bandwidth back on the fixed
+/// 250 ms, where the scatter was already small — and because the figure is
+/// per HERTZ, the two frame lengths end up with the same degrees of freedom
+/// rather than Live with half.
+///
+/// Only the NOISE side is slowed. `tau` still interpolates to
+/// [`TAU_DD_SIGNAL_MS`] by `q²` the moment a band believes it has signal,
+/// so nothing about how fast a band opens changes — the same discipline
+/// [`LEVEL_BW_MS_HZ`] keeps against the bank's gate envelope. Nor does it
+/// slow the re-close: when signal stops, `s/λ` collapses as `g_H1²`, which
+/// squares itself away in about five frames whatever `a` is.
+const DD_BW_MS_HZ: f32 = 120_000.0;
+const TAU_DD_NOISE_MAX_MS: f32 = 1_000.0;
+
+/// The ceiling on the decision-directed recursion's HISTORY term, `s/λ`.
+///
+/// `γ` one line above it is already clamped to the same figure and for the
+/// same reason; this is the half that was missed. 30 dB of a-priori SNR is
+/// `g_H1 = 0.9990`, so anything past it is a number, not a decision — and
+/// without the clamp an interior band whose profile is OFF reaches
+/// `s/λ ≈ 7·10⁵` (its λ is the −100 dB placeholder [`refloor`] lays for a
+/// band nobody taught, not a measurement), which is a quarter of the way to
+/// pinning its live neighbours' gain at unity through the cross-band vote.
+/// The vote now skips OFF bands outright, so this is belt and braces —
+/// stated as such, because a guard that cannot be reverted to red is worth
+/// only what its comment says.
+const XI_HIST_MAX: f32 = 1_000.0;
+
 /// The floor under the a-priori SNR, in dB. This is the constant that makes
 /// the REDUCE dial tell the truth: it pins the deepest the speech-present
 /// gain can ever go at ξ/(1+ξ) = −40.1 dB, which is below the bottom of the
@@ -503,9 +613,41 @@ const XI_MIN_DB: f32 = -20.0;
 /// How far above the learned profile the tracked noise estimate may climb.
 /// The floor is one-way — the estimate may never fall below what the user
 /// taught it — and this is the other side: a noise print is a measurement,
-/// and an estimate that has wandered 12 dB above it is tracking the
+/// and an estimate that has wandered this far above it is tracking the
 /// PROGRAMME, not the noise.
-const NOISE_CEIL_DB: f32 = 12.0;
+///
+/// # Why 18 and not 12
+///
+/// It was 12, and 12 put a CLIFF inside the range of "the room got a bit
+/// louder than when I taught it". Past the ceiling λ pins, γ stays large, ξ
+/// stays large, `g_H1 → 1` and every band opens: measured with the profile
+/// learned and the same noise played back hotter, at a dial asking 12 dB,
+/// the delivered cut went 12.00 dB at +16 dB to **4.07 dB at +18** and
+/// 1.71 dB at +20. That is the exact symptom this whole unit was
+/// commissioned for — the user pushes REDUCE and almost nothing happens —
+/// arriving without a sound and without a warning.
+///
+/// The ceiling is not decoration: it is what stops the tracker following
+/// PROGRAMME and cutting signal, so widening it is paid for in the tone
+/// test. Measured, a −20 dBFS 1 kHz tone over learned noise (bound 1.5 dB):
+///
+/// ```text
+///     ceiling   tone moves (Studio / Live)   full dial holds to
+///        12 dB      −0.04 / −0.10 dB              +16 dB
+///        18 dB      −0.09 / −0.23 dB              +20 dB
+///        24 dB      −0.32 / −0.70 dB              +24 dB
+///        30 dB      −1.04 / −1.27 dB              past +24 dB
+/// ```
+///
+/// 18 buys six decibels of staleness for two tenths of a decibel of tone,
+/// and stops well short of 30, where the tone is spending most of the
+/// acceptance budget. It is still a cliff — it has moved, not tapered, and
+/// `a_stale_print_holds_the_dial_until_it_does_not` writes down where it
+/// now stands so the next person changing this number is arguing with a
+/// measurement. A genuine taper wants a minimum-statistics tracker that
+/// does not reference the print at all, which is a different unit's worth
+/// of work.
+const NOISE_CEIL_DB: f32 = 18.0;
 
 /// A learn pass shorter than this is a misclick, not a noise profile, and
 /// must not wipe a good one. 200 ms, up from the 10.7 ms this file used to
@@ -890,6 +1032,11 @@ struct Spectral {
     /// Σ of each band's weights — how many bins it is worth, so a band
     /// energy can be turned into a per-bin level.
     wsum: [f32; DENOISE_BANDS],
+    /// Per band: the NOISE-side time constant of the decision-directed
+    /// recursion, in ms. Per band because the confidence of an energy
+    /// estimate depends on the bandwidth it was taken over — the spectral
+    /// twin of the bank's `BandDesign::a_level`. See [`DD_BW_MS_HZ`].
+    tau_dd: [f32; DENOISE_BANDS],
     /// This frame's per-bin power and per-band energy.
     pow: Vec<f32>,
     e: [f32; DENOISE_BANDS],
@@ -945,6 +1092,7 @@ impl Spectral {
             map_lo: vec![0; max_n / 2 + 1],
             map_frac: vec![0.0; max_n / 2 + 1],
             wsum: [1.0; DENOISE_BANDS],
+            tau_dd: [TAU_DD_NOISE_MS; DENOISE_BANDS],
             pow: vec![0.0; max_n / 2 + 1],
             e: [0.0; DENOISE_BANDS],
             ln_sum: [0.0; DENOISE_BANDS],
@@ -1054,15 +1202,24 @@ impl Spectral {
     /// # And why band gains rather than free per-bin gains
     ///
     /// A per-bin mask is a filter whose impulse response is as long as the
-    /// frame, so its circular convolution wraps: measured on this
-    /// machinery, worst-case time aliasing is −11.1 dB raw and −17.3 dB
-    /// after the synthesis window, which is audible pre-echo. Interpolating
-    /// a mask across triangles instead constrains how fast the mask can
-    /// change with frequency, which is the same thing as constraining how
-    /// long its impulse response is: the same measurement reads −40.1 dB
-    /// raw and −52.1 dB windowed. The band structure buys the
-    /// acyclic-convolution safety that zero-padding would otherwise cost a
-    /// doubled FFT. **Do not "improve" this into a per-bin mask.**
+    /// frame, so its circular convolution wraps, which is audible
+    /// pre-echo. Interpolating a mask across triangles instead constrains
+    /// how fast the mask can change with frequency, which is the same thing
+    /// as constraining how long its impulse response is. The band structure
+    /// buys the acyclic-convolution safety that zero-padding would
+    /// otherwise cost a doubled FFT. **Do not "improve" this into a per-bin
+    /// mask.**
+    ///
+    /// The size of what it buys is measured rather than asserted, by
+    /// `the_band_mask_stays_short_at_both_frame_lengths`: the REALISED
+    /// mask's circular impulse response, with signal present at the top of
+    /// the dial, puts −30.6 dB of its energy outside ±R/2 at Studio and
+    /// −33.4 dB at Live, against −6.6 and −6.7 dB for the free per-bin
+    /// Wiener mask built from the same frame's own `pow`/`lambda`. So the
+    /// triangles are worth 24 to 27 dB — and, since [`MIN_BAND_BINS`] went
+    /// to four, worth about the SAME at both frame lengths. They were not:
+    /// on a two-bin floor the same measurement read −23.5 and −16.1 dB, a
+    /// 7.4 dB spread between two kernels that differ only in resolution.
     fn lay_out_bands(&mut self, sr: f32) {
         let n = self.n;
         let bins = n / 2;
@@ -1081,7 +1238,7 @@ impl Spectral {
                 o[0] = 0.0;
             }
             for b in 1..DENOISE_BANDS {
-                f += (2.0 * bin_hz).max(k * erb(f));
+                f += (MIN_BAND_BINS * bin_hz).max(k * erb(f));
                 if let Some(o) = sink.as_deref_mut() {
                     o[b] = f;
                 }
@@ -1139,6 +1296,14 @@ impl Spectral {
         for w in self.wsum.iter_mut() {
             *w = w.max(1.0e-6);
         }
+
+        // And the per-band decision-directed time constant, which is a
+        // function of the same bandwidths — derived once here rather than
+        // per frame, exactly as the bank derives `a_level` in `new`.
+        for (t, w) in self.tau_dd.iter_mut().zip(self.wsum.iter()) {
+            let bw = (w * bin_hz as f32).max(1.0);
+            *t = (DD_BW_MS_HZ / bw).clamp(TAU_DD_NOISE_MS, TAU_DD_NOISE_MAX_MS);
+        }
     }
 
     /// The per-bin power of the analysed frame, and the 32 band energies
@@ -1166,7 +1331,28 @@ impl Spectral {
             let m = if k == 0 { 0 } else { n - k };
             let a = self.re[k] * self.re[k] + self.im[k] * self.im[k];
             let b = self.re[m] * self.re[m] + self.im[m] * self.im[m];
-            self.pow[k] = 0.5 * (a + b);
+            // **The periodogram is where a non-finite observation is
+            // stopped, and it is stopped rather than propagated.**
+            //
+            // `process` already scrubs non-finite SAMPLES, so nothing
+            // wrapped in an infinity gets this far — but a finite sample can
+            // still overflow HERE, because this line squares. One sample at
+            // 1e20 comes out of a 1024-point transform at about 7e19, and
+            // 7e19 squared is past f32's 3.4e38: `pow[k]` is infinity with
+            // every input sample finite. Downstream that is fatal and
+            // SILENT. `spectral_suppress` computes `(1 − ph1)·p`, `ph1`
+            // reaches exactly 1.0 on any loud bin, `0.0 · inf` is NaN, and
+            // `f32::clamp` passes NaN through unchanged — so `lambda[k]` is
+            // NaN forever, `lam_b[b].max(1e-30)` quietly turns it back into
+            // 1e-30, ξ explodes and every band opens. The unit stops
+            // reducing, the output stays finite, nothing logs and nothing
+            // clicks. One branch per bin, in a loop that already runs.
+            //
+            // Zero, not the previous value: a bin whose power did not fit
+            // in a float is a bin this frame knows nothing about, and
+            // silence is the observation that moves the tracker least.
+            let p = 0.5 * (a + b);
+            self.pow[k] = if p.is_finite() { p } else { 0.0 };
         }
         self.e = [0.0; DENOISE_BANDS];
         for k in 0..=bins {
@@ -1492,6 +1678,49 @@ impl Denoise {
         self.refloor();
     }
 
+    /// Apply the selector and lookahead edges WITHOUT audio, so
+    /// [`Denoise::latency`] is right before the first block.
+    ///
+    /// `latency()` answers from `self.kernel` and `self.la_on`, and those
+    /// two fields were only ever written by `process`. A unit built from a
+    /// saved blob therefore answered with the CONSTRUCTOR's engine whatever
+    /// the session said — measured, `Denoise::new(48_000.0).latency()` is
+    /// 1024 for a unit whose parameters say Bank, Spectral Studio and
+    /// Spectral Live alike. The host reads that number once at load
+    /// (`instrument::prepare_builtin`) and stores it as the seat's latency;
+    /// built-ins have no latency handle, so the only correction road is
+    /// `Backend::reported_latency` in the block loop — and that call is
+    /// skipped for a BYPASSED bay by design. A project reopened with this
+    /// bay bypassed therefore held a phantom 1024 frames in that cell for
+    /// the whole session, and `publish_latency` aligned every other lane
+    /// behind it.
+    ///
+    /// It does exactly what `process`'s first section does and no more: the
+    /// same two edges, in the same order, both allocation-free, and neither
+    /// touching the LEARN edge — freezing a profile is an audio-thread
+    /// event with a falling dial behind it, not something a host-side
+    /// primer may do. Idempotent: called with the engine already seated it
+    /// is a pair of comparisons.
+    pub fn prime(&mut self, params: &DenoiseParams) {
+        let dial = |v: f32, rest: f32| {
+            if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                rest
+            }
+        };
+        let kernel = DenoiseKernel::from_dial(dial(params.kernel, 0.5));
+        if kernel != self.kernel {
+            self.switch_kernel(kernel);
+        }
+        let la_on = dial(params.lookahead, 1.0) >= 0.5;
+        if la_on != self.la_on {
+            self.ring.iter_mut().for_each(|s| *s = 0.0);
+            self.rpos = 0;
+            self.la_on = la_on;
+        }
+    }
+
     /// Band `k`'s centre frequency, in Hz — the geometry the whole file is
     /// built on, public so a meter can label what it draws.
     pub fn center_hz(k: usize) -> f32 {
@@ -1524,9 +1753,10 @@ impl Denoise {
     }
 
     /// The honest latency, in samples, for the current settings — what a
-    /// host must be told. "Current" means as of the last `process` call
-    /// (or the constructed defaults before the first), exactly as it
-    /// already did for the lookahead toggle.
+    /// host must be told. "Current" means as of the last `process` call, or
+    /// the last [`Denoise::prime`] — which is what a host calls when it has
+    /// seated parameters and needs the number BEFORE any audio has run. The
+    /// constructed defaults answer until one of the two has happened.
     ///
     /// The bank answers with its lookahead line, zero when the toggle is
     /// down. A spectral kernel answers with the FULL FRAME, n, not n − R:
@@ -2004,7 +2234,21 @@ impl Denoise {
         };
 
         for frame in buf.chunks_exact_mut(channels).take(frames) {
-            let (l, r) = (frame[0], frame[1]);
+            // **Non-finite input is scrubbed where each kernel READS it,
+            // never at the top of `process`.** Tangent hosts third-party
+            // LV2 plugins in the same chain and nothing washes the buffer
+            // between them; `wavread.rs` already scrubs file samples for
+            // exactly this reason, and `effects.rs` guards the delay's
+            // feedback with exactly this pattern. It is done here rather
+            // than in one pass over the block because the wire fast path
+            // above must keep its promise not to touch the buffer at all —
+            // and because a wire IS allowed to pass an infinity through.
+            //
+            // The bank's version of this fault is the loud one: one
+            // infinity used to enter the resonator recursions and the
+            // biquad state and stay there, and 96,000 of the next 192,000
+            // output samples came out non-finite.
+            let (l, r) = (flush_bad(frame[0]), flush_bad(frame[1]));
 
             // The sidechain reads the UNDELAYED input — with the lookahead
             // ring on the signal path below, that is what "the detector
@@ -2213,6 +2457,11 @@ impl Denoise {
         let (a_ph1, a_psd) = (self.sp.a_ph1, self.sp.a_psd);
         for k in 0..=bins {
             let lam = self.sp.lambda[k];
+            // `p` is finite by construction: `Spectral::band_power` is the
+            // only writer of `pow` and it refuses to store anything else,
+            // which is one guard rather than two and also keeps `e[b]`
+            // finite for the recursion below. A second check here would be
+            // a branch per bin that no revert could ever turn red.
             let p = self.sp.pow[k];
             let snr_post = p / lam;
             // The likelihood ratio's LOGARITHM, clamped, and then the
@@ -2230,7 +2479,35 @@ impl Denoise {
             // it to reach the clamp at all, which is exactly the case the
             // noise-only acceptance tests cannot produce and a tone over
             // band-limited noise produces immediately.
-            let log_glr = (LOG_GLR_FACT + GLR_EXP * snr_post).min(GLR_CLAMP);
+            // The clamp is NOT `f32::min`, and the difference is the
+            // difference between a guard and a trap. `f32::min` returns THE
+            // OTHER OPERAND when one side is NaN — measured,
+            // `NAN.min(200.0) == 200.0` — so the line the comment on
+            // [`GLR_CLAMP`] describes as stopping an overflow becoming NaN
+            // in fact converted a NaN into exactly the value that
+            // MANUFACTURES one: `log_glr = 200` gives `ph1 == 1.0` exactly,
+            // and `(1.0 − ph1) · p` is then `0.0 · inf`. An unknown
+            // a-posteriori SNR is not certainty about speech; it is no
+            // information, so it reads as the constant term, which is
+            // `ph1 = 0.03`.
+            //
+            // **Honest note: with the two guards above in place this branch
+            // is unreachable, and no test in this file can turn it red.**
+            // `p` is finite because `Spectral::band_power` is the only
+            // writer of `pow` and refuses anything else; `lam` is finite and
+            // STRICTLY POSITIVE because the store below writes either
+            // `floor[k]` or a value clamped into `floor[k]..=ceil[k]`, and
+            // `refloor` floors that at 1e−30 — so `p / lam` cannot be NaN.
+            // It is one comparison, it is defence in depth for the day one
+            // of those two arguments stops holding, and it is here because
+            // this exact line's NaN semantics being the opposite of its
+            // comment is what made the fault invisible for a whole
+            // engine's worth of work.
+            let log_glr = if snr_post.is_finite() {
+                (LOG_GLR_FACT + GLR_EXP * snr_post).min(GLR_CLAMP)
+            } else {
+                LOG_GLR_FACT
+            };
             let mut ph1 = 1.0 / (1.0 + (-log_glr).exp());
             let mean = a_ph1 * self.sp.ph1mean[k] + (1.0 - a_ph1) * ph1;
             self.sp.ph1mean[k] = mean;
@@ -2239,7 +2516,21 @@ impl Denoise {
             }
             let est = ph1 * lam + (1.0 - ph1) * p;
             let next = a_psd * lam + (1.0 - a_psd) * est;
-            self.sp.lambda[k] = next.clamp(self.sp.floor[k], self.sp.ceil[k]);
+            // **A non-finite estimate is never stored, and never survives
+            // being found.** `clamp` compares with `<` and `>`, both false
+            // for NaN, so it passes NaN through UNCHANGED — which is how
+            // one bad frame used to lock this tracker for the life of the
+            // session, healed only by `clear()`, `set_thresholds()` or a
+            // kernel change, none of which normal playback calls. Falling
+            // back to the FLOOR rather than to `lam` matters: `lam` is the
+            // thing that might already be NaN, and the floor is what the
+            // user taught, so the recursion re-enters from the print
+            // instead of from a value that cannot be recovered from.
+            self.sp.lambda[k] = if next.is_finite() {
+                next.clamp(self.sp.floor[k], self.sp.ceil[k])
+            } else {
+                self.sp.floor[k]
+            };
             self.sp.ph1[k] = ph1;
         }
 
@@ -2266,9 +2557,13 @@ impl Denoise {
             let gamma = (self.sp.e[b] / lam).clamp(1.0e-6, 1_000.0);
             let s = self.sp.s_prev[b];
             let q = s / (s + lam);
-            let tau = TAU_DD_NOISE_MS + (TAU_DD_SIGNAL_MS - TAU_DD_NOISE_MS) * q * q;
+            // The noise-side constant is this band's own; the signal side
+            // is not, and that is the point. See [`DD_BW_MS_HZ`].
+            let tau_n = self.sp.tau_dd[b];
+            let tau = tau_n + (TAU_DD_SIGNAL_MS - tau_n) * q * q;
             let a = (-frame_ms / tau).exp();
-            xi[b] = (a * (s / lam) + (1.0 - a) * (gamma - 1.0).max(0.0)).max(xi_min);
+            let hist = (s / lam).min(XI_HIST_MAX);
+            xi[b] = (a * hist + (1.0 - a) * (gamma - 1.0).max(0.0)).max(xi_min);
         }
 
         // Cross-band smoothing, [0.25, 0.5, 0.25], on the ESTIMATE and
@@ -2289,10 +2584,35 @@ impl Denoise {
         // direction to be wrong in; and where it matters for the dial —
         // every band bottomed out at [`XI_MIN_DB`] — the two agree exactly,
         // because a mean of equal numbers is that number in either domain.
+        //
+        // An OFF neighbour is skipped, and its share goes back to the band
+        // itself. A band whose profile is OFF has no measurement in it: it
+        // never reduces, so nothing ever asked what its λ was, and
+        // [`Denoise::refloor`] lays it the −100 dB placeholder that
+        // [`DENOISE_THR_DB`]'s bottom works out to. Its ξ is therefore not
+        // an opinion about signal, it is `energy / placeholder` — measured
+        // at 7·10⁵ for an interior OFF band against 6·10⁻² for a live one
+        // beside it — and a quarter of that lands on a live neighbour and
+        // pins its gain at unity. Measured with bands 20..22 off at a dial
+        // asking 12 dB, band 19 delivered 6.25 dB and band 23 delivered
+        // 7.42; runs of one and two were safe only because no band in them
+        // is interior, so the triangular refloor still gave them a real λ
+        // from their live neighbours. OFF runs are an expected state, not a
+        // corruption — `freeze_thresholds` documents a silent band landing
+        // there as "the right answer", `set_thresholds` maps any non-finite
+        // persisted value to OFF, and a lossy-decoded learn source drives
+        // band 31 there through an ordinary learn pass.
         let mut sm = [0.0_f32; DENOISE_BANDS];
         for b in 0..DENOISE_BANDS {
-            let lo = xi[b.saturating_sub(1)];
-            let hi = xi[(b + 1).min(DENOISE_BANDS - 1)];
+            let vote = |k: usize| {
+                if self.band[k].thr_norm < DENOISE_OFF {
+                    xi[b]
+                } else {
+                    xi[k]
+                }
+            };
+            let lo = vote(b.saturating_sub(1));
+            let hi = vote((b + 1).min(DENOISE_BANDS - 1));
             sm[b] = 0.25 * lo + 0.5 * xi[b] + 0.25 * hi;
         }
 
@@ -2405,9 +2725,12 @@ impl Denoise {
             let mut o = self.sp.out_head;
             for i in 0..take {
                 let f = (done + i) * channels;
-                let (l, r) = (buf[f], buf[f + 1]);
-                self.sp.in_ring[2 * w] = l;
-                self.sp.in_ring[2 * w + 1] = r;
+                // Scrubbed on the way into the frame, for the reason the
+                // bank's own read gives. Here it also keeps the OUTPUT
+                // finite: an infinity in the analysed frame comes back out
+                // of the inverse transform smeared across the whole hop.
+                self.sp.in_ring[2 * w] = flush_bad(buf[f]);
+                self.sp.in_ring[2 * w + 1] = flush_bad(buf[f + 1]);
                 w += 1;
                 if w == n {
                     w = 0;
@@ -3134,8 +3457,17 @@ mod tests {
 
     /// **No setting the panel can reach may blow up.** Every dial at both
     /// extremes — including the learn and lookahead toggles flapping —
-    /// against a signal well past full scale: the output stays finite and
-    /// bounded.
+    /// against a signal well past full scale AND against non-finite input:
+    /// the output stays finite and bounded, and the unit is still a
+    /// denoiser afterwards.
+    ///
+    /// The second pass used to feed nothing but finite audio, which made
+    /// this sweep structurally blind to the fault that actually shipped: a
+    /// single infinity from an upstream plugin permanently converted the
+    /// spectral kernels into wires, and the output stayed finite the whole
+    /// time. So the poison goes in here, and the assertion afterwards is
+    /// that the unit STILL CUTS — an assertion about output finiteness
+    /// alone passed on the broken build and proved nothing.
     #[test]
     fn no_setting_the_panel_can_reach_makes_it_explode() {
         let frames = 4_800;
@@ -3169,14 +3501,70 @@ mod tests {
                 };
                 let mut buf = sine(55.0, 2.0, frames, SR);
                 add(&mut buf, &Noise::new(11, 1.0, SR).frames(frames));
+                // One of each kind of nonsense a plugin upstream can hand
+                // over, spread so they land in different frames. The
+                // finite-but-enormous case belongs to
+                // `an_enormous_finite_sample_does_not_lock_the_noise_tracker`
+                // and not here: the peak bound below is about the unit not
+                // amplifying, and a wire is entitled to pass 1e20 along.
+                buf[2 * 100] = f32::INFINITY;
+                buf[2 * 900 + 1] = f32::NEG_INFINITY;
+                buf[2 * 1_700] = f32::NAN;
+                let went_in = buf.iter().filter(|s| !s.is_finite()).count();
                 dn.process(&mut buf, frames, 2, &p);
+                // The bound is "no MORE non-finite out than in", not "none
+                // out", because one reachable setting is the provable wire
+                // — bank, nothing learned, lookahead down — which returns
+                // without reading the buffer, and a wire passing an
+                // infinity through is a wire behaving correctly. Any unit
+                // that actually processes must emit none, and the bank used
+                // to emit 96,000 for the three that went in.
+                let came_out = buf.iter().filter(|s| !s.is_finite()).count();
                 assert!(
-                    buf.iter().all(|s| s.is_finite()),
-                    "dials {bits:06b} pass {pass} produced a non-finite sample"
+                    came_out <= went_in,
+                    "dials {bits:06b} pass {pass} on {} turned {went_in} non-finite input \
+                     samples into {came_out}",
+                    kernel.label()
                 );
-                let peak = buf.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
+                let peak = buf
+                    .iter()
+                    .filter(|s| s.is_finite())
+                    .fold(0.0_f32, |m, x| m.max(x.abs()));
                 assert!(peak < 8.0, "dials {bits:06b} pass {pass} reached {peak}");
             }
+            // And the poison did not cost the unit its job. Teach it, feed
+            // it a block carrying every kind of non-finite sample, then the
+            // noise it was taught: it must still reduce. The old spectral
+            // kernels passed the finiteness assertion above and failed THIS
+            // one, permanently, which is the whole reason it is here.
+            let mut dn = learned_full_band(kernel, 0x51CC, 0.05, SR, 1.0);
+            let good = DenoiseParams {
+                reduce: 1.0,
+                ..on(kernel)
+            };
+            let mut bad = FullBandNoise::new(0x51CC, 0.05).frames(frames);
+            bad[2 * 100] = f32::INFINITY;
+            bad[2 * 900 + 1] = f32::NEG_INFINITY;
+            bad[2 * 1_700] = f32::NAN;
+            dn.process(&mut bad, frames, 2, &good);
+            let (cut, still_bad) = cut_over_two_seconds(&mut dn, &good, 0x51CC, 0.05);
+            // Checked explicitly, because an all-NaN buffer does NOT show
+            // up as a small cut: `rms_db` takes `ms.max(1e-18)`, and
+            // `f32::max` returns the other operand for a NaN, so a
+            // destroyed unit reports −180 dB out and an enormous cut.
+            assert_eq!(
+                still_bad,
+                0,
+                "{}: {still_bad} non-finite output samples two seconds after a block \
+                 carrying an infinity and a NaN",
+                kernel.label()
+            );
+            assert!(
+                cut > 8.0,
+                "{}: after one block carrying an infinity and a NaN, the unit only \
+                 removes {cut:.2} dB of the noise it learned",
+                kernel.label()
+            );
             }
         }
     }
@@ -4079,6 +4467,35 @@ mod tests {
     /// under the old behaviour, comfortably over the new one, and set where
     /// it is because the honest claim is "no faster than an ordinary open",
     /// not "arbitrarily slow".
+    ///
+    /// # What that repair did NOT move, said plainly
+    ///
+    /// The defect report `907fd2c` put in the tree names a different
+    /// number: "5.50 dB of single-block movement at the default cap and
+    /// 10.40 dB at REDUCE 1.0", over a 64-frame BLOCK and over ANY band.
+    /// The commit that constrained the target claimed the jump as repaired.
+    /// Re-measured on the same fixture, old against new, that probe reads
+    /// 5.01 → 4.98 dB at the default cap and 9.52 → 8.95 dB at the top of
+    /// the dial. It moved six per cent. **It was never the constraint.**
+    ///
+    /// What the constraint was doing is the number this test's first
+    /// assertion holds: a band that stayed CLOSED throughout moved 3.41 dB
+    /// in a tick and now moves 0.75, and over a 64-frame block 3.36 and now
+    /// 1.49. The residual ~9 dB is an ordinary gate OPEN — a band with a
+    /// note arriving in it, going from full cut to none through the 2 ms
+    /// [`DENOISE_OPEN_MS`] envelope, which over the two control ticks in a
+    /// 64-frame block is arithmetically allowed to cover 48.7 % of the
+    /// depth, or 11.7 dB of 24. The deleted `noise_straddling_a_threshold`
+    /// test said the same thing in its own words: "a legitimate fast open
+    /// moves ~half the depth in one 1.3 ms block."
+    ///
+    /// So the second assertion pins THAT, two ways: against the envelope's
+    /// own arithmetic ceiling (structural — nothing may move faster than
+    /// the smoother it goes through, which is exactly what the constraint
+    /// used to do), and against 10.0 dB (the recorded number, 8.95, with
+    /// room). If a 9 dB coefficient step per 1.33 ms is judged too fast for
+    /// a minimum-phase bell, the lever is `DENOISE_OPEN_MS` and both bounds
+    /// follow it down on their own.
     #[test]
     fn a_closed_band_does_not_jump_when_its_neighbour_stops_being_exempt() {
         let p = DenoiseParams {
@@ -4099,6 +4516,10 @@ mod tests {
                 f[1] = noise[i * 2 + 1];
             }
         }
+        // Kept dry: `process` works in place, so the second pass below
+        // needs its own copy of the fixture rather than the first pass's
+        // output.
+        let dry = buf.clone();
 
         // One control tick at a time, so a "one-tick move" is what it says.
         let tick = dn.tick_len as usize;
@@ -4141,6 +4562,40 @@ mod tests {
             "band {at}'s applied depth moved {worst:.2} dB in one tick while \
              it was closed throughout — the cross-band constraint is jumping \
              the smoother again (it was 3.41 dB before the reorder)"
+        );
+
+        // ── and the ordinary open, which is what the 10.40 dB in the
+        // defect report was actually measuring ─────────────────────────────
+        let block = 64usize;
+        let mut dn = learned_full_band(DenoiseKernel::Bank, 0x0C7A, 0.05, SR, 1.0);
+        let ticks = block / dn.tick_len as usize;
+        // What the 2 ms opening envelope can cover in `ticks` control
+        // ticks, as a fraction of the full depth — derived from the
+        // shipped coefficient, so slowing DENOISE_OPEN_MS tightens this
+        // bound automatically instead of leaving a magic number behind.
+        let ceiling = (1.0 - (1.0 - dn.a_open).powi(ticks as i32)) * p.reduce * DENOISE_REDUCE_DB;
+        let mut again = dry;
+        let traj = analysis::gain_trajectory(&mut dn, &mut again, frames, block, &p);
+        let (mut open_worst, mut open_at) = (0.0_f32, 0usize);
+        for w in traj.windows(2) {
+            for k in 0..DENOISE_BANDS {
+                let d = (w[1][k] - w[0][k]).abs();
+                if d > open_worst {
+                    open_worst = d;
+                    open_at = k;
+                }
+            }
+        }
+        println!(
+            "worst applied-depth move over any band in one {block}-frame block at              REDUCE 1.0: {open_worst:.2} dB (band {open_at}); the open envelope's own              ceiling over {ticks} ticks is {ceiling:.2} dB"
+        );
+        assert!(
+            open_worst <= ceiling,
+            "band {open_at} moved {open_worst:.2} dB in one {block}-frame block, past the              {ceiling:.2} dB the {DENOISE_OPEN_MS} ms open envelope can cover in {ticks}              ticks — something is reaching the applied depth without going through the              smoother"
+        );
+        assert!(
+            open_worst < 10.0,
+            "the ordinary open moved {open_worst:.2} dB in one {block}-frame block              (it was 9.52 dB before the constraint was reordered and 8.95 after; the              defect report's 10.40 dB figure is this measurement, not the constraint's)"
         );
     }
 
@@ -4204,6 +4659,674 @@ mod tests {
             factor > 20.0,
             "only {factor:.1}x realtime in release — this unit is meant to \
              sit on every strip"
+        );
+    }
+
+
+    // ── the estimator's edges ───────────────────────────────────────────────
+
+    /// The mean applied cut across all 32 bands, in positive dB — one
+    /// number for "is this unit still doing its job".
+    fn mean_depth(dn: &Denoise) -> f32 {
+        let d = dn.depth_db();
+        d.iter().sum::<f32>() / d.len() as f32
+    }
+
+    /// Learned noise in, cut out, measured from the AUDIO over the second
+    /// half of two seconds — and the unit is left running where it ended,
+    /// so two calls in a row measure "before" and "after" on one continuous
+    /// stream.
+    fn cut_over_two_seconds(dn: &mut Denoise, p: &DenoiseParams, seed: u32, amp: f32) -> (f32, usize) {
+        let frames = 2 * SR as usize;
+        let dry = FullBandNoise::new(seed, amp).frames(frames);
+        let mut wet = dry.clone();
+        dn.process(&mut wet, frames, 2, p);
+        let bad = wet.iter().filter(|s| !s.is_finite()).count();
+        (rms_db(&dry, frames / 2) - rms_db(&wet, frames / 2), bad)
+    }
+
+    /// Run `dn` forward to the next frame boundary, so that a block of
+    /// exactly one hop handed in afterwards fires exactly one frame — and
+    /// `depth_db()`, `sp.pow` and `sp.lambda` then describe THAT frame.
+    ///
+    /// Without this a test can only see what survived, never what happened:
+    /// a one-frame excursion inside a tenth of a second of audio is gone by
+    /// the time the block returns, which is how the settled-snapshot
+    /// measurements in this file missed 13 dB holes for as long as they
+    /// did.
+    fn to_frame_boundary(dn: &mut Denoise, p: &DenoiseParams, seed: u32, amp: f32) {
+        let pad = (dn.sp.hop - dn.sp.stage_fill) % dn.sp.hop;
+        if pad > 0 {
+            let mut b = FullBandNoise::new(seed, amp).frames(pad);
+            dn.process(&mut b, pad, 2, p);
+        }
+    }
+
+    /// **One non-finite input sample must not turn the unit into a wire,
+    /// and must not reach the output.**
+    ///
+    /// Tangent hosts third-party LV2 plugins and the denoise sits in the
+    /// same chain; nothing washes the buffer between them, `wavread.rs`
+    /// already scrubs file samples on the way in, and `effects.rs` guards
+    /// the delay's feedback recursion with exactly the pattern this one was
+    /// missing. So a NaN or an infinity arriving from upstream is a real
+    /// event, and both engines used to be destroyed by one.
+    ///
+    /// The SPECTRAL failure was the quiet one and it was permanent. One
+    /// infinity in the analysed frame made `pow[k]` non-finite; the tracker
+    /// then computed `(1 − ph1)·p` with `ph1` exactly 1.0, which is
+    /// `0.0 · inf` = NaN; and `f32::clamp` passes NaN through unchanged, so
+    /// `lambda[k]` was NaN for the life of the session. Downstream
+    /// `lam_b[b].max(1e-30)` turned the NaN quietly back into 1e-30, ξ
+    /// exploded, every band opened, and the measured broadband cut went
+    /// from 23.99 dB to 0.00 with the output still finite, nothing logged
+    /// and nothing audibly broken. Only `clear()`, `set_thresholds()` or a
+    /// kernel change healed it, and normal playback calls none of them.
+    ///
+    /// The BANK failure was the loud one: 96,000 of the next 192,000 output
+    /// samples came out non-finite.
+    ///
+    /// Both assertions matter and they guard different lines. "Still
+    /// cutting" is the tracker's guards; "output finite" is the scrub at
+    /// each kernel's own read.
+    #[test]
+    fn one_non_finite_sample_does_not_stop_the_denoiser() {
+        for kernel in DenoiseKernel::ALL {
+            for (name, poison) in [
+                ("+inf", f32::INFINITY),
+                ("-inf", f32::NEG_INFINITY),
+                ("NaN", f32::NAN),
+            ] {
+                let mut dn = learned_full_band(kernel, 0x5AFE, 0.05, SR, 1.0);
+                let p = DenoiseParams {
+                    reduce: 1.0,
+                    ..on(kernel)
+                };
+                let (before, _) = cut_over_two_seconds(&mut dn, &p, 0x5AFE, 0.05);
+                let depth_before = mean_depth(&dn);
+
+                // One sample, one channel, in the middle of an ordinary
+                // block of the same noise.
+                let tenth = SR as usize / 10;
+                let mut blk = FullBandNoise::new(0x5AFE, 0.05).frames(tenth);
+                blk[2 * (tenth / 2)] = poison;
+                dn.process(&mut blk, tenth, 2, &p);
+                assert!(
+                    blk.iter().all(|s| s.is_finite()),
+                    "{}: one {name} sample put {} non-finite samples into the OUTPUT",
+                    kernel.label(),
+                    blk.iter().filter(|s| !s.is_finite()).count()
+                );
+
+                // Two more seconds of exactly the noise it was cutting.
+                let (after, bad) = cut_over_two_seconds(&mut dn, &p, 0x5AFE, 0.05);
+                assert_eq!(
+                    bad,
+                    0,
+                    "{}: {bad} non-finite output samples two seconds after one {name}",
+                    kernel.label()
+                );
+                let lam_bad = dn.sp.lambda[..=dn.sp.n / 2]
+                    .iter()
+                    .filter(|v| !v.is_finite())
+                    .count();
+                assert_eq!(
+                    lam_bad,
+                    0,
+                    "{}: {lam_bad} of the noise tracker's bins are non-finite after one {name}",
+                    kernel.label()
+                );
+                assert!(
+                    (before - after).abs() < 0.5,
+                    "{}: one {name} sample cost the unit its cut — {before:.2} dB before, \
+                     {after:.2} dB two seconds after (band depths {:.2} -> {:.2})",
+                    kernel.label(),
+                    depth_before,
+                    mean_depth(&dn)
+                );
+            }
+        }
+    }
+
+    /// **A finite sample too big to square must not lock the noise tracker
+    /// either**, and it is a different guard from the one above.
+    ///
+    /// `1e20` is a perfectly ordinary f32. It comes out of a 1024-point
+    /// transform at about 7e19, and `band_power` squares that: 4.9e39, past
+    /// f32's 3.4e38, so `pow[k]` is INFINITY with every input sample
+    /// finite. Scrubbing the input cannot catch this — the input was fine —
+    /// and from there it is the same NaN latch as above, measured the same
+    /// way: 513 of 513 bins non-finite and the cut gone from 24 dB to zero
+    /// for the rest of the session. The guard is one branch in
+    /// `Spectral::band_power`, which is also what keeps the band energies
+    /// finite for the decision-directed recursion.
+    #[test]
+    fn an_enormous_finite_sample_does_not_lock_the_noise_tracker() {
+        for kernel in [DenoiseKernel::SpectralStudio, DenoiseKernel::SpectralLive] {
+            let mut dn = learned_full_band(kernel, 0x5AFE, 0.05, SR, 1.0);
+            let p = DenoiseParams {
+                reduce: 1.0,
+                ..on(kernel)
+            };
+            let (before, _) = cut_over_two_seconds(&mut dn, &p, 0x5AFE, 0.05);
+
+            // Exactly one frame, so what is read afterwards is the frame
+            // the overflow landed in rather than whatever survived it.
+            to_frame_boundary(&mut dn, &p, 0x5AFE, 0.05);
+            let hop = dn.sp.hop;
+            let mut blk = FullBandNoise::new(0x5AFE, 0.05).frames(hop);
+            blk[2 * (hop / 2)] = 1.0e20;
+            dn.process(&mut blk, hop, 2, &p);
+            let pow_bad = dn.sp.pow[..=dn.sp.n / 2]
+                .iter()
+                .filter(|v| !v.is_finite())
+                .count();
+            assert_eq!(
+                pow_bad,
+                0,
+                "{}: {pow_bad} bins of the periodogram overflowed to non-finite on one \
+                 1e20 sample — the band energies built from them are non-finite too",
+                kernel.label()
+            );
+
+            let (after, _) = cut_over_two_seconds(&mut dn, &p, 0x5AFE, 0.05);
+            let lam_bad = dn.sp.lambda[..=dn.sp.n / 2]
+                .iter()
+                .filter(|v| !v.is_finite())
+                .count();
+            assert_eq!(
+                lam_bad,
+                0,
+                "{}: {lam_bad} tracker bins are non-finite after one 1e20 sample — \
+                 the periodogram overflowed and the NaN latched",
+                kernel.label()
+            );
+            assert!(
+                (before - after).abs() < 0.5,
+                "{}: one 1e20 sample cost the unit its cut — {before:.2} dB before, \
+                 {after:.2} dB two seconds after",
+                kernel.label()
+            );
+        }
+    }
+
+    /// **The noise tracker cannot hold a value that is not a number**, however
+    /// it got one.
+    ///
+    /// The two tests above come at the recursion through the audio, which
+    /// is how the fault was found; this one puts the poison directly where
+    /// it used to lodge, because the contract is about the RECURSION and
+    /// not about any particular route into it. Both assertions guard a
+    /// different line:
+    ///
+    /// * The estimate heals. `f32::clamp` compares with `<` and `>`, both
+    ///   false for NaN, so `next.clamp(floor, ceil)` used to store NaN
+    ///   unchanged and every later frame re-entered from it. It now falls
+    ///   back to the learned floor.
+    /// * The frame it heals in still cuts. `f32::min` returns THE OTHER
+    ///   OPERAND when one side is NaN, so the log-GLR clamp used to answer
+    ///   200 for an unknown SNR — which is `ph1 == 1.0` exactly, i.e. total
+    ///   certainty that the bin is signal — and that certainty is voted
+    ///   into the band's presence statistic and opens it. An unknown SNR
+    ///   now reads as the constant term, `ph1 ≈ 0.03`.
+    #[test]
+    fn the_noise_tracker_cannot_latch_a_non_finite_estimate() {
+        for kernel in [DenoiseKernel::SpectralStudio, DenoiseKernel::SpectralLive] {
+            for poison in [f32::NAN, f32::INFINITY] {
+                let mut dn = learned_full_band(kernel, 0x1A7C, 0.05, SR, 1.0);
+                let p = DenoiseParams {
+                    reduce: 1.0,
+                    ..on(kernel)
+                };
+                let frames = 2 * SR as usize;
+                let mut buf = FullBandNoise::new(0x1A7C, 0.05).frames(frames);
+                dn.process(&mut buf, frames, 2, &p);
+                to_frame_boundary(&mut dn, &p, 0x1A7C, 0.05);
+                let before = dn.depth_db();
+
+                // Every bin the middle band owns, plus its neighbours'.
+                let bins = dn.sp.n / 2;
+                let poisoned: Vec<usize> = (0..=bins)
+                    .filter(|&k| (14..=16).contains(&(dn.sp.map_lo[k] as usize)))
+                    .collect();
+                assert!(!poisoned.is_empty(), "the fixture poisoned no bins");
+                for &k in poisoned.iter() {
+                    dn.sp.lambda[k] = poison;
+                }
+
+                // ONE frame, so the depth read below is the depth in the
+                // frame that healed — the excursion, not what was left of
+                // it a tenth of a second later.
+                let hop = dn.sp.hop;
+                let mut blk = FullBandNoise::new(0x1A7C, 0.05).frames(hop);
+                dn.process(&mut blk, hop, 2, &p);
+
+                let left = poisoned
+                    .iter()
+                    .filter(|&&k| !dn.sp.lambda[k].is_finite())
+                    .count();
+                assert_eq!(
+                    left,
+                    0,
+                    "{}: {left} of {} poisoned bins are still non-finite — the recursion \
+                     latched what it was handed",
+                    kernel.label(),
+                    poisoned.len()
+                );
+                let after = dn.depth_db();
+                let worst = (14..=16).fold(0.0_f32, |m, b| m.max((before[b] - after[b]).abs()));
+                assert!(
+                    worst < 1.0,
+                    "{}: band 14..16's cut moved {worst:.2} dB in the frame that healed a \
+                     {poison} — an unknown SNR is being read as certainty of signal",
+                    kernel.label()
+                );
+            }
+        }
+    }
+
+    /// **The bottom bands are wide enough to measure.**
+    ///
+    /// The ERB walk's floor was two bins, and two bins is where three
+    /// separate promises stopped being kept at once — the per-frame
+    /// flatness of the dial, the slope limit the triangles are supposed to
+    /// impose, and an aliasing figure that meant the same thing at both
+    /// frame lengths. [`MIN_BAND_BINS`] carries the measurements; this
+    /// holds the geometry it depends on, at every rate and both frames,
+    /// because the walk is a binary search and a rate it was never tried at
+    /// is a rate where it may land anywhere.
+    #[test]
+    fn every_band_is_at_least_four_bins_wide() {
+        // The DECISION, held against a literal. Asserting the layout
+        // against [`MIN_BAND_BINS`] alone would be a test that moves
+        // whenever the thing it guards moves — it would still catch the
+        // walk rounding a band away, which is the second assertion below,
+        // but it could never catch anybody putting the floor back to two.
+        assert!(
+            MIN_BAND_BINS >= 4.0,
+            "the ERB walk's floor is {MIN_BAND_BINS} bins. At two, band 0's per-frame \
+             peak-to-peak was 13.02 dB at the top of the dial, the realised mask stepped \
+             13.27 dB between adjacent bins, and the aliasing figure differed by 7.4 dB \
+             between the two frame lengths. See MIN_BAND_BINS for the whole table."
+        );
+        for sr in [44_100.0_f32, 48_000.0, 88_200.0, 96_000.0, 192_000.0] {
+            for kernel in [DenoiseKernel::SpectralStudio, DenoiseKernel::SpectralLive] {
+                let mut dn = Denoise::new(sr);
+                dn.process(&mut [0.0_f32; 8], 4, 2, &on(kernel));
+                let bins = dn.sp.n / 2;
+                // The band edges, read back out of the map the kernel
+                // actually uses rather than recomputed from the walk: a
+                // test that re-derives the thing it is checking checks
+                // nothing.
+                let mut edge = [0_usize; DENOISE_BANDS];
+                for k in (0..=bins).rev() {
+                    let b = dn.sp.map_lo[k] as usize;
+                    if dn.sp.map_frac[k] == 0.0 {
+                        edge[b] = k;
+                    }
+                }
+                // And the walk actually DELIVERS its floor at this rate:
+                // the centres are rounded onto the bin grid and squeezed
+                // by `min(room)`, either of which could collapse a band
+                // without the constant changing at all.
+                for b in 1..DENOISE_BANDS {
+                    let width = edge[b] - edge[b - 1];
+                    assert!(
+                        width >= MIN_BAND_BINS as usize,
+                        "{sr} Hz {}: band {b} is {width} bins wide, under the {} the \
+                         statistics and the slope limit are argued from (edges {:?})",
+                        kernel.label(),
+                        MIN_BAND_BINS,
+                        &edge[..8]
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The realised mask's impulse response is short, and about equally
+    /// short at both frame lengths.**
+    ///
+    /// This is the number `lay_out_bands` argues from and it had never been
+    /// measured in the tree. A per-bin mask is a filter as long as the
+    /// frame, so its circular convolution wraps and the wrap is audible
+    /// pre-echo; interpolating a mask across triangles constrains how fast
+    /// it can change with frequency, which is the same thing as
+    /// constraining how long its impulse response is.
+    ///
+    /// Measured here as: transform the mask the kernel is actually applying
+    /// after two seconds of a tone over learned noise at the top of the
+    /// dial, and take the fraction of its circular impulse response's
+    /// energy that lands more than half a hop from the centre. The free
+    /// per-bin Wiener mask built from the SAME frame's own `pow` and
+    /// `lambda` is the control — it is what "improve this into a per-bin
+    /// mask" would cost.
+    ///
+    /// On the old two-bin floor this read −23.5 dB at Studio and −16.1 at
+    /// Live: a 7.4 dB spread between two kernels that differ only in
+    /// resolution, which is why the bound below is the same number for both
+    /// rather than one each.
+    #[test]
+    fn the_band_mask_stays_short_at_both_frame_lengths() {
+        let alias_db = |g: &[f32], n: usize| -> f32 {
+            let mut re = vec![0.0_f64; n];
+            let mut im = vec![0.0_f64; n];
+            for (k, slot) in re.iter_mut().enumerate() {
+                *slot = f64::from(g[k]);
+            }
+            analysis::fft(&mut re, &mut im);
+            let (mut total, mut out) = (0.0_f64, 0.0_f64);
+            for i in 0..n {
+                let e = re[i] * re[i] + im[i] * im[i];
+                total += e;
+                if i.min(n - i) > n / 4 {
+                    out += e;
+                }
+            }
+            (10.0 * (out / total.max(1.0e-300)).max(1.0e-300).log10()) as f32
+        };
+
+        let mut rows = Vec::new();
+        for kernel in [DenoiseKernel::SpectralStudio, DenoiseKernel::SpectralLive] {
+            let mut dn = learned_full_band(kernel, 0x0C7A, 0.05, SR, 1.0);
+            let p = DenoiseParams {
+                reduce: 1.0,
+                ..on(kernel)
+            };
+            let frames = 2 * SR as usize;
+            let mut buf = sine(220.0, 0.3, frames, SR);
+            add(&mut buf, &FullBandNoise::new(0x0C7A, 0.05).frames(frames));
+            dn.process(&mut buf, frames, 2, &p);
+
+            let (n, bins) = (dn.sp.n, dn.sp.n / 2);
+            // The mask is not flat — a flat mask is a delta and would pass
+            // this test while proving nothing about the slope limit.
+            let (lo, hi) = dn.sp.gain[..=bins]
+                .iter()
+                .fold((f32::INFINITY, 0.0_f32), |(l, h), &g| (l.min(g), h.max(g)));
+            assert!(
+                20.0 * (hi / lo.max(1.0e-12)).log10() > 12.0,
+                "{}: the mask only spans {:.1} dB, so this measurement is about a delta",
+                kernel.label(),
+                20.0 * (hi / lo.max(1.0e-12)).log10()
+            );
+
+            let mut free = vec![0.0_f32; n];
+            for k in 0..=bins {
+                let xi = ((dn.sp.pow[k] / dn.sp.lambda[k].max(1.0e-30)) - 1.0).max(0.01);
+                free[k] = xi / (1.0 + xi);
+            }
+            for k in bins + 1..n {
+                free[k] = free[n - k];
+            }
+            rows.push((
+                kernel.label(),
+                n,
+                alias_db(&dn.sp.gain, n),
+                alias_db(&free, n),
+            ));
+        }
+
+        let table = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "  {:16} n={:>5}: realised mask {:>6.1} dB, free per-bin mask {:>6.1} dB",
+                    r.0, r.1, r.2, r.3
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("energy outside +-R/2 of the mask's impulse response:\n{table}");
+        assert!(
+            rows.iter().all(|r| r.2 < -27.0),
+            "the band mask is no longer short (it must stay under -27 dB at BOTH frame \
+             lengths — it was -23.5/-16.1 on the two-bin floor):\n{table}"
+        );
+        assert!(
+            rows.iter().all(|r| r.3 - r.2 > 15.0),
+            "the band structure has stopped buying anything over a free per-bin mask:\n{table}"
+        );
+    }
+
+    /// **The dial is flat and equal to itself in EVERY frame, not just the
+    /// one a settled snapshot happens to land on.**
+    ///
+    /// [`noise_only_gain_is_flat_and_equals_the_dial`] reads
+    /// `analysis::spectral_response_db`, which reads the LAST frame's mask;
+    /// the trajectory it also collects was only ever reduced to a drift
+    /// figure between two tenth-run means, and a mean is exactly the wrong
+    /// instrument for an excursion. Measured per frame over the settled
+    /// half of eight seconds, band 0 was 13.02 dB peak-to-peak at Studio's
+    /// top of dial — that is a 13 dB hole in the reduction, on and gone
+    /// inside 21 ms, in the band where a hole is a thump. 0.117 % of Studio
+    /// band-frames were more than 1 dB short of the dial at 24 dB, 0.025 %
+    /// at 18 and 0.008 % at 12; Live's worst was 5.26 dB.
+    ///
+    /// Both halves of the cause are in the fix and both are pinned
+    /// elsewhere: [`MIN_BAND_BINS`] (a two-bin band's energy is a
+    /// chi-square with about three degrees of freedom) and [`DD_BW_MS_HZ`]
+    /// (the recursion rectifies that scatter, so the narrow bands need a
+    /// longer noise-side memory the way the bank's level window does).
+    #[test]
+    fn the_gain_is_flat_and_equal_to_the_dial_in_every_frame() {
+        let mut rows = Vec::new();
+        for kernel in [DenoiseKernel::SpectralStudio, DenoiseKernel::SpectralLive] {
+            for &reduce in REDUCE_SPAN.iter() {
+                let cap = reduce * DENOISE_REDUCE_DB;
+                let mut dn = learned_full_band(kernel, 0xD1A1, 0.05, SR, 1.0);
+                let p = DenoiseParams {
+                    reduce,
+                    ..on(kernel)
+                };
+                let frames = 8 * SR as usize;
+                let mut buf = FullBandNoise::new(0xD1A1, 0.05).frames(frames);
+                // One snapshot per FRAME: the mask only moves when a frame
+                // fires, so a finer grid would report the same number twice
+                // and a coarser one would step over the excursion.
+                let hop = dn.sp.hop;
+                let traj = analysis::gain_trajectory(&mut dn, &mut buf, frames, hop, &p);
+                let settled = &traj[traj.len() / 2..];
+
+                let (mut worst_pp, mut worst_short, mut at) = (0.0_f32, 0.0_f32, 0usize);
+                let mut short = 0usize;
+                for b in 0..DENOISE_BANDS {
+                    let lo = settled.iter().map(|s| s[b]).fold(f32::INFINITY, f32::min);
+                    let hi = settled
+                        .iter()
+                        .map(|s| s[b])
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    if hi - lo > worst_pp {
+                        worst_pp = hi - lo;
+                        at = b;
+                    }
+                    worst_short = worst_short.max(cap - lo);
+                    short += settled.iter().filter(|s| cap - s[b] > 1.0).count();
+                }
+                let pct = 100.0 * short as f32 / (settled.len() * DENOISE_BANDS) as f32;
+                rows.push((kernel.label(), cap, worst_pp, at, worst_short, pct));
+            }
+        }
+
+        let table = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "  {:16} dial {:>4.1} dB: worst per-band peak-to-peak {:>6.3} dB (band {}), \
+                     worst single-frame shortfall {:>6.3} dB, {:.3} % of band-frames >1 dB short",
+                    r.0, r.1, r.2, r.3, r.4, r.5
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("per-frame band depths over the settled half of 8 s:\n{table}");
+        assert!(
+            rows.iter().all(|r| r.2 < 1.0),
+            "a band's cut is not flat FRAME BY FRAME (peak-to-peak must stay under 1.0 dB; \
+             it was 13.02 dB at band 0 on the two-bin floor):\n{table}"
+        );
+        assert!(
+            rows.iter().all(|r| r.4 < 1.0),
+            "a band fell short of the dial in a single frame (must stay under 1.0 dB; \
+             it was 13.02 dB):\n{table}"
+        );
+    }
+
+    /// **A run of OFF bands does not rob its live neighbours of the dial.**
+    ///
+    /// Both acceptance tests learn with [`learned_full_band`], which arms
+    /// all 32, so neither can see this. OFF runs are an expected state:
+    /// `freeze_thresholds` documents a band that heard silence landing
+    /// there as "the right answer", `set_thresholds` maps any non-finite
+    /// persisted value to OFF, and an ordinary learn pass on lossy-decoded
+    /// material drives the top band there through its own brickwall.
+    ///
+    /// An OFF band never reduces, so it has no λ worth the name — only the
+    /// −100 dB placeholder `refloor` lays for a band nobody taught — and
+    /// its ξ is therefore `energy / placeholder`, measured at 7·10⁵. The
+    /// cross-band vote used to hand a quarter of that to each neighbour,
+    /// which pins `g_H1` at unity and the mixed gain at 0 dB. Measured at a
+    /// dial asking 12 dB with bands 20..22 off: band 19 delivered 6.25 dB
+    /// and band 23 delivered 7.42. Runs of one and two were safe only
+    /// because no band in them is interior — the triangular refloor still
+    /// gave those a real λ from their live neighbours — which is why the
+    /// sweep below starts at three and why a run of one is checked too.
+    #[test]
+    fn a_run_of_off_bands_does_not_rob_its_live_neighbours() {
+        let mut rows = Vec::new();
+        for kernel in [DenoiseKernel::SpectralStudio, DenoiseKernel::SpectralLive] {
+            for run in 1..=5usize {
+                for &reduce in [0.5_f32, 1.0].iter() {
+                    let cap = reduce * DENOISE_REDUCE_DB;
+                    let mut dn = learned_full_band(kernel, 0x0FF0, 0.05, SR, 1.0);
+                    let mut thr = dn.thresholds();
+                    for t in thr[20..20 + run].iter_mut() {
+                        *t = 0.0;
+                    }
+                    dn.set_thresholds(&thr);
+                    let p = DenoiseParams {
+                        reduce,
+                        ..on(kernel)
+                    };
+                    let frames = 4 * SR as usize;
+                    let mut buf = FullBandNoise::new(0x0FF0, 0.05).frames(frames);
+                    dn.process(&mut buf, frames, 2, &p);
+                    let d = dn.depth_db();
+                    // The bands either side of the run, and the run itself
+                    // — which must still be a wire, because that is what
+                    // OFF means.
+                    let (below, above) = (d[19], d[20 + run]);
+                    let inside = d[20..20 + run].iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
+                    rows.push((kernel.label(), run, cap, below, above, inside));
+                }
+            }
+        }
+
+        let table = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "  {:16} {} OFF from band 20, dial {:>4.1} dB: band 19 cuts {:>6.3}, \
+                     band {} cuts {:>6.3}, the OFF run itself {:>6.3}",
+                    r.0,
+                    r.1,
+                    r.2,
+                    r.3,
+                    20 + r.1,
+                    r.4,
+                    r.5
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("live neighbours of an OFF run:\n{table}");
+        assert!(
+            rows.iter().all(|r| r.5 < 0.05),
+            "a band whose profile is OFF reduced anyway:\n{table}"
+        );
+        assert!(
+            rows.iter().all(|r| (r.3 - r.2).abs() < 0.5 && (r.4 - r.2).abs() < 0.5),
+            "a live band beside an OFF run is not getting the dialled cut (it was 6.25 and \
+             7.42 dB against a 12 dB dial before the vote learned to skip OFF):\n{table}"
+        );
+    }
+
+    /// **A stale noise print holds the dial for 18 dB, and then it does
+    /// not — and this is where it stops.**
+    ///
+    /// [`NOISE_CEIL_DB`] is a deliberate one-way limit: an estimate that
+    /// has wandered far above what the user taught is tracking the
+    /// PROGRAMME, not the noise, and letting it climb costs signal. Past
+    /// it, λ pins, γ stays large, ξ stays large, every band opens, and the
+    /// unit stops reducing — which is a CLIFF, not a taper, and the exact
+    /// symptom the whole rewrite was commissioned for ("I push REDUCE and
+    /// almost nothing happens"). At the shipped 12 dB the cliff fell inside
+    /// the range of "the room got a bit louder": 12.00 dB delivered at
+    /// +16 dB above the print, 4.07 at +18, 1.71 at +20.
+    ///
+    /// So the number was chosen against a measurement and this is the
+    /// measurement. The other direction needs no ceiling and is checked
+    /// too: a QUIETER room than the print still gets the whole dial,
+    /// because the floor is one-way.
+    ///
+    /// The bank's own cliff is in the table for scale and is not asserted —
+    /// it is an expander whose thresholds were frozen at mean + 2σ of a
+    /// quieter room, and it stops expanding at +6 dB. That is a different
+    /// mechanism in a different engine and it is not new here.
+    #[test]
+    fn a_stale_print_holds_the_dial_until_it_does_not() {
+        // The GUARANTEE, as a literal: how stale a print may be and still
+        // buy the whole dial. Written down here rather than read out of
+        // [`NOISE_CEIL_DB`], because a bound taken from the constant it
+        // guards follows that constant down and reports nothing.
+        const STALE_GUARANTEE_DB: f32 = 18.0;
+        assert!(
+            NOISE_CEIL_DB >= STALE_GUARANTEE_DB,
+            "NOISE_CEIL_DB is {NOISE_CEIL_DB} dB, under the {STALE_GUARANTEE_DB} dB of \
+             staleness this unit promises to absorb"
+        );
+        let ladder = [-20.0_f32, -6.0, 0.0, 6.0, 12.0, 18.0, 20.0, 24.0];
+        let mut rows = Vec::new();
+        for kernel in DenoiseKernel::ALL {
+            for &db in ladder.iter() {
+                let mut dn = learned_full_band(kernel, 0x40E7, 0.05, SR, 1.0);
+                let p = DenoiseParams {
+                    reduce: 0.5,
+                    ..on(kernel)
+                };
+                let frames = 4 * SR as usize;
+                let amp = 0.05 * 10.0_f32.powf(db / 20.0);
+                let dry = FullBandNoise::new(0x40E7, amp).frames(frames);
+                let mut wet = dry.clone();
+                dn.process(&mut wet, frames, 2, &p);
+                rows.push((kernel, db, rms_db(&dry, frames / 2) - rms_db(&wet, frames / 2)));
+            }
+        }
+
+        let table = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "  {:16} the room is {:+5.0} dB against the print: {:>6.2} dB removed \
+                     (dial asks 12.0)",
+                    r.0.label(),
+                    r.1,
+                    r.2
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("a print that no longer describes the room:\n{table}");
+        // The guarantee, on the spectral kernels the dial is a promise
+        // about: everything at or under the ceiling delivers the dial.
+        assert!(
+            rows.iter()
+                .filter(|r| r.0 != DenoiseKernel::Bank && r.1 <= STALE_GUARANTEE_DB)
+                .all(|r| r.2 > 11.5),
+            "the spectral kernels no longer deliver the dial for a print stale by up to \
+             {STALE_GUARANTEE_DB} dB — the cliff has moved DOWN into the range of an \
+             ordinary room change (it was between +16 and +18 dB when NOISE_CEIL_DB \
+             was 12):\n{table}"
         );
     }
 
@@ -4346,6 +5469,19 @@ mod tests {
             let drift = (0..DENOISE_BANDS).fold(0.0_f32, |m, k| {
                 m.max((mean_over(last, k) - mean_over(prev, k)).abs())
             });
+            // And the SAME trajectory read frame by frame, because a drift
+            // between two means is blind to an excursion and the
+            // composite below reads one frame only — the LAST. Band 0 was
+            // 13.02 dB peak-to-peak here while every number on this line
+            // read 0.00; see
+            // `the_gain_is_flat_and_equal_to_the_dial_in_every_frame`,
+            // which carries the full matrix and both frame lengths.
+            let settled = &traj[traj.len() / 2..];
+            let jitter = (0..DENOISE_BANDS).fold(0.0_f32, |m, k| {
+                let lo = settled.iter().map(|s| s[k]).fold(f32::INFINITY, f32::min);
+                let hi = settled.iter().map(|s| s[k]).fold(f32::NEG_INFINITY, f32::max);
+                m.max(hi - lo)
+            });
 
             let cut: Vec<f32> = analysis::spectral_response_db(&dn, &probes, SR)
                 .iter()
@@ -4368,7 +5504,7 @@ mod tests {
                 let by_audio = analysis::psd_cut_at(&psd_dry, &psd_wet, SR, hz);
                 m.max((by_coef - by_audio).abs())
             });
-            rows.push((reduce, cap, mean, lo, hi, hi - lo, drift, check));
+            rows.push((reduce, cap, mean, lo, hi, hi - lo, drift, check, jitter));
         }
 
         let table = rows
@@ -4378,9 +5514,10 @@ mod tests {
                 format!(
                     "  reduce {:.2} (dial {:>4.1} dB): mean cut {:>6.2} dB, \
                      {:>6.2}..{:>6.2}, peak-to-peak {:>5.2} dB \
-                     (drift over the last second {:.3} dB, coefficients vs \
+                     (drift over the last second {:.3} dB, worst per-band \
+                     peak-to-peak frame by frame {:.3} dB, coefficients vs \
                      audio {:.3} dB) [bank: mean {:.2}, p-p {:.2}]",
-                    r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, c.1, c.2
+                    r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.8, r.7, c.1, c.2
                 )
             })
             .collect::<Vec<_>>()
@@ -4404,6 +5541,11 @@ mod tests {
             rows.iter().all(|r| (r.2 - r.1).abs() < 1.0),
             "the settled composite gain is not the dialled reduction \
              (the mean must be within 1.0 dB of the dial):\n{table}"
+        );
+        assert!(
+            rows.iter().all(|r| r.8 < 1.0),
+            "the gain is flat in the LAST frame and not in the others (a band's cut must \
+             stay within 1.0 dB of itself frame by frame over the settled half):\n{table}"
         );
     }
 

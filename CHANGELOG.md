@@ -260,12 +260,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 - **Nine more of Tangent's own, and the shelf fills out.** The suite grows
   from four to thirteen:
 
-  *Tangent Denoise* - noise reduction as thirty-two learned expanders, not
-  spectral surgery: play it a moment of the noise alone, and each band
-  learns where the floor lives; the reduction then breathes with the music
-  instead of gating against it. No spectral processing, no musical noise,
-  no pre-echo - phase moves only in bands being attenuated, exactly as an
-  EQ cut would. What it learns saves with the project and rides presets.
+  *Tangent Denoise* - two engines behind one Kernel selector, sharing one
+  learned profile: play it a moment of the noise alone, and each of
+  thirty-two bands learns where the floor lives. **Spectral Studio** is the
+  shipped engine and the one the REDUCE dial is a promise about - a
+  weighted overlap-add with a real gain per band, so asking for 12 dB
+  removes 12 dB in every octave, and so that a bin's phase comes back
+  exactly as it went in. It costs 21 ms of honest, reported latency (1024
+  samples at 44.1 or 48 kHz, doubling with the rate), which delay
+  compensation takes care of. **Spectral Live** is the same engine at half
+  the frame, for tracking. **Bank** is the original thirty-two
+  minimum-phase expanders: zero latency, bit-transparent with nothing
+  learned, and the only one that can be - but its overlapping bells sum, so
+  its dial is an approximation rather than a number. A profile belongs to
+  the kernel that learned it, because the two do not measure the same
+  quantity through it: switch engines after a learn and learn it again.
+  What it learns saves with the project and rides presets.
 
   *Tangent Amp* - a warm, clean tube amp solved from the blackface-family
   schematic itself: the real tone stack (its mid scoop lands where the
