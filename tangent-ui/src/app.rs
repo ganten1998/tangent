@@ -1746,7 +1746,42 @@ fn copy_into_media(doc: &std::path::Path, src: &std::path::Path) -> Option<Strin
 /// A shared kit carries its samples inside it, so there is no source file to
 /// copy from — but everything downstream of the copy must be identical, or a
 /// kit loaded from a `.tgkit` would land somewhere a dragged file would not.
-/// Same media folder, same naming, same de-duplication by length.
+/// Same media folder, same naming, same de-duplication.
+///
+/// **The de-duplication compares BYTES, and it used to compare lengths.**
+/// That was written as "byte for byte as far as length can tell", which is
+/// the kind of comment that admits a bug and then ships it. Same name plus
+/// same length is not the same sample, and the collision is not exotic — it
+/// is the normal case for drum one-shots. A pack normalises every kick to the
+/// same peak and the same length and calls it `Kick.wav`; the next pack does
+/// too. Load two kits from two packs into one project and the second one's
+/// kick was never written, because a file called `Kick.wav` of that exact
+/// length was already sitting in `media/`. The pad then pointed at the FIRST
+/// kit's kick and played it, forever, with nothing said. There is no way to
+/// discover that from inside Tangent: the pad is loaded, the name is right,
+/// the waveform is drawn, and the sound is somebody else's.
+///
+/// The cost of being right is one `fs::read` of a file we were about to write
+/// the same number of bytes into anyway, and only when the name AND the
+/// length already match — the length test still runs first, as the cheap
+/// gate, so the common "nothing of that name is here" case does not read
+/// anything at all. The pathological kit is one whose hundred and twenty-eight
+/// pads all collide by name with something already in `media/`: that reads a
+/// hundred and twenty-eight files before writing. It is stated here so the
+/// number is owned rather than discovered, and it is still the right trade —
+/// a hundred and twenty-eight reads happen once, at load, and the wrong kick
+/// plays for the life of the project.
+///
+/// **The path-separator scrub below is a security guard, not tidiness**, and
+/// survived this rewrite untouched: a kit is a file from a stranger and a
+/// blob naming `../../.zshrc` must land in `media/` like everything else.
+///
+/// `copy_into_media`'s `same_file` still guesses by length on the drag-in
+/// road. That is deliberate and not an oversight: dragging the same file in
+/// twice is a person repeating themselves, the wrong answer costs a numbered
+/// duplicate rather than the wrong audio, and the source there is a path we
+/// would have to read in full to compare. It is its own decision and wants
+/// its own argument before it changes.
 fn write_into_media(doc: &std::path::Path, name: &str, bytes: &[u8]) -> Option<String> {
     let media = doc.parent()?.join("media");
     std::fs::create_dir_all(&media).ok()?;
@@ -1765,9 +1800,14 @@ fn write_into_media(doc: &std::path::Path, name: &str, bytes: &[u8]) -> Option<S
     let mut chosen = name.to_owned();
     let mut n = 2;
     while media.join(&chosen).exists() {
-        // Already here, byte for byte as far as length can tell: the same
-        // kit loaded twice is one copy of each sample, not two.
-        if std::fs::metadata(media.join(&chosen)).is_ok_and(|m| m.len() == bytes.len() as u64) {
+        // Already here, byte for byte and checked: the same kit loaded twice
+        // is one copy of each sample, not two — and a DIFFERENT sample under
+        // the same name goes on to `Kick 2.wav` rather than being silently
+        // answered with the one that was already there.
+        let at = media.join(&chosen);
+        if std::fs::metadata(&at).is_ok_and(|m| m.len() == bytes.len() as u64)
+            && std::fs::read(&at).is_ok_and(|have| have == bytes)
+        {
             return Some(format!("media/{chosen}"));
         }
         chosen = format!("{stem} {n}{ext}");
@@ -1787,6 +1827,56 @@ fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     match (std::fs::metadata(a), std::fs::metadata(b)) {
         (Ok(x), Ok(y)) => x.len() == y.len(),
         _ => false,
+    }
+}
+
+/// **What to say after a kit was written but could not take all of its
+/// audio.** Empty when the kit is whole, which is the overwhelming case and
+/// must stay silent — a status strip that speaks after every successful save
+/// is a status strip nobody reads.
+///
+/// Two causes, two sentences, because they ask for different things from the
+/// person reading them. A sample that could not be READ is a moved folder or
+/// an unmounted drive: the fix is to put it back and save again. A sample
+/// past the ceiling is a kit that is simply too large to carry itself: the
+/// fix is a smaller kit, or the knowledge that this one only works here. A
+/// single merged "N samples missing" would send both of those people looking
+/// in the wrong place.
+///
+/// Counted in SAMPLES rather than pads, matching
+/// [`crate::drumpad::KitEmbedReport`]: four pads holding one missing hat have
+/// lost one sample, and saying "4" would make a small problem sound like a
+/// destroyed kit.
+///
+/// The sentence names the consequence and not the mechanism. "3 samples are
+/// not inside it" means nothing to somebody who never knew samples were
+/// inside it in the first place; "this kit will only play on this machine" is
+/// the fact they will act on.
+fn kit_shortfall(report: &crate::drumpad::KitEmbedReport) -> String {
+    if report.is_complete() {
+        return String::new();
+    }
+    let plural = |n: usize| if n == 1 { "sample" } else { "samples" };
+    // `is_complete` above has already taken (0, 0), so the first two arms
+    // never fire with a zero in them and no arm has to say "0 samples".
+    match (report.unreadable, report.over_ceiling) {
+        (n, 0) => format!(
+            "kit saved, but {n} {} could not be read — this kit will only play \
+             on this machine",
+            plural(n)
+        ),
+        (0, n) => format!(
+            "kit saved, but it is past {} MB, so {n} {} stayed out — this kit \
+             will only play on this machine",
+            crate::drumpad::MAX_KIT_BYTES / (1024 * 1024),
+            plural(n)
+        ),
+        (u, c) => format!(
+            "kit saved, but {u} {} could not be read and {c} more were past \
+             {} MB — this kit will only play on this machine",
+            plural(u),
+            crate::drumpad::MAX_KIT_BYTES / (1024 * 1024)
+        ),
     }
 }
 
@@ -13350,6 +13440,28 @@ impl TangentApp {
                 // N files land on N consecutive pads, the RS5k rack's rule.
                 for (n, file) in dropped.into_iter().enumerate() {
                     let Some(path) = file.path else { continue };
+                    // **A kit dropped on the kit is a KIT, not a sample.**
+                    //
+                    // Every dropped path used to go to `drumpad_load`, which
+                    // copies the file into `media/` and points a pad at it —
+                    // so a `.tgkit` somebody downloaded and dragged onto the
+                    // pads, which is the single most obvious thing to do with
+                    // one and the entire reason the format exists, was filed
+                    // away as audio. The decoder cannot read a container, so
+                    // the pad went quiet and stayed quiet, with a plausible
+                    // name under it and no message anywhere. The user's own
+                    // kit was one gesture away and unreachable.
+                    //
+                    // It takes the WHOLE drop and stops. `apply_kit_preset`
+                    // clears every pad of the lane before it lays its own
+                    // down, so carrying on through the rest of a mixed drop
+                    // would put samples on pads a kit is about to erase, or
+                    // erase samples that had just landed — an order-dependent
+                    // result either way. One kit, one lane, done.
+                    if crate::drumpad::looks_like_a_kit(&path) {
+                        self.apply_kit_preset(&path);
+                        break;
+                    }
                     let at = key + n;
                     if at >= recorder::DRUM_PADS {
                         break;
@@ -17576,7 +17688,29 @@ impl TangentApp {
     /// Named for the lane's track, because that is what somebody would call
     /// it — a kit built on a track named "Verse Drums" suggests exactly that
     /// and not "kit 1".
+    ///
+    /// **Gated on the host being able to raise a panel at all**, like
+    /// `ask_for_a_media_folder`, `open_plugin_folder_picker` and the
+    /// cartridge picker before it. `Caps::PLUGIN` sets `native_file_dialogs`
+    /// false, and the plugin editor drains neither `take_save_request` nor
+    /// `take_file_request` — so in the plugin this chip took the press, set a
+    /// field nobody ever read, and said nothing. A control that lies about
+    /// being a control is worse than one that is missing, because the user
+    /// spends the next minute wondering which of the two things they did
+    /// wrong.
+    ///
+    /// Unlike those three, this one SAYS SO rather than returning in silence.
+    /// They sit behind menus and cog rows a plugin build does not draw; the
+    /// drumpad's SAVE and LOAD are painted unconditionally, right there on
+    /// the strip, so the press has to be answered.
     fn save_kit_preset(&mut self) {
+        if !self.caps.native_file_dialogs {
+            self.track.error =
+                "there is no file panel in a plugin — save this kit from the \
+                 Tangent app"
+                    .to_owned();
+            return;
+        }
         let lane = self.drumpad_lane;
         let suggested = {
             let at = crate::recorder::Strip::Channel(lane).index();
@@ -17607,20 +17741,51 @@ impl TangentApp {
             .file_stem()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let preset =
-            crate::drumpad::KitPreset::from_kit(&name, self.drumpad(), &doc);
+        let (preset, report) = crate::drumpad::KitPreset::from_kit_within(
+            &name,
+            self.drumpad(),
+            &doc,
+            crate::drumpad::MAX_KIT_BYTES,
+        );
         if preset.pads.is_empty() {
             self.track.error = "this kit has no pads to save".to_owned();
             return;
         }
         match preset.save(path) {
-            Ok(_) => self.track.error.clear(),
+            // **A kit that could not take all of its audio still saves, and
+            // now says so.** `from_kit_within` degrades to path-only for a
+            // sample it cannot read or one past the ceiling, which is the
+            // right behaviour — a layout is worth keeping and refusing the
+            // write would destroy work somebody thought they had. But the
+            // report used to stop there: `track.error` was CLEARED, the
+            // status strip said nothing, and the file on disk looked exactly
+            // like a portable one. The user found out when somebody else
+            // opened it and got empty pads, by which time the reason was a
+            // week old.
+            Ok(_) => self.track.error = kit_shortfall(&report),
             Err(e) => self.track.error = format!("could not save the kit: {e}"),
         }
     }
 
     /// Ask for a kit file to load onto the showing lane.
+    ///
+    /// Gated for the same reason `save_kit_preset` is, and the argument is
+    /// there.
+    ///
+    /// The sentence deliberately does NOT offer "drag it onto the pads
+    /// instead", tempting as that is: the drop road reads
+    /// `raw.dropped_files`, and whether a plugin editor ever fills that in is
+    /// the host's and `baseview`'s business, not ours. Telling somebody to
+    /// try a gesture that may quietly do nothing is a second dead control
+    /// wearing the first one's apology.
     fn load_kit_preset(&mut self) {
+        if !self.caps.native_file_dialogs {
+            self.track.error =
+                "there is no file panel in a plugin — load this kit from the \
+                 Tangent app"
+                    .to_owned();
+            return;
+        }
         self.file_request = Some(crate::ports::FileRequest {
             start_at: None,
             title: "Load Kit".to_owned(),
@@ -29187,6 +29352,272 @@ mod tests {
             "the sample that landed is not the one that was saved"
         );
         assert!(app.track.error.is_empty(), "reported: {}", app.track.error);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Two packs, two different kicks, both called `Kick.wav` and both the
+    /// same length — and the second one does not play the first one's.**
+    ///
+    /// `write_into_media` de-duplicated by name and BYTE LENGTH, describing
+    /// itself as "byte for byte as far as length can tell". That is not an
+    /// exotic collision: commercial packs normalise their one-shots and name
+    /// them `Kick.wav`, so two kits from two packs land on the same name at
+    /// the same length as a matter of course. The incoming sample was then
+    /// never written and the pad was pointed at the sample that was already
+    /// there — loaded, correctly named, waveform drawn, and the wrong sound
+    /// for the life of the project. Nothing inside Tangent could tell you.
+    ///
+    /// Both halves are asserted: the pad plays the KIT's kick, and the kick
+    /// that was already in the project is still byte for byte what it was —
+    /// because the other tempting fix, overwriting on a name collision,
+    /// destroys somebody else's sample instead.
+    #[test]
+    fn two_kits_with_a_same_named_same_length_sample_do_not_share_it() {
+        let root = project_scratch("samenamekick");
+        let made_in = root.join("Projects").join("pack one");
+        let media = made_in.join("media");
+        std::fs::create_dir_all(&media).expect("media");
+        std::fs::write(media.join("Kick.wav"), vec![2u8; 700]).expect("kick");
+
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        let doc = crate::arrangement::doc_in(&made_in);
+        crate::arrangement::Arrangement::default().save_to(&doc);
+        app.open_project(&doc);
+        app.drumpad_mut().pads[36] = crate::drumpad::PadSlot {
+            path: "media/Kick.wav".to_owned(),
+            name: "Kick".to_owned(),
+            ..Default::default()
+        };
+        let kit_file = root.join("Pack One.tgkit");
+        app.write_kit_preset(&kit_file);
+        assert!(kit_file.is_file(), "no kit file was written");
+
+        // A second project that already holds a DIFFERENT `Kick.wav` of
+        // exactly the same length.
+        let opened_in = root.join("Projects").join("pack two");
+        let media2 = opened_in.join("media");
+        std::fs::create_dir_all(&media2).expect("second media");
+        std::fs::write(media2.join("Kick.wav"), vec![1u8; 700]).expect("the resident kick");
+        let doc2 = crate::arrangement::doc_in(&opened_in);
+        crate::arrangement::Arrangement::default().save_to(&doc2);
+        app.open_project(&doc2);
+
+        app.apply_kit_preset(&kit_file);
+
+        let pad_path = app.drumpad().pads[36].path.clone();
+        assert!(!pad_path.is_empty(), "the pad came back empty: {}", app.track.error);
+        let landed = std::fs::read(opened_in.join(&pad_path)).expect("the pad's file");
+        assert_eq!(
+            landed,
+            vec![2u8; 700],
+            "the pad at {pad_path} plays the sample that was already in the project"
+        );
+        assert_eq!(
+            std::fs::read(media2.join("Kick.wav")).expect("the resident kick"),
+            vec![1u8; 700],
+            "loading a kit overwrote a sample the project already had"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A kit that could not embed one of its samples says so, and is still
+    /// written.**
+    ///
+    /// `from_kit` swallows an unreadable sample with `.ok()?` and leaves the
+    /// pad with a path and no blob, which is the right degrade — the layout
+    /// is worth keeping and refusing the write would destroy work. The save
+    /// then CLEARED `track.error` and reported plain success, so a kit that
+    /// was not portable was indistinguishable from one that was until
+    /// somebody else opened it.
+    ///
+    /// The count and the file are asserted together on purpose: a "fix" that
+    /// reported the shortfall by refusing the save would pass half of this
+    /// and be a far worse bug than the one it replaced.
+    #[test]
+    fn a_kit_saved_with_a_sample_it_cannot_read_says_so() {
+        let root = project_scratch("kitshortfall");
+        let dir = root.join("Projects").join("holey");
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).expect("media");
+        std::fs::write(media.join("kick.wav"), vec![9u8; 64]).expect("kick");
+
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        let doc = crate::arrangement::doc_in(&dir);
+        crate::arrangement::Arrangement::default().save_to(&doc);
+        app.open_project(&doc);
+        app.drumpad_mut().pads[36] = crate::drumpad::PadSlot {
+            path: "media/kick.wav".to_owned(),
+            ..Default::default()
+        };
+        // A pad naming a file that is not there — a moved folder, an
+        // unmounted drive, a sample deleted since it was loaded.
+        app.drumpad_mut().pads[38] = crate::drumpad::PadSlot {
+            path: "media/gone.wav".to_owned(),
+            ..Default::default()
+        };
+
+        let kit_file = root.join("Holey.tgkit");
+        app.write_kit_preset(&kit_file);
+
+        assert!(kit_file.is_file(), "the shortfall refused the save instead of reporting it");
+        assert!(
+            app.track.error.contains("could not be read"),
+            "the save said nothing about the sample it lost: {:?}",
+            app.track.error
+        );
+        assert!(
+            app.track.error.contains('1'),
+            "the report does not count what was lost: {:?}",
+            app.track.error
+        );
+        // And what it COULD take really is inside the file.
+        let back = crate::drumpad::KitPreset::load(&kit_file).expect("load it back");
+        assert_eq!(back.pads.len(), 2, "the shortfall cost the layout a pad");
+        assert_eq!(back.media.len(), 1, "the readable sample did not travel");
+        assert_eq!(back.media[0].bytes, vec![9u8; 64]);
+
+        // A kit with nothing missing stays SILENT. A status strip that
+        // speaks after every save is one nobody reads.
+        app.drumpad_mut().pads[38] = crate::drumpad::PadSlot::default();
+        app.write_kit_preset(&root.join("Whole.tgkit"));
+        assert!(
+            app.track.error.is_empty(),
+            "a whole kit was reported as a problem: {:?}",
+            app.track.error
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **In a host with no file panels the kit chips answer instead of
+    /// pretending.**
+    ///
+    /// `Caps::PLUGIN` sets `native_file_dialogs` false and the plugin editor
+    /// drains neither `take_save_request` nor `take_file_request`, so both
+    /// chips used to set a field nobody would ever read and say nothing at
+    /// all. The press was swallowed whole.
+    ///
+    /// Asserted from both ends, because a gate is only half a fix: the
+    /// plugin raises nothing and SAYS why, and the desktop still raises both
+    /// requests exactly as it did — a gate written against the wrong
+    /// capability would silently take the feature away from the app it works
+    /// in.
+    #[test]
+    fn the_kit_chips_raise_nothing_in_a_host_that_has_no_panels() {
+        let (_ctx, mut app) = headless_with(Caps::PLUGIN, Settings::default());
+        app.save_kit_preset();
+        assert!(
+            app.take_save_request().is_none(),
+            "the plugin raised a save panel it cannot answer"
+        );
+        assert!(
+            !app.track.error.is_empty(),
+            "the SAVE chip took the press and said nothing"
+        );
+        app.track.error.clear();
+        app.load_kit_preset();
+        assert!(
+            app.take_file_request().is_none(),
+            "the plugin raised a file panel it cannot answer"
+        );
+        assert!(
+            !app.track.error.is_empty(),
+            "the LOAD chip took the press and said nothing"
+        );
+
+        let (_c2, mut desk) = headless_with(Caps::DESKTOP, Settings::default());
+        desk.save_kit_preset();
+        assert!(
+            desk.take_save_request().is_some(),
+            "the gate took SAVE away from the app that can raise a panel"
+        );
+        desk.load_kit_preset();
+        assert!(
+            desk.take_file_request().is_some(),
+            "the gate took LOAD away from the app that can raise a panel"
+        );
+    }
+
+    /// **A kit dropped on the pads loads the kit.**
+    ///
+    /// Every dropped path went to `drumpad_load`, which copies the file into
+    /// `media/` and points a pad at it — so a `.tgkit` downloaded and dragged
+    /// onto the pads, the single most obvious thing anybody would do with
+    /// one, was filed away as audio. The decoder cannot read a container, so
+    /// the pad went quiet and stayed quiet under a plausible name, and the
+    /// kit was one gesture away and unreachable.
+    ///
+    /// Driven through a real frame with a real laid-out panel rather than by
+    /// calling the loader: the bug was in WHICH road the drop took, and a
+    /// test that picks the road itself would have passed the whole time.
+    #[test]
+    fn a_kit_dropped_on_the_pads_loads_the_kit_rather_than_landing_as_a_sample() {
+        let root = project_scratch("dropkit");
+        let made_in = root.join("Projects").join("made in");
+        let media = made_in.join("media");
+        std::fs::create_dir_all(&media).expect("media");
+        std::fs::write(media.join("clap.wav"), vec![6u8; 512]).expect("clap");
+
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        let doc = crate::arrangement::doc_in(&made_in);
+        crate::arrangement::Arrangement::default().save_to(&doc);
+        app.open_project(&doc);
+        app.drumpad_mut().pads[38] = crate::drumpad::PadSlot {
+            path: "media/clap.wav".to_owned(),
+            name: "Clap".to_owned(),
+            ..Default::default()
+        };
+        let kit_file = root.join("Dropped.tgkit");
+        app.write_kit_preset(&kit_file);
+        assert!(kit_file.is_file(), "no kit file was written");
+
+        // A second project, and the drumpad open and laid out by a real
+        // frame — `drumpad_rect` is what the drop is hit-tested against.
+        let opened_in = root.join("Projects").join("opened in");
+        std::fs::create_dir_all(&opened_in).expect("second project");
+        let doc2 = crate::arrangement::doc_in(&opened_in);
+        crate::arrangement::Arrangement::default().save_to(&doc2);
+        app.open_project(&doc2);
+        app.dialog = None;
+        app.open_drumpad();
+        let _ = run_frame(&ctx, &mut app);
+        let _ = run_frame(&ctx, &mut app);
+        app.dialog = None;
+        let rect = app.drumpad_rect.expect("the drumpad did not lay out");
+        let target = crate::drumpad_panel::Layout::new(rect).pads[0].center();
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                events: vec![egui::Event::PointerMoved(target)],
+                dropped_files: vec![egui::DroppedFile {
+                    path: Some(kit_file.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+
+        let pad = app.drumpad().pads[38].clone();
+        assert!(
+            !pad.path.is_empty(),
+            "the kit's own pad is empty — the drop did not load a kit: {}",
+            app.track.error
+        );
+        assert_eq!(pad.name, "Clap", "the kit's layout did not arrive");
+        assert_eq!(
+            std::fs::read(opened_in.join(&pad.path)).expect("the pad's file"),
+            vec![6u8; 512],
+            "the pad is not standing on the kit's sample"
+        );
+        // And the container itself was NOT filed away as audio.
+        let strays: Vec<String> = std::fs::read_dir(opened_in.join("media"))
+            .expect("media")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tgkit"))
+            .collect();
+        assert!(strays.is_empty(), "the kit file was copied in as a sample: {strays:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
