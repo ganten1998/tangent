@@ -7827,26 +7827,39 @@ pub fn show(
                                 ui.label(
                                     RichText::new("ICON").font(bold(10.0)).color(dim),
                                 );
-                                // **Every badge in the table, two rows** -
-                                // the owner's full kit-room of instruments.
-                                // One source of truth: the cells ARE
-                                // `recorder_panel::ICONS`, drawn by the same
-                                // dispatch the strips use, so the picker can
-                                // never show a badge the desk cannot wear.
-                                let all = crate::recorder_panel::ICONS;
-                                let per_row = all.len().div_ceil(2);
+                                // **Every DRAWING once, three rows.**
+                                //
+                                // `ICON_PICKS` and not `ICONS`: four codes
+                                // share the saxophone (the old set drew four
+                                // horn sizes, this one draws one), so the
+                                // table a desk can WEAR and the list a person
+                                // is OFFERED stopped being the same list.
+                                // Offering the horn four times would write
+                                // three codes nobody can tell apart.
+                                //
+                                // Three rows because thirty-six will not fit
+                                // two at any cell worth having: eighteen
+                                // across leaves 23.8pt a cell, so a 21pt icon
+                                // - smaller than the 22 this row used to draw
+                                // when it held far fewer. Twelve across gives
+                                // 37 and a 28pt icon, which is what makes the
+                                // harp's strings resolve at all.
+                                let all = crate::recorder_panel::ICON_PICKS;
+                                let per_row = all.len().div_ceil(3);
                                 for row in all.chunks(per_row) {
                                     ui.horizontal(|ui| {
-                                        // Thirteen cells at egui's default
-                                        // 8pt gap need 512pt and the frame
-                                        // gives 496: the last cell hung off
-                                        // the edge. A 4pt gap fits the row
-                                        // with air to spare on the right.
+                                        // Twelve cells of 37 at the 4pt gap
+                                        // this row sets need 488pt and the
+                                        // frame gives 496. The widths above
+                                        // assume that gap: egui's default 8
+                                        // would need 532 and hang the last
+                                        // cell off the edge, which is what
+                                        // this line is here to stop.
                                         ui.spacing_mut().item_spacing.x = 4.0;
                                         for (code, name) in row {
                                             let chosen = current_icon == *code;
                                             let (rect, resp) = ui.allocate_exact_size(
-                                                Vec2::new(32.0, 26.0),
+                                                Vec2::new(37.0, 32.0),
                                                 egui::Sense::click(),
                                             );
                                             ui.painter().rect_filled(
@@ -7862,7 +7875,7 @@ pub fn show(
                                             let cell_bg = if chosen { t.text } else { t.bg };
                                             let b = egui::Rect::from_center_size(
                                                 rect.center(),
-                                                Vec2::splat(22.0),
+                                                Vec2::splat(28.0),
                                             );
                                             if !crate::recorder_panel::draw_badge(
                                                 ui.painter(),

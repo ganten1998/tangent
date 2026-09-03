@@ -5315,12 +5315,20 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             quiet(on_ink(ground), ground, 0.16)
         })
     };
+    // **The click's own drawing, and the STATE is the tint.** There is one
+    // metronome in the set and this button has two states, which is not the
+    // problem it looks like: `tool` above has already painted the ground and
+    // worked out the ink that reads on it - the desk's green when the click
+    // is on, the ground's own ink pulled back when it is off - so on and off
+    // differ by colour and by the plate behind them, exactly as they did.
+    // The glyph never changed between the two; the old one was only called
+    // `draw_metronome_on` because the click being on is what it stood for.
     if let Some(ink) = tool(painter, l.tool_met, view.metronome_on) {
-        crate::recorder_panel::draw_metronome_on(
+        crate::icons::draw(
             painter,
             l.tool_met.shrink(2.0),
             ink,
-            if view.metronome_on { p.hdr_face } else { p.hdr_lane },
+            crate::icons::Icon::Metronome,
         );
     }
     // The tempo lane's switch: a small line that steps, which is what the
