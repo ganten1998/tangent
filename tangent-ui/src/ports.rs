@@ -918,9 +918,19 @@ pub struct IrOutcome {
     /// **Which of the two cuts decided this IR's length.** See
     /// [`IrLengthCut`]. Appended at the END, this struct's law.
     pub length_cut: IrLengthCut,
-    /// Each channel's own peak in the finished IR, dB under the pair's peak
-    /// (so the louder side reads 0.0). THIS is the stereo image, and it is
-    /// the number that says "the right channel is barely there".
+    /// **Each channel's total ENERGY in the finished IR**, dB under the
+    /// louder of the two (so that one reads 0.0). This is the stereo image,
+    /// and it is the number that says "the right channel is barely there".
+    ///
+    /// Energy and not peak, which is a correction rather than a preference.
+    /// A diffuse box has no strong direct arrival, so each channel's peak is
+    /// the largest sample of something noise-like and wanders several dB
+    /// between captures of the same loop: one Quadraverb plate read 3.5 dB
+    /// down on the right by peak and 0.25 dB UP by energy. The peak figure
+    /// was reported to the owner as an imbalance in his rig, and it was not
+    /// one — a track sent through the same jacks and recorded back is level,
+    /// on his meters and by ear. Energy is what a meter integrates, what an
+    /// ear hears, and what a channel that is genuinely missing shows up in.
     pub side_l_db: f32,
     pub side_r_db: f32,
     /// **How alike the two channels are**, −1..=1, over the IR's first

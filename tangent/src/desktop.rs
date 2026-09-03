@@ -10157,18 +10157,31 @@ fn process_ir_capture(
     // real and also makes it invisible, because nothing reported it. A side
     // 30 dB down is a capture with one jack barely returning, and it looks
     // exactly like a capture of a box that happens to be narrow.
-    // Against the FINISHED pair's peak, not the one measured before the
-    // truncation and the normalise — that peak belongs to a different buffer
-    // and made the louder side read +42 dB, which is not a thing a side can
-    // be. The louder side is 0.0 by construction.
-    let final_peak = l
-        .iter()
-        .chain(r.iter())
-        .fold(0.0f32, |m, &v| m.max(v.abs()));
-    let side_of = |c: &[f32]| {
-        let p = c.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-        if p > 0.0 && final_peak > 0.0 {
-            20.0 * (p / final_peak).log10()
+    // **ENERGY, not peak, and the difference is the whole point.**
+    //
+    // The question a side figure answers is "is one channel quieter", and the
+    // first version of this answered it with each channel's PEAK. On a
+    // diffuse box that is close to meaningless: a plate has no strong direct
+    // arrival, so its peak is the largest sample of something noise-like and
+    // moves several dB from capture to capture. Measured on a Quadraverb
+    // plate, one capture: by peak the right side read 3.5 dB down, by energy
+    // it read 0.25 dB UP. The peak figure was reported to the owner as an
+    // imbalance in his signal chain; he answered that a track sent through
+    // the same jacks and recorded back sounds level and every meter agrees,
+    // and he was right. Total energy is what a level meter integrates and
+    // what an ear hears, and it is what a channel being genuinely absent
+    // shows up in.
+    //
+    // Against the LOUDER side, so it reads 0.0 by construction and the other
+    // number is the difference between them.
+    let energy = |c: &[f32]| -> f64 {
+        c.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>()
+    };
+    let (e_l, e_r) = (energy(&l), energy(&r));
+    let loudest = e_l.max(e_r);
+    let side_of = |e: f64| {
+        if e > 0.0 && loudest > 0.0 {
+            (10.0 * (e / loudest).log10()) as f32
         } else {
             -200.0
         }
@@ -10210,8 +10223,8 @@ fn process_ir_capture(
         } else {
             tangent_ui::ports::IrLengthCut::Window
         },
-        side_l_db: side_of(&l),
-        side_r_db: side_of(&r),
+        side_l_db: side_of(e_l),
+        side_r_db: side_of(e_r),
         correlation,
         floor_settled: settled,
     };
@@ -10383,13 +10396,38 @@ pub fn ir_test(arg: Option<String>) {
     let pre = rate.round() as usize;
     let tail = (tail_s * rate).round() as usize;
     let level = 10.0f32.powf(level_db / 20.0);
-    println!("\ntone (2 s at the send level) - the return, per jack:");
+    println!("\ntone (4 s at the send level) - the return, per jack:");
     engine.start_ir_tone((out0, out0 + 1), (in0, in0 + 1), level);
-    for _ in 0..8 {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        let (rms, peak) = engine.ir_return_db();
-        let (l, r) = engine.ir_return_sides_db();
-        println!("  peak {peak:7.2}  rms {rms:7.2}   left {l:7.2}  right {r:7.2}  dBFS");
+    // **Accumulated, not sampled.** These cells hold the LAST audio block —
+    // about ten milliseconds — and a wet return is modal: two channels of one
+    // plate beat against each other, so any single block can favour either
+    // side by several dB. Reading one block per second and calling the
+    // difference an imbalance is what a small sample of a bouncing signal
+    // looks like when you want it to mean something. Each line below is the
+    // max and the mean over a whole second of blocks.
+    for _ in 0..4 {
+        let (mut ml, mut mr) = (-200.0f32, -200.0f32);
+        let (mut sl, mut sr, mut n) = (0.0f64, 0.0f64, 0u32);
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let (l, r) = engine.ir_return_sides_db();
+            if l > -200.0 && r > -200.0 {
+                ml = ml.max(l);
+                mr = mr.max(r);
+                sl += f64::from(l);
+                sr += f64::from(r);
+                n += 1;
+            }
+        }
+        if n == 0 {
+            println!("  (silence)");
+            continue;
+        }
+        println!(
+            "  peak-of-second  L {ml:7.2}  R {mr:7.2}     mean-of-blocks  L {:7.2}  R {:7.2}  dBFS",
+            sl / f64::from(n),
+            sr / f64::from(n)
+        );
     }
     engine.stop_ir();
     // **Long enough for the box to stop ringing.** A 100% wet reverb is still
@@ -10586,8 +10624,24 @@ pub fn ir_test(arg: Option<String>) {
     println!("usable range:  {:.1} dB", out.tail_range_db);
     println!("THD2 / THD3:   {:.1} / {:.1} dB", out.thd2_db, out.thd3_db);
     println!(
-        "channels:      left {:.2} dB   right {:.2} dB   correlation {:+.3}",
+        "channels (energy): left {:.2} dB   right {:.2} dB   correlation {:+.3}   \
+         <- as the wizard reports it",
         out.side_l_db, out.side_r_db, out.correlation
+    );
+    // **And by PEAK, computed here rather than taken from the outcome, so the
+    // two stay an independent cross-check.** They disagree on a diffuse box
+    // and the disagreement is the point: a plate has no strong direct
+    // arrival, so its per-channel peak is the largest sample of something
+    // noise-like and wanders several dB between captures of the same loop.
+    // Reading an imbalance off it is how a level rig gets accused of a fault
+    // it does not have.
+    let peak_of = |c: &[f32]| c.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    let (pk_l, pk_r) = (peak_of(&l), peak_of(&r));
+    let loudest = pk_l.max(pk_r).max(1e-30);
+    println!(
+        "channels (peak):   left {:.2} dB   right {:.2} dB",
+        20.0 * (pk_l / loudest).max(1e-30).log10(),
+        20.0 * (pk_r / loudest).max(1e-30).log10()
     );
     println!("reference:     {:?}", out.reference);
 
@@ -15501,6 +15555,117 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+
+
+    /// **The stereo image is measured by ENERGY, and on a diffuse box that is
+    /// not the same answer as the peak.**
+    ///
+    /// The report this exists to stop being repeated is one I made. A
+    /// Quadraverb plate captured through the owner's loop read 3.5 dB down on
+    /// the right BY PEAK, and I told him that was an imbalance in his signal
+    /// chain. He answered that a track sent through the same jacks and
+    /// recorded back is level, on his meters and by ear — and he was right:
+    /// the same capture measured 0.25 dB UP on the right by energy. A plate
+    /// has no strong direct arrival, so its per-channel peak is the largest
+    /// sample of something noise-like and wanders several dB between captures
+    /// of one loop.
+    ///
+    /// So the fixture is two channels that are honestly EQUAL in energy and
+    /// far apart in peak: one diffuse decay, and one carrying half its energy
+    /// as a single direct arrival. The test asserts both halves — that the
+    /// peaks really do disagree by a lot, so the discrimination is live, and
+    /// that the reported sides do not.
+    #[test]
+    fn the_stereo_image_is_energy_and_not_the_peak_of_a_diffuse_box() {
+        let rate = 48_000.0f64;
+        let (f1, f2) = (10.0, 22_000.0f64.min(0.475 * rate));
+        let dur = 1.0f64;
+        let sweep = crate::units::sweep::ess(f1, f2, dur, rate);
+        let pre = rate as usize;
+        let tail = (2.0 * rate) as usize;
+        let frames = pre + sweep.len() + tail;
+
+        // A DIFFUSE decay: `synth_plate` plants a direct impulse at index 0,
+        // and taking it out is what makes this a plate rather than a room
+        // with a wall in it.
+        let mut diffuse = synth_plate(0.5, 1.5, rate);
+        diffuse[0] = 0.0;
+        let energy = |c: &[f32]| c.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>();
+        let e_diffuse = energy(&diffuse);
+
+        // Left: the diffuse decay. Right: the same decay at half the energy,
+        // plus a direct arrival carrying the other half. Equal totals, and
+        // the right's peak is that one sample.
+        let left_ir = diffuse.clone();
+        let mut right_ir: Vec<f32> = diffuse
+            .iter()
+            .map(|&v| v * std::f32::consts::FRAC_1_SQRT_2)
+            .collect();
+        right_ir[0] = (e_diffuse / 2.0).sqrt() as f32;
+        assert!(
+            (energy(&left_ir) / energy(&right_ir) - 1.0).abs() < 0.02,
+            "the fixture's two channels do not carry equal energy"
+        );
+
+        let wl = crate::units::sweep::fft_convolve(&sweep, &left_ir);
+        let wr = crate::units::sweep::fft_convolve(&sweep, &right_ir);
+        let norm = wl
+            .iter()
+            .chain(wr.iter())
+            .fold(0.0f32, |m, &v| m.max(v.abs()))
+            .max(1e-12);
+        let g = 10.0f32.powf(-6.0 / 20.0) / norm;
+        let mut seed = 0x0f1e_2d3c_4b5a_6978u64;
+        let mut noise = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        let floor = 10.0f32.powf(-90.0 / 20.0) * 3.0f32.sqrt();
+        let mut capture = vec![0.0f32; frames * 2];
+        for f in 0..frames {
+            let at = f.checked_sub(pre + 256);
+            let l = at.and_then(|k| wl.get(k)).copied().unwrap_or(0.0) * g;
+            let r = at.and_then(|k| wr.get(k)).copied().unwrap_or(0.0) * g;
+            capture[f * 2] = l + noise() * floor;
+            capture[f * 2 + 1] = r + noise() * floor;
+        }
+
+        let (l, r, out) =
+            super::process_ir_capture(&capture, &sweep, None, pre, rate, f1, f2, dur);
+
+        // **The discrimination is live**: the two recovered channels really
+        // do have very different peaks. Without this the assertion below
+        // could pass on a fixture that never told the two measures apart.
+        let peak_of = |c: &[f32]| c.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let (pk_l, pk_r) = (peak_of(&l), peak_of(&r));
+        let by_peak = 20.0 * (pk_l.min(pk_r) / pk_l.max(pk_r)).max(1e-30).log10();
+        assert!(
+            by_peak < -6.0,
+            "the fixture's channels are only {by_peak:.1} dB apart by peak, so this \
+             test cannot tell a peak measure from an energy one"
+        );
+
+        // And the reported image says they are level, because they are.
+        let apart = (out.side_l_db - out.side_r_db).abs();
+        assert!(
+            apart < 1.5,
+            "two channels carrying equal energy were reported {apart:.1} dB apart \
+             (left {:.2}, right {:.2}) - the side figure is following the peak of a \
+             diffuse decay, which is the largest sample of something noise-like",
+            out.side_l_db,
+            out.side_r_db
+        );
+        // The louder side reads 0.0 by construction, so the pair is readable
+        // as "this one, and that one N dB under it".
+        assert!(
+            out.side_l_db.max(out.side_r_db).abs() < 1.0e-4,
+            "neither side reads 0.0: {:.3} / {:.3}",
+            out.side_l_db,
+            out.side_r_db
+        );
+    }
 
     /// **A pre-roll that is still decaying is not a noise floor, and the road
     /// says so instead of believing it.**
