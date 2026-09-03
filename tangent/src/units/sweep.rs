@@ -95,6 +95,42 @@ pub const TAIL_FADE_S: f64 = 0.010;
 /// noise; cutting 3 dB shy keeps the last audible tail and drops the hiss.
 pub const TAIL_MARGIN_DB: f64 = 3.0;
 
+/// How much of a recovered IR's END [`tail_floor_db`] reads to find the IR's
+/// own noise floor, in seconds — and how much it reads again just before
+/// that, to prove the end IS noise.
+///
+/// Half a second, twice. Long enough that a reading taken off deconvolved
+/// hiss is steady to a couple of tenths of a dB rather than wandering with
+/// whichever crest fell inside it, and long enough that half a second of a
+/// still-running decay reads visibly quieter than the half second before it
+/// — which is the whole discrimination (see [`TAIL_FLOOR_FLAT_DB`]). Short
+/// enough that both reads plus the direct impulse fit inside anything past
+/// about a second and a bit; the wizard's TAIL row bottoms out at one
+/// second, and at that setting there is simply no floor to read and the
+/// bound the caller was handed stands alone, which is the old rule and is
+/// the right answer for a window that short.
+pub const TAIL_FLOOR_READ_S: f64 = 0.5;
+
+/// How little two adjacent [`TAIL_FLOOR_READ_S`] reads may differ before the
+/// end of a buffer counts as NOISE rather than as a decay still running, in
+/// dB.
+///
+/// **This is the entire guard on reading a floor off a buffer's own end, and
+/// without it the cure is worse than the disease.** A noise floor is
+/// stationary: two adjacent half-second reads of deconvolved hiss land
+/// within a couple of tenths of a dB of each other. A decay is not — a box
+/// whose RT60 outruns the recorded window is still falling at 60/RT60 dB per
+/// second where the reading is taken, which over half a second is 2.5 dB for
+/// a twelve-second plate. Call that a floor and the threshold lands three dB
+/// under a level the tail is still comfortably above, and the cut throws
+/// away half the window of a capture that had nothing whatever wrong with
+/// it.
+///
+/// 1.5 dB sits between the two with room on both sides, and a buffer that
+/// fails the test simply has no floor to read: the caller falls back to the
+/// bound it was handed and whatever earlier cut applied still stands.
+pub const TAIL_FLOOR_FLAT_DB: f64 = 1.5;
+
 /// The furthest under an IR's own peak [`recovered_floor_db`] will ever put
 /// the truncation threshold, in dB.
 ///
@@ -564,7 +600,20 @@ pub fn noise_floor_db(silence: &[f32]) -> f32 {
     (10.0 * ms.max(1e-30).log10()) as f32
 }
 
-/// **Where a recovered IR stops being signal, in the IR's OWN scale.**
+/// **The deepest a truncation threshold may ever sit, in the IR's OWN
+/// scale.**
+///
+/// **A BOUND, not the answer — read [`tail_floor_db`] first.** This is a
+/// figure derived from the CAPTURE, and the buffer it ends up judging is the
+/// deconvolution's, whose noise floor is its own affair. Where the two
+/// disagree the truncator takes the higher of them, because a threshold
+/// below the recovered IR's own noise is a threshold no window ever reaches
+/// and the IR then comes back the length of the whole recorded tail. What
+/// this number is still good for is the other side of that: the capture
+/// could not resolve anything below its own signal-to-noise ratio, so a
+/// measured floor further down than this line is measuring the sweep's
+/// processing gain rather than the box, and cutting there keeps seconds of
+/// detail nobody can hear.
 ///
 /// [`noise_floor_db`] reads the RECORDING, in dBFS at the converter. A
 /// deconvolution is a division, and it lands the recovered IR in a
@@ -609,6 +658,117 @@ pub fn recovered_floor_db(ir_peak: f32, capture_peak: f32, capture_floor_db: f32
     let capture_peak_db = 20.0 * f64::from(capture_peak).log10();
     let snr = (capture_peak_db - f64::from(capture_floor_db)).clamp(0.0, TAIL_RANGE_MAX_DB);
     (ir_peak_db - snr) as f32
+}
+
+/// **The recovered IR's OWN noise floor, read off the end of the buffer
+/// itself** — or `None` when the buffer has not reached one.
+///
+/// [`recovered_floor_db`] answers the question "how far down could the
+/// capture hear", which is a fact about the RECORDING. This answers "how far
+/// down does this buffer actually go", which is a fact about the buffer, and
+/// the two are not the same number: a deconvolution redistributes the loop's
+/// noise across its whole output, and adds its own — the division's
+/// regularization ringing, the classic route's linear-convolution overhang,
+/// and whatever a channel with no reference behind it turned into. The
+/// truncator needs the second number, because the level it compares against
+/// the threshold is computed from these very samples.
+///
+/// **The trap this exists to close, with its sign, because the sign is what
+/// hid it.** The capture-derived threshold is `ir_peak_db − snr`: the
+/// CLEANER the capture, the LOWER the threshold, and the lower the threshold
+/// the harder it is for any window to reach. When the recovered IR's own
+/// floor sits above that line, no window ever crosses it,
+/// [`truncate_at_floor`] takes its "the tail never reaches the floor inside
+/// this buffer" path, and the IR comes back the full length of the recorded
+/// tail — 10.000 s for a 10 s TAIL setting, every time, whatever box was in
+/// the loop. Measured on the reference road with one reference channel
+/// carrying no sweep: the dead side's division explodes, the SET's peak
+/// becomes that garbage, `ir_peak_db` goes with it, and the threshold lands
+/// about a hundred dB under the side that actually holds the measurement.
+///
+/// The reading is taken from the last [`TAIL_FLOOR_READ_S`] before the
+/// buffer's own fade — a fade is not a floor, and reading through one drags
+/// the answer down by however much of it was included — and it is only
+/// believed when the [`TAIL_FLOOR_READ_S`] before THAT reads within
+/// [`TAIL_FLOOR_FLAT_DB`] of it. See that constant for what happens without
+/// the second read: a box whose decay outruns the recorded window is still
+/// falling where the reading is taken, and calling that a floor cuts half
+/// the window off a perfectly good capture.
+///
+/// `first` is the caller's earliest legal cut — the same index its search
+/// starts at — so a buffer with no room for two reads after the direct
+/// impulse answers `None` rather than reading a "floor" off the impulse's
+/// own ringing.
+pub fn tail_floor_db(ir: &[f32], first: usize, sample_rate: f64) -> Option<f32> {
+    if sample_rate <= 0.0 {
+        return None;
+    }
+    let read = ((TAIL_FLOOR_READ_S * sample_rate).round() as usize).max(1);
+    let fade = ((TAIL_FADE_S * sample_rate).round() as usize).max(1);
+    // Back off the buffer's own fade first: it is a ramp to nothing, and
+    // averaging it in reads as a floor several dB below the real one.
+    let end = ir.len().checked_sub(fade)?;
+    let mid = end.checked_sub(read)?;
+    let start = mid.checked_sub(read)?;
+    if start < first {
+        return None;
+    }
+    let late = noise_floor_db(&ir[mid..end]);
+    let early = noise_floor_db(&ir[start..mid]);
+    // Still falling means the buffer never got to its floor, and the level
+    // out here is tail rather than noise.
+    if f64::from(early - late) > TAIL_FLOOR_FLAT_DB {
+        return None;
+    }
+    Some(late)
+}
+
+/// **How far a recorded reference pass's SWEEP stands above its own pre-roll
+/// silence, in dB: the measurement that says whether this jack carried the
+/// loop back at all.**
+///
+/// [`deconvolve_by_reference`] divides by whatever it is handed, and a
+/// reference channel with no sweep in it is a divisor of noise. The two ways
+/// that ends are both wrong and neither announces itself:
+///
+/// * **A silent channel divides to silence.** An input the interface hands
+///   back as true zeros makes the reference spectrum's power peak zero, the
+///   division bails, and that side of the IR is a buffer of zeros — a stereo
+///   file with one channel deleted, which is what "the capture is all in the
+///   left" sounds like.
+/// * **A hissing channel divides to garbage, and takes the good side with
+///   it.** Bin by bin the quotient is a real return over a noise floor, so
+///   the recovered "IR" stands about a hundred dB above the side that holds
+///   the measurement — +99.97 dB, measured on the fixture in
+///   `desktop::tests::a_true_stereo_capture_survives_a_reference_jack_that_brought_nothing_back`
+///   — and since
+///   [`normalize_set`] scales the pair by ONE peak so the stereo image
+///   survives, the good channel is normalized down into inaudibility. It
+///   poisons the truncation as well: every threshold on this road is
+///   measured under the SET's peak, and the set's peak is now the garbage.
+///
+/// Both are one fault with one cause, and the cause is not the division: it
+/// is that nobody asked whether the reference was a reference. The engine
+/// plays the SAME sample on both output jacks — the loop is one mono probe
+/// into a stereo return — so when only one jack comes back, that one is a
+/// perfectly good reference for both channels, and the caller borrows it.
+///
+/// The reading is deliberately WITHIN one channel: the sweep's own level
+/// against that same channel's pre-roll silence. A comparison ACROSS the
+/// channels would refuse an honestly trimmed loop, and a channel's absolute
+/// level says nothing at all — what says the jack carried the sweep is that
+/// the jack got loud when the sweep played and was quiet before it. The
+/// pre-roll read stops four fifths of the way in for the same reason
+/// `process_ir_capture`'s floor read does: the last stretch of it may
+/// already carry the sweep's onset through the loop's latency. A channel of
+/// digital silence reads 0 dB, because two nothings are the same nothing.
+pub fn reference_range_db(channel: &[f32], pre: usize, sweep_len: usize) -> f32 {
+    let quiet = (pre * 4) / 5;
+    let loud_end = (pre + sweep_len).min(channel.len());
+    if quiet == 0 || loud_end <= pre {
+        return 0.0;
+    }
+    noise_floor_db(&channel[pre..loud_end]) - noise_floor_db(&channel[..quiet])
 }
 
 /// **The one place an IR is shortened: cut at `cut`, and fade the last
@@ -698,30 +858,94 @@ fn fade_and_cut(ir: &mut Vec<f32>, cut: usize, earliest: usize, fade: usize) {
     if cut >= ir.len() || cut < earliest {
         return;
     }
-    for i in 0..fade {
-        // Half-cosine down over the kept region's last `fade` samples.
-        let w = 0.5 * (1.0 + (std::f64::consts::PI * (i + 1) as f64 / fade as f64).cos());
-        ir[cut - fade + i] = (f64::from(ir[cut - fade + i]) * w) as f32;
-    }
     ir.truncate(cut);
+    fade_tail(ir, fade);
+}
+
+/// The half-cosine down over a buffer's last `fade` samples, in place.
+///
+/// Split out of [`fade_and_cut`] because a buffer that is never cut still
+/// has to end somewhere: [`truncate_at_floor`] and [`truncate_set_at_floor`]
+/// fade here on the path where they find no crossing, so "the IR ends on a
+/// ramp, not on a step" is a law of the road rather than a property of
+/// having been shortened.
+fn fade_tail(ir: &mut [f32], fade: usize) {
+    let n = ir.len();
+    let fade = fade.min(n);
+    for i in 0..fade {
+        let w = 0.5 * (1.0 + (std::f64::consts::PI * (i + 1) as f64 / fade as f64).cos());
+        ir[n - fade + i] = (f64::from(ir[n - fade + i]) * w) as f32;
+    }
+}
+
+/// **The level a tail has to sink to before it is cut: the higher of what
+/// the buffer's own end says and the deepest the capture could resolve, plus
+/// [`TAIL_MARGIN_DB`].**
+///
+/// The higher, and it matters which way round. [`tail_floor_db`] is a fact
+/// about these samples and [`recovered_floor_db`] is a fact about the
+/// recording; taking the lower of them would put the threshold under the
+/// buffer's own noise, where no window ever reaches it and the IR comes back
+/// the full length of the recorded tail. Taking the higher keeps whichever
+/// of the two rules bites first — the measurement stops where the capture
+/// stopped hearing, OR where the deconvolution's own noise begins, whichever
+/// comes up first out of the decay.
+///
+/// **And the bound has to earn its vote too.** It is a level in the SET's
+/// scale, derived under the SET's peak, and it says something about THIS
+/// channel only while this channel ever stood above it. When a channel's own
+/// peak is below the bound, nothing in it was ever above the line, so the
+/// line is not this channel's floor — it is a reading off some other
+/// channel's scale, and taking the higher of the two would let that other
+/// channel decide that this one has no measurement in it. That is not a
+/// hypothetical: a reference channel with no sweep in it divides to a buffer
+/// a hundred dB up (see [`reference_range_db`]), and it takes the set's peak
+/// and the bound with it.
+///
+/// A buffer whose end is still falling has no floor to read, and a bound its
+/// own peak cannot reach has no vote; with neither, this is exactly the old
+/// rule and the number the caller handed in stands alone.
+fn tail_threshold_db(ir: &[f32], first: usize, floor_db: f32, sample_rate: f64) -> f64 {
+    let own = tail_floor_db(ir, first, sample_rate).map(f64::from);
+    let peak = ir.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    // −200 is the house reading for "no signal", the same one
+    // `noise_floor_db` and `recovered_floor_db` answer with.
+    let peak_db = if peak > 0.0 {
+        20.0 * f64::from(peak).log10()
+    } else {
+        -200.0
+    };
+    let bound = (f64::from(floor_db) < peak_db).then(|| f64::from(floor_db));
+    let floor = match (own, bound) {
+        (Some(own), Some(bound)) => own.max(bound),
+        (Some(own), None) => own,
+        (None, Some(bound)) => bound,
+        (None, None) => f64::from(floor_db),
+    };
+    floor + TAIL_MARGIN_DB
 }
 
 /// Truncate the tail where its sliding level ([`TAIL_WINDOW_S`]) sinks to
 /// within [`TAIL_MARGIN_DB`] of `floor_db`, then fade the last
 /// [`TAIL_FADE_S`] of what remains with a half-cosine.
 ///
-/// **`floor_db` is in `ir`'s OWN scale**, not the recording's. This function
-/// compares a level it computes from these very samples against the number
-/// it is handed, so the two have to be the same kind of number — pass a
-/// recording's dBFS floor and the cut is arbitrary. [`recovered_floor_db`]
-/// exists to make that translation and carries the measurements that show
-/// what the mistake costs.
+/// **`floor_db` is in `ir`'s OWN scale**, not the recording's, and it is a
+/// BOUND rather than the threshold. This function compares a level it
+/// computes from these very samples against the number it acts on, so the
+/// two have to be the same kind of number — pass a recording's dBFS floor
+/// and the cut is arbitrary. [`recovered_floor_db`] exists to make that
+/// translation and carries the measurements that show what the mistake
+/// costs; [`tail_threshold_db`] then weighs it against what this buffer's
+/// own end says, because a bound derived from the capture can sit below the
+/// deconvolution's own noise and then nothing is ever cut at all.
 ///
 /// The direct impulse is sacred: the search starts at the earliest index
 /// whose fade would still fall entirely after the peak, and the cut itself
 /// is made by [`cut_with_fade`], which refuses anything earlier. When the
 /// floor is so high (or the IR so short) that no honest cut exists, the IR
-/// is left untouched.
+/// keeps its length — but it still gets the half-cosine, because an IR that
+/// ends on a step is a step the convolver rings into everything it touches
+/// and there is no path on this road where that is acceptable.
 pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) {
     if ir.is_empty() || !floor_db.is_finite() || sample_rate <= 0.0 {
         return;
@@ -730,9 +954,10 @@ pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) {
     let fade = ((TAIL_FADE_S * sample_rate).round() as usize).max(1);
     // Earliest legal cut: the fade must live entirely after the peak.
     let first = linear_peak(ir) + 1 + fade;
-    let threshold_db = f64::from(floor_db) + TAIL_MARGIN_DB;
-    if let Some(cut) = floor_crossing(ir, first, win, threshold_db) {
-        cut_with_fade(ir, cut, sample_rate);
+    let threshold_db = tail_threshold_db(ir, first, floor_db, sample_rate);
+    match floor_crossing(ir, first, win, threshold_db) {
+        Some(cut) => cut_with_fade(ir, cut, sample_rate),
+        None => fade_tail(ir, fade),
     }
 }
 
@@ -770,11 +995,31 @@ pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) {
 /// and none of the box. [`floor_crossing`] carries the measurement and the
 /// fix: a crossing has to cross.
 ///
-/// When no channel reaches the floor the set is left alone: whatever bound
-/// the caller applied before this one still stands. That is now also the
-/// answer for a capture with no decay above its own floor at all, and
-/// [`TRUSTWORTHY_RANGE_DB`] is the level at which the app says so out loud
-/// rather than handing back a long IR of a bad capture in silence.
+/// **The THRESHOLD, though, is each channel's own** — one cut, but not one
+/// number to find it with, and this is the half that shipped broken.
+///
+/// `floor_db` is a bound derived from the capture and applied under the
+/// SET's peak, which is fine right up until one channel is not a
+/// measurement. A reference channel with no sweep in it divides to garbage a
+/// hundred dB above the side that holds the box (see
+/// [`reference_range_db`]); the set's peak becomes that garbage, `floor_db`
+/// is measured under it, and the real channel's entire decay then sits below
+/// a threshold it is supposed to sink THROUGH. Nothing votes, nothing is
+/// cut, and a 10 s TAIL setting hands back a 10.000 s "IR" — measured, on
+/// exactly that fixture. Reading each channel's floor off its own end
+/// ([`tail_floor_db`], weighed against the bound by [`tail_threshold_db`])
+/// takes the decision away from the other channel's scale, and it makes the
+/// rule above self-enforcing rather than lucky: a side of stationary hiss
+/// measures its own level as its own floor, so it never stands above its own
+/// threshold, so it never votes.
+///
+/// When no channel reaches its floor the set keeps its length: whatever
+/// bound the caller applied before this one still stands. It does not keep
+/// its ENDING, though — every channel gets the half-cosine here too, so the
+/// path that declines to cut leaves an IR that ends on a ramp like every
+/// other path. That is a law about IRs, not about truncations.
+/// [`TRUSTWORTHY_RANGE_DB`] is the level at which the app says a capture is
+/// poor out loud rather than handing back a long IR in silence.
 pub fn truncate_set_at_floor(irs: &mut [Vec<f32>], floor_db: f32, sample_rate: f64) {
     if irs.is_empty() || !floor_db.is_finite() || sample_rate <= 0.0 {
         return;
@@ -784,13 +1029,20 @@ pub fn truncate_set_at_floor(irs: &mut [Vec<f32>], floor_db: f32, sample_rate: f
     // The clamp is the SET's, so every channel searches from the same index
     // and the direct impulse is sacred for the pair rather than per channel.
     let first = set_peak(irs).0 + 1 + fade;
-    let threshold_db = f64::from(floor_db) + TAIL_MARGIN_DB;
     let cut = irs
         .iter()
-        .filter_map(|ir| floor_crossing(ir, first, win, threshold_db))
+        .filter_map(|ir| {
+            let threshold_db = tail_threshold_db(ir, first, floor_db, sample_rate);
+            floor_crossing(ir, first, win, threshold_db)
+        })
         .max();
-    if let Some(cut) = cut {
-        cut_set_with_fade(irs, cut, sample_rate);
+    match cut {
+        Some(cut) => cut_set_with_fade(irs, cut, sample_rate),
+        None => {
+            for ir in irs.iter_mut() {
+                fade_tail(ir, fade);
+            }
+        }
     }
 }
 
@@ -1547,5 +1799,332 @@ mod tests {
         trim_leading(&mut ir, onset);
         assert_eq!(linear_peak(&ir), 0);
         assert_eq!(ir.len(), 700);
+    }
+
+    /// A decaying tail sitting on a flat noise floor, in one buffer: an
+    /// impulse at `peak_at`, an exponential decay with time constant `tau`,
+    /// and stationary noise `floor_db` under the impulse underneath the
+    /// whole thing. The shape every recovered IR has, in miniature and
+    /// without a deconvolution in the way.
+    fn decay_over_floor(
+        len: usize,
+        peak_at: usize,
+        tau_s: f64,
+        floor_db: f64,
+        rate: f64,
+        seed: &mut u64,
+    ) -> Vec<f32> {
+        let amp = 10.0f64.powf(floor_db / 20.0) * 3.0f64.sqrt();
+        let mut ir = vec![0.0f32; len];
+        for (i, v) in ir.iter_mut().enumerate() {
+            *v = (f64::from(lcg(seed)) * amp) as f32;
+        }
+        ir[peak_at] = 1.0;
+        for i in peak_at + 1..len {
+            let t = (i - peak_at) as f64 / rate;
+            ir[i] += (f64::from(lcg(seed)) * 0.5 * (-t / tau_s).exp()) as f32;
+        }
+        ir
+    }
+
+    /// **A tail that never reaches the floor it was HANDED is still cut, at
+    /// the floor it actually has.**
+    ///
+    /// The long-IR report, in one buffer. [`recovered_floor_db`] answers
+    /// "how far down could the capture hear" — a fact about the RECORDING —
+    /// and the truncator then compares it against levels computed from the
+    /// deconvolution's buffer, which has a noise floor of its own and not
+    /// the recording's. Note the SIGN of the trap, because it is what kept
+    /// it hidden: the derived threshold is `ir_peak_db − snr`, so the
+    /// CLEANER the capture the LOWER the threshold and the harder it is for
+    /// any window to reach. A pristine loop therefore produced the longest
+    /// IRs — the whole recorded tail, every time, whatever was in the loop —
+    /// which reads as "is every IR supposed to come out the length of the
+    /// TAIL row" and not as a truncation bug at all.
+    ///
+    /// Here the buffer's own floor is 60 dB under its peak and the handed
+    /// bound is 95 dB under it: 35 dB out of reach. Before, nothing was cut
+    /// and the full two seconds came back. Now the cut lands where the decay
+    /// meets the floor the buffer actually has, and the bound still does its
+    /// own job — it is a bound, so it is taken when it is the HIGHER of the
+    /// two, and a bound above the buffer's floor cuts earlier.
+    #[test]
+    fn a_tail_that_never_reaches_the_handed_floor_is_cut_at_the_one_it_has() {
+        let sr = 48_000.0f64;
+        let len = (2.0 * sr) as usize;
+        let mut seed = 11u64;
+        let ir = decay_over_floor(len, 100, 0.12, -60.0, sr, &mut seed);
+        // Where the decay honestly meets that floor: the envelope is
+        // 0.5·e^(−t/τ) against an RMS 60 dB down, so it crosses at
+        // τ·ln(0.5/10^(−3)) ≈ 0.75 s. The cut has to land near there and
+        // nowhere near the end of the buffer.
+        let mut cut = ir.clone();
+        truncate_at_floor(&mut cut, -95.0, sr);
+        assert!(
+            cut.len() < len,
+            "a tail on a −60 dB floor was handed a −95 dB bound and never cut: \
+             {} samples of {len}",
+            cut.len()
+        );
+        let at = cut.len() as f64 / sr;
+        assert!(
+            (0.5..1.1).contains(&at),
+            "the cut landed at {at:.3} s, nowhere near where a −60 dB floor \
+             meets a 0.12 s decay"
+        );
+        // The impulse is untouched, as it is on every path here.
+        assert_eq!(cut[100], 1.0, "the cut scaled the direct impulse");
+
+        // And the handed bound is still a bound. Above the buffer's own
+        // floor it is the one that bites, and it bites EARLIER — the
+        // capture could not resolve past it, so there is nothing down there
+        // worth keeping.
+        let mut higher = ir.clone();
+        truncate_at_floor(&mut higher, -40.0, sr);
+        assert!(
+            higher.len() < cut.len(),
+            "a −40 dB bound kept {} samples against the −95 dB bound's {} — \
+             the higher of the two floors is supposed to win",
+            higher.len(),
+            cut.len()
+        );
+    }
+
+    /// **A buffer still falling at its end has no floor to read, and is left
+    /// at the length whatever ran before this decided.**
+    ///
+    /// The guard on the fix above, and without it the cure is worse than the
+    /// disease. Reading a "floor" off the last stretch of a box whose decay
+    /// outruns the recorded window reads the TAIL, not the noise, and a
+    /// threshold three dB under a level the tail is still comfortably above
+    /// cuts a large fraction of a perfectly good capture off the end.
+    ///
+    /// [`TAIL_FLOOR_FLAT_DB`] is what separates them, and it separates them
+    /// on the one property that actually differs: noise is stationary and a
+    /// decay is not. Here a twelve-second decay in a one-second buffer is
+    /// still falling by about 5 dB a second where the reading is taken —
+    /// two adjacent half-second reads land 2.5 dB apart — while the same
+    /// buffer's noise floor would read the same twice.
+    #[test]
+    fn a_buffer_still_decaying_at_its_end_is_not_cut_at_its_own_last_level() {
+        let sr = 48_000.0f64;
+        let len = (1.4 * sr) as usize;
+        let mut seed = 23u64;
+        // RT60 12 s is τ ≈ 1.74 s: a decay that has barely started when the
+        // buffer runs out, over a floor far below anything here.
+        let ir = decay_over_floor(len, 100, 1.74, -120.0, sr, &mut seed);
+        let mut kept = ir.clone();
+        truncate_at_floor(&mut kept, -95.0, sr);
+        assert_eq!(
+            kept.len(),
+            len,
+            "a decay that never reached a floor was cut at {:.3} s anyway",
+            kept.len() as f64 / sr
+        );
+        // The reading itself refuses, rather than the crossing happening to
+        // miss — that is the rule, said in the one place it is decided.
+        let first = linear_peak(&ir) + 1 + (TAIL_FADE_S * sr) as usize;
+        assert!(
+            tail_floor_db(&ir, first, sr).is_none(),
+            "a buffer falling 2.5 dB across the two reads was called flat"
+        );
+        // And a buffer whose end IS flat answers with that level.
+        let mut settled = ir.clone();
+        let from = len - (1.1 * TAIL_FLOOR_READ_S * sr) as usize * 2;
+        let mut noise = 101u64;
+        for v in settled[from..].iter_mut() {
+            *v = lcg(&mut noise) * 1.0e-3;
+        }
+        let read = tail_floor_db(&settled, first, sr)
+            .expect("a flat end was not recognized as a floor");
+        assert!(
+            (f64::from(read) - (-65.2)).abs() < 2.0,
+            "a −65 dB flat end read {read} dB"
+        );
+    }
+
+    /// **An IR that is not cut still ends on a ramp.**
+    ///
+    /// The fade used to live only on the path that found a crossing, so the
+    /// capture road's clean captures — where nothing crosses and the window
+    /// is the binding cut — ended at full tail level. [`cut_with_fade`] took
+    /// that half of the fault; this is the other half, on the truncator's
+    /// own early return. A convolver rings a step into everything it
+    /// touches, and "it was not shortened" is not a reason to hand it one.
+    #[test]
+    fn a_truncation_that_declines_to_cut_still_fades_what_it_leaves() {
+        let sr = 48_000.0f64;
+        let fade = (TAIL_FADE_S * sr) as usize;
+        let len = (1.4 * sr) as usize;
+        let mut seed = 31u64;
+        // The same never-reaches-its-floor buffer as above: nothing crosses,
+        // so nothing is cut, so the fade is the only thing that can happen.
+        let ir = decay_over_floor(len, 100, 1.74, -120.0, sr, &mut seed);
+        let ms = |w: &[f32]| {
+            w.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / w.len().max(1) as f64
+        };
+        let before_uncut = ms(&ir[len - fade..]);
+
+        let mut left = ir.clone();
+        truncate_at_floor(&mut left, -95.0, sr);
+        assert_eq!(left.len(), len, "this fixture is supposed not to be cut");
+        assert!(
+            ms(&left[len - fade..]) < 0.6 * before_uncut,
+            "the un-cut IR ends at {:.3e} against the {:.3e} it carried — \
+             unfaded",
+            ms(&left[len - fade..]),
+            before_uncut
+        );
+        // Everything before the fade is bit-identical: declining to cut is
+        // not a licence to touch the measurement.
+        assert_eq!(
+            &left[..len - fade],
+            &ir[..len - fade],
+            "the fade reached back past its own last {fade} samples"
+        );
+        // The set spelling too, and on both channels.
+        let mut set = [ir.clone(), ir.clone()];
+        truncate_set_at_floor(&mut set, -95.0, sr);
+        for (i, ch) in set.iter().enumerate() {
+            assert_eq!(ch.len(), len, "channel {i} was cut");
+            assert!(
+                ms(&ch[len - fade..]) < 0.6 * before_uncut,
+                "channel {i} of an un-cut set was left ending at tail level"
+            );
+        }
+    }
+
+    /// **One channel's scale cannot decide where the OTHER channel's
+    /// measurement ends.**
+    ///
+    /// The set-level half of the long-IR fault, and the mechanism the
+    /// capture road actually hit. Every threshold on this road used to be
+    /// measured under the SET's peak — right, while both channels are
+    /// measurements. A reference channel with no sweep in it is not one:
+    /// [`reference_range_db`] carries what the division does with it, which
+    /// is a buffer a hundred dB above the side that holds the box. The set's
+    /// peak becomes that garbage, the derived bound is measured under it,
+    /// and the real channel's entire decay then sits BELOW a threshold it is
+    /// supposed to sink through. Nothing votes, nothing is cut, and the pair
+    /// comes back the full length of the recorded tail.
+    ///
+    /// Each channel reading its own floor off its own end takes the decision
+    /// away from the other channel's scale — and it makes the older rule
+    /// self-enforcing rather than lucky, because the garbage channel now
+    /// measures its own level as its own floor and so never stands above its
+    /// own threshold, and so never votes.
+    #[test]
+    fn a_channel_a_hundred_db_up_does_not_hold_the_pair_open() {
+        let sr = 48_000.0f64;
+        let len = (2.0 * sr) as usize;
+        let mut seed = 47u64;
+        let real = decay_over_floor(len, 100, 0.12, -60.0, sr, &mut seed);
+        // What the division hands back for a channel it had no reference
+        // for: stationary, and five orders of magnitude up — with its
+        // largest excursion near the FRONT, which is where the
+        // regularization actually concentrates a noise channel's crest
+        // (twelve seeds of it, in [`cut_set_with_fade`]). That detail is not
+        // decoration: the clamp every channel searches from is read off the
+        // SET's peak, so a crest parked late would put the earliest legal
+        // cut past the real channel's whole decay and no cut would be
+        // possible at all — correctly, since the impulse is sacred. What
+        // this fixture isolates is the THRESHOLD, which is the part that was
+        // wrong.
+        let mut garbage = vec![0.0f32; len];
+        for v in garbage.iter_mut() {
+            *v = lcg(&mut seed) * 1.0e5;
+        }
+        garbage[3] = 2.0e5;
+        // The bound exactly as the capture road computes it: the SET's peak,
+        // minus everything the capture could resolve.
+        let set_peak_db = 20.0 * f64::from(garbage.iter().fold(0.0f32, |m, &v| m.max(v.abs())))
+            .log10();
+        let bound = (set_peak_db - TAIL_RANGE_MAX_DB) as f32;
+
+        let mut set = [real.clone(), garbage.clone()];
+        truncate_set_at_floor(&mut set, bound, sr);
+        assert!(
+            set[0].len() < len,
+            "the pair came back {} samples of {len} — the dead side's scale \
+             held the measurement open",
+            set[0].len()
+        );
+        assert_eq!(set[0].len(), set[1].len(), "the pair was cut apart");
+        let at = set[0].len() as f64 / sr;
+        assert!(
+            (0.5..1.1).contains(&at),
+            "the cut landed at {at:.3} s rather than where the real channel's \
+             decay meets its own floor"
+        );
+        // And the same pair without the garbage cuts in the same place, to
+        // within a window: the dead side buys nothing and costs nothing.
+        let mut alone = [real.clone(), real];
+        truncate_set_at_floor(&mut alone, bound, sr);
+        let win = (TAIL_WINDOW_S * sr) as usize;
+        assert!(
+            set[0].len().abs_diff(alone[0].len()) <= win,
+            "with the dead side the cut is {} and without it {}",
+            set[0].len(),
+            alone[0].len()
+        );
+    }
+
+    /// **A reference channel with no sweep in it reads as no reference.**
+    ///
+    /// [`deconvolve_by_reference`] divides by whatever it is handed, so the
+    /// one thing nobody may skip is asking whether the thing being divided
+    /// by is a reference at all. The reading is deliberately WITHIN each
+    /// channel — the sweep's own level against that same channel's pre-roll
+    /// silence — because a comparison across the channels would refuse an
+    /// honestly trimmed loop, and an absolute level says nothing.
+    ///
+    /// Three ways a jack comes back with nothing on it, and all three have
+    /// to fall under [`TRUSTWORTHY_RANGE_DB`] while a real loop clears it by
+    /// tens of dB.
+    #[test]
+    fn a_reference_channel_that_never_got_loud_is_not_a_reference() {
+        let sr = 48_000.0f64;
+        let (f1, f2) = (20.0, 20_000.0);
+        let pre = sr as usize;
+        let sweep = ess(f1, f2, 1.0, sr);
+        let tail = (sr * 0.5) as usize;
+        let total = pre + sweep.len() + tail;
+        let mut seed = 53u64;
+        let mut live = vec![0.0f32; total];
+        for (i, v) in live.iter_mut().enumerate() {
+            *v = lcg(&mut seed) * 1.0e-4;
+            if let Some(&s) = i.checked_sub(pre).and_then(|k| sweep.get(k)) {
+                *v += s * 0.5;
+            }
+        }
+        let range = reference_range_db(&live, pre, sweep.len());
+        assert!(
+            range > TRUSTWORTHY_RANGE_DB,
+            "a real loop pass read only {range} dB of range"
+        );
+
+        let silent = vec![0.0f32; total];
+        assert!(
+            reference_range_db(&silent, pre, sweep.len()) < TRUSTWORTHY_RANGE_DB,
+            "a jack of digital silence passed as a reference"
+        );
+        let mut hiss = vec![0.0f32; total];
+        for v in hiss.iter_mut() {
+            *v = lcg(&mut seed) * 1.0e-4;
+        }
+        assert!(
+            reference_range_db(&hiss, pre, sweep.len()) < TRUSTWORTHY_RANGE_DB,
+            "a jack of converter hiss passed as a reference"
+        );
+        // A quiet but real loop still clears it: the line is about whether
+        // the sweep arrived, not about how hot it was.
+        let quiet: Vec<f32> = live.iter().map(|&v| v * 0.01).collect();
+        assert!(
+            reference_range_db(&quiet, pre, sweep.len()) > TRUSTWORTHY_RANGE_DB,
+            "a loop 40 dB down was refused for being quiet"
+        );
+        // Nothing to read is not a reference either, rather than a panic.
+        assert_eq!(reference_range_db(&live, 0, sweep.len()), 0.0);
+        assert_eq!(reference_range_db(&live, total, sweep.len()), 0.0);
     }
 }
