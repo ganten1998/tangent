@@ -601,15 +601,61 @@ pub fn recovered_floor_db(ir_peak: f32, capture_peak: f32, capture_floor_db: f32
 /// never searched below that index); it is stated here so the window cut
 /// inherits it rather than having to remember it. A cut at or past the end
 /// is likewise nothing to do.
+///
+/// The clamp reads THIS buffer's peak, which is the right reading for one
+/// channel standing alone. A stereo pair is not that: see
+/// [`cut_set_with_fade`], which is what the capture road uses and why.
 pub fn cut_with_fade(ir: &mut Vec<f32>, cut: usize, sample_rate: f64) {
-    let len = ir.len();
-    if len == 0 || sample_rate <= 0.0 || cut >= len {
+    if sample_rate <= 0.0 {
         return;
     }
     let fade = ((TAIL_FADE_S * sample_rate).round() as usize).max(1);
-    // The impulse clamp. Below this there is no honest cut, and a
-    // truncation that would eat the impulse is not a truncation.
-    if cut < linear_peak(ir) + 1 + fade {
+    fade_and_cut(ir, cut, linear_peak(ir) + 1 + fade, fade);
+}
+
+/// **[`cut_with_fade`] for a whole SET: one cut index, one clamp, read off
+/// the set's own peak and applied to every channel.**
+///
+/// The pair is ONE measurement, so it gets ONE cut — the rule [`set_onset`]
+/// and [`normalize_set`] already follow, stated here for the truncations
+/// too. Cutting the channels separately breaks it two ways, and both were
+/// measured on a mono box patched into one side of the loop.
+///
+/// The clamp is the loud one. `cut_with_fade` refuses any cut earlier than
+/// its OWN buffer's `peak + 1 + fade`, and a channel carrying nothing but
+/// converter hiss has its "peak" wherever the noise happened to crest —
+/// four hundred thousand samples in, on the capture measured here. The
+/// window cut, the binding one on any clean capture, then landed BEFORE
+/// that index and was refused outright: that channel kept the entire
+/// deconvolution buffer, un-faded, ending on a hard step at full noise
+/// level. Reading the clamp off the SET's peak — the direct impulse, which
+/// is what the clamp was always about — means a dead channel cannot defeat
+/// a bound that has nothing to do with it.
+///
+/// And the LENGTH. With the channels cut apart, the capture road's
+/// `resize` to the longer of them pads the good channel out to match the
+/// bad one: the same mono box, reference route, came back 480,000 samples
+/// (the full 10 s window) where the identical capture with a live right
+/// return gave 71,690 (1.494 s) — a 6.7× IR of a 1.5 s plate, and the
+/// convolver pays for every partition of it every block, forever. One cut
+/// makes the lengths equal by construction.
+pub fn cut_set_with_fade(irs: &mut [Vec<f32>], cut: usize, sample_rate: f64) {
+    if sample_rate <= 0.0 {
+        return;
+    }
+    let fade = ((TAIL_FADE_S * sample_rate).round() as usize).max(1);
+    let earliest = set_peak(irs).0 + 1 + fade;
+    for ir in irs.iter_mut() {
+        fade_and_cut(ir, cut, earliest, fade);
+    }
+}
+
+/// The cut itself, with the earliest legal index and the fade length handed
+/// in — shared so the single-channel and set-wide spellings above differ
+/// only in where the clamp comes from, which is the whole of the argument
+/// between them.
+fn fade_and_cut(ir: &mut Vec<f32>, cut: usize, earliest: usize, fade: usize) {
+    if cut >= ir.len() || cut < earliest {
         return;
     }
     for i in 0..fade {
@@ -637,35 +683,113 @@ pub fn cut_with_fade(ir: &mut Vec<f32>, cut: usize, sample_rate: f64) {
 /// floor is so high (or the IR so short) that no honest cut exists, the IR
 /// is left untouched.
 pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) {
-    let len = ir.len();
-    if len == 0 || !floor_db.is_finite() || sample_rate <= 0.0 {
+    if ir.is_empty() || !floor_db.is_finite() || sample_rate <= 0.0 {
         return;
     }
-    let peak = linear_peak(ir);
     let win = ((TAIL_WINDOW_S * sample_rate).round() as usize).max(1);
     let fade = ((TAIL_FADE_S * sample_rate).round() as usize).max(1);
-    // Prefix sums of squares, so each window is O(1) to read.
+    // Earliest legal cut: the fade must live entirely after the peak.
+    let first = linear_peak(ir) + 1 + fade;
+    let threshold_db = f64::from(floor_db) + TAIL_MARGIN_DB;
+    if let Some(cut) = floor_crossing(ir, first, win, threshold_db) {
+        cut_with_fade(ir, cut, sample_rate);
+    }
+}
+
+/// **[`truncate_at_floor`] for a whole SET: one cut, at the LATEST index
+/// any channel that actually reaches the floor asks for.**
+///
+/// The pair is one measurement and gets one cut, made by
+/// [`cut_set_with_fade`], which carries what truncating the channels apart
+/// cost. This is the other half: which channel decides where.
+///
+/// **A channel that never sinks to the floor has no measurement in it, and
+/// does not get to say when the measurement ends.** That sounds like a
+/// technicality and it is the whole bug. A return carrying nothing but
+/// converter hiss deconvolves to a level that simply sits there — stationary
+/// noise does not decay — so its sliding window never crosses the threshold
+/// at any length, and it kept the full window while the good channel was
+/// cut at 1.56 s. Reading the level off the set's envelope instead of per
+/// channel does NOT fix that, and the bench says why: on the reference
+/// route the division hands a noise channel back at roughly the capture's
+/// own signal-to-noise ratio under the peak, with none of the matched
+/// filter's processing gain, which lands it right AT the threshold rather
+/// than the tens of dB below it that [`recovered_floor_db`] assumes. So it
+/// holds any envelope open forever. Ignoring the channels that never cross,
+/// and taking the LATEST of the ones that do, keeps a genuinely longer tail
+/// on either side of a true-stereo pair and gives a dead return no vote at
+/// all.
+///
+/// When no channel reaches the floor the set is left alone: whatever bound
+/// the caller applied before this one still stands.
+pub fn truncate_set_at_floor(irs: &mut [Vec<f32>], floor_db: f32, sample_rate: f64) {
+    if irs.is_empty() || !floor_db.is_finite() || sample_rate <= 0.0 {
+        return;
+    }
+    let win = ((TAIL_WINDOW_S * sample_rate).round() as usize).max(1);
+    let fade = ((TAIL_FADE_S * sample_rate).round() as usize).max(1);
+    // The clamp is the SET's, so every channel searches from the same index
+    // and the direct impulse is sacred for the pair rather than per channel.
+    let first = set_peak(irs).0 + 1 + fade;
+    let threshold_db = f64::from(floor_db) + TAIL_MARGIN_DB;
+    let cut = irs
+        .iter()
+        .filter_map(|ir| floor_crossing(ir, first, win, threshold_db))
+        .max();
+    if let Some(cut) = cut {
+        cut_set_with_fade(irs, cut, sample_rate);
+    }
+}
+
+/// The first index at or after `first` whose `win`-long window reads at or
+/// below `threshold_db`, or `None` when the level never gets there inside
+/// this buffer. Prefix sums of squares, so each window is O(1) to read.
+fn floor_crossing(level: &[f32], first: usize, win: usize, threshold_db: f64) -> Option<usize> {
+    let len = level.len();
     let mut prefix = vec![0.0f64; len + 1];
-    for (i, &v) in ir.iter().enumerate() {
+    for (i, &v) in level.iter().enumerate() {
         prefix[i + 1] = prefix[i] + f64::from(v) * f64::from(v);
     }
-    let threshold_db = f64::from(floor_db) + TAIL_MARGIN_DB;
-    // Earliest legal cut: the fade must live entirely after the peak.
-    let first = peak + 1 + fade;
-    let mut cut = None;
     let mut start = first;
     while start + win <= len {
         let ms = (prefix[start + win] - prefix[start]) / win as f64;
         if 10.0 * ms.max(1e-30).log10() <= threshold_db {
-            cut = Some(start);
-            break;
+            return Some(start);
         }
         start += 1;
     }
-    let Some(cut) = cut else {
-        return; // The tail never reaches the floor inside this buffer.
-    };
-    cut_with_fade(ir, cut, sample_rate);
+    None
+}
+
+/// The set's envelope: the largest magnitude any channel carries at each
+/// sample, over the longest channel's length. The pair read as ONE signal,
+/// which is what [`set_onset`] needs — a lead-in that ends when nothing at
+/// all is still arriving, rather than when each channel separately says so.
+fn set_envelope<S: AsRef<[f32]>>(channels: &[S]) -> Vec<f32> {
+    let len = channels.iter().map(|c| c.as_ref().len()).max().unwrap_or(0);
+    let mut env = vec![0.0f32; len];
+    for c in channels {
+        for (d, &s) in env.iter_mut().zip(c.as_ref()) {
+            *d = d.max(s.abs());
+        }
+    }
+    env
+}
+
+/// Where the loudest sample in the whole set is, and how loud: `(index,
+/// magnitude)`, `(0, 0.0)` for a set with nothing in it.
+fn set_peak<S: AsRef<[f32]>>(channels: &[S]) -> (usize, f32) {
+    let mut at = 0usize;
+    let mut best = 0.0f32;
+    for c in channels {
+        for (i, &v) in c.as_ref().iter().enumerate() {
+            if v.abs() > best {
+                best = v.abs();
+                at = i;
+            }
+        }
+    }
+    (at, best)
 }
 
 /// The foot of the direct impulse: walking left from the peak, the first
@@ -700,27 +824,36 @@ pub fn find_onset(ir: &[f32]) -> usize {
 /// bound measured from the front — the capture window, the tail — is
 /// measured from the wrong place.
 ///
-/// So only channels that actually CARRY the capture get a vote: within
-/// [`ONSET_FLOOR_DB`] of the set's own peak, the same −40 dB line
-/// `find_onset` uses to decide what still counts as the impulse. Among
-/// those the earliest onset still wins, because a true-stereo pair can
-/// genuinely have its arrivals a few samples apart and clipping the earlier
-/// one would be the very damage this is here to avoid.
+/// **Letting only the channels that CARRY the capture vote does not fix it,
+/// because whether a noise channel clears the line is a question about how
+/// LONG the buffer is.** That was the first repair — a channel votes if any
+/// sample of it comes within [`ONSET_FLOOR_DB`] of the set's peak — and the
+/// bench measured what it is worth. A right return carrying nothing but
+/// −40 dBFS converter hiss deconvolves to a peak −39.1 dB under the left
+/// channel's impulse, which is INSIDE the −40 dB line, while its RMS sits
+/// −55.1 dB under it: the peak of a two-million-sample noise buffer stands
+/// about 16 dB above its own RMS, and it climbs with the buffer, so the
+/// longer the sweep the more certainly hiss buys a vote. It won the
+/// minimum, and the trim landed 455,466 samples — 9.5 seconds — early. The
+/// direct impulse came back 67,517 samples into the shipped IR instead of
+/// at its front: not a short IR, a destroyed one, and a threshold test on a
+/// single sample of a multi-million-sample buffer is a coin flip that noise
+/// eventually wins.
+///
+/// So the onset is read off the set's ENVELOPE, the largest magnitude any
+/// channel carries at each sample, walked by the same [`find_onset`]. The
+/// walk starts at the SET's peak — the direct impulse, wherever it lives —
+/// and stops at the first sample where NO channel is still within
+/// [`ONSET_FLOOR_DB`] of it. A lucky noise sample four hundred thousand
+/// samples away is not on the path and cannot be reached; only a contiguous
+/// run above the line holds the walk open, and stationary hiss 55 dB down
+/// does not make one. A true-stereo pair whose arrivals are a few samples
+/// apart still keeps the earlier one, because the earlier arrival lifts the
+/// envelope and the walk simply continues through it — which is the case
+/// this rule exists to protect, and the reason the answer is not just
+/// `find_onset` of the loudest channel.
 pub fn set_onset(channels: &[&[f32]]) -> usize {
-    let peak = channels
-        .iter()
-        .flat_map(|c| c.iter())
-        .fold(0.0f32, |m, &v| m.max(v.abs()));
-    if peak <= 0.0 {
-        return 0;
-    }
-    let floor = f64::from(peak) * 10.0f64.powf(ONSET_FLOOR_DB / 20.0);
-    channels
-        .iter()
-        .filter(|c| c.iter().any(|&v| f64::from(v.abs()) >= floor))
-        .map(|c| find_onset(c))
-        .min()
-        .unwrap_or(0)
+    find_onset(&set_envelope(channels))
 }
 
 /// Drop `direct` whole samples of lead-in so the direct impulse sits at
@@ -1228,6 +1361,31 @@ mod tests {
             at - 30,
             "a true-stereo pair lost its leading arrival"
         );
+
+        // **And the vote that a level test cannot win.** The first repair
+        // let a channel vote if any sample of it came within −40 dB of the
+        // set's peak, which is a question about how LONG the buffer is: a
+        // noise channel's peak stands well above its own RMS and climbs
+        // with the sample count, so on a real capture (two million samples,
+        // hiss at −40 dBFS) it read −39.1 dB against the impulse and
+        // cleared the line. Here is that channel in miniature — its RMS is
+        // 54 dB down, its loudest sample is only 34 dB down, and it is
+        // early. Reading the onset off the set's envelope makes the lucky
+        // sample irrelevant: it is nowhere near the peak the walk starts
+        // from, and stationary noise 54 dB down makes no contiguous run
+        // above the line to hold the walk open.
+        let mut lucky = hiss.clone();
+        lucky[7] = 2.0e-2;
+        assert!(
+            lucky.iter().any(|&v| f64::from(v.abs()) >= 1.0e-2),
+            "the fixture's crest was supposed to clear the −40 dB line"
+        );
+        assert_eq!(
+            set_onset(&[&live, &lucky]),
+            at,
+            "one lucky noise sample decided where the impulse starts"
+        );
+
         // Nothing anywhere is 0, not a panic.
         assert_eq!(set_onset(&[&dead, &dead]), 0);
         assert_eq!(set_onset(&[]), 0);
