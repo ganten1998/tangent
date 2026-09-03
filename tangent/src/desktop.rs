@@ -312,15 +312,19 @@ struct Recorder {
     /// `reconcile_audio` will settle to "missing" and say so.
     rate_open: Option<u32>,
     system_open: Option<String>,
-    /// **What "Default" resolved to**, cached for this driver stack.
+    /// **The watch that keeps the interface in charge of its own rate.**
     ///
-    /// `None` is "not asked yet"; `Some(None)` is "asked, and this machine has
-    /// no output to ask" — a distinction that matters because this is read
-    /// from the per-frame path check, and collapsing the two would re-probe
-    /// the audio device sixty times a second on a machine with no sound.
-    /// Thrown away whenever the audio system changes underneath it.
-    /// See `Engine::default_output_rate` for why Default must resolve at all.
-    default_rate: Option<Option<u32>>,
+    /// See [`RateWatch`]. Held here rather than beside `rate_open` because
+    /// the two answer opposite questions: `rate_open` is what TANGENT last
+    /// asked for, and this is what the DEVICE was last seen doing.
+    rate_watch: RateWatch,
+    /// When the device was last asked what rate it is really running at.
+    ///
+    /// A timer and not a per-frame ask: reading it goes out to CoreAudio (or
+    /// the platform's equivalent) and the frame rate is sixty. Once a second
+    /// is far inside the several seconds an interface takes to re-sync, which
+    /// is the event this is watching for.
+    rate_asked: Option<std::time::Instant>,
     /// Dropouts already reported, so only the new ones are announced.
     xruns_seen: u64,
     /// The graph's own count of this process's xruns, watched on a timer.
@@ -1591,6 +1595,95 @@ const ENGINE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis
 #[cfg(feature = "recorder")]
 const ENGINE_TRIES: u8 = 5;
 
+/// **How often the open device is asked what rate it is ACTUALLY running at**,
+/// and how many polls in a row have to say "moved" before the path reopens.
+///
+/// A second between asks and three of them, so an interface has three seconds
+/// of "Syncing" to settle in before Tangent believes it. The Scarlett spends
+/// about two of those re-locking its clock, and during them it will report a
+/// rate that is neither the old one nor the new one — reopening on the first
+/// disagreement would catch it mid-stride and reopen again a moment later.
+#[cfg(feature = "recorder")]
+const RATE_ASK_EVERY: std::time::Duration = std::time::Duration::from_millis(1_000);
+#[cfg(feature = "recorder")]
+const RATE_DRIFT_POLLS: u8 = 3;
+
+/// **The interface is allowed to be the one in charge of its own rate.**
+///
+/// The owner's report is the whole specification: "Tangent does not comply
+/// with a change in buffer-size from within it, Focusrite Control 2 only lets
+/// me change the SAMPLE RATE. If I switch to FC2 and change the sample rate to
+/// 44100 I get a period of 'Syncing' and a reconnect — STUCK AT 48000 no
+/// matter what. Quit Tangent after that sequence, and FC2 changes to 44100 no
+/// problem whatsoever."
+///
+/// Two separate faults produced that, and this type answers the second.
+///
+/// The first was that Tangent ASKED. `effective_sample_rate` used to resolve
+/// the "Device" setting to a number — the number the device happened to be
+/// running when Tangent started — cache it for the life of the driver stack,
+/// and hand it to both halves of the audio path. cpal's CoreAudio input
+/// builder does not treat a rate as a preference: it SETS
+/// `kAudioDevicePropertyNominalSampleRate` and then blocks until the device
+/// confirms the change. So every reopen of the input dragged the interface
+/// back to whatever it had been at launch, which is exactly the "Syncing,
+/// then stuck" the owner watched. That fault is fixed by not asking: see
+/// `Chrome::engine_rate`.
+///
+/// The second is subtler and was the one visible in the reproduction on the
+/// owner's own 18i20. Not asking is not the same as noticing. The OUTPUT
+/// builder never touches the device's nominal rate — it sets the audio unit's
+/// stream format and lets CoreAudio convert — so a device that moves out from
+/// under a running engine leaves the engine still believing the old number,
+/// silently sample-rate-converted, and every quantity derived from that number
+/// is wrong by the ratio between them: the tempo, the latency arithmetic, the
+/// sweep, the IR wizard's entire measurement. Tangent would keep making sound
+/// and keep being wrong, which is worse than stopping.
+///
+/// So the device is asked, on a timer, what it is really doing, and the answer
+/// is compared with what the engine opened at. Disagreement for
+/// [`RATE_DRIFT_POLLS`] polls running reopens the path — and the reopen asks
+/// for whatever the setting says NOW, which is "nothing" under Device (so it
+/// follows the interface) and the chosen number when somebody chose one (so it
+/// reasserts it, because that is what choosing means).
+///
+/// Compared against the ENGINE's rate rather than the setting, which is what
+/// stops the reopen storm: a device that cannot reach the chosen rate opens at
+/// the nearest it can, reports that, and agrees with itself for ever after.
+#[cfg(feature = "recorder")]
+#[derive(Default)]
+struct RateWatch {
+    /// Consecutive polls that have said the device is somewhere else.
+    moved: u8,
+}
+
+#[cfg(feature = "recorder")]
+impl RateWatch {
+    /// One poll. `device_at` is `None` when the device could not be asked at
+    /// all, which is not evidence of a move — a device being enumerated, or
+    /// gone entirely, is the watchdog's business and not this one's, and
+    /// counting it here would reopen the path every time an interface blinked.
+    fn note(&mut self, engine_at: u32, device_at: Option<u32>) -> bool {
+        let Some(real) = device_at.filter(|r| *r >= 8_000) else {
+            self.moved = 0;
+            return false;
+        };
+        if real == engine_at {
+            self.moved = 0;
+            return false;
+        }
+        self.moved = self.moved.saturating_add(1);
+        if self.moved >= RATE_DRIFT_POLLS {
+            // Latched off, not left standing: the caller is about to reopen,
+            // and the next poll asks the question again from scratch against
+            // whatever the new engine opened at.
+            self.moved = 0;
+            return true;
+        }
+        false
+    }
+}
+
 /// A background watch for the audio device coming back — "an auto recheck
 /// would be nice", the owner's word after the USB-yank test, where a replug
 /// recovered nothing because the timed retries had burnt out seconds earlier.
@@ -2150,6 +2243,9 @@ impl DesktopApp {
             }
         }
 
+        // **The device's own mind, asked on a timer.** See `RateWatch`.
+        self.follow_device_rate(ctx);
+
         // A monitor that would not open a moment ago. See `engine_retry`.
         if self.recorder.engine.is_none() && self.app.recorder_band_open() {
             if let Some((at, _)) = self.recorder.engine_retry {
@@ -2201,17 +2297,15 @@ impl DesktopApp {
 
         let want_buffer = self.app.buffer_frames();
         let want_system = self.app.audio_system();
-        // **The driver stack decides what Default resolves to**, so a change
-        // of system throws the cached answer away before it is asked for
-        // again — an ASIO driver and WASAPI do not have to agree about what
-        // the output's own rate is.
-        if self.recorder.system_open != want_system {
-            self.recorder.default_rate = None;
-        }
-        // Resolved, not raw: the change detector has to compare the rate the
-        // streams will actually OPEN at, or a Default that resolves to 48000
-        // reads as "no rate" forever and the reopen never fires.
-        let want_rate = self.effective_sample_rate();
+        // **RAW, not resolved.** This used to resolve "Device" to a number
+        // first, on the reasoning that the detector has to compare the rate
+        // the streams will actually open at — and resolving it meant caching
+        // it, and the cache was the bug: see [`RateWatch`]. The raw setting is
+        // the right thing to watch here because this detector's job is to
+        // notice the USER changing their mind. The device changing ITS mind is
+        // a different event with a different watcher, and `follow_device_rate`
+        // is the one that answers it.
+        let want_rate = self.engine_rate();
         let path_changed = self.recorder.buffer_open != want_buffer
             || self.recorder.rate_open != want_rate
             || self.recorder.system_open != want_system;
@@ -8217,33 +8311,133 @@ impl DesktopApp {
         }
     }
 
-    /// **The rate BOTH halves of the audio path open at.**
+    /// **Reopen the audio path when the INTERFACE moved, not when Tangent
+    /// did.**
     ///
-    /// The user's choice when there is one; otherwise the output device's own
-    /// rate, imposed on the input as well. See `Engine::default_output_rate`
-    /// for the failure this exists to end — two devices at two rates make a
-    /// take that drifts, and "Default" used to be the setting that caused it.
-    fn effective_sample_rate(&mut self) -> Option<u32> {
-        if let Some(chosen) = self.app.sample_rate() {
-            return Some(chosen);
+    /// The owner's ask, in full: "rectify the code so it not only works, but
+    /// allows a user to manage that through manual changes in their chosen
+    /// software, even reinitializing their entire interface, and Tangent will
+    /// start picking it back up again and not require a pivot in buffer or
+    /// sample to bring it back to life again." Not asking for a rate is half
+    /// of that; this is the other half. A device that moves under a running
+    /// engine does not stop it — CoreAudio's output unit keeps its stream
+    /// format and converts — so without this the engine goes on believing a
+    /// number that stopped being true, and the "pivot in buffer or sample" the
+    /// owner had to do was the only thing in the app that made it ask again.
+    ///
+    /// Deliberately NOT wired into the fault path. A rate change is not a
+    /// failure: nothing has gone quiet, nothing has been unplugged, and the
+    /// engine is still serving audio. It is a reopen for the same reason a
+    /// buffer change is one, and it goes down the same road — announced,
+    /// refused during a take, and answered on the next frame.
+    ///
+    /// See [`RateWatch`] for why the comparison is against the engine's rate
+    /// and why it takes three polls.
+    fn follow_device_rate(&mut self, ctx: &egui::Context) {
+        // No engine, nothing to compare against; the reopen roads above own
+        // that case and this one must not race them into a second open.
+        let Some(engine_at) = self.recorder.engine.as_ref().map(|e| e.output().sample_rate) else {
+            self.recorder.rate_watch = RateWatch::default();
+            self.recorder.rate_asked = None;
+            return;
+        };
+        // A take outranks the truth: swapping the device out from under a
+        // recording ends the recording, and `open_audio_path` would refuse
+        // anyway. The watch is reset rather than left counting, so a rate
+        // that moved and moved back during a take is not acted on after it.
+        if self.recorder.session.state().is_active() {
+            self.recorder.rate_watch = RateWatch::default();
+            return;
         }
-        if self.recorder.default_rate.is_none() {
-            // One device open, cached until the driver stack changes —
-            // including the "there is no output" answer, which costs the same
-            // probe and would otherwise be paid for every frame.
-            self.recorder.default_rate =
-                Some(crate::instrument::Engine::default_output_rate(None));
+        let now = std::time::Instant::now();
+        let due = self
+            .recorder
+            .rate_asked
+            .is_none_or(|last| now.duration_since(last) >= RATE_ASK_EVERY);
+        if !due {
+            // Ask for the frame the next poll falls on. Without this the watch
+            // only advances while something else is repainting, and a rate
+            // changed in another app's window is exactly the moment when
+            // nothing here is.
+            ctx.request_repaint_after(RATE_ASK_EVERY);
+            return;
         }
-        self.recorder.default_rate.flatten()
+        self.recorder.rate_asked = Some(now);
+        ctx.request_repaint_after(RATE_ASK_EVERY);
+        let device_at = crate::instrument::Engine::default_output_rate(None);
+        if !self.recorder.rate_watch.note(engine_at, device_at) {
+            return;
+        }
+        log::info!(
+            "the audio device moved to {} Hz on its own (the engine opened at \
+             {engine_at}) - reopening the audio path to follow it",
+            device_at.unwrap_or(0),
+        );
+        // The same teardown `path_changed` does, for the same reason: the old
+        // stream's Drop releases the device before the new one asks for it,
+        // which is the ordering CoreAudio needs.
+        self.recorder.engine = None;
+        self.recorder.inserts_loaded = vec![None; tangent_ui::recorder::INSERT_SPACE];
+        // `rate_open` is what the SETTING last asked for and the setting has
+        // not changed, so it is left exactly as it is — writing the device's
+        // new rate into it would make the next `path_changed` fire a second
+        // reopen on top of this one.
+        self.open_audio_path(ctx);
+    }
+
+    /// **What the ENGINE asks the output device for: the choice, or nothing.**
+    ///
+    /// "Nothing" is the whole fix. This used to resolve a "Device" setting to
+    /// the number the output happened to be running at the moment Tangent
+    /// started, cache it for the life of the driver stack, and hand it to both
+    /// halves of the path — which turned the setting called *Device* into the
+    /// one setting that overrode the device. See [`RateWatch`] for the owner's
+    /// report and the two faults behind it.
+    ///
+    /// Asking for `None` does not mean the two halves are free to disagree,
+    /// which is the drift this function was written to end and which is still
+    /// real: the writer drains the instrument's ring at the INPUT's rate while
+    /// the engine fills it at the OUTPUT's, and two devices left to their own
+    /// defaults make a take that slides. The invariant is kept a better way
+    /// now — the output opens first and follows the device, and then
+    /// [`Chrome::input_rate`] hands the input the rate the output ACTUALLY got
+    /// rather than a number either of them merely wished for. One rate, and it
+    /// is a measured one.
+    fn engine_rate(&self) -> Option<u32> {
+        self.app.sample_rate()
+    }
+
+    /// **What the INPUT asks for: the rate the engine is really running at.**
+    ///
+    /// Not the setting, and deliberately. cpal's CoreAudio input builder SETS
+    /// the device's nominal rate and blocks until it confirms, so whatever
+    /// this returns is imposed on the hardware — and the only number that may
+    /// safely be imposed is the one the output is already using, because on a
+    /// single interface they are the same device and asking for anything else
+    /// would move the ground out from under the running output stream.
+    ///
+    /// With an engine up that is `output().sample_rate`: measured, not
+    /// wished. Without one — the band opening before the engine has been
+    /// built, or the engine down and retrying — the choice is all there is,
+    /// and `None` under Device leaves the input on the device's own rate,
+    /// which is where the output will land too.
+    fn input_rate(&self) -> Option<u32> {
+        self.recorder
+            .engine
+            .as_ref()
+            .map(|e| e.output().sample_rate)
+            .or_else(|| self.app.sample_rate())
     }
 
     fn start_engine(&mut self, ctx: &egui::Context) {
         if self.recorder.engine.is_some() {
             return;
         }
-        // The RESOLVED rate, so the output and the input open at one rate
-        // even when the user has chosen none. See `effective_sample_rate`.
-        let rate = self.effective_sample_rate();
+        // The CHOICE, and nothing when there is none — so a device left to
+        // itself opens at its own rate and Tangent follows it. The input is
+        // then given the rate this actually got, which is what keeps the two
+        // halves on one clock. See `engine_rate` and `input_rate`.
+        let rate = self.engine_rate();
         match crate::instrument::Engine::start_sized(
             None,
             self.recorder.session.timebase(),
@@ -8251,6 +8445,29 @@ impl DesktopApp {
             rate,
         ) {
             Ok(e) => {
+                // **What was asked for, and what the device actually gave**,
+                // in one line, at INFO. Written because the owner had no way
+                // to tell the two apart from inside the app: "Tangent does not
+                // comply with a change in buffer-size from within it" reads as
+                // Tangent ignoring the setting, and the same screen would look
+                // the same if the interface had clamped the ask to its own
+                // range — which is what CoreAudio does, per device and shared
+                // between every client on it. A number that is a wish and a
+                // number that is a measurement should not be printed the same
+                // way, and until now Tangent only ever printed one of them.
+                let got = e.output();
+                log::info!(
+                    "audio out: {} - {} ch at {} Hz (asked {}), buffer {} frames (asked {})",
+                    got.device,
+                    got.channels,
+                    got.sample_rate,
+                    rate.map_or_else(|| "the device's own".to_owned(), |r| r.to_string()),
+                    got.buffer_frames
+                        .map_or_else(|| "the device's own".to_owned(), |b| b.to_string()),
+                    self.app
+                        .buffer_frames()
+                        .map_or_else(|| "the device's own".to_owned(), |b| b.to_string()),
+                );
                 self.recorder.engine = Some(e);
                 self.recorder.engine_error = None;
                 self.recorder.engine_retry = None;
@@ -8964,12 +9181,12 @@ impl DesktopApp {
                 // a single-client driver's input MUST join the output's
                 // stream set, not open a second one. Ignored on every other
                 // backend. See `tangent_record::audio::open_input`.
-                // **The same rate the ENGINE opened at**, which is the whole
-                // point of resolving Default: the writer drains the ring at
-                // the input's rate while the engine fills it at the output's,
-                // and two devices left to their own defaults drift apart.
-                // Taken before `duplex_with` borrows the engine.
-                let rate = self.effective_sample_rate();
+                // **The same rate the ENGINE opened at**, read off the engine
+                // rather than re-derived: the writer drains the ring at the
+                // input's rate while the engine fills it at the output's, and
+                // two devices left to their own defaults drift apart. Taken
+                // before `duplex_with` borrows the engine.
+                let rate = self.input_rate();
                 let duplex_with = self
                     .recorder
                     .engine
@@ -11685,7 +11902,8 @@ impl DesktopApp {
                 buffer_open: app.buffer_frames(),
                 rate_open: app.sample_rate(),
                 system_open: app.audio_system(),
-                default_rate: None,
+                rate_watch: RateWatch::default(),
+                rate_asked: None,
                 xruns_seen: 0,
                 graph_dropouts: tangent_record::audio::GraphDropouts::start(),
                 graph_floor: tangent_record::audio::graph_clock().map(|g| g.floor()),
@@ -13294,6 +13512,107 @@ impl DesktopApp {
 #[cfg(all(test, feature = "recorder"))]
 mod tests {
     use tangent_ui::busy::{Busy, Progress};
+
+    /// **An interface re-syncing is not an interface that moved.**
+    ///
+    /// The owner's Scarlett spends about two seconds saying "Syncing" after
+    /// Focusrite Control 2 changes its rate, and during them it reports
+    /// numbers that are neither the old rate nor the new one. Reopening the
+    /// audio path on the first disagreement would catch it mid-stride, and
+    /// reopening the path unloads and reloads every plugin in the desk — five
+    /// seconds each. So the disagreement has to hold.
+    ///
+    /// Revert-check: drop `RATE_DRIFT_POLLS` to 1 and the first assert goes
+    /// red on the very first poll.
+    #[test]
+    fn a_rate_watch_waits_out_an_interface_that_is_still_re_syncing() {
+        let mut w = super::RateWatch::default();
+        // Two polls of disagreement is not enough, whatever it disagrees with.
+        assert!(!w.note(48_000, Some(44_100)), "fired on the first poll");
+        assert!(!w.note(48_000, Some(96_000)), "fired on the second poll");
+        // The third is.
+        assert!(w.note(48_000, Some(44_100)), "never fired at all");
+    }
+
+    /// **A device that settles back where it was never moved.**
+    ///
+    /// The same two seconds of "Syncing" can end with the interface exactly
+    /// where it started — somebody opened FC2, looked, and closed it. One
+    /// agreeing poll wipes the count, so the next disagreement starts its
+    /// three over rather than finishing somebody else's.
+    #[test]
+    fn a_rate_that_comes_back_leaves_no_count_behind() {
+        let mut w = super::RateWatch::default();
+        assert!(!w.note(48_000, Some(44_100)));
+        assert!(!w.note(48_000, Some(44_100)));
+        assert!(!w.note(48_000, Some(48_000)), "agreement cannot fire");
+        // Back to zero: two more disagreements still are not three.
+        assert!(!w.note(48_000, Some(44_100)), "the count survived agreement");
+        assert!(!w.note(48_000, Some(44_100)), "the count survived agreement");
+    }
+
+    /// **A device that cannot be asked has not answered.**
+    ///
+    /// `default_output_rate` returns `None` for a device being enumerated, a
+    /// device gone entirely, and a machine with no sound at all. None of those
+    /// is a rate change, and all of them belong to the watchdog and the
+    /// reprobe thread — counting them here would reopen the whole audio path
+    /// every time an interface blinked, which is the "reopened for ever" the
+    /// retry ceiling exists to prevent.
+    #[test]
+    fn a_device_that_cannot_be_asked_is_not_a_device_that_moved() {
+        let mut w = super::RateWatch::default();
+        for _ in 0..10 {
+            assert!(!w.note(48_000, None), "silence read as a move");
+        }
+        // Nor is a nonsense answer. Below 8 kHz is not a rate any interface
+        // runs at; it is a property read that came back wrong.
+        for _ in 0..10 {
+            assert!(!w.note(48_000, Some(0)), "zero read as a move");
+        }
+    }
+
+    /// **The comparison is against the ENGINE, and that is what stops the
+    /// storm.**
+    ///
+    /// Somebody chooses 96000 on an interface that stops at 48000. The engine
+    /// asks, cpal narrows to what the device offers, and it opens at 48000.
+    /// If this watch compared the device against the SETTING it would find a
+    /// disagreement it can never resolve and reopen the path — reloading every
+    /// plugin — three polls apart for the rest of the session.
+    ///
+    /// It is structural rather than conditional: the watch is never told what
+    /// the setting says. This test is what says that has to stay true.
+    ///
+    /// Revert-check: pass the chosen rate as `engine_at` and it goes red.
+    #[test]
+    fn a_rate_the_device_cannot_reach_never_reopens_anything() {
+        let mut w = super::RateWatch::default();
+        // The engine opened at 48000 because that is all the device has. The
+        // device agrees with the engine, and the choice does not enter into it.
+        for _ in 0..30 {
+            assert!(!w.note(48_000, Some(48_000)), "reopened a settled path");
+        }
+    }
+
+    /// **Firing latches the count off**, so the poll a second after a reopen
+    /// cannot fire a second one on top of it.
+    ///
+    /// The reopen is not instant — it is announced, and the open happens on a
+    /// later frame — so there is a window where the device says one thing and
+    /// the old engine's rate is still the one being compared. Without the
+    /// latch that window fires again every poll it lasts.
+    #[test]
+    fn a_reopen_does_not_immediately_ask_for_another_one() {
+        let mut w = super::RateWatch::default();
+        assert!(!w.note(48_000, Some(44_100)));
+        assert!(!w.note(48_000, Some(44_100)));
+        assert!(w.note(48_000, Some(44_100)), "never fired");
+        // The very next poll, with the reopen still in flight and nothing
+        // changed, must not ask for another.
+        assert!(!w.note(48_000, Some(44_100)), "fired twice in a row");
+        assert!(!w.note(48_000, Some(44_100)), "fired twice in a row");
+    }
 
     /// One frame of the host's own loop, in the order `update` runs it: the
     /// desk draws, then the overlay draws, then eframe presents.
