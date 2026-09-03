@@ -5245,10 +5245,17 @@ fn draw_ir_level(
              a capture made now is half a measurement.",
         )
     } else if s.tone_on && pl > -200.0 && pr > -200.0 && (pl - pr).abs() > 12.0 {
+        // **Twelve dB, and the sentence does not accuse the rig.** This is a
+        // peak reading of ONE frequency: a 1 kHz tone through a wet box
+        // excites whichever modes it excites, and the two outputs of a plate
+        // can sit several dB apart at a single tone while being level across
+        // the band. Measured on a Quadraverb — 4 dB apart at 1 kHz, and the
+        // swept capture came back balanced to a fifth of a dB. So the line
+        // says where to look rather than what is wrong.
         Some(
-            "The two returns are more than 12 dB apart. That is the stereo \
-             image the capture will keep - check it is the box and not a \
-             cable or a trim.",
+            "The two returns are more than 12 dB apart at 1 kHz. On a wet box \
+             that can be the box itself; on a dry loop it is a cable or a \
+             trim. The swept capture measures the whole band.",
         )
     } else if s.tone_on && peak < -30.0 {
         // The case the owner hit from the other side: a quiet return is a
