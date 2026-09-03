@@ -414,6 +414,15 @@ pub fn grid_lines(view: &MidiEditView<'_>, from: f64, to: f64, mut f: impl FnMut
 pub fn grid_word(view: &MidiEditView<'_>) -> String {
     // The editor's own meter, so the word matches the magnet here too —
     // see `grid_label`, which now derives the name from the division.
+    //
+    // **`grid_label` and NOT `grid_label_text`, on purpose.** The two
+    // spellings split when the owner asked for the arrange toolbar's quarter
+    // rung to read "1/4" instead of `\u{266a}`; he asked about ARRANGE, and a
+    // shared helper would have moved this chip in the same edit without
+    // anyone deciding to. So this call stays on the glyph until he says
+    // otherwise, and `the_gridbox_word_carries_the_shape` pins it at exp -2
+    // in both directions — it fails if a future edit here drifts, and it
+    // fails if somebody changes the editor without changing the test.
     let base = crate::arrangement_panel::grid_label(
         view.grid_exp,
         view.sig_top.clamp(1, 32) as u8,
@@ -1739,7 +1748,21 @@ mod tests {
         assert_eq!(SWING_PRESETS[5], ("Dotted (Hard)", "3:1", 75.0));
     }
 
-    /// The grid word says the shape, not just the size.
+    /// The grid word says the shape, not just the size — and the quarter
+    /// rung of THIS chip is still the note glyph.
+    ///
+    /// The second half is new, and it is here because this test used to
+    /// exercise exp -3 only. That pinned nothing about the one rung the two
+    /// panels now spell differently: the arrange gridbox reads "1/4" as
+    /// text, on the owner's word that a beginner spots a fraction faster
+    /// than a five-point picture, and the editor's chip was not part of that
+    /// request. With only the eighth asserted, a blunt edit to the shared
+    /// `note_label` would have moved this chip in the same stroke with the
+    /// whole suite staying green — which is exactly how a surface gets
+    /// changed that nobody asked to change. So the glyph rung is pinned in
+    /// both directions: it fails if the editor drifts by accident, and it
+    /// fails if somebody moves the editor on purpose without coming through
+    /// here to say so.
     #[test]
     fn the_gridbox_word_carries_the_shape() {
         let n: [ArrNote; 0] = [];
@@ -1753,6 +1776,19 @@ mod tests {
         v.triplet = false;
         v.swing = true;
         assert_eq!(grid_word(&v), "1/8 sw");
+        // exp -2 in 4/4 is the quarter note: the rung that split.
+        v.swing = false;
+        v.grid_exp = -2;
+        assert_eq!(grid_word(&v), "\u{266a}");
+        v.triplet = true;
+        assert_eq!(grid_word(&v), "\u{266a}T");
+        v.triplet = false;
+        v.swing = true;
+        assert_eq!(grid_word(&v), "\u{266a} sw");
+        // The arrange box, at the same exponent and the same meter, prints
+        // the other spelling. Asserted side by side so the split is visible
+        // as a decision rather than as a difference somebody has to notice.
+        assert_eq!(crate::arrangement_panel::grid_label_text(-2, 4, 4), "1/4");
     }
 }
 

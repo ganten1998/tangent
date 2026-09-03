@@ -2722,10 +2722,16 @@ fn strip(
     }
     if l.theory.is_positive() {
         // **The NOTE, not a letter** - the owner's call, and the character
-        // is the one the grid box already shows for the quarter division
-        // (`\u{266a}`), which renders through egui's fallback face on every
-        // platform this app ships to. Drawn like a switch: framed, lit
-        // while the channel's MIDI feeds the theory view.
+        // is the one the MIDI EDITOR's gridbox shows for the quarter
+        // division (`\u{266a}`), which renders through egui's fallback face
+        // on every platform this app ships to. It used to say "the grid box"
+        // with no panel named, and that reference has since gone half stale:
+        // the ARRANGE gridbox spells that rung "1/4" now, because a beginner
+        // reads a fraction faster than a five-point picture (the argument is
+        // on `arrangement_panel::grid_label_text`). This switch is not a
+        // grid readout and keeps the glyph either way; the pointer is simply
+        // aimed at the surface where it is still checkable. Drawn like a
+        // switch: framed, lit while the channel's MIDI feeds the theory view.
         // Lit in the SELECT colour, not engrave: the owner pressed the old
         // engrave-lit letter and saw nothing change.
         switch(painter, l.theory, "\u{266a}", v.to_theory, p.lit, p);
