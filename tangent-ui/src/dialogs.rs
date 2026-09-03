@@ -774,7 +774,56 @@ pub struct IrWizardState {
     /// So the press only ARMS, and [`Self::settle_from_live`] believes it
     /// once the host's own count has moved past the number recorded here.
     pub save_asked: Option<u64>,
+    /// **The level meter's held readings**, dBFS — pair peak, left, right.
+    /// Appended at the END, this struct's law.
+    ///
+    /// The cells the host pushes hold ONE audio block, about ten
+    /// milliseconds, and the UI samples whichever block it happens to land
+    /// on. On a wet box that is a modal signal and the sample jumps several
+    /// dB a frame: the owner's words were that the meter "consistently
+    /// visibly hit a region then bounce off of it over and over again". A
+    /// meter that flickers is a meter nobody can set a level with, and the
+    /// flicker also made the warning under it blink on and off.
+    ///
+    /// So these are a real meter's ballistics: instant attack, and a decay of
+    /// [`METER_FALL_DB_S`] when the signal drops. Held on the wizard's own
+    /// state rather than in the host, because it is a property of the
+    /// PICTURE — the host keeps publishing the truth per block, and anything
+    /// else reading those cells still gets it.
+    pub meter_peak: f32,
+    pub meter_l: f32,
+    pub meter_r: f32,
+    /// **What each SEND setting actually returned**: (send dBFS, the loudest
+    /// return peak seen at it). Appended at the END.
+    ///
+    /// The level page's whole advice is "drive the loop as hard as the box
+    /// takes" — which assumes driving it harder does something. On the
+    /// owner's Quadraverb it stops doing anything above −18 dBFS: measured
+    /// through the loop, the return follows the send from −24 to −18 and then
+    /// flattens, so twenty-one dB of extra send buys eight tenths of a dB of
+    /// return. The box's input stage is limiting, and the page was telling
+    /// him to aim for a level his rig cannot reach while the meter sat still
+    /// and looked broken.
+    ///
+    /// Two entries far apart in send and close together in return is that
+    /// fact, and it is only knowable across MORE THAN ONE setting — so the
+    /// page has to remember what it saw. See [`IrWizardState::limiting`].
+    pub probe: Vec<(f32, f32)>,
 }
+
+/// **How fast the level meter's held reading falls**, dB per second.
+///
+/// Twenty, which is a peak-programme meter's own order of magnitude and is
+/// slow enough that a modal wet return reads as one level rather than as a
+/// flicker. The cells the host publishes hold a single ~10 ms block and the
+/// UI samples one of them per frame, so without this the needle jumps
+/// several dB between frames on any reverb — "hits a region then bounces off
+/// of it over and over again", in the owner's words, which is a meter nobody
+/// can set a level with.
+///
+/// Instant on the way UP, because the whole job of a level meter is to catch
+/// the loudest thing that happened.
+const METER_FALL_DB_S: f32 = 20.0;
 
 /// The offered sweep lengths, seconds. 15 is the default (Farina's own
 /// experiments; between Apple's 10 and 50); 5 for quick passes on short
@@ -799,6 +848,10 @@ impl Default for IrWizardState {
             origin: None,
             saved: false,
             save_asked: None,
+            meter_peak: -200.0,
+            meter_l: -200.0,
+            meter_r: -200.0,
+            probe: Vec::new(),
         }
     }
 }
@@ -943,6 +996,66 @@ impl IrWizardState {
     /// there was one.
     pub fn way_back(&self) -> Option<(usize, usize)> {
         (self.stage == IrStage::Result).then_some(self.origin).flatten()
+    }
+
+    /// **Has the return stopped following the send?**
+    ///
+    /// Answers with the two settings that prove it: `(quiet send, loud send,
+    /// how many dB more send, how many dB more return)`. `None` while the
+    /// loop is still behaving, and while too few settings have been tried to
+    /// tell.
+    ///
+    /// See [`Self::probe`] for the measurement that made this necessary. The
+    /// bar is deliberately blunt — at least 5.5 dB more send returning less
+    /// than 2 dB more level — because what it has to catch is a box that has
+    /// stopped responding at all, not one that is merely compressing a
+    /// little. A wet box's return wanders a couple of dB on its own, which is
+    /// why 2 and not 0.5.
+    pub fn limiting(&self) -> Option<(f32, f32, f32, f32)> {
+        let mut worst: Option<(f32, f32, f32, f32)> = None;
+        for (a_send, a_ret) in &self.probe {
+            for (b_send, b_ret) in &self.probe {
+                let more_send = b_send - a_send;
+                let more_ret = b_ret - a_ret;
+                if more_send >= 5.5 && more_ret < 2.0 {
+                    let better = worst.is_none_or(|(_, _, s, _)| more_send > s);
+                    if better {
+                        worst = Some((*a_send, *b_send, more_send, more_ret));
+                    }
+                }
+            }
+        }
+        worst
+    }
+
+    /// One frame of meter ballistics and one frame of the send record.
+    ///
+    /// A METHOD rather than eight lines inside the level page, for the reason
+    /// [`Self::settle_from_live`]'s own note gives: a rule written out inside
+    /// an egui closure can only be pinned by a copy of itself.
+    pub fn meter_tick(&mut self, dt: f32) {
+        let fall = METER_FALL_DB_S * dt.clamp(0.0, 0.25);
+        let hold = |held: f32, now: f32| {
+            if now > held {
+                now
+            } else {
+                (held - fall).max(now).max(-200.0)
+            }
+        };
+        self.meter_peak = hold(self.meter_peak, self.live.peak_db);
+        self.meter_l = hold(self.meter_l, self.live.peak_l_db);
+        self.meter_r = hold(self.meter_r, self.live.peak_r_db);
+        // The record is only meaningful while the tone is actually driving
+        // the loop: a reading taken with nothing going out says what the room
+        // is doing, not what the box does with a given send.
+        if !self.tone_on || self.live.peak_db <= -200.0 {
+            return;
+        }
+        let send = self.level_db;
+        match self.probe.iter_mut().find(|(s, _)| (*s - send).abs() < 0.5) {
+            Some(entry) => entry.1 = entry.1.max(self.meter_peak),
+            None => self.probe.push((send, self.meter_peak)),
+        }
     }
 
     /// **The Save button fired.** Which is not the same as a file existing —
@@ -1380,6 +1493,14 @@ pub enum DialogAction {
     ///
     /// **[`IR_BROWSE`] in `path` means "ask me instead".** See there.
     SetInsertIr { strip: usize, slot: usize, path: String },
+    /// **Switch one bay out of circuit, or back in.** Appended at the END,
+    /// this enum's law.
+    ///
+    /// The state is `settings::insert_bypass`, which the mixer's bay menu
+    /// already toggles — so this carries the WANTED value rather than a
+    /// "toggle", because a face and a menu that both toggled could disagree
+    /// about the current state and cancel each other out.
+    SetInsertBypass { strip: usize, slot: usize, on: bool },
     /// The theme key was pressed inside a plugin window. On the desktop
     /// that window has its own input and the main window never sees the
     /// key, so the dialog carries it back and the app cycles exactly as it
@@ -5003,6 +5124,10 @@ fn draw_ir_io(ui: &mut egui::Ui, t: &DialogTheme, s: &mut IrWizardState) {
                         .clicked()
                     {
                         s.out_sel = i;
+                        // A different pair of jacks is a different loop, so
+                        // what the old one returned at each send says nothing
+                        // about this one. See `IrWizardState::probe`.
+                        s.probe.clear();
                     }
                 }
             });
@@ -5023,6 +5148,10 @@ fn draw_ir_io(ui: &mut egui::Ui, t: &DialogTheme, s: &mut IrWizardState) {
                         .clicked()
                     {
                         s.in_sel = i;
+                        // A different pair of jacks is a different loop, so
+                        // what the old one returned at each send says nothing
+                        // about this one. See `IrWizardState::probe`.
+                        s.probe.clear();
                     }
                 }
             });
@@ -5157,7 +5286,10 @@ fn draw_ir_level(
     );
     ui.painter().rect_filled(rect, 2.0, t.field_bg);
     let frac = |db: f32| ((db + 60.0) / 60.0).clamp(0.0, 1.0);
-    let (rms, peak) = (s.live.rms_db, s.live.peak_db);
+    // **The HELD peak, not this frame's block.** See `METER_FALL_DB_S`. The
+    // RMS is left as it is: a mean over a block is already an average and does
+    // not jump the way a peak does.
+    let (rms, peak) = (s.live.rms_db, s.meter_peak);
     if rms > -200.0 {
         let w = rect.width() * frac(rms);
         ui.painter().rect_filled(
@@ -5214,7 +5346,7 @@ fn draw_ir_level(
     // channel having most of the information there and right channel audible
     // but mostly cancelled". This is the last page where that is still a
     // cable and not a ruined afternoon.
-    let (pl, pr) = (s.live.peak_l_db, s.live.peak_r_db);
+    let (pl, pr) = (s.meter_l, s.meter_r);
     let side = |db: f32| {
         if db <= -200.0 {
             "silent".to_owned()
@@ -5229,41 +5361,46 @@ fn draw_ir_level(
     );
     // The warnings, in the order they matter.
     let warn = if peak > -0.5 {
-        Some("CLIPPING - bring the unit's output (or the send) down.")
+        Some("CLIPPING - bring the unit's output (or the send) down.".to_owned())
     } else if peak > -6.0 {
-        Some("Under 6 dB of headroom - the sweep will hit harder than this tone.")
+        Some("Under 6 dB of headroom - the sweep will hit harder than this tone.".to_owned())
     } else if s.tone_on && peak <= -200.0 {
-        Some("Nothing is coming back - check the loop's cables and the unit's bypass.")
+        Some("Nothing is coming back - check the loop's cables and the unit's bypass.".to_owned())
     } else if s.tone_on && pl > -200.0 && pr <= -200.0 {
         Some(
             "Only the LEFT jack is returning. Check the right return cable - \
-             a capture made now is half a measurement.",
+             a capture made now is half a measurement.".to_owned(),
         )
     } else if s.tone_on && pr > -200.0 && pl <= -200.0 {
         Some(
             "Only the RIGHT jack is returning. Check the left return cable - \
-             a capture made now is half a measurement.",
+             a capture made now is half a measurement.".to_owned(),
         )
-    } else if s.tone_on && pl > -200.0 && pr > -200.0 && (pl - pr).abs() > 12.0 {
-        // **Twelve dB, and the sentence does not accuse the rig.** This is a
-        // peak reading of ONE frequency: a 1 kHz tone through a wet box
-        // excites whichever modes it excites, and the two outputs of a plate
-        // can sit several dB apart at a single tone while being level across
-        // the band. Measured on a Quadraverb — 4 dB apart at 1 kHz, and the
-        // swept capture came back balanced to a fifth of a dB. So the line
-        // says where to look rather than what is wrong.
-        Some(
-            "The two returns are more than 12 dB apart at 1 kHz. On a wet box \
-             that can be the box itself; on a dry loop it is a cable or a \
-             trim. The swept capture measures the whole band.",
-        )
+    } else if let Some((a, b, more_send, more_ret)) = s.limiting() {
+        // **The box has stopped taking more send, and the page has to say so
+        // rather than repeat its advice.**
+        //
+        // Everything above this line tells the user to drive the loop harder.
+        // On a box whose input stage limits, driving it harder does nothing
+        // at all: measured on the owner's Quadraverb, the return follows the
+        // send from -24 to -18 dBFS and then flattens — twenty-one dB more
+        // send bought eight tenths of a dB more return. What that looks like
+        // from the front is a meter that "rides the level regardless of
+        // anything I can change", and the page was answering it by suggesting
+        // he change it more.
+        Some(format!(
+            "The return has stopped following the send: {a:.0} to {b:.0} dBFS is \
+             {more_send:.0} dB more out and {more_ret:+.1} dB more back. The box is \
+             limiting - past this, more send is more distortion and not more tail. \
+             Take the loudest send that still moves the meter."
+        ))
     } else if s.tone_on && peak < -30.0 {
         // The case the owner hit from the other side: a quiet return is a
         // quiet capture is a short IR, and nothing else in this wizard says
         // so until the tail comes back stubbed.
         Some(
             "Very quiet - raise the SEND, or the unit's own output. A return \
-             this low costs tail, not just level.",
+             this low costs tail, not just level.".to_owned(),
         )
     } else {
         None
@@ -5767,9 +5904,19 @@ fn confirm_ir_delete(strip: usize, slot: usize, path: &str, loaded: bool) -> Dia
              through, and there is no undo."
         ),
         kept: if loaded {
-            "This is the impulse this bay is playing. The sound does not \
-             change now \u{2014} it is already loaded \u{2014} but the bay will come up \
-             empty the next time this project is opened."
+            // **The bay is emptied, and the box says so before the click.**
+            //
+            // This line used to promise the opposite: that the sound would not
+            // change, because the samples were already loaded, and the bay
+            // would only come up empty next session. The owner overruled that
+            // — "deleting an in use IR file should immediately reinitialize to
+            // no file loaded, it shouldn't keep the state" — and he is right:
+            // a bay playing a file that no longer exists is a project that
+            // sounds one way today and another way tomorrow. See
+            // `desktop::clear_insert_ir`.
+            "This is the impulse this bay is playing, and the bay is emptied \
+             with it \u{2014} the sound stops now, not next time this project is \
+             opened. Any other bay playing the same file is emptied too."
                 .to_owned()
         } else {
             "Nothing else is touched. The bay keeps playing whatever it has \
@@ -6093,6 +6240,13 @@ pub fn show(
                                 // an `Option` rather than assuming there is
                                 // always something for the app to do.
                                 action = match act {
+                                    crate::faces::FaceAction::SetBypass { on } => {
+                                        Some(DialogAction::SetInsertBypass {
+                                            strip,
+                                            slot,
+                                            on,
+                                        })
+                                    }
                                     crate::faces::FaceAction::Set { id, value } => {
                                         Some(DialogAction::SetInsertParam {
                                             strip,
@@ -9498,6 +9652,12 @@ pub fn show(
             // can only be pinned by a copy of itself, and a copy goes on
             // passing after the original has been broken.
             s.settle_from_live();
+            // One frame of meter ballistics and one of the send record. Here
+            // rather than inside the level page because the meter has to keep
+            // falling while the user is on another page — a needle that froze
+            // when you clicked Next and then jumped when you came back is a
+            // needle nobody believes. See `IrWizardState::meter_tick`.
+            s.meter_tick(ctx.input(|i| i.stable_dt));
             // **And the way back the panel left, taken once.** See
             // `IrWizardState::adopt_origin`: the take is what stops a later
             // Setup-opened wizard from inheriting it.
@@ -14963,14 +15123,24 @@ at: None,
                 _ => panic!("the delete button does not delete"),
             }
         }
-        // The loaded case says what actually happens, which is nothing now
-        // and an empty bay later. The alternative — clearing the bay on the
-        // delete — would silence a track for tidying a folder.
+        // **The loaded case says the bay is emptied NOW**, which is what
+        // actually happens. It used to promise the opposite — that the sound
+        // would not change, because the samples were already loaded — and the
+        // owner overruled that: "deleting an in use IR file should immediately
+        // reinitialize to no file loaded, it shouldn't keep the state". A bay
+        // playing a file that no longer exists is a project that sounds one
+        // way today and another way tomorrow. The old promise is asserted
+        // ABSENT, because a confirmation that says the sound will survive and
+        // then stops it is worse than one that says nothing.
         let Dialog::Confirm { kept, .. } = confirm_ir_delete(0, 0, path, true) else {
             unreachable!()
         };
-        assert!(kept.contains("does not change now"), "{kept:?}");
-        assert!(kept.contains("empty"), "{kept:?}");
+        assert!(kept.contains("emptied"), "{kept:?}");
+        assert!(kept.contains("stops now"), "{kept:?}");
+        assert!(
+            !kept.contains("does not change"),
+            "the box still promises the sound survives the delete: {kept:?}"
+        );
         let Dialog::Confirm { kept, .. } = confirm_ir_delete(0, 0, path, false) else {
             unreachable!()
         };
@@ -15330,6 +15500,194 @@ at: None,
         live.face.path = "@tangent-ir".to_owned();
         live.face.extra = vec![("ir_path".to_owned(), loaded.to_owned())];
         Dialog::InsertFace { strip, slot, live: Box::new(live) }
+    }
+
+
+    /// **The level meter holds and falls; it does not follow the last block.**
+    ///
+    /// The cells the host publishes carry ONE audio block, about ten
+    /// milliseconds, and the UI samples whichever one it lands on. On a wet
+    /// box that is a modal signal, so consecutive frames differ by several dB
+    /// and the needle flickers — the owner's words were that it "consistently
+    /// visibly hit a region then bounce off of it over and over again", which
+    /// is a meter nobody can set a level with. The blinking also made the
+    /// warning underneath it appear and vanish.
+    ///
+    /// Instant on the way up, [`METER_FALL_DB_S`] on the way down.
+    #[test]
+    fn the_level_meter_holds_a_peak_and_falls_rather_than_flickering() {
+        let mut s = IrWizardState::default();
+        // A block that is loud, then five that are not — which is what one
+        // reverb tail looks like sampled at sixty frames a second.
+        let blocks = [-12.0f32, -34.0, -31.0, -36.0, -30.0, -35.0];
+        let mut readings = Vec::new();
+        for b in blocks {
+            s.live.peak_db = b;
+            s.live.peak_l_db = b;
+            s.live.peak_r_db = b;
+            s.meter_tick(1.0 / 60.0);
+            readings.push(s.meter_peak);
+        }
+        assert_eq!(readings[0], -12.0, "the meter did not catch the loud block");
+        // Over five frames at 60 Hz the hold may fall by 5 * 20/60 dB and no
+        // more, so the needle is still up near the peak rather than down at
+        // the quietest block it happened to see.
+        let fell = readings[0] - readings[readings.len() - 1];
+        assert!(
+            fell <= 5.0 * METER_FALL_DB_S / 60.0 + 1.0e-3,
+            "the hold fell {fell:.2} dB in five frames"
+        );
+        assert!(
+            readings[5] > -20.0,
+            "the meter chased the quiet blocks down to {:.1} dB in a twelfth of a \
+             second - that is the flicker, not a reading",
+            readings[5]
+        );
+        // **And the PAGE draws the held value, which is the half that
+        // matters.** The ballistics above are a helper; a page that computed
+        // them and then printed `live.peak_db` anyway would flicker exactly as
+        // before and this test would not know. Read off the painted frame, the
+        // way the theme sweeps are.
+        {
+            let mut slot = Slot::new(Dialog::IrWizard {
+                state: Box::new(IrWizardState {
+                    stage: IrStage::Level,
+                    tone_on: true,
+                    live: crate::ports::IrLive {
+                        peak_db: -12.0,
+                        peak_l_db: -12.0,
+                        peak_r_db: -12.0,
+                        rms_db: -15.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            });
+            let reading = |slot: &mut Slot| -> String {
+                slot.settle()
+                    .iter()
+                    .find(|(_, _, w)| w.starts_with("return:"))
+                    .map(|(_, _, w)| w.clone())
+                    .unwrap_or_else(|| "<no return line>".to_owned())
+            };
+            let loud = reading(&mut slot);
+            assert!(
+                loud.contains("-12."),
+                "the page did not print the loud block at all: {loud:?}"
+            );
+            // One quiet block. The held reading may have fallen a fraction of
+            // a dB; what it must NOT do is jump to the quiet block's level.
+            if let Some(Dialog::IrWizard { state }) = slot.dialog.as_mut() {
+                state.live.peak_db = -34.0;
+                state.live.peak_l_db = -34.0;
+                state.live.peak_r_db = -34.0;
+            }
+            let quiet = reading(&mut slot);
+            assert!(
+                !quiet.contains("-34."),
+                "the page followed one quiet block straight down: {quiet:?} - that is \
+                 the flicker the hold exists to stop"
+            );
+        }
+
+        // And it does come down: a meter that only ever rose would read the
+        // loudest thing that ever happened, forever.
+        for _ in 0..200 {
+            s.live.peak_db = -60.0;
+            s.live.peak_l_db = -60.0;
+            s.live.peak_r_db = -60.0;
+            s.meter_tick(1.0 / 60.0);
+        }
+        assert!(
+            (s.meter_peak + 60.0).abs() < 0.5,
+            "the hold never came down: {:.1}",
+            s.meter_peak
+        );
+    }
+
+    /// **A loop that has stopped taking more send is named, not nagged at.**
+    ///
+    /// The level page's whole advice is "drive the loop as hard as the box
+    /// takes", which assumes driving it harder does something. Measured
+    /// through the owner's Quadraverb on outputs 13/14, it stops doing
+    /// anything above −18 dBFS:
+    ///
+    /// ```text
+    ///   send −24  ->  return −25.7        send  −9  ->  return −20.6
+    ///   send −18  ->  return −19.9        send  −6  ->  return −20.8
+    ///   send −12  ->  return −20.5        send  −3  ->  return −20.7
+    /// ```
+    ///
+    /// Twenty-one dB more send buys eight tenths of a dB more return: the
+    /// box's input stage is limiting. What that looks like from the front is a
+    /// meter that "rides the level regardless of anything I can change", and
+    /// the page was answering it by suggesting he change it more.
+    #[test]
+    fn a_loop_that_stops_taking_more_send_says_so() {
+        let mut s = IrWizardState::default();
+        // The owner's rig, as measured.
+        s.probe = vec![
+            (-24.0, -25.68),
+            (-18.0, -19.93),
+            (-12.0, -20.48),
+            (-9.0, -20.61),
+            (-6.0, -20.80),
+            (-3.0, -20.69),
+        ];
+        let (a, b, more_send, more_ret) =
+            s.limiting().expect("a loop that flattened over 21 dB was called healthy");
+        assert!(
+            more_send >= 5.5,
+            "the pair chosen is only {more_send:.1} dB apart in send"
+        );
+        assert!(
+            more_ret < 2.0,
+            "the pair chosen gained {more_ret:.1} dB of return, which is not a ceiling"
+        );
+        // **It picks the widest pair that is actually FLAT, which is where
+        // the ceiling starts — not the widest pair on the page.**
+        //
+        // −24 to −3 is the widest walk of all, and it does not qualify: the
+        // return rose 4.99 dB across it, because this loop still responds
+        // between −24 and −18. The ceiling begins at −18, and −18 to −3 is
+        // fifteen dB of send for eight tenths of a dB back. Naming that pair
+        // rather than the widest one is what makes the sentence actionable —
+        // it tells him where to stop pushing.
+        assert!(
+            (a + 18.0).abs() < 0.01 && (b + 3.0).abs() < 0.01,
+            "the ceiling was located at {a} -> {b} rather than at -18 -> -3"
+        );
+        assert!(
+            (more_send - 15.0).abs() < 0.01,
+            "the named span is {more_send} dB rather than 15"
+        );
+        // And the pair that spans the responsive part is correctly refused.
+        let mut responsive = IrWizardState::default();
+        responsive.probe = vec![(-24.0, -25.68), (-18.0, -19.93)];
+        assert!(
+            responsive.limiting().is_none(),
+            "the six dB where this loop DID respond was called a ceiling"
+        );
+
+        // **And a loop that is behaving is left alone.** Six sends, each one
+        // returning what it was given: nothing to say.
+        let mut ok = IrWizardState::default();
+        ok.probe = vec![
+            (-24.0, -30.0),
+            (-18.0, -24.0),
+            (-12.0, -18.0),
+            (-9.0, -15.0),
+            (-6.0, -12.0),
+            (-3.0, -9.0),
+        ];
+        assert!(
+            ok.limiting().is_none(),
+            "a loop that followed the send perfectly was called limiting"
+        );
+        // One setting can never prove it: the fact is about MORE THAN ONE.
+        let mut one = IrWizardState::default();
+        one.probe = vec![(-18.0, -20.0)];
+        assert!(one.limiting().is_none(), "one reading proved a ceiling");
     }
 
     /// **The two capture buttons say what you DO.**

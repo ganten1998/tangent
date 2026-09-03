@@ -23777,6 +23777,18 @@ impl TangentApp {
             DialogAction::FaceLoadPreset { unit, path } => {
                 self.request_recorder(recorder::RecorderRequest::LoadPreset { unit, path });
             }
+            DialogAction::SetInsertBypass { strip, slot, on } => {
+                // **Through the seat map and onto the mixer's own flag.** The
+                // face speaks DESK terms; `insert_bypass` is keyed by seat,
+                // and the master's (and a folder's) slots 3..5 live in another
+                // rack — so a face that wrote the raw index would bypass
+                // somebody else's plugin. The same translation every other
+                // bay-shaped ask in this file makes.
+                let (seat, bay) = crate::recorder::seat_bay(strip, slot);
+                if self.insert_bypassed(seat, bay) != on {
+                    self.toggle_insert_bypass(seat, bay);
+                }
+            }
             DialogAction::SetInsertIr { strip, slot, path } => {
                 let (seat, bay) = recorder::seat_bay(strip, slot);
                 self.request_recorder(recorder::RecorderRequest::SetInsertIr {
@@ -28585,6 +28597,11 @@ impl TangentApp {
                     live.correlation = self.tapring.correlation();
                 }
                 _ => {}
+            }
+            // The bay's bypass, pushed like every other fact the face draws.
+            {
+                let (seat, bay) = crate::recorder::seat_bay(strip, slot);
+                live.bypassed = self.insert_bypassed(seat, bay);
             }
             self.dialog = Some(dialogs::Dialog::InsertFace { strip, slot, live });
             // The meters breathe even when the hand is still.
