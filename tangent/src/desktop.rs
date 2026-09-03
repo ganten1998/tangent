@@ -9884,10 +9884,19 @@ impl DesktopApp {
     /// Latched on `covering_screen` so each direction fires exactly once.
     #[cfg(target_os = "macos")]
     fn reconcile_screen_cover(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        let (maximised, fullscreen) = ctx.input(|i| {
-            let v = i.viewport();
-            (v.maximized.unwrap_or(false), v.fullscreen.unwrap_or(false))
-        });
+        // **Maximized comes from the app, fullscreen from the viewport.**
+        //
+        // Not a style preference: on macOS `egui-winit` reads `maximized` once,
+        // on the frame the window is created, and never again — so a window
+        // reopened at a remembered screen-filling size reports itself maximized
+        // for the whole session no matter what the owner does to it afterwards.
+        // Read raw here, turning borderless on would then have snapped a small
+        // window out to fill the screen. `TangentApp` holds that flag to a
+        // measurement of the actual window (`maximized_truthfully`), so this
+        // asks it rather than asking again. Fullscreen is refreshed every
+        // frame on every platform and is taken straight from the viewport.
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let maximised = self.app.maximized_now();
         let want = self.app.borderless() && maximised && !fullscreen;
         if want == self.covering_screen {
             return;
