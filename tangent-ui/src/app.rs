@@ -1930,6 +1930,168 @@ fn smart_knob_travel(base: f32, room_px: f32, remaining: f32) -> f32 {
     base.min((room_px / remaining).max(40.0))
 }
 
+/// **How far in from a rail the edge-drag zone reaches, in points.**
+///
+/// Two dozen: wider than the border a lane or a strip draws around itself, so
+/// the zone is not something you fall into by aiming at the edge of a thing;
+/// narrower than a mixer strip's name plate, so grabbing the LAST visible
+/// strip by its name does not immediately start scrolling it away from you.
+const EDGE_ZONE: f32 = 24.0;
+
+/// The edge law's two speeds, in POINTS PER SECOND: at the zone's inner lip,
+/// and at the rail itself. See [`edge_scroll_pps`] — the slow end is a floor
+/// on purpose, not the bottom of a ramp from zero.
+const EDGE_SLOW: f32 = 90.0;
+const EDGE_FAST: f32 = 1200.0;
+
+/// The longest frame [`edge_scroll_step`] will price. One `GUI_TICK`.
+const EDGE_DT_CAP: f32 = 0.05;
+
+/// How soon the next frame is wanted while an edge scroll is running.
+const EDGE_TICK: Duration = Duration::from_millis(16);
+
+/// Which axes of an edge zone are live for a given gesture.
+///
+/// A track carried up the arrangement's header column has nowhere to go
+/// sideways — there is nothing to the left or right of a name — and a strip
+/// carried across the mixer has nowhere to go up or down. Saying so is not
+/// only tidiness: [`edge_scroll_step`] asks for a fast frame whenever it
+/// returns motion, and a mixer that asked for 60 Hz because the hand happened
+/// to be near the top of the desk would be burning frames to move nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EdgeAxes {
+    Both,
+    X,
+    Y,
+}
+
+/// **The one edge-drag scroll law**, in POINTS PER SECOND. Positive x walks
+/// the view later/right, positive y walks it down.
+///
+/// Three surfaces have the same problem — a note dragged past the end of the
+/// roll, a clip dragged past the last visible lane, a strip carried past the
+/// eighth column — and until now exactly one of the six axes answered it. That
+/// one, the MIDI roll's horizontal crawl, was `view_len_s * 0.010` applied
+/// once PER FRAME. That is not a speed, it is a frame counter wearing a
+/// speed's clothes: the same hold, held for the same second, moved the window
+/// 60% of its width while a drag kept the loop hot and 20% on the idle tick,
+/// and a machine that paints faster travelled further for the identical
+/// gesture. It is the same fault the meter fall's comment argues against —
+/// the frame clock leaking into the ballistics — and this is that argument
+/// applied to a view instead of a needle.
+///
+/// So: one law, six axes, seconds. `depth` is how far INSIDE a rail the
+/// pointer is; within `EDGE_ZONE` of it the speed ramps from `EDGE_SLOW` at
+/// the lip to `EDGE_FAST` at the rail, and past the rail it SATURATES. That
+/// saturation is the load-bearing half. The pointer can legitimately be a very
+/// long way outside the zone — a note dragged clean out of the editor is still
+/// a note being dragged, and the hand pins against the screen's own edge long
+/// before it runs out of intent — so "past the rail" has to mean "as fast as
+/// this goes", never "proportionally faster for ever".
+///
+/// The slow end is a FLOOR rather than the bottom of a ramp from zero because
+/// a ramp that starts at nothing spends the outer third of its zone moving the
+/// view by less than a point a second. That reads as a dead zone inside the
+/// live zone: you push, nothing happens, you push harder, it lurches. Ninety
+/// points a second is about the slowest a view can move and still look like it
+/// is moving on purpose.
+///
+/// The two axes are computed independently, so a corner scrolls diagonally —
+/// which is what a hand held in a corner means.
+///
+/// Deliberately NOT [`WheelSteps`]. That helper accrues notches of INTENT and
+/// spends them in whole rows, because a wheel arrives in lumps and a lane
+/// stack has no half lanes. Edge scroll is the opposite kind of thing: a
+/// continuous hold priced against a clock, with nothing to bank. Unifying the
+/// two would hand each of them the other's bug.
+fn edge_scroll_pps(zone: Rect, p: Pos2) -> Vec2 {
+    if !zone.is_positive() {
+        return Vec2::ZERO;
+    }
+    let axis = |lo: f32, hi: f32, at: f32| -> f32 {
+        // The nearer rail decides the direction; `depth` is how far inside it
+        // the pointer sits, and goes negative once the pointer is past it. On
+        // a zone narrower than two zones' worth the two overlap, and picking
+        // the nearer rail is what keeps a thin strip from scrolling both ways
+        // at once.
+        let (dir, depth) = if at - lo < hi - at {
+            (-1.0, at - lo)
+        } else {
+            (1.0, hi - at)
+        };
+        let f = ((EDGE_ZONE - depth) / EDGE_ZONE).clamp(0.0, 1.0);
+        if f <= 0.0 {
+            0.0
+        } else {
+            dir * (EDGE_SLOW + (EDGE_FAST - EDGE_SLOW) * f)
+        }
+    };
+    Vec2::new(
+        axis(zone.left(), zone.right(), p.x),
+        axis(zone.top(), zone.bottom(), p.y),
+    )
+}
+
+/// **One frame's worth of [`edge_scroll_pps`], and the frame that has to come
+/// after it.** Returns POINTS to move this frame; `Vec2::ZERO` when the hand
+/// is not in a live zone.
+///
+/// Two clocks to get right, and the app has already been bitten by one of
+/// them.
+///
+/// FIRST, `unstable_dt` and not `stable_dt`. egui's `stable_dt` is just
+/// `predicted_dt` unless the PREVIOUS frame asked for a zero-delay repaint
+/// (`input_state/mod.rs`, `begin_pass`), and this app's default pacing —
+/// `Pace::Off` — ends every frame with `request_repaint_after(GUI_TICK)`,
+/// which is never zero. Neither eframe nor egui-winit ever writes
+/// `predicted_dt`, so it sits at its 1/60 default for the life of the
+/// process. `stable_dt` therefore reports 16.7 ms on a frame that really took
+/// fifty, and a rate law built on it would be a per-frame law again in
+/// disguise, running at a third of the speed it advertises — which would read
+/// as a tuning problem and get "fixed" by tripling the constants.
+/// `unstable_dt` is real wall clock: egui-winit stamps `RawInput::time` every
+/// frame, and the difference is measured, not predicted.
+///
+/// The cap is one `GUI_TICK`. A frame that took a quarter of a second — a disk
+/// stall, a plugin scan, the first frame after the window was left alone —
+/// must not fling a clip a quarter of a second's worth of scroll across the
+/// song. Capping makes a hitch look like a stutter; not capping makes it look
+/// like a lost clip. Where a host gives no honest clock at all (the plugin
+/// build's baseview backend is unverified on this point) the fallback is the
+/// frame budget, which is exactly the behaviour that shipped before this
+/// existed — worse, but not a regression.
+///
+/// SECOND, the repaint, and it is the whole reason this function exists rather
+/// than a bare multiply at each call site. A hand HELD at an edge emits no
+/// events at all; nothing wakes the loop, so the scroll would tick at the
+/// 50 ms idle cadence — twenty frames a second of "auto-scroll" that stalls
+/// the moment the hand stops wiggling, which is precisely the failure this is
+/// meant to fix. Asking for the frame HERE means the next surface that wants
+/// an edge zone cannot forget to. `request_repaint_after` keeps the MINIMUM of
+/// a frame's requests, so this survives the tick at the end of `paint` without
+/// needing a flag on the app; and egui subtracts `predicted_dt` from every
+/// delay, so 16 ms resolves to zero, the gesture self-paces against vsync, and
+/// as a side effect the NEXT frame's `stable_dt` finally tells the truth.
+fn edge_scroll_step(ctx: &egui::Context, zone: Rect, p: Pos2, axes: EdgeAxes) -> Vec2 {
+    let mut pps = edge_scroll_pps(zone, p);
+    match axes {
+        EdgeAxes::Both => {}
+        EdgeAxes::X => pps.y = 0.0,
+        EdgeAxes::Y => pps.x = 0.0,
+    }
+    if pps == Vec2::ZERO {
+        return Vec2::ZERO;
+    }
+    ctx.request_repaint_after(EDGE_TICK);
+    let dt = ctx.input(|i| i.unstable_dt);
+    let dt = if dt.is_finite() && dt > 0.0 {
+        dt.min(EDGE_DT_CAP)
+    } else {
+        1.0 / 60.0
+    };
+    pps * dt
+}
+
 /// Where a FRESH session lives: `Untitled`, unless somebody literally
 /// SAVED a project by that name — an auto-saved scratch is reclaimed, a
 /// kept one is stepped past to `Untitled 2` and so on.
@@ -9642,6 +9804,168 @@ impl TangentApp {
         }
     }
 
+    /// **One lane's height in points**, as every consumer of the lane stack
+    /// measures it.
+    ///
+    /// It is a function and not two copies of a division because the wheel and
+    /// the edge-drag auto-scroll both have to turn pixels into lanes, and two
+    /// copies of "how tall is a lane" is exactly the pair that drifts: change
+    /// the floor for one and the other spends a different number of pixels per
+    /// row for the same gesture. The 24-point floor is what keeps a window
+    /// squeezed down to nothing from making every pixel worth a lane.
+    fn arr_lane_h(&self, rect: Rect) -> f32 {
+        (rect.height() / self.arr_visible().max(1) as f32).max(24.0)
+    }
+
+    /// **Pixels of vertical intent, spent in whole lanes.** Positive is DOWN
+    /// the stack, the screen's own sign.
+    ///
+    /// The lane stack distributes exact heights — bus half-rows, automation
+    /// shrinkage — and has no notion of a partial lane, so the delta ACCRUES
+    /// in `arr_scroll_acc` and steps a lane each time roughly a lane's height
+    /// of it has arrived: a trackpad flick moves what it is worth, a slow drag
+    /// moves nothing until it means it, and nobody gets the old
+    /// one-lane-per-micro-tick jump.
+    ///
+    /// **Extracted from the wheel so the edge scroll cannot grow a second
+    /// copy.** The rail-clear at the bottom of this function is the reason it
+    /// matters. Unspendable intent has to DIE at the rails rather than bank
+    /// up; an edge scroll that wrote `arr_scroll_acc` without it would spend
+    /// three seconds of held pointer piling up credit against a stack that
+    /// cannot move, and the first several wheel notches back the other way
+    /// would then do nothing at all. That is the precise fault this
+    /// accumulator's rail-clear was written to fix once already, and sharing
+    /// the function is what stops it being re-introduced by the back door.
+    fn arr_scroll_lanes_by_px(&mut self, dpx: f32, lane_h: f32) {
+        let max = self.active_channels().saturating_sub(self.arr_visible());
+        let lane_h = lane_h.max(1.0);
+        self.arr_scroll_acc += dpx;
+        while self.arr_scroll_acc >= lane_h {
+            self.arr_scroll_acc -= lane_h;
+            self.arr_lane_scroll = (self.arr_lane_scroll + 1).min(max);
+        }
+        while self.arr_scroll_acc <= -lane_h {
+            self.arr_scroll_acc += lane_h;
+            self.arr_lane_scroll = self.arr_lane_scroll.saturating_sub(1);
+        }
+        // Unspendable intent dies at the rails rather than banking up:
+        // holding at the top must not owe the desk a screenful of downward
+        // scroll.
+        if self.arr_lane_scroll == 0 && self.arr_scroll_acc < 0.0 {
+            self.arr_scroll_acc = 0.0;
+        }
+        if self.arr_lane_scroll >= max && self.arr_scroll_acc > 0.0 {
+            self.arr_scroll_acc = 0.0;
+        }
+    }
+
+    /// **The desk, scrolled by pixels.** Positive is RIGHT — toward the later
+    /// channels — the screen's own sign.
+    ///
+    /// Extracted from the wheel for the same reason as
+    /// `arr_scroll_lanes_by_px`: the clamp is the shared thing. It is the
+    /// layout's own arithmetic, so the stored value never banks up past the
+    /// end and goes dead on the way back, and an edge scroll that computed its
+    /// own ceiling would be free to disagree with the wheel about where the
+    /// desk ends. Note that `max_scroll_px` does NOT know about the two-row
+    /// fold — the layout zeroes the range when the desk folds and this does
+    /// not — which is a real mismatch the wheel has always had. It is shared
+    /// here DELIBERATELY: fixing it inside this function would make the wheel
+    /// and the edge scroll agree on a number neither of them used before, and
+    /// it wants its own change with its own test.
+    fn mixer_scroll_by_px(&mut self, dpx: f32, rect: Rect) {
+        let max = crate::mixer_panel::Layout::max_scroll_px(
+            rect,
+            self.mixer_visible(),
+            self.mixer_shown_channels(),
+        );
+        self.mixer_scroll_px = (self.mixer_scroll_px + dpx).clamp(0.0, max);
+    }
+
+    /// **Auto-scroll the arrangement while something is being carried off its
+    /// edge.** One rate law with the MIDI editor and the mixer — see
+    /// [`edge_scroll_pps`] — turned into this surface's own two units: seconds
+    /// of window sideways, whole lanes downward.
+    ///
+    /// **An ALLOW list, and never a deny list.** Half of `ArrDrag`'s variants
+    /// are VIEW gestures: `Pan` and `Nav` and the ruler's `Zoom` move the
+    /// window themselves, and a window that also auto-scrolls fights its own
+    /// hand — hold a pan against the right edge and the view accelerates away
+    /// under the very pointer that is steering it, which is a runaway, not a
+    /// feature. Most of the rest are dials, which have no view to move at all.
+    /// `ClipBand` is excluded for the marquee reason the MIDI editor's
+    /// `Marquee` is: `arr_band` holds both corners as SCREEN points, so
+    /// scrolling under it would drag the anchor and select the wrong clips
+    /// without saying so. Spelling the live set as an allow list means the
+    /// next variant somebody adds is inert until a person decides otherwise,
+    /// which is the safe direction for this to be wrong in.
+    fn arr_edge_scroll(&mut self, ctx: &egui::Context, rect: Rect, drag: ArrDrag, p: Pos2) {
+        let on_lanes = matches!(
+            drag,
+            ArrDrag::Move { .. }
+                | ArrDrag::TrimLeft { .. }
+                | ArrDrag::TrimRight { .. }
+                | ArrDrag::Stretch { .. }
+                | ArrDrag::FadeIn { .. }
+                | ArrDrag::FadeOut { .. }
+                | ArrDrag::CreateMidi { .. }
+        );
+        // A track being carried lives in the HEADER column, which has no
+        // horizontal extent to travel along — there is nothing to the left or
+        // right of a name — so that one is vertical only. It is what makes a
+        // track reorderable past the eighth row: `header_rows` exists only for
+        // the lanes that are drawn, so today a carry simply cannot reach one
+        // that is not.
+        let on_header = matches!(drag, ArrDrag::ReorderLane { .. });
+        if !on_lanes && !on_header {
+            return;
+        }
+        let (zone, axes) = {
+            let clips = self.arr_clip_views();
+            let view = self.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            if on_lanes {
+                (l.lanes_area, EdgeAxes::Both)
+            } else {
+                (l.header, EdgeAxes::Y)
+            }
+        };
+        let step = edge_scroll_step(ctx, zone, p, axes);
+        if step == Vec2::ZERO {
+            return;
+        }
+        if step.x != 0.0 {
+            // Points into seconds through `time_at`, the same pair of calls
+            // the wheel over the grid already uses, and out through
+            // `arr_steer` — the ONE clamp the horizontal window has.
+            //
+            // The pair is sampled from the MIDDLE of the field and not from
+            // the window's origin, because `time_at` floors its answer at
+            // zero: with the window parked at the song's start, x=0 and x=1
+            // are both left of the lanes and both come back 0, so the scale
+            // came out as nought seconds per point and the whole horizontal
+            // scroll was a silent no-op. Anywhere inside the field gives the
+            // true slope, and the centre is inside it by construction.
+            let probe = zone.center().x;
+            let (start, len, s_per_px) = {
+                let clips = self.arr_clip_views();
+                let view = self.arrange_view(&clips);
+                let (start, len) = self.arr_window_now();
+                let a = crate::arrangement_panel::time_at(rect, &view, probe);
+                (
+                    start,
+                    len,
+                    crate::arrangement_panel::time_at(rect, &view, probe + 1.0) - a,
+                )
+            };
+            self.arr_steer(start + f64::from(step.x) * s_per_px, len);
+        }
+        if step.y != 0.0 {
+            let lane_h = self.arr_lane_h(rect);
+            self.arr_scroll_lanes_by_px(step.y, lane_h);
+        }
+    }
+
     /// Clamp a steered window into the song's neighbourhood and keep it.
     fn arr_steer(&mut self, start: f64, len: f64) {
         // An HOUR of viewport, empty project or not — the owner hit the old
@@ -15736,24 +16060,98 @@ impl TangentApp {
         let holding = pointer_down
             || (secondary_down && matches!(drag_now, Some(MeDrag::Marquee { .. })));
         if let (Some(drag), Some(p), true) = (drag_now, pointer, holding) {
-            // **Past the roll's edge, the window CRAWLS** — the owner's
-            // ask: dragging a note off either side pans the view slowly,
-            // and the note lands on the grid the magnet keeps.
+            // **Past the roll's edge the view follows the hand** — the
+            // owner's ask, in all four directions now and priced in seconds.
+            //
+            // What was here was `view_len_s * 0.010` applied once a FRAME and
+            // horizontal only: see `edge_scroll_pps` for why a per-frame law
+            // is not a speed at all. The up-and-down half never existed, so a
+            // note could not be dragged to a pitch that was off the top of
+            // the roll without first zooming out — which is the same "resize
+            // before you can move it" the sideways crawl was written to end.
+            //
+            // `Stretch` joins the list because it is the resize family under
+            // a modifier and has the identical reach problem. `Marquee` stays
+            // OUT on purpose: its anchor is a SCREEN point (`MidiEdit.marquee`
+            // holds both corners in window space), so scrolling underneath it
+            // would drag the anchor along with the view and the box would
+            // quietly select notes nobody swept. Re-basing that anchor into
+            // document space is a fair second job; selecting the wrong notes
+            // silently is not a thing to ship in the meantime.
             if matches!(
                 drag,
                 MeDrag::Move { .. }
                     | MeDrag::Resize { .. }
                     | MeDrag::ResizeLeft { .. }
+                    | MeDrag::Stretch { .. }
                     | MeDrag::Create { .. }
             ) {
                 let l = crate::midi_editor::Layout::new(rect);
                 if l.roll.is_positive() {
-                    if let Some(st) = self.midi_edit.as_mut() {
-                        let crawl = st.view_len_s * 0.010;
-                        if p.x > l.roll.right() {
-                            st.view_start_s += crawl;
-                        } else if p.x < l.roll.left() {
-                            st.view_start_s = (st.view_start_s - crawl).max(0.0);
+                    // **BEFORE `t_at` and `key_at` below, and that ordering is
+                    // load-bearing.** The pointer's meaning depends on the
+                    // window, so a scroll applied after the meaning is read
+                    // moves the view this frame and the note next frame — the
+                    // dragged thing visibly rubber-bands against the grid for
+                    // as long as the hold lasts. The old crawl already got
+                    // this right; do not tidy the block to the end of the
+                    // match.
+                    let step = edge_scroll_step(ctx, l.roll, p, EdgeAxes::Both);
+                    if step != Vec2::ZERO {
+                        // Points into the roll's own units through the
+                        // functions the PAINTER uses. A drag that did its own
+                        // arithmetic would be a third mapping, and the third
+                        // mapping is the one that drifts.
+                        let (s_per_px, kh, hi) = {
+                            let st = self.midi_edit.as_ref().unwrap();
+                            let clip =
+                                self.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+                            let view = self.midi_edit_view(st, clip);
+                            let a = crate::midi_editor::time_at(&l, &view, 0.0);
+                            // **The rail the roll has never had.** Every
+                            // writer of `view_start_s` in this file clamps at
+                            // zero and NOTHING clamps the other end, so a hand
+                            // held at the right edge sailed the window off
+                            // into empty space for ever. Nobody hit it while
+                            // the crawl moved one per cent of a window per
+                            // frame; an honest rate law is out past the clip
+                            // in about two seconds. The domain is
+                            // `me_fit_clip`'s — the clip plus its pad —
+                            // because `me_move_selection` already refuses to
+                            // put a note outside the clip, so there is
+                            // nothing out there to drag to.
+                            let pad = (clip.len_s * 0.08).max(self.arr_bar_s() * 0.5);
+                            (
+                                crate::midi_editor::time_at(&l, &view, 1.0) - a,
+                                crate::midi_editor::key_h(&l, view.keys_shown),
+                                clip.start_s + clip.len_s + pad - st.view_len_s,
+                            )
+                        };
+                        let kv = self.midi_keys_visible();
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            // The rails STOP the walk; they never pull it
+                            // back. A window somebody zoomed out until it is
+                            // wider than the clip, or panned past the end with
+                            // the wheel, is where they PUT it — having the
+                            // first edge-scroll frame yank it home would be a
+                            // second gesture nobody asked for, and would make
+                            // this rail a change to the wheel's behaviour by
+                            // proxy. Left rail stays the zero every other
+                            // writer already uses: the song has a start.
+                            let ds = f64::from(step.x) * s_per_px;
+                            let want = st.view_start_s + ds;
+                            st.view_start_s = if ds >= 0.0 {
+                                want.min(hi.max(st.view_start_s))
+                            } else {
+                                want.max(0.0_f64.min(st.view_start_s))
+                            };
+                            // DOWN is toward the lower notes, and `top_key`
+                            // counts upward — so the screen's sign is read
+                            // backwards here. Same expression and the same
+                            // `(kv, 128.0)` rails as the wheel over the piano
+                            // column, which is the other place a pointer
+                            // walks this value.
+                            st.top_key = (st.top_key - step.y / kh).clamp(kv, 128.0);
                         }
                     }
                 }
@@ -16505,38 +16903,15 @@ impl TangentApp {
                             self.save_settings();
                         }
                     } else {
-                        // **Pixels of intent, spent in whole lanes.** The
-                        // lane stack distributes exact heights — bus
-                        // half-rows, automation shrinkage — and has no
-                        // notion of a partial lane, so the delta ACCRUES
-                        // and steps a lane each time roughly a lane's
-                        // height of it has arrived: a trackpad flick moves
-                        // what it is worth, a slow drag moves nothing
-                        // until it means it, and nobody gets the old
-                        // one-lane-per-micro-tick jump.
-                        let max =
-                            self.active_channels().saturating_sub(self.arr_visible());
-                        let lane_h = (rect.height()
-                            / self.arr_visible().max(1) as f32)
-                            .max(24.0);
-                        self.arr_scroll_acc -= d;
-                        while self.arr_scroll_acc >= lane_h {
-                            self.arr_scroll_acc -= lane_h;
-                            self.arr_lane_scroll = (self.arr_lane_scroll + 1).min(max);
-                        }
-                        while self.arr_scroll_acc <= -lane_h {
-                            self.arr_scroll_acc += lane_h;
-                            self.arr_lane_scroll = self.arr_lane_scroll.saturating_sub(1);
-                        }
-                        // Unspendable intent dies at the rails rather than
-                        // banking up: holding the wheel at the top must
-                        // not owe the desk a screenful of downward scroll.
-                        if self.arr_lane_scroll == 0 && self.arr_scroll_acc < 0.0 {
-                            self.arr_scroll_acc = 0.0;
-                        }
-                        if self.arr_lane_scroll >= max && self.arr_scroll_acc > 0.0 {
-                            self.arr_scroll_acc = 0.0;
-                        }
+                        // **Pixels of intent, spent in whole lanes** — and
+                        // spent through `arr_scroll_lanes_by_px`, which the
+                        // edge-drag auto-scroll also calls. A wheel notch is
+                        // a POSITIVE delta meaning "earlier lanes", so it
+                        // arrives at that shared function negated: the
+                        // function's own sign is the screen's, positive
+                        // being down.
+                        let lane_h = self.arr_lane_h(rect);
+                        self.arr_scroll_lanes_by_px(-d, lane_h);
                     }
                     return;
                 }
@@ -17269,6 +17644,13 @@ impl TangentApp {
         let arr_holding = pointer_down
             || (arr_secondary_down && matches!(self.arr_drag, Some(ArrDrag::ClipBand)));
         if let (Some(drag), Some(p), true) = (self.arr_drag, pointer, arr_holding) {
+            // **The view follows a clip dragged off the edge — BEFORE the
+            // pointer is asked what it means.** `t_at` below, and the
+            // `lane_at` inside `ArrDrag::Move`, are both read against the
+            // window this frame; scrolling afterwards would move the view now
+            // and the clip next frame, and the clip visibly lags the edge for
+            // as long as the hold lasts. See `arr_edge_scroll`.
+            self.arr_edge_scroll(ctx, rect, drag, p);
             let t_at = {
                 let clips = self.arr_clip_views();
                 let view = self.arrange_view(&clips);
@@ -17516,6 +17898,28 @@ impl TangentApp {
             if !released {
                 if !active && (p - origin).length() > 8.0 {
                     self.bay_carry = Some((strip, bay, origin, true));
+                } else if active {
+                    // **A carried bay walks the stack too.** It lands on
+                    // `header_rows`, which exist only for the lanes that are
+                    // drawn, so without this a plugin cannot be carried to the
+                    // ninth track at all — the same reach problem the clip
+                    // drag has, on the column instead of the field. Vertical
+                    // only: the header does not scroll sideways.
+                    //
+                    // `bay_carry` is one field for two surfaces, but the mixer
+                    // and the arrangement are drawn into the SAME rectangle
+                    // and are never up at once (see the Tab cycle), so
+                    // whichever one is running owns the hand.
+                    let zone = {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        crate::arrangement_panel::Layout::new(rect, &view).header
+                    };
+                    let step = edge_scroll_step(ctx, zone, p, EdgeAxes::Y);
+                    if step.y != 0.0 {
+                        let lane_h = self.arr_lane_h(rect);
+                        self.arr_scroll_lanes_by_px(step.y, lane_h);
+                    }
                 }
             } else {
                 let clips = self.arr_clip_views();
@@ -27616,16 +28020,12 @@ impl TangentApp {
                         // Plain wheel SCROLLS, in PIXELS — the raw delta IS
                         // pixels of intent, so a trackpad glides and a mouse
                         // notch moves about half a strip instead of exactly
-                        // one whole one. Clamped here against the same
-                        // arithmetic the layout uses, so the value never
-                        // banks up past the end and goes dead.
-                        let max = crate::mixer_panel::Layout::max_scroll_px(
-                            rect,
-                            self.mixer_visible(),
-                            self.mixer_shown_channels(),
-                        );
-                        self.mixer_scroll_px =
-                            (self.mixer_scroll_px - d).clamp(0.0, max);
+                        // one whole one. The clamp lives in
+                        // `mixer_scroll_by_px`, which the edge-drag
+                        // auto-scroll also calls; negated here because a
+                        // positive wheel means "earlier channels" while that
+                        // function's sign is the screen's.
+                        self.mixer_scroll_by_px(-d, rect);
                     }
                 }
             }
@@ -27929,6 +28329,45 @@ impl TangentApp {
                                 }
                             }
                         }
+                    }
+                }
+            }
+            // **A carried strip or bay drags the desk under it.**
+            //
+            // The mixer's reach problem, and the reason this item exists on
+            // three surfaces at once: `strip_at` only answers about columns
+            // that were LAID OUT, so a track carried toward the right edge
+            // can only be dropped on one of the eight that happen to show.
+            // Moving a channel past the eighth meant zooming the desk out
+            // first, doing the drag, and zooming back — which is a workaround,
+            // not a gesture.
+            //
+            // The zone is the SCROLLING REGION and not the panel. The click
+            // and the master are pinned to the panel's right and never move,
+            // so an edge zone on the panel would sit under two columns that
+            // cannot scroll and would auto-scroll while the hand hovers
+            // something standing still. Pushing past the region's right rail —
+            // out over the pinned pair, which is exactly where a hand reaching
+            // for "further" ends up — saturates instead, which is what
+            // `edge_scroll_pps` guarantees.
+            //
+            // Only once ARMED, the `true` in each carry: a motionless press is
+            // still a click, and a click that scrolled the desk out from under
+            // itself would be unusable. And nothing to do at the landing
+            // sites — `mixer_view()` is rebuilt from `mixer_scroll_px` every
+            // frame, so `strip_at` and the carry's own highlight both answer
+            // about whatever column has scrolled under the pointer.
+            if pointer_down {
+                let carrying = self.mixer_reorder.is_some_and(|(_, _, live)| live)
+                    || self.bay_carry.is_some_and(|(_, _, _, live)| live);
+                if let (true, Some(p)) = (carrying, pos) {
+                    let region = {
+                        let view = self.mixer_view();
+                        crate::mixer_panel::Layout::new(rect, &view).region
+                    };
+                    let step = edge_scroll_step(&ctx, region, p, EdgeAxes::X);
+                    if step.x != 0.0 {
+                        self.mixer_scroll_by_px(step.x, rect);
                     }
                 }
             }
@@ -40177,6 +40616,893 @@ mod tests {
         app.dialog = Some(dialogs::Dialog::About);
         assert!(app.dialog_blocks_keys(&ctx), "a modal dialog let the shortcuts through");
         assert!(app.dialog_blocks_pointer(&ctx));
+    }
+
+    // ── edge-drag auto-scroll ───────────────────────────────────────────────
+
+    /// One frame with a CHOSEN frame time and no events at all — which is the
+    /// exact shape a held edge drag has, because a pointer that is not moving
+    /// emits nothing. Returns what the frame asked the host to wait before
+    /// painting again.
+    ///
+    /// `RawInput::time` is left `None` on purpose. egui then derives the
+    /// frame's clock from `predicted_dt` (`InputState::begin_pass`), so
+    /// `unstable_dt` — the number `edge_scroll_step` actually spends — is
+    /// exactly what is handed in here. That is what makes "the same fifth of a
+    /// second, in twelve frames or in four" a question a test can put to the
+    /// rate law.
+    fn hold_frame(ctx: &egui::Context, app: &mut TangentApp, dt: f32) -> Duration {
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                predicted_dt: dt,
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        out.viewport_output
+            .values()
+            .map(|v| v.repaint_delay)
+            .min()
+            .unwrap_or(Duration::MAX)
+    }
+
+    /// A MIDI clip with one fat note, the editor open on it and ZOOMED IN, one
+    /// frame drawn. Returns the editor's rectangle and the clip's id.
+    ///
+    /// The zoom is the point of the fixture. `open_midi_editor` fits the clip
+    /// plus its pad, which is the whole domain the roll is allowed to show — so
+    /// from a fresh open there is nowhere for a horizontal edge scroll to GO,
+    /// and a test that started there would be asserting about a rail rather
+    /// than about a scroll. Two seconds of an eight-second clip leaves seven
+    /// seconds of room to the right and four to the left.
+    fn midi_editor_zoomed_in(ctx: &egui::Context, app: &mut TangentApp) -> (Rect, u64) {
+        use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+        app.arrangement_open = true;
+        let _ = run_frame(ctx, app);
+        app.arrangement.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            notes: vec![ArrNote { at_s: 0.5, dur_s: 1.0, key: 60, vel: 100 }],
+            lane: 0,
+            path: String::new(),
+            start_s: 4.0,
+            offset_s: 0.0,
+            len_s: 8.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "m".into(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        let id = app.arrangement.clips[0].id;
+        app.open_midi_editor(id);
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.view_start_s = 4.0;
+            st.view_len_s = 2.0;
+        }
+        let _ = run_frame(ctx, app);
+        (app.midi_edit_rect.expect("the editor drew nowhere"), id)
+    }
+
+    /// Where the clip's only note is drawn, through the painter's own
+    /// `note_rect` — a test that guessed at the geometry would be pressing
+    /// empty roll.
+    fn me_note_centre(app: &TangentApp, rect: Rect, id: u64) -> Pos2 {
+        let st = app.midi_edit.as_ref().unwrap();
+        let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+        let view = app.midi_edit_view(st, clip);
+        let l = crate::midi_editor::Layout::new(rect);
+        let r = crate::midi_editor::note_rect(&l, &view, &clip.notes[0]);
+        assert!(r.is_positive(), "the note drew nowhere");
+        r.center()
+    }
+
+    /// **One law, and it saturates instead of running away.**
+    ///
+    /// The three things a rate law over an edge zone has to get right, asserted
+    /// on the law itself because they are properties of the ARITHMETIC and
+    /// nothing else: a ramp across the zone, a floor at the lip so the outer
+    /// third of the zone is not a dead zone inside a live one, and a ceiling
+    /// past the rail. The ceiling is the one that matters most — the pointer
+    /// can be an arbitrary distance outside (a note dragged clean out of the
+    /// editor is still a note being dragged), and a law that stayed
+    /// proportional out there would fling the view across the song the moment
+    /// the hand left the panel.
+    #[test]
+    fn the_edge_law_is_one_law_and_it_saturates() {
+        let r = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(600.0, 400.0));
+        let mid_y = r.center().y;
+        // The middle of a view is not an edge, and neither is a point just
+        // outside the zone.
+        assert_eq!(edge_scroll_pps(r, r.center()), Vec2::ZERO);
+        assert_eq!(
+            edge_scroll_pps(r, Pos2::new(r.right() - EDGE_ZONE - 1.0, mid_y)),
+            Vec2::ZERO
+        );
+        // The first live sample already moves at the FLOOR, not at a hair
+        // above nothing.
+        let lip = edge_scroll_pps(r, Pos2::new(r.right() - EDGE_ZONE + 0.5, mid_y));
+        assert!(
+            lip.x >= EDGE_SLOW && lip.x < EDGE_SLOW + 60.0,
+            "the zone's lip runs at {} points a second, not the floor",
+            lip.x
+        );
+        assert_eq!(lip.y, 0.0, "a hand halfway down the view moved it vertically");
+        // The rail is the fast end, and two hundred points past it is the
+        // SAME speed rather than nine times it.
+        let rail = edge_scroll_pps(r, Pos2::new(r.right(), mid_y)).x;
+        let past = edge_scroll_pps(r, Pos2::new(r.right() + 200.0, mid_y)).x;
+        assert!((rail - EDGE_FAST).abs() < 1.0e-3, "the rail runs at {rail}");
+        assert!(
+            (past - EDGE_FAST).abs() < 1.0e-3,
+            "two hundred points off the edge ran away to {past}"
+        );
+        // Monotone across the zone, and it really does climb.
+        let mut last = 0.0;
+        for i in 0..=24 {
+            let x = r.right() - EDGE_ZONE + i as f32;
+            let s = edge_scroll_pps(r, Pos2::new(x, mid_y)).x;
+            assert!(s >= last - 1.0e-3, "the ramp fell at x={x}: {s} after {last}");
+            last = s;
+        }
+        assert!(last > EDGE_SLOW * 2.0, "the ramp never climbed: {last}");
+        // Signs: left and up are negative, right and down positive.
+        assert!(edge_scroll_pps(r, Pos2::new(r.left(), mid_y)).x < 0.0);
+        assert!(edge_scroll_pps(r, Pos2::new(r.center().x, r.top())).y < 0.0);
+        assert!(edge_scroll_pps(r, Pos2::new(r.center().x, r.bottom())).y > 0.0);
+        // A corner scrolls DIAGONALLY — both axes, both at full tilt.
+        let corner = edge_scroll_pps(r, r.max);
+        assert!(
+            (corner.x - EDGE_FAST).abs() < 1.0e-3 && (corner.y - EDGE_FAST).abs() < 1.0e-3,
+            "the corner gave {corner:?}"
+        );
+        // And a rectangle that was never drawn is not an edge zone.
+        assert_eq!(edge_scroll_pps(Rect::NOTHING, Pos2::ZERO), Vec2::ZERO);
+    }
+
+    /// **The keystone: an edge hold moves the view by TIME, not by frames.**
+    ///
+    /// What this replaced was `view_len_s * 0.010` applied once a FRAME, so the
+    /// same hold for the same second travelled three times as far while a drag
+    /// kept the loop hot as it did on the fifty-millisecond idle tick, and
+    /// further again on a machine that paints faster. Twelve frames of a
+    /// sixtieth and four frames of a twentieth are the same fifth of a second:
+    /// a rate law lands them in the same place, and a frame counter lands them
+    /// three to one apart.
+    #[test]
+    fn an_edge_hold_moves_the_view_by_time_and_not_by_frames() {
+        let travel = |frames: usize, dt: f32| -> f64 {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            let (rect, id) = midi_editor_zoomed_in(&ctx, &mut app);
+            let grab = me_note_centre(&app, rect, id);
+            press(&ctx, &mut app, grab);
+            assert!(
+                matches!(app.midi_edit.as_ref().unwrap().drag, Some(MeDrag::Move { .. })),
+                "the press did not grab the note"
+            );
+            let roll = crate::midi_editor::Layout::new(rect).roll;
+            move_to(&ctx, &mut app, Pos2::new(roll.right() - 1.0, roll.center().y));
+            let from = app.midi_edit.as_ref().unwrap().view_start_s;
+            for _ in 0..frames {
+                hold_frame(&ctx, &mut app, dt);
+            }
+            app.midi_edit.as_ref().unwrap().view_start_s - from
+        };
+        let many = travel(12, 1.0 / 60.0);
+        let few = travel(4, 0.05);
+        assert!(many > 0.1, "the hold at the right edge moved {many} s");
+        assert!(
+            (many - few).abs() < many * 0.05,
+            "twelve fast frames moved {many} s and four slow ones {few} s — \
+             that is a frame counter wearing a rate's clothes"
+        );
+    }
+
+    /// **The half that never existed: up and down.**
+    ///
+    /// Before this there was no vertical edge scroll on the roll at all, so a
+    /// note could not be dragged to a pitch that was off the top without first
+    /// zooming the key range out, doing the drag, and zooming back — the same
+    /// "resize before you can move it" the sideways crawl was written to end.
+    /// The note has to come WITH the view: `key_at` is read after the scroll,
+    /// so the row under the hand is the row the scroll just put there.
+    #[test]
+    fn a_note_dragged_off_the_top_of_the_roll_walks_the_keys() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, id) = midi_editor_zoomed_in(&ctx, &mut app);
+        let grab = me_note_centre(&app, rect, id);
+        press(&ctx, &mut app, grab);
+        let roll = crate::midi_editor::Layout::new(rect).roll;
+        let key_of = |app: &TangentApp| app.arrangement.clips[0].notes[0].key;
+        let top_key = |app: &TangentApp| app.midi_edit.as_ref().unwrap().top_key;
+
+        let (key0, tk0) = (key_of(&app), top_key(&app));
+        move_to(&ctx, &mut app, Pos2::new(roll.center().x, roll.top() + 1.0));
+        for _ in 0..4 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        assert!(top_key(&app) > tk0, "the top edge did not raise the range");
+        assert!(
+            key_of(&app) > key0,
+            "the range rose to {} and the note stayed on {}",
+            top_key(&app),
+            key_of(&app)
+        );
+
+        // And back down.
+        let tk1 = top_key(&app);
+        let key1 = key_of(&app);
+        move_to(&ctx, &mut app, Pos2::new(roll.center().x, roll.bottom() - 1.0));
+        for _ in 0..4 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        assert!(top_key(&app) < tk1, "the bottom edge did not lower the range");
+        assert!(key_of(&app) < key1, "the note did not follow the range down");
+
+        // The rails are the wheel's rails: `midi_keys_visible()` at the
+        // bottom of the keyboard, 128 at the top. Ten seconds of hold at
+        // either end lands exactly on them and stops.
+        let kv = app.midi_keys_visible();
+        move_to(&ctx, &mut app, Pos2::new(roll.center().x, roll.bottom() + 200.0));
+        for _ in 0..200 {
+            hold_frame(&ctx, &mut app, 0.05);
+        }
+        assert!(
+            (top_key(&app) - kv).abs() < 1.0e-4,
+            "the bottom rail is {kv}, the range stopped at {}",
+            top_key(&app)
+        );
+        move_to(&ctx, &mut app, Pos2::new(roll.center().x, roll.top() - 200.0));
+        for _ in 0..200 {
+            hold_frame(&ctx, &mut app, 0.05);
+        }
+        assert!(
+            (top_key(&app) - 128.0).abs() < 1.0e-4,
+            "the top rail is 128, the range stopped at {}",
+            top_key(&app)
+        );
+    }
+
+    /// **The roll stops at the song's start and at the end of the clip.**
+    ///
+    /// The right-hand rail is new. Every writer of `view_start_s` in this file
+    /// clamps at zero and nothing ever clamped the other end, so a hand held at
+    /// the right edge sailed the window off into empty space for ever — nobody
+    /// found it because one per cent of a window per frame never got there, and
+    /// an honest rate law gets there in about two seconds.
+    #[test]
+    fn the_roll_never_sails_past_the_clip_or_before_zero() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, id) = midi_editor_zoomed_in(&ctx, &mut app);
+        let grab = me_note_centre(&app, rect, id);
+        press(&ctx, &mut app, grab);
+        let roll = crate::midi_editor::Layout::new(rect).roll;
+        // Ten seconds of hold, well past what either rail is worth.
+        move_to(&ctx, &mut app, Pos2::new(roll.left() - 50.0, roll.center().y));
+        for _ in 0..200 {
+            hold_frame(&ctx, &mut app, 0.05);
+        }
+        let start = app.midi_edit.as_ref().unwrap().view_start_s;
+        assert!(start >= 0.0, "the roll went to {start} s, before the song");
+        assert!(start < 1.0e-9, "the roll stopped short of zero, at {start}");
+
+        move_to(&ctx, &mut app, Pos2::new(roll.right() + 50.0, roll.center().y));
+        for _ in 0..200 {
+            hold_frame(&ctx, &mut app, 0.05);
+        }
+        let (start, len) = {
+            let st = app.midi_edit.as_ref().unwrap();
+            (st.view_start_s, st.view_len_s)
+        };
+        let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+        let pad = (clip.len_s * 0.08).max(app.arr_bar_s() * 0.5);
+        let wall = clip.start_s + clip.len_s + pad;
+        assert!(
+            start + len <= wall + 1.0e-6,
+            "the roll sailed to {} s, past the clip's own wall at {wall} s",
+            start + len
+        );
+        assert!(
+            start + len > wall - 1.0e-6,
+            "the roll stopped at {} s, short of the wall at {wall} s",
+            start + len
+        );
+    }
+
+    /// The arrangement, one MIDI clip on lane 0, snap off, one frame drawn.
+    ///
+    /// Snap OFF because two of these tests assert that the clip and the window
+    /// moved by the SAME number of seconds, and a grid would quantise one of
+    /// the two.
+    fn arrangement_with_a_clip(ctx: &egui::Context, app: &mut TangentApp) -> (Rect, u64) {
+        use crate::arrangement::{ArrClip, ClipKind};
+        app.arrangement_open = true;
+        app.settings.arr_snap = false;
+        app.arrangement.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 0,
+            path: String::new(),
+            start_s: 2.0,
+            offset_s: 0.0,
+            len_s: 4.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "m".into(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        let id = app.arrangement.clips[0].id;
+        let _ = run_frame(ctx, app);
+        (app.arrangement_rect.expect("the arrangement drew nowhere"), id)
+    }
+
+    fn arr_clip_centre(app: &TangentApp, rect: Rect, id: u64) -> Pos2 {
+        let clips = app.arr_clip_views();
+        let view = app.arrange_view(&clips);
+        let c = clips.iter().find(|c| c.id == id).expect("the clip has a view");
+        let r = crate::arrangement_panel::clip_rect(rect, &view, c);
+        assert!(r.is_positive(), "the clip drew nowhere");
+        r.center()
+    }
+
+    /// **A clip dragged past the right edge takes the window with it, and stays
+    /// under the hand the whole way.**
+    ///
+    /// The second half is the ORDERING guard, and it has to ask about WHERE THE
+    /// CLIP IS DRAWN rather than about how far it travelled. The pointer's
+    /// meaning (`t_at`) is read against the window, so the scroll has to run
+    /// first; move it after and every frame places the clip using the PREVIOUS
+    /// frame's window, which on screen is a clip sitting a fixed distance
+    /// behind the hand for as long as the hold lasts.
+    ///
+    /// The first version of this compared the window's travel against the
+    /// clip's, and it stayed GREEN through exactly that revert — a constant
+    /// one-frame lag cancels out of a difference of two deltas taken over the
+    /// same number of frames. The gap between the hand and the clip's left edge
+    /// does not cancel, because it IS the lag, so that is what is measured, in
+    /// points, off the same `clip_rect` the painter draws with.
+    #[test]
+    fn a_clip_dragged_past_the_right_edge_takes_the_window_with_it() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, id) = arrangement_with_a_clip(&ctx, &mut app);
+        let clip_left = |app: &TangentApp| {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let c = clips.iter().find(|c| c.id == id).expect("the clip has a view");
+            let r = crate::arrangement_panel::clip_rect(rect, &view, c);
+            assert!(r.is_positive(), "the clip drew nowhere");
+            r.left()
+        };
+        let grab = arr_clip_centre(&app, rect, id);
+        press(&ctx, &mut app, grab);
+        assert!(
+            matches!(app.arr_drag, Some(ArrDrag::Move { .. })),
+            "the press did not grab the clip: {:?}",
+            app.arr_drag
+        );
+        // How far into the clip the hand took hold. Whatever the view does
+        // afterwards, the clip has to keep riding under that same point.
+        let held_at = grab.x - clip_left(&app);
+        let lanes = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            crate::arrangement_panel::Layout::new(rect, &view).lanes_area
+        };
+        let at = Pos2::new(lanes.right() - 2.0, lanes.center().y);
+        move_to(&ctx, &mut app, at);
+        let win0 = app.arr_window_now().0;
+        let clip0 = app.arrangement.clips[0].start_s;
+        for _ in 0..10 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        let win_d = app.arr_window_now().0 - win0;
+        let clip_d = app.arrangement.clips[0].start_s - clip0;
+        assert!(win_d > 0.5, "the window only moved {win_d} s");
+        assert!(clip_d > 0.5, "the window ran off and left the clip behind");
+        let now = at.x - clip_left(&app);
+        assert!(
+            (now - held_at).abs() < 1.0,
+            "the clip is drawn {now} points into the hand instead of \
+             {held_at} — it is lagging the view, which means the scroll is \
+             running after the pointer has been read"
+        );
+    }
+
+    /// **A clip dragged to the bottom of the stack scrolls the lanes** — and
+    /// stops at the last one, with nothing banked against the rail.
+    ///
+    /// `lane_rows` exists only for the lanes that are DRAWN, so before this a
+    /// clip simply could not be dropped on the ninth track: the row it wanted
+    /// was not on screen and `position(..contains)` answered None. The
+    /// accumulator assertion is the other half — unspendable intent has to die
+    /// at the rail, or three seconds of held pointer bank up credit that eats
+    /// the first several wheel notches back the other way.
+    #[test]
+    fn a_clip_dragged_to_the_bottom_of_the_lanes_scrolls_the_stack() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.arr_visible = 8;
+        for n in 0..12 {
+            app.add_bare_track(n);
+        }
+        let (rect, id) = arrangement_with_a_clip(&ctx, &mut app);
+        let grab = arr_clip_centre(&app, rect, id);
+        press(&ctx, &mut app, grab);
+        let lanes = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            crate::arrangement_panel::Layout::new(rect, &view).lanes_area
+        };
+        let drawn_at_press: Vec<usize> = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            (0..crate::recorder::CHANNELS)
+                .filter(|&i| l.lane_rows[i].is_positive())
+                .collect()
+        };
+        assert!(
+            !drawn_at_press.contains(&(app.active_channels() - 1)),
+            "the fixture drew every lane, so there is nothing to scroll to"
+        );
+        // Straight down the middle of the field, hard against the bottom.
+        move_to(&ctx, &mut app, Pos2::new(lanes.center().x, lanes.bottom() - 2.0));
+        for _ in 0..30 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        assert!(app.arr_lane_scroll > 0, "the stack did not move");
+        assert!(
+            !drawn_at_press.contains(&app.arrangement.clips[0].lane),
+            "the clip landed on lane {}, which was already on screen",
+            app.arrangement.clips[0].lane
+        );
+        // Long past the rail: it stops there, and owes the wheel nothing.
+        for _ in 0..200 {
+            hold_frame(&ctx, &mut app, 0.05);
+        }
+        let max = app.active_channels().saturating_sub(app.arr_visible());
+        assert_eq!(app.arr_lane_scroll, max, "the stack ran past its last lane");
+        assert_eq!(
+            app.arr_scroll_acc, 0.0,
+            "the hold banked {} points of unspendable intent at the rail",
+            app.arr_scroll_acc
+        );
+    }
+
+    /// **A view gesture does not auto-scroll itself.**
+    ///
+    /// `Pan` and `Nav` move the window with the hand; a window that also ran
+    /// away from the edge under them would be accelerating away from the very
+    /// pointer that is steering it. This is why the live set is spelled as an
+    /// ALLOW list — a deny list would have to be remembered every time somebody
+    /// adds a variant, and the failure is a runaway rather than a nothing.
+    /// The `Move` leg is the control: the same hold in the same place, on a
+    /// drag that IS meant to scroll, really does move the window.
+    #[test]
+    fn a_view_gesture_does_not_auto_scroll_itself() {
+        for gesture in ["pan", "nav", "move"] {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            let (rect, id) = arrangement_with_a_clip(&ctx, &mut app);
+            let lanes = {
+                let clips = app.arr_clip_views();
+                let view = app.arrange_view(&clips);
+                crate::arrangement_panel::Layout::new(rect, &view).lanes_area
+            };
+            let at = Pos2::new(lanes.right() - 2.0, lanes.center().y);
+            // Grab the clip for real, then swap in the gesture under test —
+            // the pointer stays down across the swap, which is what a drag in
+            // flight is.
+            let grab = arr_clip_centre(&app, rect, id);
+            press(&ctx, &mut app, grab);
+            move_to(&ctx, &mut app, at);
+            app.arr_drag = match gesture {
+                "pan" => Some(ArrDrag::Pan { last_x: at.x }),
+                "nav" => Some(ArrDrag::Nav { last: at, px_w: 100.0 }),
+                _ => app.arr_drag,
+            };
+            let win0 = app.arr_window_now();
+            for _ in 0..10 {
+                hold_frame(&ctx, &mut app, 1.0 / 60.0);
+            }
+            let win1 = app.arr_window_now();
+            if gesture == "move" {
+                assert!(win1.0 > win0.0 + 0.5, "the control leg did not scroll");
+            } else {
+                assert!(
+                    (win1.0 - win0.0).abs() < 1.0e-9 && (win1.1 - win0.1).abs() < 1.0e-9,
+                    "{gesture} auto-scrolled itself from {win0:?} to {win1:?}"
+                );
+            }
+        }
+    }
+
+    /// A twelve-track arrangement whose stack is taller than its window, one
+    /// frame drawn. Returns the panel's rectangle and which header rows were
+    /// on screen at that moment.
+    fn arrangement_with_a_tall_stack(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+    ) -> (Rect, Vec<usize>) {
+        app.arrangement_open = true;
+        app.settings.arr_visible = 4;
+        for n in 0..12 {
+            app.add_bare_track(n);
+        }
+        let _ = run_frame(ctx, app);
+        let rect = app.arrangement_rect.expect("the arrangement drew nowhere");
+        let drawn = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            (0..crate::recorder::CHANNELS)
+                .filter(|&i| l.header_rows[i].panel.is_positive())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            drawn.len() < 12,
+            "the fixture drew every header row, so there is nothing to scroll to"
+        );
+        (rect, drawn)
+    }
+
+    /// **A track carried down the header column walks the stack.**
+    ///
+    /// The mixer's reach problem stood upright. `header_rows` exists only for
+    /// the lanes that are DRAWN, so a carried track could not be dropped on the
+    /// ninth row: the row it wanted was not laid out and `arr_row_under`
+    /// answered None. Vertical only — the header has no horizontal extent for a
+    /// name to travel along.
+    #[test]
+    fn a_track_carried_down_the_header_walks_the_stack() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, drawn_at_press) = arrangement_with_a_tall_stack(&ctx, &mut app);
+        let (grab, header) = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            (l.header_rows[0].name.center(), l.header)
+        };
+        press(&ctx, &mut app, grab);
+        assert!(
+            matches!(app.arr_drag, Some(ArrDrag::ReorderLane { from: 0, .. })),
+            "the press on the name plate did not arm a track carry: {:?}",
+            app.arr_drag
+        );
+        let at = Pos2::new(header.center().x, header.bottom() - 2.0);
+        move_to(&ctx, &mut app, at);
+        for _ in 0..30 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        assert!(app.arr_lane_scroll > 0, "the carried track did not move the stack");
+        let under = app.arr_row_under(rect, at).map(|(n, _)| n);
+        assert!(
+            under.is_some_and(|n| !drawn_at_press.contains(&n)),
+            "the hand ended over row {under:?}, which was already on screen"
+        );
+    }
+
+    /// **A carried bay walks the stack too**, on the arrangement's header as on
+    /// the mixer's desk — the header carries the same three chips, and a plugin
+    /// that cannot be dropped on the ninth track is the same gap.
+    #[test]
+    fn a_carried_bay_walks_the_arrangement_header_too() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.set_insert(crate::recorder::Strip::Channel(0).index(), 0, Some("/x/Comp.vst3"));
+        let (rect, _) = arrangement_with_a_tall_stack(&ctx, &mut app);
+        let (grab, header) = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            (l.header_rows[0].bays[0].center(), l.header)
+        };
+        press(&ctx, &mut app, grab);
+        assert!(app.bay_carry.is_some(), "the press on the chip did not arm a carry");
+        move_to(
+            &ctx,
+            &mut app,
+            Pos2::new(header.center().x, header.bottom() - 2.0),
+        );
+        for _ in 0..30 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        assert!(app.arr_lane_scroll > 0, "the carried bay did not move the stack");
+    }
+
+    /// **A carried strip scrolls the desk, and lands on a column that was not
+    /// there when it was picked up.**
+    ///
+    /// `strip_at` only answers about columns the layout DREW, so moving a
+    /// channel past the last visible one used to mean zooming the desk out,
+    /// doing the drag, and zooming back. The zone is the scrolling region and
+    /// not the panel, so the pinned click and master on its right are a place
+    /// the hand can push INTO — which is exactly where a hand reaching for
+    /// "further right" ends up.
+    #[test]
+    fn a_carried_strip_scrolls_the_desk_and_lands_where_it_was_dropped() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.mixer_open = true;
+        app.settings.mixer_visible = 4;
+        for n in 0..10 {
+            app.add_bare_track(n);
+        }
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.mixer_rect.expect("the mixer drew nowhere");
+        let (grab, region, drawn_at_press) = {
+            let view = app.mixer_view();
+            let l = crate::mixer_panel::Layout::new(rect, &view);
+            let drawn: Vec<usize> = (0..crate::recorder::CHANNELS)
+                .filter(|&i| l.strips[i].panel.is_positive())
+                .collect();
+            (l.strips[0].name.center(), l.region, drawn)
+        };
+        assert!(
+            drawn_at_press.len() < 10,
+            "the fixture drew every strip, so there is nothing to scroll to"
+        );
+        press(&ctx, &mut app, grab);
+        assert!(app.mixer_reorder.is_some(), "the press did not arm a carry");
+        let at = Pos2::new(region.right() - 2.0, region.center().y);
+        move_to(&ctx, &mut app, at);
+        for _ in 0..20 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        assert!(app.mixer_scroll_px > 0.0, "the desk did not move");
+        let max = crate::mixer_panel::Layout::max_scroll_px(
+            rect,
+            app.mixer_visible(),
+            app.mixer_shown_channels(),
+        );
+        assert!(
+            app.mixer_scroll_px <= max + 1.0e-3,
+            "the desk scrolled to {} past its own end at {max}",
+            app.mixer_scroll_px
+        );
+        let under = {
+            let view = app.mixer_view();
+            crate::mixer_panel::strip_at(rect, &view, at)
+                .and_then(crate::recorder::Column::strip)
+        };
+        let Some(crate::recorder::Strip::Channel(to)) = under else {
+            panic!("nothing is under the hand after the scroll: {under:?}");
+        };
+        assert!(
+            !drawn_at_press.contains(&to),
+            "the hand ended over channel {to}, which was already on screen"
+        );
+    }
+
+    /// **The desk has no up and down, and does not burn frames pretending it
+    /// has.**
+    ///
+    /// A strip's name plate sits at the TOP of its column, so a hand carrying a
+    /// strip is very often within a couple of dozen points of the scrolling
+    /// region's top rail — for the whole gesture, not as a corner case. A zone
+    /// that answered on both axes there would return a velocity every frame
+    /// that nothing can spend (the desk scrolls sideways and only sideways) and
+    /// would ask for a 60 Hz frame to spend it, for as long as the hand was
+    /// held. That is the reason `EdgeAxes` exists rather than the zone simply
+    /// always being both.
+    #[test]
+    fn a_carry_near_the_desks_top_edge_neither_scrolls_nor_asks_for_frames() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.mixer_open = true;
+        app.settings.mixer_visible = 4;
+        for n in 0..10 {
+            app.add_bare_track(n);
+        }
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.mixer_rect.expect("the mixer drew nowhere");
+        let (grab, region) = {
+            let view = app.mixer_view();
+            let l = crate::mixer_panel::Layout::new(rect, &view);
+            (l.strips[0].name.center(), l.region)
+        };
+        press(&ctx, &mut app, grab);
+        assert!(app.mixer_reorder.is_some(), "the press did not arm a carry");
+        // Hard against the top rail, and nowhere near either side.
+        let at = Pos2::new(region.center().x, region.top() + 1.0);
+        move_to(&ctx, &mut app, at);
+        assert!(
+            edge_scroll_pps(region, at).y != 0.0,
+            "the fixture is not actually in the vertical zone, so this proves \
+             nothing"
+        );
+        let was = app.mixer_scroll_px;
+        hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        let delay = hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        assert_eq!(app.mixer_scroll_px, was, "the desk moved sideways for a hand \
+             held against its TOP edge");
+        assert!(
+            delay > Duration::from_millis(5),
+            "a carry held against an edge the desk cannot travel along pinned \
+             the app at {delay:?}"
+        );
+    }
+
+    /// **A carried bay scrolls the desk too.** It is a second branch on the
+    /// same condition, and a bay dropped on a plugin slot has the identical
+    /// reach problem: `strip_at` and `hit_test` both only answer about drawn
+    /// columns.
+    #[test]
+    fn a_carried_bay_scrolls_the_desk_too() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.mixer_open = true;
+        app.settings.mixer_visible = 4;
+        for n in 0..10 {
+            app.add_bare_track(n);
+        }
+        app.set_insert(crate::recorder::Strip::Channel(0).index(), 0, Some("/x/Comp.vst3"));
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.mixer_rect.expect("the mixer drew nowhere");
+        let (grab, region) = {
+            let view = app.mixer_view();
+            let l = crate::mixer_panel::Layout::new(rect, &view);
+            (l.strips[0].inserts[0].center(), l.region)
+        };
+        press(&ctx, &mut app, grab);
+        assert!(app.bay_carry.is_some(), "the press did not arm a bay carry");
+        let at = Pos2::new(region.right() - 2.0, region.center().y);
+        move_to(&ctx, &mut app, at);
+        for _ in 0..20 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        assert!(app.mixer_scroll_px > 0.0, "the carried bay did not move the desk");
+    }
+
+    /// **A held edge asks for the next frame; a held middle does not.**
+    ///
+    /// This is the anti-stall guard, and it is the only way to pin the thing
+    /// that makes auto-scroll work at all. A hand that is not moving emits no
+    /// events, so nothing wakes the loop: without the ask, the scroll would run
+    /// at the fifty-millisecond idle cadence — twenty frames a second of
+    /// "auto-scroll" that stalls the instant the hand goes still, which is the
+    /// exact complaint this item exists to answer.
+    ///
+    /// Read from `viewport_output`, which is what the host actually obeys. The
+    /// SECOND frame after each move is the one asserted on: egui carries one
+    /// outstanding immediate repaint over from a zero-delay request, so the
+    /// frame straight after an edge frame reports zero whatever happens on it.
+    #[test]
+    fn an_edge_hold_asks_for_a_fast_frame() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, id) = midi_editor_zoomed_in(&ctx, &mut app);
+        let grab = me_note_centre(&app, rect, id);
+        press(&ctx, &mut app, grab);
+        let roll = crate::midi_editor::Layout::new(rect).roll;
+        move_to(&ctx, &mut app, Pos2::new(roll.right() - 1.0, roll.center().y));
+        hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        let at_edge = hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        assert!(
+            at_edge < Duration::from_millis(5),
+            "a hand held at the edge asked the host to wait {at_edge:?} — the \
+             scroll would tick at whatever slow cadence the rest of the frame \
+             happens to want"
+        );
+        // The same drag, the same stillness, in the middle of the roll: the
+        // ask goes away again. Compared against the EDGE's answer rather than
+        // against `GUI_TICK`, because the band's own animation is already
+        // asking for a frame every 33 ms in this fixture — the claim being
+        // pinned is that the edge asks for a faster frame than the same drag
+        // in the middle does, not that the app is otherwise idle.
+        move_to(&ctx, &mut app, Pos2::new(roll.center().x, roll.center().y));
+        hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        let in_middle = hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        assert!(
+            in_middle > at_edge + Duration::from_millis(5),
+            "a drag in the middle of the view asked for {in_middle:?} against \
+             the edge's {at_edge:?} — the edge is not asking for anything the \
+             frame was not already going to give it"
+        );
+    }
+
+    /// **The wheel and the edge spend the same pixels, and stop at the same
+    /// rails.**
+    ///
+    /// Both surfaces' scrolls were lifted out of their wheel branches on
+    /// purpose: the CLAMPS are the shared thing. The lane stack's accumulator
+    /// has a rail-clear that took a bug report to get, and the desk's ceiling
+    /// is the layout's own arithmetic — an edge path that grew its own copy of
+    /// either would be free to disagree about where the end is, and the
+    /// disagreement would show up as dead notches after a long hold. So: drive
+    /// the REAL wheel with a budget of pixels, drive the shared function with
+    /// the same budget, and demand the same state.
+    ///
+    /// **The budget deliberately overshoots the rail and then comes back.** A
+    /// first version spent a polite twelve hundred points and never reached
+    /// either end, so it compared two copies of the same unclamped
+    /// multiplication and stayed green when the wheel was given a ceiling half
+    /// the size of the shared one. Everything interesting about a clamp is at
+    /// the rail, so both runs are driven hard against it and then walked back,
+    /// which is also the shape that exposes banked intent.
+    #[test]
+    fn the_wheel_and_the_edge_spend_the_same_pixels() {
+        let wheel = |app: &mut TangentApp, ctx: &egui::Context, at: Pos2, dy: f32| {
+            pointer_frame(
+                ctx,
+                app,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, dy),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        };
+        // Down hard past the end, then a little way back up.
+        let budget: Vec<f32> = std::iter::repeat_n(220.0_f32, 30)
+            .chain(std::iter::repeat_n(-220.0_f32, 4))
+            .collect();
+
+        // ── the lane stack ──
+        let lanes = |by_hand: bool| -> (usize, f32) {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.arr_visible = 4;
+            for n in 0..12 {
+                app.add_bare_track(n);
+            }
+            let (rect, _) = arrangement_with_a_clip(&ctx, &mut app);
+            let header = {
+                let clips = app.arr_clip_views();
+                let view = app.arrange_view(&clips);
+                crate::arrangement_panel::Layout::new(rect, &view).header
+            };
+            for d in &budget {
+                if by_hand {
+                    let lane_h = app.arr_lane_h(rect);
+                    app.arr_scroll_lanes_by_px(*d, lane_h);
+                } else {
+                    wheel(&mut app, &ctx, header.center(), -*d);
+                }
+            }
+            (app.arr_lane_scroll, app.arr_scroll_acc)
+        };
+        let (by_wheel, by_hand) = (lanes(false), lanes(true));
+        assert!(by_wheel.0 > 0, "the wheel never reached the lane stack at all");
+        assert_eq!(
+            by_wheel, by_hand,
+            "the wheel and the shared lane scroll parted company"
+        );
+
+        // ── the desk ──
+        let desk = |by_hand: bool| -> f32 {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.mixer_open = true;
+            app.settings.mixer_visible = 4;
+            for n in 0..10 {
+                app.add_bare_track(n);
+            }
+            let _ = run_frame(&ctx, &mut app);
+            let rect = app.mixer_rect.expect("the mixer drew nowhere");
+            for d in &budget {
+                if by_hand {
+                    app.mixer_scroll_by_px(*d, rect);
+                } else {
+                    wheel(&mut app, &ctx, rect.center(), -*d);
+                }
+            }
+            app.mixer_scroll_px
+        };
+        let (by_wheel, by_hand) = (desk(false), desk(true));
+        assert!(by_wheel > 0.0, "the wheel never reached the desk at all");
+        assert!(
+            (by_wheel - by_hand).abs() < 1.0e-3,
+            "the wheel left the desk at {by_wheel} and the shared scroll at \
+             {by_hand}"
+        );
     }
 }
 
