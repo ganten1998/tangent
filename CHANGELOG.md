@@ -12,6 +12,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **Drag to the edge and the view follows.** Holding a drag against the edge
+  of a view now scrolls it that way, on all three surfaces that needed it: the
+  MIDI editor's roll in all four directions, the arrangement's lanes sideways
+  along the song and downward through the track stack, and the mixer's desk
+  across its channels. Things can be moved beyond what is currently on screen
+  without resizing or zooming out first — a note to a pitch off the top, a
+  clip to the ninth track, a channel past the eighth column. One rate law
+  serves all three, measured in points per SECOND rather than per frame, so
+  the same hold covers the same ground whether the window is painting at 240
+  frames a second or ticking over at twenty; it ramps from a slow floor at the
+  zone's inner lip to a ceiling at the rail and holds that ceiling however far
+  past the edge the hand goes. The gesture asks for its own frames, so it
+  keeps moving while the hand is perfectly still. View gestures — the alt-drag
+  pan, the navigator — are exempt: a view that auto-scrolled while being panned
+  would accelerate away from the hand steering it.
+
 - **Nothing waits in silence any more.** Every operation that used to freeze
   the window with no explanation now says what it is doing. A survey traced
   seventy-six of them. The ones that can be counted show a real meter —

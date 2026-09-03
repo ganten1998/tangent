@@ -65,6 +65,17 @@ header (the header's arm dot and the strip's R are one state).
 - **Split** — the `s` key, at the playhead.
 - **Fades** — drag DOWN-IN from a clip's top corners: top-left drags a fade
   in, top-right a fade out.
+- **Edge-drag auto-scroll** — hold a drag at the edge of the field and the
+  view goes that way, so a clip can be moved past what is currently visible
+  without resizing anything first. Sideways it walks the window, downward it
+  walks the lane stack; a track carried in the header column scrolls the
+  stack too. Same law on all three surfaces (the MIDI editor's roll, the
+  lanes, the mixer's desk): the speed ramps from a floor at the zone's inner
+  lip to a ceiling at the rail and SATURATES past it, and it is measured in
+  points per SECOND, so the same hold covers the same ground on any machine.
+  View gestures (alt-drag pan, the navigator) are exempt by an allow-list —
+  a view that also auto-scrolled would run away from the hand steering it —
+  and so are the marquees, whose anchors are screen points.
 
 **Import.** Drag a file from Finder and DROP IT ON A LANE — the clip lands
 where it was dropped. That is the one way in; no picker, no menu row.
@@ -233,6 +244,12 @@ channels play back their clips and nothing else. "Ready to play" and
     strip: name, SWG/TRP/SNAP chips, gridbox, ×. Separate settings
     (`midi_snap/midi_grid_exp/midi_swing/midi_triplet`) so note grids and
     clip grids never surprise each other.
+  - **Edge-drag auto-scroll in the roll**: a note dragged to any of the
+    four edges takes the view with it — sideways along the clip, up and
+    down the keyboard — so a note can be moved to a time or a pitch that is
+    off screen without zooming out first. The window stops at the song's
+    start and at the clip's own end plus its pad; the key range stops where
+    the wheel's does. Same rate law as the arrangement and the mixer.
   - Editor still owed: velocity editing, note selection in bulk, a bar
     ruler inside the popup, quantise-existing, and the arrangement-ruler
     numbers reflecting inside the roll.
