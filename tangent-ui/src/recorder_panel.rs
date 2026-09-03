@@ -13088,3 +13088,185 @@ mod claim_probe {
         println!("worst readout overhang left of the bar {worst_over:.2} at w={worst_w:.0}; worst after/before ratio {ratio_worst:.2} at w={ratio_w:.0}");
     }
 }
+
+#[cfg(test)]
+mod icon_export {
+    use super::*;
+
+    /// Every icon that can stand on a track, rendered to PNG for redrawing.
+    ///
+    ///     ICONS_OUT=~/Desktop/"Tangent Track Icons" \
+    ///       cargo test -p tangent-ui --lib icon_export -- --ignored --nocapture
+    ///
+    /// The badges are VECTOR, drawn with the theme's ink, so what a hand-drawn
+    /// replacement has to be is an ALPHA MASK: white shape, transparent ground,
+    /// tinted at draw time. That is the whole reason for the format note this
+    /// writes beside them - a coloured icon could not follow the theme, and
+    /// following the theme is not optional here.
+    const PX: usize = 512;
+
+    fn crc32(d: &[u8]) -> u32 {
+        let mut t = [0u32; 256];
+        for (n, e) in t.iter_mut().enumerate() {
+            let mut c = n as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+            *e = c;
+        }
+        let mut c = 0xFFFF_FFFFu32;
+        for &b in d {
+            c = t[((c ^ u32::from(b)) & 0xFF) as usize] ^ (c >> 8);
+        }
+        c ^ 0xFFFF_FFFF
+    }
+
+    fn adler32(d: &[u8]) -> u32 {
+        let (mut a, mut b) = (1u32, 0u32);
+        for &x in d {
+            a = (a + u32::from(x)) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    }
+
+    fn chunk(out: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]) {
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(tag);
+        out.extend_from_slice(body);
+        let mut c = tag.to_vec();
+        c.extend_from_slice(body);
+        out.extend_from_slice(&crc32(&c).to_be_bytes());
+    }
+
+    /// A real PNG with an alpha channel, using STORED deflate blocks so no
+    /// compressor is needed. Bigger on disk, byte-exact, and no new crate.
+    fn png(w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
+        let mut raw = Vec::with_capacity((w * 4 + 1) * h);
+        for y in 0..h {
+            raw.push(0); // filter: none
+            raw.extend_from_slice(&rgba[y * w * 4..(y + 1) * w * 4]);
+        }
+        let mut z = vec![0x78, 0x01];
+        for (i, part) in raw.chunks(65_535).enumerate() {
+            let last = u8::from((i + 1) * 65_535 >= raw.len());
+            z.push(last);
+            z.extend_from_slice(&(part.len() as u16).to_le_bytes());
+            z.extend_from_slice(&(!(part.len() as u16)).to_le_bytes());
+            z.extend_from_slice(part);
+        }
+        z.extend_from_slice(&adler32(&raw).to_be_bytes());
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+        ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+        chunk(&mut out, b"IHDR", &ihdr);
+        chunk(&mut out, b"IDAT", &z);
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn write_them() {
+        let dir = std::env::var("ICONS_OUT").expect("set ICONS_OUT");
+        let dir = std::path::PathBuf::from(shellexpand(&dir));
+        std::fs::create_dir_all(dir.join("current")).unwrap();
+        std::fs::create_dir_all(dir.join("template")).unwrap();
+
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+
+        // code, file name, and how it is reached in the app.
+        let mut jobs: Vec<(String, String)> = ICONS
+            .iter()
+            .skip(1)
+            .map(|(c, n)| (format!("{c:02}-{}", n.replace(' ', "-")), (*n).to_owned()))
+            .collect();
+        jobs.push(("auto-instrument".into(), "auto: a MIDI channel".into()));
+        jobs.push(("auto-microphone".into(), "auto: an audio channel".into()));
+        jobs.push(("auto-metronome".into(), "auto: the click".into()));
+
+        for (i, (stem, _)) in jobs.iter().enumerate() {
+            let out = ctx.run(Default::default(), |c| {
+                let r = Rect::from_min_size(Pos2::ZERO, egui::vec2(PX as f32, PX as f32));
+                let p = egui::Painter::new(c.clone(), egui::LayerId::debug(), r);
+                let pad = PX as f32 * 0.08;
+                let b = Rect::from_min_max(
+                    Pos2::new(pad, pad),
+                    Pos2::new(PX as f32 - pad, PX as f32 - pad),
+                );
+                let ink = Color32::WHITE;
+                let bg = Color32::TRANSPARENT;
+                let code = ICONS.get(i + 1).map(|(c, _)| *c).unwrap_or(255);
+                if !draw_badge(&p, b, ink, bg, code) {
+                    match stem.as_str() {
+                        "auto-instrument" => draw_instrument_icon(&p, b, ink),
+                        "auto-microphone" => draw_microphone(&p, b, ink),
+                        "auto-metronome" => draw_metronome_on(&p, b, ink, bg),
+                        _ => {}
+                    }
+                }
+            });
+            let prims = ctx.tessellate(out.shapes, 1.0);
+            let mut buf = vec![0u8; PX * PX * 4];
+            for prim in &prims {
+                let egui::epaint::Primitive::Mesh(m) = &prim.primitive else { continue };
+                for tri in m.indices.chunks_exact(3) {
+                    let v: Vec<_> = tri.iter().map(|&x| m.vertices[x as usize]).collect();
+                    let ar = |a: egui::epaint::Vertex, b2: egui::epaint::Vertex, x: f32, y: f32| {
+                        (b2.pos.x - a.pos.x) * (y - a.pos.y) - (b2.pos.y - a.pos.y) * (x - a.pos.x)
+                    };
+                    let den = ar(v[0], v[1], v[2].pos.x, v[2].pos.y);
+                    if den.abs() < 1e-9 { continue; }
+                    let xs = [v[0].pos.x, v[1].pos.x, v[2].pos.x];
+                    let ys = [v[0].pos.y, v[1].pos.y, v[2].pos.y];
+                    let x0 = xs.iter().fold(f32::MAX, |a, b| a.min(*b)).floor().max(0.0) as usize;
+                    let x1 = xs.iter().fold(f32::MIN, |a, b| a.max(*b)).ceil().min(PX as f32 - 1.0) as usize;
+                    let y0 = ys.iter().fold(f32::MAX, |a, b| a.min(*b)).floor().max(0.0) as usize;
+                    let y1 = ys.iter().fold(f32::MIN, |a, b| a.max(*b)).ceil().min(PX as f32 - 1.0) as usize;
+                    for py in y0..=y1 {
+                        for px in x0..=x1 {
+                            let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+                            let (w0, w1, w2) = (
+                                ar(v[1], v[2], fx, fy) / den,
+                                ar(v[2], v[0], fx, fy) / den,
+                                ar(v[0], v[1], fx, fy) / den,
+                            );
+                            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+                            let a = (w0 * f32::from(v[0].color.a())
+                                + w1 * f32::from(v[1].color.a())
+                                + w2 * f32::from(v[2].color.a()))
+                                .clamp(0.0, 255.0) as u8;
+                            if a == 0 { continue; }
+                            let d = &mut buf[(py * PX + px) * 4..(py * PX + px) * 4 + 4];
+                            d[0] = 255;
+                            d[1] = 255;
+                            d[2] = 255;
+                            d[3] = d[3].max(a);
+                        }
+                    }
+                }
+            }
+            std::fs::write(dir.join("current").join(format!("{stem}.png")), png(PX, PX, &buf)).unwrap();
+            // A blank of the same size, so a hand drawing starts on the grid.
+            let blank = vec![0u8; PX * PX * 4];
+            std::fs::write(dir.join("template").join(format!("{stem}.png")), png(PX, PX, &blank)).unwrap();
+        }
+        println!("wrote {} icons to {}", jobs.len(), dir.display());
+        for (stem, what) in &jobs {
+            println!("  {stem}.png  — {what}");
+        }
+    }
+
+    fn shellexpand(s: &str) -> String {
+        if let Some(rest) = s.strip_prefix("~/") {
+            if let Ok(h) = std::env::var("HOME") {
+                return format!("{h}/{rest}");
+            }
+        }
+        s.to_owned()
+    }
+}
