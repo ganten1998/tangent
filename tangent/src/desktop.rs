@@ -650,6 +650,22 @@ pub struct DesktopApp {
     /// sample rate. Entries no clip references leave with the edit.
     #[cfg(feature = "recorder")]
     track_cache: std::collections::HashMap<std::path::PathBuf, Arc<tangent_record::decode::Clip>>,
+    /// **Files the decoder has already refused**, so it is asked once.
+    ///
+    /// `queue_warm` skips anything already in `track_cache`, which is what
+    /// stops a decoded file being queued twice. A file that FAILS to decode
+    /// never lands there, so without this it was queued again the moment the
+    /// queue drained - forever. That is not merely wasteful: `run_warm`
+    /// answers `clips_owed` only on the frame the queue comes up EMPTY, so a
+    /// queue that refills itself every frame means the reload is never run,
+    /// and a MIDI note anybody draws never reaches the engine at all. One
+    /// missing WAV in a project was enough to make the whole timeline silent.
+    ///
+    /// Swept exactly where `track_cache` is: cleared on a project switch and
+    /// evicted with the clips that reference it, so fixing a path and coming
+    /// back is a fresh attempt rather than a permanent refusal.
+    #[cfg(feature = "recorder")]
+    warm_refused: std::collections::HashSet<std::path::PathBuf>,
     /// Clips that have been time-stretched, by `(file, ratio in millionths,
     /// mode)`.
     ///
@@ -6865,6 +6881,7 @@ impl DesktopApp {
                 self.force_insert_reload();
                 let _ = self.app.take_desk_reload();
                 self.track_cache.clear();
+                self.warm_refused.clear();
                 self.stretch_cache.clear();
                 self.pad_cache.clear();
                 self.clips_owed = true;
@@ -7110,13 +7127,23 @@ impl DesktopApp {
             .engine
             .as_ref()
             .map_or(48_000, |e| e.output().sample_rate);
-        if let Ok(c) = tangent_record::decode::decode(&path, rate) {
-            let c = Arc::new(c);
-            if pads {
-                self.pad_cache.insert(path, c);
-            } else {
-                self.track_cache.insert(path, c);
+        match tangent_record::decode::decode(&path, rate) {
+            Ok(c) => {
+                let c = Arc::new(c);
+                if pads {
+                    self.pad_cache.insert(path, c);
+                } else {
+                    self.warm_refused.remove(&path);
+                    self.track_cache.insert(path, c);
+                }
             }
+            // **A refusal is an answer, and has to be remembered as one.**
+            // Nothing else records it: a file that will not decode is absent
+            // from the cache exactly like one nobody has tried yet.
+            Err(_) if !pads => {
+                self.warm_refused.insert(path);
+            }
+            Err(_) => {}
         }
         // A file a frame only advances if frames arrive.
         ctx.request_repaint();
@@ -7140,7 +7167,10 @@ impl DesktopApp {
                     }
                     let path =
                         tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
-                    if self.track_cache.contains_key(&path) || !seen.insert(path.clone()) {
+                    if self.track_cache.contains_key(&path)
+                        || self.warm_refused.contains(&path)
+                        || !seen.insert(path.clone())
+                    {
                         continue;
                     }
                     self.warm.push_back(Warm::Clip(path));
@@ -7354,11 +7384,15 @@ impl DesktopApp {
         // nothing can match, and sweeping on that basis would throw away every
         // decoded file the moment a project became unsaved.
         if let Some(doc_path) = doc_path.as_ref() {
-            self.track_cache.retain(|path, _| {
+            let referenced = |path: &std::path::PathBuf| {
                 doc.clips
                     .iter()
                     .any(|c| tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path) == *path)
-            });
+            };
+            self.track_cache.retain(|path, _| referenced(path));
+            // A refusal outlives its clip no longer than a decode does, so
+            // re-importing a file that has been fixed on disk tries again.
+            self.warm_refused.retain(referenced);
         }
         // And the stretched renders with them — including every ratio a drag
         // passed through on its way to the one that stuck. A drag across a
@@ -10279,6 +10313,7 @@ impl DesktopApp {
             browse_extensions: Vec::new(),
             #[cfg(feature = "recorder")]
             track_cache: std::collections::HashMap::new(),
+            warm_refused: std::collections::HashSet::new(),
             #[cfg(feature = "recorder")]
             stretch_cache: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
@@ -12020,6 +12055,47 @@ mod tests {
     /// `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`
     /// below); what it stops is somebody reintroducing the slot rather than
     /// adding a notification.
+    /// **A file the decoder refuses must not be asked for again**, or the
+    /// warm queue never comes up empty and nothing downstream of it ever
+    /// runs.
+    ///
+    /// `run_warm` answers `clips_owed` on ONE frame: the one where the queue
+    /// pops nothing. `queue_warm` refills whenever the queue is empty and
+    /// skips only what is already decoded, so a file that cannot decode was
+    /// re-queued on every drain, the empty frame never arrived, and
+    /// `reload_clips` - which is what hands the engine its MIDI - was never
+    /// reached. One missing WAV made every note anybody drew silent on
+    /// playback, for as long as that clip was in the project.
+    ///
+    /// This reads the source rather than driving a frame because the queue
+    /// needs an engine, a document and a decoder behind it; what it pins is
+    /// the three lines that make the loop impossible, each of which a
+    /// well-meaning edit could drop without any other test noticing.
+    #[test]
+    fn a_file_the_decoder_refuses_is_not_asked_for_twice() {
+        let src = include_str!("desktop.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        assert!(
+            body.contains("self.warm_refused.insert(path);"),
+            "a refused decode has to be remembered as an answer"
+        );
+        assert!(
+            body.contains("|| self.warm_refused.contains(&path)"),
+            "queue_warm has to skip what the decoder already refused, or it \
+             refills forever and clips_owed is never answered"
+        );
+        // And the memory must not outlive its reason, or a file fixed on
+        // disk is refused for the rest of the session.
+        assert!(
+            body.contains("self.warm_refused.clear();"),
+            "a project switch has to forget every refusal"
+        );
+        assert!(
+            body.contains("self.warm_refused.retain(referenced);"),
+            "a refusal has to leave with the clip that caused it"
+        );
+    }
+
     #[test]
     fn every_message_leaves_through_the_notify_door() {
         let src = include_str!("desktop.rs");
