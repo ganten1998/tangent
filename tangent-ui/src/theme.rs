@@ -1028,11 +1028,27 @@ pub fn factory() -> Vec<Theme> {
         // read as one flat mask, only in dark mode, which is exactly what the
         // owner photographed. So each names `dark.white_key`/`dark.black_key`
         // outright: a keyboard that stays legible against its own dark ground
-        // (naturals ~2.6:1 on the ground, the two key colours ~2:1 apart)
-        // instead of inheriting a swap written for the light sixteen. The
-        // sweep `every_theme_keeps_a_legible_keyboard_in_dark_mode` is the
-        // lock. `dark.background` still equals `black_key`, the theory-ground
-        // rule the sweep beside it checks.
+        // instead of inheriting a swap written for the light sixteen.
+        // `dark.background` still equals `black_key`, the theory-ground rule
+        // the sweep beside it checks.
+        //
+        // **And their LIGHT keyboards were the same mask, which the dark fix
+        // did not touch.** The owner again: "Phosphor and Nocturne both still
+        // have the dark mode mask over the keyboard issue… the mask is in
+        // light mode." Measured before the fix: Nocturne 1.10:1, Phosphor
+        // 1.04:1, against 9–15:1 on every one of the other seventeen. The
+        // keyboard was not dim; it was absent.
+        //
+        // **Neither of these themes could fix it from here, and that is why
+        // the answer is in the piano.** The naturals must equal `background`
+        // (the theory page sits on the naturals' colour —
+        // `the_theory_ground_is_the_keyboard_not_the_band`) and the sharps
+        // must equal `dark.background` (the dark page sits on the sharps'),
+        // so on a theme whose BOTH grounds are near-black every field this
+        // struct has for a key is already spoken for. Every other theme has
+        // slack because its light ground is pale; these two have none.
+        // `piano::keys_apart` lifts the sharps clear instead, and only where
+        // a theme is trapped this way — see it for the rule and the numbers.
         //
         // ── Nocturne: Navi's night side, worn as the light-mode dress. The
         // periwinkle and cyan are the same values the Navi theme carries,

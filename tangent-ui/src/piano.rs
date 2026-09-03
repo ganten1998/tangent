@@ -52,7 +52,10 @@ fn idle_colors(s: &Settings) -> (Color32, Color32) {
     let white = s.white_key_idle_color.to_color32();
     let black = s.black_key_idle_color.to_color32();
     if !s.dark_mode {
-        return (white, black);
+        // The naturals ARE the page's ground by design, so the SHARPS are
+        // what make a keyboard visible. On a dark-designed theme they are
+        // near-black on near-black; see [`keys_apart`].
+        return (white, keys_apart(white, black));
     }
     // **What the theme SAYS, before what dark mode would derive.**
     //
@@ -64,6 +67,71 @@ fn idle_colors(s: &Settings) -> (Color32, Color32) {
         s.dark_role("white_key").map_or(black, |c| c.to_color32()),
         s.dark_role("black_key").map_or(white, |c| c.to_color32()),
     )
+}
+
+/// **How far apart the two idle key colours have to be** for a keyboard to
+/// read as a keyboard rather than as one flat slab, as a contrast ratio.
+///
+/// Not a floor picked in the abstract: it is where the seventeen themes that
+/// have never had this problem actually sit. The narrowest of them is
+/// Sandstone at 9.34:1 and the widest Iris at 15.29:1, so a derived pair that
+/// clears 9 lands at the bottom of the band everybody else is already in
+/// rather than at a bar of its own.
+const KEYS_APART: f32 = 9.0;
+
+/// **The sharps, lifted clear of the naturals when the theme could not do it
+/// itself.**
+///
+/// In light mode the naturals are the theme's `white_key` and the sharps its
+/// `black_key`, and on seventeen themes that is a near-black sharp on an
+/// ivory natural — nothing to derive. On the two dark-designed themes
+/// (Nocturne, Phosphor) both are near-black and the whole piano band was one
+/// slab: 1.10:1 and 1.04:1 measured, which is not a dim keyboard but an
+/// absent one. The owner photographed it twice.
+///
+/// **The theme cannot fix this from its own fields, which is why the piano
+/// does.** `white_key` is pinned to `background` and `black_key` to
+/// `dark.background` — the theory page sits on the naturals' colour in light
+/// mode and on the sharps' in dark, which is the owner's own rule and is
+/// tested (`theme::the_theory_ground_is_the_keyboard_not_the_band`). A theme
+/// whose two grounds are both near-black has therefore already spent both key
+/// colours before the piano is drawn. Every other theme has slack because its
+/// light ground is pale; these have none.
+///
+/// So the sharps walk AWAY from the naturals — toward white on a dark
+/// natural, toward black on a pale one — until they clear [`KEYS_APART`], and
+/// the result is the same picture a light theme wears in dark mode: pale
+/// sharps on a dark field. A theme already clear of the line is returned
+/// untouched, so this is inert on all seventeen.
+///
+/// **Only in light mode.** Dark mode has an escape a theme can actually
+/// reach — `dark.white_key` / `dark.black_key`, which both of these themes
+/// use, deliberately, to sit at their own quieter level. A derivation there
+/// would overrule a theme that has spoken. This one only speaks where the
+/// theme has been silenced by another rule.
+fn keys_apart(natural: Color32, sharp: Color32) -> Color32 {
+    use crate::recorder_panel::contrast_ratio;
+    if contrast_ratio(sharp, natural) >= KEYS_APART {
+        return sharp;
+    }
+    // Away from the naturals: a dark keyboard gets pale sharps and a pale one
+    // dark sharps. `luminance` rather than a channel average, because what is
+    // being escaped is a contrast ratio and that is what a ratio is made of.
+    let away = if crate::recorder_panel::luminance(natural) < 0.18 {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
+    // Toward it in twentieths, keeping as much of the theme's own hue as the
+    // ratio allows: the first step that clears is the one taken.
+    let mut out = sharp;
+    for k in 1..=20u8 {
+        out = mix(sharp, away, f32::from(k) * 0.05);
+        if contrast_ratio(out, natural) >= KEYS_APART {
+            break;
+        }
+    }
+    out
 }
 
 /// Blend two colours, `t` of the way from `a` to `b`.
@@ -464,7 +532,8 @@ mod tests {
         assert!(bad.is_empty(), "note names unreadable:\n  {}", bad.join("\n  "));
     }
 
-    /// **The keyboard must not collapse into its own ground in dark mode.**
+    /// **The keyboard must not collapse into its own ground, in either
+    /// mode.**
     ///
     /// Dark mode SWAPS the keys (`idle_colors`): the naturals take the
     /// sharps' colour, which is why on every theme they equal the theory
@@ -479,20 +548,36 @@ mod tests {
     /// still take a legible ink — it took a screenshot. This is the test that
     /// screenshot is worth.
     ///
+    /// **And it only ever walked DARK, which is how the same fault survived
+    /// in the other mode for a whole release.** The owner, on the two themes
+    /// this test was written for: "Phosphor and Nocturne both still have the
+    /// dark mode mask over the keyboard issue… the mask is in light mode."
+    /// In light mode there is no swap to go wrong — the naturals are simply
+    /// `white_key` and the ground is `background` — and both of those themes
+    /// set the two to the same value, so the band was one flat slab at
+    /// 1.10:1 and 1.04:1 while every other theme sat at 9–15:1. A sweep
+    /// written to catch exactly this shape, in the one mode where it was not
+    /// happening. It walks both now.
+    ///
     /// The floor is the codebase's 2:1-ish "this large object is visible on
     /// its ground" reading rather than the 3:1 large-object bar, because on a
     /// 0x05–0x0d ground a key light enough for 3:1 crosses into the dead zone
     /// where its own note name stops clearing 4.5:1 (the sweep above). At
     /// least one idle key must clear the ground, and the two key colours must
-    /// differ enough to tell one key from the next.
+    /// differ enough to tell one key from the next. It is a FLOOR and not a
+    /// target: seventeen themes clear it five times over in both modes, and
+    /// the two that sit near it in dark mode do so by their own design.
     #[test]
-    fn every_theme_keeps_a_legible_keyboard_in_dark_mode() {
+    fn every_theme_keeps_a_legible_keyboard_in_both_modes() {
         use crate::recorder_panel::contrast_ratio;
         let mut bad: Vec<String> = Vec::new();
-        for theme in crate::theme::factory() {
+        for (theme, dark) in crate::theme::factory()
+            .into_iter()
+            .flat_map(|t| [(t.clone(), false), (t, true)])
+        {
             let mut s = Settings::default();
             theme.apply(&mut s);
-            s.dark_mode = true;
+            s.dark_mode = dark;
             let (naturals, sharps) = idle_colors(&s);
             let ground = themed_bg(&s);
             let shows =
@@ -500,15 +585,60 @@ mod tests {
             let distinct = contrast_ratio(naturals, sharps);
             if shows < 2.0 || distinct < 1.25 {
                 bad.push(format!(
-                    "{}: keyboard {shows:.2}:1 on its ground, keys {distinct:.2}:1 apart",
-                    theme.name
+                    "{} {}: keyboard {shows:.2}:1 on its ground, keys {distinct:.2}:1 apart",
+                    theme.name,
+                    if dark { "dark" } else { "light" }
                 ));
             }
         }
         assert!(
             bad.is_empty(),
-            "the keyboard collapses into its ground in dark mode:\n  {}",
+            "the keyboard collapses into its ground:\n  {}",
             bad.join("\n  ")
+        );
+
+        // **And the lift is INERT where it is not needed.** `keys_apart` is a
+        // derivation, and a derivation that quietly repaints seventeen themes
+        // to fix two is worse than the fault. Every theme whose light sharps
+        // already clear the line keeps exactly the colour it named.
+        for theme in crate::theme::factory() {
+            let mut s = Settings::default();
+            theme.apply(&mut s);
+            s.dark_mode = false;
+            let named = s.black_key_idle_color.to_color32();
+            let painted = idle_colors(&s).1;
+            let clear = contrast_ratio(named, s.white_key_idle_color.to_color32())
+                >= KEYS_APART;
+            if clear {
+                assert_eq!(
+                    painted, named,
+                    "{}: a theme already clear of the line was repainted",
+                    theme.name
+                );
+            } else {
+                assert_ne!(
+                    painted, named,
+                    "{}: a theme whose keys sit on top of each other was left there",
+                    theme.name
+                );
+            }
+        }
+        // The two that need it are the two dark-designed themes, and nobody
+        // else — named, so this notices if a new theme joins them silently.
+        let lifted: Vec<String> = crate::theme::factory()
+            .into_iter()
+            .filter(|theme| {
+                let mut s = Settings::default();
+                theme.apply(&mut s);
+                s.dark_mode = false;
+                idle_colors(&s).1 != s.black_key_idle_color.to_color32()
+            })
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(
+            lifted,
+            ["Nocturne", "Phosphor"],
+            "a different set of themes needs the sharps lifted now"
         );
     }
 
