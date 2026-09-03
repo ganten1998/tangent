@@ -205,6 +205,17 @@ pub struct FaceLive {
     /// the browser — a walk, a wheel, a press — cancels it, because by then
     /// the hand has said where it wants to be.
     pub ir_reveal: bool,
+    /// **Is this bay bypassed right now?** Pushed by the app, appended at the
+    /// END, this struct's law.
+    ///
+    /// Bypass has always existed — it is a row in the mixer's own bay menu —
+    /// but nothing on a FACE said so or offered it, so a panel could be open
+    /// with its unit switched out of circuit and look exactly like one in it.
+    /// The owner asked for the button while asking for the delete to empty the
+    /// bay ("there should be a bypass button somewhere anyways"), and the two
+    /// belong together: the answer to "I want this impulse out of the way"
+    /// should not have to be deleting the file.
+    pub bypassed: bool,
 }
 
 /// One row of the IR browser: a folder to walk into, or an impulse to load.
@@ -324,6 +335,14 @@ pub enum FaceAction {
     /// The source is [`FaceLive::ir_clip`] and the app supplies it, because
     /// the app is where the clipboard lives.
     PasteIr { into: String },
+    /// **Switch this bay out of circuit, or back in.** Appended at the END,
+    /// this enum's law.
+    ///
+    /// The state itself is the mixer's — `insert_bypass` in the settings, the
+    /// same flag its bay menu toggles — so this is a second door onto one
+    /// switch and not a second switch. A face that owned its own bypass would
+    /// be a unit that reads bypassed in one place and live in another.
+    SetBypass { on: bool },
 }
 
 fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {
@@ -911,6 +930,8 @@ pub struct IrLayout {
     /// Where the kit rows go.
     pub controls: Rect,
     pub wizard: Rect,
+    /// The BYPASS chip, beside the wand at the foot of the left half.
+    pub bypass: Rect,
     /// The browser: the pane, its header, the two chips, the list.
     pub browse: Rect,
     pub browse_head: Rect,
@@ -946,6 +967,7 @@ impl IrLayout {
             name: Rect::NOTHING,
             controls: Rect::NOTHING,
             wizard: Rect::NOTHING,
+            bypass: Rect::NOTHING,
             browse: Rect::NOTHING,
             browse_head: Rect::NOTHING,
             browse_up: Rect::NOTHING,
@@ -1017,9 +1039,23 @@ impl IrLayout {
             egui::vec2(left.width(), IR_NAME_H.min(left.height())),
         );
         let wizard_top = (left.bottom() - IR_WIZARD_H).max(name.bottom() + IR_GAP);
-        let wizard = Rect::from_min_max(
+        // **The wand row carries the BYPASS chip beside it.** The foot of the
+        // left half is the one strip of this panel that is neither a control
+        // nor the browser, and bypass belongs with the doors rather than among
+        // the knobs — it is not a parameter of the unit, it is whether the
+        // unit is in circuit at all.
+        let row = Rect::from_min_max(
             egui::pos2(left.left(), wizard_top),
             egui::pos2(left.right(), left.bottom()),
+        );
+        let bypass_w = IR_BYPASS_W.min(row.width() * 0.45);
+        let bypass = Rect::from_min_max(
+            row.min,
+            egui::pos2(row.left() + bypass_w, row.bottom()),
+        );
+        let wizard = Rect::from_min_max(
+            egui::pos2((bypass.right() + IR_GAP).min(row.right()), row.top()),
+            row.max,
         );
         let controls = Rect::from_min_max(
             egui::pos2(left.left(), name.bottom() + IR_GAP),
@@ -1053,6 +1089,7 @@ impl IrLayout {
             name,
             controls,
             wizard,
+            bypass,
             browse,
             browse_head,
             browse_up,
@@ -1127,6 +1164,11 @@ impl IrLayout {
 /// these are targets, not text), a hairline between rows, and a width wide
 /// enough for `Paste "a-long-impulse-name.wav"` without being so wide it
 /// cannot sit inside a stacked panel's browser.
+/// How wide the BYPASS chip is at the foot of the IR panel, points — or
+/// 45% of the row, whichever is less, so a panel dragged narrow gives the
+/// wand room rather than two chips that both say nothing.
+const IR_BYPASS_W: f32 = 78.0;
+
 const IR_MENU_ROW_H: f32 = 20.0;
 const IR_MENU_GAP: f32 = 1.0;
 const IR_MENU_W: f32 = 168.0;
@@ -1461,6 +1503,34 @@ fn draw_ir(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
         );
         for id in 0..=1 {
             face::keep(&mut out, row(&mut sub, st, &live.face, id));
+        }
+    }
+
+    // **BYPASS, beside the wand.** The switch itself is the mixer's — the
+    // same `insert_bypass` flag its bay menu toggles — so this is a second
+    // door onto one state. Lit when the unit is OUT of circuit, because that
+    // is the condition somebody needs to notice from across the room: a panel
+    // whose unit is switched out looked exactly like one that was working.
+    if l.bypass.is_positive() {
+        let on = live.bypassed;
+        let hit = ui.put(
+            l.bypass,
+            egui::Button::new(
+                egui::RichText::new(if on { "BYPASSED" } else { "BYPASS" })
+                    .font(bold(9.5))
+                    .color(if on { st.s.bg } else { st.s.ink }),
+            )
+            .fill(if on { st.s.ink } else { st.s.raised }),
+        );
+        if hit
+            .on_hover_text(if on {
+                "the unit is out of circuit - press to put it back"
+            } else {
+                "take this unit out of circuit without unloading it"
+            })
+            .clicked()
+        {
+            out = Some(FaceAction::SetBypass { on: !on });
         }
     }
 

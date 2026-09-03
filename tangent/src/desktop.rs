@@ -3981,8 +3981,52 @@ impl DesktopApp {
                         // file operation and the sentence about it.
                         IrAsk::Delete(p) => {
                             let root = self.app.irs_root();
+                            let gone = p.to_owned();
                             let (kind, said) = ir_delete_file(p, &root);
+                            let removed = kind == Kind::Success;
                             self.app.notify(kind, said);
+                            // **Every bay playing that file is emptied**, not
+                            // just the one the menu was opened over: the same
+                            // impulse can be loaded in several bays, and the
+                            // file is gone from all of them. See
+                            // `clear_insert_ir` for why the bay is cleared at
+                            // all — the owner overruled the first answer.
+                            if removed {
+                                let bays = tangent_ui::recorder::INSERTS;
+                                let seats = tangent_ui::recorder::TOTAL_SEATS;
+                                let mut emptied = 0usize;
+                                for seat in 0..seats {
+                                    for bay in 0..bays {
+                                        let here = self
+                                            .recorder
+                                            .engine
+                                            .as_ref()
+                                            .and_then(|e| {
+                                                e.builtin_extra(seat, bay)
+                                                    .iter()
+                                                    .find(|(k, _)| k == "ir_path")
+                                                    .map(|(_, v)| v.clone())
+                                            })
+                                            .unwrap_or_default();
+                                        if !here.is_empty()
+                                            && same_file(&here, &gone)
+                                            && self.clear_insert_ir(seat, bay)
+                                        {
+                                            emptied += 1;
+                                        }
+                                    }
+                                }
+                                if emptied > 0 {
+                                    self.app.notify(
+                                        Kind::Info,
+                                        if emptied == 1 {
+                                            "The bay playing it is now empty.".to_owned()
+                                        } else {
+                                            format!("{emptied} bays playing it are now empty.")
+                                        },
+                                    );
+                                }
+                            }
                             // Bumps `ir_scan_gen`, so the browser that
                             // asked re-lists itself without being told.
                             self.push_ir_rows();
@@ -4209,6 +4253,47 @@ impl DesktopApp {
         let mut extra = e.builtin_extra(strip, slot).to_vec();
         extra.retain(|(k, _)| k != "ir_path");
         extra.push(("ir_path".to_owned(), path.to_owned()));
+        let blob = crate::builtin_fx::state_text(spec, values, &extra).into_bytes();
+        write_insert_state(strip, slot, spec.path, &blob);
+        let bays = tangent_ui::recorder::INSERTS;
+        if let Some(cell) = self.recorder.inserts_loaded.get_mut(strip * bays + slot) {
+            *cell = Some("\u{1f}reload".to_owned());
+        }
+        true
+    }
+
+    /// **Point an IR bay at nothing**, and reload it so the change is heard.
+    ///
+    /// [`Self::bind_insert_ir`] refuses a path that is not a file, which is
+    /// what stops an undecoded ask from being persisted — so clearing a bay
+    /// cannot go through it and needs its own road. Same two writes otherwise:
+    /// the sidecar, then the reload sentinel.
+    ///
+    /// **Deleting the impulse a bay is playing clears it.** The first version
+    /// of the delete deliberately did NOT: the argument was that tidying a
+    /// folder must not silence a track mid-session, and the confirmation said
+    /// so — the sound does not change now, the bay comes up empty next time.
+    /// The owner overruled it: "deleting an in use IR file should immediately
+    /// reinitialize to no file loaded, it shouldn't keep the state". He is
+    /// right, and the old argument had it backwards. A bay playing a file that
+    /// no longer exists is a project that sounds one way today and another
+    /// way tomorrow, with nothing on screen to say why; and the delete is
+    /// already behind a confirmation that names the file. Silence you asked
+    /// for beats a surprise you did not.
+    #[cfg(feature = "recorder")]
+    fn clear_insert_ir(&mut self, strip: usize, slot: usize) -> bool {
+        let Some(e) = self.recorder.engine.as_ref() else {
+            return false;
+        };
+        let Some((spec, values)) = e.builtin_insert(strip, slot) else {
+            return false;
+        };
+        if spec.path != crate::builtin_fx::IR_PATH {
+            return false;
+        }
+        let mut extra = e.builtin_extra(strip, slot).to_vec();
+        extra.retain(|(k, _)| k != "ir_path");
+        extra.push(("ir_path".to_owned(), String::new()));
         let blob = crate::builtin_fx::state_text(spec, values, &extra).into_bytes();
         write_insert_state(strip, slot, spec.path, &blob);
         let bays = tangent_ui::recorder::INSERTS;
@@ -4526,15 +4611,76 @@ impl DesktopApp {
                              buffer, or use the same device for input and output."
                         ));
                     } else if p.reference {
-                        self.ir.reference = Some(IrReference {
-                            capture,
-                            sweep_len: p.sweep.len(),
-                            total: p.total,
-                        });
+                        // **A reference pass is judged HERE, not two minutes
+                        // later.**
+                        //
+                        // `process_ir_capture` already measures whether each
+                        // jack carried the loop, because dividing by a jack
+                        // that brought nothing back deletes a channel or
+                        // multiplies it by a hundred dB. But it measures it at
+                        // DECONVOLUTION time — so a reference that recorded
+                        // silence was stored, announced as "reference
+                        // captured", and only disowned on the result page of
+                        // the NEXT capture, with a red line saying neither
+                        // jack carried the loop. The owner met exactly that:
+                        // he took a dry reference, armed the real capture, and
+                        // was told after the fact that the pass he had just
+                        // made was thrown away.
+                        //
+                        // The same measurement, run now, is the difference
+                        // between a mystery and a cable.
+                        let (mut rl, mut rr) = (
+                            Vec::with_capacity(p.total),
+                            Vec::with_capacity(p.total),
+                        );
+                        for fr in capture.chunks_exact(2) {
+                            rl.push(fr[0]);
+                            rr.push(fr[1]);
+                        }
+                        let range = |c: &[f32]| {
+                            crate::units::sweep::reference_range_db(c, p.pre, p.sweep.len())
+                        };
+                        let (gl, gr) = (range(&rl), range(&rr));
+                        let line = crate::units::sweep::TRUSTWORTHY_RANGE_DB;
+                        let (live_l, live_r) = (gl >= line, gr >= line);
                         self.ir.live.capturing = false;
-                        self.ir.live.has_reference = true;
-                        self.ir.live.phase =
-                            "reference captured - now capture through the unit".to_owned();
+                        if !live_l && !live_r {
+                            // Not stored. A reference nobody can divide by is
+                            // not a reference, and keeping it would only let
+                            // the next capture discover the same thing.
+                            self.ir.reference = None;
+                            self.ir.live.has_reference = false;
+                            self.ir.live.phase =
+                                "that pass carried no sweep - not kept".to_owned();
+                            refused = Some(format!(
+                                "The dry reference recorded nothing: neither return \
+                                 jack rose more than {gl:.0} / {gr:.0} dB above its own \
+                                 silence, against the {line:.0} dB a pass has to clear. \
+                                 Is the unit muted rather than bypassed? A 100% wet box \
+                                 has no dry path - patch the send straight back to the \
+                                 return for this one pass, or skip it and use the \
+                                 inverse-filter route."
+                            ));
+                        } else {
+                            self.ir.reference = Some(IrReference {
+                                capture,
+                                sweep_len: p.sweep.len(),
+                                total: p.total,
+                            });
+                            self.ir.live.has_reference = true;
+                            self.ir.live.phase =
+                                "reference captured - now capture through the unit"
+                                    .to_owned();
+                            if !live_l || !live_r {
+                                let dead = if live_l { "right" } else { "left" };
+                                warned = Some(format!(
+                                    "Only one return jack carried the dry reference; the \
+                                     {dead} one will borrow it. The engine plays the same \
+                                     sample into both outputs, so that is the right \
+                                     reference - but check the {dead} return cable."
+                                ));
+                            }
+                        }
                     } else {
                         // The heavy half, off this thread: a fifty-second
                         // capture deconvolves through multi-million-point
@@ -9514,6 +9660,28 @@ fn ir_inside_root(path: &std::path::Path, root: &std::path::Path) -> bool {
     path.starts_with(&root)
 }
 
+/// **Are these two strings the same file on the disk?**
+///
+/// Compared by RESOLVED path, not by text. A bay's `ir_path` was written
+/// whenever it was loaded and the browser's row was built from a fresh
+/// `read_dir`, so the two can spell one file differently — a symlinked media
+/// folder, `/var` against `/private/var` on macOS, a trailing `.` from a
+/// hand-edited sidecar. A bay that kept playing a deleted file because the
+/// two spellings did not match as text would be the exact surprise the clear
+/// exists to prevent.
+///
+/// Falls back to a plain comparison when neither side resolves, which is what
+/// happens once the file is already gone — and that is the ordinary case
+/// here, since this is asked immediately after a delete.
+#[cfg(feature = "recorder")]
+fn same_file(a: &str, b: &str) -> bool {
+    let (pa, pb) = (std::path::Path::new(a), std::path::Path::new(b));
+    match (pa.canonicalize(), pb.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => pa == pb,
+    }
+}
+
 /// **Delete one impulse**, and the sentence that goes with it.
 ///
 /// Already confirmed by `dialogs::confirm_ir_delete` before it gets here, so
@@ -10396,8 +10564,55 @@ pub fn ir_test(arg: Option<String>) {
     let pre = rate.round() as usize;
     let tail = (tail_s * rate).round() as usize;
     let level = 10.0f32.powf(level_db / 20.0);
+    // **Does the meter TRACK THE SEND?** The owner: the level page's meter
+    // "consistently visibly hit a region then bounce off of it over and over
+    // again i.e. riding the level regardless of anything I can change." That
+    // is two claims — it jitters, and it does not respond — and only the
+    // second can be answered by walking the send and watching the return.
+    if num(8, 0.0) > 0.5 {
+        println!("\nsend sweep - does the return follow the send?");
+        for send in [-24.0f32, -18.0, -12.0, -9.0, -6.0, -3.0] {
+            // **dBFS, not a linear gain.** `start_ir_tone` takes dBFS and
+            // clamps to (-80..=0); handing it 10^(dB/20) makes every value
+            // positive, every value clamp to 0.0, and every send play at FULL
+            // SCALE. The first run of this sweep did exactly that and the
+            // return sat at -14.7 dBFS across a 21 dB walk of the send — which
+            // reads precisely like the meter the owner reported, and was this
+            // probe lying rather than the app.
+            engine.start_ir_tone((out0, out0 + 1), (in0, in0 + 1), send);
+            // A wet box takes a moment to reach steady state at a new level.
+            std::thread::sleep(std::time::Duration::from_millis(1_200));
+            let (mut ml, mut mr) = (-200.0f32, -200.0f32);
+            let (mut sl, mut sr, mut n) = (0.0f64, 0.0f64, 0u32);
+            for _ in 0..80 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let (l, r) = engine.ir_return_sides_db();
+                if l > -200.0 && r > -200.0 {
+                    ml = ml.max(l);
+                    mr = mr.max(r);
+                    sl += f64::from(l);
+                    sr += f64::from(r);
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            println!(
+                "  send {send:6.1}  ->  peak-hold L {ml:7.2} R {mr:7.2}   \
+                 mean L {:7.2} R {:7.2}   spread L-R {:6.2}",
+                sl / f64::from(n),
+                sr / f64::from(n),
+                sl / f64::from(n) - sr / f64::from(n)
+            );
+        }
+        engine.stop_ir();
+        while engine.take_captured().is_some() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        return;
+    }
     println!("\ntone (4 s at the send level) - the return, per jack:");
-    engine.start_ir_tone((out0, out0 + 1), (in0, in0 + 1), level);
+    // dBFS — see the send sweep above for what passing the linear gain costs.
+    engine.start_ir_tone((out0, out0 + 1), (in0, in0 + 1), level_db);
     // **Accumulated, not sampled.** These cells hold the LAST audio block —
     // about ten milliseconds — and a wet return is modal: two channels of one
     // plate beat against each other, so any single block can favour either
