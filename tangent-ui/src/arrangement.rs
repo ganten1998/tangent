@@ -561,6 +561,70 @@ impl ArrClip {
     }
 }
 
+/// **A MIDI clip's notes as the SONG hears them**: every loop pass spelled
+/// out, every note at its place on the timeline in seconds from 0:00.
+///
+/// A clip's own notes are held ONCE and clip-relative — measured from the
+/// clip's source origin, so a note's timeline position is `start_s + (at_s -
+/// offset_s)` — and a clip with a `loop_s` repeats them beyond that without
+/// copying them, which is what keeps a loop in step with the take it came
+/// from when one of its notes is edited. See [`ArrClip::loop_s`]. Anything
+/// that wants to HEAR a clip, or write it down, has to do that expansion.
+///
+/// **This exists because the expansion was written three times.** The
+/// binary's `desktop::midi_clip_notes` does it in FRAMES for playback and for
+/// the offline bounce; `TangentApp::arr_glue_selection` did it in SECONDS to
+/// weld clips together; and the MIDI export needs it in seconds too. The
+/// first of those cannot be shared — it lives across the firewall and works
+/// in frames — and its own doc comment records that this exact class of drift
+/// has already shipped once here, when the loop was expanded for playback and
+/// not for the bounce. The two that CAN share must, or an exported file will
+/// eventually disagree with the sound for the same reason.
+///
+/// The two skips and the bound are all inherited from that schedule, verbatim
+/// in effect: a note that would sound before the clip's own head is dropped
+/// rather than played early; a repeat that BEGINS past the clip's end is not
+/// played at all, because the last pass is usually a partial one; and the
+/// pass count is clamped, because a clip dragged out to an hour over a loop
+/// of a sixteenth is not something to hand the audio thread — or, here, to
+/// build a note list from.
+///
+/// Nothing is truncated at the clip's end. A note that STARTS inside the clip
+/// and rings past it rings past it, which is what playback does and therefore
+/// what an export has to write.
+pub fn clip_notes_in_song_time(clip: &ArrClip) -> Vec<ArrNote> {
+    let passes: usize = if clip.loop_s > 1.0e-6 {
+        ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 4_096)
+    } else {
+        1
+    };
+    // Not `with_capacity(notes * passes)`: most passes of a short loop under
+    // a long clip are cut short by the skip below, so that reservation is
+    // wrong by a factor of the loop count — up to four thousand of them —
+    // and on a busy clip it is a hundred megabytes claimed to hold a few
+    // hundred notes.
+    let mut out: Vec<ArrNote> = Vec::new();
+    for pass in 0..passes {
+        let shift = clip.loop_s * pass as f64;
+        for n in &clip.notes {
+            let at = n.at_s - clip.offset_s + shift;
+            if at < -1.0e-9 {
+                continue;
+            }
+            if clip.loop_s > 1.0e-6 && at >= clip.len_s - 1.0e-9 {
+                continue;
+            }
+            out.push(ArrNote {
+                at_s: clip.start_s + at,
+                dur_s: n.dur_s,
+                key: n.key,
+                vel: n.vel,
+            });
+        }
+    }
+    out
+}
+
 /// The DESK a session carries — what makes a project a SESSION rather
 /// than a clip list: which channels are what, what stands in their bays,
 /// their names, colours, faders and sends, and the transport's musical
