@@ -15076,6 +15076,71 @@ mod tests {
         assert!(span_envelope(&quiet, 9_999, 100, 4).is_empty());
     }
 
+    /// **Running the test suite must not write the user's own desk.**
+    ///
+    /// `Caps::DESKTOP` carries `persist_global_settings`, so anything a test
+    /// does that reaches `save_settings` — `set_insert` alone is used by
+    /// dozens of them — writes the REAL `~/.config/tangent/settings.json`
+    /// with whatever that test was holding. `Settings::path`'s own
+    /// `#[cfg(test)]` redirect does NOT cover this crate: it fires only while
+    /// `tangent-ui` itself is compiled for test, and a test in the BINARY
+    /// crate links an ordinary `tangent-ui` and takes the branch that finds
+    /// the real home directory. That function's doc says so in as many words,
+    /// and names an offscreen screenshot test that "emptied the owner's
+    /// instrument slots".
+    ///
+    /// It has now happened twice. A pedalboard-seeding test written during
+    /// this pass ran under `Caps::DESKTOP` and left seven pedals on a channel
+    /// with no amp in it, plus six bypass rows, in a settings file nobody had
+    /// opened the app to edit.
+    ///
+    /// `composite.rs` has always answered this by setting
+    /// `IVORY_SETTINGS_PATH` — honoured in every build — beside each of its
+    /// app constructions. That was a convention nothing enforced, and the
+    /// file that did not follow it is this one. So the convention is a test
+    /// now: every `TangentApp::new` in either file either asks for capabilities
+    /// that cannot persist, or redirects the path first.
+    ///
+    /// A source scan rather than a runtime assertion, for the reason the
+    /// tempo-map test below is one: the thing being pinned is what the NEXT
+    /// person writes, and there is no hook between a `#[test]` and the
+    /// constructor it calls.
+    ///
+    /// Revert-check: change the seeding test's `Caps::PLUGIN` to
+    /// `Caps::DESKTOP` and this goes red naming it.
+    #[test]
+    fn no_test_in_this_crate_writes_the_real_settings_file() {
+        for (name, src) in [
+            ("desktop.rs", include_str!("desktop.rs")),
+            ("composite.rs", include_str!("composite.rs")),
+        ] {
+            // Only the test module's constructions are in question; the app
+            // the real binary builds is supposed to persist.
+            let tests_at = src.find("\nmod tests {").or_else(|| src.find("\n#[cfg(test)]"));
+            let Some(tests_at) = tests_at else { continue };
+            let body = &src[tests_at..];
+            let mut at = 0usize;
+            while let Some(hit) = body[at..].find("TangentApp::new") {
+                let abs = at + hit;
+                // The call's own argument list, which is where the caps are.
+                let tail = &body[abs..body.len().min(abs + 400)];
+                let desktop = tail.contains("Caps::DESKTOP");
+                // The redirect is set before the construction, so look back
+                // over the enclosing test rather than forward.
+                let back = &body[abs.saturating_sub(3_000)..abs];
+                let redirected = back.contains("IVORY_SETTINGS_PATH");
+                assert!(
+                    !desktop || redirected,
+                    "{name}: a test builds a Caps::DESKTOP app without pointing \
+                     IVORY_SETTINGS_PATH somewhere safe first, so running the \
+                     suite writes the user's own settings file (byte {abs} of \
+                     the test module)"
+                );
+                at = abs + "TangentApp::new".len();
+            }
+        }
+    }
+
     /// **A fresh engine is told the song's musical time.**
     ///
     /// `push_maps` is change-detected against `pushed_maps` because
