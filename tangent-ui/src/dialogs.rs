@@ -3499,18 +3499,19 @@ impl Placement {
     /// `None` survives for the case that really has nowhere to go: no parent
     /// AND no monitor, which is a host that has told us nothing at all.
     fn position_for(self, size: Vec2) -> Option<Pos2> {
+        let parent = self.believable_parent();
         // **Anchored, when something asked to be beside a point.** Offset a
         // few points down and right of the hand, the way every menu on this
         // desk hangs off what opened it, and clamped like any other so a
         // press near the screen's edge does not push it off.
-        if let (Some(at), Some(parent)) = (self.at, self.parent) {
+        if let (Some(at), Some(parent)) = (self.at, parent) {
             return Some(crate::settings::clamp_to_monitor(
                 parent.min + at.to_vec2() + Vec2::new(6.0, 6.0),
                 size,
                 self.monitor,
             ));
         }
-        let centre = match (self.parent, self.monitor) {
+        let centre = match (parent, self.monitor) {
             (Some(parent), _) => parent.center(),
             (None, Some(monitor)) => (monitor * 0.5).to_pos2(),
             (None, None) => return None,
@@ -3521,6 +3522,119 @@ impl Placement {
             self.monitor,
         ))
     }
+
+    /// **The parent rect, when it is describing a window somebody is
+    /// actually looking at.**
+    ///
+    /// The rect travels a long way to get here: `app::last_drawn` is the pane
+    /// the layout was drawn into, translated by the main window's own origin
+    /// as the host last reported it. Either half can be a frame behind, and
+    /// around a hide, a Space change or a display change the host can report
+    /// an origin that puts the whole window off the screen it is supposedly
+    /// on.
+    ///
+    /// **What that costs is not a dialog slightly off-centre.** The centred
+    /// position is clamped, and a clamp handed a position far off the screen
+    /// does not nudge it — it returns exactly `monitor - size`, which is the
+    /// bottom-right corner. That is the owner's report, verbatim: "tab back
+    /// = the plugin window is now on the right bottom of your monitor.
+    /// consistent." A window does not creep towards that corner; it arrives
+    /// there in one frame, because the corner is what the clamp answers with
+    /// when the question was nonsense.
+    ///
+    /// So the question is asked of the one part of the rect this function
+    /// uses: **is the MIDDLE of the parent on the monitor?** If it is not,
+    /// the rect is not a window on this screen, centring on it is centring on
+    /// nothing, and the monitor's own middle is the honest answer — the same
+    /// answer [`Self::position_for`] already gives for a parent it has not
+    /// been told about yet.
+    ///
+    /// Note the case this deliberately does NOT reject: a window dragged hard
+    /// against an edge, whose centre is still on screen. A dialog centred on
+    /// that really does belong close to the edge, and the clamp putting it as
+    /// near as it can get is the right answer rather than a symptom.
+    ///
+    /// With no monitor there is nothing to test the rect against and the
+    /// parent is taken at its word — a host that has told us nothing is not a
+    /// host that has told us something wrong.
+    fn believable_parent(self) -> Option<Rect> {
+        let parent = self.parent.filter(|r| r.is_positive())?;
+        let Some(m) = self.monitor.filter(|m| m.x > 0.0 && m.y > 0.0) else {
+            return Some(parent);
+        };
+        Rect::from_min_size(Pos2::ZERO, m)
+            .contains(parent.center())
+            .then_some(parent)
+    }
+}
+
+/// **The size and place a floating surface was BORN with, held for as long
+/// as it is alive.**
+///
+/// **A window's position belongs to the user the moment it exists.**
+/// Centring is the right answer to where a window OPENS and the wrong answer
+/// to where it IS; [`Placement::position_for`] answers the first question,
+/// and this is what stops it being asked over and over.
+/// [`show_dialog_viewport`] rebuilds its `ViewportBuilder` every frame, and
+/// egui's builder diff turns a `pos` that has changed into a
+/// `ViewportCommand::OuterPosition` (`viewport.rs`, `ViewportBuilder::patch`).
+/// So a surface that recomputes its position from the parent walks back to
+/// the middle every time the main window moves and cannot be dragged aside at
+/// all. The export window had exactly that and was fixed by holding its own
+/// geometry; every plugin face still had it, and this is that fix made
+/// general.
+///
+/// **One bad frame is enough**, which is why holding beats hardening the
+/// inputs. A single frame in which the host reports a stale or off-screen
+/// origin is a single `OuterPosition`, and the window is moved for good — it
+/// does not drift back, because nothing asks again. That is the difference
+/// between a window that wobbles and the owner's, which lands in the
+/// bottom-right corner and stays there.
+///
+/// **The size is held WITH the position, and that is not tidiness.** A
+/// position is only a position for a size: `position_for` centres one inside
+/// the other, so holding half of a pair computed together is how a window
+/// ends up off-centre when the other half moves. And now that a face's size
+/// follows the screen it opens on ([`face_window_size`]), re-deriving it
+/// mid-life would send an `InnerSize` that throws away whatever the user did
+/// with the resize grip.
+///
+/// **`what` is WHICH window this is**, because every dialog shares one
+/// viewport id and one slot in the app: choosing a pedal from a face replaces
+/// the dialog with no undrawn frame in between, and the window that arrives
+/// must not inherit the rectangle of the one that left. The title is what the
+/// window says it is, so the title is what identity is keyed on.
+///
+/// Let go by the same one-pass liveness `shell::surface` uses for a window's
+/// birth, so closing a dialog and opening it again centres afresh — which is
+/// the reveal this whole rule turns on. Not drawing a surface is what
+/// destroys it, here as there.
+///
+/// **A window with no position has not been placed, and nothing is held for
+/// it.** `position_for` answers `None` only for a host that has told us
+/// nothing at all — no parent and no monitor — which on the desktop is the
+/// first frame or two of a launch, and the welcome card is the one dialog
+/// that opens inside them. Holding that `None` would leave the first thing
+/// anybody ever sees wherever the platform felt like putting it, which is
+/// the exact bug `position_for`'s own note is about. So `None` keeps asking,
+/// and the first real answer is the one that sticks.
+fn held_geometry(
+    ctx: &egui::Context,
+    id: &str,
+    what: &str,
+    make: impl FnOnce() -> (Vec2, Option<Pos2>),
+) -> (Vec2, Option<Pos2>) {
+    let slot = egui::Id::new((id, "geometry"));
+    let pass = ctx.cumulative_pass_nr();
+    let key = egui::Id::new(what);
+    let held = ctx
+        .memory(|m| m.data.get_temp::<(u64, egui::Id, Vec2, Option<Pos2>)>(slot))
+        .filter(|(p, k, _, _)| pass.saturating_sub(*p) <= 1 && *k == key);
+    let (size, pos) = held.map_or_else(make, |(_, _, size, pos)| (size, pos));
+    if pos.is_some() {
+        ctx.memory_mut(|m| m.data.insert_temp(slot, (pass, key, size, pos)));
+    }
+    (size, pos)
 }
 
 fn show_dialog_viewport(
@@ -3547,11 +3661,22 @@ fn show_dialog_viewport(
     // live; everything else is modal and wears the OS's chrome. Both facts
     // come from the one `Dialog::is_modal`, carried here in `chrome`.
     let plugin = placement.chrome.is_some();
+    // **Where it opens, decided once and then left alone** — see
+    // [`held_geometry`], which is where the whole argument lives. The size
+    // comes back through the same door because a position is only ever a
+    // position for a size.
+    let (size, pos) = held_geometry(ctx, DIALOG_ID, title, || {
+        (size, placement.position_for(size))
+    });
     let spec = crate::shell::SurfaceSpec {
         id: DIALOG_ID,
         title,
         size,
-        min_size,
+        // Never larger than the window we just asked for. The arms name a
+        // floor the layout is designed to, and a face's size now follows the
+        // screen it opens on — on a display too small to hold that floor, a
+        // minimum bigger than the size is a window that cannot be placed.
+        min_size: min_size.min(size),
         // The modal dialogs are MODAL — `handle_main_interaction` drops every
         // event while one is open — so a dialog that ends up behind the main
         // window is not merely untidy, it is an app that has stopped
@@ -3560,7 +3685,7 @@ fn show_dialog_viewport(
         // already looking at. A plugin window floats for a different reason:
         // it is the thing being worked in, and it must not vanish behind the
         // desk it is being worked against.
-        pos: placement.position_for(size),
+        pos,
         decorated: !plugin,
         resizable: true,
         takes_focus: true,
@@ -3742,6 +3867,121 @@ fn export_min_size(size: Vec2) -> Vec2 {
     EXPORT_MIN.min(size)
 }
 
+// ── how big a suite face opens ──────────────────────────────────────────────
+
+/// **How big a plugin face opens, per unit: a share, a floor and a ceiling.**
+///
+/// The owner: "Make default plugin window size a bit bigger." These were five
+/// fixed point counts, and a fixed point count is a percentage of nothing in
+/// particular — the same thing `app::main_width` and [`EXPORT_SHARE`] say
+/// about the windows they size. 400 by 360 is a comfortable panel on the
+/// display this file was written on, a postage stamp on a 5K and, on a small
+/// laptop, most of the height there is.
+///
+/// So each face keeps the shape it was drawn at and gets the room the machine
+/// has:
+///
+/// * **the floor is exactly the size it opened at before**, so nothing this
+///   change touches is ever smaller than it is today, and a genuinely small
+///   screen gets the layout the panel was designed to;
+/// * **the share** is set so a 14-inch laptop — the small screen this has to
+///   stay sane on — lands about a third larger in each direction, which is
+///   half again the area; and
+/// * **the ceiling is the floor scaled by 1.6 in both directions**, so the
+///   proportions survive the cap. A share with no cap is a knob panel eating
+///   a 6K, and a face is a fixed set of controls: past a point it gains air
+///   rather than anything to read.
+///
+/// The shares are given rather than derived because the faces are not one
+/// shape: the amp is wide, the imager is tall, the EQ is square, and each was
+/// laid out that way on purpose. What is shared is the RULE —
+/// [`crate::shell::share_of_screen`], the same one the main window and the
+/// export window use, floor and ceiling and a last clamp inside the screen.
+///
+/// [`FACE_IR`] is the exception and says why in its own note.
+const FACE_SIZES: &[(&str, Vec2, Vec2, Vec2)] = &[
+    // unit, share of the screen, floor, ceiling
+    ("@tangent-amp", Vec2::new(0.464, 0.477), Vec2::new(540.0, 360.0), Vec2::new(864.0, 576.0)),
+    ("@tangent-eq", Vec2::new(0.404, 0.622), Vec2::new(470.0, 470.0), Vec2::new(752.0, 752.0)),
+    ("@tangent-imager", Vec2::new(0.292, 0.635), Vec2::new(340.0, 480.0), Vec2::new(544.0, 768.0)),
+    ("@tangent-comp", Vec2::new(0.344, 0.569), Vec2::new(400.0, 430.0), Vec2::new(640.0, 688.0)),
+];
+
+/// Every other face: the shape the knob rows were laid out in.
+const FACE_DEFAULT: (Vec2, Vec2, Vec2) = (
+    Vec2::new(0.344, 0.477),
+    Vec2::new(400.0, 360.0),
+    Vec2::new(640.0, 576.0),
+);
+
+/// **The IR face is a drumpad-sized window**, because it is about to be one.
+///
+/// The face is growing a file browser down its right half, which makes it the
+/// same kind of window as the sixteen-pad sampler: a machine on the left, a
+/// list of files on the right, and a list wants rows more than it wants
+/// anything else. So it is sized the drumpad's way rather than the other
+/// faces' — `drumpad_panel::place` takes four fifths of the screen's WIDTH,
+/// floors it at 600 so neither half collapses and caps it at 1160 so it does
+/// not eat a display, and derives its height from what is inside rather than
+/// from the shape of a knob panel.
+///
+/// The numbers here are this window's own and not the drumpad's: the height
+/// share is set so the browser gets more rows than the drumpad's pad grid
+/// needs, and the ceiling is the height that share reaches on the width
+/// ceiling. What is followed is the derivation — four fifths, a floor that
+/// keeps both halves usable, a cap — and not a measurement lifted from
+/// another panel, which would go stale the day the drumpad's own layout
+/// moves.
+const FACE_IR: (Vec2, Vec2, Vec2) = (
+    Vec2::new(0.80, 0.66),
+    Vec2::new(600.0, 400.0),
+    Vec2::new(1160.0, 620.0),
+);
+
+/// The face window for `unit` on this display. See [`FACE_SIZES`].
+///
+/// `monitor` is whatever [`Placement`] was handed — the screen on the
+/// desktop, the plugin editor's own canvas inline — and `None` on the frames
+/// before anything has been measured, where `share_of_screen` answers with
+/// the floor, which is the size these faces opened at for their whole life so
+/// far.
+pub fn face_window_size(unit: &str, monitor: Option<Vec2>) -> Vec2 {
+    let (share, floor, ceiling) = if unit == "@tangent-ir" {
+        FACE_IR
+    } else {
+        FACE_SIZES
+            .iter()
+            .find(|(u, ..)| *u == unit)
+            .map_or(FACE_DEFAULT, |&(_, share, floor, ceiling)| {
+                (share, floor, ceiling)
+            })
+    };
+    crate::shell::share_of_screen(monitor, share, floor, ceiling)
+}
+
+/// **The smallest a face may be dragged to.**
+///
+/// A face is a fixed set of controls in a fixed arrangement, so its minimum
+/// is a property of the layout and not of the screen — 320 by 300 is what the
+/// knob rows need, and it has been the answer for every face since there were
+/// faces. The IR window is the exception for the same reason it is sized
+/// differently: two halves, one of them a list, and a window dragged down to
+/// a knob panel's minimum would leave the browser a column of ellipses.
+///
+/// Capped by the size actually asked for, because on a display too small to
+/// hold the floor a minimum larger than the window is a window that cannot be
+/// placed. [`show_dialog_viewport`] applies that cap to every dialog; this
+/// says the same thing at the one call site where the two numbers are far
+/// enough apart to matter.
+fn face_min_size(unit: &str, size: Vec2) -> Vec2 {
+    let least = if unit == "@tangent-ir" {
+        Vec2::new(640.0, 400.0)
+    } else {
+        Vec2::new(320.0, 300.0)
+    };
+    least.min(size)
+}
+
 /// The window's margin, the label's line, the bar's thickness, and the air
 /// between them: everything the wave does NOT get. See [`export_layout`].
 const EXPORT_PAD: f32 = 14.0;
@@ -3848,40 +4088,21 @@ fn playhead_ink(well: Color32) -> Color32 {
 /// **Where the export window opens, and how big — decided once, then left
 /// alone.**
 ///
-/// [`Placement::position_for`] is recomputed from the parent's rect every
-/// frame, and a `pos` that changes is a `ViewportCommand::OuterPosition`:
-/// this window walked back to the middle of the main window every time the
-/// main window moved, and could not be dragged aside at all. It is up for
-/// the length of a render, which is exactly long enough to want it
-/// somewhere else.
+/// This window is where the rule was learned. It walked back to the middle of
+/// the main window every time the main window moved and could not be dragged
+/// aside at all, and it is up for the length of a render, which is exactly
+/// long enough to want it somewhere else. [`held_geometry`] is that fix, now
+/// serving every floating surface in this file; the four numbers below it are
+/// all this window still owns.
 ///
-/// **The size is frozen with it, and that is not tidiness.** A position is
-/// only a position FOR a size — `position_for` centres one inside the other
-/// — so freezing half of a pair computed together is how a window ends up
-/// off-centre. Drag this window to a second display mid-render, or let the
-/// host report a different monitor, and the size would change under a
-/// position that was worked out for the old one. They are taken together on
-/// the frame it opens and held together until it closes.
-///
-/// Dropped when it does close, by the same one-pass liveness
-/// `shell::surface` uses, so the next export centres again at the size of
-/// whatever screen it is started on rather than reopening where and how the
-/// last one was left.
+/// One window, one name for it, and the name never changes: the identity
+/// [`held_geometry`] keys on is the id rather than the title, because the
+/// title says which pass of the render it is on.
 fn export_geometry(ctx: &egui::Context, placement: Placement) -> (Vec2, Option<Pos2>) {
-    let id = egui::Id::new((EXPORT_ID, "geometry"));
-    let pass = ctx.cumulative_pass_nr();
-    let held = ctx
-        .memory(|m| m.data.get_temp::<(u64, Vec2, Option<Pos2>)>(id))
-        .filter(|(p, _, _)| pass.saturating_sub(*p) <= 1);
-    let (size, pos) = held.map_or_else(
-        || {
-            let size = export_window_size(placement.monitor);
-            (size, placement.position_for(size))
-        },
-        |(_, size, pos)| (size, pos),
-    );
-    ctx.memory_mut(|m| m.data.insert_temp(id, (pass, size, pos)));
-    (size, pos)
+    held_geometry(ctx, EXPORT_ID, EXPORT_ID, || {
+        let size = export_window_size(placement.monitor);
+        (size, placement.position_for(size))
+    })
 }
 
 /// The export window: a wave that draws itself while the render walks the
@@ -4915,19 +5136,20 @@ pub fn show(
             let unit = live.face.path.clone();
             let (title, about) =
                 crate::faces::suite_unit(&unit).unwrap_or(("Tangent", ""));
-            let size = match unit.as_str() {
-                "@tangent-amp" => Vec2::new(540.0, 360.0),
-                "@tangent-eq" => Vec2::new(470.0, 470.0),
-                "@tangent-imager" => Vec2::new(340.0, 480.0),
-                "@tangent-comp" => Vec2::new(400.0, 430.0),
-                _ => Vec2::new(400.0, 360.0),
-            };
+            // A share of the screen with a floor and a ceiling, per unit —
+            // see `FACE_SIZES`. It was five fixed point counts, which is a
+            // percentage of nothing in particular. Taken through
+            // `held_geometry` inside `show_dialog_viewport`, so the window
+            // is sized once on the display it opens on and a monitor change
+            // cannot resize it out from under a hand on the grip.
+            let size = face_window_size(&unit, placement.monitor);
+            let least = face_min_size(&unit, size);
             show_dialog_viewport(
                 ctx,
                 placement,
                 title,
                 size,
-                Vec2::new(320.0, 300.0),
+                least,
                 |ui, result| {
                     apply_theme(ui.style_mut(), &theme(face));
                     ui.painter().rect_filled(ui.max_rect(), 0.0, p.bg);
@@ -10405,8 +10627,11 @@ mod tests {
             "off-centre in y"
         );
 
-        // A window near an edge still puts the whole dialog on the monitor.
-        let edge = Rect::from_min_size(Pos2::new(2400.0, 1380.0), Vec2::new(1300.0, 200.0));
+        // A window near an edge still puts the whole dialog on the monitor —
+        // and the dialog really does go to the edge, because the window it
+        // belongs to is there. This is the case `believable_parent` must not
+        // reject: the parent's middle is still on screen.
+        let edge = Rect::from_min_size(Pos2::new(1200.0, 1000.0), Vec2::new(1300.0, 400.0));
         let p = Placement {
             at: None,
             native_panel_up: false,
@@ -10421,6 +10646,55 @@ mod tests {
         assert!(p.x >= 0.0 && p.y >= 0.0, "pushed off the top-left: {p:?}");
         assert!(p.x + size.x <= 2560.0 + 0.5, "hangs off the right: {p:?}");
         assert!(p.y + size.y <= 1440.0 + 0.5, "hangs off the bottom: {p:?}");
+        assert!(
+            (p.x + size.x * 0.5 - edge.center().x).abs() < 0.5,
+            "a parent on screen was not centred on: {p:?}"
+        );
+
+        // And a parent that is mostly OFF the monitor is not a window
+        // anybody is looking at. Centring on it lands past the bottom-right
+        // corner, the clamp answers with the corner exactly, and that corner
+        // is the owner's bug report. See `believable_parent`.
+        let gone = Rect::from_min_size(Pos2::new(2400.0, 1380.0), Vec2::new(1300.0, 200.0));
+        let mon = Vec2::new(2560.0, 1440.0);
+        let corner = (mon - size).to_pos2();
+        assert_eq!(
+            crate::settings::clamp_to_monitor(gone.center() - size * 0.5, size, monitor),
+            corner,
+            "this parent no longer produces the corner, so the test proves nothing"
+        );
+        let p = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: Some(gone),
+            monitor,
+            caps: crate::host::Caps::DESKTOP,
+            chrome: None,
+        }
+        .position_for(size)
+        .unwrap();
+        assert_ne!(p, corner, "an off-screen parent still corners the dialog");
+        let centre = p + size * 0.5;
+        assert!(
+            (centre.x - mon.x * 0.5).abs() < 0.5 && (centre.y - mon.y * 0.5).abs() < 0.5,
+            "an unbelievable parent did not fall back to the middle of the monitor: {p:?}"
+        );
+
+        // The anchored road takes the same answer: a point measured against a
+        // window nobody can see is not a point to hang a menu off.
+        let anchored = Placement {
+            at: Some(Pos2::new(40.0, 30.0)),
+            native_panel_up: false,
+            raise: false,
+            parent: Some(gone),
+            monitor,
+            caps: crate::host::Caps::DESKTOP,
+            chrome: None,
+        }
+        .position_for(size)
+        .unwrap();
+        assert_ne!(anchored, corner, "an off-screen anchor still corners the menu");
     }
 
     // ── the custom tuning editor ────────────────────────────────────────────
@@ -12589,6 +12863,303 @@ at: None,
         let (size2, pos2) = again.expect("the next export answered nothing");
         assert_eq!(size2, export_window_size(Some(small)), "it reopened at the old size");
         assert_eq!(pos2, at(small).position_for(size2), "it reopened in the old place");
+    }
+
+    /// What the app is asking for the one dialog window this frame — read
+    /// back through the same one-pass liveness `held_geometry` writes it
+    /// with, so a rectangle left behind by a window that has closed reads as
+    /// nothing rather than as this window's.
+    fn asked_geometry(ctx: &egui::Context) -> Option<(Vec2, Option<Pos2>)> {
+        let pass = ctx.cumulative_pass_nr();
+        ctx.memory(|m| {
+            m.data
+                .get_temp::<(u64, egui::Id, Vec2, Option<Pos2>)>(egui::Id::new((
+                    DIALOG_ID, "geometry",
+                )))
+        })
+        .filter(|(p, ..)| pass.saturating_sub(*p) <= 1)
+        .map(|(_, _, size, pos)| (size, pos))
+    }
+
+    /// **A plugin window that has been placed is never placed again.**
+    ///
+    /// The owner, on the bug this pins: "open plugin window --> tab out or
+    /// workspace change with it still open --> tab back = the plugin window
+    /// is now on the right bottom of your monitor. consistent."
+    ///
+    /// The mechanism, in three steps and all of them in this file. The
+    /// position was recomputed from the parent's rect on every frame; egui
+    /// turns a `pos` that has changed into a `ViewportCommand::OuterPosition`
+    /// (`ViewportBuilder::patch`); and `clamp_to_monitor` handed a position
+    /// well off the screen does not nudge it but returns exactly
+    /// `monitor - size`, which IS the bottom-right corner. So one frame with
+    /// a stale or off-screen parent — which is what a hide, a Space change or
+    /// a display change can produce — moved the window there for good,
+    /// because nothing ever asked again afterwards.
+    ///
+    /// The fix is that the window is placed ONCE, so the frames afterwards
+    /// have nothing to say. This drives the real funnel — `show`, the real
+    /// `Dialog`, the real `show_dialog_viewport` — and walks the parent
+    /// around underneath it, ending with the rect that used to corner it.
+    #[test]
+    fn a_placed_plugin_window_is_never_moved_again_by_the_parent() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let monitor = Vec2::new(1512.0, 982.0);
+        let screen = Rect::from_min_size(Pos2::ZERO, monitor);
+        let at = |parent: Rect| Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: Some(parent),
+            monitor: Some(monitor),
+            caps: crate::host::Caps::DESKTOP,
+            chrome: None,
+        };
+        let olive = Color32::from_rgb(0x6B, 0x71, 0x3E);
+        let frame = |dialog: &mut Option<Dialog>, parent: Rect| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(ctx, dialog, olive, at(parent));
+                },
+            );
+        };
+        let face = || {
+            Some(Dialog::InsertFace {
+                strip: 0,
+                slot: 0,
+                live: Box::default(),
+            })
+        };
+
+        let home = Rect::from_min_size(Pos2::new(80.0, 60.0), Vec2::new(1240.0, 800.0));
+        let mut dialog = face();
+        frame(&mut dialog, home);
+        let (size, pos) = asked_geometry(&ctx).expect("the face was never placed");
+        assert_eq!(
+            pos,
+            at(home).position_for(size),
+            "it did not open centred on the window it belongs to"
+        );
+
+        // The parent moves the way a main window moves, and then the way a
+        // host that has lost track of it reports one: off the screen
+        // entirely. The last of these is the frame that used to corner the
+        // window, and this asserts it exactly.
+        // `clamp_to_monitor` rounds what it hands back, so the corner it
+        // would answer with is rounded too.
+        let corner = Pos2::new((monitor.x - size.x).round(), (monitor.y - size.y).round());
+        let lying = Rect::from_min_size(Pos2::new(4000.0, 2600.0), Vec2::new(1240.0, 800.0));
+        assert_eq!(
+            crate::settings::clamp_to_monitor(lying.center() - size * 0.5, size, Some(monitor)),
+            corner,
+            "this parent no longer corners a dialog, so the test proves nothing"
+        );
+        for parent in [
+            home.translate(Vec2::new(120.0, 40.0)),
+            home.translate(Vec2::new(-60.0, 90.0)),
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 500.0)),
+            lying,
+            lying,
+        ] {
+            frame(&mut dialog, parent);
+            assert_eq!(
+                asked_geometry(&ctx),
+                Some((size, pos)),
+                "the placed window followed the parent to {parent:?}"
+            );
+        }
+        assert_ne!(pos, Some(corner), "it ended up in the corner after all");
+
+        // **Closed and opened again, it centres afresh.** That is the reveal
+        // the whole rule turns on: a window is placed when it is born and
+        // never afterwards, and closing one is what makes the next one a
+        // birth. Three idle passes, the same liveness `shell::surface` uses.
+        let mut shut = None;
+        for _ in 0..3 {
+            frame(&mut shut, home);
+        }
+        let mut dialog = face();
+        frame(&mut dialog, home);
+        let (again_size, again_pos) = asked_geometry(&ctx).expect("it never reopened");
+        assert_eq!(
+            (again_size, again_pos),
+            (size, at(home).position_for(size)),
+            "the second opening did not centre on the window again"
+        );
+
+        // **A different window under the same slot gets its own rectangle.**
+        // Every dialog shares one viewport and one slot in the app, and a
+        // face that opens a picker is replaced with no undrawn frame between
+        // them — so identity is what the window says it is, not the slot it
+        // came through.
+        let mut picker = Some(Dialog::plugin_picker(&[], None, false));
+        frame(&mut picker, home);
+        let (other_size, _) = asked_geometry(&ctx).expect("the picker was never placed");
+        assert_ne!(
+            other_size, size,
+            "the picker inherited the face's window instead of asking for its own"
+        );
+
+        // **A window nothing could place yet keeps asking.** The welcome card
+        // opens on the first frame of a launch, before the host has said
+        // where anything is, and `position_for` answers `None` — which is not
+        // a place and must not be held, or the first thing anybody ever sees
+        // lands wherever the platform felt like putting it.
+        for _ in 0..3 {
+            frame(&mut shut, home);
+        }
+        let blind = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::DESKTOP,
+            chrome: None,
+        };
+        let mut welcome = Some(Dialog::Welcome {
+            dont_show_again: false,
+        });
+        for pass in 0..2 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(ctx, &mut welcome, olive, blind);
+                },
+            );
+            assert_eq!(
+                asked_geometry(&ctx).and_then(|(_, pos)| pos),
+                None,
+                "pass {pass}: a window nobody could place was held unplaced"
+            );
+        }
+        // The host reports a monitor, and the card centres on it at once.
+        frame(&mut welcome, home);
+        let (card, placed) = asked_geometry(&ctx).expect("the card was never placed");
+        assert_eq!(
+            placed,
+            at(home).position_for(card),
+            "the card never took the first answer it was given"
+        );
+    }
+
+    /// **How big a face opens: a share of the screen, floored and capped.**
+    ///
+    /// The floor is the size each face opened at before this rule existed, so
+    /// nothing ever gets smaller; the ceiling is that floor scaled by 1.6 in
+    /// both directions, so a face keeps its proportions when the cap bites;
+    /// and a laptop lands comfortably between the two. See [`FACE_SIZES`].
+    #[test]
+    fn a_face_is_sized_from_the_screen_between_its_floor_and_its_ceiling() {
+        // Every face that has a size of its own, with the size it used to
+        // open at. The floor IS that size, which is the promise being kept.
+        let was = [
+            ("@tangent-amp", Vec2::new(540.0, 360.0)),
+            ("@tangent-eq", Vec2::new(470.0, 470.0)),
+            ("@tangent-imager", Vec2::new(340.0, 480.0)),
+            ("@tangent-comp", Vec2::new(400.0, 430.0)),
+            ("@tangent-tape", Vec2::new(400.0, 360.0)),
+        ];
+        for (unit, floor) in was {
+            // No monitor is no guess: the floor, which is today's size.
+            assert_eq!(face_window_size(unit, None), floor, "{unit} with no screen");
+            // A tiny screen cannot be given the floor and is not given a
+            // window bigger than itself either.
+            let tiny = Vec2::new(700.0, 520.0);
+            let small = face_window_size(unit, Some(tiny));
+            assert!(
+                small.x <= tiny.x && small.y <= tiny.y,
+                "{unit} opened bigger than a {tiny:?} screen: {small:?}"
+            );
+            // A laptop: meaningfully bigger in both directions, and still a
+            // long way from filling the screen.
+            let laptop = Vec2::new(1512.0, 982.0);
+            let mid = face_window_size(unit, Some(laptop));
+            assert!(
+                mid.x > floor.x * 1.2 && mid.y > floor.y * 1.2,
+                "{unit} is barely bigger on a laptop: {mid:?} against {floor:?}"
+            );
+            assert!(
+                mid.x < laptop.x * 0.6 && mid.y < laptop.y * 0.7,
+                "{unit} eats the laptop's screen: {mid:?}"
+            );
+            // A big desk display: the ceiling, and the ceiling holds the
+            // shape the face was drawn at.
+            let desk = face_window_size(unit, Some(Vec2::new(3840.0, 2160.0)));
+            assert!(
+                (desk.x / desk.y - floor.x / floor.y).abs() < 0.01,
+                "{unit} changed shape at the ceiling: {desk:?} against {floor:?}"
+            );
+            assert!(
+                (desk.x / floor.x - 1.6).abs() < 0.01,
+                "{unit}'s ceiling is not 1.6 times its floor: {desk:?}"
+            );
+            // Bigger screens never give back a smaller window.
+            let mut last = 0.0_f32;
+            for w in [700.0_f32, 1280.0, 1440.0, 1512.0, 1920.0, 2560.0, 3840.0] {
+                let got = face_window_size(unit, Some(Vec2::new(w, w * 0.62)));
+                assert!(got.x >= last - 0.01, "{unit} shrank at {w}: {got:?}");
+                last = got.x;
+            }
+        }
+    }
+
+    /// **The IR face is a drumpad-sized window.**
+    ///
+    /// It is becoming the same kind of thing — a machine on the left, a file
+    /// browser on the right — and this is the contract the lane laying out
+    /// those two halves builds against. Checked against
+    /// `drumpad_panel::place` itself rather than against a number copied out
+    /// of it, so the day the drumpad's own rule moves, this says so.
+    #[test]
+    fn the_ir_face_opens_in_the_drumpads_size_class() {
+        for m in [
+            Vec2::new(1280.0, 800.0),
+            Vec2::new(1512.0, 982.0),
+            Vec2::new(1920.0, 1080.0),
+            Vec2::new(2560.0, 1440.0),
+        ] {
+            let ir = face_window_size("@tangent-ir", Some(m));
+            let pad = crate::drumpad_panel::place(Rect::from_min_size(Pos2::ZERO, m), None);
+            // The same width, because it is derived the same way: four
+            // fifths of the screen, the same floor and the same cap.
+            assert!(
+                (ir.x - pad.width()).abs() < 0.5,
+                "the IR face is {ir:?} where the drumpad is {:?} on a {m:?} screen",
+                pad.size()
+            );
+            // And a height in the same class: a browser wants more rows than
+            // a pad grid, never fewer, and never so many that it stops being
+            // the same kind of window.
+            assert!(
+                ir.y >= pad.height() && ir.y <= pad.height() * 1.3,
+                "the IR face is {ir:?} where the drumpad is {:?} on a {m:?} screen",
+                pad.size()
+            );
+            // Both halves stay usable: the minimum is a browser's, not a
+            // knob panel's.
+            let least = face_min_size("@tangent-ir", ir);
+            assert!(
+                least.x >= 600.0 && least.x < ir.x,
+                "the IR face can be dragged down to {least:?}"
+            );
+        }
+        // It is meaningfully bigger than the generic face it used to share a
+        // size with, which is the whole reason it is called out.
+        let laptop = Some(Vec2::new(1512.0, 982.0));
+        assert!(
+            face_window_size("@tangent-ir", laptop).x
+                > face_window_size("@tangent-tape", laptop).x * 2.0
+        );
     }
 
     /// **A real modal dialog opened mid-render comes out in front of it, on
