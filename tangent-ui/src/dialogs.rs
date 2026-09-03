@@ -13749,6 +13749,174 @@ at: None,
         );
     }
 
+    // ── the busy cover, and what it has to be over ──────────────────────────
+
+    /// The placement the two cover guards below draw against: the PLUGIN
+    /// caps, where every surface is an `Area` in one canvas and the paint
+    /// order is the whole of the z-order. On the desktop each of these is an
+    /// OS window and the ladder is `shell::SurfaceTier`'s, which
+    /// `a_cover_is_painted_above_every_surface_this_app_can_open` reads from
+    /// the other end.
+    fn cover_placement() -> Placement {
+        Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+            chrome: None,
+            surface: None,
+        }
+    }
+
+    /// Run one frame twice — the surface alone, then the surface with a busy
+    /// cover painted FIRST — and hand back the two shape lists.
+    ///
+    /// **The cover is painted before the surface on purpose.** It is drawn
+    /// last in the real frame (`desktop.rs`'s `paint_busy` sits at the bottom
+    /// of `update`), and a guard that relied on that would be measuring the
+    /// call order rather than the rule. Painted first, the only thing that can
+    /// put it on top is the band [`crate::busy::COVER_ORDER`] names — which is
+    /// exactly the property that has to survive somebody moving a call.
+    ///
+    /// One `Context` for both passes, so the surface lays out identically in
+    /// each and the difference in the two lists is the cover and nothing else.
+    fn frame_with_and_without_cover(
+        label: &str,
+        mut draw: impl FnMut(&egui::Context),
+    ) -> (Vec<egui::epaint::ClippedShape>, Vec<egui::epaint::ClippedShape>) {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 900.0))),
+            ..Default::default()
+        };
+        // Two settling passes first: an `Area` places itself from what it
+        // measured LAST time, so the first pass lays out against a rectangle
+        // nobody has agreed on yet.
+        let mut bare = Vec::new();
+        for _ in 0..2 {
+            bare = ctx.run(input(), |ctx| draw(ctx)).shapes;
+        }
+        let mut busy = crate::busy::Busy::new(label);
+        let with = ctx
+            .run(input(), |ctx| {
+                let painter = ctx.layer_painter(crate::busy::cover_layer("tangent-busy"));
+                busy.draw(&painter, ctx.screen_rect(), FALLBACK_FACE, 0.0);
+                draw(ctx);
+            })
+            .shapes;
+        (bare, with)
+    }
+
+    /// Assert that everything the cover painted came AFTER everything the
+    /// surface did, which is what "on top" means in egui.
+    ///
+    /// The measurement is a count, not a colour: the surface's own shapes are
+    /// identical in both passes, so the cover's are exactly the ones the
+    /// second list has and the first does not. If the cover is on top they are
+    /// the TAIL of the second list, and the head of it — the first `bare.len()`
+    /// shapes — is the surface's frame untouched. `mark` is a string only the
+    /// cover paints and `under` one only the surface does, so the two ends are
+    /// named as well as counted.
+    fn cover_is_on_top(
+        bare: &[egui::epaint::ClippedShape],
+        with: &[egui::epaint::ClippedShape],
+        mark: &str,
+        under: &str,
+    ) {
+        assert!(
+            with.len() > bare.len(),
+            "the cover painted nothing at all: {} shapes either way",
+            bare.len()
+        );
+        let at = |want: &str| {
+            with.iter().position(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => t.galley.job.text == want,
+                _ => false,
+            })
+        };
+        let under_at = at(under).unwrap_or_else(|| {
+            panic!("the surface never painted {under:?}, so nothing below means anything")
+        });
+        let mark_at = at(mark).unwrap_or_else(|| {
+            panic!("the cover never painted {mark:?}, so nothing below means anything")
+        });
+        assert!(
+            mark_at > under_at,
+            "the cover's {mark:?} was painted at shape {mark_at} and the \
+             surface's {under:?} at {under_at} — the cover is UNDER the \
+             surface, which is the whole fault"
+        );
+        // And not merely later than one string of it: the surface's frame is
+        // the same in both passes, so the cover is on top only if every shape
+        // it added is past the end of that frame.
+        assert!(
+            mark_at >= bare.len(),
+            "the cover's {mark:?} landed at shape {mark_at}, inside the {} \
+             the surface painted on its own — part of the cover is under it",
+            bare.len()
+        );
+    }
+
+    /// **The busy cover paints over the export dialog.**
+    ///
+    /// The owner's report was "the export loading bar comes up behind the
+    /// export menu itself", and this is the first half of it: pressing Export
+    /// announces a block, and the frame that carries the announcement is the
+    /// frame the dialog is still in.
+    ///
+    /// It was green before the fix and for the wrong reason — a layer that is
+    /// not an `Area` is missing from `Areas::order`, and `GraphicLayers::drain`
+    /// sweeps those up after the ones that are, out of a hash map, down a
+    /// branch egui annotates "we don't think we end up here in normal
+    /// situations". So this one is here to stay green while the band moves,
+    /// and its sibling below is the one that was red.
+    #[test]
+    fn the_busy_cover_paints_over_the_export_dialog() {
+        let mut dialog = Some(Dialog::ExportProject {
+            spec: crate::ports::ProjectExportSpec::default(),
+            sel: None,
+        });
+        let (bare, with) = frame_with_and_without_cover("Preparing export", |ctx| {
+            let _ = show(ctx, &mut dialog, FALLBACK_FACE, cover_placement());
+        });
+        cover_is_on_top(&bare, &with, "Preparing export", "Export");
+    }
+
+    /// **The busy cover paints over the export RENDER window**, which is the
+    /// half that was broken.
+    ///
+    /// That window stands on [`crate::shell::SurfaceTier::Uncovered`], which
+    /// inline is `Order::Tooltip` — one band above the `Order::Foreground` the
+    /// cover used to name, so it covered the cover outright. And the two are
+    /// up together by design, not by accident: the offline export sets its
+    /// progress to "Writing files" and announces a block under that same
+    /// label in the same breath (`tick_offline_bounce`), so the last thing
+    /// anybody sees before the format pass blocks for a minute is a render
+    /// window with the cover hidden behind it.
+    ///
+    /// Revert-check: set `busy::COVER_ORDER` back to `egui::Order::Foreground`
+    /// and this goes red — the cover's label lands in the head of the frame
+    /// rather than the tail.
+    #[test]
+    fn the_busy_cover_paints_over_the_export_render_window() {
+        let progress = crate::ports::ExportProgress {
+            fraction: 1.0,
+            label: "Rendering".to_owned(),
+            peaks: vec![(0.0, 0.0); 8],
+        };
+        let (bare, with) = frame_with_and_without_cover("Writing files", |ctx| {
+            show_export_progress(ctx, &progress, cover_placement());
+        });
+        // The window prints its own label with a percentage after it, so
+        // "Rendering  100%" is the string only IT paints and "Writing files"
+        // the string only the cover does.
+        cover_is_on_top(&bare, &with, "Writing files", "Rendering  100%");
+    }
+
     // ── the plugin picker ───────────────────────────────────────────────────
 
     fn entry(path: &str, name: &str, vendor: &str) -> PluginEntry {

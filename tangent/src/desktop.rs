@@ -6087,8 +6087,10 @@ impl DesktopApp {
                         stem_writers.push((lane, w));
                     }
                 }
-                e.set_stems(true);
-                e.set_stems_dry(stems_dry);
+                // The same door the offline twin arms its tap through, so the
+                // two passes cannot disagree about what a mode means. See
+                // `arm_stem_tap`.
+                arm_stem_tap(e, true, stems_dry);
             }
         }
         self.recorder.bounce = Some(Bounce {
@@ -6370,9 +6372,13 @@ impl DesktopApp {
     }
 
     /// Start a full-speed export: an OFFLINE engine, furnished exactly like
-    /// the live one — desk, racks with their saved states, clips, pads —
-    /// and pulled by hand a slice of a second per frame. The click stays
-    /// out; nothing live reaches it.
+    /// the live one — desk, racks with the knobs the live racks are wearing
+    /// this second, clips, pads — and pulled by hand a slice of a second per
+    /// frame. The click stays out; nothing live reaches it.
+    ///
+    /// "The knobs the live racks are wearing this second" used to read "their
+    /// saved states", and the difference is the export bug the stems chips
+    /// were blamed for: see `desk_insert_state`.
     fn start_offline_bounce(&mut self, spec: tangent_ui::ports::ProjectExportSpec) {
         use tangent_ui::ports::ExportFormat;
         // Every road out of here is a road out of a message that is already
@@ -6557,13 +6563,16 @@ impl DesktopApp {
             // export engine's racks exactly as they do the live one's.
             let engine_want = want.as_deref().filter(|p| !is_instrument_sentinel(p));
             let Some(path) = engine_want else { continue };
-            let state = saved_insert_state(seat, bay, path);
-            if let Err(err) = e.load_insert(
-                seat,
-                bay,
-                Some(std::path::Path::new(path)),
-                state.as_deref(),
-            ) {
+            // **From the DESK, not from the shelf** — see `desk_insert_state`,
+            // which is where the whole of that finding is written up. The
+            // mirror used to be furnished from the sidecars alone, so a unit
+            // dialled in since the last save rendered at whatever its bay had
+            // been wearing then — and when that was one of the settings a
+            // unit sits at before anybody dials it, the "processed" stem came
+            // out identical to the dry one.
+            if let Err(err) =
+                furnish_mirror_bay(&mut e, self.recorder.engine.as_ref(), seat, bay, path)
+            {
                 refused.push(format!("{} ({err})", leaf_of(path)));
             }
         }
@@ -6671,12 +6680,9 @@ impl DesktopApp {
                 e.set_pad_params(lane, &self.app.drum_kit_params_of(lane));
             }
         }
-        e.set_stems(spec.stems);
-        // Only meaningful with the tap armed, and the engine ANDs it with
-        // the tap again on its own side — but stated here too, so a spec
-        // carrying the unreachable fourth state (dry with no stems) cannot
-        // arm a mode for a pass that takes no stems.
-        e.set_stems_dry(spec.stems && spec.stems_dry);
+        // The chips' answer, through the one place either road turns a spec
+        // into the engine's two atomics. See `arm_stem_tap`.
+        arm_stem_tap(&e, spec.stems, spec.stems_dry);
         e.set_transport(1, (from_s * f64::from(rate)).round() as u64);
         e.set_rolling(true);
         // ── the files ──
@@ -10151,6 +10157,113 @@ fn saved_insert_state(strip: usize, bay: usize, bundle: &str) -> Option<Vec<u8>>
     (owner == bundle).then(|| raw[split + 1..].to_vec())
 }
 
+/// **What a bay sounds like RIGHT NOW** — the desk that is playing first, its
+/// sidecar on disk only when the desk cannot answer.
+///
+/// **This is what was behind the owner's "Export Processed stems exports
+/// unprocessed".** The full-speed export builds a second engine and furnishes
+/// it by hand, and it used to fill every rack from [`saved_insert_state`]
+/// alone. That file is not the desk: it is written when a project is SAVED,
+/// when a plugin's own OS window is closed, when a session is replaced, and at
+/// quit — and nowhere else. No knob writes it. The suite's own units have no
+/// OS window whose closing writes it either, so a unit dialled in on an audio
+/// track and exported before the next save was rendered by a mirror wearing
+/// whatever that bay was wearing at the last save: its shipped defaults if it
+/// had never been saved at all, the pre-dial setting if it had.
+///
+/// **And "stale" reads as "unprocessed" far more often than it should**,
+/// because the settings a plugin sits at before somebody dials it in are the
+/// ones that do nothing: an EQ still flat, a saturator at zero drive, a
+/// compressor still at 1 : 1 or with its threshold above the loudest thing on
+/// the track. Render the mirror with those and the "processed" stem is the dry
+/// stem, while every chip, every atomic and every buffer between the dialog
+/// and the tap does its job perfectly on audio that has been through a rack
+/// with nothing in it.
+///
+/// **The live engine is the ledger, which is why it is asked first.** A
+/// built-in bay's knobs live in `Engine`'s own `BuiltinBay`, an LV2 bay's in
+/// the host's port ledger, a VST3's in the plugin — and
+/// [`crate::instrument::Engine::save_insert_state`] is the one door to all
+/// three. Asking it costs the same call a save would make, and the export is
+/// already standing under a cover that says it is preparing.
+///
+/// **The bundle has to MATCH before the live answer is taken.** The desk and
+/// the engine disagree for a frame or two whenever a bay is being reloaded —
+/// the desk says what should be there, `inserts_loaded` says what is — and a
+/// state blob belonging to the outgoing tenant handed to the incoming one is
+/// worse than a stale file: `load_insert` would refuse it and the bay would
+/// come up at defaults with a state error, which is the very failure this
+/// exists to stop. Mismatched, the sidecar is the better answer, and it is
+/// also the only answer available when there is no live engine at all.
+#[cfg(feature = "recorder")]
+fn desk_insert_state(
+    live: Option<&crate::instrument::Engine>,
+    strip: usize,
+    bay: usize,
+    bundle: &str,
+) -> Option<Vec<u8>> {
+    live.filter(|e| {
+        e.insert(strip, bay)
+            .is_some_and(|l| l.bundle == std::path::Path::new(bundle))
+    })
+    .and_then(|e| e.save_insert_state(strip, bay))
+    .or_else(|| saved_insert_state(strip, bay, bundle))
+}
+
+/// **Seat one bay of a MIRROR engine from the desk it is mirroring.**
+///
+/// The offline export's engine is a copy of the desk built by hand, and this
+/// is the one line of that copy that had to know where a plugin's knobs
+/// really are. A function rather than two statements inline so the rule has a
+/// name to be reverted against — see
+/// `an_export_mirror_takes_its_racks_from_the_desk_and_not_from_the_last_save`,
+/// which drives exactly this call with a comp dialled in on one engine and the
+/// same comp, still at the ratio it came up with, sitting on the shelf.
+#[cfg(feature = "recorder")]
+fn furnish_mirror_bay(
+    mirror: &mut crate::instrument::Engine,
+    live: Option<&crate::instrument::Engine>,
+    strip: usize,
+    bay: usize,
+    bundle: &str,
+) -> Result<(), String> {
+    let state = desk_insert_state(live, strip, bay, bundle);
+    mirror
+        .load_insert(
+            strip,
+            bay,
+            Some(std::path::Path::new(bundle)),
+            state.as_deref(),
+        )
+        .map(|_| ())
+}
+
+/// **Arm a pass's stem tap from the two bools the Export dialog filled in.**
+///
+/// One function because there are two export roads and they spelled the same
+/// decision differently: the offline one as `set_stems(spec.stems)` and
+/// `set_stems_dry(spec.stems && spec.stems_dry)`, the realtime one as
+/// `set_stems(true)` and `set_stems_dry(stems_dry)` inside a branch that had
+/// already tested `stems`. Two spellings of one rule is how a mode reaches one
+/// pass and not the other, which is the class of fault these chips were
+/// reported for — so there is one spelling now, and
+/// `the_export_dialogs_stem_chips_reach_the_buffer_the_engine_taps` drives the
+/// dialog's own pack function straight into it.
+///
+/// **`dry` is ANDed with `stems` HERE**, not at the callers. The pair has a
+/// fourth state — dry asked for with no stems to be dry — that
+/// `dialogs::set_export_source` already makes unreachable from the UI; this
+/// closes it at the engine's door as well, so a spec arriving from anywhere
+/// else cannot arm a mode for a pass that takes no stems. The engine ANDs it
+/// a third time on its own side, once a block, because five writers of the dry
+/// buffer have to agree and one place to agree in is cheaper than five — see
+/// `Shared::stems_dry`.
+#[cfg(feature = "recorder")]
+fn arm_stem_tap(e: &crate::instrument::Engine, stems: bool, dry: bool) {
+    e.set_stems(stems);
+    e.set_stems_dry(stems && dry);
+}
+
 #[cfg(feature = "recorder")]
 fn write_insert_state(strip: usize, bay: usize, bundle: &str, state: &[u8]) {
     let mut out = Vec::with_capacity(bundle.len() + 1 + state.len());
@@ -12998,10 +13111,17 @@ impl DesktopApp {
 
     /// Paint the splash, and decide when it goes.
     ///
-    /// Drawn on the FOREGROUND layer after the app's own frame, so it covers
+    /// Drawn on a COVER layer after the app's own frame, so it covers
     /// everything including any dialog that opened underneath it — a Welcome
     /// card half-visible through a loading screen is the sort of detail that
     /// makes an app feel unfinished.
+    ///
+    /// **That sentence used to name `Order::Foreground` and was not true.**
+    /// Foreground is where the dialogs are and one band UNDER where the
+    /// export render window is, so "covers everything" was an accident of
+    /// egui's drain order in one direction and simply wrong in the other.
+    /// The band is `tangent_ui::busy::COVER_ORDER`'s to decide now, and this
+    /// asks for it by name; the whole argument is written there.
     fn paint_splash(&mut self, ctx: &egui::Context) {
         if self.splash.is_none() {
             return;
@@ -13057,10 +13177,7 @@ impl DesktopApp {
             self.splash = None;
             return;
         }
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("tangent-splash"),
-        ));
+        let painter = ctx.layer_painter(tangent_ui::busy::cover_layer("tangent-splash"));
         let rect = ctx.screen_rect();
         tangent_ui::splash::draw(&painter, rect, fade);
         // While it is up, the window must keep repainting — nothing else is
@@ -13221,13 +13338,23 @@ fn is_gesture(e: &egui::Event) -> bool {
 /// Whether an announced job may be run this frame.
 ///
 /// The gate of the two-phase sequence, in one place so the reason survives:
-/// the job waits for its announcement to be ON SCREEN, and `None` — an
-/// overlay that was dropped, capped, or never had a window with any area to
-/// paint into — means there is nothing left to wait for. A job that never
-/// runs is a lost session where an uncovered stall is only a bad second.
+/// the job waits for its announcement to be on screen with nothing of ours
+/// left over it, and `None` — an overlay that was dropped, capped, or never
+/// had a window with any area to paint into — means there is nothing left to
+/// wait for. A job that never runs is a lost session where an uncovered stall
+/// is only a bad second.
+///
+/// **It asks `outlived_the_asking_frame` rather than `on_screen`**, which is
+/// one frame later and is the fix for the owner's "the export loading bar
+/// comes up behind the export menu itself". The frame that announces a block
+/// is also the last frame the window that ASKED for it was drawn in — a
+/// viewport is destroyed by not being drawn, and the pass that would not draw
+/// it is the pass that blocks — so gating on `on_screen` freezes the screen
+/// on a picture with the Export dialog sitting over the cover for the length
+/// of the render. `busy.rs` carries the whole argument.
 #[cfg(feature = "recorder")]
 fn chore_ready(busy: Option<&tangent_ui::busy::Busy>) -> bool {
-    busy.is_none_or(tangent_ui::busy::Busy::on_screen)
+    busy.is_none_or(tangent_ui::busy::Busy::outlived_the_asking_frame)
 }
 
 /// A chunked operation's meter, carried between frames.
@@ -13485,9 +13612,19 @@ impl DesktopApp {
     /// Paint the overlay, and decide when it goes. The bottom of the frame,
     /// beside `paint_splash`, for the reason `Busy::on_screen` gives.
     ///
+    /// **Being last in the frame is not what puts it on top**, and believing
+    /// it was is the fault the owner reported as "the export loading bar comes
+    /// up behind the export menu itself". egui paints by BAND first and by
+    /// call order only within a band, and the export render window asks for a
+    /// band above the one this used to name. The band comes from
+    /// `tangent_ui::busy::cover_layer` now — one rule, stated there, for this
+    /// cover and the splash both.
+    ///
     /// **The splash wins while both could be up, and there is nothing to
-    /// arbitrate.** The splash is opaque and drawn on the same Foreground
-    /// layer, so a card underneath it would be invisible and would then snap
+    /// arbitrate.** The splash is opaque and drawn in the same cover band —
+    /// two layers on one rung, which egui orders out of a hash map, so which
+    /// of them landed on top would not even be decidable — and a card
+    /// underneath it would be invisible and would then snap
     /// into view the instant the splash faded — a worse picture than either
     /// alone. The two also say the same thing at launch, since the splash
     /// already waits on `inserts_pending`, and `splash.rs` decided on purpose
@@ -13523,10 +13660,7 @@ impl DesktopApp {
         // colours on the thing that colour lands on.
         let face = self.app.panel_face();
         let time = ctx.input(|i| i.time);
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("tangent-busy"),
-        ));
+        let painter = ctx.layer_painter(tangent_ui::busy::cover_layer("tangent-busy"));
         let rect = ctx.screen_rect();
         let Some(busy) = self.busy.as_mut() else {
             return;
@@ -13543,6 +13677,42 @@ impl DesktopApp {
 #[cfg(all(test, feature = "recorder"))]
 mod tests {
     use tangent_ui::busy::{Busy, Progress};
+
+    /// **A cover asks for its band; it never spells one.**
+    ///
+    /// The busy overlay and the splash are the two drawings in this file that
+    /// have to be over everything, and each used to name its own
+    /// `egui::Order` at its own call site. Both named `Foreground`, both
+    /// carried a comment claiming that put them over any dialog, and the
+    /// export render window sits a band above it — which is how the owner got
+    /// "the export loading bar comes up behind the export menu itself".
+    ///
+    /// A source scan, because what has to be checked is that nobody spells a
+    /// band HERE rather than what any particular painter does with one; the
+    /// precedent is `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag`
+    /// below. `busy::COVER_ORDER` carries the argument and
+    /// `shell::a_cover_is_painted_above_every_surface_this_app_can_open`
+    /// checks the answer against the tier ladder.
+    #[test]
+    fn a_cover_takes_its_band_from_one_place() {
+        let whole = include_str!("desktop.rs");
+        // Everything above this module, so the strings spelled out below do
+        // not find themselves.
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        assert_eq!(
+            src.matches("busy::cover_layer(").count(),
+            2,
+            "the busy overlay and the splash are the two covers; each asks \
+             `busy::cover_layer` for its layer exactly once"
+        );
+        assert!(
+            !src.contains("egui::Order::"),
+            "a band is spelled out in desktop.rs — the ladder is \
+             `busy::COVER_ORDER`'s and `shell::SurfaceTier`'s to decide, and \
+             a second opinion here is how the cover ended up under the export \
+             window"
+        );
+    }
 
     /// **An interface re-syncing is not an interface that moved.**
     ///
@@ -13674,14 +13844,28 @@ mod tests {
         ctx
     }
 
-    /// **The announcement reaches the screen BEFORE the block runs.**
+    /// **The announcement reaches the screen BEFORE the block runs, and so
+    /// does the disappearance of whatever asked for it.**
     ///
-    /// The whole two-phase sequence in one assertion, and the failure it
-    /// guards is the one the export's format pass shipped with for months: a
-    /// label set and the blocking call made in the same frame, so the words
-    /// were true and nobody ever saw them. `chore_ready` is the gate, and it
-    /// must answer NO on the frame the work is announced on and YES on the
-    /// one after.
+    /// The two-phase sequence in one walk. The first failure it guards is the
+    /// one the export's format pass shipped with for months: a label set and
+    /// the blocking call made in the same frame, so the words were true and
+    /// nobody ever saw them. So `chore_ready` must answer NO on the frame the
+    /// work is announced on.
+    ///
+    /// **The second is the frame after that, and it is the owner's own
+    /// report**: "the export loading bar comes up behind the export menu
+    /// itself". Pressing Export announces the render on the very frame the
+    /// Export dialog is last drawn in. On the desktop that dialog is a window
+    /// of its own, and a viewport is destroyed by NOT being drawn — so the
+    /// pass that would take it down is the pass that blocks, and the picture
+    /// frozen on the screen for the whole render is the cover with the dialog
+    /// still on top of it. No paint order can fix that; the two are different
+    /// OS windows. One more presented frame can, and this is the assertion
+    /// that it is waited for.
+    ///
+    /// Revert-check: make `chore_ready` ask `Busy::on_screen` again — which
+    /// is what it asked before — and the middle assertion goes red.
     #[test]
     fn an_announced_block_waits_for_its_own_frame() {
         let ctx = ctx();
@@ -13693,10 +13877,19 @@ mod tests {
             "the work must not run on the frame it was announced on"
         );
         assert!(present(&ctx, &mut busy), "the overlay paints at once");
-        // Frame N+1, at the top: the announcement is out.
+        // Frame N+1, at the top: the announcement is out — but the frame
+        // carrying it also carried the window that asked, so blocking here
+        // freezes that window on top of the cover.
+        assert!(
+            !super::chore_ready(Some(&busy)),
+            "the work ran while the window it was asked from was still on \
+             the last frame presented"
+        );
+        assert!(present(&ctx, &mut busy), "the overlay is still up");
+        // Frame N+2: a frame has gone out that is the cover and nothing else.
         assert!(
             super::chore_ready(Some(&busy)),
-            "the work must run once its announcement has been presented"
+            "the work must run once a frame of its own has been presented"
         );
         // And an overlay that is GONE never holds the work hostage: a window
         // with no area, or a cap that has fired, must not cost a session.
@@ -16942,7 +17135,8 @@ mod tests {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// What a project open pays the filesystem
+// The sidecar shelf: what a project open pays for it, and what an export may
+// take off it
 // ───────────────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "recorder"))]
@@ -17320,6 +17514,265 @@ mod sidecar_walk_probe {
             3 * (2069 - 16)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── what an export takes off the shelf, and what it must not ────────────
+
+    /// The lane the two export guards below work on, and its bay. Nothing
+    /// special about the number; it is a general channel, so it walks
+    /// `mix_channels` like any audio track the owner would put a compressor
+    /// on.
+    const EXPORT_SEAT: usize = 2;
+
+    /// A compressor squeezing hard enough that its presence is not a matter
+    /// of opinion: −30 dB threshold, 20:1, the fastest attack and release the
+    /// unit offers. The same fixture `instrument.rs`'s stem tests use, spelled
+    /// again here because that one lives in another module's `tests`.
+    fn deep_comp_state() -> Vec<u8> {
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::COMP_PATH)
+            .expect("the comp has a spec");
+        let mut v = spec.defaults();
+        v[0] = 0.5; // threshold: −30 dB
+        v[1] = 1.0; // ratio: 20:1
+        v[2] = 0.0; // attack: 0.1 ms
+        v[3] = 0.0; // release: 20 ms
+        crate::builtin_fx::state_text(spec, &v, &[]).into_bytes()
+    }
+
+    /// The same unit as somebody's shelf would hold it BEFORE they dialled it
+    /// in: the ratio at the bottom of its travel, which `units::comp`'s own
+    /// note calls "exactly 1 : 1 (a wire)".
+    ///
+    /// Deliberately not the spec's defaults, and that is worth recording: the
+    /// comp SHIPS at −18 dB and 4 : 1, which squeezes a 0.9 constant to about
+    /// 0.17, so a fixture built on "the defaults do nothing" measured nothing.
+    /// The stale state a real shelf holds is whatever the bay was wearing at
+    /// the last save, and the one that makes this failure invisible in a mix
+    /// is a unit still sitting at its no-op — a flat EQ, zero drive, 1 : 1.
+    fn idle_comp_state() -> Vec<u8> {
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::COMP_PATH)
+            .expect("the comp has a spec");
+        let mut v = spec.defaults();
+        v[1] = 0.0; // ratio: 1 : 1, which is a wire
+        crate::builtin_fx::state_text(spec, &v, &[]).into_bytes()
+    }
+
+    /// One constant mono clip on `EXPORT_SEAT`, a second long, thirty
+    /// decibels over the comp's threshold. A constant because its level needs
+    /// no window to agree on.
+    fn flat_clip(level: f32) -> crate::instrument::Placed {
+        crate::instrument::Placed {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: vec![level; 48_000],
+                rate: 48_000,
+                source: std::path::PathBuf::from("export-guard.wav"),
+            }),
+            strip: EXPORT_SEAT,
+            start: 0,
+            offset: 0,
+            len: 48_000,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+        }
+    }
+
+    /// An offline engine with the comp seated in `EXPORT_SEAT`'s first bay at
+    /// whatever state is handed in, warmed until the hand-off ring has drained
+    /// and the plugin is really seated.
+    fn engine_with_comp(state: Option<&[u8]>) -> crate::instrument::Engine {
+        let mut e = crate::instrument::Engine::offline(
+            48_000,
+            tangent_record::audio::Timebase::new(),
+        )
+        .expect("offline engine");
+        e.load_insert(
+            EXPORT_SEAT,
+            0,
+            Some(std::path::Path::new(crate::builtin_fx::COMP_PATH)),
+            state,
+        )
+        .expect("the comp loads")
+        .expect("the bay reports it");
+        warm(&mut e);
+        e
+    }
+
+    /// Eight blocks thrown away, which is what it takes for a plugin handed
+    /// over the rings to be seated in the rack that will run it.
+    fn warm(e: &mut crate::instrument::Engine) {
+        let mut out = vec![0.0f32; 512 * 2];
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+    }
+
+    /// Roll a clip through `e` and hand back the loudest sample of
+    /// `EXPORT_SEAT`'s STEM.
+    ///
+    /// Six settling blocks thrown away and six measured: a compressor's attack
+    /// transient is louder than its steady state, so a peak over the whole
+    /// roll would report the moment before the plugin had squeezed anything.
+    fn stem_peak(e: &mut crate::instrument::Engine) -> f32 {
+        e.set_clips(vec![flat_clip(0.9)]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 512 * 2];
+        let mut drained: Vec<f32> = Vec::new();
+        for _ in 0..6 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            e.drain_stems(&mut drained);
+        }
+        drained.clear();
+        for _ in 0..6 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            e.drain_stems(&mut drained);
+        }
+        let wide = tangent_ui::recorder::CHANNELS * 2;
+        (0..drained.len() / wide)
+            .map(|f| drained[f * wide + EXPORT_SEAT * 2].abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// **The Export dialog's STEMS chips reach the buffer the engine taps.**
+    ///
+    /// The whole road, driven from the end the user touches: the dialog's own
+    /// pack functions put a chip index into a `ProjectExportSpec`, the spec
+    /// goes through `arm_stem_tap` exactly as `start_offline_bounce` sends it,
+    /// and what comes out of the stem tap is measured. Nothing here restates
+    /// the mapping — `set_export_stem_mode` is the mapping, so a chip renamed,
+    /// reordered or inverted moves this test rather than agreeing with it.
+    ///
+    /// Dry has to come back at the clip's own level, because a dry stem is the
+    /// strip's inserts removed and NOT its fader. Processed has to come back
+    /// squeezed. Equal peaks mean the chips are decoration.
+    ///
+    /// Revert-check: make `arm_stem_tap` ignore its `dry` argument, or swap
+    /// the arms of `dialogs::set_export_stem_mode`, and this goes red.
+    #[test]
+    fn the_export_dialogs_stem_chips_reach_the_buffer_the_engine_taps() {
+        let peak = |chip: usize| -> f32 {
+            let mut spec = tangent_ui::ports::ProjectExportSpec::default();
+            // SOURCE: stems only, which is what makes the STEMS row live.
+            tangent_ui::dialogs::set_export_source(&mut spec, 1);
+            tangent_ui::dialogs::set_export_stem_mode(&mut spec, chip);
+            assert!(spec.stems, "the fixture never armed the tap at all");
+            let mut e = engine_with_comp(Some(&deep_comp_state()));
+            super::arm_stem_tap(&e, spec.stems, spec.stems_dry);
+            stem_peak(&mut e)
+        };
+        let chips = tangent_ui::dialogs::EXPORT_STEM_CHIPS;
+        let dry = peak(chips.iter().position(|c| *c == "Dry").expect("a Dry chip"));
+        let processed = peak(
+            chips
+                .iter()
+                .position(|c| *c == "Processed")
+                .expect("a Processed chip"),
+        );
+        assert!(
+            dry > 0.8,
+            "the Dry chip's stem is not the clip as it left the fader: {dry}"
+        );
+        assert!(
+            processed < dry * 0.5,
+            "the Processed chip's stem peaked at {processed} and the Dry \
+             chip's at {dry} — the chips render the same audio twice"
+        );
+    }
+
+    /// **An export's racks come from the desk that is playing, not from the
+    /// last time anything was saved.**
+    ///
+    /// The owner's "Export Processed stems exports unprocessed", as a test.
+    /// The desk here is an engine with the comp dialled in hard; the shelf
+    /// holds the SAME plugin as it was before anybody dialled it — still at
+    /// 1 : 1, which is a wire. Furnish a mirror from both and roll the same
+    /// clip through it: from the desk it squeezes, from the shelf it does not
+    /// — and "does not" is the export the owner got, in which every chip and
+    /// every atomic between the dialog and the tap was working perfectly on
+    /// audio that had been through a rack with nothing in it.
+    ///
+    /// The tap is armed PROCESSED for both, so the only difference between the
+    /// two numbers is where the knobs came from.
+    ///
+    /// **Sandboxed, and in this module for that reason.** `IVORY_SETTINGS_PATH`
+    /// is process-global and `SIDECAR_ENV` is the one lock that makes writing
+    /// a sidecar safe while the rest of the suite runs beside it.
+    ///
+    /// Revert-check: make `desk_insert_state` return `saved_insert_state`
+    /// alone and the first assertion goes red — the mirror comes up at the
+    /// shelf's defaults and passes the clip through untouched.
+    #[test]
+    fn an_export_mirror_takes_its_racks_from_the_desk_and_not_from_the_last_save() {
+        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("export-mirror");
+        // SAFETY: `SIDECAR_ENV` above is what makes this single-threaded.
+        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", dir.join("settings.json")) };
+
+        // The shelf: the same unit, at the knobs it is born with.
+        write_insert_state(
+            EXPORT_SEAT,
+            0,
+            crate::builtin_fx::COMP_PATH,
+            &idle_comp_state(),
+        );
+        // The desk: the same unit, dialled in and never saved.
+        let desk = engine_with_comp(Some(&deep_comp_state()));
+
+        let mut from_desk = crate::instrument::Engine::offline(
+            48_000,
+            tangent_record::audio::Timebase::new(),
+        )
+        .expect("offline engine");
+        super::furnish_mirror_bay(
+            &mut from_desk,
+            Some(&desk),
+            EXPORT_SEAT,
+            0,
+            crate::builtin_fx::COMP_PATH,
+        )
+        .expect("the mirror seats the comp");
+        warm(&mut from_desk);
+        super::arm_stem_tap(&from_desk, true, false);
+        let squeezed = stem_peak(&mut from_desk);
+
+        // The same call with no desk to ask, which is the road the export took
+        // before: the shelf, and nothing else.
+        let mut from_shelf = crate::instrument::Engine::offline(
+            48_000,
+            tangent_record::audio::Timebase::new(),
+        )
+        .expect("offline engine");
+        super::furnish_mirror_bay(
+            &mut from_shelf,
+            None,
+            EXPORT_SEAT,
+            0,
+            crate::builtin_fx::COMP_PATH,
+        )
+        .expect("the mirror seats the comp");
+        warm(&mut from_shelf);
+        super::arm_stem_tap(&from_shelf, true, false);
+        let untouched = stem_peak(&mut from_shelf);
+
+        // SAFETY: still under `SIDECAR_ENV`.
+        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            untouched > 0.8,
+            "the shelf's defaults did not pass the clip through, so the two \
+             numbers below say nothing: {untouched}"
+        );
+        assert!(
+            squeezed < untouched * 0.5,
+            "the mirror rendered at {squeezed} from the desk and {untouched} \
+             from the shelf — it took the knobs off the shelf, so a plugin \
+             dialled in since the last save is not in the export at all"
+        );
     }
 }
 
