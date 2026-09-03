@@ -217,6 +217,13 @@ fn parse_cli() -> CliArgs {
             // question is what a converter, a cable and a box actually did.
             // `--ir-test 13,13` plays the sweep on outputs 13/14 and records
             // inputs 13/14. See `desktop::ir_test`.
+            // Whether this app is holding an interface's sample rate against
+            // its owner. See `desktop::device_watch`.
+            #[cfg(feature = "recorder")]
+            "--device-watch" => {
+                desktop::device_watch(args.next());
+                std::process::exit(0);
+            }
             #[cfg(feature = "recorder")]
             "--ir-test" => {
                 desktop::ir_test(args.next());
