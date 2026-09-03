@@ -3202,12 +3202,29 @@ impl TimeSignature {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StreamStats {
     pub sample_rate: u32,
+    /// **The DEVICE's width, on both sides.**
+    ///
+    /// The output has always published this. The input published the TAKE's
+    /// width — `TAP_CHANNELS`, a constant 2 — so a 20-input interface read
+    /// "2 ch" on the INPUT line, "20 ch" on the OUTPUT line and "all 20, as
+    /// one device" three rows further down, and the only number carrying no
+    /// information at all was the one that looked like a contradiction.
     pub channels: u16,
     /// Frames per callback, when the device is running one it will admit to.
     /// `None` is cpal's `BufferSize::Default` — the device chose, and did not
     /// say what it chose.
     ///
-    /// **This is what was ASKED for.** See `observed_frames`.
+    /// **This is what TANGENT ASKED FOR — which is not always what the user
+    /// chose.** Three numbers live in this area and the panel used to name
+    /// two: the CHOICE (a size off the BUFFER SIZE row, or "Device"), the ASK
+    /// (this — the choice resolved through `pick_buffer`, which turns "Device"
+    /// into `WANT_BUFFER_FRAMES`, clamps to the device's range and multiplies
+    /// by `BUFFER_PERIODS` where the host reads a request as a ring), and the
+    /// MEASUREMENT (`observed_frames`). Labelling this one "asked for" in a
+    /// panel whose chip said "Device" is how the owner came to be told his
+    /// interface had refused a 256 he never typed. The choice is not carried
+    /// here on purpose — see `Dialog::AudioSetup`, where the readout and the
+    /// chip read one variable and therefore cannot disagree.
     pub buffer_frames: Option<u32>,
     /// **What the callback is actually being handed**, counted rather than
     /// requested. `None` before the first callback, or on a side that does

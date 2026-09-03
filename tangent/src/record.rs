@@ -639,8 +639,21 @@ impl Writer {
 /// An open input device plus the thread draining it.
 struct Audio {
     /// `!Send`; this is why the whole struct lives on the UI thread.
-    _stream: InputStream,
+    ///
+    /// It was `_stream` — held only for its `Drop`, which stops the device —
+    /// until the status panel started needing the number the CALLBACK is
+    /// really running at. That lives on the stream's [`CaptureStats`] and
+    /// nowhere else, so the field is read as well as held now, and the name
+    /// says so.
+    stream: InputStream,
     device_name: String,
+    /// **The TAKE's width, not the device's** — `TAP_CHANNELS`, because the
+    /// file is the desk and the desk is stereo whatever the microphone is.
+    /// This is what the WAV header declares (see `Audio::spec`), and it is
+    /// deliberately NOT what the status panel reports: a 20-input interface
+    /// that says "2 ch" on one line and "all 20, as one device" on another is
+    /// two halves of a panel talking about different things. See
+    /// [`Session::input_stats`], which publishes `dev_channels`.
     channels: u16,
     sample_rate: u32,
     /// Frames per callback, when the device accepted a fixed size. `None` is
@@ -651,9 +664,10 @@ struct Audio {
     meters: Arc<Mutex<AudioMeters>>,
     running: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// The live tap, until the engine takes it. See `Session::take_monitor`.
-    /// The device's channel count — what the rings carry.
+    /// The device's channel count — what the rings carry, and what the status
+    /// panel means when it says how wide the input is.
     dev_channels: usize,
+    /// The live tap, until the engine takes it. See `Session::take_monitor`.
     monitor: Option<(
         rtrb::Consumer<f32>,
         u16,
@@ -678,6 +692,17 @@ impl Audio {
         // made of a 64-frame input and a 1024-frame output is a number nobody
         // can act on. The rate is the same bargain for the same reason — two
         // devices at two rates make a take that drifts.
+        //
+        // **That sentence was false on macOS for as long as it has been
+        // written here**, and the panel wore the consequences: `open_input`
+        // asked the device for a QUARTER of this, on a property CoreAudio
+        // keeps per DEVICE rather than per stream, so the output the engine
+        // had already opened was dragged down with it and the whole DSP graph
+        // ran at a quarter of the chosen size. See
+        // `tangent_record::audio::input_ask_frames` for the measurement and
+        // for the one case where the quarter is still right — a microphone in
+        // a genuinely different box, where the two properties really are
+        // two.
         let wish = audio::ConfigWish {
             buffer_frames,
             sample_rate,
@@ -870,7 +895,7 @@ impl Audio {
             .map_err(|e| format!("could not start the recording thread: {e}"))?;
 
         Ok(Self {
-            _stream: stream,
+            stream,
             device_name: config.device.clone(),
             channels: take_channels as u16,
             sample_rate: config.sample_rate,
@@ -1297,14 +1322,21 @@ impl Session {
             a.device_name.clone(),
             tangent_ui::recorder::StreamStats {
                 sample_rate: a.sample_rate,
-                channels: a.channels,
+                channels: a.dev_channels as u16,
                 buffer_frames: a.buffer_frames,
-                // **Not measured on this side yet.** The output's is the one
-                // that matters: the round trip is `input + 2 x output`, so a
-                // frame the OUTPUT is really running is worth two of the
-                // input's, and it is the output whose size another host
-                // holding the device would be dictating.
-                observed_frames: None,
+                // **What the input callback is really handed**, counted by
+                // `CaptureSource::accept` rather than requested.
+                //
+                // This was a hardcoded `None`, with a note arguing that the
+                // output's measurement was the one that mattered — and the
+                // note was true about the ROUND TRIP and beside the point
+                // about the panel. A `None` here is not "we decided not to
+                // say"; it renders as a line that cannot contradict itself,
+                // so an input running at a size nobody asked for looked
+                // exactly like one running at the size it was given. On the
+                // owner's interface those were four times apart. The number
+                // was already being counted one field away.
+                observed_frames: a.stream.stats().block_seen(),
                 // An output-side concept; the input stream keeps no ring of
                 // ours to name here.
                 buffer_ring: None,

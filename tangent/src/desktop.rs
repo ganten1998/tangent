@@ -325,6 +325,18 @@ struct Recorder {
     /// is far inside the several seconds an interface takes to re-sync, which
     /// is the event this is watching for.
     rate_asked: Option<std::time::Instant>,
+    /// The output block size already written to the log for THIS engine, so
+    /// the measurement is announced once rather than sixty times a second.
+    ///
+    /// **The number `start_engine`'s line cannot print.** At the moment the
+    /// engine opens, everything about the buffer is a request: the setting,
+    /// `pick_buffer`'s period, the size handed to cpal. What the callback is
+    /// really run at exists only after the callback has run, and on the
+    /// owner's interface it was a QUARTER of the request — so the one line in
+    /// the log about buffers was the one number that could not have caught it.
+    /// Cleared whenever an engine is built, because a new stream's first
+    /// callback is a new fact.
+    out_block_logged: Option<u32>,
     /// Dropouts already reported, so only the new ones are announced.
     xruns_seen: u64,
     /// The graph's own count of this process's xruns, watched on a timer.
@@ -1647,9 +1659,34 @@ const RATE_DRIFT_POLLS: u8 = 3;
 /// follows the interface) and the chosen number when somebody chose one (so it
 /// reasserts it, because that is what choosing means).
 ///
-/// Compared against the ENGINE's rate rather than the setting, which is what
-/// stops the reopen storm: a device that cannot reach the chosen rate opens at
-/// the nearest it can, reports that, and agrees with itself for ever after.
+/// Compared against the rates TANGENT ALREADY KNOWS ABOUT rather than against
+/// the setting, which is what stops the reopen storm. There are two of them,
+/// and the first draft only had one.
+///
+/// The engine's own rate is the obvious one: a device that cannot reach the
+/// chosen rate opens at the nearest it can, reports that, and agrees with
+/// itself for ever after. That much was right, and
+/// `a_rate_the_device_cannot_reach_never_reopens_anything` still says so.
+///
+/// **The rate the DEVICE was found at is the other, and leaving it out was a
+/// storm of its own.** cpal's CoreAudio OUTPUT builder never touches the
+/// device's nominal rate — it sets the audio unit's stream format and lets
+/// CoreAudio convert — so choosing 96000 on an interface that CAN do 96000 but
+/// is sitting at 48000, with no input open on it to drag it across (the input
+/// builder does set the rate, and blocks until the hardware confirms), leaves
+/// the engine legitimately rendering at 96000 while the device is legitimately
+/// still at 48000. Comparing the poll against the engine alone found a
+/// disagreement that nothing in the session could ever resolve: reopen, reload
+/// every plugin in the desk, three seconds, reopen again, for as long as the
+/// app is running. The paragraph above used to claim that could not happen. It
+/// could; it just needed a rate the device could reach rather than one it
+/// could not. See [`crate::instrument::OutputInfo::device_rate`].
+///
+/// So a poll fires only when the device is at a rate that is NEITHER what the
+/// engine is rendering at NOR what the device was found at when the engine
+/// opened. Both of those are numbers Tangent put there or already accounted
+/// for; anything else is the interface having been moved by somebody else,
+/// which is the entire event this type exists to notice.
 #[cfg(feature = "recorder")]
 #[derive(Default)]
 struct RateWatch {
@@ -1663,12 +1700,16 @@ impl RateWatch {
     /// all, which is not evidence of a move — a device being enumerated, or
     /// gone entirely, is the watchdog's business and not this one's, and
     /// counting it here would reopen the path every time an interface blinked.
-    fn note(&mut self, engine_at: u32, device_at: Option<u32>) -> bool {
+    ///
+    /// `opened_at` is the device's own nominal rate when this engine was
+    /// built. Pass `engine_at` for it and this degrades exactly to the
+    /// one-sided comparison that stormed.
+    fn note(&mut self, engine_at: u32, opened_at: u32, device_at: Option<u32>) -> bool {
         let Some(real) = device_at.filter(|r| *r >= 8_000) else {
             self.moved = 0;
             return false;
         };
-        if real == engine_at {
+        if real == engine_at || real == opened_at {
             self.moved = 0;
             return false;
         }
@@ -2112,6 +2153,36 @@ impl DesktopApp {
         {
             if let Some((pixels, ..)) = self.recorder.camera_rgba.take() {
                 self.recorder.session.recycle_frame(pixels);
+            }
+        }
+
+        // **The size the output callback is really running, once, into the
+        // log.** `start_engine`'s line cannot carry it — at that point there
+        // is no callback yet and every number it has is a request — and the
+        // panel carries it only for somebody with the panel open. A log a
+        // user can be asked to send is the third place, and this fault spent
+        // its whole life invisible to the first two.
+        //
+        // Out here rather than inside the closure below because it writes to
+        // `self.recorder` while that borrows it. See
+        // `Recorder::out_block_logged`.
+        if let Some((seen, asked)) = self
+            .recorder
+            .engine
+            .as_ref()
+            .and_then(|e| e.observed_out_block().map(|b| (b, e.output().buffer_frames)))
+        {
+            if self.recorder.out_block_logged != Some(seen) {
+                self.recorder.out_block_logged = Some(seen);
+                log::info!(
+                    "audio out: the callback is running {seen} frames{}",
+                    match asked {
+                        Some(a) if a != seen =>
+                            format!(" - the request was {a}, and the device did not grant it"),
+                        Some(_) => " - the request, granted".to_owned(),
+                        None => " - no size was requested".to_owned(),
+                    }
+                );
             }
         }
 
@@ -8336,7 +8407,18 @@ impl DesktopApp {
     fn follow_device_rate(&mut self, ctx: &egui::Context) {
         // No engine, nothing to compare against; the reopen roads above own
         // that case and this one must not race them into a second open.
-        let Some(engine_at) = self.recorder.engine.as_ref().map(|e| e.output().sample_rate) else {
+        //
+        // Two numbers, not one: what the engine is RENDERING at, and what the
+        // device was FOUND at when it opened. On a converting output those are
+        // different and both are legitimate — see [`RateWatch`] for the
+        // three-second reopen loop that comparing against only the first
+        // produced.
+        let Some((engine_at, opened_at)) = self
+            .recorder
+            .engine
+            .as_ref()
+            .map(|e| (e.output().sample_rate, e.output().device_rate))
+        else {
             self.recorder.rate_watch = RateWatch::default();
             self.recorder.rate_asked = None;
             return;
@@ -8365,12 +8447,13 @@ impl DesktopApp {
         self.recorder.rate_asked = Some(now);
         ctx.request_repaint_after(RATE_ASK_EVERY);
         let device_at = crate::instrument::Engine::default_output_rate(None);
-        if !self.recorder.rate_watch.note(engine_at, device_at) {
+        if !self.recorder.rate_watch.note(engine_at, opened_at, device_at) {
             return;
         }
         log::info!(
-            "the audio device moved to {} Hz on its own (the engine opened at \
-             {engine_at}) - reopening the audio path to follow it",
+            "the audio device moved to {} Hz on its own (the engine renders at \
+             {engine_at} and the device was at {opened_at} when it opened) - \
+             reopening the audio path to follow it",
             device_at.unwrap_or(0),
         );
         // The same teardown `path_changed` does, for the same reason: the old
@@ -8429,6 +8512,39 @@ impl DesktopApp {
             .or_else(|| self.app.sample_rate())
     }
 
+    /// **What the INPUT asks for: the buffer the engine is really running.**
+    ///
+    /// The buffer's half of the split [`Chrome::input_rate`] made for the
+    /// rate, and made for the same reason. On one CoreAudio device the buffer
+    /// size is not two settings but one — `kAudioDevicePropertyBufferFrameSize`
+    /// belongs to the DEVICE, and cpal's macOS builders both write it — so the
+    /// input is not stating a preference here any more than it is with the
+    /// rate. It is imposing something on the output that is already running,
+    /// and the only number that may safely be imposed is the one the output
+    /// already has.
+    ///
+    /// That is `output().buffer_frames`, not `App::buffer_frames()`, and the
+    /// difference is the whole value of the function. `pick_buffer` resolves
+    /// "Device" to `WANT_BUFFER_FRAMES`, clamps to the device's own range, and
+    /// on WASAPI and ALSA asks for `period * BUFFER_PERIODS` while reporting
+    /// the period — so the setting and the size the output is actually running
+    /// part company on three separate roads, and the input reading the setting
+    /// would set off down none of them. This hands over the arrival, the way
+    /// `input_rate` hands over the rate the output ACTUALLY got.
+    ///
+    /// `None` — no engine, or an engine whose device would not name a size —
+    /// falls back to the choice, which is what the first open of the session
+    /// has anyway. `None` all the way through leaves the input on its own
+    /// default, and `tangent_record::audio::INPUT_DEFAULT_FRAMES` is what that
+    /// means there: the same number the output asks for with no choice made.
+    fn input_buffer(&self) -> Option<u32> {
+        self.recorder
+            .engine
+            .as_ref()
+            .and_then(|e| e.output().buffer_frames)
+            .or_else(|| self.app.buffer_frames())
+    }
+
     fn start_engine(&mut self, ctx: &egui::Context) {
         if self.recorder.engine.is_some() {
             return;
@@ -8455,9 +8571,16 @@ impl DesktopApp {
                 // between every client on it. A number that is a wish and a
                 // number that is a measurement should not be printed the same
                 // way, and until now Tangent only ever printed one of them.
+                //
+                // **The buffer half of it printed a wish as an outcome** and
+                // is corrected here: at this line the stream is built and no
+                // callback has run, so BOTH numbers are requests and the line
+                // now says so. The measurement follows later and once — see
+                // `Recorder::out_block_logged`.
                 let got = e.output();
                 log::info!(
-                    "audio out: {} - {} ch at {} Hz (asked {}), buffer {} frames (asked {})",
+                    "audio out: {} - {} ch at {} Hz (asked {}), buffer request \
+                     {} frames (the setting says {}) - not yet measured",
                     got.device,
                     got.channels,
                     got.sample_rate,
@@ -8468,6 +8591,8 @@ impl DesktopApp {
                         .buffer_frames()
                         .map_or_else(|| "the device's own".to_owned(), |b| b.to_string()),
                 );
+                // A new stream is a new callback to be measured.
+                self.recorder.out_block_logged = None;
                 self.recorder.engine = Some(e);
                 self.recorder.engine_error = None;
                 self.recorder.engine_retry = None;
@@ -9184,9 +9309,18 @@ impl DesktopApp {
                 // **The same rate the ENGINE opened at**, read off the engine
                 // rather than re-derived: the writer drains the ring at the
                 // input's rate while the engine fills it at the output's, and
-                // two devices left to their own defaults drift apart. Taken
-                // before `duplex_with` borrows the engine.
+                // two devices left to their own defaults drift apart.
+                //
+                // **And the same buffer the engine is really running**, off
+                // the same struct and for a sharper version of the same
+                // reason: on one CoreAudio device the two halves do not have
+                // two buffer sizes to disagree about, they have one property,
+                // and a number the input merely wished for lands on the
+                // running output. See `Chrome::input_buffer`.
+                //
+                // Both taken before `duplex_with` borrows the engine.
                 let rate = self.input_rate();
+                let buffer = self.input_buffer();
                 let duplex_with = self
                     .recorder
                     .engine
@@ -9195,7 +9329,7 @@ impl DesktopApp {
                 self.recorder.session.open_input(
                     &choice.selection,
                     choice.channels,
-                    self.app.buffer_frames(),
+                    buffer,
                     rate,
                     duplex_with,
                 );
@@ -11934,6 +12068,7 @@ impl DesktopApp {
                 rate_open: app.sample_rate(),
                 system_open: app.audio_system(),
                 rate_watch: RateWatch::default(),
+                out_block_logged: None,
                 rate_asked: None,
                 xruns_seen: 0,
                 graph_dropouts: tangent_record::audio::GraphDropouts::start(),
@@ -13558,11 +13693,17 @@ mod tests {
     #[test]
     fn a_rate_watch_waits_out_an_interface_that_is_still_re_syncing() {
         let mut w = super::RateWatch::default();
+        // The ordinary case, here and in the three tests below: the engine
+        // opened at the rate the device was found at, so the two numbers the
+        // watch already knows about are one number. They part company only
+        // when the output is converting — see
+        // `a_converting_output_does_not_reopen_the_path_for_ever`.
+        //
         // Two polls of disagreement is not enough, whatever it disagrees with.
-        assert!(!w.note(48_000, Some(44_100)), "fired on the first poll");
-        assert!(!w.note(48_000, Some(96_000)), "fired on the second poll");
+        assert!(!w.note(48_000, 48_000, Some(44_100)), "fired on the first poll");
+        assert!(!w.note(48_000, 48_000, Some(96_000)), "fired on the second poll");
         // The third is.
-        assert!(w.note(48_000, Some(44_100)), "never fired at all");
+        assert!(w.note(48_000, 48_000, Some(44_100)), "never fired at all");
     }
 
     /// **A device that settles back where it was never moved.**
@@ -13574,12 +13715,12 @@ mod tests {
     #[test]
     fn a_rate_that_comes_back_leaves_no_count_behind() {
         let mut w = super::RateWatch::default();
-        assert!(!w.note(48_000, Some(44_100)));
-        assert!(!w.note(48_000, Some(44_100)));
-        assert!(!w.note(48_000, Some(48_000)), "agreement cannot fire");
+        assert!(!w.note(48_000, 48_000, Some(44_100)));
+        assert!(!w.note(48_000, 48_000, Some(44_100)));
+        assert!(!w.note(48_000, 48_000, Some(48_000)), "agreement cannot fire");
         // Back to zero: two more disagreements still are not three.
-        assert!(!w.note(48_000, Some(44_100)), "the count survived agreement");
-        assert!(!w.note(48_000, Some(44_100)), "the count survived agreement");
+        assert!(!w.note(48_000, 48_000, Some(44_100)), "the count survived agreement");
+        assert!(!w.note(48_000, 48_000, Some(44_100)), "the count survived agreement");
     }
 
     /// **A device that cannot be asked has not answered.**
@@ -13594,12 +13735,12 @@ mod tests {
     fn a_device_that_cannot_be_asked_is_not_a_device_that_moved() {
         let mut w = super::RateWatch::default();
         for _ in 0..10 {
-            assert!(!w.note(48_000, None), "silence read as a move");
+            assert!(!w.note(48_000, 48_000, None), "silence read as a move");
         }
         // Nor is a nonsense answer. Below 8 kHz is not a rate any interface
         // runs at; it is a property read that came back wrong.
         for _ in 0..10 {
-            assert!(!w.note(48_000, Some(0)), "zero read as a move");
+            assert!(!w.note(48_000, 48_000, Some(0)), "zero read as a move");
         }
     }
 
@@ -13622,8 +13763,52 @@ mod tests {
         // The engine opened at 48000 because that is all the device has. The
         // device agrees with the engine, and the choice does not enter into it.
         for _ in 0..30 {
-            assert!(!w.note(48_000, Some(48_000)), "reopened a settled path");
+            assert!(!w.note(48_000, 48_000, Some(48_000)), "reopened a settled path");
         }
+    }
+
+    /// **A rate the device CAN reach, that nothing moved it to, is not a
+    /// device that wandered off — and reading it as one reopened the whole
+    /// audio path every three seconds for the rest of the session.**
+    ///
+    /// The hole the test above did not cover, and the doc above it used to
+    /// claim did not exist. Somebody picks 96000 on an interface that offers
+    /// 96000 but is sitting at 48000, with nothing recording — no input open
+    /// on that device. cpal's CoreAudio OUTPUT builder does not touch the
+    /// device's nominal rate: it sets the audio unit's stream format and lets
+    /// CoreAudio convert (`build_output_stream_raw`, which writes
+    /// `kAudioUnitProperty_StreamFormat` and nothing else; the INPUT builder
+    /// is the one that calls `set_sample_rate` and blocks). So the engine
+    /// really renders at 96000, the device really stays at 48000, and both of
+    /// them are right.
+    ///
+    /// Comparing the poll against the engine alone made that a permanent
+    /// disagreement: reopen, unload and reload every plugin in the desk — five
+    /// seconds each — poll again three seconds later, reopen again, for ever.
+    /// The second known number is what ends it.
+    ///
+    /// Revert-check: drop `opened_at` from the guard in `note` — leave only
+    /// `real == engine_at` — and the first loop below fires on its third poll.
+    #[test]
+    fn a_converting_output_does_not_reopen_the_path_for_ever() {
+        let mut w = super::RateWatch::default();
+        // Engine rendering 96000, device found at 48000 when it opened, device
+        // still at 48000. Nobody has moved anything.
+        for _ in 0..30 {
+            assert!(
+                !w.note(96_000, 48_000, Some(48_000)),
+                "reopened a path where nothing had moved"
+            );
+        }
+        // And the event it still has to catch: somebody opens Focusrite
+        // Control 2 and drags the interface to 44100, which is neither of the
+        // two numbers Tangent knows about.
+        assert!(!w.note(96_000, 48_000, Some(44_100)));
+        assert!(!w.note(96_000, 48_000, Some(44_100)));
+        assert!(
+            w.note(96_000, 48_000, Some(44_100)),
+            "a device moved by hand went unnoticed"
+        );
     }
 
     /// **Firing latches the count off**, so the poll a second after a reopen
@@ -13636,13 +13821,13 @@ mod tests {
     #[test]
     fn a_reopen_does_not_immediately_ask_for_another_one() {
         let mut w = super::RateWatch::default();
-        assert!(!w.note(48_000, Some(44_100)));
-        assert!(!w.note(48_000, Some(44_100)));
-        assert!(w.note(48_000, Some(44_100)), "never fired");
+        assert!(!w.note(48_000, 48_000, Some(44_100)));
+        assert!(!w.note(48_000, 48_000, Some(44_100)));
+        assert!(w.note(48_000, 48_000, Some(44_100)), "never fired");
         // The very next poll, with the reopen still in flight and nothing
         // changed, must not ask for another.
-        assert!(!w.note(48_000, Some(44_100)), "fired twice in a row");
-        assert!(!w.note(48_000, Some(44_100)), "fired twice in a row");
+        assert!(!w.note(48_000, 48_000, Some(44_100)), "fired twice in a row");
+        assert!(!w.note(48_000, 48_000, Some(44_100)), "fired twice in a row");
     }
 
     /// One frame of the host's own loop, in the order `update` runs it: the
@@ -14611,7 +14796,16 @@ mod tests {
         let start = src
             .find("fn start_engine")
             .expect("the engine starter is still called that");
-        let body = &src[start..start + 4_000];
+        // **A window over the function, and it has had to grow.** 4_000 was
+        // enough until `start_engine` gained the buffer-measurement reset and
+        // the paragraph that says why the line above it prints two requests
+        // and no measurement; the cache invalidation this is looking for then
+        // sat just outside the sample and the test went red for a reason that
+        // had nothing to do with tempo maps. The number is a sample size, not
+        // a claim — what actually pins the invalidation in place is the
+        // ordering assertion below, which holds it between the two sibling
+        // resets whatever the function's length.
+        let body = &src[start..src.len().min(start + 6_000)];
         assert!(
             body.contains("self.pushed_maps = None;"),
             "`start_engine` does not invalidate the tempo-map cache, so the new \

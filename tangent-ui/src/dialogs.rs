@@ -7911,6 +7911,52 @@ fn show_on(
                                 .max_height((ui.available_height() - button_row).max(0.0))
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
+                            // **The user's own choice, read from the very
+                            // variable the BUFFER SIZE chips below are drawn
+                            // from.**
+                            //
+                            // Three numbers live in this panel and it used to
+                            // name two: what the USER chose, what TANGENT
+                            // asked the device for, and what the callback is
+                            // MEASURED running at. `StreamStats::buffer_frames`
+                            // is the second, and the readout labelled it
+                            // "asked for" — so with the chip on "Device" and
+                            // `pick_buffer` turning that into
+                            // `WANT_BUFFER_FRAMES`, the panel told the owner
+                            // his interface had refused a 256 he never typed,
+                            // three rows above a chip that said he had chosen
+                            // nothing.
+                            //
+                            // Carried through `*buffer` rather than through a
+                            // new `StreamStats` field on purpose: a copy
+                            // pushed from the host is a copy that can fall out
+                            // of step with the chips, and this way the readout
+                            // and the chip are LITERALLY the same value. See
+                            // `a_setup_panels_buffer_chip_and_its_readout_name_the_same_asker`.
+                            let chose = *buffer;
+                            // **Whether the microphone is a SECOND box**, by
+                            // the same test the host makes: two names, and
+                            // they differ. The host's copy of it decides
+                            // whether the input may ask for a shorter buffer
+                            // than the output — on one CoreAudio device it may
+                            // not, because there is only one buffer property
+                            // and the input's ask lands on the running output.
+                            // See `tangent_record::audio::is_second_device`.
+                            //
+                            // This panel keeps its own copy rather than being
+                            // told, because being told would be a third number
+                            // to keep in step and the two names are already
+                            // here. If they ever disagree, the panel is
+                            // reporting a device it is not looking at, which
+                            // is a bigger problem than this sentence.
+                            let second_box = match (&status.input, &status.output) {
+                                (Some((i, _)), Some((o, _))) => i != o,
+                                _ => false,
+                            };
+                            // What the OUTPUT was asked for, so the input line
+                            // can tell a deliberate shortening from a refusal.
+                            let out_asked =
+                                status.output.as_ref().and_then(|(_, o)| o.buffer_frames);
                             for (title, side) in
                                 [("INPUT", &status.input), ("OUTPUT", &status.output)]
                             {
@@ -7978,20 +8024,91 @@ fn show_on(
                                         // is a smaller failure than a confident
                                         // wrong explanation.
                                         let real = s.observed_frames.or(s.buffer_frames);
-                                        let asked = s.buffer_frames.unwrap_or(0);
+                                        // **Who asked, in the user's own
+                                        // terms.** Never a bare "asked for
+                                        // {n}": the number in `buffer_frames`
+                                        // belongs to whoever put it there, and
+                                        // under "Device" that is Tangent. The
+                                        // three-way match is the three numbers
+                                        // — and the arm that says both is the
+                                        // one that fires when the graph widens
+                                        // a request, when `IVORY_OUT_BUFFER`
+                                        // overrides it, or when the device's
+                                        // own range clamps it.
+                                        //
+                                        // **The one place the two halves are
+                                        // still allowed to differ gets a
+                                        // reason rather than a bare second
+                                        // number.** A microphone in a
+                                        // genuinely different box has a
+                                        // genuinely different buffer property,
+                                        // and Tangent shortens it on purpose —
+                                        // the input callback only copies into
+                                        // a ring, so the round trip gets the
+                                        // saving for free. Printing "Tangent
+                                        // asked for 128" under a chip that
+                                        // says 512, with no reason, is how a
+                                        // deliberate optimisation gets
+                                        // reported as a bug.
+                                        let shortened = title == "INPUT"
+                                            && second_box
+                                            && matches!(
+                                                (s.buffer_frames, out_asked),
+                                                (Some(a), Some(o)) if a < o
+                                            );
+                                        let chose_said = chose.map_or_else(
+                                            || "no size chosen".to_owned(),
+                                            |c| format!("you chose {c}"),
+                                        );
+                                        let ask = match (chose, s.buffer_frames) {
+                                            (_, Some(a)) if shortened => format!(
+                                                "{chose_said}; a separate input device runs \
+                                                 a shorter buffer, and this one is {a}"
+                                            ),
+                                            (Some(c), Some(a)) if c == a => {
+                                                format!("you chose {a}")
+                                            }
+                                            (Some(c), Some(a)) => format!(
+                                                "you chose {c} and Tangent asked for {a}"
+                                            ),
+                                            (None, Some(a)) => format!(
+                                                "no size chosen, so Tangent asked for {a}"
+                                            ),
+                                            (Some(_), None) | (None, None) => chose_said,
+                                        };
                                         let buf = match (real, s.buffer_ms()) {
-                                            (Some(f), Some(ms)) if s.honoured() => {
+                                            // Running what was picked: saying
+                                            // the same number twice is noise.
+                                            (Some(f), Some(ms))
+                                                if s.honoured()
+                                                    && !shortened
+                                                    && chose == s.buffer_frames =>
+                                            {
                                                 format!("{f} frames  ({ms:.1} ms)")
                                             }
+                                            // Granted, but the number is not
+                                            // the one on the chip — which is
+                                            // the "Device" case, and the whole
+                                            // reason the owner could not tell
+                                            // where 256 had come from.
+                                            (Some(f), Some(ms)) if s.honoured() => {
+                                                format!("{f} frames  ({ms:.1} ms)  - {ask}")
+                                            }
                                             (Some(f), Some(ms)) => match status.graph_floor {
-                                                Some(floor) if asked < floor => format!(
-                                                    "{f} frames  ({ms:.1} ms)  - asked for \
-                                                     {asked}; this machine's audio graph will \
-                                                     not serve below {floor}"
-                                                ),
+                                                Some(floor)
+                                                    if s
+                                                        .buffer_frames
+                                                        .is_some_and(|a| a < floor) =>
+                                                {
+                                                    format!(
+                                                        "{f} frames  ({ms:.1} ms)  - {ask}; \
+                                                         this machine's audio graph will not \
+                                                         serve below {floor}"
+                                                    )
+                                                }
                                                 _ => format!(
-                                                    "{f} frames  ({ms:.1} ms)  - asked for \
-                                                     {asked}, and the device gave this instead"
+                                                    "{f} frames  ({ms:.1} ms)  - {ask}, and \
+                                                     the device gave this instead"
                                                 ),
                                             },
                                             // The device chose and did not say
@@ -13418,6 +13535,264 @@ at: None,
         assert!(
             needed <= AUDIO_W,
             "the audio panel needs {needed:.0} points of width and has {AUDIO_W:.0}"
+        );
+    }
+
+    /// **The buffer chip and the readout above it cannot disagree about who
+    /// asked.**
+    ///
+    /// The owner's screen, in full:
+    ///
+    /// ```text
+    ///     OUTPUT  Scarlett 18i20 USB
+    ///             48000 Hz  20 ch  64 frames (1.3 ms)  - asked for 256, and
+    ///             the device gave this instead
+    ///     BUFFER SIZE   [Device]  64  128  256  512  1024  2048
+    /// ```
+    ///
+    /// "Device" is the SELECTED chip, and nobody typed 256. `pick_buffer`
+    /// resolves an unstated choice to `WANT_BUFFER_FRAMES`,
+    /// `StreamStats::buffer_frames` carries that number, and this readout
+    /// labelled it "asked for" — so the panel told him his interface had
+    /// refused a size he had never chosen, three rows above the chip saying he
+    /// had chosen nothing. His words: "Asked for doesn't equal got still ...
+    /// display is firm."
+    ///
+    /// Three numbers, and the panel used to name two. What the USER chose is
+    /// now read from `*buffer`, which is the same variable the chips are drawn
+    /// from — so the two are not merely kept in step, they are one value, and
+    /// this drives the real chip through a real `egui::Context` to say so:
+    /// read the sentence, PRESS 256, read it again.
+    ///
+    /// Revert-check: change the `(None, Some(a))` arm of `ask` back to a bare
+    /// `format!("asked for {a}")` and the first block goes red on the missing
+    /// attribution.
+    #[test]
+    fn a_setup_panels_buffer_chip_and_its_readout_name_the_same_asker() {
+        let out = crate::recorder::StreamStats {
+            sample_rate: 48_000,
+            // The device's width, the same number the INPUT line reports now.
+            channels: 20,
+            // What `pick_buffer` turned "Device" into. A wish, not a choice.
+            buffer_frames: Some(256),
+            // And what the callback is really handed, which on the owner's
+            // 18i20 was a quarter of it.
+            observed_frames: Some(64),
+            buffer_ring: None,
+        };
+        let mut slot = Slot::new(Dialog::AudioSetup {
+            status: crate::recorder::AudioStatus {
+                output: Some(("Scarlett 18i20 USB".to_owned(), out)),
+                ..Default::default()
+            },
+            // The "Device" chip: nothing chosen.
+            buffer: None,
+            rate: None,
+            systems: Vec::new(),
+            system: None,
+            rates: Vec::new(),
+            input_channels: 20,
+            exposed: Vec::new(),
+            take_summary: true,
+            alias: String::new(),
+            output_path: crate::ports::OutputPath::default(),
+        });
+        // The buffer sentence is the only line on this panel with the word
+        // "frames" in it.
+        fn reading(slot: &mut Slot) -> String {
+            let texts = slot.settle();
+            texts
+                .iter()
+                .map(|(_, _, s)| s.as_str())
+                .find(|s| s.contains("frames"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no buffer reading on screen; it says {:?}",
+                        texts.iter().map(|(_, _, s)| s.as_str()).collect::<Vec<_>>()
+                    )
+                })
+                .to_owned()
+        }
+
+        let line = reading(&mut slot);
+        // What is RUNNING leads, as it always has.
+        assert!(line.contains("64 frames"), "the running size is not first: {line}");
+        // And the 256 is attributed, both to the chip and to Tangent.
+        assert!(
+            line.contains("no size chosen"),
+            "the readout did not say the chip says Device: {line}"
+        );
+        assert!(
+            line.contains("Tangent asked for 256"),
+            "256 is named with nobody attached to it: {line}"
+        );
+        assert!(
+            !line.contains("you chose"),
+            "a size nobody picked was put in the user's mouth: {line}"
+        );
+
+        // Now PRESS the 256 chip. The same number, chosen this time — and the
+        // sentence has to change, because who asked has changed.
+        let asked = slot.click("256");
+        assert!(
+            matches!(asked, Some(DialogAction::SetBufferFrames(Some(256)))),
+            "the 256 chip did not set the buffer"
+        );
+        let line = reading(&mut slot);
+        assert!(
+            line.contains("you chose 256"),
+            "the chip moved to 256 and the readout did not follow: {line}"
+        );
+        assert!(
+            !line.contains("no size chosen"),
+            "the readout still says nothing was chosen: {line}"
+        );
+    }
+
+    /// **The one place the two halves are still allowed to differ says WHY,
+    /// and only where it is true.**
+    ///
+    /// On macOS Tangent opens a second input device at a quarter of the
+    /// output's buffer, on purpose: the capture callback only copies into a
+    /// ring, and the saving is the difference between a duplex host's two
+    /// buffers and this one's — the 18.7 ms against 6.6 ms the optimisation
+    /// was measured on. That reasoning holds only when the microphone really
+    /// is a different box; on ONE CoreAudio device the buffer size is a
+    /// property of the device and the input's quarter took the running output
+    /// down with it. See `tangent_record::audio::input_ask_frames`.
+    ///
+    /// So the panel gets the same two-name test the host uses, and the second
+    /// number gets a reason. A deliberate optimisation reported as a bare
+    /// "Tangent asked for 128" under a chip that says 512 is a bug report
+    /// waiting to be filed against a working feature.
+    ///
+    /// Revert-check: drop the `shortened` arm and the first block reads
+    /// "you chose 512 and Tangent asked for 128" with no reason attached.
+    #[test]
+    fn a_second_input_device_says_why_its_buffer_is_shorter() {
+        let stats = |ch, frames| crate::recorder::StreamStats {
+            sample_rate: 48_000,
+            channels: ch,
+            buffer_frames: Some(frames),
+            observed_frames: Some(frames),
+            buffer_ring: None,
+        };
+        let panel = |input_name: &str| Dialog::AudioSetup {
+            status: crate::recorder::AudioStatus {
+                input: Some((input_name.to_owned(), stats(2, 128))),
+                output: Some(("Scarlett 18i20 USB".to_owned(), stats(20, 512))),
+                ..Default::default()
+            },
+            buffer: Some(512),
+            rate: None,
+            systems: Vec::new(),
+            system: None,
+            rates: Vec::new(),
+            input_channels: 2,
+            exposed: Vec::new(),
+            take_summary: true,
+            alias: String::new(),
+            output_path: crate::ports::OutputPath::default(),
+        };
+
+        // A laptop microphone against an external interface: two boxes, two
+        // buffer properties, and the shorter one is deliberate.
+        let mut slot = Slot::new(panel("MacBook Pro Microphone"));
+        let texts = slot.settle();
+        let lines: Vec<&str> = texts
+            .iter()
+            .map(|(_, _, s)| s.as_str())
+            .filter(|s| s.contains("frames"))
+            .collect();
+        assert_eq!(lines.len(), 2, "expected two readings, got {lines:?}");
+        let input = lines[0];
+        let output = lines[1];
+        assert!(
+            input.contains("a separate input device runs a shorter buffer"),
+            "the shorter input buffer was left unexplained: {input}"
+        );
+        assert!(input.contains("128"), "the input's own size is missing: {input}");
+        // The output is running what was picked, and says so in four words.
+        assert_eq!(
+            output, "48000 Hz   20 ch   512 frames  (10.7 ms)",
+            "the output line grew an explanation it does not need"
+        );
+
+        // **The same two numbers on ONE device are not an optimisation, they
+        // are a refusal** — and calling them deliberate would be the panel
+        // inventing a cause, which is the failure the whole block above the
+        // readout was rewritten to stop.
+        let mut slot = Slot::new(panel("Scarlett 18i20 USB"));
+        let texts = slot.settle();
+        assert!(
+            !texts
+                .iter()
+                .any(|(_, _, s)| s.contains("a separate input device")),
+            "one interface was described as two: {:?}",
+            texts.iter().map(|(_, _, s)| s.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// **A 20-input interface says 20 on the INPUT line.**
+    ///
+    /// It said "2 ch" — `TAP_CHANNELS`, the take's stereo width, which is a
+    /// constant and therefore carries no information about any device — while
+    /// the OUTPUT line said 20 and INPUT CHANNELS said "all 20, as one
+    /// device". Three rows of one panel, two of them talking about the
+    /// interface and one about the file, and only the number that meant
+    /// nothing looked like a contradiction.
+    ///
+    /// The publisher is `record::Session::input_stats`, which needs a real
+    /// device and cannot be reached from here; what this holds is the panel's
+    /// half — that the width it is given is the width it prints — so a future
+    /// change to the line cannot quietly drop back to a constant.
+    #[test]
+    fn the_input_line_reports_the_width_of_the_interface_it_was_given() {
+        let stats = |ch| crate::recorder::StreamStats {
+            sample_rate: 48_000,
+            channels: ch,
+            buffer_frames: Some(256),
+            observed_frames: Some(256),
+            buffer_ring: None,
+        };
+        let mut slot = Slot::new(Dialog::AudioSetup {
+            status: crate::recorder::AudioStatus {
+                input: Some(("Scarlett 18i20 USB".to_owned(), stats(20))),
+                output: Some(("Scarlett 18i20 USB".to_owned(), stats(20))),
+                ..Default::default()
+            },
+            buffer: Some(256),
+            rate: None,
+            systems: Vec::new(),
+            system: None,
+            rates: Vec::new(),
+            input_channels: 20,
+            exposed: Vec::new(),
+            take_summary: true,
+            alias: String::new(),
+            output_path: crate::ports::OutputPath::default(),
+        });
+        let texts = slot.settle();
+        let widths: Vec<&str> = texts
+            .iter()
+            .map(|(_, _, s)| s.as_str())
+            .filter(|s| s.contains(" ch   "))
+            .collect();
+        assert_eq!(
+            widths.len(),
+            2,
+            "expected an INPUT and an OUTPUT line, got {widths:?}"
+        );
+        for line in &widths {
+            assert!(
+                line.contains("20 ch"),
+                "a 20-input interface reported a different width: {line}"
+            );
+        }
+        // And the row further down is talking about the same interface.
+        assert!(
+            texts.iter().any(|(_, _, s)| s == "all 20, as one device"),
+            "the channels row does not agree with the lines above it"
         );
     }
 
