@@ -291,6 +291,15 @@ pub enum FaceAction {
     PickIr { path: String },
     /// The amp face's pedal chip: open the picker over pedal `pedal`'s
     /// seat. The face knows only the ordinal; the app owns the seat math.
+    ///
+    /// **Superseded by [`Self::PedalGesture`] and kept anyway.** The chip
+    /// stopped raising this the day it learned to carry its own modifiers,
+    /// and the arm that answers it still works — a picker over the pedal's
+    /// seat, which is what it always meant. Kept because this enum is
+    /// append-only and a variant is a promise as much as a shape: deleting
+    /// it to tidy up would renumber nothing and break nothing today, and
+    /// would quietly change what an older serialised or forwarded ask means
+    /// the day somebody adds one.
     OpenPedal { pedal: usize },
     /// **The IR face's name field was clicked: raise the system file
     /// chooser and load whatever comes back.** Appended at the END, this
@@ -343,6 +352,21 @@ pub enum FaceAction {
     /// switch and not a second switch. A face that owned its own bypass would
     /// be a unit that reads bypassed in one place and live in another.
     SetBypass { on: bool },
+    /// **A pedal chip was pressed, with the modifiers this window's own
+    /// keyboard was holding.** Appended at the END, this enum's law —
+    /// [`Self::OpenPedal`] above is left exactly as it was rather than
+    /// widened, which is the same law read from the other end.
+    ///
+    /// The modifiers travel in the action because they cannot be read where
+    /// it lands. `App::alt_down` and `App::shift_down` are latched once a
+    /// frame from the MAIN window's context, and on the desktop a face is a
+    /// separate OS window with an input stream of its own — so a chip whose
+    /// Alt came from the latched pair would be reporting on a keyboard
+    /// nobody was typing on, and Alt-clicking a chip in the amp's window
+    /// would do nothing while Alt-clicking it with the desk focused would
+    /// empty a seat you could not see. Read here with `ui.input`, carried,
+    /// and applied by the same function a rack bay's gesture goes through.
+    PedalGesture { pedal: usize, alt: bool, shift: bool },
 }
 
 fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {

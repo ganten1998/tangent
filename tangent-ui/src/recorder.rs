@@ -1915,9 +1915,18 @@ pub enum RecorderRequest {
     /// A request because the tap is the engine's: this crate cannot reach
     /// `Engine::set_insert_tap` — the firewall is the whole point — so the
     /// face says which bay it is looking at and the host arms the tap and
-    /// starts draining it into `TangentApp::insert_tap_feed`. Only one face
-    /// is ever open, so the LAST request wins and `on: false` from the
-    /// closing face disarms.
+    /// starts draining it into `TangentApp::insert_tap_feed`. The LAST
+    /// request wins and `on: false` from the closing face disarms.
+    ///
+    /// **There can be TWO faces open now**, and this comment used to say
+    /// there could not: the amp's pedal chips open the pedal's own window
+    /// stacked over the amp's. There is still ONE tap, and the rule the app
+    /// keeps is that it belongs to the window being worked in — the stacked
+    /// one while it is up, handed back to the face underneath when it
+    /// closes. Two windows sharing a tap means the top one's analyzer is
+    /// live and the one below it is holding its last picture, which is the
+    /// right answer for a needle nobody is looking at and much better than
+    /// the alternative of a second tap nothing in the engine has.
     SetInsertTap { strip: usize, slot: usize, on: bool },
     // ── presets ─────────────────────────────────────────────────────────
     // The preset road's three requests, at the END because the enum is
