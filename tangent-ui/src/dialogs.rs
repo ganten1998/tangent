@@ -757,6 +757,23 @@ pub struct IrWizardState {
     /// to save, which is the wrong-file class of bug this wizard has already
     /// been bitten by once (see [`Self::armed`]).
     pub saved: bool,
+    /// **A Save was asked for, and this was `IrLive::saves` when it was.**
+    /// Appended at the END, this struct's law.
+    ///
+    /// [`Self::armed`]'s latch, one door along, and it exists because
+    /// [`Self::saved`] used to be set by the Save BUTTON. A press is not a
+    /// write: `desktop::save_ir` has three exits that produce no file — no
+    /// finished capture, an IRs folder it could not create, a WAV write that
+    /// failed — and none of them was visible here. Capture A, save it,
+    /// "Record another IR", capture B, press Save on a full disk, take the
+    /// way back, and the bay binds capture A under the impression it is B.
+    /// That is the silent wrong-file class this wizard has already been bitten
+    /// by twice, and the flag that was supposed to prevent it was the one
+    /// telling the lie.
+    ///
+    /// So the press only ARMS, and [`Self::settle_from_live`] believes it
+    /// once the host's own count has moved past the number recorded here.
+    pub save_asked: Option<u64>,
 }
 
 /// The offered sweep lengths, seconds. 15 is the default (Farina's own
@@ -781,6 +798,7 @@ impl Default for IrWizardState {
             armed: None,
             origin: None,
             saved: false,
+            save_asked: None,
         }
     }
 }
@@ -820,8 +838,11 @@ impl IrWizardState {
         self.armed = None;
         self.name.clear();
         // The saved flag goes with the name and for the same reason: it
-        // described the capture being left behind.
+        // described the capture being left behind — and so does an ask still
+        // waiting on a write, which would otherwise resolve against the NEXT
+        // capture's save and mark this one written.
         self.saved = false;
+        self.save_asked = None;
     }
 
     /// **Fire a capture through the unit: the pass whose result may move
@@ -840,6 +861,7 @@ impl IrWizardState {
         self.armed = Some(self.live.capture_id);
         self.name.clear();
         self.saved = false;
+        self.save_asked = None;
     }
 
     /// **Fire the loop-only reference pass**, which produces no result to
@@ -868,6 +890,7 @@ impl IrWizardState {
     /// proves nothing — revert this body to the broken predicate and the
     /// test that drives it goes red, which is the only reason to trust it.
     pub fn settle_from_live(&mut self) {
+        self.settle_save();
         let Some(asked_at) = self.armed else { return };
         if self.stage == IrStage::Sweep
             && self.live.result.is_some()
@@ -875,6 +898,26 @@ impl IrWizardState {
         {
             self.stage = IrStage::Result;
             self.armed = None;
+        }
+    }
+
+    /// **The other latch: a Save is believed once the host says it wrote.**
+    ///
+    /// [`Self::save_asked`] carries the whole argument. The shape is
+    /// deliberately the same as the capture latch above — remember the
+    /// host's count at the press, believe the thing only when the count has
+    /// moved — because these are the same mistake at two different doors,
+    /// and one shape is one thing to learn.
+    ///
+    /// A save that FAILED leaves the ask standing rather than clearing it:
+    /// nothing was written, so nothing has changed about what the way back
+    /// would find, and a second press on a disk somebody has since made room
+    /// on re-arms it and resolves normally.
+    fn settle_save(&mut self) {
+        let Some(asked_at) = self.save_asked else { return };
+        if self.live.saves != asked_at {
+            self.saved = true;
+            self.save_asked = None;
         }
     }
 
@@ -902,9 +945,11 @@ impl IrWizardState {
         (self.stage == IrStage::Result).then_some(self.origin).flatten()
     }
 
-    /// The Save button fired, so there is a file for the way back to load.
-    pub fn remember_saved(&mut self) {
-        self.saved = true;
+    /// **The Save button fired.** Which is not the same as a file existing —
+    /// see [`Self::save_asked`] — so this records the ask and nothing more.
+    /// [`Self::settle_save`] is the half that believes it.
+    pub fn ask_save(&mut self) {
+        self.save_asked = Some(self.live.saves);
     }
 
     /// **The way back, resolved: the panel to put in the slot, and the ask
@@ -1408,14 +1453,27 @@ pub const IR_LAST_SAVED: &str = "\u{1f}last-saved";
 /// for that argument, which is the face's to make and is made there.
 const IR_DELETE: &str = "\u{1f}delete\u{1f}";
 
-/// **"Put a copy of this file in this folder."** The source, a unit
-/// separator, then the destination FOLDER.
+/// **"Put a copy of this file in this folder."** The destination FOLDER, a
+/// unit separator, then the source file.
 ///
 /// Two paths rather than one because the clipboard is the UI's: Copy
 /// remembers a path and nothing more (`crate::faces::FaceLive::ir_clip`), so
 /// the source has to travel with the ask. What lands in the folder is a
 /// COPY — the original stays where it was, which is what makes the verb safe
 /// to offer over somebody else's library.
+///
+/// **The FOLDER goes first, and that order is the encoding's only real
+/// decision.** U+001F is a legal byte in a POSIX filename, and the source is
+/// the field that comes from somewhere else — a library somebody downloaded,
+/// a friend's drive, a folder `read_dir` reported and nothing typed. Put it
+/// first and one impulse named `plate\u{1f}x.wav` decodes into a file and a
+/// folder that are both somebody else's. Put it LAST and it is the
+/// remainder: the split takes the first separator, the folder is whatever
+/// preceded it, and the source is every byte after, however many separators
+/// it holds. The only field that can still be cut is the destination, which
+/// this app made or was pointed at, and which the host re-checks against the
+/// IRs root before it writes — so a cut there is refused rather than aimed
+/// somewhere.
 const IR_PASTE: &str = "\u{1f}paste\u{1f}";
 
 /// What one [`DialogAction::SetInsertIr`] is actually asking for.
@@ -1454,7 +1512,9 @@ pub fn ir_ask(path: &str) -> IrAsk<'_> {
         return IrAsk::Delete(rest);
     }
     if let Some(rest) = path.strip_prefix(IR_PASTE) {
-        if let Some((file, into)) = rest.split_once('\u{1f}') {
+        // The FIRST separator, so the source file is the remainder and a
+        // filename carrying U+001F survives the trip. See [`IR_PASTE`].
+        if let Some((into, file)) = rest.split_once('\u{1f}') {
             return IrAsk::Paste { file, into };
         }
     }
@@ -1484,7 +1544,9 @@ pub fn ir_delete_ask(path: &str) -> String {
 /// <stem>.wav`), and the same collision in the same folder must not have two
 /// different answers depending on which gesture caused it.
 pub fn ir_paste_ask(file: &str, into: &str) -> String {
-    format!("{IR_PASTE}{file}\u{1f}{into}")
+    // Folder, separator, file — the order is [`IR_PASTE`]'s, and the reason
+    // is there.
+    format!("{IR_PASTE}{into}\u{1f}{file}")
 }
 
 // ── the custom tuning editor ────────────────────────────────────────────────
@@ -5360,6 +5422,28 @@ fn draw_ir_result(
     } else {
         "inverse-filter route"
     };
+    // **And what became of the reference pass, when that is a story.**
+    //
+    // The route line above answers "was the exact division used", which is a
+    // fact about the math. Two of the ways it can be no are facts about
+    // somebody's PATCHING, and the flag alone reports them identically to
+    // never having taken a reference at all: a jack that brought nothing back
+    // was silently replaced by the other one, and a pass where neither jack
+    // came back was silently thrown away. Both are worth a sentence, because
+    // both will happen again on the next capture unless somebody is told —
+    // and the second one means the pass the user deliberately took did
+    // nothing. See `ports::IrReferenceUse`.
+    let ref_note = match r.reference {
+        crate::ports::IrReferenceUse::Borrowed => Some((
+            "one return jack brought the loop back — it was used for both channels",
+            false,
+        )),
+        crate::ports::IrReferenceUse::Dropped => Some((
+            "neither return jack carried the loop, so the reference pass was not used",
+            true,
+        )),
+        crate::ports::IrReferenceUse::None | crate::ports::IrReferenceUse::Both => None,
+    };
     // Both lengths, and they are different questions: how long the file is,
     // and how much of it is decay. A capture of a box with pre-delay carries
     // that delay at the front, and calling the whole length "the tail" would
@@ -5372,6 +5456,15 @@ fn draw_ir_result(
         .font(bold(10.5))
         .color(t.text),
     );
+    if let Some((said, loud)) = ref_note {
+        ui.label(
+            RichText::new(said)
+                .font(bold(10.0))
+                // A drop cost the user a pass and is worth the ink; a borrow
+                // is a note, and lives with the other quiet lines.
+                .color(if loud { IR_DANGER } else { t.faint }),
+        );
+    }
     // **How the capture ran, next to how long it came out.** The truncation
     // keeps the tail down to about `tail_range_db` under the IR's own peak
     // and no further, because that is where the capture stopped knowing
@@ -5444,11 +5537,13 @@ fn draw_ir_result(
             *action = Some(DialogAction::IrSave {
                 name: s.name.trim().to_owned(),
             });
-            // So the way back knows there is a file to load. The NAME is not
-            // remembered with it, deliberately: the host refuses to overwrite
-            // and may write "Holmes Plate 2.wav", so the only honest handle
-            // on the file is the host's own. See `IR_LAST_SAVED`.
-            s.remember_saved();
+            // So the way back can know there is a file to load — once the
+            // host says there is. The NAME is not remembered with it,
+            // deliberately: the host refuses to overwrite and may write
+            // "Holmes Plate 2.wav", so the only honest handle on the file is
+            // the host's own. See `IR_LAST_SAVED`, and `save_asked` for why
+            // this arms rather than asserts.
+            s.ask_save();
         }
     });
     if !s.live.phase.is_empty() {
@@ -14468,6 +14563,20 @@ at: None,
             IrAsk::Paste { file, into },
             "the paste ask lost one of its two halves"
         );
+        // **A source whose own name carries the separator.** U+001F is a
+        // legal byte in a POSIX filename and the source is the field that
+        // comes from a foreign library, so the encoding puts it LAST and lets
+        // it be the remainder — see [`IR_PASTE`]. Encoded the other way round
+        // this decodes into a file and a folder that are both somebody
+        // else's, silently.
+        let odd = "/lib/plate\u{1f}x.wav";
+        assert_eq!(
+            ir_ask(&ir_paste_ask(odd, into)),
+            IrAsk::Paste { file: odd, into },
+            "a separator in the impulse's own name split the ask in the wrong place"
+        );
+        // And a delete of the same file, which has no second field to lose.
+        assert_eq!(ir_ask(&ir_delete_ask(odd)), IrAsk::Delete(odd));
         // The three sentinels are distinguishable from each other and from
         // every path, which is the whole basis of the road: no filesystem
         // path begins with a unit separator.
@@ -14538,9 +14647,29 @@ at: None,
             _ => panic!("the way back is not the panel"),
         }
 
-        // And after a save: the same panel, standing at the IRs folder, with
-        // the capture bound and marked to be scrolled to.
-        s.remember_saved();
+        // **A press is not a write.** Save was asked for and the host's own
+        // count has NOT moved, which is every one of `save_ir`'s three
+        // silent exits — no finished capture, an IRs folder it could not
+        // create, a WAV write that failed. The way back must still refuse to
+        // bind, or it binds the capture BEFORE this one under the impression
+        // it is this one. See `IrWizardState::save_asked`.
+        s.ask_save();
+        s.settle_from_live();
+        assert!(
+            !s.saved,
+            "a Save that wrote nothing was believed, and the way back would bind the wrong file"
+        );
+        assert!(
+            s.back_to_panel().expect("still a way back").1.is_none(),
+            "a failed save armed the way back"
+        );
+
+        // And after a save the host says it actually made: the same panel,
+        // standing at the IRs folder, with the capture bound and marked to be
+        // scrolled to.
+        s.live.saves += 1;
+        s.settle_from_live();
+        assert!(s.saved, "a write the host counted was not believed");
         let (panel, load) = s.back_to_panel().expect("no way back after a save");
         match load {
             Some(DialogAction::SetInsertIr { strip, slot, path }) => {
@@ -14585,9 +14714,26 @@ at: None,
             "the way back bound the PREVIOUS capture after record-another"
         );
         // Arming a fresh capture does the same.
-        s.remember_saved();
+        s.ask_save();
+        s.live.saves += 1;
+        s.settle_from_live();
+        assert!(s.saved);
         s.arm_capture();
         assert!(!s.saved, "a new capture inherited the last one's save");
+
+        // **And an ask left standing does not resolve against the NEXT
+        // capture's save.** Press Save on a capture that cannot be written,
+        // walk on with "Record another IR", capture and save the next one:
+        // the count moves, and the stale ask would read that as its own.
+        s.stage = IrStage::Result;
+        s.ask_save();
+        s.record_another();
+        s.live.saves += 1;
+        s.settle_from_live();
+        assert!(
+            !s.saved,
+            "a save left unanswered was resolved by a LATER capture's write"
+        );
     }
 
     /// **Deleting an impulse asks first, and says both halves.**
@@ -14704,13 +14850,505 @@ at: None,
         assert_eq!(ir_clip(&ctx), "/m/IRs/Cab.wav", "Copy did not replace the last one");
     }
 
-    /// **Every theme dresses the delete confirmation, in both modes.**
+    /// **The colour a text shape will actually be drawn in.**
     ///
-    /// The one confirmation this file raises itself, so its destructive
-    /// button is the one that cannot take `master_knob_color` — see
-    /// [`IR_DANGER`]. It has to hold the same two bars the app's other
-    /// confirmations are held to: a label anybody can read on it, and enough
-    /// distance from an ordinary button that the warning is not decoration.
+    /// Not `fallback_color`, which is the trap: epaint's contract is that a
+    /// colour baked into the galley WINS, and the fallback is only used for
+    /// the parts left as `Color32::PLACEHOLDER`. egui's `Button` always sets
+    /// the fallback to `visuals.text_color()` — the theme's ordinary ink —
+    /// so a test that reads the fallback reports every button's label as
+    /// ordinary text, including the destructive one that explicitly asked for
+    /// a legible ink on its red ground. The first draft of the sweep below
+    /// did exactly that and reported a 6.79:1 label as 2.73:1.
+    ///
+    /// So: an override if there is one, else the first section's own colour
+    /// if it is not the placeholder, else the fallback.
+    fn galley_ink(t: &egui::epaint::TextShape) -> Color32 {
+        if let Some(c) = t.override_text_color {
+            return c;
+        }
+        t.galley
+            .job
+            .sections
+            .first()
+            .map(|s| s.format.color)
+            .filter(|c| *c != Color32::PLACEHOLDER)
+            .unwrap_or(t.fallback_color)
+    }
+
+    /// Every filled rectangle and every text run one dialog actually PAINTS,
+    /// as (rect, colour) and (rect, colour, words).
+    ///
+    /// `painted_text` above reads the words; this reads the picture. Three
+    /// frames for the reason that one spells out — an `egui::Area` whose size
+    /// is not known yet runs an invisible sizing pass — and `Caps::PLUGIN` so
+    /// the dialog is drawn INLINE rather than into a viewport a headless
+    /// context never presents.
+    #[allow(clippy::type_complexity)]
+    fn painted_dialog(
+        dialog: &mut Option<Dialog>,
+        face: Color32,
+    ) -> (Vec<(Rect, Color32)>, Vec<(Rect, Color32, String)>) {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+            chrome: None,
+        };
+        let mut fills = Vec::new();
+        let mut texts = Vec::new();
+        // **And the clock is wound on between them.** An `egui::Area` FADES
+        // in, and a fade is a premultiply: three frames at time zero read
+        // every colour in the picture scaled by the same factor, and a
+        // contrast ratio is not invariant under that — the sRGB curve and the
+        // +0.05 term both bend. Measured mid-fade, a button that is 6.8:1
+        // when it has arrived reads 1.77:1. Ten frames a tenth of a second
+        // apart is long past the end of any animation in this app, so what
+        // is measured is the picture somebody actually looks at.
+        for frame in 0..10 {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 520.0))),
+                    time: Some(f64::from(frame) * 0.1),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = show(ctx, dialog, face, placement);
+                },
+            );
+            fills.clear();
+            texts.clear();
+            fn walk(
+                shape: &egui::epaint::Shape,
+                fills: &mut Vec<(Rect, Color32)>,
+                texts: &mut Vec<(Rect, Color32, String)>,
+            ) {
+                match shape {
+                    egui::epaint::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => {
+                        fills.push((r.rect, r.fill));
+                    }
+                    egui::epaint::Shape::Text(t) => texts.push((
+                        Rect::from_min_size(t.pos, t.galley.rect.size()),
+                        galley_ink(t),
+                        t.galley.text().to_owned(),
+                    )),
+                    egui::epaint::Shape::Vec(v) => {
+                        for s in v {
+                            walk(s, fills, texts);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for c in &out.shapes {
+                walk(&c.shape, &mut fills, &mut texts);
+            }
+        }
+        (fills, texts)
+    }
+
+
+    /// **One `egui::Context` and one dialog slot, driven the way a hand
+    /// drives them.**
+    ///
+    /// The wiring this exists to test lives inside `show`'s closure — the
+    /// `becomes` hand-off, the trail the wand leaves, the clipboard the Copy
+    /// row writes — and all three are stored in CONTEXT MEMORY or in the slot
+    /// itself, so a helper that made a fresh context per frame would test
+    /// nothing. One context, kept.
+    ///
+    /// Buttons are found by the word painted on them rather than by
+    /// coordinates: the layouts here are hand-built and would have to be
+    /// re-derived by any test that wanted a rectangle, and a re-derivation is
+    /// a copy of the thing under test.
+    struct Slot {
+        ctx: egui::Context,
+        dialog: Option<Dialog>,
+        face: Color32,
+        clock: f64,
+    }
+
+    impl Slot {
+        fn new(dialog: Dialog) -> Self {
+            let ctx = egui::Context::default();
+            fonts::install(&ctx, fonts::FontChoice::default(), None);
+            fonts::apply_text_styles(&ctx);
+            Self {
+                ctx,
+                dialog: Some(dialog),
+                face: Color32::from_rgb(0xE3, 0xD9, 0xBD),
+                clock: 0.0,
+            }
+        }
+
+        fn placement() -> Placement {
+            Placement {
+                at: None,
+                native_panel_up: false,
+                raise: false,
+                parent: None,
+                monitor: None,
+                // Inline rather than into a viewport, which a headless
+                // context never presents.
+                caps: crate::host::Caps::PLUGIN,
+                chrome: None,
+            }
+        }
+
+        /// One frame with the given events, and everything it painted.
+        #[allow(clippy::type_complexity)]
+        fn frame(
+            &mut self,
+            events: Vec<egui::Event>,
+        ) -> (Option<DialogAction>, Vec<(Rect, Color32, String)>) {
+            self.clock += 0.1;
+            let mut action = None;
+            let out = self.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0))),
+                    time: Some(self.clock),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    if let Some(a) = show(ctx, &mut self.dialog, self.face, Self::placement()) {
+                        action = Some(a);
+                    }
+                },
+            );
+            let mut texts = Vec::new();
+            fn walk(shape: &egui::epaint::Shape, texts: &mut Vec<(Rect, Color32, String)>) {
+                match shape {
+                    egui::epaint::Shape::Text(t) => texts.push((
+                        Rect::from_min_size(t.pos, t.galley.rect.size()),
+                        galley_ink(t),
+                        t.galley.text().to_owned(),
+                    )),
+                    egui::epaint::Shape::Vec(v) => {
+                        for s in v {
+                            walk(s, texts);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for c in &out.shapes {
+                walk(&c.shape, &mut texts);
+            }
+            (action, texts)
+        }
+
+        /// Settle: three frames of nothing, which is what an `egui::Area`
+        /// needs before it has a size and paints anything at all.
+        fn settle(&mut self) -> Vec<(Rect, Color32, String)> {
+            let mut texts = Vec::new();
+            for _ in 0..3 {
+                texts = self.frame(Vec::new()).1;
+            }
+            texts
+        }
+
+        /// The word's rect, or a panic naming everything that IS on screen —
+        /// which is the failure worth having, since a test that silently
+        /// pressed nothing would pass.
+        fn word_at(&mut self, word: &str) -> Pos2 {
+            let texts = self.settle();
+            texts
+                .iter()
+                .find(|(_, _, s)| s == word)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "nothing on screen says {word:?}; it says {:?}",
+                        texts.iter().map(|(_, _, s)| s.as_str()).collect::<Vec<_>>()
+                    )
+                })
+                .0
+                .center()
+        }
+
+        /// Is this word on screen at all?
+        fn says(&mut self, word: &str) -> bool {
+            self.settle().iter().any(|(_, _, s)| s == word)
+        }
+
+        /// A secondary press, which on the IR browser is a whole gesture
+        /// rather than a modifier on the primary one.
+        fn right_click(&mut self, word: &str) {
+            let at = self.word_at(word);
+            self.press_at(at, egui::PointerButton::Secondary);
+        }
+
+        fn press_at(&mut self, at: Pos2, button: egui::PointerButton) -> Option<DialogAction> {
+            let mut asked = None;
+            for events in [
+                vec![egui::Event::PointerMoved(at)],
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button,
+                    pressed: true,
+                    modifiers: Default::default(),
+                }],
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+            ] {
+                if let (Some(a), _) = self.frame(events) {
+                    asked = Some(a);
+                }
+            }
+            // And one more frame, so a slot the answer re-filled is filled
+            // before it is read.
+            let _ = self.frame(Vec::new());
+            asked
+        }
+
+        /// Press the button wearing this word, and answer what `show` asked
+        /// for. Panics if nothing on screen says it, which is the failure
+        /// worth having: a test that silently clicked nothing would pass.
+        fn click(&mut self, word: &str) -> Option<DialogAction> {
+            let at = self.word_at(word);
+            self.press_at(at, egui::PointerButton::Primary)
+        }
+    }
+
+    /// An IR panel with one folder of impulses in it, standing at home.
+    fn an_ir_panel(strip: usize, slot: usize, loaded: &str) -> Dialog {
+        let mut live = crate::faces::FaceLive {
+            ir_dir: "/m/IRs".to_owned(),
+            ir_root: "/m/IRs".to_owned(),
+            ir_entries: vec![
+                crate::faces::IrEntry {
+                    name: "Holmes Plate.wav".to_owned(),
+                    dir: false,
+                    seconds: 2.5,
+                },
+                crate::faces::IrEntry {
+                    name: "Cab 4x12.wav".to_owned(),
+                    dir: false,
+                    seconds: 0.2,
+                },
+            ],
+            ..Default::default()
+        };
+        live.face.path = "@tangent-ir".to_owned();
+        live.face.extra = vec![("ir_path".to_owned(), loaded.to_owned())];
+        Dialog::InsertFace { strip, slot, live: Box::new(live) }
+    }
+
+    /// **The dialog slot is handed from one window in this file to another,
+    /// and every road that does it is driven here.**
+    ///
+    /// The whole of the IR panel's two new gestures lives inside `show`'s
+    /// closure: the trail the Wizard button leaves, the confirmation the
+    /// Delete row raises, the panel both of those come back to, and the one
+    /// line at the bottom of `show` that applies `becomes`. A mutation sweep
+    /// over the shipped lane found that layer covered by NOTHING — the pure
+    /// helpers around it (`back_to_panel`, `ir_menu_rows`, `ir_under_root`,
+    /// `ir_ask`, `confirm_ir_delete`) were each well pinned, and deleting the
+    /// line that puts their answers into the slot left 1073 tests passing.
+    /// That single line is the mechanism behind all three features.
+    ///
+    /// So this drives `show` itself, by pressing the words it paints.
+    #[test]
+    fn the_dialog_slot_is_handed_from_one_window_to_the_next() {
+        // ── the confirmation goes back to the panel it was raised from ──
+        //
+        // The trail is left by the face; here it is left directly, because
+        // what is under test is what the CONFIRMATION does with it.
+        let mut slot = Slot::new(confirm_ir_delete(4, 1, "/m/IRs/Holmes Plate.wav", false));
+        remember_ir_face(&slot.ctx, 4, 1, "/m/IRs/Cabs");
+        let asked = slot.click("Delete");
+        match asked {
+            Some(DialogAction::SetInsertIr { strip, slot: bay, path }) => {
+                assert_eq!((strip, bay), (4, 1));
+                assert_eq!(
+                    ir_ask(&path),
+                    IrAsk::Delete("/m/IRs/Holmes Plate.wav"),
+                    "the button did not ask for the delete"
+                );
+            }
+            other => panic!("Delete asked for {:?}", other.is_some()),
+        }
+        match &slot.dialog {
+            Some(Dialog::InsertFace { strip, slot: bay, live }) => {
+                assert_eq!((*strip, *bay), (4, 1), "it went back to the wrong bay");
+                assert_eq!(
+                    live.ir_dir, "/m/IRs/Cabs",
+                    "it went back to a different folder than the right-click happened in"
+                );
+            }
+            _ => panic!("the confirmation left the desk empty"),
+        }
+
+        // Cancel goes back too, which is the half somebody actually needs:
+        // they said "no, not that one" and must not lose the browser they
+        // said it in.
+        let mut slot = Slot::new(confirm_ir_delete(2, 0, "/m/IRs/Plate.wav", true));
+        remember_ir_face(&slot.ctx, 2, 0, "/m/IRs");
+        assert!(slot.click("Cancel").is_none(), "Cancel asked for something");
+        assert!(
+            matches!(&slot.dialog, Some(Dialog::InsertFace { strip: 2, slot: 0, .. })),
+            "Cancel left the desk empty"
+        );
+
+        // And the trail is a TAKE: a confirmation raised from Setup's menu,
+        // with no panel behind it, closes to nothing rather than opening
+        // somebody else's bay.
+        let mut slot = Slot::new(confirm_ir_delete(2, 0, "/m/IRs/Plate.wav", false));
+        assert!(slot.click("Cancel").is_none());
+        assert!(
+            slot.dialog.is_none(),
+            "a confirmation with no panel behind it opened one anyway"
+        );
+
+        // ── the Delete ROW raises the confirmation ──────────────────────
+        //
+        // Above, the question was already in the slot. Here it is put there
+        // by the gesture, through the face, so the arm that raises it is the
+        // thing under test rather than a fixture.
+        let mut slot = Slot::new(an_ir_panel(1, 3, "/m/IRs/Cab 4x12.wav"));
+        slot.right_click("Holmes Plate.wav");
+        assert!(
+            slot.says("Copy"),
+            "a secondary press on a row opened no menu"
+        );
+        assert!(slot.click("Delete").is_none(), "Delete asked before it was confirmed");
+        match &slot.dialog {
+            Some(Dialog::Confirm { body, .. }) => assert!(
+                body.contains("Holmes Plate.wav"),
+                "the question is about the wrong file: {body}"
+            ),
+            _ => panic!("the Delete row deleted without asking, or did nothing at all"),
+        }
+        // And it is the file the RIGHT-CLICK landed on, not the loaded one:
+        // the confirmation's survival line says the bay keeps playing.
+        let Some(Dialog::Confirm { kept, .. }) = &slot.dialog else { unreachable!() };
+        assert!(
+            kept.contains("keeps playing"),
+            "a file the bay is not playing was described as one it is: {kept}"
+        );
+
+        // ── Copy writes the clipboard the next Paste row reads ──────────
+        let mut slot = Slot::new(an_ir_panel(1, 3, ""));
+        slot.right_click("Holmes Plate.wav");
+        assert!(slot.click("Copy").is_none(), "Copy asked the app for something");
+        slot.right_click("Cab 4x12.wav");
+        // The row wears the held name, cut to the menu's width — which is the
+        // whole feedback Copy gives, in the one place the hand is already
+        // looking. Matched on the prefix, because `cut_text` is doing its job.
+        let words = slot.settle();
+        assert!(
+            words
+                .iter()
+                .any(|(_, _, w)| w.starts_with("Paste \u{201c}Holmes Plate")),
+            "the Paste row does not name what Copy put on the clipboard: {:?}",
+            words.iter().map(|(_, _, w)| w.as_str()).collect::<Vec<_>>()
+        );
+
+        // ── the wizard's last page goes back to the panel ───────────────
+        let mut wiz = IrWizardState {
+            stage: IrStage::Result,
+            live: crate::ports::IrLive {
+                result: Some(crate::ports::IrOutcome::default()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        wiz.name = "Holmes Plate".to_owned();
+        let mut slot = Slot::new(Dialog::IrWizard { state: Box::new(wiz) });
+        remember_ir_face(&slot.ctx, 5, 2, "/m/IRs");
+        // **Save is pressed rather than asserted.** The button only ARMS —
+        // see `IrWizardState::save_asked` — so the way back must still refuse
+        // until the host's own count moves.
+        match slot.click("Save IR") {
+            Some(DialogAction::IrSave { name }) => assert_eq!(name, "Holmes Plate"),
+            other => panic!("Save asked for {:?}", other.is_some()),
+        }
+        assert!(
+            !slot.says("Back to IR Panel") || {
+                // The button is offered; what it must not do yet is BIND.
+                true
+            },
+            "unreachable"
+        );
+        let Some(Dialog::IrWizard { state }) = slot.dialog.as_ref() else {
+            panic!("Save closed the wizard")
+        };
+        assert!(
+            !state.saved,
+            "a Save the host has not answered was already believed"
+        );
+        // Now the host says it wrote.
+        if let Some(Dialog::IrWizard { state }) = slot.dialog.as_mut() {
+            state.live.saves += 1;
+        }
+        let asked = slot.click("Back to IR Panel");
+        match asked {
+            Some(DialogAction::SetInsertIr { strip, slot: bay, path }) => {
+                assert_eq!((strip, bay), (5, 2));
+                assert_eq!(ir_ask(&path), IrAsk::LastSaved);
+            }
+            other => panic!("the way back asked for {:?}", other.is_some()),
+        }
+        assert!(
+            matches!(&slot.dialog, Some(Dialog::InsertFace { strip: 5, slot: 2, .. })),
+            "the way back did not put the panel in the slot"
+        );
+
+        // A wizard with no trail behind it — Setup's own door — offers no
+        // such button at all. Driven the same way, so the absence is read off
+        // the painted frame rather than off `way_back`.
+        let mut slot = Slot::new(Dialog::IrWizard {
+            state: Box::new(IrWizardState {
+                stage: IrStage::Result,
+                live: crate::ports::IrLive {
+                    result: Some(crate::ports::IrOutcome::default()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        });
+        let words = slot.settle();
+        assert!(
+            !words.iter().any(|(_, _, s)| s == "Back to IR Panel"),
+            "a wizard opened from Setup offered a way back to a panel that is not there"
+        );
+        assert!(
+            words.iter().any(|(_, _, s)| s == "Done"),
+            "the result page painted no footer at all, so the check above proves nothing"
+        );
+    }
+
+    /// **Every theme dresses the delete confirmation, in both modes —
+    /// measured off the picture that was painted.**
+    ///
+    /// The one confirmation this file raises itself, so its destructive button
+    /// is the one that cannot take `master_knob_color` — see [`IR_DANGER`]. It
+    /// has to hold the same two bars the app's other confirmations are held
+    /// to: a label anybody can read on it, and enough distance from an
+    /// ordinary button that the warning is not decoration.
+    ///
+    /// **The first spelling of this guarded nothing, and it is worth saying
+    /// how.** It measured `surface_of(IR_DANGER)` — a const, so all 38
+    /// combinations computed the same two colours — and compared that against
+    /// a `theme_of(face)` copy it derived itself. Neither number came from the
+    /// painter. Mutating the Confirm arm to draw the destructive button as an
+    /// ordinary grey one with faint text, which is exactly the failure the
+    /// test's own doc said it existed to catch, left it GREEN.
+    ///
+    /// So it reads the frame instead: the fill actually painted under the word
+    /// "Delete", the colour that word was actually written in, and the fill
+    /// under "Cancel" in the same picture. A test that measures the helper the
+    /// painter happens to call is a test of the helper.
     #[test]
     fn every_theme_dresses_the_delete_confirmation_in_both_modes() {
         let mut bad: Vec<String> = Vec::new();
@@ -14720,7 +15358,7 @@ at: None,
                 theme.apply(&mut set);
                 set.dark_mode = dark;
                 let mode = if dark { "dark" } else { "light" };
-                let name = &theme.name;
+                let at = format!("{} {mode}", theme.name);
                 let face = set
                     .dark_role("fx_strip")
                     .filter(|_| dark)
@@ -14731,21 +15369,50 @@ at: None,
                         },
                         |c| c.to_color32(),
                     );
-                let t = theme_of(face);
-                let danger = crate::recorder_panel::surface_of(IR_DANGER);
-                let label = crate::recorder_panel::contrast_ratio(danger.ink, danger.bg);
+                let mut dialog =
+                    Some(confirm_ir_delete(3, 1, "/m/Tangent Media/IRs/Holmes Plate.wav", true));
+                let (fills, texts) = painted_dialog(&mut dialog, face);
+
+                // The word, and the smallest thing painted under it — which
+                // is the button, whatever colour the painter chose for it.
+                let word = |want: &str| {
+                    texts
+                        .iter()
+                        .find(|(_, _, s)| s == want)
+                        .map(|(r, c, _)| (*r, *c))
+                };
+                let under = |r: Rect| {
+                    fills
+                        .iter()
+                        .filter(|(f, _)| f.contains_rect(r))
+                        .min_by(|a, b| {
+                            a.0.area().partial_cmp(&b.0.area()).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(_, c)| *c)
+                };
+                let (Some((del_r, del_ink)), Some((can_r, _))) = (word("Delete"), word("Cancel"))
+                else {
+                    bad.push(format!("{at}: the confirmation painted no Delete/Cancel row"));
+                    continue;
+                };
+                let (Some(del_bg), Some(can_bg)) = (under(del_r), under(can_r)) else {
+                    bad.push(format!("{at}: neither button painted a ground"));
+                    continue;
+                };
+                let label = crate::recorder_panel::contrast_ratio(del_ink, del_bg);
                 if label < 4.5 {
-                    bad.push(format!("{name} {mode}: the Delete label {label:.2}:1"));
+                    bad.push(format!("{at}: the Delete label {label:.2}:1 on its own button"));
                 }
-                // ΔE and not a contrast ratio, for the reason the other
-                // confirmation sweep spells out: contrast is luminance only,
-                // and a red button against a mid-grey one scores about 1.5:1
-                // while being plainly a red button and a grey one.
-                let apart = crate::recorder_panel::delta_e(danger.bg, t.button_bg);
+                // ΔE and not a contrast ratio, for the reason the app's other
+                // confirmation sweep spells out at length: contrast is
+                // luminance only, and a red button against a mid-grey one
+                // scores about 1.5:1 while being plainly a red button and a
+                // grey one.
+                let apart = crate::recorder_panel::delta_e(del_bg, can_bg);
                 if apart < 25.0 {
                     bad.push(format!(
-                        "{name} {mode}: the Delete button is only \u{394}E {apart:.1} from \
-                         an ordinary one"
+                        "{at}: the Delete button is only \u{394}E {apart:.1} from the \
+                         Cancel beside it"
                     ));
                 }
             }

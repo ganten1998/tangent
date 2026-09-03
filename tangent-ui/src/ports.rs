@@ -904,6 +904,50 @@ pub struct IrOutcome {
     /// its own peak the recovered IR is still telling the truth. A short IR
     /// is nearly always a small number here, which is why it is shown.
     pub tail_range_db: f32,
+    /// **What became of the loop-only reference pass.** Appended at the END,
+    /// this struct's law.
+    ///
+    /// [`Self::has_reference`] answers "was the exact route taken", which is
+    /// the right question for the route line and the wrong one for the user.
+    /// Two of the three ways the answer can be no are things that happened to
+    /// somebody's PATCHING — a return jack that brought nothing back, or two
+    /// of them — and until this field existed the wizard said the same thing
+    /// about a reference that was never asked for as about one that was
+    /// captured and then silently discarded. See [`IrReferenceUse`].
+    pub reference: IrReferenceUse,
+}
+
+/// **What the deconvolution did with the reference pass it was handed**, so
+/// the result stage can say it.
+///
+/// `desktop::process_ir_capture` measures each reference channel with
+/// `sweep::reference_range_db` and judges it against the same
+/// `TRUSTWORTHY_RANGE_DB` the wizard judges the capture by. Below the line a
+/// jack did not carry the loop back, and dividing by it is dividing by noise
+/// — one channel deleted, or one channel a hundred dB up dragging the other
+/// into inaudibility. That measurement has three outcomes and they mean
+/// different things to whoever is standing at the interface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IrReferenceUse {
+    /// No reference pass was captured. The classic inverse-filter route ran,
+    /// which is the ordinary case and needs no remark.
+    #[default]
+    None,
+    /// Both return jacks carried the sweep, and each channel divided by its
+    /// own. The exact route, as asked for.
+    Both,
+    /// **One jack brought nothing back, so the live one divided both
+    /// channels.** Worth saying: the capture is still exact, and the engine
+    /// plays the same sample into both outputs so the borrowed reference is
+    /// the right one — but a jack that recorded nothing is a cable, a routing
+    /// mistake or a dead input, and the next capture will have the same
+    /// problem unless somebody is told.
+    Borrowed,
+    /// **Neither jack carried the sweep, so the reference was dropped and the
+    /// classic route ran.** The pass the user deliberately took was thrown
+    /// away, and the flag alone would have reported that identically to never
+    /// having taken one.
+    Dropped,
 }
 
 /// The wizard's live picture, pushed by the host once per frame while the
@@ -946,6 +990,25 @@ pub struct IrLive {
     /// handled: a result carrying an id the wizard already knew cannot be
     /// mistaken for the one it is waiting for.
     pub capture_id: u64,
+    /// **How many captures have actually been WRITTEN**, counted up by the
+    /// host once per save that reached the disk, never reset. Appended at
+    /// the END, this struct's law.
+    ///
+    /// [`Self::capture_id`]'s argument, one door along. The Save button used
+    /// to set the wizard's own "there is a file to load" flag as it fired the
+    /// ask, which is a record of a PRESS rather than of a save: `save_ir` has
+    /// three exits that write nothing — no finished capture, an IRs folder it
+    /// could not create, a WAV write that failed — and each one left the
+    /// wizard believing the capture on screen was on the disk. Press Save on
+    /// a full disk, take the way back, and the bay binds the PREVIOUS
+    /// capture under the impression it is this one.
+    ///
+    /// So the fact is read off the host rather than off the click, and the
+    /// host moves this number only past a successful write. The wizard
+    /// remembers the value it saw when it pressed Save and believes the save
+    /// happened only once this has moved past it — the same latch, for the
+    /// same reason, as the one that guards the result page.
+    pub saves: u64,
 }
 
 #[cfg(test)]

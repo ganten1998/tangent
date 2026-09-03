@@ -3931,20 +3931,65 @@ impl DesktopApp {
                     self.push_ir_rows();
                 }
                 R::SetInsertIr { strip, slot, path } => {
-                    // **The sentinel first.** `IR_BROWSE` is the face's name
-                    // field asking for the system chooser rather than naming
-                    // a file; it is parked for `take_ir_browse` because rfd
-                    // must not be raised inside an egui frame. See the
-                    // constant for why the ask rides this field at all.
-                    if path == tangent_ui::dialogs::IR_BROWSE {
-                        self.ir.browse = Some((strip, slot));
-                        self.ir.browse_settle = IR_BROWSE_SETTLE_FRAMES;
-                        ctx.request_repaint();
-                    } else {
+                    // **Decoded, never tested against.** Four of the five
+                    // things this ask can be are sentinels riding the path
+                    // field — see `dialogs::IR_BROWSE` for why they travel
+                    // that way — and `dialogs::ir_ask` is the only thing
+                    // that reads them. Testing the constants here instead
+                    // would be a second place that has to agree about an
+                    // encoding written in another crate, which is the exact
+                    // drift the one-decoder design exists to prevent.
+                    use tangent_ui::dialogs::IrAsk;
+                    match tangent_ui::dialogs::ir_ask(&path) {
                         // The shelf's ordinary road. A bay that is no
                         // longer an IR just does not take it; the shelf is
                         // drawn from the same face and cannot be stale.
-                        let _ = self.bind_insert_ir(strip, slot, &path);
+                        IrAsk::Load(p) => {
+                            let _ = self.bind_insert_ir(strip, slot, p);
+                        }
+                        // The face's name field asking for the system
+                        // chooser rather than naming a file; parked for
+                        // `take_ir_browse` because rfd must not be raised
+                        // inside an egui frame.
+                        IrAsk::Browse => {
+                            self.ir.browse = Some((strip, slot));
+                            self.ir.browse_settle = IR_BROWSE_SETTLE_FRAMES;
+                            ctx.request_repaint();
+                        }
+                        // The wizard's way back, asking for the capture it
+                        // just made without being able to name it. Only
+                        // this side knows which name `unique_ir_stem` gave
+                        // it — see `IrRoad::last_saved`.
+                        IrAsk::LastSaved => match self.ir.last_saved.clone() {
+                            Some(p) => {
+                                let _ =
+                                    self.bind_insert_ir(strip, slot, &p.to_string_lossy());
+                            }
+                            None => self.app.notify(
+                                Kind::Error,
+                                "Nothing has been saved this session, so there is \
+                                 no capture to load.",
+                            ),
+                        },
+                        // The browser's two writing verbs. Both already
+                        // said their piece on the far side — Delete behind
+                        // a confirmation, Paste with the folder named in
+                        // its own hover text — so what is left here is the
+                        // file operation and the sentence about it.
+                        IrAsk::Delete(p) => {
+                            let root = self.app.irs_root();
+                            let (kind, said) = ir_delete_file(p, &root);
+                            self.app.notify(kind, said);
+                            // Bumps `ir_scan_gen`, so the browser that
+                            // asked re-lists itself without being told.
+                            self.push_ir_rows();
+                        }
+                        IrAsk::Paste { file, into } => {
+                            let root = self.app.irs_root();
+                            let (kind, said) = ir_paste_file(file, into, &root);
+                            self.app.notify(kind, said);
+                            self.push_ir_rows();
+                        }
                     }
                 }
                 R::IrSave { name } => {
@@ -4125,8 +4170,30 @@ impl DesktopApp {
     /// does the rest, state and all. Answers whether the bay took it, so the
     /// chooser road can say something when it was pointed at a seat that is
     /// no longer an IR.
+    ///
+    /// **It refuses a path that is not a file on the disk, and that refusal
+    /// is load-bearing rather than tidy.** What this writes is PERSISTED:
+    /// `write_insert_state` is a `std::fs::write` of the bay's sidecar, and
+    /// the next project open hands whatever is in it to `wavread::read`. So
+    /// a path that names nothing does not fail politely a frame later — it
+    /// replaces a working bay's impulse with a string, on disk, silently,
+    /// and the sound is gone the next time the project is opened.
+    ///
+    /// That is exactly what an UNDECODED sentinel would do. Four asks ride
+    /// this ask's path field (`dialogs::IR_BROWSE` and its neighbours), and
+    /// `dialogs::ir_ask`'s own doc leans on this check by name: "a sentinel
+    /// this build does not know decodes as `Load` of itself, and the host's
+    /// `bind_insert_ir` answers `false` for a file that is not there". It
+    /// did not, until here — the claim that made a missing arm look
+    /// survivable was the one thing not being enforced. A leading unit
+    /// separator is refused first and by name, because that is the shape of
+    /// every sentinel this app has ever written and it can only arrive here
+    /// through a decoder that has fallen behind its encoder.
     #[cfg(feature = "recorder")]
     fn bind_insert_ir(&mut self, strip: usize, slot: usize, path: &str) -> bool {
+        if !ir_bindable(path) {
+            return false;
+        }
         let Some(e) = self.recorder.engine.as_ref() else {
             return false;
         };
@@ -4573,8 +4640,18 @@ impl DesktopApp {
                 w.write_interleaved(&interleaved)?;
                 w.finish()
             });
+        // **The write is counted and remembered only when it happened.**
+        // The wizard reads `IrLive::saves` rather than its own Save click to
+        // decide whether there is a file for the way back to load — see that
+        // field for the wrong-file fault a click-shaped record caused — and
+        // `last_saved` is the answer to `IR_LAST_SAVED`. Both move together
+        // and only on `Ok`.
         self.ir.live.phase = match written {
-            Ok(()) => format!("saved {stem}.wav"),
+            Ok(()) => {
+                self.ir.last_saved = Some(path.clone());
+                self.ir.live.saves = self.ir.live.saves.wrapping_add(1);
+                format!("saved {stem}.wav")
+            }
             Err(e) => format!("save failed: {e}"),
         };
         self.app.set_ir_live(self.ir.live.clone());
@@ -9281,6 +9358,158 @@ fn sanitize_file_stem(name: &str) -> String {
     }
 }
 
+// ── the browser's three verbs, host-side ────────────────────────────────────
+//
+// `faces::draw_ir_browser`'s right-click menu decides WHAT the verbs mean and
+// says so in its own doc comments; the file operations are here because this
+// side owns `IRs/`. They ride `SetInsertIr`'s path field as sentinels and
+// arrive through `dialogs::ir_ask` — see `dialogs::IR_BROWSE` for why the ask
+// travels that way at all.
+//
+// **Both of them re-ask the question the face already asked.** The menu draws
+// Delete and Paste dead outside the IRs folder, and that is the right place
+// for the user-facing rule — but the ask crosses as a free-form string, and a
+// face is not an authorisation. A DAW that erases a file it did not create,
+// out of a folder it was never given, is one nobody can leave pointed at
+// their sample drive; the check that makes that true has to be on the side
+// that holds the file handle.
+
+/// **Is this string a path a bay may be pointed at?**
+///
+/// The guard on [`DesktopApp::bind_insert_ir`], out here so it can be tested
+/// without an engine — `ir_load_verdict`'s precedent, and for its reason.
+///
+/// Two refusals, and the second is the load-bearing one: a path that is not a
+/// file on the disk. What the bay is pointed at gets WRITTEN to the sidecar,
+/// so a bad path does not fail politely a frame later — it replaces a working
+/// impulse with a string that names nothing, on disk, and the sound is gone
+/// the next time the project opens.
+///
+/// The first is [`ir_is_sentinel`], and it is deliberately kept even though
+/// no absolute path can pass the file test and start with a unit separator at
+/// the same time. It states the rule as a rule — a sentinel is an ASK and is
+/// never a file — so the day the file test is relaxed the ask does not
+/// quietly become bindable, and so the thing being refused has a name.
+#[cfg(feature = "recorder")]
+fn ir_bindable(path: &str) -> bool {
+    !ir_is_sentinel(path) && std::path::Path::new(path).is_file()
+}
+
+/// **Is this string one of the app's ASKS rather than a path?**
+///
+/// A leading unit separator is the shape of every sentinel this app writes —
+/// `dialogs::IR_BROWSE` and its three neighbours, and the insert reload's own
+/// `"\u{1f}reload"` — chosen because no filesystem path begins with one. One
+/// arriving at a bay can only mean a decoder that has fallen behind its
+/// encoder, which is precisely how the browser's Delete and Paste shipped one
+/// wave ahead of the arm that answers them.
+#[cfg(feature = "recorder")]
+fn ir_is_sentinel(path: &str) -> bool {
+    path.starts_with('\u{1f}')
+}
+
+/// **Is `path` really inside `root`?** — the host's own answer, resolved.
+///
+/// `faces::ir_under_root` asks this lexically, which is right for drawing a
+/// row dead: it runs every frame, on strings the app itself just listed, and
+/// it must not touch the disk to decide what a menu looks like.
+///
+/// Here it is a permission, so it is answered on the filesystem instead.
+/// `Path::starts_with` compares COMPONENTS, and `IRs/../../etc/passwd` has
+/// `IRs` as its third one — a lexical test says yes to that, and to a
+/// symlink inside `IRs/` pointing anywhere at all. Both sides are
+/// canonicalised, so `..` is resolved before it is judged and a link is
+/// judged by where it lands.
+///
+/// A root that does not exist canonicalises to `None` and nothing is inside
+/// it, which is the same answer `ir_under_root` gives before the app has
+/// said where home is.
+#[cfg(feature = "recorder")]
+fn ir_inside_root(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let (Ok(path), Ok(root)) = (path.canonicalize(), root.canonicalize()) else {
+        return false;
+    };
+    path.starts_with(&root)
+}
+
+/// **Delete one impulse**, and the sentence that goes with it.
+///
+/// Already confirmed by `dialogs::confirm_ir_delete` before it gets here, so
+/// there is no second question — see that function for why an impulse earns
+/// the first one. What is left is the doing and the saying.
+///
+/// Separated from the request arm the way `ir_load_verdict` is: the arm needs
+/// an engine and an egui context, and this is the half with the opinions.
+#[cfg(feature = "recorder")]
+fn ir_delete_file(path: &str, root: &std::path::Path) -> (Kind, String) {
+    let path = std::path::Path::new(path);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    if !ir_inside_root(path, root) {
+        return (
+            Kind::Error,
+            format!("{name} is outside Tangent's IRs folder, so Tangent will not delete it."),
+        );
+    }
+    // A folder is not an impulse. The menu only offers Delete on a file row,
+    // and `remove_file` would refuse a directory anyway — but with an error
+    // from the OS in place of a sentence, and this is a gesture whose whole
+    // content is what happened.
+    if path.is_dir() {
+        return (Kind::Error, format!("{name} is a folder, not an impulse."));
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => (Kind::Success, format!("Deleted {name}.")),
+        Err(e) => (Kind::Error, format!("Could not delete {name}: {e}")),
+    }
+}
+
+/// **Copy one impulse into a folder, beside whatever is already there** — and
+/// say which name it got.
+///
+/// `dialogs::ir_paste_ask` decides that a collision lands BESIDE rather than
+/// over, and argues it there. The numbering itself is [`unique_ir_stem`], the
+/// same function `save_ir` uses, because the same collision in the same
+/// folder must not have two different answers depending on which gesture
+/// caused it.
+///
+/// **The notification is part of the feature, not decoration.** The menu's
+/// own hover text promises the app says which name it got, and that promise
+/// is the whole difference between a numbered copy and a silent surprise.
+///
+/// Read anywhere, write only at home: `file` may be anywhere on the disk —
+/// that is the road from somebody else's library into your own — and `into`
+/// must be inside the IRs folder.
+#[cfg(feature = "recorder")]
+fn ir_paste_file(file: &str, into: &str, root: &std::path::Path) -> (Kind, String) {
+    let src = std::path::Path::new(file);
+    let dir = std::path::Path::new(into);
+    if !ir_inside_root(dir, root) {
+        return (
+            Kind::Error,
+            "Tangent only pastes impulses inside its own IRs folder.".to_owned(),
+        );
+    }
+    if !src.is_file() {
+        return (
+            Kind::Error,
+            "That impulse is no longer where it was copied from.".to_owned(),
+        );
+    }
+    let stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = unique_ir_stem(dir, &sanitize_file_stem(&stem));
+    let dest = dir.join(format!("{stem}.wav"));
+    match std::fs::copy(src, &dest) {
+        Ok(_) => (Kind::Success, format!("Pasted as {stem}.wav.")),
+        Err(e) => (Kind::Error, format!("Could not copy that impulse: {e}")),
+    }
+}
+
 /// The format pass over freshly written WAVs: encode an MP3 beside each
 /// where the spec asks for one, and remove the WAV where it does not.
 #[cfg(feature = "recorder")]
@@ -9472,6 +9701,18 @@ struct IrRoad {
     /// the difference between showing a fresh capture and silently saving
     /// somebody's previous one under a new name.
     captures: u64,
+    /// **The file the last successful `save_ir` actually wrote.**
+    ///
+    /// The wizard's way back asks for its capture by MEANING rather than by
+    /// name (`dialogs::IR_LAST_SAVED`), because the UI cannot name it:
+    /// `save_ir` refuses to overwrite, so a second "Holmes Plate" is written
+    /// as `Holmes Plate 2.wav` and only this side knows which name it got.
+    /// Guessing there would load the file the PREVIOUS capture is in, under
+    /// the name somebody just typed.
+    ///
+    /// Written only on `Ok`, so a failed write leaves no path for the way
+    /// back to bind.
+    last_saved: Option<std::path::PathBuf>,
 }
 
 /// How many frames a browse request waits before the file panel is raised.
@@ -9595,8 +9836,21 @@ fn process_ir_capture(
     // measurement, and that is as true of a reference pass as of the pass it
     // divides. When NEITHER channel clears it the reference is dropped
     // altogether and the classic route runs, which is honest — the result
-    // stage's "reference" flag then reads false, and a wrong IR is worse
-    // than a slightly less exact one.
+    // stage says so in its own words (`ports::IrReferenceUse::Dropped`), and
+    // a wrong IR is worse than a slightly less exact one.
+    //
+    // **The line stays where the capture's is rather than being lowered to
+    // buy margin**, and the asymmetry is the reason. A genuine but heavily
+    // trimmed return reads 35.66 dB at a 40 dB trim over a −80 dBFS floor and
+    // 15.77 dB at 60 dB of trim, while the two dead cases read 0.00 and 0.03
+    // (measured; `sweep::a_reference_channel_that_never_got_loud_is_not_a_reference`
+    // carries the table). So a jack wrongly called DEAD costs its own
+    // converter coloration and nothing else — the other jack is borrowed and
+    // the engine played the same sample into both. A jack wrongly called LIVE
+    // is DIVIDED BY, which is the whole fault this measurement exists to
+    // prevent. The two mistakes are not the same size, so the line sits on
+    // the expensive side of them and the borrow is announced instead.
+    use tangent_ui::ports::IrReferenceUse as RefUse;
     let usable = reference
         .filter(|r| r.len() == capture.len())
         .and_then(|refc| {
@@ -9609,23 +9863,36 @@ fn process_ir_capture(
             let live = |c: &[f32]| {
                 ess::reference_range_db(c, pre, sweep.len()) >= ess::TRUSTWORTHY_RANGE_DB
             };
+            // The verdict travels with the channels, because the result
+            // stage has to be able to SAY which of the three happened — a
+            // borrow and a drop are both things that happened to somebody's
+            // patching, and a bare `has_reference` reports a dropped
+            // reference identically to one nobody ever took. See
+            // `ports::IrReferenceUse`.
             match (live(&rl), live(&rr)) {
-                (true, true) => Some((rl, rr)),
+                (true, true) => Some((rl, rr, RefUse::Both)),
                 (true, false) => {
                     rr.clone_from(&rl);
-                    Some((rl, rr))
+                    Some((rl, rr, RefUse::Borrowed))
                 }
                 (false, true) => {
                     rl.clone_from(&rr);
-                    Some((rl, rr))
+                    Some((rl, rr, RefUse::Borrowed))
                 }
                 (false, false) => None,
             }
         });
+        // A reference pass was HANDED IN and none of it was usable: that is a
+        // drop, and it is not the same story as never having taken one.
+        let reference_use = match (&usable, reference.is_some()) {
+            (Some((_, _, how)), _) => *how,
+            (None, true) => RefUse::Dropped,
+            (None, false) => RefUse::None,
+        };
 
     // The IR itself: exact division when a reference exists, classic else.
     let (mut l, mut r, has_reference) = match usable {
-        Some((rl, rr)) => {
+        Some((rl, rr, _)) => {
             let mut hl = ess::deconvolve_by_reference(&left, &rl, f1, f2, rate);
             let mut hr = ess::deconvolve_by_reference(&right, &rr, f1, f2, rate);
             // The division is circular: harmonic images and regularization
@@ -9757,6 +10024,7 @@ fn process_ir_capture(
         capture_peak_db,
         tail_range_db: (capture_peak_db - floor_db)
             .clamp(0.0, ess::TAIL_RANGE_MAX_DB as f32),
+        reference: reference_use,
     };
     (l, r, outcome)
 }
@@ -14423,6 +14691,185 @@ mod tests {
             "the classic fallback lost the left box: RT60 {:.3} s",
             rt60_of(&l, rate)
         );
+    }
+
+
+
+
+    /// **The browser's three verbs, host-side: what they do to the disk and
+    /// what they refuse to do.**
+    ///
+    /// The UI half shipped one wave ahead of this one, and the gap was a
+    /// blocker rather than a no-op. `dialogs::ir_ask`'s own doc leaned on a
+    /// claim that was not true — "a sentinel this build does not know decodes
+    /// as `Load` of itself, and the host's `bind_insert_ir` answers `false`
+    /// for a file that is not there" — and `bind_insert_ir` never looked at
+    /// the file. So a right-click Delete deleted nothing and instead WROTE
+    /// `"\u{1f}delete\u{1f}/…/Holmes Plate.wav"` into the bay's `ir_path`,
+    /// through `write_insert_state`, onto the disk: the bay that had been
+    /// playing an impulse came up empty the next time the project was opened,
+    /// while the confirmation box said in so many words that the sound would
+    /// not change.
+    ///
+    /// Three rules are pinned here and each of them is that fault:
+    ///
+    /// * a path the decoder did not turn into a real file is not bindable,
+    ///   so an undecoded sentinel is inert rather than destructive;
+    /// * Delete and Paste re-ask the IRs-root question the FACE already
+    ///   asked, because the ask crosses as a free-form string and a face is
+    ///   not an authorisation — and they ask it on the filesystem, since
+    ///   `Path::starts_with` compares components and would say yes to
+    ///   `IRs/../../etc`;
+    /// * a paste onto a name already in the folder lands BESIDE it under a
+    ///   numbered name, and says which name it got — the promise the menu's
+    ///   own hover text makes, and the same rule `unique_ir_stem` already
+    ///   applies to two captures called the same thing.
+    #[test]
+    fn the_browsers_verbs_only_write_inside_the_irs_folder() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-ir-verbs-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let irs = root.join("IRs");
+        let outside = root.join("Samples");
+        std::fs::create_dir_all(&irs).expect("the IRs folder");
+        std::fs::create_dir_all(&outside).expect("the foreign folder");
+        let write = |at: &std::path::Path, name: &str| {
+            let p = at.join(name);
+            std::fs::write(&p, b"not really a wav").expect("write");
+            p
+        };
+
+        // ── nothing but a real file is bindable ─────────────────────────
+        let real = write(&irs, "Holmes Plate.wav");
+        assert!(super::ir_bindable(&real.to_string_lossy()));
+        // Every ask the UI can encode is recognised AS an ask. Pinned on
+        // `ir_is_sentinel` directly as well as through `ir_bindable`, because
+        // through `ir_bindable` alone the file test would refuse these on its
+        // own and the rule would be guarded by nothing.
+        for ask in [
+            tangent_ui::dialogs::IR_BROWSE.to_owned(),
+            tangent_ui::dialogs::IR_LAST_SAVED.to_owned(),
+            tangent_ui::dialogs::ir_delete_ask(&real.to_string_lossy()),
+            tangent_ui::dialogs::ir_paste_ask(
+                &real.to_string_lossy(),
+                &irs.to_string_lossy(),
+            ),
+        ] {
+            assert!(
+                super::ir_is_sentinel(&ask),
+                "{ask:?} is an ask and was not recognised as one"
+            );
+        }
+        assert!(
+            !super::ir_is_sentinel(&real.to_string_lossy()),
+            "an ordinary path was mistaken for an ask"
+        );
+        for refused in [
+            // The three sentinels, exactly as `dialogs` encodes them. Each
+            // one used to be written into the bay and persisted.
+            tangent_ui::dialogs::IR_BROWSE.to_owned(),
+            tangent_ui::dialogs::IR_LAST_SAVED.to_owned(),
+            tangent_ui::dialogs::ir_delete_ask(&real.to_string_lossy()),
+            tangent_ui::dialogs::ir_paste_ask(
+                &real.to_string_lossy(),
+                &irs.to_string_lossy(),
+            ),
+            // And the ordinary way a bay goes bad: a path that names nothing.
+            irs.join("gone.wav").to_string_lossy().into_owned(),
+            String::new(),
+            // A folder is not an impulse either.
+            irs.to_string_lossy().into_owned(),
+        ] {
+            assert!(
+                !super::ir_bindable(&refused),
+                "{refused:?} would have been written into a bay and persisted"
+            );
+        }
+
+        // ── delete ──────────────────────────────────────────────────────
+        let doomed = write(&irs, "doomed.wav");
+        let (kind, said) = super::ir_delete_file(&doomed.to_string_lossy(), &irs);
+        assert_eq!(kind, Kind::Success, "{said}");
+        assert!(said.contains("doomed.wav"), "the receipt did not name it: {said}");
+        assert!(!doomed.exists(), "the file is still there");
+
+        // Outside the folder: refused, and the file survives.
+        let foreign = write(&outside, "someone-elses.wav");
+        let (kind, said) = super::ir_delete_file(&foreign.to_string_lossy(), &irs);
+        assert_eq!(kind, Kind::Error, "{said}");
+        assert!(
+            foreign.exists(),
+            "a DAW deleted a file out of a folder it was never given"
+        );
+
+        // **And the lexical escape, which is why the check resolves.** Every
+        // component of this path but two is inside `IRs`, so
+        // `Path::starts_with` — which is what the FACE uses to draw the row —
+        // says yes to it.
+        let escape = irs.join("..").join("Samples").join("someone-elses.wav");
+        assert!(
+            std::path::Path::new(&escape).starts_with(&irs),
+            "the fixture no longer reproduces the lexical hole it exists for"
+        );
+        let (kind, _) = super::ir_delete_file(&escape.to_string_lossy(), &irs);
+        assert_eq!(kind, Kind::Error, "a `..` walked out of the IRs folder");
+        assert!(foreign.exists(), "the escape deleted the file it aimed at");
+
+        // ── paste ───────────────────────────────────────────────────────
+        // From a foreign library into the IRs folder: the road the two verbs
+        // exist to make, and the original stays where it was.
+        let (kind, said) = super::ir_paste_file(
+            &foreign.to_string_lossy(),
+            &irs.to_string_lossy(),
+            &irs,
+        );
+        assert_eq!(kind, Kind::Success, "{said}");
+        assert!(irs.join("someone-elses.wav").is_file(), "nothing landed");
+        assert!(foreign.is_file(), "paste MOVED the file instead of copying it");
+
+        // The same paste again: beside, numbered, and the name is said out
+        // loud. Not over the top of a measurement that cost somebody an
+        // evening, and not a dead-end refusal either.
+        let (kind, said) = super::ir_paste_file(
+            &foreign.to_string_lossy(),
+            &irs.to_string_lossy(),
+            &irs,
+        );
+        assert_eq!(kind, Kind::Success, "{said}");
+        assert!(
+            said.contains("someone-elses 2.wav"),
+            "the numbered name was not reported: {said}"
+        );
+        assert!(irs.join("someone-elses 2.wav").is_file());
+        assert!(
+            irs.join("someone-elses.wav").is_file(),
+            "the second paste wrote over the first"
+        );
+
+        // Aimed outside: refused, and nothing lands there.
+        let (kind, _) = super::ir_paste_file(
+            &real.to_string_lossy(),
+            &outside.to_string_lossy(),
+            &irs,
+        );
+        assert_eq!(kind, Kind::Error);
+        assert!(
+            !outside.join("Holmes Plate.wav").exists(),
+            "Tangent wrote into a folder it was never given"
+        );
+        // A source that has since gone is a sentence, not a zero-byte file.
+        let (kind, _) = super::ir_paste_file(
+            &irs.join("vanished.wav").to_string_lossy(),
+            &irs.to_string_lossy(),
+            &irs,
+        );
+        assert_eq!(kind, Kind::Error);
+        assert!(!irs.join("vanished.wav").exists(), "an empty file was created");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **A box that only hisses while it is WORKING does not ship its whole
