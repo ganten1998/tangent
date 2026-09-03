@@ -1821,6 +1821,34 @@ fn draw_ir_browser(
         // **The secondary press opens the menu over THIS row**, carrying the
         // name and the folder it was opened in so the verbs cannot be handed
         // a different file later. See [`IrRowMenu`].
+        // **And the Delete key, on the row under the pointer.**
+        //
+        // The owner asked for it beside the menu — "delete key should work
+        // too" — and the row under the pointer is the right target for the
+        // same reason the right-click's is: this browser has no selection to
+        // aim at. A press LOADS, so a selection would either fight the load
+        // or shadow it; the pointer is already how the user says which file
+        // they mean, and hovering one is the gesture they are making when
+        // they reach for the key.
+        //
+        // It goes through the same `DeleteIr` the menu's row does, so it
+        // lands on the same confirmation with the same file named in it —
+        // which is what makes a key that deletes safe to offer at all. Dead
+        // over a folder and outside the IRs folder, exactly as the menu row
+        // is; `ir_menu_rows` decides that once and this asks it rather than
+        // re-deriving the rule.
+        if !e.dir
+            && hit.hovered()
+            && ui.input(|inp| {
+                inp.key_pressed(egui::Key::Delete) || inp.key_pressed(egui::Key::Backspace)
+            })
+            && ir_under_root(&dir, &live.ir_root)
+        {
+            out = Some(FaceAction::DeleteIr {
+                path: path.clone(),
+                loaded: here,
+            });
+        }
         if hit.secondary_clicked() {
             open_menu = Some(IrRowMenu {
                 entry: Some(live.ir_scroll + i),
@@ -2665,6 +2693,142 @@ mod tests {
             );
         }
         asked
+    }
+
+
+    /// Hover `at` and press `key`, and answer what the face asked for. Two
+    /// frames: egui hit-tests against the previous frame's layout, so the
+    /// move has to land before the key does.
+    fn key_over(
+        ctx: &egui::Context,
+        st: &FaceStyle,
+        live: &mut FaceLive,
+        size: Vec2,
+        at: egui::Pos2,
+        key: egui::Key,
+    ) -> Option<FaceAction> {
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), size);
+        let mut asked = None;
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            if let Some(a) = draw(ui, st, live) {
+                                asked = Some(a);
+                            }
+                        });
+                },
+            );
+        }
+        asked
+    }
+
+    /// **The Delete key deletes the impulse under the pointer**, and it asks
+    /// for it exactly the way the menu row does.
+    ///
+    /// The owner asked for it beside the right-click: "delete key should work
+    /// too". The row under the pointer is the target because this browser has
+    /// no selection to aim at — a press LOADS, so a selection would either
+    /// fight the load or shadow it — and the pointer is already how the user
+    /// says which file they mean.
+    ///
+    /// What makes a key that deletes safe to offer is that it goes through the
+    /// same `DeleteIr` the menu does, so it lands on the same confirmation
+    /// with the same file named in it. The three things it must NOT do are
+    /// each pinned below: no folder, nothing outside the IRs folder, and
+    /// nothing when the pointer is not on a row at all.
+    #[test]
+    fn the_delete_key_removes_the_impulse_under_the_pointer() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let size = Vec2::new(1000.0, 620.0);
+        let l = ir_layout(&ctx, size);
+        let rows = l.browse_rows();
+
+        // Rows 0 and 1 are folders; row 2 is the first impulse.
+        let mut live = a_full_face("@tangent-ir", 2);
+        assert!(!live.ir_entries[2].dir, "the fixture's row 2 is not a file");
+        let name = live.ir_entries[2].name.clone();
+        let want = format!("/m/IRs/{name}");
+        let asked = key_over(
+            &ctx,
+            &st,
+            &mut live,
+            size,
+            rows[2].center(),
+            egui::Key::Delete,
+        );
+        match asked {
+            Some(FaceAction::DeleteIr { path, loaded }) => {
+                assert_eq!(path, want, "the key deleted a different row");
+                assert!(!loaded, "the fixture's row 2 is not the loaded impulse");
+            }
+            other => panic!("Delete over an impulse asked for something else: {}", other.is_some()),
+        }
+
+        // Backspace too: the key that means "delete" on a laptop.
+        let mut live = a_full_face("@tangent-ir", 2);
+        assert!(matches!(
+            key_over(&ctx, &st, &mut live, size, rows[2].center(), egui::Key::Backspace),
+            Some(FaceAction::DeleteIr { .. })
+        ));
+
+        // **A FOLDER is not an impulse.** The menu draws its Delete row dead
+        // over one; the key is dead over one for the same reason.
+        let mut live = a_full_face("@tangent-ir", 2);
+        assert!(live.ir_entries[0].dir);
+        assert!(
+            key_over(&ctx, &st, &mut live, size, rows[0].center(), egui::Key::Delete)
+                .is_none(),
+            "the key deleted a folder"
+        );
+
+        // **And nothing outside the IRs folder.** Read anywhere, write only
+        // at home — `ir_under_root`'s rule, which the key asks rather than
+        // re-derives.
+        let mut live = a_full_face("@tangent-ir", 2);
+        live.ir_dir = "/elsewhere/library".to_owned();
+        assert!(
+            key_over(&ctx, &st, &mut live, size, rows[2].center(), egui::Key::Delete)
+                .is_none(),
+            "the key erased a file out of somebody else's library"
+        );
+
+        // **And nothing at all when the pointer is not on a row.** A key that
+        // deleted whatever was loaded whenever the panel had focus would be a
+        // different and much worse feature.
+        let mut live = a_full_face("@tangent-ir", 2);
+        assert!(
+            key_over(
+                &ctx,
+                &st,
+                &mut live,
+                size,
+                l.browse_head.center(),
+                egui::Key::Delete
+            )
+            .is_none(),
+            "the key acted with the pointer off the list"
+        );
     }
 
     /// **The browser opens on the IRs folder, walks anywhere, and comes

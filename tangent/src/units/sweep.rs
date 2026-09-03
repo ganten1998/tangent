@@ -1025,9 +1025,9 @@ fn tail_threshold_db(ir: &[f32], first: usize, floor_db: f32, sample_rate: f64) 
 /// keeps its length — but it still gets the half-cosine, because an IR that
 /// ends on a step is a step the convolver rings into everything it touches
 /// and there is no path on this road where that is acceptable.
-pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) {
+pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) -> bool {
     if ir.is_empty() || !floor_db.is_finite() || sample_rate <= 0.0 {
-        return;
+        return false;
     }
     let win = ((TAIL_WINDOW_S * sample_rate).round() as usize).max(1);
     let fade = ((TAIL_FADE_S * sample_rate).round() as usize).max(1);
@@ -1035,13 +1035,17 @@ pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) {
     let first = linear_peak(ir) + 1 + fade;
     let threshold_db = tail_threshold_db(ir, first, floor_db, sample_rate);
     match floor_crossing(ir, first, win, threshold_db) {
-        Some(cut) => cut_with_fade(ir, cut, sample_rate),
+        Some(cut) => {
+            cut_with_fade(ir, cut, sample_rate);
+            true
+        }
         // The fade may not reach back past the earliest legal cut — see
         // `fade_tail`. `first` is that index, so what is left after it is all
         // the room a fade is allowed.
         None => {
             let room = ir.len().saturating_sub(first);
             fade_tail(ir, fade.min(room));
+            false
         }
     }
 }
@@ -1098,6 +1102,13 @@ pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) {
 /// measures its own level as its own floor, so it never stands above its own
 /// threshold, so it never votes.
 ///
+/// **Answers whether it CUT**, and that answer is not a nicety: the caller's
+/// other cut is the recorded window, so a set this declines to shorten comes
+/// back exactly as long as the TAIL row said. Ten captures of a plate that
+/// all measure 10.000 s look like a working tool until one is loaded, and the
+/// wizard could not tell the user which of its two cuts it had made. See
+/// `ports::IrLengthCut`.
+///
 /// When no channel reaches its floor the set keeps its length: whatever
 /// bound the caller applied before this one still stands. It does not keep
 /// its ENDING, though — every channel gets the half-cosine here too, so the
@@ -1105,9 +1116,9 @@ pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) {
 /// other path. That is a law about IRs, not about truncations.
 /// [`TRUSTWORTHY_RANGE_DB`] is the level at which the app says a capture is
 /// poor out loud rather than handing back a long IR in silence.
-pub fn truncate_set_at_floor(irs: &mut [Vec<f32>], floor_db: f32, sample_rate: f64) {
+pub fn truncate_set_at_floor(irs: &mut [Vec<f32>], floor_db: f32, sample_rate: f64) -> bool {
     if irs.is_empty() || !floor_db.is_finite() || sample_rate <= 0.0 {
-        return;
+        return false;
     }
     let win = ((TAIL_WINDOW_S * sample_rate).round() as usize).max(1);
     let fade = ((TAIL_FADE_S * sample_rate).round() as usize).max(1);
@@ -1122,7 +1133,10 @@ pub fn truncate_set_at_floor(irs: &mut [Vec<f32>], floor_db: f32, sample_rate: f
         })
         .max();
     match cut {
-        Some(cut) => cut_set_with_fade(irs, cut, sample_rate),
+        Some(cut) => {
+            cut_set_with_fade(irs, cut, sample_rate);
+            true
+        }
         None => {
             for ir in irs.iter_mut() {
                 // The SET's earliest legal cut, so a short channel's fade
@@ -1130,6 +1144,7 @@ pub fn truncate_set_at_floor(irs: &mut [Vec<f32>], floor_db: f32, sample_rate: f
                 let room = ir.len().saturating_sub(first);
                 fade_tail(ir, fade.min(room));
             }
+            false
         }
     }
 }

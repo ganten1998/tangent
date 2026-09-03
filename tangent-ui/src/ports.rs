@@ -915,6 +915,36 @@ pub struct IrOutcome {
     /// about a reference that was never asked for as about one that was
     /// captured and then silently discarded. See [`IrReferenceUse`].
     pub reference: IrReferenceUse,
+    /// **Which of the two cuts decided this IR's length.** See
+    /// [`IrLengthCut`]. Appended at the END, this struct's law.
+    pub length_cut: IrLengthCut,
+    /// Each channel's own peak in the finished IR, dB under the pair's peak
+    /// (so the louder side reads 0.0). THIS is the stereo image, and it is
+    /// the number that says "the right channel is barely there".
+    pub side_l_db: f32,
+    pub side_r_db: f32,
+    /// **How alike the two channels are**, −1..=1, over the IR's first
+    /// half-second — the part a listener hears as the room's width.
+    ///
+    /// +1 is mono, 0 is a wide decorrelated stereo field, and NEGATIVE means
+    /// the two sides are inverses of each other: summed to mono they cancel,
+    /// which is what "the right channel is audible but mostly cancelled"
+    /// sounds like and is a fault in the patching or the box rather than a
+    /// picture of a room. A number, so it can be reported rather than
+    /// guessed at by ear.
+    pub correlation: f32,
+    /// **Was the pre-roll actually silent?** Appended at the END, this
+    /// struct's law.
+    ///
+    /// The pre-roll is where the loop's noise floor is measured and every
+    /// threshold on the road is derived from it. `false` means the stretch
+    /// was still falling across itself — the box was ringing from the last
+    /// sound — so the floor, the usable range and the length are all
+    /// downstream of a number nobody measured. The engine waits for the loop
+    /// to go quiet before it records (`IrCaptureSpec::settle_frames`), but
+    /// that wait is capped, so this is the honest report for a box that never
+    /// settles inside the tail it was given.
+    pub floor_settled: bool,
 }
 
 /// **What the deconvolution did with the reference pass it was handed**, so
@@ -948,6 +978,33 @@ pub enum IrReferenceUse {
     /// away, and the flag alone would have reported that identically to never
     /// having taken one.
     Dropped,
+}
+
+/// **Why the IR is the length it is.**
+///
+/// The wizard cuts a capture twice: to the recorded WINDOW, which is the tail
+/// setting and is the edge of what was ever observed, and then to the level
+/// where the decay meets its own noise floor. The second cut is the one that
+/// produces an IR the length of the reverb; when it does not happen the first
+/// one stands and the file is exactly as long as the TAIL row said.
+///
+/// The owner, after ten captures: "every single IR recorded is pinned to the
+/// tail time, so my Holmes' Plate has been captured 10 times now and still is
+/// a 10s reverb". It was, and the wizard said nothing about it — a 10.000 s
+/// file out of a 10 s setting looks like a working tool right up until you
+/// load it. An archival tool has to say which of its two cuts it made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IrLengthCut {
+    /// The decay sank to its own floor and the IR was cut there. The ordinary
+    /// answer, and the only one that produces a file shorter than the window.
+    Floor,
+    /// **Nothing ever reached the floor inside the recorded window**, so the
+    /// IR is the whole window and its length is the TAIL row rather than a
+    /// measurement of anything. Either the box outlasts the setting — take it
+    /// again with a longer tail — or the capture is too noisy for a decay to
+    /// be told from its own floor, which the range figure beside it answers.
+    #[default]
+    Window,
 }
 
 /// The wizard's live picture, pushed by the host once per frame while the
@@ -1009,6 +1066,18 @@ pub struct IrLive {
     /// happened only once this has moved past it — the same latch, for the
     /// same reason, as the one that guards the result page.
     pub saves: u64,
+    /// **Each return jack's peak on its own**, dBFS, −200 for silence.
+    /// Appended at the END, this struct's law.
+    ///
+    /// [`Self::peak_db`] is the PAIR's — the larger of the two — so a loop
+    /// with one jack dead or one jack inverted meters exactly like a healthy
+    /// one, and the wizard's level page says "set the send here" about a
+    /// return that is half missing. That is not a hypothetical: it is what
+    /// "the left channel having most of the information there and right
+    /// channel audible but mostly cancelled" looks like from the level page,
+    /// which is the last page where a cable can still be moved.
+    pub peak_l_db: f32,
+    pub peak_r_db: f32,
 }
 
 #[cfg(test)]
