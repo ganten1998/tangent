@@ -11279,15 +11279,23 @@ pub fn device_watch(arg: Option<String>) {
     if open {
         // Exactly what `desktop::start_engine` does: the resolved rate and
         // the chosen buffer, both handed to cpal.
+        // `buf=N` asks the output for N frames; `buf=device` asks for nothing.
+        // The buffer is the second half of the same question the rate half of
+        // this probe answers, and it has to be movable to be measured.
+        let want_buffer: Option<u32> = match parts.iter().find_map(|p| p.strip_prefix("buf=")) {
+            Some("device") => None,
+            Some(v) => v.parse().ok(),
+            None => Some(256),
+        };
         match crate::instrument::Engine::start_sized(
             None,
             tangent_record::audio::Timebase::new(),
-            Some(256),
+            want_buffer,
             want_rate,
         ) {
             Ok(mut e) => {
                 println!(
-                    "engine:   opened at {} Hz, {} ch  (asked {want_rate:?} / 256 frames)",
+                    "engine:   opened at {} Hz, {} ch  (asked {want_rate:?} / {want_buffer:?} frames)",
                     e.output().sample_rate,
                     e.output().channels
                 );
@@ -11313,10 +11321,15 @@ pub fn device_watch(arg: Option<String>) {
                     .map_or(tangent_record::audio::InputSelection::Default, |d| {
                         tangent_record::audio::InputSelection::Key(d.key)
                     });
+                // **The same buffer the desk hands the input**, which is the
+                // whole point: `open_audio_path` passes the SETTING to both
+                // halves, and on macOS the input turns it into a quarter. A
+                // probe that passed `None` here was measuring a case the app
+                // never produces.
                 sess.open_input(
                     &sel,
                     tangent_record::audio::Picks::EVERYTHING,
-                    None,
+                    want_buffer,
                     Some(e.output().sample_rate),
                     duplex.as_deref(),
                 );
@@ -11325,10 +11338,28 @@ pub fn device_watch(arg: Option<String>) {
                 }
                 e.set_monitor_on(true);
                 println!(
-                    "input:    {}",
-                    sess.audio_device_name().unwrap_or("<none>")
+                    "input:    {}  ({})",
+                    sess.audio_device_name().unwrap_or("<none>"),
+                    sess.input_stats().map_or_else(
+                        || "no stats".to_owned(),
+                        |(_, st)| format!(
+                            "{} ch at {} Hz, buffer {:?}",
+                            st.channels, st.sample_rate, st.buffer_frames
+                        )
+                    ),
                 );
                 std::thread::sleep(std::time::Duration::from_millis(400));
+                // **What the CALLBACK is really running at**, which is the
+                // only buffer number in the app that is a measurement rather
+                // than a wish. The plan's period is what was ASKED for; this
+                // is counted in the callback itself, and the whole of the
+                // owner's "asked for doesn't equal got" is the distance
+                // between the two. See `Engine::observed_out_block`.
+                println!(
+                    "buffer:   asked {:?} (plan), callback is really running {:?}",
+                    e.output().buffer_frames,
+                    e.observed_out_block(),
+                );
                 session_hold = Some(sess);
                 engine = Some(e);
             }
