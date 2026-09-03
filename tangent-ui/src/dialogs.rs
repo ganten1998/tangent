@@ -732,6 +732,31 @@ pub struct IrWizardState {
     /// inside out (and only for the Retry button, which is why re-entry was
     /// never covered).
     pub armed: Option<u64>,
+    /// **The IR panel this wizard was opened from**, in DESK terms, or
+    /// nothing when it was opened from Setup's menu.
+    ///
+    /// Appended at the END, this struct's law. Adopted once, on the first
+    /// frame — see [`Self::adopt_origin`] — from what the face left behind
+    /// when it pressed the wand.
+    ///
+    /// The owner's report is the whole reason it exists: "at the end,
+    /// there's no option to go back to preset menu, it just has to close the
+    /// window." The result page could save and it could loop back for
+    /// another capture, and those are both forward; the one thing it could
+    /// not do was return to the panel with the browser and the presets in
+    /// it, which is where somebody who has just made an impulse wants to be.
+    /// Closing the window and finding the bay again is a long way round at
+    /// the exact moment enthusiasm is highest.
+    pub origin: Option<(usize, usize)>,
+    /// **This capture has been written to disk**, so the way back knows
+    /// there is a file to load.
+    ///
+    /// Cleared by anything that starts a new capture, because it belongs to
+    /// ONE result: leaving it set through "Record another IR" would have the
+    /// way back binding the PREVIOUS impulse after a pass the user chose not
+    /// to save, which is the wrong-file class of bug this wizard has already
+    /// been bitten by once (see [`Self::armed`]).
+    pub saved: bool,
 }
 
 /// The offered sweep lengths, seconds. 15 is the default (Farina's own
@@ -754,6 +779,8 @@ impl Default for IrWizardState {
             live: crate::ports::IrLive::default(),
             name: String::new(),
             armed: None,
+            origin: None,
+            saved: false,
         }
     }
 }
@@ -792,6 +819,9 @@ impl IrWizardState {
         self.stage = IrStage::Sweep;
         self.armed = None;
         self.name.clear();
+        // The saved flag goes with the name and for the same reason: it
+        // described the capture being left behind.
+        self.saved = false;
     }
 
     /// **Fire a capture through the unit: the pass whose result may move
@@ -809,6 +839,7 @@ impl IrWizardState {
     pub fn arm_capture(&mut self) {
         self.armed = Some(self.live.capture_id);
         self.name.clear();
+        self.saved = false;
     }
 
     /// **Fire the loop-only reference pass**, which produces no result to
@@ -845,6 +876,72 @@ impl IrWizardState {
             self.stage = IrStage::Result;
             self.armed = None;
         }
+    }
+
+    /// **Take the way back the face left, once.**
+    ///
+    /// Called on every frame the wizard draws and does nothing on all but
+    /// the first, because the origin is only ever adopted while there is
+    /// none: a wizard that kept re-reading would pick up the trail a LATER
+    /// panel left, which is a Setup-opened wizard offering to walk back into
+    /// somebody else's bay.
+    pub fn adopt_origin(&mut self, from: Option<(usize, usize)>) {
+        if self.origin.is_none() {
+            self.origin = from;
+        }
+    }
+
+    /// **The way back, if there is one to offer.**
+    ///
+    /// Only from the result page. Not because the other pages could not
+    /// carry it, but because they already have the right word for leaving:
+    /// Cancel, which stops the tone and the capture on the way out. A
+    /// second door out of a page that has one is two things to read where
+    /// there was one.
+    pub fn way_back(&self) -> Option<(usize, usize)> {
+        (self.stage == IrStage::Result).then_some(self.origin).flatten()
+    }
+
+    /// The Save button fired, so there is a file for the way back to load.
+    pub fn remember_saved(&mut self) {
+        self.saved = true;
+    }
+
+    /// **The way back, resolved: the panel to put in the slot, and the ask
+    /// that lands this capture in it.**
+    ///
+    /// A method rather than fifteen lines inside `show`'s closure, for the
+    /// reason [`Self::settle_from_live`]'s own note gives: a rule written out
+    /// inside an egui frame can only be pinned by a copy of itself, and a
+    /// copy goes on passing after the original has been broken. `show` calls
+    /// exactly this, and so does its test.
+    ///
+    /// Three decisions live here.
+    ///
+    /// The panel comes back standing at the IRs folder rather than wherever
+    /// the browser was when the wand was pressed, because that is where the
+    /// wizard writes and therefore where the thing just made is. An empty
+    /// `ir_dir` is how the app is asked for its own default —
+    /// `app::refresh_ir_browser` fills it in only when it is empty.
+    ///
+    /// The capture is LOADED on the way in, which is the whole reason
+    /// somebody presses the button: they have just made an impulse and want
+    /// to hear it. It goes into the bay the wizard was opened from, which is
+    /// the bay whose panel is about to be on screen.
+    ///
+    /// And it does that only if a save actually happened. Pressing this after
+    /// a capture somebody deliberately did not save must not rebind the bay
+    /// to the last file on the shelf — the wrong-file class of fault
+    /// [`Self::armed`] was written to make impossible, one door along.
+    pub fn back_to_panel(&self) -> Option<(Dialog, Option<DialogAction>)> {
+        let (strip, slot) = self.way_back()?;
+        let home = IrFaceReturn { strip, slot, dir: String::new() };
+        let ask = self.saved.then(|| DialogAction::SetInsertIr {
+            strip,
+            slot,
+            path: IR_LAST_SAVED.to_owned(),
+        });
+        Some((home.face(self.saved), ask))
     }
 }
 
@@ -1272,6 +1369,123 @@ pub enum DialogAction {
 /// settle every other picker in that file takes, and comes out of
 /// fullscreen first on the window managers that need it.
 pub const IR_BROWSE: &str = "\u{1f}browse";
+
+// ── the rest of the sentinels that ride the same field ──────────────────────
+//
+// [`IR_BROWSE`] proved the road; three more asks needed it, for its exact
+// reason. Each one is something only the host can do — it owns `IRs/`, the
+// file operations and the notification queue — and none of them can have an
+// arm in `app.rs`, so each rides the `path` field of the ask that already
+// goes to the right place with the right bay attached.
+//
+// **One parser, [`ir_ask`], and the host calls nothing else.** The first
+// draft of this had the host testing `path == IR_BROWSE` and then
+// `path.starts_with(IR_DELETE)` and so on, which is four places that have to
+// agree about an encoding — and the encoding is written HERE, so the fourth
+// one to be added is the one that gets it wrong. The decoder and the two
+// encoders live together and are tested against each other.
+
+/// **"Load whatever the last capture was saved as."**
+///
+/// The way back from the wizard needs the file it just wrote, and the UI
+/// cannot name it: `desktop::save_ir` refuses to overwrite, so a second
+/// "Holmes Plate" is written as `Holmes Plate 2.wav` and only the host knows
+/// which name it got. Guessing would be worse than useless — it would load
+/// the file the PREVIOUS capture is in, under the name somebody just typed,
+/// which is the same class of silent wrong-file bug `IrLive::capture_id`
+/// exists to make impossible.
+///
+/// So the ask says what it means rather than naming a file: bind whatever
+/// the last save wrote. The host is the only side that can answer, and it
+/// already has the answer in its hand.
+pub const IR_LAST_SAVED: &str = "\u{1f}last-saved";
+
+/// **"Delete this file."** The path follows the prefix.
+///
+/// Only ever sent behind a [`Dialog::Confirm`] — see
+/// [`crate::faces::FaceAction::DeleteIr`] for why an impulse earns one — and
+/// only ever aimed inside the IRs folder; see [`crate::faces::ir_under_root`]
+/// for that argument, which is the face's to make and is made there.
+const IR_DELETE: &str = "\u{1f}delete\u{1f}";
+
+/// **"Put a copy of this file in this folder."** The source, a unit
+/// separator, then the destination FOLDER.
+///
+/// Two paths rather than one because the clipboard is the UI's: Copy
+/// remembers a path and nothing more (`crate::faces::FaceLive::ir_clip`), so
+/// the source has to travel with the ask. What lands in the folder is a
+/// COPY — the original stays where it was, which is what makes the verb safe
+/// to offer over somebody else's library.
+const IR_PASTE: &str = "\u{1f}paste\u{1f}";
+
+/// What one [`DialogAction::SetInsertIr`] is actually asking for.
+///
+/// The host matches on this and nothing else. `Load` is the ordinary case
+/// and carries a real path; the rest are the sentinels above, decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IrAsk<'a> {
+    /// Point the bay at this file — the shelf's own road.
+    Load(&'a str),
+    /// Raise the system chooser instead. See [`IR_BROWSE`].
+    Browse,
+    /// Bind whatever the last save wrote. See [`IR_LAST_SAVED`].
+    LastSaved,
+    /// Remove this file from the disk. Already confirmed.
+    Delete(&'a str),
+    /// Copy `file` into the folder `into`, never over anything already
+    /// there — see [`ir_paste_ask`] for what "never over" has to mean.
+    Paste { file: &'a str, into: &'a str },
+}
+
+/// Decode one `SetInsertIr` path. Total: anything that is not a sentinel is
+/// a file to load, which is what every path from the shelf is.
+///
+/// A sentinel this build does not know decodes as `Load` of itself, and the
+/// host's `bind_insert_ir` answers `false` for a file that is not there. The
+/// alternative — guessing at a near miss — is how a typo becomes an action.
+pub fn ir_ask(path: &str) -> IrAsk<'_> {
+    if path == IR_BROWSE {
+        return IrAsk::Browse;
+    }
+    if path == IR_LAST_SAVED {
+        return IrAsk::LastSaved;
+    }
+    if let Some(rest) = path.strip_prefix(IR_DELETE) {
+        return IrAsk::Delete(rest);
+    }
+    if let Some(rest) = path.strip_prefix(IR_PASTE) {
+        if let Some((file, into)) = rest.split_once('\u{1f}') {
+            return IrAsk::Paste { file, into };
+        }
+    }
+    IrAsk::Load(path)
+}
+
+/// The delete ask, encoded. One spelling, so [`ir_ask`] cannot drift from
+/// the thing that produced what it is reading.
+pub fn ir_delete_ask(path: &str) -> String {
+    format!("{IR_DELETE}{path}")
+}
+
+/// The paste ask, encoded: which file, and which folder it lands in.
+///
+/// **What the host must do with a name already in that folder is the
+/// interesting half, and it is decided here because it is a promise the menu
+/// makes.** Not a silent overwrite: the file being written over may be a
+/// capture that cost a sweep, a tail and an evening with hardware, and
+/// nothing about right-clicking Paste says "replace". Not a refusal either —
+/// "a file of that name already exists" at the end of a two-step gesture is
+/// a dead end that leaves the user to go and rename something by hand.
+///
+/// So it lands BESIDE, under a numbered name, and the app says which name it
+/// got. That is not a new rule invented for this menu: it is exactly what
+/// `desktop::save_ir` already does when two captures in one session are
+/// named the same thing (`unique_ir_stem`, then a line saying `saved
+/// <stem>.wav`), and the same collision in the same folder must not have two
+/// different answers depending on which gesture caused it.
+pub fn ir_paste_ask(file: &str, into: &str) -> String {
+    format!("{IR_PASTE}{file}\u{1f}{into}")
+}
 
 // ── the custom tuning editor ────────────────────────────────────────────────
 //
@@ -3370,6 +3584,160 @@ pub fn live_lcd(ctx: &egui::Context) -> (Color32, Color32) {
         ))
 }
 
+// ── the IR panel's two memories ─────────────────────────────────────────────
+//
+// Both are `remember_face`'s trick and both are here for its reason: one fact
+// that has to outlive the window holding it, carried by the context rather
+// than threaded through a signature nobody else needs.
+//
+// They are NOT state the app owns. The app's own clipboards (a copied track,
+// a copied clip) live on `TangentApp` because the app is what acts on them;
+// these two exist only to get one panel back to where it was, and putting
+// them on the app would mean a field, a getter, a push into `FaceLive` and an
+// arm in `apply_dialog_action` for a fact that never leaves this file.
+
+/// The remembered impulse: what Paste would put in a folder.
+const IR_CLIP_ID: &str = "dialog-ir-clip";
+
+/// **Copy: remember a path.** Nothing is read and nothing is written.
+///
+/// A path rather than the file's bytes, and rather than the system
+/// clipboard. The bytes are out of the question — an impulse is a WAV and a
+/// face has no reader, which is this whole crate's line. The system
+/// clipboard is a real option and is deliberately not taken: what would go
+/// on it is a line of text, so pasting it anywhere outside Tangent gives you
+/// a path and not a file, and quietly replacing whatever somebody had copied
+/// with that is a surprise nobody asked a right-click for.
+///
+/// It outlives the face, which is the point: copy an impulse, close the
+/// panel, open another bay's, walk somewhere and paste. It does not outlive
+/// the session, which is honest — the file may not either.
+pub fn remember_ir_clip(ctx: &egui::Context, path: &str) {
+    ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new(IR_CLIP_ID), path.to_owned()));
+}
+
+/// What Copy last remembered, or empty. Pushed into
+/// [`crate::faces::FaceLive::ir_clip`] before the panel draws, so the face
+/// reads it the way it reads everything else.
+pub fn ir_clip(ctx: &egui::Context) -> String {
+    ctx.memory(|m| m.data.get_temp::<String>(egui::Id::new(IR_CLIP_ID)))
+        .unwrap_or_default()
+}
+
+/// **Where an IR panel went, so the window that replaced it can put it
+/// back.**
+const IR_FACE_ID: &str = "dialog-ir-face";
+
+/// The panel that raised whatever is on screen now: its bay, and the folder
+/// its browser was standing in.
+#[derive(Clone)]
+struct IrFaceReturn {
+    strip: usize,
+    slot: usize,
+    dir: String,
+}
+
+impl IrFaceReturn {
+    /// The panel, ready to be put back in the dialog slot.
+    ///
+    /// **A fresh `FaceLive` with two fields set, and that is correct rather
+    /// than lazy.** `app::update`'s face refresh rebuilds every other field
+    /// from the pushed picture before the panel draws — the unit's
+    /// parameters, its preset shelf, the folder listing — so anything filled
+    /// in here would be overwritten by the truth on the next frame. The two
+    /// that are set are the two the app will NOT overwrite: `refresh_ir_browser`
+    /// only defaults `ir_dir` when it is empty, and the reveal is a wish
+    /// nobody else makes.
+    ///
+    /// The unit path is set for the same reason a window is sized before it
+    /// is filled: `faces::draw` picks the IR panel by it, and a frame drawn
+    /// as the generic row list before the push lands is a visible flinch.
+    fn face(&self, reveal: bool) -> Dialog {
+        let mut live = crate::faces::FaceLive {
+            ir_dir: self.dir.clone(),
+            ir_reveal: reveal,
+            ..Default::default()
+        };
+        live.face.path = "@tangent-ir".to_owned();
+        Dialog::InsertFace {
+            strip: self.strip,
+            slot: self.slot,
+            live: Box::new(live),
+        }
+    }
+}
+
+/// **Leave a way back**, at the moment the IR panel raises something over
+/// itself.
+///
+/// Written on that frame and on no other, which is what keeps it from going
+/// stale: the two doors that write it — the Wizard button and the delete
+/// confirmation — both put another dialog in the slot immediately, and the
+/// thing they put there takes this on its own first frame. A wizard opened
+/// from Setup's menu finds nothing here, which is exactly right: there is no
+/// panel behind it to go back to.
+fn remember_ir_face(ctx: &egui::Context, strip: usize, slot: usize, dir: &str) {
+    ctx.memory_mut(|m| {
+        m.data.insert_temp(
+            egui::Id::new(IR_FACE_ID),
+            IrFaceReturn { strip, slot, dir: dir.to_owned() },
+        );
+    });
+}
+
+/// Take it, once. Taken rather than read, so a way back can only ever be
+/// used by the window it was left for.
+fn take_ir_face(ctx: &egui::Context) -> Option<IrFaceReturn> {
+    ctx.memory_mut(|m| {
+        let id = egui::Id::new(IR_FACE_ID);
+        let held = m.data.get_temp::<IrFaceReturn>(id);
+        if held.is_some() {
+            m.data.remove::<IrFaceReturn>(id);
+        }
+        held
+    })
+}
+
+/// **The panel a closing dialog goes back to**, if one left a way back.
+///
+/// A function rather than four lines in the `Confirm` arm, for the reason
+/// `IrWizardState::settle_from_live` gives about rules written inside egui
+/// frames: this one can only be reached by clicking a button in a viewport,
+/// so written there it could only ever be pinned by a copy of itself.
+///
+/// **The take is the rule.** A way back is followed exactly once, by the
+/// window it was left for. Every other `Dialog::Confirm` in the app is raised
+/// from `app.rs` with nothing left here, so for those this reads as nothing
+/// at all; and a trail that somehow outlived its window cannot be picked up
+/// twice by two of them.
+///
+/// No reveal on this road: nothing new was made, and the browser goes back to
+/// the folder the right-click happened in.
+fn face_to_return_to(ctx: &egui::Context, closed: bool) -> Option<Dialog> {
+    if !closed {
+        return None;
+    }
+    take_ir_face(ctx).map(|back| back.face(false))
+}
+
+/// **The destructive button's colour in a confirmation this module raises
+/// itself.**
+///
+/// Every other `Dialog::Confirm` is built in `app.rs` and handed
+/// `master_knob_color` — the theme's own warning red — because that file
+/// reads settings and this one does not. The IR panel's delete confirmation
+/// is raised HERE, one frame after a right-click, and there is no settings
+/// in reach at that point.
+///
+/// So it takes the app's fixed warning red instead, which is a real answer
+/// and not a stand-in: `CORR_RED` is the fixed-meaning family — record red,
+/// limiter red, out-of-phase red — colours no theme is allowed to repaint
+/// because what they mean does not change with the decor. "This erases a
+/// file" belongs in that family as squarely as any of them. It goes through
+/// `surface_of` like every other ground in the app, so its label is measured
+/// on it rather than guessed, on all nineteen themes in both modes.
+const IR_DANGER: Color32 = crate::face::CORR_RED;
+
 fn apply_theme(style: &mut egui::Style, t: &DialogTheme) {
     style.spacing.button_padding = egui::vec2(12.0, 4.0); // Qt: padding 4px 12px
     let set = |wv: &mut egui::style::WidgetVisuals, bg: Color32| {
@@ -5076,6 +5444,11 @@ fn draw_ir_result(
             *action = Some(DialogAction::IrSave {
                 name: s.name.trim().to_owned(),
             });
+            // So the way back knows there is a file to load. The NAME is not
+            // remembered with it, deliberately: the host refuses to overwrite
+            // and may write "Holmes Plate 2.wav", so the only honest handle
+            // on the file is the host's own. See `IR_LAST_SAVED`.
+            s.remember_saved();
         }
     });
     if !s.live.phase.is_empty() {
@@ -5085,6 +5458,66 @@ fn draw_ir_result(
                 .font(bold(10.0))
                 .color(t.faint),
         );
+    }
+}
+
+/// **The question in front of deleting an impulse.**
+///
+/// A `Dialog::Confirm` like the four the app already raises, and it earns one
+/// for a reason none of those quite have: a captured impulse is a
+/// MEASUREMENT. A preset can be dialled again, a track can be recorded again,
+/// a project can be reopened — an IR is a session with hardware, and the plate,
+/// the cabinet, the room or the friend's amp it was taken through may not be
+/// set up again this year. There is nothing on screen it could be rebuilt
+/// from, and `std::fs::remove_file` has no undo. That is the definition of the
+/// class this dialog exists for.
+///
+/// **What happens when the deleted impulse is the one the bay is playing** is
+/// the other half, and it is answered by saying it rather than by acting on
+/// it. The engine has already read the file — `bind_insert_ir` writes the
+/// path into the bay's state and the convolver loads the samples — so the
+/// sound does not stop, change or glitch when the file goes. What breaks is
+/// LATER: the path in the bay now names nothing, so the next time the project
+/// is opened that bay comes up empty.
+///
+/// The tempting fix is for the delete to clear the bay. It is the wrong one.
+/// Tidying a folder would then silence a track mid-session, which is a far
+/// worse surprise than the one being avoided, and it would do it at the exact
+/// moment somebody is looking at a file browser rather than at their mix. So
+/// the sound is left alone and the consequence is printed in the `kept` line,
+/// which is what that line is for: what survives, and how far.
+fn confirm_ir_delete(strip: usize, slot: usize, path: &str, loaded: bool) -> Dialog {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_owned());
+    Dialog::Confirm {
+        title: "Delete impulse".to_owned(),
+        body: format!(
+            "\u{201c}{name}\u{201d} is removed from the disk. A captured impulse \
+             cannot be measured again without the hardware it was taken \
+             through, and there is no undo."
+        ),
+        kept: if loaded {
+            "This is the impulse this bay is playing. The sound does not \
+             change now \u{2014} it is already loaded \u{2014} but the bay will come up \
+             empty the next time this project is opened."
+                .to_owned()
+        } else {
+            "Nothing else is touched. The bay keeps playing whatever it has \
+             loaded, and every other impulse in the folder stays where it is."
+                .to_owned()
+        },
+        choices: vec![ConfirmChoice::new(
+            "Delete",
+            DialogAction::SetInsertIr {
+                strip,
+                slot,
+                path: ir_delete_ask(path),
+            },
+            true,
+        )],
+        warn: IR_DANGER,
     }
 }
 
@@ -5101,6 +5534,21 @@ pub fn show(
     remember_face(ctx, face);
     let dialog = dialog_opt.as_mut()?;
     let mut action = None;
+    // **What this dialog turns into when the frame ends**, if it turns into
+    // anything.
+    //
+    // `show` already owns the slot — the tail below empties it on a close —
+    // and three gestures now need the step past that: the IR panel raising
+    // its delete confirmation over itself, that confirmation coming back to
+    // the panel, and the wizard's way back. Every one of them is one window
+    // in this file handing the slot to another window in this file, with
+    // nothing for the app to decide, so routing them through
+    // `apply_dialog_action` would mean three actions and three arms in a
+    // file this lane does not own.
+    //
+    // Applied AFTER the close, so a dialog that both closed and named a
+    // successor gets the successor rather than nothing.
+    let mut becomes: Option<Dialog> = None;
     // The one place the classification becomes a window: a plugin dialog
     // gets the in-house bar in this frame's face, a question gets the OS's.
     // Decided here rather than in each arm so an arm cannot disagree.
@@ -5326,6 +5774,22 @@ pub fn show(
             let strip = *strip;
             let slot = *slot;
             let unit = live.face.path.clone();
+            // **The clipboard is pushed, like everything else the face
+            // reads.** It lives in this file (see `ir_clip`) rather than on
+            // the face, because it has to outlive the panel; the face gets
+            // this frame's copy and stays a picture of pushed data.
+            //
+            // Only the IR panel, because only the IR panel reads it, and this
+            // runs once a frame for whichever face is open.
+            let is_ir = unit == "@tangent-ir";
+            if is_ir {
+                live.ir_clip = ir_clip(ctx);
+            }
+            // Where the browser is standing, taken BEFORE the panel draws.
+            // A verb that raises another window over this one has to leave a
+            // way back to the folder the hand was in, and the browser can
+            // walk during the frame.
+            let standing = if is_ir { live.ir_dir.clone() } else { String::new() };
             let (title, about) =
                 crate::faces::suite_unit(&unit).unwrap_or(("Tangent", ""));
             // A share of the screen with a floor and a ceiling, per unit —
@@ -5355,32 +5819,45 @@ pub fn show(
                             );
                             ui.add_space(4.0);
                             if let Some(act) = crate::faces::draw(ui, &st, live) {
-                                action = Some(match act {
+                                // **Not every ask is a `DialogAction`.** Copy
+                                // is answered inside this file and Delete
+                                // becomes another window, so the match yields
+                                // an `Option` rather than assuming there is
+                                // always something for the app to do.
+                                action = match act {
                                     crate::faces::FaceAction::Set { id, value } => {
-                                        DialogAction::SetInsertParam {
+                                        Some(DialogAction::SetInsertParam {
                                             strip,
                                             slot,
                                             id,
                                             value,
-                                        }
+                                        })
                                     }
                                     crate::faces::FaceAction::SavePreset { name } => {
-                                        DialogAction::FaceSavePreset { strip, slot, name }
+                                        Some(DialogAction::FaceSavePreset { strip, slot, name })
                                     }
                                     crate::faces::FaceAction::LoadPreset { path } => {
-                                        DialogAction::FaceLoadPreset {
+                                        Some(DialogAction::FaceLoadPreset {
                                             unit: unit.clone(),
                                             path,
-                                        }
+                                        })
                                     }
                                     crate::faces::FaceAction::OpenPedal { pedal } => {
-                                        DialogAction::OpenPedalPicker { strip, slot, pedal }
+                                        Some(DialogAction::OpenPedalPicker { strip, slot, pedal })
                                     }
                                     crate::faces::FaceAction::OpenWizard => {
-                                        DialogAction::OpenIrWizard
+                                        // **Leave a way back before the wand
+                                        // takes the slot.** The wizard adopts
+                                        // this on its own first frame; a
+                                        // wizard opened from Setup's menu
+                                        // finds nothing and offers no return,
+                                        // which is right — there is no panel
+                                        // behind it.
+                                        remember_ir_face(ui.ctx(), strip, slot, &standing);
+                                        Some(DialogAction::OpenIrWizard)
                                     }
                                     crate::faces::FaceAction::PickIr { path } => {
-                                        DialogAction::SetInsertIr { strip, slot, path }
+                                        Some(DialogAction::SetInsertIr { strip, slot, path })
                                     }
                                     crate::faces::FaceAction::BrowseIr => {
                                         // **The face window goes down with
@@ -5409,13 +5886,69 @@ pub fn show(
                                         // long before it raises anything.
                                         // See `IR_BROWSE`.
                                         result.close = true;
-                                        DialogAction::SetInsertIr {
+                                        Some(DialogAction::SetInsertIr {
                                             strip,
                                             slot,
                                             path: IR_BROWSE.to_owned(),
-                                        }
+                                        })
                                     }
-                                });
+                                    // ── the browser's row menu ──────────
+                                    crate::faces::FaceAction::CopyIr { path } => {
+                                        // Answered here and nowhere else: the
+                                        // clipboard is a path in this file's
+                                        // memory, so Copy touches no disk and
+                                        // asks the app for nothing. The Paste
+                                        // row wearing the file's name on the
+                                        // next right-click IS the feedback,
+                                        // and it is in the one place the hand
+                                        // is going to look.
+                                        remember_ir_clip(ui.ctx(), &path);
+                                        None
+                                    }
+                                    crate::faces::FaceAction::PasteIr { into } => {
+                                        // The clip is re-read rather than
+                                        // taken from the pushed copy: a frame
+                                        // old is a frame too many for the one
+                                        // fact this ask is made of.
+                                        let file = ir_clip(ui.ctx());
+                                        (!file.is_empty()).then(|| {
+                                            DialogAction::SetInsertIr {
+                                                strip,
+                                                slot,
+                                                path: ir_paste_ask(&file, &into),
+                                            }
+                                        })
+                                    }
+                                    crate::faces::FaceAction::DeleteIr { path, loaded } => {
+                                        // **The panel steps aside for the
+                                        // question and is put back when it is
+                                        // answered** — either way, including
+                                        // Cancel. There is one dialog slot, so
+                                        // a confirmation over a face IS the
+                                        // face going away; leaving somebody in
+                                        // an empty desk after cancelling a
+                                        // delete would be the same dead end
+                                        // the wizard's missing way back was.
+                                        //
+                                        // The window goes DOWN rather than
+                                        // being redressed in place, which is
+                                        // `BrowseIr`'s move four arms up and
+                                        // is not tidiness: a face is a
+                                        // non-modal plugin window with the
+                                        // in-house bar and a question is a
+                                        // modal one with the OS's, and one
+                                        // viewport asked to become the other
+                                        // mid-life is the kind of change that
+                                        // half-lands. A question is its own
+                                        // window.
+                                        result.close = true;
+                                        remember_ir_face(ui.ctx(), strip, slot, &standing);
+                                        becomes = Some(confirm_ir_delete(
+                                            strip, slot, &path, loaded,
+                                        ));
+                                        None
+                                    }
+                                };
                             }
                         });
                 },
@@ -8697,7 +9230,16 @@ pub fn show(
             // can only be pinned by a copy of itself, and a copy goes on
             // passing after the original has been broken.
             s.settle_from_live();
-            show_dialog_viewport(
+            // **And the way back the panel left, taken once.** See
+            // `IrWizardState::adopt_origin`: the take is what stops a later
+            // Setup-opened wizard from inheriting it.
+            s.adopt_origin(take_ir_face(ctx).map(|o| (o.strip, o.slot)));
+            let back_to = s.way_back();
+            // The button below only says it was pressed; what that MEANS is
+            // `IrWizardState::back_to_panel`, on the state where a test can
+            // drive the very same code.
+            let mut back_now = false;
+            let report = show_dialog_viewport(
                 ctx,
                 placement,
                 "IR Wizard",
@@ -8826,6 +9368,44 @@ pub fn show(
                                         {
                                             s.record_another();
                                         }
+                                        // **Back to the panel this came
+                                        // from** — the owner's ask, and the
+                                        // last of the three roads out of
+                                        // this page. Done closes everything,
+                                        // Record another IR stays in the
+                                        // wizard, and this one returns to the
+                                        // browser and the presets with the
+                                        // impulse just made LOADED and
+                                        // scrolled to.
+                                        //
+                                        // Only when there is a panel behind
+                                        // the wizard: opened from Setup's
+                                        // menu there is nothing to go back
+                                        // to, and a button that closed the
+                                        // window and opened a bay nobody
+                                        // asked for would be worse than no
+                                        // button.
+                                        //
+                                        // Leftmost of the three, so neither
+                                        // hand already trained on Done nor
+                                        // one trained on Record another has
+                                        // to find its button somewhere new.
+                                        if back_to.is_some() {
+                                            if ui
+                                                .add(Button::new(
+                                                    RichText::new("Back to IR Panel")
+                                                        .color(t.text),
+                                                ))
+                                                .on_hover_text(
+                                                    "back to the impulse browser \u{2014} \
+                                                     this capture loaded and waiting",
+                                                )
+                                                .clicked()
+                                            {
+                                                result.close = true;
+                                                back_now = true;
+                                            }
+                                        }
                                     }
                                 }
                                 if s.stage != IrStage::Result
@@ -8841,7 +9421,14 @@ pub fn show(
                             });
                         });
                 },
-            )
+            );
+            if back_now {
+                if let Some((panel, load)) = s.back_to_panel() {
+                    becomes = Some(panel);
+                    action = action.or(load);
+                }
+            }
+            report
         }
         Dialog::Confirm {
             title,
@@ -8870,7 +9457,7 @@ pub fn show(
             // a button row, and `kept` is usually the longest of the three.
             let lines = 1 + body.len() / 46 + if kept.is_empty() { 0 } else { 1 + kept.len() / 46 };
             let height = (108.0 + lines as f32 * 15.0).clamp(150.0, 340.0);
-            show_dialog_viewport(
+            let report = show_dialog_viewport(
                 ctx,
                 placement,
                 title,
@@ -8919,7 +9506,22 @@ pub fn show(
                             });
                         });
                 },
-            )
+            );
+            // **A confirmation raised BY the IR panel goes back to it**, on
+            // either answer.
+            //
+            // There is one dialog slot, so this question took the panel's
+            // place; leaving the desk empty after it is answered would be
+            // exactly the dead end the wizard's missing way back was, and
+            // after CANCEL it would be worse — the user said "no, not that
+            // one" and lost the browser they said it in.
+            //
+            // Every other `Dialog::Confirm` in the app is raised from
+            // `app.rs` with nothing left here, so this reads as nothing at
+            // all for them; `take_ir_face` is a take, so a trail can be
+            // followed exactly once, by the window it was left for.
+            becomes = face_to_return_to(ctx, report.close);
+            report
         }
         // **The A button's menu: which lanes this track exposes.**
         //
@@ -10395,6 +10997,9 @@ pub fn show(
 
     if result.close {
         *dialog_opt = None;
+    }
+    if let Some(next) = becomes {
+        *dialog_opt = Some(next);
     }
     // The arm's own ask first: it is a hand on a control, and the theme key
     // is one press that can simply be pressed again. Both on one frame is
@@ -13826,6 +14431,330 @@ at: None,
         assert!((fresh.level_db + 18.0).abs() < 0.01);
         assert!((fresh.tail_s - 10.0).abs() < 0.01);
         assert!((fresh.sweep_s() - 15.0).abs() < 0.01);
+    }
+
+    // ── the way back out of the wizard, and the browser's row menu ──────
+
+    /// **Every ask that rides `SetInsertIr`'s path field decodes back to
+    /// exactly what put it there.**
+    ///
+    /// One decoder, [`ir_ask`], and it is the only thing the host calls. The
+    /// first draft of this road had the host testing the sentinels one by one
+    /// at the call site, which is several places that all have to agree about
+    /// an encoding written here — and the one added last is the one that gets
+    /// it wrong. So the encoders and the decoder are pinned against each
+    /// other, and an ordinary path is pinned as still being an ordinary path.
+    #[test]
+    fn every_ir_ask_decodes_back_to_what_encoded_it() {
+        // The ordinary case, which must stay ordinary: real paths, including
+        // awkward ones, are loads and nothing else.
+        for path in [
+            "/m/Tangent Media/IRs/Holmes Plate.wav",
+            "C:\\Users\\x\\IRs\\cab 4x12.wav",
+            "/m/IRs/\u{4e2d}\u{6587}.wav",
+            "",
+        ] {
+            assert_eq!(ir_ask(path), IrAsk::Load(path), "{path:?} stopped being a load");
+        }
+        assert_eq!(ir_ask(IR_BROWSE), IrAsk::Browse);
+        assert_eq!(ir_ask(IR_LAST_SAVED), IrAsk::LastSaved);
+
+        let file = "/m/Tangent Media/IRs/Holmes Plate.wav";
+        assert_eq!(ir_ask(&ir_delete_ask(file)), IrAsk::Delete(file));
+
+        let into = "/m/Tangent Media/IRs/Cabs";
+        assert_eq!(
+            ir_ask(&ir_paste_ask(file, into)),
+            IrAsk::Paste { file, into },
+            "the paste ask lost one of its two halves"
+        );
+        // The three sentinels are distinguishable from each other and from
+        // every path, which is the whole basis of the road: no filesystem
+        // path begins with a unit separator.
+        for ask in [
+            IR_BROWSE.to_owned(),
+            IR_LAST_SAVED.to_owned(),
+            ir_delete_ask(file),
+            ir_paste_ask(file, into),
+        ] {
+            assert!(ask.starts_with('\u{1f}'), "{ask:?} could be a real path");
+        }
+    }
+
+    /// **The wizard's last page has a way back to the panel, and it lands
+    /// with the capture loaded.**
+    ///
+    /// The owner's report: "at the end, there's no option to go back to
+    /// preset menu, it just has to close the window." The page could save and
+    /// it could loop round for another capture — both forward — and the one
+    /// thing it could not do was return to the browser and the presets, which
+    /// is where somebody who has just made an impulse wants to be.
+    ///
+    /// **Driven through the production methods, not a copy of them**, which
+    /// is the law the stage machine's own test lays down two doors along: a
+    /// rule written out inside `show`'s closure could only be pinned by a
+    /// copy of itself, and a copy goes on passing after the original is
+    /// broken. `show` calls `adopt_origin`, `way_back` and `back_to_panel`,
+    /// and so does this.
+    #[test]
+    fn the_wizards_last_page_goes_back_to_the_panel_with_the_capture_loaded() {
+        let mut s = IrWizardState::default();
+        // Opened from Setup's menu: no panel behind it, so no way back, on
+        // any page. A button that closed the window and opened a bay nobody
+        // asked for would be worse than no button.
+        s.adopt_origin(None);
+        s.stage = IrStage::Result;
+        assert!(s.way_back().is_none(), "a Setup-opened wizard offered a way back");
+        assert!(s.back_to_panel().is_none());
+
+        // Opened from a panel's wand: the bay comes with it.
+        let mut s = IrWizardState::default();
+        s.adopt_origin(Some((4, 1)));
+        // Adopted ONCE. A wizard that kept re-reading would pick up the trail
+        // a later panel left behind.
+        s.adopt_origin(Some((9, 2)));
+        assert_eq!(s.origin, Some((4, 1)), "the origin was overwritten mid-life");
+
+        // Not offered before the end: the earlier pages already have the
+        // right word for leaving, and it stops the tone on the way out.
+        for stage in [IrStage::Io, IrStage::Level, IrStage::Sweep] {
+            s.stage = stage;
+            assert!(s.way_back().is_none(), "the way back showed up on {stage:?}");
+        }
+
+        // On the result page, with nothing saved: the panel still comes back
+        // — somebody may simply be done — but NOTHING is bound. A capture
+        // deliberately not saved must not rebind the bay to the last file on
+        // the shelf.
+        s.stage = IrStage::Result;
+        assert_eq!(s.way_back(), Some((4, 1)));
+        let (panel, load) = s.back_to_panel().expect("no way back from the result page");
+        assert!(load.is_none(), "an unsaved capture bound something anyway");
+        match &panel {
+            Dialog::InsertFace { strip, slot, live } => {
+                assert_eq!((*strip, *slot), (4, 1), "it went back to the wrong bay");
+                assert!(!live.ir_reveal, "nothing was made, so nothing to reveal");
+            }
+            _ => panic!("the way back is not the panel"),
+        }
+
+        // And after a save: the same panel, standing at the IRs folder, with
+        // the capture bound and marked to be scrolled to.
+        s.remember_saved();
+        let (panel, load) = s.back_to_panel().expect("no way back after a save");
+        match load {
+            Some(DialogAction::SetInsertIr { strip, slot, path }) => {
+                assert_eq!((strip, slot), (4, 1), "the capture went into the wrong bay");
+                // **Not a filename.** `desktop::save_ir` refuses to
+                // overwrite, so a second "Holmes Plate" is written as
+                // "Holmes Plate 2.wav" and only the host knows which name it
+                // got. Guessing here would load the PREVIOUS capture under
+                // the name somebody just typed.
+                assert_eq!(path, IR_LAST_SAVED);
+                assert_eq!(ir_ask(&path), IrAsk::LastSaved);
+            }
+            other => panic!(
+                "the way back did not load the capture: {}",
+                other.is_some() as u8
+            ),
+        }
+        match &panel {
+            Dialog::InsertFace { strip, slot, live } => {
+                assert_eq!((*strip, *slot), (4, 1));
+                assert_eq!(live.face.path, "@tangent-ir", "it opened as the wrong face");
+                assert!(live.ir_reveal, "the capture would not be scrolled to");
+                // Empty is how the app is asked for its own default folder,
+                // which is the IRs folder — where the wizard writes, and so
+                // where the thing just made is. See `app::refresh_ir_browser`.
+                assert!(
+                    live.ir_dir.is_empty(),
+                    "the panel came back standing somewhere of its own: {:?}",
+                    live.ir_dir
+                );
+            }
+            _ => panic!("the way back is not the panel"),
+        }
+
+        // "Record another IR" clears the save, so the way back after a pass
+        // nobody saved cannot bind the one before it.
+        s.record_another();
+        assert!(!s.saved);
+        s.stage = IrStage::Result;
+        assert!(
+            s.back_to_panel().expect("still a way back").1.is_none(),
+            "the way back bound the PREVIOUS capture after record-another"
+        );
+        // Arming a fresh capture does the same.
+        s.remember_saved();
+        s.arm_capture();
+        assert!(!s.saved, "a new capture inherited the last one's save");
+    }
+
+    /// **Deleting an impulse asks first, and says both halves.**
+    ///
+    /// The app has exactly one answer for a gesture that cannot be taken back
+    /// and this is squarely in that class: an IR is a MEASUREMENT, and the
+    /// plate or the cabinet or the friend's amp it was taken through may not
+    /// be set up again. What the box has to carry is what goes and what
+    /// survives — and when the file is the one the bay is playing, the
+    /// survival line is the interesting one, because the sound does not stop
+    /// and the project will still come up empty next time.
+    #[test]
+    fn deleting_an_impulse_asks_first_and_says_what_survives() {
+        let path = "/m/Tangent Media/IRs/Holmes Plate.wav";
+        for loaded in [false, true] {
+            let Dialog::Confirm { title, body, kept, choices, warn } =
+                confirm_ir_delete(3, 2, path, loaded)
+            else {
+                panic!("deleting an impulse did not raise a confirmation");
+            };
+            assert!(!title.is_empty());
+            // It names the file, not the path: the words have to match the
+            // row that was right-clicked.
+            assert!(body.contains("Holmes Plate.wav"), "{body:?}");
+            assert!(body.contains("no undo"), "the box does not say it is final: {body:?}");
+            assert!(!kept.is_empty(), "no survival line");
+            // One destructive answer and nothing else; Cancel is drawn by
+            // the dialog itself and is never in here.
+            assert_eq!(choices.len(), 1);
+            assert!(choices[0].destructive, "the delete button is not marked");
+            assert_eq!(warn, IR_DANGER);
+            // And the button's action is the delete ask, aimed at exactly
+            // the file the words name.
+            match &choices[0].action {
+                DialogAction::SetInsertIr { strip, slot, path: p } => {
+                    assert_eq!((*strip, *slot), (3, 2));
+                    assert_eq!(ir_ask(p), IrAsk::Delete(path));
+                }
+                _ => panic!("the delete button does not delete"),
+            }
+        }
+        // The loaded case says what actually happens, which is nothing now
+        // and an empty bay later. The alternative — clearing the bay on the
+        // delete — would silence a track for tidying a folder.
+        let Dialog::Confirm { kept, .. } = confirm_ir_delete(0, 0, path, true) else {
+            unreachable!()
+        };
+        assert!(kept.contains("does not change now"), "{kept:?}");
+        assert!(kept.contains("empty"), "{kept:?}");
+        let Dialog::Confirm { kept, .. } = confirm_ir_delete(0, 0, path, false) else {
+            unreachable!()
+        };
+        assert!(!kept.contains("empty"), "an unloaded impulse warned about the bay: {kept:?}");
+    }
+
+    /// **A confirmation the IR panel raised goes back to it, once.**
+    ///
+    /// There is one dialog slot, so a question over a face IS the face going
+    /// away; leaving the desk empty afterwards would be the same dead end the
+    /// wizard's missing way back was, and after CANCEL it would be worse —
+    /// the user said "no, not that one" and lost the browser they said it in.
+    ///
+    /// The take is the rule: a way back is followed exactly once, by the
+    /// window it was left for. Every other `Dialog::Confirm` in the app is
+    /// raised from `app.rs` with nothing left here, so for those this reads
+    /// as nothing at all.
+    #[test]
+    fn a_confirmation_the_panel_raised_goes_back_to_it_exactly_once() {
+        let ctx = egui::Context::default();
+        assert!(
+            face_to_return_to(&ctx, true).is_none(),
+            "a confirmation nobody raised from a panel went somewhere"
+        );
+
+        remember_ir_face(&ctx, 5, 3, "/m/Tangent Media/IRs/Cabs");
+        // A dialog that has not closed goes nowhere, and does not spend the
+        // trail on its way past.
+        assert!(face_to_return_to(&ctx, false).is_none());
+
+        match face_to_return_to(&ctx, true) {
+            Some(Dialog::InsertFace { strip, slot, live }) => {
+                assert_eq!((strip, slot), (5, 3));
+                assert_eq!(live.face.path, "@tangent-ir");
+                // Back to the folder the right-click happened in, not to the
+                // root: the hand was standing somewhere.
+                assert_eq!(live.ir_dir, "/m/Tangent Media/IRs/Cabs");
+                // Nothing new was made, so nothing to scroll to.
+                assert!(!live.ir_reveal);
+            }
+            _ => panic!("the confirmation did not go back to the panel"),
+        }
+        assert!(
+            face_to_return_to(&ctx, true).is_none(),
+            "the way back was followed twice"
+        );
+    }
+
+    /// **Copy remembers a path, and it outlives the panel.**
+    ///
+    /// The whole point of the gesture is the walk between the two halves:
+    /// copy an impulse out of somebody else's library, walk home, paste. A
+    /// clipboard tied to the open face would not survive that, and one tied
+    /// to the system clipboard would quietly replace whatever the user had
+    /// copied with a line of text.
+    #[test]
+    fn the_ir_clipboard_holds_a_path_and_nothing_else() {
+        let ctx = egui::Context::default();
+        assert!(ir_clip(&ctx).is_empty(), "something was on the clipboard at rest");
+        remember_ir_clip(&ctx, "/elsewhere/library/Plate 140.wav");
+        assert_eq!(ir_clip(&ctx), "/elsewhere/library/Plate 140.wav");
+        // Read, not taken: Paste can be pressed in two folders in a row.
+        assert_eq!(ir_clip(&ctx), "/elsewhere/library/Plate 140.wav");
+        remember_ir_clip(&ctx, "/m/IRs/Cab.wav");
+        assert_eq!(ir_clip(&ctx), "/m/IRs/Cab.wav", "Copy did not replace the last one");
+    }
+
+    /// **Every theme dresses the delete confirmation, in both modes.**
+    ///
+    /// The one confirmation this file raises itself, so its destructive
+    /// button is the one that cannot take `master_knob_color` — see
+    /// [`IR_DANGER`]. It has to hold the same two bars the app's other
+    /// confirmations are held to: a label anybody can read on it, and enough
+    /// distance from an ordinary button that the warning is not decoration.
+    #[test]
+    fn every_theme_dresses_the_delete_confirmation_in_both_modes() {
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                set.dark_mode = dark;
+                let mode = if dark { "dark" } else { "light" };
+                let name = &theme.name;
+                let face = set
+                    .dark_role("fx_strip")
+                    .filter(|_| dark)
+                    .map_or_else(
+                        || {
+                            let c = set.fx_strip_color.to_color32();
+                            if dark { crate::mixer_panel::shade_face(c, 0.88) } else { c }
+                        },
+                        |c| c.to_color32(),
+                    );
+                let t = theme_of(face);
+                let danger = crate::recorder_panel::surface_of(IR_DANGER);
+                let label = crate::recorder_panel::contrast_ratio(danger.ink, danger.bg);
+                if label < 4.5 {
+                    bad.push(format!("{name} {mode}: the Delete label {label:.2}:1"));
+                }
+                // ΔE and not a contrast ratio, for the reason the other
+                // confirmation sweep spells out: contrast is luminance only,
+                // and a red button against a mid-grey one scores about 1.5:1
+                // while being plainly a red button and a grey one.
+                let apart = crate::recorder_panel::delta_e(danger.bg, t.button_bg);
+                if apart < 25.0 {
+                    bad.push(format!(
+                        "{name} {mode}: the Delete button is only \u{394}E {apart:.1} from \
+                         an ordinary one"
+                    ));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "the delete confirmation is unreadable on some theme:\n  {}",
+            bad.join("\n  ")
+        );
     }
 
     /// **The wizard walks the same four stages on its second run as on its

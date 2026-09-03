@@ -168,6 +168,43 @@ pub struct FaceLive {
     /// one mouse notch is one event, a trackpad flick is thirty, and both
     /// have to mean the same amount of walking.
     pub ir_wheel: crate::app::WheelSteps,
+    /// **The row menu a secondary click opened**, or nothing.
+    ///
+    /// Held here rather than raised as a [`FaceAction`], for the reason
+    /// [`ir_dir`](Self::ir_dir) is: opening a menu changes nothing outside
+    /// this panel, so there is nothing for the app to *do* about it. The
+    /// three verbs it offers are the asks; the menu itself is a gesture, and
+    /// gestures live in the face's own state.
+    pub ir_menu: Option<IrRowMenu>,
+    /// **What Paste would put here — a PATH, pushed like everything else.**
+    ///
+    /// Copy remembers a file; it never reads one. So the clipboard holds the
+    /// path of the impulse that was copied and nothing else: no samples, no
+    /// system clipboard. Two reasons, and both are this module's own law.
+    /// A face never asks the filesystem a question, so it cannot hold a
+    /// file's bytes honestly; and a path is what PASTE needs anyway, because
+    /// the copy itself is a host act. It also survives the walk that is the
+    /// whole point of the gesture — copy an impulse out of somebody else's
+    /// library, walk home, paste — which a selection tied to the visible
+    /// listing would not.
+    ///
+    /// Empty means nothing has been copied. `dialogs::ir_clip` is where it
+    /// actually lives, for the lifetime the face does not have.
+    pub ir_clip: String,
+    /// **Scroll the loaded impulse into view on the next listing that holds
+    /// it.**
+    ///
+    /// The way back from the wizard sets this. Somebody who has just
+    /// captured, saved and asked to go back to the panel is going back to
+    /// hear the thing they made, and a browser that lands on row zero of
+    /// forty makes them hunt for it — the file is highlighted, three
+    /// screens down. It is a wish rather than a scroll position because the
+    /// answer is not known yet on the frame it is made: the host has still
+    /// to bind the file and push its path back, and the folder has still to
+    /// be listed. So it stands until it can be honoured, and any gesture in
+    /// the browser — a walk, a wheel, a press — cancels it, because by then
+    /// the hand has said where it wants to be.
+    pub ir_reveal: bool,
 }
 
 /// One row of the IR browser: a folder to walk into, or an impulse to load.
@@ -182,6 +219,40 @@ pub struct IrEntry {
     pub name: String,
     pub dir: bool,
     pub seconds: f32,
+}
+
+/// **The browser's open row menu: what the secondary click landed on.**
+///
+/// The mixer's insert menu is the shape this follows — a small set of rows
+/// drawn over the panel in the same frame, hit-tested before anything under
+/// them, dismissed by a press anywhere else — because that is how this app
+/// already answers a secondary click and a second idiom would be a second
+/// thing to learn. What it adds is the two fields under `entry`, and they
+/// are here because a browser's list MOVES: a capture landing in the folder
+/// on screen re-lists it, and the wheel scrolls it. A menu that remembered
+/// only a row number would offer "Delete" over one file's name and delete
+/// whichever file had slid into that row.
+///
+/// So the menu carries what it was opened over and the folder it was opened
+/// in, and every verb checks both before it fires. Disagreement is not an
+/// error to report — the listing simply moved — so the menu closes and the
+/// hand tries again, over a row it can see.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrRowMenu {
+    /// The entry the click landed on, as an index into
+    /// [`FaceLive::ir_entries`] — absolute, not a row on screen.
+    ///
+    /// `None` for a press on the list's empty space, and that case is not a
+    /// mistake to swallow: Paste has to be reachable in a folder with
+    /// nothing in it yet, which is exactly the folder somebody makes to put
+    /// a copied impulse into.
+    pub entry: Option<usize>,
+    /// The name that entry carried when the menu opened.
+    pub name: String,
+    /// The folder the browser was standing in when it opened.
+    pub dir: String,
+    /// Where the press landed — the menu's anchor.
+    pub at: egui::Pos2,
 }
 
 /// Whether a file name is an impulse this build can load.
@@ -220,6 +291,39 @@ pub enum FaceAction {
     /// to press to change what is loaded — so it is now the door to the
     /// ordinary chooser, exactly as every other file in this app is picked.
     BrowseIr,
+    // ── the browser's row menu ──────────────────────────────────────────
+    // Three verbs, appended at the END, this enum's law. They are asks and
+    // not acts: a face does not touch a disk, so what leaves here is the
+    // path and the wish, and the host owns every byte that moves.
+    /// **Delete this impulse from disk.** `loaded` says it is the one the
+    /// bay is playing, which the confirmation the app raises has to be able
+    /// to say out loud.
+    ///
+    /// The face never deletes, and it does not even ask the host directly:
+    /// this rides into a `Dialog::Confirm` first. The app has exactly one
+    /// answer for a gesture that cannot be taken back, and an impulse is
+    /// squarely in that class — a capture is a session with hardware (a
+    /// plate, a cabinet, a room, somebody else's amp) that may never be set
+    /// up again, and unlike a preset there is nothing on screen it could be
+    /// rebuilt from.
+    DeleteIr { path: String, loaded: bool },
+    /// **Remember this impulse for Paste.** A path and nothing else — see
+    /// [`FaceLive::ir_clip`], which is where the answer comes back in.
+    ///
+    /// Nothing is read from disk here and nothing is written: Copy is the
+    /// cheapest verb in the menu and the only one that cannot fail. That is
+    /// also why it is offered ANYWHERE the browser can walk, including deep
+    /// inside somebody else's library — remembering where a file is asks
+    /// nobody's permission.
+    CopyIr { path: String },
+    /// **Put a copy of the remembered impulse in this folder.**
+    ///
+    /// The folder, not the row: a paste lands BESIDE what is already there,
+    /// and aiming it at a file would raise the question of replacing that
+    /// file — a question with no good answer at the end of a right-click.
+    /// The source is [`FaceLive::ir_clip`] and the app supplies it, because
+    /// the app is where the clipboard lives.
+    PasteIr { into: String },
 }
 
 fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {
@@ -979,7 +1083,53 @@ impl IrLayout {
             })
             .collect()
     }
+
+    /// **Where an open row menu's rows go**, anchored at the press and
+    /// clamped inside the browser pane.
+    ///
+    /// `mixer_panel::fx_menu_rows`'s bargain, on a different panel: a menu
+    /// that overhung its pane would be a menu whose press lands on somebody
+    /// else's control — here, the kit rows in the other half — and one that
+    /// ran off the bottom of the window would have a row nobody can reach.
+    /// So the whole stack is pushed back inside the pane rather than drawn
+    /// where the pointer happened to be.
+    ///
+    /// A pane with no room for the stack answers `Rect::NOTHING`, and the
+    /// browser closes the menu rather than drawing one that cannot be
+    /// pressed: a menu you can see and cannot dismiss is worse than none.
+    pub fn menu_rows(&self, at: egui::Pos2) -> Vec<Rect> {
+        let none = vec![Rect::NOTHING; IR_MENU_ROWS];
+        if !self.browse.is_positive() {
+            return none;
+        }
+        let n = IR_MENU_ROWS as f32;
+        let total = IR_MENU_ROW_H * n + IR_MENU_GAP * (n - 1.0);
+        let pane = self.browse.shrink(3.0);
+        if pane.width() < 60.0 || pane.height() < total {
+            return none;
+        }
+        let w = IR_MENU_W.min(pane.width());
+        let left = at.x.clamp(pane.left(), pane.right() - w);
+        let top = at.y.clamp(pane.top(), pane.bottom() - total);
+        (0..IR_MENU_ROWS)
+            .map(|i| {
+                Rect::from_min_size(
+                    egui::pos2(left, top + (IR_MENU_ROW_H + IR_MENU_GAP) * i as f32),
+                    egui::vec2(w, IR_MENU_ROW_H),
+                )
+            })
+            .collect()
+    }
 }
+
+/// The row menu's own numbers: a pressing height rather than a reading one
+/// (the mixer's insert menu makes the same move, and for the same reason —
+/// these are targets, not text), a hairline between rows, and a width wide
+/// enough for `Paste "a-long-impulse-name.wav"` without being so wide it
+/// cannot sit inside a stacked panel's browser.
+const IR_MENU_ROW_H: f32 = 20.0;
+const IR_MENU_GAP: f32 = 1.0;
+const IR_MENU_W: f32 = 168.0;
 
 /// What the two kit rows need when the panel is stacked rather than split.
 /// `slider_row` draws at eighteen points and `ui.horizontal` adds its own
@@ -1042,6 +1192,162 @@ pub fn ir_parent(dir: &str) -> String {
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| dir.to_owned())
+}
+
+/// **Whether a path is the IRs folder or somewhere inside it.**
+///
+/// The line the row menu's two writing verbs are drawn on, and the whole of
+/// this panel's answer to "the browser can walk anywhere, so these verbs can
+/// be aimed at a file outside the IRs folder".
+///
+/// **Read anywhere, write only at home.** The browser walks the whole disk
+/// on purpose — "you load any irs there" — so at any moment it may be
+/// standing in a library somebody bought, unzipped and has one copy of. Copy
+/// is fine there: remembering where a file is changes nothing. Delete and
+/// Paste are not, and the reason is not that they are risky in general but
+/// that they would be this app doing them: a DAW that can erase a file it
+/// did not create, out of a folder it was never given, is a DAW nobody can
+/// leave pointed at their sample drive. The confirmation in front of Delete
+/// guards against a mis-aimed click; it does not grant a mandate.
+///
+/// The IRs folder is where the Wizard writes and where the panel opens, so
+/// it is the one place the app already owns files in — and the road from a
+/// foreign library into it is exactly the pair of verbs left live
+/// everywhere: copy there, walk home, paste. Nothing a person can reasonably
+/// want to do is out of reach; it just goes through their own folder.
+///
+/// String work, so it stays on this side of the push with the rest of the
+/// path arithmetic. `Path::starts_with` compares COMPONENTS, which is what
+/// makes `IRs-old` not a child of `IRs`; a `str::starts_with` here would
+/// have quietly said it was.
+pub fn ir_under_root(path: &str, root: &str) -> bool {
+    if path.is_empty() || root.is_empty() {
+        // Before the app has said where home is, nothing is home. A default
+        // of "yes" here would arm Delete on the first frame of a panel that
+        // has not been told anything yet.
+        return false;
+    }
+    std::path::Path::new(path).starts_with(std::path::Path::new(root))
+}
+
+/// How many rows the browser's context menu has. Named because the layout,
+/// the painter and the tests all count to it.
+pub const IR_MENU_ROWS: usize = 3;
+
+/// One row of that menu: the word on it, whether it can be pressed, and the
+/// sentence it says on hover.
+///
+/// **A row that cannot act is drawn dead, never hidden.** The Track menu's
+/// own rule, in its own words: "a row that appears only sometimes is a row
+/// nobody learns is there". A menu whose length changed with where the
+/// browser was standing would teach nobody that Paste exists, and the one
+/// question a person actually has — *why can I not delete this?* — is
+/// answered by the row itself rather than by nothing at all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrMenuRow {
+    pub label: String,
+    pub live: bool,
+    pub tip: String,
+    /// What pressing it asks for. `None` on a dead row.
+    pub ask: Option<IrMenuAsk>,
+}
+
+/// What a live menu row does. Resolved with the row so the painter never
+/// re-derives a path the words were chosen against.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IrMenuAsk {
+    Delete { path: String, loaded: bool },
+    Copy { path: String },
+    Paste { into: String },
+}
+
+/// **The three rows of an open menu, resolved.**
+///
+/// One function for the words, the enablement and the ask, because the three
+/// have to agree: a row that said "Delete" and was live while its ask
+/// resolved to nothing would be a menu row that does nothing, and a row
+/// greyed for one reason while its hover text gave another is worse than no
+/// hover text. The painter draws exactly what comes back and the tests press
+/// exactly what comes back.
+///
+/// `loaded` is the impulse the bay is playing, so Delete can carry the fact
+/// the confirmation needs.
+pub fn ir_menu_rows(live: &FaceLive, menu: &IrRowMenu, loaded: &str) -> Vec<IrMenuRow> {
+    // **The row the menu was opened over, and only if it is still that
+    // row.** See [`IrRowMenu`]: the listing moves under an open menu.
+    let file = menu
+        .entry
+        .and_then(|i| live.ir_entries.get(i))
+        .filter(|e| !e.dir && e.name == menu.name);
+    let target = file.map(|e| {
+        std::path::Path::new(&menu.dir)
+            .join(&e.name)
+            .to_string_lossy()
+            .into_owned()
+    });
+    let home = ir_under_root(&menu.dir, &live.ir_root);
+    let dead = |label: &str, tip: &str| IrMenuRow {
+        label: label.to_owned(),
+        live: false,
+        tip: tip.to_owned(),
+        ask: None,
+    };
+    let delete = match (&target, home) {
+        (Some(path), true) => IrMenuRow {
+            label: "Delete".to_owned(),
+            live: true,
+            tip: format!("{path}\n\nremove this file from the disk — there is no undo"),
+            ask: Some(IrMenuAsk::Delete {
+                path: path.clone(),
+                loaded: path == loaded,
+            }),
+        },
+        (Some(_), false) => dead(
+            "Delete",
+            "Tangent only deletes inside its own IRs folder — copy this\n\
+             impulse home first if you want to manage it here",
+        ),
+        (None, _) => dead("Delete", "right-click an impulse to delete it"),
+    };
+    let copy = match &target {
+        Some(path) => IrMenuRow {
+            label: "Copy".to_owned(),
+            live: true,
+            tip: format!("{path}\n\nremember this file, so Paste can put a copy of it\n\
+                          in another folder"),
+            ask: Some(IrMenuAsk::Copy { path: path.clone() }),
+        },
+        None => dead("Copy", "right-click an impulse to copy it"),
+    };
+    let held = std::path::Path::new(&live.ir_clip)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let paste = match (held.is_empty(), home) {
+        (false, true) => IrMenuRow {
+            label: format!("Paste “{held}”"),
+            live: true,
+            // **The folder is NAMED**, not called "this folder". Paste
+            // always lands where the browser is STANDING, and the menu can
+            // be opened over a folder row — so "this folder" is exactly the
+            // word somebody would read as the one they right-clicked.
+            tip: format!(
+                "{}\n\nput a copy in {} — a name already there is never\n\
+                 written over: the copy is numbered and the app says which\n\
+                 name it got",
+                live.ir_clip,
+                ir_where(&menu.dir, &live.ir_root)
+            ),
+            ask: Some(IrMenuAsk::Paste { into: menu.dir.clone() }),
+        },
+        (true, _) => dead("Paste", "nothing copied yet — Copy an impulse first"),
+        (false, false) => dead(
+            "Paste",
+            "Tangent only writes inside its own IRs folder — walk home\n\
+             with the IRs chip and paste there",
+        ),
+    };
+    vec![delete, copy, paste]
 }
 
 /// The path the header prints: inside the IRs folder it is written relative
@@ -1331,6 +1637,42 @@ fn draw_ir_browser(
             .clamp(0, max_scroll as isize) as usize;
     }
     live.ir_scroll = live.ir_scroll.min(max_scroll);
+    // **A wheel step closes an open menu.** The words on it name a row, and
+    // scrolling slides a different row under them — see [`IrRowMenu`]. The
+    // stale check further down would catch it, but catching it here is what
+    // stops the menu from sitting over a list that has visibly moved.
+    if steps != 0 {
+        live.ir_menu = None;
+        live.ir_reveal = false;
+    }
+
+    // ── the impulse the way back came here to show ──────────────────────
+    // **Scroll the loaded impulse into view, once, when it can be found.**
+    // See [`FaceLive::ir_reveal`]: somebody who has just captured and saved
+    // has come back to hear it, and a folder of forty with the new one three
+    // screens down is a hunt. It is honoured LATE — after the scroll clamp
+    // above and before the rows are drawn — because the answer only exists
+    // once the host has bound the file and listed the folder, which is one
+    // or two frames after the wish was made.
+    if live.ir_reveal && !loaded.is_empty() && !rows.is_empty() {
+        let here = std::path::Path::new(loaded).parent();
+        if here == Some(std::path::Path::new(&dir)) {
+            let name = std::path::Path::new(loaded)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if let Some(at) = live.ir_entries.iter().position(|e| !e.dir && e.name == name) {
+                // The row lands on screen wherever it already was if it was
+                // already showing, and at the top of the window otherwise:
+                // a reveal that always scrolled would jump a list somebody
+                // is already looking at the right part of.
+                if at < live.ir_scroll || at >= live.ir_scroll + rows.len() {
+                    live.ir_scroll = at.min(max_scroll);
+                }
+                live.ir_reveal = false;
+            }
+        }
+    }
 
     // ── the rows ────────────────────────────────────────────────────────
     if live.ir_entries.is_empty() {
@@ -1362,6 +1704,24 @@ fn draw_ir_browser(
     // a widget that is absent every other frame cannot be double-clicked
     // and looks like a list that flinches.
     let mut walk_to: Option<String> = None;
+    // **Nothing under an open menu answers a press.**
+    //
+    // The alternative is to draw the menu on top and trust egui to resolve
+    // the overlap, and that is a bet this panel does not need to take: the
+    // rows are still DRAWN (the strobe rule above), they simply stop being
+    // interactive while a menu names one of them. It also happens to be the
+    // right behaviour — a click on the list with a menu up means "not that,
+    // then", not "load this one instead".
+    let menu_up = live.ir_menu.is_some();
+    // **The list's own ground, registered BEFORE the rows.** egui hands a
+    // press to the last widget registered over the point, so a background
+    // added after the rows would eat every one of their clicks. It is here
+    // for the secondary press on EMPTY space, which is not a mistake to
+    // swallow: Paste has to be reachable in a folder with nothing in it.
+    let ground = (!menu_up).then(|| {
+        ui.interact(l.browse_list, ui.id().with("ir-list"), egui::Sense::click())
+    });
+    let mut open_menu: Option<IrRowMenu> = None;
     for (i, r) in rows.iter().enumerate() {
         let Some(e) = live.ir_entries.get(live.ir_scroll + i) else {
             break;
@@ -1371,7 +1731,9 @@ fn draw_ir_browser(
             .to_string_lossy()
             .into_owned();
         let here = !e.dir && path == loaded;
-        let hit = ui.interact(*r, ui.id().with(("ir-row", i)), egui::Sense::click());
+        let hit = (!menu_up)
+            .then(|| ui.interact(*r, ui.id().with(("ir-row", i)), egui::Sense::click()));
+        let hovered = hit.as_ref().is_some_and(egui::Response::hovered);
         // **The row's own surface, named once**: the loaded impulse wears
         // the raised ground, the row under the pointer the hover shade, and
         // everything else is the pane it is drawn on. Both the fill and the
@@ -1379,12 +1741,12 @@ fn draw_ir_browser(
         // lands on and never of the row it came from.
         let under = if here {
             st.s.raised
-        } else if hit.hovered() {
+        } else if hovered {
             st.s.hover
         } else {
             st.s.well
         };
-        if here || hit.hovered() {
+        if here || hovered {
             ui.painter().rect_filled(*r, 1.5, under);
         }
         // A folder wears the pointing triangle the drumpad's explorer uses,
@@ -1432,13 +1794,35 @@ fn draw_ir_browser(
                 quiet,
             );
         }
+        // A menu is up, so this row was drawn and nothing more — the rest of
+        // the body is the interaction it does not have this frame.
+        let Some(hit) = hit else { continue };
         let hit = hit.on_hover_cursor(egui::CursorIcon::PointingHand);
+        // **A folder is not promised the three verbs**, because two of them
+        // are dead over one: an impulse can be deleted and copied and a
+        // folder cannot. Saying so here rather than letting the menu say it
+        // — the menu still opens, and still explains itself — because a
+        // tooltip that offers what the next click will grey out is the sort
+        // of small lie that makes a whole panel feel untrustworthy.
         let hit = hit.on_hover_text(if e.dir {
-            format!("{}\n\nclick to walk in", e.name)
+            format!("{}\n\nclick to walk in\n\nright-click for the impulse menu", e.name)
         } else {
-            format!("{path}\n\nclick to load this impulse")
+            format!(
+                "{path}\n\nclick to load this impulse\n\nright-click to delete, copy \
+                 or paste"
+            )
         });
-        if hit.clicked() {
+        // **The secondary press opens the menu over THIS row**, carrying the
+        // name and the folder it was opened in so the verbs cannot be handed
+        // a different file later. See [`IrRowMenu`].
+        if hit.secondary_clicked() {
+            open_menu = Some(IrRowMenu {
+                entry: Some(live.ir_scroll + i),
+                name: e.name.clone(),
+                dir: dir.clone(),
+                at: hit.interact_pointer_pos().unwrap_or_else(|| r.left_top()),
+            });
+        } else if hit.clicked() {
             if e.dir {
                 walk_to = Some(path);
             } else if !here {
@@ -1449,9 +1833,32 @@ fn draw_ir_browser(
             }
         }
     }
+    // The empty space below the rows answers the same press, with no file
+    // under it: Delete and Copy come up dead and say why, and Paste — the
+    // one verb that is about the FOLDER — is live.
+    if let Some(g) = ground {
+        if open_menu.is_none() && g.secondary_clicked() {
+            open_menu = Some(IrRowMenu {
+                entry: None,
+                name: String::new(),
+                dir: dir.clone(),
+                at: g
+                    .interact_pointer_pos()
+                    .unwrap_or_else(|| l.browse_list.left_top()),
+            });
+        }
+    }
+    let fresh = open_menu.is_some();
+    if let Some(m) = open_menu {
+        live.ir_menu = Some(m);
+        // A hand that has started aiming at rows does not need the panel
+        // scrolling itself somewhere else underneath it.
+        live.ir_reveal = false;
+    }
     if let Some(into) = walk_to {
         live.ir_dir = into;
         live.ir_scroll = 0;
+        live.ir_reveal = false;
     }
     // More below? A quiet count, so a long folder says so — the drumpad's
     // own marker, for the same reason.
@@ -1464,6 +1871,139 @@ fn draw_ir_browser(
             bold(8.0),
             st.s.faint,
         );
+    }
+    // Last, so it is on top of everything it covers — and registered last,
+    // which is what makes its presses beat the pane under it.
+    face::keep(&mut out, draw_ir_menu(ui, st, live, l, loaded, fresh));
+    out
+}
+
+/// **The row menu: three verbs over the browser.**
+///
+/// Drawn and hit-tested here rather than through egui's own context menu,
+/// because this app hand-draws its menus — the mixer's insert menu is rows
+/// painted over the strip, the arrangement's is a dialog — and a popup with
+/// egui's stock frame inside a themed face would be the one surface in the
+/// panel wearing somebody else's paint.
+///
+/// **Every colour is measured on the surface it lands on.** The stack sits
+/// on `raised` (the ground the header chips already use, held at 4.5:1
+/// against `ink` by `surface_of`), a live row under the pointer moves to
+/// `hover`, and a DEAD row's word takes [`row_faint`] against whichever of
+/// the two it is actually on — the same walk the browser's own durations
+/// take, and for the same reason: `faint` measures 2.95:1 on `raised` on
+/// Mono, Aurora and Moss, which is under the floor a caption has to clear.
+fn draw_ir_menu(
+    ui: &mut egui::Ui,
+    st: &FaceStyle,
+    live: &mut FaceLive,
+    l: &IrLayout,
+    loaded: &str,
+    fresh: bool,
+) -> Option<FaceAction> {
+    let Some(menu) = live.ir_menu.clone() else {
+        return None;
+    };
+    // **A menu whose folder has moved is not this menu.** The chips above
+    // still walk while it is open, and the words on a menu opened in
+    // `IRs/Cabs` mean nothing standing in `IRs`. Closing is the whole
+    // answer: nothing was done, and the hand can press again on a row it
+    // can see.
+    if menu.dir != live.ir_dir {
+        live.ir_menu = None;
+        return None;
+    }
+    let rects = l.menu_rows(menu.at);
+    if rects.iter().any(|r| !r.is_positive()) {
+        // No room to draw it, so no menu — see `IrLayout::menu_rows`.
+        live.ir_menu = None;
+        return None;
+    }
+    let rows = ir_menu_rows(live, &menu, loaded);
+    let bold = |size: f32| egui::FontId::new(size, crate::fonts::courier_bold());
+    let bounds = rects
+        .iter()
+        .fold(Rect::NOTHING, |a, r| a.union(*r))
+        .expand(2.0);
+    ui.painter().rect_filled(bounds, 2.0, st.s.raised);
+    ui.painter().rect_stroke(
+        bounds,
+        2.0,
+        egui::Stroke::new(1.0_f32, st.s.edge),
+        egui::StrokeKind::Inside,
+    );
+    let mut out = None;
+    let mut close = false;
+    for (i, (r, row)) in rects.iter().zip(rows.iter()).enumerate() {
+        let hit = ui.interact(*r, ui.id().with(("ir-menu", i)), egui::Sense::click());
+        let on = if row.live && hit.hovered() {
+            st.s.hover
+        } else {
+            st.s.raised
+        };
+        if row.live && hit.hovered() {
+            ui.painter().rect_filled(*r, 1.5, on);
+        }
+        ui.painter().text(
+            egui::pos2(r.left() + 6.0, r.center().y),
+            egui::Align2::LEFT_CENTER,
+            crate::drumpad_panel::cut_text(
+                ui.painter(),
+                (r.width() - 12.0).max(0.0),
+                &row.label,
+                &bold(11.0),
+            ),
+            bold(11.0),
+            if row.live { st.s.ink } else { row_faint(st, on) },
+        );
+        let hit = if row.live {
+            hit.on_hover_cursor(egui::CursorIcon::PointingHand)
+        } else {
+            hit
+        };
+        let hit = hit.on_hover_text(&row.tip);
+        // A DEAD row swallows its press and stays put, which is deliberate:
+        // it is the one row somebody has a question about, and closing the
+        // menu out from under the sentence that answers it would mean
+        // opening it again to read the rest.
+        if hit.clicked() {
+            if let Some(ask) = row.ask.clone() {
+                close = true;
+                out = Some(match ask {
+                    IrMenuAsk::Delete { path, loaded } => {
+                        FaceAction::DeleteIr { path, loaded }
+                    }
+                    IrMenuAsk::Copy { path } => FaceAction::CopyIr { path },
+                    IrMenuAsk::Paste { into } => FaceAction::PasteIr { into },
+                });
+            }
+        }
+    }
+    // **A press anywhere else dismisses it**, the mixer's manner. Read off
+    // the raw pointer rather than a scrim widget, because a scrim big enough
+    // to catch every press would also have to sit under the menu and over
+    // the rows, and this panel has just gone to some trouble to have no
+    // ambiguous overlaps in it at all.
+    //
+    // **Never on the frame the menu opened.** The press that opens it is
+    // itself a click landing outside the rows that do not exist yet, and it
+    // is not even reliably inside the menu that is about to be drawn:
+    // `menu_rows` CLAMPS the stack back inside the pane, so a right-click
+    // near the bottom or the right-hand edge lands outside the menu it just
+    // summoned. Without this the menu would appear and vanish in one frame,
+    // and only in the corners — the kind of fault that reads as a flaky
+    // right-click rather than as a rule with a hole in it.
+    if !close && !fresh {
+        let away = ui
+            .ctx()
+            .pointer_interact_pos()
+            .is_none_or(|p| !bounds.contains(p));
+        if away && ui.input(|i| i.pointer.any_click()) {
+            close = true;
+        }
+    }
+    if close {
+        live.ir_menu = None;
     }
     out
 }
@@ -1892,6 +2432,33 @@ mod tests {
             // The two halves share the body and never each other.
             assert!(l.body.expand(0.01).contains_rect(l.left), "{at}: left");
             assert!(l.body.expand(0.01).contains_rect(l.browse), "{at}: browse");
+            // **An open row menu never leaves the browser pane.** Summoned
+            // from any of the pane's four corners and from its middle, at
+            // every size the panel can be dragged to — `mixer_panel`'s rule
+            // that a menu row overhanging its pane is a press that lands on
+            // somebody else's control, which here means the kit rows in the
+            // other half. A pane too small for the stack answers
+            // `Rect::NOTHING`, and the browser closes the menu rather than
+            // drawing one nobody can dismiss.
+            for corner in [
+                l.browse.left_top(),
+                l.browse.right_top(),
+                l.browse.left_bottom(),
+                l.browse.right_bottom(),
+                l.browse.center(),
+            ] {
+                let stack = l.menu_rows(corner);
+                assert_eq!(stack.len(), IR_MENU_ROWS, "{at}: wrong number of verbs");
+                if stack.iter().all(|r| !r.is_positive()) {
+                    continue;
+                }
+                for (i, r) in stack.iter().enumerate() {
+                    assert!(
+                        l.browse.expand(0.5).contains_rect(*r),
+                        "{at}: menu row {i} summoned at {corner:?} escaped to {r:?}"
+                    );
+                }
+            }
             assert!(
                 !l.left.intersects(l.browse),
                 "{at}: the halves overlap - {:?} and {:?}",
@@ -2032,19 +2599,33 @@ mod tests {
         size: Vec2,
         at: egui::Pos2,
     ) -> Option<FaceAction> {
+        press_with(ctx, st, live, size, at, egui::PointerButton::Primary)
+    }
+
+    /// The same, with the button named — the secondary press is a whole
+    /// gesture on this panel now, and it has to be driven the way the mouse
+    /// drives it rather than by writing `live.ir_menu` from a test.
+    fn press_with(
+        ctx: &egui::Context,
+        st: &FaceStyle,
+        live: &mut FaceLive,
+        size: Vec2,
+        at: egui::Pos2,
+        button: egui::PointerButton,
+    ) -> Option<FaceAction> {
         let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), size);
         let mut asked = None;
         for events in [
             vec![egui::Event::PointerMoved(at)],
             vec![egui::Event::PointerButton {
                 pos: at,
-                button: egui::PointerButton::Primary,
+                button,
                 pressed: true,
                 modifiers: Default::default(),
             }],
             vec![egui::Event::PointerButton {
                 pos: at,
-                button: egui::PointerButton::Primary,
+                button,
                 pressed: false,
                 modifiers: Default::default(),
             }],
@@ -2141,6 +2722,569 @@ mod tests {
                 other.map(|a| std::mem::discriminant(&a))
             ),
         }
+    }
+
+    // ── the browser's row menu ──────────────────────────────────────────
+
+    /// One ordinary frame with nothing pressed — the panel drawing itself.
+    fn settle(ctx: &egui::Context, st: &FaceStyle, live: &mut FaceLive, size: Vec2) {
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), size);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let _ = draw(ui, st, live);
+                    });
+            },
+        );
+    }
+
+    /// Open the menu with a real secondary press on row `row`, and hand back
+    /// the rects its three verbs are drawn into.
+    ///
+    /// Through the same door the app goes through — a pointer event, the
+    /// production `draw`, and then `IrLayout::menu_rows` with the anchor the
+    /// PANEL stored — so a test that presses `rects[0].center()` presses the
+    /// row that is really there.
+    fn open_menu_on(
+        ctx: &egui::Context,
+        st: &FaceStyle,
+        live: &mut FaceLive,
+        size: Vec2,
+        at: egui::Pos2,
+    ) -> Vec<Rect> {
+        let asked = press_with(ctx, st, live, size, at, egui::PointerButton::Secondary);
+        assert!(
+            asked.is_none(),
+            "opening a menu is not an ask; the panel acted on the secondary press"
+        );
+        let menu = live
+            .ir_menu
+            .clone()
+            .expect("the secondary press opened no menu");
+        ir_layout(ctx, size).menu_rows(menu.at)
+    }
+
+    /// **The secondary press opens the menu over the row it landed on, and
+    /// each verb acts on THAT file.**
+    ///
+    /// The owner's second ask — "the picker needs a right click to
+    /// delete/copy/paste ir" — driven as events rather than by writing the
+    /// menu into the live state, because the interesting half is the aiming:
+    /// a browser's list scrolls and re-lists under an open menu, so a row
+    /// number is not an identity. The menu carries the name and the folder
+    /// and every verb is resolved against them.
+    #[test]
+    fn a_right_click_opens_the_menu_and_every_verb_acts_on_that_row() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let size = Vec2::new(1000.0, 620.0);
+        let mut live = a_full_face("@tangent-ir", 2);
+        let l = ir_layout(&ctx, size);
+        let rows = l.browse_rows();
+        // Rows 0 and 1 are the folders; row 2 is the first impulse.
+        assert!(!live.ir_entries[2].dir);
+        let name = live.ir_entries[2].name.clone();
+        let want = format!("/m/IRs/{name}");
+
+        let menu_rects = open_menu_on(&ctx, &st, &mut live, size, rows[2].center());
+        {
+            let menu = live.ir_menu.clone().expect("no menu");
+            assert_eq!(menu.entry, Some(2), "the menu aimed at the wrong row");
+            assert_eq!(menu.name, name, "the menu did not remember the file");
+            assert_eq!(menu.dir, "/m/IRs", "the menu did not remember the folder");
+        }
+        // The whole stack sits inside the browser pane, wherever it was
+        // summoned — `mixer_panel::fx_menu_rows`'s rule.
+        for (i, r) in menu_rects.iter().enumerate() {
+            assert!(
+                l.browse.expand(0.5).contains_rect(*r),
+                "menu row {i} escaped the pane: {r:?} against {:?}",
+                l.browse
+            );
+        }
+
+        // COPY: a path, and nothing read from disk.
+        match press(&ctx, &st, &mut live, size, menu_rects[1].center()) {
+            Some(FaceAction::CopyIr { path }) => assert_eq!(path, want),
+            other => panic!("Copy asked for {}", named(other.as_ref())),
+        }
+        assert!(live.ir_menu.is_none(), "the menu stayed up after a verb");
+
+        // DELETE, on the same row: the whole path, and the fact the
+        // confirmation needs — this one is not the impulse in the bay.
+        let menu_rects = open_menu_on(&ctx, &st, &mut live, size, rows[2].center());
+        match press(&ctx, &st, &mut live, size, menu_rects[0].center()) {
+            Some(FaceAction::DeleteIr { path, loaded }) => {
+                assert_eq!(path, want);
+                assert!(!loaded, "an impulse nobody loaded was called loaded");
+            }
+            other => panic!("Delete asked for {}", named(other.as_ref())),
+        }
+
+        // And DELETE over the row the bay IS playing says so, because the
+        // question in front of it has to be able to.
+        live.face.extra = vec![("ir_path".to_owned(), want.clone())];
+        let menu_rects = open_menu_on(&ctx, &st, &mut live, size, rows[2].center());
+        match press(&ctx, &st, &mut live, size, menu_rects[0].center()) {
+            Some(FaceAction::DeleteIr { path, loaded }) => {
+                assert_eq!(path, want);
+                assert!(loaded, "the loaded impulse was not reported as loaded");
+            }
+            other => panic!("Delete asked for {}", named(other.as_ref())),
+        }
+
+        // PASTE is about the FOLDER, not the row: it lands beside what is
+        // there and cannot name a file to write over.
+        live.ir_clip = "/elsewhere/library/plate.wav".to_owned();
+        let menu_rects = open_menu_on(&ctx, &st, &mut live, size, rows[2].center());
+        match press(&ctx, &st, &mut live, size, menu_rects[2].center()) {
+            Some(FaceAction::PasteIr { into }) => assert_eq!(into, "/m/IRs"),
+            other => panic!("Paste asked for {}", named(other.as_ref())),
+        }
+    }
+
+    /// A name for whatever came back, for a panic message. `FaceAction` has
+    /// no `Debug` and does not want one — it carries paths.
+    fn named(a: Option<&FaceAction>) -> String {
+        match a {
+            None => "nothing".to_owned(),
+            Some(FaceAction::PickIr { path }) => format!("PickIr({path})"),
+            Some(FaceAction::DeleteIr { path, loaded }) => {
+                format!("DeleteIr({path}, loaded={loaded})")
+            }
+            Some(FaceAction::CopyIr { path }) => format!("CopyIr({path})"),
+            Some(FaceAction::PasteIr { into }) => format!("PasteIr({into})"),
+            Some(FaceAction::BrowseIr) => "BrowseIr".to_owned(),
+            Some(FaceAction::OpenWizard) => "OpenWizard".to_owned(),
+            Some(_) => "some other ask".to_owned(),
+        }
+    }
+
+    /// **A press on the empty space below the rows opens the menu too**, with
+    /// no file under it: Delete and Copy come up dead and say why, and Paste
+    /// — the one verb that is about the folder — is live.
+    ///
+    /// Not a nicety. Copy an impulse, make a folder for it, walk in: there is
+    /// no row to right-click, and a menu that only opened over rows would put
+    /// Paste out of reach in the one place somebody has just walked to in
+    /// order to use it.
+    #[test]
+    fn the_empty_space_below_the_rows_still_answers_the_right_click() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let size = Vec2::new(1000.0, 620.0);
+        let mut live = a_full_face("@tangent-ir", 2);
+        live.ir_entries.clear();
+        live.ir_clip = "/elsewhere/library/plate.wav".to_owned();
+        let l = ir_layout(&ctx, size);
+        let rows = l.browse_rows();
+        // Row 4 of an empty listing is empty space by construction.
+        let menu_rects = open_menu_on(&ctx, &st, &mut live, size, rows[4].center());
+        let menu = live.ir_menu.clone().expect("no menu");
+        assert_eq!(menu.entry, None, "empty space claimed to be a row");
+        let verbs = ir_menu_rows(&live, &menu, "");
+        assert!(!verbs[0].live, "Delete was live with no file under it");
+        assert!(!verbs[1].live, "Copy was live with no file under it");
+        assert!(verbs[2].live, "Paste was dead in the folder it is for");
+        assert!(
+            verbs[0].tip.contains("right-click an impulse"),
+            "the dead Delete row does not say what it wants: {:?}",
+            verbs[0].tip
+        );
+        match press(&ctx, &st, &mut live, size, menu_rects[2].center()) {
+            Some(FaceAction::PasteIr { into }) => assert_eq!(into, "/m/IRs"),
+            other => panic!("Paste asked for {}", named(other.as_ref())),
+        }
+        // And the two dead rows swallow their press: nothing is asked for,
+        // and the menu stays up so the sentence explaining them can be read.
+        let menu_rects = open_menu_on(&ctx, &st, &mut live, size, rows[4].center());
+        assert!(
+            press(&ctx, &st, &mut live, size, menu_rects[0].center()).is_none(),
+            "a dead Delete row acted"
+        );
+        assert!(live.ir_menu.is_some(), "a dead row dismissed the menu");
+    }
+
+    /// **Read anywhere, write only at home.**
+    ///
+    /// The browser walks the whole disk, so the two writing verbs have to
+    /// answer for where they are aimed. Copy is live everywhere — remembering
+    /// a path changes nothing — and Delete and Paste are live only inside the
+    /// IRs folder, which is the only place this app has any business writing.
+    /// See [`ir_under_root`], which carries the argument.
+    #[test]
+    fn delete_and_paste_stop_at_the_edge_of_the_irs_folder() {
+        // The line itself, componentwise: a sibling whose name merely starts
+        // the same way is NOT inside.
+        assert!(ir_under_root("/m/IRs", "/m/IRs"));
+        assert!(ir_under_root("/m/IRs/Cabs/Marshall", "/m/IRs"));
+        assert!(!ir_under_root("/m/IRs-old", "/m/IRs"));
+        assert!(!ir_under_root("/m", "/m/IRs"));
+        assert!(!ir_under_root("/elsewhere/library", "/m/IRs"));
+        // And before the app has said where home is, nothing is home.
+        assert!(!ir_under_root("/m/IRs", ""));
+
+        let mut live = a_full_face("@tangent-ir", 2);
+        live.ir_clip = "/m/IRs/plate.wav".to_owned();
+        let over_a_file = |live: &FaceLive, dir: &str| IrRowMenu {
+            entry: Some(2),
+            name: live.ir_entries[2].name.clone(),
+            dir: dir.to_owned(),
+            at: egui::pos2(0.0, 0.0),
+        };
+
+        let home = ir_menu_rows(&live, &over_a_file(&live, "/m/IRs"), "");
+        assert!(home[0].live && home[1].live && home[2].live, "all three sleep at home");
+
+        // Standing in somebody else's library: Copy still works, and it is
+        // the road home — copy there, walk back, paste.
+        live.ir_dir = "/elsewhere/library".to_owned();
+        let away = ir_menu_rows(&live, &over_a_file(&live, "/elsewhere/library"), "");
+        assert!(!away[0].live, "Delete was offered outside the IRs folder");
+        assert!(away[1].live, "Copy was refused outside the IRs folder");
+        assert!(!away[2].live, "Paste was offered outside the IRs folder");
+        for row in [&away[0], &away[2]] {
+            assert!(
+                row.tip.contains("IRs folder"),
+                "a dead row does not say why: {:?}",
+                row.tip
+            );
+        }
+    }
+
+    /// **Pasting onto a name that is already there is OFFERED, not refused —
+    /// and the ask cannot express an overwrite.**
+    ///
+    /// The two failures the owner ruled out are a silent overwrite and a
+    /// cryptic refusal, and the shape of the ask is what rules the first one
+    /// out for good: [`FaceAction::PasteIr`] carries a FOLDER. There is no
+    /// field in it that could name the file to write over, so no arm on the
+    /// far side can be written that does. What the host does with the
+    /// collision — number the copy and say which name it got, exactly as
+    /// `desktop::save_ir` already does for two captures named the same thing
+    /// — is the other half, and it is stated on `dialogs::ir_paste_ask`.
+    #[test]
+    fn pasting_onto_a_name_already_in_the_folder_is_offered_not_refused() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let size = Vec2::new(1000.0, 620.0);
+        let mut live = a_full_face("@tangent-ir", 2);
+        // The clipboard holds a file whose name is ALREADY in this folder.
+        let clash = live.ir_entries[3].name.clone();
+        assert!(!live.ir_entries[3].dir);
+        live.ir_clip = format!("/elsewhere/library/{clash}");
+        let l = ir_layout(&ctx, size);
+        let rows = l.browse_rows();
+        let menu_rects = open_menu_on(&ctx, &st, &mut live, size, rows[3].center());
+        let menu = live.ir_menu.clone().expect("no menu");
+        let verbs = ir_menu_rows(&live, &menu, "");
+        assert!(
+            verbs[2].live,
+            "Paste refused a name already in the folder: {:?}",
+            verbs[2].tip
+        );
+        assert!(
+            verbs[2].label.contains(&clash),
+            "the Paste row does not name what it would put here: {:?}",
+            verbs[2].label
+        );
+        match press(&ctx, &st, &mut live, size, menu_rects[2].center()) {
+            // The folder, and only the folder.
+            Some(FaceAction::PasteIr { into }) => assert_eq!(into, "/m/IRs"),
+            other => panic!("Paste asked for {}", named(other.as_ref())),
+        }
+    }
+
+    /// **The menu cannot be handed a different file from the one it names.**
+    ///
+    /// A capture landing in the folder on screen re-lists it and the wheel
+    /// scrolls it, both while a menu is open. The menu remembers the name and
+    /// the folder; when either stops matching it closes, because nothing was
+    /// done and the hand can press again on a row it can see.
+    #[test]
+    fn a_menu_over_a_listing_that_moved_closes_rather_than_aiming_somewhere_else() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let size = Vec2::new(1000.0, 620.0);
+        let mut live = a_full_face("@tangent-ir", 2);
+        let l = ir_layout(&ctx, size);
+        let rows = l.browse_rows();
+        let menu_rects = open_menu_on(&ctx, &st, &mut live, size, rows[2].center());
+
+        // The row the menu names is now a DIFFERENT file — the shape a
+        // re-listing takes when a capture lands ahead of it in the sort.
+        live.ir_entries[2].name = "something-else.wav".to_owned();
+        let stale = live.ir_menu.clone().expect("the menu vanished on its own");
+        assert!(
+            ir_menu_rows(&live, &stale, "")[0].ask.is_none(),
+            "Delete resolved against a row whose file had changed"
+        );
+        assert!(
+            press(&ctx, &st, &mut live, size, menu_rects[0].center()).is_none(),
+            "a menu over a moved listing still deleted something"
+        );
+
+        // **A folder change with no press at all still closes it.** The
+        // walk below closes it twice over — the press lands outside the menu
+        // AND the folder moves — so the folder check has to be cornered on
+        // its own, or a rule this panel depends on is guarded by nothing.
+        // It is not a hypothetical road: the app owns `ir_dir` too, and
+        // `refresh_ir_browser` writes it.
+        let _ = open_menu_on(&ctx, &st, &mut live, size, rows[2].center());
+        live.ir_dir = "/m/IRs/Cabs".to_owned();
+        settle(&ctx, &st, &mut live, size);
+        assert!(
+            live.ir_menu.is_none(),
+            "the menu survived the browser moving to another folder"
+        );
+        live.ir_dir = "/m/IRs".to_owned();
+
+        // And a walk out from under it closes it outright: the words on a
+        // menu opened in one folder mean nothing standing in another.
+        let menu_rects = open_menu_on(&ctx, &st, &mut live, size, rows[2].center());
+        let _ = press(&ctx, &st, &mut live, size, l.browse_up.center());
+        assert_eq!(live.ir_dir, "/m");
+        assert!(live.ir_menu.is_none(), "the menu survived the walk");
+        // Pressing where its rows WERE is now a press on the list again —
+        // which is the point: the menu is gone, so nothing it offered can
+        // still be reached. Whatever the row under the pointer does, it is
+        // not one of the three verbs.
+        let after = press(&ctx, &st, &mut live, size, menu_rects[1].center());
+        assert!(
+            !matches!(
+                after,
+                Some(FaceAction::DeleteIr { .. })
+                    | Some(FaceAction::CopyIr { .. })
+                    | Some(FaceAction::PasteIr { .. })
+            ),
+            "a menu closed by a walk still ran a verb: {}",
+            named(after.as_ref())
+        );
+    }
+
+    /// **The way back from the wizard lands with the new impulse in view.**
+    ///
+    /// `FaceLive::ir_reveal` is a wish rather than a scroll position because
+    /// the answer does not exist yet on the frame it is made: the host has
+    /// still to bind the file and list the folder. So it stands until it can
+    /// be honoured — and then honours itself once, and only for a file that
+    /// is actually in the folder on screen.
+    #[test]
+    fn the_way_back_scrolls_the_impulse_it_came_to_show_into_view() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let size = Vec2::new(1000.0, 620.0);
+        let mut live = a_full_face("@tangent-ir", 2);
+        let l = ir_layout(&ctx, size);
+        let rows = l.browse_rows();
+        // Something far enough down the folder to be off the first page.
+        let at = live.ir_entries.len() - 1;
+        let name = live.ir_entries[at].name.clone();
+        assert!(at >= rows.len(), "the fixture is too short to test a scroll");
+        let path = format!("/m/IRs/{name}");
+        live.face.extra = vec![("ir_path".to_owned(), path)];
+        live.ir_reveal = true;
+        assert_eq!(live.ir_scroll, 0);
+
+        // One ordinary frame is all it takes, once the listing holds it.
+        let _ = press(&ctx, &st, &mut live, size, l.browse.left_bottom());
+        assert!(!live.ir_reveal, "the wish was not spent");
+        assert!(
+            live.ir_scroll > 0 && at >= live.ir_scroll && at < live.ir_scroll + rows.len(),
+            "row {at} is not on screen: scroll {} of {} rows",
+            live.ir_scroll,
+            rows.len()
+        );
+
+        // A wish aimed at a file this folder does NOT hold stands rather than
+        // scrolling somewhere arbitrary — the file may be about to arrive.
+        let mut live = a_full_face("@tangent-ir", 2);
+        live.face.extra = vec![("ir_path".to_owned(), "/other/place/x.wav".to_owned())];
+        live.ir_reveal = true;
+        let _ = press(&ctx, &st, &mut live, size, l.browse.left_bottom());
+        assert!(live.ir_reveal, "a wish that could not be honoured was thrown away");
+        assert_eq!(live.ir_scroll, 0, "the browser scrolled to a file it does not hold");
+    }
+
+    /// Draw one frame of the panel with `live` as it stands and hand back
+    /// every rectangle filled and every run of text painted: the fill's
+    /// colour and rect, and each text's colour and where it landed.
+    ///
+    /// **The sweep below reads this rather than the palette**, and that is
+    /// the whole point of it. A theme test that measures `row_faint(&st,
+    /// st.s.raised)` is measuring `row_faint`, which nobody broke; it goes on
+    /// passing after the painter has been changed to write `st.s.faint`
+    /// straight onto the button. Asking the picture what colour it actually
+    /// is, is the only version of this test that can fail for the reason it
+    /// was written.
+    fn painted(
+        ctx: &egui::Context,
+        st: &FaceStyle,
+        live: &mut FaceLive,
+        size: Vec2,
+    ) -> (Vec<(Rect, egui::Color32)>, Vec<(Rect, egui::Color32)>) {
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), size);
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let _ = draw(ui, st, live);
+                    });
+            },
+        );
+        let mut fills = Vec::new();
+        let mut texts = Vec::new();
+        for cs in &out.shapes {
+            match &cs.shape {
+                egui::Shape::Rect(r) if r.fill != egui::Color32::TRANSPARENT => {
+                    fills.push((r.rect, r.fill));
+                }
+                egui::Shape::Text(t) => {
+                    let r = Rect::from_min_size(t.pos, t.galley.rect.size());
+                    texts.push((
+                        r,
+                        t.override_text_color.unwrap_or(t.fallback_color),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        (fills, texts)
+    }
+
+    /// **Every theme dresses the row menu, in both modes — measured off the
+    /// picture.**
+    ///
+    /// The menu is new SURFACE: a stack over the browser's well with live
+    /// words, dead words and a hover shade on it. This app's most repeated
+    /// fault, seven times now, is ink inherited from a role instead of
+    /// measured on the ground it lands on, and every one of those seven was
+    /// found in a SCREENSHOT rather than by a test — because the tests were
+    /// measuring the helper that would have got it right.
+    ///
+    /// So this one draws the menu and reads the shapes back: for every run of
+    /// text inside the stack, the fill actually painted under it, and the
+    /// contrast between the two. A dead row is a caption and clears 3:1; a
+    /// live one is body text and clears 4.5:1.
+    #[test]
+    fn every_theme_dresses_the_row_menu_in_both_modes() {
+        let ctx = a_test_ctx();
+        let size = Vec2::new(1000.0, 620.0);
+        let l = ir_layout(&ctx, size);
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                set.dark_mode = dark;
+                let p = crate::recorder_panel::palette(&set);
+                let st = FaceStyle::new(p.bg, p.lcd, p.lcd_face);
+                let mode = if dark { "dark" } else { "light" };
+                let at = format!("{} {mode}", theme.name);
+
+                // A menu over a FOLDER row: Delete and Copy come up dead
+                // (a folder is not an impulse) and Paste is live, so one
+                // frame carries both kinds of word.
+                let mut live = a_full_face("@tangent-ir", 2);
+                live.ir_clip = "/elsewhere/plate.wav".to_owned();
+                let rows = l.browse_rows();
+                live.ir_menu = Some(IrRowMenu {
+                    entry: Some(0),
+                    name: live.ir_entries[0].name.clone(),
+                    dir: live.ir_dir.clone(),
+                    at: rows[0].center(),
+                });
+                let verbs = ir_menu_rows(
+                    &live,
+                    live.ir_menu.as_ref().expect("the fixture set a menu"),
+                    "",
+                );
+                assert!(
+                    verbs.iter().any(|v| v.live) && verbs.iter().any(|v| !v.live),
+                    "the fixture stopped carrying both a live and a dead row"
+                );
+                let stack = l
+                    .menu_rows(rows[0].center())
+                    .iter()
+                    .fold(Rect::NOTHING, |a, r| a.union(*r));
+                let (fills, texts) = painted(&ctx, &st, &mut live, size);
+
+                // The stack has to be FINDABLE over the pane it covers, or a
+                // menu is three words floating on a list. Read off the fill
+                // that was actually painted at the stack's own rectangle.
+                let ground = fills
+                    .iter()
+                    .filter(|(r, _)| r.contains_rect(stack.shrink(1.0)) && r.width() < l.browse.width())
+                    .map(|(_, c)| *c)
+                    .next_back();
+                match ground {
+                    None => bad.push(format!("{at}: the menu painted no ground of its own")),
+                    Some(c) => {
+                        let over = crate::recorder_panel::contrast_ratio(c, st.s.well);
+                        if over < 1.1 {
+                            bad.push(format!("{at}: the menu is {over:.2}:1 on the pane"));
+                        }
+                    }
+                }
+                let ground = ground.unwrap_or(st.s.raised);
+
+                // And every word inside it, against that ground. The floor
+                // is a caption's, because the dead rows are the ones somebody
+                // stops to read and they are the quietest thing here.
+                let mut words = 0;
+                for (r, ink) in &texts {
+                    // A run with no width is a galley that laid out nothing,
+                    // which is a row with no word on it however honest its
+                    // colour is. Counted out, so the tally below notices.
+                    if !stack.expand(1.0).contains_rect(*r) || r.width() < 1.0 {
+                        continue;
+                    }
+                    words += 1;
+                    let ratio = crate::recorder_panel::contrast_ratio(*ink, ground);
+                    if ratio < 3.0 {
+                        bad.push(format!("{at}: a menu word is {ratio:.2}:1 on its ground"));
+                    }
+                }
+                if words < IR_MENU_ROWS {
+                    bad.push(format!("{at}: only {words} of three verbs were painted"));
+                }
+                // The live words are body text and owe the full bar. Read
+                // from the palette, because THAT is what the painter writes
+                // for a live row — and the picture above has already proved
+                // it is the palette the painter is reading.
+                let live_ink = crate::recorder_panel::contrast_ratio(st.s.ink, ground);
+                if live_ink < 4.5 {
+                    bad.push(format!("{at}: a live verb is {live_ink:.2}:1"));
+                }
+                let hovered = crate::recorder_panel::contrast_ratio(st.s.ink, st.s.hover);
+                if hovered < 4.5 {
+                    bad.push(format!("{at}: a live verb under the pointer is {hovered:.2}:1"));
+                }
+                // Dead has to READ as dead beside live, or greying it out
+                // says nothing at all.
+                let apart =
+                    crate::recorder_panel::contrast_ratio(row_faint(&st, ground), st.s.ink);
+                if apart < 1.15 {
+                    bad.push(format!("{at}: a dead verb is only {apart:.2}:1 from a live one"));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "the row menu is unreadable on some theme:\n  {}",
+            bad.join("\n  ")
+        );
     }
 
     /// An empty folder and a filename nobody could have meant both lay out
