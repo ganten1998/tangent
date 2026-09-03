@@ -21693,6 +21693,14 @@ impl TangentApp {
                         .unwrap_or_default()
                 })
             });
+        // **And which of them are out of circuit**, off the same seat
+        // arithmetic in the same breath, so a chip's word and its state can
+        // never come from two different pedals. The board ships bypassed
+        // (see `desktop::seed_amp_board`), so this is the difference
+        // between a seeded board and a broken one, on screen.
+        live.pedals_off = recorder::pedal_owner(seat).map_or([false; recorder::AMP_PEDALS], |ch| {
+            std::array::from_fn(|p| self.insert_bypassed(recorder::amp_pedal_seat(ch, p), 0))
+        });
         match live.face.path.as_str() {
             "@tangent-eq" => {
                 let dt = ctx.input(|i| i.stable_dt);
@@ -23270,6 +23278,28 @@ impl TangentApp {
         let on = self.settings.insert_bypass.toggle(strip, slot);
         self.save_settings();
         on
+    }
+
+    /// **Put one bay in a STATED position** rather than flipping whatever it
+    /// was in. Answers whether anything moved.
+    ///
+    /// [`Self::toggle_insert_bypass`] is the gesture — a hand on a chip, and
+    /// the hand can see what it is flipping. This is for a caller that knows
+    /// what it wants and cannot see: the host's default-pedalboard seed
+    /// (`desktop::seed_amp_board`) writes seven pedals into a channel's
+    /// board and needs all seven OUT of circuit, and a toggle there would
+    /// switch back on any seat a previous seed had already switched off.
+    ///
+    /// Saved only when the flag actually moved, exactly as
+    /// `BypassBays::set` answers: the seed runs inside a per-frame reconcile
+    /// and a settings write per frame for a file that is already correct is
+    /// the kind of thing that shows up as a disk light nobody can explain.
+    pub fn set_insert_bypass(&mut self, strip: usize, slot: usize, on: bool) -> bool {
+        let moved = self.settings.insert_bypass.set(strip, slot, on);
+        if moved {
+            self.save_settings();
+        }
+        moved
     }
 
     /// A short name for the audio interface, used on every one of its inputs.

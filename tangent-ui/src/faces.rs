@@ -216,6 +216,26 @@ pub struct FaceLive {
     /// belong together: the answer to "I want this impulse out of the way"
     /// should not have to be deleting the file.
     pub bypassed: bool,
+    /// **Which of the seven pedal chips are switched OUT of circuit** —
+    /// loaded, named, openable, and not applied. Pushed by the app,
+    /// appended at the END, this struct's law.
+    ///
+    /// Read only where [`pedals`](Self::pedals) is `Some`, and indexed the
+    /// same way, because the two answer about the same seven seats. A
+    /// separate array rather than widening `pedals` to a pair for exactly
+    /// that reason this struct is append-only: `pedals` is read in three
+    /// places and changing its shape is a change every one of them has to
+    /// be right about on the same commit.
+    ///
+    /// It exists because a chip had exactly two looks, empty and filled,
+    /// and the seeded board now ships switched off (see
+    /// `desktop::seed_amp_board`). A default nobody can SEE is a board
+    /// that mysteriously does nothing, which is a worse fault than the one
+    /// shipping it bypassed fixes. Shift-clicking a chip has toggled this
+    /// same flag since the day the chip learned to carry its own modifiers
+    /// — `App::bay_gesture`, the one door every bay gesture comes through —
+    /// and until now nothing on screen answered.
+    pub pedals_off: [bool; crate::recorder::AMP_PEDALS],
 }
 
 /// One row of the IR browser: a folder to walk into, or an impulse to load.
@@ -641,8 +661,15 @@ pub fn preset_foot_height(ui: &egui::Ui) -> f32 {
 }
 
 /// The whole face: glass on top where a unit has a picture, rows under it,
-/// presets at the foot. Returns at most one ask per frame — a hand only
-/// does one thing at a time, and a queue of asks is a queue of bugs.
+/// the bypass switch and then the presets at the foot. Returns at most one
+/// ask per frame — a hand only does one thing at a time, and a queue of asks
+/// is a queue of bugs.
+///
+/// The two footer rows are appended HERE rather than drawn by each panel,
+/// which is what makes them promises rather than habits: a face added
+/// tomorrow gets both without being told, and the one panel that has to
+/// RESERVE room for them (`faces_amp::amp_floor_cost`) has one place to
+/// read. [`draws_its_own_bypass`] names the two exceptions and why.
 pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<FaceAction> {
     let path = live.face.path.clone();
     let mut action = match path.as_str() {
@@ -680,9 +707,81 @@ pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fa
             out
         }
     };
+    if !draws_its_own_bypass(&path) {
+        face::keep(&mut action, bypass_row(ui, st, live));
+    }
     face::keep(&mut action, preset_strip(ui, st, live));
     action
 }
+
+/// **Which faces are NOT given the shared bypass row**, and why each one is
+/// out. Two, and neither is an oversight.
+///
+/// `@tangent-ir` draws its own, in its own layout, beside the wand — it was
+/// the first face to have one and the rect is part of `IrLayout`. Adding a
+/// second would be two switches onto one flag on one panel.
+///
+/// The AMP is out on room. Its panel is a measured budget — nine rows,
+/// three captions, a board and the preset strip under them — and at the 540
+/// by 360 window `dialogs::FACE_SIZES` opens it at, on JetBrains Mono,
+/// `the_amp_is_whole_at_its_own_window_on_every_font` measures ONE point of
+/// headroom. A row here would push the save strip off the bottom of the
+/// window, where the desktop path puts no scroll area under it, which is
+/// exactly the fault that test exists to catch. The amp's own bypass is
+/// where it has always been: shift-click its bay in the mixer, or in the
+/// arrangement's header chips. The seven pedals in front of it — the units
+/// this row was actually asked for — each get one on their own face.
+fn draws_its_own_bypass(path: &str) -> bool {
+    matches!(path, "@tangent-ir" | crate::faces_amp::AMP_PATH)
+}
+
+/// **BYPASS, on every face that has room for it.**
+///
+/// The owner asked for this while asking for a pedalboard that ships
+/// switched off: "there should be a bypass button somewhere anyways". The
+/// two go together and neither is honest alone — a board seeded bypassed
+/// with no way to see or change it from the unit's own window is a board
+/// that does nothing for no reason anybody can find, and six of the seven
+/// seeded pedals (the comp on its own face, and the wah, drive, chorus,
+/// tremolo, echo and plate through the generic rows) had no switch on their
+/// panel at all.
+///
+/// **The switch is the MIXER's**, the same `insert_bypass` flag a bay menu
+/// row and a shift-click both toggle, pushed in as [`FaceLive::bypassed`]
+/// and asked back as [`FaceAction::SetBypass`]. A face that owned its own
+/// would be a unit that reads bypassed in one place and live in another.
+///
+/// Lit when the unit is OUT of circuit — the same rule and the same two
+/// words `draw_ir` has used since it grew the first one of these, because
+/// two panels wearing one switch in two liveries is worse than either
+/// livery. It is the condition somebody needs to notice from across the
+/// room: a panel whose unit is switched out looks exactly like one that is
+/// working.
+fn bypass_row(ui: &mut egui::Ui, st: &FaceStyle, live: &FaceLive) -> Option<FaceAction> {
+    ui.add_space(BYPASS_LEAD);
+    let on = live.bypassed;
+    let hit = ui
+        .add(
+            egui::Button::new(
+                egui::RichText::new(if on { "BYPASSED" } else { "BYPASS" })
+                    .font(egui::FontId::new(9.5, crate::fonts::courier_bold()))
+                    .color(if on { st.s.bg } else { st.s.ink }),
+            )
+            .fill(if on { st.s.ink } else { st.s.raised }),
+        )
+        .on_hover_text(if on {
+            "the unit is out of circuit - press to put it back"
+        } else {
+            "take this unit out of circuit without unloading it"
+        });
+    hit.clicked().then_some(FaceAction::SetBypass { on: !on })
+}
+
+/// The air over the bypass row, so it reads as part of the footer rather
+/// than as one more control stacked under the last knob. Half
+/// [`PRESET_LEAD`], because the strip below it opens with its own lead and
+/// two full leads in a row is a gap, not a separation.
+const BYPASS_LEAD: f32 = 3.0;
 
 fn draw_comp(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<FaceAction> {
     // The needle first: the face IS the reduction; the knobs serve it.
