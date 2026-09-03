@@ -2231,6 +2231,30 @@ struct Shared {
     /// window read as silence.)
     insert_key_n: AtomicUsize,
 
+    // ── the bypass table ────────────────────────────────────────────────────
+    /// **Which bays are OUT OF CIRCUIT** — one word per (seat, bay), 1 for
+    /// bypassed and 0 for in circuit, the `seat_latency`/`insert_key` row law
+    /// (`seat * INSERTS + bay`) so a comp on a pad, a folder's second rack
+    /// and the master all answer the same question the same way.
+    ///
+    /// A bypassed bay's plugin is kept, seated and running nowhere: the
+    /// render loop simply does not hand it the block, and `planar` walks
+    /// past unaltered. Read one relaxed load per FILLED bay, which is the
+    /// whole cost of the feature on a desk that never uses it.
+    ///
+    /// **No count word beside it, unlike `insert_key_n` — deliberately.**
+    /// That count exists so a chunk landing mid-publish reads "no keys",
+    /// which is the safe answer for a key: a key modulates a detector and
+    /// one block of not doing so is a meter flicker. The safe answer here is
+    /// the OPPOSITE — a chunk that read "nothing is bypassed" would put
+    /// every switched-off plugin back into the audio for one block, which is
+    /// a click on the master. So [`Engine::set_insert_bypass`] never clears
+    /// first: it walks the table once and moves each word straight from its
+    /// old value to its new one. Each word is one atomic, so a racing chunk
+    /// reads some bays' new state and some bays' old state and never a bay's
+    /// wrong state.
+    insert_bypass: Vec<AtomicU32>,
+
     // ── the IR wizard's capture road ────────────────────────────────────────
     /// A one-shot capture job on its way IN — host to audio thread, the
     /// `pending_monitor` handoff exactly: the host builds every buffer, the
@@ -2389,6 +2413,7 @@ impl Shared {
             insert_tap: Mutex::new(None),
             insert_key: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             insert_key_n: AtomicUsize::new(0),
+            insert_bypass: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             pending_ir: std::sync::Mutex::new(None),
             finished_ir: std::sync::Mutex::new(None),
             ir_stop: AtomicBool::new(false),
@@ -3225,6 +3250,62 @@ fn run_rack(
             }
             continue;
         };
+        // **A BYPASSED bay: the plugin stays, the block goes past it.**
+        //
+        // Read before anything else this bay would do, because "not applied"
+        // has to mean not applied: no `process_effect`, no `process_voice`,
+        // no copy-back out of `out`, no key de-interleave, no gain-reduction
+        // meter. `planar` is left holding exactly what it arrived with,
+        // which is the definition the desk paints and the definition a test
+        // can measure bit for bit.
+        //
+        // **The reported latency is NOT touched, and that is the point.**
+        //
+        // A bay's figure lives in `seat_latency` and is written from three
+        // places: `load_insert` at load, `poll_latency` from the main thread
+        // whenever a VST3 or LV2 says its own has moved, and the
+        // `set_latency` call further down this loop. Skipping the block
+        // skips only the third, so the cell keeps the figure it already had,
+        // `Rack::latency` still sums it, and `publish_latency` still aligns
+        // every other lane behind it. Flipping the switch therefore changes
+        // WHAT you hear and never WHEN you hear it.
+        //
+        // That is the whole reason to keep the delay. A bypass exists to
+        // answer "is this thing helping"; if taking a 64-frame lookahead
+        // compressor out of circuit also pulled that channel 1.3 ms earlier
+        // than the rest of the session, every A/B would be a comparison
+        // between two different timings as well as two different sounds, and
+        // the honest answer would be buried under a flam. Every desk worth
+        // the name keeps the delay standing for exactly this reason, and it
+        // costs nothing: the compensation graph never moves, so nothing has
+        // to be rebuilt and no lane has to re-align on a click.
+        //
+        // The one honest limitation, written down rather than hidden: an LV2
+        // reports its latency on an output port that only means anything
+        // after a block has run, so an LV2 that has been bypassed since the
+        // session opened has never told anybody its figure and its bay reads
+        // zero until it is put back in circuit. That is not this switch
+        // moving the number — it is the number never having arrived — and it
+        // is the same state a freshly loaded LV2 is in for one block.
+        // VST3s and built-ins are polled and set independently of the block,
+        // so neither is affected.
+        //
+        // One relaxed load per FILLED bay, after the empty-bay early-out
+        // above: an empty bay has nothing to bypass and pays nothing.
+        if shared
+            .insert_bypass
+            .get(seat * INSERTS + bay)
+            .is_some_and(|c| c.load(Ordering::Relaxed) != 0)
+        {
+            // **An armed tap still shows the truth**: what leaves a bypassed
+            // bay is what entered it, and an analyzer that froze on the last
+            // block the plugin managed would be drawing a signal nobody is
+            // hearing. The same rule the refused-block arm below follows.
+            if tap_bay == Some(bay) {
+                push_insert_tap(shared, planar, frames);
+            }
+            continue;
+        }
         let bay_params = params.get(bay).copied().unwrap_or(&[]);
         // **This bay's key, de-interleaved on demand.** One relaxed load per
         // effect bay, and only on a pass that carries a feed at all. The
@@ -11189,6 +11270,52 @@ impl Engine {
         self.shared.insert_key_n.store(n, Ordering::Release);
     }
 
+    /// Publish which bays are OUT OF CIRCUIT — the whole table, every call,
+    /// exactly as [`Engine::set_insert_keys`] publishes keys: a bay absent
+    /// from `bays` is a bay in circuit.
+    ///
+    /// Each tuple is `(seat, bay)` in ENGINE terms — the seat space
+    /// `load_insert` speaks. The desk stores them in that space too
+    /// (`settings::BypassBays`), so unlike the key table there is no
+    /// `seat_bay` translation on the way here and therefore none to get
+    /// wrong. Out-of-range entries are ignored: the desk can shrink between
+    /// the write and the read.
+    ///
+    /// **No clear-then-fill phase**, which is the one place this deliberately
+    /// departs from `set_insert_keys`. See `Shared::insert_bypass`: clearing
+    /// first would open a window in which every switched-off plugin is back
+    /// in the audio, and a chunk landing in that window is an audible click
+    /// on the master rather than a meter flicker. Instead the whole table is
+    /// walked once and each word moved straight from what it was to what it
+    /// should be.
+    ///
+    /// **Read before written**, and only written where it differs. This runs
+    /// every frame beside the routes, and a blind store would dirty fifty
+    /// kilobytes of cache lines sixty times a second for a desk on which
+    /// nothing has changed — lines the audio thread is about to read. In the
+    /// steady state this is loads only, and the callback's line stays clean.
+    // `&self`, like `set_routes` and `set_insert_keys`: the whole write is
+    // interior atomics and the publish path holds the engine by shared
+    // reference.
+    pub fn set_insert_bypass(&self, bays: &[(usize, usize)]) {
+        for (i, cell) in self.shared.insert_bypass.iter().enumerate() {
+            let want = u32::from(bays.contains(&(i / INSERTS, i % INSERTS)));
+            if cell.load(Ordering::Relaxed) != want {
+                cell.store(want, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Whether one bay is currently out of circuit, as the audio thread sees
+    /// it. The engine's own answer, for tests and for anything that has to
+    /// agree with what is actually being heard rather than with the desk.
+    pub fn insert_bypassed(&self, seat: usize, bay: usize) -> bool {
+        self.shared
+            .insert_bypass
+            .get(seat * INSERTS + bay)
+            .is_some_and(|c| c.load(Ordering::Relaxed) != 0)
+    }
+
     /// Whether the tenant of one bay can take a sidechain key at all — the
     /// question the bay menu's "Sidechain from…" row greys on.
     ///
@@ -16706,6 +16833,188 @@ mod tests {
         assert_eq!(t.key_prev.len(), MAX_BLOCK as usize * CHANNELS * 2);
         assert_eq!(t.key_io.len(), TAP_CHANNELS);
         assert!(t.key_io.iter().all(|c| c.len() == MAX_BLOCK as usize));
+    }
+
+    // ── the bypass table ────────────────────────────────────────────────────
+
+    /// **A bypassed bay is a wire — bit for bit — and an unbypassed one is
+    /// not.**
+    ///
+    /// Three renders of one desk: the bay empty, the bay filled and switched
+    /// off, the bay filled and in circuit. The first two have to come out
+    /// SAMPLE-IDENTICAL, because "not applied" is a claim about the audio
+    /// and not about a meter; the third has to differ, or the fixture is a
+    /// unit that does nothing and the first assertion proves nothing.
+    ///
+    /// Compared against the EMPTY bay rather than against an earlier block
+    /// of the same run, because that is the honest reading of "untouched":
+    /// what leaves the bay is what would have left it had the plugin never
+    /// been loaded at all.
+    ///
+    /// **On the MASTER's rack**, not a track's, and only because of where
+    /// audio can be got into a rack today: `mix_clips` says in as many words
+    /// that a clip does not yet run through its lane's own insert chain
+    /// ("Not its rack yet… that unification is a later phase's"), so a
+    /// comp on channel 2 would process silence and both runs would match for
+    /// the wrong reason. `run_rack` is one function and the skip is in it,
+    /// so what this proves about the master's seat is what happens at every
+    /// seat; that the right SEAT is addressed is the desk's half, and the
+    /// UI's `shift_clicking_a_bay_bypasses_it_in_both_views_on_tracks_and_folders`
+    /// holds that end.
+    #[test]
+    fn a_bypassed_bay_passes_the_audio_through_bit_for_bit() {
+        let seat = tangent_ui::recorder::MASTER_SEAT;
+        // The key tests' compressor: fast, deep, and audibly doing something
+        // to a steady signal — and, like every unit in the suite, reporting
+        // no latency, so the empty-bay run and the loaded ones are aligned
+        // identically and the comparison is of samples rather than of two
+        // differently delayed copies of the same thing.
+        let state = fast_deep_comp_state();
+        let run = |load: bool, bypass: bool| -> Vec<f32> {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            if load {
+                e.load_insert(
+                    seat,
+                    0,
+                    Some(Path::new(crate::builtin_fx::COMP_PATH)),
+                    Some(&state),
+                )
+                .expect("the comp loads")
+                .expect("the bay reports it");
+            }
+            // Whole-table publish, the routes' bargain: absent means in
+            // circuit, so the un-bypassed runs publish an empty table rather
+            // than relying on the cells never having been written.
+            let table: Vec<(usize, usize)> =
+                if bypass { vec![(seat, 0)] } else { Vec::new() };
+            e.set_insert_bypass(&table);
+            assert_eq!(e.insert_bypassed(seat, 0), bypass);
+            let mut out = vec![0.0f32; 512 * 2];
+            // The hand-off rings drain on the callback, so the plugin is not
+            // really seated until some blocks have run. Identical in all
+            // three runs, so nothing here can favour one of them.
+            for _ in 0..8 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_clips(vec![flat_clip(2, 0.9)]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut got = Vec::new();
+            for _ in 0..6 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                got.extend_from_slice(&out);
+            }
+            got
+        };
+        let bare = run(false, false);
+        assert!(
+            bare.iter().any(|s| s.abs() > 0.01),
+            "the fixture never made a sound, so nothing below means anything"
+        );
+        let in_circuit = run(true, false);
+        assert_ne!(
+            in_circuit, bare,
+            "the drive changed nothing in circuit, so this test cannot tell \
+             a bypass from a plugin that does not work"
+        );
+        let bypassed = run(true, true);
+        assert_eq!(
+            bypassed, bare,
+            "a bypassed bay altered the audio it was supposed to walk past"
+        );
+    }
+
+    /// **Flipping the switch does not move the clock.**
+    ///
+    /// The one thing about this feature that could ruin the comparison it
+    /// exists for. A plugin's reported delay is what every other lane and
+    /// every clip is aligned behind (`publish_latency`); if switching a
+    /// lookahead unit off also gave that channel its milliseconds back, then
+    /// every A/B would be a comparison of two TIMINGS as well as two sounds,
+    /// and the flam would drown the question.
+    ///
+    /// So the figure is left exactly where it was: `run_rack` skips the
+    /// block and therefore skips the `set_latency` at the bottom of it,
+    /// while `load_insert` and `poll_latency` — the other two authors of
+    /// that cell — never asked whether the bay was in circuit and still do
+    /// not. The denoise is the fixture because it is the one built-in that
+    /// reports an honest non-zero figure out of the box: its lookahead ships
+    /// up, which is three milliseconds of it.
+    #[test]
+    fn bypassing_a_bay_does_not_change_the_latency_it_reports() {
+        let seat = 5usize;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.load_insert(seat, 0, Some(Path::new(crate::builtin_fx::DENOISE_PATH)), None)
+            .expect("the denoise loads")
+            .expect("the bay reports it");
+        let mut out = vec![0.0f32; 512 * 2];
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let owed = e.seat_latency_for_test(seat, 0);
+        assert!(
+            owed > 0,
+            "the fixture reports no latency, so this test cannot see one being lost"
+        );
+        let lanes = e.latency_frames();
+
+        // ── switched OFF ──
+        e.set_insert_bypass(&[(seat, 0)]);
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        assert_eq!(
+            e.seat_latency_for_test(seat, 0),
+            owed,
+            "bypassing the bay gave its delay back and moved the channel in time"
+        );
+        assert_eq!(
+            e.latency_frames(),
+            lanes,
+            "the compensation graph moved when the switch flipped"
+        );
+
+        // ── and back ON, which must not move it either ──
+        e.set_insert_bypass(&[]);
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        assert_eq!(e.seat_latency_for_test(seat, 0), owed);
+        assert_eq!(e.latency_frames(), lanes);
+    }
+
+    /// **The published table is the whole truth, and it is published
+    /// without a hole in it.**
+    ///
+    /// Absent means in circuit, the `set_routes` bargain; an entry past the
+    /// desk is dropped rather than stored; and — the reason this one is not
+    /// merely `set_insert_keys` again — a second publish that re-states a
+    /// bypass never lets go of it in between. A clear-then-fill would open a
+    /// window in which every switched-off plugin was back in the audio, and
+    /// on a desk publishing every frame that window is sixty chances a
+    /// second at a click on the master.
+    #[test]
+    fn the_bypass_table_is_republished_without_ever_letting_go() {
+        let e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_insert_bypass(&[(3, 1), (RACK_SEATS + 9, 0), (4, INSERTS + 2)]);
+        assert!(e.insert_bypassed(3, 1));
+        assert!(!e.insert_bypassed(3, 0), "a neighbour was switched off too");
+        assert!(!e.insert_bypassed(4, 0), "an out-of-range bay landed somewhere real");
+
+        // Re-stating it is a no-op the cell never notices: the same word is
+        // already there, so nothing is written and nothing is momentarily
+        // cleared.
+        e.set_insert_bypass(&[(3, 1)]);
+        assert!(e.insert_bypassed(3, 1), "a republish dropped a standing bypass");
+
+        // And an absent entry is a cleared one.
+        e.set_insert_bypass(&[]);
+        assert!(!e.insert_bypassed(3, 1), "an absent entry did not clear");
     }
 
     /// **A folder inside a folder**, which the single descending fold has to

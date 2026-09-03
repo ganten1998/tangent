@@ -102,6 +102,16 @@ pub struct StripView<'a> {
     /// Which bays wear a sidechain key, for the dot in the chip's corner.
     /// Same indexing as `inserts`: the strip's visible slots.
     pub keyed: [bool; INSERTS * 2],
+    /// **Which bays are BYPASSED** — kept, loaded, editable, and not
+    /// applied. Same indexing as `inserts` and `keyed`: the strip's visible
+    /// slots, which for the master and a folder span two racks. The caller
+    /// resolves that through `recorder::seat_bay` before asking, exactly as
+    /// it does for the names.
+    ///
+    /// Appended after `keyed` and not woven in beside it, for the reason
+    /// every list in this app grows at the end: an existing field's meaning
+    /// is a thing other code has already been written against.
+    pub bypassed: [bool; INSERTS * 2],
 }
 
 impl StripView<'_> {
@@ -1770,11 +1780,21 @@ pub fn a11y_nodes(rect: Rect, view: &MixerView<'_>) -> Vec<crate::a11y::Node> {
             Hit::Routing(_) => Node::button(id, r, format!("{who} routing")),
             Hit::Insert(_, bay) => {
                 let what = s.inserts.get(bay).copied().unwrap_or("");
+                // **A reader is told the bay is bypassed**, because the
+                // amber bar and the greyed name are the whole of the on-screen
+                // answer and neither reaches a reader. Said in the value
+                // rather than in the label, so the bay is still "insert 2"
+                // when it is switched on again.
+                let off = s.bypassed.get(bay).copied().unwrap_or(false);
                 Node::readout(
                     id,
                     r,
                     format!("{who} insert {}", bay + 1),
-                    if what.is_empty() { "empty".to_owned() } else { what.to_owned() },
+                    match (what.is_empty(), off) {
+                        (true, _) => "empty".to_owned(),
+                        (false, true) => format!("{what}, bypassed"),
+                        (false, false) => what.to_owned(),
+                    },
                 )
             }
             Hit::RouteGain(_, k) => {
@@ -2531,21 +2551,54 @@ fn strip(
             // The tab at the left edge is the "loaded" light the whole chip
             // used to be. Blue on bone says the same thing and leaves the
             // width for the name, which is the point of stacking them.
+            //
+            // **And AMBER when the bay is bypassed** — the mute colour, out
+            // of the same `Ink` the M switch two rows down reads, because
+            // "this is loaded and you are not hearing it" is the same
+            // sentence a muted channel says. A light that changes colour
+            // rather than a mark that appears somewhere else: the eye is
+            // already on this bar to know whether the bay is filled, so it
+            // is the one place a second fact costs nothing to find.
+            //
+            // Through `lit_on`, which the desk uses wherever a fixed light
+            // sits on a themed ground: raw amber on an amber theme is a tab
+            // that vanishes on precisely the themes somebody chose for being
+            // warm. See the all-theme sweep in this file's tests.
+            let bypassed = v.bypassed.get(n).copied().unwrap_or(false);
+            let tab = if bypassed {
+                crate::recorder_panel::lit_on(p.mute, p.face)
+            } else {
+                p.lit
+            };
             painter.rect_filled(
                 Rect::from_min_max(
                     cell.min,
                     Pos2::new(cell.left() + 3.0, cell.bottom()),
                 ),
                 1.0,
-                p.lit,
+                tab,
             );
             let text = Rect::from_min_max(Pos2::new(cell.left() + 6.0, cell.top()), cell.max);
+            // **The name goes quiet with it**, the second half of the
+            // arrangement's own bypass grammar (`AutoView::bypassed`: the M
+            // plate lights AND the row's word is pulled toward its ground).
+            // Two signals rather than one because a colour alone is a thing
+            // you have to have been told; a name that has gone grey reads as
+            // "off" to anybody. Blended toward the face rather than made
+            // transparent — `quiet` keeps 4.5:1 on whatever the theme put
+            // underneath, which `gamma_multiply` cannot promise since it
+            // lowers alpha and lets the panel through.
+            let word_ink = if bypassed {
+                crate::arrangement_panel::quiet(p.engrave, p.face, 0.45)
+            } else {
+                p.engrave
+            };
             centred(
                 painter,
                 text,
                 &shorten_plugin(painter, text.width(), name, &font),
                 font.clone(),
-                p.engrave,
+                word_ink,
             );
             // A keyed bay wears a dot in its corner — the loaded-tab's own
             // light, so "listening to another channel" reads in the same
@@ -3328,6 +3381,7 @@ mod tests {
             removable: !empty && matches!(strip, Some(Strip::Channel(_))),
             armed: false,
             keyed: [false; INSERTS * 2],
+            bypassed: [false; INSERTS * 2],
         }
     }
 
@@ -3511,6 +3565,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **A BYPASSED bay reads as bypassed on every theme, in both modes.**
+    ///
+    /// Three things have to survive the wardrobe, and each of them has been
+    /// got wrong somewhere in this app before:
+    ///
+    /// 1. the amber tab has to be VISIBLE on the strip face — a fixed light
+    ///    on a themed ground is the oldest fault in this file, and a warm
+    ///    theme is exactly where amber-on-amber would disappear;
+    /// 2. the tab has to be visibly DIFFERENT from the blue "loaded" tab it
+    ///    replaces, or the switch has no picture at all — "quieter blue"
+    ///    would be a state you can only learn by clicking;
+    /// 3. the dimmed name has to stay READABLE. Quieter is a matter of
+    ///    weight; a plugin whose name you cannot read is a plugin you cannot
+    ///    identify to put back.
+    ///
+    /// Failures are collected rather than asserted one at a time, so a run
+    /// names every theme that is wrong instead of the first.
+    #[test]
+    fn a_bypassed_bay_reads_as_bypassed_on_every_theme_in_both_modes() {
+        let mut bad: Vec<String> = Vec::new();
+        for t in crate::theme::factory() {
+            let Some(strip) = t.fx_strip else { continue };
+            let mut v = a_view();
+            v.fx_strip = strip.to_color32();
+            for dark in [false, true] {
+                v.dark_mode = dark;
+                let p = ink(&v);
+                let mode = if dark { "dark" } else { "light" };
+                let tab = crate::recorder_panel::lit_on(p.mute, p.face);
+                let word = crate::arrangement_panel::quiet(p.engrave, p.face, 0.45);
+
+                // A graphic mark, so the 3.0 floor the rest of the app holds
+                // its lights to rather than the 4.5 text asks for.
+                let seen = crate::recorder_panel::contrast_ratio(tab, p.face);
+                if seen < 3.0 {
+                    bad.push(format!("{} {mode}: the amber tab is {seen:.2}:1 on the face", t.name));
+                }
+                // And a DIFFERENT colour from loaded, not merely a legible
+                // one: `delta_e` is this app's "is it another colour" answer.
+                let apart = crate::recorder_panel::delta_e(tab, p.lit);
+                if apart < 15.0 {
+                    bad.push(format!(
+                        "{} {mode}: bypassed and loaded are {apart:.1} apart, which is one light",
+                        t.name
+                    ));
+                }
+                let read = crate::recorder_panel::contrast_ratio(word, p.face);
+                if read < 4.5 {
+                    bad.push(format!(
+                        "{} {mode}: a bypassed plugin's name is {read:.2}:1 on the face",
+                        t.name
+                    ));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "the bypassed bay does not read on every theme:\n  {}",
+            bad.join("\n  ")
+        );
     }
 
     /// **A channel that routes gets the BUTTON and nothing else.**
