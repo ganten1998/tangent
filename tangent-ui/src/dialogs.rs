@@ -6089,6 +6089,104 @@ fn confirm_ir_delete(strip: usize, slot: usize, path: &str, loaded: bool) -> Dia
     }
 }
 
+/// **How tall the project-export window asks to be, and it did NOT have to
+/// grow for the STEMS row.**
+///
+/// It was grown, on the reasoning every fixed-size dialog in this file is
+/// written to: no scroll area, every row is height somebody has to pay for,
+/// and the Export button is the last thing down the stack — so a row added
+/// without paying for it is a button nobody can click, which has happened
+/// here before. Thirty-six points went on, and then the guard was pointed at
+/// it and stayed green all the way down to three hundred and seventy.
+///
+/// The reasoning was right about the class and wrong about this dialog. The
+/// last row is a `right_to_left` band that takes whatever vertical space is
+/// left over, so the fixed rows above it come to a fixed total — measured at
+/// between three hundred and forty and three hundred and seventy points,
+/// STEMS and its advice line included — and everything past that is slack
+/// the band absorbs. Four hundred and forty-six leaves about eighty points
+/// of it. Growing the window would have bought thirty-six more points of
+/// empty band under a dialog that already had plenty, which is the fault the
+/// Track menu's own size comment argues against a few hundred lines down.
+///
+/// So the number is unchanged and the guard is
+/// `the_project_export_dialog_fits_the_window_it_asks_for`, which finds the
+/// Export button in the painted frame. It bites at three hundred and forty,
+/// which is the budget the next row to be added here has to fit inside.
+const EXPORT_PROJECT_H: f32 = 446.0;
+/// The floor the same stack still fits in — and it does: the guard is green
+/// here too, with the band down to about twenty-five points.
+const EXPORT_PROJECT_MIN_H: f32 = 396.0;
+
+/// The SOURCE row's chip labels — the one array, so the drawing and the
+/// test cannot disagree about how many there are or what they say.
+pub const EXPORT_SOURCE_CHIPS: [&str; 3] = ["Master mix", "Stems", "Both"];
+
+/// The STEMS row's chip labels.
+///
+/// **A second ROW rather than two more chips on SOURCE**, which was the
+/// obvious move and does not fit. The window is 380 points wide and the row
+/// label eats ninety-six of them; "Master mix", "Stems (dry)",
+/// "Stems (processed)" and "Both" want well past the two hundred and sixty
+/// that leaves, and a chip that overruns its row in egui does not wrap — it
+/// is simply not there to click. Two rows also read better: SOURCE answers
+/// "what files", STEMS answers "which stems", and the second question is
+/// meaningless until the first has been answered with stems at all.
+pub const EXPORT_STEM_CHIPS: [&str; 2] = ["Dry", "Processed"];
+
+/// Which SOURCE chip a spec is standing on.
+///
+/// **Lifted out of the dialog arm, where it was an inline `match` inside a
+/// closure inside an egui frame and therefore untestable.** The pack and
+/// the unpack are two halves of one mapping and there was nothing holding
+/// them together: a chip renamed or reordered on one side and not the other
+/// is an export that quietly writes the wrong files, which is the class of
+/// fault that survives a demo. Four functions and a round-trip test cost
+/// less than one of those.
+pub fn export_source_chip(spec: &crate::ports::ProjectExportSpec) -> usize {
+    match (spec.master, spec.stems) {
+        (true, false) => 0,
+        (false, true) => 1,
+        _ => 2,
+    }
+}
+
+/// Put a spec on a SOURCE chip.
+///
+/// **Chip 0 clears `stems_dry` as well as `stems`.** The pair has three
+/// legal states and a fourth — dry asked for with no stems to be dry — that
+/// every reader in the host happens to be immune to today because they all
+/// test `stems` first. "Happens to be immune" is not a guarantee; a seventh
+/// reader written next year that looks at `stems_dry` alone would write a
+/// folder nobody asked for. Closing the state at its only entrance costs
+/// one line here and needs no discipline from anybody later.
+pub fn set_export_source(spec: &mut crate::ports::ProjectExportSpec, chip: usize) {
+    spec.master = chip != 1;
+    spec.stems = chip != 0;
+    if !spec.stems {
+        spec.stems_dry = false;
+    }
+}
+
+/// Which STEMS chip a spec is standing on.
+pub fn export_stem_mode_chip(spec: &crate::ports::ProjectExportSpec) -> usize {
+    usize::from(!spec.stems_dry)
+}
+
+/// Put a spec on a STEMS chip.
+///
+/// **Deliberately does NOT turn `stems` on.** A row that reached up and
+/// changed SOURCE under the cursor would be worse than one that waits, and
+/// the dialog does not ask it to: the row is drawn DISABLED while SOURCE
+/// says master only, so this is unreachable in that state and the illegal
+/// pair is closed from both ends — nothing can set `stems_dry` while
+/// `stems` is off, and `set_export_source` clears it if `stems` goes off
+/// afterwards.
+pub fn set_export_stem_mode(spec: &mut crate::ports::ProjectExportSpec, chip: usize) {
+    spec.stems_dry = chip == 0;
+}
+
+
 /// **The desk's own dialog window**, in the one slot the app has always had.
 ///
 /// A thin wrapper since the amp grew a stacked pedal window: `show_on` below
@@ -8646,8 +8744,16 @@ fn show_on(
                 "Export",
                 // Taller for the WHEN DONE row, which was added below the
                 // window's floor and could not be reached at all.
-                Vec2::new(380.0, 446.0),
-                Vec2::new(380.0, 396.0),
+                //
+                // **The STEMS row cost nothing more**, and that is measured
+                // rather than assumed — see `EXPORT_PROJECT_H`, where the
+                // eighty points of slack this window already carries are
+                // argued, and
+                // `the_project_export_dialog_fits_the_window_it_asks_for`,
+                // which finds the Export button in the painted frame and
+                // goes red at three hundred and forty.
+                Vec2::new(380.0, EXPORT_PROJECT_H),
+                Vec2::new(380.0, EXPORT_PROJECT_MIN_H),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
@@ -8689,16 +8795,53 @@ fn show_on(
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::same(12))
                         .show(ui, |ui| {
-                            let src = match (spec.master, spec.stems) {
-                                (true, false) => 0,
-                                (false, true) => 1,
-                                _ => 2,
-                            };
-                            if let Some(i) =
-                                choice(ui, "SOURCE", &["Master mix", "Stems", "Both"], src)
-                            {
-                                spec.master = i != 1;
-                                spec.stems = i != 0;
+                            if let Some(i) = choice(
+                                ui,
+                                "SOURCE",
+                                &EXPORT_SOURCE_CHIPS,
+                                export_source_chip(spec),
+                            ) {
+                                set_export_source(spec, i);
+                            }
+                            // **Drawn always, live only when it applies.**
+                            //
+                            // A row that came and went would make the
+                            // window's height a function of a chip, and this
+                            // file has already paid for that twice — the
+                            // WHEN DONE row fell off the bottom edge once
+                            // for exactly that reason. So the STEMS row
+                            // always occupies its band and egui greys it
+                            // while SOURCE says master only. That is also
+                            // what makes the illegal spec state unreachable
+                            // from the UI: `stems_dry` cannot be set while
+                            // `stems` is off, because the widget that sets
+                            // it is not accepting clicks.
+                            let on = spec.stems;
+                            let picked = ui
+                                .add_enabled_ui(on, |ui| {
+                                    let at = export_stem_mode_chip(spec);
+                                    let i = choice(ui, "STEMS", &EXPORT_STEM_CHIPS, at);
+                                    // The DEPTH row's voice: what the choice
+                                    // MEANS, not what it is called. One
+                                    // sentence, because somebody reading it
+                                    // has already decided to export and is
+                                    // looking for permission to press the
+                                    // button.
+                                    ui.label(
+                                        RichText::new(if spec.stems_dry {
+                                            "each lane before its own inserts - to remix elsewhere"
+                                        } else {
+                                            "each lane through its own inserts - the mix's sound"
+                                        })
+                                        .font(plain(8.0))
+                                        .color(dim),
+                                    );
+                                    ui.add_space(2.0);
+                                    i
+                                })
+                                .inner;
+                            if let Some(i) = picked {
+                                set_export_stem_mode(spec, i);
                             }
                             if let Some(range) = sel {
                                 let at = usize::from(spec.span.is_some());
@@ -13392,6 +13535,218 @@ at: None,
             ),
             _ => panic!("the dialog closed itself, or changed into another one"),
         }
+    }
+
+    // ── the project export dialog's two stem modes ──────────────────────────
+
+    /// **The row says what it exports, and the mapping goes both ways.**
+    ///
+    /// The chip labels are asserted LITERALLY, because they are the whole of
+    /// what the owner asked for: "Stems" split into a dry one and a
+    /// processed one. A rename or a reorder that leaves the mapping behind
+    /// is an export that writes the wrong files under the right name, and
+    /// there is nothing downstream that could notice.
+    ///
+    /// The round trip is the other half. `export_source_chip` and
+    /// `set_export_source` are two directions of one mapping and used to be
+    /// two inline `match`es inside an egui closure, where nothing could
+    /// reach them; a chip that does not survive being set and read back is
+    /// a control that snaps to another position under the cursor.
+    #[test]
+    fn the_export_source_row_offers_dry_and_processed_stems() {
+        assert_eq!(EXPORT_SOURCE_CHIPS, ["Master mix", "Stems", "Both"]);
+        assert_eq!(EXPORT_STEM_CHIPS, ["Dry", "Processed"]);
+        for chip in 0..EXPORT_SOURCE_CHIPS.len() {
+            let mut spec = crate::ports::ProjectExportSpec::default();
+            set_export_source(&mut spec, chip);
+            assert_eq!(
+                export_source_chip(&spec),
+                chip,
+                "SOURCE chip {chip} ({}) did not survive the round trip: \
+                 master={} stems={}",
+                EXPORT_SOURCE_CHIPS[chip],
+                spec.master,
+                spec.stems
+            );
+        }
+        for chip in 0..EXPORT_STEM_CHIPS.len() {
+            let mut spec = crate::ports::ProjectExportSpec::default();
+            // Stems on first: the mode row is dead while SOURCE says master
+            // only, and this is the state the user is in when they touch it.
+            set_export_source(&mut spec, 1);
+            set_export_stem_mode(&mut spec, chip);
+            assert_eq!(
+                export_stem_mode_chip(&spec),
+                chip,
+                "STEMS chip {chip} ({}) did not survive the round trip",
+                EXPORT_STEM_CHIPS[chip]
+            );
+        }
+        // And the default is PROCESSED — the mode that carries the mix's own
+        // sound, and the one the old single "Stems" option already produced
+        // for every source class that reached a rack at all.
+        let spec = crate::ports::ProjectExportSpec::default();
+        assert!(!spec.stems_dry);
+        assert_eq!(EXPORT_STEM_CHIPS[export_stem_mode_chip(&spec)], "Processed");
+    }
+
+    /// **An export cannot ask for dry stems and no stems.**
+    ///
+    /// The pair has three legal states and a fourth that means nothing. Six
+    /// places in the host read `stems`, and all six happen to test it before
+    /// they would look at the mode — so the fourth state is inert today by
+    /// coincidence rather than by construction. This closes it at its only
+    /// entrance: the SOURCE row, which is the one control that can take
+    /// stems away after a mode has been chosen.
+    #[test]
+    fn an_export_cannot_ask_for_dry_stems_with_stems_off() {
+        let mut spec = crate::ports::ProjectExportSpec::default();
+        set_export_source(&mut spec, 2);
+        set_export_stem_mode(&mut spec, 0);
+        assert!(spec.stems && spec.stems_dry, "the fixture never armed dry stems");
+        set_export_source(&mut spec, 0);
+        assert!(!spec.stems, "SOURCE chip 0 left the stems on");
+        assert!(
+            !spec.stems_dry,
+            "SOURCE chip 0 took the stems away and left the mode behind"
+        );
+        // And the two modes name two different folders, so the second export
+        // of a project cannot overwrite the first with different-sounding
+        // files under identical names.
+        let mut dry = crate::ports::ProjectExportSpec::default();
+        set_export_source(&mut dry, 1);
+        set_export_stem_mode(&mut dry, 0);
+        let mut wet = crate::ports::ProjectExportSpec::default();
+        set_export_source(&mut wet, 1);
+        set_export_stem_mode(&mut wet, 1);
+        assert_ne!(dry.stems_folder(), wet.stems_folder());
+        assert_eq!(wet.stems_folder(), "stems");
+        assert_ne!(dry.source_label(), wet.source_label());
+    }
+
+    /// **The window is tall enough for the row it just grew.**
+    ///
+    /// This dialog has no scroll area: every row is drawn straight down and
+    /// the Export button is the last of them, so a row added without paying
+    /// for it in height pushes the button past the bottom edge and there is
+    /// no way to reach it. That has happened here before — the WHEN DONE row
+    /// went in below the floor and could not be clicked at all, which is why
+    /// the size argument at the arm is written the way it is.
+    ///
+    /// So the frame is run for real, inline (the plugin path, where the
+    /// dialog is an `Area` in a canvas), and the question put to it is the
+    /// user's own: **is the word "Export" on the screen, inside the window,
+    /// where it can be clicked?** The button's own painted glyphs are found
+    /// among the frame's shapes and their rectangle is compared with the
+    /// window's.
+    ///
+    /// **Three measurements were tried and two of them measured nothing**,
+    /// which is worth recording because both looked right.
+    ///
+    /// Asking the shell for the dialog's inline rect measures the size the
+    /// arm REQUESTED — shrinking the window left that green, because it was
+    /// watching a request agree with itself.
+    ///
+    /// Asking the layout how tall it came to is no better: this dialog's
+    /// last row is a `right_to_left` band that takes whatever vertical space
+    /// is left, so the content is exactly as tall as the window by
+    /// construction, at any window height. That measurement returns the
+    /// window's own number too.
+    ///
+    /// What cannot lie is whether the button is there. egui asks
+    /// `is_rect_visible` before painting, so a control pushed past the
+    /// bottom edge emits no glyphs at all — and a control merely clipped
+    /// emits them outside the window. Both are caught by looking for the
+    /// text and asking where it landed.
+    ///
+    /// **Where it bites**, which is the number the next person adding a row
+    /// here needs: the fixed rows come to somewhere between three hundred
+    /// and forty and three hundred and seventy points, so the guard goes red
+    /// the moment `EXPORT_PROJECT_H` is set to three hundred and forty. At
+    /// the four hundred and forty-six the arm asks for there is about eighty
+    /// points of slack, which is why the STEMS row needed no more window —
+    /// see the constant, where that finding is argued.
+    #[test]
+    fn the_project_export_dialog_fits_the_window_it_asks_for() {
+        let ctx = egui::Context::default();
+        // The dialogs name Courier Prime explicitly and epaint PANICS on a
+        // font family that is not bound.
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+
+        // A time selection standing, which is the taller of the two TIME
+        // rows' cases and the state a person exporting a section is in.
+        let mut dialog = Some(Dialog::ExportProject {
+            spec: crate::ports::ProjectExportSpec::default(),
+            sel: Some((0.0, 4.0)),
+        });
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+            chrome: None,
+            surface: None,
+        };
+        let mut action = None;
+        let mut shapes = Vec::new();
+        // Two passes: an `Area` places itself from what it measured LAST
+        // time, so the first pass lays out against a rectangle nobody has
+        // agreed on yet. The second is the one that is measured.
+        for _ in 0..2 {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(900.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    action = show(
+                        ctx,
+                        &mut dialog,
+                        Color32::from_rgb(0xE3, 0xD9, 0xBD),
+                        placement,
+                    );
+                },
+            );
+            shapes = out.shapes;
+        }
+        assert!(action.is_none(), "the dialog exported without being asked");
+        assert!(
+            matches!(dialog, Some(Dialog::ExportProject { .. })),
+            "the dialog closed itself, or changed into another one"
+        );
+        let window = crate::shell::inline_rect(&ctx, DIALOG_ID)
+            .expect("the dialog drew nothing inline");
+        assert!(
+            (window.height() - EXPORT_PROJECT_H).abs() < 0.5,
+            "the shell gave the dialog {}pt rather than the \
+             {EXPORT_PROJECT_H}pt it asked for, so what follows would be \
+             measured against the wrong window",
+            window.height()
+        );
+        let button = shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "Export" => {
+                    Some(egui::Rect::from_min_size(t.pos, t.galley.size()))
+                }
+                _ => None,
+            })
+            .next()
+            .expect(
+                "the Export button painted no text at all — it was laid out \
+                 past the bottom of its own window and egui skipped it",
+            );
+        assert!(
+            window.contains_rect(button),
+            "the Export button landed at {button:?}, outside the \
+             {EXPORT_PROJECT_H}pt window at {window:?} — nobody can click it"
+        );
     }
 
     // ── the plugin picker ───────────────────────────────────────────────────

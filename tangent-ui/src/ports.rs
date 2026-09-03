@@ -107,6 +107,76 @@ pub struct ProjectExportSpec {
     /// somebody walks away from, and the first thing they want on returning
     /// is the file — not the app that made it.
     pub open_when_done: bool,
+    /// **APPENDED — take the stems DRY: every strip's own inserts left out
+    /// of its file.**
+    ///
+    /// Read only when `stems` is on, and the dialog cannot set it without
+    /// `stems` (see `set_export_source`, which clears it whenever it clears
+    /// `stems`) — so the fourth combination of the two bools is unreachable
+    /// rather than merely unused, and `an_export_cannot_ask_for_processed_
+    /// stems_with_stems_off` holds that end.
+    ///
+    /// **False is PROCESSED, and that is the deliberate default.** Two
+    /// reasons. It is what the tap has always produced for an instrument,
+    /// an input, a drum lane and a group — the old single "Stems" option
+    /// was never dry for any of those — and it is what it now produces for
+    /// an audio track as well, since a clip finally reaches its lane's
+    /// rack. And it is the mode somebody asking for stems in order to hand
+    /// a mix on almost always wants: the files sum to the record. Dry is
+    /// the specialist's answer, for a re-mix somewhere else, and it is the
+    /// one you have to ask for.
+    ///
+    /// Appended last because the struct is append-only and because, if this
+    /// spec is ever written to settings, a missing field must read back
+    /// false and mean "processed" — the behaviour every project saved
+    /// before today already had.
+    pub stems_dry: bool,
+}
+
+/// The subfolder name for a stems pass, from the mode alone.
+///
+/// A free function as well as the method above because the REALTIME pass
+/// does not hold a spec — it is handed the two bools and writes its files
+/// as it goes, while the spec only reappears at the finish to say where they
+/// are copied. Both ends must produce the same name or the copy reads an
+/// empty directory and the export lands with no stems in it and no error, so
+/// there is exactly one place the name is spelled.
+pub fn stems_folder_name(dry: bool) -> &'static str {
+    if dry {
+        "stems-dry"
+    } else {
+        "stems"
+    }
+}
+
+impl ProjectExportSpec {
+    /// **What this export writes, in one word for a notification.**
+    ///
+    /// One function rather than the two inline `match (master, stems)`
+    /// arms that used to live in the host — they were three-armed, they
+    /// disagreed about their separator ("master and stems" against
+    /// "master+stems"), and adding a fourth state to two copies of a match
+    /// is how one of them ends up calling a dry export "stems" for ever.
+    pub fn source_label(&self) -> &'static str {
+        match (self.master, self.stems, self.stems_dry) {
+            (_, false, _) => "master",
+            (false, true, false) => "stems",
+            (false, true, true) => "dry stems",
+            (true, true, false) => "master+stems",
+            (true, true, true) => "master+dry stems",
+        }
+    }
+
+    /// **The subfolder a stems pass writes into, named for what is in it.**
+    ///
+    /// Two exports of one project must not overwrite each other with
+    /// different-sounding files of identical names — the collision
+    /// `export_out_dir` was written to prevent, one level down. And a year
+    /// later the folder itself is the only thing left that says which mode
+    /// produced the WAVs inside it.
+    pub fn stems_folder(&self) -> &'static str {
+        stems_folder_name(self.stems_dry)
+    }
 }
 
 impl Default for ProjectExportSpec {
@@ -124,6 +194,7 @@ impl Default for ProjectExportSpec {
             realtime: false,
             span: None,
             depth: ExportDepth::Pcm24,
+            stems_dry: false,
         }
     }
 }
