@@ -3508,6 +3508,38 @@ struct IrJob {
     cap_pos: usize,
     /// Frames played so far — output-driven.
     play_pos: usize,
+    /// **Input frames the monitor path threw away while this pass was
+    /// recording** — frames torn OUT of the middle of the sweep.
+    ///
+    /// `cap_pos` above says the capture is input-driven so a late interface
+    /// stretches it rather than tearing a hole in it, and that is true of
+    /// lateness and false of surplus. `mix_monitor` drops whatever has built
+    /// up in the input ring beyond one block each way rather than playing it
+    /// late — right for monitoring, argued for where it happens — and the
+    /// capture tap reads that ring AFTERWARDS. So a surplus does not arrive
+    /// late, it never arrives: the sweep is spliced, everything past the
+    /// splice shifts early, and `cap_pos` counts what it was handed and sees
+    /// nothing wrong. It cannot, which is why the count is kept here instead
+    /// of inferred.
+    ///
+    /// Two AudioUnits is what makes a surplus happen: input and output are
+    /// separate crystals, so any drift feeds this, and one late output
+    /// callback does it on its own. What it costs is not subtle — 32 frames
+    /// out of the middle of a 5 s sweep take a pure delay's in-band ripple
+    /// from 0.14 dB to 16.7 dB, measured — so `desktop::Host::ir_tick`
+    /// refuses a pass this is non-zero on rather than shipping the smear.
+    ///
+    /// **Detected rather than prevented, deliberately.** The obvious repair
+    /// is to stop trimming while a capture runs: the user is listening to a
+    /// sweep, so the monitoring latency the trim exists to bound does not
+    /// matter for those fifteen seconds. But then the surplus keeps growing
+    /// and the ring's PRODUCER starts dropping instead, where nothing counts
+    /// it — the same corruption, silent again, and reachable only on hardware
+    /// whose two clocks actually disagree. A count that is exact and a
+    /// refusal that is honest are worth more than a repair that cannot be
+    /// proved here; the tap taking its own drain ahead of the trim is the
+    /// real fix and wants a machine to test it on.
+    slipped: usize,
     /// `in_pair` resolved to the monitor ring's columns, once, on accept.
     cols: (usize, usize),
     cols_ready: bool,
@@ -5942,6 +5974,19 @@ impl Renderer {
                 self.shared
                     .monitor_slip
                     .fetch_add((stale / ch_in) as u64, Ordering::Relaxed);
+                // **And if a measurement is recording, it just lost those
+                // frames out of the middle of its sweep.** The capture tap is
+                // below this, so what is dropped here never reaches it and
+                // `cap_pos` cannot tell. Counted against the job rather than
+                // read off the global afterwards, because the global keeps
+                // moving between the last captured frame and the host thread
+                // noticing, and a good pass must not be refused for a drop
+                // that happened after it ended. See `IrJob::slipped`.
+                if let Some(job) = self.ir.as_mut() {
+                    if !job.done && job.tone_hz == 0.0 {
+                        job.slipped += stale / ch_in;
+                    }
+                }
             }
         }
         let got = ring.slots().min(want);
@@ -11805,6 +11850,7 @@ impl Engine {
             capture: Vec::new(),
             cap_pos: 0,
             play_pos: 0,
+            slipped: 0,
             cols: (0, 0),
             cols_ready: false,
             done: false,
@@ -11835,6 +11881,7 @@ impl Engine {
             capture: vec![0.0; total * 2],
             cap_pos: 0,
             play_pos: 0,
+            slipped: 0,
             cols: (0, 0),
             cols_ready: false,
             done: false,
@@ -11869,13 +11916,19 @@ impl Engine {
     }
 
     /// The finished capture, once the audio thread has handed it back:
-    /// the interleaved-stereo buffer and whether it is COMPLETE (a cancel
-    /// returns the partial fill, and the caller can tell). `None` until
+    /// the interleaved-stereo buffer, whether it is COMPLETE (a cancel
+    /// returns the partial fill, and the caller can tell), and how many
+    /// input frames the monitor path threw away underneath it. `None` until
     /// then, which is the ordinary answer most frames.
-    pub fn take_captured(&mut self) -> Option<(Vec<f32>, bool)> {
+    ///
+    /// The third number is not a quality hint, it is a verdict: any value but
+    /// zero means the recorded sweep has a lump missing from its middle and
+    /// is not a measurement of anything. `IrJob::slipped` carries why the
+    /// capture cannot notice that for itself.
+    pub fn take_captured(&mut self) -> Option<(Vec<f32>, bool, usize)> {
         let job = self.shared.finished_ir.lock().ok()?.take()?;
         // The sweep Vec inside dies right here, host-side, with the job.
-        Some((job.capture, job.done))
+        Some((job.capture, job.done, job.slipped))
     }
 
     /// Capture progress as (frames done, frames total). (0, 0) while idle
@@ -21566,7 +21619,7 @@ mod ir_road {
                 break;
             }
         }
-        let (capture, complete) = got.expect("the capture never came back");
+        let (capture, complete, slipped) = got.expect("the capture never came back");
         assert!(complete, "the road stopped short of the buffer");
         assert_eq!(capture.len(), total * 2, "the buffer is not the spec's size");
         // The pre-roll is honest silence.
@@ -21583,9 +21636,91 @@ mod ir_road {
             worst = worst.max((l - want * 0.5).abs()).max((r - want * 0.5).abs());
         }
         assert!(worst < 1.0e-5, "the loop bent the sweep by {worst}");
+        // Nothing was thrown away underneath it. This is the control for
+        // `a_capture_the_monitor_ring_trimmed_under_comes_home_marked`: the
+        // counter has to be silent on the pass that is right, or a verdict
+        // built on it refuses every capture.
+        assert_eq!(slipped, 0, "a clean loop pass reported {slipped} dropped frames");
         // And the road is idle again: nothing further comes back.
         ir_loop_block(&mut e, &mut tx, &mut out);
         assert!(e.take_captured().is_none());
+    }
+
+    /// **A capture the monitor ring trimmed under comes home marked, and the
+    /// sweep in it is torn.**
+    ///
+    /// The IR tap reads the monitor ring downstream of that ring's backlog
+    /// trim, and the trim is not a delay the measurement can absorb — it
+    /// DROPS frames. So a surplus in the ring does not make the capture late,
+    /// it makes it a splice: a lump gone from the middle of the sweep,
+    /// everything after it early, and `cap_pos` counting only what it was
+    /// handed. What that costs a deconvolution is out of all proportion to
+    /// its size — 32 frames out of a 5 s sweep take a pure delay's in-band
+    /// ripple from 0.14 dB to 16.7 dB, which is "it rings and it has
+    /// artifacts" and nothing a person could distinguish from the maths being
+    /// wrong.
+    ///
+    /// Two AudioUnits is what makes the surplus happen: input and output run
+    /// on separate crystals, so any drift feeds the ring, and one late output
+    /// callback does it on its own. Here it is provoked the honest way —
+    /// blocks arriving faster than the callback takes them — and what is
+    /// pinned is that the count comes back non-zero and the recorded sweep
+    /// really is no longer the sweep that was played. `desktop::Host::ir_tick`
+    /// is what refuses the pass on that count.
+    #[test]
+    fn a_capture_the_monitor_ring_trimmed_under_comes_home_marked() {
+        let (mut e, mut tx) = ir_loop_rig();
+        let sr = 48_000.0f64;
+        let sweep = crate::units::sweep::ess(20.0, 20_000.0, 0.25, sr);
+        let (pre, tail) = (4_800usize, 4_800usize);
+        e.start_ir_capture(IrCaptureSpec {
+            out_pair: (0, 1),
+            in_pair: (0, 1),
+            sweep: sweep.clone(),
+            pre_silence_frames: pre,
+            post_silence_frames: tail,
+            level: 0.5,
+        });
+        let mut out = vec![0.0f32; 1024 * 2];
+        let mut got = None;
+        for block in 0..80 {
+            ir_loop_block(&mut e, &mut tx, &mut out);
+            // Block 6 lands inside the sweep (the pre-roll is 4,800 frames,
+            // the sweep runs to 16,800). Two extra blocks arrive before the
+            // next callback takes one, which is what a late output callback
+            // leaves behind and what a fast input clock builds up to. The
+            // trim keeps one block each way and discards the rest.
+            if block == 6 {
+                for _ in 0..2 {
+                    for &v in out.iter() {
+                        let _ = tx.push(v);
+                    }
+                }
+            }
+            if let Some(back) = e.take_captured() {
+                got = Some(back);
+                break;
+            }
+        }
+        let (capture, complete, slipped) = got.expect("the capture never came back");
+        assert!(complete, "the road stopped short of the buffer");
+        assert!(
+            slipped > 0,
+            "the ring trimmed under a running capture and the job came home \
+             saying nothing was lost"
+        );
+        // And it is a real tear, not a bookkeeping note: the sweep is no
+        // longer where the spec put it.
+        let mut worst = 0.0f32;
+        for (t, &want) in sweep.iter().enumerate() {
+            let l = capture[(pre + t) * 2];
+            worst = worst.max((l - want * 0.5).abs());
+        }
+        assert!(
+            worst > 0.01,
+            "frames were dropped and the recorded sweep still matches the \
+             played one to {worst} - the fixture is not reproducing the splice"
+        );
     }
 
     /// **Stopping a capture hands back the partial fill, marked partial.**
@@ -21619,7 +21754,7 @@ mod ir_road {
                 break;
             }
         }
-        let (_, complete) = got.expect("the cancelled job never came home");
+        let (_, complete, _) = got.expect("the cancelled job never came home");
         assert!(!complete, "a cancel claimed to be a finished capture");
     }
 
