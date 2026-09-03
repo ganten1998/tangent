@@ -18318,3 +18318,267 @@ pub fn denoise_test(arg: Option<String>) {
     }
     println!("out:      {dst}  {out_frames} frames, latency {skip} trimmed off the head");
 }
+
+/// **Run the denoiser over a file, offline, at a stated set of dials.**
+///
+/// `--denoise-test in.wav out.wav[,learn=A-B][,reduce=X][,kernel=K][,smooth=X][,release=X]`
+///
+/// The unit under this probe is the one thing in the app whose quality is a
+/// matter of taste and whose faults are a matter of measurement, and the two
+/// were not connected: every judgement about it so far has been somebody
+/// playing a file and saying a word. The owner's word this time was "a crispy
+/// bathroom sounding frequency that sounds like a digital artifact", against a
+/// reference rendered by another tool from the same take — which is a
+/// comparison a machine can make, but only if the same take can be pushed
+/// through this unit on demand.
+///
+/// So: a file in, a file out, the dials named on the command line, and the
+/// learn pass driven exactly as the panel drives it — `learn` held up across a
+/// region and dropped, which is the falling edge that freezes the profile. No
+/// device, no engine, no transport. What comes out is what the insert would
+/// have written, and it can be scored against a reference by anything that can
+/// read a WAV.
+///
+/// `learn=A-B` is the noise-only region in seconds; the default is the
+/// quietest half-second the file has, found by the same short-time RMS a
+/// person would be eyeballing. That default is the honest one for a
+/// comparison: the reference tool was not told where the noise was either.
+#[cfg(feature = "recorder")]
+pub fn denoise_test(arg: Option<String>) {
+    use crate::units::denoise::{Denoise, DenoiseKernel, DenoiseParams, DENOISE_REDUCE_DB};
+
+    let parts: Vec<String> = arg
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .collect();
+    let (Some(src), Some(dst)) = (parts.first(), parts.get(1)) else {
+        eprintln!("usage: --denoise-test in.wav,out.wav[,learn=A-B][,reduce=DB][,kernel=bank|studio|live][,smooth=0..1][,release=0..1]");
+        std::process::exit(2);
+    };
+    let opt = |name: &str| -> Option<String> {
+        parts
+            .iter()
+            .find_map(|p| p.strip_prefix(&format!("{name}=")))
+            .map(str::to_owned)
+    };
+
+    let wav = match crate::wavread::read(std::path::Path::new(src)) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let rate = wav.rate.max(1);
+    let ch = wav.channels.len().max(1);
+    let frames = wav.channels.first().map_or(0, Vec::len);
+    if frames == 0 {
+        eprintln!("{src} holds no audio");
+        std::process::exit(1);
+    }
+    println!("in:       {src}  {ch} ch, {rate} Hz, {frames} frames ({:.2} s)", frames as f64 / f64::from(rate));
+
+    // **Interleaved, because that is what `process` is handed in the rack.**
+    // A probe that fed it planar would be testing a function the app does not
+    // call.
+    let mut buf: Vec<f32> = vec![0.0; frames * ch];
+    for (c, chan) in wav.channels.iter().enumerate() {
+        for (f, v) in chan.iter().enumerate() {
+            buf[f * ch + c] = *v;
+        }
+    }
+
+    // The learn window: named, or the quietest half-second in the file.
+    let learn_win = (rate as usize / 2).max(1);
+    let (l0, l1) = match opt("learn") {
+        Some(spec) => {
+            let mut it = spec.split('-').filter_map(|v| v.parse::<f64>().ok());
+            let a = it.next().unwrap_or(0.0);
+            let b = it.next().unwrap_or(a + 0.5);
+            (
+                ((a * f64::from(rate)) as usize).min(frames),
+                ((b * f64::from(rate)) as usize).min(frames),
+            )
+        }
+        None => {
+            // **The quietest half-second that is still ROOM, not digital
+            // silence**, and the distinction is the whole of this branch.
+            //
+            // The first draft took the quietest window outright and landed on
+            // a stretch of true zeroes — this take has 7.4% of them — which
+            // teaches the unit a floor below the bottom of `DENOISE_THR_DB`.
+            // Every band clamps to `thr_norm = 0`, `recount` reads nothing
+            // live, and the spectral kernel becomes a wire that reports
+            // success: the probe wrote a file bit-identical to its input with
+            // nothing anywhere saying why. A person holding the LEARN button
+            // over a silent bar gets exactly the same result in the app, which
+            // is worth its own guard and is noted where the panel can act on
+            // it.
+            const ROOM_FLOOR: f64 = 1.0e-9; // −90 dBFS mean square: a room, not a zero
+            let step = learn_win / 4;
+            let mut best = (0usize, f64::INFINITY);
+            let mut any = (0usize, f64::INFINITY);
+            let mut at = 0usize;
+            while at + learn_win <= frames {
+                let e: f64 = (at..at + learn_win)
+                    .map(|f| f64::from(buf[f * ch]) * f64::from(buf[f * ch]))
+                    .sum::<f64>()
+                    / learn_win as f64;
+                if e < any.1 {
+                    any = (at, e);
+                }
+                if e > ROOM_FLOOR && e < best.1 {
+                    best = (at, e);
+                }
+                at += step.max(1);
+            }
+            let (pick, _) = if best.1.is_finite() { best } else { any };
+            (pick, pick + learn_win)
+        }
+    };
+    println!(
+        "learn:    {:.2} s .. {:.2} s{}",
+        l0 as f64 / f64::from(rate),
+        l1 as f64 / f64::from(rate),
+        if opt("learn").is_some() { " (named)" } else { " (quietest half-second)" },
+    );
+
+    let kernel = match opt("kernel").as_deref() {
+        Some("bank") => DenoiseKernel::Bank,
+        Some("live") => DenoiseKernel::SpectralLive,
+        _ => DenoiseKernel::SpectralStudio,
+    };
+    let reduce_db: f32 = opt("reduce")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DENOISE_REDUCE_DB * 0.5);
+    let mut params = DenoiseParams {
+        kernel: kernel.dial(),
+        reduce: (reduce_db / DENOISE_REDUCE_DB).clamp(0.0, 1.0),
+        ..DenoiseParams::default()
+    };
+    if let Some(v) = opt("smooth").and_then(|v| v.parse::<f32>().ok()) {
+        params.smooth = v.clamp(0.0, 1.0);
+    }
+    if let Some(v) = opt("release").and_then(|v| v.parse::<f32>().ok()) {
+        params.release = v.clamp(0.0, 1.0);
+    }
+    println!(
+        "dials:    kernel {}  reduce {reduce_db:.1} dB  smooth {:.2}  release {:.2}",
+        kernel.label(),
+        params.smooth,
+        params.release,
+    );
+
+    let mut dn = Denoise::new(rate as f32);
+    dn.prime(&params);
+
+    // **The learn pass, then the falling edge, then the file.** Block-sized
+    // exactly as a rack call is, because the kernel's frame machinery is
+    // block-rate and a single 26-second call would be a path the app never
+    // takes.
+    const BLOCK: usize = 256;
+    let mut learning = params.clone();
+    learning.learn = 1.0;
+    let mut scratch = vec![0.0f32; BLOCK * ch];
+    let mut at = l0;
+    while at < l1 {
+        let n = BLOCK.min(l1 - at);
+        scratch[..n * ch].copy_from_slice(&buf[at * ch..(at + n) * ch]);
+        dn.process(&mut scratch[..n * ch], n, ch, &learning);
+        at += n;
+    }
+    // The falling edge freezes the profile. One empty block with learn down,
+    // exactly as the panel's toggle produces it.
+    dn.process(&mut scratch[..0], 0, ch, &params);
+    // **NOT `clear()` here**, which was the first draft and made this probe a
+    // wire. `Denoise::clear` calls `refloor` and resets the spectral kernel,
+    // and the learned profile goes with them — so the play pass ran with
+    // nothing learned and the file came back bit-identical to its input. The
+    // panel does not clear after a learn pass either; the small transient the
+    // play pass inherits from the learn pass's ring is what the insert has too.
+
+    // **What the learn pass actually taught it**, printed because the first
+    // draft of this probe produced a file bit-identical to its input and there
+    // was nothing on screen to say why.
+    let thr = dn.thresholds();
+    let live_bands = thr.iter().filter(|v| **v > 0.0).count();
+    println!(
+        "learned:  {live_bands} of {} bands live, thresholds {:.3}..{:.3}",
+        thr.len(),
+        thr.iter().cloned().fold(f32::INFINITY, f32::min),
+        thr.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+    );
+    // And what the unit says the pass WAS, which is now a thing it can say.
+    // The kernel refuses a pass over digital silence rather than freezing a
+    // profile of nothing — see `units::denoise::DenoiseLearn` — so this line
+    // is the difference between "the region you named holds the room" and
+    // "the region you named holds zeroes and the run below is a wire".
+    match dn.last_learn() {
+        crate::units::denoise::DenoiseLearn::Taught => {}
+        crate::units::denoise::DenoiseLearn::Silent => {
+            eprintln!(
+                "learn:    REFUSED — that region is digital silence, not room tone. The \
+                 profile in force is whatever was there before (here: nothing), so the run \
+                 below is a wire. Name a region with the room in it: ,learn=A-B"
+            );
+        }
+        crate::units::denoise::DenoiseLearn::TooShort => {
+            eprintln!(
+                "learn:    REFUSED — that region is shorter than the minimum learn pass. \
+                 The run below is a wire."
+            );
+        }
+        crate::units::denoise::DenoiseLearn::None => {
+            eprintln!("learn:    nothing was taught; the run below is a wire.");
+        }
+    }
+
+    let began = std::time::Instant::now();
+    let mut at = 0usize;
+    while at < frames {
+        let n = BLOCK.min(frames - at);
+        dn.process(&mut buf[at * ch..(at + n) * ch], n, ch, &params);
+        at += n;
+    }
+    let took = began.elapsed().as_secs_f64();
+    println!(
+        "ran:      {took:.2} s for {:.2} s of audio ({:.0}x real time), reported latency {} frames",
+        frames as f64 / f64::from(rate),
+        (frames as f64 / f64::from(rate)) / took.max(1e-9),
+        dn.latency(),
+    );
+
+    // **Written at the unit's own latency**, so the file lines up with the
+    // input sample for sample and a comparison does not have to guess. The
+    // insert path compensates this in the rack; a bare probe has to do it
+    // here or every measurement made from the file is out by 21 ms.
+    let skip = dn.latency() as usize;
+    let out_frames = frames.saturating_sub(skip);
+    let spec = tangent_record::wav::WavSpec {
+        sample_rate: rate,
+        channels: ch as u16,
+        format: tangent_record::wav::SampleFormat::Float32,
+    };
+    let bext = tangent_record::wav::Bext::new(
+        tangent_record::wav::Wallclock::from_unix(0, 0),
+        spec,
+    );
+    let mut w = match tangent_record::wav::WavWriter::create(std::path::Path::new(dst), spec, &bext)
+    {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("could not write {dst}: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = w.write_interleaved(&buf[skip * ch..skip * ch + out_frames * ch]) {
+        eprintln!("could not write {dst}: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = w.finish() {
+        eprintln!("could not close {dst}: {e}");
+        std::process::exit(1);
+    }
+    println!("out:      {dst}  {out_frames} frames, latency {skip} trimmed off the head");
+}
