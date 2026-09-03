@@ -115,6 +115,35 @@ pub const TAIL_MARGIN_DB: f64 = 3.0;
 /// crosses.
 pub const TAIL_RANGE_MAX_DB: f64 = 80.0;
 
+/// **The range below which a capture is not a measurement, in dB.**
+///
+/// The capture's peak minus the loop's own floor is all the dynamic range
+/// there is to find a decay in, and the truncator can only follow a tail
+/// down as far as that number reaches. Past some point it is no longer
+/// cutting the hiss off the end of the decay, it is cutting inside the
+/// decay — and the IR that comes back is a fraction of the box with nothing
+/// on screen to say so.
+///
+/// 30 dB, and the bench says why. A 1.5 s plate through the wizard's own
+/// settings, with the range walked down by raising a dead return's hiss:
+///
+///   range 58.8 dB → 0.99 s kept, RT60 1.495 s against the plate's 1.5
+///   range 38.8 dB → 0.49 s kept, RT60 1.011 s — short, but still the box
+///   range 28.8 dB → 0.24 s kept, RT60 0.363 s — no longer the box at all
+///   range 18.8 dB → 0.05 s kept, RT60 0.016 s
+///
+/// The recovered decay stops being the box's somewhere between 39 and 29 dB
+/// of range, so the line is drawn at 30. **This is a line for TELLING the
+/// user, not for refusing the capture**: a short honest IR of a quiet box is
+/// still worth having, and the wizard prints the peak, the floor and the
+/// range beside it. What must not happen is handing one back in silence.
+///
+/// Below about 22 dB there is not even a decay to cut: see
+/// [`floor_crossing`], where a level that never stood above its own floor is
+/// refused a vote rather than allowed to end the IR at the earliest legal
+/// sample.
+pub const TRUSTWORTHY_RANGE_DB: f32 = 30.0;
+
 /// How far below the peak a sample still counts as part of the direct
 /// impulse when hunting for its foot. −40 dB: below the pre-ringing a
 /// bandpassed Dirac carries, above any capture's noise floor.
@@ -621,16 +650,27 @@ pub fn cut_with_fade(ir: &mut Vec<f32>, cut: usize, sample_rate: f64) {
 /// too. Cutting the channels separately breaks it two ways, and both were
 /// measured on a mono box patched into one side of the loop.
 ///
-/// The clamp is the loud one. `cut_with_fade` refuses any cut earlier than
+/// The clamp is one of them. `cut_with_fade` refuses any cut earlier than
 /// its OWN buffer's `peak + 1 + fade`, and a channel carrying nothing but
 /// converter hiss has its "peak" wherever the noise happened to crest —
-/// four hundred thousand samples in, on the capture measured here. The
-/// window cut, the binding one on any clean capture, then landed BEFORE
-/// that index and was refused outright: that channel kept the entire
-/// deconvolution buffer, un-faded, ending on a hard step at full noise
-/// level. Reading the clamp off the SET's peak — the direct impulse, which
-/// is what the clamp was always about — means a dead channel cannot defeat
-/// a bound that has nothing to do with it.
+/// a number with nothing whatever to do with the measurement, deciding how
+/// early that channel may be cut. Reading the clamp off the SET's peak —
+/// the direct impulse, which is what the clamp was always about — takes the
+/// decision away from the noise.
+///
+/// **A WITHDRAWN CLAIM, kept here because it was in the tree as measured
+/// and is not.** The commit that made this change said the dead channel's
+/// crest landed PAST the window cut, so the cut was refused outright and
+/// that channel kept the entire deconvolution buffer un-faded, ending on a
+/// hard step at full noise level. It does not reproduce. Twelve noise seeds
+/// on the reference route put the dead channel's crest between sample
+/// 17,434 and 178,100 of a 768,000-sample buffer, and the window cut sits at
+/// 480,000: nothing was ever refused, and the channel ended faded every
+/// time. The reason is structural rather than lucky — the division's
+/// regularization concentrates a noise channel's largest excursions near the
+/// front of the buffer, so the crest does not roam the way a uniform draw
+/// would. The hazard the clamp change removes is real and is the paragraph
+/// above; the hard step was never observed and no longer claimed.
 ///
 /// And the LENGTH. With the channels cut apart, the capture road's
 /// `resize` to the longer of them pads the good channel out to match the
@@ -720,8 +760,21 @@ pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) {
 /// on either side of a true-stereo pair and gives a dead return no vote at
 /// all.
 ///
+/// **And the DUAL of that rule, which is where this shipped a stub.** A
+/// channel that never sinks to the floor has no measurement in it; so does a
+/// channel that was never ABOVE the floor to begin with, and that one used
+/// to answer with the very first index the search looked at. Since the
+/// search starts at `peak + 1 + fade`, which is also the earliest cut
+/// [`cut_set_with_fade`] will accept, the answer was a cut nothing could
+/// refuse and the whole pair came back 10 ms long — the impulse, its fade,
+/// and none of the box. [`floor_crossing`] carries the measurement and the
+/// fix: a crossing has to cross.
+///
 /// When no channel reaches the floor the set is left alone: whatever bound
-/// the caller applied before this one still stands.
+/// the caller applied before this one still stands. That is now also the
+/// answer for a capture with no decay above its own floor at all, and
+/// [`TRUSTWORTHY_RANGE_DB`] is the level at which the app says so out loud
+/// rather than handing back a long IR of a bad capture in silence.
 pub fn truncate_set_at_floor(irs: &mut [Vec<f32>], floor_db: f32, sample_rate: f64) {
     if irs.is_empty() || !floor_db.is_finite() || sample_rate <= 0.0 {
         return;
@@ -744,16 +797,58 @@ pub fn truncate_set_at_floor(irs: &mut [Vec<f32>], floor_db: f32, sample_rate: f
 /// The first index at or after `first` whose `win`-long window reads at or
 /// below `threshold_db`, or `None` when the level never gets there inside
 /// this buffer. Prefix sums of squares, so each window is O(1) to read.
+///
+/// **A crossing has to be a CROSSING.** The level must stand ABOVE the
+/// threshold where the search begins; a buffer that is already at or under
+/// its own floor at the first window never rose above it, and the index the
+/// search happened to start at is not "where the tail ended" — there is no
+/// tail. That distinction is the whole of this function's contract and it
+/// was missing, at a cost the bench put a number on.
+///
+/// The callers hand `first` in as `peak + 1 + fade`, which is also the
+/// earliest cut [`cut_with_fade`] and [`cut_set_with_fade`] will accept — so
+/// a crossing returned AT `first` is a cut those functions cannot refuse,
+/// and it deletes everything except the direct impulse and the fade that
+/// follows it. Measured on the road, at 48 kHz: a capture running 21.4 dB
+/// above the loop's floor came back **481 samples — 10.0 ms — of a 3 s
+/// window**, on both deconvolution routes, with the wizard reporting it as a
+/// successful capture. A quiet outboard unit is not an edge case; it is what
+/// half the reason to own this wizard sounds like.
+///
+/// **The clamp is not the lever, and this is why it is fixed here.** Raising
+/// [`cut_set_with_fade`]'s `earliest` above `first` would make the same cut
+/// get refused instead of made, which stops the destruction — but it stops
+/// it by accident, at whatever gap the two numbers happen to differ by, and
+/// it would refuse honest short cuts with it. The fault is that the search
+/// answered at all. A pure delay captured at full range still crosses
+/// properly and is still cut at 1,357 samples, because its recovered ringing
+/// genuinely stands above the threshold at `first` and genuinely sinks below
+/// it later; it is only the capture with no measurement in it that now
+/// declines to vote.
+///
+/// When nothing crosses, the caller leaves the buffer alone and whatever
+/// bound it applied before this one — on the capture road, the post-sweep
+/// window — still stands. A long IR of an untrustworthy capture is a poor
+/// result the user can see and re-take; a 10 ms one looks like a good result
+/// and is a deleted measurement. See [`TRUSTWORTHY_RANGE_DB`] for the level
+/// the app says this out loud at.
 fn floor_crossing(level: &[f32], first: usize, win: usize, threshold_db: f64) -> Option<usize> {
     let len = level.len();
     let mut prefix = vec![0.0f64; len + 1];
     for (i, &v) in level.iter().enumerate() {
         prefix[i + 1] = prefix[i] + f64::from(v) * f64::from(v);
     }
-    let mut start = first;
-    while start + win <= len {
+    let window_db = |start: usize| {
         let ms = (prefix[start + win] - prefix[start]) / win as f64;
-        if 10.0 * ms.max(1e-30).log10() <= threshold_db {
+        10.0 * ms.max(1e-30).log10()
+    };
+    // Nothing to measure, and nothing above the floor to measure it from.
+    if first + win > len || window_db(first) <= threshold_db {
+        return None;
+    }
+    let mut start = first + 1;
+    while start + win <= len {
+        if window_db(start) <= threshold_db {
             return Some(start);
         }
         start += 1;
