@@ -185,6 +185,13 @@ const COMP_FACE_PARAMS: &[ParamSpec] = &[
 /// two together. The 32 learned thresholds are NOT knobs: they persist as
 /// the extra-state symbols `t0..t31` (see [`is_extra_symbol`]), because a
 /// threshold is a measurement, not a dial an automation lane should sweep.
+///
+/// `kernel` sits at the END, at id 6, and stays there. Ids and symbols are
+/// persisted forever and a value must never move one knob to the left
+/// because a parameter was added, so a new one takes a new number at the
+/// end of the road — which is also why a session written before this
+/// parameter existed reads it as the spec's default (Spectral Studio) and
+/// not as position zero.
 const DENOISE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 0, symbol: "learn", name: "Learn", units: "", default: 0.0, steps: 2 },
     ParamSpec { id: 1, symbol: "reduce", name: "Reduce", units: "dB", default: 0.5, steps: 0 },
@@ -192,7 +199,13 @@ const DENOISE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 3, symbol: "release", name: "Release", units: "ms", default: 0.5, steps: 0 },
     ParamSpec { id: 4, symbol: "sc_hpf", name: "Detector HPF", units: "Hz", default: 0.0, steps: 0 },
     ParamSpec { id: 5, symbol: "lookahead", name: "Lookahead", units: "", default: 1.0, steps: 2 },
+    ParamSpec { id: 6, symbol: "kernel", name: "Kernel", units: "", default: 0.5, steps: DENOISE_KERNEL_STEPS },
 ];
+
+/// How many positions the denoise's KERNEL menu has. A literal so the table
+/// above stays `const`; a test pins it to `DenoiseKernel::ALL`, the enum it
+/// steps through — the same arrangement the EQ's shape knob uses.
+const DENOISE_KERNEL_STEPS: i32 = crate::units::denoise::DENOISE_KERNEL_STEPS;
 
 /// One knob per panel control of `units::amp`. Ids 0..4 are the top strip
 /// (bright, volume, tone stack), 5..8 the vibrato group. Defaults are
@@ -513,13 +526,17 @@ pub fn describe(path: &str, id: u32, value: f32) -> String {
                         fmt_hz(sweep(DENOISE_SC_HPF_HZ))
                     }
                 }
-                _ => {
+                5 => {
                     if v >= 0.5 {
                         fmt_ms(DENOISE_LOOKAHEAD_MS)
                     } else {
                         "off".to_owned()
                     }
                 }
+                // The engine, in the selector's own words — the same
+                // strings `choices` offers, so the row and the reading can
+                // never disagree about which kernel is in the circuit.
+                _ => DenoiseKernel::from_dial(v).label().to_owned(),
             }
         }
         (AMP_PATH, 0) => (if v >= 0.5 { "on" } else { "off" }).to_owned(),
@@ -589,6 +606,10 @@ pub fn choices(path: &str, id: u32) -> Vec<String> {
         // The learn toggle's positions are the BUTTON's words, not on/off:
         // at rest it offers the verb, engaged it reports the state.
         (DENOISE_PATH, 0) => vec!["Learn".to_owned(), "Listening".to_owned()],
+        (DENOISE_PATH, 6) => crate::units::denoise::DenoiseKernel::ALL
+            .iter()
+            .map(|k| k.label().to_owned())
+            .collect(),
         (DENOISE_PATH, 5) | (AMP_PATH, 0) => {
             vec!["off".to_owned(), "on".to_owned()]
         }
@@ -976,7 +997,12 @@ impl BuiltinUnit {
             // The denoise's clear keeps what was LEARNED — its kernel
             // documents "forget what was playing, keep the thresholds",
             // which is exactly what a restored preset needs from the
-            // `create`-then-`clear` load path.
+            // `create`-then-`clear` load path. Seating the ENGINE is
+            // `DenoiseUnit::set_param`'s job and is deliberately not
+            // duplicated here: `create` writes every parameter through
+            // `set_param` before it calls this, `set_param` primes on every
+            // write, and a second call would be a guard no revert could
+            // turn red.
             BuiltinUnit::Denoise(u) => u.kernel.clear(),
             BuiltinUnit::Amp(u) => u.kernel.clear(),
             BuiltinUnit::Drive(u) => u.kernel.clear(),
@@ -1350,8 +1376,21 @@ impl DenoiseUnit {
             2 => self.params.smooth = v,
             3 => self.params.release = v,
             4 => self.params.sc_hpf = v,
-            _ => self.params.lookahead = v,
+            5 => self.params.lookahead = v,
+            _ => self.params.kernel = v,
         }
+        // **The selector and the lookahead toggle move LATENCY, and the
+        // kernel answers about them from its own fields, not from these.**
+        // Those fields were only ever written inside `process`, so a unit
+        // built from a blob answered with the CONSTRUCTOR's engine until it
+        // had seen a block: `UnitSpec::create` sets the parameters and
+        // `prepare_builtin` reads `latency()` the next line, so a bay
+        // restored on Bank reported the spectral frame instead of zero, and
+        // for a bay restored BYPASSED it kept reporting it — the block loop
+        // is the only correction road and it is skipped for a bypassed bay
+        // by design. `prime` runs the same two edges `process` runs, in the
+        // same order, allocation-free, so it is safe from here.
+        self.kernel.prime(&self.params);
     }
 
     fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
@@ -2028,10 +2067,24 @@ mod tests {
         // And the wave-4 nine, same disease, same cure.
         let d = crate::units::denoise::DenoiseParams::default();
         for (spec, want) in DENOISE_FACE_PARAMS.iter().zip([
-            d.learn, d.reduce, d.smooth, d.release, d.sc_hpf, d.lookahead,
+            d.learn, d.reduce, d.smooth, d.release, d.sc_hpf, d.lookahead, d.kernel,
         ]) {
             assert_eq!(spec.default, want, "{} drifted from DenoiseParams::default", spec.symbol);
         }
+        // The kernel menu steps across exactly the kernel's enum, ends
+        // inclusive, and its default position is the one the enum calls
+        // Spectral Studio — a literal in the table, pinned to its source.
+        use crate::units::denoise::DenoiseKernel;
+        assert_eq!(
+            DENOISE_KERNEL_STEPS as usize,
+            DenoiseKernel::ALL.len(),
+            "the kernel knob's step count drifted from DenoiseKernel::ALL"
+        );
+        assert_eq!(
+            DenoiseKernel::from_dial(d.kernel),
+            DenoiseKernel::SpectralStudio,
+            "the shipped denoise no longer opens on Spectral Studio"
+        );
         // The amp's table is nine knobs to the kernel's eight: VIB is a
         // panel SWITCH the wrapper folds into vib_depth (off = depth 0),
         // so the switch and the intensity both rest at zero by design and
@@ -2385,6 +2438,78 @@ mod tests {
         vec![l, r]
     }
 
+    /// **A denoise seated from a saved blob reports its latency BEFORE it
+    /// has seen a block.**
+    ///
+    /// `Denoise::latency` answers from the kernel's own `kernel` and
+    /// `la_on` fields, and those were only ever written inside `process`.
+    /// `UnitSpec::create` sets the parameters and `instrument`'s
+    /// `prepare_builtin` reads `latency()` on the very next line, so a bay
+    /// restored on Bank claimed the SPECTRAL frame — 1024 samples at 48 kHz
+    /// — and a bay restored on Spectral Live claimed 1024 instead of 512.
+    /// Built-ins carry no latency handle, so the only correction road is
+    /// `Backend::reported_latency` in the block loop, and that call is
+    /// skipped for a BYPASSED bay by design: a project reopened with this
+    /// bay bypassed held a phantom 1024 frames in that cell for the whole
+    /// session, and `publish_latency` aligned every other lane behind it.
+    ///
+    /// Read through the real load path — `state_text`, `values_from_state`,
+    /// `create` — because the fault lives in the seam between them and a
+    /// test that called `set_param` by hand would have walked past it.
+    #[test]
+    fn a_denoise_seated_from_a_blob_reports_its_latency_before_the_first_block() {
+        use crate::units::denoise::{DenoiseKernel, DenoiseParams, DENOISE_LOOKAHEAD_MS};
+        let spec = spec_for(DENOISE_PATH).unwrap();
+        let la = (48_000.0 * DENOISE_LOOKAHEAD_MS / 1_000.0).round() as u32;
+        for (kernel, lookahead, want) in [
+            (DenoiseKernel::Bank, 1.0_f32, la),
+            (DenoiseKernel::Bank, 0.0, 0),
+            (DenoiseKernel::SpectralStudio, 1.0, 1_024),
+            (DenoiseKernel::SpectralLive, 1.0, 512),
+            (DenoiseKernel::SpectralLive, 0.0, 512),
+        ] {
+            let p = DenoiseParams {
+                lookahead,
+                kernel: kernel.dial(),
+                ..DenoiseParams::default()
+            };
+            let values = vec![p.learn, p.reduce, p.smooth, p.release, p.sc_hpf, p.lookahead, p.kernel];
+            let text = state_text(spec, &values, &[]);
+            let back = values_from_state(spec, text.as_bytes()).expect("own text reads back");
+            let unit = spec.create(48_000.0, &back);
+            assert_eq!(
+                unit.latency(),
+                want,
+                "{} with lookahead {lookahead} reported {} frames before its first block",
+                kernel.label(),
+                unit.latency()
+            );
+        }
+
+        // And the disclosure this unit's Kernel selector owes every blob
+        // written before it existed: a state block with no `kernel=` line
+        // reads as the spec default, which is Spectral Studio, so it opens
+        // on the spectral engine and reports the frame rather than the
+        // bank's zero. That is deliberate — the enum's own doc argues for
+        // it and the CHANGELOG says so out loud — and it is written down
+        // here so that changing it is a decision rather than a drift. The
+        // profile such a blob carries was learned by the BANK, and a
+        // profile belongs to the kernel that learned it.
+        let old_blob = b"tangentfx 1\nlearn=0\nreduce=0.5\nsmooth=0.5\nrelease=0.5\nsc_hpf=0\nlookahead=1\n";
+        let back = values_from_state(spec, old_blob).expect("a pre-kernel blob still reads");
+        assert_eq!(
+            back[6],
+            DenoiseKernel::SpectralStudio.dial(),
+            "a blob written before the Kernel parameter no longer reads as Spectral Studio"
+        );
+        let unit = spec.create(48_000.0, &back);
+        assert_eq!(
+            unit.latency(),
+            1_024,
+            "a pre-kernel blob's bay does not report the spectral frame it will actually cost"
+        );
+    }
+
     /// **Learn, freeze, persist, restore: the denoise's whole threshold
     /// story at the unit level.** The dial up is listening, the falling edge
     /// freezes, the snapshot is offered for exactly the freeze block, and a
@@ -2400,9 +2525,13 @@ mod tests {
         let frames = 512;
         let mut out = vec![vec![0.0f32; frames]; 2];
         let mut seed = 7u32;
-        // Listening: ~160 ms of noise, far past the kernel's minimum pass.
+        // Listening: ~213 ms of noise, past the kernel's 200 ms minimum
+        // pass. This was 15 blocks and 160 ms, which cleared the 10.7 ms
+        // guard the bank shipped with; the guard is 200 ms now, because a
+        // tenth of a second is a mouse bounce and both kernels' learned
+        // statistics are averages that mean nothing over one.
         unit.set_param(0, 1.0);
-        for _ in 0..15 {
+        for _ in 0..20 {
             let input = noise_planar(frames, &mut seed);
             unit.process(&input, frames, &mut out);
         }
@@ -2547,6 +2676,11 @@ mod tests {
         assert_eq!(describe(DENOISE_PATH, 1, 0.5), "-12.0 dB");
         assert_eq!(describe(DENOISE_PATH, 1, 0.0), "off");
         assert_eq!(describe(DENOISE_PATH, 5, 1.0), "3.0 ms");
+        // The kernel selector reads as the engine, in the words the
+        // cycling row offers, at each of its three positions.
+        assert_eq!(describe(DENOISE_PATH, 6, 0.0), "Bank");
+        assert_eq!(describe(DENOISE_PATH, 6, 0.5), "Spectral Studio");
+        assert_eq!(describe(DENOISE_PATH, 6, 1.0), "Spectral Live");
         // The shipped level is unity to a tenth of a dB: 0.71² · 2 ≈ 1.008.
         assert_eq!(describe(DRIVE_PATH, 2, 0.71), "+0.1 dB");
         assert_eq!(describe(DRIVE_PATH, 3, 0.0), "matched");
@@ -2565,6 +2699,10 @@ mod tests {
         assert_eq!(describe(TAPE_PATH, 3, 0.3), fmt_pct(0.3));
         assert_eq!(describe(TAPE_PATH, 4, 0.25), fmt_pct(0.25));
         assert_eq!(choices(DENOISE_PATH, 0), vec!["Learn", "Listening"]);
+        assert_eq!(
+            choices(DENOISE_PATH, 6),
+            vec!["Bank", "Spectral Studio", "Spectral Live"]
+        );
         assert_eq!(choices(DRIVE_PATH, 3), vec!["matched", "uneven"]);
         assert_eq!(choices(AMP_PATH, 0), vec!["off", "on"]);
         assert!(choices(TREM_PATH, 0).is_empty(), "a continuous dial grew steps");
