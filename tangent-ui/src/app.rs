@@ -1030,6 +1030,14 @@ pub struct TangentApp {
     /// level deep. Pushed like the preset rows; the app never opens the
     /// folder itself.
     ir_rows: Vec<crate::ports::IrRow>,
+    /// How many times the shelf above has been replaced. The IR face's
+    /// browser holds a listing of one folder and the generation it read it
+    /// at, so a capture that lands in the folder being browsed shows up
+    /// without anybody having to walk out and back in. A counter rather
+    /// than a flag because the browser is not the only thing that could
+    /// ever want to know, and a flag one reader clears is a flag the next
+    /// reader never sees.
+    ir_scan_gen: u64,
     /// The IR road's live picture, pushed by the host while the wizard
     /// meters, captures or deconvolves. Copied into the open wizard each
     /// frame, the `InsertFace` live-refresh bargain.
@@ -1441,8 +1449,13 @@ pub struct TangentApp {
 /// accrued points makes both dialects mean the same amount. The carry
 /// decays whenever the wheel goes quiet, so a fading tail can never
 /// bank a phantom step for the next gesture.
+///
+/// Public because a face wants it too: the IR browser walks its listing by
+/// the wheel exactly as the drumpad's media explorer does, and the whole
+/// point of packaging this was that every stepped consumer spends intent the
+/// same way.
 #[derive(Default)]
-struct WheelSteps {
+pub struct WheelSteps {
     carry: f32,
 }
 
@@ -1452,7 +1465,7 @@ impl WheelSteps {
 
     /// Feed this frame's delta over the consumer's hotspot (zero when the
     /// wheel is quiet there); take back how many whole steps it earned.
-    fn steps(&mut self, delta: f32) -> i32 {
+    pub fn steps(&mut self, delta: f32) -> i32 {
         if delta == 0.0 {
             self.carry *= 0.75;
             if self.carry.abs() < 1.0 {
@@ -2511,6 +2524,7 @@ impl TangentApp {
             preset_rows: std::collections::HashMap::new(),
             preset_loaded: None,
             ir_rows: Vec::new(),
+            ir_scan_gen: 0,
             ir_live: crate::ports::IrLive::default(),
             plugin_rescan: false,
             reveal_request: None,
@@ -19788,6 +19802,80 @@ impl TangentApp {
     /// preset rows do, so what any picker shows is what the disk holds.
     pub fn set_ir_rows(&mut self, rows: Vec<crate::ports::IrRow>) {
         self.ir_rows = rows;
+        self.ir_scan_gen = self.ir_scan_gen.wrapping_add(1);
+    }
+
+    /// Re-list the IR browser's folder into the open face.
+    ///
+    /// The drumpad's `refresh_media` for impulses: the app opens the folder,
+    /// the panel draws what it is handed. Folders first, then the files
+    /// `faces::is_ir_file` says this build can load, both sorted, dotfiles
+    /// skipped — the explorer's own rules, because two browsers in one app
+    /// that sorted differently would read as two apps.
+    ///
+    /// **The listing carries the key it was read under.** `ir_listed` is the
+    /// folder the rows describe and `ir_gen` the shelf generation they were
+    /// read at, so a resting panel costs nothing, a walk costs exactly one
+    /// `read_dir`, and a capture landing in the folder on screen appears by
+    /// itself. Durations are looked up from the host's own scan rather than
+    /// re-measured here: reading a WAV header is the engine side's job and
+    /// this crate has no WAV reader to do it honestly with.
+    fn refresh_ir_browser(&mut self, live: &mut crate::faces::FaceLive) {
+        let root = self.irs_root().to_string_lossy().into_owned();
+        live.ir_root = root.clone();
+        if live.ir_dir.is_empty() {
+            live.ir_dir = root;
+        }
+        if live.ir_listed == live.ir_dir && live.ir_gen == self.ir_scan_gen {
+            return;
+        }
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&live.ir_dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                // `metadata`, never `file_type` — the explorer's own hard
+                // lesson: a symlink is neither a dir nor a file to the
+                // entry's own type, and ~/Dropbox is exactly that.
+                match std::fs::metadata(e.path()) {
+                    Ok(t) if t.is_dir() => dirs.push(name),
+                    Ok(t) if t.is_file() && crate::faces::is_ir_file(&name) => {
+                        files.push(name)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        dirs.sort_by_key(|n| n.to_lowercase());
+        files.sort_by_key(|n| n.to_lowercase());
+        let here = std::path::Path::new(&live.ir_dir);
+        let seconds = |name: &str| {
+            let path = here.join(name);
+            self.ir_rows
+                .iter()
+                .find(|r| std::path::Path::new(&r.path) == path)
+                .map(|r| r.seconds)
+                .unwrap_or(0.0)
+        };
+        live.ir_entries = dirs
+            .into_iter()
+            .map(|name| crate::faces::IrEntry {
+                name,
+                dir: true,
+                seconds: 0.0,
+            })
+            .chain(files.into_iter().map(|name| crate::faces::IrEntry {
+                seconds: seconds(&name),
+                name,
+                dir: false,
+            }))
+            .collect();
+        live.ir_listed = live.ir_dir.clone();
+        live.ir_gen = self.ir_scan_gen;
+        live.ir_scroll = 0;
     }
 
     /// What the host last found under `IRs/`. Empty until it has pushed —
@@ -28006,7 +28094,11 @@ impl TangentApp {
             live.gr_db = self.insert_gr(seat, bay);
             live.preset_rows = self.preset_rows(&live.face.path).to_vec();
             if live.face.path == "@tangent-ir" {
-                live.irs = self.ir_rows().to_vec();
+                // The face used to be handed the whole shelf and drew it
+                // flat. It walks folders now, so what it needs is a listing
+                // of ONE of them; the host's shelf stays where it is, as the
+                // place the durations in that listing are read from.
+                self.refresh_ir_browser(&mut live);
             }
             // The amp face's pedal chips, refreshed from settings like the
             // rest of the picture — and only for a CHANNEL's seat: the
@@ -39928,6 +40020,111 @@ mod folder_tests {
         // A mono input device still offers a loop.
         assert_eq!(TangentApp::ir_channel_pairs(1), vec![(0, 0)]);
         assert!(TangentApp::ir_channel_pairs(0).is_empty());
+    }
+
+    /// **The IR browser opens on the IRs folder, lists only impulses, and
+    /// walks anywhere.**
+    ///
+    /// The app half of the panel: `refresh_ir_browser` is the drumpad's
+    /// `refresh_media` for impulses, and the three promises the owner made
+    /// about it — "it defaults in the tangent media irs folder", "you load
+    /// any irs there", and a browser that keeps up with the Wizard — are
+    /// all promises about this function, so it is driven against a real
+    /// folder rather than a mock one.
+    #[test]
+    fn the_ir_browser_opens_on_the_irs_folder_and_walks_anywhere() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-ir-browse-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let irs = root.join("IRs");
+        let cabs = irs.join("Cabs");
+        std::fs::create_dir_all(&cabs).expect("make the folders");
+        std::fs::write(irs.join("plate.wav"), b"x").unwrap();
+        std::fs::write(irs.join("spring.WAV"), b"x").unwrap();
+        // Everything the reader cannot read, and one thing an explorer
+        // never shows: a browser that offered these would offer files the
+        // convolver refuses.
+        std::fs::write(irs.join("notes.txt"), b"x").unwrap();
+        std::fs::write(irs.join("take.aiff"), b"x").unwrap();
+        std::fs::write(irs.join(".hidden.wav"), b"x").unwrap();
+        std::fs::write(cabs.join("4x12.wav"), b"x").unwrap();
+
+        let mut a = app();
+        a.settings.irs_dir = Some(irs.to_string_lossy().into_owned());
+        let mut live = crate::faces::FaceLive::default();
+        // An empty `ir_dir` is a panel that has just opened, and the folder
+        // it lands in is the whole of "it defaults in the tangent media irs
+        // folder though".
+        a.refresh_ir_browser(&mut live);
+        assert_eq!(live.ir_dir, irs.to_string_lossy());
+        assert_eq!(live.ir_root, irs.to_string_lossy());
+        let names: Vec<&str> = live.ir_entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Cabs", "plate.wav", "spring.WAV"],
+            "folders first, then impulses, nothing else"
+        );
+        assert!(live.ir_entries[0].dir, "the folder did not read as one");
+        assert!(!live.ir_entries[1].dir);
+
+        // Walking in: the face writes the folder, the app lists it. One
+        // `read_dir` per walk and none at rest — the listing carries the
+        // key it was read under.
+        live.ir_dir = cabs.to_string_lossy().into_owned();
+        a.refresh_ir_browser(&mut live);
+        assert_eq!(live.ir_entries.len(), 1);
+        assert_eq!(live.ir_entries[0].name, "4x12.wav");
+
+        // And out of the IRs tree entirely, which is what "you load any irs
+        // there" is really asking for: the browser is not fenced in.
+        live.ir_dir = root.to_string_lossy().into_owned();
+        a.refresh_ir_browser(&mut live);
+        assert_eq!(live.ir_entries.len(), 1);
+        assert!(live.ir_entries[0].dir, "the IRs folder itself should be a row");
+
+        // A folder with no impulses at all lists nothing and says nothing —
+        // the panel prints the sentence, not the scan.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        live.ir_dir = empty.to_string_lossy().into_owned();
+        a.refresh_ir_browser(&mut live);
+        assert!(live.ir_entries.is_empty());
+
+        // Durations come off the HOST's scan rather than being re-measured
+        // on this side, which has no WAV reader to do it with honestly.
+        a.set_ir_rows(vec![crate::ports::IrRow {
+            name: "plate".to_owned(),
+            path: irs.join("plate.wav").to_string_lossy().into_owned(),
+            seconds: 3.25,
+        }]);
+        live.ir_dir = irs.to_string_lossy().into_owned();
+        a.refresh_ir_browser(&mut live);
+        let plate = live
+            .ir_entries
+            .iter()
+            .find(|e| e.name == "plate.wav")
+            .expect("the plate went missing");
+        assert!((plate.seconds - 3.25).abs() < 1e-6, "{}", plate.seconds);
+
+        // **A capture that lands in the folder on screen shows up.** The
+        // host rescans and pushes; the generation the listing was read at no
+        // longer matches, so the next frame re-lists without anybody having
+        // to walk out and back in.
+        std::fs::write(irs.join("new-capture.wav"), b"x").unwrap();
+        let before = live.ir_entries.len();
+        a.refresh_ir_browser(&mut live);
+        assert_eq!(live.ir_entries.len(), before, "it re-listed while resting");
+        a.set_ir_rows(Vec::new());
+        a.refresh_ir_browser(&mut live);
+        assert_eq!(
+            live.ir_entries.len(),
+            before + 1,
+            "the new capture never appeared"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
