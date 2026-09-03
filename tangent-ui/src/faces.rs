@@ -1582,6 +1582,11 @@ fn draw_ir_browser(
     ) {
         live.ir_dir = parent;
         live.ir_scroll = 0;
+        // A chip is a gesture like any other, so it spends the reveal — see
+        // [`FaceLive::ir_reveal`]. Without this a wish the folder could not
+        // honour stands, and the browser scrolls itself somewhere a frame
+        // after the hand said where it wanted to be.
+        live.ir_reveal = false;
     }
     if chip(
         ui,
@@ -1593,6 +1598,7 @@ fn draw_ir_browser(
     ) {
         live.ir_dir = live.ir_root.clone();
         live.ir_scroll = 0;
+        live.ir_reveal = false;
     }
     let where_r = Rect::from_min_max(
         egui::pos2(l.browse_home.right() + 6.0, l.browse_head.top()),
@@ -1830,6 +1836,9 @@ fn draw_ir_browser(
                 // OK button to hunt for, and the readout above says what
                 // took.
                 out = Some(FaceAction::PickIr { path });
+                // And the press spends the reveal: the loaded impulse is
+                // about to be the one under the pointer.
+                live.ir_reveal = false;
             }
         }
     }
@@ -1985,14 +1994,22 @@ fn draw_ir_menu(
     // the rows, and this panel has just gone to some trouble to have no
     // ambiguous overlaps in it at all.
     //
-    // **Never on the frame the menu opened.** The press that opens it is
-    // itself a click landing outside the rows that do not exist yet, and it
-    // is not even reliably inside the menu that is about to be drawn:
-    // `menu_rows` CLAMPS the stack back inside the pane, so a right-click
-    // near the bottom or the right-hand edge lands outside the menu it just
-    // summoned. Without this the menu would appear and vanish in one frame,
-    // and only in the corners — the kind of fault that reads as a flaky
-    // right-click rather than as a rule with a hole in it.
+    // **Never on the frame the menu opened**, which is belt to the clamp's
+    // braces rather than the thing holding the trousers up. The press that
+    // opens a menu is itself a press, and it arrives with the release in the
+    // same frame often enough — so the rule above would be asked whether
+    // that press landed away from a menu that did not exist when it was
+    // made.
+    //
+    // It never has, and cannot: `IrLayout::menu_rows` clamps the stack with
+    // `at.clamp(pane.min, pane.max - size)`, so whenever the clamp moves the
+    // stack it moves it far enough that the far edge reaches the pointer, and
+    // the opening press is by construction inside the pane. An earlier note
+    // here claimed the opposite — that a corner right-click lands outside the
+    // menu it just summoned — and it is worth correcting rather than
+    // deleting, because the guard reads as load-bearing and is not.
+    // `the_ir_parts_come_from_one_layout`'s neighbour pins the containment
+    // from five corners of the pane.
     if !close && !fresh {
         let away = ui
             .ctx()
@@ -2791,6 +2808,81 @@ mod tests {
         assert!(!live.ir_entries[2].dir);
         let name = live.ir_entries[2].name.clone();
         let want = format!("/m/IRs/{name}");
+
+        // **The menu opened by a press the clamp cannot reach.**
+        //
+        // `menu_rows` clamps the stack into `browse.shrink(3.0)`, and the
+        // rows it is summoned from span the whole of `browse_list` — so a
+        // secondary press in the outermost three points of the browser lands
+        // on a row while the menu it opens sits up to three points away from
+        // the pointer. "A press anywhere else dismisses it" is then TRUE of
+        // the press that opened it, and the menu appears and vanishes in one
+        // frame. `!fresh` is what stops that, and it is reachable only there
+        // and only when the press and its release arrive together — which is
+        // what a quick right-click looks like at sixty frames a second.
+        {
+            let at = egui::pos2(l.browse_list.right(), l.browse_list.top() + 4.0);
+            let stack = l.menu_rows(at);
+            let bounds = stack.iter().fold(Rect::NOTHING, |a, r| a.union(*r)).expand(2.0);
+            assert!(
+                !bounds.contains(at),
+                "the fixture no longer reproduces the gap between the row and the \
+                 clamped menu, so the guard below is inert here and this proves nothing"
+            );
+            let mut edge = a_full_face("@tangent-ir", 2);
+            let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), size);
+            // One quiet frame first, so the rows have been laid out and there
+            // is something for the press to land on.
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            let _ = draw(ui, &st, &mut edge);
+                        });
+                },
+            );
+            // Then the whole click in ONE frame, which is the case the guard
+            // is for: three separate frames put the release on a frame where
+            // the menu is no longer fresh.
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Secondary,
+                            pressed: true,
+                            modifiers: Default::default(),
+                        },
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Secondary,
+                            pressed: false,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            let _ = draw(ui, &st, &mut edge);
+                        });
+                },
+            );
+            assert!(
+                edge.ir_menu.is_some(),
+                "a right-click at the edge of the browser opened a menu and dismissed \
+                 it in the same frame"
+            );
+        }
 
         let menu_rects = open_menu_on(&ctx, &st, &mut live, size, rows[2].center());
         {

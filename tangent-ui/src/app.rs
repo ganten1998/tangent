@@ -28540,6 +28540,38 @@ impl TangentApp {
                 });
             }
         }
+        // **And a face that arrived this frame gets the tap put back.**
+        //
+        // `open_unit_face` is the app's own door and it always pairs the
+        // panel with an armed tap, because the host reads the arming as "a
+        // face just opened here" and re-scans the unit's preset shelf off
+        // the back of it. `dialogs::show` now has a second door — the delete
+        // confirmation returning to the panel it was raised from, and the
+        // wizard's way back — and those write the dialog slot directly,
+        // which is the one thing `open_unit_face` does that they cannot.
+        //
+        // So the pairing is enforced HERE, where every door is visible,
+        // rather than at each of them: a panel that appears in a slot that
+        // did not hold that panel is a panel that was opened, however it got
+        // there — which also covers a face that moves from one bay to
+        // another without closing. Without it the returned face runs
+        // untapped and shows whatever preset rows were last pushed — stale,
+        // and missing anything saved since.
+        //
+        // `open_unit_face` keeps its own arm rather than leaning on this,
+        // because it is also called from outside a frame (its tests do), and
+        // a door that only works from inside `update` is a worse door. The
+        // cost is one duplicate ask on the frame a panel opens from the
+        // desk, which the host answers idempotently.
+        if let Some(dialogs::Dialog::InsertFace { strip, slot, .. }) = self.dialog {
+            if face_watch != Some((strip, slot)) {
+                self.request_recorder(recorder::RecorderRequest::SetInsertTap {
+                    strip,
+                    slot,
+                    on: true,
+                });
+            }
+        }
         // The wizard closed this frame: whatever the IR road was doing —
         // the tone above all — stops with it. A tone that outlives its
         // meter is a signal generator nobody can find the switch for.

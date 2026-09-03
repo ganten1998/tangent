@@ -96,39 +96,88 @@ pub const TAIL_FADE_S: f64 = 0.010;
 pub const TAIL_MARGIN_DB: f64 = 3.0;
 
 /// How much of a recovered IR's END [`tail_floor_db`] reads to find the IR's
-/// own noise floor, in seconds — and how much it reads again just before
-/// that, to prove the end IS noise.
+/// own noise floor, in seconds — and how much it reads again earlier, to
+/// prove the end IS noise.
 ///
 /// Half a second, twice. Long enough that a reading taken off deconvolved
 /// hiss is steady to a couple of tenths of a dB rather than wandering with
-/// whichever crest fell inside it, and long enough that half a second of a
-/// still-running decay reads visibly quieter than the half second before it
-/// — which is the whole discrimination (see [`TAIL_FLOOR_FLAT_DB`]). Short
-/// enough that both reads plus the direct impulse fit inside anything past
-/// about a second and a bit; the wizard's TAIL row bottoms out at one
-/// second, and at that setting there is simply no floor to read and the
-/// bound the caller was handed stands alone, which is the old rule and is
-/// the right answer for a window that short.
+/// whichever crest fell inside it. Short enough that both reads, the gap
+/// between them ([`TAIL_FLOOR_SPAN_S`]) and the fade all fit inside the
+/// shortest window this road can produce: the wizard's TAIL row is 5, 10 or
+/// 20 seconds (the literal row in `dialogs::draw_ir_sweep`), and even the 5 s
+/// setting clears the ~2.51 s the three of them need by half the buffer. An
+/// earlier draft of this paragraph said the row bottomed out at one second
+/// and leaned on that setting to justify the number; no such setting exists,
+/// which made the guard look far closer to its edge than it is. A window too
+/// short
+/// for the pair reads no floor at all and the bound the caller was handed
+/// stands alone, which is the old rule — a defensive path here rather than
+/// the answer for any setting somebody can select.
 pub const TAIL_FLOOR_READ_S: f64 = 0.5;
 
-/// How little two adjacent [`TAIL_FLOOR_READ_S`] reads may differ before the
-/// end of a buffer counts as NOISE rather than as a decay still running, in
-/// dB.
+/// How far apart the two [`TAIL_FLOOR_READ_S`] reads sit, in seconds —
+/// start to start.
+///
+/// **The lever arm, and it has to be long.** What the pair is really
+/// measuring is a RATE: a decay falls 60/RT60 dB per second and a noise floor
+/// falls at nothing, so the two reads differ by `60 · span / RT60` dB and the
+/// guard's real threshold is a slope. With the reads touching — half a second
+/// apart, which is what this was when it was written — 1.5 dB of allowance is
+/// 3 dB per second, and every box with an RT60 of 20 seconds or more reads as
+/// stationary. Measured on the road at that separation, a flat −85 dBFS loop
+/// and a 10 s tail row: RT60 24 s came back 8.256 s, RT60 30 s 7.852 s, RT60
+/// 45 s 7.172 s — a fifth to a third of a perfectly good capture deleted,
+/// which is precisely the failure [`TAIL_FLOOR_FLAT_DB`] exists to prevent,
+/// with the constant sitting exactly ON the boundary rather than past it.
+///
+/// The fix is not a tighter allowance: two reads half a second apart are
+/// steady to a couple of tenths of a dB, so anything under about a dB is
+/// asking them to resolve their own noise. It is a longer arm, which grows
+/// the signal while the noise stays where it is. Two seconds puts the same
+/// 1.5 dB at 0.75 dB per second, so the guard now believes an end is
+/// stationary only below 60/0.75 = 80 seconds of RT60 — past every reverb
+/// anybody captures and well past every room.
+///
+/// The cost is that a buffer still decaying two and a half seconds from its
+/// end reads no floor. That is the right answer rather than a regression: a
+/// buffer that has not reached its floor has no floor to read, and the whole
+/// window is what an honest truncator gives back.
+pub const TAIL_FLOOR_SPAN_S: f64 = 2.0;
+
+/// How little two [`TAIL_FLOOR_READ_S`] reads a [`TAIL_FLOOR_SPAN_S`] apart
+/// may differ before the end of a buffer counts as NOISE rather than as
+/// something still moving, in dB.
 ///
 /// **This is the entire guard on reading a floor off a buffer's own end, and
 /// without it the cure is worse than the disease.** A noise floor is
-/// stationary: two adjacent half-second reads of deconvolved hiss land
-/// within a couple of tenths of a dB of each other. A decay is not — a box
-/// whose RT60 outruns the recorded window is still falling at 60/RT60 dB per
-/// second where the reading is taken, which over half a second is 2.5 dB for
-/// a twelve-second plate. Call that a floor and the threshold lands three dB
-/// under a level the tail is still comfortably above, and the cut throws
-/// away half the window of a capture that had nothing whatever wrong with
-/// it.
+/// stationary: two half-second reads of deconvolved hiss land within a couple
+/// of tenths of a dB of each other however far apart they are taken. A decay
+/// is not — a box whose RT60 outruns the recorded window is still falling at
+/// 60/RT60 dB per second where the reading is taken. Call that a floor and
+/// the threshold lands three dB under a level the tail is still comfortably
+/// above, and the cut throws away a third of the window of a capture that had
+/// nothing whatever wrong with it. What separates the two is a SLOPE, and the
+/// slope this pair can resolve is set by how far apart they are; see
+/// [`TAIL_FLOOR_SPAN_S`], which is the half of this rule that was wrong.
 ///
-/// 1.5 dB sits between the two with room on both sides, and a buffer that
-/// fails the test simply has no floor to read: the caller falls back to the
-/// bound it was handed and whatever earlier cut applied still stands.
+/// **The test is two-sided, and that half is not symmetry for its own sake.**
+/// Read as "the end is not still falling" it only ever needed the one
+/// direction, and that is how it was written. But what the caller needs to
+/// know is that the end is NOISE, and an end LOUDER than the read before it
+/// is not noise either — it is a chair, a door, a passing car, the HVAC
+/// coming on. The TAIL row runs to twenty seconds and this road is pointed at
+/// rooms and halls, so a stray transient in the last half second is ordinary,
+/// and a one-sided test accepts it as the floor however far above the real
+/// one it sits. Measured on a 3 s decay over a −60 dB floor with a −30 dB
+/// disturbance across the last 0.4 s: the floor read −35.5 dB instead of
+/// −60.0, the threshold landed 24 dB too high, and the truncation cut at
+/// 0.295 s where the clean buffer cut at 0.751 — sixty per cent of a valid
+/// measurement, deleted silently, in the destructive direction.
+///
+/// 1.5 dB over the span sits between the two with room on both sides, and a
+/// buffer that fails the test in EITHER direction simply has no floor to
+/// read: the caller falls back to the bound it was handed and whatever
+/// earlier cut applied still stands.
 pub const TAIL_FLOOR_FLAT_DB: f64 = 1.5;
 
 /// The furthest under an IR's own peak [`recovered_floor_db`] will ever put
@@ -689,14 +738,16 @@ pub fn recovered_floor_db(ir_peak: f32, capture_peak: f32, capture_floor_db: f32
 /// The reading is taken from the last [`TAIL_FLOOR_READ_S`] before the
 /// buffer's own fade — a fade is not a floor, and reading through one drags
 /// the answer down by however much of it was included — and it is only
-/// believed when the [`TAIL_FLOOR_READ_S`] before THAT reads within
-/// [`TAIL_FLOOR_FLAT_DB`] of it. See that constant for what happens without
-/// the second read: a box whose decay outruns the recorded window is still
-/// falling where the reading is taken, and calling that a floor cuts half
-/// the window off a perfectly good capture.
+/// believed when a second read a [`TAIL_FLOOR_SPAN_S`] earlier lands within
+/// [`TAIL_FLOOR_FLAT_DB`] of it, in EITHER direction. See those two
+/// constants for what each half is holding back: a box whose decay outruns
+/// the recorded window is still falling where the reading is taken, and a
+/// room capture with a door closing in its last half second is louder there
+/// than it was before. Calling either one a floor cuts a large part of a
+/// perfectly good capture off the end.
 ///
 /// `first` is the caller's earliest legal cut — the same index its search
-/// starts at — so a buffer with no room for two reads after the direct
+/// starts at — so a buffer with no room for both reads after the direct
 /// impulse answers `None` rather than reading a "floor" off the impulse's
 /// own ringing.
 pub fn tail_floor_db(ir: &[f32], first: usize, sample_rate: f64) -> Option<f32> {
@@ -704,20 +755,25 @@ pub fn tail_floor_db(ir: &[f32], first: usize, sample_rate: f64) -> Option<f32> 
         return None;
     }
     let read = ((TAIL_FLOOR_READ_S * sample_rate).round() as usize).max(1);
+    let span = ((TAIL_FLOOR_SPAN_S * sample_rate).round() as usize).max(1);
     let fade = ((TAIL_FADE_S * sample_rate).round() as usize).max(1);
     // Back off the buffer's own fade first: it is a ramp to nothing, and
     // averaging it in reads as a floor several dB below the real one.
     let end = ir.len().checked_sub(fade)?;
-    let mid = end.checked_sub(read)?;
-    let start = mid.checked_sub(read)?;
+    let late_at = end.checked_sub(read)?;
+    // The earlier read is a SPAN back from the later one, not touching it.
+    // See `TAIL_FLOOR_SPAN_S`: what the pair measures is a slope, and a slope
+    // read over half a second cannot be told from the reads' own noise.
+    let start = late_at.checked_sub(span)?;
     if start < first {
         return None;
     }
-    let late = noise_floor_db(&ir[mid..end]);
-    let early = noise_floor_db(&ir[start..mid]);
-    // Still falling means the buffer never got to its floor, and the level
-    // out here is tail rather than noise.
-    if f64::from(early - late) > TAIL_FLOOR_FLAT_DB {
+    let late = noise_floor_db(&ir[late_at..end]);
+    let early = noise_floor_db(&ir[start..start + read]);
+    // Still falling means the buffer never got to its floor and the level out
+    // here is tail rather than noise; RISING means something happened in the
+    // room while the tail was being recorded, and that is not a floor either.
+    if f64::from(early - late).abs() > TAIL_FLOOR_FLAT_DB {
         return None;
     }
     Some(late)
@@ -869,6 +925,29 @@ fn fade_and_cut(ir: &mut Vec<f32>, cut: usize, earliest: usize, fade: usize) {
 /// fade here on the path where they find no crossing, so "the IR ends on a
 /// ramp, not on a step" is a law of the road rather than a property of
 /// having been shortened.
+///
+/// **The caller owns the clamp.** This scales the last `fade` samples of
+/// whatever it is handed and clamps only to the buffer's length, so a caller
+/// that hands in more fade than there is tail after the direct impulse gets
+/// the impulse scaled — and the direct impulse is sacred everywhere else on
+/// this road ([`fade_and_cut`] refuses a cut earlier than `earliest` for
+/// exactly that reason). Both no-crossing arms therefore pass
+/// `fade.min(room)`, where `room` is the distance from their own earliest
+/// legal cut to the end. Probed before that clamp existed: a one-sample IR
+/// came back `[0.0]` — the whole measurement zeroed — and a 200-sample IR
+/// peaking 1.0 at index 150 came back peaking 0.141.
+///
+/// **A second application squares the ramp, and on the wizard's road that
+/// happens.** `desktop::process_ir_capture` runs `cut_set_with_fade` for the
+/// post-sweep window first, which always bites and always fades; when the
+/// floor pass then finds no crossing it fades the same last samples again,
+/// so those carry `w²` rather than `w`. Measured on a flat buffer of 9600
+/// ones cut to 4800: the mid-fade sample reads 0.4967 after the window cut
+/// and 0.2467 after the second pass — exactly `w²`. It is left alone
+/// deliberately. The shape is still monotone to zero and still continuous
+/// where the fade begins, so nothing rings; the alternative is a caller
+/// telling this function whether somebody already faded, which is a fact no
+/// buffer carries and a flag two roads would have to keep in step.
 fn fade_tail(ir: &mut [f32], fade: usize) {
     let n = ir.len();
     let fade = fade.min(n);
@@ -957,7 +1036,13 @@ pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) {
     let threshold_db = tail_threshold_db(ir, first, floor_db, sample_rate);
     match floor_crossing(ir, first, win, threshold_db) {
         Some(cut) => cut_with_fade(ir, cut, sample_rate),
-        None => fade_tail(ir, fade),
+        // The fade may not reach back past the earliest legal cut — see
+        // `fade_tail`. `first` is that index, so what is left after it is all
+        // the room a fade is allowed.
+        None => {
+            let room = ir.len().saturating_sub(first);
+            fade_tail(ir, fade.min(room));
+        }
     }
 }
 
@@ -1040,7 +1125,10 @@ pub fn truncate_set_at_floor(irs: &mut [Vec<f32>], floor_db: f32, sample_rate: f
         Some(cut) => cut_set_with_fade(irs, cut, sample_rate),
         None => {
             for ir in irs.iter_mut() {
-                fade_tail(ir, fade);
+                // The SET's earliest legal cut, so a short channel's fade
+                // cannot reach the pair's direct impulse. See `fade_tail`.
+                let room = ir.len().saturating_sub(first);
+                fade_tail(ir, fade.min(room));
             }
         }
     }
@@ -1816,7 +1904,7 @@ mod tests {
     ) -> Vec<f32> {
         let amp = 10.0f64.powf(floor_db / 20.0) * 3.0f64.sqrt();
         let mut ir = vec![0.0f32; len];
-        for (i, v) in ir.iter_mut().enumerate() {
+        for v in ir.iter_mut() {
             *v = (f64::from(lcg(seed)) * amp) as f32;
         }
         ir[peak_at] = 1.0;
@@ -1826,6 +1914,8 @@ mod tests {
         }
         ir
     }
+
+
 
     /// **A tail that never reaches the floor it was HANDED is still cut, at
     /// the floor it actually has.**
@@ -1851,7 +1941,13 @@ mod tests {
     #[test]
     fn a_tail_that_never_reaches_the_handed_floor_is_cut_at_the_one_it_has() {
         let sr = 48_000.0f64;
-        let len = (2.0 * sr) as usize;
+        // **Five seconds because that is the shortest buffer this road can
+        // produce**, and the floor read now needs a lever arm: two half-second
+        // reads a [`TAIL_FLOOR_SPAN_S`] apart plus the fade is ~2.51 s of
+        // settled end. A two-second fixture — which is what this was — is not
+        // a capture the wizard's TAIL row (5 / 10 / 20 s) can make, and sizing
+        // the guard to fit one would be sizing it to fit the test.
+        let len = (5.0 * sr) as usize;
         let mut seed = 11u64;
         let ir = decay_over_floor(len, 100, 0.12, -60.0, sr, &mut seed);
         // Where the decay honestly meets that floor: the envelope is
@@ -1890,6 +1986,184 @@ mod tests {
         );
     }
 
+
+    /// **A room that is still ringing at the end of its window keeps the
+    /// whole window — and "still ringing" now reaches out to eighty seconds
+    /// of RT60, not twenty.**
+    ///
+    /// The other side of [`TAIL_FLOOR_FLAT_DB`]'s guard, and the side that
+    /// shipped wrong. What the two reads measure is a SLOPE: a decay falls
+    /// 60/RT60 dB per second, so reads a span apart differ by
+    /// `60 · span / RT60`. With the reads touching — half a second apart,
+    /// which is how this was written — 1.5 dB of allowance is 3 dB per
+    /// second, and every box at or above RT60 20 s read as stationary. The
+    /// threshold then landed three dB under a level the tail was still
+    /// comfortably above, and the cut deleted a fifth to a third of a
+    /// capture that had nothing whatever wrong with it. Measured on the
+    /// road, flat −85 dBFS loop, 10 s tail row, before → after:
+    /// RT60 24 s 8.257 → 10.000, RT60 30 s 7.853 → 10.000, RT60 45 s
+    /// 7.173 → 10.000; at the 20 s row, RT60 24 s 18.318 → 20.000 and
+    /// RT60 45 s 16.892 → 20.000.
+    ///
+    /// [`TAIL_FLOOR_SPAN_S`] is the fix — a longer lever arm rather than a
+    /// tighter allowance, because two reads half a second apart are steady to
+    /// a couple of tenths of a dB and anything under about a dB asks them to
+    /// resolve their own noise.
+    ///
+    /// This test is the boundary's far side. The near side —
+    /// `a_buffer_still_decaying_at_its_end_is_not_cut_at_its_own_last_level`
+    /// — pins that a decay is refused; `desktop::a_box_that_only_hisses…`
+    /// pins that a real floor is still found and still cuts. All three have
+    /// to hold at once or the guard is only useful in one direction.
+    #[test]
+    fn a_thirty_second_decay_is_not_mistaken_for_a_noise_floor() {
+        let sr = 48_000.0f64;
+        let first = 100 + 1 + (TAIL_FADE_S * sr) as usize;
+        // 10 s of window, which is the wizard's default TAIL row, holding
+        // decays that outrun it by two to four and a half times over.
+        let len = (10.0 * sr) as usize;
+        // τ from RT60: the envelope is e^(−t/τ) and RT60 is where it reaches
+        // 10^(−3), so τ = RT60 / (3·ln 10). The same conversion the fixture
+        // one door up names in words ("RT60 12 s is τ ≈ 1.74 s").
+        let tau_of = |rt60: f64| rt60 / (3.0 * std::f64::consts::LN_10);
+        for rt60 in [24.0f64, 30.0, 45.0] {
+            let mut seed = 77u64;
+            let ir = decay_over_floor(len, 100, tau_of(rt60), -120.0, sr, &mut seed);
+            assert!(
+                tail_floor_db(&ir, first, sr).is_none(),
+                "RT60 {rt60} s: the end of a still-falling buffer was read as a floor"
+            );
+            let mut kept = ir.clone();
+            truncate_at_floor(&mut kept, -95.0, sr);
+            assert_eq!(
+                kept.len(),
+                len,
+                "RT60 {rt60} s: {:.3} s of a {:.0} s window came back",
+                kept.len() as f64 / sr,
+                len as f64 / sr
+            );
+        }
+        // **And the far side, stated rather than left to be discovered.** Any
+        // two reads a finite distance apart have a slope they can no longer
+        // resolve, and 1.5 dB over two seconds puts it at RT60 80 s: past
+        // that, a decay does read as stationary and is cut. Ninety seconds of
+        // RT60 is a freeze rather than a room, and the alternative — a longer
+        // span — no longer fits the 5 s tail row, which is a setting people
+        // actually use. The boundary is a choice; this is where it is.
+        let mut seed = 78u64;
+        let freeze = decay_over_floor(len, 100, tau_of(90.0), -120.0, sr, &mut seed);
+        assert!(
+            tail_floor_db(&freeze, first, sr).is_some(),
+            "the documented boundary moved: RT60 90 s was refused, so the span \
+             is longer than TAIL_FLOOR_SPAN_S says"
+        );
+    }
+
+    /// **A door closing in the last half second is not a noise floor
+    /// either.**
+    ///
+    /// The guard was written as "the end is not still FALLING" and tested only
+    /// in that direction, so an end LOUDER than the read before it passed
+    /// unconditionally, however far louder. What the caller actually needs to
+    /// know is that the end is NOISE, and this road is pointed at rooms and
+    /// halls with a TAIL row that runs to twenty seconds — a chair, a door, a
+    /// passing car or the HVAC starting in the last stretch is ordinary, not
+    /// exotic.
+    ///
+    /// Measured on this fixture before the second direction existed: the
+    /// floor read −35.46 dB instead of −59.99, the threshold landed 24 dB too
+    /// high, and the truncation cut at 0.295 s where the clean buffer cut at
+    /// 0.751 — sixty per cent of a valid measurement, deleted silently. It
+    /// fails in the destructive direction, which is the one an archival tool
+    /// may not fail in.
+    #[test]
+    fn a_disturbance_in_the_last_half_second_is_not_a_floor() {
+        let sr = 48_000.0f64;
+        let len = (5.0 * sr) as usize;
+        let first = 100 + 1 + (TAIL_FADE_S * sr) as usize;
+        let mut seed = 991u64;
+        let clean = decay_over_floor(len, 100, 0.12, -60.0, sr, &mut seed);
+        // The clean buffer is the control: it has a floor and it is cut at it.
+        let read = tail_floor_db(&clean, first, sr).expect("a settled end read no floor");
+        assert!(
+            (f64::from(read) + 60.0).abs() < 3.0,
+            "a −60 dB floor read {read} dB"
+        );
+        let mut cut = clean.clone();
+        truncate_at_floor(&mut cut, -95.0, sr);
+        let clean_at = cut.len() as f64 / sr;
+        assert!(
+            (0.5..1.1).contains(&clean_at),
+            "the control cut at {clean_at:.3} s"
+        );
+        // The same buffer with something loud happening in its last stretch.
+        // Thirty dB above the floor is a chair; the point is the DIRECTION,
+        // so it is checked at three levels and two lengths.
+        for (db, secs) in [(-30.0f64, 0.4f64), (-45.0, 0.4), (-50.0, 1.0)] {
+            let mut ir = clean.clone();
+            let amp = 10.0f64.powf(db / 20.0) * 3.0f64.sqrt();
+            let from = len - (secs * sr) as usize;
+            for v in ir[from..].iter_mut() {
+                *v += (f64::from(lcg(&mut seed)) * amp) as f32;
+            }
+            assert!(
+                tail_floor_db(&ir, first, sr).is_none(),
+                "a {db} dB disturbance across the last {secs} s was read as this \
+                 buffer's noise floor"
+            );
+            let mut bumped = ir.clone();
+            truncate_at_floor(&mut bumped, -95.0, sr);
+            assert_eq!(
+                bumped.len(),
+                len,
+                "a disturbed end cut the measurement at {:.3} s instead of \
+                 falling back to the bound it was handed",
+                bumped.len() as f64 / sr
+            );
+        }
+    }
+
+    /// **The fade on a cut that never happened cannot reach the direct
+    /// impulse.**
+    ///
+    /// [`fade_and_cut`] refuses a cut earlier than `earliest` precisely so a
+    /// fade can never touch the peak, and this module asserts that invariant
+    /// by name elsewhere ("a high floor scaled the direct impulse"). The
+    /// no-crossing arms bypass it: they call [`fade_tail`] directly, and that
+    /// clamps only to the buffer's length.
+    ///
+    /// Probed before the clamp: `truncate_at_floor` on a one-sample IR
+    /// returned `[0.0]` — the whole measurement zeroed — and a 200-sample IR
+    /// peaking 1.0 at index 150 came back peaking 0.141. No caller on the
+    /// wizard's road reaches it today, because its buffers are five seconds
+    /// and up with the peak at the front, so this is a contract this module
+    /// states in its own doc rather than a shipped bug — which is exactly the
+    /// kind that gets found by the caller who arrives later.
+    #[test]
+    fn a_declined_cut_never_fades_into_the_direct_impulse() {
+        let sr = 48_000.0f64;
+        // The smallest buffer there is: a single sample that IS the impulse.
+        let mut one = vec![1.0f32];
+        truncate_at_floor(&mut one, -100.0, sr);
+        assert_eq!(one, vec![1.0f32], "a one-sample IR was faded to nothing");
+
+        // A short buffer whose peak sits near its end, so a full 10 ms fade
+        // would reach back over it.
+        let mut late = vec![0.0f32; 200];
+        late[150] = 1.0;
+        truncate_at_floor(&mut late, -100.0, sr);
+        assert_eq!(late[150], 1.0, "the declined cut's fade scaled the peak");
+
+        // And the same for the set-wide spelling, where the clamp is the
+        // SET's earliest cut rather than each channel's own.
+        let mut set = [vec![0.0f32; 200], vec![0.0f32; 200]];
+        set[0][150] = 1.0;
+        set[1][150] = 0.5;
+        truncate_set_at_floor(&mut set, -100.0, sr);
+        assert_eq!(set[0][150], 1.0, "the set's declined cut scaled the peak");
+        assert_eq!(set[1][150], 0.5, "the set's declined cut scaled the quiet channel");
+    }
+
     /// **A buffer still falling at its end has no floor to read, and is left
     /// at the length whatever ran before this decided.**
     ///
@@ -1901,14 +2175,18 @@ mod tests {
     ///
     /// [`TAIL_FLOOR_FLAT_DB`] is what separates them, and it separates them
     /// on the one property that actually differs: noise is stationary and a
-    /// decay is not. Here a twelve-second decay in a one-second buffer is
-    /// still falling by about 5 dB a second where the reading is taken —
-    /// two adjacent half-second reads land 2.5 dB apart — while the same
-    /// buffer's noise floor would read the same twice.
+    /// decay is not. Here a twelve-second decay is still falling by 5 dB a
+    /// second where the reading is taken, so the two reads land about 10 dB
+    /// apart across the [`TAIL_FLOOR_SPAN_S`] between them, while the same
+    /// buffer's noise floor would read the same twice however far apart they
+    /// were taken. The span is what makes that true of a THIRTY-second decay
+    /// as well; see its own doc for the measurements at the boundary.
     #[test]
     fn a_buffer_still_decaying_at_its_end_is_not_cut_at_its_own_last_level() {
         let sr = 48_000.0f64;
-        let len = (1.4 * sr) as usize;
+        // The road's shortest window; see the test above for why the fixture
+        // is that length rather than shorter.
+        let len = (5.0 * sr) as usize;
         let mut seed = 23u64;
         // RT60 12 s is τ ≈ 1.74 s: a decay that has barely started when the
         // buffer runs out, over a floor far below anything here.
@@ -1926,11 +2204,16 @@ mod tests {
         let first = linear_peak(&ir) + 1 + (TAIL_FADE_S * sr) as usize;
         assert!(
             tail_floor_db(&ir, first, sr).is_none(),
-            "a buffer falling 2.5 dB across the two reads was called flat"
+            "a buffer falling 10 dB across the span between the reads was called flat"
         );
-        // And a buffer whose end IS flat answers with that level.
+        // And a buffer whose end IS flat answers with that level. The flat
+        // stretch has to cover the whole footprint the reading takes — both
+        // reads, the span between them and the fade — or the earlier read
+        // lands back in the decay and the answer is `None` for the right
+        // reason at the wrong moment.
         let mut settled = ir.clone();
-        let from = len - (1.1 * TAIL_FLOOR_READ_S * sr) as usize * 2;
+        let settled_s = TAIL_FLOOR_SPAN_S + TAIL_FLOOR_READ_S + 0.2;
+        let from = len - (settled_s * sr) as usize;
         let mut noise = 101u64;
         for v in settled[from..].iter_mut() {
             *v = lcg(&mut noise) * 1.0e-3;
@@ -2016,7 +2299,10 @@ mod tests {
     #[test]
     fn a_channel_a_hundred_db_up_does_not_hold_the_pair_open() {
         let sr = 48_000.0f64;
-        let len = (2.0 * sr) as usize;
+        // The road's shortest window; see
+        // `a_tail_that_never_reaches_the_handed_floor_is_cut_at_the_one_it_has`
+        // for why the fixture is that length.
+        let len = (5.0 * sr) as usize;
         let mut seed = 47u64;
         let real = decay_over_floor(len, 100, 0.12, -60.0, sr, &mut seed);
         // What the division hands back for a channel it had no reference
@@ -2116,12 +2402,45 @@ mod tests {
             reference_range_db(&hiss, pre, sweep.len()) < TRUSTWORTHY_RANGE_DB,
             "a jack of converter hiss passed as a reference"
         );
-        // A quiet but real loop still clears it: the line is about whether
-        // the sweep arrived, not about how hot it was.
-        let quiet: Vec<f32> = live.iter().map(|&v| v * 0.01).collect();
+        // **A quiet but real loop still clears it, and the quiet has to be
+        // REAL.** The first spelling of this scaled the whole buffer by 0.01
+        // — signal and converter noise together — and asserted the result
+        // still cleared the line. `reference_range_db` is a DIFFERENCE of two
+        // dB readings taken from the same buffer, so a uniform gain cancels
+        // exactly: live read 75.66 dB and the "quiet" copy read 75.66 dB, and
+        // the assertion could not fail whatever the function did.
+        //
+        // What a quiet loop actually is — a mis-set trim, a padded DI, a long
+        // unbalanced run — is a smaller RETURN over the same converter floor,
+        // so only the sweep term is scaled here. Measured across that fixture,
+        // 1 s sweep at 48 kHz over a −80 dBFS floor: trim 0 dB reads 75.66,
+        // −20 dB reads 55.66, −40 dB reads 35.66, −60 dB reads 15.77. The two
+        // dead cases read 0.00 and 0.03. That is the separation the line sits
+        // in, and it is why the line stays where the capture's is rather than
+        // being lowered to buy margin: a jack wrongly called DEAD costs the
+        // user that jack's coloration and nothing else, because the other
+        // one is borrowed and the engine played the same sample into both. A
+        // jack wrongly called LIVE is divided by, and that is the fault this
+        // whole measurement exists to prevent.
+        let mut quiet = vec![0.0f32; total];
+        let mut qseed = 53u64;
+        for (i, v) in quiet.iter_mut().enumerate() {
+            *v = lcg(&mut qseed) * 1.0e-4;
+            if let Some(&s) = i.checked_sub(pre).and_then(|k| sweep.get(k)) {
+                *v += s * 0.5 * 0.01;
+            }
+        }
+        let quiet_range = reference_range_db(&quiet, pre, sweep.len());
         assert!(
-            reference_range_db(&quiet, pre, sweep.len()) > TRUSTWORTHY_RANGE_DB,
-            "a loop 40 dB down was refused for being quiet"
+            quiet_range > TRUSTWORTHY_RANGE_DB,
+            "a loop trimmed 40 dB down over its own converter floor was \
+             refused for being quiet: {quiet_range} dB"
+        );
+        // And the margin is stated rather than implied, so a change that eats
+        // it is visible here rather than in somebody's session.
+        assert!(
+            (30.0..45.0).contains(&f64::from(quiet_range)),
+            "the 40 dB-trim margin moved: {quiet_range} dB"
         );
         // Nothing to read is not a reference either, rather than a panic.
         assert_eq!(reference_range_db(&live, 0, sweep.len()), 0.0);
