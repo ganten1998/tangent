@@ -52,7 +52,7 @@ pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
     (
         "@tangent-denoise",
         "Tangent Denoise",
-        "learns your noise, then holds 32 small doors shut",
+        "learns your noise, then takes exactly what you dial out",
     ),
     (
         "@tangent-amp",
