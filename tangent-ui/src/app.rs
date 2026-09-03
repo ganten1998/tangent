@@ -9470,6 +9470,96 @@ impl TangentApp {
     /// Found a template shelf with no `default` on it: write one, carrying
     /// THIS desk — at first launch that is the stock desk, which is what a
     /// default should be until the owner saves their own over it.
+
+/// **Every desk a shipped Tangent has ever seeded a template with**, oldest
+/// first, each as the bays it fills — index into `DeskSnap::inserts`, and the
+/// unit that sits there. Every other bay is empty, and the instrument tracks
+/// are however many rows those bays reach.
+///
+/// # Why a LIST and not just the current one
+///
+/// The default template lives in the user's Projects folder, not in the app.
+/// It is written once, on the first launch that finds none, and after that it
+/// is theirs — `seed_template` will not overwrite a template somebody has
+/// arranged, which is the whole point of a template and something the owner
+/// asked for in as many words ("if something is silently overwriting it,
+/// that's a huge problem").
+///
+/// The consequence is the thing this list exists for: **when the shipped desk
+/// changes, everyone who has already launched keeps the old one, and no
+/// reinstall can fix it.** It is not in the bundle. It is not in
+/// `settings.json`. Deleting the app and installing it again leaves it exactly
+/// where it was. The only thing that can reach it is a rule that recognises an
+/// untouched seed and replaces it — and to recognise one it has to know every
+/// shape a seed has ever had.
+///
+/// That is why an entry is never removed. A user who launched once in
+/// August and comes back in a year still has an August template, and the
+/// moment this list forgets what August looked like, that template becomes
+/// permanently theirs by accident.
+///
+/// # How it went wrong
+///
+/// This was one shape rather than a list: the built-in on bay 0 and nothing
+/// else, which is the desk from before the drumpad existed. Two changes since
+/// then — the drumpad arriving on the second track, and the owner asking for
+/// the kit to come FIRST — each left a shape the test did not know. A template
+/// minted between them matched neither, read as "somebody touched this", and
+/// stood.
+///
+/// The owner's own install, seeded 2 September, opened every launch with the
+/// DX7 on track one and the drums on track two: the reverse of what he asked
+/// for and the reverse of what `Settings::default()` says, with the arm and
+/// the theory switch apparently on the wrong instrument because those ride the
+/// SEAT and the seats had swapped under them.
+///
+/// # Adding to it
+///
+/// Append the OLD desk when you change the default, and put the new default
+/// last. `the_stock_desk_list_ends_with_what_a_fresh_install_writes` is what
+/// makes that not optional: change `Settings::default()`'s desk without
+/// touching this and it goes red, naming both.
+const STOCK_DESKS: &[&[(usize, &str)]] = &[
+    // Before the drumpad: one instrument track, the built-in DX7.
+    &[(0, crate::dialogs::BUILTIN_PATH)],
+    // The drumpad arrives on track two.
+    &[
+        (0, crate::dialogs::BUILTIN_PATH),
+        (crate::recorder::INSERTS, crate::dialogs::DRUMPAD_PATH),
+    ],
+    // "it needs to have drums slot 1 and Tangent DX7 slot 2" — the kit first,
+    // which is what a fresh install writes today.
+    &[
+        (0, crate::dialogs::DRUMPAD_PATH),
+        (crate::recorder::INSERTS, crate::dialogs::BUILTIN_PATH),
+    ],
+];
+
+/// Whether `d` is exactly the desk `shipped` describes and nothing more.
+///
+/// Both halves matter. Every named bay must hold what it says, and every bay
+/// NOT named must be empty — otherwise a template with an extra plugin on
+/// track three would read as stock and be thrown away. The track kinds come
+/// from the same list rather than from a second constant: an instrument track
+/// is one the list puts a bay on, so the two cannot disagree.
+fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) -> bool {
+    let tracks = shipped
+        .iter()
+        .map(|(at, _)| at / crate::recorder::INSERTS + 1)
+        .max()
+        .unwrap_or(0);
+    d.kinds
+        .iter()
+        .enumerate()
+        .all(|(n, k)| *k == u8::from(n < tracks))
+        && d.inserts.iter().enumerate().all(|(n, p)| {
+            match shipped.iter().find(|(at, _)| *at == n) {
+                Some((_, want)) => p == want,
+                None => p.is_empty(),
+            }
+        })
+}
+
     pub fn seed_template(&self, dir: &std::path::Path) {
         let doc = crate::arrangement::doc_in(dir);
         // A template that cannot be read is nobody's song — it is the
@@ -9481,23 +9571,37 @@ impl TangentApp {
             crate::arrangement::Arrangement::read_from(&doc)
         {
             // A template somebody touched stands. But an UNTOUCHED stock
-            // seed — no clips, no names, the desk exactly as an older
-            // default wrote it — is re-seeded, so the drumpad's arrival on
-            // track 8 reaches templates minted before it shipped.
+            // seed — no clips, no names, the desk exactly as SOME shipped
+            // default wrote it — is re-seeded, so a desk that changes after
+            // a person has already launched once reaches them.
+            //
+            // **"Some" is the word this got wrong.** It used to test one
+            // shape: the built-in on bay 0 and every other bay empty, which
+            // is the desk from before the drumpad existed. The day the
+            // drumpad arrived that shape stopped being what a fresh install
+            // wrote, and the day the owner asked for the kit to come first
+            // it stopped again — so a template minted between those two
+            // changes matched neither the old test nor the new default, was
+            // read as "somebody touched this", and stood for ever.
+            //
+            // What that looked like: the owner's own install, seeded on
+            // 2 September, opened every launch with the DX7 on track one
+            // and the drums on track two — the reverse of what he had asked
+            // for and of what `Settings::default()` says — with the arm and
+            // the theory switch on the drums, because those ride the SEAT.
+            // Reinstalling did not fix it and could not: the stale desk was
+            // in his Projects folder, not in the app. Every user who
+            // launched once before the swap has the same file.
+            //
+            // See [`STOCK_DESKS`], which is the list, and the test that
+            // makes the list keep up with the default.
             let stock = old.clips.is_empty()
                 && old.next_id <= 1
                 && old.desk.as_ref().is_some_and(|d| {
                     d.names.iter().all(String::is_empty)
-                        && d.kinds.iter().enumerate().all(|(n, k)| {
-                            *k == u8::from(n == 0)
-                        })
-                        && d.inserts.iter().enumerate().all(|(n, p)| {
-                            if n == 0 {
-                                p == crate::dialogs::BUILTIN_PATH
-                            } else {
-                                p.is_empty()
-                            }
-                        })
+                        && Self::STOCK_DESKS
+                            .iter()
+                            .any(|shipped| Self::matches_stock(d, shipped))
                 });
             if !stock {
                 // A touched template stands — minus one flag. Templates
@@ -9529,8 +9633,15 @@ impl TangentApp {
         arr.save_to(&doc);
     }
 
-    /// **What a fresh Tangent is**: the shipped desk, with the built-in
-    /// instrument on channel one and the drums on channel two.
+    /// **What a fresh Tangent is**: the shipped desk, with the DRUMS on
+    /// channel one and the built-in DX7 on channel two.
+    ///
+    /// That sentence used to say the reverse, and it was left saying it when
+    /// the owner asked for the kit to come first — "it needs to have drums
+    /// slot 1 and Tangent DX7 slot 2". A doc comment is the design record in
+    /// this repo, so one that has quietly become the opposite of the code is
+    /// worse than none: the next reader trusts it. See [`Self::STOCK_DESKS`]
+    /// for what that change cost every install that had already launched.
     ///
     /// Built from `Settings::default()` rather than from whatever is live,
     /// so it is the same desk on every machine and every launch — and so
@@ -32416,6 +32527,161 @@ mod tests {
             assert!(app.to_theory(n), "the mixer's T missed track {n}");
         }
         assert!(!app.to_theory(9), "the mixer's T reached outside the selection");
+    }
+
+    /// **The stock-desk list has to end with what a fresh install writes.**
+    ///
+    /// The default template lives in the USER'S Projects folder, not in the
+    /// app bundle. It is written once, on the first launch that finds none,
+    /// and after that `seed_template` will not overwrite it — which is the
+    /// point of a template. So when the shipped desk changes, everybody who
+    /// has already launched keeps the old one, and **no reinstall can fix
+    /// it**: the file is not in the bundle and not in `settings.json`.
+    ///
+    /// The only thing that reaches it is `TangentApp::STOCK_DESKS`, and only
+    /// if that list knows the shape their template actually has. This test is
+    /// what makes keeping it up to date not optional.
+    ///
+    /// Revert-check: swap the two entries in `Settings::default`'s
+    /// `strip_inserts` and this goes red naming both bays.
+    #[test]
+    fn the_stock_desk_list_ends_with_what_a_fresh_install_writes() {
+        let shipped = TangentApp::template_desk();
+        let last = TangentApp::STOCK_DESKS
+            .last()
+            .expect("there has always been at least one shipped desk");
+        assert!(
+            TangentApp::matches_stock(&shipped, last),
+            "the shipped desk is no longer the last entry in STOCK_DESKS. \
+             Append the OLD desk to that list and put the new one last, or \
+             every user who has launched once keeps the old desk for ever. \
+             The shipped desk fills {:?}; the list's last entry is {last:?}",
+            shipped
+                .inserts
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| !p.is_empty())
+                .map(|(n, p)| (n, p.as_str()))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// **A template minted by an OLDER default is replaced, not kept.**
+    ///
+    /// The owner's own install, seeded on 2 September, opened every launch
+    /// with the DX7 on track one and the drums on track two — the reverse of
+    /// what he had asked for and the reverse of `Settings::default()` — with
+    /// the arm and the theory switch apparently on the wrong instrument,
+    /// because those ride the SEAT and the seats had swapped underneath them.
+    /// The stale desk was in his Projects folder; reinstalling could not
+    /// touch it.
+    ///
+    /// Every shape in `STOCK_DESKS` must heal that way, and a template
+    /// somebody has actually arranged must survive untouched. Both halves are
+    /// here because the second is what stops the first becoming a data-loss
+    /// bug.
+    #[test]
+    fn a_template_from_an_older_default_is_reseeded_and_a_touched_one_is_not() {
+        use crate::recorder::INSERTS;
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-template-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let doc = crate::arrangement::doc_in(&dir);
+        let (_ctx, app) = headless(Caps::PLUGIN);
+
+        // Write a template holding the desk `shipped` describes, untouched.
+        let write_stock = |shipped: &[(usize, &str)]| {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("template dir");
+            let mut arr = crate::arrangement::Arrangement::default();
+            let mut d = TangentApp::template_desk();
+            for p in d.inserts.iter_mut() {
+                p.clear();
+            }
+            let tracks = shipped
+                .iter()
+                .map(|(at, _)| at / INSERTS + 1)
+                .max()
+                .unwrap_or(0);
+            for (n, k) in d.kinds.iter_mut().enumerate() {
+                *k = u8::from(n < tracks);
+            }
+            for (at, path) in shipped {
+                d.inserts[*at] = (*path).to_owned();
+            }
+            arr.desk = Some(d);
+            arr.save_to(&doc);
+        };
+
+        // **The shapes are spelled out HERE, not read from `STOCK_DESKS`.**
+        //
+        // The first draft looped over that list, which cannot fail the way
+        // the bug did: deleting an entry deleted its own test with it, and
+        // the entry that was missing is exactly what broke the owner's
+        // install. A guard that reads the thing it guards is not a guard.
+        //
+        // So these are written down as the app actually shipped them, and
+        // an entry is never removed from this array either. The second one
+        // is the owner's own template, seeded 2 September 2026.
+        const SHIPPED_OVER_TIME: &[&[(usize, &str)]] = &[
+            &[(0, crate::dialogs::BUILTIN_PATH)],
+            &[
+                (0, crate::dialogs::BUILTIN_PATH),
+                (INSERTS, crate::dialogs::DRUMPAD_PATH),
+            ],
+            &[
+                (0, crate::dialogs::DRUMPAD_PATH),
+                (INSERTS, crate::dialogs::BUILTIN_PATH),
+            ],
+        ];
+        for shipped in SHIPPED_OVER_TIME {
+            write_stock(shipped);
+            app.seed_template(&dir);
+            let back = match crate::arrangement::Arrangement::read_from(&doc) {
+                crate::arrangement::LoadOutcome::Loaded(a) => a,
+                _ => panic!("the reseeded template would not read back"),
+            };
+            let desk = back.desk.expect("a template has a desk");
+            assert_eq!(
+                desk.inserts.get(0).map(String::as_str),
+                Some(crate::dialogs::DRUMPAD_PATH),
+                "a template holding {shipped:?} was not healed to the shipped desk"
+            );
+            assert_eq!(
+                desk.inserts.get(INSERTS).map(String::as_str),
+                Some(crate::dialogs::BUILTIN_PATH),
+                "a template holding {shipped:?} was not healed to the shipped desk"
+            );
+        }
+
+        // And a template somebody ARRANGED stands. One extra plugin on a
+        // third track is the whole difference, and it must be enough.
+        write_stock(SHIPPED_OVER_TIME[0]);
+        {
+            let crate::arrangement::LoadOutcome::Loaded(mut a) =
+                crate::arrangement::Arrangement::read_from(&doc)
+            else {
+                panic!("the fixture would not read back")
+            };
+            let d = a.desk.as_mut().expect("a desk");
+            d.inserts[2 * INSERTS] = crate::dialogs::BUILTIN_PATH.to_owned();
+            a.save_to(&doc);
+        }
+        app.seed_template(&dir);
+        let crate::arrangement::LoadOutcome::Loaded(kept) =
+            crate::arrangement::Arrangement::read_from(&doc)
+        else {
+            panic!("the touched template would not read back")
+        };
+        let desk = kept.desk.expect("a desk");
+        assert_eq!(
+            desk.inserts.get(2 * INSERTS).map(String::as_str),
+            Some(crate::dialogs::BUILTIN_PATH),
+            "a template somebody had arranged was overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, TangentApp) {
