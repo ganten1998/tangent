@@ -446,6 +446,175 @@ impl Rgb {
     }
 }
 
+/// **Which insert bays are BYPASSED** — kept, loaded, editable, and not
+/// applied.
+///
+/// The wording is `TangentApp::arr_auto_bypassed`'s, on purpose: a bypassed
+/// automation row is still drawn, still editable and still holds every node
+/// somebody put down, and simply does not move its parameter. A bypassed
+/// BAY is that same bargain one layer down — the plugin stays seated, its
+/// window still opens, its name still reads on the chip, its settings are
+/// untouched, and the audio walks past it. Nothing is unloaded, so putting
+/// it back is a click and not a reload.
+///
+/// **Addressed in SEAT space — `(seat, bay)`, the plugin's own address.**
+///
+/// This is the one thing here that had to be got right. A bay's tenant lives
+/// at `strip_inserts[seat * INSERTS + bay]`; storing the flag at any OTHER
+/// address needs a translation, and a translation is a thing that can be
+/// wrong. The master's six visible slots run 3..5 and then 0..2 across two
+/// racks, a folder's run 0..2 and then 3..5 across two others, and neither
+/// rule is guessable from a slot number — which is exactly why
+/// `recorder::seat_bay` exists and why every call site is made to go through
+/// it. Sharing the plugin's own address means the flag and the plugin are
+/// moved by the same permutation, in the same pass, or not at all.
+///
+/// It is also the only space wide enough. The DESK address —
+/// `(strip, visible slot)`, which [`crate::routing::KeyEdges`] uses because
+/// a key names a CHANNEL at both ends and channels are what a reorder moves
+/// — cannot name a pad seat or a pedal seat at all, and there are 224 pedal
+/// seats (`recorder::AMP_PEDAL_SEATS`).
+///
+/// **Sparse, and kept SORTED.** Sparse for the reason [`crate::routing::Routes`]
+/// is: almost nothing is ever bypassed, and a `TOTAL_SEATS * INSERTS` bitmap
+/// would put thirteen thousand zeroes in everybody's settings file. Sorted
+/// because a reorder rewrites the seats in place: a list left in the order
+/// the hand made it would come out of every drag shuffled, and turn every
+/// diff of a settings file into noise.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BypassBays(pub Vec<(usize, usize)>);
+
+impl BypassBays {
+    /// Whether this bay's tenant is out of circuit.
+    ///
+    /// A linear scan, like [`crate::routing::KeyEdges::get`]: the list is a
+    /// handful of entries at the very most, and it is asked once per drawn
+    /// chip and once per published frame — a map would cost more to keep
+    /// than it could ever save.
+    pub fn contains(&self, seat: usize, bay: usize) -> bool {
+        self.0.contains(&(seat, bay))
+    }
+
+    /// Put one bay out of circuit, or back in. Answers whether anything
+    /// moved, so a caller can decline to save a file that would be
+    /// byte-identical.
+    pub fn set(&mut self, seat: usize, bay: usize, on: bool) -> bool {
+        let at = self.0.iter().position(|e| *e == (seat, bay));
+        match (at, on) {
+            (Some(_), true) | (None, false) => false,
+            (Some(at), false) => {
+                self.0.remove(at);
+                true
+            }
+            (None, true) => {
+                // Sorted on the way IN rather than at save time, so the list
+                // reads in one order everywhere — the file, the published
+                // table, a debug print — and no reader has to wonder which
+                // of them is canonical.
+                let at = self.0.partition_point(|e| *e < (seat, bay));
+                self.0.insert(at, (seat, bay));
+                true
+            }
+        }
+    }
+
+    /// Flip one bay, and answer what it now is — the gesture's own verb.
+    pub fn toggle(&mut self, seat: usize, bay: usize) -> bool {
+        let on = !self.contains(seat, bay);
+        self.set(seat, bay, on);
+        on
+    }
+
+    /// **Forget one bay, because whatever was in it has gone.**
+    ///
+    /// Called wherever a bay's tenant changes — see
+    /// `TangentApp::set_insert` — for the reason `insert_keys` is dropped on
+    /// a track delete: a flag left standing would silently bypass the NEXT
+    /// plugin to land here. An effect that is loaded, drawn, named on its
+    /// chip and inaudible for no reason anybody can see is the worst failure
+    /// this feature has available to it.
+    pub fn drop_bay(&mut self, seat: usize, bay: usize) -> bool {
+        self.set(seat, bay, false)
+    }
+
+    /// Every bay of one seat, for a rack whose whole contents have gone — a
+    /// deleted track's own seat and its folder-extra seat. Returns how many
+    /// went, so a caller can tell somebody, exactly as
+    /// [`crate::routing::KeyEdges::drop_channel`] does.
+    pub fn drop_seat(&mut self, seat: usize) -> usize {
+        let before = self.0.len();
+        self.0.retain(|(s, _)| *s != seat);
+        before - self.0.len()
+    }
+
+    /// **Follow a reorder.** `order[new] = old`, over the WHOLE seat space —
+    /// that is, exactly what `recorder::seat_order` returns, which is where
+    /// the knowledge lives that a channel's folder-extra seat and its seven
+    /// pedal seats travel with it while every other seat holds still.
+    ///
+    /// The inversion happens HERE rather than at the call site. A set NAMES
+    /// seats, so it needs `old -> new`, while every array in the reorder is
+    /// rebuilt by reading `new -> old`; passing the wrong one of those two
+    /// is silent, survives any test that only ever swaps two adjacent rows,
+    /// and lands a bypass on somebody else's plugin. One inversion, in one
+    /// function, and no caller can get it the wrong way round.
+    pub fn remap_seats(&mut self, order: &[usize]) {
+        let mut inv = vec![usize::MAX; order.len()];
+        for (new, old) in order.iter().enumerate() {
+            if let Some(slot) = inv.get_mut(*old) {
+                *slot = new;
+            }
+        }
+        for (seat, _) in &mut self.0 {
+            // A seat the permutation does not name holds still — the rule
+            // `KeyEdges::remap_channels` states for the buses and the
+            // master, and the one `seat_order` writes into its own identity
+            // entries.
+            if let Some(new) = inv.get(*seat).copied().filter(|n| *n != usize::MAX) {
+                *seat = new;
+            }
+        }
+        self.0.sort_unstable();
+    }
+
+    pub fn to_json(&self) -> Value {
+        Value::Array(
+            self.0
+                .iter()
+                .map(|(seat, bay)| {
+                    let mut m = Map::new();
+                    m.insert("seat".into(), Value::from(*seat as i64));
+                    m.insert("bay".into(), Value::from(*bay as i64));
+                    Value::Object(m)
+                })
+                .collect(),
+        )
+    }
+
+    /// Read them back. A malformed entry is skipped rather than failing the
+    /// whole list — the forgiveness `KeyEdges::from_json` extends — and
+    /// `as_u64` rather than `as_i64` for the reason it gives: a negative
+    /// index is malformed, and clamping it to zero would bypass a real
+    /// plugin on the first channel.
+    pub fn from_json(v: &Value) -> Self {
+        let Value::Array(items) = v else {
+            return Self::default();
+        };
+        let mut out = Self::default();
+        for it in items {
+            let Value::Object(m) = it else { continue };
+            let (Some(seat), Some(bay)) = (
+                m.get("seat").and_then(Value::as_u64),
+                m.get("bay").and_then(Value::as_u64),
+            ) else {
+                continue;
+            };
+            out.set(seat as usize, bay as usize, true);
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub dark_mode: bool,
@@ -526,6 +695,12 @@ pub struct Settings {
     /// [`crate::routing::KeyEdges`]. Desk topology like `routes`, addressed
     /// by (strip, visible slot) so it rides out seat renumbering.
     pub insert_keys: crate::routing::KeyEdges,
+    /// Which insert bays are out of circuit — see [`BypassBays`]. Beside the
+    /// key edges because both are facts about a BAY rather than about the
+    /// plugin sitting in it, and both therefore have to outlive that plugin
+    /// being swapped for another build of itself; unlike the keys, this one
+    /// is addressed in SEAT space, for the reason the type's own docs give.
+    pub insert_bypass: BypassBays,
     /// Wrap a saved project in its own folder. **On by default**, because a
     /// project is a DIRECTORY (document plus `media/`) and saving one into a
     /// folder that already has things in it scatters those parts among them.
@@ -1512,6 +1687,7 @@ impl Default for Settings {
             theme_name: "Default".to_owned(),
             routes: crate::routing::Routes::default(),
             insert_keys: crate::routing::KeyEdges::default(),
+            insert_bypass: BypassBays::default(),
             project_subdir: true,
             prefer_flats: true,
             chord_detection_enabled: true,
@@ -2256,6 +2432,13 @@ impl Settings {
         // before sidechains existed, and absence is simply no keys.
         if let Some(v) = map.shift_remove("insert_keys") {
             s.insert_keys = crate::routing::KeyEdges::from_json(&v);
+        }
+        // And the bypassed bays, beside them; absent in every file written
+        // before the gesture existed, and absence is simply "everything is
+        // in circuit" — which is the only safe reading, because the opposite
+        // default would open old sessions with plugins silently switched off.
+        if let Some(v) = map.shift_remove("insert_bypass") {
+            s.insert_bypass = BypassBays::from_json(&v);
         }
         if let Some(v) = map.shift_remove("theme_name") {
             if let Some(t) = v.as_str() {
@@ -4268,6 +4451,13 @@ impl Settings {
         if let Some(v) = self.irs_dir.as_ref().filter(|v| !v.is_empty()) {
             map.insert("irs_dir".into(), Value::String(v.clone()));
         }
+        // The bypassed bays, at the END like every additive key, and only
+        // when somebody has taken something out of circuit — so a desk that
+        // has never used the gesture keeps its byte-for-byte shape, the same
+        // bargain `insert_keys` and the folder overrides above make.
+        if !self.insert_bypass.0.is_empty() {
+            map.insert("insert_bypass".into(), self.insert_bypass.to_json());
+        }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -4589,6 +4779,10 @@ impl Settings {
         // The key edges are desk topology like the routes, and a wiped desk
         // keeping them would key tracks that no longer exist.
         self.insert_keys = fresh.insert_keys.clone();
+        // And the bypassed bays, for the plainer reason: the reset empties
+        // every rack, so a flag kept here would be waiting to switch off the
+        // first plugin somebody loads into the desk they have just wiped.
+        self.insert_bypass = fresh.insert_bypass.clone();
         self.master_gain = fresh.master_gain;
         self.varispeed = fresh.varispeed;
         self.lufs_window = fresh.lufs_window;
@@ -6935,6 +7129,63 @@ mod tests {
         assert_eq!(s2.insert_keys.get(2, 0), Some(9), "first edge wins the bay");
         assert_eq!(s2.insert_keys.0.len(), 1, "the malformed row was skipped");
         assert!(s2.extra.contains_key("future_key"));
+    }
+
+    /// **The bypassed bays round-trip, sit at the END of the map, and are
+    /// absent until somebody switches something off.**
+    ///
+    /// The additive-key law, with one extra thing to prove: the ABSENCE of
+    /// the key has to read as "everything is in circuit". The opposite
+    /// default would open every session written before this existed with
+    /// plugins silently switched off, which is a bug nobody would think to
+    /// look for in a settings file.
+    #[test]
+    fn insert_bypass_round_trips_at_the_end_and_is_absent_until_one_is_made() {
+        assert!(!Settings::default().to_map().contains_key("insert_bypass"));
+        assert!(
+            !Settings::default().insert_bypass.contains(0, 0),
+            "a fresh desk came up with a bay switched off"
+        );
+
+        let mut s = Settings::default();
+        // Out of order and out of seat order, so the sorting is doing work.
+        assert!(s.insert_bypass.set(crate::recorder::MASTER_EXTRA_SEAT, 1, true));
+        assert!(s.insert_bypass.set(3, 2, true));
+        assert!(s.insert_bypass.set(3, 0, true));
+        // Setting a bay that is already set changes nothing and says so.
+        assert!(!s.insert_bypass.set(3, 0, true));
+        let out = s.to_map();
+        assert_eq!(
+            out.keys().last().map(String::as_str),
+            Some("insert_bypass"),
+            "insert_bypass is not the last of our own keys"
+        );
+        let back = Settings::from_map(out);
+        assert_eq!(back.insert_bypass, s.insert_bypass);
+        assert_eq!(
+            back.insert_bypass.0,
+            vec![(3, 0), (3, 2), (crate::recorder::MASTER_EXTRA_SEAT, 1)],
+            "the list did not come back sorted"
+        );
+
+        // A file with bypasses AND an unknown future key keeps both, and a
+        // malformed row is skipped rather than failing the list.
+        let s2 = Settings::from_map(map_of(
+            r#"{"insert_bypass": [{"seat": 5, "bay": 1},
+                                  {"seat": 5, "bay": 1},
+                                  {"seat": -2, "bay": 0},
+                                  {"bay": 0}],
+                "future_key": true}"#,
+        ));
+        assert!(s2.insert_bypass.contains(5, 1));
+        assert_eq!(s2.insert_bypass.0.len(), 1, "a bad row or a repeat got in");
+        assert!(s2.extra.contains_key("future_key"));
+
+        // And the desk reset takes them: a wiped desk keeping a flag would
+        // be waiting to silence the first plugin loaded onto it.
+        let mut wiped = s.clone();
+        wiped.reset(super::ResetScope::Everything);
+        assert!(wiped.insert_bypass.0.is_empty());
     }
 
     #[test]

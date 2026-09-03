@@ -4425,6 +4425,21 @@ impl TangentApp {
             self.set_insert(at, bay, None);
             self.set_insert(crate::recorder::folder_extra_seat(at), bay, None);
         }
+        // **And every bypass on the seats those bays live in.**
+        //
+        // `set_insert` above has already dropped the flag off each bay whose
+        // tenant it actually changed, so this is belt and braces for the one
+        // case it cannot see: a bay that was already empty and carrying a
+        // flag from a hand-edited file. Exactly these two seats and no more
+        // — the flag goes where the plugin goes and never further. The
+        // pedal seats keep theirs, because `remove_channel` deliberately
+        // leaves the pedals loaded; taking their flags but not their plugins
+        // would put somebody else's pedalboard back in circuit under a new
+        // track, which is louder and less honest than leaving both.
+        self.settings.insert_bypass.drop_seat(at);
+        self.settings
+            .insert_bypass
+            .drop_seat(crate::recorder::folder_extra_seat(at));
         self.save_settings();
     }
 
@@ -4914,6 +4929,16 @@ impl TangentApp {
                 keyed: std::array::from_fn(|n| {
                     self.settings.insert_keys.get(i, n).is_some()
                 }),
+                // **Through `seat_bay` again, like the names beside it.** A
+                // bypass is stored at the plugin's own address, so the flag
+                // and the word on the chip are read out of the same two
+                // numbers and cannot end up describing different bays —
+                // which is the failure the `inserts` block above records
+                // having had, in this very strip, when it indexed raw.
+                bypassed: std::array::from_fn(|n| {
+                    let (seat, bay) = crate::recorder::seat_bay(i, n);
+                    self.insert_bypassed(seat, bay)
+                }),
                 kind,
                 icon,
                 empty,
@@ -5019,6 +5044,13 @@ impl TangentApp {
                             .insert_keys
                             .get(crate::recorder::MASTER_SEAT, n)
                             .is_some()
+                    }),
+                    // The master's two racks, resolved the way its names
+                    // are: slots 0..2 are the extra seat, 3..5 the original.
+                    bypassed: std::array::from_fn(|n| {
+                        let (seat, bay) =
+                            crate::recorder::seat_bay(crate::recorder::STRIPS, n);
+                        self.insert_bypassed(seat, bay)
                     }),
                 },
             }),
@@ -8499,6 +8531,22 @@ impl TangentApp {
         // into its source's old row. Bus and master destinations sit past
         // the channels and hold still, which `remap_channels` knows.
         self.settings.insert_keys.remap_channels(&inv);
+
+        // **And the bypassed bays, through the SEAT permutation.**
+        //
+        // Not `inv`: a bypass names a SEAT, and the seats a channel drags
+        // along with it are its own row, its folder-extra seat and its seven
+        // pedal seats — the same three blocks `strip_inserts` was just moved
+        // by, forty lines up. `recorder::seat_order` is where that knowledge
+        // is written down (the engine's `permute_channel_inserts` reads the
+        // very same function to carry the live plugins), so the flags and
+        // the plugins are moved by one description of the move and cannot
+        // drift apart. Handed the permutation the way it comes —
+        // `order[new] = old` — because `remap_seats` inverts it itself; see
+        // its docs for why that inversion is not left to a call site.
+        self.settings
+            .insert_bypass
+            .remap_seats(&crate::recorder::seat_order(order));
 
         self.desk_state_perm = Some(order.to_vec());
         self.save_settings();
@@ -17793,6 +17841,12 @@ impl TangentApp {
                 let (seat, bay) = crate::recorder::seat_bay(crate::recorder::STRIPS, n);
                 self.insert(seat, bay).map_or("", plugin_display_name)
             }),
+            // Which of them are out of circuit, read from the same pair of
+            // numbers as the names above — see `settings::BypassBays`.
+            master_bypassed: std::array::from_fn(|n| {
+                let (seat, bay) = crate::recorder::seat_bay(crate::recorder::STRIPS, n);
+                self.insert_bypassed(seat, bay)
+            }),
             // No UI to open it yet — the row exists so the tempo work has
             // somewhere to land.
             show_tempo_lane: self.settings.arr_tempo_lane,
@@ -17909,6 +17963,13 @@ impl TangentApp {
                         // seat map answers for every slot. See seat_bay.
                         let (seat, bay) = crate::recorder::seat_bay(n, b);
                         self.insert(seat, bay).map_or("", plugin_display_name)
+                    }),
+                    // And which are bypassed, through the same seat map —
+                    // so a FOLDER's second rack answers for its own bays and
+                    // never for the three above them.
+                    bypassed: std::array::from_fn(|b| {
+                        let (seat, bay) = crate::recorder::seat_bay(n, b);
+                        self.insert_bypassed(seat, bay)
                     }),
                     color: self.strip_color(n),
                     kind,
@@ -19909,6 +19970,40 @@ impl TangentApp {
             }
             return;
         }
+        // **Shift+click BYPASSES the bay**, and clicking again puts it back.
+        //
+        // Here, in the one door every bay gesture already comes through —
+        // the mixer's rack, the arrangement's header chips, a FOLDER's
+        // second rack, the master's, and the pads' — so the gesture reaches
+        // every surface at once and no surface can disagree with another
+        // about what it means. It is the same argument `alt_down` above
+        // makes, one modifier along.
+        //
+        // **Shift is free on a bay.** Every other modifier on a rack is
+        // already spoken for: alt empties it (above), right-click opens
+        // delete/replace/sidechain, a plain press arms the CARRY that copies
+        // an effect to another channel, and a double-click is the desk's
+        // reset. Shift on a bay did nothing at all in either view — the only
+        // thing it touched was the press-anywhere-on-a-strip SELECT the
+        // mixer does before the hit test, which extends the track selection
+        // from the anchor exactly as shift+arm already does today. That is
+        // pre-existing and deliberate, so it is left alone rather than made
+        // into a special case only this chip knows about.
+        //
+        // AFTER the alt arm, so shift+alt still empties. Alt is this app's
+        // eraser everywhere (a node, a tempo point, a bay); a hand holding
+        // both is holding the eraser, and the destructive reading is the one
+        // a user can see they got.
+        //
+        // An EMPTY bay is left alone, for `alt_down`'s reason: there is
+        // nothing to take out of circuit, and a bypass flag sitting on an
+        // empty bay would be waiting to silence whatever lands there next.
+        if self.shift_down {
+            if self.insert(strip, bay).is_some() {
+                self.toggle_insert_bypass(strip, bay);
+            }
+            return;
+        }
         match self.insert(strip, bay) {
             Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
             // The drumpad's face is the drumpad: pads, kit and browser in
@@ -21394,11 +21489,67 @@ impl TangentApp {
             self.settings.strip_inserts.resize(need, String::new());
         }
         let at = strip * crate::recorder::INSERTS + slot;
+        // **A bay that changes tenant loses its bypass**, and this is the
+        // one place that can know it did.
+        //
+        // Every road into a bay ends here — the picker, the FX menu's
+        // Replace, alt-click, the track delete, a carried copy landing
+        // (`Desktop::copy_insert`), a project load. A flag left behind by any
+        // of them would come back on with the NEXT plugin, which would then
+        // be loaded, drawn, named on its chip and silent for no reason
+        // anybody could see. That is the worst failure this feature has
+        // available to it, so it is closed at the single writer rather than
+        // at six call sites, one of which somebody would later add a seventh
+        // beside.
+        //
+        // Only when the path really MOVES: the reconcile and the settings
+        // reader both rewrite bays with what is already in them, and a
+        // no-op write that quietly put a plugin back in circuit would be the
+        // same bug wearing the other face.
+        let changed = self
+            .settings
+            .strip_inserts
+            .get(at)
+            .is_some_and(|cell| cell.as_str() != path.unwrap_or_default());
         if let Some(cell) = self.settings.strip_inserts.get_mut(at) {
             *cell = path.unwrap_or_default().to_owned();
         }
+        if changed {
+            self.settings.insert_bypass.drop_bay(strip, slot);
+        }
         self.save_settings();
         self.undo_commit();
+    }
+
+    /// Whether this bay's tenant is out of circuit — kept, loaded, editable,
+    /// and not applied. See [`crate::settings::BypassBays`].
+    ///
+    /// `strip` is a SEAT and `slot` a BAY, exactly as [`Self::insert`] takes
+    /// them: the flag shares the plugin's own address so the two can never
+    /// come apart. A caller holding a strip's visible SLOT resolves it
+    /// through `recorder::seat_bay` first, like every other bay question.
+    pub fn insert_bypassed(&self, strip: usize, slot: usize) -> bool {
+        self.settings.insert_bypass.contains(strip, slot)
+    }
+
+    /// Every bypassed bay, for the host to publish to the engine.
+    ///
+    /// Already in SEAT terms — unlike [`Self::insert_keys`], which the host
+    /// has to put through `seat_bay` on its way out — so the publish has no
+    /// translation in it and therefore no translation to get wrong.
+    pub fn insert_bypass(&self) -> &[(usize, usize)] {
+        &self.settings.insert_bypass.0
+    }
+
+    /// Take one bay out of circuit, or put it back. Answers what it now is.
+    ///
+    /// Saved on the spot, like every other desk fact a click changes: the
+    /// engine reads the published table next frame and a crash between the
+    /// two must not lose which of two plugins somebody was comparing.
+    pub fn toggle_insert_bypass(&mut self, strip: usize, slot: usize) -> bool {
+        let on = self.settings.insert_bypass.toggle(strip, slot);
+        self.save_settings();
+        on
     }
 
     /// A short name for the audio interface, used on every one of its inputs.
@@ -34348,6 +34499,225 @@ mod tests {
         pointer_frame(ctx, app, vec![egui::Event::PointerMoved(pos)]);
     }
 
+    /// **A whole click at `pos` with `mods` held down throughout** — arrive,
+    /// press, release — as a hand does it.
+    ///
+    /// The modifier goes on `RawInput::modifiers` AS WELL AS on each event,
+    /// which is the detail that makes this worth a helper. The app latches
+    /// `alt_down` and `shift_down` once a frame from `ctx.input(|i|
+    /// i.modifiers)`, so a test that decorated only the events would drive a
+    /// press the app reads as unmodified — and would pass, silently, against
+    /// a feature that was never exercised. `move_to_fine` already had to
+    /// learn this; this is the same lesson with a button on the end.
+    ///
+    /// Held on the RELEASE frame too, because that is when the gesture
+    /// lands: a press on a LOADED bay only arms the carry, and the deed
+    /// happens in `land_bay_carry` when the hand comes up.
+    fn click_with(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+        pos: Pos2,
+        mods: egui::Modifiers,
+    ) {
+        let frame = |app: &mut TangentApp, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(1300.0, 900.0),
+                    )),
+                    modifiers: mods,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: mods,
+        };
+        frame(app, vec![egui::Event::PointerMoved(pos)]);
+        frame(app, vec![button(true)]);
+        frame(app, vec![button(false)]);
+    }
+
+    /// **Shift-clicking an insert bay takes it out of circuit and puts it
+    /// back — in BOTH views, on a track's rack and on a FOLDER's second one
+    /// — and a plain click still opens the plugin.**
+    ///
+    /// Driven at the event level rather than through `open_insert_face`,
+    /// because what is actually being asserted is that a real press with a
+    /// real modifier reaches that function at all. The two views arm the bay
+    /// differently (the mixer through `Hit::Insert`, the arrangement through
+    /// `Hit::HdrBay`) and both hand a LOADED bay to `bay_carry`, so the deed
+    /// happens on the RELEASE — a state-level test would have proved nothing
+    /// about either road.
+    ///
+    /// The folder case is here because slot 3 is the one address a slot
+    /// number alone cannot resolve: it is bay 0 of `folder_extra_seat`, and
+    /// a bypass that resolved it wrong would land on the neighbour's plugin
+    /// while the chip that was clicked went on looking untouched.
+    #[test]
+    fn shift_clicking_a_bay_bypasses_it_in_both_views_on_tracks_and_folders() {
+        let track_seat = crate::recorder::Strip::Channel(3).index();
+        let folder_seat = crate::recorder::folder_extra_seat(1);
+        for arrangement in [false, true] {
+            let where_ = if arrangement { "arrangement" } else { "mixer" };
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            if arrangement {
+                app.arrangement_open = true;
+            } else {
+                app.mixer_open = true;
+            }
+            for n in 0..5 {
+                app.add_bare_track(n);
+            }
+            app.toggle_folder(1);
+            app.set_insert(track_seat, 0, Some("/x/Comp.vst3"));
+            app.set_insert(folder_seat, 0, Some("/x/Verb.vst3"));
+            let _ = run_frame(&ctx, &mut app);
+            let rect = if arrangement {
+                app.arrangement_rect.expect("the arrangement was never drawn")
+            } else {
+                app.mixer_rect.expect("the mixer was never drawn")
+            };
+            // Asked fresh before every gesture: a bypass repaints the rack,
+            // and a rectangle cached across a click is a rectangle from
+            // before the thing under test happened.
+            let bay_at = |app: &TangentApp, lane: usize, slot: usize| -> Pos2 {
+                let r = if arrangement {
+                    let clips = app.arr_clip_views();
+                    let v = app.arrange_view(&clips);
+                    crate::arrangement_panel::Layout::new(rect, &v).header_rows[lane].bays[slot]
+                } else {
+                    let v = app.mixer_view();
+                    crate::mixer_panel::Layout::new(rect, &v).strips[lane].inserts[slot]
+                };
+                assert!(r.is_positive(), "{where_}: lane {lane} has no bay {slot} to press");
+                r.center()
+            };
+            for (seat, lane, slot) in [(track_seat, 3usize, 0usize), (folder_seat, 1, 3)] {
+                // ── a plain click still opens the plugin ──
+                while app.take_recorder_request().is_some() {}
+                let at = bay_at(&app, lane, slot);
+                click_with(&ctx, &mut app, at, egui::Modifiers::NONE);
+                assert!(
+                    !app.insert_bypassed(seat, 0),
+                    "{where_}: a plain click on seat {seat} bypassed it"
+                );
+                let mut opened = false;
+                while let Some(r) = app.take_recorder_request() {
+                    opened |= r == recorder::RecorderRequest::OpenInsertEditor(seat, 0);
+                }
+                assert!(opened, "{where_}: a plain click on seat {seat} opened nothing");
+
+                // ── shift+click takes it out of circuit, and ONLY that ──
+                let at = bay_at(&app, lane, slot);
+                click_with(&ctx, &mut app, at, egui::Modifiers::SHIFT);
+                assert!(
+                    app.insert_bypassed(seat, 0),
+                    "{where_}: shift-clicking seat {seat} did not bypass it"
+                );
+                let mut opened = false;
+                while let Some(r) = app.take_recorder_request() {
+                    opened |= r == recorder::RecorderRequest::OpenInsertEditor(seat, 0);
+                }
+                assert!(
+                    !opened,
+                    "{where_}: shift-clicking seat {seat} opened the window as well"
+                );
+                // The plugin is KEPT — that is the whole bargain.
+                assert!(
+                    app.insert(seat, 0).is_some(),
+                    "{where_}: the bypass unloaded seat {seat}"
+                );
+
+                // ── and again puts it back ──
+                let at = bay_at(&app, lane, slot);
+                click_with(&ctx, &mut app, at, egui::Modifiers::SHIFT);
+                assert!(
+                    !app.insert_bypassed(seat, 0),
+                    "{where_}: the second shift-click did not put seat {seat} back"
+                );
+            }
+            // Neither gesture touched the other rack: a folder's second seat
+            // and a plain track's own are different addresses and stayed so.
+            assert!(app.insert_bypass().is_empty(), "{where_}: a flag was left standing");
+        }
+    }
+
+    /// **The bypass reaches the drawn chip in both views**, which is the
+    /// other half of the gesture: a switch that works and does not show is a
+    /// switch nobody trusts. Asserted on the VIEW rather than on the pixels,
+    /// because the view is what the painter is handed and the slot-to-seat
+    /// resolution is what could be wrong.
+    #[test]
+    fn a_bypassed_bay_says_so_in_the_view_the_painter_gets() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        for n in 0..5 {
+            app.add_bare_track(n);
+        }
+        app.toggle_folder(1);
+        let folder_seat = crate::recorder::folder_extra_seat(1);
+        app.set_insert(folder_seat, 0, Some("/x/Verb.vst3"));
+        app.set_insert(recorder::MASTER_EXTRA_SEAT, 1, Some("/x/Pro-L.vst3"));
+        app.toggle_insert_bypass(folder_seat, 0);
+        app.toggle_insert_bypass(recorder::MASTER_EXTRA_SEAT, 1);
+
+        let v = app.mixer_view();
+        assert!(v.strips[1].bypassed[3], "the mixer's folder rack lost the flag");
+        assert!(!v.strips[1].bypassed[0], "the flag reached the wrong bay");
+        // The MASTER's slots run extra-first: its extra seat's bay 1 is
+        // slot 1, which is exactly the resolution `seat_bay` exists for.
+        let master = v.strips.len() - 1;
+        assert!(
+            v.strips[master].bypassed[1],
+            "the master's second rack lost the flag"
+        );
+        assert!(!v.strips[master].bypassed[4], "the master's flag hit the other rack");
+
+        let clips = app.arr_clip_views();
+        let av = app.arrange_view(&clips);
+        assert!(av.lanes[1].bypassed[3], "the arrangement's folder rack lost the flag");
+        assert!(!av.lanes[1].bypassed[0], "the flag reached the wrong bay");
+        assert!(av.master_bypassed[1], "the arrangement's master row lost the flag");
+    }
+
+    /// **A bay that changes tenant comes back IN CIRCUIT.**
+    ///
+    /// The flag is a fact about the plugin somebody switched off, not about
+    /// the hole it sits in. Left standing it would silently bypass whatever
+    /// lands there next — an effect loaded, drawn, named on its chip and
+    /// inaudible for no reason anybody could see, which is the worst thing
+    /// this feature can do. And the other half: a write of the SAME path
+    /// must not put a bypassed plugin back, because the reconcile and the
+    /// settings reader both do that every time they run.
+    #[test]
+    fn a_bay_that_changes_tenant_comes_back_in_circuit() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.set_insert(4, 1, Some("/x/Comp.vst3"));
+        app.toggle_insert_bypass(4, 1);
+        assert!(app.insert_bypassed(4, 1));
+
+        app.set_insert(4, 1, Some("/x/Comp.vst3"));
+        assert!(
+            app.insert_bypassed(4, 1),
+            "rewriting the same path put a bypassed plugin back in circuit"
+        );
+
+        app.set_insert(4, 1, Some("/x/Verb.vst3"));
+        assert!(!app.insert_bypassed(4, 1), "the replacement arrived bypassed");
+
+        app.toggle_insert_bypass(4, 1);
+        app.set_insert(4, 1, None);
+        assert!(!app.insert_bypassed(4, 1), "an emptied bay kept its flag");
+        // And the neighbours were never involved.
+        assert!(app.insert_bypass().is_empty());
+    }
+
     // ── the effect panels ───────────────────────────────────────────────────
 
     /// An app with the band up and the effect defaults the host would push.
@@ -39792,6 +40162,110 @@ mod folder_tests {
             "an edge keyed BY the deleted track survived it"
         );
         assert!(a.settings.insert_keys.0.is_empty());
+    }
+
+    /// **A bypass follows its track through a reorder — on all three of the
+    /// seats a channel drags along — and dies with the plugins it named.**
+    ///
+    /// The same disease as the kits, the curves and the key edges, and the
+    /// nastiest version of it: a flag left on a seat does not move audio to
+    /// the wrong place, it SILENCES the plugin of whoever moved in, and the
+    /// chip goes on drawing a perfectly correct-looking bay. Asserted
+    /// against the actual new seats rather than against a count, and in both
+    /// directions — arrived AND did not stay behind.
+    ///
+    /// The pedal seat is in here on purpose: it is the block the desk's own
+    /// `(strip, slot)` address cannot name at all, and the reason the flags
+    /// are stored in seat space.
+    #[test]
+    fn a_bypass_follows_its_track_through_a_reorder_and_dies_with_it() {
+        use crate::recorder::{
+            amp_pedal_seat, folder_extra_seat, Strip, CHANNELS, MASTER_SEAT,
+        };
+        let mut a = app();
+        for n in [1usize, 2, 3] {
+            a.add_bare_track(n);
+        }
+        // Track 3 wears a plugin on its own rack, on its folder-extra rack
+        // and on one pedal of its board; the master wears one too, as the
+        // control that must NOT move.
+        let seats = [
+            (Strip::Channel(3).index(), 1usize),
+            (folder_extra_seat(3), 0),
+            (amp_pedal_seat(3, 2), 0),
+            (MASTER_SEAT, 2),
+        ];
+        for (seat, bay) in seats {
+            a.set_insert(seat, bay, Some("/x/Comp.vst3"));
+            assert!(a.toggle_insert_bypass(seat, bay));
+        }
+
+        // Move 3 up to 1: order[new] = old — the kit test's move.
+        let mut order: Vec<usize> = (0..CHANNELS).collect();
+        order.remove(3);
+        order.insert(1, 3);
+        a.reorder_channels(&order);
+
+        // Arrived, on the seats the track really landed on…
+        for (seat, bay) in [
+            (Strip::Channel(1).index(), 1usize),
+            (folder_extra_seat(1), 0),
+            (amp_pedal_seat(1, 2), 0),
+        ] {
+            assert!(
+                a.insert_bypassed(seat, bay),
+                "seat {seat} bay {bay} lost its bypass in the reorder"
+            );
+            // …beside the plugin it belongs to, which moved by the other
+            // code path entirely. If these two ever disagree, one of the
+            // two permutations is wrong.
+            assert_eq!(
+                a.insert(seat, bay),
+                Some("/x/Comp.vst3"),
+                "the flag and its plugin came apart at seat {seat}"
+            );
+        }
+        // …and did not ALSO stay behind, which is how a set gets remapped
+        // with the permutation the wrong way round and still looks right.
+        for (seat, bay) in [
+            (Strip::Channel(3).index(), 1usize),
+            (folder_extra_seat(3), 0),
+            (amp_pedal_seat(3, 2), 0),
+        ] {
+            assert!(
+                !a.insert_bypassed(seat, bay),
+                "seat {seat} bay {bay} kept a flag the track took with it"
+            );
+        }
+        // The master sits past the channels and a reorder never touches it.
+        assert!(
+            a.insert_bypassed(MASTER_SEAT, 2),
+            "the master's bypass moved with somebody else's track"
+        );
+
+        // And a DELETE takes the flags of exactly the bays it empties.
+        a.remove_channel(1);
+        assert!(
+            !a.insert_bypassed(Strip::Channel(1).index(), 1),
+            "a deleted track kept a bypass"
+        );
+        assert!(
+            !a.insert_bypassed(folder_extra_seat(1), 0),
+            "a deleted track's second rack kept a bypass"
+        );
+        // The pedalboard is the documented exception: `remove_channel`
+        // leaves the pedals LOADED, so their flags stay with them. Taking
+        // the flag and not the plugin would put somebody else's board back
+        // in circuit under the next track to use that row.
+        assert!(
+            a.insert_bypassed(amp_pedal_seat(1, 2), 0),
+            "a pedal's flag left without its pedal"
+        );
+        assert_eq!(a.insert(amp_pedal_seat(1, 2), 0), Some("/x/Comp.vst3"));
+        assert!(
+            a.insert_bypassed(MASTER_SEAT, 2),
+            "the master lost a flag to somebody else's delete"
+        );
     }
 
     /// **The source picker lists what a key can honestly listen to.**
