@@ -915,6 +915,14 @@ pub struct Layout {
 pub struct StripStrip {
     pub panel: Rect,
     pub icon: Rect,
+    /// **The room the badge was allowed**, before it was squared off into
+    /// [`Self::icon`].
+    ///
+    /// Carried so a test can ask whether the badge takes ALL of it. Measuring
+    /// the fill any other way means re-deriving the band's fractions in the
+    /// test, and a re-derivation is a copy of the thing under test — it would
+    /// go on agreeing with itself after the layout had shrunk.
+    pub icon_room: Rect,
     pub name: Rect,
     pub detail: Rect,
     pub meter: Rect,
@@ -970,6 +978,7 @@ impl StripStrip {
         mono: Rect::NOTHING,
         panel: Rect::NOTHING,
         icon: Rect::NOTHING,
+        icon_room: Rect::NOTHING,
         name: Rect::NOTHING,
         detail: Rect::NOTHING,
         meter: Rect::NOTHING,
@@ -1521,21 +1530,46 @@ impl Layout {
         // sat a band lower than the master's — twelve labels at one height and
         // one at another, which reads as the master being a different kind of
         // object rather than the same strip with nothing to pick.
+        let mut icon_room = Rect::NOTHING;
         let icon = if has_icon {
-            // The click and the drum bus have no input chip under them, so
-            // their badges drop and CENTRE in the room between the name
-            // and the rack — the owner watched them float high.
+            // **The badge takes the whole room between the name and whatever
+            // is under it** — the owner's ask, in his words: as large as they
+            // can fit.
+            //
+            // The band used to be a pair of fractions that left slack on both
+            // sides and then a 0.82 shrink on top of that, so the badge used
+            // about two thirds of what it had. The band IS the clearance now:
+            // its top sits just under the name plate (which ends at 0.078)
+            // and its bottom just over the row beneath, so a badge that fills
+            // it cannot reach either of them however the desk is sized. That
+            // is what makes this safe in the folded sixteen-over-sixteen
+            // desk, where every strip is half height — the room and the badge
+            // scale together, and the clearance is a fraction rather than a
+            // number of points that runs out.
+            //
+            // The click and the drum bus draw nothing in their detail row
+            // (`app.rs` gives DRUM BUS and CLICK no second line), so theirs
+            // reaches down through it. If a bus is ever given a second line,
+            // `the_strip_badge_clears_the_name_above_it_and_the_chip_below`
+            // is what fails.
             let r = if matches!(view.strip, Some(Strip::Channel(_))) {
-                cut(0.088, 0.145)
+                cut(0.082, 0.149)
             } else {
-                cut(0.105, 0.180)
+                cut(0.098, 0.186)
             };
-            // A shade lower than the band's centre - the owner's eye: the
-            // badge floated high against the name above it.
-            let at = Pos2::new(r.center().x, r.center().y + r.height() * 0.12);
-            // ~18% smaller than the band allows - the owner measured the
-            // badges "too big by at least 15%" against the strip.
-            Rect::from_center_size(at, Vec2::splat(r.height().min(r.width()) * 0.82))
+            // Centred, and no longer nudged down. The nudge was there because
+            // a badge two thirds the size of its band floated high in it; a
+            // badge that fills the band has nowhere to float, and any offset
+            // now would push it into a neighbour.
+            //
+            // Square, and the SHORT side wins: a strip is narrow, and a badge
+            // as tall as its band on a tall window would be wider than the
+            // strip it is drawn on.
+            icon_room = r;
+            Rect::from_center_size(
+                r.center(),
+                Vec2::splat(r.height().min(r.width())),
+            )
         } else {
             Rect::NOTHING
         };
@@ -1544,6 +1578,7 @@ impl Layout {
             routing,
             routes,
             icon,
+            icon_room,
             // **Loosely fitting the text, not a band of face.** These were a
             // fifteenth of the strip each, which at any usable window size is
             // three times the height of what is written in them: the plate
@@ -3484,9 +3519,40 @@ mod tests {
     #[test]
     fn the_strip_badge_clears_the_name_above_it_and_the_chip_below() {
         let mut worst = f32::MAX;
-        for h in [340.0_f32, 420.0, 520.0, 640.0, 780.0, 1000.0, 1400.0] {
+        let mut folded_seen = false;
+        let mut tightest_fill = f32::MAX;
+        // **Both desks, and the narrow window too.** The fold into sixteen
+        // over sixteen halves every strip's height, which is the case the
+        // owner named when he asked for bigger badges — and a narrow window
+        // is the case where the strip's WIDTH is what stops one growing. A
+        // sweep that only walked the height would miss both.
+        for (w, h) in [
+            (1300.0_f32, 340.0_f32),
+            (1300.0, 420.0),
+            (1300.0, 520.0),
+            (1300.0, 640.0),
+            (1300.0, 780.0),
+            (1300.0, 1000.0),
+            (1300.0, 1400.0),
+            // Folded: two rows need `TWO_ROW_MIN_H` each, so these are the
+            // heights where the desk is sixteen over sixteen.
+            (1900.0, 900.0),
+            (1900.0, 1100.0),
+            (2560.0, 1400.0),
+            // And a window narrow enough that the columns are near the floor.
+            (760.0, 900.0),
+            (620.0, 620.0),
+        ] {
             let v = a_view();
-            let l = Layout::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, h)), &v);
+            let l = Layout::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h)), &v);
+            // Did the desk actually fold here? Read off the layout rather
+            // than re-deriving the rule: a second row is a channel strip
+            // whose panel starts below the middle of the window.
+            if l.strips.iter().enumerate().any(|(i, s)| {
+                i != MASTER && i != CLICK && s.panel.is_positive() && s.panel.top() > h * 0.4
+            }) {
+                folded_seen = true;
+            }
             for (i, s) in l.strips.iter().enumerate() {
                 if !s.icon.is_positive() {
                     continue;
@@ -3498,28 +3564,46 @@ mod tests {
                 let ink = seat.shrink(pad);
                 assert!(
                     s.icon.contains_rect(seat),
-                    "h={h}: strip {i} paints outside its seat"
+                    "{w}x{h}: strip {i} paints outside its seat"
                 );
                 assert!(
                     ink.top() > s.name.bottom(),
-                    "h={h}: strip {i} badge overlaps its own name"
+                    "{w}x{h}: strip {i} badge overlaps its own name"
                 );
                 // A bus draws nothing in its detail row, so only a strip with
                 // a real chip under it has something to collide with.
                 if s.input_chip.is_positive() {
                     let gap = s.input_chip.top() - ink.bottom();
-                    assert!(gap > 0.0, "h={h}: strip {i} badge overlaps the input chip by {:.2}", -gap);
+                    assert!(gap > 0.0, "{w}x{h}: strip {i} badge overlaps the input chip by {:.2}", -gap);
                     worst = worst.min(gap);
                 }
                 // And it is not a speck: the seat takes most of the band it
                 // was given, which is what "big enough to see" means here.
                 let band = s.icon.width().min(s.icon.height());
-                assert!(band >= 11.0, "h={h}: strip {i} badge is only {band:.1}pt");
+                assert!(band >= 11.0, "{w}x{h}: strip {i} badge is only {band:.1}pt");
+                // **And it takes ALL of the room, which is the ask.** The
+                // badge is square, so what it can have is the shorter of the
+                // band's height and the strip's usable width; anything less
+                // than the whole of that is the 0.82 shrink coming back.
+                let room = s.icon_room.height().min(s.icon_room.width());
+                if room > 0.0 {
+                    tightest_fill = tightest_fill.min(band / room);
+                }
             }
         }
         assert!(
             worst.is_finite() && worst > 1.0,
             "the tightest badge-to-chip gap is {worst:.2}pt"
+        );
+        assert!(
+            folded_seen,
+            "no size in the sweep folded the desk into two rows, so the case \
+             the owner named is not covered"
+        );
+        assert!(
+            tightest_fill > 0.999,
+            "the badge uses only {:.0}% of the room it has",
+            tightest_fill * 100.0
         );
     }
 
