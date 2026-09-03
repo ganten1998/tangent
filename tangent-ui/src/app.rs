@@ -2177,6 +2177,16 @@ fn plugin_display_name(path: &str) -> &str {
     if path == dialogs::KEYS_PATH {
         return "TANGENT KEYS";
     }
+    // **The suite units are named, not spelled.** Their paths are sentinels
+    // (`"@tangent-denoise"`), not files, so the filename fallback below hands
+    // the sentinel straight back — and a bay holding the denoiser read
+    // "@tangent-denoise" on its chip, which is the app showing somebody its
+    // own internal spelling. `faces::SUITE_UNITS` is where those units are
+    // named for every other surface; it answers here too, so a unit cannot
+    // end up with two names.
+    if let Some((name, _)) = crate::faces::suite_unit(path) {
+        return name;
+    }
     // Both separators: a Windows path split on '/' alone came back WHOLE,
     // and the tester's bays read like a registry dump.
     path.rsplit(['/', '\\'])
@@ -2184,6 +2194,28 @@ fn plugin_display_name(path: &str) -> &str {
         .unwrap_or(path)
         .trim_end_matches(".vst3")
         .trim_end_matches(".VST3")
+}
+
+/// **The word an insert BAY's chip shows** — the name above with the house
+/// prefix taken off.
+///
+/// A bay is already inside Tangent's own rack, so "Tangent" on the chip is a
+/// word that is true of every in-house unit and therefore tells nobody
+/// anything, in the one place on the desk with the least room for it. A chip
+/// carries four or five characters at the sizes the mixer is actually drawn
+/// at, and spending seven of them on the maker's name is how "Tangent
+/// Denoise" arrives as an ellipsis. So the chips read `Denoise`, `Amp`, `EQ`,
+/// `DX7`.
+///
+/// The prefix stays wherever the unit is being CHOSEN or NAMED rather than
+/// shown in a slot — the picker's shelf, a channel taking its name from its
+/// instrument — because there the question is whose EQ this is, and the
+/// answer matters.
+fn insert_chip_name(path: &str) -> &str {
+    let name = plugin_display_name(path);
+    name.strip_prefix("Tangent ")
+        .or_else(|| name.strip_prefix("TANGENT "))
+        .unwrap_or(name)
 }
 
 /// Where the press that started the gesture in flight landed.
@@ -5085,7 +5117,7 @@ impl TangentApp {
                 // first three do. Everything else answers itself.
                 inserts: std::array::from_fn(|n| {
                     let (seat, bay) = crate::recorder::seat_bay(i, n);
-                    self.insert(seat, bay).map_or("", plugin_display_name)
+                    self.insert(seat, bay).map_or("", insert_chip_name)
                 }),
                 // The dot on a keyed chip. By SLOT, matching `inserts`; the
                 // key table speaks slot too, so no translation here.
@@ -5181,7 +5213,7 @@ impl TangentApp {
                     inserts: std::array::from_fn(|n| {
                         let (seat, bay) =
                             crate::recorder::seat_bay(crate::recorder::STRIPS, n);
-                        self.insert(seat, bay).map_or("", plugin_display_name)
+                        self.insert(seat, bay).map_or("", insert_chip_name)
                     }),
                     kind: None,
                     empty: false,
@@ -11808,13 +11840,41 @@ impl TangentApp {
     ///
     /// A carry that never travelled is a CLICK and opens the plugin, which
     /// is what a press on a bay has always done — see `bay_carry`.
-    fn land_bay_carry(&mut self, to: Option<usize>) {
+    ///
+    /// **`onto` is the BAY under the hand and it is the more specific
+    /// answer**, so it is asked first. The owner: "dragging occupied fx slot
+    /// x to any other occupied slot should swap them." Two loaded bays trade
+    /// places; anything else is the gesture's older meaning — copy this
+    /// effect to that channel's next free bay — which is what a drop on a
+    /// strip's paint, on an empty bay, or on a header row still does.
+    ///
+    /// One function for both surfaces, so the mixer's rack and the
+    /// arrangement's header cannot disagree about what a drop means. The
+    /// callers answer only what is under the hand, which is the one thing
+    /// that differs between them.
+    fn land_bay_carry(&mut self, to: Option<usize>, onto: Option<(usize, usize)>) {
         let Some((strip, bay, _, active)) = self.bay_carry.take() else {
             return;
         };
         if !active {
             self.open_insert_face(strip, bay);
             return;
+        }
+        // **The swap first, because it is the aimed one.** A drop onto a
+        // LOADED bay is unambiguous: the hand picked one unit up and put it
+        // down on another, and the only thing that could mean is trade.
+        // Nothing is written here for `CopyInsert`'s reason, doubled — see
+        // `RecorderRequest::SwapInserts`.
+        if let Some((to_strip, to_bay)) = onto {
+            if (to_strip, to_bay) != (strip, bay) && self.insert(to_strip, to_bay).is_some() {
+                self.request_recorder(recorder::RecorderRequest::SwapInserts {
+                    a_strip: strip,
+                    a_bay: bay,
+                    b_strip: to_strip,
+                    b_bay: to_bay,
+                });
+                return;
+            }
         }
         // **Nothing is written here.** The target BAY is the host's to
         // choose — the next free one — and the copy is only worth having
@@ -13543,7 +13603,7 @@ impl TangentApp {
                 let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
                 std::array::from_fn(|bay| {
                     self.insert(recorder::pad_insert_index(sel), bay)
-                        .map_or("", plugin_display_name)
+                        .map_or("", insert_chip_name)
                 })
             },
             media_dir: self.media_dir.to_str().unwrap_or(""),
@@ -17456,17 +17516,32 @@ impl TangentApp {
                     self.bay_carry = Some((strip, bay, origin, true));
                 }
             } else {
-                let target = {
-                    let clips = self.arr_clip_views();
-                    let view = self.arrange_view(&clips);
-                    let l = crate::arrangement_panel::Layout::new(rect, &view);
-                    l.header_rows.iter().position(|row| {
-                        row.panel.is_positive()
-                            && (row.panel.top()..=row.panel.bottom()).contains(&p.y)
-                    })
+                let clips = self.arr_clip_views();
+                let view = self.arrange_view(&clips);
+                let l = crate::arrangement_panel::Layout::new(rect, &view);
+                let target = l.header_rows.iter().position(|row| {
+                    row.panel.is_positive()
+                        && (row.panel.top()..=row.panel.bottom()).contains(&p.y)
+                });
+                // The header carries the same three chips, so it can answer
+                // the same aimed question — and it must, or the swap would
+                // be a gesture that works on one surface and quietly does
+                // something else on the other.
+                let onto = match crate::arrangement_panel::hit_test(rect, &view, p) {
+                    // Slots 3..5 are a FOLDER's second rack — through the
+                    // seat map like every other caller on this header.
+                    Some(crate::arrangement_panel::Hit::HdrBay(n, b)) => {
+                        Some(crate::recorder::seat_bay(n, b))
+                    }
+                    // The master's six slots live in two racks, and the
+                    // header reaches them by their own variant.
+                    Some(crate::arrangement_panel::Hit::BusBay(_, slot)) => {
+                        Some(crate::recorder::seat_bay(crate::recorder::STRIPS, slot))
+                    }
+                    _ => None,
                 };
                 let _ = (strip, bay, active);
-                self.land_bay_carry(target);
+                self.land_bay_carry(target, onto);
             }
         }
         if released {
@@ -18002,7 +18077,7 @@ impl TangentApp {
             // place that knows which of its six slots lives where.
             master_inserts: std::array::from_fn(|n| {
                 let (seat, bay) = crate::recorder::seat_bay(crate::recorder::STRIPS, n);
-                self.insert(seat, bay).map_or("", plugin_display_name)
+                self.insert(seat, bay).map_or("", insert_chip_name)
             }),
             // Which of them are out of circuit, read from the same pair of
             // numbers as the names above — see `settings::BypassBays`.
@@ -18125,7 +18200,7 @@ impl TangentApp {
                         // Slots 3..5 are the folder's second rack - the
                         // seat map answers for every slot. See seat_bay.
                         let (seat, bay) = crate::recorder::seat_bay(n, b);
-                        self.insert(seat, bay).map_or("", plugin_display_name)
+                        self.insert(seat, bay).map_or("", insert_chip_name)
                     }),
                     // And which are bypassed, through the same seat map —
                     // so a FOLDER's second rack answers for its own bays and
@@ -18534,7 +18609,7 @@ impl TangentApp {
     /// in it — the automation menu says exactly what the chip says.
     pub fn insert_short_name(&self, strip: usize, bay: usize) -> String {
         self.insert(strip, bay)
-            .map(plugin_display_name)
+            .map(insert_chip_name)
             .unwrap_or_default()
             .to_owned()
     }
@@ -27850,13 +27925,20 @@ impl TangentApp {
                         self.bay_carry = Some((strip, bay, origin, true));
                     }
                 } else {
-                    let target = {
-                        let view = self.mixer_view();
-                        crate::mixer_panel::strip_at(rect, &view, p)
-                            .map(crate::recorder::Column::desk_index)
+                    let view = self.mixer_view();
+                    let target = crate::mixer_panel::strip_at(rect, &view, p)
+                        .map(crate::recorder::Column::desk_index);
+                    // The BAY under the hand, in SEAT space like the carry
+                    // itself — `slot_seat` is the one place that knows a
+                    // strip's Nth slot may live in another rack.
+                    let onto = match crate::mixer_panel::hit_test(rect, &view, p) {
+                        Some(crate::mixer_panel::Hit::Insert(i, n)) => {
+                            Some(self.slot_seat(i, n))
+                        }
+                        _ => None,
                     };
                     let _ = active;
-                    self.land_bay_carry(target);
+                    self.land_bay_carry(target, onto);
                 }
             }
             if let (Some((from, origin, active)), Some(p)) =
@@ -31023,29 +31105,30 @@ mod tests {
     #[test]
     fn opening_the_builtin_shows_patches_and_a_vst_shows_its_own_editor() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        // The shipped desk: the Tangent DX7 in channel 1's first bay. A VST
-        // beside it in the second, to prove the two bays answer differently.
-        app.set_insert(0, 1, Some("/x/Grand 8.vst3"));
+        // The shipped desk: the Tangent DX7 in channel 1's first bay — the
+        // kit takes channel 0. A VST beside it in the second, to prove the
+        // two bays answer differently.
+        app.set_insert(1, 1, Some("/x/Grand 8.vst3"));
 
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(0), 0), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(1), 0), 0.0);
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::PatchPicker { slot: 0, .. })),
+            matches!(app.dialog, Some(dialogs::Dialog::PatchPicker { slot: 1, .. })),
             "the built-in did not open its patches"
         );
         // The one thing asked of the host is the STRIP's cartridge names —
         // never a window, which is the regression this test exists for.
         assert_eq!(
             app.take_recorder_request(),
-            Some(recorder::RecorderRequest::LoadStripCartridge { strip: 0 })
+            Some(recorder::RecorderRequest::LoadStripCartridge { strip: 1 })
         );
         assert!(app.take_recorder_request().is_none());
 
         app.dialog = None;
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(0), 1), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(1), 1), 0.0);
         assert!(app.dialog.is_none(), "a VST3 does not use the patch picker");
         assert_eq!(
             app.take_recorder_request(),
-            Some(recorder::RecorderRequest::OpenInsertEditor(0, 1))
+            Some(recorder::RecorderRequest::OpenInsertEditor(1, 1))
         );
     }
 
@@ -31740,14 +31823,14 @@ mod tests {
         let root = project_scratch("reorder");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
-        // Dress channel 0 (the DX7) distinctly.
+        // Dress channel 1 (the DX7) distinctly.
         app.settings
             .strip_names
             .resize(crate::recorder::STRIPS + 1, String::new());
-        app.settings.strip_names[0] = "LEAD".to_owned();
-        app.settings.channel_icons[0] = 2; // guitar badge
-        app.settings.strip_colors[0] = 7;
-        app.settings.channel_gains[0] = 0.42;
+        app.settings.strip_names[1] = "LEAD".to_owned();
+        app.settings.channel_icons[1] = 2; // guitar badge
+        app.settings.strip_colors[1] = 7;
+        app.settings.channel_gains[1] = 0.42;
         // A clip on its lane.
         let mid = root.join("r.mid");
         let mut b: Vec<u8> = Vec::new();
@@ -31760,10 +31843,12 @@ mod tests {
         b.extend_from_slice(&(track.len() as u32).to_be_bytes());
         b.extend_from_slice(&track);
         std::fs::write(&mid, &b).unwrap();
-        app.import_midi_at(&mid, 0, 0.0).expect("midi in");
+        app.import_midi_at(&mid, 1, 0.0).expect("midi in");
 
-        // Move the DX7 from row 0 to row 3.
-        app.move_channel(0, 3);
+        // Move the DX7 from its own row to row 3. It ships on channel 1 —
+        // the kit takes the first row — so this is the row the fixture set
+        // everything else on, too.
+        app.move_channel(1, 3);
 
         assert_eq!(app.settings.strip_names[3], "LEAD");
         assert_eq!(app.settings.channel_icons[3], 2);
@@ -31775,12 +31860,12 @@ mod tests {
             Some(dialogs::BUILTIN_PATH),
             "the DX7 did not ride to row 4"
         );
-        // Moving channel 0 to position 3 shifts channels 1..3 down one, so
-        // the drumpad (channel 1 by default now) lands on row 0.
+        // Moving channel 1 to position 3 shifts channels 2..3 down one and
+        // leaves row 0 — the drum's — exactly where it was.
         assert_eq!(
             app.insert(0, 0),
             Some(dialogs::DRUMPAD_PATH),
-            "the drum on old row 1 did not shift into row 0"
+            "the drum on row 0 moved when a row below it did"
         );
         assert_eq!(
             app.arrangement().clips[0].lane,
@@ -31790,11 +31875,11 @@ mod tests {
         // Nothing rode onto row 7 — the drum lives near the top now.
         assert_eq!(app.insert(7, 0), None);
         // And the host is told exactly what happened: order[new] = old. The
-        // moved span is 0..3; every channel above it is carried unchanged,
+        // moved span is 1..3; every channel outside it is carried unchanged,
         // however many the desk has.
         let perm = app.take_desk_state_perm().expect("no perm for the host");
         let mut want: Vec<usize> = (0..crate::recorder::CHANNELS).collect();
-        want.splice(0..4, [1, 2, 3, 0]);
+        want.splice(1..4, [2, 3, 1]);
         assert_eq!(perm, want);
         assert!(app.take_desk_state_perm().is_none(), "taken twice");
         let _ = std::fs::remove_dir_all(&root);
@@ -32066,13 +32151,15 @@ mod tests {
         use crate::mixer_panel::Hit;
         use crate::recorder::{ChannelKind, Column};
         let (_, mut app) = headless(Caps::DESKTOP);
-        // The shipped desk: the DX7 on channel 0 opens LIVE, nothing else.
-        assert_eq!(app.armed_mask(), 1, "a fresh desk should open with the DX7 armed");
+        // The shipped desk: the DX7 opens LIVE and nothing else. It sits on
+        // channel 1 — the kit is first — and the arm FOLLOWS THE INSTRUMENT
+        // rather than the seat, which is what `default_armed` is for.
+        assert_eq!(app.armed_mask(), 2, "a fresh desk should open with the DX7 armed");
 
-        app.apply_mixer_hit(Hit::Arm(Column(0)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column(1)), 0.0);
         assert_eq!(app.armed_mask(), 0, "R did not disarm");
-        app.apply_mixer_hit(Hit::Arm(Column(0)), 0.0);
-        assert_eq!(app.armed_mask(), 1, "R did not arm again");
+        app.apply_mixer_hit(Hit::Arm(Column(1)), 0.0);
+        assert_eq!(app.armed_mask(), 2, "R did not arm again");
 
         // A track somebody just added touches NOBODY's arms — its own
         // included. It armed itself for a while (first additively, then
@@ -32080,12 +32167,12 @@ mod tests {
         let n = (1..crate::recorder::CHANNELS)
             .find(|n| app.channel_kind(*n).is_none())
             .expect("an unused channel");
-        assert_eq!(app.armed_mask(), 1, "the DX7 should stand armed here");
+        assert_eq!(app.armed_mask(), 2, "the DX7 should stand armed here");
         app.set_channel_input_spec(n, "midi:all");
         assert_eq!(app.channel_kind(n), Some(ChannelKind::Midi));
         assert_eq!(
             app.armed_mask(),
-            1,
+            2,
             "adding a track changed the arms (its own or another's)"
         );
         app.apply_mixer_hit(Hit::Arm(Column(n)), 0.0);
@@ -32113,26 +32200,26 @@ mod tests {
         use crate::mixer_panel::Hit;
         use crate::recorder::Column;
         let (_, mut app) = headless(Caps::DESKTOP);
-        assert_eq!(app.armed_mask(), 1, "the desk opens with the DX7 armed");
+        assert_eq!(app.armed_mask(), 2, "the desk opens with the DX7 armed");
 
         // Two fresh tracks, bound one after the other: binds touch NO
         // arms — the DX7's stays the only one standing.
         app.set_channel_input_spec(2, "midi:all");
         app.set_channel_input_spec(3, "midi:all");
-        assert_eq!(app.armed_mask(), 1, "a bind changed the arms");
+        assert_eq!(app.armed_mask(), 2, "a bind changed the arms");
 
         // Plain presses STACK — a deliberate multi-lane take…
         app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
         app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
         assert_eq!(
             app.armed_mask(),
-            1 | (1 << 2) | (1 << 3),
+            2 | (1 << 2) | (1 << 3),
             "three lanes armed by hand should stay armed"
         );
 
         // …a plain press on an armed lane disarms just that lane…
         app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
-        assert_eq!(app.armed_mask(), 1 | (1 << 2), "the toggle took the wrong lanes");
+        assert_eq!(app.armed_mask(), 2 | (1 << 2), "the toggle took the wrong lanes");
 
         // …and Shift+press is THIS LANE ALONE.
         app.shift_down = true;
@@ -32264,7 +32351,7 @@ mod tests {
     #[test]
     fn loading_a_cartridge_refills_the_open_picker() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(0), 0), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(1), 0), 0.0);
 
         app.set_cartridge(crate::ports::CartridgeInfo {
             factory: false,
@@ -32298,7 +32385,7 @@ mod tests {
     #[test]
     fn a_cartridge_that_fails_leaves_the_good_one_alone() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(0), 0), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(1), 0), 0.0);
         app.set_cartridge(crate::ports::CartridgeInfo {
             factory: false,
             bank: "ROM1A".to_owned(),
@@ -35936,17 +36023,19 @@ mod tests {
         );
     }
 
-    /// **A fresh install sends track ONE to the theory view and nothing
+    /// **A fresh install sends track TWO to the theory view and nothing
     /// else** — the DX7, which is the instrument somebody plays while they
-    /// are learning what they just played.
+    /// are learning what they just played. It rides with the INSTRUMENT
+    /// rather than with the seat, so it moved to channel 1 with the DX7 when
+    /// the kit took the first row.
     ///
     /// Sixteen tracks all feeding one chord detector is a chord nobody
     /// played, which is what "all on" would mean.
     #[test]
-    fn the_theory_send_ships_on_for_track_one_alone() {
+    fn the_theory_send_ships_on_for_the_keyboards_track_alone() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
-        assert!(app.to_theory(0), "track one does not reach the theory view");
-        for n in 1..crate::recorder::CHANNELS {
+        assert!(app.to_theory(1), "track two does not reach the theory view");
+        for n in (0..crate::recorder::CHANNELS).filter(|n| *n != 1) {
             assert!(!app.to_theory(n), "track {} ships switched on", n + 1);
         }
         // The switch is a saved preference, unlike the arm beside it.
@@ -35955,7 +36044,7 @@ mod tests {
         let json = app.settings.to_json();
         let back = crate::settings::Settings::from_json(&json);
         assert!(back.strip_to_theory[3], "the switch did not survive a save");
-        assert!(back.strip_to_theory[0], "track one's switch was lost");
+        assert!(back.strip_to_theory[1], "track two's switch was lost");
         // And an untouched desk writes nothing, so a fresh file keeps its
         // shape — the rule every additive key here follows.
         let plain = crate::settings::Settings::default();
@@ -35977,20 +36066,20 @@ mod tests {
     #[test]
     fn playback_reaches_the_theory_view_only_where_the_switch_is_on() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
-        // Track 1 is on out of the box; track 3 is not.
-        app.recorder.lane_sounding[0] = 1u128 << 60;
+        // Track 2 is on out of the box — it carries the DX7; track 3 is not.
+        app.recorder.lane_sounding[1] = 1u128 << 60;
         app.recorder.lane_sounding[2] = 1u128 << 72;
         let lit = app.display_notes();
-        assert!(lit.contains(&60), "track one's clip did not light the view");
+        assert!(lit.contains(&60), "track two's clip did not light the view");
         assert!(!lit.contains(&72), "track three's clip lit it uninvited");
         // Turn three on and it joins.
         app.set_to_theory(2, true);
         let lit = app.display_notes();
         assert!(lit.contains(&72), "the switch did not let track three in");
-        // Turn one off and it leaves.
-        app.set_to_theory(0, false);
+        // Turn two off and it leaves.
+        app.set_to_theory(1, false);
         let lit = app.display_notes();
-        assert!(!lit.contains(&60), "track one stayed after being switched off");
+        assert!(!lit.contains(&60), "track two stayed after being switched off");
     }
 
     /// **Normalise acts on the selected AUDIO and asks the host to measure.**
@@ -36571,7 +36660,7 @@ mod tests {
         // here — the target bay is the host's to choose, because only the
         // host can lay the plugin's state beside it.
         app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(Some(4));
+        app.land_bay_carry(Some(4), None);
         let req = app.take_recorder_request();
         assert!(
             matches!(
@@ -36592,7 +36681,7 @@ mod tests {
         // EDITOR, which is a request of its own — the assertion is about
         // which one, not about whether anything was asked.
         app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), false));
-        app.land_bay_carry(Some(4));
+        app.land_bay_carry(Some(4), None);
         let req = app.take_recorder_request();
         assert!(
             matches!(req, Some(recorder::RecorderRequest::OpenInsertEditor(0, 1))),
@@ -36602,7 +36691,7 @@ mod tests {
 
         // Dropped on nothing: nothing asked, and the carry still lets go.
         app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(None);
+        app.land_bay_carry(None, None);
         assert!(app.take_recorder_request().is_none());
         assert_eq!(app.bay_carry, None);
 
@@ -36610,8 +36699,71 @@ mod tests {
         // compressor to the channel it is already on is a second instance of
         // it in the next bay, which is never what the gesture meant.
         app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
-        app.land_bay_carry(Some(0));
+        app.land_bay_carry(Some(0), None);
         assert!(app.take_recorder_request().is_none(), "it copied onto itself");
+
+        // ── **and a drop on another LOADED bay trades them** ────────────
+        //
+        // The owner: "dragging occupied fx slot x to any other occupied slot
+        // should swap them." Aimed at a bay the gesture is a different verb
+        // from the channel-wide copy above, and the useful one: a rack is an
+        // ORDER, and the only way to re-order it was to unload both and load
+        // them back the other way round.
+        app.set_insert(0, 0, Some("/x/EQ.vst3"));
+        app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
+        app.land_bay_carry(Some(0), Some((0, 0)));
+        let req = app.take_recorder_request();
+        assert!(
+            matches!(
+                req,
+                Some(recorder::RecorderRequest::SwapInserts {
+                    a_strip: 0,
+                    a_bay: 1,
+                    b_strip: 0,
+                    b_bay: 0
+                })
+            ),
+            "a drop on a loaded bay asked for {req:?}"
+        );
+        // **Within one channel**, which the copy road refuses outright — the
+        // most useful case there is, and the one a channel-shaped answer
+        // could never give.
+        assert!(app.insert(0, 0).is_some() && app.insert(0, 1).is_some());
+        // Nothing is written here: the states have to travel with the units
+        // and only the host can ask a live plugin for one.
+        assert_eq!(app.insert(0, 0), Some("/x/EQ.vst3"), "the app swapped them itself");
+
+        // Across channels, the same trade.
+        app.set_insert(4, 2, Some("/x/Verb.vst3"));
+        app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
+        app.land_bay_carry(Some(4), Some((4, 2)));
+        assert!(matches!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::SwapInserts {
+                a_strip: 0,
+                a_bay: 1,
+                b_strip: 4,
+                b_bay: 2
+            })
+        ));
+
+        // **An EMPTY bay is not a trade**, and the older meaning still
+        // stands: the copy goes to the channel and the host picks the bay.
+        app.set_insert(4, 2, None);
+        app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
+        app.land_bay_carry(Some(4), Some((4, 2)));
+        assert!(matches!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::CopyInsert { to_strip: 4, .. })
+        ));
+
+        // And a drop on the bay it started in is nothing at all.
+        app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
+        app.land_bay_carry(Some(0), Some((0, 1)));
+        assert!(
+            app.take_recorder_request().is_none(),
+            "a bay dropped on itself asked for something"
+        );
     }
 
     /// **A right-click on a knob opens it for typing** — all eight — and
@@ -38422,8 +38574,13 @@ mod tests {
         // picker is reached by clicking the bay it is in.
         assert_eq!(
             bay_of(&s, 0, 0),
-            Some(dialogs::BUILTIN_PATH),
+            Some(dialogs::DRUMPAD_PATH),
             "a reset left the desk empty"
+        );
+        assert_eq!(
+            bay_of(&s, 1, 0),
+            Some(dialogs::BUILTIN_PATH),
+            "a reset left the keyboard off the desk"
         );
     }
 
@@ -38515,12 +38672,12 @@ mod tests {
     #[test]
     fn a_fresh_install_has_the_built_in_loaded() {
         let s = crate::settings::Settings::first_launch();
-        assert_eq!(bay_of(&s, 0, 0), Some(dialogs::BUILTIN_PATH));
-        // Channel 1 carries the drumpad — the other out-of-the-box
-        // instrument, moved off the old track-8 seat now the desk is wide.
-        assert_eq!(bay_of(&s, 1, 0), Some(dialogs::DRUMPAD_PATH));
+        // **The kit first, the keyboard second** — the owner's order for the
+        // out-of-the-box desk. See `Settings::default`.
+        assert_eq!(bay_of(&s, 0, 0), Some(dialogs::DRUMPAD_PATH));
+        assert_eq!(bay_of(&s, 1, 0), Some(dialogs::BUILTIN_PATH));
         // And nothing else: two channels with instruments, not sixteen of
-        // something. Channels 0 (DX7) and 1 (drumpad) each hold one bay-0
+        // something. Channels 0 (drumpad) and 1 (DX7) each hold one bay-0
         // instrument; every other bay everywhere is empty.
         assert!(
             (2..=crate::recorder::STRIPS)
@@ -38531,6 +38688,35 @@ mod tests {
         );
         // No cartridge chosen means the one that ships. See `dx7::factory`.
         assert!(s.dx7_cartridge.is_empty());
+
+        // **And exactly two switches are lit on the whole desk, both on the
+        // keyboard's track.** The owner's ruling for the out-of-the-box
+        // session: "only buttons active — track 2 rec and theory". A desk
+        // that opens with anything else on is a desk somebody has to go round
+        // switching off before they can hear what they play.
+        let (_ctx, app) = headless_with(Caps::DESKTOP, s.clone());
+        assert_eq!(
+            app.armed_mask(),
+            1 << 1,
+            "the record light opens somewhere other than the keyboard's track"
+        );
+        for n in 0..crate::recorder::CHANNELS {
+            assert_eq!(
+                app.to_theory(n),
+                n == 1,
+                "track {} ships with the wrong theory switch",
+                n + 1
+            );
+        }
+        assert_eq!(
+            (s.strip_muted, s.strip_soloed, s.strip_phase),
+            (0, 0, 0),
+            "a fresh desk opens with a mute, a solo or a polarity flip on"
+        );
+        // The kit's drum badge rides with the KIT, so the row that plays
+        // drums is the row that looks like it.
+        assert_eq!(s.channel_icons[0], 1, "the drum badge is on the wrong row");
+        assert_eq!(s.channel_icons[1], 0, "the keyboard's row wears a badge");
     }
 
     /// **One tempo, one source.**
@@ -38923,6 +39109,57 @@ mod tests {
             [76u8, 48, 52, 55].into_iter().collect::<HashSet<u8>>(),
             "the controller's chord was projected"
         );
+    }
+
+    /// **A bay's chip says what the unit is called, and not what the app
+    /// calls it internally.**
+    ///
+    /// The owner: "make the actual names of the in house plugins what shows
+    /// up in inserts. right now it reads as their @pluginname names" — and
+    /// then, on the shape of it: "remove tangent from the displayed name if
+    /// it's being used in a slot, it should read just 'Denoise' 'Amp' etc".
+    ///
+    /// Two faults in one line. The suite units' paths are SENTINELS rather
+    /// than files, so `plugin_display_name`'s filename fallback handed the
+    /// sentinel straight back and the chip read `@tangent-denoise`. And the
+    /// three that did have names wore the maker's, which is true of every
+    /// in-house unit and so distinguishes none of them, in the narrowest
+    /// piece of text on the desk.
+    #[test]
+    fn a_bay_chip_names_the_unit_rather_than_its_path() {
+        // Every suite unit is named, and none of them leaks its sentinel.
+        for (path, name, _) in crate::faces::SUITE_UNITS {
+            assert_eq!(
+                super::plugin_display_name(path),
+                name,
+                "{path} is not named after itself"
+            );
+            let chip = super::insert_chip_name(path);
+            assert!(
+                !chip.contains('@') && !chip.contains("Tangent"),
+                "the chip for {path} reads {chip:?}"
+            );
+            assert!(
+                name.ends_with(chip) && !chip.is_empty(),
+                "{name} lost more than its prefix: {chip:?}"
+            );
+        }
+        assert_eq!(super::insert_chip_name("@tangent-denoise"), "Denoise");
+        assert_eq!(super::insert_chip_name("@tangent-amp"), "Amp");
+        assert_eq!(super::insert_chip_name("@tangent-eq"), "EQ");
+
+        // The three instruments lose the prefix in a slot too, and keep it
+        // where the question is whose instrument this is.
+        assert_eq!(super::insert_chip_name(dialogs::BUILTIN_PATH), "DX7");
+        assert_eq!(super::insert_chip_name(dialogs::DRUMPAD_PATH), "DRUMS");
+        assert_eq!(super::insert_chip_name(dialogs::KEYS_PATH), "KEYS");
+        assert_eq!(super::plugin_display_name(dialogs::BUILTIN_PATH), "TANGENT DX7");
+
+        // And somebody else's plugin is untouched — still the file's own
+        // name, still without its extension, still split on both separators.
+        assert_eq!(super::insert_chip_name("/Library/Audio/Plug-Ins/VST3/Pro-R.vst3"), "Pro-R");
+        assert_eq!(super::insert_chip_name("C:\\Program Files\\VST3\\Serum2.vst3"), "Serum2");
+        assert_eq!(super::insert_chip_name(""), "");
     }
 
     /// The offset is bounded, or a held-down arrow key walks it somewhere a

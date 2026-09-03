@@ -3623,6 +3623,9 @@ impl DesktopApp {
                 R::CopyInsert { from_strip, from_bay, to_strip } => {
                     self.copy_insert(from_strip, from_bay, to_strip);
                 }
+                R::SwapInserts { a_strip, a_bay, b_strip, b_bay } => {
+                    self.swap_inserts(a_strip, a_bay, b_strip, b_bay);
+                }
                 R::ResetLoudness => {
                     if let Some(e) = self.recorder.engine.as_ref() {
                         e.reset_loudness();
@@ -7736,6 +7739,61 @@ impl DesktopApp {
             write_insert_state(to_strip, to_bay, &bundle, &state);
         }
         self.app.set_insert(to_strip, to_bay, Some(&bundle));
+    }
+
+
+    /// **Exchange two loaded bays, with the settings each is playing at.**
+    ///
+    /// [`Self::copy_insert`]'s sibling and its inverse in one respect that
+    /// matters: copy REFUSES a full rack, because putting one effect in
+    /// meant throwing another out. A swap has nowhere to refuse to — both
+    /// units survive, both keep their settings, and the only thing that
+    /// changes is which order the signal meets them in. So this is the
+    /// gesture that makes a rack re-orderable, and the reason the drop
+    /// finally had to know which BAY it landed on rather than which channel.
+    ///
+    /// **Both sidecars are written before either bay is re-pointed**, which
+    /// is `copy_insert`'s ordering rule and the same fault if it is got
+    /// wrong: the reconcile reads a bay's sidecar as it constructs the
+    /// instance, so a state written afterwards is a state the plugin has
+    /// already come up without.
+    ///
+    /// Each state is written under the bundle that is going to READ it —
+    /// `saved_insert_state` refuses a sidecar whose owner does not match, so
+    /// a state left tagged with the old occupant's name is a plugin coming up
+    /// at its defaults with the file it wanted sitting right there.
+    #[cfg(feature = "recorder")]
+    fn swap_inserts(&mut self, a_strip: usize, a_bay: usize, b_strip: usize, b_bay: usize) {
+        if (a_strip, a_bay) == (b_strip, b_bay) {
+            return;
+        }
+        let (Some(a), Some(b)) = (
+            self.app.insert(a_strip, a_bay).map(str::to_owned),
+            self.app.insert(b_strip, b_bay).map(str::to_owned),
+        ) else {
+            // Only two LOADED bays trade. An empty target is the carry's
+            // older meaning and `copy_insert` still answers for it.
+            return;
+        };
+        // The states they are playing at, not the ones on disk: a plugin
+        // somebody has been turning knobs on has not written a sidecar since
+        // it loaded. Both are read before either is written, or the second
+        // read finds the first write.
+        let (a_state, b_state) = match self.recorder.engine.as_ref() {
+            Some(e) => (
+                e.save_insert_state(a_strip, a_bay),
+                e.save_insert_state(b_strip, b_bay),
+            ),
+            None => (None, None),
+        };
+        if let Some(state) = a_state {
+            write_insert_state(b_strip, b_bay, &a, &state);
+        }
+        if let Some(state) = b_state {
+            write_insert_state(a_strip, a_bay, &b, &state);
+        }
+        self.app.set_insert(a_strip, a_bay, Some(&b));
+        self.app.set_insert(b_strip, b_bay, Some(&a));
     }
 
     fn save_plugin_states(&mut self) {
