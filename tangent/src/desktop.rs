@@ -1474,7 +1474,10 @@ fn push_builtin_faces(
                         units: p.units.to_owned(),
                         default: p.default,
                         steps: p.steps,
-                        reading: crate::builtin_fx::describe(spec.path, p.id, *v),
+                        // The whole bay, not just this knob: a control can be
+                        // inert because of what a SIBLING says. See
+                        // `builtin_fx::describe`.
+                        reading: crate::builtin_fx::describe(spec.path, p.id, *v, values),
                         choices: crate::builtin_fx::choices(spec.path, p.id),
                         value: *v,
                     })
