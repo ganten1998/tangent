@@ -616,16 +616,17 @@ const XI_MIN_DB: f32 = -20.0;
 /// and an estimate that has wandered this far above it is tracking the
 /// PROGRAMME, not the noise.
 ///
-/// # Why 18 and not 12
+/// # Why 24, and why it used to be 18
 ///
-/// It was 12, and 12 put a CLIFF inside the range of "the room got a bit
-/// louder than when I taught it". Past the ceiling λ pins, γ stays large, ξ
-/// stays large, `g_H1 → 1` and every band opens: measured with the profile
-/// learned and the same noise played back hotter, at a dial asking 12 dB,
-/// the delivered cut went 12.00 dB at +16 dB to **4.07 dB at +18** and
-/// 1.71 dB at +20. That is the exact symptom this whole unit was
+/// It was 12 first, and 12 put a CLIFF inside the range of "the room got a
+/// bit louder than when I taught it". Past the ceiling λ pins, γ stays
+/// large, ξ stays large, `g_H1 → 1` and every band opens: measured with the
+/// profile learned and the same noise played back hotter, at a dial asking
+/// 12 dB, the delivered cut went 12.00 dB at +16 dB to **4.07 dB at +18**
+/// and 1.71 dB at +20. That is the exact symptom this whole unit was
 /// commissioned for — the user pushes REDUCE and almost nothing happens —
-/// arriving without a sound and without a warning.
+/// arriving without a sound and without a warning. 18 moved that cliff to
+/// +20 and there it sat.
 ///
 /// The ceiling is not decoration: it is what stops the tracker following
 /// PROGRAMME and cutting signal, so widening it is paid for in the tone
@@ -639,15 +640,176 @@ const XI_MIN_DB: f32 = -20.0;
 ///        30 dB      −1.04 / −1.27 dB              past +24 dB
 /// ```
 ///
-/// 18 buys six decibels of staleness for two tenths of a decibel of tone,
-/// and stops well short of 30, where the tone is spending most of the
-/// acceptance budget. It is still a cliff — it has moved, not tapered, and
+/// **18 only became the binding number the day [`VAD_QUIET_DB`] let the
+/// tracker actually climb.** While the estimate was frozen by its own
+/// speech-presence probability this ceiling was very nearly theoretical: on
+/// the challenge take, sweeping it from 18 to 60 dB moved every number the
+/// scorer prints by 0.01 dB or less, because λ never came within sight of
+/// it. With the broadband gate in, λ goes where the room actually is — and
+/// on that take the room between words sits 6.4 dB over its print in the
+/// mids at the median and past 12 dB in a quarter of the frames. Measured
+/// on `~/Desktop/challenge/dry.wav` at the shipped dial with the gate at
+/// 9–15 dB:
+///
+/// ```text
+///     ceiling   BATHROOM HUMP   residual flatness   voice down
+///        18 dB      +0.74 dB          0.2136          −4.33 dB
+///        20 dB      +0.59             0.2210          −4.37
+///        22 dB      +0.51             0.2261          −4.39
+///        24 dB      +0.45             0.2298          −4.40
+///        30 dB      +0.41             0.2322          −4.43
+/// ```
+///
+/// The curve flattens: 18→24 buys 0.29 dB of tilt, 24→30 buys 0.04. 24 is
+/// where it stops paying, and it costs almost nothing on the take (0.07 dB
+/// of voice against 18) because the gate, not the ceiling, is what decides
+/// whether λ moves at all. It is also the row the tone table above already
+/// measured, so the six decibels beyond 18 cost 0.23 dB more of a −20 dBFS
+/// tone out of a 1.5 dB budget.
+///
+/// **How much room this number has is decided by the GATE, not by itself.**
+/// At the shipped gate of 9–15 dB a −20 dBFS tone over learned noise holds
+/// its frames on the programme side, λ never comes near this ceiling, and
+/// `a_tone_survives_the_suppression_that_kills_the_noise` passes at every
+/// value tried from 18 up to 30. Widen the gate to 9–18 and the tone's
+/// frames start reading as room: λ climbs to whatever this number allows
+/// and the tone comes back **1.94 dB** down at a ceiling of 24. Widen it
+/// to 15–21 and the same ceiling costs **11.98 dB** of it. The two
+/// constants are only independent while the gate stays clear of the tone,
+/// and the note under [`VAD_QUIET_DB`] is where that margin is kept.
+///
+/// It is still a cliff — it has moved, not tapered, and
 /// `a_stale_print_holds_the_dial_until_it_does_not` writes down where it
 /// now stands so the next person changing this number is arguing with a
 /// measurement. A genuine taper wants a minimum-statistics tracker that
 /// does not reference the print at all, which is a different unit's worth
 /// of work.
-const NOISE_CEIL_DB: f32 = 18.0;
+const NOISE_CEIL_DB: f32 = 24.0;
+
+/// **The two ends of the broadband speech-presence gate**, in dB of whole-
+/// frame level above the whole PRINT — the sum of the per-bin floors the
+/// learn pass laid down. At or below [`VAD_QUIET_DB`] the frame is room and
+/// every bin's noise estimate is allowed to hear it in full; at or above
+/// [`VAD_SPEECH_DB`] the frame is programme and the per-bin probability
+/// decides alone, exactly as it did before. Between them the weight ramps
+/// linearly.
+///
+/// # The measurement that put them there
+///
+/// The owner's word for the shipped sound was "a crispy bathroom sounding
+/// frequency that sounds like a digital artifact", set against a render of
+/// the same take by a tool he likes. That sentence is two numbers — the
+/// residual's mid-band tilt between words, and how flat the residual is —
+/// and both said the same thing. Between words we took 11.3 dB out of the
+/// low bands and the air and 8.5 out of 800 Hz–5 kHz, which leaves a
+/// mid-forward floor, which is what a small tiled room sounds like; and the
+/// residual came back markedly PEAKIER than the noise it removed (0.183
+/// against the source's 0.268) where the reference left one slightly
+/// flatter (0.270).
+///
+/// The cause was never the amount — both tools take about 7 dB out once
+/// makeup gain is removed. The cause is that the mid band spent **a third
+/// of the between-word frames wide open**: per-frame gain better than −6 dB
+/// in 32.8 % of them, against the reference's 7.2 %. And the reason it did
+/// is that on that take the room between words sits **6.4 dB over its own
+/// learned print at the median, and more than 12 dB over it in 27 % of
+/// frames**, in the mids alone — the low band and the air sit within about
+/// a decibel of theirs. The mids are where a room's low-level activity
+/// lives (breath, mouth, clothing, a chair), and a noise print taken over
+/// the quietest half-second of a take does not describe it.
+///
+/// The tracker is supposed to climb to meet exactly that, and could not.
+/// The speech-presence probability is a PER-BIN SNR test against a fixed
+/// 15 dB ([`SPP_XI_H1`]), so a bin sitting 12 dB over its print reads as
+/// speech at `p = 0.99999` whether it is a word or a chair. λ froze at the
+/// print, γ stayed at +12 dB, ξ stayed large, and the band rode open.
+/// Measured over the frames more than half a second from anything the
+/// analysis calls speech — 75 % of the between-word mid energy — we
+/// delivered −8.55 dB where the reference delivered −12.88.
+///
+/// A per-bin test cannot fix this, because in one bin a chair and a
+/// syllable look the same. A frame that is quiet ACROSS THE WHOLE SPECTRUM
+/// is not a syllable, and that is the whole of this gate.
+///
+/// # Why the reference is the whole print, and not λ and not a minimum
+///
+/// The comparison is the frame's total periodogram against Σ`floor` — the
+/// print the user taught, summed across the spectrum, laid down once per
+/// profile in [`Denoise::refloor`] rather than per frame.
+///
+/// **A gate is only as good as the line it is judged against, and the line
+/// has to be one the gate cannot move.** The first draft compared the frame
+/// against Σλ, the tracker's own current belief, which is a feedback loop
+/// with a fixed point in the wrong place: a −20 dBFS tone over learned
+/// noise half-opens the gate, λ climbs a little, the frame's excess over λ
+/// drops, the gate opens further. Measured, it settles at 8.65 dB of excess
+/// (Studio) with λ pinned to its ceiling and the tone **1.96 dB down**
+/// against a 1.5 dB budget. That is the right failure to have found early:
+/// an estimator that can eat a steady tone can eat a held note.
+///
+/// It is not a long-window broadband MINIMUM either, which scores about the
+/// same on the tilt and fails the same way — a running minimum over
+/// 1.5–2 s puts the reference at the take's own quietest bar, and a
+/// two-second held tone is then quiet by its own measure.
+///
+/// Against the print the gate has the property that matters: **it can only
+/// ever let the tracker hear MORE, never less.** The weight multiplies a
+/// probability that is already there, and a product with something in
+/// 0..=1 is at or below it, so no case that worked before can stop working
+/// — and because the denominator is fixed by the profile, nothing the gate
+/// does to the estimate can move the line it is judged against.
+///
+/// And the print is the right line even though the print is what was wrong,
+/// because the fault is per BAND and the sum is not. On the challenge take
+/// the mid print under-reads the room by 6–12 dB, but the frame TOTAL is
+/// carried by the low band and the air, where the same print is accurate to
+/// about a decibel. That is the whole reason to ask a broadband question.
+///
+/// # Why 9 and 15, and what actually sets the top
+///
+/// On the challenge take the two populations are miles apart. Frame level
+/// over the whole print, taken with the analysis' own masks: the quiet 30 %
+/// of frames run 0.2 dB at the tenth percentile to 11.3 dB at the
+/// ninety-ninth, and the loud 15 % run 30.8 to 36.3. Nineteen decibels of
+/// empty air between them, and no threshold anywhere in that gap changes
+/// which side a noise frame or a voice frame lands on. What the top end
+/// really decides is the 55 % of frames that are NEITHER — onsets, tails,
+/// breaths, half-syllables — and those are spread right through it. Swept
+/// at the shipped dial with [`NOISE_CEIL_DB`] at 24:
+///
+/// ```text
+///     gate           BATHROOM HUMP   flatness   voice down   TRUE reduction
+///     none (shipped)     +3.24 dB     0.1784     −3.79 dB       −6.81 dB
+///      8–14 dB           +0.52        0.2225     −4.33          −7.31
+///      9–15 dB           +0.45        0.2298     −4.40          −7.30
+///     10–16 dB           +0.38        0.2375     −4.51          −7.26
+///     12–18 dB           +0.28        0.2477     −4.76          −7.08
+///     15–21 dB           +0.21        0.2578     −5.02          −6.89
+///     the reference      +0.48        0.2704     −6.15          −6.65
+/// ```
+///
+/// Every row of that table is inside the reference tool's own voice cost,
+/// so the voice is not what stops us going higher. The TONE is. **A
+/// −20 dBFS 1 kHz tone over the noise this file's tests learn on holds the
+/// frame only 17.5 dB above the print** — a musical signal at 17 dB SNR is
+/// a quiet one, and a gate calibrated for speech at 30 dB will happily call
+/// its frames room. Measured by running the whole suite at each setting:
+/// 9–15 passes at every ceiling tried up to 30 dB, 9–16 passes at 24, and
+/// **9–18 fails, the tone 1.94 dB down against a 1.5 dB budget** — because
+/// a weight of 0.94 still leaks six percent of a very confident bin's
+/// observation into λ every frame, and two seconds of that is plenty.
+///
+/// So the top is set by the tone, not by the take: 15 dB is 2.5 dB clear of
+/// the tone's frames and 15 dB clear of the take's speech. What that costs
+/// is legible in the table — 9–15 gives up 0.24 dB of tilt and 0.028 of
+/// flatness against 15–21 — and it is the right way round, because the tilt
+/// target is met either way and a signal that dies is not.
+///
+/// A six-decibel RAMP rather than a step, because a step makes the
+/// tracker's speed a function of which side of one number a frame landed
+/// on, and the frames that decide this are the ones nearest the line.
+const VAD_QUIET_DB: f32 = 9.0;
+const VAD_SPEECH_DB: f32 = 15.0;
 
 /// A learn pass shorter than this is a misclick, not a noise profile, and
 /// must not wipe a good one. 200 ms, up from the 10.7 ms this file used to
@@ -1057,6 +1219,12 @@ struct Spectral {
     ph1: Vec<f32>,
     floor: Vec<f32>,
     ceil: Vec<f32>,
+    /// Σ`floor` over the live bins — the whole spectrum's worth of what the
+    /// user taught the unit, as one number. Kept because the broadband
+    /// speech gate of [`VAD_QUIET_DB`] compares every frame against it, and
+    /// it only changes when a profile does. Written by
+    /// [`Denoise::refloor`], which is the only writer of `floor`.
+    floor_sum: f32,
     /// Per band: last frame's estimated SIGNAL power, which is what the
     /// decision-directed recursion feeds on.
     s_prev: [f32; DENOISE_BANDS],
@@ -1103,6 +1271,7 @@ impl Spectral {
             ph1: vec![0.0; max_n / 2 + 1],
             floor: vec![0.0; max_n / 2 + 1],
             ceil: vec![0.0; max_n / 2 + 1],
+            floor_sum: 0.0,
             s_prev: [0.0; DENOISE_BANDS],
             a_ph1: 0.0,
             a_psd: 0.0,
@@ -1512,6 +1681,51 @@ pub struct Denoise {
     /// misclick guard, in samples rather than in a fixed count, so it means
     /// the same 200 ms everywhere.
     min_learn_ticks: f64,
+    /// What the last falling edge of the LEARN toggle did with the pass it
+    /// was handed. Read by [`Denoise::last_learn`]; see [`DenoiseLearn`].
+    learn_outcome: DenoiseLearn,
+}
+
+/// **What a learn pass did, so a panel can say so out loud.**
+///
+/// Two of the four values are refusals, and they exist because both of them
+/// used to be silent. [`DenoiseLearn::TooShort`] is the mouse-bounce guard
+/// [`MIN_LEARN_MS`] has always applied; it kept the old profile and told
+/// nobody. [`DenoiseLearn::Silent`] is the one this enum was added for:
+///
+/// A learn pass over DIGITAL SILENCE teaches a floor below the bottom of
+/// [`DENOISE_THR_DB`]. Every band clamps to `thr_norm = 0`, which is OFF;
+/// [`Denoise::recount`] then reads nothing live, and both kernels take the
+/// wire path — `process` returns the buffer untouched and reports success.
+/// The unit is off, the panel shows a full set of frozen thresholds, and
+/// nothing anywhere says the profile it just took is a profile of nothing.
+/// The offline probe hit it first (`--denoise-test` picked the quietest
+/// half-second of a take that is 7.4 % true zeroes and wrote a file
+/// bit-identical to its input), and a person holding LEARN over a silent
+/// bar gets exactly the same, with a mouse instead of a command line.
+///
+/// So it is now impossible AND visible: impossible because the freeze is
+/// refused and whatever profile was there stands, visible because this
+/// value says which of the two happened.
+///
+/// Not persisted anywhere — it is the state of one pass, not a setting —
+/// so it carries none of the append-only obligations the serialized
+/// parameter enums do. Still: append at the end if it ever grows, because
+/// the reason those rules exist is that somebody always ends up matching on
+/// the discriminant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenoiseLearn {
+    /// Nothing has been taught since this unit was built or cleared.
+    None,
+    /// A pass finished and a new profile is in force.
+    Taught,
+    /// The pass was shorter than [`MIN_LEARN_MS`]. The old profile stands.
+    TooShort,
+    /// The pass heard nothing above the bottom of [`DENOISE_THR_DB`] —
+    /// digital silence, a muted input, or a stretch of a file that is
+    /// literal zeroes. Taking it would have turned the unit into a wire
+    /// that reports success, so the old profile stands.
+    Silent,
 }
 
 impl Denoise {
@@ -1636,6 +1850,7 @@ impl Denoise {
             studio_n,
             live_n: studio_n / 2,
             min_learn_ticks: f64::from(MIN_LEARN_MS) / (tick_s * 1_000.0),
+            learn_outcome: DenoiseLearn::None,
         };
         // Nothing is learned yet, so this lays a floor of nothing — but it
         // is the one place the per-bin arrays get their shape, and a unit
@@ -1728,6 +1943,18 @@ impl Denoise {
         DENOISE_BAND_HZ.0 * (DENOISE_BAND_HZ.1 / DENOISE_BAND_HZ.0).powf(t)
     }
 
+    /// **What the last learn pass did.** Four answers, two of them
+    /// refusals; see [`DenoiseLearn`] for why a refusal has to be sayable.
+    ///
+    /// The panel's job with this is one line of text after the LEARN button
+    /// comes back up. [`DenoiseLearn::Silent`] in particular must not be
+    /// left to the meters: the refusal is what keeps the old profile alive,
+    /// so the meters look exactly as they did a moment before and the user
+    /// has no way to tell a pass that worked from one that was thrown away.
+    pub fn last_learn(&self) -> DenoiseLearn {
+        self.learn_outcome
+    }
+
     /// The frozen per-band thresholds, normalized across
     /// [`DENOISE_THR_DB`] — 0.0 is "this band never reduces". These are the
     /// 32 state symbols a session persists.
@@ -1802,26 +2029,53 @@ impl Denoise {
     /// at mean + [`DENOISE_LEARN_SIGMA`]·σ of the log energy it heard. A
     /// band that heard essentially silence normalizes to ~0 and lands on
     /// OFF, which is the right answer — there is nothing there to cut.
+    ///
+    /// **All THIRTY-TWO of them landing there is not an answer**, and the
+    /// pass is refused rather than taken. See [`DenoiseLearn::Silent`]: a
+    /// profile of nothing turns the unit into a wire that reports success,
+    /// with a full set of thresholds on the panel and no way to tell. The
+    /// outcome — taken, too short, or silent — comes back out of
+    /// [`Denoise::last_learn`], because a refusal that keeps the old
+    /// profile is by construction invisible in everything else the panel
+    /// can see.
     fn freeze_thresholds(&mut self) {
         if self.kernel != DenoiseKernel::Bank {
             self.freeze_spectral_thresholds();
             return;
         }
         let min_ticks = self.min_learn_ticks;
-        for b in self.band.iter_mut() {
+        // **Proposed first, written second**, so the all-silent case can be
+        // refused whole. A band that heard silence landing on OFF is still
+        // the right answer for that band; thirty-two of them landing there
+        // is not an answer, it is a unit that has just been switched off
+        // without saying so. See [`DenoiseLearn::Silent`].
+        let mut proposed: [f32; DENOISE_BANDS] = [0.0; DENOISE_BANDS];
+        let mut taught = false;
+        for (p, b) in proposed.iter_mut().zip(self.band.iter()) {
+            *p = b.thr_norm;
             if b.n < min_ticks {
                 continue; // a misclick, not a profile — keep the old value
             }
+            taught = true;
             let mean = b.sum / b.n;
             let var = (b.sumsq / b.n - mean * mean).max(0.0);
             let thr = mean
                 + f64::from(DENOISE_LEARN_SIGMA) * var.sqrt()
                 + f64::from(DENOISE_LEARN_HEADROOM_DB);
             let span = f64::from(DENOISE_THR_DB.1 - DENOISE_THR_DB.0);
-            let norm = ((thr - f64::from(DENOISE_THR_DB.0)) / span).clamp(0.0, 1.0) as f32;
-            b.thr_norm = norm;
-            b.thr_db = DENOISE_THR_DB.0 + (DENOISE_THR_DB.1 - DENOISE_THR_DB.0) * norm;
+            *p = ((thr - f64::from(DENOISE_THR_DB.0)) / span).clamp(0.0, 1.0) as f32;
         }
+        self.learn_outcome = if !taught {
+            DenoiseLearn::TooShort
+        } else if proposed.iter().all(|n| *n < DENOISE_OFF) {
+            DenoiseLearn::Silent
+        } else {
+            for (p, b) in proposed.iter().zip(self.band.iter_mut()) {
+                b.thr_norm = *p;
+                b.thr_db = DENOISE_THR_DB.0 + (DENOISE_THR_DB.1 - DENOISE_THR_DB.0) * *p;
+            }
+            DenoiseLearn::Taught
+        };
         for b in self.band.iter_mut() {
             b.n = 0.0;
             b.sum = 0.0;
@@ -1854,6 +2108,14 @@ impl Denoise {
     /// level — so **a profile belongs to the kernel that learned it**.
     /// Switching kernels after a learn is a re-learn, and the panel should
     /// say so.
+    ///
+    /// Two passes are refused instead of taken, and both keep whatever
+    /// profile was already there: one shorter than [`MIN_LEARN_MS`], and
+    /// one that heard nothing above the bottom of [`DENOISE_THR_DB`]. The
+    /// second is [`DenoiseLearn::Silent`] and it is the one that used to be
+    /// invisible — every band clamping to OFF makes the unit a wire that
+    /// reports success. [`Denoise::last_learn`] is how the panel finds out
+    /// which of the three happened.
     fn freeze_spectral_thresholds(&mut self) {
         // The misclick guard measures how long the PASS was, not how many
         // frames survived it: the warm-up frames thrown away at the top are
@@ -1862,15 +2124,34 @@ impl Denoise {
         // for.
         let heard = (self.sp.ln_n + self.sp.warm as f64) * self.sp.hop as f64;
         let need = f64::from(MIN_LEARN_MS) * f64::from(self.sample_rate) / 1_000.0;
-        if self.sp.ln_n > 0.0 && heard >= need {
+        if self.sp.ln_n <= 0.0 || heard < need {
+            self.learn_outcome = DenoiseLearn::TooShort;
+        } else {
+            // **Proposed first, written second.** A pass over digital
+            // silence puts every band's geometric mean below the bottom of
+            // [`DENOISE_THR_DB`], all 32 norms clamp to zero, `recount`
+            // reads nothing live and the kernel becomes a wire that reports
+            // success — with a full set of thresholds on the panel and
+            // nothing saying they are thresholds of nothing. Refusing the
+            // whole freeze keeps whatever was there and
+            // [`Denoise::last_learn`] says which happened. See
+            // [`DenoiseLearn::Silent`].
             let span = f64::from(DENOISE_THR_DB.1 - DENOISE_THR_DB.0);
-            for (b, sum) in self.band.iter_mut().zip(self.sp.ln_sum.iter()) {
+            let mut proposed: [f32; DENOISE_BANDS] = [0.0; DENOISE_BANDS];
+            for (p, sum) in proposed.iter_mut().zip(self.sp.ln_sum.iter()) {
                 // 10·log10(exp(mean ln E)) — the geometric mean, in dB.
                 let db = 10.0 / std::f64::consts::LN_10 * (sum / self.sp.ln_n);
-                let norm = ((db - f64::from(DENOISE_THR_DB.0)) / span).clamp(0.0, 1.0) as f32;
-                b.thr_norm = norm;
-                b.thr_db = DENOISE_THR_DB.0 + (DENOISE_THR_DB.1 - DENOISE_THR_DB.0) * norm;
+                *p = ((db - f64::from(DENOISE_THR_DB.0)) / span).clamp(0.0, 1.0) as f32;
             }
+            self.learn_outcome = if proposed.iter().all(|n| *n < DENOISE_OFF) {
+                DenoiseLearn::Silent
+            } else {
+                for (p, b) in proposed.iter().zip(self.band.iter_mut()) {
+                    b.thr_norm = *p;
+                    b.thr_db = DENOISE_THR_DB.0 + (DENOISE_THR_DB.1 - DENOISE_THR_DB.0) * *p;
+                }
+                DenoiseLearn::Taught
+            };
         }
         for b in self.band.iter_mut() {
             b.n = 0.0;
@@ -2389,12 +2670,25 @@ impl Denoise {
     /// instantaneous probability leaves 1 % of every frame flowing in,
     /// which is enough to unstick it.
     ///
-    /// The estimate is FLOORED at the learned profile and ceilinged 12 dB
-    /// above it. The floor is one-way and it is the whole point of having
-    /// asked the user to teach the unit: a tracker that may fall below what
-    /// it was taught will, on a quiet passage, decide the room is quieter
-    /// than it is and stop cutting. The ceiling is the other side — an
-    /// estimate 12 dB above the print is tracking the programme.
+    /// **That per-bin probability is then multiplied by ONE number for the
+    /// whole frame**, the broadband gate of [`VAD_QUIET_DB`], which is what
+    /// makes this unit usable on a recording rather than on a call. A bin
+    /// sitting 12 dB over its print reads as speech at 0.99999 whether it
+    /// holds a syllable or a chair, so on a real take the mid band — the
+    /// only band where a room's low-level activity lives — froze its
+    /// estimate at the print and rode open through a third of the frames
+    /// between words. A frame that is quiet across the WHOLE spectrum is
+    /// not a syllable, and the weight only ever lets the estimate hear more
+    /// of the observation, never less.
+    ///
+    /// The estimate is FLOORED at the learned profile and ceilinged
+    /// [`NOISE_CEIL_DB`] above it. The floor is one-way and it is the whole
+    /// point of having asked the user to teach the unit: a tracker that may
+    /// fall below what it was taught will, on a quiet passage, decide the
+    /// room is quieter than it is and stop cutting. The ceiling is the
+    /// other side — an estimate that far above the print is tracking the
+    /// programme — and it only started mattering once the gate above let
+    /// the estimate climb at all.
     ///
     /// # The gain: decision-directed, then mixed against the dial
     ///
@@ -2452,6 +2746,40 @@ impl Denoise {
     fn spectral_suppress(&mut self, plan: &SpectralPlan) {
         let n = self.sp.n;
         let bins = n / 2;
+
+        // ── is this frame quiet all the way across? ─────────────────────
+        //
+        // One number, taken before the tracker runs, because the tracker is
+        // about to consume it: λ is written in place below, so a sum taken
+        // inside that loop would be half this frame's and half the last
+        // one's.
+        //
+        // The denominator is the PRINT and not λ, and that is the whole
+        // difference between a gate and a runaway. Measured against λ, a
+        // −20 dBFS tone over learned noise settles into a feedback: the
+        // gate half-opens, λ climbs a little, the frame's excess over λ
+        // falls, the gate opens further. It converges at 8.65 dB of excess
+        // with λ pinned to its ceiling and the tone 1.96 dB down — a test
+        // failure with a 1.5 dB budget, and the right failure to have,
+        // because a noise tracker that can eat a steady tone will eat a
+        // held note. The print cannot drift, so nothing the gate does to
+        // the estimate can move the line the gate is judged against.
+        //
+        // Finite by construction and therefore clamped rather than
+        // branched: `pow` is finite because `Spectral::band_power` refuses
+        // to store anything else, and `floor_sum` is a sum of terms
+        // `refloor` floors at 1e−30. The `max(TINY)` is for digital
+        // silence, where `heard` is a true zero and the logarithm would
+        // otherwise be −∞: that frame reads −200 dB of excess, which is as
+        // quiet as a frame can be and exactly the answer wanted. See
+        // [`VAD_QUIET_DB`] for what this buys.
+        let mut heard = 0.0_f32;
+        for k in 0..=bins {
+            heard += self.sp.pow[k];
+        }
+        let frame_db = 10.0 * (heard / self.sp.floor_sum.max(TINY)).max(TINY).log10();
+        let speech =
+            ((frame_db - VAD_QUIET_DB) / (VAD_SPEECH_DB - VAD_QUIET_DB)).clamp(0.0, 1.0);
 
         // ── the per-bin noise tracker ───────────────────────────────────
         let (a_ph1, a_psd) = (self.sp.a_ph1, self.sp.a_psd);
@@ -2514,7 +2842,19 @@ impl Denoise {
             if mean > SPP_STAGNATION_CAP {
                 ph1 = ph1.min(SPP_STAGNATION_CAP);
             }
-            let est = ph1 * lam + (1.0 - ph1) * p;
+            // **The frame's own verdict multiplies the bin's.** A bin 12 dB
+            // over its print reads as speech at 0.99999 whether it is a
+            // syllable or a chair; a frame that is quiet across the whole
+            // spectrum is not a syllable. The product is at or below `ph1`
+            // for every weight in 0..=1, so this can only let the estimate
+            // hear MORE of the observation than it used to — never less.
+            // See [`VAD_QUIET_DB`].
+            //
+            // `ph1` itself is left alone: it is the band presence the GAIN
+            // mixes against the dial below, and that is a question about
+            // this bin, not about the frame around it.
+            let track = ph1 * speech;
+            let est = track * lam + (1.0 - track) * p;
             let next = a_psd * lam + (1.0 - a_psd) * est;
             // **A non-finite estimate is never stored, and never survives
             // being found.** `clamp` compares with `<` and `>`, both false
@@ -2676,18 +3016,25 @@ impl Denoise {
         for (p, b) in per_band.iter_mut().zip(self.band.iter()) {
             *p = 10.0_f32.powf(b.thr_db / 10.0) * n as f32;
         }
+        let mut sum = 0.0_f32;
         for k in 0..=bins {
             let (b, frac) = (self.sp.map_lo[k] as usize, self.sp.map_frac[k]);
             let hi = if b + 1 < DENOISE_BANDS { per_band[b + 1] } else { per_band[b] };
             let floor = ((1.0 - frac) * per_band[b] + frac * hi).max(1.0e-30);
             self.sp.floor[k] = floor;
             self.sp.ceil[k] = floor * ceil_mul;
+            sum += floor;
             // The tracker starts AT the print rather than at zero: it may
             // only ever climb away from what it was taught, so opening
             // below the floor would just be one clamp's worth of nothing.
             self.sp.lambda[k] = floor;
             self.sp.ph1mean[k] = 0.5;
         }
+        // The whole print as one number, for the broadband gate. Summed
+        // HERE and not per frame because it is a property of the profile,
+        // not of the audio — the same reason `wsum` and `tau_dd` are laid
+        // down in `lay_out_bands` rather than recomputed in the hot loop.
+        self.sp.floor_sum = sum;
         self.sp.s_prev = [0.0; DENOISE_BANDS];
     }
 
@@ -5260,11 +5607,22 @@ mod tests {
     /// it, λ pins, γ stays large, ξ stays large, every band opens, and the
     /// unit stops reducing — which is a CLIFF, not a taper, and the exact
     /// symptom the whole rewrite was commissioned for ("I push REDUCE and
-    /// almost nothing happens"). At the shipped 12 dB the cliff fell inside
+    /// almost nothing happens"). At the first 12 dB the cliff fell inside
     /// the range of "the room got a bit louder": 12.00 dB delivered at
-    /// +16 dB above the print, 4.07 at +18, 1.71 at +20.
+    /// +16 dB above the print, 4.07 at +18, 1.71 at +20. At 18 it moved to
+    /// +20, which is where the guarantee below used to read 18.
     ///
-    /// So the number was chosen against a measurement and this is the
+    /// **It now stands at +20, and the ladder printed below is why the
+    /// number moved.** [`NOISE_CEIL_DB`] went to 24 for the challenge
+    /// take's sake (see its own note), and this is the other end of that
+    /// change measured rather than assumed: both spectral kernels deliver
+    /// the full 12.00 dB at +20 dB of staleness and start to give way at
+    /// +24 (Studio 10.71, Live 8.19). So the promise is now two decibels
+    /// wider than it was, and the assertion is written at 20 rather than at
+    /// 18 — a guarantee that is not raised when the thing it guards
+    /// improves is a guarantee that quietly stops being tested.
+    ///
+    /// The number was chosen against a measurement and this is the
     /// measurement. The other direction needs no ceiling and is checked
     /// too: a QUIETER room than the print still gets the whole dial,
     /// because the floor is one-way.
@@ -5279,7 +5637,7 @@ mod tests {
         // buy the whole dial. Written down here rather than read out of
         // [`NOISE_CEIL_DB`], because a bound taken from the constant it
         // guards follows that constant down and reports nothing.
-        const STALE_GUARANTEE_DB: f32 = 18.0;
+        const STALE_GUARANTEE_DB: f32 = 20.0;
         assert!(
             NOISE_CEIL_DB >= STALE_GUARANTEE_DB,
             "NOISE_CEIL_DB is {NOISE_CEIL_DB} dB, under the {STALE_GUARANTEE_DB} dB of \
@@ -5326,8 +5684,204 @@ mod tests {
             "the spectral kernels no longer deliver the dial for a print stale by up to \
              {STALE_GUARANTEE_DB} dB — the cliff has moved DOWN into the range of an \
              ordinary room change (it was between +16 and +18 dB when NOISE_CEIL_DB \
-             was 12):\n{table}"
+             was 12, and between +20 and +24 when it went to 24):\n{table}"
         );
+    }
+
+    /// **A room that got livelier in ONE region than the bar it was taught
+    /// on is still the room, and still gets the whole dial.**
+    ///
+    /// This is [`VAD_QUIET_DB`]'s guard, and it is the synthetic form of
+    /// the fault the owner heard as "a crispy bathroom sounding frequency
+    /// that sounds like a digital artifact". On his take the mid band
+    /// between words sits 6 dB over its own learned print at the median and
+    /// past 12 dB in a quarter of the frames — breath, mouth, clothing, a
+    /// chair, none of which is in the quietest half-second anybody picks to
+    /// teach the unit with. The speech-presence probability is a PER-BIN
+    /// SNR test against a fixed 15 dB, so every one of those bins read as
+    /// speech at 0.99999, λ froze at the print, and the band rode open
+    /// through a third of the between-word frames. Measured against a
+    /// reference render of the same take: −8.55 dB delivered where the
+    /// reference delivered −12.88.
+    ///
+    /// So: a print taught on flat noise, then the same noise with the
+    /// 150 Hz–2 kHz region alone brought up about 13 dB. The frame as a
+    /// whole barely moves — that region is a slice of a full-band spectrum
+    /// — so the broadband gate calls it room and lets the estimate climb;
+    /// the bins in it, on their own, look exactly like speech.
+    ///
+    /// **The window is the first second, and that is the measurement, not
+    /// a convenience.** Left running for six seconds the un-gated tracker
+    /// gets there in the end: [`SPP_STAGNATION_CAP`] leaks one percent of
+    /// every frame into a pinned estimate, which closes a 13 dB gap with an
+    /// effective time constant of several seconds. A gap between two words
+    /// is two hundred milliseconds. An estimate that arrives after the
+    /// take is over is the same as one that never arrives, so what is
+    /// asserted is that the room is caught inside a second.
+    ///
+    /// **The revert that makes this bite is dropping `* speech` from
+    /// `track` in [`Denoise::spectral_suppress`].** Measured with it gone:
+    /// the lively region comes back **2.97 dB down at 400 Hz and 4.46 at
+    /// 1 kHz** against a dial asking 12, while the quiet region at 8 kHz
+    /// still gets its 12.04 — the mid-forward tilt, in three numbers, in
+    /// one run. With the gate in they read 11.78, 12.17 and 12.04.
+    #[test]
+    fn a_room_livelier_in_one_region_than_its_print_still_gets_the_dial() {
+        let mut rows = Vec::new();
+        for kernel in [DenoiseKernel::SpectralStudio, DenoiseKernel::SpectralLive] {
+            let mut dn = learned_full_band(kernel, 0x11EF, 0.05, SR, 1.0);
+            let p = DenoiseParams {
+                reduce: 0.5,
+                ..on(kernel)
+            };
+            // Six seconds: long against λ's 71.7 ms and against the
+            // decision-directed recursion's second, so what is measured is
+            // where the tracker ARRIVES rather than how it set off.
+            let frames = 6 * SR as usize;
+            let mut dry = FullBandNoise::new(0x11EF, 0.05).frames(frames);
+            add(&mut dry, &Noise::new(0x5E77, 0.30, SR).frames(frames));
+            let mut wet = dry.clone();
+            dn.process(&mut wet, frames, 2, &p);
+            let (from, len) = (SR as usize / 4, SR as usize);
+            let psd_dry = analysis::power_spectrum(&dry, from, len);
+            let psd_wet = analysis::power_spectrum(&wet, from, len);
+            let at = |hz: f32| analysis::psd_cut_at(&psd_dry, &psd_wet, SR, hz);
+            let lift = |hz: f32| {
+                let flat = analysis::power_spectrum(
+                    &FullBandNoise::new(0x11EF, 0.05).frames(frames),
+                    from,
+                    len,
+                );
+                analysis::psd_cut_at(&psd_dry, &flat, SR, hz)
+            };
+            rows.push((kernel, lift(400.0), at(400.0), at(1_000.0), at(8_000.0)));
+        }
+
+        let table = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "  {:16} the lively region is {:+5.1} dB over its print: \
+                     {:>5.2} dB cut at 400 Hz, {:>5.2} at 1 kHz, {:>5.2} at 8 kHz \
+                     (dial asks 12.0)",
+                    r.0.label(),
+                    r.1,
+                    r.2,
+                    r.3,
+                    r.4
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("a print that under-reads one region:\n{table}");
+        assert!(
+            rows.iter().all(|r| r.1 > 9.0),
+            "the fixture is not lively enough to be about anything:\n{table}"
+        );
+        assert!(
+            rows.iter().all(|r| r.2 > 10.0 && r.3 > 10.0),
+            "the lively region no longer gets the dial — the tracker has stopped being \
+             allowed to hear a room that is livelier than the bar it was taught on, which \
+             is the whole of the mid-forward tilt the owner called a bathroom:\n{table}"
+        );
+        assert!(
+            rows.iter().all(|r| r.4 > 10.0),
+            "the quiet region stopped getting the dial, so this test is measuring a unit \
+             that has broken generally rather than the tilt:\n{table}"
+        );
+    }
+
+    /// **A learn pass over digital silence keeps the profile it had, and
+    /// says that it did.**
+    ///
+    /// A pass over true zeroes puts every band's geometric mean below the
+    /// bottom of [`DENOISE_THR_DB`]. All 32 norms clamp to zero, which is
+    /// OFF; [`Denoise::recount`] then reads nothing live and both kernels
+    /// take the wire path — `process` hands the buffer back untouched and
+    /// reports success. The panel meanwhile shows a full set of frozen
+    /// thresholds, because a freeze DID happen. There is no error, no
+    /// meter movement and no sound: the unit is off and looks armed.
+    ///
+    /// It was found by the offline probe, which picks the quietest
+    /// half-second of a file to learn on and landed on a stretch of the
+    /// zeroes that make up 7.4 % of the owner's take — it wrote a file
+    /// bit-identical to its input. A person holding LEARN over a silent bar
+    /// gets the same thing with a mouse.
+    ///
+    /// **The revert that makes this bite is deleting the
+    /// [`DenoiseLearn::Silent`] arm from `freeze_spectral_thresholds` (or
+    /// from `freeze_thresholds`, for the bank).** The profile is then
+    /// overwritten with 32 zeroes and the assertions below fail three ways
+    /// at once: the thresholds move, `last_learn` stops saying anything,
+    /// and the unit stops cutting.
+    #[test]
+    fn a_learn_pass_over_digital_silence_keeps_the_profile_it_had() {
+        for kernel in DenoiseKernel::ALL {
+            let mut dn = learned_full_band(kernel, 0x51_1E, 0.05, SR, 1.0);
+            assert_eq!(
+                dn.last_learn(),
+                DenoiseLearn::Taught,
+                "{}: the fixture's own learn pass did not take",
+                kernel.label()
+            );
+            let taught = dn.thresholds();
+            assert!(
+                taught.iter().any(|t| *t >= DENOISE_OFF),
+                "{}: the fixture learned nothing, so this test is about nothing",
+                kernel.label()
+            );
+
+            // Four seconds of digital silence, held under LEARN, then the
+            // falling edge — the panel's own gesture, over a silent bar.
+            //
+            // Four and not one because of the BANK, whose learn pass reads
+            // a per-band level envelope that runs to 400 ms at the bottom
+            // of the grid (see [`LEVEL_BW_MS_HZ`]). One second of zeroes
+            // leaves those envelopes only 21 dB down from the noise that
+            // came before, which is a quiet room and not silence, and the
+            // pass is rightly taken. Four seconds puts them 87 dB down,
+            // under the bottom of [`DENOISE_THR_DB`], which is the state
+            // this guard is about. The spectral kernels get there in one
+            // frame either way — their statistic is the frame's own
+            // periodogram, with no envelope in front of it.
+            let learn = DenoiseParams {
+                learn: 1.0,
+                ..on(kernel)
+            };
+            let frames = 4 * SR as usize;
+            let mut quiet = vec![0.0_f32; frames * 2];
+            dn.process(&mut quiet, frames, 2, &learn);
+            let mut tiny = [0.0_f32; 8];
+            dn.process(&mut tiny, 4, 2, &on(kernel));
+
+            assert_eq!(
+                dn.last_learn(),
+                DenoiseLearn::Silent,
+                "{}: a pass over digital silence did not report itself as one",
+                kernel.label()
+            );
+            assert_eq!(
+                dn.thresholds(),
+                taught,
+                "{}: a pass over digital silence overwrote the profile that was there",
+                kernel.label()
+            );
+
+            // And the unit is still a denoiser, not a wire: the same noise
+            // it was taught still comes back cut.
+            let p = on(kernel);
+            let n = 2 * SR as usize;
+            let dry = FullBandNoise::new(0x51_1E, 0.05).frames(n);
+            let mut wet = dry.clone();
+            dn.process(&mut wet, n, 2, &p);
+            let cut = rms_db(&dry, n / 2) - rms_db(&wet, n / 2);
+            assert!(
+                cut > 6.0,
+                "{}: after a silent learn pass the unit only removes {cut:.2} dB — it has \
+                 been turned into a wire that reports success",
+                kernel.label()
+            );
+        }
     }
 
     // ── the target, met ─────────────────────────────────────────────────────
@@ -5646,3 +6200,4 @@ mod tests {
         }
     }
 }
+
