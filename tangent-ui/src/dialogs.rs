@@ -4160,13 +4160,15 @@ pub fn face_window_size(unit: &str, monitor: Option<Vec2>) -> Vec2 {
 /// placed. [`show_dialog_viewport`] applies that cap to every dialog; this
 /// says the same thing at the one call site where the two numbers are far
 /// enough apart to matter.
-fn face_min_size(unit: &str, size: Vec2) -> Vec2 {
-    let least = if unit == "@tangent-ir" {
-        Vec2::new(640.0, 400.0)
-    } else {
-        Vec2::new(320.0, 300.0)
-    };
-    least.min(size)
+pub(crate) fn face_min_size(unit: &str, size: Vec2) -> Vec2 {
+    // **A face's own floor IS its minimum**, because the floor is the size it
+    // was laid out in - the size it opened at for its whole life before the
+    // windows started following the screen. A flat 320x300 for everything let
+    // the EQ be dragged 129 points shorter than its own rows, the Imager 99
+    // and the amp 94, and a face has no scroll area under it on the desktop
+    // path, so what went past the bottom was drawn, clipped and unreachable:
+    // the owner's cut-off complaint wearing its other edge.
+    face_window_size(unit, None).min(size)
 }
 
 /// The window's margin, the label's line, the bar's thickness, and the air
