@@ -125,6 +125,38 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A full-speed export rendered every plugin at its last-saved knobs, not the
+  ones the desk is playing.** An export builds a second engine and furnishes it
+  by hand, and it filled every rack from the sidecar files on disk — which are
+  written when a project is saved, when a plugin's own window is closed, when a
+  session is replaced and at quit, and by nothing else. No knob writes them,
+  and the suite's own units have no window whose closing writes them either. So
+  a compressor dialled in on a track and exported before the next save was
+  rendered by a mirror still wearing whatever that bay wore at the last save —
+  its shipped defaults, if the bay had never been saved at all. On the master
+  that reads as "the export sounds wrong". On stems it reads as something
+  worse, and is how it was reported: the settings a unit sits at before
+  somebody dials it in are precisely the ones that do nothing — a flat EQ, zero
+  drive, a compressor still at 1:1 — so a **Processed** stems export came out
+  indistinguishable from the dry one, with every part of the dry/processed
+  switch working correctly on audio that had been through a rack with nothing
+  in it. An export now takes each bay's knobs off the desk, and falls back to
+  the file only for a bay the running engine cannot answer for.
+
+- **The busy overlay came up underneath the windows it was explaining.** It
+  painted in the same egui band as the dialogs and one band below the export
+  render window, so a "Preparing export" or "Writing files" cover could sit
+  behind the very window whose work it was reporting. There is one rule now,
+  stated once and used by both covers — this one and the launch splash: a cover
+  paints above every band any surface of this app can ask for, because a cover
+  is the last thing on screen before the app stops answering. And on the
+  desktop, where a dialog is a window of its own that no paint order can reach
+  over, an announced block now waits one frame longer: for a frame that no
+  longer carries the window that asked for the work. A window is destroyed by
+  not being drawn, and the pass that would not draw it was the pass that
+  blocked — so pressing Export used to freeze the Export dialog on top of the
+  progress cover for the whole length of the render.
+
 - **A plugin on an audio track did nothing at all.** Not "processed silence" —
   it did not run. An audio clip passed through its lane's fader, pan, mute,
   solo and send, and then went straight to the master having entered no insert

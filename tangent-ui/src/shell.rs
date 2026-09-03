@@ -1355,6 +1355,59 @@ mod tests {
         );
     }
 
+    /// **Nothing this app can open may paint above a cover.**
+    ///
+    /// A cover — the busy overlay, the launch splash — is the last thing on
+    /// screen before the UI thread stops answering, so it has to be over
+    /// every surface that can be up while the app works: the export dialog
+    /// and every other question, a plugin's face, the pedal window, the menu
+    /// and its submenu, and the export render window that stands for the
+    /// whole of a bounce. That was stated at two call sites in `desktop.rs`
+    /// as `Order::Foreground` and was false in both directions — under the
+    /// render window outright, over a dialog only by egui's hash-ordered
+    /// sweep of layers that are not `Area`s. It is
+    /// [`crate::busy::COVER_ORDER`] now, and this is the guard that ties the
+    /// one to the other.
+    ///
+    /// **Read off `inline_order` rather than off a list**, because a list is
+    /// the thing that drifts: a fourth tier added above `Uncovered`, or
+    /// `Uncovered` moved up a band, fails here on the next `cargo test`
+    /// instead of on somebody's screen during an export. `asked` is swept
+    /// over every band a caller can pass in, since `Ordinary` and `Asking`
+    /// hand it straight back.
+    ///
+    /// Revert-check: set `busy::COVER_ORDER` back to `egui::Order::Foreground`
+    /// and the `Uncovered` row goes red here, and
+    /// `the_busy_cover_paints_over_the_export_render_window` goes red in
+    /// `dialogs.rs`.
+    #[test]
+    fn a_cover_is_painted_above_every_surface_this_app_can_open() {
+        use SurfaceTier::{Asking, Ordinary, Uncovered};
+        let cover = crate::busy::COVER_ORDER;
+        for tier in [Ordinary, Uncovered, Asking] {
+            for asked in [
+                egui::Order::Background,
+                egui::Order::Middle,
+                egui::Order::Foreground,
+                egui::Order::Tooltip,
+            ] {
+                for other in [None, Some(Ordinary), Some(Uncovered), Some(Asking)] {
+                    let band = tier.inline_order(asked, other);
+                    assert!(
+                        band < cover,
+                        "{tier:?} asking for {asked:?} (others: {other:?}) paints \
+                         in {band:?}, which is not under a cover in {cover:?}"
+                    );
+                }
+            }
+        }
+        // The two bands nothing in this app declares but everything gets for
+        // free: `notify`'s column draws in `Foreground`, and egui puts its own
+        // hover text in `Tooltip` whether we ask or not.
+        assert!(egui::Order::Foreground < cover, "the notice column is over a cover");
+        assert!(egui::Order::Tooltip < cover, "a tooltip is over a cover");
+    }
+
     /// Run one `surface` on the desktop path and report the window levels it
     /// asked the host for on that frame.
     ///
