@@ -5121,14 +5121,24 @@ impl DesktopApp {
         }
         // **Start where the thing being saved LIVES**, and let the panel
         // wander anywhere from there: the Projects folder for the project
-        // purposes — the owner's word — and the drum kits' own preset
-        // drawer for a kit. The drawer is made here, on the way in, because
-        // this is the first save's lazy moment and a default directory that
-        // does not exist is a panel that opens somewhere arbitrary. The
-        // answered path is still honoured whole either way.
+        // purposes — the owner's word — the drum kits' own preset drawer for
+        // a kit, and the exports folder for a `.mid`, which is where every
+        // other thing this app renders out of a session already goes. Both
+        // drawers are made here, on the way in, because this is the first
+        // save's lazy moment and a default directory that does not exist is
+        // a panel that opens somewhere arbitrary. The answered path is still
+        // honoured whole either way — with the one documented exception, a
+        // multi-track MIDI export, where it is honoured as a stem; see
+        // `SavePurpose::ExportMidi`, and note that the panel's TITLE says so
+        // before anybody clicks Save.
         let start = match request.purpose {
             tangent_ui::ports::SavePurpose::KitPreset => {
                 let dir = self.app.preset_root().join(DRUM_PRESET_FOLDER);
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            }
+            tangent_ui::ports::SavePurpose::ExportMidi => {
+                let dir = self.app.export_root();
                 let _ = std::fs::create_dir_all(&dir);
                 dir
             }
