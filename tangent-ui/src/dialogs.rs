@@ -3505,27 +3505,79 @@ impl Placement {
     /// AND no monitor, which is a host that has told us nothing at all.
     fn position_for(self, size: Vec2) -> Option<Pos2> {
         let parent = self.believable_parent();
+        // The DISPLAY, not the size of one — see [`Self::screen`]. Every
+        // clamp below is into this rather than into a box at the origin,
+        // because a window on the second monitor is centred on a rect that
+        // the origin's box does not contain and clamping it there drags the
+        // dialog onto the wrong screen.
+        let screen = self.screen();
         // **Anchored, when something asked to be beside a point.** Offset a
         // few points down and right of the hand, the way every menu on this
         // desk hangs off what opened it, and clamped like any other so a
         // press near the screen's edge does not push it off.
         if let (Some(at), Some(parent)) = (self.at, parent) {
-            return Some(crate::settings::clamp_to_monitor(
+            return Some(clamp_into(
                 parent.min + at.to_vec2() + Vec2::new(6.0, 6.0),
                 size,
-                self.monitor,
+                screen,
             ));
         }
-        let centre = match (parent, self.monitor) {
+        let centre = match (parent, screen) {
             (Some(parent), _) => parent.center(),
-            (None, Some(monitor)) => (monitor * 0.5).to_pos2(),
+            (None, Some(screen)) => screen.center(),
             (None, None) => return None,
         };
-        Some(crate::settings::clamp_to_monitor(
-            centre - size * 0.5,
-            size,
-            self.monitor,
-        ))
+        Some(clamp_into(centre - size * 0.5, size, screen))
+    }
+
+    /// **The display the parent is on, in the coordinates the parent is
+    /// reported in.**
+    ///
+    /// `monitor` is a SIZE and nothing more: the host says how big the
+    /// display the main window is on IS, never where on the desk it starts.
+    /// The parent arrives in the other space entirely — `app::last_drawn`
+    /// translated by the main window's origin — and a desk with a second
+    /// display has room in it for a negative origin and for coordinates
+    /// well past the first screen's width.
+    ///
+    /// Comparing the two directly is what [`Self::believable_parent`] used
+    /// to do, and it is a category error: the centre of a perfectly real
+    /// window on the monitor to the right is not inside
+    /// `Rect::from_min_size(ZERO, monitor)`, so that window was called a
+    /// lie and every dialog it owned opened on the wrong screen — and the
+    /// clamp that followed pinned them to the first screen's edge.
+    ///
+    /// What IS known is that the parent is ON this display: the size came
+    /// from the display the MAIN WINDOW is on, and the parent is the main
+    /// window's own pane. So the screen is a monitor-sized box that covers
+    /// the parent — the one at the origin when the parent is where a
+    /// single-screen desk puts it, and otherwise slid by the least it takes
+    /// to cover it. No grid of identical displays is assumed, because a
+    /// laptop panel beside a 4K is not one.
+    ///
+    /// A parent WIDER than the whole display cannot be covered by any slide
+    /// — a stale origin with a live size can look like that — so the box
+    /// centres on it instead, and the dialog still lands beside the middle
+    /// of the thing it belongs to.
+    fn screen(self) -> Option<Rect> {
+        let m = self.monitor.filter(|m| m.x > 0.0 && m.y > 0.0)?;
+        let base = Rect::from_min_size(Pos2::ZERO, m);
+        let Some(parent) = self.believable_parent() else {
+            return Some(base);
+        };
+        // Per axis: stay at the origin if that already covers the parent,
+        // otherwise slide by the smallest amount that does.
+        let slide = |lo: f32, hi: f32, size: f32| {
+            if hi - lo <= size {
+                0.0_f32.clamp(hi - size, lo)
+            } else {
+                (lo + hi) * 0.5 - size * 0.5
+            }
+        };
+        Some(base.translate(Vec2::new(
+            slide(parent.left(), parent.right(), m.x),
+            slide(parent.top(), parent.bottom(), m.y),
+        )))
     }
 
     /// **The parent rect, when it is describing a window somebody is
@@ -3548,11 +3600,28 @@ impl Placement {
     /// when the question was nonsense.
     ///
     /// So the question is asked of the one part of the rect this function
-    /// uses: **is the MIDDLE of the parent on the monitor?** If it is not,
-    /// the rect is not a window on this screen, centring on it is centring on
-    /// nothing, and the monitor's own middle is the honest answer — the same
-    /// answer [`Self::position_for`] already gives for a parent it has not
-    /// been told about yet.
+    /// uses: **is the MIDDLE of the parent anywhere a window could be?** If
+    /// it is not, the rect is not a window anybody is looking at, centring
+    /// on it is centring on nothing, and the middle of the screen is the
+    /// honest answer — the same answer [`Self::position_for`] already gives
+    /// for a parent it has not been told about yet.
+    ///
+    /// **"Anywhere a window could be" is the DESK, not one screen**, and
+    /// that distinction is the whole of the second bug here. The first draft
+    /// tested the parent's centre against `Rect::from_min_size(ZERO,
+    /// monitor)` — a box in a space the parent does not live in, see
+    /// [`Self::screen`] — so a window on the display to the right, or on one
+    /// hung above and therefore at a negative y, was thrown out as a lie.
+    /// On a two-monitor desk that is not an edge case, it is Tuesday.
+    ///
+    /// So the box is the primary screen grown by [`DESK_REACH`] displays in
+    /// every direction. That is a bound and not a measurement, and it is
+    /// worth being honest about which: nothing here can be told where the
+    /// second display starts, so nothing here can tell a window on it from
+    /// a stale origin that happens to land nearby. What the bound DOES
+    /// catch is the shape the real fault has — a host parking a hidden or
+    /// Space-switched window at a coordinate no desk reaches — while never
+    /// again rejecting a display somebody could actually own.
     ///
     /// Note the case this deliberately does NOT reject: a window dragged hard
     /// against an edge, whose centre is still on screen. A dialog centred on
@@ -3568,9 +3637,37 @@ impl Placement {
             return Some(parent);
         };
         Rect::from_min_size(Pos2::ZERO, m)
+            .expand2(m * DESK_REACH)
             .contains(parent.center())
             .then_some(parent)
     }
+}
+
+/// **How many displays out from the primary a desk is allowed to reach**,
+/// for the one question [`Placement::believable_parent`] asks with it.
+///
+/// Four in every direction — a desk nine screens across and nine tall, which
+/// nobody owns — because the cost of being too generous is that one wrong
+/// rect gets believed for the one frame a window is placed on, and the cost
+/// of being too mean is a real second monitor whose dialogs all open on the
+/// wrong screen. The two are not symmetrical.
+const DESK_REACH: f32 = 4.0;
+
+/// [`crate::settings::clamp_to_monitor`], asked about a screen that is not
+/// necessarily the one at the origin.
+///
+/// The same rule — a window fully inside the display, rounded to whole
+/// points — against a box that can sit anywhere on the desk. It answers
+/// exactly what that function answers when the box IS the origin's, which is
+/// the single-display desk and most of the world.
+fn clamp_into(pos: Pos2, size: Vec2, screen: Option<Rect>) -> Pos2 {
+    let Some(s) = screen.filter(|s| s.width() > 0.0 && s.height() > 0.0) else {
+        return pos;
+    };
+    Pos2::new(
+        pos.x.clamp(s.left(), (s.right() - size.x).max(s.left())).round(),
+        pos.y.clamp(s.top(), (s.bottom() - size.y).max(s.top())).round(),
+    )
 }
 
 /// **The size and place a floating surface was BORN with, held for as long
@@ -3608,7 +3705,30 @@ impl Placement {
 /// viewport id and one slot in the app: choosing a pedal from a face replaces
 /// the dialog with no undrawn frame in between, and the window that arrives
 /// must not inherit the rectangle of the one that left. The title is what the
-/// window says it is, so the title is what identity is keyed on.
+/// window says it is, so the title is where identity starts.
+///
+/// **And the title is not enough on its own, because titles are not
+/// unique.** `Dialog::Cheated` is called "Tangent" and so is a face whose
+/// unit the suite table has never heard of; a `FileBrowser` is called
+/// whatever the arm that opened it says. Two windows sharing a name is not a
+/// bug, but a window inheriting the SIZE of a different window that shares
+/// its name is: the second one came here with a size its caller had just
+/// worked out, and handing back the first one's threw that away. So the ask
+/// is part of the identity. A window whose caller wants a different size
+/// from the one being held is not the window being held, whatever it is
+/// called, and it is born rather than inherited.
+///
+/// **The monitor is held too, and for the opposite reason.** A size that
+/// changes because the DISPLAY changed is not a different window — it is the
+/// same window on a different screen, and re-deriving it there would send an
+/// `InnerSize` that throws away whatever the user did with the resize grip.
+/// But neither may it simply be left alone: a window placed on a display that
+/// is then unplugged is stranded off-screen with nothing to rescue it, which
+/// is the one job the per-frame clamp used to do for free. So a monitor
+/// change re-VALIDATES rather than re-derives — the size capped to what the
+/// new screen can hold, the position clamped back onto it, and nothing else
+/// touched. It happens on the frame the screen changes and on no other, which
+/// is the difference between rescuing a window and re-placing one.
 ///
 /// Let go by the same one-pass liveness `shell::surface` uses for a window's
 /// birth, so closing a dialog and opening it again centres afresh — which is
@@ -3627,19 +3747,83 @@ fn held_geometry(
     ctx: &egui::Context,
     id: &str,
     what: &str,
-    make: impl FnOnce() -> (Vec2, Option<Pos2>),
+    placement: Placement,
+    asked: Vec2,
 ) -> (Vec2, Option<Pos2>) {
     let slot = egui::Id::new((id, "geometry"));
     let pass = ctx.cumulative_pass_nr();
     let key = egui::Id::new(what);
     let held = ctx
-        .memory(|m| m.data.get_temp::<(u64, egui::Id, Vec2, Option<Pos2>)>(slot))
-        .filter(|(p, k, _, _)| pass.saturating_sub(*p) <= 1 && *k == key);
-    let (size, pos) = held.map_or_else(make, |(_, _, size, pos)| (size, pos));
+        .memory(|m| m.data.get_temp::<Held>(slot))
+        .filter(|h| pass.saturating_sub(h.pass) <= 1 && h.what == key);
+    // Every arm answers with all four — what the window IS, and the two
+    // inputs it is being held against — because carrying the wrong pair
+    // forward is how a window forgets which screen it was placed on.
+    let born = || (asked, placement.position_for(asked), placement.monitor, asked);
+    let (size, pos, screen, ask) = match (held, placement.monitor) {
+        // Nothing alive under this name: a birth.
+        (None, _) => born(),
+        // **A frame that says nothing about the display says nothing.** The
+        // host can go quiet for a frame around a hide or a Space switch, and
+        // one silent frame is neither a display change nor a new window. The
+        // window keeps what it has AND keeps remembering the screen it was
+        // placed on: forgetting that would make the display coming back look
+        // like a different one, and the size derived on it look like some
+        // other window's.
+        (Some(h), None) => (h.size, h.pos, h.monitor, h.asked),
+        // A screen arriving where there has never been one is not a display
+        // change either — nothing was ever really placed against a screen,
+        // so this is the first frame that can place it.
+        (Some(h), Some(_)) if h.monitor.is_none() => born(),
+        // **The same window, on the same screen.** Whatever it has become is
+        // what it is, and nothing here has anything to say about it.
+        (Some(h), m) if h.monitor == m && h.asked == asked => (h.size, h.pos, m, h.asked),
+        // The same NAME on the same screen, asking to be a different size:
+        // two windows that share a title, and this is the second of them.
+        (Some(h), m) if h.monitor == m => born(),
+        // **The screen moved out from under it.** Keep the size — a hand may
+        // be on the grip — and put the window back where it can be seen. The
+        // ask carried forward is THIS frame's, worked out on the new screen,
+        // so every frame after it takes the same-window arm above.
+        (Some(h), m) => {
+            let size = crate::settings::clamp_size_to_monitor(h.size, m);
+            (
+                size,
+                h.pos.map(|p| clamp_into(p, size, placement.screen())),
+                m,
+                asked,
+            )
+        }
+    };
     if pos.is_some() {
-        ctx.memory_mut(|m| m.data.insert_temp(slot, (pass, key, size, pos)));
+        ctx.memory_mut(|m| {
+            m.data.insert_temp(
+                slot,
+                Held {
+                    pass,
+                    what: key,
+                    asked: ask,
+                    monitor: screen,
+                    size,
+                    pos,
+                },
+            );
+        });
     }
     (size, pos)
+}
+
+/// What [`held_geometry`] keeps between frames. `asked` and `monitor` are
+/// the two inputs it has to be able to notice a change in; `size` and `pos`
+/// are the answer it is holding on to.
+#[derive(Clone, Copy)]
+struct Held {
+    pass: u64,
+    what: egui::Id,
+    asked: Vec2,
+    monitor: Option<Vec2>,
+    size: Vec2,
+    pos: Option<Pos2>,
 }
 
 fn show_dialog_viewport(
@@ -3670,9 +3854,7 @@ fn show_dialog_viewport(
     // [`held_geometry`], which is where the whole argument lives. The size
     // comes back through the same door because a position is only ever a
     // position for a size.
-    let (size, pos) = held_geometry(ctx, DIALOG_ID, title, || {
-        (size, placement.position_for(size))
-    });
+    let (size, pos) = held_geometry(ctx, DIALOG_ID, title, placement, size);
     let spec = crate::shell::SurfaceSpec {
         id: DIALOG_ID,
         title,
@@ -4104,10 +4286,13 @@ fn playhead_ink(well: Color32) -> Color32 {
 /// [`held_geometry`] keys on is the id rather than the title, because the
 /// title says which pass of the render it is on.
 fn export_geometry(ctx: &egui::Context, placement: Placement) -> (Vec2, Option<Pos2>) {
-    held_geometry(ctx, EXPORT_ID, EXPORT_ID, || {
-        let size = export_window_size(placement.monitor);
-        (size, placement.position_for(size))
-    })
+    held_geometry(
+        ctx,
+        EXPORT_ID,
+        EXPORT_ID,
+        placement,
+        export_window_size(placement.monitor),
+    )
 }
 
 /// The export window: a wave that draws itself while the render walks the
@@ -10656,50 +10841,144 @@ mod tests {
             "a parent on screen was not centred on: {p:?}"
         );
 
-        // And a parent that is mostly OFF the monitor is not a window
-        // anybody is looking at. Centring on it lands past the bottom-right
-        // corner, the clamp answers with the corner exactly, and that corner
-        // is the owner's bug report. See `believable_parent`.
-        let gone = Rect::from_min_size(Pos2::new(2400.0, 1380.0), Vec2::new(1300.0, 200.0));
+        // **A window on the display NEXT DOOR is a window.** Its rect
+        // comes in virtual-desktop coordinates, where the second monitor
+        // starts past the first screen's width, so its centre is nowhere
+        // near the box at the origin — and the first draft of
+        // `believable_parent` compared it against exactly that box and
+        // called it a lie, sending every dialog it owned to the middle of
+        // the WRONG screen. It is centred on, like any other parent, and it
+        // lands on the screen it belongs to. See `Placement::screen`.
         let mon = Vec2::new(2560.0, 1440.0);
         let corner = (mon - size).to_pos2();
+        let next_door =
+            Rect::from_min_size(Pos2::new(2600.0, 200.0), Vec2::new(1300.0, 800.0));
+        // What the old clamp did with it, which is the fault written out:
+        // it pinned the dialog inside the box at the ORIGIN, which is the
+        // primary screen — a dialog on a different display from the window
+        // it belongs to, every time.
+        let onto_primary =
+            crate::settings::clamp_to_monitor(next_door.center() - size * 0.5, size, monitor);
+        assert!(
+            Rect::from_min_size(Pos2::ZERO, mon).contains(onto_primary),
+            "this parent is no longer dragged onto the primary, so the test proves nothing"
+        );
+        let beside = |parent: Rect, at: Option<Pos2>| {
+            Placement {
+                at,
+                native_panel_up: false,
+                raise: false,
+                parent: Some(parent),
+                monitor,
+                caps: crate::host::Caps::DESKTOP,
+                chrome: None,
+            }
+            .position_for(size)
+            .unwrap()
+        };
+        let p = beside(next_door, None);
+        assert_ne!(
+            p, onto_primary,
+            "a window on the next screen is still dragged onto the primary"
+        );
+        assert!(
+            (p.x + size.x * 0.5 - next_door.center().x).abs() < 0.5
+                && (p.y + size.y * 0.5 - next_door.center().y).abs() < 0.5,
+            "a window on the next screen was not centred on: {p:?}"
+        );
+
+        // **A rect no desk could hold is still a lie**, and still falls back
+        // to the middle of the screen we do know about. This is the hide,
+        // the Space change and the display change — a host reporting an
+        // origin from nowhere — and it is the case the believability test
+        // exists for.
+        let nowhere =
+            Rect::from_min_size(Pos2::new(40_000.0, 30_000.0), Vec2::new(1300.0, 200.0));
+        // And this one really does produce the owner's corner: the clamp,
+        // handed a centre far past the screen, answers with `monitor - size`
+        // exactly rather than nudging towards it.
         assert_eq!(
-            crate::settings::clamp_to_monitor(gone.center() - size * 0.5, size, monitor),
+            crate::settings::clamp_to_monitor(nowhere.center() - size * 0.5, size, monitor),
             corner,
             "this parent no longer produces the corner, so the test proves nothing"
         );
-        let p = Placement {
-            at: None,
-            native_panel_up: false,
-            raise: false,
-            parent: Some(gone),
-            monitor,
-            caps: crate::host::Caps::DESKTOP,
-            chrome: None,
-        }
-        .position_for(size)
-        .unwrap();
-        assert_ne!(p, corner, "an off-screen parent still corners the dialog");
+        let p = beside(nowhere, None);
+        assert_ne!(p, corner, "an off-desk parent still corners the dialog");
         let centre = p + size * 0.5;
         assert!(
             (centre.x - mon.x * 0.5).abs() < 0.5 && (centre.y - mon.y * 0.5).abs() < 0.5,
             "an unbelievable parent did not fall back to the middle of the monitor: {p:?}"
         );
 
-        // The anchored road takes the same answer: a point measured against a
-        // window nobody can see is not a point to hang a menu off.
-        let anchored = Placement {
-            at: Some(Pos2::new(40.0, 30.0)),
+        // The anchored road takes both answers: a point measured against a
+        // window nobody can see is not a point to hang a menu off, and a
+        // point measured against one on the next screen is.
+        assert_ne!(
+            beside(nowhere, Some(Pos2::new(40.0, 30.0))),
+            corner,
+            "an off-desk anchor still corners the menu"
+        );
+        let hung = beside(next_door, Some(Pos2::new(40.0, 30.0)));
+        assert!(
+            (hung.x - (next_door.left() + 46.0)).abs() < 0.5
+                && (hung.y - (next_door.top() + 36.0)).abs() < 0.5,
+            "a menu on the next screen did not hang off the point it was given: {hung:?}"
+        );
+    }
+
+    /// **The screen a dialog is clamped into is the one its parent is on.**
+    ///
+    /// `monitor` is a size with no origin and the parent is in
+    /// virtual-desktop coordinates, so the two only line up on a
+    /// single-display desk. `Placement::screen` is what reconciles them, and
+    /// this walks a parent around a desk that has a display in each
+    /// direction — including the negative ones, which is a monitor hung
+    /// above or placed to the left of the primary.
+    #[test]
+    fn a_dialog_is_clamped_into_the_display_its_parent_is_on() {
+        let m = Vec2::new(1920.0, 1080.0);
+        let size = Vec2::new(400.0, 300.0);
+        let at = |parent: Rect| Placement {
+            at: None,
             native_panel_up: false,
             raise: false,
-            parent: Some(gone),
-            monitor,
+            parent: Some(parent),
+            monitor: Some(m),
             caps: crate::host::Caps::DESKTOP,
             chrome: None,
+        };
+        // A window on each of five displays: the primary, and one out in
+        // each direction. Each window is well inside its own screen.
+        for (what, origin) in [
+            ("primary", Vec2::ZERO),
+            ("right", Vec2::new(1920.0, 0.0)),
+            ("left", Vec2::new(-1920.0, 0.0)),
+            ("above", Vec2::new(0.0, -1080.0)),
+            ("below", Vec2::new(0.0, 1080.0)),
+        ] {
+            let screen = Rect::from_min_size(origin.to_pos2(), m);
+            let parent = Rect::from_min_size(screen.min + Vec2::new(200.0, 150.0), m * 0.6);
+            let p = at(parent).position_for(size).expect("nowhere to put it");
+            assert!(
+                screen.expand(0.5).contains_rect(Rect::from_min_size(p, size)),
+                "the {what} screen's dialog landed at {p:?}, off {screen:?}"
+            );
+            assert!(
+                (p + size * 0.5 - parent.center()).length() < 0.5,
+                "the {what} screen's dialog was not centred on its window: {p:?}"
+            );
         }
-        .position_for(size)
-        .unwrap();
-        assert_ne!(anchored, corner, "an off-screen anchor still corners the menu");
+        // And a window shoved against the far edge of the display to the
+        // right stays fully ON that display rather than hanging into the gap
+        // beyond it — the clamp still clamps, it just clamps to the right
+        // box now.
+        let screen = Rect::from_min_size(Pos2::new(1920.0, 0.0), m);
+        let edge = Rect::from_min_size(Pos2::new(3600.0, 900.0), Vec2::new(230.0, 170.0));
+        let p = at(edge).position_for(size).expect("nowhere to put it");
+        assert!(
+            screen.expand(0.5).contains_rect(Rect::from_min_size(p, size)),
+            "a dialog on the right-hand screen's edge hung off it: {p:?}"
+        );
     }
 
     // ── the custom tuning editor ────────────────────────────────────────────
@@ -12876,14 +13155,9 @@ at: None,
     /// nothing rather than as this window's.
     fn asked_geometry(ctx: &egui::Context) -> Option<(Vec2, Option<Pos2>)> {
         let pass = ctx.cumulative_pass_nr();
-        ctx.memory(|m| {
-            m.data
-                .get_temp::<(u64, egui::Id, Vec2, Option<Pos2>)>(egui::Id::new((
-                    DIALOG_ID, "geometry",
-                )))
-        })
-        .filter(|(p, ..)| pass.saturating_sub(*p) <= 1)
-        .map(|(_, _, size, pos)| (size, pos))
+        ctx.memory(|m| m.data.get_temp::<Held>(egui::Id::new((DIALOG_ID, "geometry"))))
+            .filter(|h| pass.saturating_sub(h.pass) <= 1)
+            .map(|h| (h.size, h.pos))
     }
 
     /// **A plugin window that has been placed is never placed again.**
@@ -13055,6 +13329,182 @@ at: None,
             at(home).position_for(card),
             "the card never took the first answer it was given"
         );
+    }
+
+    /// **Two dialogs that share a title do not share a size.**
+    ///
+    /// Identity was the title alone, and titles are not unique: the chord
+    /// game's `Cheated` is called "Tangent", and so is a face whose unit the
+    /// suite table has never heard of. Every dialog goes through one viewport
+    /// and one slot, and one can replace another with no undrawn frame in
+    /// between — so the second window found a rectangle already held under
+    /// its own name and wore it, throwing away the size its caller had just
+    /// worked out. A 440-by-170 question opened as a 520-point knob panel.
+    ///
+    /// The fix is that the ask is part of the identity, and this drives the
+    /// real funnel to prove it: `show`, the real dialogs, no idle frame.
+    #[test]
+    fn two_dialogs_that_share_a_title_do_not_share_a_size() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let monitor = Vec2::new(1512.0, 982.0);
+        let screen = Rect::from_min_size(Pos2::ZERO, monitor);
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: Some(Rect::from_min_size(Pos2::new(80.0, 60.0), Vec2::new(1240.0, 800.0))),
+            monitor: Some(monitor),
+            caps: crate::host::Caps::DESKTOP,
+            chrome: None,
+        };
+        let olive = Color32::from_rgb(0x6B, 0x71, 0x3E);
+        let frame = |dialog: &mut Option<Dialog>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(ctx, dialog, olive, placement);
+                },
+            );
+        };
+
+        // The face first. Its unit is not in the suite table, so the window
+        // it opens is called "Tangent" — and it is sized from the screen.
+        let mut face = Some(Dialog::InsertFace {
+            strip: 0,
+            slot: 0,
+            live: Box::default(),
+        });
+        frame(&mut face);
+        let (face_size, _) = asked_geometry(&ctx).expect("the face was never placed");
+        assert_eq!(face_size, face_window_size("", Some(monitor)));
+
+        // And straight into the other window of that name, with no undrawn
+        // frame between them, which is the case the holding is FOR.
+        let cheat = Vec2::new(440.0, 170.0);
+        assert_ne!(cheat, face_size, "the two windows agree, so this proves nothing");
+        let mut cheated = Some(Dialog::Cheated);
+        frame(&mut cheated);
+        let (size, _) = asked_geometry(&ctx).expect("the second window was never placed");
+        assert_eq!(
+            size, cheat,
+            "a window inherited the size of a different window that shares its title"
+        );
+    }
+
+    /// **A window on a display that goes away is brought back.**
+    ///
+    /// Holding the geometry fixed the window that walked to the corner, and
+    /// took a rescue away with it: the per-frame clamp used to put a window
+    /// back on the screen for free, every frame, as a side effect of
+    /// re-placing it. Nothing did it afterwards. Undock the laptop with a
+    /// face open on the big display and the face is simply gone — still
+    /// open, still taking every event a modal drops, at a coordinate the
+    /// remaining screen does not reach.
+    ///
+    /// The answer is neither to go back to asking every frame nor to leave
+    /// it alone: a display change re-VALIDATES. The size is kept, because a
+    /// hand may be on the grip and the screen changing is not a reason to
+    /// resize under it; the position is clamped back onto the screen that is
+    /// left. This asserts both halves, and that the window sits still on
+    /// every frame either side of the change.
+    #[test]
+    fn a_window_left_on_a_display_that_goes_away_is_brought_back() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let big = Vec2::new(3840.0, 2160.0);
+        let small = Vec2::new(1512.0, 982.0);
+        // No parent: the window centres on the screen, which is where a
+        // stranding is plainest — the main window is on the display that
+        // went away too, and its rect is the thing least worth trusting on
+        // the frame a display changes.
+        let at = |monitor: Option<Vec2>| Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor,
+            caps: crate::host::Caps::DESKTOP,
+            chrome: None,
+        };
+        let olive = Color32::from_rgb(0x6B, 0x71, 0x3E);
+        let frame = |dialog: &mut Option<Dialog>, monitor: Option<Vec2>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, big)),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(ctx, dialog, olive, at(monitor));
+                },
+            );
+        };
+
+        let mut dialog = Some(Dialog::InsertFace {
+            strip: 0,
+            slot: 0,
+            live: Box::default(),
+        });
+        frame(&mut dialog, Some(big));
+        let (size, pos) = asked_geometry(&ctx).expect("the face was never placed");
+        let pos = pos.expect("a known monitor is enough to place a window");
+        assert!(
+            pos.x + size.x > small.x || pos.y + size.y > small.y,
+            "this window already fits the small screen, so the test proves nothing"
+        );
+
+        // It does not move while the screen stays put — the whole point of
+        // holding, and the thing the rescue must not undo.
+        for _ in 0..3 {
+            frame(&mut dialog, Some(big));
+            assert_eq!(
+                asked_geometry(&ctx),
+                Some((size, Some(pos))),
+                "the held window moved with nothing under it changing"
+            );
+        }
+
+        // **A frame where the host says nothing about a monitor is not a
+        // display change.** There is nothing to validate the window against,
+        // and one silent frame around a hide or a Space switch is not a
+        // reason to move somebody's window — that is the fault this whole
+        // mechanism exists to stop, arriving through the new door.
+        frame(&mut dialog, None);
+        assert_eq!(
+            asked_geometry(&ctx),
+            Some((size, Some(pos))),
+            "a frame with no monitor re-placed the window"
+        );
+
+        // The display goes away.
+        frame(&mut dialog, Some(small));
+        let (after, back) = asked_geometry(&ctx).expect("the face vanished");
+        let back = back.expect("the rescue took the position away");
+        assert_eq!(
+            after, size,
+            "the rescue resized a window a hand may be on the grip of"
+        );
+        assert!(
+            Rect::from_min_size(Pos2::ZERO, small)
+                .expand(0.5)
+                .contains_rect(Rect::from_min_size(back, after)),
+            "the window is stranded at {back:?} on a {small:?} screen"
+        );
+
+        // And it settles there rather than walking every frame afterwards.
+        for _ in 0..3 {
+            frame(&mut dialog, Some(small));
+            assert_eq!(
+                asked_geometry(&ctx),
+                Some((after, Some(back))),
+                "the rescued window kept being rescued"
+            );
+        }
     }
 
     /// **How big a face opens: a share of the screen, floored and capped.**

@@ -281,45 +281,24 @@ fn step_row(
 /// never about the Imager or the Amp in particular: it was about the strip
 /// they both wear.
 ///
-/// Two things fix it and both are needed. The shares below keep the strip on
-/// ONE line at every width a face is opened at, and `horizontal_wrapped`
-/// makes the failure mode at any width below that a SECOND LINE rather than
-/// a part that is simply not there — an item that will not fit the rest of
-/// the row starts a new one instead of running off the end. A layout that
-/// cannot overflow is worth more than a layout whose arithmetic happens to
-/// be right today.
+/// Two things fix it and both are needed. The shares — [`preset_parts`],
+/// which is where they live now — keep the strip on ONE line at every width
+/// a face is opened at, and `horizontal_wrapped` makes the failure mode at
+/// any width below that a SECOND LINE rather than a part that is simply not
+/// there: an item that will not fit the rest of the row starts a new one
+/// instead of running off the end. A layout that cannot overflow is worth
+/// more than a layout whose arithmetic happens to be right today.
+///
+/// The shares moved out of this function so the one panel that has to
+/// RESERVE room for the strip can ask the same arithmetic how tall it is
+/// going to be rather than guessing. See [`preset_foot_height`].
 fn preset_strip(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<FaceAction> {
     let mut action = None;
-    ui.add_space(6.0);
+    ui.add_space(PRESET_LEAD);
     let bold = |size: f32| egui::FontId::new(size, crate::fonts::courier_bold());
-    // The two fixed parts are MEASURED, not guessed: a button is its text
-    // plus the theme's own padding, and both of those move with the font
-    // and the style. Guessing them is how a strip gets to be 330 wide.
-    let word_w = |text: &str| {
-        ui.painter()
-            .layout_no_wrap(text.to_owned(), bold(10.0), egui::Color32::WHITE)
-            .rect
-            .width()
-    };
     let pad = ui.spacing().button_padding.x * 2.0;
-    let gap = ui.spacing().item_spacing.x;
-    let save_w = word_w("Save") + pad;
-    let caption_w = word_w("PRESET");
-    let w = ui.available_width();
-    // The caption is the one part that is pure decoration, so it is the
-    // first thing the budget spends: a narrow strip says what it is by
-    // being a menu and a name field, which nobody mistakes for anything.
-    let captioned = w >= caption_w + gap + PRESET_MIN_PARTS;
-    let fixed =
-        save_w + gap * 2.0 + if captioned { caption_w + gap } else { 0.0 };
-    let free = (w - fixed).max(PRESET_MIN_PARTS);
-    // The menu takes a little over half of what is left; the field takes
-    // the rest. Both stop growing well before the panel does — a preset
-    // menu three hundred points wide is not more useful than one at a
-    // hundred and sixty, and the empty run to its right is what tells the
-    // eye the strip is a footer rather than the panel's subject.
-    let combo_w = (free * 0.52).clamp(PRESET_MIN_COMBO, 160.0);
-    let name_w = (free - combo_w).clamp(PRESET_MIN_NAME, 160.0);
+    let PresetParts { captioned, combo_w, name_w, .. } =
+        preset_parts(ui, ui.available_width());
     ui.horizontal_wrapped(|ui| {
         if captioned {
             ui.label(
@@ -393,6 +372,126 @@ const PRESET_MIN_NAME: f32 = 54.0;
 /// What the two of them and the gap between them cost together — the figure
 /// the caption is weighed against.
 const PRESET_MIN_PARTS: f32 = PRESET_MIN_COMBO + PRESET_MIN_NAME;
+
+/// The space the strip opens with, so it reads as a footer rather than as
+/// one more thing stacked on the last control above it.
+const PRESET_LEAD: f32 = 6.0;
+
+/// egui's own margin around a `TextEdit`'s text — `Margin::symmetric(4, 2)`,
+/// which it adds to the width the caller asked for and to the row height.
+/// Named here because the strip has to know what its own field will cost
+/// before it draws one.
+const TEXT_EDIT_MARGIN: egui::Vec2 = egui::vec2(8.0, 4.0);
+
+/// **What the preset strip is made of at a given width, and how tall that
+/// makes it.**
+///
+/// One function for the drawing and for the RESERVING, because the two have
+/// to agree. Most faces stack down their panel and the strip lands wherever
+/// the rows above it left the cursor, so how tall it is is nobody's
+/// business; the IR panel is the exception, because it fills the rect it is
+/// handed and has to keep a foot back before it can lay anything else out.
+///
+/// That foot used to be `IR_FOOT_H`, a flat thirty-two points — the same
+/// four-fixed-numbers disease [`preset_strip`] was itself cured of, and it
+/// failed the same way. Below about two hundred and ninety-six points the
+/// row wraps to a second line, and a second line is a whole row the
+/// reservation never had: the strip ran out of the bottom of the window,
+/// and the browser it was supposed to sit under ended up underneath IT.
+///
+/// So it is measured. Every width below is the width actually handed to a
+/// widget, and the line count is the greedy walk `horizontal_wrapped` does:
+/// an item that will not fit the rest of the row starts a new one.
+struct PresetParts {
+    /// Whether the "PRESET" caption is affordable at this width.
+    captioned: bool,
+    combo_w: f32,
+    name_w: f32,
+    /// One row of it, from the font and the style rather than a number.
+    line_h: f32,
+    /// How many rows `horizontal_wrapped` will put the parts on.
+    lines: usize,
+}
+
+fn preset_parts(ui: &egui::Ui, w: f32) -> PresetParts {
+    let font = egui::FontId::new(10.0, crate::fonts::courier_bold());
+    // The fixed parts are MEASURED, not guessed: a button is its text plus
+    // the theme's own padding, and both of those move with the font and the
+    // style. Guessing them is how a strip gets to be 330 wide.
+    let word = |text: &str| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+            .rect
+    };
+    let pad = ui.spacing().button_padding.x * 2.0;
+    let gap = ui.spacing().item_spacing.x;
+    let save = word("Save");
+    let save_w = save.width() + pad;
+    let caption_w = word("PRESET").width();
+    // The caption is the one part that is pure decoration, so it is the
+    // first thing the budget spends: a narrow strip says what it is by
+    // being a menu and a name field, which nobody mistakes for anything.
+    let captioned = w >= caption_w + gap + PRESET_MIN_PARTS;
+    let fixed = save_w + gap * 2.0 + if captioned { caption_w + gap } else { 0.0 };
+    let free = (w - fixed).max(PRESET_MIN_PARTS);
+    // The menu takes a little over half of what is left; the field takes
+    // the rest. Both stop growing well before the panel does — a preset
+    // menu three hundred points wide is not more useful than one at a
+    // hundred and sixty, and the empty run to its right is what tells the
+    // eye the strip is a footer rather than the panel's subject.
+    let combo_w = (free * 0.52).clamp(PRESET_MIN_COMBO, 160.0);
+    let name_w = (free - combo_w).clamp(PRESET_MIN_NAME, 160.0);
+    // **A row is as tall as the tallest thing on it**, and each of the three
+    // is measured the way egui itself sizes it. The menu is the tall one and
+    // not for an obvious reason: `ComboBox` lays its arrow out at
+    // `icon_width` and takes the greater of that and its own text, so a
+    // ten-point word in a twelve-by-four theme rides on a fourteen-point
+    // icon. The Save button is its text and the padding; the name field is
+    // its text and egui's own margin; and nothing on the row may come out
+    // under what the style says a thing you can hit must measure.
+    let row_h = save.height();
+    let least = ui.spacing().interact_size.y;
+    let pad_y = ui.spacing().button_padding.y * 2.0;
+    let combo_h = (row_h.max(ui.spacing().icon_width) + pad_y).max(least);
+    let button_h = (row_h + pad_y).max(least);
+    let line_h = combo_h.max(button_h).max(row_h + TEXT_EDIT_MARGIN.y);
+    // The walk, in the order the widgets are added. The field's own margin
+    // is added back on because `desired_width` sizes the TEXT inside it,
+    // which is why the share had it taken off in the first place.
+    let mut lines = 1usize;
+    let mut used = 0.0_f32;
+    for item in [
+        captioned.then_some(caption_w),
+        Some(combo_w),
+        Some((name_w - pad).max(24.0) + TEXT_EDIT_MARGIN.x),
+        Some(save_w),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if used > 0.0 && used + gap + item > w {
+            lines += 1;
+            used = item;
+        } else {
+            used += if used > 0.0 { gap + item } else { item };
+        }
+    }
+    PresetParts { captioned, combo_w, name_w, line_h, lines }
+}
+
+/// **The room a panel must keep back for the preset strip**, when it is the
+/// kind of panel that has to keep any back at all.
+///
+/// The strip's own lead and lines, plus the gap the allocation ABOVE it
+/// leaves: a panel that hands its body to `allocate_rect` gets the cursor
+/// put one `item_spacing` below that rect, and the strip starts from there.
+/// Every number in it comes off the live `Ui`, so a bigger font or a roomier
+/// theme moves the reservation with it instead of silently overrunning it.
+pub fn preset_foot_height(ui: &egui::Ui) -> f32 {
+    let p = preset_parts(ui, ui.available_width());
+    let gap = ui.spacing().item_spacing.y;
+    gap + PRESET_LEAD + p.lines as f32 * p.line_h + (p.lines as f32 - 1.0) * gap
+}
 
 /// The whole face: glass on top where a unit has a picture, rows under it,
 /// presets at the foot. Returns at most one ask per frame — a hand only
@@ -665,9 +764,13 @@ const IR_HOME_W: f32 = 34.0;
 const IR_NAME_H: f32 = 26.0;
 /// The Wizard button at the foot of the left half.
 const IR_WIZARD_H: f32 = 24.0;
-/// What the preset strip needs under the panel — its own `add_space`, a row
-/// of buttons, and the descender room a text field asks for.
-const IR_FOOT_H: f32 = 32.0;
+/// **The least the foot may be**, whatever the strip says it wants.
+///
+/// The strip's height is measured — [`preset_foot_height`] — and a
+/// measurement taken from a `Ui` that has not been given a real style yet
+/// can come back tiny. A floor under it costs nothing on a panel of any
+/// usable height and stops a foot of two points from ever being reserved.
+const IR_FOOT_MIN: f32 = 26.0;
 /// Narrower than this and the two halves stop being halves: the browser
 /// goes UNDER the controls instead of beside them, and takes the whole width
 /// while it is there.
@@ -715,7 +818,22 @@ pub struct IrLayout {
 }
 
 impl IrLayout {
-    pub fn new(rect: Rect) -> Self {
+    /// The layout for the `Ui` the panel is about to be drawn into: the rect
+    /// it has been given, and a foot measured from the preset strip that is
+    /// going to land in it.
+    ///
+    /// The one door `draw_ir` and its tests both go through, so the foot the
+    /// layout reserves and the foot the strip actually fills are the same
+    /// number by construction rather than by two people agreeing.
+    pub fn for_ui(ui: &egui::Ui) -> Self {
+        Self::new(ui.available_rect_before_wrap(), preset_foot_height(ui))
+    }
+
+    /// `foot` is what the preset strip will cost — see [`preset_foot_height`],
+    /// which is where that number comes from on every live path. Passed in
+    /// rather than looked up so this stays a pure function of two rectangles
+    /// and can be reasoned about at sizes no window ever opens at.
+    pub fn new(rect: Rect, foot: f32) -> Self {
         let nothing = Self {
             panel: rect,
             body: Rect::NOTHING,
@@ -749,7 +867,13 @@ impl IrLayout {
         // The strip at the foot is the panel's, not the browser's: it spans
         // the whole width the way it does on every other face, so the two
         // halves above it stop at its top edge.
-        let foot_h = IR_FOOT_H.min(rect.height() * 0.25);
+        //
+        // Capped at a quarter of the panel, because a foot bigger than that
+        // is a panel with no body left: on a window dragged down to nothing
+        // there is no arrangement that works and the browser is the part
+        // worth keeping. Every size a face can actually be opened at is far
+        // above that cap.
+        let foot_h = foot.max(IR_FOOT_MIN).min(rect.height() * 0.25);
         let body = Rect::from_min_max(
             rect.min,
             egui::pos2(rect.right(), rect.bottom() - foot_h),
@@ -862,6 +986,50 @@ impl IrLayout {
 /// spacing; two of them plus that is what the number is.
 const IR_STACKED_CONTROLS: f32 = 48.0;
 
+/// **The quiet ink for a row that has a FILL under it.**
+///
+/// `faint` is a ratio of ink to ground, held at 4.5:1 against the panel it
+/// was derived from — and a highlighted row is not that ground. `raised` and
+/// `hover` are steps AWAY from the panel in the direction the ink came from,
+/// so every step costs `faint` contrast: on Mono, Aurora and Moss it lands
+/// at 2.95:1, under the floor a caption has to clear, and the duration at
+/// the right of the loaded impulse's own row — the one row a person is most
+/// likely to be reading — is the thing that goes blind.
+///
+/// The header chips answer the same question by moving the SURFACE: a dead
+/// chip loses its raised ground and prints on the well instead. A row cannot
+/// do that, because its fill is what SAYS it is the loaded one or the one
+/// under the pointer. So the ink moves instead, walking back toward full
+/// strength by the least it takes — `recorder_panel::hold_ink`'s move,
+/// against a caption's floor rather than a body's, and against the surface
+/// the words are actually landing on rather than the one they were derived
+/// from.
+fn row_faint(st: &FaceStyle, on: egui::Color32) -> egui::Color32 {
+    /// A duration at the end of a row is a caption, not body text.
+    const FLOOR: f32 = 3.0;
+    if crate::recorder_panel::contrast_ratio(st.s.faint, on) >= FLOOR {
+        return st.s.faint;
+    }
+    // Toward `ink`, which is guaranteed to clear both fills — `surface_of`
+    // holds `raised` and `hover` at 4.5:1 against it — so this terminates on
+    // something readable however far it has to walk.
+    for k in 1u8..=12 {
+        let t = f32::from(k) / 12.0;
+        let mix = |a: u8, b: u8| {
+            (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8
+        };
+        let out = egui::Color32::from_rgb(
+            mix(st.s.faint.r(), st.s.ink.r()),
+            mix(st.s.faint.g(), st.s.ink.g()),
+            mix(st.s.faint.b(), st.s.ink.b()),
+        );
+        if crate::recorder_panel::contrast_ratio(out, on) >= FLOOR {
+            return out;
+        }
+    }
+    st.s.ink
+}
+
 /// Where the browser walks when the UP chip is pressed.
 ///
 /// A pure string answer, so the walk can be tested without a disk: the
@@ -911,13 +1079,13 @@ pub fn ir_where(dir: &str, root: &str) -> String {
 /// two do not compete.
 fn draw_ir(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<FaceAction> {
     let mut out = None;
-    let l = IrLayout::new(ui.available_rect_before_wrap());
+    let l = IrLayout::for_ui(ui);
     if !l.body.is_positive() {
         return None;
     }
     // Everything above the foot is drawn by hand into `l`; taking the body
-    // in one allocation is what leaves the cursor on the preset strip's own
-    // line and keeps this panel from fighting the layout above it.
+    // in one allocation is what keeps this panel from fighting the layout
+    // above it.
     ui.allocate_rect(l.body, egui::Sense::hover());
     let bold = |size: f32| egui::FontId::new(size, crate::fonts::courier_bold());
 
@@ -1008,6 +1176,23 @@ fn draw_ir(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
     }
 
     face::keep(&mut out, draw_ir_browser(ui, st, live, &l, &loaded));
+    // **The cursor is put on the foot LAST, and that is the whole of it.**
+    //
+    // Claiming the body up front is not enough, because `Ui::put` — which
+    // is how the Wizard button is drawn into its rect — advances the cursor
+    // after the child, and `Layout::advance_after_rects` SETS the cursor to
+    // the child's bottom rather than taking the further of the two. The
+    // Wizard sits at the foot of the LEFT HALF, and whenever the panel is
+    // stacked the left half ends well above the body does. So the cursor
+    // came back up into the middle of the pane and the preset strip drew
+    // itself on top of the browser, over the ".." chip, eating its clicks —
+    // at every width the face actually opens at, because the face opens
+    // stacked.
+    //
+    // Re-asserting it here means no widget drawn above can move it, whatever
+    // order they are drawn in and whatever egui does with the cursor on the
+    // way: the last word belongs to the layout.
+    ui.advance_cursor_after_rect(l.body);
     out
 }
 
@@ -1187,9 +1372,20 @@ fn draw_ir_browser(
             .into_owned();
         let here = !e.dir && path == loaded;
         let hit = ui.interact(*r, ui.id().with(("ir-row", i)), egui::Sense::click());
+        // **The row's own surface, named once**: the loaded impulse wears
+        // the raised ground, the row under the pointer the hover shade, and
+        // everything else is the pane it is drawn on. Both the fill and the
+        // ink below read this, because ink is a property of the surface it
+        // lands on and never of the row it came from.
+        let under = if here {
+            st.s.raised
+        } else if hit.hovered() {
+            st.s.hover
+        } else {
+            st.s.well
+        };
         if here || hit.hovered() {
-            ui.painter()
-                .rect_filled(*r, 1.5, if here { st.s.raised } else { st.s.hover });
+            ui.painter().rect_filled(*r, 1.5, under);
         }
         // A folder wears the pointing triangle the drumpad's explorer uses,
         // so the two lists are read the same way. The duration sits at the
@@ -1200,11 +1396,12 @@ fn draw_ir_browser(
         } else {
             format!("{:.1}s", e.seconds)
         };
+        let quiet = row_faint(st, under);
         let tail_w = if tail.is_empty() {
             0.0
         } else {
             ui.painter()
-                .layout_no_wrap(tail.clone(), bold(10.0), st.s.faint)
+                .layout_no_wrap(tail.clone(), bold(10.0), quiet)
                 .rect
                 .width()
                 + 8.0
@@ -1232,7 +1429,7 @@ fn draw_ir_browser(
                 egui::Align2::RIGHT_CENTER,
                 &tail,
                 bold(10.0),
-                st.s.faint,
+                quiet,
             );
         }
         let hit = hit.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1511,6 +1708,43 @@ mod tests {
         }
     }
 
+    /// **The style the faces are actually drawn under.**
+    ///
+    /// `dialogs::apply_theme` widens `button_padding` to the twelve-by-four
+    /// every dialog in this app wears, and that number decides where the
+    /// preset strip wraps: at egui's own four-by-one it holds one line down
+    /// to about two hundred and twenty points, and at the dialog's it gives
+    /// up around two hundred and ninety-six. Both are swept, because the
+    /// point of measuring the foot rather than naming it is that the answer
+    /// follows the style rather than a width somebody wrote down once.
+    fn padded(ctx: &egui::Context, pad: Vec2) {
+        ctx.style_mut(|s| s.spacing.button_padding = pad);
+    }
+
+    /// The layout the IR panel will actually be drawn with in a `w` × `h`
+    /// window — the same door `draw_ir` goes through, so a test that presses
+    /// at `l.browse_up.center()` presses the chip that is really there.
+    ///
+    /// It has to be this rather than `IrLayout::new(rect, ..)` with a foot
+    /// of the test's own choosing: the foot is measured off the live `Ui`,
+    /// and a test that guessed it would be testing a panel the app never
+    /// draws.
+    fn ir_layout(ctx: &egui::Context, size: Vec2) -> IrLayout {
+        let mut out = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), size)),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| out = Some(IrLayout::for_ui(ui)));
+            },
+        );
+        out.expect("the panel was never laid out")
+    }
+
     /// A folder with both kinds of row in it, one of them named far longer
     /// than any column could hold.
     fn a_folder() -> Vec<IrEntry> {
@@ -1634,19 +1868,21 @@ mod tests {
     /// panel the drumpad's shape was borrowed for.
     #[test]
     fn the_ir_parts_come_from_one_layout() {
-        for (w, h) in [
-            (1160.0f32, 700.0f32), // the widest the drumpad ever opens
-            (1000.0, 620.0),       // a drumpad-sized window
-            (620.0, 420.0),
-            (520.0, 360.0), // the last width that still splits
-            (519.0, 360.0), // and the first that stacks
-            (400.0, 300.0),
-            (296.0, 300.0), // the narrowest a dialog can be dragged to
-            (200.0, 200.0),
+        for (w, h, foot) in [
+            (1160.0f32, 700.0f32, 30.0f32), // the widest the drumpad ever opens
+            (1000.0, 620.0, 30.0),          // a drumpad-sized window
+            (620.0, 420.0, 30.0),
+            (520.0, 360.0, 30.0), // the last width that still splits
+            (519.0, 360.0, 30.0), // and the first that stacks
+            (400.0, 300.0, 30.0),
+            (296.0, 300.0, 56.0), // the narrowest a dialog can be dragged to,
+            (296.0, 300.0, 30.0), // where the strip wraps and where it does not
+            (200.0, 200.0, 56.0),
+            (200.0, 200.0, 0.0), // a foot nobody measured: the floor holds
         ] {
             let rect = Rect::from_min_size(egui::pos2(17.0, 23.0), Vec2::new(w, h));
-            let l = IrLayout::new(rect);
-            let at = format!("{w}x{h}");
+            let l = IrLayout::new(rect, foot);
+            let at = format!("{w}x{h} foot {foot}");
             assert!(l.body.is_positive(), "{at}: no body");
             // The panel divides into a body and a foot, with nothing lost
             // between them — the preset strip's room is the foot.
@@ -1721,17 +1957,19 @@ mod tests {
     /// read, not two rows and a scrollbar.
     #[test]
     fn a_drumpad_sized_panel_lists_a_folder_whole() {
-        let l = IrLayout::new(Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            Vec2::new(1000.0, 620.0),
-        ));
+        let l = IrLayout::new(
+            Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(1000.0, 620.0)),
+            32.0,
+        );
         assert!(!l.stacked, "a wide panel should split");
         assert!(l.browse.width() > 380.0, "the browser is a sliver: {:?}", l.browse);
         assert!(l.browse_rows().len() >= 20, "only {} rows", l.browse_rows().len());
         // And a panel dragged well under the drumpad's own floor still has a
         // browser — the whole width of one, stacked under the controls.
-        let narrow =
-            IrLayout::new(Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 360.0)));
+        let narrow = IrLayout::new(
+            Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 360.0)),
+            32.0,
+        );
         assert!(narrow.stacked, "a narrow panel should stack");
         assert!(
             (narrow.browse.width() - 400.0).abs() < 0.01,
@@ -1745,10 +1983,13 @@ mod tests {
     /// lays out. A panel whose foot is at infinity draws nothing.
     #[test]
     fn an_infinite_rect_still_lays_out() {
-        let l = IrLayout::new(Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            Vec2::new(f32::INFINITY, f32::INFINITY),
-        ));
+        let l = IrLayout::new(
+            Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                Vec2::new(f32::INFINITY, f32::INFINITY),
+            ),
+            32.0,
+        );
         assert!(l.body.is_positive());
         assert!(l.body.width().is_finite() && l.body.height().is_finite());
         assert!(!l.browse_rows().is_empty());
@@ -1840,7 +2081,7 @@ mod tests {
         let st = a_test_style();
         let size = Vec2::new(1000.0, 620.0);
         let mut live = a_full_face("@tangent-ir", 2);
-        let l = IrLayout::new(Rect::from_min_size(egui::pos2(0.0, 0.0), size));
+        let l = ir_layout(&ctx, size);
         let rows = l.browse_rows();
         // The panel opens where the app put it: the IRs folder.
         assert_eq!(live.ir_dir, "/m/IRs");
@@ -1870,7 +2111,7 @@ mod tests {
         let st = a_test_style();
         let size = Vec2::new(1000.0, 620.0);
         let mut live = a_full_face("@tangent-ir", 2);
-        let l = IrLayout::new(Rect::from_min_size(egui::pos2(0.0, 0.0), size));
+        let l = ir_layout(&ctx, size);
         let rows = l.browse_rows();
         // Row 2 is the first file; rows 0 and 1 are the folders.
         assert!(!live.ir_entries[2].dir);
@@ -1908,9 +2149,9 @@ mod tests {
     /// The long name is the one that would run off the right if it were
     /// printed whole, and the bottom edge is checked here and nowhere else
     /// because this is the only face that fills the rect it is given rather
-    /// than stacking down it: its foot is a number (`IR_FOOT_H`) that has to
-    /// be enough for the preset strip that lands in it, and a foot that was
-    /// a point short would push the strip off the bottom of the window.
+    /// than stacking down it: its foot has to be enough for the preset strip
+    /// that lands in it — see `preset_foot_height` — and a foot a point short
+    /// would push the strip off the bottom of the window.
     #[test]
     fn an_empty_folder_and_an_absurd_filename_both_lay_out() {
         let ctx = a_test_ctx();
@@ -1931,6 +2172,205 @@ mod tests {
     }
 
 
+
+    /// **The preset strip can never land inside the browser.**
+    ///
+    /// Three lanes built this panel at once and each assumed another had
+    /// done the sizing, and this is where it showed: `draw_ir` allocates the
+    /// body up front so the cursor lands on the foot, and then draws the
+    /// Wizard with `ui.put`, which advances the cursor AFTER its child —
+    /// `Layout::advance_after_rects` sets the cursor to that child's bottom
+    /// rather than taking the further of the two. The Wizard sits at the
+    /// foot of the LEFT HALF, so on every stacked width — which is every
+    /// width the face actually opens at — the cursor came back up into the
+    /// middle of the pane and the strip drew itself across the browser.
+    ///
+    /// The contract is the cursor, so that is what this asks, at a walk of
+    /// widths either side of the split rather than at one size: after the
+    /// panel has drawn, the next thing to be laid out starts at the foot.
+    #[test]
+    fn the_preset_strip_never_lands_inside_the_browser_at_any_width() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let mut bad: Vec<String> = Vec::new();
+        let mut stacked = 0;
+        for pad in [Vec2::new(4.0, 1.0), Vec2::new(12.0, 4.0)] {
+            padded(&ctx, pad);
+            for w in [
+                200.0f32, 260.0, 296.0, 340.0, 400.0, 460.0, 519.0, 520.0, 560.0,
+                700.0, 900.0, 1160.0,
+            ] {
+                for h in [300.0f32, 420.0, 620.0, 700.0] {
+                    let mut live = a_full_face("@tangent-ir", 2);
+                    let mut seen = None;
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                egui::pos2(0.0, 0.0),
+                                Vec2::new(w, h),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::NONE)
+                                .show(ctx, |ui| {
+                                    let l = IrLayout::for_ui(ui);
+                                    let _ = draw_ir(ui, &st, &mut live);
+                                    seen = Some((l, ui.cursor().top()));
+                                });
+                        },
+                    );
+                    let (l, cursor) = seen.expect("the panel never drew");
+                    if l.stacked {
+                        stacked += 1;
+                    }
+                    if cursor < l.body.bottom() - 0.01 {
+                        bad.push(format!(
+                            "{pad:?} {w}x{h}: the strip starts at {cursor:.1}, \
+                             {:.1} points inside a pane that ends at {:.1}",
+                            l.body.bottom() - cursor,
+                            l.body.bottom(),
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(stacked > 0, "no width in the sweep stacks, so this proves nothing");
+        assert!(
+            bad.is_empty(),
+            "the preset strip is drawn over the browser:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
+    /// **And the ".." chip still takes a press with the strip under it.**
+    ///
+    /// The cost of the fault above, said the way the owner would meet it: a
+    /// strip drawn across the header is a strip whose own widgets are on
+    /// top of the chip, and egui gives a click to the last thing registered
+    /// at the point — so the browser lost the one control that gets it back
+    /// out of a folder. A stacked panel, which is what the face opens as.
+    #[test]
+    fn the_up_chip_still_walks_out_of_a_folder_with_the_strip_below_it() {
+        let ctx = a_test_ctx();
+        padded(&ctx, Vec2::new(12.0, 4.0));
+        let st = a_test_style();
+        for size in [
+            Vec2::new(400.0, 420.0),
+            Vec2::new(460.0, 620.0),
+            Vec2::new(519.0, 500.0),
+        ] {
+            let l = ir_layout(&ctx, size);
+            assert!(l.stacked, "{size:?} is not a stacked panel");
+            let mut live = a_full_face("@tangent-ir", 2);
+            live.ir_dir = "/m/IRs/Cabs".to_owned();
+            let _ = press(&ctx, &st, &mut live, size, l.browse_up.center());
+            assert_eq!(
+                live.ir_dir, "/m/IRs",
+                "{size:?}: the UP chip took no press — \
+                 something is drawn on top of it"
+            );
+        }
+    }
+
+    /// **The foot reserves what the strip actually takes.**
+    ///
+    /// `IR_FOOT_H` was a flat thirty-two points, guessed once from a strip
+    /// on one line under one style — the same four-fixed-numbers disease
+    /// `preset_strip` had already been cured of. A strip that wraps needs
+    /// half again as much, and what it does not get it takes: the whole face
+    /// runs off the bottom of the window it was handed.
+    ///
+    /// So this sweeps into the widths where the row really does wrap, under
+    /// both styles, and asserts that it does — a sweep that never wrapped
+    /// would pass against the bug it is meant to indict.
+    #[test]
+    fn the_foot_reserves_what_the_preset_strip_actually_takes() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let mut bad: Vec<String> = Vec::new();
+        let mut wrapped = 0;
+        for pad in [Vec2::new(4.0, 1.0), Vec2::new(12.0, 4.0)] {
+            padded(&ctx, pad);
+            for w in [
+                160.0f32, 180.0, 200.0, 220.0, 240.0, 260.0, 280.0, 296.0, 300.0,
+                340.0, 400.0, 520.0, 700.0, 1000.0,
+            ] {
+                let h = 620.0;
+                // What the layout reserves, against what the strip really
+                // takes when it is drawn at that width. The reservation
+                // starts one `item_spacing` above the strip, because that is
+                // where the body's own allocation leaves the cursor.
+                let mut seen = None;
+                let mut live = a_full_face("@tangent-ir", 2);
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            Vec2::new(w, h),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                let reserved = preset_foot_height(ui);
+                                let lines = preset_parts(ui, ui.available_width()).lines;
+                                let gap = ui.spacing().item_spacing.y;
+                                let drew = ui
+                                    .scope(|ui| {
+                                        let _ = preset_strip(ui, &st, &mut live);
+                                    })
+                                    .response
+                                    .rect
+                                    .height();
+                                seen = Some((reserved, lines, gap + drew));
+                            });
+                    },
+                );
+                let (reserved, lines, took_foot) = seen.expect("the strip never drew");
+                if lines > 1 {
+                    wrapped += 1;
+                }
+                if reserved < took_foot - 0.01 {
+                    bad.push(format!(
+                        "{pad:?} {w} wide, strip on {lines}: reserved {reserved:.1} \
+                         for a foot that takes {took_foot:.1}"
+                    ));
+                }
+                let mut live = a_full_face("@tangent-ir", 2);
+                let (took, painted) = extent(&ctx, w, h, &mut |ui| {
+                    let _ = draw(ui, &st, &mut live);
+                });
+                let panel =
+                    Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(w, h)).expand(1.0);
+                if !panel.contains_rect(took) {
+                    bad.push(format!(
+                        "{pad:?} {w} wide, strip on {lines}: took to {:.1} of {h}",
+                        took.bottom()
+                    ));
+                }
+                if !panel.contains_rect(painted) {
+                    bad.push(format!(
+                        "{pad:?} {w} wide, strip on {lines}: painted to {:.1} of {h}",
+                        painted.bottom()
+                    ));
+                }
+            }
+        }
+        assert!(
+            wrapped > 0,
+            "no width in the sweep wraps the strip, so this proves nothing"
+        );
+        assert!(
+            bad.is_empty(),
+            "the face runs out of the window it was given:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
     /// **The list does not flinch when it is pressed.**
     ///
     /// `face::a_dragged_row_never_moves_the_rows_under_it` is the same
@@ -1949,7 +2389,7 @@ mod tests {
         let st = a_test_style();
         let size = Vec2::new(1000.0, 620.0);
         let mut live = a_full_face("@tangent-ir", 2);
-        let l = IrLayout::new(Rect::from_min_size(egui::pos2(0.0, 0.0), size));
+        let l = ir_layout(&ctx, size);
         let at = l.browse_rows()[4].center();
         let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), size);
         let mut counts = Vec::new();
@@ -2017,7 +2457,7 @@ mod tests {
         // A short panel, so a listing of thirty-three has somewhere to go.
         let size = Vec2::new(1000.0, 260.0);
         let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), size);
-        let l = IrLayout::new(screen);
+        let l = ir_layout(&ctx, size);
         let over = l.browse_list.center();
         let mut live = a_full_face("@tangent-ir", 2);
         let rows = l.browse_rows().len();
@@ -2075,6 +2515,9 @@ mod tests {
     #[test]
     fn the_ir_browser_wears_every_theme_legibly() {
         let mut bad: Vec<String> = Vec::new();
+        // Every theme the app ships, and the count is asserted so a sweep
+        // cannot quietly shrink to the handful somebody happened to look at.
+        assert_eq!(crate::theme::factory().len(), 19, "the theme list moved");
         for theme in crate::theme::factory() {
             for dark in [false, true] {
                 let mut set = crate::settings::Settings::default();
@@ -2107,6 +2550,28 @@ mod tests {
                 // and the answer to that is to move the SURFACE.
                 check("a header chip", st.s.raised, st.s.well, 1.1);
                 check("a chip with nowhere to go", st.s.faint, st.s.well, 3.0);
+                // **The duration at the end of a row, on the row's OWN
+                // fill.** This is the pairing the browser actually failed
+                // on and the one the first sweep never asked about: it
+                // checked `faint` on the well and `ink` on the two
+                // highlights, and never `faint` on a highlight. Plain
+                // `faint` measures 2.95:1 on `raised` and as little as
+                // 2.42:1 on `hover` — the loaded impulse's own row, the one
+                // row somebody is most likely to be reading, with its
+                // length gone. `row_faint` is what moves, and this measures
+                // what it hands back rather than trusting it.
+                for (what, on) in [
+                    ("the loaded row", st.s.raised),
+                    ("the hovered row", st.s.hover),
+                    ("a plain row", st.s.well),
+                ] {
+                    check(
+                        &format!("the duration on {what}"),
+                        row_faint(&st, on),
+                        on,
+                        3.0,
+                    );
+                }
             }
         }
         assert!(
