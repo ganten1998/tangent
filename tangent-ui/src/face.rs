@@ -159,6 +159,41 @@ pub fn lcd_text(
     painter.text(at, align, text, FontId::monospace(size), lcd_ink(st, tier));
 }
 
+/// The floor a quiet word has to clear on whatever it is printed on. A
+/// caption is not the story, but a caption nobody can read is not a caption.
+const QUIET_FLOOR: f32 = 3.0;
+
+/// **A quiet word, held readable on the ground it is actually printed on.**
+///
+/// `Surface::faint` is a ratio of the panel's ink to the panel's GROUND, so
+/// it clears its floor there by construction and nowhere else. A raised
+/// button is a step back toward the ink — that step is what makes it read as
+/// raised — so every point of relief it gains costs the quiet ink contrast.
+/// On Mono a `faint` word on `raised` measures 2.95:1, which is under the
+/// floor, and Aurora and Moss do the same thing.
+///
+/// The dead-zone law says the SURFACE moves when the ink cannot clear it, and
+/// where the surface is free to move that is still the answer: the IR
+/// browser's dead header chips drop their raised ground rather than dimming
+/// their word, and look flatter for it, which is what they are. A LIVE
+/// control cannot take that road — a button that gave up its ground to stay
+/// readable has stopped saying it is a button — so here the INK moves
+/// instead, walking back toward the panel's own ink until it clears.
+/// Hierarchy is sacrificed before legibility, in that order, which is the
+/// same bargain [`FaceStyle::new`] already settles for the glass tiers.
+///
+/// On every theme where `faint` already clears, this returns it unchanged and
+/// not one pixel moves.
+pub fn quiet_ink(st: &FaceStyle, on: Color32) -> Color32 {
+    let mut c = st.s.faint;
+    let mut t = 0.0_f32;
+    while contrast_ratio(c, on) < QUIET_FLOOR && t < 1.0 {
+        t += 0.05;
+        c = lerp(st.s.faint, st.s.ink, t);
+    }
+    c
+}
+
 /// The size at which `widest` fits `r` — the cluster's rule: size against
 /// the widest reading a field can ever show, so the digits never resize as
 /// the value moves. Monospace advance is ~0.60 of the point size.
@@ -175,6 +210,28 @@ pub fn fit_mono(r: Rect, widest: &str, nominal: f32) -> f32 {
 /// 0.86), which is also the fader rows'.
 const LABEL_W: f32 = 0.34;
 const READING_W: f32 = 0.19;
+
+/// How tall a kit row is drawn.
+///
+/// Named rather than spelled three times, because it is not only the number
+/// [`slider_row`] and [`stepped_row`] hand to `add_sized` — it is what a
+/// panel has to know to work out whether its rows will fit the window it
+/// was given. `faces_amp::amp_floor_cost` is the first caller that needs it
+/// from outside, and asking a panel to re-guess this figure is how a layout
+/// comes to be built out of numbers that were true once.
+///
+/// A floor rather than a height: `add_sized` takes the LARGER of what it is
+/// handed and what the widget's own galley needs, so a font whose eleven
+/// point line runs taller than this makes the row taller with it. Anything
+/// budgeting against this must take the same maximum.
+pub const ROW_H: f32 = 18.0;
+
+/// The narrowest the stepped row's back chevron is drawn — a floor under a
+/// measurement, not a width. What it actually costs is its glyph plus the
+/// theme's button padding, which is wider than this on every style the app
+/// ships; see [`stepped_row`] for what happened when the row subtracted a
+/// guess instead of asking.
+const BACK_W: f32 = 22.0;
 
 /// Keep the FIRST wish of the frame — having DRAWN every row that could have
 /// made one.
@@ -303,7 +360,7 @@ pub fn slider_row(
         let w = ui.available_width();
         let bold = |size: f32| FontId::new(size, fonts::courier_bold());
         ui.add_sized(
-            Vec2::new(w * LABEL_W, 18.0),
+            Vec2::new(w * LABEL_W, ROW_H),
             egui::Label::new(
                 egui::RichText::new(name).font(bold(11.0)).color(st.s.ink),
             ),
@@ -389,22 +446,61 @@ pub fn stepped_row(
         let w = ui.available_width();
         let bold = |size: f32| FontId::new(size, fonts::courier_bold());
         ui.add_sized(
-            Vec2::new(w * LABEL_W, 18.0),
+            Vec2::new(w * LABEL_W, ROW_H),
             egui::Label::new(
                 egui::RichText::new(name).font(bold(11.0)).color(st.s.ink),
             ),
         );
+        // **The forty this row used to subtract was a guess, and it stopped
+        // being right the day the dialogs took Qt's button padding.**
+        //
+        // The chevron beside the body is `add_sized(22)`, and `add_sized`
+        // only ASKS: egui sizes a button from its own galley plus the
+        // theme's padding and takes the LARGER of that and what it was
+        // handed. `dialogs::apply_theme` sets that padding to twelve points
+        // a side, so the chevron is about thirty-one wide however small a
+        // number this row hands it — and forty was never going to cover
+        // thirty-one plus two gaps. Every stepped row on the shelf ran
+        // seven or eight points off the right of its panel at EVERY width,
+        // the EQ's three band-type rows most visibly, and it was invisible
+        // for the same reason the preset strip's Save button was: egui
+        // clips rather than overdraws.
+        //
+        // So both parts are measured. The chevron is asked what it costs,
+        // the gaps are the style's own, and the body takes the rest — and
+        // the body's word is CUT to that rest, because a button is no
+        // narrower than its own text and "high shelf" on a dragged-in EQ is
+        // wider than the room. The whole choice is on the hover, where the
+        // gesture text already was.
+        let gap = ui.spacing().item_spacing.x;
+        let word = |text: &str, f: FontId| {
+            ui.painter()
+                .layout_no_wrap(text.to_owned(), f, Color32::WHITE)
+                .rect
+                .width()
+        };
+        let pad = ui.spacing().button_padding.x * 2.0;
+        let back_w = (word("\u{2039}", bold(11.0)) + pad).max(BACK_W);
+        let body_w = (w * (1.0 - LABEL_W) - back_w - gap * 2.0).max(0.0);
         let body = ui
             .add_sized(
-                Vec2::new(w * (1.0 - LABEL_W) - 40.0, 18.0),
+                Vec2::new(body_w, ROW_H),
                 egui::Button::new(
-                    egui::RichText::new(choice).font(bold(10.0)).color(st.s.ink),
+                    egui::RichText::new(crate::drumpad_panel::cut_text(
+                        ui.painter(),
+                        (body_w - pad).max(0.0),
+                        choice,
+                        &bold(10.0),
+                    ))
+                    .font(bold(10.0))
+                    .color(st.s.ink),
                 )
                 .fill(st.s.raised),
             )
-            .on_hover_text(
-                "click to cycle; right-click steps back; alt-click resets",
-            );
+            .on_hover_text(format!(
+                "{choice} - click to cycle; right-click steps back; \
+                 alt-click resets"
+            ));
         if alt_home_gesture(&body) {
             out = Some(StepAsk::Home);
         } else if body.secondary_clicked() {
@@ -412,10 +508,16 @@ pub fn stepped_row(
         } else if body.clicked() {
             out = Some(StepAsk::By(1));
         }
+        // The chevron is quieter than the word beside it on purpose — the
+        // click on the body is the gesture, this is the way back — but it
+        // is printed on the RAISED ground, not the panel's, so its ink is
+        // held to that. See [`quiet_ink`].
         let back = ui.add_sized(
-            Vec2::new(22.0, 18.0),
+            Vec2::new(back_w, ROW_H),
             egui::Button::new(
-                egui::RichText::new("‹").font(bold(11.0)).color(st.s.faint),
+                egui::RichText::new("‹")
+                    .font(bold(11.0))
+                    .color(quiet_ink(st, st.s.raised)),
             )
             .fill(st.s.raised),
         );
@@ -924,6 +1026,362 @@ pub fn vectorscope(painter: &Painter, r: Rect, st: &FaceStyle, frames: &[(f32, f
     }
 }
 
+/// The shared harness for "does this panel stay inside the window a person
+/// can put it at", and for "does its ink read on the surface it landed on".
+///
+/// Both questions are asked of every face, and the amp asks the first one of
+/// itself as well, so the apparatus lives here rather than in one panel's
+/// test module. Both are answered off the SHAPE STREAM — what egui was
+/// actually told to paint — because that is the only place the answer is
+/// not a restatement of the code being tested. A layout that returns the
+/// right rectangle and then paints outside it looks perfect to every
+/// assertion made against its own arithmetic.
+#[cfg(test)]
+pub(crate) mod fit {
+    use super::*;
+
+    /// The plugin margin `dialogs` puts inside every face window.
+    ///
+    /// Spelled here rather than read, because `dialogs::PLUGIN_MARGIN` is
+    /// private to that module and this crate's firewall gives no other road
+    /// to it. It is the one number in this harness that can drift: if the
+    /// dialogs ever change their margin these sweeps go on measuring the old
+    /// one, and they will do it in the safe direction — a bigger real margin
+    /// makes a green sweep still green, a smaller one makes it optimistic.
+    /// Whoever changes `PLUGIN_MARGIN` changes this with it.
+    pub const MARGIN: f32 = 12.0;
+
+    /// Dress egui's own widgets the way the face window does before it draws
+    /// a face.
+    ///
+    /// `dialogs::apply_theme` is private to that module, so this restates
+    /// the derivation rather than calling it — and it is a derivation, not a
+    /// palette: a button's ground is the surface's `raised`, a typed field's
+    /// is its `well`, the page is `bg` and the text is `ink`, all read off
+    /// the same [`Surface`] the face itself is handed. Both halves of this
+    /// harness need it and for different reasons. The fit sweeps need it
+    /// because the app's button padding is twelve by four against egui's own
+    /// six by three, and padding is width; the ink sweep needs it because a
+    /// combo box paints its own frame, and measuring the panel's ink against
+    /// egui's stock grey would be measuring a window nobody has.
+    pub fn dress(style: &mut egui::Style, s: &Surface) {
+        style.spacing.button_padding = Vec2::new(12.0, 4.0);
+        for wv in [
+            &mut style.visuals.widgets.inactive,
+            &mut style.visuals.widgets.hovered,
+            &mut style.visuals.widgets.active,
+            &mut style.visuals.widgets.open,
+        ] {
+            wv.bg_fill = s.raised;
+            wv.weak_bg_fill = s.raised;
+            wv.bg_stroke = Stroke::new(1.0, s.edge);
+            wv.fg_stroke = Stroke::new(1.0, s.ink);
+            wv.expansion = 0.0;
+        }
+        style.visuals.widgets.hovered.bg_fill = s.hover;
+        style.visuals.widgets.hovered.weak_bg_fill = s.hover;
+        style.visuals.widgets.noninteractive.bg_fill = s.bg;
+        style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, s.ink);
+        style.visuals.window_fill = s.bg;
+        style.visuals.extreme_bg_color = s.well;
+        style.visuals.override_text_color = None;
+    }
+
+    /// One frame of a face, drawn the way `dialogs`' face window draws it,
+    /// into a window `window` points across.
+    ///
+    /// The chain is the real one and each link costs height: a face is a
+    /// PLUGIN window, so it wears `shell`'s own title bar rather than the
+    /// OS's and loses [`crate::shell::CHROME_BAR_H`] off the top; then the
+    /// plugin margin on all four sides; then the unit's strap-line and the
+    /// air under it, which `dialogs` prints above every face. A sweep that
+    /// handed the face the whole window would be measuring a panel nobody
+    /// ever sees.
+    ///
+    /// Returns how far the face escaped to the right and below the room it
+    /// was given — zero or less when it stayed inside.
+    pub fn escape(
+        ctx: &egui::Context,
+        window: Vec2,
+        about: &str,
+        s: &Surface,
+        body: &mut dyn FnMut(&mut egui::Ui),
+    ) -> (f32, f32) {
+        let room = Vec2::new(window.x, window.y - crate::shell::CHROME_BAR_H);
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), room);
+        let mut took = Rect::NOTHING;
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        dress(ui.style_mut(), s);
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin::same(MARGIN as i8))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(about)
+                                        .font(FontId::new(10.0, fonts::courier_bold())),
+                                );
+                                ui.add_space(4.0);
+                                took = ui.scope(&mut *body).response.rect;
+                            });
+                    });
+            },
+        );
+        // **The allocation is one question and what got PAINTED is the
+        // other.** A row that asked for more room than the panel has is a
+        // layout fault and shows up in `took`; a widget allocated correctly
+        // and then drawn past its allocation — which is what a button whose
+        // text will not fit does — shows up only in the shapes. egui CLIPS
+        // the second kind, so it leaves no trace in the picture at all
+        // except the part that is missing, which is exactly why the owner
+        // had to report it rather than a test catching it.
+        let mut painted = Rect::NOTHING;
+        for cs in &out.shapes {
+            let b = cs.shape.visual_bounding_rect();
+            if b.is_positive() && b.max.is_finite() {
+                painted = painted.union(b);
+            }
+        }
+        (
+            painted.right().max(took.right()) - room.x,
+            painted.bottom().max(took.bottom()) - room.y,
+        )
+    }
+
+    /// Every word one frame of a face painted, each with the surface it
+    /// actually landed on.
+    ///
+    /// The answer comes off the shape stream and not off the code: egui is
+    /// handed shapes in paint order, so the ground under a word is the LAST
+    /// opaque rectangle painted before it that contains it, and the panel's
+    /// own ground when nothing does. That is the only way to ask the
+    /// question the theme law actually poses — ink is a property of the
+    /// surface it lands on, never of the role it was fetched from — because
+    /// a test that reads the palette instead is a test that agrees with
+    /// whatever the drawing code does.
+    ///
+    /// Semi-transparent fills are skipped rather than composited: the kit
+    /// paints its surfaces opaque, and a blend guessed here would be a
+    /// second implementation of something egui already owns.
+    pub fn ink_on_its_surface(
+        ctx: &egui::Context,
+        window: Vec2,
+        about: &str,
+        s: &Surface,
+        body: &mut dyn FnMut(&mut egui::Ui),
+    ) -> Vec<(Color32, Color32, String)> {
+        let ground = s.bg;
+        let room = Vec2::new(window.x, window.y - crate::shell::CHROME_BAR_H);
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), room)),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        dress(ui.style_mut(), s);
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin::same(MARGIN as i8))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(about)
+                                        .font(FontId::new(10.0, fonts::courier_bold())),
+                                );
+                                ui.add_space(4.0);
+                                body(ui);
+                            });
+                    });
+            },
+        );
+        let mut surfaces: Vec<(Rect, Color32)> = Vec::new();
+        let mut words: Vec<(Color32, Color32, String)> = Vec::new();
+        fn walk(
+            shape: &egui::Shape,
+            surfaces: &mut Vec<(Rect, Color32)>,
+            words: &mut Vec<(Color32, Color32, String)>,
+            ground: Color32,
+        ) {
+            match shape {
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, surfaces, words, ground);
+                    }
+                }
+                egui::Shape::Rect(r) => {
+                    if r.fill.a() == 255 && r.rect.is_positive() && r.rect.max.is_finite() {
+                        surfaces.push((r.rect, r.fill));
+                    }
+                }
+                egui::Shape::Text(t) => {
+                    let box_ = Rect::from_min_size(t.pos, t.galley.rect.size());
+                    let under = surfaces
+                        .iter()
+                        .rev()
+                        .find(|(r, _)| r.contains_rect(box_))
+                        .map_or(ground, |&(_, c)| c);
+                    let ink = t.override_text_color.or_else(|| {
+                        t.galley.job.sections.first().map(|s| s.format.color)
+                    });
+                    if let Some(ink) = ink {
+                        if ink.a() == 255 {
+                            words.push((ink, under, t.galley.text().to_owned()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for cs in &out.shapes {
+            walk(&cs.shape, &mut surfaces, &mut words, ground);
+        }
+        words
+    }
+
+    /// A face with everything a panel can be asked to draw pushed into it:
+    /// the real parameter count from the engine's own spec table, the
+    /// longest name and reading any unit prints, a full pedalboard wearing
+    /// the longest label a chip can carry, a saved preset, and a folder of
+    /// impulses. A sweep run against an EMPTY face measures the one picture
+    /// that was never going to overflow.
+    pub fn a_worst_case_face(
+        path: &str,
+        params: usize,
+        stepped: &[u32],
+        pedals: bool,
+    ) -> crate::faces::FaceLive {
+        crate::faces::FaceLive {
+            face: crate::ports::BuiltinFace {
+                path: path.to_owned(),
+                params: (0..params as u32)
+                    .map(|i| crate::ports::BuiltinFaceParam {
+                        id: i,
+                        symbol: format!("p{i}"),
+                        // "Detector HPF" and "high shelf" are the longest
+                        // name and the longest reading in `builtin_fx`'s
+                        // tables today. Every row wears them, which no real
+                        // unit does — a floor under the real panels, not a
+                        // picture of one.
+                        name: "Detector HPF".to_owned(),
+                        units: "Hz".to_owned(),
+                        default: 0.25,
+                        reading: "high shelf".to_owned(),
+                        choices: if stepped.contains(&i) {
+                            vec!["high shelf".to_owned(), "Listening".to_owned()]
+                        } else {
+                            Vec::new()
+                        },
+                        steps: i32::from(stepped.contains(&i)) * 2,
+                        value: 0.5,
+                    })
+                    .collect(),
+                curve_db: vec![0.0; CURVE_POINTS],
+                ..Default::default()
+            },
+            // The last seat is left EMPTY on purpose: an empty chip wears
+            // the quiet ink where a filled one wears the panel's, so a
+            // board of seven filled chips is a board with one of the two
+            // inks never drawn — and it is the quiet one, which is the one
+            // that has a floor to miss.
+            pedals: pedals.then(|| {
+                std::array::from_fn(|i| {
+                    if i + 1 == crate::recorder::AMP_PEDALS {
+                        String::new()
+                    } else {
+                        "compresso\u{2026}".to_owned()
+                    }
+                })
+            }),
+            preset_rows: vec![crate::ports::PresetRow {
+                name: "a saved sound".to_owned(),
+                path: "/p/a.tanfx".to_owned(),
+            }],
+            preset_name: "typed".to_owned(),
+            ir_root: "/m/IRs".to_owned(),
+            ir_dir: "/m/IRs".to_owned(),
+            ir_entries: (0..40)
+                .map(|i| crate::faces::IrEntry {
+                    name: format!("cab-{i:02}.wav"),
+                    dir: false,
+                    seconds: 0.5,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// One face's shape as this harness needs it: the sentinel, how many
+    /// parameters the engine declares for it, which of those are stepped,
+    /// whether its seat carries a pedalboard, and the two windows it lives
+    /// between. Named because the tuple has six parts and an unnamed
+    /// six-tuple is a shape nobody can read at the call site.
+    pub type FaceShape = (&'static str, usize, &'static [u32], bool, Vec2, Vec2);
+
+    /// Every suite face, with the parameter count and the stepped ids the
+    /// engine's `builtin_fx` spec tables actually declare, the window it
+    /// OPENS at (`dialogs::FACE_SIZES`' floor, which is the size it gets on
+    /// any display too small to earn more) and the window it can grow to.
+    ///
+    /// The counts are restated rather than imported because `tangent-ui`
+    /// cannot see the `tangent` crate — the firewall that keeps a plugin
+    /// build from linking the engine. `faces::every_suite_unit_routes_to_a_face`
+    /// already pins the paths against the same table; this pins the shapes.
+    pub const FACES: &[FaceShape] = &[
+        ("@tangent-eq", 15, &[0, 1, 5, 6, 10, 11], false, Vec2::new(470.0, 470.0), Vec2::new(752.0, 752.0)),
+        ("@tangent-imager", 3, &[], false, Vec2::new(340.0, 480.0), Vec2::new(544.0, 768.0)),
+        ("@tangent-tape", 6, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
+        ("@tangent-comp", 7, &[], false, Vec2::new(400.0, 430.0), Vec2::new(640.0, 688.0)),
+        ("@tangent-denoise", 6, &[0, 5], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
+        ("@tangent-amp", 9, &[0, 5], true, Vec2::new(540.0, 360.0), Vec2::new(864.0, 576.0)),
+        ("@tangent-drive", 4, &[3], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
+        ("@tangent-trem", 3, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
+        ("@tangent-chorus", 5, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
+        ("@tangent-echo", 4, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
+        ("@tangent-plate", 4, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
+        ("@tangent-wah", 4, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
+        ("@tangent-ir", 2, &[], false, Vec2::new(600.0, 400.0), Vec2::new(1160.0, 620.0)),
+    ];
+
+    /// The smallest a face may be DRAGGED to — `dialogs::face_min_size`,
+    /// which answers a flat 320 by 300 for every face but the IR browser.
+    pub fn drag_minimum(path: &str) -> Vec2 {
+        if path == "@tangent-ir" {
+            Vec2::new(640.0, 400.0)
+        } else {
+            Vec2::new(320.0, 300.0)
+        }
+    }
+
+    /// A context with one of the three fonts a person can choose installed.
+    /// The font is an axis of this question and not a detail: a nine-point
+    /// caption is ten points tall on Courier Prime and twelve on JetBrains
+    /// Mono, and the amp's whole margin at its own window was five.
+    pub fn a_ctx(font: fonts::FontChoice) -> egui::Context {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, font, None);
+        fonts::apply_text_styles(&ctx);
+        ctx
+    }
+
+    pub const FONTS: [fonts::FontChoice; 3] = [
+        fonts::FontChoice::Courier,
+        fonts::FontChoice::Terminess,
+        fonts::FontChoice::JetBrains,
+    ];
+
+    /// A point of slack, because egui justifies a widget to a fractional
+    /// width and rounds the galley it lays out inside it. A sub-pixel
+    /// overhang is arithmetic; the faults these sweeps pin ran to a hundred.
+    pub const SLACK: f32 = 1.0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1207,8 +1665,8 @@ mod tests {
     /// layout, so every gesture test dresses itself the same way.
     fn a_test_ctx() -> egui::Context {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
-        crate::fonts::apply_text_styles(&ctx);
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
         ctx
     }
 
@@ -1838,6 +2296,264 @@ mod tests {
             seen.iter().all(|s| *s == at_rest),
             "the EQ face is not the face it was at rest while a node is \
              dragged - (auto ids consumed, content rect) per frame: {seen:#?}"
+        );
+    }
+
+    // ── the panels stay inside their windows ────────────────────────────────
+
+    /// **Every face fits the window it opens at, on every font, at both ends
+    /// of the size it is allowed to be.**
+    ///
+    /// The owner's report was "menus that are cut off in them (cut off on the
+    /// right side): Imager, Amp". The shared cause was the preset strip, built
+    /// out of four fixed numbers that came to more than the Imager's whole
+    /// window; the amp had a second one of its own in seven pedal chips that
+    /// could not be sized below their own text. Both are fixed, and this is
+    /// the sweep that says so for the WHOLE shelf rather than the two panels
+    /// somebody happened to open — thirteen faces, not the six the first sweep
+    /// reached, and the seven that route through the generic rows are exactly
+    /// the ones nobody had ever measured.
+    ///
+    /// Three things this asks that the first sweep did not, each of which
+    /// found something:
+    ///
+    /// * **The window is the real one.** Not a bare width, but the size
+    ///   `dialogs::FACE_SIZES` opens that unit at, less the in-house title
+    ///   bar, the plugin margin and the strap-line above the panel. A face
+    ///   handed its whole window is a face measured in a room it never gets.
+    /// * **Downwards as well as sideways.** There is no scroll area under a
+    ///   face on the desktop path, so a panel taller than its window is drawn
+    ///   and unreachable, which is the same failure the owner reported wearing
+    ///   a different direction. The amp ran four points past its own window
+    ///   here, with nothing dragged, and nothing said so.
+    /// * **All three fonts, dressed as the app dresses them.** A nine-point
+    ///   caption is ten points tall on Courier Prime and twelve on JetBrains
+    ///   Mono, and `dialogs::apply_theme` gives every button twelve points of
+    ///   padding a side against egui's own six — so the amp's four points
+    ///   past became twenty, and the EQ's band-type rows ran eight off the
+    ///   right at EVERY width. A sweep run on stock egui in the default font
+    ///   is a sweep of a window nobody has. See [`fit::dress`].
+    #[test]
+    fn every_face_fits_the_window_it_opens_at() {
+        let set = crate::settings::Settings::default();
+        let p = crate::recorder_panel::palette(&set);
+        let st = FaceStyle::new(p.bg, p.lcd, p.lcd_face);
+        let mut bad: Vec<String> = Vec::new();
+        for font in fit::FONTS {
+            let ctx = fit::a_ctx(font);
+            for &(path, n, stepped, pedals, floor, ceiling) in fit::FACES {
+                let about = crate::faces::suite_unit(path).map_or("", |(_, a)| a);
+                for (edge, window) in [("opens at", floor), ("grown to", ceiling)] {
+                    let mut live = fit::a_worst_case_face(path, n, stepped, pedals);
+                    let (right, bottom) = fit::escape(&ctx, window, about, &st.s, &mut |ui| {
+                        let _ = crate::faces::draw(ui, &st, &mut live);
+                    });
+                    if right > fit::SLACK {
+                        bad.push(format!(
+                            "{path} on {} {edge} {}x{}: {right:.1} off the right",
+                            font.key(),
+                            window.x,
+                            window.y
+                        ));
+                    }
+                    if bottom > fit::SLACK {
+                        bad.push(format!(
+                            "{path} on {} {edge} {}x{}: {bottom:.1} off the bottom",
+                            font.key(),
+                            window.x,
+                            window.y
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a face is drawn outside its own window:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
+    /// **Dragged to the smallest a face may be, nothing runs off the SIDE —
+    /// and exactly three faces still run off the BOTTOM.**
+    ///
+    /// `dialogs::face_min_size` answers a flat 320 by 300 for every face but
+    /// the IR browser, on the stated ground that "320 by 300 is what the knob
+    /// rows need". Sideways that is now true of all thirteen, and it is what
+    /// the preset strip's shares bought: at 296 points of content the strip
+    /// folds rather than losing its Save button, and the amp's chips cut their
+    /// word rather than pushing the board off the edge.
+    ///
+    /// Downwards it is not true and never was. At 320 by 300 the EQ's fifteen
+    /// rows want between 114 and 129 points more than the window holds
+    /// depending on the font, the Imager's goniometer 97 to 99 and the amp's
+    /// board 65 to 94 — drawn, clipped, and unreachable, because the desktop
+    /// path puts no scroll area under a face. That is one number in one
+    /// function in `dialogs`, and it belongs to whoever owns that file; what
+    /// this test is for is that the list cannot grow behind anybody's back. A
+    /// face that starts overflowing joins it and fails; a face that stops
+    /// overflowing — because the minimum was finally made a property of the
+    /// layout rather than a constant — also fails, and the fix is to strike it
+    /// from the list, which is the day this test wants to be looked at.
+    #[test]
+    fn the_smallest_a_face_can_be_dragged_to_holds_it_sideways() {
+        /// The three whose layout is taller than `face_min_size` promises.
+        const TOO_TALL: [&str; 3] = ["@tangent-eq", "@tangent-imager", "@tangent-amp"];
+        let set = crate::settings::Settings::default();
+        let p = crate::recorder_panel::palette(&set);
+        let st = FaceStyle::new(p.bg, p.lcd, p.lcd_face);
+        let mut bad: Vec<String> = Vec::new();
+        for font in fit::FONTS {
+            let ctx = fit::a_ctx(font);
+            for &(path, n, stepped, pedals, _, _) in fit::FACES {
+                let about = crate::faces::suite_unit(path).map_or("", |(_, a)| a);
+                let window = fit::drag_minimum(path);
+                let mut live = fit::a_worst_case_face(path, n, stepped, pedals);
+                let (right, bottom) = fit::escape(&ctx, window, about, &st.s, &mut |ui| {
+                    let _ = crate::faces::draw(ui, &st, &mut live);
+                });
+                if right > fit::SLACK {
+                    bad.push(format!(
+                        "{path} on {}: {right:.1} off the right at {}x{}",
+                        font.key(),
+                        window.x,
+                        window.y
+                    ));
+                }
+                let over = bottom > fit::SLACK;
+                if over != TOO_TALL.contains(&path) {
+                    bad.push(format!(
+                        "{path} on {}: {} off the bottom at {}x{}, and the list {}",
+                        font.key(),
+                        if over {
+                            format!("{bottom:.1}")
+                        } else {
+                            "nothing".to_owned()
+                        },
+                        window.x,
+                        window.y,
+                        if over { "does not say so" } else { "says it should be" }
+                    ));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "the drag minimum no longer holds what it is recorded as holding:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
+    // ── the ink lands on a surface that can carry it ────────────────────────
+
+    /// **Every word a face prints is measured against the surface it actually
+    /// landed on** — all thirteen panels, all sixteen factory themes, both
+    /// modes.
+    ///
+    /// This replaces a sweep that read as coverage and was not. That one
+    /// walked the themes, built a `FaceStyle` and compared pairs of palette
+    /// colours to each other — `ink` against `well`, `faint` against `well` —
+    /// and never called the panel it was named after. It passed with the
+    /// browser's rows printed on the panel ground and its dead chips printing
+    /// `faint` on `raised`, which is the exact fault its own comment said it
+    /// existed to prevent. A test that cannot fail against the code it names
+    /// is worse than no test, because the next person reads it as proof.
+    ///
+    /// So this one asks the picture instead. It draws the face, walks the
+    /// shape stream in paint order, and for every word finds the last opaque
+    /// rectangle painted UNDER it — which is the surface, whatever the code
+    /// believed it was. Ink is recognised by its colour, and each role carries
+    /// the floor it has always carried: reading contrast for the panel's own
+    /// ink, the caption floor for `faint`, the cluster's three tiers for the
+    /// glass. Move a word onto a ground that cannot hold it, or move the
+    /// ground out from under a word, and this goes red; that is the whole
+    /// point, and `every_theme_dresses_a_face` above still guards the palette
+    /// the roles are derived from.
+    ///
+    /// **The vacuity guard is the important line.** Classifying by colour
+    /// means a word wearing something unrecognised is skipped rather than
+    /// failed — egui's own stock widget text is in this stream too, and the
+    /// app's `dialogs::apply_theme` is private to that module, so it cannot be
+    /// spoken for here. A skip that grew to cover everything is precisely how
+    /// the sweep this replaces became empty, so the count is asserted: if a
+    /// face ever stops offering words this can recognise, the build says so
+    /// rather than quietly passing.
+    #[test]
+    fn every_face_prints_its_ink_on_the_surface_it_lands_on() {
+        let ctx = fit::a_ctx(fonts::FontChoice::default());
+        let mut bad: Vec<String> = Vec::new();
+        /// The fewest words a face may print and still be something this
+        /// sweep is evidence about. See the assertion at the foot.
+        const WORDS_FLOOR: usize = 8;
+        let mut thinnest: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                set.dark_mode = dark;
+                let p = crate::recorder_panel::palette(&set);
+                let st = FaceStyle::new(p.bg, p.lcd, p.lcd_face);
+                let mode = if dark { "dark" } else { "light" };
+                // Ink the kit and the faces choose, and the floor each has
+                // always had to clear. `faint` is a caption and asks the
+                // caption floor; the glass tiers ask the cluster's own.
+                let roles: [(&str, Color32, f32); 6] = [
+                    ("the panel's ink", st.s.ink, 4.5),
+                    ("a reading at rest", st.s.faint, 3.0),
+                    ("the primary digits", lcd_ink(&st, LcdTier::Primary), 3.0),
+                    ("the secondary digits", lcd_ink(&st, LcdTier::Secondary), 2.0),
+                    ("a grid label", lcd_ink(&st, LcdTier::Label), 1.6),
+                    ("the correlation red", CORR_RED, 1.6),
+                ];
+                for &(path, n, stepped, pedals, floor, _) in fit::FACES {
+                    let about = crate::faces::suite_unit(path).map_or("", |(_, a)| a);
+                    let mut live = fit::a_worst_case_face(path, n, stepped, pedals);
+                    let words = fit::ink_on_its_surface(&ctx, floor, about, &st.s, &mut |ui| {
+                        let _ = crate::faces::draw(ui, &st, &mut live);
+                    });
+                    let mut seen = 0usize;
+                    for (ink, ground, text) in words {
+                        let Some(&(what, _, need)) =
+                            roles.iter().find(|(_, c, _)| *c == ink)
+                        else {
+                            continue;
+                        };
+                        seen += 1;
+                        let got = contrast_ratio(ink, ground);
+                        if got < need {
+                            bad.push(format!(
+                                "{} {mode} {path}: {what} on what it landed on is \
+                                 {got:.2}:1, wants {need:.1} ({text:?})",
+                                theme.name
+                            ));
+                        }
+                    }
+                    if seen < WORDS_FLOOR {
+                        thinnest.push(format!("{path}: {seen}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a face prints ink its own surface cannot carry:\n  {}",
+            bad.join("\n  ")
+        );
+        // **The guard against this sweep going the way of the one it
+        // replaces.** The smallest panel on the shelf is the tremolo, three
+        // rows and the preset strip, and it offers ten recognised words; a
+        // face that drops under eight has either lost its rows or started
+        // printing them in a colour this cannot account for, and either way
+        // the sweep has stopped being evidence about that face. Fail rather
+        // than pass quietly, which is exactly what the sweep this replaces
+        // did for the whole of its short life.
+        thinnest.sort();
+        thinnest.dedup();
+        assert!(
+            thinnest.is_empty(),
+            "the sweep no longer recognises enough of what these faces print \
+             to be evidence about them:\n  {}",
+            thinnest.join("\n  ")
         );
     }
 }
