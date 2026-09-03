@@ -12,6 +12,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **Stems export asks which stems: dry, or processed.** The export dialog's
+  SOURCE row is joined by a STEMS row with two chips. *Processed* writes each
+  lane through its own insert rack — the mix's own sound, one file per lane,
+  and the default. *Dry* writes each lane before its own inserts, for a remix
+  somewhere else. The rule is the same at every strip: a dry stem is that
+  strip's own bays taken out and nothing else's, so a group's dry stem is the
+  group before its bus compressor with its children exactly as they reach the
+  mix. The two write to different folders — `stems/` and `stems-dry/` — so a
+  second export cannot overwrite the first with different-sounding files under
+  identical names. Choosing dry does not move one sample of the master.
+
 - **Drag to the edge and the view follows.** Holding a drag against the edge
   of a view now scrolls it that way, on all three surfaces that needed it: the
   MIDI editor's roll in all four directions, the arrangement's lanes sideways
@@ -113,6 +124,32 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   ships, this stops being a note and becomes something the loader has to do.
 
 ### Fixed
+
+- **A plugin on an audio track did nothing at all.** Not "processed silence" —
+  it did not run. An audio clip passed through its lane's fader, pan, mute,
+  solo and send, and then went straight to the master having entered no insert
+  rack anywhere in the engine; the lane's rack was reached only by MIDI notes
+  and a live input, and a lane holding nothing but audio never got that far.
+  A compressor dropped into an audio track's bay metered zero and changed
+  nothing, in the speakers and in the exported file alike. Measured on a
+  fixture with a constant clip thirty decibels over a 20:1 compressor's
+  threshold, on that compressor's own lane: the master peaked at 0.8999999
+  with the plugin loaded and 0.8999999 without it, bit for bit. It now peaks
+  at 0.0285 — thirty decibels of gain reduction that had been going nowhere.
+
+  **This changes the mix of existing projects.** Any project with a plugin in
+  an audio track's bay has been rendering as if that bay were empty, and will
+  now render through it: the master, the stems and every bounce. An export
+  made before this release is not reproducible after it. Nothing needs
+  converting — the desk always showed the plugin, and the audio has finally
+  caught up with what it said — but a mix balanced against a bay that was
+  doing nothing will want another listen.
+
+  The clips' separate delay compensation went with it. They used to hold
+  themselves back by an arithmetic figure that reconstructed, per lane, what
+  the lane would pay downstream; they now wait on the lane's own delay line by
+  the lane's own formula, which is the one that already knew about groups and
+  about an amp's seven pedal seats.
 
 - **The window title was costing a sixth of every frame.** It asked whether the
   project was dirty once per frame, and asking meant serialising the entire
