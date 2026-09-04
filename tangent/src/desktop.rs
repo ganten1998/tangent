@@ -325,6 +325,9 @@ struct Recorder {
     /// is far inside the several seconds an interface takes to re-sync, which
     /// is the event this is watching for.
     rate_asked: Option<std::time::Instant>,
+    /// The device's rate, polled off the UI thread. See [`RatePoll`].
+    #[cfg(feature = "recorder")]
+    rate_poll: RatePoll,
     /// The output block size already written to the log for THIS engine, so
     /// the measurement is announced once rather than sixty times a second.
     ///
@@ -554,6 +557,9 @@ pub struct DesktopApp {
     /// A clip or kit reload that is owed and is waiting on the warm-up.
     #[cfg(feature = "recorder")]
     clips_owed: bool,
+    /// When the notes were first owed, so a queue that never drains cannot
+    /// hold them forever. See `run_warm` and [`CLIPS_OWED_DEADLINE`].
+    clips_owed_at: Option<std::time::Instant>,
     #[cfg(feature = "recorder")]
     pads_owed: bool,
     /// What the insert loader's meter reads for the batch it is working
@@ -1677,7 +1683,84 @@ const ENGINE_TRIES: u8 = 5;
 /// rate that is neither the old one nor the new one — reopening on the first
 /// disagreement would catch it mid-stride and reopen again a moment later.
 #[cfg(feature = "recorder")]
+/// **How long the engine may go without notes somebody has drawn.**
+///
+/// `run_warm` hands the arrangement over on the frame the decode queue pops
+/// nothing, which couples MIDI — which needs no decoding at all — to whatever
+/// the audio decoder happens to be doing. That coupling has now produced the
+/// SAME reported symptom twice, by two different roads: "you have to audition
+/// a note in non draw mode in order for it to ever sound on playback", fixed
+/// by remembering decode refusals, and then "midi input in non draw mode is
+/// back to not playing back notes input without auditioning them with click
+/// first". A shape that fails twice from two different causes is the shape,
+/// not the causes.
+///
+/// So the drain is no longer the only door. Notes owed for longer than this
+/// are handed over regardless, and the drain-triggered reload still happens
+/// afterwards — `reload_clips` rebuilds from the document either way, so the
+/// cost of being early is at most one extra rebuild and the benefit is that
+/// no decoder state can silence a note.
+///
+/// A quarter of a second: under what anybody would notice between drawing a
+/// note and pressing play, and far above a frame, so a drag that dirties the
+/// clips continuously still answers four times a second rather than sixty.
+const CLIPS_OWED_DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+
 const RATE_ASK_EVERY: std::time::Duration = std::time::Duration::from_millis(1_000);
+
+/// **The device's rate, asked on a thread of its own.**
+///
+/// `Engine::default_output_rate` looks cheap and is not: it takes the cpal
+/// host, ENUMERATES the devices to resolve the output, and reads that
+/// device's default config — a round trip into CoreAudio. Doing that once a
+/// second on the UI thread put a stall in every second of playback, which is
+/// exactly how the owner described it: "the playhead pacing [is] jumpy when
+/// it's moving (seems like smooth until a hitch every second or so of
+/// playback)". A frame that misses its deadline once a second is not a
+/// dropped frame anywhere else; it is the one the eye tracks.
+///
+/// So the question is asked somewhere the answer costing 20 ms does not
+/// matter, and the UI thread reads a number. `0` means "nothing known yet",
+/// which is the same thing `None` meant before and is what the first second
+/// after launch honestly has.
+///
+/// The thread ends when the app drops the cell: it holds a `Weak` and exits
+/// the moment the upgrade fails, so there is no flag to remember to set and
+/// nothing to join at quit.
+#[cfg(feature = "recorder")]
+struct RatePoll {
+    seen: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[cfg(feature = "recorder")]
+impl RatePoll {
+    fn start() -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let seen = std::sync::Arc::new(AtomicU32::new(0));
+        let weak = std::sync::Arc::downgrade(&seen);
+        let _ = std::thread::Builder::new()
+            .name("tangent-rate-watch".to_owned())
+            .spawn(move || loop {
+                let Some(cell) = weak.upgrade() else { return };
+                let hz = crate::instrument::Engine::default_output_rate(None).unwrap_or(0);
+                cell.store(hz, Ordering::Relaxed);
+                // Dropped BEFORE the sleep, so the last owner going away is
+                // noticed within one tick rather than being held alive by
+                // this loop for the length of it.
+                drop(cell);
+                std::thread::sleep(RATE_ASK_EVERY);
+            });
+        Self { seen }
+    }
+
+    /// What the device last said, or `None` while nothing has been asked yet.
+    fn rate(&self) -> Option<u32> {
+        match self.seen.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            hz => Some(hz),
+        }
+    }
+}
 #[cfg(feature = "recorder")]
 const RATE_DRIFT_POLLS: u8 = 3;
 
@@ -7909,6 +7992,21 @@ impl DesktopApp {
         if !self.clips_owed && !self.pads_owed && self.warm.is_empty() {
             return;
         }
+        // **The notes do not wait on the decoder.** See
+        // `CLIPS_OWED_DEADLINE`: the drain below is still the ordinary door
+        // and the fast one, and this is the door that cannot be held shut.
+        if self.clips_owed {
+            let since = *self
+                .clips_owed_at
+                .get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= CLIPS_OWED_DEADLINE {
+                self.clips_owed = false;
+                self.clips_owed_at = None;
+                self.reload_clips();
+            }
+        } else {
+            self.clips_owed_at = None;
+        }
         if self.warm.is_empty() {
             self.queue_warm();
         }
@@ -7928,6 +8026,7 @@ impl DesktopApp {
             self.warm_count = Counted::default();
             self.busy_chunk_done(Busied::Decode);
             if std::mem::take(&mut self.clips_owed) {
+                self.clips_owed_at = None;
                 self.reload_clips();
             }
             if std::mem::take(&mut self.pads_owed) {
@@ -8886,7 +8985,8 @@ impl DesktopApp {
         }
         self.recorder.rate_asked = Some(now);
         ctx.request_repaint_after(RATE_ASK_EVERY);
-        let device_at = crate::instrument::Engine::default_output_rate(None);
+        // Read, not asked: the asking happens on `RatePoll`'s thread.
+        let device_at = self.recorder.rate_poll.rate();
         if !self.recorder.rate_watch.note(engine_at, opened_at, device_at) {
             return;
         }
@@ -12997,6 +13097,8 @@ impl DesktopApp {
                 rate_watch: RateWatch::default(),
                 out_block_logged: None,
                 rate_asked: None,
+                #[cfg(feature = "recorder")]
+                rate_poll: RatePoll::start(),
                 xruns_seen: 0,
                 graph_dropouts: tangent_record::audio::GraphDropouts::start(),
                 graph_floor: tangent_record::audio::graph_clock().map(|g| g.floor()),
@@ -13039,6 +13141,7 @@ impl DesktopApp {
             warm_count: Counted::default(),
             #[cfg(feature = "recorder")]
             clips_owed: false,
+            clips_owed_at: None,
             #[cfg(feature = "recorder")]
             pads_owed: false,
             #[cfg(feature = "recorder")]
@@ -14699,9 +14802,15 @@ mod tests {
         // tighter bound. What actually pins the ordering is the `before`
         // slice below, which is cut at the poll itself.
         let body = &src[at..src.len().min(at + 8_000)];
+        // **The READ, not the ask.** The asking moved to `RatePoll`'s own
+        // thread when a once-a-second CoreAudio round trip turned out to be
+        // the hitch in the playhead, so `default_output_rate` is no longer
+        // spelled in this function at all. What has to come after the guards
+        // is the moment the follower ACTS on the device's answer, and that is
+        // where the answer is read.
         let poll = body
-            .find("default_output_rate")
-            .expect("the follower still asks the device");
+            .find("rate_poll.rate()")
+            .expect("the follower still reads the polled device rate");
         let before = &body[..poll];
         for (what, needle) in [
             ("a take rolling", "self.recorder.session.state().is_active()"),
@@ -15147,6 +15256,30 @@ mod tests {
             body.contains("|| self.warm_refused.contains(&path)"),
             "queue_warm has to skip what the decoder already refused, or it \
              refills forever and clips_owed is never answered"
+        );
+        // **And the door the decoder cannot hold shut**, which is what stops
+        // this being a THIRD report of the same silence. Both of the fixes
+        // above answer one cause of a queue that never drains; the deadline
+        // answers the shape, so a cause nobody has thought of yet costs a
+        // quarter of a second rather than every note in the session.
+        assert!(
+            body.contains("CLIPS_OWED_DEADLINE"),
+            "nothing hands the notes over on a deadline any more, so MIDI is \
+             back to waiting on whatever the audio decoder is doing"
+        );
+        let warm = body
+            .find("fn run_warm")
+            .map(|at| &body[at..body.len().min(at + 2_000)])
+            .expect("run_warm is still called that");
+        let door = warm
+            .find("CLIPS_OWED_DEADLINE")
+            .expect("the deadline is checked inside run_warm");
+        let pop = warm.find("self.warm.pop_front()").unwrap_or(usize::MAX);
+        assert!(
+            door < pop,
+            "the deadline is checked AFTER the queue is popped, so a queue \
+             that always has an item never reaches it - which is the whole \
+             failure it exists to end"
         );
         // **And the PADS half, which is where this went wrong a second
         // time.** The refusal arm used to read `Err(_) if !pads`, so a pad

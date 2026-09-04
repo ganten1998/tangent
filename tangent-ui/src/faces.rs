@@ -28,7 +28,7 @@ use crate::ports::{BuiltinFace, BuiltinFaceParam, PresetRow};
 /// same list; the PATH is the contract between them, exactly as
 /// `KEYS_PATCH_NAMES` documents for the keyboard.
 pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
-    ("@tangent-eq", "Tangent EQ", "three bands you can hold in your hand"),
+    ("@tangent-eq", "Tangent EQ", "5 bands, no more no less"),
     (
         "@tangent-imager",
         "Tangent Imager",

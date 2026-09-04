@@ -15519,9 +15519,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         let Some(p) = pointer else { return };
         if !rect.contains(p) {
-            // A press on the world outside puts the popup away; the press
-            // still lands where it fell — the editor's own manner.
-            self.close_drumpad();
+            // **A press outside LEAVES IT OPEN.**
+            //
+            // It used to close here, borrowed from the MIDI editor's manner
+            // — and on a popup that is only ever opened to be played FROM,
+            // that manner is wrong. Every other in-house unit's face is a
+            // real window (`Dialog::InsertFace`, which `show_dialog_viewport`
+            // gives its own viewport) and none of them vanish because a hand
+            // reached past them. The drumpad was the only one that did, and
+            // the gesture it punished is the ordinary one: turn a knob on
+            // the desk underneath and the pads were gone. The owner: "it's
+            // also the only one that loses focus or disappears when a knob
+            // under it is turned."
+            //
+            // It still goes away by its own ×, by Esc, and by the key that
+            // opened it — three doors, all of them deliberate, which is what
+            // the popup's own note already promised.
             return;
         }
         let hit = {
@@ -21863,6 +21876,44 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             page.min(crate::recorder::DRUM_PAGES - 1) as u8;
     }
 
+    /// **The pads as the default template has them**, or empty if it has
+    /// none.
+    ///
+    /// One road, shared by the reset and by anything else that ever needs to
+    /// say "the default kit": the answer is whatever a fresh session would
+    /// be handed, and a fresh session is `adopt_template`. Reading the shelf
+    /// rather than holding a second copy is what stops the two drifting —
+    /// the day somebody changes the shipped kit, this follows without being
+    /// told.
+    ///
+    /// The lane the kit lands on is the one the template puts it on, so a
+    /// desk whose drums are on track 1 resets its track 1.
+    fn reset_kits_to_default(&mut self) {
+        let shelf = self.project_root().join(TEMPLATE_SHELF).join("default");
+        let doc = crate::arrangement::doc_in(&shelf);
+        let (kits, lane) = if doc.exists() {
+            crate::drumpad::DrumpadDoc::load_all_beside(
+                &doc,
+                crate::recorder::CHANNELS,
+                None,
+            )
+        } else {
+            (
+                (0..crate::recorder::CHANNELS)
+                    .map(|_| crate::drumpad::DrumpadDoc::default())
+                    .collect(),
+                None,
+            )
+        };
+        self.drumpad_kits = kits;
+        if let Some(lane) = lane {
+            self.drumpad_lane = lane;
+        }
+        // The pads changed under whatever is playing them, and the sidecar
+        // has to follow — the same flag `apply_kit_preset` raises.
+        self.drumpad_dirty = true;
+    }
+
     /// **Where the drumpad's explorer lands when nobody has said otherwise.**
     ///
     /// The DEF chip's folder if there is one, and it is still a folder — a
@@ -25455,6 +25506,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.media_sel = None;
                 self.refresh_media();
             }
+        }
+        // **And the PADS go back to the default, which nothing else did.**
+        //
+        // The kit is project data rather than a setting, so a reset walked
+        // straight past it and whatever was loaded stayed loaded: "CR78.kit
+        // loaded? Reset all, it's still there. Manually remove then reset?
+        // Now it's gone" — the pads simply kept the last state in both
+        // directions, which is the one thing a reset must not do.
+        //
+        // The default is the DEFAULT TEMPLATE's kit, because that is already
+        // what a New session is handed (`adopt_template`) and a reset that
+        // disagreed with New would be a second answer to one question. A
+        // shelf with no kit beside it resets to empty pads, which is the
+        // honest reading of "there is no default here".
+        //
+        // Everything only. Resetting the DEVICES must not empty somebody's
+        // drums — that scope is about which interface is open.
+        if matches!(scope, R::Everything) {
+            self.reset_kits_to_default();
         }
 
         // Closing the detached window re-attaches; Python's close handler then
@@ -45158,6 +45228,113 @@ mod tests {
         );
     }
 
+    /// **Reset Everything puts the PADS back to the default too.**
+    ///
+    /// The kit is project data rather than a setting, so a reset walked
+    /// straight past it: "CR78.kit loaded? Reset all, it's still there.
+    /// Manually remove then reset? Now it's gone." The pads kept the last
+    /// state in BOTH directions, which is the one thing a reset must not do
+    /// — a control that keeps whatever it found is not a reset, it is a
+    /// no-op with a confirmation dialog in front of it.
+    ///
+    /// The default is the default template's kit, because that is already
+    /// what a New session is handed (`adopt_template`) and a reset that
+    /// disagreed with New would be a second answer to one question. Both
+    /// directions are tested: a loaded kit is REPLACED by the template's,
+    /// and emptied pads are FILLED from it.
+    ///
+    /// Revert-check performed: drop the `reset_kits_to_default()` call from
+    /// `reset_settings` and both halves go red, each naming its direction.
+    #[test]
+    fn reset_everything_puts_the_drum_kit_back_to_the_template() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-kitreset-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let projects = root.join("Projects");
+        let shelf = projects.join(super::TEMPLATE_SHELF).join("default");
+        std::fs::create_dir_all(&shelf).expect("the template shelf");
+
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+
+        // The template's kit: one pad, so "did it come from here" is a fact
+        // and not a coincidence.
+        let mut shipped = crate::drumpad::DrumpadDoc::default();
+        shipped.pads[0].path = "media/Kick.wav".to_owned();
+        let doc = crate::arrangement::doc_in(&shelf);
+        crate::arrangement::Arrangement::default().save_to(&doc);
+        crate::drumpad::DrumpadDoc::save_all_beside(
+            &[shipped],
+            0,
+            &doc,
+        );
+
+        // (1) A kit somebody loaded is REPLACED, not kept.
+        app.drumpad_kits[0].pads[0].path = "media/Somebody Elses Snare.wav".to_owned();
+        app.reset_settings(&ctx, crate::settings::ResetScope::Everything);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+        assert_eq!(
+            app.drumpad_kits[0].pads[0].path, "media/Kick.wav",
+            "the reset kept the kit that was loaded - it is not a reset"
+        );
+
+        // (2) And pads somebody EMPTIED are filled back in, which is the
+        // other direction the owner saw fail.
+        app.drumpad_kits[0].pads[0].path = String::new();
+        app.reset_settings(&ctx, crate::settings::ResetScope::Everything);
+        app.settings.project_dir = Some(projects.to_string_lossy().into_owned());
+        assert_eq!(
+            app.drumpad_kits[0].pads[0].path, "media/Kick.wav",
+            "emptied pads stayed empty through a reset"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A press outside the pads does not put them away.**
+    ///
+    /// The drumpad was the only in-house unit whose face vanished because a
+    /// hand reached past it: every other one is a `Dialog::InsertFace`, which
+    /// `show_dialog_viewport` gives a window of its own, and a window does
+    /// not close because you clicked something else. The pads borrowed the
+    /// MIDI editor's manner instead — "a press on the world outside puts the
+    /// popup away" — and on a surface whose whole purpose is to be played
+    /// FROM while you work the desk, that manner is wrong. The owner: "it's
+    /// also the only one that loses focus or disappears when a knob under it
+    /// is turned."
+    ///
+    /// Three doors remain, all deliberate: its own ×, Esc, and the key that
+    /// opened it. The third block is here because a fix that made it
+    /// unclosable would be the worse bug.
+    ///
+    /// Revert-check performed: put the `close_drumpad()` back in the
+    /// `!rect.contains(p)` arm and the first block goes red.
+    #[test]
+    fn a_press_outside_the_drumpad_leaves_it_open() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.open_drumpad();
+        assert!(app.drumpad_open, "the fixture never opened it");
+        // Settle so the panel has claimed a rect to be outside OF.
+        hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        let outside = app
+            .drumpad_rect
+            .map_or(Pos2::new(4.0, 4.0), |r| Pos2::new(r.left() * 0.5, r.top() * 0.5));
+
+        press(&ctx, &mut app, outside);
+        hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        assert!(
+            app.drumpad_open,
+            "a press on the desk outside the pads closed them, so a knob \
+             cannot be turned while they are up"
+        );
+
+        // And the × still works, which is the door that has to survive.
+        app.close_drumpad();
+        assert!(!app.drumpad_open, "the drumpad cannot be closed at all now");
+    }
+
     /// **A dragged clip keeps up with the scroll everywhere, including off
     /// the bottom of the window and out of egui's sight altogether.**
     ///
@@ -47396,6 +47573,7 @@ mod folder_tests {
         a.arrangement.named = true;
         assert!(!a.new_is_noop(), "a kept session blocked New");
     }
+
 
     /// **Nothing is written until somebody says so, and leaving asks.**
     ///
