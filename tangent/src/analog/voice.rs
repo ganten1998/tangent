@@ -402,10 +402,11 @@ impl Voice {
     /// queue up, run substep by substep across the voices the CPU
     /// overlaps them. Same arithmetic, a third of the time.
     ///
-    /// `pre`: contours, glide, the modulation bus, the oscillators, the
-    /// mixer, the cutoff, and the upsample into `up4`.
+    /// `pre_mix`: contours, glide, the modulation bus, the oscillators,
+    /// the mixer and the cutoff — everything before the upsample, which
+    /// the frame's pair bank does in lanes, or [`Voice::pre`] does here.
     #[inline]
-    pub fn pre(&mut self, p: &VoiceParams, taps: &Taps, ctx: &TickCtx, lfo_raw: f32) {
+    pub fn pre_mix(&mut self, p: &VoiceParams, ctx: &TickCtx, lfo_raw: f32) -> f32 {
         let fe = self.f_env.tick(&self.f_coeffs);
         self.ae = self.a_env.tick(&self.a_coeffs);
         if self.lfo_fade < 1.0 {
@@ -451,7 +452,27 @@ impl Voice {
         let oct = (self.cutoff_base + ctx.contour_oct * fe + cutoff_mod).clamp(0.0, ctx.top_oct);
         let hz = CUTOFF_HZ.0 * oct.exp2();
         self.cut = Cutoff::new(hz, ctx.rate4, self.damp);
+        mix
+    }
+
+    /// `pre_mix` and then the voice's own upsample: the scalar road.
+    #[inline]
+    pub fn pre(&mut self, p: &VoiceParams, taps: &Taps, ctx: &TickCtx, lfo_raw: f32) {
+        let mix = self.pre_mix(p, ctx, lfo_raw);
         self.up4 = self.os.up(taps, mix);
+    }
+
+    /// The frame's pair bank hands back the four 4× samples.
+    #[inline]
+    pub fn set_up4(&mut self, up4: [f32; 4]) {
+        self.up4 = up4;
+    }
+
+    /// The four filtered 4× samples, for the frame's pair bank to take
+    /// down.
+    #[inline]
+    pub fn y4(&self) -> [f32; 4] {
+        self.y4
     }
 
     /// Substep `j` of four at 4×, the way in: the feedback into the mixer
@@ -489,12 +510,20 @@ impl Voice {
         (&self.cut, self.k, self.damp)
     }
 
-    /// The downsample, the amplifier, the pan: the sample's stereo output.
+    /// The amplifier and the pan on a downsampled `y`: the sample's
+    /// stereo output.
+    #[inline]
+    pub fn post_with(&self, y: f32) -> (f32, f32) {
+        let v = y * self.ae * self.vel_gain * self.level_gain;
+        (v * self.pan_l, v * self.pan_r)
+    }
+
+    /// The voice's own downsample, then [`Voice::post_with`]: the scalar
+    /// road.
     #[inline]
     pub fn post(&mut self, taps: &Taps) -> (f32, f32) {
         let y = self.os.down(taps, self.y4);
-        let v = y * self.ae * self.vel_gain * self.level_gain;
-        (v * self.pan_l, v * self.pan_r)
+        self.post_with(y)
     }
 
     /// One sample, the three phases in a row: the bench's road.
