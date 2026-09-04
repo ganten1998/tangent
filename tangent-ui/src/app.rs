@@ -22170,18 +22170,41 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if doc_wide { CHANNELS } else { FREE_CHANNELS }
     }
 
+    /// **The window the two auto counts are measured against.**
+    ///
+    /// `last_pane` is what the app was handed to draw in on the frame before —
+    /// the window's content on the desktop, the editor's canvas in a plugin —
+    /// and `paint` writes it BEFORE it builds either view, so a window the
+    /// owner maximises mid-session is answered on that very frame rather than
+    /// at the next launch. That is the whole of requirement "it must respond at
+    /// runtime": there is no monitor reading, no relaunch, and no flag to be
+    /// wrong about — the pane changed, so the count changed.
+    ///
+    /// Zero until the first frame has been laid out, and there the size the
+    /// window is about to open at is the honest stand-in — the same fallback
+    /// `request_natural_size` makes for the same reason.
+    fn count_pane(&self) -> Vec2 {
+        if self.last_pane.x > 1.0 && self.last_pane.y > 1.0 {
+            self.last_pane
+        } else {
+            initial_window_size(&self.settings)
+        }
+    }
+
     fn mixer_visible(&self) -> usize {
         // **Zero is the auto sentinel** — the shipped, un-chosen state, the
         // same idiom `arr_header_w` uses. There it means derive the strip
-        // count from the monitor; a Shift+wheel writes a concrete number and
+        // count from the window; a Shift+wheel writes a concrete number and
         // the derivation steps aside for good (see `default_mixer_visible`).
         //
         // No screen-size forcing on the CHOSEN value: the floor it used to
         // impose was exactly what killed Shift+wheel zoom in fullscreen — the
         // owner's "track zoom regressed". The fold no longer reads this
-        // either; windowed or full, a chosen zoom is the user's.
+        // either; windowed or full, a chosen zoom is the user's. The pane is
+        // read only on the auto side, so growing the window still moves the
+        // DEFAULT and still leaves a chosen count alone.
         let want = if self.settings.mixer_visible == 0 {
-            default_mixer_visible(&self.settings)
+            default_mixer_visible(self.count_pane())
         } else {
             self.settings.mixer_visible as usize
         };
@@ -22191,7 +22214,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // Zero is the auto sentinel; see `mixer_visible` and
         // `default_arr_visible`.
         let want = if self.settings.arr_visible == 0 {
-            default_arr_visible(&self.settings)
+            default_arr_visible(&self.settings, self.count_pane())
         } else {
             self.settings.arr_visible as usize
         };
@@ -26444,36 +26467,103 @@ const BASE_OF_MONITOR: f64 = 0.5;
 /// **The rungs a DEFAULT track count is allowed to land on.**
 ///
 /// A raw "how many fit" division lands on 11, or 13, or 5 — numbers that read
-/// as an accident. Musicians reach for round handfuls: four, six, eight, a
-/// dozen, sixteen. So the derived count is snapped to this ladder rather than
+/// as an accident. Musicians reach for round handfuls: four, six, eight, ten,
+/// a dozen, sixteen. So the derived count is snapped to this ladder rather than
 /// shown exactly, trading a few points of slack for a number that reads as a
 /// decision. The steps widen as they climb — nobody distinguishes a 27-lane
 /// default from a 28-lane one, but 6 versus 8 is a real choice — and it ends at
 /// [`crate::recorder::CHANNELS`], the most lanes the desk has to show.
-const COUNT_LADDER: [usize; 7] = [4, 6, 8, 12, 16, 24, 32];
+///
+/// **Ten was added when the owner asked for ten strips**, and it belongs here
+/// on the ladder's own terms rather than as a favour to one number: ten is as
+/// round a handful as eight or a dozen, and without it the jump from 8 to 12 is
+/// the one gap in the low half wide enough for a whole desk to fall through —
+/// the mixer at the window this app opens at landed on 8 or on 12 with nothing
+/// in between, and the step between those two takes nearly a third off every
+/// strip's width (127 points to 90) for one point of window. It costs a little:
+/// with a rung at 10 there are more boundaries for a
+/// quotient to sit near, which is why [`COMFY_LANE_H`] and
+/// [`COMFY_STRIP_PITCH`] are now chosen for their DISTANCE from a boundary
+/// across a table of real displays rather than solved off one screen.
+const COUNT_LADDER: [usize; 8] = [4, 6, 8, 10, 12, 16, 24, 32];
 
 /// **A comfortable arrangement LANE height, in points.**
 ///
-/// The number that turns "how much monitor is there" into "how many lanes".
-/// Solved, not picked: on the display this app was tuned against — 2560 wide,
-/// ~1400 usable after the dock — the usable height less the recorder band is
-/// about 1134 points, and the owner's long-standing default was a dozen lanes,
-/// so a lane's share is ~92. Every other monitor is measured against the same
-/// 92, which is what makes the default a fixed DENSITY rather than a fixed
-/// count: a taller screen shows proportionally more, a laptop proportionally
-/// fewer, and both land on a ladder rung.
-const COMFY_LANE_H: f32 = 92.0;
+/// The number that turns "how much room has the timeline got" into "how many
+/// lanes". A fixed DENSITY rather than a fixed count: a taller window shows
+/// proportionally more, a short one proportionally fewer, and both land on a
+/// [`COUNT_LADDER`] rung.
+///
+/// **It was 92, solved off the MONITOR, and both halves of that changed.** The
+/// old derivation: on the display this app was tuned against — 2560 wide, ~1400
+/// usable after the dock — the monitor's usable height less the recorder band
+/// is about 1134 points, and the owner's long-standing default was a dozen
+/// lanes, so a lane's share was ~92. That number was right for the screen and
+/// wrong for the window, because [`default_arr_visible`] now measures the
+/// WINDOW; see its doc for why the monitor stopped being the input.
+///
+/// **Chosen inside a range rather than solved, because the owner gave three
+/// numbers that no single density satisfies.** "8 default in arrange" at the
+/// window this app opens at on his display, "climbing to 12 when maxxed OR FULL
+/// SCREEN" — and those last two are not the same size. Maximising leaves the
+/// menu bar and the Dock; full screen takes them as well, sixty-two points
+/// more. The timeline's own area, which is the pane less the recorder band, is
+/// 644 points at 100%, 1112 maximised and 1174 full screen, so what he asked
+/// for is 80.5 points a lane, then 92.7, then 97.8.
+///
+/// One constant cannot be three numbers and does not have to be: the ladder's
+/// steps widen as they climb, so one density gives eight in the small window
+/// and a dozen in both big ones over a whole BAND of values. The band is
+/// bounded at each end by the first of his own numbers that breaks —
+///
+///   above 1174/14 = 83.9, or full screen tips from twelve lanes to sixteen;
+///   below   644/7 = 92.0, or the opening window tips from eight down to six;
+///   below   968/11 = 88.0, or his 150% preset tips from twelve down to ten.
+///
+/// — which leaves 83.9 to 88.0, and 86 is the middle of it. The tightest any of
+/// his five window sizes then sits to a boundary is 22 points of window height
+/// (the 150% preset); solving off any ONE of his three numbers instead lands
+/// within five points of a boundary and would flip on the height of a Dock.
+///
+/// `the_default_track_counts_stay_sane_on_other_displays` is the other half of
+/// the justification: five more displays, windowed and filled, so this is not a
+/// number tuned until one machine read right.
+///
+/// **One knife edge is known and accepted**, written down so the next person
+/// does not think they found something: a 5K in FULL SCREEN comes to 2409
+/// points of timeline, which over 86 is 28.01 — one point of window from the
+/// boundary between twenty-four lanes and thirty-two. Both are perfectly good
+/// 5Ks (100 points a lane against 75). 84 or 88 would clear it comfortably, and
+/// each costs the OWNER: 84 puts his own full screen 1.6 points from tipping to
+/// sixteen, and 88 puts his 150% preset exactly ON the tie and gives him ten.
+/// A screen nobody in the table owns loses the coin toss ahead of the screen
+/// the request came from.
+const COMFY_LANE_H: f32 = 86.0;
 
 /// **A comfortable mixer STRIP pitch — the strip's width plus the gap to the
 /// next — in points.**
 ///
 /// The desk's counterpart to [`COMFY_LANE_H`], and it keys off WIDTH because
-/// the strips run across, not down. `46` is the width below which a strip stops
-/// being usable ([`crate::mixer_panel`]'s `MIN_STRIP_W`); `70` is that with
-/// breathing room and the 6-point gap folded in, and it reproduces the owner's
-/// sixteen strips at the default window on the reference display. See
-/// [`default_mixer_visible`].
-const COMFY_STRIP_PITCH: f32 = 70.0;
+/// the strips run across, not down.
+///
+/// **Solved from the owner's count at his own window, which is how the old 70
+/// was solved too.** `mixer_panel::Layout::metrics` divides the window less its
+/// two 10-point margins among the visible strips plus the two pinned columns,
+/// so the pitch a count implies is `(w - 20) / (visible + 2)`. At the 1280-point
+/// window his display opens at, the sixteen strips he used to run come to
+/// 1260/18 = 70 exactly — the old constant, and not a coincidence. He asked for
+/// ten: 1260/12 = 105.
+///
+/// The old doc argued 70 up from `MIN_STRIP_W` (46, the width below which a
+/// strip is a toothpick) "with breathing room", which was true and is still the
+/// floor the desk enforces at draw time — `fits_across` in
+/// [`crate::mixer_panel`] never lets a count outrun the width whatever this
+/// says. What changed is that 70 was the least a strip can be and the owner
+/// wants what a strip should be: at 105 a fader, its meter, the name and the
+/// switch row get about 100 points across instead of 64.
+///
+/// See [`default_mixer_visible`].
+const COMFY_STRIP_PITCH: f32 = 105.0;
 
 /// **Snap a raw "how many items fit" to a sensible default count.**
 ///
@@ -26503,46 +26593,79 @@ fn sensible_visible_count(span_px: f32, item_px: f32, floor: usize, ceil: usize)
     best.clamp(floor, ceil)
 }
 
-/// **The arrangement's default visible-LANE count for this monitor.**
+/// **The arrangement's default visible-LANE count for this WINDOW.**
 ///
 /// Used only while the setting is at its `0` sentinel — the shipped, un-chosen
 /// state; the moment a Shift+wheel writes a concrete count that count is the
 /// user's and this is not consulted (see [`TangentApp::arr_visible`]).
 ///
-/// The lanes are worked at a TALL window — the timeline is what a person drags
-/// the window open FOR — so the height that matters is not the short default
-/// window's but the monitor's own usable height, less the one band always
-/// pinned above the lanes: the recorder. That remainder over [`COMFY_LANE_H`],
-/// snapped, is the count.
+/// `pane` is what the app was given to draw in — [`TangentApp::count_pane`]
+/// says where it comes from and what stands in before the first frame. The
+/// timeline takes everything under the recorder band when it is open (see the
+/// `daw_view` arm in `paint`, which is where this arithmetic is copied from),
+/// so the span is the pane's height less that band at the pane's width. That
+/// remainder over [`COMFY_LANE_H`], snapped, is the count.
 ///
-/// Falls back to the historical dozen while no monitor has been learned — the
-/// first launch on a new machine, before any window has existed long enough to
-/// measure one. A guess keyed off `monitor_width == 0` would be worse.
-fn default_arr_visible(settings: &Settings) -> usize {
-    if settings.monitor_usable_h < 240 || settings.monitor_width < 320 {
-        return 12;
-    }
-    let recorder = crate::recorder_panel::band_height(settings.monitor_width as f32);
-    let avail = (settings.monitor_usable_h as f32 - recorder).max(0.0);
+/// **This used to measure the MONITOR, and the argument for it is worth
+/// keeping.** It read `monitor_usable_h`, and its doc said: "The lanes are
+/// worked at a TALL window — the timeline is what a person drags the window
+/// open FOR — so the height that matters is not the short default window's but
+/// the monitor's own usable height." The reasoning was that the count should
+/// anticipate the window the user is about to make rather than the one they are
+/// handed, and it is not silly — but the owner, on the screen it was tuned
+/// against, met the consequence: "at 100 percent window size we need less
+/// tracks default visible. Should be at 8 default in arrange... climbing to 12
+/// when maxxed or full screen." Anticipating a window nobody has opened yet
+/// means twelve lanes crammed into 644 points, 53 apiece, on a window whose
+/// whole point is that it is the size he asked for. So the position is
+/// superseded: the count follows the window it is actually drawn in, and
+/// because `pane` is re-read every frame it CLIMBS when the window is
+/// maximised instead of waiting for a relaunch — which is the half of his
+/// sentence the monitor rule could never have delivered anyway.
+///
+/// No monitor guard survives either, and none is needed: a window always has a
+/// size, so there is nothing to fall back FROM. The old `monitor_width == 0`
+/// arm returned a flat dozen on a first launch, which was a guess about a
+/// screen; the answer now is a measurement of the 1300-point window that first
+/// launch actually opens — eight lanes, the same as his.
+fn default_arr_visible(settings: &Settings, pane: Vec2) -> usize {
+    let w = pane.x.max(1.0).trunc();
+    let recorder = band_sizes_at(settings, w).recorder_h;
+    let avail = (pane.y - recorder).max(0.0);
     sensible_visible_count(avail, COMFY_LANE_H, 4, crate::recorder::CHANNELS)
 }
 
-/// **The mixer's default visible-STRIP count for this monitor.**
+/// **The mixer's default visible-STRIP count for this WINDOW.**
 ///
-/// The desk fills the window's WIDTH and the window opens at a fixed share of
-/// the monitor ([`main_width`]), so — unlike the arrangement, whose default
-/// window is too short to speak for it — the default window's own width is a
-/// faithful measure of the room the desk has. Two columns are always pinned at
-/// the right (the click and the master), and the desk keeps a 10-point margin
-/// each side (`mixer_panel`'s `PAD`), so the scrolling run is the width less
-/// both. That run over [`COMFY_STRIP_PITCH`], snapped, is the count.
+/// The desk fills the window's WIDTH, so the width is the measure. Two columns
+/// are always pinned at the right (the click and the master), and the desk
+/// keeps a 10-point margin each side (`mixer_panel`'s `PAD`), so the scrolling
+/// run is the width less both. That run over [`COMFY_STRIP_PITCH`], snapped, is
+/// the count.
 ///
-/// No monitor guard is needed: with none learned, `main_width` falls back to
-/// its 1300-point window, which lands this on the historical sixteen.
-fn default_mixer_visible(settings: &Settings) -> usize {
+/// **`pane`, not [`main_width`], and the difference is a maximised window.**
+/// This used to ask what width the window OPENS at, on the argument that the
+/// desk's default window is a faithful measure of the room it has — true of the
+/// window it opens at and false of the window five seconds later. The owner
+/// maximises an already-open window, and the answer has to move when he does;
+/// see [`TangentApp::count_pane`]. At the opening width the two agree exactly,
+/// so nothing about a launch changed.
+///
+/// **What the desk does with a big number is not this function's business.**
+/// Past 32 active channels the desk folds itself into two rows of sixteen when
+/// the height allows (`mixer_panel`'s `two_rows`), and that fold is what puts
+/// all thirty-two on a full screen — the owner's "the switch to the 32 mixer
+/// layout is fine here". It does not consult this count and must not: a single
+/// pitch that gave ten strips in a 1280-point window would have to give
+/// thirty-two in a 2560-point one, and 2560 is not 3.2 times 1280.
+///
+/// Takes no `Settings`: unlike the timeline, which has to know how tall the
+/// recorder band is before it knows what is left, the desk's answer depends on
+/// nothing but the width it is drawn at.
+fn default_mixer_visible(pane: Vec2) -> usize {
     // 20 = the desk's two 10-point edge margins; `2.0 * COMFY_STRIP_PITCH` =
     // the two pinned columns that never scroll.
-    let run = (main_width(settings) - 20.0 - 2.0 * COMFY_STRIP_PITCH).max(0.0);
+    let run = (pane.x - 20.0 - 2.0 * COMFY_STRIP_PITCH).max(0.0);
     sensible_visible_count(run, COMFY_STRIP_PITCH, 4, crate::recorder::CHANNELS)
 }
 
@@ -47191,6 +47314,13 @@ mod aspect_snap_tests {
     /// "how many fit" into a musician-friendly rung, ties toward the smaller
     /// (safe) count, then clamps. Every interesting case is here so a change to
     /// the ladder or the tie rule has to say so.
+    ///
+    /// It said so once already: the ladder gained a 10 rung when the owner
+    /// asked for ten strips, and two rows of this table changed their answer —
+    /// 10.0 used to snap DOWN to 8 and 11.0 UP to 12, because there was nothing
+    /// between 8 and 12 to land on. Two more rows were added at the same time,
+    /// the ties either side of the new rung (9 and 11), so the "smaller wins"
+    /// rule is held across it as well as everywhere else.
     #[test]
     fn a_default_count_snaps_to_a_musician_friendly_rung() {
         // (span, item, floor, ceil) -> count. item 100 keeps the quotient
@@ -47201,14 +47331,17 @@ mod aspect_snap_tests {
             (800.0, 100.0, 4, 32, 8),
             (1200.0, 100.0, 4, 32, 12),
             (1600.0, 100.0, 4, 32, 16),
+            // Ten is a rung too, since the owner asked for ten strips.
+            (1000.0, 100.0, 4, 32, 10),
             // Between rungs: nearest wins.
             (560.0, 100.0, 4, 32, 6),   // 5.6 -> 6
-            (1100.0, 100.0, 4, 32, 12), // 11 -> 12
+            (1050.0, 100.0, 4, 32, 10), // 10.5 -> 10 (|10.5-10| < |10.5-12|)
             (2600.0, 100.0, 4, 32, 24), // 26 -> 24 (|26-24|=2 < |26-32|=6)
             // Dead-centre ties break toward the SMALLER, taller-row count.
             (500.0, 100.0, 4, 32, 4),   // 5.0 between 4 and 6 -> 4
             (700.0, 100.0, 4, 32, 6),   // 7.0 between 6 and 8 -> 6
-            (1000.0, 100.0, 4, 32, 8),  // 10 between 8 and 12 -> 8
+            (900.0, 100.0, 4, 32, 8),   // 9.0 between 8 and 10 -> 8
+            (1100.0, 100.0, 4, 32, 10), // 11 between 10 and 12 -> 10
             (1400.0, 100.0, 4, 32, 12), // 14 between 12 and 16 -> 12
             (2000.0, 100.0, 4, 32, 16), // 20 between 16 and 24 -> 16
             // Below the smallest rung still lands on the smallest rung.
@@ -47228,69 +47361,429 @@ mod aspect_snap_tests {
         }
     }
 
-    /// **The default track counts scale with the MONITOR, and land on the
-    /// owner's historical numbers on the display they were tuned against.**
+    /// **How the window stands on the screen**, because the three states are
+    /// three different panes and the owner named two of them.
     ///
-    /// The reference is the anchor — 2560 wide, ~1400 usable, a dozen lanes and
-    /// sixteen strips, exactly what shipped as the flat default — and every
-    /// other screen is measured against it: a laptop shows strictly fewer, a 5K
-    /// strictly more, and an ULTRAWIDE (same height, more width) keeps the same
-    /// lane count while gaining strips. The exact off-reference numbers are left
-    /// to inequalities on purpose, so tuning the recorder band's height does not
-    /// churn this test.
-    #[test]
-    fn the_default_track_counts_scale_with_the_monitor() {
-        let mon = |w: i64, h: i64| {
-            let mut s = Settings::default();
-            s.monitor_width = w;
-            s.monitor_usable_h = h;
-            s.window_size_percent = 100;
-            s
+    /// Maximised and full screen are NOT the same size on macOS: maximising
+    /// leaves the menu bar and the Dock, and full screen takes them too — 1378
+    /// points against 1440 on his display. A count keyed to the pane has to be
+    /// asked about both, and the flags are set separately because the app reads
+    /// them separately (`maximized_truthfully`, and the `fullscreen` arm beside
+    /// it).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fills {
+        No,
+        Maximised,
+        FullScreen,
+    }
+
+    /// **A frame of the real app on a real display, and a settings file that
+    /// is never touched.**
+    ///
+    /// `persist_global_settings` off is not decoration: these tests hand the
+    /// app a monitor and a window and let it run its whole first-frame
+    /// sequence, and `paint` writes the monitor it learns into
+    /// `~/.config/tangent/settings.json`. A test that edits the developer's
+    /// own desk while measuring a default is a test nobody can trust twice.
+    const NO_SAVE: Caps = Caps {
+        persist_global_settings: false,
+        ..Caps::DESKTOP
+    };
+
+    /// The owner's desk as it ships, on the display he reported.
+    ///
+    /// `first_launch`, because that is the set of bands a person actually has
+    /// up — `Settings::default` has no recorder and no neck, which is a
+    /// 147-point window and a question nobody is asking. `tracks_added` full,
+    /// so the paywall's sixteen is never what a count is measuring: the
+    /// licence on the machine running these tests is whatever it is, and a
+    /// document that already carries work on every lane opens the whole desk
+    /// for everybody (see `active_channels`).
+    fn desk_on(w: i64, usable_h: i64, percent: i64) -> Settings {
+        let mut s = Settings::first_launch();
+        s.show_welcome = false;
+        s.monitor_width = w;
+        s.monitor_usable_h = usable_h;
+        s.window_size_percent = percent;
+        s.tracks_added = -1;
+        s
+    }
+
+    /// One frame of the whole app, at a window of `pane` on a monitor of
+    /// `monitor`, and every word it painted.
+    ///
+    /// The monitor is handed back the same usable height the settings already
+    /// carry, which is what stops the monitor-learning block from deciding
+    /// anything has changed — belt and braces beside `NO_SAVE`.
+    fn frame_on(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+        pane: Vec2,
+        monitor: Vec2,
+        how: Fills,
+    ) -> Vec<(Rect, String)> {
+        let rect = Rect::from_min_size(Pos2::ZERO, pane);
+        let info = egui::ViewportInfo {
+            inner_rect: Some(rect),
+            outer_rect: Some(rect),
+            monitor_size: Some(monitor),
+            maximized: Some(how == Fills::Maximised),
+            fullscreen: Some(how == Fills::FullScreen),
+            native_pixels_per_point: Some(1.0),
+            ..Default::default()
         };
-        let chans = crate::recorder::CHANNELS;
-
-        // The anchor: the display this app was tuned on keeps the old defaults.
-        let reference = mon(2560, 1400);
-        assert_eq!(default_arr_visible(&reference), 12, "reference lanes moved");
-        assert_eq!(default_mixer_visible(&reference), 16, "reference strips moved");
-
-        // Nothing learned yet: the historical fallback, so a first launch on a
-        // fresh machine looks exactly as it always did.
-        let blank = mon(0, 0);
-        assert_eq!(default_arr_visible(&blank), 12, "the no-monitor fallback moved");
-        assert_eq!(default_mixer_visible(&blank), 16, "the no-monitor fallback moved");
-
-        // A laptop shows fewer of each; a 5K, more.
-        let laptop = mon(1280, 648);
-        assert!(default_arr_visible(&laptop) < 12, "the laptop showed as many lanes as the reference");
-        assert!(default_mixer_visible(&laptop) < 16, "the laptop showed as many strips as the reference");
-        let five_k = mon(5120, 2800);
-        assert!(default_arr_visible(&five_k) > 12, "the 5K showed no more lanes than the reference");
-        assert!(default_mixer_visible(&five_k) > 16, "the 5K showed no more strips than the reference");
-
-        // An ultrawide is the reference's HEIGHT with far more width: the same
-        // lanes (height decides them), more strips (width decides them).
-        let ultrawide = mon(3440, 1400);
-        assert_eq!(
-            default_arr_visible(&ultrawide),
-            default_arr_visible(&reference),
-            "the ultrawide's equal height did not give equal lanes"
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(egui::ViewportId::ROOT, info);
+        // **Exactly ONE frame, and that is a claim, not an economy.** `paint`
+        // writes the pane it was given into `last_pane` before it builds
+        // either view, so the frame a resize arrives on is already drawn at
+        // the new count — no settling pass, no second frame, no relaunch. A
+        // caller that had to run this three times to get a stable answer would
+        // be evidence that the count lags the window by a frame, which is the
+        // thing the owner would see as a flicker.
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                viewports,
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
         );
-        assert!(
-            default_mixer_visible(&ultrawide) > default_mixer_visible(&reference),
-            "the ultrawide's extra width gave no extra strips"
-        );
-
-        // Every answer is a real ladder rung (or the desk's own ceiling), never
-        // an odd raw count.
-        for s in [&reference, &blank, &laptop, &five_k, &ultrawide] {
-            for count in [default_arr_visible(s), default_mixer_visible(s)] {
-                assert!(
-                    COUNT_LADDER.contains(&count) || count == chans,
-                    "a default of {count} is not a ladder rung"
-                );
-                assert!((4..=chans).contains(&count), "a default of {count} is out of bounds");
+        let mut words = Vec::new();
+        fn walk(shape: &egui::epaint::Shape, words: &mut Vec<(Rect, String)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => words.push((
+                    Rect::from_min_size(t.pos, t.galley.rect.size()),
+                    t.galley.text().to_owned(),
+                )),
+                egui::epaint::Shape::Vec(v) => {
+                    for sh in v {
+                        walk(sh, words);
+                    }
+                }
+                _ => {}
             }
+        }
+        for c in &out.shapes {
+            walk(&c.shape, &mut words);
+        }
+        words
+    }
+
+    /// **The lanes the timeline actually PAINTED, and how tall each row came
+    /// out**, counted off the shape list rather than asked of anything.
+    ///
+    /// Every visible lane draws its own number down the left of the header
+    /// column and a lane outside the window is `Rect::NOTHING` — not drawn, not
+    /// hit — so the numbers in that column ARE the rows on screen. Their
+    /// spacing is the row height, which is the thing a person sees when the
+    /// count changes: fewer visible means taller rows in the same area.
+    ///
+    /// Deliberately not `default_arr_visible`, and not `Layout::new` either.
+    /// Between the derived count and the screen sit the active-channel clamp
+    /// and `visible_lanes.clamp(1, active)`, and a guard that stops before
+    /// those is a guard on arithmetic instead of on a timeline.
+    fn painted_lanes(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+        pane: Vec2,
+        monitor: Vec2,
+        how: Fills,
+    ) -> (usize, f32) {
+        let words = frame_on(ctx, app, pane, monitor, how);
+        let area = app.arrangement_rect.expect("the timeline was not drawn");
+        let mut ys: Vec<f32> = words
+            .iter()
+            .filter(|(r, s)| {
+                r.left() - area.left() < 40.0
+                    && area.contains(r.center())
+                    && s.parse::<usize>()
+                        .is_ok_and(|n| (1..=crate::recorder::CHANNELS).contains(&n))
+            })
+            .map(|(r, _)| r.top())
+            .collect();
+        ys.sort_by(f32::total_cmp);
+        let pitch = ys
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .fold(f32::MAX, f32::min);
+        (ys.len(), pitch)
+    }
+
+    /// **The strips the desk actually PAINTED**, the same way.
+    ///
+    /// Every column on screen — a channel, the click, the master — draws its
+    /// own fader scale, so the scales are the columns. The two pinned ones
+    /// come off: they are not part of the scrolling run and no count decides
+    /// whether they are there.
+    ///
+    /// The scale is read INSIDE the desk's rect on purpose. The recorder band
+    /// above it draws two faders of its own with the same scale on them, and
+    /// counting those would have made every answer two too many.
+    fn painted_strips(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+        pane: Vec2,
+        monitor: Vec2,
+        how: Fills,
+    ) -> usize {
+        let words = frame_on(ctx, app, pane, monitor, how);
+        let area = app.mixer_rect.expect("the desk was not drawn");
+        let scales = words
+            .iter()
+            .filter(|(r, s)| s == "48" && area.contains(r.center()))
+            .count();
+        scales.saturating_sub(2)
+    }
+
+    /// **The owner's own screen, pinned: eight lanes and ten strips at the
+    /// window it opens at, a dozen lanes and the whole folded desk when that
+    /// window is made to fill the display.**
+    ///
+    /// Verbatim, and every number in this test is one of his: "at 100 percent
+    /// window size (which is a percentage of the monitor res (i think)), we
+    /// need less tracks default visible. Should be at 8 default in arrange and
+    /// 10 in mixer on 100%, climbing to 12 arrange when maxxed or full screen,
+    /// and the switch to the 32 mixer layout is fine here." His display is
+    /// 2560x1378 usable, at 100%.
+    ///
+    /// What he had instead was twelve and sixteen, because both defaults were
+    /// solved against the MONITOR rather than the window — see
+    /// `default_arr_visible` for the argument that was, and why it was
+    /// superseded. So this test is the screen arguing back: the day somebody
+    /// retunes `COMFY_LANE_H`, `COMFY_STRIP_PITCH` or `COUNT_LADDER`, his desk
+    /// is what has to agree.
+    ///
+    /// **One app, resized in place**, which is the other half of what he asked
+    /// for. He maximises a window that is already open; nothing here relaunches
+    /// anything, and `frame_on` runs exactly ONE frame at each size, so the
+    /// climb from eight to a dozen is a claim about the frame the resize
+    /// arrives on and not about the frame after it.
+    ///
+    /// Revert-checks, all four performed, and each one is the fault it undoes:
+    /// put `COMFY_LANE_H` back to 92 and the lane assertion reads 6; key
+    /// `default_arr_visible` back to `monitor_usable_h` and it reads 12 — the
+    /// number he complained about, out of the code he complained about; put
+    /// `COMFY_STRIP_PITCH` back to 70 and the strip assertion reads 16, the
+    /// other number he complained about; drop the 10 rung from `COUNT_LADDER`
+    /// and the strip assertion reads 8, because with the rung gone there is
+    /// nowhere near ten to land.
+    #[test]
+    fn the_owners_screen_opens_eight_lanes_and_ten_strips_and_climbs_to_a_dozen() {
+        let s = desk_on(2560, 1378, 100);
+        let ctx = egui::Context::default();
+        let win = initial_window_size(&s);
+        let mut app = TangentApp::new(&ctx, s, NO_SAVE);
+        // The display, and the two things that count as "filling" it. A
+        // maximised window keeps the menu bar and the Dock, so it gets the
+        // 1378 he reported; full screen takes those too and gets all 1440.
+        // They are different panes and he asked for the same dozen in both.
+        let monitor = Vec2::new(2560.0, 1440.0);
+        let usable = Vec2::new(2560.0, 1378.0);
+
+        app.arrangement_open = true;
+        let (lanes, pitch) = painted_lanes(&ctx, &mut app, win, monitor, Fills::No);
+        assert_eq!(
+            lanes, 8,
+            "the timeline opened {lanes} lanes at 100% on 2560x1378, not the eight he asked for"
+        );
+        let (max_lanes, max_pitch) =
+            painted_lanes(&ctx, &mut app, usable, monitor, Fills::Maximised);
+        assert_eq!(
+            max_lanes, 12,
+            "maximised gave {max_lanes} lanes, not a dozen"
+        );
+        let (fs_lanes, _) = painted_lanes(&ctx, &mut app, monitor, monitor, Fills::FullScreen);
+        assert_eq!(
+            fs_lanes, 12,
+            "full screen gave {fs_lanes} lanes, not a dozen — and full screen is 62 points \
+             taller than maximised, which is exactly the gap a density has to swallow"
+        );
+        // **And the point of showing fewer is that each one is TALLER.** The
+        // count is the setting; the row height is what he is actually looking
+        // at. The timeline gets 644 points at this window whatever the count
+        // is, so the dozen he was getting were 53 points each — 60 is the
+        // floor that says the rows really did grow, and not merely that a
+        // number changed. The filled window must not go backwards from there
+        // either: more lanes AND more room per lane is the whole bargain.
+        assert!(
+            pitch > 60.0 && max_pitch > pitch * 0.9,
+            "eight lanes came out {pitch} tall and a dozen {max_pitch}"
+        );
+
+        app.arrangement_open = false;
+        app.mixer_open = true;
+        let strips = painted_strips(&ctx, &mut app, win, monitor, Fills::No);
+        assert_eq!(
+            strips, 10,
+            "the desk opened {strips} strips at 100% on 2560x1378, not the ten he asked for"
+        );
+        // **Thirty-two on a full screen, and not because a count says so.**
+        // The desk folds into two rows of sixteen once it has the height for
+        // it (`mixer_panel`'s `two_rows`), which is the "32 mixer layout" he
+        // called fine. No pitch could have produced it: ten strips in 1280
+        // points and thirty-two in 2560 is not the same density twice.
+        for (how, pane) in [(Fills::Maximised, usable), (Fills::FullScreen, monitor)] {
+            let full_strips = painted_strips(&ctx, &mut app, pane, monitor, how);
+            assert_eq!(
+                full_strips,
+                crate::recorder::CHANNELS,
+                "the filled desk painted {full_strips} strips, not the folded thirty-two"
+            );
+        }
+    }
+
+    /// **A count somebody CHOSE outlives every window they open it in.**
+    ///
+    /// The `0` sentinel is the whole of the auto rule: a concrete number in the
+    /// settings file is a Shift+wheel somebody spent, and no window size may
+    /// overrule it. Five lanes and seven strips are deliberately not on
+    /// `COUNT_LADDER` — no derivation can produce them, so seeing them on
+    /// screen proves the derivation never ran.
+    ///
+    /// Revert-check, performed: make `arr_visible`/`mixer_visible` consult the
+    /// default unconditionally — drop the `== 0` arm — and the first assertion
+    /// reads 8, which is a rung and therefore a derivation, in place of the
+    /// five somebody chose.
+    ///
+    /// The desk is asked at two WINDOWED sizes rather than maximised, and the
+    /// reason is worth writing down: a full desk on a tall panel folds into two
+    /// rows and paints all thirty-two whatever the count is. That is the fold's
+    /// decision, not the count's — the timeline, which has no fold, is asked
+    /// maximised as well.
+    #[test]
+    fn a_chosen_track_count_beats_the_window_at_every_size() {
+        let mut s = desk_on(2560, 1378, 100);
+        s.arr_visible = 5;
+        s.mixer_visible = 7;
+        let ctx = egui::Context::default();
+        let win = initial_window_size(&s);
+        let mut app = TangentApp::new(&ctx, s, NO_SAVE);
+        let monitor = Vec2::new(2560.0, 1440.0);
+        let usable = Vec2::new(2560.0, 1378.0);
+
+        app.arrangement_open = true;
+        assert_eq!(
+            painted_lanes(&ctx, &mut app, win, monitor, Fills::No).0,
+            5,
+            "the window overruled a chosen five lanes"
+        );
+        assert_eq!(
+            painted_lanes(&ctx, &mut app, usable, monitor, Fills::Maximised).0,
+            5,
+            "maximising overruled a chosen five lanes"
+        );
+        assert_eq!(
+            painted_lanes(&ctx, &mut app, monitor, monitor, Fills::FullScreen).0,
+            5,
+            "full screen overruled a chosen five lanes"
+        );
+
+        app.arrangement_open = false;
+        app.mixer_open = true;
+        assert_eq!(
+            painted_strips(&ctx, &mut app, win, monitor, Fills::No),
+            7,
+            "the window overruled a chosen seven strips"
+        );
+        assert_eq!(
+            painted_strips(&ctx, &mut app, Vec2::new(1000.0, 700.0), monitor, Fills::No),
+            7,
+            "a smaller window overruled a chosen seven strips"
+        );
+    }
+
+    /// **Every other display, before and after, so one man's screen is not the
+    /// only thing the constants were fitted to.**
+    ///
+    /// `COMFY_LANE_H` and `COMFY_STRIP_PITCH` are taste numbers anchored on the
+    /// owner's desk, and the way that goes wrong is that somebody tunes until
+    /// his machine reads right and a laptop opens four toothpicks. So the whole
+    /// table is here, with the counts as they were BEFORE this change beside
+    /// them — both columns measured, by running the two functions on either
+    /// side of it, at the window each display opens at:
+    ///
+    ///   display        window      lanes was → now   strips was → now
+    ///   2560x1378      1280x831       12 → 8            16 → 10
+    ///   1920x1030       960x623        8 → 6            12 → 6
+    ///   3840x2100      1920x1213      16 → 12           24 → 16
+    ///   1280x648        640x413        6 → 4             6 → 4
+    ///   5120x2800      2560x1557      24 → 16           32 → 24
+    ///   3440x1400      1720x1105      12 → 10           24 → 16
+    ///
+    /// Every screen loses a rung or two, which is the point — the old numbers
+    /// were the monitor's answer imposed on a window half its size. Nothing
+    /// collapses: the smallest window in the table still opens four lanes and
+    /// four strips, and the 5K still opens sixteen.
+    ///
+    /// **What is ASSERTED below is what is PAINTED, which is not always that
+    /// number.** Once the desk has thirty-two channels and a panel tall enough
+    /// for two rows it folds, and a folded desk paints all thirty-two whatever
+    /// the count says — that is why the 4K's and the 5K's windows assert 32
+    /// strips against a derived 16 and 24. The fold is `mixer_panel`'s
+    /// decision and this change does not touch it.
+    ///
+    /// The claims that have to hold everywhere are the ones after the table:
+    /// every answer is a real rung, a bigger window is never given fewer of
+    /// either, and no lane is crushed below a height a waveform can be read in.
+    /// The exact numbers are asserted too, because a table nobody checks is a
+    /// comment.
+    ///
+    /// Revert-check, performed: `COMFY_LANE_H` back to 92 fails here as well as
+    /// on the owner's screen, and on a row that is nobody's reference — the
+    /// 1920x1030 laptop, filled out, drops from 10 lanes to 8. That is what the
+    /// table is for: a retune has to come here and say what it did to five
+    /// other people's displays, not only to his.
+    #[test]
+    fn the_default_track_counts_stay_sane_on_other_displays() {
+        // display w, usable h, lanes windowed, strips windowed, lanes full,
+        // strips full.
+        let table = [
+            (1920i64, 1030i64, 6usize, 6usize, 10usize, 16usize),
+            (3840, 2100, 12, 32, 24, 32),
+            (1280, 648, 4, 4, 6, 10),
+            (5120, 2800, 16, 32, 24, 32),
+            (3440, 1400, 10, 16, 12, 32),
+        ];
+        let chans = crate::recorder::CHANNELS;
+        for (w, h, lanes_win, strips_win, lanes_full, strips_full) in table {
+            let s = desk_on(w, h, 100);
+            let ctx = egui::Context::default();
+            let win = initial_window_size(&s);
+            let mut app = TangentApp::new(&ctx, s, NO_SAVE);
+            // `h` IS the usable height here, so maximised and the monitor are
+            // the same pane on these rows; the owner's own test is where the
+            // maximised/full-screen difference is asked about.
+            let monitor = Vec2::new(w as f32, h as f32);
+            let usable = monitor;
+
+            app.arrangement_open = true;
+            let (lw, pitch_w) = painted_lanes(&ctx, &mut app, win, monitor, Fills::No);
+            let (lf, pitch_f) = painted_lanes(&ctx, &mut app, usable, monitor, Fills::Maximised);
+            app.arrangement_open = false;
+            app.mixer_open = true;
+            let sw = painted_strips(&ctx, &mut app, win, monitor, Fills::No);
+            let sf = painted_strips(&ctx, &mut app, usable, monitor, Fills::Maximised);
+            let at = format!("{w}x{h}, window {}x{}", win.x, win.y);
+
+            assert_eq!((lw, sw), (lanes_win, strips_win), "windowed on {at}");
+            assert_eq!((lf, sf), (lanes_full, strips_full), "full screen on {at}");
+            assert!(lf >= lw && sf >= sw, "the bigger window showed less on {at}");
+            for n in [lw, lf, sw, sf] {
+                assert!(
+                    COUNT_LADDER.contains(&n) || n == chans,
+                    "a default of {n} is not a ladder rung, on {at}"
+                );
+                assert!((4..=chans).contains(&n), "a default of {n} is out of bounds on {at}");
+            }
+            // **No toothpick rows.** The whole reason the count follows the
+            // window is that a lane has to be tall enough to see a waveform in;
+            // 45 points is about where a clip stops being a shape and becomes a
+            // line, and it is the number this rule exists to stay above.
+            assert!(
+                pitch_w >= 45.0 && pitch_f >= 45.0,
+                "lanes came out {pitch_w} and {pitch_f} tall on {at}"
+            );
         }
     }
 
