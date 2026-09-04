@@ -1808,6 +1808,14 @@ struct Shared {
     rolling: AtomicBool,
     /// The frame the callback reached at the end of the last chunk.
     transport_pos: AtomicU64,
+    /// **The engine's sample rate, for whoever on the audio thread needs
+    /// to turn `transport_pos` into beats.** A built-in voice's
+    /// arpeggiator does (`run_rack` builds it a `Transport`), and the rack
+    /// has the board but not the renderer. Written once, at start, from
+    /// the rate the device actually opened at; 48 kHz until then.
+    /// Appended to this struct rather than threaded through ten
+    /// `run_rack` call sites.
+    rate: AtomicU32,
     /// **The loop region, in frames: `[loop_a, loop_b)`.** Active only when
     /// `loop_b > loop_a`; zero-width means no loop. While rolling, the
     /// callback wraps `pos` from `loop_b` back to `loop_a` — so the wrap
@@ -2363,6 +2371,7 @@ impl Shared {
             transport_req: AtomicU64::new(0),
             transport_ack: AtomicU64::new(0),
             rolling: AtomicBool::new(false),
+            rate: AtomicU32::new(48_000),
             transport_pos: AtomicU64::new(0),
             loop_a: AtomicU64::new(0),
             loop_b: AtomicU64::new(0),
@@ -2650,10 +2659,20 @@ enum Backend {
 
 impl Backend {
     /// Render a voice: notes in, the plugin's own buffers out.
+    ///
+    /// `params` is this block's automation and `transport` the song's
+    /// position. Both arrived with the built-in voice (brief §7.3): the
+    /// VST3 and LV2 arms ignore them exactly as they did before — a VST3
+    /// instrument's automation still travels the editor's own road, and
+    /// LV2's is a control port — while the analog reads both, because
+    /// without the first its automation lanes would point at knobs
+    /// nothing reads, and without the second its arpeggiator has no grid.
     fn process_voice(
         &mut self,
         notes: &[tangent_host::Note],
         controls: &[tangent_host::Control],
+        params: &[tangent_host::ParamPoint],
+        transport: crate::analog::arp::Transport,
         frames: usize,
         bufs: &mut [Vec<f32>],
     ) -> Result<(), String> {
@@ -2711,10 +2730,16 @@ impl Backend {
                 // A voice reads nothing; `bufs` is both scratch and output.
                 inst.process_planar(frames, &[], bufs)
             }
-            // Unreachable by construction — the loader seats every built-in
-            // with `voice: false` — but an arm that renders silence would
-            // hide the day that changes, and an error names it.
-            Backend::Builtin(_) => Err("a built-in effect takes no notes".to_owned()),
+            // **The day this arm named has come.** The loader seats a
+            // built-in with the flag its table row declares, and the one
+            // row with `voice: true` is the analog, which takes the notes,
+            // the automation and the transport. An effect that somehow
+            // arrives here answers silence, in `BuiltinUnit::process_voice`,
+            // rather than passing anything through.
+            Backend::Builtin(unit) => {
+                unit.process_voice(notes, controls, params, transport, frames, bufs);
+                Ok(())
+            }
         }
     }
 
@@ -3310,6 +3335,21 @@ fn run_rack(
         Some((s, b)) if s == seat => Some(b),
         _ => None,
     };
+    // **The song's position, for a built-in voice.** Three relaxed loads
+    // per rack call; the beat is the frame the callback reached, at the
+    // board's tempo — the same figure the arpeggiator would free-run from
+    // when the transport stops. Read once here so every bay in the rack
+    // sees the same block.
+    let transport = {
+        let bpm = f64::from_bits(shared.bpm.load(Ordering::Relaxed));
+        let rate = f64::from(shared.rate.load(Ordering::Relaxed).max(1));
+        let pos = shared.transport_pos.load(Ordering::Relaxed) as f64;
+        crate::analog::arp::Transport {
+            bpm,
+            playing: shared.rolling.load(Ordering::Relaxed),
+            beat: pos / rate * bpm / 60.0,
+        }
+    };
     for (bay, slot) in rack.slots.iter_mut().enumerate() {
         let Some(p) = slot.0.as_mut() else {
             // **An armed EMPTY bay taps what the bay WOULD see** — the
@@ -3428,7 +3468,7 @@ fn run_rack(
             // instrument, and whatever was in `planar` before bay 1 ran is
             // silence or an upstream voice being superseded.
             if p.backend
-                .process_voice(notes, controls, frames, &mut p.bufs)
+                .process_voice(notes, controls, bay_params, transport, frames, &mut p.bufs)
                 .is_err()
             {
                 continue;
@@ -3448,13 +3488,21 @@ fn run_rack(
             }
             continue;
         }
-        // **After the block, and only for an effect.** Before it the port
-        // holds whatever it was initialised to; and a VOICE's own delay holds
-        // nothing else up, which is the same exemption the VST3 path makes.
-        if !p.voice {
+        // **After the block, and only for an effect** — and for a BUILT-IN
+        // voice. Before it the port holds whatever it was initialised to. A
+        // VST3 voice's own delay holds nothing else up, the exemption the
+        // VST3 path makes because it has no route to say its figure here;
+        // the analog has one (`BuiltinUnit::latency`) and the brief asks
+        // for it to be honest (§7.9): its oscillators' correction window
+        // and its 4× pair put its sound sixty-eight samples behind the note,
+        // and reporting that is what lets the compensation graph line it up
+        // with the lanes beside it.
+        if !p.voice || matches!(p.backend, Backend::Builtin(_)) {
             if let Some(n) = p.backend.reported_latency() {
                 Rack::set_latency(shared, seat, bay, n);
             }
+        }
+        if !p.voice {
             // **And the meter, for a built-in with a gain element.** The
             // unit's own read resets its max-hold, so this drains it every
             // block; `fetch_max` on the bits — non-negative dB, the
@@ -10175,6 +10223,7 @@ impl Engine {
         };
 
         let shared = Arc::new(Shared::new());
+        shared.rate.store(rate as u32, Ordering::Relaxed);
         // What was actually asked of the host, recorded once, **taken from the
         // plan rather than re-derived from it** — see `Shared::out_ring_asked`.
         //
@@ -10894,9 +10943,14 @@ impl Engine {
         Ok(Prepared {
             display_name: spec.class.to_owned(),
             backend: Backend::Builtin(unit),
-            // Always an effect: a built-in INSTRUMENT is a mask and a
-            // `mix_channels` branch, never a bay tenant. See the module doc.
-            voice: false,
+            // **What the table says.** For a long time this was a hard
+            // `false` — "a built-in INSTRUMENT is a mask and a
+            // `mix_channels` branch, never a bay tenant" — and the three
+            // mask instruments still are. The analog is the first built-in
+            // that is a bay tenant AND a voice, and its row declares it; a
+            // voice here is handed the block's notes and REPLACES the
+            // channel's signal, the `Hosted::voice` contract.
+            voice: spec.voice,
             channels: TAP_CHANNELS,
             loaded: Loaded {
                 bundle: PathBuf::from(spec.path),
@@ -16669,6 +16723,65 @@ mod tests {
         let mut out = vec![0.0f32; 512 * 2];
         e.render_offline(&mut out);
         assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    /// **The analog loads into a bay AS A VOICE, and a note through the
+    /// live rack comes out as sound.** The trim's proof, one road further:
+    /// sixty-one automation lanes with the kernel's own titles, the latency
+    /// the kernel reports, and a MIDI clip rolled through the channel that
+    /// makes audio where an empty bay makes none — which is the whole of
+    /// what `voice: true` buys and what `is_instrument_sentinel` would have
+    /// silently taken away.
+    #[test]
+    fn the_builtin_analog_loads_as_a_voice_and_a_note_sounds() {
+        use std::sync::Arc;
+        const CH: usize = 3;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let loaded = e
+            .load_insert(CH, 0, Some(Path::new(crate::builtin_fx::ANALOG_PATH)), None)
+            .expect("the analog must load")
+            .expect("a load reports what it seated");
+        assert_eq!(loaded.class, "Tangent Analog");
+        assert_eq!(loaded.vendor, "built in");
+        assert!(e.insert_state_error(CH, 0).is_none());
+        let lanes = e.insert_parameters(CH, 0);
+        assert_eq!(lanes.len(), crate::analog::PARAMS.len(), "{} lanes", lanes.len());
+        let cutoff = lanes
+            .iter()
+            .find(|l| l.id == crate::analog::P_CUTOFF as u32)
+            .expect("the cutoff has a lane");
+        assert_eq!(cutoff.title, "Cutoff");
+        assert_eq!(cutoff.units, "Hz");
+        assert_eq!(cutoff.step_count, 0);
+        let voices = lanes.iter().find(|l| l.id == crate::analog::P_VOICES as u32).unwrap();
+        assert_eq!(voices.step_count, 16);
+
+        e.set_channel_gain(CH, 0.5);
+        e.set_master_gain(1.0);
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; 1024 * 2];
+        for _ in 0..3 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let quiet = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        assert!(quiet < 1e-6, "a bay with no notes made sound: {quiet}");
+        e.set_midi_clips(vec![PlacedMidi {
+            strip: CH,
+            start: 0,
+            len: 96_000,
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 48_000, key: 48, vel: 110 }]),
+        }]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            assert!(out.iter().all(|s| s.is_finite()));
+            peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+        }
+        assert!(peak > 0.005, "a note through the analog's bay made no sound: {peak}");
     }
 
     /// **An untouched trim is a null through the real rack** — planar hand-in,

@@ -539,11 +539,15 @@ impl Analog {
         self.laned = laned;
     }
 
-    /// Everything silent, phases kept, dials kept.
+    /// Everything silent, phases kept, dials kept — and the dials SETTLED
+    /// where they were set, not slewing there: the loader calls this after
+    /// writing a restored state, and a preset that faded in over a few
+    /// milliseconds would be somebody's setting arriving late.
     pub fn clear(&mut self) {
         for v in &mut self.voices {
             v.clear();
         }
+        self.smooth = self.vals;
         self.bank.clear();
         self.voice_lane = [NO_LANE; MAX_VOICES];
         self.corpse_lane = [NO_LANE; CORPSES];

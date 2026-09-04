@@ -55,6 +55,8 @@ use std::sync::OnceLock;
 /// switch at 32′ or 8′ gives a fixed-frequency oscillator for audio-rate
 /// modulation, which is the other half of the 1970 machine's trick.
 pub const RANGE_OCTAVES: [f32; 6] = [-5.0, -2.0, -1.0, 0.0, 1.0, 2.0];
+/// The same six positions as the panel engraves them.
+pub const RANGE_LABELS: [&str; 6] = ["LO", "32'", "16'", "8'", "4'", "2'"];
 
 /// The six waveform positions, in switch order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
