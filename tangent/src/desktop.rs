@@ -14923,7 +14923,17 @@ mod tests {
         for (path, name, about) in tangent_ui::faces::SUITE_UNITS {
             let spec = crate::builtin_fx::spec_for(path)
                 .unwrap_or_else(|| panic!("{path} has a face and no unit"));
-            assert_eq!(spec.class, name, "{path}: the chip and the face disagree");
+            // **The class, plus the standing where a unit has one.** A
+            // unit that is not finished says so in its display name — the
+            // Keys have said "(Experimental)" for releases, and the denoiser
+            // says it now — while `class` stays the plain word because
+            // `preset_subfolder` spells a directory out of it and a rename
+            // would hide every preset already saved in it. So the two agree
+            // up to that suffix and must agree exactly below it.
+            let bare = name
+                .strip_suffix(" (Experimental)")
+                .map_or(name, str::trim_end);
+            assert_eq!(spec.class, bare, "{path}: the chip and the face disagree");
             assert!(!about.is_empty());
             // The trademark rule, same as every effect since the phaser:
             // the NAME is ours; hardware lives in descriptions only.

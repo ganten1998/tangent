@@ -2629,10 +2629,41 @@ fn plugin_display_name(path: &str) -> &str {
 /// answer matters.
 fn insert_chip_name(path: &str) -> &str {
     let name = plugin_display_name(path);
-    name.strip_prefix("Tangent ")
+    let name = name
+        .strip_prefix("Tangent ")
         .or_else(|| name.strip_prefix("TANGENT "))
-        .unwrap_or(name)
+        .unwrap_or(name);
+    // **And the standing the unit is at comes off too.**
+    //
+    // The owner asked for "(Experimental)" on the denoiser's full name — "as
+    // its still not satisfactory, but usable" — and for a bay's chip to read
+    // just "Denoise" in the same breath he asked for the house prefix off it.
+    // Both hold: the picker, the face's title and the preset shelf carry the
+    // standing, because those are where somebody CHOOSES the unit and where
+    // the warning is worth its width; a chip in a three-bay strip is a label
+    // on a thing already chosen, and forty points of it.
+    //
+    // Suffix and not a second table, so a unit cannot be experimental in one
+    // place and not the other: there is one name, and this is the one place
+    // that shortens it. See `EXPERIMENTAL_SUFFIX`.
+    name.strip_suffix(EXPERIMENTAL_SUFFIX)
+        .map_or(name, str::trim_end)
 }
+
+/// **What marks a unit as not finished**, spelled once.
+///
+/// Appended to the NAME in `faces::SUITE_UNITS` rather than kept as a flag
+/// beside it, because every surface that shows a unit already reads that
+/// table and none of them would have to learn a second field. The one surface
+/// that must not carry it — an insert bay's chip — takes it off again in
+/// `insert_chip_name`, which is also the only place the house prefix comes
+/// off, so the two shortenings live together and cannot disagree.
+///
+/// NOT part of `UnitSpec::class`, deliberately: `preset_subfolder` names a
+/// folder on disk from that string, so putting the standing there would move
+/// `Presets/Tangent Denoise` out from under every preset already saved in it
+/// the moment the unit graduated.
+const EXPERIMENTAL_SUFFIX: &str = " (Experimental)";
 
 /// Where the press that started the gesture in flight landed.
 ///
@@ -42180,10 +42211,31 @@ mod tests {
                 !chip.contains('@') && !chip.contains("Tangent"),
                 "the chip for {path} reads {chip:?}"
             );
-            assert!(
-                name.ends_with(chip) && !chip.is_empty(),
-                "{name} lost more than its prefix: {chip:?}"
+            // **The prefix and the STANDING, and nothing else.** A chip is
+            // the name with the house prefix off it and, for a unit that is
+            // not finished, the parenthetical off it too — the owner asked
+            // for "(Experimental)" on the denoiser's full name and for its
+            // chip to read just "Denoise", and both are the same name shown
+            // at two widths. Anything beyond those two is the chip inventing
+            // a word, which is what this line is here to catch.
+            let want = name
+                .strip_prefix("Tangent ")
+                .or_else(|| name.strip_prefix("TANGENT "))
+                .unwrap_or(name)
+                .strip_suffix(super::EXPERIMENTAL_SUFFIX)
+                .map_or_else(
+                    || {
+                        name.strip_prefix("Tangent ")
+                            .or_else(|| name.strip_prefix("TANGENT "))
+                            .unwrap_or(name)
+                    },
+                    str::trim_end,
+                );
+            assert_eq!(
+                chip, want,
+                "{name} lost more than its prefix and its standing"
             );
+            assert!(!chip.is_empty(), "{name} shortened to nothing");
         }
         assert_eq!(super::insert_chip_name("@tangent-denoise"), "Denoise");
         assert_eq!(super::insert_chip_name("@tangent-amp"), "Amp");
