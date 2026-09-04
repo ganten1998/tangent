@@ -6,7 +6,7 @@ use block2::Block;
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSModalResponse, NSOpenPanel, NSSavePanel, NSWindow, NSWindowLevel};
-use objc2_foundation::{NSArray, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer, NSURL};
+use objc2_foundation::{NSArray, NSString, NSURL};
 use raw_window_handle::RawWindowHandle;
 
 use super::super::{
@@ -43,6 +43,22 @@ impl InnerModal for NSSavePanel {
         unsafe { self.runModal() }
     }
 }
+
+/// TANGENT: an AppKit pair carried to the MAIN QUEUE and unwrapped there.
+///
+/// `Retained` is deliberately not `Send`, and rightly: these are main-thread
+/// objects. The only thing this crosses is a `DispatchQueue::main().after`
+/// block, which runs ON the main thread — the thread both objects were made
+/// on and belong to. Nothing here is touched anywhere else. See
+/// `Panel::hold_directory`.
+struct OnMain(Retained<NSSavePanel>, Retained<NSURL>);
+
+// SAFETY: only ever unwrapped inside a block dispatched to the main queue.
+// Both halves: the queue's own bound asks for a closure that is `Send`, and
+// the closure carrying this by value needs the wrapper to be `Sync` too.
+unsafe impl Send for OnMain {}
+// SAFETY: as above — never observed from any thread but the main one.
+unsafe impl Sync for OnMain {}
 
 impl Panel {
     fn as_open_panel(&self) -> Option<&NSOpenPanel> {
@@ -101,17 +117,40 @@ impl Panel {
     /// in `NSModalPanelRunLoopMode`, and a timer left in the default mode
     /// alone would not fire until the panel had already closed.
     fn hold_directory(&self, url: Retained<NSURL>) {
-        for after in [0.03_f64, 0.08, 0.18] {
-            let panel = self.panel.clone();
-            let url = url.clone();
-            let block = block2::RcBlock::new(move |_t: core::ptr::NonNull<NSTimer>| unsafe {
-                panel.setDirectoryURL(Some(&url));
+        // **On the MAIN QUEUE, not on a run-loop timer.**
+        //
+        // The first attempt scheduled `NSTimer`s in `NSRunLoopCommonModes`.
+        // That holds in a standalone AppKit program — measured, three shots,
+        // all three fired — and did NOT hold inside Tangent, where the save
+        // panel runs as a sheet nested inside winit's own event loop: the
+        // app handed the panel the right folder, logged that it existed, and
+        // the panel opened at home anyway. Which run-loop modes are common
+        // under a nested loop is not something to reason about from here.
+        //
+        // The main QUEUE has no such question. It is drained while a modal
+        // panel is up regardless of mode, and it is what the original
+        // measurement used — the one that established 30 ms is late enough
+        // and the next run-loop turn is not.
+        //
+        // `Retained` is not `Send`, so the pair crosses in a wrapper. It is
+        // sound for the reason the wrapper's own note gives: the block runs
+        // ON the main thread, which is where these objects live and where
+        // they were made, and nothing touches them anywhere else.
+        for after in [30_u64, 80, 180, 320] {
+            let carry = OnMain(self.panel.clone(), url.clone());
+            let when = dispatch2::DispatchTime::try_from(
+                std::time::Duration::from_millis(after),
+            );
+            let Ok(when) = when else { continue };
+            let _ = dispatch2::DispatchQueue::main().after(when, move || {
+                // **The WHOLE wrapper crosses, not its two fields.** Rust
+                // 2021 captures disjoint fields, so destructuring `carry`
+                // straight away made the closure hold two `Retained`s and
+                // the `Send` on the wrapper applied to nothing. Naming it
+                // once as itself is what puts the wrapper in the capture.
+                let carry = carry;
+                unsafe { carry.0.setDirectoryURL(Some(&carry.1)) };
             });
-            let timer =
-                unsafe { NSTimer::timerWithTimeInterval_repeats_block(after, false, &block) };
-            unsafe {
-                NSRunLoop::currentRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
-            }
         }
     }
 

@@ -54,8 +54,12 @@ pub fn courier_bold() -> FontFamily {
 /// deliberately in favour of the option working for everyone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum FontChoice {
-    #[default]
     Courier,
+    /// **The one a fresh install wears**, at the owner's word. Courier Prime
+    /// was the default from the beginning and stays in the list — a settings
+    /// file that names it keeps it, so nobody's desk changes typeface under
+    /// them; only an install that has never chosen gets this.
+    #[default]
     Terminess,
     JetBrains,
 }
@@ -64,9 +68,13 @@ impl FontChoice {
     /// Stable key for settings.json. Unknown values fall back to the default.
     pub fn from_key(s: &str) -> Self {
         match s {
-            "terminess" => FontChoice::Terminess,
+            "courier" => FontChoice::Courier,
             "jetbrains" => FontChoice::JetBrains,
-            _ => FontChoice::Courier,
+            // Unknown falls back to the DEFAULT, which is what this
+            // function's own doc promises — it used to name Courier
+            // outright, so the promise and the code disagreed the moment the
+            // default moved.
+            _ => FontChoice::default(),
         }
     }
 

@@ -496,6 +496,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
     // in neither place meant the two most-pressed shortcuts in any editor
     // went undocumented on every surface.
     rows.push(("C-S", "save the project"));
+    rows.push(("C-R", "record the arrangement - a take may be rolling"));
     rows.push(("C-Z", "undo"));
     rows.push(("C-S-Z", "redo"));
     rows.push(heading(match view {
@@ -753,10 +754,15 @@ fn layout(rect: Rect, rows: usize, widest: usize, widest_key: usize) -> (Rect, f
     let measure = |cols: usize| measure_card(rect, rows, widest, widest_key, cols);
 
     let mut best: Option<(usize, f32, f32, f32)> = None;
-    // Up to FIVE columns now: the arrangement's card carries the gesture
-    // rows — forty-plus of them with the navigator — and a short window
-    // cannot hold them any other way at a legible size.
-    for cols in 1..=5usize {
+    // Up to SIX columns now: the arrangement's card carries the gesture
+    // rows — fifty-plus of them once the global chords are listed — and a
+    // short window cannot hold them any other way at a legible size. It was
+    // five until Ctrl+R joined Ctrl+S on the GENERAL block and the card
+    // stopped fitting 650x125, which `the_card_fits_the_window_at_every_size
+    // _and_row_count` reported to the point: "51 rows in 5 col(s) need
+    // 125.58 of 119.99". A column is cheap; a row with nowhere to be is a
+    // shortcut nobody can look up.
+    for cols in 1..=6usize {
         let (size, w, h) = measure(cols);
         if w <= rect.width() * 0.94 && h <= rect.height() {
             if best.is_none_or(|(_, bs, ..)| size > bs) {
@@ -768,8 +774,8 @@ fn layout(rect: Rect, rows: usize, widest: usize, widest_key: usize) -> (Rect, f
     // widest arrangement and let the clamp below trim it, which clips inside
     // the window rather than painting outside it.
     let (cols, size, w, h) = best.unwrap_or_else(|| {
-        let (size, w, h) = measure(5);
-        (5, size, w, h)
+        let (size, w, h) = measure(6);
+        (6, size, w, h)
     });
     // Never flush against the window edges: a card touching them reads as
     // clipped even when it is not, and exact-equality containment is a float
@@ -947,6 +953,9 @@ mod tests {
             // the two cannot collide because `pressed` refuses any modified
             // press outright.
             "C-S" => vec!["S"],
+            // Ctrl/Cmd+R. The bare `R` is Clear Notes and lives in
+            // `BINDINGS`; this row vouches for the chord `paint` reads.
+            "C-R" => vec!["R"],
             // The view chords. Dispatched from `fn paint` rather than from
             // any view's own handler — the old version of this test filed
             // every one of them under "gesture" and checked nothing.
@@ -1328,9 +1337,10 @@ mod tests {
             .filter(|&&(_, _, a, s)| s && available(a, gates))
             .count();
         // Plus the prose rows every card carries — the two view keys, SAVE,
-        // and the two undo/redo chords, none of which are in `BINDINGS`
-        // because that table is single keys — and the TWO section headings.
-        assert_eq!(piano.len(), shown + 7, "the piano card dropped a live key");
+        // RECORD, and the two undo/redo chords, none of which are in
+        // `BINDINGS` because that table is single keys — and the TWO section
+        // headings.
+        assert_eq!(piano.len(), shown + 8, "the piano card dropped a live key");
 
         for (view, name) in [
             (HelpView::Mixer, "mixer"),
@@ -1676,7 +1686,7 @@ mod tests {
         for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() }] {
             for (label, _) in card_rows(gates, HelpView::Piano) {
                 // The view-key gesture rows are card prose, not bindings.
-                if matches!(label, "S-1" | "S-2" | "S-3" | "C-S" | "C-Z" | "C-S-Z")
+                if matches!(label, "S-1" | "S-2" | "S-3" | "C-S" | "C-R" | "C-Z" | "C-S-Z")
                     || label.is_empty()
                 {
                     // The view-key gesture rows and the section headings

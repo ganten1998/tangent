@@ -2094,7 +2094,10 @@ impl ResetScope {
             }
             ResetScope::Everything => {
                 "This puts all five of the above back at once: colours, \
-                 layout, playing, the desk, and your devices and folders."
+                 layout, playing, the desk, and your devices and folders - \
+                 and then opens a fresh session from the default template, \
+                 so the desk you are left looking at is the one a new \
+                 install shows."
             }
             ResetScope::Template => {
                 "Every launch opens the default template, and every New is a \

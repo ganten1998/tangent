@@ -21069,6 +21069,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if let Some(slot) = self.settings.strip_dx7_patch.get_mut(strip) {
             *slot = index.min(dialogs::CARTRIDGE_VOICES - 1);
         }
+        // **And it is WRITTEN DOWN**, which it was not.
+        //
+        // `set_dx7_cartridge_of` directly above saves; this did not, so a
+        // patch somebody chose lived in memory and nowhere else. The
+        // settings file kept whatever it had — zero on the owner's machine,
+        // every strip — and every session opened on it. He read that as the
+        // instrument having no memory at all: "the DX7 patches... DO NOT
+        // seem to store the chosen patches."
+        //
+        // The read side was never the problem: `strip_dx7_patch` is parsed
+        // and serialised and has been all along. Only the write was missing,
+        // which is why it looked like persistence was unimplemented rather
+        // than half-wired.
+        self.save_settings();
     }
 
     /// Which of the modelled keyboard's patches strip `strip` plays, as an
@@ -24854,14 +24868,32 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // driven per frame by `audition_tick`, because a press repeats and
             // a held chord must not.
             K::StopRecording => {
-                // ANY recording — the take's machine OR the arrangement's
-                // red button — and the rolling transport besides: Space is
-                // the wide key every DAW binds to stop, and stop returns
-                // the playhead to the EDIT CURSOR.
-                if self.recorder.state.is_active()
-                    || self.recorder.arr_recording
-                    || self.recorder.playing
-                {
+                // **A TAKE is the one thing Space cannot end.**
+                //
+                // It used to stop that too, and the cost only shows up in
+                // the way the app is actually used: a take is when somebody
+                // is playing, and while it rolls the whole desk should still
+                // answer — Space included, doing whatever Space does on the
+                // surface they are looking at. The owner: "space no longer
+                // stops a take, so i can control the whole daw while I do a
+                // take -- for showcasing. Only the button should start it and
+                // stop it now." So while the take machine is running Space
+                // is INERT here: not a stop, and not a play either, because
+                // rolling the transport out from under a take is the same
+                // accident wearing the other name.
+                //
+                // The arrangement's red button is deliberately NOT in that
+                // exemption. It is a different control with a different
+                // meaning — recording INTO the timeline, where stop is the
+                // ordinary end of the gesture — and it was not what he asked
+                // about.
+                if self.recorder.state.is_active() {
+                    return;
+                }
+                // The arrangement's red button and the rolling transport:
+                // Space is the wide key every DAW binds to stop, and stop
+                // returns the playhead to the EDIT CURSOR.
+                if self.recorder.arr_recording || self.recorder.playing {
                     self.request_recorder(recorder::RecorderRequest::Stop);
                 } else if self.mixer_open || self.arrangement_open {
                     // **And on the desk's surfaces, Space is PLAY too** —
@@ -25575,6 +25607,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // drums — that scope is about which interface is open.
         if matches!(scope, R::Everything) {
             self.reset_kits_to_default();
+            // **And the SESSION goes back too.**
+            //
+            // Everything else in this scope is a setting, and the desk on
+            // screen is not: it is the open project, so a reset put the
+            // parameters back and left the tracks standing. The owner: "i
+            // can open a session i made, then reset everything and the
+            // parameters are reset but tracks persist and i have to manually
+            // open 'new'." A reset that leaves you looking at the thing you
+            // were resetting is a reset you have to finish by hand.
+            //
+            // `NewDiscarding` rather than `New`, because `New` is allowed to
+            // stop and ask about a scratch with takes in it — and this road
+            // has already asked. `ask_before_resetting` is the only way in
+            // and its confirmation now says a fresh session is part of the
+            // deal, so a second question here would be the same question
+            // twice.
+            self.project_request = Some(crate::ports::ProjectRequest::NewDiscarding);
         }
 
         // Closing the detached window re-attaches; Python's close handler then
@@ -30469,6 +30518,31 @@ impl TangentApp {
             }) {
                 self.arrangement.named = true;
                 self.project_request = Some(crate::ports::ProjectRequest::Save);
+            }
+            // **Ctrl/Cmd+R — the ARRANGEMENT's record**, which is not the
+            // take machine and deliberately does not care whether one is
+            // rolling. The owner: "CMD or CTRL + R now starts recording (not
+            // takes but the actual daw transport recording -- can happen
+            // while a take is occuring even."
+            //
+            // `Capture` is the request that road already answers: it cancels
+            // a count-in, finishes a running arrangement record, or starts
+            // one with the count-in from settings. Enter reaches it too, but
+            // only THROUGH the take machine — `StartRecording` sends
+            // `Capture` when a take is active and `Toggle` when one is not —
+            // so there was no key that meant the arrangement's red button on
+            // its own.
+            //
+            // The bare `R` is Clear Notes and stays that way: `keys::pressed`
+            // refuses any modified press before it reaches the table, so the
+            // two cannot collide.
+            if ctx.input(|i| {
+                (i.modifiers.ctrl || i.modifiers.command)
+                    && !i.modifiers.shift
+                    && !i.modifiers.alt
+                    && i.key_pressed(egui::Key::R)
+            }) {
+                self.request_recorder(recorder::RecorderRequest::Capture);
             }
             // **Shift+1/2/3: theory, arrange, mixer** — the ctrl chords
             // retired because Windows' Ctrl+V is PASTE and a view key on
@@ -42194,13 +42268,16 @@ mod tests {
     fn a_focused_take_name_swallows_the_transport_key() {
         let (ctx, mut app) = recorder_app();
         app.settings.show_recorder = true;
-        // **Space means whichever of its two jobs is live.** Rolling, it
-        // stops. Idle, "stop" means nothing, so it sounds what is lit.
+        // **A take rolling, Space does NOTHING** — the owner's rule, so the
+        // desk stays playable through a take and only the button ends one.
+        // Kept here because this test's own subject is which keys reach the
+        // transport at all, and "none of them, while a take is up" is now
+        // part of that answer.
         app.recorder.state = recorder::RecordState::Rolling;
         assert_eq!(
             space(&ctx, &mut app),
-            Some(recorder::RecorderRequest::Stop),
-            "with a take rolling, Space stops it"
+            None,
+            "Space ended a take - only the button may do that"
         );
         app.recorder.state = recorder::RecordState::Idle;
         // Keytoggle on, because that is what "toggle notes on the neck" means
@@ -42251,8 +42328,12 @@ mod tests {
         assert_eq!(space(&ctx, &mut app), None);
         // And the same app, one flag later, DOES respond — otherwise this test
         // would go on passing if Space stopped working entirely.
+        //
+        // Proven with the TRANSPORT rolling rather than a take: a take is the
+        // one thing Space may no longer end, so using one here would make
+        // this half unfalsifiable the moment that rule was written.
         app.settings.show_recorder = true;
-        app.recorder.state = recorder::RecordState::Rolling;
+        app.recorder.playing = true;
         assert_eq!(
             space(&ctx, &mut app),
             Some(recorder::RecorderRequest::Stop)
@@ -45331,6 +45412,74 @@ mod tests {
         assert!(
             !matches!(asked, Some(crate::ports::ProjectRequest::Save)),
             "Cmd+Shift+S saved, so the chord does not check its modifiers"
+        );
+    }
+
+    /// **Ctrl/Cmd+R records the ARRANGEMENT, take or no take.**
+    ///
+    /// The owner: "CMD or CTRL + R now starts recording (not takes but the
+    /// actual daw transport recording -- can happen while a take is occuring
+    /// even." The second half is the whole point of the key: Enter reaches
+    /// `Capture` only THROUGH the take machine, so there was no way to mean
+    /// the arrangement's red button on its own, and no way at all to mean it
+    /// while a take was up.
+    ///
+    /// The bare `R` is Clear Notes and has to stay that way; the third block
+    /// is that, and it passes for a reason worth naming — `keys::pressed`
+    /// refuses any modified press before the table is consulted.
+    ///
+    /// Revert-check performed: delete the chord block and the first two go
+    /// red; drop the `!i.modifiers.alt` guard and alt-Cmd+R starts recording
+    /// as well, which the fourth block catches.
+    #[test]
+    fn ctrl_r_records_the_arrangement_even_under_a_take() {
+        let take = |rolling: bool, mods: egui::Modifiers| {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.show_recorder = true;
+            if rolling {
+                app.recorder.state = recorder::RecordState::Rolling;
+            }
+            while app.take_recorder_request().is_some() {}
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(1300.0, 900.0),
+                    )),
+                    modifiers: mods,
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::R,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: mods,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            let mut saw = false;
+            while let Some(r) = app.take_recorder_request() {
+                if r == recorder::RecorderRequest::Capture {
+                    saw = true;
+                }
+            }
+            saw
+        };
+        let cmd = egui::Modifiers::COMMAND;
+        assert!(take(false, cmd), "Cmd+R did not record the arrangement");
+        assert!(
+            take(true, cmd),
+            "Cmd+R did nothing with a take rolling - which is the case it \
+             was asked for"
+        );
+        assert!(
+            !take(false, egui::Modifiers::NONE),
+            "the bare R recorded - it is Clear Notes"
+        );
+        assert!(
+            !take(false, egui::Modifiers { alt: true, ..cmd }),
+            "alt+Cmd+R recorded, so the chord does not check its modifiers"
         );
     }
 

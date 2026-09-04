@@ -275,6 +275,36 @@ pub fn draw_amp(
                             pedal + 1
                         )
                     });
+                    // **The bay's own two verbs, on the right button.**
+                    //
+                    // The owner: "right click Delete and Replace buttons on
+                    // the pedals please, just like fx inserts have." A pedal
+                    // seat IS an ordinary insert bay — see
+                    // `FaceAction::PedalGesture`, which is why nothing here
+                    // needs a new addressing road — so the two rows are the
+                    // two the mixer's insert menu offers, and both are asks
+                    // this enum already carries: ALT is how a bay is
+                    // emptied, and `OpenPedal` is the picker over that seat,
+                    // which is what Replace means everywhere else.
+                    //
+                    // An empty seat gets no menu: there is nothing to delete
+                    // and a plain click already opens the picker.
+                    if !empty {
+                        chip.context_menu(|ui| {
+                            if ui.button("Delete FX").clicked() {
+                                out = Some(FaceAction::PedalGesture {
+                                    pedal,
+                                    alt: true,
+                                    shift: false,
+                                });
+                                ui.close_menu();
+                            }
+                            if ui.button("Replace FX").clicked() {
+                                out = Some(FaceAction::OpenPedal { pedal });
+                                ui.close_menu();
+                            }
+                        });
+                    }
                     if chip.clicked() && out.is_none() {
                         // **Read from THIS window's input, not from the
                         // desk's.** The app latches `alt_down`/`shift_down`
