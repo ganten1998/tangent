@@ -17547,6 +17547,31 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.save_settings();
                     return;
                 }
+                // **Flatten the tempo, from the curve itself.**
+                //
+                // It used to live on the tempo lane's HEADER, and that header
+                // is gone: the lane draws in the master's now and has no
+                // strip of its own to put a control on. The right button over
+                // the curve is where it belongs anyway — it is the one
+                // destructive thing the tempo has, and a gesture nobody
+                // reaches for by accident suits it better than a button did.
+                // It still ASKS, for the reason it always did: a map somebody
+                // spent an evening on is not something to lose to a click.
+                let on_tempo = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    matches!(
+                        crate::arrangement_panel::hit_test(rect, &view, p),
+                        Some(
+                            crate::arrangement_panel::Hit::TempoLane(..)
+                                | crate::arrangement_panel::Hit::TempoPoint(_)
+                        )
+                    )
+                };
+                if on_tempo {
+                    self.arr_ask_flatten_tempo();
+                    return;
+                }
                 // **A right-press on the METRONOME opens its panel** — the
                 // tempo, the signature, how often it clicks and what it
                 // clicks with.
@@ -25624,6 +25649,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // deal, so a second question here would be the same question
             // twice.
             self.project_request = Some(crate::ports::ProjectRequest::NewDiscarding);
+            // **And the Konami walk, quietly.**
+            //
+            // The owner: "Have 'reset everything' quietly reset the konami
+            // code state to initialized (as if it were never entered)." It
+            // is the one thing this scope touches that is not in
+            // `settings.json` at all — the marker lives on disk beside the
+            // licence (`LicenseStore::relock_cheat`, which walks it back off
+            // in-session AND across launches), so a settings reset walked
+            // straight past it and the corruption survived every road that
+            // claimed to put the app back as it came.
+            //
+            // Quietly is the word: no dialog, no receipt. `Everything` has
+            // already asked once, and a second sentence about a cheat code
+            // is a reset explaining a joke.
+            //
+            // The half-typed walk goes with it, so a reset in the middle of
+            // the sequence does not leave four arrows banked.
+            self.license.relock_cheat();
+            self.konami = crate::keys::Konami::default();
         }
 
         // Closing the detached window re-attaches; Python's close handler then
@@ -26967,7 +27011,14 @@ fn main_width(settings: &Settings) -> f32 {
     } else {
         1300.0
     };
-    let want = base * settings.window_size_percent as f64 / 100.0;
+    // **Onto a rung the menu still offers.** The ladder went from seven
+    // values to three, and a settings file written by an older build can name
+    // 50 or 200 — sizes there is now no way back from, since the only road to
+    // this number is the menu. Clamped HERE and not on the way in, so the
+    // file still round-trips whatever it holds: what is bounded is the
+    // window, which is the thing somebody is stuck with.
+    let pct = settings.window_size_percent.clamp(75, 125);
+    let want = base * pct as f64 / 100.0;
     let want = (want.trunc() as f32).max(crate::settings::MIN_WINDOW.x);
     // Never wider than the screen either. At 200% the share above is the
     // monitor's whole width, and a window one point wider than the display
@@ -27035,7 +27086,19 @@ pub fn fit_width_to_display(settings: &Settings, want: f32) -> f32 {
 }
 
 /// What 100% is, as a share of the monitor's width. See [`main_width`].
-const BASE_OF_MONITOR: f64 = 0.5;
+/// **Half the monitor was 100%, and 100% is a quarter wider than that now.**
+///
+/// The owner: "Change the values of the size for 100 percent to be equal to
+/// the current 125 percent, So now the new 100 percent will be bigger."
+/// 0.5 × 1.25 = 0.625, so the new 100% is exactly what 125% used to give and
+/// the whole ladder moves with it — which is the point, since the ladder is
+/// what the menu offers.
+///
+/// Written as the arithmetic rather than as 0.625 because the fact worth
+/// keeping is that this MOVED and by how much: a settings file saying
+/// `window_size_percent: 100` now asks for a bigger window than the same
+/// file did yesterday, and that is deliberate rather than drift.
+const BASE_OF_MONITOR: f64 = 0.5 * 1.25;
 
 /// **The rungs a DEFAULT track count is allowed to land on.**
 ///
@@ -27111,7 +27174,7 @@ const COUNT_LADDER: [usize; 8] = [4, 6, 8, 10, 12, 16, 24, 32];
 /// sixteen, and 88 puts his 150% preset exactly ON the tie and gives him ten.
 /// A screen nobody in the table owns loses the coin toss ahead of the screen
 /// the request came from.
-const COMFY_LANE_H: f32 = 86.0;
+const COMFY_LANE_H: f32 = 65.0;
 
 /// **A comfortable mixer STRIP pitch — the strip's width plus the gap to the
 /// next — in points.**
@@ -27205,7 +27268,19 @@ fn default_arr_visible(settings: &Settings, pane: Vec2) -> usize {
     let w = pane.x.max(1.0).trunc();
     let recorder = band_sizes_at(settings, w).recorder_h;
     let avail = (pane.y - recorder).max(0.0);
-    sensible_visible_count(avail, COMFY_LANE_H, 4, crate::recorder::CHANNELS)
+    // **Twelve is the most a DEFAULT opens with**, at the owner's word:
+    // "Track counts can be 12 default now at 100 Percent and up, and 10 at
+    // 75 percent." The derivation still does the work — it is what makes 75%
+    // land on ten and a small display land lower still — and the ceiling is
+    // what stops a big window opening on sixteen or twenty-four lanes
+    // nobody asked for. Somebody who wants more sets it; this is only where
+    // an untouched install starts.
+    //
+    // Measured on his 2560x1378 desk, which is the display every number in
+    // this area was chosen against: at `COMFY_LANE_H` the quotient is 9.29
+    // at 75%, 12.42 at 100% and 15.52 at 125%, so the ladder lands on 10,
+    // 12 and 16 and the cap takes the last one back to a dozen.
+    sensible_visible_count(avail, COMFY_LANE_H, 4, 12)
 }
 
 /// **The mixer's default visible-STRIP count for this WINDOW.**
@@ -43801,7 +43876,11 @@ mod tests {
                 s.theory_order = "circle+tonnetz+triangles+staff".to_owned();
             }
             let mut last = Vec2::ZERO;
-            for pct in [50, 75, 100, 125, 150] {
+            // The offered ladder, which is three rungs now: a clamped 50 and
+            // a clamped 150 would tie with their neighbours and the climb
+            // this asserts would read as a failure of the climb rather than
+            // of the clamp.
+            for pct in [75, 100, 125] {
                 s.window_size_percent = pct;
                 let got = initial_window_size(&s);
                 assert!(
@@ -44069,14 +44148,17 @@ mod tests {
         // a failure here unreadable.
         let mut s = Settings::default();
         s.theory_order = String::new();
+        // **The three rungs the menu offers, and only those.** The list went
+        // from seven to 75/100/125, and `main_width` clamps to that range —
+        // so 50 and 200 no longer have arithmetic of their own to check;
+        // they resolve to 75 and 125. The numbers on these three rows did
+        // not move: this test runs with no monitor recorded, which takes the
+        // 1300-point fallback rather than the share of a display that
+        // `BASE_OF_MONITOR` widened.
         let table = [
-            (50, 650.0, 75.0, 25.0),
             (75, 975.0, 112.0, 37.0),
             (100, 1300.0, 150.0, 50.0),
             (125, 1625.0, 187.0, 62.0),
-            (150, 1950.0, 225.0, 75.0),
-            (175, 2275.0, 262.0, 87.0),
-            (200, 2600.0, 300.0, 100.0),
         ];
         for (pct, w, piano_h, chord_h) in table {
             s.window_size_percent = pct;
@@ -49122,7 +49204,7 @@ mod aspect_snap_tests {
     /// and the strip assertion reads 8, because with the rung gone there is
     /// nowhere near ten to land.
     #[test]
-    fn the_owners_screen_opens_eight_lanes_and_ten_strips_and_climbs_to_a_dozen() {
+    fn the_owners_screen_opens_a_dozen_lanes_and_ten_at_seventy_five() {
         let s = desk_on(2560, 1378, 100);
         let ctx = egui::Context::default();
         let win = initial_window_size(&s);
@@ -49137,9 +49219,24 @@ mod aspect_snap_tests {
         app.arrangement_open = true;
         let (lanes, pitch) = painted_lanes(&ctx, &mut app, win, monitor, Fills::No);
         assert_eq!(
-            lanes, 8,
-            "the timeline opened {lanes} lanes at 100% on 2560x1378, not the eight he asked for"
+            lanes, 12,
+            "the timeline opened {lanes} lanes at 100% on 2560x1378, not the \
+             dozen he asked for"
         );
+        // **And ten at 75%**, the other half of the same sentence: "Track
+        // counts can be 12 default now at 100 Percent and up, and 10 at 75
+        // percent." Two rungs, and the derivation is what puts them there —
+        // 9.29 of a lane fits at 75% and 12.42 at 100%, so the ladder lands
+        // on ten and a dozen without either being spelled anywhere.
+        {
+            let s75 = desk_on(2560, 1378, 75);
+            let ctx75 = egui::Context::default();
+            let win75 = initial_window_size(&s75);
+            let mut app75 = TangentApp::new(&ctx75, s75, NO_SAVE);
+            app75.arrangement_open = true;
+            let (lanes75, _) = painted_lanes(&ctx75, &mut app75, win75, monitor, Fills::No);
+            assert_eq!(lanes75, 10, "75% opened {lanes75} lanes, not ten");
+        }
         let (max_lanes, max_pitch) =
             painted_lanes(&ctx, &mut app, usable, monitor, Fills::Maximised);
         assert_eq!(
@@ -49161,15 +49258,22 @@ mod aspect_snap_tests {
         // either: more lanes AND more room per lane is the whole bargain.
         assert!(
             pitch > 60.0 && max_pitch > pitch * 0.9,
-            "eight lanes came out {pitch} tall and a dozen {max_pitch}"
+            "a dozen lanes came out {pitch} tall and a maximised dozen {max_pitch}"
         );
 
         app.arrangement_open = false;
         app.mixer_open = true;
         let strips = painted_strips(&ctx, &mut app, win, monitor, Fills::No);
+        // A dozen here too. The rule he gave is about TRACK COUNTS and does
+        // not distinguish the two surfaces — "12 default now at 100 Percent
+        // and up, and 10 at 75 percent" — and the mixer's own derivation
+        // lands there on its own now that the window is a quarter wider,
+        // since `COMFY_STRIP_PITCH` keys off width where the lanes key off
+        // height.
         assert_eq!(
-            strips, 10,
-            "the desk opened {strips} strips at 100% on 2560x1378, not the ten he asked for"
+            strips, 12,
+            "the desk opened {strips} strips at 100% on 2560x1378, not the \
+             dozen he asked for"
         );
         // **Thirty-two on a full screen, and not because a count says so.**
         // The desk folds into two rows of sixteen once it has the height for
@@ -49282,21 +49386,25 @@ mod aspect_snap_tests {
     /// The exact numbers are asserted too, because a table nobody checks is a
     /// comment.
     ///
-    /// Revert-check, performed: `COMFY_LANE_H` back to 92 fails here as well as
-    /// on the owner's screen, and on a row that is nobody's reference — the
-    /// 1920x1030 laptop, filled out, drops from 10 lanes to 8. That is what the
-    /// table is for: a retune has to come here and say what it did to five
-    /// other people's displays, not only to his.
+    /// Revert-check, performed: `COMFY_LANE_H` back to 86 fails here as well
+    /// as on the owner's screen, and on a row that is nobody's reference —
+    /// the 1920x1030 laptop drops from 10 windowed lanes to 6. That is what
+    /// the table is for: a retune has to come here and say what it did to
+    /// five other people's displays, not only to his.
     #[test]
     fn the_default_track_counts_stay_sane_on_other_displays() {
         // display w, usable h, lanes windowed, strips windowed, lanes full,
         // strips full.
+        // **Re-measured when the default became a dozen.** The lane column
+        // tops out at 12 everywhere now — `default_arr_visible` caps it, at
+        // the owner's word — while the STRIP column still climbs to the full
+        // desk, which is the mixer's own layout and was left alone.
         let table = [
-            (1920i64, 1030i64, 6usize, 6usize, 10usize, 16usize),
-            (3840, 2100, 12, 32, 24, 32),
-            (1280, 648, 4, 4, 6, 10),
-            (5120, 2800, 16, 32, 24, 32),
-            (3440, 1400, 10, 16, 12, 32),
+            (1920i64, 1030i64, 10usize, 10usize, 12usize, 16usize),
+            (3840, 2100, 12, 32, 12, 32),
+            (1280, 648, 6, 6, 8, 10),
+            (5120, 2800, 12, 32, 12, 32),
+            (3440, 1400, 12, 32, 12, 32),
         ];
         let chans = crate::recorder::CHANNELS;
         for (w, h, lanes_win, strips_win, lanes_full, strips_full) in table {
@@ -49852,3 +49960,4 @@ mod dirty_cost_probe {
         say("AFTER  undo_commit (a real edit)", t.elapsed() / n);
     }
 }
+

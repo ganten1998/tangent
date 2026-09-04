@@ -939,6 +939,26 @@ impl DeskSnap {
     }
 }
 
+/// **A named place in the song.**
+///
+/// A marker is a fact about the SONG, so it lives in the document beside the
+/// tempo and meter maps rather than in settings — which also puts it inside
+/// the undo funnel for nothing, since `undo_state` serialises the whole
+/// arrangement. The owner's rule for where it may be stored is the same one
+/// that shape gives for free: "only be stored as values in a project where
+/// they are added. Load new? Reset all? Markers gone. Save track, then new
+/// track, then load saved, the markers should stay from the first save."
+///
+/// In SECONDS and not in bars, unlike a meter point. A meter change is a
+/// property of the grid and can only happen on a bar line; a marker names a
+/// moment — a downbeat, an entry, the place a take goes wrong — and pinning
+/// it to the grid would move it whenever the tempo map did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrMarker {
+    pub at_s: f64,
+    pub name: String,
+}
+
 /// The whole document.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Arrangement {
@@ -977,6 +997,11 @@ pub struct Arrangement {
     pub tempo: crate::tempo::TempoMap,
     /// Time signatures over the whole song, by bar.
     pub meter: crate::tempo::MeterMap,
+    /// Named places in the song, in no particular order — see [`ArrMarker`].
+    /// Appended to this struct, and its key is absent from a document with
+    /// none, so an older build reads a newer document unharmed and a project
+    /// nobody marked writes nothing.
+    pub markers: Vec<ArrMarker>,
     /// The schema version this document is IN, which is never lower than
     /// [`ARRANGEMENT_VERSION`].
     ///
@@ -1028,6 +1053,7 @@ impl Default for Arrangement {
             version: ARRANGEMENT_VERSION,
             tempo: crate::tempo::TempoMap::default(),
             meter: crate::tempo::MeterMap::default(),
+            markers: Vec::new(),
             automation: crate::automation::Automation::default(),
         }
     }
@@ -1376,6 +1402,37 @@ impl Arrangement {
             .shift_remove("named")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // **Read out of the map, so it does not fall through to `extra`.**
+        // Anything left in `map` becomes the unknown-keys bag and is written
+        // back verbatim; a key this build DOES understand has to be taken
+        // first or the document would carry two copies of it.
+        //
+        // Forgiving in the settings file's manner: a row without a usable
+        // time is dropped rather than defaulted to zero, because a marker at
+        // the wrong place is worse than a marker that is missing. An unnamed
+        // one is kept — the name is the only thing somebody can fix in the
+        // app, and the place is the thing they cannot.
+        let markers: Vec<ArrMarker> = match map.shift_remove("markers") {
+            Some(Value::Array(v)) => v
+                .into_iter()
+                .filter_map(|x| {
+                    let o = x.as_object()?;
+                    let at_s = o.get("at")?.as_f64()?;
+                    if !at_s.is_finite() || at_s < 0.0 {
+                        return None;
+                    }
+                    Some(ArrMarker {
+                        at_s,
+                        name: o
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         Self {
             clips,
             desk,
@@ -1387,6 +1444,7 @@ impl Arrangement {
             version: version.max(ARRANGEMENT_VERSION),
             tempo,
             meter,
+            markers,
             automation,
         }
     }
@@ -1757,6 +1815,31 @@ impl Arrangement {
                 ),
             );
         }
+        // **Only when there are any.** A project nobody marked writes no
+        // `markers` key at all, which is what keeps a fresh document byte
+        // for byte what it always was — `seed_template`'s stock-shape test
+        // compares documents, and a new empty key would have made every
+        // shipped template read as somebody's arrangement.
+        if !self.markers.is_empty() {
+            map.insert(
+                "markers".into(),
+                Value::Array(
+                    self.markers
+                        .iter()
+                        .map(|m| {
+                            let mut o = Map::new();
+                            o.insert(
+                                "at".into(),
+                                serde_json::Number::from_f64(m.at_s)
+                                    .map_or(Value::Null, Value::Number),
+                            );
+                            o.insert("name".into(), Value::String(m.name.clone()));
+                            Value::Object(o)
+                        })
+                        .collect(),
+                ),
+            );
+        }
         // Unknown keys LAST, like the settings file: a newer build's keys win
         // over nothing, and they survive.
         for (k, v) in &self.extra {
@@ -1932,6 +2015,54 @@ mod tests {
     /// **Missing, empty and damaged are three different findings**, and only
     /// a clean parse may be adopted silently. `load_from` keeps collapsing
     /// them for the probes that only peek; `read_from` is the opening road.
+    /// **Markers survive a save and a load, and a document with none says
+    /// nothing about them.**
+    ///
+    /// The owner's rule for where they may live: "only be stored as values in
+    /// a project where they are added. Load new? Reset all? Markers gone.
+    /// Save track, then new track, then load saved, the markers should stay
+    /// from the first save." Putting them in the document gives all four for
+    /// free — a new project is a fresh `Arrangement`, and a reset opens one —
+    /// so what is left to check is the round trip and the silence.
+    ///
+    /// The silence half is not tidiness. `seed_template` decides whether a
+    /// template is an untouched stock seed by comparing documents, so a key
+    /// written unconditionally would make every shipped template read as
+    /// somebody's arrangement and stop being re-seeded.
+    ///
+    /// Revert-checks, both performed: drop the `is_empty` guard on the write
+    /// and the silence assert goes red; drop the `shift_remove("markers")`
+    /// read and the round trip comes back with none, because the key falls
+    /// through to `extra` and is written back beside a fresh empty list.
+    #[test]
+    fn markers_round_trip_and_an_unmarked_song_writes_none() {
+        let mut arr = Arrangement::default();
+        assert!(
+            !arr.to_json().contains("markers"),
+            "a song nobody marked wrote a markers key: {}",
+            arr.to_json()
+        );
+
+        arr.markers.push(ArrMarker { at_s: 12.5, name: "Verse".to_owned() });
+        arr.markers.push(ArrMarker { at_s: 48.0, name: String::new() });
+        let back = Arrangement::from_json(&arr.to_json());
+        assert_eq!(back.markers, arr.markers, "the markers did not come home");
+        // And they did not ALSO land in the unknown-keys bag, which would
+        // write two copies on the next save.
+        assert!(
+            !back.extra.contains_key("markers"),
+            "the markers fell through to `extra` as well"
+        );
+
+        // A row with no usable time is dropped rather than defaulted to zero:
+        // a marker in the wrong place is worse than one that is missing.
+        let hand = r#"{"arrangement_version":6,"clips":[],"markers":[
+            {"at":3.0,"name":"keep"},{"name":"no time"},{"at":-1.0,"name":"before the song"}]}"#;
+        let read = Arrangement::from_json(hand);
+        assert_eq!(read.markers.len(), 1, "a bad row was kept: {:?}", read.markers);
+        assert_eq!(read.markers[0].name, "keep");
+    }
+
     #[test]
     fn read_from_tells_missing_empty_and_damaged_apart() {
         let dir = std::env::temp_dir()
