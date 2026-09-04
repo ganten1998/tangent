@@ -1431,12 +1431,17 @@ pub struct Settings {
     /// a scroll position.
     ///
     /// **Zero is the AUTO sentinel**, the same idiom as `arr_header_w`: at the
-    /// shipped default the count is derived from the monitor (a bigger screen
+    /// shipped default the count is derived from the WINDOW (a bigger window
     /// shows more, snapped to a musician-friendly rung — see
     /// `app::default_mixer_visible` / `default_arr_visible`), and the first
     /// Shift+wheel writes a concrete number that is then the user's for good.
     /// A concrete value is clamped to `[1, CHANNELS]` on load; `0` is left as
     /// itself so the derivation still runs.
+    ///
+    /// It said "derived from the monitor" until the owner met what that gives
+    /// at 100%: a dozen lanes in a window with room for eight. The derivation
+    /// reads the pane the app is drawing into now, so the sentinel's answer
+    /// also climbs when the window is maximised — see `app::count_pane`.
     pub mixer_visible: u8,
     pub arr_visible: u8,
     /// How many KEYS the MIDI editor shows at once (semitones); Shift+wheel
@@ -1904,9 +1909,10 @@ impl Default for Settings {
             // 1/4 out of the box, both grids — the owner's default.
             arr_grid_exp: -2,
             arr_header_w: 0.0,
-            // **Auto out of the box** — derived from the monitor, so the box
-            // shows a sensible density on a laptop and on a 5K alike. Zero is
-            // the sentinel; Shift+wheel writes a concrete count and makes it a
+            // **Auto out of the box** — derived from the WINDOW, so the box
+            // shows a sensible density on a laptop and on a 5K alike, and the
+            // same density again when either one is maximised. Zero is the
+            // sentinel; Shift+wheel writes a concrete count and makes it a
             // choice. See `mixer_visible`'s doc and `app::default_arr_visible`.
             mixer_visible: 0,
             arr_visible: 0,
