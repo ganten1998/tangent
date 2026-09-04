@@ -49,6 +49,14 @@ mod effects;
 /// piecemeal inside. Ungated: pure std, nothing a Minimal build lacks.
 #[allow(dead_code)]
 mod units;
+/// Tangent Analog, the subtractive synthesiser: the fourth built-in
+/// instrument and the first built-in VOICE, seated in a rack bay the way
+/// the effects are (`docs/ANALOG-BRIEF.md` §7). Ungated and unreachable
+/// this wave, exactly as `units` was before its hosts existed: pure std,
+/// proven by its own tests and by `tools/analogrig`, and told about the
+/// dead-code lint here for the same reason.
+#[allow(dead_code)]
+mod analog;
 /// Tangent's own effects as ordinary insert-bay tenants — the `@tangent-*`
 /// effect sentinels the engine seats in a rack rather than rendering by mask.
 #[cfg(feature = "recorder")]
