@@ -2999,6 +2999,21 @@ pub const KEYS_PATH: &str = "@tangent-keys";
 /// instrument, not a change of identity.
 pub const KEYS_NAME: &str = "Tangent Keys (Experimental)";
 
+/// **The fourth built-in instrument's sentinel, and the first that is a
+/// VOICE in a bay.** It rides the picker exactly as the three above do,
+/// filed under the house's shelf right after Keys, and every layer between
+/// the picker and the saved session carries it as a path. Where it differs
+/// is the far end: the engine seats it in the rack like an effect and hands
+/// it the block's notes (`builtin_fx::UnitSpec::voice`), so it is NOT in
+/// `desktop::is_instrument_sentinel`. The string is the contract with the
+/// engine's `builtin_fx::ANALOG_PATH`; a test on each side pins the
+/// spelling.
+pub const ANALOG_PATH: &str = "@tangent-analog";
+/// The display name. The preset folder is the engine's class, "Tangent
+/// Analog", spelled by `desktop::preset_subfolder` from the unit's row;
+/// this is what the picker and the face's title say.
+pub const ANALOG_NAME: &str = "Tangent Analog";
+
 /// How many patches the modelled keyboard ships, and what they are called.
 ///
 /// **The names live here rather than only in the engine** because the picker,
@@ -3449,6 +3464,16 @@ fn plugin_choice<'a>(
 /// first picker they ever see shows what ships before what they bought.
 pub const LABS_VENDOR: &str = "Tangent Labs";
 
+/// **The house's instruments, in the order the picker shows them** under
+/// [`LABS_VENDOR`], above the suite. Appended, never reordered: a beginner
+/// learns where the piano is.
+pub const INSTRUMENT_ROWS: [(&str, &str); 4] = [
+    (BUILTIN_PATH, BUILTIN_NAME),
+    (DRUMPAD_PATH, DRUMPAD_NAME),
+    (KEYS_PATH, KEYS_NAME),
+    (ANALOG_PATH, ANALOG_NAME),
+];
+
 fn plugin_folder(entry: &PluginEntry) -> &str {
     if entry.vendor.trim().is_empty() {
         "Other"
@@ -3570,23 +3595,22 @@ impl Dialog {
         // then the suite — so somebody who has never installed a VST3 finds
         // a full rack rather than an empty list, and somebody with ninety
         // plugins finds ours exactly once, at the top, closed.
-        for (at, (path, name)) in [
-            (0, (BUILTIN_PATH, BUILTIN_NAME)),
-            (1, (DRUMPAD_PATH, DRUMPAD_NAME)),
-            (2, (KEYS_PATH, KEYS_NAME)),
-        ] {
+        // The four instruments first, then the suite: `INSTRUMENT_ROWS` is
+        // the one list, so the count the suite starts after is its length
+        // and not a number restated here.
+        for (at, (path, name)) in INSTRUMENT_ROWS.iter().enumerate() {
             plugins.insert(
                 at,
                 PluginEntry {
-                    path: path.to_owned(),
-                    name: name.to_owned(),
+                    path: (*path).to_owned(),
+                    name: (*name).to_owned(),
                     vendor: LABS_VENDOR.to_owned(),
                 },
             );
         }
         for (i, (path, name, _)) in crate::faces::SUITE_UNITS.iter().enumerate() {
             plugins.insert(
-                3 + i,
+                INSTRUMENT_ROWS.len() + i,
                 PluginEntry {
                     path: (*path).to_owned(),
                     name: (*name).to_owned(),
@@ -4950,6 +4974,10 @@ fn export_min_size(size: Vec2) -> Vec2 {
 const FACE_SIZES: &[(&str, Vec2, Vec2, Vec2)] = &[
     // unit, share of the screen, floor, ceiling
     ("@tangent-amp", Vec2::new(0.464, 0.477), Vec2::new(540.0, 360.0), Vec2::new(864.0, 576.0)),
+    // The analog is a whole panel — five sections of dials, three rows of
+    // switches, the preset strip — and the brief's sizes (§6): the floor
+    // is a promise `faces_analog` holds on every font.
+    (ANALOG_PATH, Vec2::new(0.62, 0.52), Vec2::new(900.0, 560.0), Vec2::new(1400.0, 840.0)),
     ("@tangent-eq", Vec2::new(0.404, 0.622), Vec2::new(470.0, 470.0), Vec2::new(752.0, 752.0)),
     ("@tangent-imager", Vec2::new(0.292, 0.635), Vec2::new(340.0, 480.0), Vec2::new(544.0, 768.0)),
     ("@tangent-comp", Vec2::new(0.344, 0.569), Vec2::new(400.0, 430.0), Vec2::new(640.0, 688.0)),
@@ -14955,6 +14983,7 @@ at: None,
                         BUILTIN_NAME,
                         DRUMPAD_NAME,
                         KEYS_NAME,
+                        ANALOG_NAME,
                         "Tangent EQ",
                         "Tangent Imager",
                         "Tangent Tape",
@@ -14984,13 +15013,17 @@ at: None,
                     .iter()
                     .filter(|p| !is_builtin(&p.path))
                     .all(|p| p.vendor.is_empty()));
-                // Seventeen, not one: the house shelf took the first sixteen
-                // rows — three instruments and the thirteen-unit suite.
-                assert_eq!(*selected, Some(17), "it did not open on what is loaded");
+                // Eighteen, not one: the house shelf took the first
+                // seventeen rows — the four instruments and the thirteen-unit
+                // suite — and the number is derived from those two lists so
+                // the next instrument moves it rather than breaking it.
+                let shelf = INSTRUMENT_ROWS.len() + crate::faces::SUITE_UNITS.len();
+                assert_eq!(shelf, 17);
+                assert_eq!(*selected, Some(shelf + 1), "it did not open on what is loaded");
                 assert_eq!(current.as_deref(), Some(loaded.as_str()));
                 assert!(filter.is_empty() && *focus);
                 assert!(
-                    plugin_row(&plugins[17], Some(&loaded)).starts_with('\u{2022}'),
+                    plugin_row(&plugins[shelf + 1], Some(&loaded)).starts_with('\u{2022}'),
                     "the loaded plugin is not marked"
                 );
                 assert!(
@@ -14999,7 +15032,7 @@ at: None,
                 );
                 // Every row is bare — the folder heading carries the vendor,
                 // the house shelf's included.
-                assert_eq!(plugin_row(&plugins[18], None), "  Vital");
+                assert_eq!(plugin_row(&plugins[shelf + 2], None), "  Vital");
                 assert_eq!(plugin_row(&plugins[0], None), format!("  {BUILTIN_NAME}"));
                 // The vendor is a FOLDER heading now, never a row suffix —
                 // the owner's ruling. A scanned plugin's row is bare.

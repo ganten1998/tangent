@@ -58,6 +58,16 @@ pub const ECHO_PATH: &str = "@tangent-echo";
 pub const PLATE_PATH: &str = "@tangent-plate";
 pub const WAH_PATH: &str = "@tangent-wah";
 pub const IR_PATH: &str = "@tangent-ir";
+/// **The first built-in VOICE.** Seated by `load_insert` exactly as the
+/// effects above are — the hand-off rings, `run_rack`, delay compensation,
+/// state and automation all treat it as one more tenant — and the one row
+/// in [`UNITS`] with `voice: true`, which is what routes the block's notes
+/// to it and its output over the channel. Deliberately NOT in
+/// `desktop::is_instrument_sentinel`: that list names the three mask-rendered
+/// instruments, and adding this one there would filter it out of the engine
+/// — a synth that loads, names itself, draws its panel and is silent. See
+/// `docs/ANALOG-BRIEF.md` §7.
+pub const ANALOG_PATH: &str = "@tangent-analog";
 
 /// One parameter a unit publishes: what the automation lane, the state blob
 /// and (one day) a knob panel all address it by.
@@ -65,6 +75,7 @@ pub const IR_PATH: &str = "@tangent-ir";
 /// `id` and `symbol` are both persisted — the id into automation curves as
 /// `fx:<bay>:<id>`, the symbol into the state sidecar — so both are
 /// append-only forever, exactly as `AutoParam` documents for its own space.
+#[derive(Clone, Copy)]
 pub struct ParamSpec {
     /// The lane's address. Stable for the life of the product; new
     /// parameters take new ids and dead ones retire their number.
@@ -95,6 +106,14 @@ pub struct UnitSpec {
     /// A plain fn pointer rather than a trait method, so the table stays a
     /// `const` and the dispatch stays visible.
     build: fn(f32) -> BuiltinUnit,
+    /// **Whether this unit GENERATES rather than transforms** — the same
+    /// flag `instrument::Hosted` carries for a VST3 instrument, decided
+    /// here for a built-in. `true` means `run_rack` hands the bay the
+    /// block's notes, controls and automation and takes its output as the
+    /// channel's signal; `false` means the channel's signal goes in and
+    /// comes back transformed. Appended, this struct's law; `false` on
+    /// every effect and `true` on the analog alone.
+    pub voice: bool,
 }
 
 const TRIM_PARAMS: &[ParamSpec] = &[ParamSpec {
@@ -384,6 +403,44 @@ fn build_ir(sample_rate: f32) -> BuiltinUnit {
     BuiltinUnit::Ir(IrUnit::new(sample_rate))
 }
 
+/// How many parameters the analog publishes: the kernel's own table.
+const ANALOG_N: usize = crate::analog::PARAMS.len();
+
+/// **The analog's parameter table, row for row the kernel's own.** The
+/// kernel keeps its table in its own `ParamSpec` type so the module and its
+/// bench stand alone without this crate's; this is that table transcribed
+/// at compile time — id, symbol, name, units, default, steps, in order —
+/// so there is one list and the two cannot drift. A test below holds them
+/// equal anyway, because "cannot" is what every second copy said.
+pub const ANALOG_FACE_PARAMS: [ParamSpec; ANALOG_N] = {
+    let mut out = [ParamSpec {
+        id: 0,
+        symbol: "",
+        name: "",
+        units: "",
+        default: 0.0,
+        steps: 0,
+    }; ANALOG_N];
+    let mut i = 0;
+    while i < ANALOG_N {
+        let p = &crate::analog::PARAMS[i];
+        out[i] = ParamSpec {
+            id: p.id,
+            symbol: p.symbol,
+            name: p.name,
+            units: p.units,
+            default: p.default,
+            steps: p.steps,
+        };
+        i += 1;
+    }
+    out
+};
+
+fn build_analog(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Analog(AnalogUnit::new(sample_rate))
+}
+
 /// Every effect this build ships. Order is nothing; the path is the key.
 pub const UNITS: &[UnitSpec] = &[
     UnitSpec {
@@ -391,84 +448,107 @@ pub const UNITS: &[UnitSpec] = &[
         class: "Tangent Trim",
         params: TRIM_PARAMS,
         build: build_trim,
+        voice: false,
     },
     UnitSpec {
         path: EQ_PATH,
         class: "Tangent EQ",
         params: EQ_FACE_PARAMS,
         build: build_eq,
+        voice: false,
     },
     UnitSpec {
         path: IMAGER_PATH,
         class: "Tangent Imager",
         params: IMAGER_FACE_PARAMS,
         build: build_imager,
+        voice: false,
     },
     UnitSpec {
         path: TAPE_PATH,
         class: "Tangent Tape",
         params: TAPE_FACE_PARAMS,
         build: build_tape,
+        voice: false,
     },
     UnitSpec {
         path: COMP_PATH,
         class: "Tangent Comp",
         params: COMP_FACE_PARAMS,
         build: build_comp,
+        voice: false,
     },
     UnitSpec {
         path: DENOISE_PATH,
         class: "Tangent Denoise",
         params: DENOISE_FACE_PARAMS,
         build: build_denoise,
+        voice: false,
     },
     UnitSpec {
         path: AMP_PATH,
         class: "Tangent Amp",
         params: AMP_FACE_PARAMS,
         build: build_amp,
+        voice: false,
     },
     UnitSpec {
         path: DRIVE_PATH,
         class: "Tangent Drive",
         params: DRIVE_FACE_PARAMS,
         build: build_drive,
+        voice: false,
     },
     UnitSpec {
         path: TREM_PATH,
         class: "Tangent Trem",
         params: TREM_FACE_PARAMS,
         build: build_trem,
+        voice: false,
     },
     UnitSpec {
         path: CHORUS_PATH,
         class: "Tangent Chorus",
         params: CHORUS_FACE_PARAMS,
         build: build_chorus,
+        voice: false,
     },
     UnitSpec {
         path: ECHO_PATH,
         class: "Tangent Echo",
         params: ECHO_FACE_PARAMS,
         build: build_echo,
+        voice: false,
     },
     UnitSpec {
         path: PLATE_PATH,
         class: "Tangent Plate",
         params: PLATE_FACE_PARAMS,
         build: build_plate,
+        voice: false,
     },
     UnitSpec {
         path: WAH_PATH,
         class: "Tangent Wah",
         params: WAH_FACE_PARAMS,
         build: build_wah,
+        voice: false,
     },
     UnitSpec {
         path: IR_PATH,
         class: "Tangent IR",
         params: IR_FACE_PARAMS,
         build: build_ir,
+        voice: false,
+    },
+    // The one voice. Its class is the preset folder's name, so it stays
+    // the plain words even if the picker one day wears a suffix.
+    UnitSpec {
+        path: ANALOG_PATH,
+        class: "Tangent Analog",
+        params: &ANALOG_FACE_PARAMS,
+        build: build_analog,
+        voice: true,
     },
 ];
 
@@ -670,6 +750,7 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
         // character, not calibration, and a fake decibel is worse than an
         // honest one. Every dial not named above — drive amount, depths,
         // widths, mixes, the wah's damping — is percent for the same reason.
+        (ANALOG_PATH, id) => analog_reading(id, v),
         _ => fmt_pct(v),
     }
 }
@@ -698,6 +779,112 @@ pub fn choices(path: &str, id: u32) -> Vec<String> {
         // One diode against one, or against two — what the toggle does to
         // the harmonics, in the clipper's own terms.
         (DRIVE_PATH, 3) => vec!["matched".to_owned(), "uneven".to_owned()],
+        (ANALOG_PATH, id) => analog_choices(id),
+        _ => Vec::new(),
+    }
+}
+
+/// **What each of the analog's dials reads**, printed by the kernel's own
+/// mappings — the consts beside the DSP — so the face and the sound cannot
+/// disagree. Ids are the kernel's `P_*` names; a stepped dial prints its
+/// position's word.
+fn analog_reading(id: u32, v: f32) -> String {
+    use crate::analog::arp::{ArpMode, ARP_RATES};
+    use crate::analog::ensemble::EnsembleMode;
+    use crate::analog::env::{secs, ATTACK_SECS, DECAY_SECS, RELEASE_SECS};
+    use crate::analog::filter::cutoff_hz;
+    use crate::analog::osc::{LfoWave, Wave, RANGE_LABELS};
+    use crate::analog::*;
+    use tangent_ui::face::{fmt_hz, fmt_ms, fmt_pct};
+    let id = id as usize;
+    let onoff = |v: f32| (if v >= 0.5 { "on" } else { "off" }).to_owned();
+    let semis = |s: f32| format!("{s:+.2} semi");
+    let cents = |c: f32| format!("{c:+.0} c");
+    match id {
+        P_TUNE => cents((v - 0.5) * 2.0 * TUNE_CENTS),
+        P_GLIDE => {
+            if v <= 0.0 {
+                "off".to_owned()
+            } else {
+                fmt_ms(GLIDE_SECS.0 * (GLIDE_SECS.1 / GLIDE_SECS.0).powf(v) * 1000.0)
+            }
+        }
+        P_MOD_MIX => {
+            if v <= 0.0 {
+                "osc 3".to_owned()
+            } else if v >= 1.0 {
+                "noise".to_owned()
+            } else {
+                format!("{} noise", fmt_pct(v))
+            }
+        }
+        P_MOD_DEPTH | P_PRESSURE | P_PWM | P_OSC_DRIFT | P_MIX_O1 | P_MIX_O2 | P_MIX_O3
+        | P_MIX_NOISE | P_DRIVE | P_EMPHASIS | P_CONTOUR | P_KEYTRACK | P_F_SUSTAIN
+        | P_A_SUSTAIN | P_VEL_AMP | P_VEL_FILTER | P_UNISON_SPREAD | P_DRIFT | P_ENS_WIDTH
+        | P_SPREAD | P_VOLUME | P_ARP_GATE => fmt_pct(v),
+        P_BEND_RANGE => format!("{} semi", step_index(v, 13)),
+        P_O1_RANGE | P_O2_RANGE | P_O3_RANGE => RANGE_LABELS[step_index(v, 6)].to_owned(),
+        P_O1_WAVE | P_O2_WAVE | P_O3_WAVE => Wave::from_norm(v).label().to_owned(),
+        P_O2_TUNE | P_O3_TUNE => semis((v - 0.5) * 2.0 * OSC_TUNE_SEMIS),
+        P_O3_TRACK | P_SYNC | P_OSC_MOD | P_FILTER_MOD | P_ARP_HOLD => onoff(v),
+        P_NOISE_COLOUR => (if v >= 0.5 { "pink" } else { "white" }).to_owned(),
+        P_FILTER_MODEL => (if v >= 0.5 { "SEM 12" } else { "Ladder 24" }).to_owned(),
+        P_CUTOFF => fmt_hz(cutoff_hz(v)),
+        P_SEM_MODE => {
+            if v < 0.03 {
+                "lowpass".to_owned()
+            } else if (v - 0.5).abs() < 0.03 {
+                "notch".to_owned()
+            } else if v > 0.97 {
+                "highpass".to_owned()
+            } else if v < 0.5 {
+                format!("LP {} notch", fmt_pct(v * 2.0))
+            } else {
+                format!("notch {} HP", fmt_pct((v - 0.5) * 2.0))
+            }
+        }
+        P_F_ATTACK | P_A_ATTACK => fmt_ms(secs(v, ATTACK_SECS) * 1000.0),
+        P_F_DECAY | P_A_DECAY => fmt_ms(secs(v, DECAY_SECS) * 1000.0),
+        P_F_RELEASE | P_A_RELEASE => fmt_ms(secs(v, RELEASE_SECS) * 1000.0),
+        P_VOICE_MODE => ["mono", "unison", "poly"][step_index(v, 3)].to_owned(),
+        P_VOICES => format!("{}", step_index(v, 16) + 1),
+        P_DETUNE => format!("{:.0} c", v * DETUNE_CENTS),
+        P_PRIORITY => ["low", "last", "high"][step_index(v, 3)].to_owned(),
+        P_TRIGGER => (if v >= 0.5 { "retrigger" } else { "legato" }).to_owned(),
+        P_LFO_RATE => fmt_hz(LFO_HZ.0 * (LFO_HZ.1 / LFO_HZ.0).powf(v)),
+        P_LFO_WAVE => LfoWave::from_norm(v).label().to_owned(),
+        P_LFO_DELAY => fmt_ms(v * LFO_DELAY_SECS * 1000.0),
+        P_ENSEMBLE => EnsembleMode::from_norm(v).label().to_owned(),
+        P_ARP_MODE => ArpMode::from_norm(v).label().to_owned(),
+        P_ARP_RATE => ARP_RATES[crate::analog::arp::rate_index(v)].0.to_owned(),
+        P_ARP_OCT => format!("{} oct", step_index(v, 4) + 1),
+        _ => fmt_pct(v),
+    }
+}
+
+/// The analog's stepped dials, each position's word in order.
+fn analog_choices(id: u32) -> Vec<String> {
+    use crate::analog::arp::{ArpMode, ARP_RATES};
+    use crate::analog::ensemble::EnsembleMode;
+    use crate::analog::osc::{LfoWave, Wave, RANGE_LABELS};
+    use crate::analog::*;
+    let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    match id as usize {
+        P_BEND_RANGE => (0..=12).map(|n| format!("{n} semi")).collect(),
+        P_O1_RANGE | P_O2_RANGE | P_O3_RANGE => words(&RANGE_LABELS),
+        P_O1_WAVE | P_O2_WAVE | P_O3_WAVE => Wave::ALL.iter().map(|w| w.label().to_owned()).collect(),
+        P_O3_TRACK | P_SYNC | P_OSC_MOD | P_FILTER_MOD | P_ARP_HOLD => words(&["off", "on"]),
+        P_NOISE_COLOUR => words(&["white", "pink"]),
+        P_FILTER_MODEL => words(&["Ladder 24", "SEM 12"]),
+        P_VOICE_MODE => words(&["mono", "unison", "poly"]),
+        P_VOICES => (1..=16).map(|n| format!("{n}")).collect(),
+        P_PRIORITY => words(&["low", "last", "high"]),
+        P_TRIGGER => words(&["legato", "retrigger"]),
+        P_LFO_WAVE => LfoWave::ALL.iter().map(|w| w.label().to_owned()).collect(),
+        P_ENSEMBLE => EnsembleMode::ALL.iter().map(|m| m.label().to_owned()).collect(),
+        P_ARP_MODE => ArpMode::ALL.iter().map(|m| m.label().to_owned()).collect(),
+        P_ARP_RATE => ARP_RATES.iter().map(|(l, _)| (*l).to_owned()).collect(),
+        P_ARP_OCT => (1..=4).map(|n| format!("{n} oct")).collect(),
         _ => Vec::new(),
     }
 }
@@ -861,6 +1048,8 @@ pub enum BuiltinUnit {
     Plate(PlateUnit),
     Wah(WahUnit),
     Ir(IrUnit),
+    /// The voice. Appended, the enum's law.
+    Analog(AnalogUnit),
 }
 
 impl BuiltinUnit {
@@ -912,6 +1101,11 @@ impl BuiltinUnit {
                     0
                 }
             }
+            // The oscillators' correction window plus the 4× pair: the
+            // honest figure, reported so delay compensation can do its job
+            // (brief §7.9). `run_rack` reads it for a built-in voice where
+            // it exempts a VST3 one, which has no route to say.
+            BuiltinUnit::Analog(u) => u.synth.latency(),
         }
     }
 
@@ -938,6 +1132,7 @@ impl BuiltinUnit {
             BuiltinUnit::Plate(u) => u.set_param(id, value),
             BuiltinUnit::Wah(u) => u.set_param(id, value),
             BuiltinUnit::Ir(u) => u.set_param(id, value),
+            BuiltinUnit::Analog(u) => u.set_param(id, value),
         }
     }
 
@@ -1034,6 +1229,45 @@ impl BuiltinUnit {
             BuiltinUnit::Plate(u) => u.process(input, frames, out),
             BuiltinUnit::Wah(u) => u.process(input, frames, out),
             BuiltinUnit::Ir(u) => u.process(input, frames, out),
+            // A voice asked to work as an effect has no input to transform
+            // and no notes to play: it answers silence rather than passing
+            // the input through as if it had done something. `run_rack`
+            // never asks — `voice: true` routes it to `process_voice` — so
+            // this arm is the same kind of line the loader's used to be.
+            BuiltinUnit::Analog(_) => {
+                for ch in out.iter_mut() {
+                    for s in ch.iter_mut().take(frames) {
+                        *s = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Render a voice: notes in, the plugin's own buffers out** — the
+    /// VST3 `process_voice` contract, for the one built-in that takes notes.
+    /// `params` is this block's automation and `transport` the song's
+    /// position, both of which the effects' road carries past a voice; the
+    /// analog reads both (the arpeggiator needs the second). Every other
+    /// unit is an effect and answers silence, the arm above's line.
+    pub fn process_voice(
+        &mut self,
+        notes: &[tangent_host::Note],
+        controls: &[tangent_host::Control],
+        params: &[tangent_host::ParamPoint],
+        transport: crate::analog::arp::Transport,
+        frames: usize,
+        bufs: &mut [Vec<f32>],
+    ) {
+        match self {
+            BuiltinUnit::Analog(u) => u.process_voice(notes, controls, params, transport, frames, bufs),
+            _ => {
+                for ch in bufs.iter_mut() {
+                    for s in ch.iter_mut().take(frames) {
+                        *s = 0.0;
+                    }
+                }
+            }
         }
     }
 
@@ -1096,6 +1330,8 @@ impl BuiltinUnit {
             // And the convolver's clear keeps the IR itself: tails go, the
             // loaded filter stays, the same knowledge-vs-signal split.
             BuiltinUnit::Ir(u) => u.kernel.clear(),
+            // Every voice off, the dials settled where they stand.
+            BuiltinUnit::Analog(u) => u.synth.clear(),
         }
     }
 }
@@ -1960,6 +2196,143 @@ impl Trim {
     }
 }
 
+// ── Tangent Analog, seated ──────────────────────────────────────────────────
+
+/// The most events one block may carry to the synth. A block of 128 frames
+/// at a keyboard's fastest carries a few dozen; the ceiling is for a stuck
+/// controller sending a value per sample, and past it the extras are
+/// dropped rather than allocated for, because this runs on the audio
+/// thread.
+const ANALOG_EVENTS: usize = 1024;
+
+/// The voice, seated. Translates the host's notes, controls and automation
+/// points — VST3's shapes — into the kernel's own events, in time order,
+/// and de-interleaves the kernel's stereo into the bay's planar buffers.
+pub struct AnalogUnit {
+    synth: crate::analog::Analog,
+    /// Events gathered with their offset and arrival order, then sorted
+    /// unstably on both — the second key is what makes the sort stable
+    /// without the allocation a stable sort makes.
+    queue: Vec<(usize, u32, crate::analog::Event)>,
+    events: Vec<crate::analog::Event>,
+    scratch: Vec<f32>,
+}
+
+impl AnalogUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            synth: crate::analog::Analog::new(sample_rate),
+            queue: Vec::with_capacity(ANALOG_EVENTS),
+            events: Vec::with_capacity(ANALOG_EVENTS),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        self.synth.set_param(id, value);
+    }
+
+    /// Notes, controls and automation into events; events into the synth;
+    /// the synth's stereo into `bufs`. Frames past [`SCRATCH_FRAMES`] are
+    /// rendered in passes with the events re-based, so a long offline
+    /// block is the same audio as the same block in callback-sized pieces.
+    pub fn process_voice(
+        &mut self,
+        notes: &[tangent_host::Note],
+        controls: &[tangent_host::Control],
+        params: &[tangent_host::ParamPoint],
+        transport: crate::analog::arp::Transport,
+        frames: usize,
+        bufs: &mut [Vec<f32>],
+    ) {
+        use crate::analog::Event;
+        if frames == 0 || bufs.is_empty() {
+            return;
+        }
+        self.queue.clear();
+        let last = frames - 1;
+        let mut seq = 0u32;
+        let mut push = |queue: &mut Vec<(usize, u32, Event)>, at: i32, e: Event| {
+            if queue.len() < ANALOG_EVENTS {
+                queue.push(((at.max(0) as usize).min(last), seq, e));
+                seq += 1;
+            }
+        };
+        for n in notes {
+            let key = n.pitch.clamp(0, 127) as u8;
+            let e = if n.on {
+                Event::NoteOn { at: 0, key, vel: n.velocity.clamp(0.0, 1.0) }
+            } else {
+                Event::NoteOff { at: 0, key }
+            };
+            push(&mut self.queue, n.offset, e);
+        }
+        for c in controls {
+            let e = match c.controller {
+                tangent_host::Control::PITCH_BEND => Event::Bend {
+                    at: 0,
+                    amount: (f32::from(c.value.min(16383)) - 8192.0) / 8192.0,
+                },
+                tangent_host::Control::AFTERTOUCH => Event::Pressure {
+                    at: 0,
+                    value: f32::from(c.value.min(127)) / 127.0,
+                },
+                // The modulation wheel: CC 1, the one controller the
+                // 1970 machine's whole modulation section hangs off.
+                1 => Event::Wheel { at: 0, value: f32::from(c.value.min(127)) / 127.0 },
+                tangent_host::Control::SUSTAIN => Event::Sustain { at: 0, down: c.value >= 64 },
+                // All sound off, all notes off: the wire's two panic buttons.
+                120 | 123 => Event::AllNotesOff { at: 0 },
+                _ => continue,
+            };
+            push(&mut self.queue, c.offset, e);
+        }
+        for p in params {
+            push(
+                &mut self.queue,
+                p.offset,
+                Event::Param { at: 0, id: p.id, value: p.value as f32 },
+            );
+        }
+        self.queue.sort_unstable_by_key(|e| (e.0, e.1));
+
+        // Passes of at most the scratch's length, events re-based into
+        // each and the ones past it held back for the next.
+        let mut done = 0usize;
+        while done < frames {
+            let n = (frames - done).min(SCRATCH_FRAMES);
+            self.events.clear();
+            for (at, _, e) in &self.queue {
+                if *at < done || *at >= done + n {
+                    continue;
+                }
+                let at = *at - done;
+                self.events.push(match *e {
+                    Event::NoteOn { key, vel, .. } => Event::NoteOn { at, key, vel },
+                    Event::NoteOff { key, .. } => Event::NoteOff { at, key },
+                    Event::Bend { amount, .. } => Event::Bend { at, amount },
+                    Event::Wheel { value, .. } => Event::Wheel { at, value },
+                    Event::Pressure { value, .. } => Event::Pressure { at, value },
+                    Event::Sustain { down, .. } => Event::Sustain { at, down },
+                    Event::Param { id, value, .. } => Event::Param { at, id, value },
+                    Event::AllNotesOff { .. } => Event::AllNotesOff { at },
+                });
+            }
+            let mut t = transport;
+            if t.playing {
+                t.beat += done as f64 * t.bpm / 60.0 / f64::from(self.synth.sample_rate());
+            }
+            self.synth.render(&mut self.scratch, n, 2, &self.events, t);
+            for (ch, buf) in bufs.iter_mut().enumerate() {
+                for (i, s) in buf.iter_mut().skip(done).take(n).enumerate() {
+                    *s = if ch < 2 { self.scratch[2 * i + ch] } else { 0.0 };
+                }
+            }
+            done += n;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1974,6 +2347,136 @@ mod tests {
         let mut out = vec![vec![0.0f32; frames]; input.len()];
         unit.process(input, frames, &mut out);
         out
+    }
+
+    /// **The analog's registration is the kernel's table, row for row**, the
+    /// voice flag is on it and on nothing else, and every one of its dials
+    /// reads and, where stepped, offers its positions. The transcription
+    /// is a compile-time loop, so "cannot drift" is true; this is here for
+    /// the day somebody rewrites that loop.
+    #[test]
+    fn the_analog_registers_as_the_kernels_table_and_the_only_voice() {
+        let spec = spec_for(ANALOG_PATH).expect("the analog is in the table");
+        assert!(spec.voice, "the analog is not a voice");
+        assert_eq!(spec.class, "Tangent Analog");
+        for u in UNITS {
+            assert_eq!(u.voice, u.path == ANALOG_PATH, "{} has the wrong voice flag", u.path);
+        }
+        assert_eq!(spec.params.len(), crate::analog::PARAMS.len());
+        for (a, b) in spec.params.iter().zip(crate::analog::PARAMS) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.symbol, b.symbol);
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.units, b.units);
+            assert_eq!(a.default, b.default);
+            assert_eq!(a.steps, b.steps);
+        }
+        let values = spec.defaults();
+        for p in spec.params {
+            let reading = describe(ANALOG_PATH, p.id, p.default, &values);
+            assert!(!reading.is_empty(), "{} reads nothing", p.symbol);
+            let choices = choices(ANALOG_PATH, p.id);
+            if p.steps >= 2 {
+                assert_eq!(
+                    choices.len(),
+                    p.steps as usize,
+                    "{} offers {} positions for {} steps",
+                    p.symbol,
+                    choices.len(),
+                    p.steps
+                );
+                let at = crate::analog::step_index(p.default, p.steps);
+                assert_eq!(choices[at], reading, "{}'s reading is not its position's word", p.symbol);
+            } else {
+                assert!(choices.is_empty(), "{} is continuous but offers positions", p.symbol);
+            }
+        }
+        // A few readings by the kernel's own mappings.
+        assert_eq!(describe(ANALOG_PATH, crate::analog::P_O1_RANGE as u32, 0.6, &values), "8'");
+        assert_eq!(describe(ANALOG_PATH, crate::analog::P_O1_WAVE as u32, 0.4, &values), "saw");
+        assert_eq!(describe(ANALOG_PATH, crate::analog::P_VOICES as u32, 7.0 / 15.0, &values), "8");
+        assert_eq!(describe(ANALOG_PATH, crate::analog::P_GLIDE as u32, 0.0, &values), "off");
+        assert!(describe(ANALOG_PATH, crate::analog::P_CUTOFF as u32, 0.5, &values).contains("632"));
+    }
+
+    /// **The analog's state round-trips by symbol** — sixty-one lines out,
+    /// the same sixty-one values back, and a blob from a build that lacked
+    /// a dial reads that dial at its default.
+    #[test]
+    fn the_analogs_state_round_trips_by_symbol() {
+        let spec = spec_for(ANALOG_PATH).unwrap();
+        let mut values = spec.defaults();
+        for (i, v) in values.iter_mut().enumerate() {
+            *v = (i as f32 * 0.37) % 1.0;
+        }
+        let blob = state_text(spec, &values, &[]);
+        let back = values_from_state(spec, blob.as_bytes()).expect("parses");
+        assert_eq!(back, values);
+        let short = "tangentfx 1\ncutoff=0.25\n";
+        let back = values_from_state(spec, short.as_bytes()).expect("parses");
+        let cut = spec.params.iter().position(|p| p.symbol == "cutoff").unwrap();
+        assert_eq!(back[cut], 0.25);
+        let vol = spec.params.iter().position(|p| p.symbol == "volume").unwrap();
+        assert_eq!(back[vol], spec.params[vol].default);
+    }
+
+    /// **A note through the seated voice makes sound, and a pitch-bend
+    /// control and an automation point both reach the kernel**: the three
+    /// translations `process_voice` does, each observable at the output.
+    #[test]
+    fn the_seated_analog_plays_notes_and_hears_controls_and_automation() {
+        let spec = spec_for(ANALOG_PATH).unwrap();
+        let render = |controls: &[tangent_host::Control], params: &[tangent_host::ParamPoint]| {
+            let mut unit = spec.create(48_000.0, &spec.defaults());
+            let notes = [tangent_host::Note { offset: 0, pitch: 60, velocity: 0.8, on: true }];
+            let mut bufs = vec![vec![0.0f32; 512]; 2];
+            let mut out = Vec::new();
+            for block in 0..40 {
+                unit.process_voice(
+                    if block == 0 { &notes } else { &[] },
+                    if block == 0 { controls } else { &[] },
+                    if block == 0 { params } else { &[] },
+                    crate::analog::arp::Transport::default(),
+                    512,
+                    &mut bufs,
+                );
+                out.extend_from_slice(&bufs[0]);
+            }
+            out
+        };
+        let plain = render(&[], &[]);
+        let peak = plain.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        assert!(peak > 0.005, "no sound: {peak}");
+        // A bend a whole step up moves the pitch.
+        let bent = render(
+            &[tangent_host::Control {
+                offset: 0,
+                controller: tangent_host::Control::PITCH_BEND,
+                value: 16383,
+                channel: 0,
+            }],
+            &[],
+        );
+        let hz = |x: &[f32], guess: f32| crate::analog::measure::measure_hz(&x[8192..], guess, 48_000.0);
+        let (f_plain, f_bent) = (hz(&plain, 261.63), hz(&bent, 293.66));
+        assert!((f_plain / 261.63 - 1.0).abs() < 0.01, "plain at {f_plain} Hz");
+        assert!((f_bent / 293.66 - 1.0).abs() < 0.01, "bent to {f_bent} Hz, not a whole step");
+        // A cutoff point at the floor darkens the note.
+        let dark = render(
+            &[],
+            &[tangent_host::ParamPoint { offset: 0, id: crate::analog::P_CUTOFF as u32, value: 0.0 }],
+        );
+        let hf = |x: &[f32]| {
+            let w = &x[8192..];
+            let (mut high, mut total) = (0.0f64, 0.0f64);
+            for p in w.windows(2) {
+                let d = f64::from(p[1] - p[0]);
+                high += d * d;
+                total += f64::from(p[1]) * f64::from(p[1]);
+            }
+            high / total.max(1e-18)
+        };
+        assert!(hf(&dark) < hf(&plain) * 0.5, "the cutoff point did not darken the note");
     }
 
     #[test]

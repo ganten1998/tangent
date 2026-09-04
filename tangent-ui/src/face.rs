@@ -111,6 +111,32 @@ impl FaceStyle {
     }
 }
 
+/// **The app's own mark, drawn.** `assets/icon-small-square.svg` is a
+/// triad — an equilateral triangle stroked with a filled circle at each
+/// vertex — and on its 512 viewBox the geometry is vertices `(256,150)`,
+/// `(136,356)`, `(376,356)`, node radius 82, stroke width 48. Those nine
+/// numbers, scaled to `r`, so it stays the icon rather than a thing that
+/// resembles it. It takes the ink it is handed and no colour of its own:
+/// the icon file's plate and ink are a dark icon's, and stamping them on
+/// a themed panel is the "ink inherited from somewhere else" fault this
+/// repo has shipped seven times. Here beside the rest of the face
+/// vocabulary so the next panel that wants a badge finds one.
+pub fn triad_badge(painter: &Painter, r: Rect, ink: Color32) {
+    if !r.is_positive() {
+        return;
+    }
+    let scale = r.width().min(r.height()) / 512.0;
+    let at = |x: f32, y: f32| r.center() + Vec2::new(x - 256.0, y - 256.0) * scale;
+    let nodes = [at(256.0, 150.0), at(136.0, 356.0), at(376.0, 356.0)];
+    let stroke = Stroke::new(48.0 * scale, ink);
+    painter.line_segment([nodes[0], nodes[1]], stroke);
+    painter.line_segment([nodes[1], nodes[2]], stroke);
+    painter.line_segment([nodes[2], nodes[0]], stroke);
+    for n in nodes {
+        painter.circle_filled(n, 82.0 * scale, ink);
+    }
+}
+
 /// The three brightnesses the cluster prints at. The hierarchy IS the
 /// readability: the value is the story, the caption is not.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1412,6 +1438,19 @@ pub(crate) mod fit {
         ("@tangent-plate", 4, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
         ("@tangent-wah", 4, &[], false, Vec2::new(400.0, 360.0), Vec2::new(640.0, 576.0)),
         ("@tangent-ir", 2, &[], false, Vec2::new(600.0, 400.0), Vec2::new(1160.0, 620.0)),
+        // The analog's ids are sparse (0..85 with gaps between the blocks),
+        // and this harness numbers its parameters densely, so the count is
+        // the id ceiling: every dial the panel draws finds a pushed value,
+        // and the gaps are ids the panel never asks for. The stepped list
+        // is the kernel's own (`crate::faces_analog::STEPPED`).
+        (
+            crate::faces_analog::ANALOG_PATH,
+            crate::faces_analog::ID_CEILING,
+            crate::faces_analog::STEPPED,
+            false,
+            Vec2::new(900.0, 560.0),
+            Vec2::new(1400.0, 840.0),
+        ),
     ];
 
     /// The smallest a face may be DRAGGED to, asked of the production

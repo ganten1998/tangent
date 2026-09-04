@@ -102,12 +102,39 @@ pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
     ),
 ];
 
-/// The face a sentinel names, if it is one of the suite's.
+/// **The built-in VOICES with a face of their own** — the sibling of
+/// [`SUITE_UNITS`], which is an effects table and stays one. One row so
+/// far. Kept apart on purpose: the picker files instruments above the
+/// suite from its own list (`dialogs::INSTRUMENT_ROWS`), the bypass row
+/// does not apply to a voice, and the sweeps that walk `SUITE_UNITS`
+/// walk effects. **A voice's coverage does not come from any loop over a
+/// table it might not be in**: `faces_analog` carries its own named
+/// tests for its window and its ink, and `face::fit::FACES` lists it
+/// explicitly for the shared sweeps.
+pub const VOICE_UNITS: [(&str, &str, &str); 1] = [(
+    crate::faces_analog::ANALOG_PATH,
+    crate::dialogs::ANALOG_NAME,
+    crate::faces_analog::ANALOG_ABOUT,
+)];
+
+/// The face a sentinel names, if it is one of the suite's — or one of the
+/// voices', which open through the same door and wear the same title bar.
 pub fn suite_unit(path: &str) -> Option<(&'static str, &'static str)> {
     SUITE_UNITS
         .iter()
+        .chain(VOICE_UNITS.iter())
         .find(|(p, _, _)| *p == path)
         .map(|(_, name, about)| (*name, *about))
+}
+
+/// Whether a sentinel names a built-in VOICE: a panel with no bypass row,
+/// because bypassing bay 0 already silences the lane and the mixer already
+/// has mute. Its own predicate rather than a third name in
+/// [`draws_its_own_bypass`], which means "this panel draws the row itself"
+/// — a different answer, and a rule that means two things is a rule
+/// nobody can revert-check.
+pub fn is_voice_face(path: &str) -> bool {
+    VOICE_UNITS.iter().any(|(p, _, _)| *p == path)
 }
 
 /// Everything a face draws this frame, refreshed by the app before the
@@ -749,6 +776,7 @@ pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fa
         "@tangent-comp" => draw_comp(ui, st, live),
         "@tangent-ir" => draw_ir(ui, st, live),
         crate::faces_amp::AMP_PATH => crate::faces_amp::draw_amp(ui, st, live),
+        crate::faces_analog::ANALOG_PATH => crate::faces_analog::draw_analog(ui, st, live),
         // The tape, the trim, and anything the suite grows before its face
         // does: every parameter as a row, in id order — sliders for the
         // continuous ones, the cycling button for anything stepped, so a
@@ -778,7 +806,7 @@ pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fa
             out
         }
     };
-    if !draws_its_own_bypass(&path) {
+    if !draws_its_own_bypass(&path) && !is_voice_face(&path) {
         face::keep(&mut action, bypass_row(ui, st, live));
     }
     face::keep(&mut action, preset_strip(ui, st, live));
