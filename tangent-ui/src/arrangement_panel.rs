@@ -657,7 +657,35 @@ const MASTER_ROW_SHARE: f32 = 0.5;
 pub const MASTER_COLUMN: usize = CHANNELS + 1;
 
 /// The ruler's height in points. Short — it is a scale, not a band.
-const RULER_H: (f32, f32, f32) = (0.06, 16.0, 24.0);
+///
+/// **Raised from `(0.06, 16, 24)` when the strip inside it grew words.** The
+/// signature chips and the marker flags share the ruler's top third, and at
+/// the old height that third was eight points, which put their labels at a
+/// six-point font: present, hittable, and not readable. The owner asked to
+/// "heighten the loop/timereadout strip" for exactly that reason. The ruler
+/// has to grow with it or the bar numbers and the clock below lose the room
+/// the strip takes.
+const RULER_H: (f32, f32, f32) = (0.075, 20.0, 30.0);
+
+/// The size the ruler strip's words are set at, from the strip's height.
+///
+/// **One definition**, because the painter lays the chips and flags out at
+/// this size and the hit-test re-derives their widths from it: the two
+/// drifting apart by a point is a label you can read and cannot press. It
+/// was two copies of `(h * 0.78).clamp(6.0, 10.0)` until the strip grew.
+fn strip_font_h(strip: Rect) -> f32 {
+    (strip.height() * 0.74).clamp(8.0, 12.0)
+}
+
+/// How much of the strip a chip or a flag actually fills.
+///
+/// The flags sit ATOP the strip — the owner's word — so the pole can be seen
+/// crossing the rest of it on its way down. A box that filled the strip
+/// would hide the line that says which moment it belongs to, which is the
+/// whole job of a flag over a ruler.
+fn strip_box_h(strip: Rect) -> f32 {
+    (strip.height() * 0.74).max(9.0).min(strip.height())
+}
 
 /// How wide a clip's trim edge is, in points, and its fade corner square.
 const EDGE_W: f32 = 7.0;
@@ -1132,7 +1160,7 @@ impl Layout {
         // Always: the flags and the chips share it, and a song has no
         // markers until somebody right-clicks the strip to make one.
         let meter_strip = {
-            let h = (ruler_h * 0.34).clamp(8.0, 13.0).min(ruler_h * 0.5);
+            let h = (ruler_h * 0.46).clamp(12.0, 17.0).min(ruler_h * 0.55);
             Rect::from_min_max(ruler.min, Pos2::new(ruler.right(), ruler.top() + h))
         };
         let lanes_area = Rect::from_min_max(
@@ -2437,7 +2465,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     // ruler and a press on one must not also locate — the same pre-pass rule
     // the band's timeline × follows.
     if l.meter_strip.is_positive() && l.meter_strip.contains(pos) {
-        let font_h = (l.meter_strip.height() * 0.78).clamp(6.0, 10.0);
+        let font_h = strip_font_h(l.meter_strip);
         // **Flags answer first**, because they are painted over the chips and
         // the thing under the pointer is the thing that was drawn last.
         for (i, m) in view.markers.iter().enumerate().rev() {
@@ -2454,14 +2482,19 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             }
         }
         for pt in view.meter.points() {
-            if pt.at_bar == 0 && view.meter.points().len() == 1 {
+            let typing = view.meter_edit.filter(|(b, _)| *b == pt.at_bar);
+            // Skipped exactly where the painter skips it, typing included —
+            // see the `continue` in `draw`. A chip that is on screen only
+            // while a field is open is a chip that has to be pressable only
+            // while a field is open.
+            if pt.at_bar == 0 && view.meter.points().len() == 1 && typing.is_none() {
                 continue;
             }
             let x = x_of(rect, view, bar_at(view, pt.at_bar));
             // The same width the chip is DRAWN at, including the field's
             // caret: a target that disagreed with the paint by a character
             // would be a chip you cannot press once you have opened it.
-            let text = match view.meter_edit.filter(|(b, _)| *b == pt.at_bar) {
+            let text = match typing {
                 Some((_, t)) => format!("{t}|"),
                 None => format!("{}/{}", pt.sig.beats, pt.sig.unit),
             };
@@ -4547,23 +4580,29 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // song-wide markers would take height from the tracks to say something
     // the bar numbers are already sitting next to.
     if l.meter_strip.is_positive() {
-        let font = FontId::new(
-            (l.meter_strip.height() * 0.78).clamp(6.0, 10.0),
-            crate::fonts::courier(),
-        );
+        let font = FontId::new(strip_font_h(l.meter_strip), crate::fonts::courier());
+        let box_h = strip_box_h(l.meter_strip);
         for pt in view.meter.points() {
+            let typing = view.meter_edit.filter(|(b, _)| *b == pt.at_bar);
             // Bar 0's signature is the song's, not a CHANGE — there is
             // nothing before it for it to be different from, and a chip on
             // the first bar of every song would be noise on the overwhelming
             // majority that never change.
-            if pt.at_bar == 0 && view.meter.points().len() == 1 {
+            //
+            // **Unless it is being typed into**, and that exception is the
+            // whole reason this reads the way it does. "New time sig." puts
+            // the field on the bar the playhead is in, which on a fresh song
+            // is bar zero — and this `continue` fired before the field was
+            // ever drawn, so the caret went somewhere invisible and the
+            // owner's report was "doesn't let me change from 4/4". It did
+            // change it; there was simply nothing on screen saying so.
+            if pt.at_bar == 0 && view.meter.points().len() == 1 && typing.is_none() {
                 continue;
             }
             let x = x_of(rect, view, bar_at(view, pt.at_bar));
             if x < l.meter_strip.left() - 2.0 || x > l.meter_strip.right() + 2.0 {
                 continue;
             }
-            let typing = view.meter_edit.filter(|(b, _)| *b == pt.at_bar);
             let text = match typing {
                 Some((_, t)) => format!("{t}|"),
                 None => format!("{}/{}", pt.sig.beats, pt.sig.unit),
@@ -4573,7 +4612,17 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             let w = (font.size * 0.62 * text.chars().count() as f32 + 6.0).max(font.size * 2.2);
             let chip = Rect::from_min_size(
                 Pos2::new(x, l.meter_strip.top()),
-                Vec2::new(w, l.meter_strip.height()),
+                Vec2::new(w, box_h),
+            );
+            // **A chip has a pole too.** It marks a bar the same way a flag
+            // marks a moment, and at the strip's new height a box floating
+            // over the ruler with nothing under it does not say WHICH bar.
+            painter.line_segment(
+                [
+                    Pos2::new(x, chip.bottom()),
+                    Pos2::new(x, l.ruler.bottom()),
+                ],
+                Stroke::new(1.0, p.engrave.gamma_multiply(0.55)),
             );
             painter.rect_filled(chip, 2.0, if typing.is_some() { p.select } else { p.face });
             painter.text(
@@ -4615,18 +4664,27 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 .max(font.size * 2.2);
             let flag = Rect::from_min_size(
                 Pos2::new(x, l.meter_strip.top()),
-                Vec2::new(w, l.meter_strip.height()),
+                Vec2::new(w, box_h),
             );
             let body = if typing.is_some() {
                 p.select
             } else {
                 flag_body(&p, view.accent)
             };
-            // The pole, so a flag reads as pointing AT a moment rather than
-            // as a label that happens to start there.
+            // **The pole, from the flag's foot down through the strip.**
+            //
+            // It used to start at the strip's top, which put the whole of it
+            // behind the flag's own box for the strip's height — a pole you
+            // could only see below the ruler's chip band. The owner asked
+            // for flags "atop it with lines going through the strip", and
+            // that is the same picture from the other side: the box sits on
+            // the strip's top edge, and the line leaves its foot and crosses
+            // the rest of the strip on its way down. So a flag reads as
+            // pointing AT a moment rather than as a label that happens to
+            // start there.
             painter.line_segment(
                 [
-                    Pos2::new(x, l.meter_strip.top()),
+                    Pos2::new(x, flag.bottom()),
                     Pos2::new(x, l.ruler.bottom()),
                 ],
                 Stroke::new(1.0, body),
@@ -5961,6 +6019,103 @@ LaneView {
         ]
     }
 
+
+    /// **The signature field at bar zero is ON SCREEN while it is open.**
+    ///
+    /// A song in one signature draws no chip at bar 0 — bar one's signature
+    /// is the song's, not a change, and a chip on the first bar of every
+    /// song would be noise on the vast majority that never change. But "New
+    /// time sig." puts the field on the bar the PLAYHEAD is in, which on a
+    /// fresh song is bar 0, and the skip fired before the field was drawn:
+    /// the caret went somewhere invisible, and the owner reported it as
+    /// "doesn't let me change from 4/4". The value was changing. Nothing on
+    /// screen said so.
+    ///
+    /// So: the exception is exactly "while somebody is typing into it", the
+    /// hit-test carries the same exception (a chip you can see and cannot
+    /// press is the same bug wearing a hat), and the closed state still
+    /// draws nothing.
+    ///
+    /// Revert-checks, both performed: drop `&& typing.is_none()` from the
+    /// painter's `continue` and the first block goes red; drop it from
+    /// `hit_test`'s and the last block goes red.
+    #[test]
+    fn a_signature_being_typed_at_bar_zero_is_on_screen() {
+        let clips: Vec<ClipView<'_>> = Vec::new();
+        let mut v = a_view(&clips);
+        assert_eq!(v.meter.points().len(), 1, "the fixture is not a plain song");
+
+        // Closed: bar 0 says nothing, which is the rule this exception is
+        // carved out of.
+        assert!(
+            !strip_words(&v).iter().any(|w| w.contains("4/4")),
+            "a song in one signature drew a chip at bar 0"
+        );
+
+        // Open: the field is there, caret and all.
+        v.meter_edit = Some((0, "3/"));
+        let words = strip_words(&v);
+        assert!(
+            words.iter().any(|w| w == "3/|"),
+            "the field at bar 0 was invisible while being typed into: {words:?}"
+        );
+
+        // And it can be pressed where it was drawn.
+        let l = Layout::new(rect(), &v);
+        let x = x_of(rect(), &v, bar_at(&v, 0)) + 3.0;
+        assert_eq!(
+            hit_test(rect(), &v, Pos2::new(x, l.meter_strip.center().y)),
+            Some(Hit::MeterChip(0)),
+            "the open field at bar 0 is not where it was painted"
+        );
+    }
+
+    /// **The strip is tall enough to read, and its words are one size.**
+    ///
+    /// The owner asked to "heighten the loop/timereadout strip" because at
+    /// the old height its third of the ruler was eight points and its labels
+    /// were set at six — present, hittable, unreadable. This pins the floor
+    /// so a later tightening of `RULER_H` cannot quietly take it back, and
+    /// pins the flags to the TOP of the strip so the pole can be seen
+    /// crossing the rest of it, which is the picture that was asked for.
+    ///
+    /// Revert-check performed: put `RULER_H` back to `(0.06, 16.0, 24.0)`
+    /// and the font floor goes red at 8.88pt.
+    #[test]
+    fn the_ruler_strip_can_be_read_and_its_flags_sit_on_top_of_it() {
+        let clips: Vec<ClipView<'_>> = Vec::new();
+        let v = a_view(&clips);
+        let l = Layout::new(rect(), &v);
+        assert!(
+            l.meter_strip.height() >= 12.0,
+            "the strip is {:.1}pt tall, which cannot carry a word",
+            l.meter_strip.height()
+        );
+        assert!(
+            strip_font_h(l.meter_strip) >= 9.0,
+            "the strip's words are {:.2}pt",
+            strip_font_h(l.meter_strip)
+        );
+        // Atop, not filling: the pole needs strip left to cross.
+        let box_h = strip_box_h(l.meter_strip);
+        assert!(
+            box_h < l.meter_strip.height(),
+            "a box filling the strip leaves the pole nowhere to be seen"
+        );
+        assert!(
+            box_h >= 9.0,
+            "the box is {box_h:.1}pt and the words are {:.1}pt",
+            strip_font_h(l.meter_strip)
+        );
+        // And the ruler still has room under the strip for the bar numbers
+        // and the clock, which is what it grew for.
+        assert!(
+            l.ruler.height() - l.meter_strip.height() >= 12.0,
+            "the strip ate the ruler: {:.1} of {:.1}",
+            l.meter_strip.height(),
+            l.ruler.height()
+        );
+    }
 
     /// **A flag says its name, says the signature that shares its bar, and
     /// answers the pointer where it was drawn.**
