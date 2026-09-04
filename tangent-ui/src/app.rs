@@ -14615,9 +14615,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             media_sel: self.media_sel,
             // Lit when the explorer is standing on the folder a fresh open
             // would land on — which is the DEF chip's own folder when one has
-            // been chosen and the drum drawer when none has. Reading only the
-            // setting left the chip dark on a fresh install standing in
-            // exactly the right place. See `drum_media_home`.
+            // been chosen and home when none has. Reading only the setting
+            // left the chip dark on a fresh install standing in exactly the
+            // right place. See `drum_media_home`.
             def_lit: self.drum_media_home() == self.media_dir,
             typing: self
                 .drumpad_num
@@ -21778,35 +21778,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// has since been moved or unplugged falls through rather than landing
     /// nowhere.
     ///
-    /// Otherwise the drum kits' own preset drawer. It used to be the HOME
-    /// directory, which is a folder with nothing to do with drums in it: the
-    /// owner asked for "the actual presets drums folder... it can still
-    /// change, but should open that folder first because it's neater
-    /// anyways", and it is also where the app's own Save Kit panel has always
-    /// written.
+    /// Otherwise HOME.
     ///
-    /// Nothing is CREATED here. `Settings::preset_root`'s doc is explicit
-    /// that the per-unit drawers are made on the first save so that `Presets`
-    /// does not open on a crowd of empty ones — so an install that has never
-    /// saved a kit lands one level up, in `Presets`, which is still a folder
-    /// about presets and is one click from everything. Home remains the last
-    /// resort, for a machine where even that is missing.
+    /// **This browser is for SAMPLES, and the kit drawer was the wrong answer
+    /// to the wrong question.** It briefly opened on
+    /// `Presets/<DRUMPAD_NAME>` because the owner asked for "the actual
+    /// presets drums folder"; what he was actually describing was the two
+    /// NATIVE panels — Load Kit and Save Kit — which is a different road
+    /// entirely and is now fixed where it lives (`DesktopApp::load_start` and
+    /// `save_start`). His correction, verbatim: "do not make it so the
+    /// drumpad's media explorer has access to .kit, i totally forget the
+    /// actual problem is that the system dialogs there for load and save do
+    /// not go to those folders".
+    ///
+    /// A kit drawer holds `.kit` documents and this explorer lists audio, so
+    /// landing there showed an empty folder — the drawer is the right place
+    /// to look for a kit and the wrong place to look for a snare. Home is
+    /// where somebody's samples actually are, and the DEF chip still honours
+    /// a folder they chose for themselves.
     fn drum_media_home(&self) -> std::path::PathBuf {
         let chosen = std::path::PathBuf::from(&self.settings.media_default_dir);
         if !self.settings.media_default_dir.is_empty() && chosen.is_dir() {
             return chosen;
-        }
-        let presets = self.settings.preset_root();
-        // The same words the host's `DRUM_PRESET_FOLDER` spells, and the same
-        // drawer `SavePurpose::KitPreset` opens on. Two crates name one
-        // folder; `the_drum_drawer_is_spelled_the_same_on_both_sides` is what
-        // stops them drifting.
-        let drums = presets.join(dialogs::DRUMPAD_NAME);
-        if drums.is_dir() {
-            return drums;
-        }
-        if presets.is_dir() {
-            return presets;
         }
         dirs_home()
     }
@@ -21815,7 +21808,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.drumpad_open = true;
         self.drumpad_focus(Self::HOME_KEY);
         // A remembered default folder is where a fresh open LANDS — and
-        // without one, the drum kits' own drawer. See `drum_media_home`.
+        // without one, home. See `drum_media_home`.
         let def = self.drum_media_home();
         if def.is_dir() && def != self.media_dir {
             self.media_dir = def;
@@ -25354,8 +25347,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **And the explorer STANDING somewhere goes with the setting.**
         //
         // `take_devices` puts `media_default_dir` back to empty, which is the
-        // "nobody has chosen" state that `drum_media_home` answers with the
-        // drum kits' own drawer. That is the right answer for the next OPEN;
+        // "nobody has chosen" state that `drum_media_home` answers with HOME.
+        // That is the right answer for the next OPEN;
         // it does nothing for a drumpad already on screen, which would sit in
         // whatever folder the reset was supposed to forget. The owner asked
         // for both: "reset everything resets to that folder as well".
@@ -25686,6 +25679,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             DialogAction::SetInsertParam { strip, slot, id, value } => {
                 let (seat, bay) = recorder::seat_bay(strip, slot);
                 self.set_insert_param(seat, bay, id, value);
+            }
+            // Both, in the order they were asked for, through the one road a
+            // single one takes — so a pair is exactly two of the same thing
+            // and not a second way to set a parameter.
+            DialogAction::SetInsertParamPair {
+                strip,
+                slot,
+                id_a,
+                value_a,
+                id_b,
+                value_b,
+            } => {
+                let (seat, bay) = recorder::seat_bay(strip, slot);
+                self.set_insert_param(seat, bay, id_a, value_a);
+                self.set_insert_param(seat, bay, id_b, value_b);
             }
             DialogAction::FaceSavePreset { strip, slot, name } => {
                 let (seat, bay) = recorder::seat_bay(strip, slot);
@@ -33304,26 +33312,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// **The drumpad opens on the drum kits' own drawer, and a reset puts it
-    /// back there.**
+    /// **The sample explorer opens at HOME unless somebody chose otherwise,
+    /// and a reset puts it back.**
     ///
-    /// It used to open at the HOME directory — a folder with nothing to do
-    /// with drums in it — because `media_dir` starts at `dirs_home()` and
-    /// only a DEF chip somebody had pressed ever moved it. The owner: "set
-    /// the Drum plugins default folder to the actual presets drums folder...
-    /// it can still change, but should open that folder first because it's
-    /// neater anyways", and then "reset everything resets to that folder as
-    /// well don't forget".
+    /// It spent one build opening on the kit drawer, on a reading of "set the
+    /// Drum plugins default folder to the actual presets drums folder" that
+    /// turned out to be about the wrong control. The owner's correction: "do
+    /// not make it so the drumpad's media explorer has access to .kit, i
+    /// totally forgot the actual problem is that the system dialogs there for
+    /// load and save do not go to those folders... and revert the default
+    /// start folder to home dir in the media explorer."
+    ///
+    /// He is right about the substance and not only the preference: this
+    /// browser lists AUDIO, a kit drawer holds `.kit` documents, so landing
+    /// there showed an empty folder. The panels he actually meant are the two
+    /// native ones, fixed in `DesktopApp::load_start` and `save_start`.
     ///
     /// Both halves are here because they fail differently: the first is where
     /// a fresh open LANDS, the second is a drumpad already on screen that
     /// would otherwise sit in the folder the reset was meant to forget.
     ///
-    /// Revert-checks: make `drum_media_home` return `dirs_home()` and the
-    /// first assert goes red; drop the `Devices | Everything` arm in
+    /// Revert-checks: make `drum_media_home` return the kit drawer again and
+    /// the first assert goes red; drop the `Devices | Everything` arm in
     /// `reset_settings` and the last one does.
     #[test]
-    fn the_drumpad_lands_in_the_drum_drawer_and_a_reset_puts_it_back() {
+    fn the_sample_explorer_lands_at_home_and_a_reset_puts_it_back() {
         let root = std::env::temp_dir().join(format!(
             "tangent-drumdir-{}-{:?}",
             std::process::id(),
@@ -33338,11 +33351,17 @@ mod tests {
         let (_ctx, mut app) = headless(Caps::PLUGIN);
         app.settings.preset_dir = Some(root.to_string_lossy().into_owned());
 
-        // (1) Nobody has chosen: a fresh open lands in the drawer, not home.
+        // (1) Nobody has chosen: a fresh open lands at HOME — and NOT in the
+        // kit drawer, which is the specific wrong answer this went through.
         assert_eq!(
             app.drum_media_home(),
+            super::dirs_home(),
+            "a sample explorer with no chosen folder should open at home"
+        );
+        assert_ne!(
+            app.drum_media_home(),
             drawer,
-            "a drumpad with no chosen folder should open on the kits' drawer"
+            "the explorer is back on the kit drawer, which holds no samples"
         );
 
         // (2) A chosen folder still wins — the chip is not overridden.
@@ -33353,7 +33372,11 @@ mod tests {
         // landing nowhere.
         app.settings.media_default_dir =
             root.join("deleted").to_string_lossy().into_owned();
-        assert_eq!(app.drum_media_home(), drawer, "a missing DEF folder stranded it");
+        assert_eq!(
+            app.drum_media_home(),
+            super::dirs_home(),
+            "a missing DEF folder stranded it"
+        );
 
         // (4) Reset Everything forgets the choice AND moves the explorer.
         app.settings.media_default_dir = elsewhere.to_string_lossy().into_owned();

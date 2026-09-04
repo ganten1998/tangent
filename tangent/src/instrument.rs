@@ -6410,10 +6410,28 @@ impl Renderer {
             }
             if raw_frames > 0 {
                 let rms = (sumsq / (raw_frames as f64 * 2.0)).sqrt() as f32;
+                // **The peaks ACCUMULATE; the reader clears them.**
+                //
+                // These used to be a plain `store`, which is the one thing
+                // that makes a meter lie about a signal it is being handed
+                // correctly: the audio thread runs a block every few
+                // milliseconds and the wizard reads once a frame, so a
+                // `store` means the UI sees roughly one block in six and
+                // never learns what happened in the other five. Every other
+                // meter in this app is a max-hold that CLEARS AS IT READS —
+                // see `Engine::strip_peaks` — and this was the only one that
+                // threw blocks away. The owner, on the one page where it
+                // costs him a measurement: "the meter in the 2/4 test tone
+                // stage LIES... why on earth is that meter alone limited?"
+                //
+                // The RMS stays a plain store on purpose: it is a MEAN over
+                // a block and the loudest mean is not a meaningful reading,
+                // so the sparse sample is the honest one and the wizard
+                // gives it the ballistics instead.
                 self.shared.ir_rms.store(rms.to_bits(), Ordering::Relaxed);
-                self.shared.ir_peak.store(peak.to_bits(), Ordering::Relaxed);
-                self.shared.ir_peak_l.store(peak_l.to_bits(), Ordering::Relaxed);
-                self.shared.ir_peak_r.store(peak_r.to_bits(), Ordering::Relaxed);
+                bump_peak(&self.shared.ir_peak, peak);
+                bump_peak(&self.shared.ir_peak_l, peak_l);
+                bump_peak(&self.shared.ir_peak_r, peak_r);
                 // **The settle, decided on the level and not on a clock.**
                 //
                 // While `settle` is non-zero the pass records nothing and
@@ -9897,6 +9915,37 @@ fn fold_mono(buf: &mut [f32], on: bool) {
     }
 }
 
+/// **Raise a peak cell to `v` if `v` is louder, from the audio thread.**
+///
+/// The lock-free half of the max-hold the IR meter reads. A plain
+/// `store` would be a per-block overwrite and a `load`-then-`store` would
+/// race the reader's `swap(0)` — losing exactly the block the reader was
+/// about to take credit for — so the exchange loop re-reads what the reader
+/// left and gives up the moment the cell already holds something louder.
+/// Bit patterns rather than floats because `AtomicF32` does not exist; the
+/// comparison is done on the decoded value, which is what makes it a max
+/// and not a bitwise one.
+fn bump_peak(cell: &AtomicU32, v: f32) {
+    if !(v > 0.0) {
+        return;
+    }
+    let mut cur = cell.load(Ordering::Relaxed);
+    loop {
+        if f32::from_bits(cur) >= v {
+            return;
+        }
+        match cell.compare_exchange_weak(
+            cur,
+            v.to_bits(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
 impl Engine {
     /// Open the default output device (or `out_device` by name) and start it.
     ///
@@ -12834,32 +12883,32 @@ impl Engine {
         )
     }
 
-    /// The chosen input pair's return level over the last block: (rms, peak)
-    /// in dBFS, −200 for silence — the wizard's meter reads this per frame.
+    /// The chosen input pair's return: (rms of the last block, LOUDEST PEAK
+    /// SINCE THIS WAS LAST CALLED) in dBFS, −200 for silence — the wizard's
+    /// meter reads this per frame.
+    ///
+    /// **The peak clears as it reads**, the same bargain
+    /// [`Engine::strip_peaks`] makes and for the same reason: a meter that
+    /// samples a per-block cell once a frame misses five blocks in six. Call
+    /// it once per frame and nowhere else, or two readers will each get part
+    /// of the answer.
     pub fn ir_return_db(&self) -> (f32, f32) {
-        let db = |cell: &AtomicU32| {
-            let v = f32::from_bits(cell.load(Ordering::Relaxed));
-            if v > 0.0 {
-                20.0 * v.log10()
-            } else {
-                -200.0
-            }
-        };
-        (db(&self.shared.ir_rms), db(&self.shared.ir_peak))
+        let db = |v: f32| if v > 0.0 { 20.0 * v.log10() } else { -200.0 };
+        (
+            db(f32::from_bits(self.shared.ir_rms.load(Ordering::Relaxed))),
+            db(f32::from_bits(self.shared.ir_peak.swap(0, Ordering::Relaxed))),
+        )
     }
 
-    /// The two jacks' peaks on their own, dBFS, −200 for silence. See
-    /// [`Shared::ir_peak_l`] for why the pair's number is not enough.
+    /// The two jacks' peaks on their own since this was last called, dBFS,
+    /// −200 for silence. See [`Shared::ir_peak_l`] for why the pair's number
+    /// is not enough, and [`Engine::ir_return_db`] for why these clear.
     pub fn ir_return_sides_db(&self) -> (f32, f32) {
-        let db = |cell: &AtomicU32| {
-            let v = f32::from_bits(cell.load(Ordering::Relaxed));
-            if v > 0.0 {
-                20.0 * v.log10()
-            } else {
-                -200.0
-            }
-        };
-        (db(&self.shared.ir_peak_l), db(&self.shared.ir_peak_r))
+        let db = |v: f32| if v > 0.0 { 20.0 * v.log10() } else { -200.0 };
+        (
+            db(f32::from_bits(self.shared.ir_peak_l.swap(0, Ordering::Relaxed))),
+            db(f32::from_bits(self.shared.ir_peak_r.swap(0, Ordering::Relaxed))),
+        )
     }
 
     /// Put the playhead at `frames`, stamped with the host's generation.
@@ -17530,7 +17579,11 @@ mod tests {
         };
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
         let cases: [(&str, &str, usize); 13] = [
-            (EQ_PATH, "Tangent EQ", 15),
+            // Five bands of five knobs. Was 15 when the face showed three;
+            // the two extra bands were APPENDED at ids 15..25, so this number
+            // going UP is the whole change and this number going DOWN would
+            // be old projects losing parameters.
+            (EQ_PATH, "Tangent EQ", 25),
             (IMAGER_PATH, "Tangent Imager", 3),
             (TAPE_PATH, "Tangent Tape", 6),
             (COMP_PATH, "Tangent Comp", 7),
@@ -23923,6 +23976,88 @@ mod ir_road {
         }
         let (_, complete, _) = got.expect("the cancelled job never came home");
         assert!(!complete, "a cancel claimed to be a finished capture");
+    }
+
+    /// **The wizard's meter keeps every block, and CLEARS AS IT READS.**
+    ///
+    /// This is the literal answer to the owner's "why on earth is that meter
+    /// alone limited?" — it was the only meter in the app whose source
+    /// threw blocks away. `ir_peak` was a plain per-block `store`, the audio
+    /// thread writes one every few milliseconds, and the wizard reads once a
+    /// frame: roughly one block in six reached the picture and the other
+    /// five were overwritten unseen. Every other meter here is a max-hold
+    /// that clears on read — see `Engine::strip_peaks` — and this one now is
+    /// too.
+    ///
+    /// Driven through a CAPTURE rather than the tone, because the fault only
+    /// shows where the level changes inside one job: a capture is pre-roll
+    /// silence, then the sweep, then a second of silence after it. Read once
+    /// at the end and a max-hold reports the sweep; a `store` reports the
+    /// silence it happened to land in, which is a meter that watched the
+    /// loudest thing it will ever see and said nothing.
+    ///
+    /// Revert-checks, both performed: put `store` back in place of
+    /// `bump_peak` and the first assert goes red at −200; make the readers
+    /// `load` instead of `swap` and the second goes red, still holding the
+    /// reading it already gave out.
+    #[test]
+    fn the_wizards_return_meter_keeps_every_block_and_clears_as_it_reads() {
+        let (mut e, mut tx) = ir_loop_rig();
+        let sweep = crate::units::sweep::ess(20.0, 20_000.0, 0.25, 48_000.0);
+        e.start_ir_capture(IrCaptureSpec {
+            out_pair: (0, 1),
+            in_pair: (0, 1),
+            sweep,
+            pre_silence_frames: 2_048,
+            post_silence_frames: 24_000,
+            level: 0.25,
+            settle_frames: 0,
+        });
+        // Everything below stays INSIDE the pass. A completed capture zeroes
+        // these cells on purpose — the road is idle and the meters say so —
+        // so a test that ran the pass out would be measuring that instead.
+        // 2048 pre-roll + 12000 of sweep is ~14 blocks; the post-silence
+        // carries it to ~37.
+        let mut out = vec![0.0f32; 1024 * 2];
+        for _ in 0..10 {
+            ir_loop_block(&mut e, &mut tx, &mut out);
+        }
+        // The per-jack pair first, mid-sweep, because it clears too.
+        let (l, r) = e.ir_return_sides_db();
+        assert!(
+            l > -200.0 || r > -200.0,
+            "neither jack reported anything while the sweep was playing"
+        );
+        let (l2, r2) = e.ir_return_sides_db();
+        assert!(
+            l2 <= -200.0 && r2 <= -200.0,
+            "the per-jack peaks did not clear on the read: {l2:.1}/{r2:.1}"
+        );
+
+        // Now the rest of the sweep and well into the SILENCE after it,
+        // without looking once. A meter that only remembers its last block
+        // is standing in that silence when the reading is taken.
+        for _ in 0..20 {
+            ir_loop_block(&mut e, &mut tx, &mut out);
+        }
+        let (_, peak) = e.ir_return_db();
+        assert!(
+            peak > -30.0,
+            "the meter read {peak:.1} dBFS over blocks that carried the end \
+             of the sweep - it is reporting the block it happened to land in \
+             rather than the loudest one since it was last read"
+        );
+
+        // And it is EMPTY now. The next reading is the next thing that
+        // happens, not the last thing that did — which is what makes the
+        // line above safe to accumulate into.
+        let (_, again) = e.ir_return_db();
+        assert!(
+            again <= -200.0,
+            "a second read with no audio in between still reports \
+             {again:.1} dBFS, so the cell never cleared and two readers would \
+             each be told the other's peak"
+        );
     }
 
     /// **The tone road plays at its level and the meter reads the return.**
