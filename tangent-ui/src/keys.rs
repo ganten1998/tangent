@@ -495,6 +495,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
     // they cannot live in `BINDINGS` — that table is single keys — and being
     // in neither place meant the two most-pressed shortcuts in any editor
     // went undocumented on every surface.
+    rows.push(("C-S", "save the project"));
     rows.push(("C-Z", "undo"));
     rows.push(("C-S-Z", "redo"));
     rows.push(heading(match view {
@@ -941,6 +942,11 @@ mod tests {
             "C-T" => vec!["T"],
             "C-C/V" => vec!["C", "V"],
             "C-C/V/X" => vec!["C", "V", "X"],
+            // Ctrl/Cmd+S. The BARE `S` is the supporter key and lives in
+            // `BINDINGS`; this row vouches for the chord `paint` reads, and
+            // the two cannot collide because `pressed` refuses any modified
+            // press outright.
+            "C-S" => vec!["S"],
             // The view chords. Dispatched from `fn paint` rather than from
             // any view's own handler — the old version of this test filed
             // every one of them under "gesture" and checked nothing.
@@ -1321,10 +1327,10 @@ mod tests {
             .iter()
             .filter(|&&(_, _, a, s)| s && available(a, gates))
             .count();
-        // Plus the prose rows every card carries — the two view keys and the
-        // two undo/redo chords, which are not in `BINDINGS` because that
-        // table is single keys — and the TWO section headings.
-        assert_eq!(piano.len(), shown + 6, "the piano card dropped a live key");
+        // Plus the prose rows every card carries — the two view keys, SAVE,
+        // and the two undo/redo chords, none of which are in `BINDINGS`
+        // because that table is single keys — and the TWO section headings.
+        assert_eq!(piano.len(), shown + 7, "the piano card dropped a live key");
 
         for (view, name) in [
             (HelpView::Mixer, "mixer"),
@@ -1670,7 +1676,9 @@ mod tests {
         for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() }] {
             for (label, _) in card_rows(gates, HelpView::Piano) {
                 // The view-key gesture rows are card prose, not bindings.
-                if matches!(label, "S-1" | "S-2" | "S-3" | "C-Z" | "C-S-Z") || label.is_empty() {
+                if matches!(label, "S-1" | "S-2" | "S-3" | "C-S" | "C-Z" | "C-S-Z")
+                    || label.is_empty()
+                {
                     // The view-key gesture rows and the section headings
                     // have no table entry to cross-check.
                     continue;

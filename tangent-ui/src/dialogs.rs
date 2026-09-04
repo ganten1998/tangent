@@ -1736,6 +1736,10 @@ pub enum DialogAction {
         id_b: u32,
         value_b: f32,
     },
+    /// **A run of a bay's numbers in one frame.** Appended at the END, this
+    /// enum's law. See [`crate::faces::FaceAction::SetMany`] — the EQ's
+    /// double-click reset puts a whole band back and that is five of them.
+    SetInsertParamsMany { strip: usize, slot: usize, sets: Vec<(u32, f32)> },
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -6847,6 +6851,13 @@ fn show_on(
                                         id_b,
                                         value_b,
                                     }),
+                                    crate::faces::FaceAction::SetMany { sets } => {
+                                        Some(DialogAction::SetInsertParamsMany {
+                                            strip,
+                                            slot,
+                                            sets,
+                                        })
+                                    }
                                     crate::faces::FaceAction::SavePreset { name } => {
                                         Some(DialogAction::FaceSavePreset { strip, slot, name })
                                     }
@@ -14956,7 +14967,7 @@ at: None,
                         "Tangent Echo",
                         "Tangent Plate",
                         "Tangent Wah",
-                        "Tangent IR",
+                        "Tangent IR (Experimental)",
                         "analog lab v",
                         "the modelled piano",
                         "Vital"

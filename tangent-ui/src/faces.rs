@@ -91,7 +91,13 @@ pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
     ),
     (
         "@tangent-ir",
-        "Tangent IR",
+        // Experimental on the same terms the denoiser is: the wizard behind
+        // it is younger than the unit and still learning what a bad capture
+        // looks like. `class` stays the plain word - `preset_subfolder`
+        // spells a directory out of it and a rename would hide every preset
+        // already saved there - and `the_suite_faces_and_the_suite_units_are
+        // _the_same_list` compares the two up to this suffix.
+        "Tangent IR (Experimental)",
         "plays any impulse response you can capture",
     ),
 ];
@@ -397,6 +403,16 @@ pub enum FaceAction {
     /// leave the other for a frame that never came while the hand kept
     /// moving. See `faces::draw_eq`'s `Move` arm for what that felt like.
     SetPair { id_a: u32, value_a: f32, id_b: u32, value_b: f32 },
+    /// **A whole control back to how it shipped, in one frame.** Appended at
+    /// the END, this enum's law.
+    ///
+    /// [`Self::SetPair`] exists for a gesture that moves two numbers and is
+    /// the common case; this is for the one that moves ALL of a band's — the
+    /// EQ's double-click reset, which is five. Two variants rather than one
+    /// because the pair is what a DRAG sends, sixty times a second, and it
+    /// costs no allocation; this fires once on a double-click and can afford
+    /// a Vec.
+    SetMany { sets: Vec<(u32, f32)> },
 }
 
 fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {
@@ -951,12 +967,39 @@ fn draw_eq(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
                 live.band = node;
                 None
             }
+            // **A double-click puts the whole band back where it shipped**,
+            // which includes being off — so the curve still drops, exactly
+            // as it always did, and the HANDLE goes home with it.
+            //
+            // This used to set the on-switch to zero and nothing else. The
+            // wave flattened and the node stayed wherever the hand had left
+            // it: hollow, silent, and floating twelve dB above a curve it
+            // was no longer part of. The owner: "dbl click reset node should
+            // make the node jump back to its default position, right now
+            // only the wave moves down when reset, leaving the node stranded
+            // above/below."
+            //
+            // Every knob, not just the two that make the position, because
+            // "reset" is a word with one meaning and a band left on a shape
+            // and a width somebody dialled in is not reset. The numbers come
+            // from the pushed parameters' own `default`, so the face never
+            // has a second opinion about what shipped — `EQ_FACE_PARAMS` is
+            // the only place that is written down.
             CurveAction::Remove { node } => {
                 live.band = node;
-                Some(FaceAction::Set {
-                    id: node as u32 * EQ_KNOBS,
-                    value: 0.0,
-                })
+                let base = node as u32 * EQ_KNOBS;
+                let sets: Vec<(u32, f32)> = (0..EQ_KNOBS)
+                    .filter_map(|k| {
+                        param(&live.face, base + k).map(|p| (base + k, p.default))
+                    })
+                    .collect();
+                if sets.is_empty() {
+                    // No parameters pushed yet: the old behaviour is still
+                    // the right one, and it needs nothing to read.
+                    Some(FaceAction::Set { id: base, value: 0.0 })
+                } else {
+                    Some(FaceAction::SetMany { sets })
+                }
             }
             CurveAction::Add { freq_hz, .. } => {
                 // Wake the nearest sleeping band and park it where the hand
