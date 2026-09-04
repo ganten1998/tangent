@@ -1021,6 +1021,13 @@ pub struct TangentApp {
     /// The CLIP's own right-click menu: (clip id, where it hangs). Two rows
     /// — delete the take, copy the take — the owner's words on both.
     arr_clip_menu: Option<(u64, egui::Pos2)>,
+    /// **The ruler strip's menu**, and which flag it was opened on.
+    ///
+    /// `None` for the empty strip — the two rows there make something — and
+    /// `Some(i)` over a flag, where the rows act on the marker under the
+    /// hand. One field rather than two because it is one menu with two
+    /// shapes, and two would be two things to remember to close.
+    arr_flag_menu: Option<(Option<usize>, egui::Pos2)>,
     /// The arrange header BAY's right-click menu: (lane, bay, where).
     /// Two rows — Delete FX, Replace FX — the mixer's insert menu, here.
     arr_fx_menu: Option<(usize, usize, egui::Pos2)>,
@@ -1770,6 +1777,26 @@ enum ClipMenuAction {
     ResetStretch,
     /// Write the acting set's MIDI clips out, one `.mid` per track.
     ExportMidi,
+}
+
+/// What a row of the RULER's flag menu means.
+///
+/// The same bargain [`ClipMenuAction`] struck, for the same reason and one
+/// menu later: this one was painted from one hard-coded list and matched
+/// from another, so "Rename" was row 1 in two places that had to be edited
+/// together. A third row on one shape and not the other is exactly the edit
+/// that goes wrong — and it is the shape this menu already has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlagMenuAction {
+    /// A marker at the playhead, field open.
+    New,
+    /// A signature starting at the bar the PLAYHEAD is in.
+    NewSigAtPlayhead,
+    Delete(usize),
+    Rename(usize),
+    /// A signature starting at the bar this MARKER is in — which is what
+    /// makes the two share a place and read as "Name (4/4)".
+    NewSigAtMarker(usize),
 }
 
 /// A gesture in flight on the arrangement. What the press grabbed, and the
@@ -3169,6 +3196,7 @@ impl TangentApp {
             arr_stretch_orig: Vec::new(),
             tap_times: Vec::new(),
             arr_clip_menu: None,
+            arr_flag_menu: None,
             arr_fx_menu: None,
             met_menu: None,
             met_drag: false,
@@ -11860,6 +11888,71 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_save_edits();
     }
 
+    /// **Put the playhead on a marker.** What a named place is for.
+    fn arr_locate_marker(&mut self, i: usize) {
+        let Some(m) = self.arrangement.markers.get(i) else {
+            return;
+        };
+        let to = m.at_s.max(0.0);
+        self.request_recorder(recorder::RecorderRequest::Locate(to));
+    }
+
+    /// **A new marker at the playhead, with its field already open.**
+    ///
+    /// Unnamed until somebody types: the owner asked for "a small field to
+    /// type/enter", so the flag exists the moment the row is chosen and the
+    /// caret is in it. An empty name is a legal marker — it draws as a
+    /// pennant and still locates — so walking away without typing leaves a
+    /// place rather than nothing.
+    fn arr_new_marker(&mut self) {
+        let at_s = self.playhead_s().max(0.0);
+        self.arrangement.markers.push(crate::arrangement::ArrMarker {
+            at_s,
+            name: String::new(),
+        });
+        let i = self.arrangement.markers.len() - 1;
+        self.arr_save_edits();
+        self.arr_rename_marker(i);
+    }
+
+    /// Open the field on an existing flag, prefilled with its name.
+    fn arr_rename_marker(&mut self, i: usize) {
+        let Some(m) = self.arrangement.markers.get(i) else {
+            return;
+        };
+        self.num_edit = Some(recorder::NumEdit::prefilled(
+            recorder::NumField::MarkerName(i),
+            m.name.clone(),
+        ));
+        self.name_focused = false;
+    }
+
+    /// Take one out. Any field open on it goes too — an index into a list
+    /// that just got shorter is the one thing this must not leave behind.
+    fn arr_delete_marker(&mut self, i: usize) {
+        if i >= self.arrangement.markers.len() {
+            return;
+        }
+        self.arrangement.markers.remove(i);
+        if matches!(
+            self.num_edit.as_ref().map(|e| e.field),
+            Some(recorder::NumField::MarkerName(_))
+        ) {
+            self.num_edit = None;
+        }
+        self.arr_save_edits();
+    }
+
+    /// Which bar a marker falls in, for the signature rows that act on it.
+    fn arr_marker_bar(&self, i: usize) -> u32 {
+        let Some(m) = self.arrangement.markers.get(i) else {
+            return 0;
+        };
+        self.live_meter_map()
+            .bar_beat_at_quarter(self.live_tempo_map().beat_at_seconds(m.at_s.max(0.0)))
+            .0
+    }
+
     /// Open the signature at `bar` for typing, in place on the ruler.
     ///
     /// **A field on the chip, not a dialog.** A signature is two numbers and
@@ -12830,6 +12923,73 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Export goes LAST on purpose, under the separator's business end:
     /// Delete and Copy are the rows the hand already knows where to find,
     /// and a row that comes and goes must not move them.
+    /// **What the flag menu offers, in the owner's words and his order.**
+    ///
+    /// Two shapes: the empty strip MAKES something, a flag ACTS on the one
+    /// under the hand. One list for both the painter and the press handler
+    /// — see [`FlagMenuAction`] for why that is not a refactor for its own
+    /// sake.
+    /// Do what a flag-menu row means.
+    ///
+    /// Split from the press handler so a test can drive the row it resolved
+    /// rather than assert about the state afterwards: the arm that maps an
+    /// action to an effect is where the flag's signature row could quietly
+    /// start aiming at the playhead, and that arm was unreachable from a
+    /// test while it lived inside a `ctx`-driven input pass.
+    fn apply_flag_menu(&mut self, action: FlagMenuAction) {
+        match action {
+            FlagMenuAction::New => self.arr_new_marker(),
+            FlagMenuAction::NewSigAtPlayhead => {
+                let bar = self
+                    .live_meter_map()
+                    .bar_beat_at_quarter(
+                        self.live_tempo_map().beat_at_seconds(self.playhead_s().max(0.0)),
+                    )
+                    .0;
+                self.arr_edit_meter(bar);
+            }
+            FlagMenuAction::Delete(i) => self.arr_delete_marker(i),
+            FlagMenuAction::Rename(i) => self.arr_rename_marker(i),
+            // **The signature row on a flag acts on the FLAG's bar**, so the
+            // two land in the same place — which is what makes the
+            // "Name (4/4)" label happen at all.
+            FlagMenuAction::NewSigAtMarker(i) => {
+                let bar = self.arr_marker_bar(i);
+                self.arr_edit_meter(bar);
+            }
+        }
+    }
+
+    /// Which row of the flag menu anchored at `at` the pointer is on.
+    ///
+    /// The rectangles come from the same `clip_menu_rows` the painter lays
+    /// out and the list from the same `flag_menu_rows` it labels, so this
+    /// is the whole press decision in one place a test can actually drive —
+    /// which is the point. A helper that resolved a row from the row index
+    /// would be a helper that cannot be wrong.
+    fn flag_menu_hit(on: Option<usize>, at: Pos2, pointer: Option<Pos2>) -> Option<FlagMenuAction> {
+        let list = Self::flag_menu_rows(on);
+        let rows = Self::clip_menu_rows(at, list.len());
+        let p = pointer?;
+        let n = rows.iter().position(|r| r.contains(p))?;
+        list.get(n).map(|(_, a)| *a)
+    }
+
+    fn flag_menu_rows(on: Option<usize>) -> Vec<(String, FlagMenuAction)> {
+        use FlagMenuAction as A;
+        match on {
+            None => vec![
+                ("New marker".to_owned(), A::New),
+                ("New time sig.".to_owned(), A::NewSigAtPlayhead),
+            ],
+            Some(i) => vec![
+                ("Delete".to_owned(), A::Delete(i)),
+                ("Rename".to_owned(), A::Rename(i)),
+                ("New time sig.".to_owned(), A::NewSigAtMarker(i)),
+            ],
+        }
+    }
+
     fn clip_menu_rows_for(&self, id: u64) -> Vec<(String, ClipMenuAction)> {
         let mut out = vec![
             ("Delete take".to_owned(), ClipMenuAction::Delete),
@@ -13133,6 +13293,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             )
         } else if let Some((.., at)) = self.arr_fx_menu {
             (at, vec!["Delete FX".to_owned(), "Replace FX".to_owned()])
+        } else if let Some((on, at)) = self.arr_flag_menu {
+            (
+                at,
+                Self::flag_menu_rows(on)
+                    .into_iter()
+                    .map(|(label, _)| label)
+                    .collect(),
+            )
         } else {
             return;
         };
@@ -17392,6 +17560,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         // The BAY's FX menu: while it is up it owns every press.
         // The stored pair is a SEAT and bay - resolved at the click.
+        if let Some((on, at)) = self.arr_flag_menu {
+            let (pressed, sec, pointer) = ctx.input(|i| {
+                (
+                    i.pointer.primary_pressed(),
+                    i.pointer.secondary_pressed(),
+                    i.pointer.interact_pos(),
+                )
+            });
+            if pressed || sec {
+                self.arr_flag_menu = None;
+                // **The row's ACTION, not its index** — one list answers what
+                // was painted and what was pressed. See [`FlagMenuAction`].
+                match Self::flag_menu_hit(on, at, pointer.filter(|_| pressed)) {
+                    Some(action) => self.apply_flag_menu(action),
+                    None => self.menu_ate_press = true,
+                }
+            }
+            return;
+        }
         if let Some((seat, bay, at)) = self.arr_fx_menu {
             let (pressed, sec, pointer) = ctx.input(|i| {
                 (
@@ -17570,6 +17757,29 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 };
                 if on_tempo {
                     self.arr_ask_flatten_tempo();
+                    return;
+                }
+                // **The ruler's strip: the flag menu.**
+                //
+                // Over a flag it acts on that marker; over empty strip it
+                // makes one. The owner asked for both lists by name — "New
+                // marker" & "New time sig." on the strip, "Delete" "Rename"
+                // "New Time sig." on a marker — and they are one menu
+                // because the strip is one place.
+                let on_flag = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    match crate::arrangement_panel::hit_test(rect, &view, p) {
+                        Some(crate::arrangement_panel::Hit::Flag(i)) => Some(Some(i)),
+                        Some(
+                            crate::arrangement_panel::Hit::MeterStrip(_)
+                            | crate::arrangement_panel::Hit::MeterChip(_),
+                        ) => Some(None),
+                        _ => None,
+                    }
+                };
+                if let Some(on) = on_flag {
+                    self.arr_flag_menu = Some((on, p));
                     return;
                 }
                 // **A right-press on the METRONOME opens its panel** — the
@@ -18128,6 +18338,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     Some(A::TempoHeader) => self.arr_ask_flatten_tempo(),
                     Some(A::MeterChip(bar)) => self.arr_edit_meter(bar),
                     Some(A::MeterStrip(bar)) => self.arr_edit_meter(bar),
+                    // **A press on a flag goes to it.** That is what a
+                    // named place is FOR, and it leaves the right button
+                    // free for the two things that change it.
+                    Some(A::Flag(i)) => self.arr_locate_marker(i),
                     // **A press on empty room makes a point only with ALT
                     // held**; a plain press moves the playhead, like every
                     // other empty surface on this timeline. The owner's
@@ -19421,6 +19635,38 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             tempo_hot: self.arr_tempo_hot,
             meter_edit: self.num_edit.as_ref().and_then(|e| match e.field {
                 crate::recorder::NumField::MeterAt(bar) => Some((bar, e.text.as_str())),
+                _ => None,
+            }),
+            // **Built here, owned by the view**, the way the tempo map is:
+            // the pairing with a signature is a question about two maps and
+            // the painter should be handed the answer rather than the maps.
+            markers: {
+                let tempo = self.live_tempo_map();
+                let meter = self.live_meter_map();
+                self.arrangement
+                    .markers
+                    .iter()
+                    .map(|m| {
+                        let bar = meter
+                            .bar_beat_at_quarter(tempo.beat_at_seconds(m.at_s.max(0.0)))
+                            .0;
+                        crate::arrangement_panel::MarkerView {
+                            at_s: m.at_s,
+                            name: m.name.clone(),
+                            // Only where a change actually STARTS: every bar
+                            // has a signature, and printing it on every flag
+                            // would say nothing.
+                            sig: meter
+                                .points()
+                                .iter()
+                                .find(|pt| pt.at_bar == bar)
+                                .map(|pt| (pt.sig.beats, pt.sig.unit)),
+                        }
+                    })
+                    .collect()
+            },
+            marker_edit: self.num_edit.as_ref().and_then(|e| match e.field {
+                crate::recorder::NumField::MarkerName(i) => Some((i, e.text.as_str())),
                 _ => None,
             }),
             // **The master's own automation rows**, built exactly as a
@@ -23048,6 +23294,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // than left to a catch-all so a hit that grows a value later
             // has to be decided about here.
             A::MasterLane(_) => {}
+            // A flag locates, which is what a press on one does. Renaming
+            // and deleting are the right button's, and a reader reaches
+            // those the way a hand does.
+            A::Flag(i) => self.arr_locate_marker(i),
             A::Arm(n) => self.apply_mixer_hit(M::Arm(Column(n)), 0.0),
             A::Mute(n) => self.apply_mixer_hit(M::Mute(Column(n)), 0.0),
             A::Solo(n) => self.apply_mixer_hit(M::Solo(Column(n)), 0.0),
@@ -24354,8 +24604,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             return;
         }
+        // **A NAME, not a number** — the one field here whose value is a
+        // word, so it lands before the parse table below rather than in it.
+        // Empty is allowed: a marker with no name is still a place, and it
+        // draws as a pennant.
+        if let F::MarkerName(i) = edit.field {
+            if let Some(m) = self.arrangement.markers.get_mut(i) {
+                m.name = edit.text.trim().to_owned();
+                self.arr_save_edits();
+            }
+            return;
+        }
         let hit = match edit.field {
             F::Meter => None,
+            // Answered above, before this table: its value is a word.
+            F::MarkerName(_) => None,
             F::Tempo => recorder::parse_bpm(&edit.text).map(Hit::SetTempo),
             // The setter takes a FADER POSITION, not a gain, so a typed dB
             // has to go back through the same curve the drag uses. Doing it
@@ -24422,6 +24685,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn field_seed(&self, field: recorder::NumField) -> String {
         use recorder::NumField as F;
         let raw = match field {
+            // A flag's seed is its own name, and `arr_rename_marker` hands
+            // it over directly rather than coming through here — a name has
+            // no reading to trim.
+            F::MarkerName(i) => self
+                .arrangement
+                .markers
+                .get(i)
+                .map(|m| m.name.clone())
+                .unwrap_or_default(),
             F::Tempo => format!("{:.0}", self.tempo_bpm()),
             F::Meter => {
                 let sig = self.time_signature();
@@ -24875,12 +25147,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // in wrong will try — and `Toggle` is where that already lives.
             // Pressing it while a take is ROLLING does nothing, because Space
             // is the key that ends a performance.
+            // **The ARRANGEMENT, always — never the take.**
+            //
+            // This used to send `Capture` (the take) whenever one was
+            // rolling and `Toggle` (the arrangement) otherwise, so one key
+            // meant two different recordings depending on state. The owner's
+            // ruling: "The take record should be bound to nothing but the
+            // click button." So no key starts, ends or cancels a take now —
+            // the cassette's own button is the whole interface to it — and
+            // Enter means what its card has always said it means.
             K::StartRecording => {
-                if self.recorder.state.is_active() && !self.recorder.state.is_writing() {
-                    // The count-in is the CAPTURE's now, so the cancel goes
-                    // to the cassette — Enter during the count still bails.
-                    self.request_recorder(recorder::RecorderRequest::Capture);
-                } else if !self.recorder.state.is_writing() {
+                if !self.recorder.state.is_writing() {
                     self.request_recorder(recorder::RecorderRequest::Toggle);
                 }
             }
@@ -25668,6 +25945,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // the sequence does not leave four arrows banked.
             self.license.relock_cheat();
             self.konami = crate::keys::Konami::default();
+            // **And the window goes back to 100% on screen, not just in the
+            // file.** `Settings::reset` already puts `window_size_percent`
+            // back; nothing asked for the resize, so the desk stayed
+            // whatever size it had been dragged or stepped to and the reset
+            // looked like it had half worked. The owner: "Reset everything
+            // should set the window size to 100% immediately after
+            // resetting."
+            //
+            // The same two slots `MenuAction::SetSizePercent` uses, and for
+            // the same reason: a host that owns the window has to be asked,
+            // and the ask is recorded here for the binary that knows how.
+            if self.caps.window_sizing {
+                self.pending_resize = Some(initial_window_size(&self.settings));
+            } else {
+                self.pending_window_size = Some(initial_window_size(&self.settings));
+            }
         }
 
         // Closing the detached window re-attaches; Python's close handler then
@@ -30600,13 +30893,14 @@ impl TangentApp {
             // takes but the actual daw transport recording -- can happen
             // while a take is occuring even."
             //
-            // `Capture` is the request that road already answers: it cancels
-            // a count-in, finishes a running arrangement record, or starts
-            // one with the count-in from settings. Enter reaches it too, but
-            // only THROUGH the take machine — `StartRecording` sends
-            // `Capture` when a take is active and `Toggle` when one is not —
-            // so there was no key that meant the arrangement's red button on
-            // its own.
+            // **`Toggle`, which is the arrangement's red button.** It was
+            // `Capture` for one build, and `Capture` is the TAKE — the two
+            // arms sit next to each other in the host's match and I read the
+            // boundary wrong, so the chord recorded exactly the thing it was
+            // added to avoid: "I press Cmd + R on every view and it starts
+            // recording a take." `Toggle` cancels a count-in, finishes a
+            // running arrangement record, or starts one with the count-in
+            // from settings.
             //
             // The bare `R` is Clear Notes and stays that way: `keys::pressed`
             // refuses any modified press before it reaches the table, so the
@@ -30617,7 +30911,7 @@ impl TangentApp {
                     && !i.modifiers.alt
                     && i.key_pressed(egui::Key::R)
             }) {
-                self.request_recorder(recorder::RecorderRequest::Capture);
+                self.request_recorder(recorder::RecorderRequest::Toggle);
             }
             // **Shift+1/2/3: theory, arrange, mixer** — the ctrl chords
             // retired because Windows' Ctrl+V is PASTE and a view key on
@@ -34049,6 +34343,217 @@ mod tests {
         let app = TangentApp::new(&ctx, settings, caps);
         (ctx, app)
     }
+
+    /// **The flag menu says the owner's words, and a press does the thing
+    /// beside the word it was painted with.**
+    ///
+    /// His two lists, verbatim: right-clicking the strip reads "New marker"
+    /// then "New time sig."; right-clicking a flag reads "Delete",
+    /// "Rename", "New time sig.". The rows are checked as WORDS because
+    /// that is what he specified, and the press is driven THROUGH the row
+    /// rectangles the painter uses, so an off-by-one between the two lists
+    /// cannot pass here.
+    ///
+    /// The last block is the pairing that matters most: the signature row
+    /// on a flag has to open the FLAG's bar and not the playhead's, or a
+    /// marker and its signature never share a place and the "Name (4/4)"
+    /// label can never happen.
+    ///
+    /// Revert-checks, all four performed: swap "Delete" and "Rename" in
+    /// `flag_menu_rows` and the word list goes red; give the empty-strip
+    /// shape a third row and it goes red again; make `New` do nothing and
+    /// the first press goes red; point `NewSigAtMarker` at bar 0 instead of
+    /// the flag's bar and the last block goes red.
+    #[test]
+    fn the_flag_menu_reads_and_acts_the_way_the_owner_asked() {
+        use recorder::NumField as F;
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let words = |on| -> Vec<String> {
+            TangentApp::flag_menu_rows(on)
+                .into_iter()
+                .map(|(l, _)| l)
+                .collect()
+        };
+        assert_eq!(words(None), vec!["New marker", "New time sig."]);
+        assert_eq!(words(Some(0)), vec!["Delete", "Rename", "New time sig."]);
+
+        // **Pressed at a PIXEL**, resolved by the same road the handler
+        // takes — the half a list-only assertion would miss. The point is
+        // taken from the row the PAINTER lays out and handed to the
+        // resolver as a bare position, so the two lists have to agree for
+        // this to come back right.
+        let at = Pos2::new(200.0, 40.0);
+        let press = |on: Option<usize>, row: usize| {
+            let rows = TangentApp::clip_menu_rows(at, TangentApp::flag_menu_rows(on).len());
+            TangentApp::flag_menu_hit(on, at, Some(rows[row].center()))
+        };
+        // A press off the menu does nothing at all, which is the state the
+        // "eat it" arm depends on.
+        assert_eq!(
+            TangentApp::flag_menu_hit(None, at, Some(Pos2::new(0.0, 0.0))),
+            None,
+            "a press beside the menu picked a row"
+        );
+
+        // Empty strip, row 0: a marker appears at the playhead.
+        app.arrangement.markers.clear();
+        let new = press(None, 0).expect("the first row of the strip menu");
+        assert_eq!(new, FlagMenuAction::New);
+        app.apply_flag_menu(new);
+        assert_eq!(app.arrangement.markers.len(), 1, "\"New marker\" made nothing");
+
+        // A flag, row 0 and row 1: his two verbs, in his order.
+        assert_eq!(press(Some(0), 0), Some(FlagMenuAction::Delete(0)));
+        assert_eq!(press(Some(0), 1), Some(FlagMenuAction::Rename(0)));
+
+        // **The signature row on a flag opens the FLAG's bar.** Put the
+        // marker somewhere the playhead is not, so "it opened a signature"
+        // and "it opened the RIGHT signature" cannot be confused.
+        app.commit_number();
+        app.arrangement.markers[0].at_s = 60.0;
+        app.request_recorder(recorder::RecorderRequest::Locate(0.0));
+        let mark_bar = app.arr_marker_bar(0);
+        let head_bar = app
+            .live_meter_map()
+            .bar_beat_at_quarter(app.live_tempo_map().beat_at_seconds(app.playhead_s().max(0.0)))
+            .0;
+        assert_ne!(
+            mark_bar, head_bar,
+            "the fixture put the flag on the playhead's own bar, so this proves nothing"
+        );
+        let action = press(Some(0), 2).expect("the third row of a flag menu");
+        assert_eq!(action, FlagMenuAction::NewSigAtMarker(0));
+        app.apply_flag_menu(action);
+        assert_eq!(
+            app.num_edit.as_ref().map(|e| e.field),
+            Some(F::MeterAt(mark_bar)),
+            "the signature field did not open on the flag's own bar"
+        );
+    }
+
+    /// **The four things a marker row does, end to end.**
+    ///
+    /// New puts a flag AT THE PLAYHEAD with its field already open, typing
+    /// names it, rename re-opens it on the name it has, delete takes it out
+    /// and takes the open field with it. The owner's shape for the menu was
+    /// "New marker … Delete / Rename", and each of those is a row somebody
+    /// picks — so each is driven here rather than asserted about the state
+    /// it leaves.
+    ///
+    /// Locate is in here too, because a named place that does not take you
+    /// there is a label, not a marker.
+    ///
+    /// The signature PAIRING is in here too — `MarkerView::sig`, out of the
+    /// real view builder — because it is the field the "Name (4/4)" label is
+    /// made of and it is easy to write as "the signature in force here",
+    /// which would put a signature on every flag in the song.
+    ///
+    /// Revert-checks, all five performed and each turning THIS test red:
+    /// drop the `arr_rename_marker` call at the end of `arr_new_marker` and
+    /// the field never opens; commit without `trim()` and the name keeps its
+    /// spaces; drop the `num_edit = None` in `arr_delete_marker` and a field
+    /// survives pointing at an index that no longer exists; drop the
+    /// `Locate` and nothing is asked of the transport; feed the pairing from
+    /// `sig_at_bar` instead of the change points and the middle flag claims
+    /// to start a signature.
+    #[test]
+    fn a_marker_is_made_named_renamed_and_taken_out_again() {
+        use recorder::NumField as F;
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.arrangement.markers.clear();
+        app.recorder_request.clear();
+
+        // NEW — at the playhead, with the caret in it.
+        let at = app.playhead_s().max(0.0);
+        app.arr_new_marker();
+        assert_eq!(app.arrangement.markers.len(), 1, "no marker was made");
+        assert!(
+            (app.arrangement.markers[0].at_s - at).abs() < 1e-9,
+            "the flag did not land on the playhead: {} vs {at}",
+            app.arrangement.markers[0].at_s
+        );
+        assert_eq!(
+            app.num_edit.as_ref().map(|e| e.field),
+            Some(F::MarkerName(0)),
+            "the field was not open on the new flag"
+        );
+
+        // TYPING — the word lands, trimmed.
+        app.num_edit.as_mut().unwrap().text = "  Chorus  ".to_owned();
+        app.commit_number();
+        assert_eq!(app.arrangement.markers[0].name, "Chorus");
+        assert!(app.num_edit.is_none(), "the field stayed open after commit");
+
+        // RENAME — re-opened on the name it has, not on an empty box.
+        app.arr_rename_marker(0);
+        assert_eq!(
+            app.num_edit.as_ref().map(|e| (e.field, e.text.clone())),
+            Some((F::MarkerName(0), "Chorus".to_owned())),
+            "rename did not open on the flag's own name"
+        );
+
+        // LOCATE — the transport is actually asked to go there.
+        app.arrangement.markers[0].at_s = 42.5;
+        app.recorder_request.clear();
+        app.arr_locate_marker(0);
+        assert!(
+            app.recorder_request.iter().any(|r| matches!(
+                r,
+                recorder::RecorderRequest::Locate(t) if (*t - 42.5).abs() < 1e-9
+            )),
+            "locating a marker asked the transport for nothing: {:?}",
+            app.recorder_request
+        );
+
+        // **The PAIRING the label depends on**, out of the real view
+        // builder. The panel prints "Name (4/4)" from `MarkerView::sig`, and
+        // that field is only ever right if the app answers the two-map
+        // question — which bar is this marker in, and does a signature
+        // CHANGE start there — rather than handing the painter the maps.
+        {
+            app.arrangement.markers[0].at_s = 0.0;
+            app.arrangement.meter = crate::tempo::MeterMap::sanitised(vec![
+                crate::tempo::MeterPoint {
+                    at_bar: 0,
+                    sig: recorder::TimeSignature { beats: 4, unit: 4 },
+                },
+                crate::tempo::MeterPoint {
+                    at_bar: 4,
+                    sig: recorder::TimeSignature { beats: 7, unit: 8 },
+                },
+            ]);
+            let on_change = app.arr_marker_bar(0);
+            app.arrangement.markers.push(crate::arrangement::ArrMarker {
+                at_s: 60.0,
+                name: "Later".to_owned(),
+            });
+            let clips: Vec<crate::arrangement_panel::ClipView<'_>> = Vec::new();
+            let v = app.arrange_view_for_shot(&clips);
+            assert_eq!(on_change, 0, "the fixture's first flag left bar 0");
+            assert_eq!(
+                v.markers[0].sig,
+                Some((4, 4)),
+                "a flag on a bar where a signature starts did not carry it"
+            );
+            assert_eq!(
+                v.markers[1].sig, None,
+                "a flag in the middle of a signature claimed to start one"
+            );
+            app.arrangement.markers.truncate(1);
+            app.arrangement.meter =
+                crate::tempo::MeterMap::constant(recorder::TimeSignature { beats: 4, unit: 4 });
+        }
+
+        // DELETE — and the field open on it does not outlive it.
+        app.arr_rename_marker(0);
+        app.arr_delete_marker(0);
+        assert!(app.arrangement.markers.is_empty(), "the flag survived delete");
+        assert!(
+            app.num_edit.is_none(),
+            "a field is still open on a marker that no longer exists"
+        );
+    }
+
 
     /// **Every mixer column moves its own control and nothing else.**
     ///
@@ -45427,6 +45932,50 @@ mod tests {
 
 
 
+    /// **Reset Everything takes the Konami corruption off, and the marker
+    /// with it.**
+    ///
+    /// It is the one thing that scope touches which is not in
+    /// `settings.json` at all: the cheat lives as a `cheat.unlock` file
+    /// beside the licence, so every road that claimed to put the app back as
+    /// it came walked straight past it. The heart's own two settings were
+    /// always covered — `take_colours` restores them — which is exactly why
+    /// this went unnoticed: the visible half reset and the standing did not.
+    ///
+    /// Driven against a store pointed at a temp directory, because the real
+    /// one is the developer's own licence and a test must not relock it.
+    ///
+    /// Revert-check performed: drop the `relock_cheat()` call from
+    /// `reset_settings` and this goes red with the marker still on disk.
+    #[test]
+    fn reset_everything_takes_the_konami_corruption_off() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-cheat-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("the store's home");
+        let key = root.join("license.key");
+
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.license = tangent_core::license::LicenseStore::load_from(&key);
+        app.license.unlock_cheat();
+        assert!(app.license.cheated(), "the fixture never cheated");
+        assert!(root.join("cheat.unlock").exists(), "no marker was written");
+
+        app.reset_settings(&ctx, crate::settings::ResetScope::Everything);
+        assert!(
+            !app.license.cheated(),
+            "the reset left the corruption on in this session"
+        );
+        assert!(
+            !root.join("cheat.unlock").exists(),
+            "the marker survived on disk, so the next launch cheats again"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **Ctrl/Cmd+S keeps the session, and the bare S still does not.**
     ///
     /// The chord the owner asked for — "Ctrl/CMD + S to save should summon a
@@ -45497,6 +46046,81 @@ mod tests {
         );
     }
 
+    /// **No key starts, ends or cancels a TAKE. The button is the whole
+    /// interface to it.**
+    ///
+    /// The owner, after a chord meant to record the arrangement recorded a
+    /// take on every view instead: "The take record should be bound to
+    /// nothing but the click button." Enter used to send `Capture` whenever
+    /// one was rolling and `Toggle` otherwise, so one key meant two
+    /// different recordings depending on state — and Space used to stop a
+    /// take outright.
+    ///
+    /// Every key the transport owns is driven here against a take that IS
+    /// rolling, which is the state all three of them used to behave
+    /// differently in. `Capture` is the take's request and it may not appear.
+    ///
+    /// Revert-check performed: give `K::StartRecording` its `Capture` arm
+    /// back and this goes red naming Enter.
+    #[test]
+    fn no_key_touches_a_take() {
+        let press = |key: egui::Key, mods: egui::Modifiers, state: recorder::RecordState| {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.show_recorder = true;
+            app.recorder.state = state;
+            while app.take_recorder_request().is_some() {}
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(1300.0, 900.0),
+                    )),
+                    modifiers: mods,
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: mods,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            let mut out = Vec::new();
+            while let Some(r) = app.take_recorder_request() {
+                out.push(r);
+            }
+            out
+        };
+        // **Both live states**, because the old code behaved differently in
+        // each and only one of them exposes the fault: `Rolling` is
+        // `is_writing`, which the take arm excluded, so Enter did nothing
+        // there and a sweep over Rolling alone passed on the broken code.
+        // `CountIn` is active and NOT writing — the one state the take arm
+        // actually fired in.
+        for state in [
+            recorder::RecordState::Rolling,
+            recorder::RecordState::CountIn { beat: 1, of: 4 },
+        ] {
+            for (key, mods, what) in [
+                (egui::Key::Enter, egui::Modifiers::NONE, "Enter"),
+                (egui::Key::R, egui::Modifiers::COMMAND, "Cmd+R"),
+                (egui::Key::Space, egui::Modifiers::NONE, "Space"),
+            ] {
+                let asked = press(key, mods, state);
+                assert!(
+                    !asked.contains(&recorder::RecorderRequest::Capture),
+                    "{what} reached the take machine in {state:?}: {asked:?}"
+                );
+                assert!(
+                    !asked.contains(&recorder::RecorderRequest::Stop),
+                    "{what} stopped the take in {state:?}: {asked:?}"
+                );
+            }
+        }
+    }
+
     /// **Ctrl/Cmd+R records the ARRANGEMENT, take or no take.**
     ///
     /// The owner: "CMD or CTRL + R now starts recording (not takes but the
@@ -45505,6 +46129,13 @@ mod tests {
     /// `Capture` only THROUGH the take machine, so there was no way to mean
     /// the arrangement's red button on its own, and no way at all to mean it
     /// while a take was up.
+    ///
+    /// **`Toggle` and not `Capture`**, which is the whole of the bug this
+    /// grew from: the two arms sit side by side in the host's match, the
+    /// boundary was read wrong, and the chord recorded a TAKE on every view
+    /// — the one thing it was added to avoid. Naming the request in the
+    /// assertion rather than "a recording started" is what makes that
+    /// distinguishable at all.
     ///
     /// The bare `R` is Clear Notes and has to stay that way; the third block
     /// is that, and it passes for a reason worth naming — `keys::pressed`
@@ -45542,7 +46173,7 @@ mod tests {
             );
             let mut saw = false;
             while let Some(r) = app.take_recorder_request() {
-                if r == recorder::RecorderRequest::Capture {
+                if r == recorder::RecorderRequest::Toggle {
                     saw = true;
                 }
             }
@@ -46639,6 +47270,7 @@ mod velocity_selection_tests {
 mod folder_tests {
     use super::tests::headless;
     use super::*;
+
 
     fn app() -> TangentApp {
         let (_, app) = headless(Caps::DESKTOP);

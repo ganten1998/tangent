@@ -332,6 +332,19 @@ pub fn auto_header(header: Rect) -> AutoHeader {
     AutoHeader { close, arm, bypass, name, dial, readout }
 }
 
+/// One named place, as the ruler needs it.
+///
+/// The SIGNATURE that shares its bar rides along, because the two are drawn
+/// as one label — "Chorus (3/4)" — and deciding that here would mean the
+/// painter asking the meter map a question the app has already answered.
+pub struct MarkerView {
+    pub at_s: f64,
+    pub name: String,
+    /// `Some((beats, unit))` when a signature change starts at this
+    /// marker's bar, so the flag can say both.
+    pub sig: Option<(u8, u8)>,
+}
+
 /// Everything the arrangement draws, pushed in.
 pub struct ArrangeView<'a> {
     pub lanes: [LaneView<'a>; CHANNELS],
@@ -406,6 +419,14 @@ pub struct ArrangeView<'a> {
     pub tempo_hot: Option<usize>,
     /// A signature chip being typed into, and what is in the field so far.
     pub meter_edit: Option<(u32, &'a str)>,
+    /// **The song's named places**, in document order — see
+    /// `arrangement::ArrMarker`. Drawn as flags in the ruler's top strip,
+    /// beside the signature chips, because both are facts about the song at
+    /// a point in it and a second row would take height from the tracks.
+    pub markers: Vec<MarkerView>,
+    /// A flag being typed into, by index, and what is in the field so far —
+    /// `meter_edit`'s twin, and the same shape on purpose.
+    pub marker_edit: Option<(usize, &'a str)>,
     /// The zoom window, in seconds of song.
     pub view_start_s: f64,
     pub view_len_s: f64,
@@ -545,6 +566,8 @@ pub enum Hit {
     /// The tempo lane's own header: show the song's tempo map, or a button
     /// to put the whole thing back to one tempo.
     TempoHeader,
+    /// A marker flag in the ruler's strip, by index into `markers`.
+    Flag(usize),
     /// A time-signature chip on the ruler, by the bar it starts at. A press
     /// opens it for editing.
     MeterChip(u32),
@@ -763,12 +786,20 @@ pub struct Row {
 pub struct Layout {
     pub header: Rect,
     pub ruler: Rect,
-    /// The top sliver of the ruler, where the time-signature chips sit.
+    /// The top sliver of the ruler: the time-signature chips and the
+    /// MARKER FLAGS, which share it.
     ///
     /// Carved OUT of the ruler rather than added above it: the ruler already
     /// has a bar-number row and a clock row, and a third band would push the
     /// lanes down to say something that belongs beside the bar numbers. The
-    /// chips take the top third, where nothing was drawn.
+    /// strip takes the top third, where nothing was drawn.
+    ///
+    /// **Always present now.** It used to be `NOTHING` on a song in one
+    /// signature — nearly all of them — so the bar numbers could keep the
+    /// whole ruler. Markers live here too and a song has none until somebody
+    /// makes one, so a strip that appears only once there is something in it
+    /// is a strip nobody can right-click to put the first thing in. It costs
+    /// nothing to reserve: the top third was empty space either way.
     pub meter_strip: Rect,
     /// The corner cell's toolbar: metronome, magnet, grid box.
     pub tool_met: Rect,
@@ -1098,12 +1129,9 @@ impl Layout {
             Pos2::new(field_x, rect.top()),
             Pos2::new(rect.right(), rect.top() + ruler_h),
         );
-        // Only when there is a change to show: on a song in one signature —
-        // which is nearly all of them — the strip is nothing and the bar
-        // numbers keep the whole ruler.
-        let meter_strip = if view.meter.is_constant() {
-            Rect::NOTHING
-        } else {
+        // Always: the flags and the chips share it, and a song has no
+        // markers until somebody right-clicks the strip to make one.
+        let meter_strip = {
             let h = (ruler_h * 0.34).clamp(8.0, 13.0).min(ruler_h * 0.5);
             Rect::from_min_max(ruler.min, Pos2::new(ruler.right(), ruler.top() + h))
         };
@@ -1764,6 +1792,51 @@ fn auto_dial_body(p: &Ink, accent: (u8, u8, u8)) -> Color32 {
     on_ink(face)
 }
 
+/// **A marker flag's body: the theme's own accent, walked until it stands
+/// off the ruler.**
+///
+/// The owner asked for "a good, per themed flag system", and the accent —
+/// `settings.white_key_active_color` — is the role that already means "the
+/// user put this here" on this view: it is what an automation dial wears.
+/// A flag in the same colour says the two systems belong to the same hand.
+///
+/// It is deliberately NOT `playhead`. That is a red in every theme, and the
+/// flag draws a vertical line down the ruler exactly like the playhead does
+/// — a red pole beside a red pole is a second transport line, which is the
+/// one thing a landmark must not look like.
+///
+/// The walk is [`auto_dial_body`]'s, against a different surface: the flag
+/// sits on the RULER, not on the header face, and measuring it against the
+/// header would be the mistake this file's theme audit exists to catch. A
+/// theme whose accent already reads keeps its colour exactly; one that does
+/// not gives up the least brightness that works; and if nothing does — an
+/// accent the same tone as that theme's ruler — the ruler's own ink is the
+/// honest answer, because a flag you can see in the wrong colour beats one
+/// you cannot see in the right one.
+fn flag_body(p: &Ink, accent: (u8, u8, u8)) -> Color32 {
+    let ok = |c: Color32| {
+        crate::recorder_panel::contrast_ratio(c, p.ruler) >= 1.6
+            && crate::recorder_panel::contrast_ratio(on_ink(c), c) >= 4.5
+    };
+    let base = Color32::from_rgb(accent.0, accent.1, accent.2);
+    if ok(base) {
+        return base;
+    }
+    for step in 1..=24 {
+        let d = step as f32 * 0.05;
+        for k in [1.0 - d, 1.0 + d] {
+            if k <= 0.0 {
+                continue;
+            }
+            let c = shade(base, k);
+            if ok(c) {
+                return c;
+            }
+        }
+    }
+    on_ink(p.ruler)
+}
+
 /// The MASTER's cap. Black, and the only dial on the timeline that is.
 ///
 /// Not pure black: the needle drawn across it is the row's own ink, and on a
@@ -2365,6 +2438,21 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     // the band's timeline × follows.
     if l.meter_strip.is_positive() && l.meter_strip.contains(pos) {
         let font_h = (l.meter_strip.height() * 0.78).clamp(6.0, 10.0);
+        // **Flags answer first**, because they are painted over the chips and
+        // the thing under the pointer is the thing that was drawn last.
+        for (i, m) in view.markers.iter().enumerate().rev() {
+            let x = x_of(rect, view, m.at_s);
+            let shown = match m.sig {
+                Some((b, u)) if m.name.is_empty() => format!("({b}/{u})"),
+                Some((b, u)) => format!("{} ({b}/{u})", m.name),
+                None if m.name.is_empty() => "\u{2691}".to_owned(),
+                None => m.name.to_owned(),
+            };
+            let w = (font_h * 0.62 * shown.chars().count() as f32 + 8.0).max(font_h * 2.2);
+            if pos.x >= x && pos.x <= x + w {
+                return Some(Hit::Flag(i));
+            }
+        }
         for pt in view.meter.points() {
             if pt.at_bar == 0 && view.meter.points().len() == 1 {
                 continue;
@@ -2775,6 +2863,14 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
             Hit::HeaderGrip => continue,
             // ── the rows' own headers ─────────────────────────────────
             Hit::TempoHeader => Node::button(id, r, "Song tempo, flatten to one tempo"),
+            Hit::Flag(i) => Node::button(
+                id,
+                r,
+                &match view.markers.get(i) {
+                    Some(m) if !m.name.is_empty() => format!("Marker {}, go to it", m.name),
+                    _ => "Unnamed marker, go to it".to_owned(),
+                },
+            ),
             Hit::Phase(i) => Node::toggle(
                 id,
                 r,
@@ -4488,6 +4584,62 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 p.engrave,
             );
         }
+        // **The flags, over the chips.**
+        //
+        // A pennant and a label, in the theme's own accent — see
+        // [`flag_body`] for why that role and not the transport red. The
+        // owner asked for "a good, per themed flag system", and a flag that
+        // carried its own colour would be the one thing on this ruler that
+        // does not follow the theme.
+        //
+        // Drawn AFTER the signature chips so a marker sitting on a change is
+        // legible: the two share a place by design, and the label says both
+        // — "Chorus (3/4)" — rather than stacking a chip under a flag and
+        // letting the eye work it out.
+        for (i, m) in view.markers.iter().enumerate() {
+            let x = x_of(rect, view, m.at_s);
+            if x < l.meter_strip.left() - 2.0 || x > l.meter_strip.right() + 2.0 {
+                continue;
+            }
+            let typing = view.marker_edit.filter(|(n, _)| *n == i);
+            let shown = match typing {
+                Some((_, t)) => format!("{t}|"),
+                None => match m.sig {
+                    Some((b, u)) if m.name.is_empty() => format!("({b}/{u})"),
+                    Some((b, u)) => format!("{} ({b}/{u})", m.name),
+                    None if m.name.is_empty() => "\u{2691}".to_owned(),
+                    None => m.name.to_owned(),
+                },
+            };
+            let w = (font.size * 0.62 * shown.chars().count() as f32 + 8.0)
+                .max(font.size * 2.2);
+            let flag = Rect::from_min_size(
+                Pos2::new(x, l.meter_strip.top()),
+                Vec2::new(w, l.meter_strip.height()),
+            );
+            let body = if typing.is_some() {
+                p.select
+            } else {
+                flag_body(&p, view.accent)
+            };
+            // The pole, so a flag reads as pointing AT a moment rather than
+            // as a label that happens to start there.
+            painter.line_segment(
+                [
+                    Pos2::new(x, l.meter_strip.top()),
+                    Pos2::new(x, l.ruler.bottom()),
+                ],
+                Stroke::new(1.0, body),
+            );
+            painter.rect_filled(flag, 2.0, body);
+            painter.text(
+                Pos2::new(flag.left() + 4.0, flag.center().y),
+                Align2::LEFT_CENTER,
+                &shown,
+                font.clone(),
+                on_ink(body),
+            );
+        }
     }
 
     // ── the clips ─────────────────────────────────────────────────────────
@@ -5809,6 +5961,111 @@ LaneView {
         ]
     }
 
+
+    /// **A flag says its name, says the signature that shares its bar, and
+    /// answers the pointer where it was drawn.**
+    ///
+    /// The owner's rule for the pairing: "When a time sig and marker exist
+    /// on the same place, they will read as Name then Time Sig in
+    /// parentheses." Two facts about one moment, on one label, rather than a
+    /// chip and a flag stacked on each other for the eye to reconcile.
+    ///
+    /// The hit half is here because the two are one decision: the label's
+    /// width is what the flag covers, so a test that checked only the text
+    /// would pass on a flag nobody can click.
+    ///
+    /// Revert-checks, both performed: drop the `sig` arm from the label and
+    /// the pairing assert goes red; hit-test the flags AFTER the signature
+    /// chips and the last block goes red, because the chip under the flag
+    /// answers first.
+    #[test]
+    fn a_flag_says_its_name_and_the_signature_that_shares_its_bar() {
+        let clips: Vec<ClipView<'_>> = Vec::new();
+        let mut v = a_view(&clips);
+        // 120 BPM in 4/4 makes a bar two seconds, so bar 4 IS eight seconds:
+        // the chip and the flag below really do land on the same pixel, which
+        // is the situation this whole item is about. A fixture where they
+        // merely both existed would prove nothing about either.
+        v.meter = crate::tempo::MeterMap::sanitised(vec![
+            crate::tempo::MeterPoint {
+                at_bar: 0,
+                sig: crate::recorder::TimeSignature { beats: 4, unit: 4 },
+            },
+            crate::tempo::MeterPoint {
+                at_bar: 4,
+                sig: crate::recorder::TimeSignature { beats: 3, unit: 4 },
+            },
+        ]);
+        v.markers = vec![
+            MarkerView { at_s: 4.0, name: "Verse".to_owned(), sig: None },
+            MarkerView { at_s: 8.0, name: "Chorus".to_owned(), sig: Some((3, 4)) },
+            MarkerView { at_s: 12.0, name: String::new(), sig: None },
+        ];
+        assert!(
+            (bar_at(&v, 4) - 8.0).abs() < 1e-9,
+            "the fixture's chip and flag are not on the same moment"
+        );
+        let words = strip_words(&v);
+        assert!(
+            words.iter().any(|w| w == "Verse"),
+            "a plain marker did not say its name: {words:?}"
+        );
+        assert!(
+            words.iter().any(|w| w == "Chorus (3/4)"),
+            "a marker sharing a bar with a signature did not read as \
+             \"Chorus (3/4)\": {words:?}"
+        );
+        assert!(
+            words.iter().any(|w| w == "\u{2691}"),
+            "an unnamed marker drew nothing to aim at: {words:?}"
+        );
+
+        // And the pointer finds them where they were drawn.
+        let l = Layout::new(rect(), &v);
+        assert!(l.meter_strip.is_positive(), "the ruler has no strip");
+        let y = l.meter_strip.center().y;
+        for (i, m) in v.markers.iter().enumerate() {
+            let x = x_of(rect(), &v, m.at_s) + 3.0;
+            assert_eq!(
+                hit_test(rect(), &v, Pos2::new(x, y)),
+                Some(Hit::Flag(i)),
+                "the flag for {:?} is not where it was painted",
+                m.name
+            );
+        }
+    }
+
+    /// Every word one frame of the arrangement painted INTO THE RULER'S
+    /// STRIP — the band the flags and the signature chips share.
+    ///
+    /// Harvested out of a real `draw` into a real context rather than asked
+    /// of the label-making code, because this panel has twice been caught by
+    /// a test that measured a helper the painter happens to call.
+    fn strip_words(v: &ArrangeView<'_>) -> Vec<String> {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let r = rect();
+        let strip = Layout::new(r, v).meter_strip;
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(r), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(r);
+                    draw(ui.painter(), r, v);
+                });
+            },
+        );
+        out.shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if strip.intersects(t.visual_bounding_rect()) => {
+                    Some(t.galley.text().to_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    }
     pub(super) fn a_view<'a>(clips: &'a [ClipView<'a>]) -> ArrangeView<'a> {
 ArrangeView {
             master_gain: 1.0,
@@ -5822,6 +6079,8 @@ ArrangeView {
             show_tempo_lane: false,
             tempo_hot: None,
             meter_edit: None,
+            markers: Vec::new(),
+            marker_edit: None,
             fx_strip: (0xE3, 0xD9, 0xBD),
             meter_bg: (0x0B, 0x0E, 0x0A),
             header_w: None,
@@ -6657,6 +6916,28 @@ ArrangeView {
                 check("automation dial", cap, hface, 1.35);
                 // And the needle drawn ACROSS it has to read on it.
                 check("automation needle", p.clip_ink, cap, 1.9);
+                }
+                // **A marker flag, per theme.** Its body is the theme's own
+                // accent and its label is whatever ink that body can carry,
+                // so both pairings move together on all sixteen — and the
+                // surface is the RULER, which is where the flag is actually
+                // drawn. The first thing this catches is a theme whose
+                // accent happens to be its ruler's own tone: a flag that is
+                // there, hittable, and invisible.
+                {
+                    let fb = flag_body(
+                        &p,
+                        (
+                            set.white_key_active_color.r,
+                            set.white_key_active_color.g,
+                            set.white_key_active_color.b,
+                        ),
+                    );
+                    check("marker flag", fb, p.ruler, 1.6);
+                    check("marker flag label", on_ink(fb), fb, 4.5);
+                    // And the pole, which is drawn down the ruler in the
+                    // same colour — structure, so it only has to be seen.
+                    check("marker pole", fb, p.ruler, 1.6);
                 }
                 // **The MASTER's dial, per theme.** Its body is the theme's
                 // own master red and its outline and needle are fixed, so
