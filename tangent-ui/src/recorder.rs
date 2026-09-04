@@ -1977,6 +1977,10 @@ pub enum RecorderRequest {
         tail_s: f64,
         level_db: f32,
         reference: bool,
+        /// How high the sweep climbs, in hertz — appended at the END of this
+        /// variant, and clamped by the host to what the rate can carry. See
+        /// `dialogs::IR_TOP_CHOICES` for the device this exists for.
+        top_hz: f64,
     },
     /// Stop whatever the IR road is doing — tone or capture — and reclaim
     /// its buffers. Also what closing the wizard sends.

@@ -25781,7 +25781,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     on,
                 });
             }
-            DialogAction::IrCapture { out, inp, sweep_s, tail_s, level_db, reference } => {
+            DialogAction::IrCapture {
+                out,
+                inp,
+                sweep_s,
+                tail_s,
+                level_db,
+                reference,
+                top_hz,
+            } => {
                 self.request_recorder(recorder::RecorderRequest::IrCapture {
                     out,
                     inp,
@@ -25789,6 +25797,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     tail_s,
                     level_db,
                     reference,
+                    top_hz,
                 });
             }
             DialogAction::IrCancel => {
@@ -46352,6 +46361,9 @@ mod folder_tests {
             a.take_recorder_request(),
             Some(R::IrTone { out: (12, 13), inp: (2, 3), level_db: -18.0, on: true })
         );
+        // A top that is on no chip row, deliberately: the point of this
+        // assertion is that the number the WIZARD chose crosses to the host
+        // untouched, and a value the table also holds could pass by accident.
         a.apply_dialog_action(dialogs::DialogAction::IrCapture {
             out: (12, 13),
             inp: (2, 3),
@@ -46359,6 +46371,7 @@ mod folder_tests {
             tail_s: 10.0,
             level_db: -12.0,
             reference: true,
+            top_hz: 15_500.0,
         });
         assert_eq!(
             a.take_recorder_request(),
@@ -46369,6 +46382,7 @@ mod folder_tests {
                 tail_s: 10.0,
                 level_db: -12.0,
                 reference: true,
+                top_hz: 15_500.0,
             })
         );
         a.apply_dialog_action(dialogs::DialogAction::IrCancel);
