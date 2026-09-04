@@ -11960,6 +11960,34 @@ const PRE_ROLL_FLAT_DB: f64 = 6.0;
 /// way the app does before watching, so the two runs differ in exactly one
 /// thing: whether Tangent has a stream on the device.
 #[cfg(feature = "recorder")]
+/// **Move the default device's nominal rate to `want`, and answer what it
+/// actually landed on.**
+///
+/// By opening an INPUT, because that is the only cpal road on macOS that
+/// writes `kAudioDevicePropertyNominalSampleRate` and blocks for the
+/// hardware's answer; an output stream sets its own unit's format and lets
+/// CoreAudio convert around it. Used by `device_watch` to put back a rate its
+/// own measurements moved — see the note there for what leaving one behind
+/// cost the owner's ADAT expander.
+#[cfg(feature = "recorder")]
+fn force_device_rate(want: u32) -> Option<u32> {
+    let tap = std::sync::Arc::new(crate::midi::RawMidiTap::new(64));
+    let mut sess = crate::record::Session::new(
+        std::sync::Arc::clone(&tap),
+        tangent_record::audio::Timebase::new(),
+    );
+    sess.open_input(
+        &tangent_record::audio::InputSelection::Default,
+        tangent_record::audio::Picks::EVERYTHING,
+        None,
+        Some(want),
+        None,
+    );
+    let got = sess.input_stats().map(|(_, st)| st.sample_rate);
+    drop(sess);
+    got
+}
+
 pub fn device_watch(arg: Option<String>) {
     use cpal::traits::{DeviceTrait, HostTrait};
     let parts: Vec<String> = arg
@@ -11977,16 +12005,29 @@ pub fn device_watch(arg: Option<String>) {
     // device, since the thing under test is whether asking moves it.
     // `device` in the arg list means ASK FOR NOTHING — the case the Setup
     // screen calls "Device", and the one under test.
-    let want_rate: Option<u32> = if parts.iter().any(|p| p == "device") {
-        None
-    } else {
-        Some(
-            parts
-                .iter()
-                .find_map(|s| s.parse::<u32>().ok().filter(|r| *r >= 8_000))
-                .unwrap_or(48_000),
-        )
-    };
+    // **Nothing is forced unless a rate is spelled out.**
+    //
+    // This used to default to `Some(48_000)` — so every run of this probe
+    // that was measuring something else entirely, a buffer size say, SET the
+    // interface to 48 kHz and left it there. Asking for a rate is not asking:
+    // cpal's CoreAudio input builder writes the device's nominal rate and
+    // blocks for the hardware's answer.
+    //
+    // On the owner's rig that is not cosmetic. Ten of his twenty inputs
+    // arrive over ADAT from an OctoPre, and an expander on its own clock
+    // feeds literal digital zero to every channel it owns when the host moves
+    // underneath it. Several runs of this probe at 48000 left his interface
+    // there; inputs 11 upward read -200 dBFS for the rest of the session, his
+    // 13/14 monitoring loop went silent, and both of us spent a while reading
+    // that as evidence about his outboard. He is the one who caught it:
+    // "what sample rate are you testing at... if you've been testing with
+    // 44100, since I switched earlier today, every test is moot."
+    //
+    // `device` is kept as an explicit word for the same case, so the arg list
+    // still reads the way the Setup screen does.
+    let want_rate: Option<u32> = parts
+        .iter()
+        .find_map(|s| s.parse::<u32>().ok().filter(|r| *r >= 8_000));
 
     let host = cpal::default_host();
     let dev = match host.default_output_device() {
@@ -11996,6 +12037,31 @@ pub fn device_watch(arg: Option<String>) {
             std::process::exit(1);
         }
     };
+    // **What the device was at before this probe touched it.**
+    //
+    // Asking for a rate here does not ask, it SETS: cpal's CoreAudio input
+    // builder writes `kAudioDevicePropertyNominalSampleRate` and blocks until
+    // the hardware confirms. So a probe run to measure something else leaves
+    // the interface wherever it was pointed — and on a rig whose extra
+    // channels arrive over ADAT from a second box, that is not a cosmetic
+    // change: the expander stays on its own clock and every channel it feeds
+    // goes to literal digital zero.
+    //
+    // That is not hypothetical. This probe was run at 48000 several times to
+    // verify the buffer fix, on an 18i20 whose last ten inputs come from an
+    // OctoPre, and it left the owner's interface there. Inputs 11 upward read
+    // -200 dBFS for the rest of the session, his monitoring loop on 13/14
+    // went silent, and both of us spent a while treating that as evidence
+    // about his outboard.
+    //
+    // So the probe puts it back. Announced either way, because a tool that
+    // quietly moves shared hardware state and quietly moves it back is still
+    // a tool nobody can reason about.
+    let was_rate: Option<u32> = dev
+        .default_output_config()
+        .ok()
+        .map(|c| c.sample_rate().0)
+        .filter(|r| (8_000..=768_000).contains(r));
     let name = dev.name().unwrap_or_else(|_| "<unnamed>".to_owned());
     println!("device:   {name}");
     println!("watching: {secs} s   engine open: {open}");
@@ -12197,6 +12263,43 @@ pub fn device_watch(arg: Option<String>) {
         std::thread::sleep(std::time::Duration::from_millis(1_000));
     }
     drop(engine);
+    // The rate this probe may have moved, put back — see `was_rate`.
+    if let (Some(before), Some(now)) = (
+        was_rate,
+        cpal::default_host()
+            .default_output_device()
+            .and_then(|d| d.default_output_config().ok())
+            .map(|c| c.sample_rate().0),
+    ) {
+        if before != now {
+            println!(
+                "\nthis probe moved the device from {before} Hz to {now} Hz; putting it back"
+            );
+            // **An INPUT, and that is the whole trick.** The output builder
+            // sets the audio unit's stream format and lets CoreAudio convert;
+            // only cpal's INPUT builder writes
+            // `kAudioDevicePropertyNominalSampleRate` and waits for the
+            // hardware to confirm. A first draft of this restore opened an
+            // output at the old rate, reported success off `output()`, and
+            // left the device exactly where it had moved it — the engine's
+            // own belief, not the interface's. See `Chrome::input_rate` for
+            // the same asymmetry stated from the app's side.
+            force_device_rate(before);
+            // Re-read the DEVICE rather than believe the session that just
+            // asked: a first draft reported `input_stats()`'s rate, which is
+            // what that stream was built for and not necessarily where the
+            // hardware landed.
+            let after = cpal::default_host()
+                .default_output_device()
+                .and_then(|d| d.default_output_config().ok())
+                .map(|c| c.sample_rate().0);
+            match after {
+                Some(got) if got == before => println!("  the device is back at {got} Hz"),
+                Some(got) => println!("  COULD NOT put it back; it is at {got} Hz"),
+                None => println!("  COULD NOT read the device back"),
+            }
+        }
+    }
     drop(session_hold);
     println!("\nengine dropped; watching five seconds more");
     for _ in 0..5 {
