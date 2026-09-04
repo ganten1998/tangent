@@ -11933,6 +11933,32 @@ pub fn ir_test(arg: Option<String>) {
             tangent_ui::ports::IrFoldover::None => "no",
         }
     );
+    // The fit BEHIND the verdict, because "suspected" alone cannot be argued
+    // with. A fold descends at the sweep's own octaves-per-second; a reverb
+    // whose highs die first also descends, but at a rate of its own. Printing
+    // the slope is what lets the two be told apart by CHANGING THE SWEEP and
+    // watching whether the number follows.
+    // The SAME channel and the SAME start the verdict used — a fit taken from
+    // anywhere else is a different measurement wearing the verdict's name, and
+    // the first version of this line printed one and made the detector look
+    // broken when it was not.
+    let judged = if l.iter().map(|v| v.abs()).sum::<f32>() >= r.iter().map(|v| v.abs()).sum::<f32>()
+    {
+        &l
+    } else {
+        &r
+    };
+    if let Some(fit) = crate::units::sweep::tail_chirp(judged, rate, 1.5) {
+        println!(
+            "  tail fit:    {:.3} oct/s   R2 {:.3}   over {:.1} oct   (sweep runs {:.3} oct/s)",
+            fit.slope_oct_s,
+            fit.r2,
+            fit.span_oct,
+            (top_hz / 10.0).log2() / sweep_s
+        );
+    } else {
+        println!("  tail fit:    nothing straight enough to fit");
+    }
     println!("capture peak:  {:.2} dBFS", out.capture_peak_db);
     println!("loop floor:    {:.2} dBFS", out.noise_floor_db);
     println!("usable range:  {:.1} dB", out.tail_range_db);
