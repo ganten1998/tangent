@@ -387,6 +387,16 @@ pub enum FaceAction {
     /// empty a seat you could not see. Read here with `ui.input`, carried,
     /// and applied by the same function a rack bay's gesture goes through.
     PedalGesture { pedal: usize, alt: bool, shift: bool },
+    /// **Two numbers in ONE frame, because some gestures move two at once.**
+    /// Appended at the END, this enum's law.
+    ///
+    /// Everything else here is a single wish because a row is a single
+    /// number. The EQ's curve is not: dragging a handle moves its frequency
+    /// AND its gain, and this face may return one action per frame, so the
+    /// curve used to send whichever of the two had drifted furthest and
+    /// leave the other for a frame that never came while the hand kept
+    /// moving. See `faces::draw_eq`'s `Move` arm for what that felt like.
+    SetPair { id_a: u32, value_a: f32, id_b: u32, value_b: f32 },
 }
 
 fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {
@@ -823,7 +833,7 @@ fn draw_imager(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option
 
 /// The EQ's ids, band-major: `band * 5 + {on, kind, freq, gain, q}`.
 const EQ_KNOBS: u32 = 5;
-const EQ_BANDS: usize = 3;
+const EQ_BANDS: usize = 5;
 
 fn draw_eq(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<FaceAction> {
     let (rect, _) = ui.allocate_exact_size(
@@ -873,25 +883,34 @@ fn draw_eq(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
             CurveAction::Move { node, freq_hz, gain_db } => {
                 live.band = node;
                 let base = node as u32 * EQ_KNOBS;
-                // One ask per frame: the freq this frame, the gain rides
-                // the next — a drag is many frames, and the pair converges
-                // in two. Waking a sleeping band wins the frame instead.
+                // **BOTH numbers, every frame.** This used to send the
+                // frequency whenever it disagreed with the hand by more than
+                // 0.002 of the knob's travel and the gain only once it
+                // agreed, on the reasoning that "a drag is many frames, and
+                // the pair converges in two". The premise is false while the
+                // hand is still moving: 0.002 of this log sweep is about a
+                // PIXEL, so on any diagonal drag the frequency test never
+                // converged, the gain was never sent, and the handle tracked
+                // the pointer sideways while refusing to follow it up or
+                // down until the hand stopped. The owner: "the eq needs
+                // treatment as well, it is not smooth dragging those nodes
+                // around."
+                //
+                // A curve handle is one gesture carrying two numbers, so it
+                // says two. Waking a sleeping band still wins the frame — a
+                // band that is off has nowhere to be dragged to yet.
                 if !on[node] {
                     Some(FaceAction::Set { id: base, value: 1.0 })
                 } else {
                     let f = (freq_hz.max(1.0) / face::CURVE_LO_HZ).ln()
                         / (face::CURVE_HI_HZ / face::CURVE_LO_HZ).ln();
                     let g = (gain_db / face::CURVE_DB + 1.0) * 0.5;
-                    let pf = param(&live.face, base + 2).map(|p| p.value).unwrap_or(0.5);
-                    let want_f = f.clamp(0.0, 1.0);
-                    if (want_f - pf).abs() > 0.002 {
-                        Some(FaceAction::Set { id: base + 2, value: want_f })
-                    } else {
-                        Some(FaceAction::Set {
-                            id: base + 3,
-                            value: g.clamp(0.0, 1.0),
-                        })
-                    }
+                    Some(FaceAction::SetPair {
+                        id_a: base + 2,
+                        value_a: f.clamp(0.0, 1.0),
+                        id_b: base + 3,
+                        value_b: g.clamp(0.0, 1.0),
+                    })
                 }
             }
             CurveAction::Turn { node, steps } => {
@@ -925,6 +944,12 @@ fn draw_eq(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
                 } else {
                     Some(FaceAction::Set { id: base, value: 1.0 })
                 }
+            }
+            // A tap chooses which band the rows below serve, and asks the
+            // engine for nothing at all.
+            CurveAction::Pick { node } => {
+                live.band = node;
+                None
             }
             CurveAction::Remove { node } => {
                 live.band = node;

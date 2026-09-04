@@ -743,6 +743,10 @@ pub enum CurveAction {
     Remove { node: usize },
     /// A double-click on empty curve: put a node here.
     Add { freq_hz: f32, gain_db: f32 },
+    /// **A plain tap on a node: make it the one the rows below serve.**
+    /// Appended at the END, and it changes nothing about the sound — which
+    /// is the whole point, since the gesture it takes over from did.
+    Pick { node: usize },
 }
 
 /// How close a pointer must be to own a node, in points.
@@ -896,8 +900,28 @@ pub fn eq_curve(
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(i, _)| i)
     });
+    // **The dragged handle is drawn AT THE HAND, not where the engine last
+    // said it was.**
+    //
+    // Everything else on this glass comes from `nodes`, which the face built
+    // from a mirror of the unit's parameters — and that mirror is a frame
+    // old by construction: this frame's gesture becomes a `FaceAction`, the
+    // app writes it after the frame returns, the host pushes the new value,
+    // and the face sees it NEXT frame. So a handle painted from the mirror
+    // trails the pointer by one frame for the whole gesture, every gesture.
+    //
+    // The remedy is the ordinary immediate-mode one: while this widget owns
+    // the drag it already knows where the hand is, so it paints there and
+    // lets the mirror catch up underneath. The CURVE still trails — that
+    // response is computed by the unit and cannot be known here — but the
+    // thing the eye is actually tracking stops lagging, which is most of
+    // what "not smooth" was.
+    let held = drag.and_then(|n| pointer.map(|p| (n, p)));
     for (i, nd) in nodes.iter().enumerate() {
-        let at = egui::pos2(hz_to_x(inner, nd.freq_hz), db_to_y(inner, nd.gain_db));
+        let at = match held {
+            Some((n, p)) if n == i => p,
+            _ => egui::pos2(hz_to_x(inner, nd.freq_hz), db_to_y(inner, nd.gain_db)),
+        };
         let hot = hovered_node == Some(i) || *drag == Some(i);
         painter.circle_filled(at, if hot { 6.0 } else { 5.0 }, st.lcd_face);
         painter.circle_stroke(
@@ -920,10 +944,33 @@ pub fn eq_curve(
     // `drag` keeps a moving hand on the node it took, however far it leaves.
     let resp = ui.interact(r, ui.id().with("eq-curve"), egui::Sense::click_and_drag());
     let mut action = None;
-    if resp.drag_started() {
+    // **BY THE PRIMARY BUTTON, spelled out.** egui decides a drag from the
+    // pointer's travel and does NOT ask which button is down
+    // (`Sense::click_and_drag` plus any button), so the bare `dragged()` this
+    // used to call meant a right-press that wandered two pixels MOVED the
+    // node instead of cycling it — the exact hand a right-click gesture
+    // invites. `dragged_by` asks.
+    use egui::PointerButton as Btn;
+    // **The grab is taken on the PRESS, not when egui admits it is a drag.**
+    //
+    // A widget that senses clicks as well as drags does not report
+    // `drag_started` until the hand has travelled far enough not to be a
+    // click — and this one only grabbed the node under the pointer at that
+    // moment, by which time a quick hand is already past `NODE_GRAB` and
+    // `hovered_node` is None. So a decisive flick grabbed NOTHING and the
+    // node sat still, while a slow careful one worked: the difference
+    // between the two is the hand, not the intent, which is a control that
+    // punishes confidence. Measured while writing the test below — the first
+    // step of 15 px landed outside the 12 px radius and the drag produced no
+    // asks at all.
+    //
+    // The press is the moment the hand chose a node, so that is when it is
+    // remembered. Released clears it, and the click gestures below still
+    // read the same latch on their way out.
+    if ui.input(|i| i.pointer.primary_pressed()) {
         *drag = hovered_node;
     }
-    if resp.dragged() {
+    if resp.dragged_by(Btn::Primary) {
         if let (Some(node), Some(p)) = (*drag, pointer) {
             action = Some(CurveAction::Move {
                 node,
@@ -932,11 +979,20 @@ pub fn eq_curve(
             });
         }
     }
-    if resp.drag_stopped() {
-        *drag = None;
-    }
     if action.is_none() {
-        if resp.double_clicked() {
+        // **The shape walk is the SECONDARY button now**, at the owner's
+        // word: "right click now cycling types". It was the primary click,
+        // which cost this widget the one rough edge its own note admitted —
+        // egui reports the first press of a double-click as an ordinary
+        // click before it can know a second is coming, so double-clicking a
+        // node to remove it cycled the shape once on the way past. Moving
+        // the walk to the other button retires that entirely rather than
+        // trading it for a hand-tuned click delay.
+        if resp.secondary_clicked() {
+            if let Some(node) = hovered_node {
+                action = Some(CurveAction::Cycle { node });
+            }
+        } else if resp.double_clicked() {
             action = match hovered_node {
                 Some(node) => Some(CurveAction::Remove { node }),
                 None => pointer.map(|p| CurveAction::Add {
@@ -945,10 +1001,19 @@ pub fn eq_curve(
                 }),
             };
         } else if resp.clicked() {
+            // And the freed primary tap SELECTS: the five rows under the
+            // glass serve one band at a time, and until now the only way to
+            // choose which was the walker. A tap on a handle is what
+            // everybody tries first and it used to change the sound.
             if let Some(node) = hovered_node {
-                action = Some(CurveAction::Cycle { node });
+                action = Some(CurveAction::Pick { node });
             }
         }
+    }
+    // Last, so a click that lands on the release frame still sees the node
+    // the press took.
+    if ui.input(|i| i.pointer.primary_released()) {
+        *drag = None;
     }
     if action.is_none() {
         if let Some(node) = hovered_node {
@@ -2018,9 +2083,15 @@ mod tests {
         stream(40.0, walker, 6, &mut live, &mut |live| {
             walked.push(live.band + 1);
         });
+        // Five stops, and it wraps at the fifth: the face grew two bands at
+        // the owner's ask and this row is how they are reached from the
+        // keyboard. Six steps from band one is 2,3,4,5,1,2 — a sequence that
+        // is wrong in a DIFFERENT place if the walker stalls (repeats) than
+        // if the count regresses (wraps early), which is why the whole run
+        // is compared rather than the last value.
         assert_eq!(
             walked,
-            vec![2, 3, 1, 2, 3, 1],
+            vec![2, 3, 4, 5, 1, 2],
             "the EQ band walker stopped walking under a fast hand"
         );
 
@@ -2030,6 +2101,14 @@ mod tests {
         // then ask.
         let alt = egui::Modifiers::ALT;
         let none = egui::Modifiers::NONE;
+        // **Home first, so this half does not inherit the last one's
+        // finishing post.** The run above walks a fixed six steps, so where
+        // it stops depends on how many bands there are — it landed on band 1
+        // with three and band 2 with five, and this assertion went red for
+        // the band COUNT changing rather than for anything it is about.
+        // What it is about is the step and the alt-click, and both are
+        // measured from a known place.
+        live.band = 0;
         frame(50.0, vec![press_at(walker, true)], none, &mut live);
         frame(50.1, vec![press_at(walker, false)], none, &mut live);
         assert_eq!(live.band, 1, "the walker did not step off band 1");
@@ -2191,6 +2270,207 @@ mod tests {
         );
     }
 
+
+    /// **The three things the owner asked of the EQ, measured through
+    /// `faces::draw` rather than argued about.**
+    ///
+    /// He asked for two of them and the third fell out of reading the code
+    /// for the first: "the eq needs treatment as well, it is not smooth
+    /// dragging those nodes around. Additionally, add 2 more nodes for a 5
+    /// total with right click now cycling types."
+    ///
+    /// 1. **A drag moves BOTH numbers.** It used to send the frequency
+    ///    whenever it disagreed with the hand by more than 0.002 of the
+    ///    knob's travel — about one pixel on this glass — and the gain only
+    ///    once it agreed, which on a diagonal drag is never while the hand
+    ///    is moving. So the handle tracked X and refused Y. That is the
+    ///    whole of "not smooth", and it is why the assertion is that the
+    ///    GAIN moved: the frequency always did.
+    /// 2. **The secondary button walks the shapes and the primary does
+    ///    not.** Moving the walk off the primary click also retires the
+    ///    rough edge `eq_curve`'s own note admitted — egui reports the first
+    ///    press of a double-click as a click, so removing a band used to
+    ///    cycle its shape on the way past.
+    /// 3. **A right-DRAG does not move the node.** egui decides a drag from
+    ///    travel and never asks which button is down, so the bare
+    ///    `dragged()` this used to call meant a right-press that wandered
+    ///    two pixels moved the node instead of cycling it — which is the
+    ///    exact hand a right-click gesture invites.
+    /// 4. **And the grab survives a FLICK.** The node under the pointer is
+    ///    remembered on the press rather than when egui admits the gesture
+    ///    is a drag — by that moment a decisive hand is already outside the
+    ///    12-point grab radius and the old code grabbed nothing at all. The
+    ///    first step of the drag below is 15 points for exactly that reason:
+    ///    it is a flick, and it used to produce no asks whatsoever.
+    ///
+    /// Revert-checks, all performed:
+    ///
+    /// * put the `(want_f - pf).abs() > 0.002` branch back → (1) goes red
+    ///   with the gain unmoved;
+    /// * swap `secondary_clicked` for `clicked` → (2) goes red both ways;
+    /// * take the grab at `drag_started_by` again → (1) goes red, because
+    ///   the flick grabs nothing;
+    /// * (3) needs BOTH of its guards undone — loosen the latch to
+    ///   `any_pressed()` AND drop `dragged_by(Btn::Primary)`. Either one
+    ///   alone still refuses a right-drag, which is not a vacuous test but a
+    ///   deliberate second lock: the latch is what actually holds today, and
+    ///   the button gate is what keeps holding if somebody moves the latch.
+    ///   Said out loud because a revert-check that passes is worth nothing
+    ///   unless the reason it passes is written down.
+    #[test]
+    fn the_curve_moves_on_the_left_and_changes_shape_on_the_right() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(470.0, 470.0));
+        // Five bands of five now — the face's own band-major id plan, grown
+        // by two. Only the first is woken: a sleeping band answers every
+        // gesture with "wake up" instead of the thing being measured.
+        let mut live = a_face_of(25);
+        live.face.path = "@tangent-eq".to_owned();
+        for band in 0..5 {
+            let base = band * 5;
+            live.face.params[base].value = f32::from(u8::from(band == 0));
+            live.face.params[base + 1].choices =
+                ["bell", "lo-shelf", "hi-shelf"].map(str::to_owned).to_vec();
+            live.face.params[base + 1].steps = 3;
+            for k in 1..5 {
+                live.face.params[base + k].value = 0.5;
+            }
+        }
+        let home = egui::pos2(235.0, 95.0);
+
+        let press = |p: egui::Pos2, down: bool, button: egui::PointerButton| {
+            egui::Event::PointerButton {
+                pos: p,
+                button,
+                pressed: down,
+                modifiers: egui::Modifiers::NONE,
+            }
+        };
+        let mut frame = |events: Vec<egui::Event>,
+                         live: &mut crate::faces::FaceLive| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                        ctx,
+                        |ui| {
+                            let act = crate::faces::draw(ui, &st, live);
+                            let mut apply = |id: u32, value: f32| {
+                                if let Some(p) =
+                                    live.face.params.iter_mut().find(|p| p.id == id)
+                                {
+                                    p.value = value;
+                                }
+                            };
+                            match act {
+                                Some(crate::faces::FaceAction::Set { id, value }) => {
+                                    apply(id, value);
+                                }
+                                Some(crate::faces::FaceAction::SetPair {
+                                    id_a,
+                                    value_a,
+                                    id_b,
+                                    value_b,
+                                }) => {
+                                    apply(id_a, value_a);
+                                    apply(id_b, value_b);
+                                }
+                                _ => {}
+                            }
+                        },
+                    );
+                },
+            );
+        };
+        let value = |live: &crate::faces::FaceLive, id: u32| -> f32 {
+            live.face.params.iter().find(|p| p.id == id).map_or(-1.0, |p| p.value)
+        };
+
+        // ── 1. a diagonal drag moves the frequency AND the gain ──────────
+        let (was_f, was_g) = (value(&live, 2), value(&live, 3));
+        let mut at = home;
+        // Settle, then press with the pointer already there in the SAME
+        // frame: egui takes the grab on the press and only for a pointer it
+        // already knows the position of.
+        frame(Vec::new(), &mut live);
+        frame(
+            vec![
+                egui::Event::PointerMoved(at),
+                press(at, true, egui::PointerButton::Primary),
+            ],
+            &mut live,
+        );
+        // Decisively past egui's click/drag threshold on the FIRST step, then
+        // a real hand's smaller ones - and diagonal, which is the case that
+        // was broken.
+        for step in 0..6 {
+            let d = if step == 0 { 11.0 } else { 4.0 };
+            at += Vec2::new(d, -d);
+            frame(vec![egui::Event::PointerMoved(at)], &mut live);
+        }
+        frame(vec![press(at, false, egui::PointerButton::Primary)], &mut live);
+        let (now_f, now_g) = (value(&live, 2), value(&live, 3));
+        assert!(
+            now_f > was_f + 0.005,
+            "the drag did not move the frequency at all: {was_f} -> {now_f}"
+        );
+        assert!(
+            now_g > was_g + 0.005,
+            "the drag moved the frequency and NOT the gain, which is the \
+             one-ask-per-frame throttle back: gain {was_g} -> {now_g}"
+        );
+
+        // ── 2. the buttons: right walks the shape, left does not ─────────
+        // Park the handle back in the middle rather than computing where the
+        // drag left it: the arithmetic that would find it is the arithmetic
+        // under test, so a test that used it could agree with a broken curve.
+        for p in live.face.params.iter_mut() {
+            if p.id == 2 || p.id == 3 {
+                p.value = 0.5;
+            }
+        }
+        let node_at = home;
+        frame(Vec::new(), &mut live);
+        let kind_before = value(&live, 1);
+        frame(vec![egui::Event::PointerMoved(node_at)], &mut live);
+        frame(vec![press(node_at, true, egui::PointerButton::Primary)], &mut live);
+        frame(vec![press(node_at, false, egui::PointerButton::Primary)], &mut live);
+        assert_eq!(
+            value(&live, 1),
+            kind_before,
+            "a LEFT click on a node still changes its shape - the walk was \
+             supposed to move to the other button"
+        );
+        frame(vec![press(node_at, true, egui::PointerButton::Secondary)], &mut live);
+        frame(vec![press(node_at, false, egui::PointerButton::Secondary)], &mut live);
+        assert_ne!(
+            value(&live, 1),
+            kind_before,
+            "a RIGHT click on a node did not walk its shape"
+        );
+
+        // ── 3. and a right-DRAG leaves it where it is ────────────────────
+        let (held_f, held_g) = (value(&live, 2), value(&live, 3));
+        let mut at = node_at;
+        frame(vec![press(at, true, egui::PointerButton::Secondary)], &mut live);
+        for _ in 0..6 {
+            at += Vec2::new(9.0, -9.0);
+            frame(vec![egui::Event::PointerMoved(at)], &mut live);
+        }
+        frame(vec![press(at, false, egui::PointerButton::Secondary)], &mut live);
+        assert_eq!(
+            (value(&live, 2), value(&live, 3)),
+            (held_f, held_g),
+            "a right-drag MOVED the node: egui decides a drag from travel and \
+             not from the button, so the gesture has to say which one"
+        );
+    }
+
     /// **The curve is the other draggable, and it drags the same rows.**
     /// The EQ's nodes take their id from [`eq_curve`]'s own explicit
     /// `ui.id().with("eq-curve")` rather than the auto counter, so the
@@ -2251,15 +2531,36 @@ mod tests {
                                     act
                                 });
                                 seen = (consumed, drawn.response.rect);
-                                if let Some(crate::faces::FaceAction::Set { id, value }) =
-                                    drawn.inner
-                                {
-                                    acted += 1;
+                                // **A curve drag sends a PAIR now** — one
+                                // gesture carrying a frequency and a gain —
+                                // so a counter that only knew `Set` counted
+                                // zero, and this test's own "the node was
+                                // never actually dragged" guard is what
+                                // caught it. Both shapes are applied here,
+                                // exactly as the app applies them.
+                                let mut apply = |id: u32, value: f32| {
                                     if let Some(p) =
                                         live.face.params.iter_mut().find(|p| p.id == id)
                                     {
                                         p.value = value;
                                     }
+                                };
+                                match drawn.inner {
+                                    Some(crate::faces::FaceAction::Set { id, value }) => {
+                                        acted += 1;
+                                        apply(id, value);
+                                    }
+                                    Some(crate::faces::FaceAction::SetPair {
+                                        id_a,
+                                        value_a,
+                                        id_b,
+                                        value_b,
+                                    }) => {
+                                        acted += 1;
+                                        apply(id_a, value_a);
+                                        apply(id_b, value_b);
+                                    }
+                                    _ => {}
                                 }
                             });
                     },

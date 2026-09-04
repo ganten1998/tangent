@@ -5274,11 +5274,14 @@ impl DesktopApp {
         // **No portal, no zenity: our own browser.** Otherwise this opens a
         // dialog that never appears and returns the same `None` a cancel does.
         if !Self::native_dialogs_work() {
-            let at = request
-                .start_at
-                .filter(|p| p.is_dir())
-                .or_else(dirs::home_dir)
-                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            // **The same answer the native panel would have got.** Our own
+            // browser is the box with no portal, which is also the box most
+            // likely to be a fresh install — so a kit loaded here lands on
+            // the drawer too, rather than at home with the drawer nowhere in
+            // sight. `panel_start` makes ours and never invents somebody
+            // else's; see `load_start`.
+            let (kind, want) = self.load_start(&request);
+            let at = Self::panel_start(&request.title, kind, want);
             let (entries, _) = Self::list_dir(&at, &request.extensions);
             self.browse_extensions = request.extensions.clone();
             // Our own browser is a dialog like any other, and wants to float.
@@ -5303,8 +5306,8 @@ impl DesktopApp {
         // Always a real directory — see `panel_start`. The old form dropped
         // the call when the remembered place had gone, which hands the choice
         // to an OS whose answer is the home directory and says nothing.
-        let start =
-            Self::panel_start(&request.title, PanelDir::Remembered, request.start_at.clone());
+        let (kind, at) = self.load_start(&request);
+        let start = Self::panel_start(&request.title, kind, at);
         dialog = dialog.set_directory(start);
         if !request.extensions.is_empty() {
             let exts: Vec<&str> = request.extensions.iter().map(String::as_str).collect();
@@ -5847,6 +5850,56 @@ impl DesktopApp {
     /// somebody was about to overwrite. Saving one called `default` replaces
     /// the session every New clones, so seeing the shelf first is the whole
     /// point of the panel.
+    /// **Where the LOAD panel opens, one arm per purpose and NO wildcard —
+    /// [`Self::save_start`]'s twin.**
+    ///
+    /// The save side got this treatment first and the load side did not, so
+    /// the two halves of the same gesture disagreed: Save Kit opened on the
+    /// kit drawer (`SavePurpose::KitPreset`, since the day it was written)
+    /// and Load Kit opened at HOME, because `load_kit_preset` asked for
+    /// `start_at: None` and there was nowhere for the host to say otherwise.
+    /// One road wrote to a folder the other could not find. The owner: "the
+    /// system dialogs there for load and save do not go to those folders...
+    /// just make those work like you hardened the project save ones."
+    ///
+    /// So the request's own `start_at` is a SUGGESTION and this is the
+    /// answer. A purpose that names one of the app's own folders gets it,
+    /// and gets [`PanelDir::Ours`] with it so a fresh install that has never
+    /// saved a kit still opens on the drawer instead of falling back to
+    /// home — that install is exactly the one with nothing to fall back to.
+    /// Everything else keeps the place it was asked to remember.
+    ///
+    /// Written out in full for the reason `save_start` is: `FilePurpose` is
+    /// append-only, and a `_` arm would swallow the next variant in silence.
+    /// `the_load_panels_folder_is_chosen_by_a_match_with_no_wildcard` refuses
+    /// one being put back.
+    #[cfg(feature = "recorder")]
+    fn load_start(
+        &self,
+        request: &tangent_ui::ports::FileRequest,
+    ) -> (PanelDir, Option<std::path::PathBuf>) {
+        use tangent_ui::ports::FilePurpose as P;
+        match request.purpose {
+            // The drawer Save Kit writes to, spelled once — see
+            // `DRUM_PRESET_FOLDER` and the test that pins both crates to the
+            // same words. A caller that named somewhere itself still wins.
+            P::KitPreset => (
+                PanelDir::Ours,
+                Some(request.start_at.clone().unwrap_or_else(|| {
+                    self.app.preset_root().join(DRUM_PRESET_FOLDER)
+                })),
+            ),
+            // Somebody else's folders, every one of them: the sysex library,
+            // the click they picked last time, a backing track, a project,
+            // a sample being dropped on a bay. Remembered, never made.
+            P::Cartridge
+            | P::ClickSample
+            | P::BackingTrack
+            | P::Project
+            | P::InsertMedia(_) => (PanelDir::Remembered, request.start_at.clone()),
+        }
+    }
+
     #[cfg(feature = "recorder")]
     fn save_start(&self, purpose: tangent_ui::ports::SavePurpose) -> std::path::PathBuf {
         use tangent_ui::ports::SavePurpose as P;
@@ -10968,6 +11021,21 @@ impl IrRoad {
             self.live.peak_l_db = rest;
             self.live.peak_r_db = rest;
             self.live.progress = 0.0;
+            // **And the line says what is actually true.** This arm is "no
+            // engine answered", which during a capture is the device having
+            // gone away mid-pass — and it used to leave the settle line from
+            // the paragraph below standing, so a wizard whose interface had
+            // been unplugged sat forever under "waiting for the loop to go
+            // quiet". Nothing else here can clear it: `pending` is only taken
+            // where a reading exists, so the picture would otherwise be
+            // re-pushed unchanged every frame for the life of the wizard.
+            self.live.phase = if self.pending.is_some() {
+                "the audio device stopped answering - the capture cannot \
+                 finish"
+                    .to_owned()
+            } else {
+                String::new()
+            };
             return busy;
         };
         if r.total_f > 0 {
@@ -10990,11 +11058,26 @@ impl IrRoad {
         // only moves once the recording starts, so the two together say
         // exactly which phase this is. See
         // `instrument::IrCaptureSpec::settle_frames`.
-        if r.total_f > 0 && r.done_f == 0 && self.pending.is_some() {
-            self.live.phase =
-                "waiting for the loop to go quiet \u{2014} the noise floor is                      measured before the sweep"
-                    .to_owned();
-        }
+        //
+        // **Written on EVERY road through here, which is the fault.** This
+        // used to be a bare `if` with no else, so the line latched the moment
+        // the settle began and then simply stopped being rewritten: the
+        // capture ran, the progress bar advanced under it, and the page still
+        // said the recording had not started for the whole twenty-five
+        // seconds. The owner: "the waiting for silence message doesn't go
+        // away... it just says waiting for silence the whole time even
+        // through a successful capture." A status line has to answer for
+        // every state it can be read in, so this is an expression and not a
+        // statement — there is nowhere left for a state to fall through.
+        self.live.phase = if r.total_f == 0 || self.pending.is_none() {
+            String::new()
+        } else if r.done_f == 0 {
+            "waiting for the loop to go quiet - the noise floor is measured \
+             before the sweep"
+                .to_owned()
+        } else {
+            "recording - the sweep and the tail after it".to_owned()
+        };
         busy
     }
 }
@@ -16107,6 +16190,105 @@ mod tests {
     }
 
 
+    /// **The settle line answers for every state it can be read in.**
+    ///
+    /// The owner, on the page he was watching for twenty-five seconds:
+    /// "the waiting for silence message doesn't go away... it just says
+    /// waiting for silence the whole time even through a successful
+    /// capture."
+    ///
+    /// It was a bare `if` with no else. The line latched the moment the
+    /// settle began and was then simply never rewritten — the capture ran,
+    /// the progress bar advanced underneath it, and the page went on saying
+    /// the recording had not started until the whole pass came back. Nothing
+    /// in `note_levels` could clear it, including the arm that fires when no
+    /// engine answered at all, which is the device having been unplugged
+    /// mid-capture: `pending` is only taken where a reading exists, so that
+    /// picture would be re-pushed unchanged for the life of the wizard.
+    ///
+    /// A status line is an ANSWER, so it is written on every road through
+    /// here and there is nowhere for a state to fall through. The four
+    /// states are the four blocks below.
+    ///
+    /// Revert-check performed: make the settle line a bare
+    /// `if ... { self.live.phase = ... }` again and the "recording" block
+    /// goes red with the wizard still waiting for silence over a pass that
+    /// is 40% done.
+    #[test]
+    fn the_settle_line_says_which_phase_the_capture_is_actually_in() {
+        let armed = || IrPending {
+            reference: false,
+            sweep: vec![0.0; 8],
+            pre: 4,
+            rate: 48_000.0,
+            f1: 20.0,
+            f2: 20_000.0,
+            duration: 1.0,
+            total: 32,
+        };
+        let reading = |done_f: u32, total_f: u32| IrReading {
+            rms_db: -30.0,
+            peak_db: -24.0,
+            peak_l_db: -24.0,
+            peak_r_db: -25.0,
+            done_f,
+            total_f,
+        };
+
+        // (1) Armed, nothing recorded yet: the loop is being listened to.
+        let mut road = IrRoad::default();
+        road.pending = Some(armed());
+        road.note_levels(Some(reading(0, 100)), true);
+        assert!(
+            road.live.phase.contains("quiet"),
+            "the settle was not narrated at all: {:?}",
+            road.live.phase
+        );
+
+        // (2) THE FAULT. Frames are going in now, so the wait is over — and
+        // the line has to stop saying otherwise.
+        road.note_levels(Some(reading(40, 100)), true);
+        assert!(
+            !road.live.phase.contains("quiet"),
+            "the capture is 40% recorded and the page still says it is \
+             waiting for the loop to go quiet: {:?}",
+            road.live.phase
+        );
+        assert!(
+            !road.live.phase.is_empty(),
+            "a running capture says nothing at all about itself"
+        );
+
+        // (3) Nothing armed: no phase to report, and no stale one either.
+        let mut road = IrRoad::default();
+        road.live.phase = "left over from last time".to_owned();
+        road.note_levels(Some(reading(0, 0)), true);
+        assert!(
+            road.live.phase.is_empty(),
+            "an idle wizard is still wearing an old status line: {:?}",
+            road.live.phase
+        );
+
+        // (4) The device went away mid-capture. `pending` can never be taken
+        // from here, so this is the state that used to freeze forever under
+        // "waiting for the loop to go quiet".
+        let mut road = IrRoad::default();
+        road.pending = Some(armed());
+        road.note_levels(Some(reading(0, 100)), true);
+        road.note_levels(None, true);
+        assert!(
+            !road.live.phase.contains("quiet"),
+            "the interface is gone and the page still says it is listening \
+             to the loop: {:?}",
+            road.live.phase
+        );
+        assert!(
+            road.live.phase.contains("device"),
+            "nothing told anybody the device stopped answering: {:?}",
+            road.live.phase
+        );
+    }
+
     /// **A wizard on screen is pushed to whatever the meter says, and a road
     /// with no engine behind it rests at silence.**
     ///
@@ -16284,9 +16466,15 @@ mod tests {
              `Self::panel_start` returned, because that is the only thing \
              that guarantees a directory which exists"
         );
+        // **One more `panel_start` than `set_directory`, and the extra one is
+        // named.** The in-app browser we fall back to where there is no
+        // portal has no rfd dialog to hand a directory to, so it takes the
+        // same answer and opens itself there — see the note at that call.
+        // Counting it as a panel is the point: it IS one, and the fault this
+        // whole test exists for is a panel that picked its own folder.
         assert_eq!(
             src.matches("Self::panel_start(").count(),
-            sets,
+            sets + 1,
             "there are {sets} `set_directory` calls and a different number of \
              `Self::panel_start` calls: a panel is choosing its own start \
              directory again, which is how the save panel came to open at the \
@@ -16337,6 +16525,64 @@ mod tests {
     ///
     /// Revert-check performed: replace the `P::ExportMidi` arm with
     /// `_ => self.app.export_root()` and this goes red.
+    /// **And the LOAD panel's folder is chosen the same way.**
+    ///
+    /// The twin of the test below, for the twin of the function it guards.
+    /// The fault it exists for is the one that reached the owner: Save Kit
+    /// had an arm and Load Kit had none, so the two ends of one gesture
+    /// pointed at different folders and a kit saved by this app could not be
+    /// found by it.
+    ///
+    /// Revert-check performed: replace the `P::KitPreset` arm with
+    /// `_ => (PanelDir::Remembered, request.start_at.clone())` and this goes
+    /// red on the wildcard; delete the arm entirely and it goes red naming
+    /// the purpose.
+    #[test]
+    fn the_load_panels_folder_is_chosen_by_a_match_with_no_wildcard() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        let body = {
+            let a = src.find("fn load_start(").expect("`load_start` is gone");
+            let b = src[a..].find("\n    /// ").expect("the end of `load_start`");
+            &src[a..a + b]
+        };
+        assert!(
+            !body.contains("_ =>"),
+            "`load_start` has a wildcard arm again: a purpose added to the end \
+             of `FilePurpose` will inherit somebody else's folder instead of \
+             failing to compile until it is given one"
+        );
+        for arm in [
+            "P::KitPreset",
+            "P::Cartridge",
+            "P::ClickSample",
+            "P::BackingTrack",
+            "P::Project",
+            "P::InsertMedia(_)",
+        ] {
+            assert!(
+                body.contains(arm),
+                "`load_start` no longer answers for `{arm}` - either the \
+                 purpose is gone or it has been folded in with another one"
+            );
+        }
+        // A kit opens on OUR drawer, which is the half that has to be made
+        // rather than remembered.
+        assert!(
+            body.contains("P::KitPreset => (\n                PanelDir::Ours,"),
+            "the kit arm no longer opens on a folder this app will create, so \
+             an install that has never saved a kit is back at home"
+        );
+        // And BOTH panel roads ask it - the native one and the browser we
+        // fall back to where there is no portal.
+        assert_eq!(
+            src.matches("self.load_start(&request)").count(),
+            2,
+            "the load panels do not both ask `load_start`, so the match above \
+             decides less than it looks like it does"
+        );
+    }
+
     #[test]
     fn the_save_panels_folder_is_chosen_by_a_match_with_no_wildcard() {
         let whole = include_str!("desktop.rs");

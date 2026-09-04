@@ -814,6 +814,24 @@ pub struct IrWizardState {
     pub meter_peak: f32,
     pub meter_l: f32,
     pub meter_r: f32,
+    /// **The RMS, with the same ballistics.** Appended at the END.
+    ///
+    /// The note above was written for the peak and the fill was left raw —
+    /// which is the wrong way round for the complaint it answers, because
+    /// the fill is the large shape the eye actually reads and the peak is a
+    /// one-pixel tick. Through a 100% wet box the per-block mean of a tone
+    /// wanders several dB on the reverb's own modulation, so the bar was the
+    /// thing "bouncing off a region over and over" while the tick sat still.
+    pub meter_rms: f32,
+    /// **How long the send has been where it is**, seconds — the settling
+    /// clock [`Self::probe`] will not record without.
+    ///
+    /// Appended at the END. Zeroed whenever the send moves; the record is
+    /// only written once it has run past [`PROBE_SETTLE_S`].
+    pub probe_settle_s: f32,
+    /// The send the settling clock is counting for, so a change can be seen.
+    /// Appended at the END.
+    pub probe_send: f32,
     /// **What each SEND setting actually returned**: (send dBFS, the loudest
     /// return peak seen at it). Appended at the END.
     ///
@@ -922,12 +940,32 @@ impl Default for IrWizardState {
             saved: false,
             save_asked: None,
             meter_peak: -200.0,
+            meter_rms: -200.0,
+            probe_settle_s: 0.0,
+            probe_send: -18.0,
             meter_l: -200.0,
             meter_r: -200.0,
             probe: Vec::new(),
         }
     }
 }
+
+/// **How long a send has to stand still before its return is believed**,
+/// seconds.
+///
+/// Three quarters of a second, and every part of it is somebody's latency:
+/// the ask crosses the app and the host to the audio callback, the callback
+/// plays it, the converter and the box and the converter again carry it, and
+/// the monitor ring the meter reads is 120 ms deep on its own. A wet box then
+/// wants a moment to reach steady state at the new drive — the developer
+/// probe waits 1.2 s before it believes a tone level, and this is the
+/// interactive version of the same wait.
+///
+/// It is a floor on how fast the level page can learn, and that is the right
+/// trade: a table that fills instantly with numbers from the previous send is
+/// worse than one that fills a beat late, because the page prints a VERDICT
+/// off it. See `IrWizardState::meter_tick`.
+const PROBE_SETTLE_S: f32 = 0.75;
 
 impl IrWizardState {
     /// The chosen device channels, resolved — the wizard's actions carry
@@ -1126,18 +1164,51 @@ impl IrWizardState {
             }
         };
         self.meter_peak = hold(self.meter_peak, self.live.peak_db);
+        self.meter_rms = hold(self.meter_rms, self.live.rms_db);
         self.meter_l = hold(self.meter_l, self.live.peak_l_db);
         self.meter_r = hold(self.meter_r, self.live.peak_r_db);
+        // **The send has to have SETTLED before its return means anything.**
+        //
+        // This is the fault the owner reported as the meter lying, and the
+        // lie was not the needle: it was the sentence under it. The record
+        // below feeds `limiting()`, whose verdict the page prints as "The
+        // box is limiting — past this, more send is more distortion and not
+        // more tail". Two things made it print that about a healthy rig.
+        //
+        // FIRST, it recorded `meter_peak` — the BALLISTIC HOLD, which is
+        // still falling from the previous send at 20 dB per second — under
+        // the label of the send that had just been chosen. Stepping DOWN the
+        // send row therefore filed the loud return under the quiet send, and
+        // stepping down the row is exactly the gesture somebody uses to find
+        // a level. SECOND, nothing waited for the new level to arrive: the
+        // ask has to cross the app, the host, the audio callback, the
+        // converter, the box, and a 120 ms monitor ring before one block at
+        // the new send exists to be read at all.
+        //
+        // So the reading is the BLOCK (`live.peak_db`), and it is only taken
+        // once the send has stood still for `PROBE_SETTLE_S`. The `max` that
+        // follows is then a ratchet over honest readings at one send, which
+        // is what a peak measurement should be.
+        if (self.probe_send - self.level_db).abs() >= 0.5 {
+            self.probe_send = self.level_db;
+            self.probe_settle_s = 0.0;
+        }
         // The record is only meaningful while the tone is actually driving
         // the loop: a reading taken with nothing going out says what the room
         // is doing, not what the box does with a given send.
         if !self.tone_on || self.live.peak_db <= -200.0 {
+            self.probe_settle_s = 0.0;
+            return;
+        }
+        self.probe_settle_s += dt.clamp(0.0, 0.25);
+        if self.probe_settle_s < PROBE_SETTLE_S {
             return;
         }
         let send = self.level_db;
+        let now = self.live.peak_db;
         match self.probe.iter_mut().find(|(s, _)| (*s - send).abs() < 0.5) {
-            Some(entry) => entry.1 = entry.1.max(self.meter_peak),
-            None => self.probe.push((send, self.meter_peak)),
+            Some(entry) => entry.1 = entry.1.max(now),
+            None => self.probe.push((send, now)),
         }
     }
 
@@ -1652,6 +1723,18 @@ pub enum DialogAction {
         pedal: usize,
         alt: bool,
         shift: bool,
+    },
+    /// **Two of a bay's numbers in one frame.** Appended at the END, this
+    /// enum's law. See [`crate::faces::FaceAction::SetPair`] for the gesture
+    /// that needs it — an EQ handle carries a frequency and a gain, and this
+    /// road used to make it choose one per frame.
+    SetInsertParamPair {
+        strip: usize,
+        slot: usize,
+        id_a: u32,
+        value_a: f32,
+        id_b: u32,
+        value_b: f32,
     },
 }
 
@@ -5509,10 +5592,15 @@ fn draw_ir_level(
     );
     ui.painter().rect_filled(rect, 2.0, t.field_bg);
     let frac = |db: f32| ((db + 60.0) / 60.0).clamp(0.0, 1.0);
-    // **The HELD peak, not this frame's block.** See `METER_FALL_DB_S`. The
-    // RMS is left as it is: a mean over a block is already an average and does
-    // not jump the way a peak does.
-    let (rms, peak) = (s.live.rms_db, s.meter_peak);
+    // **Both HELD, not this frame's block.** See `METER_FALL_DB_S`.
+    //
+    // The peak was given ballistics first and the fill was left raw on the
+    // reasoning that "a mean over a block is already an average and does not
+    // jump the way a peak does". True of a steady tone through a wire and
+    // false of one through a reverb: the owner's box modulates its own tail,
+    // so the per-block mean wandered several dB and the FILL — the big shape
+    // the eye reads — was the thing bouncing while the tick sat still.
+    let (rms, peak) = (s.meter_rms, s.meter_peak);
     if rms > -200.0 {
         let w = rect.width() * frac(rms);
         ui.painter().rect_filled(
@@ -6746,6 +6834,19 @@ fn show_on(
                                             value,
                                         })
                                     }
+                                    crate::faces::FaceAction::SetPair {
+                                        id_a,
+                                        value_a,
+                                        id_b,
+                                        value_b,
+                                    } => Some(DialogAction::SetInsertParamPair {
+                                        strip,
+                                        slot,
+                                        id_a,
+                                        value_a,
+                                        id_b,
+                                        value_b,
+                                    }),
                                     crate::faces::FaceAction::SavePreset { name } => {
                                         Some(DialogAction::FaceSavePreset { strip, slot, name })
                                     }
@@ -17504,6 +17605,124 @@ at: None,
             !words.iter().any(|w| w.starts_with("Nothing is coming back")),
             "the page sent somebody to check the cables of a loop that has no \
              engine behind it: {words:?}"
+        );
+    }
+
+
+    /// **Walking the send DOWN must not manufacture a limiter, and this is
+    /// the only test that drives the recorder and the reader together.**
+    ///
+    /// The owner never once managed to set his level on this page: "the
+    /// meter in the 2/4 test tone stage LIES, i can only set via some other
+    /// method because it's limited. why on earth is that meter alone
+    /// limited?" The word he is reading is the page's own — `limiting()`'s
+    /// verdict, printed under the bar — and the wizard was manufacturing it
+    /// out of two mistakes in `meter_tick`.
+    ///
+    /// It recorded `meter_peak`, the BALLISTIC HOLD, which falls at
+    /// [`METER_FALL_DB_S`] and therefore still carries the PREVIOUS send's
+    /// return for the better part of a second; and it recorded on the very
+    /// first frame after the chip was pressed, before a block at the new
+    /// send could physically exist — the ask has to cross the app, the host,
+    /// the callback, the converter, the box, the converter again and a
+    /// 120 ms monitor ring. Both errors point the same way, and only
+    /// downward: press a QUIETER send and the louder return is filed under
+    /// it. `probe` then ratchets with `max` and is never cleared except on a
+    /// jack change, so one wrong row poisons the verdict for the life of the
+    /// wizard.
+    ///
+    /// `a_loop_that_stops_taking_more_send_says_so` below hand-assigns
+    /// `probe` and never calls `meter_tick`, so the recorder and the reader
+    /// had no test between them at all — which is exactly the seam the fault
+    /// lived in. This one presses the chips.
+    ///
+    /// Revert-checks, both performed: record `self.meter_peak` instead of
+    /// `self.live.peak_db` and this goes red with a limiter on a rig that
+    /// tracks its send perfectly; drop the `PROBE_SETTLE_S` gate and it goes
+    /// red the same way, because the stale reading is recorded before the
+    /// real one arrives and `max` keeps it.
+    #[test]
+    fn walking_the_send_down_does_not_invent_a_limiter() {
+        let mut s = IrWizardState {
+            tone_on: true,
+            level_db: -18.0,
+            ..Default::default()
+        };
+        // A loop that follows its send exactly: whatever goes out comes back
+        // at the same number. Nothing here is limiting anything.
+        let mut settle_at = |s: &mut IrWizardState, send: f32, ring: f32| {
+            s.level_db = send;
+            // The old reading, still in flight through the ring.
+            for _ in 0..3 {
+                s.live.peak_db = ring;
+                s.live.rms_db = ring - 3.0;
+                s.meter_tick(0.1);
+            }
+            // Then the real one, for long enough to be believed.
+            for _ in 0..12 {
+                s.live.peak_db = send;
+                s.live.rms_db = send - 3.0;
+                s.meter_tick(0.1);
+            }
+        };
+        settle_at(&mut s, -18.0, -200.0);
+        // And now DOWN, which is the gesture that used to poison the table.
+        settle_at(&mut s, -24.0, -18.0);
+
+        fn row_of(probe: &[(f32, f32)], want: f32) -> f32 {
+            probe
+                .iter()
+                .find(|(send, _)| (*send - want).abs() < 0.5)
+                .unwrap_or_else(|| panic!("no row for a {want} dBFS send: {probe:?}"))
+                .1
+        }
+
+        assert!(
+            (row_of(&s.probe, -18.0) + 18.0).abs() < 0.5,
+            "the -18 row reads {:.2}, not the -18 the loop returned",
+            row_of(&s.probe, -18.0)
+        );
+        assert!(
+            (row_of(&s.probe, -24.0) + 24.0).abs() < 0.5,
+            "the -24 row reads {:.2} - the louder return from the PREVIOUS \
+             send was filed under the quieter one",
+            row_of(&s.probe, -24.0)
+        );
+        assert_eq!(
+            s.limiting(),
+            None,
+            "the page found a limiter in a loop that returns exactly what it \
+             is sent; its table says {:?}",
+            s.probe
+        );
+
+        // ── and a drop the HOLD cannot fall through ─────────────────────
+        //
+        // The settle gate alone rescues a small step, because the ballistic
+        // hold has time to reach the truth inside it — a six dB drop is gone
+        // in three tenths of a second at 20 dB/s. A big one is not: from
+        // −12 to −40 is 28 dB and the hold is still 20 dB high when the gate
+        // opens. This leg is why the reading is `live.peak_db` and not the
+        // hold, and without it that half of the fix has no test.
+        settle_at(&mut s, -12.0, -24.0);
+        settle_at(&mut s, -40.0, -12.0);
+        assert!(
+            (row_of(&s.probe, -40.0) + 40.0).abs() < 0.5,
+            "the -40 row reads {:.2} - that is the ballistic hold on its way \
+             down from -12, not what the loop returned at -40",
+            row_of(&s.probe, -40.0)
+        );
+
+        // And the gate is a real gate: a send that has only just moved has
+        // nothing to say about itself yet.
+        s.level_db = -30.0;
+        s.live.peak_db = -24.0;
+        s.meter_tick(0.1);
+        assert!(
+            s.probe.iter().all(|(send, _)| (*send + 30.0).abs() >= 0.5),
+            "a row was written 100 ms after the chip was pressed, which is \
+             before a block at that send can have reached the meter: {:?}",
+            s.probe
         );
     }
 

@@ -106,19 +106,30 @@ const TRIM_PARAMS: &[ParamSpec] = &[ParamSpec {
     steps: 0,
 }];
 
-/// The EQ face's slice of the kernel: three bands of the eight
+/// The EQ face's slice of the kernel: FIVE bands of the eight
 /// `units::eq::EqKernel` carries, five knobs each — on, shape, frequency,
 /// gain, width. Ids run dense from 0 in band-major order, which is what lets
 /// `EqUnit::set_param` decode them by division instead of a lookup; both
-/// spaces are persisted, so bands four to eight, when a bigger face wants
-/// them, take ids 15 upward and never renumber these.
+/// spaces are persisted, so bands six to eight, when a bigger face wants
+/// them, take ids 25 upward and never renumber these.
+///
+/// **Bands four and five were APPENDED, and the first three did not move.**
+/// The owner asked for "2 more nodes for a 5 total"; the note above, written
+/// when there were three, promised ids 15 upward for exactly this and that
+/// promise is what makes it a non-event. Every project and preset ever saved
+/// stores ids 0..15, they still mean what they meant, and the two new bands
+/// arrive OFF — so an old EQ loaded into the bigger face sounds identical
+/// and simply has two more parked handles to reach for.
 ///
 /// Defaults are the kernel's shipped sound — every band OFF, gain centred,
 /// width at Butterworth — except the frequency parking spots: the kernel's
 /// own default spreads eight handles log-evenly as a ruler, and the first
-/// three rungs of an eight-rung ruler are all in the bass. Three handles get
-/// the three-handle version of the same idea: low, mid, high, at the quarter
-/// points of the sweep (about 112 Hz, 632 Hz and 3.6 kHz).
+/// three rungs of an eight-rung ruler are all in the bass. The original
+/// three sit at the quarter points of the sweep (about 112 Hz, 632 Hz and
+/// 3.6 kHz) and STAY there, because moving them would move a handle on every
+/// EQ anybody inserts from now on for the sake of tidiness. The two new ones
+/// take the ends nobody was parked on — about 47 Hz and 8.4 kHz — which is
+/// where a low shelf and an air band want to start anyway.
 const EQ_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 0, symbol: "b1_on", name: "Band 1 On", units: "", default: 0.0, steps: 2 },
     ParamSpec { id: 1, symbol: "b1_kind", name: "Band 1 Type", units: "", default: 0.0, steps: EQ_KIND_STEPS },
@@ -135,6 +146,16 @@ const EQ_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 12, symbol: "b3_freq", name: "Band 3 Freq", units: "Hz", default: 0.75, steps: 0 },
     ParamSpec { id: 13, symbol: "b3_gain", name: "Band 3 Gain", units: "dB", default: 0.5, steps: 0 },
     ParamSpec { id: 14, symbol: "b3_q", name: "Band 3 Q", units: "", default: crate::units::eq::EQ_Q_BUTTERWORTH, steps: 0 },
+    ParamSpec { id: 15, symbol: "b4_on", name: "Band 4 On", units: "", default: 0.0, steps: 2 },
+    ParamSpec { id: 16, symbol: "b4_kind", name: "Band 4 Type", units: "", default: 0.0, steps: EQ_KIND_STEPS },
+    ParamSpec { id: 17, symbol: "b4_freq", name: "Band 4 Freq", units: "Hz", default: 0.125, steps: 0 },
+    ParamSpec { id: 18, symbol: "b4_gain", name: "Band 4 Gain", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 19, symbol: "b4_q", name: "Band 4 Q", units: "", default: crate::units::eq::EQ_Q_BUTTERWORTH, steps: 0 },
+    ParamSpec { id: 20, symbol: "b5_on", name: "Band 5 On", units: "", default: 0.0, steps: 2 },
+    ParamSpec { id: 21, symbol: "b5_kind", name: "Band 5 Type", units: "", default: 0.0, steps: EQ_KIND_STEPS },
+    ParamSpec { id: 22, symbol: "b5_freq", name: "Band 5 Freq", units: "Hz", default: 0.875, steps: 0 },
+    ParamSpec { id: 23, symbol: "b5_gain", name: "Band 5 Gain", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 24, symbol: "b5_q", name: "Band 5 Q", units: "", default: crate::units::eq::EQ_Q_BUTTERWORTH, steps: 0 },
 ];
 
 /// How many positions the band-shape menu has. Spelled as a literal so the
@@ -144,7 +165,7 @@ const EQ_KIND_STEPS: i32 = 6;
 
 /// How many of the kernel's bands the face exposes, and how many knobs each
 /// band takes in the id space.
-const EQ_FACE_NODES: usize = 3;
+const EQ_FACE_NODES: usize = 5;
 const EQ_KNOBS_PER_NODE: u32 = 5;
 
 /// One knob per `units::tape::TapeParams` field, ids in declaration order.
@@ -2097,13 +2118,15 @@ mod tests {
             assert_eq!(spec.default, want, "{} drifted from CompParams::default", spec.symbol);
         }
         // The EQ: kernel defaults for everything except the parking spots,
-        // which are the documented three-handle spread (see EQ_FACE_PARAMS).
+        // which are the documented five-handle spread (see EQ_FACE_PARAMS) —
+        // the original three at the quarter points, unmoved, and the two
+        // appended bands at the ends nobody was standing on.
         let n = crate::units::eq::NodeParams::default();
         assert!(!n.on, "the kernel ships FLAT; the face must too");
         for (band, chunk) in EQ_FACE_PARAMS.chunks(EQ_KNOBS_PER_NODE as usize).enumerate() {
             assert_eq!(chunk[0].default, 0.0, "band {band} does not open off");
             assert_eq!(chunk[1].default, 0.0, "band {band} does not open a bell");
-            assert_eq!(chunk[2].default, [0.25, 0.5, 0.75][band]);
+            assert_eq!(chunk[2].default, [0.25, 0.5, 0.75, 0.125, 0.875][band]);
             assert_eq!(chunk[3].default, n.gain);
             assert_eq!(chunk[4].default, n.q);
         }
