@@ -4355,6 +4355,41 @@ struct Renderer {
     /// milliseconds of a fading-in signal at the price of the duplication
     /// this app has been bitten by three times.
     board_live: u32,
+    /// **Which channels the ROOM clocked a rack for**, written by
+    /// `mix_monitor` and read by the lane pass, exactly as
+    /// [`Renderer::board_live`] is and for a sharper version of the same
+    /// reason.
+    ///
+    /// A rack is a stateful chain and there is ONE of it per seat. The room's
+    /// pass runs `racks[ch]` over the live input; the lane pass runs the same
+    /// `racks[ch]` over the timeline. Both in one chunk is that chain clocked
+    /// twice, and the second run does not merely cost time — it emits the
+    /// plugin's response to the signal the FIRST run pushed through it. A
+    /// reverb's tail, a delay's repeat, a cabinet's ring.
+    ///
+    /// The invariant was already written three lines above the gate that
+    /// broke it: "An AUDIO channel's bit is set and its rack runs in
+    /// `mix_monitor`, over its input — running it here too would fold its
+    /// effect tails twice." `bf9300e` added `has_audio` to that gate so a
+    /// plugin on an audio track would stop being furniture, which was a real
+    /// and much-needed fix, and in doing so it let the timeline pass reach
+    /// the rack of a channel the room was already playing.
+    ///
+    /// What the owner heard: "FX INSERT ON == Another wet only signal, but
+    /// very staticcy, overlayed onto the clean signal... the wet only is
+    /// guilty redhanded and doesn't listen to 'hear the input' off." Wet only
+    /// because the lane pass feeds it the clip, which is silence while the
+    /// transport is parked. Staticcy because the chain is re-excited at chunk
+    /// rate by alternating live input and silence. Deaf to the monitor switch
+    /// because that switch is not a gain on the input — it is the subtraction
+    /// `room = mix - input_dry`, and the lane pass's fold writes into `mix`
+    /// with no matching subtrahend, so it survives.
+    ///
+    /// One chunk late by construction, like `board_live`: the room runs after
+    /// the lane pass. The cost of that is one chunk of a clip paying its rack
+    /// on the chunk an input is first armed — inaudible, and the alternative
+    /// is a second walk of the interface at the head of every block.
+    room_rack: u32,
 }
 
 impl Renderer {
@@ -6178,6 +6213,10 @@ impl Renderer {
         // to stand aside for a guitar that is no longer there. See
         // `Renderer::board_live`.
         self.board_live = 0;
+        // And no channel's RACK belongs to the room until this pass says so,
+        // cleared here for the same reason and by the same single writer.
+        // See `Renderer::room_rack`.
+        self.room_rack = 0;
         // A ring arriving, or being taken away. `try_lock`, never `lock`.
         // **A layout change for the ring already held.** Read before the
         // ring handoff so a frame where both arrive takes the new ring's own
@@ -6700,6 +6739,10 @@ impl Renderer {
                             .map_or(&[][..], Vec::as_slice)
                     });
                 if !is_folder {
+                    // **The room's claim on this seat's rack.** See
+                    // `Renderer::room_rack`: the lane pass reads this next
+                    // chunk and stands aside, so one chain is clocked once.
+                    self.room_rack |= 1u32 << strip.index().min(31);
                     run_rack(
                         &mut self.racks[strip.index()],
                         &mut self.fx_in,
@@ -8604,7 +8647,27 @@ impl Renderer {
                     dst[..n].copy_from_slice(&src[..n]);
                 }
             }
-            if rack_live && !is_folder {
+            // **The lane pass stands aside for a seat the ROOM is playing.**
+            //
+            // One rack per seat, one clock per chunk. See
+            // `Renderer::room_rack` for the whole of why, and for what the
+            // owner heard when this was missing.
+            //
+            // The consequence, stated rather than hidden: a clip on a lane
+            // whose input the room is monitoring goes to the bus DRY that
+            // chunk. That is what shipped for years — the comment on `armed`
+            // above says so — and it is the narrow price of not clocking a
+            // stateful chain twice. It costs `bf9300e`'s fix nothing where
+            // that fix was aimed: an audio track being MIXED is not a track
+            // the room is monitoring, so a compressor on a recorded vocal
+            // still runs, which was the fault that commit existed to end.
+            // Giving a recording channel both at once needs the timeline's
+            // audio summed into the room's own `fx_in` and the room's dry
+            // subtrahend taken from an input-only pass — two runs of a
+            // non-linear chain to separate what one run mixed — and that is
+            // a bigger piece of work than the regression it would close.
+            let room_owns = self.room_rack & (1u32 << ch.min(31)) != 0;
+            if rack_live && !is_folder && !room_owns {
                 // ── THE PEDALBOARD ─────────────────────────────────────────
                 // **A bay holding the amp arms the channel's seven pedal
                 // racks**, run over `fx_in` — the signal as it stands before
@@ -10364,6 +10427,7 @@ impl Engine {
             stems_dry: false,
             board_ran: 0,
             board_live: 0,
+            room_rack: 0,
         };
 
         let (stream, out_device_obj, offline_renderer) = match dev {
@@ -15557,6 +15621,7 @@ mod tests {
             stems_dry: false,
             board_ran: 0,
             board_live: 0,
+            room_rack: 0,
             racks,
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -17086,6 +17151,93 @@ mod tests {
              says nothing: {} against {}",
             settled(&pedalled),
             settled(&bare)
+        );
+    }
+
+
+    /// **The room hears NOTHING from an armed channel while monitoring is
+    /// off.** The owner, on the freshly installed build: "FX INSERT BYPASSED
+    /// = NO CUTOUTS but FX INSERT ON == Another wet only signal, but very
+    /// staticcy, overlayed onto the clean signal. How am I so sure it's
+    /// definitely 2 signals? Because the wet only is guilty redhanded and
+    /// doesn't listen to 'hear the input' off".
+    ///
+    /// The rig is `a_guitar_through_an_amp`'s with the control room switched
+    /// OUT: a silent take parked on the lane, a guitar arriving in the ring,
+    /// an insert in bay 0, and `monitor_on` false. Nothing on this desk can
+    /// legitimately make a sound — the clip is digital silence and the
+    /// transport is parked — so any master peak at all is the live input
+    /// reaching the speakers by a road the monitor gate does not stand on.
+    fn a_guitar_with_the_room_switched_off(insert: bool, take: bool, blocks: usize) -> Vec<f32> {
+        const CH: usize = 3;
+        const FRAMES: usize = 512;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        if insert {
+            e.load_insert(CH, 0, Some(Path::new(crate::builtin_fx::AMP_PATH)), None)
+                .expect("the amp loads")
+                .expect("the bay reports it");
+        }
+        if take {
+            e.set_clips(vec![flat_clip(CH, 0.0)]);
+        }
+        e.set_channel_gain(CH, 1.0);
+        e.set_master_gain(1.0);
+        e.set_midi_off(1 << CH);
+        e.set_armed(1 << CH);
+        e.set_pick_strips([Some(CH), None, None, None]);
+        e.set_monitor_on(false);
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; FRAMES * 2];
+        for _ in 0..6 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let (mut jack, ring) = RingBuffer::<f32>::new(1 << 15);
+        e.set_monitor(Some((
+            ring,
+            1,
+            [1, 0, 0, 0],
+            FRAMES as u32,
+            tangent_record::audio::Picks::EVERYTHING,
+        )));
+        let mut phase = 0.0f64;
+        let mut peaks = Vec::with_capacity(blocks);
+        for _ in 0..blocks {
+            for _ in 0..FRAMES {
+                let _ = jack.push((phase.sin() * 0.5) as f32);
+                phase += std::f64::consts::TAU * 440.0 / 48_000.0;
+            }
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            peaks.push(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+        }
+        peaks
+    }
+
+    #[test]
+    fn the_room_hears_nothing_from_an_armed_channel_with_monitoring_off() {
+        let bare = a_guitar_with_the_room_switched_off(false, true, 24);
+        let loudest = bare.iter().fold(0.0f32, |a, v| a.max(*v));
+        assert!(
+            loudest <= 1.0e-6,
+            "an EMPTY bay leaked the live input into the room with monitoring off: {loudest}"
+        );
+        let inserted = a_guitar_with_the_room_switched_off(true, true, 24);
+        let loudest = inserted.iter().fold(0.0f32, |a, v| a.max(*v));
+        assert!(
+            loudest <= 1.0e-6,
+            "an insert on an armed channel leaked the live input into the room \
+             with monitoring off: {loudest}, block peaks {inserted:?}"
+        );
+    }
+
+    #[test]
+    fn the_room_hears_nothing_from_an_armed_channel_with_no_take_and_monitoring_off() {
+        let inserted = a_guitar_with_the_room_switched_off(true, false, 24);
+        let loudest = inserted.iter().fold(0.0f32, |a, v| a.max(*v));
+        assert!(
+            loudest <= 1.0e-6,
+            "an insert on an armed channel with NO take leaked: {loudest}, {inserted:?}"
         );
     }
 
