@@ -712,6 +712,12 @@ pub enum SavePurpose {
     /// templates live under `Projects/Templates/<name>` wherever the panel
     /// was pointed, and saving one called `default` replaces the session
     /// every New Project clones.
+    ///
+    /// **The host opens the panel ON that shelf**, which is a courtesy this
+    /// crate cannot arrange and should not be surprised by: the name is
+    /// still the only thing that travels, but a panel showing the templates
+    /// somebody is about to overwrite beats one showing the projects. See
+    /// `DesktopApp::save_start`.
     Template,
     /// **Write the showing lane's kit out as a preset.** Unlike a template,
     /// the whole path is honoured — a kit is a file you keep wherever you
