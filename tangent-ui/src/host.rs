@@ -243,6 +243,15 @@ pub struct Gesture {
     /// drag is indistinguishable from a tiler and would otherwise disable the
     /// aspect snap for the whole session.
     pub resize_known: bool,
+    /// **`mouse_down` is a real answer, not a default.** Appended at the END.
+    ///
+    /// Same bargain as [`Self::resize_known`], and needed for the same reason
+    /// in the other direction: `mouse_down` is FALSE on every host that
+    /// cannot say, so "the hand has let go" and "nobody can tell me" are the
+    /// same bit. Anything that ENDS a gesture on it would therefore end every
+    /// gesture immediately in the plugin, on Windows and on Linux. Only a
+    /// host that sets this may be believed when it says the button is up.
+    pub mouse_known: bool,
 }
 
 impl Gesture {

@@ -264,6 +264,11 @@ pub fn publish(
             // here, so "a size nobody asked for" may be read as a window
             // manager. Everywhere else that inference is unsafe.
             resize_known: true,
+            // And so is `mouse_down` above: `NSEvent::pressedMouseButtons`
+            // is a global read that AppKit keeps answering through a native
+            // window drag, which is the one gesture egui cannot see the end
+            // of. See `host::Gesture::mouse_known`.
+            mouse_known: true,
         },
         os_aspect_lock: hooked,
     }
