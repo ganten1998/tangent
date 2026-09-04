@@ -1,0 +1,29 @@
+# The standalone bench for Tangent Analog.
+#
+# It compiles the REAL module out of the repo by `#[path]`, so there is exactly
+# one copy of the DSP and no chance of the bench and the app drifting apart.
+# Nothing is vendored and nothing is copied — `src/units.rs` reaches the one
+# oversampler in `tangent/src/units/drive.rs` the same way.
+#
+# Zero dependencies, deliberately: `tangent/src/analog/` must stay pure `std`
+# the way `tangent/src/keys/` is, because a new crate in the app's lock file
+# costs a THIRD-PARTY-LICENSES byte-diff at release time. The WAV writer is
+# forty lines.
+#
+# DELIBERATELY OUTSIDE the main workspace (the empty [workspace] table below),
+# exactly as keysrig, tangent-fulfil and tangent-keygen are: the bench must
+# never touch the app's lock file, and `cargo test --workspace` has no opinions
+# to offer about a measurement rig. `cargo test` HERE runs the module's own
+# `#[cfg(test)]` suite as well as the bench's, in seconds.
+[workspace]
+
+[package]
+name = "analogrig"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+debug = true

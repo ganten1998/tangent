@@ -105,13 +105,13 @@ pub const DRIVE_DC_HZ: f32 = 10.0;
 /// [`HB_A_CUTOFF`] below the fold, which moves the whole fold region into
 /// true stopband (−50 dB and falling) for ~1 dB of shading at 20 kHz per
 /// pass in a 48 kHz session.
-const HB_A_TAPS: usize = 63;
-const HB_B_TAPS: usize = 23;
+pub(crate) const HB_A_TAPS: usize = 63;
+pub(crate) const HB_B_TAPS: usize = 23;
 
 /// Stage A's cutoff as a fraction of its running rate (0.25 would be the
 /// exact halfband). 0.224 puts −54 dB at one kilohertz past the fold in a
 /// 48 kHz session, sized numerically against the alias test's worst path.
-const HB_A_CUTOFF: f64 = 0.224;
+pub(crate) const HB_A_CUTOFF: f64 = 0.224;
 
 /// Below this a 0..=1 dial is at its resting position and means OFF.
 const DRIVE_OFF: f32 = 0.0005;
@@ -140,6 +140,14 @@ fn dial(v: f32, rest: f32) -> f32 {
 }
 
 // ── the halfband pair ───────────────────────────────────────────────────────
+//
+// **Shared with `crate::analog`, deliberately.** The synth runs its ladder
+// and its mixer overload at 4× and needs exactly this pair — the same
+// Kaiser designer, the same tap counts, the same shaded cutoff — plus the
+// ADAA knee below it for the overload. The pieces are `pub(crate)` rather
+// than copied: a second oversampler in this repo would be a second place
+// for an alias to hide, and the alias test at the bottom of this file
+// would not know about it.
 
 /// Modified Bessel I₀ by its power series — all the Kaiser window needs,
 /// and it converges in a few dozen terms for any β this file uses.
@@ -159,7 +167,7 @@ fn bessel_i0(x: f64) -> f64 {
 /// A Kaiser-windowed sinc low-pass with its cutoff at `fc` of the running
 /// rate, DC gain one. At `fc = 0.25` this is the classic halfband — every
 /// second off-centre tap a true zero.
-fn windowed_sinc<const N: usize>(beta: f64, fc: f64) -> [f32; N] {
+pub(crate) fn windowed_sinc<const N: usize>(beta: f64, fc: f64) -> [f32; N] {
     let m = (N - 1) as f64 / 2.0;
     let denom = bessel_i0(beta);
     let mut taps = [0.0_f32; N];
@@ -180,17 +188,17 @@ fn windowed_sinc<const N: usize>(beta: f64, fc: f64) -> [f32; N] {
 /// A direct-form FIR delay line. Taps live outside so both channels (and
 /// both directions) share one designed set.
 #[derive(Clone)]
-struct Fir<const N: usize> {
+pub(crate) struct Fir<const N: usize> {
     z: [f32; N],
     pos: usize,
 }
 
 impl<const N: usize> Fir<N> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { z: [0.0; N], pos: 0 }
     }
     #[inline]
-    fn run(&mut self, taps: &[f32; N], x: f32) -> f32 {
+    pub(crate) fn run(&mut self, taps: &[f32; N], x: f32) -> f32 {
         self.pos = if self.pos == 0 { N - 1 } else { self.pos - 1 };
         self.z[self.pos] = x;
         let mut acc = 0.0_f32;
@@ -200,7 +208,7 @@ impl<const N: usize> Fir<N> {
         }
         acc
     }
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.z = [0.0; N];
         self.pos = 0;
     }
@@ -241,7 +249,7 @@ impl Default for DriveParams {
 /// `ln(cosh(t))`, overflow-safe: for any sizeable `|t|` it is just
 /// `|t| − ln 2` plus a vanishing correction, so the naive `cosh` never runs.
 #[inline]
-fn ln_cosh(t: f64) -> f64 {
+pub(crate) fn ln_cosh(t: f64) -> f64 {
     let a = t.abs();
     a + (-2.0 * a).exp().ln_1p() - std::f64::consts::LN_2
 }
@@ -249,7 +257,7 @@ fn ln_cosh(t: f64) -> f64 {
 /// The diode knee: a tanh at the ceiling for the sign of `x` — one drop on
 /// the positive side, and two when the symmetry toggle stacks them.
 #[inline]
-fn knee(x: f64, pos: f64, neg: f64) -> f64 {
+pub(crate) fn knee(x: f64, pos: f64, neg: f64) -> f64 {
     let ceil = if x >= 0.0 { pos } else { neg };
     ceil * (x / ceil).tanh()
 }
@@ -258,7 +266,7 @@ fn knee(x: f64, pos: f64, neg: f64) -> f64 {
 /// zero on both sides, so the pieces join with continuous value AND slope
 /// and one global antiderivative covers the asymmetric curve.
 #[inline]
-fn knee_integral(x: f64, pos: f64, neg: f64) -> f64 {
+pub(crate) fn knee_integral(x: f64, pos: f64, neg: f64) -> f64 {
     let ceil = if x >= 0.0 { pos } else { neg };
     ceil * ceil * ln_cosh(x / ceil)
 }
@@ -277,7 +285,7 @@ fn knee_integral(x: f64, pos: f64, neg: f64) -> f64 {
 /// near-equal numbers, and the fallback (the curve at the midpoint) takes
 /// over when the segment is too short to divide safely.
 #[inline]
-fn clip_adaa(x: f32, x1: f32, pos: f32, neg: f32) -> f32 {
+pub(crate) fn clip_adaa(x: f32, x1: f32, pos: f32, neg: f32) -> f32 {
     let (x, x1) = (f64::from(x), f64::from(x1));
     let (pos, neg) = (f64::from(pos), f64::from(neg));
     let dx = x - x1;
