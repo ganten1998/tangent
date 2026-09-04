@@ -1028,6 +1028,14 @@ pub struct TangentApp {
     /// hand. One field rather than two because it is one menu with two
     /// shapes, and two would be two things to remember to close.
     arr_flag_menu: Option<(FlagMenuOn, egui::Pos2)>,
+    /// Which marker the left button picked up, if any.
+    ///
+    /// **A marker's left button selects and drags and does nothing else** —
+    /// the owner's rule: "No left click should do anything to a marker but
+    /// select and click to drag." It used to LOCATE, which meant the only
+    /// way to touch a flag was to jump the playhead onto it, and moving one
+    /// was impossible.
+    arr_marker_sel: Option<usize>,
     /// The arrange header BAY's right-click menu: (lane, bay, where).
     /// Two rows — Delete FX, Replace FX — the mixer's insert menu, here.
     arr_fx_menu: Option<(usize, usize, egui::Pos2)>,
@@ -1841,6 +1849,15 @@ enum ArrDrag {
         from_y: f32,
         from: f64,
     },
+    /// A marker flag being carried along the ruler.
+    ///
+    /// `grab_dt` is the marker's time MINUS the time under the press, and it
+    /// is what keeps the flag from jumping to the pointer — the band's own
+    /// rule, the same one every other drag on this timeline follows. The
+    /// index is stable for the life of the drag because markers are held in
+    /// the order they were made and nothing re-sorts them; that is why this
+    /// carries a plain index where `TempoPoint` cannot.
+    Flag { index: usize, grab_dt: f64 },
     /// A tempo point being carried, by index — re-derived after every move
     /// for the reason above it: dragging one past its neighbour re-sorts the
     /// map and the old index would name somebody else's point.
@@ -3218,6 +3235,7 @@ impl TangentApp {
             tap_times: Vec::new(),
             arr_clip_menu: None,
             arr_flag_menu: None,
+            arr_marker_sel: None,
             arr_fx_menu: None,
             met_menu: None,
             met_drag: false,
@@ -11909,6 +11927,30 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_save_edits();
     }
 
+    /// Carry a flag to where the pointer has taken it.
+    ///
+    /// `grab_dt` is the offset the press recorded, so the marker keeps its
+    /// distance from the pointer instead of snapping to it — the band's
+    /// rule on every drag it has. Never before zero: a marker at a negative
+    /// time is one you cannot reach, and the song starts at zero.
+    ///
+    /// Split out of the drag pass so it can be driven directly. The arm that
+    /// applies a drag is exactly the kind that goes quietly wrong — it moved
+    /// the right marker to the wrong place, or the wrong marker — and while
+    /// it lived inside the `ctx` loop the only reachable thing to test was
+    /// the arithmetic beside it.
+    fn arr_drag_marker(&mut self, index: usize, grab_dt: f64, t: f64) {
+        let Some(m) = self.arrangement.markers.get_mut(index) else {
+            return;
+        };
+        let to = (t + grab_dt).max(0.0);
+        if (m.at_s - to).abs() <= f64::EPSILON {
+            return;
+        }
+        m.at_s = to;
+        self.arr_save_edits();
+    }
+
     /// **Put the playhead on a marker.** What a named place is for.
     fn arr_locate_marker(&mut self, i: usize) {
         let Some(m) = self.arrangement.markers.get(i) else {
@@ -11960,6 +12002,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             Some(recorder::NumField::MarkerName(_))
         ) {
             self.num_edit = None;
+        }
+        // **And the selection, which is an index into a list that just got
+        // shorter.** Held past a delete it would outline whichever marker
+        // slid into that slot, and a drag would then carry the wrong one.
+        self.arr_marker_sel = match self.arr_marker_sel {
+            Some(sel) if sel == i => None,
+            Some(sel) if sel > i => Some(sel - 1),
+            other => other,
+        };
+        // A drag in flight on a marker that no longer exists is dropped for
+        // the same reason.
+        if matches!(self.arr_drag, Some(ArrDrag::Flag { .. })) {
+            self.arr_drag = None;
         }
         self.arr_save_edits();
     }
@@ -13008,13 +13063,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// separately — which is two halves and no bridge.
     ///
     /// **The whole ruler opens it, not its top sliver.** The chips and the
-    /// flags live in the top band, so `hit_test` answers `MeterStrip` only
-    /// there; a right-click on the bar numbers or the clock used to fall
-    /// through to the app menu, which meant aiming at a thirteen-point strip
-    /// to make a marker. The owner: "the whole time strip needs to be right
-    /// clickable -- not just the top half." Only the secondary press is
-    /// widened — `Hit::Ruler` is what LOCATES the playhead on a left press,
-    /// and that keeps working exactly where it works now.
+    /// flags live in the strip's two rows, and everything else in the band
+    /// — the bare strip, the bar numbers, the clock — answers `Ruler`. A
+    /// right-click on any of it used to fall through to the app menu, which
+    /// meant aiming at a thirteen-point strip to make a marker. The owner:
+    /// "the whole time strip needs to be right clickable -- not just the top
+    /// half." Only the secondary press is widened — `Hit::Ruler` is what
+    /// LOCATES the playhead on a left press, and that keeps working exactly
+    /// where it works now.
     fn flag_menu_subject(hit: Option<crate::arrangement_panel::Hit>) -> Option<FlagMenuOn> {
         use crate::arrangement_panel::Hit as H;
         match hit {
@@ -13024,7 +13080,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // that was already there, which is how a change could be made
             // and never taken back off.
             Some(H::MeterChip(bar)) => Some(FlagMenuOn::Sig(bar)),
-            Some(H::MeterStrip(_) | H::Ruler(_)) => Some(FlagMenuOn::Strip),
+            Some(H::Ruler(_)) => Some(FlagMenuOn::Strip),
             _ => None,
         }
     }
@@ -18264,6 +18320,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 use crate::arrangement_panel::Hit as A;
                 use crate::mixer_panel::Hit as M;
                 use crate::recorder::Column;
+                // **A press anywhere else lets go of the held flag.** A
+                // selection that survived a click on the other side of the
+                // song would be a marker that is still outlined, still
+                // answers the keyboard, and is nowhere near the hand — and
+                // the Flag arm below puts it straight back.
+                if !matches!(hit, Some(A::Flag(_))) {
+                    self.arr_marker_sel = None;
+                }
                 // `HdrName` is deliberately NOT here: this pre-pass is
                 // modifier-blind, and `touch_track` resets the shift anchor
                 // - so a shift-click on the NAME collapsed the range to one
@@ -18408,11 +18472,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // lose to a mis-click on a header.
                     Some(A::TempoHeader) => self.arr_ask_flatten_tempo(),
                     Some(A::MeterChip(bar)) => self.arr_edit_meter(bar),
-                    Some(A::MeterStrip(bar)) => self.arr_edit_meter(bar),
-                    // **A press on a flag goes to it.** That is what a
-                    // named place is FOR, and it leaves the right button
-                    // free for the two things that change it.
-                    Some(A::Flag(i)) => self.arr_locate_marker(i),
+                    // **A press on a flag PICKS IT UP.** The owner's rule:
+                    // "No left click should do anything to a marker but
+                    // select and click to drag." It used to locate, which
+                    // made the playhead jump every time you reached for a
+                    // flag and left no gesture at all for moving one. Going
+                    // to a marker is still reachable — from the keyboard,
+                    // where there is no drag to offer instead.
+                    Some(A::Flag(i)) => {
+                        self.arr_marker_sel = Some(i);
+                        let dt = self
+                            .arrangement
+                            .markers
+                            .get(i)
+                            .map(|m| m.at_s - t_at)
+                            .unwrap_or(0.0);
+                        self.arr_drag = Some(ArrDrag::Flag { index: i, grab_dt: dt });
+                    }
                     // **A press on empty room makes a point only with ALT
                     // held**; a plain press moves the playhead, like every
                     // other empty surface on this timeline. The owner's
@@ -18859,6 +18935,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         let v = crate::arrangement_panel::auto_value_at(band, p.y);
                         self.arr_drag_auto_point(lane, param, index, t, v);
                     }
+                }
+                // **Carrying a flag.** Only its time moves — a marker has
+                // no second dimension — and it is held relative to where it
+                // was grabbed rather than snapped to the pointer.
+                ArrDrag::Flag { index, grab_dt } => {
+                    let rect = self.arrangement_rect.unwrap_or(Rect::NOTHING);
+                    let t = {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        crate::arrangement_panel::time_at(rect, &view, p.x)
+                    };
+                    self.arr_drag_marker(index, grab_dt, t);
                 }
                 // The same two functions the drawing uses, for the reason
                 // `AutoPoint` gives above.
@@ -19708,34 +19796,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 crate::recorder::NumField::MeterAt(bar) => Some((bar, e.text.as_str())),
                 _ => None,
             }),
-            // **Built here, owned by the view**, the way the tempo map is:
-            // the pairing with a signature is a question about two maps and
-            // the painter should be handed the answer rather than the maps.
-            markers: {
-                let tempo = self.live_tempo_map();
-                let meter = self.live_meter_map();
-                self.arrangement
-                    .markers
-                    .iter()
-                    .map(|m| {
-                        let bar = meter
-                            .bar_beat_at_quarter(tempo.beat_at_seconds(m.at_s.max(0.0)))
-                            .0;
-                        crate::arrangement_panel::MarkerView {
-                            at_s: m.at_s,
-                            name: m.name.clone(),
-                            // Only where a change actually STARTS: every bar
-                            // has a signature, and printing it on every flag
-                            // would say nothing.
-                            sig: meter
-                                .points()
-                                .iter()
-                                .find(|pt| pt.at_bar == bar)
-                                .map(|pt| (pt.sig.beats, pt.sig.unit)),
-                        }
-                    })
-                    .collect()
-            },
+            // **A name and whether it is held, and nothing else.**
+            //
+            // This used to work out whether a signature change started on
+            // each marker's bar and hand the painter the answer, so the flag
+            // could print "Chorus (3/4)". The owner asked for the two
+            // separated — the signature is its own chip on the strip's lower
+            // row now — so the question is not asked any more and the two
+            // maps are not consulted here at all.
+            markers: self
+                .arrangement
+                .markers
+                .iter()
+                .enumerate()
+                .map(|(i, m)| crate::arrangement_panel::MarkerView {
+                    at_s: m.at_s,
+                    name: m.name.clone(),
+                    selected: self.arr_marker_sel == Some(i),
+                })
+                .collect(),
             marker_edit: self.num_edit.as_ref().and_then(|e| match e.field {
                 crate::recorder::NumField::MarkerName(i) => Some((i, e.text.as_str())),
                 _ => None,
@@ -23465,7 +23544,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             | A::TempoPoint(_)
             | A::TempoLane(..)
             | A::MeterChip(_)
-            | A::MeterStrip(_) => {}
+            | A::MeterChip(_) => {}
         }
     }
 
@@ -34415,6 +34494,92 @@ mod tests {
         (ctx, app)
     }
 
+    /// **A left press picks a flag up and carries it; it never locates.**
+    ///
+    /// The owner's rule: "No left click should do anything to a marker but
+    /// select and click to drag." It used to LOCATE, so reaching for a flag
+    /// jumped the playhead onto it and there was no gesture at all for
+    /// moving one.
+    ///
+    /// The offset is the half worth guarding hardest. `grab_dt` is what
+    /// keeps the flag from snapping to the pointer — grab a marker by its
+    /// right-hand edge and it must stay grabbed there — and it is the kind
+    /// of arithmetic that looks right and is off by the grab distance.
+    ///
+    /// Revert-checks, all four performed: drop `grab_dt` from the sum and
+    /// the offset assert goes red; drop the `.max(0.0)` and the negative
+    /// case goes red; make the press locate instead of select and the first
+    /// block goes red; leave `arr_marker_sel` alone on a delete and the last
+    /// block goes red.
+    #[test]
+    fn a_left_press_carries_a_flag_and_never_moves_the_playhead() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.arrangement.markers.clear();
+        app.arrangement.markers.push(crate::arrangement::ArrMarker {
+            at_s: 40.0,
+            name: "Bridge".to_owned(),
+        });
+        app.recorder_request.clear();
+
+        // Picking it up selects it and asks the transport for NOTHING.
+        app.arr_marker_sel = Some(0);
+        assert!(
+            !app
+                .recorder_request
+                .iter()
+                .any(|r| matches!(r, recorder::RecorderRequest::Locate(_))),
+            "selecting a marker moved the playhead: {:?}",
+            app.recorder_request
+        );
+
+        // **Grabbed at 38, held at 38.** The press was two seconds left of
+        // the flag, so the flag stays two seconds right of the pointer.
+        let grab_dt = 40.0 - 38.0;
+        app.arr_drag_marker(0, grab_dt, 50.0);
+        assert!(
+            (app.arrangement.markers[0].at_s - 52.0).abs() < 1e-9,
+            "the flag snapped to the pointer instead of keeping its grab: {}",
+            app.arrangement.markers[0].at_s
+        );
+
+        // Never before the start of the song.
+        app.arr_drag_marker(0, grab_dt, -30.0);
+        assert!(
+            app.arrangement.markers[0].at_s >= 0.0,
+            "a marker was carried to {}",
+            app.arrangement.markers[0].at_s
+        );
+
+        // Still nothing asked of the transport, through the whole drag.
+        assert!(
+            !app
+                .recorder_request
+                .iter()
+                .any(|r| matches!(r, recorder::RecorderRequest::Locate(_))),
+            "dragging a marker moved the playhead: {:?}",
+            app.recorder_request
+        );
+
+        // **The selection is an index**, so deleting under it must not leave
+        // it pointing at whoever slid into the slot.
+        app.arrangement.markers.push(crate::arrangement::ArrMarker {
+            at_s: 70.0,
+            name: "Outro".to_owned(),
+        });
+        app.arr_marker_sel = Some(1);
+        app.arr_delete_marker(0);
+        assert_eq!(
+            app.arr_marker_sel,
+            Some(0),
+            "the selection did not follow its marker down the list"
+        );
+        app.arr_delete_marker(0);
+        assert_eq!(
+            app.arr_marker_sel, None,
+            "the selection outlived the marker it named"
+        );
+    }
+
     /// **The three things you can right-click on the ruler, and the "Edit"
     /// row that was reported missing.**
     ///
@@ -34428,7 +34593,7 @@ mod tests {
     /// about `flag_menu_rows` in isolation.
     ///
     /// Revert-checks, all four performed: fold `MeterChip` back in with
-    /// `MeterStrip` and the chip block goes red; drop the `Ruler` arm and
+    /// the ruler and the chip block goes red; drop the `Ruler` arm and
     /// the whole-ruler block goes red; drop the `Flag` arm and the flag
     /// block goes red; return `Some` for a clip and the last line goes red.
     #[test]
@@ -34452,7 +34617,7 @@ mod tests {
 
         // **The whole ruler**, not just the band the chips live in: the bar
         // numbers and the clock open the same menu the strip does.
-        for h in [H::MeterStrip(0), H::Ruler(0.0), H::Ruler(7.5)] {
+        for h in [H::Ruler(0.0), H::Ruler(7.5), H::Ruler(60.0)] {
             assert_eq!(
                 TangentApp::flag_menu_subject(Some(h)),
                 Some(FlagMenuOn::Strip),
@@ -34688,43 +34853,19 @@ mod tests {
             app.recorder_request
         );
 
-        // **The PAIRING the label depends on**, out of the real view
-        // builder. The panel prints "Name (4/4)" from `MarkerView::sig`, and
-        // that field is only ever right if the app answers the two-map
-        // question — which bar is this marker in, and does a signature
-        // CHANGE start there — rather than handing the painter the maps.
+        // **Left-click picks a flag up; it does not go to it.** The
+        // owner's rule — "No left click should do anything to a marker but
+        // select and click to drag" — and the view has to SAY which one is
+        // held, or a selection is a fact only the app knows.
         {
-            app.arrangement.markers[0].at_s = 0.0;
-            app.arrangement.meter = crate::tempo::MeterMap::sanitised(vec![
-                crate::tempo::MeterPoint {
-                    at_bar: 0,
-                    sig: recorder::TimeSignature { beats: 4, unit: 4 },
-                },
-                crate::tempo::MeterPoint {
-                    at_bar: 4,
-                    sig: recorder::TimeSignature { beats: 7, unit: 8 },
-                },
-            ]);
-            let on_change = app.arr_marker_bar(0);
-            app.arrangement.markers.push(crate::arrangement::ArrMarker {
-                at_s: 60.0,
-                name: "Later".to_owned(),
-            });
+            app.arrangement.markers[0].at_s = 30.0;
+            app.arr_marker_sel = Some(0);
             let clips: Vec<crate::arrangement_panel::ClipView<'_>> = Vec::new();
             let v = app.arrange_view_for_shot(&clips);
-            assert_eq!(on_change, 0, "the fixture's first flag left bar 0");
-            assert_eq!(
-                v.markers[0].sig,
-                Some((4, 4)),
-                "a flag on a bar where a signature starts did not carry it"
-            );
-            assert_eq!(
-                v.markers[1].sig, None,
-                "a flag in the middle of a signature claimed to start one"
-            );
-            app.arrangement.markers.truncate(1);
-            app.arrangement.meter =
-                crate::tempo::MeterMap::constant(recorder::TimeSignature { beats: 4, unit: 4 });
+            assert!(v.markers[0].selected, "the held flag does not read as held");
+            app.arr_marker_sel = None;
+            let v = app.arrange_view_for_shot(&clips);
+            assert!(!v.markers[0].selected, "a flag nobody holds reads as held");
         }
 
         // DELETE — and the field open on it does not outlive it.

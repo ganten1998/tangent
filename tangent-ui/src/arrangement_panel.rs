@@ -340,9 +340,10 @@ pub fn auto_header(header: Rect) -> AutoHeader {
 pub struct MarkerView {
     pub at_s: f64,
     pub name: String,
-    /// `Some((beats, unit))` when a signature change starts at this
-    /// marker's bar, so the flag can say both.
-    pub sig: Option<(u8, u8)>,
+    /// Whether this is the flag a left-press picked up. A marker's left
+    /// button now SELECTS and drags and does nothing else — the owner's
+    /// rule — so the strip has to say which one is held.
+    pub selected: bool,
 }
 
 /// Everything the arrangement draws, pushed in.
@@ -573,7 +574,6 @@ pub enum Hit {
     MeterChip(u32),
     /// The ruler's chip strip, where there is no chip: `bar`. A press adds a
     /// signature change at that bar.
-    MeterStrip(u32),
     ToolMetronome,
     /// The toolbar: the magnet.
     ToolSnap,
@@ -665,26 +665,57 @@ pub const MASTER_COLUMN: usize = CHANNELS + 1;
 /// "heighten the loop/timereadout strip" for exactly that reason. The ruler
 /// has to grow with it or the bar numbers and the clock below lose the room
 /// the strip takes.
-const RULER_H: (f32, f32, f32) = (0.085, 22.0, 34.0);
+const RULER_H: (f32, f32, f32) = (0.10, 18.0, 44.0);
 
-/// The size the ruler strip's words are set at, from the strip's height.
+/// **The ruler strip is two rows: names on top, signatures under them.**
+///
+/// It was one row carrying both, and a marker that shared a bar with a
+/// signature change was printed as a single label — "Chorus (3/4)". The
+/// owner asked for that undone: "no more 'name (timesig)' just 'name' and
+/// time sig is seperate and when they are both on one spot, the time sig
+/// will sit below the label."
+///
+/// Two fixed rows rather than a rule that moves a chip down only when
+/// something is over it. A signature that lived on the upper row until a
+/// marker arrived and then jumped to the lower one is a thing that moves
+/// under the hand for reasons the hand did not cause; a reader who has
+/// learned "names up here, signatures down there" has learned it once and
+/// it is true on every song. The stacking the owner asked for then falls
+/// out of the layout rather than out of a special case.
+///
+/// The name row is the taller of the two: it carries WORDS, where the other
+/// carries three characters on a chip.
+fn flag_row(strip: Rect) -> Rect {
+    Rect::from_min_max(
+        strip.min,
+        Pos2::new(strip.right(), strip.top() + strip.height() * 0.55),
+    )
+}
+
+/// The signature row: the strip's lower band. See [`flag_row`].
+fn sig_row(strip: Rect) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(strip.left(), strip.top() + strip.height() * 0.55),
+        strip.max,
+    )
+}
+
+/// The size a row's words are set at, from that ROW's height.
 ///
 /// **One definition**, because the painter lays the chips and flags out at
 /// this size and the hit-test re-derives their widths from it: the two
 /// drifting apart by a point is a label you can read and cannot press. It
 /// was two copies of `(h * 0.78).clamp(6.0, 10.0)` until the strip grew.
-fn strip_font_h(strip: Rect) -> f32 {
-    (strip.height() * 0.74).clamp(8.0, 12.0)
+fn strip_font_h(row: Rect) -> f32 {
+    (row.height() * 0.72).clamp(7.5, 12.0)
 }
 
-/// How much of the strip a chip or a flag actually fills.
+/// How much of its row a chip or a flag actually fills.
 ///
-/// The flags sit ATOP the strip — the owner's word — so the pole can be seen
-/// crossing the rest of it on its way down. A box that filled the strip
-/// would hide the line that says which moment it belongs to, which is the
-/// whole job of a flag over a ruler.
-fn strip_box_h(strip: Rect) -> f32 {
-    (strip.height() * 0.74).max(9.0).min(strip.height())
+/// Not all of it: the pole has to be seen leaving the box on its way down,
+/// which is the whole job of a flag over a ruler.
+fn strip_box_h(row: Rect) -> f32 {
+    (row.height() * 0.82).max(8.0).min(row.height())
 }
 
 /// How wide a clip's trim edge is, in points, and its fade corner square.
@@ -1160,12 +1191,19 @@ impl Layout {
         // Always: the flags and the chips share it, and a song has no
         // markers until somebody right-clicks the strip to make one.
         let meter_strip = {
-            // **A smaller SHARE of a taller ruler.** At 46% the strip read
-            // as half the band and the owner's word for it was "tight" —
-            // the bar numbers and the clock were pressed into what was
-            // left. 40% of 34 points is the same 13-point strip, with a
-            // third of the ruler given back to the two rows underneath.
-            let h = (ruler_h * 0.40).clamp(12.0, 16.0).min(ruler_h * 0.5);
+            // **TWO rows now, so the band is bigger again.** Markers on
+            // top, signatures under them — see [`flag_row`]. It was one row
+            // holding both, with a co-located pair printed as one label,
+            // and the owner asked for them separated. Two rows need the
+            // height of two rows; the ruler grew with it so the bar numbers
+            // and the clock keep the room they got.
+            // **No hard floor**, only a share and a ceiling. A floor of 24
+            // points was 19% of a 150-point arrangement's whole height and
+            // pushed the lanes' own controls off the bottom — a guard
+            // caught it. The band shrinks with the ruler instead; at a size
+            // where the strip cannot carry two readable rows, nothing else
+            // on this view is readable either.
+            let h = (ruler_h * 0.55).clamp(8.0, 28.0);
             Rect::from_min_max(ruler.min, Pos2::new(ruler.right(), ruler.top() + h))
         };
         let lanes_area = Rect::from_min_max(
@@ -1382,27 +1420,46 @@ impl Layout {
             Pos2::new(rect.left() + header_w, rect.top() + ruler_h),
         )
         .shrink2(Vec2::new(3.0, 2.0));
-        let side = (corner.height()).clamp(1.0, 20.0);
+        // **All four the same size, and sized to the room they now have.**
+        //
+        // They were three squares capped at twenty points and a grid box
+        // 2.4 times as wide as the rest — four controls in three sizes,
+        // which read as three unrelated things and a mistake. The owner:
+        // "make the 4 buttons (met, grid, tempo arm, and frequency) equal
+        // sized and fit their new area". The corner grew when the ruler did,
+        // so a fixed twenty-point cap now leaves half of it empty.
+        //
+        // The side is whichever runs out first: the corner's HEIGHT, or the
+        // width five and a half cells need — the four buttons, their gaps,
+        // and the navigator's own minimum of one and a half. Solving for the
+        // navigator here rather than letting it take what is left is what
+        // stops a narrow header from growing four fat buttons and leaving it
+        // nothing, which is how it would disappear on the smallest header
+        // the seam allows.
+        const TOOL_GAP: f32 = 3.0;
+        const TOOL_MAX: f32 = 28.0;
+        let side = corner
+            .height()
+            .min((corner.width() - TOOL_GAP * 4.0) / 5.5)
+            .clamp(1.0, TOOL_MAX);
+        // Centred in the corner's height: the cells are square and the
+        // corner is taller than they are, and a row of buttons pinned to the
+        // top of a band with room under it reads as having slipped.
+        let top = corner.top() + ((corner.height() - side) * 0.5).max(0.0);
         let cell = |k: f32| {
             Rect::from_min_size(
-                Pos2::new(corner.left() + k * (side + 3.0), corner.top()),
+                Pos2::new(corner.left() + k * (side + TOOL_GAP), top),
                 Vec2::splat(side),
             )
         };
-        let (tool_met, tool_snap, tool_tempo) = (cell(0.0), cell(1.0), cell(2.0));
-        let tool_grid = Rect::from_min_max(
-            Pos2::new(tool_tempo.right() + 3.0, corner.top()),
-            Pos2::new(
-                (tool_tempo.right() + 3.0 + side * 2.4).min(corner.right()),
-                corner.bottom(),
-            ),
-        );
+        let (tool_met, tool_snap, tool_tempo, tool_grid) =
+            (cell(0.0), cell(1.0), cell(2.0), cell(3.0));
         // The NAVIGATOR takes whatever the corner has left — longer than
         // the gridbox, as asked: a rectangle inside a rectangle, and a
         // hand on it steers the whole view.
         let tool_nav = Rect::from_min_max(
-            Pos2::new(tool_grid.right() + 3.0, corner.top()),
-            corner.max,
+            Pos2::new(tool_grid.right() + TOOL_GAP, top),
+            Pos2::new(corner.right(), top + side),
         )
         .intersect(corner);
         let tool_nav = if tool_nav.width() >= side * 1.5 {
@@ -2466,26 +2523,41 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             return Some(Hit::HdrRouting(i));
         }
     }
-    // **The signature chips, before the ruler itself.** They sit ON the
+    // **The strip's two rows, before the ruler itself.** They sit ON the
     // ruler and a press on one must not also locate — the same pre-pass rule
     // the band's timeline × follows.
     if l.meter_strip.is_positive() && l.meter_strip.contains(pos) {
-        let font_h = strip_font_h(l.meter_strip);
-        // **Flags answer first**, because they are painted over the chips and
-        // the thing under the pointer is the thing that was drawn last.
-        for (i, m) in view.markers.iter().enumerate().rev() {
-            let x = x_of(rect, view, m.at_s);
-            let shown = match m.sig {
-                Some((b, u)) if m.name.is_empty() => format!("({b}/{u})"),
-                Some((b, u)) => format!("{} ({b}/{u})", m.name),
-                None if m.name.is_empty() => "\u{2691}".to_owned(),
-                None => m.name.to_owned(),
-            };
-            let w = (font_h * 0.62 * shown.chars().count() as f32 + 8.0).max(font_h * 2.2);
-            if pos.x >= x && pos.x <= x + w {
-                return Some(Hit::Flag(i));
+        let names = flag_row(l.meter_strip);
+        let sigs = sig_row(l.meter_strip);
+        // **Each row answers for its own kind**, which is what separating
+        // them bought: a flag and a signature on the same beat no longer
+        // overlap, so there is no "which was drawn last" to resolve. The
+        // reverse walk stays, for two markers close enough to overlap each
+        // other — there the later one is still the one on top.
+        if names.contains(pos) {
+            let font_h = strip_font_h(names);
+            for (i, m) in view.markers.iter().enumerate().rev() {
+                let x = x_of(rect, view, m.at_s);
+                let shown = match view.marker_edit.filter(|(n, _)| *n == i) {
+                    Some((_, t)) => format!("{t}|"),
+                    None if m.name.is_empty() => "\u{2691}".to_owned(),
+                    None => m.name.clone(),
+                };
+                let w = (font_h * 0.62 * shown.chars().count() as f32 + 8.0).max(font_h * 2.2);
+                if pos.x >= x && pos.x <= x + w {
+                    return Some(Hit::Flag(i));
+                }
             }
+            // **Bare name row is RULER, and that is deliberate.** It used
+            // to answer `MeterStrip`, whose left press opened a signature
+            // field — which was tolerable when the strip was eight points
+            // and is not now that it is twenty-five: a quarter of the ruler
+            // would swallow every click meant to move the playhead. Left
+            // locates, right opens the menu (`flag_menu_subject` maps
+            // `Ruler` to the same rows), which is the split the owner asked
+            // for on the flags and is the right one here too.
         }
+        let font_h = strip_font_h(sigs);
         for pt in view.meter.points() {
             let typing = view.meter_edit.filter(|(b, _)| *b == pt.at_bar);
             // Skipped exactly where the painter skips it, typing included —
@@ -2508,10 +2580,9 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
                 return Some(Hit::MeterChip(pt.at_bar));
             }
         }
-        // Empty strip: the bar under the pointer, which is where a new
-        // signature would start. Snapped to a BAR by construction — a
-        // signature change part-way through a bar is not a thing.
-        return Some(Hit::MeterStrip(bar_of(view, time_at(rect, view, pos.x))));
+        // Bare signature row falls through to the ruler as well, for the
+        // reason above: the whole band locates unless something is under
+        // the pointer.
     }
     // **The tempo lane**, on the same terms as an automation row: the
     // handles overhang, so it is checked before the rows below it.
@@ -3126,8 +3197,7 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
             | Hit::AutoMenu(_)
             | Hit::TempoPoint(_)
             | Hit::TempoLane(..)
-            | Hit::MeterChip(_)
-            | Hit::MeterStrip(_) => continue,
+            | Hit::MeterChip(_) => continue,
         };
         out.push(node);
     }
@@ -4585,8 +4655,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // song-wide markers would take height from the tracks to say something
     // the bar numbers are already sitting next to.
     if l.meter_strip.is_positive() {
-        let font = FontId::new(strip_font_h(l.meter_strip), crate::fonts::courier());
-        let box_h = strip_box_h(l.meter_strip);
+        let names = flag_row(l.meter_strip);
+        let sigs = sig_row(l.meter_strip);
+        let font = FontId::new(strip_font_h(sigs), crate::fonts::courier());
+        let box_h = strip_box_h(sigs);
         for pt in view.meter.points() {
             let typing = view.meter_edit.filter(|(b, _)| *b == pt.at_bar);
             // Bar 0's signature is the song's, not a CHANGE — there is
@@ -4615,10 +4687,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // A minimum width, so a chip emptied down to its caret is still
             // a rectangle somebody can see and aim at.
             let w = (font.size * 0.62 * text.chars().count() as f32 + 6.0).max(font.size * 2.2);
-            let chip = Rect::from_min_size(
-                Pos2::new(x, l.meter_strip.top()),
-                Vec2::new(w, box_h),
-            );
+            let chip = Rect::from_min_size(Pos2::new(x, sigs.top()), Vec2::new(w, box_h));
             // **A chip has a pole too.** It marks a bar the same way a flag
             // marks a moment, and at the strip's new height a box floating
             // over the ruler with nothing under it does not say WHICH bar.
@@ -4650,27 +4719,26 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // legible: the two share a place by design, and the label says both
         // — "Chorus (3/4)" — rather than stacking a chip under a flag and
         // letting the eye work it out.
+        let nfont = FontId::new(strip_font_h(names), crate::fonts::courier());
+        let nbox = strip_box_h(names);
         for (i, m) in view.markers.iter().enumerate() {
             let x = x_of(rect, view, m.at_s);
             if x < l.meter_strip.left() - 2.0 || x > l.meter_strip.right() + 2.0 {
                 continue;
             }
             let typing = view.marker_edit.filter(|(n, _)| *n == i);
+            // **The name, and only the name.** A signature that starts on
+            // this marker's bar is drawn as its own chip on the row below —
+            // see [`flag_row`] for why the two are separated rather than
+            // printed as "Chorus (3/4)".
             let shown = match typing {
                 Some((_, t)) => format!("{t}|"),
-                None => match m.sig {
-                    Some((b, u)) if m.name.is_empty() => format!("({b}/{u})"),
-                    Some((b, u)) => format!("{} ({b}/{u})", m.name),
-                    None if m.name.is_empty() => "\u{2691}".to_owned(),
-                    None => m.name.to_owned(),
-                },
+                None if m.name.is_empty() => "\u{2691}".to_owned(),
+                None => m.name.clone(),
             };
-            let w = (font.size * 0.62 * shown.chars().count() as f32 + 8.0)
-                .max(font.size * 2.2);
-            let flag = Rect::from_min_size(
-                Pos2::new(x, l.meter_strip.top()),
-                Vec2::new(w, box_h),
-            );
+            let w = (nfont.size * 0.62 * shown.chars().count() as f32 + 8.0)
+                .max(nfont.size * 2.2);
+            let flag = Rect::from_min_size(Pos2::new(x, names.top()), Vec2::new(w, nbox));
             let body = if typing.is_some() {
                 p.select
             } else {
@@ -4695,11 +4763,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 Stroke::new(1.0, body),
             );
             painter.rect_filled(flag, 2.0, body);
+            // **The held one is outlined**, not recoloured: a flag that
+            // changed colour when picked up would be a flag that looks like
+            // a different KIND of marker while it is moving.
+            if m.selected {
+                painter.rect_stroke(
+                    flag.expand(1.0),
+                    3.0,
+                    Stroke::new(1.5, on_ink(body)),
+                    egui::StrokeKind::Outside,
+                );
+            }
             painter.text(
                 Pos2::new(flag.left() + 4.0, flag.center().y),
                 Align2::LEFT_CENTER,
                 &shown,
-                font.clone(),
+                nfont.clone(),
                 on_ink(body),
             );
         }
@@ -6069,10 +6148,78 @@ LaneView {
         let l = Layout::new(rect(), &v);
         let x = x_of(rect(), &v, bar_at(&v, 0)) + 3.0;
         assert_eq!(
-            hit_test(rect(), &v, Pos2::new(x, l.meter_strip.center().y)),
+            hit_test(rect(), &v, Pos2::new(x, sig_row(l.meter_strip).center().y)),
             Some(Hit::MeterChip(0)),
             "the open field at bar 0 is not where it was painted"
         );
+    }
+
+    /// **The corner's four buttons are one size, and they use the room the
+    /// taller ruler gave them.**
+    ///
+    /// They were three squares capped at twenty points and a grid box 2.4
+    /// times as wide — four controls in three sizes. The owner: "make the 4
+    /// buttons (met, grid, tempo arm, and frequency) equal sized and fit
+    /// their new area." Checked across the whole span of header widths the
+    /// seam allows, because the narrow end is where equal-sizing and the
+    /// navigator's minimum fight each other, and the wide end is where a
+    /// missing cap would let them grow silly.
+    ///
+    /// Revert-checks, all three performed: give `tool_grid` its old 2.4x
+    /// width and the equality assert goes red; cap `side` at 20 again and
+    /// the "uses the corner" assert goes red at the wide end; drop the
+    /// 5.5-cell division and the navigator vanishes on a 150-point header.
+    #[test]
+    fn the_corner_holds_four_buttons_of_one_size() {
+        let clips: Vec<ClipView<'_>> = Vec::new();
+        for hw in [150.0_f32, 170.0, 200.0, 220.0] {
+            let mut v = a_view(&clips);
+            v.header_w = Some(hw);
+            let l = Layout::new(rect(), &v);
+            let four = [l.tool_met, l.tool_snap, l.tool_tempo, l.tool_grid];
+            let first = four[0];
+            for (n, r) in four.iter().enumerate() {
+                assert!(r.is_positive(), "button {n} is not drawn at header {hw}");
+                assert!(
+                    (r.width() - first.width()).abs() < 0.01
+                        && (r.height() - first.height()).abs() < 0.01,
+                    "button {n} is {:.1}x{:.1} where the first is {:.1}x{:.1} at header {hw}",
+                    r.width(),
+                    r.height(),
+                    first.width(),
+                    first.height()
+                );
+                assert!(
+                    (r.width() - r.height()).abs() < 0.01,
+                    "button {n} is not square at header {hw}"
+                );
+            }
+            // **They use the room.** The old cap was 20 points against a
+            // corner that is 40 tall now.
+            assert!(
+                first.height() >= 24.0,
+                "the buttons are {:.1}pt in a {:.1}pt corner at header {hw}",
+                first.height(),
+                l.ruler.height()
+            );
+            // And the navigator still has somewhere to be, which is what
+            // stops the four from eating the corner.
+            assert!(
+                l.tool_nav.is_positive(),
+                "the navigator was squeezed out at header {hw}"
+            );
+            // In order, left to right, with air between them.
+            for pair in four.windows(2) {
+                assert!(
+                    pair[1].left() >= pair[0].right() + 1.0,
+                    "two buttons touch or overlap at header {hw}"
+                );
+            }
+            assert!(
+                l.tool_nav.left() >= l.tool_grid.right() + 1.0,
+                "the navigator overlaps the grid box at header {hw}"
+            );
+        }
     }
 
     /// **The strip is tall enough to read, and its words are one size.**
@@ -6122,30 +6269,29 @@ LaneView {
         );
     }
 
-    /// **A flag says its name, says the signature that shares its bar, and
-    /// answers the pointer where it was drawn.**
+    /// **A flag says its name and nothing else, a signature sits on the row
+    /// under it, and each answers the pointer in its own row.**
     ///
-    /// The owner's rule for the pairing: "When a time sig and marker exist
-    /// on the same place, they will read as Name then Time Sig in
-    /// parentheses." Two facts about one moment, on one label, rather than a
-    /// chip and a flag stacked on each other for the eye to reconcile.
+    /// The owner's redirection: "no more 'name (timesig)' just 'name' and
+    /// time sig is seperate and when they are both on one spot, the time sig
+    /// will sit below the label." So the strip is two rows — see
+    /// [`flag_row`] — and a marker sharing a bar with a change no longer
+    /// prints "Chorus (3/4)"; it prints "Chorus", with "3/4" beneath it.
     ///
-    /// The hit half is here because the two are one decision: the label's
-    /// width is what the flag covers, so a test that checked only the text
-    /// would pass on a flag nobody can click.
+    /// The fixture puts a marker on bar 4 AND a signature change on bar 4,
+    /// because that co-location is the whole subject: at 120 BPM in 4/4 a
+    /// bar is two seconds, so bar 4 is eight seconds and the two really do
+    /// land on the same pixel.
     ///
-    /// Revert-checks, both performed: drop the `sig` arm from the label and
-    /// the pairing assert goes red; hit-test the flags AFTER the signature
-    /// chips and the last block goes red, because the chip under the flag
-    /// answers first.
+    /// Revert-checks, all three performed: put the `sig` back into the
+    /// label and the "no parentheses" assert goes red; draw the flags in
+    /// `sig_row` and the stacking assert goes red; hit-test the whole strip
+    /// for flags rather than the name row and the last block goes red,
+    /// because the flag then answers for a press on the signature under it.
     #[test]
-    fn a_flag_says_its_name_and_the_signature_that_shares_its_bar() {
+    fn a_flag_says_its_name_and_a_signature_sits_on_the_row_below_it() {
         let clips: Vec<ClipView<'_>> = Vec::new();
         let mut v = a_view(&clips);
-        // 120 BPM in 4/4 makes a bar two seconds, so bar 4 IS eight seconds:
-        // the chip and the flag below really do land on the same pixel, which
-        // is the situation this whole item is about. A fixture where they
-        // merely both existed would prove nothing about either.
         v.meter = crate::tempo::MeterMap::sanitised(vec![
             crate::tempo::MeterPoint {
                 at_bar: 0,
@@ -6157,42 +6303,97 @@ LaneView {
             },
         ]);
         v.markers = vec![
-            MarkerView { at_s: 4.0, name: "Verse".to_owned(), sig: None },
-            MarkerView { at_s: 8.0, name: "Chorus".to_owned(), sig: Some((3, 4)) },
-            MarkerView { at_s: 12.0, name: String::new(), sig: None },
+            MarkerView { at_s: 4.0, name: "Verse".to_owned(), selected: false },
+            MarkerView { at_s: 8.0, name: "Chorus".to_owned(), selected: false },
+            MarkerView { at_s: 12.0, name: String::new(), selected: false },
         ];
         assert!(
             (bar_at(&v, 4) - 8.0).abs() < 1e-9,
             "the fixture's chip and flag are not on the same moment"
         );
+
         let words = strip_words(&v);
+        assert!(words.iter().any(|w| w == "Verse"), "{words:?}");
         assert!(
-            words.iter().any(|w| w == "Verse"),
-            "a plain marker did not say its name: {words:?}"
+            words.iter().any(|w| w == "Chorus"),
+            "the marker sharing a bar with a change did not say its plain name: {words:?}"
         );
         assert!(
-            words.iter().any(|w| w == "Chorus (3/4)"),
-            "a marker sharing a bar with a signature did not read as \
-             \"Chorus (3/4)\": {words:?}"
+            !words.iter().any(|w| w.contains('(')),
+            "a flag is still printing its signature in parentheses: {words:?}"
         );
+        assert!(words.iter().any(|w| w == "3/4"), "the signature is gone: {words:?}");
         assert!(
             words.iter().any(|w| w == "\u{2691}"),
             "an unnamed marker drew nothing to aim at: {words:?}"
         );
 
-        // And the pointer finds them where they were drawn.
+        // **Stacked, not merged**: the name is ABOVE the signature that
+        // shares its moment.
         let l = Layout::new(rect(), &v);
-        assert!(l.meter_strip.is_positive(), "the ruler has no strip");
-        let y = l.meter_strip.center().y;
+        let names = flag_row(l.meter_strip);
+        let sigs = sig_row(l.meter_strip);
+        assert!(
+            names.bottom() <= sigs.top() + 0.01 && names.top() < sigs.top(),
+            "the rows are not stacked: names {names:?} sigs {sigs:?}"
+        );
+        assert_eq!(
+            painted_in(&v, names),
+            vec!["Verse", "Chorus", "\u{2691}"],
+            "the name row is not carrying exactly the names"
+        );
+        // Bar 0's chip draws too, because this song HAS a change: the
+        // "no chip on bar zero" rule is for songs in one signature, where
+        // there is nothing for the first bar to differ from.
+        assert_eq!(
+            painted_in(&v, sigs),
+            vec!["4/4", "3/4"],
+            "the signature row is not carrying exactly the signatures"
+        );
+
+        // And each row answers the pointer for its own kind.
         for (i, m) in v.markers.iter().enumerate() {
             let x = x_of(rect(), &v, m.at_s) + 3.0;
             assert_eq!(
-                hit_test(rect(), &v, Pos2::new(x, y)),
+                hit_test(rect(), &v, Pos2::new(x, names.center().y)),
                 Some(Hit::Flag(i)),
                 "the flag for {:?} is not where it was painted",
                 m.name
             );
         }
+        // The chip under "Chorus" belongs to the chip, not to the flag.
+        let x = x_of(rect(), &v, bar_at(&v, 4)) + 3.0;
+        assert_eq!(
+            hit_test(rect(), &v, Pos2::new(x, sigs.center().y)),
+            Some(Hit::MeterChip(4)),
+            "a press on the signature under a flag was taken by the flag"
+        );
+    }
+
+    /// The words one frame painted inside `band`.
+    fn painted_in(v: &ArrangeView<'_>, band: Rect) -> Vec<String> {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let r = rect();
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(r), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(r);
+                    draw(ui.painter(), r, v);
+                });
+            },
+        );
+        out.shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if band.contains(t.visual_bounding_rect().center()) => {
+                    Some(t.galley.text().to_owned())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Every word one frame of the arrangement painted INTO THE RULER'S
