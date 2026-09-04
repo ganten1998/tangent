@@ -1068,7 +1068,38 @@ pub struct IrOutcome {
     /// that wait is capped, so this is the honest report for a box that never
     /// settles inside the tail it was given.
     pub floor_settled: bool,
+    /// **Whether the tail is the excitation coming back rather than a decay.**
+    /// Appended at the END, this struct's law. See
+    /// `units::sweep::tail_chirp` for the measurement and for the plate that
+    /// has to survive it.
+    pub foldover: IrFoldover,
 }
+/// **What the wizard makes of an IR's tail.**
+///
+/// A device whose own sample rate is below the host's folds everything the
+/// sweep plays above its Nyquist back down, and a descending alias is not a
+/// linear response the inverse filter can cancel. It lands in the recovered
+/// IR as a narrowband tone sliding downward — for as long as the capture
+/// window allows — and the IR looks plausible, saves, loads, and puts a
+/// swept whistle behind everything it is ever used on.
+///
+/// The owner met it on a Quadraverb sampling near 31 kHz with the wizard
+/// sweeping to 20.9 kHz: "odd descending chirpy artifacts". Nothing on
+/// screen said a word.
+///
+/// APPEND-ONLY, like every enum that rides a saved or pushed structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IrFoldover {
+    /// Nothing in the tail fits a slide — the ordinary answer, and the one a
+    /// real decay gives however narrow it gets.
+    #[default]
+    None,
+    /// The tail slides downward at the inverse filter's own rate, over
+    /// octaves. The capture is measuring the device's aliasing as if it were
+    /// reverb; the fix is to sweep no higher than the device can hear.
+    Suspected,
+}
+
 
 /// **What the deconvolution did with the reference pass it was handed**, so
 /// the result stage can say it.

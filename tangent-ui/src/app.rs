@@ -2195,6 +2195,43 @@ fn edge_scroll_step(ctx: &egui::Context, zone: Rect, p: Pos2, axes: EdgeAxes) ->
     pps * dt
 }
 
+/// **The shelf templates live on, under `Projects/`.**
+///
+/// Spelled once here because three roads need the same word and the host
+/// needs it too — `desktop::PROJECT_TEMPLATE_FOLDER` is the same string on
+/// the other side of the firewall, and its own doc says why two spellings of
+/// one folder is a bug.
+pub const TEMPLATE_SHELF: &str = "Templates";
+
+/// **Is this path inside the template shelf?**
+///
+/// The shelf is the one thing in the app a fresh install and every New
+/// depend on, and until this existed it was writable by every ordinary save
+/// road. What that cost, on the owner's machine, in one evening:
+///
+/// * `Templates/default/project.tan` and a `state/` folder beside it, both
+///   stamped 22:10 — a SESSION that had come to stand on the template and
+///   saved itself there. From then on every launch opened his own four-track
+///   desk believing it was the shipped one, which is what he reported as
+///   "startup project is NOT loaded from the default template, but rather a
+///   stale state from earlier on".
+/// * `Templates/default/default/` — a whole project copied INTO the
+///   template, stamped 23:04. Save-As nests into a folder that already
+///   exists when `project_subdir` is on, and the shelf is a folder that
+///   already exists.
+///
+/// Neither road meant to touch the shelf and neither was stopped. Compared
+/// against the resolved project root rather than by looking for the word
+/// anywhere in the path, so a person whose own music lives in a folder they
+/// happened to call Templates is not refused.
+pub fn inside_template_shelf(path: &std::path::Path, project_root: &std::path::Path) -> bool {
+    let shelf = project_root.join(TEMPLATE_SHELF);
+    // Lexical, and deliberately so: this runs on a path the user is about to
+    // be handed and must answer the same way whether or not the folder has
+    // been created yet. `canonicalize` cannot see an unwritten target.
+    path.starts_with(&shelf)
+}
+
 /// Where a FRESH session lives: `Untitled`, unless somebody literally
 /// SAVED a project by that name — an auto-saved scratch is reclaimed, a
 /// kept one is stepped past to `Untitled 2` and so on.
@@ -9876,13 +9913,39 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// does not write the path at all, and the caller writes the scratch's
     /// once it has repointed.
     fn open_project_keeping(&mut self, doc: &std::path::Path, keep: KeepPath) {
+        // **A document on the template shelf is READ, never inhabited.**
+        //
+        // `adopt_template` already knew this — it opens the stencil and then
+        // repoints at a scratch, and its own comment says opening one in
+        // place "would mean every edit, and every save, writing over the
+        // thing every New is made from". Nothing enforced it for the OTHER
+        // doors: an Open dialog pointed into `Projects/Templates`, or a
+        // settings file naming one after a crash.
+        //
+        // The owner's template ended up holding his own four-track session
+        // and a `state/` shelf beside it, both stamped the same minute — a
+        // session that had come to stand on the stencil and saved itself
+        // there. Every launch afterwards opened that as the shipped desk.
+        //
+        // So an adopting open is the only kind the shelf gets: the document
+        // is read and the session is left pointing wherever the caller aimed
+        // it, which for every road but `adopt_template` is where it already
+        // was. Refusing outright would be worse — somebody who opens a
+        // template wants to SEE it, and now they can, they just cannot save
+        // over it by accident.
+        let on_shelf = inside_template_shelf(doc, &self.project_root());
+        let keep = if on_shelf { KeepPath::Leave } else { keep };
         // An explicit open owns its own folder; nothing is borrowed from a
         // template. `adopt_template` sets this again immediately after,
         // which is why it is cleared here rather than by every caller.
         self.media_source = None;
         let (arr, doc) = self.read_for_adoption(doc);
         self.arrangement = arr;
-        self.project_doc = doc.clone();
+        // A stencil is read but never inhabited: the session keeps whatever
+        // home it had, and `adopt_template` gives it a scratch a line later.
+        if !on_shelf {
+            self.project_doc = doc.clone();
+        }
         if keep == KeepPath::Write {
             self.settings.project_path = doc.to_string_lossy().into_owned();
             self.save_settings();
@@ -10012,6 +10075,28 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// without the `.tangent` the panel's filter appended, it names the new
     /// project DIRECTORY.
     pub fn save_project_as(&mut self, target: &std::path::Path) {
+        // **Not onto the template shelf.**
+        //
+        // A project saved there is not a project any more, it is what every
+        // fresh install and every New is made from — and with
+        // `project_subdir` on, Save-As NESTS into a folder that already
+        // exists, which the shelf always is. The owner ended an evening with
+        // `Templates/default/default/`: a whole session copied inside the
+        // stencil it was cloned from. See [`inside_template_shelf`] for the
+        // second road and what the pair of them did to his launches.
+        //
+        // Refused rather than redirected, and named: Save as a Template is
+        // one row away in the same menu, it takes a NAME rather than a
+        // place, and it is the road that knows a template is a stencil.
+        if inside_template_shelf(target, &self.project_root()) {
+            self.notify(
+                crate::notify::Kind::Error,
+                "That is the template shelf. Use Save as a Template to put a \
+                 stencil there — saving a project into it makes every new \
+                 session a copy of this one.",
+            );
+            return;
+        }
         let chosen = if target
             .extension()
             .is_some_and(|e| crate::ports::PROJECT_EXTENSIONS.iter().any(|x| e == *x))
@@ -33138,6 +33223,99 @@ mod tests {
              session is briefly standing on it"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The template shelf is read, never written and never inhabited.**
+    ///
+    /// The shelf is the one thing every fresh install and every New is made
+    /// from, and until this guard it was writable by every ordinary save
+    /// road. One evening on the owner's machine produced both of the ways in,
+    /// and he reported the consequence rather than the cause: "startup
+    /// project is NOT loaded from the default template, but rather a stale
+    /// state from earlier on... I checked by selecting reset everything so
+    /// theres only 2 channels, adding a channel, close, discard, start
+    /// tangent -- the same 4 tracks from earlier."
+    ///
+    /// His template held `project.tan` and a `state/` folder stamped the same
+    /// minute — a session that had come to stand on the stencil and saved
+    /// itself there — and, an hour later, a whole `default/` project copied
+    /// inside it, because Save-As nests into a folder that already exists
+    /// when `project_subdir` is on and the shelf always exists. The launch
+    /// was loading the template faithfully. The template was his own desk.
+    ///
+    /// Revert-checks, both performed: drop the `inside_template_shelf` early
+    /// return in `save_project_as` and the second half goes red; drop the
+    /// `on_shelf` guard in `open_project_keeping` and the first does.
+    #[test]
+    fn a_template_is_read_but_never_saved_over_or_moved_into() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-shelf-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let shelf = root.join(super::TEMPLATE_SHELF);
+        let template = shelf.join("default");
+        std::fs::create_dir_all(&template).expect("template dir");
+        crate::arrangement::Arrangement::default()
+            .save_to(&crate::arrangement::doc_in(&template));
+
+        let (_ctx, mut app) = headless(Caps::PLUGIN);
+        // The guard asks the RESOLVED project root, so the test has to be
+        // standing in the same tree the app thinks it lives in.
+        app.settings.project_dir = Some(root.to_string_lossy().into_owned());
+        assert_eq!(app.project_root(), root, "the fixture is not where the app looks");
+
+        // A session that has a home of its own.
+        let mine = root.join("My Song");
+        std::fs::create_dir_all(&mine).expect("project dir");
+        crate::arrangement::Arrangement::default()
+            .save_to(&crate::arrangement::doc_in(&mine));
+        app.open_project(&crate::arrangement::doc_in(&mine));
+        assert!(
+            app.project_doc().is_some_and(|d| d.starts_with(&mine)),
+            "the ordinary open did not take"
+        );
+
+        // (1) OPENING a template shows it without moving in.
+        app.open_project(&crate::arrangement::doc_in(&template));
+        assert!(
+            app.project_doc().is_some_and(|d| d.starts_with(&mine)),
+            "opening a template moved the session onto the shelf, so every \
+             save from here writes the thing every New is made from — it went \
+             to {:?}",
+            app.project_doc()
+        );
+        assert!(
+            !std::path::Path::new(&app.settings.project_path).starts_with(&shelf),
+            "the settings now name the shelf: {}",
+            app.settings.project_path
+        );
+
+        // (2) SAVING onto the shelf is refused, and writes nothing.
+        let before: Vec<_> = std::fs::read_dir(&shelf)
+            .expect("shelf")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        app.save_project_as(&template);
+        app.save_project_as(&shelf.join("Something Else"));
+        let after: Vec<_> = std::fs::read_dir(&shelf)
+            .expect("shelf")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "a Save-As put something on the template shelf"
+        );
+        assert!(
+            !template.join("default").exists(),
+            "a project was nested INSIDE the template, which is exactly what \
+             `Templates/default/default/` was"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
