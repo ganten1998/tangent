@@ -46,7 +46,7 @@ pub mod voice;
 
 use arp::{rate_index, Arp, ArpMode, ArpOut, ArpParams, Transport};
 use ensemble::{Ensemble, EnsembleMode};
-use filter::{FilterModel, Taps, CUTOFF_HZ, OVERSAMPLER_LATENCY};
+use filter::{CutoffLanes, FilterModel, LadderLanes, SemLanes, Taps, CUTOFF_HZ, OVERSAMPLER_LATENCY};
 use osc::{blep_table, Lfo, LfoWave, Osc, Wave, RANGE_OCTAVES};
 use voice::{TickCtx, Voice, VoiceParams, CHUNK};
 
@@ -336,6 +336,69 @@ struct Corpse {
     total: u32,
 }
 
+/// Lanes per group of the filter bank, and the groups: voices 0..8,
+/// voices 8..16, and the corpses. Eight because a corpse pool is eight
+/// and two groups cover the poly side; the lane arithmetic is the same
+/// at four or sixteen (measured), so the count is the pool's shape.
+const LANE: usize = 8;
+const GROUPS: usize = 3;
+const CORPSE_GROUP: usize = 2;
+
+/// **The filters of every voice, in lanes.** The voice computes its own
+/// cutoff, feedback and damping and hands them here each sample; the
+/// bank runs one group's eight filters as one vectorised tick. The
+/// state lives here rather than in the voice, so a steal copies a lane
+/// and a vacated slot clears one. See `filter::LadderLanes`.
+struct FilterBank {
+    ladder: [LadderLanes<LANE>; GROUPS],
+    sem: [SemLanes<LANE>; GROUPS],
+    cut: [CutoffLanes<LANE>; GROUPS],
+    k: [[f32; LANE]; GROUPS],
+    damp: [[f32; LANE]; GROUPS],
+}
+
+impl FilterBank {
+    fn new() -> Self {
+        Self {
+            ladder: [LadderLanes::default(); GROUPS],
+            sem: [SemLanes::default(); GROUPS],
+            cut: [CutoffLanes::default(); GROUPS],
+            k: [[0.0; LANE]; GROUPS],
+            damp: [[1.0; LANE]; GROUPS],
+        }
+    }
+    fn clear_lane(&mut self, g: usize, l: usize) {
+        self.ladder[g].clear_lane(l);
+        self.sem[g].clear_lane(l);
+    }
+    /// Lane `from` into lane `to`, across groups: through a copy of the
+    /// source group with the lane moved into the target's position, then
+    /// taken lane-wise, so two groups are never borrowed at once.
+    fn copy_lane(&mut self, from: (usize, usize), to: (usize, usize)) {
+        let (fg, fl) = from;
+        let (tg, tl) = to;
+        let mut ladder = self.ladder[fg];
+        ladder.copy_lane(fl, tl);
+        self.ladder[tg].take_lane(&ladder, tl);
+        let mut sem = self.sem[fg];
+        sem.copy_lane(fl, tl);
+        self.sem[tg].take_lane(&sem, tl);
+    }
+    fn clear(&mut self) {
+        *self = Self::new();
+    }
+}
+
+/// The bank lane a voice slot or corpse index lives in.
+#[inline]
+fn voice_lane(slot: usize) -> (usize, usize) {
+    (slot / LANE, slot % LANE)
+}
+#[inline]
+fn corpse_lane(c: usize) -> (usize, usize) {
+    (CORPSE_GROUP, c)
+}
+
 /// The instrument.
 pub struct Analog {
     rate: f32,
@@ -362,6 +425,11 @@ pub struct Analog {
     round_robin: usize,
     transport: Transport,
     scratch: [f32; CHUNK * 2],
+    bank: FilterBank,
+    /// Whether the filters run in the bank's lanes or in each voice — the
+    /// two roads produce the same samples, and a test holds them to it;
+    /// the scalar road is the reference the lanes are measured against.
+    laned: bool,
     out_x1: [f32; 2],
     out_dc: [f32; 2],
     dc_coef: f32,
@@ -395,6 +463,8 @@ impl Analog {
             round_robin: 0,
             transport: Transport::default(),
             scratch: [0.0; CHUNK * 2],
+            bank: FilterBank::new(),
+            laned: true,
             out_x1: [0.0; 2],
             out_dc: [0.0; 2],
             dc_coef: 1.0 - (-std::f32::consts::TAU * OUT_DC_HZ / rate).exp(),
@@ -445,11 +515,17 @@ impl Analog {
         self.smooth = self.vals;
     }
 
+    /// Which road the filters take; see the `laned` field.
+    pub fn set_laned(&mut self, laned: bool) {
+        self.laned = laned;
+    }
+
     /// Everything silent, phases kept, dials kept.
     pub fn clear(&mut self) {
         for v in &mut self.voices {
             v.clear();
         }
+        self.bank.clear();
         for c in &mut self.corpses {
             c.left = 0;
         }
@@ -693,7 +769,9 @@ impl Analog {
         corpse.voice = self.voices[slot];
         corpse.total = ((CORPSE_FADE_MS * 0.001 * self.rate) as u32).max(1);
         corpse.left = corpse.total;
+        self.bank.copy_lane(voice_lane(slot), corpse_lane(c));
         self.voices[slot].vacate();
+        self.bank.clear_lane(slot / LANE, slot % LANE);
         self.round_robin = (slot + 1) % n;
         slot
     }
@@ -962,6 +1040,8 @@ impl Analog {
         if live.is_empty() && dead.is_empty() {
             return;
         }
+        let model = vp.model;
+        let mode = vp.sem_mode;
         for i in 0..len {
             let lfo = self.lfo_buf[from + i];
             for &v in live {
@@ -970,12 +1050,68 @@ impl Analog {
             for &c in dead {
                 self.corpses[usize::from(c)].voice.pre(vp, taps, &ctx, lfo);
             }
-            for j in 0..4 {
+            if self.laned {
+                // The voices' settings into their lanes, then each
+                // substep: gather the inputs, tick the groups that have
+                // anyone in them, scatter the answers.
+                let mut used = [false; GROUPS];
                 for &v in live {
-                    self.voices[usize::from(v)].substep(vp, &ctx, j);
+                    let (g, l) = voice_lane(usize::from(v));
+                    let (cut, k, damp) = self.voices[usize::from(v)].filter_settings();
+                    self.bank.cut[g].set(l, cut);
+                    self.bank.k[g][l] = k;
+                    self.bank.damp[g][l] = damp;
+                    used[g] = true;
                 }
                 for &c in dead {
-                    self.corpses[usize::from(c)].voice.substep(vp, &ctx, j);
+                    let (g, l) = corpse_lane(usize::from(c));
+                    let (cut, k, damp) = self.corpses[usize::from(c)].voice.filter_settings();
+                    self.bank.cut[g].set(l, cut);
+                    self.bank.k[g][l] = k;
+                    self.bank.damp[g][l] = damp;
+                    used[g] = true;
+                }
+                for j in 0..4 {
+                    let mut x = [[0.0_f32; LANE]; GROUPS];
+                    let mut y = [[0.0_f32; LANE]; GROUPS];
+                    for &v in live {
+                        let (g, l) = voice_lane(usize::from(v));
+                        x[g][l] = self.voices[usize::from(v)].substep_in(&ctx, j);
+                    }
+                    for &c in dead {
+                        let (g, l) = corpse_lane(usize::from(c));
+                        x[g][l] = self.corpses[usize::from(c)].voice.substep_in(&ctx, j);
+                    }
+                    for g in 0..GROUPS {
+                        if !used[g] {
+                            continue;
+                        }
+                        match model {
+                            FilterModel::Ladder => {
+                                self.bank.ladder[g].tick(&x[g], &self.bank.cut[g], &self.bank.k[g], &mut y[g])
+                            }
+                            FilterModel::Sem => {
+                                self.bank.sem[g].tick(&x[g], &self.bank.cut[g], &self.bank.damp[g], mode, &mut y[g])
+                            }
+                        }
+                    }
+                    for &v in live {
+                        let (g, l) = voice_lane(usize::from(v));
+                        self.voices[usize::from(v)].substep_out(j, y[g][l]);
+                    }
+                    for &c in dead {
+                        let (g, l) = corpse_lane(usize::from(c));
+                        self.corpses[usize::from(c)].voice.substep_out(j, y[g][l]);
+                    }
+                }
+            } else {
+                for j in 0..4 {
+                    for &v in live {
+                        self.voices[usize::from(v)].substep(vp, &ctx, j);
+                    }
+                    for &c in dead {
+                        self.corpses[usize::from(c)].voice.substep(vp, &ctx, j);
+                    }
                 }
             }
             let (mut l, mut r) = (0.0_f32, 0.0_f32);
@@ -985,7 +1121,8 @@ impl Analog {
                 r += b;
             }
             for &c in dead {
-                let c = &mut self.corpses[usize::from(c)];
+                let ci = usize::from(c);
+                let c = &mut self.corpses[ci];
                 if c.left > 0 {
                     let g = c.left as f32 / c.total as f32;
                     let (a, b) = c.voice.post(taps);
@@ -994,6 +1131,8 @@ impl Analog {
                     c.left -= 1;
                     if c.left == 0 {
                         c.voice.vacate();
+                        let (bg, bl) = corpse_lane(ci);
+                        self.bank.clear_lane(bg, bl);
                     }
                 } else {
                     let _ = c.voice.post(taps);
@@ -1134,6 +1273,70 @@ mod tests {
         assert_eq!(synth.voice_count(), 8);
         assert_eq!(synth.voice_mode(), VoiceMode::Poly);
         assert_eq!(synth.latency(), 68);
+    }
+
+    /// **The laned frame is the scalar frame, bit for bit**: a score with
+    /// steals, a pedal, both filters, drift and the ensemble, rendered
+    /// through the bank's lanes and through each voice's own filter, is
+    /// one set of samples. The two roads are different code — a lane
+    /// tick over arrays against a voice's own tick — so this is the
+    /// guard the lanes answer to, and the scalar road is kept as its
+    /// reference.
+    #[test]
+    fn the_laned_frame_renders_the_scalar_frame_bit_for_bit() {
+        for model in [0.0_f32, 1.0] {
+            let setup = [
+                (P_DRIFT as u32, 0.8),
+                (P_OSC_DRIFT as u32, 0.5),
+                (P_ENSEMBLE as u32, 0.33),
+                (P_FILTER_MODEL as u32, model),
+                (P_EMPHASIS as u32, 0.7),
+                (P_SEM_MODE as u32, 0.4),
+                (P_DRIVE as u32, 0.4),
+                (P_MIX_O2 as u32, 0.5),
+            ];
+            let mut ev = vec![(0, Ev::Pedal(true))];
+            for (i, k) in [48u8, 52, 55, 59, 60, 64, 67, 71, 72, 76].iter().enumerate() {
+                ev.push((ms(10.0 + 30.0 * i as f32), Ev::On(*k, 90 + i as u8)));
+            }
+            ev.push((secs(0.5), Ev::Off(60)));
+            ev.push((secs(0.55), Ev::On(60, 110)));
+            let render = |laned: bool| {
+                let mut synth = Analog::new(SR);
+                synth.set_laned(laned);
+                synth.set_all(&setup);
+                let frames = secs(0.8);
+                let mut out = vec![0.0_f32; frames * 2];
+                let mut evs = ev.clone();
+                evs.sort_by_key(|e| e.0);
+                let mut next = 0usize;
+                let mut at = 0usize;
+                let mut block = vec![0.0_f32; BLOCK * 2];
+                while at < frames {
+                    let n = BLOCK.min(frames - at);
+                    let mut bev = Vec::new();
+                    while next < evs.len() && evs[next].0 < at + n {
+                        let off = evs[next].0 - at;
+                        bev.push(match evs[next].1 {
+                            Ev::On(k, v) => Event::NoteOn { at: off, key: k, vel: f32::from(v) / 127.0 },
+                            Ev::Off(k) => Event::NoteOff { at: off, key: k },
+                            Ev::Pedal(d) => Event::Sustain { at: off, down: d },
+                            Ev::Param(id, v) => Event::Param { at: off, id, value: v },
+                        });
+                        next += 1;
+                    }
+                    synth.render(&mut block, n, 2, &bev, Transport::default());
+                    out[at * 2..(at + n) * 2].copy_from_slice(&block[..n * 2]);
+                    at += n;
+                }
+                out
+            };
+            let a = render(true);
+            let b = render(false);
+            assert!(peak(&a) > 0.01, "silence");
+            let first = a.iter().zip(&b).position(|(x, y)| x.to_bits() != y.to_bits());
+            assert!(first.is_none(), "model {model}: laned and scalar differ first at frame {}", first.unwrap() / 2);
+        }
     }
 
     /// **Drift determinism**: the same score twice is the same audio, bit

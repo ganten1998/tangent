@@ -161,7 +161,11 @@ impl Ladder {
     /// same first-order accuracy as the step, and one tanh per sample
     /// instead of three. The bracket `S ± G⁴·L` is the physical range of
     /// `y` and the iterate is held inside it, so the method cannot
-    /// diverge whatever the input does. One step suffices at 4×: the
+    /// diverge whatever the input does. The bracket is applied as
+    /// `max().min()` rather than `clamp()`: `clamp` asserts `lo <= hi`,
+    /// which is always true here but the compiler cannot see it, and a
+    /// panic branch in the body is what kept the laned form of this
+    /// function scalar. One step suffices at 4×: the
     /// prediction is within a few parts in a thousand and the step is
     /// quadratic, and the self-oscillation and bass-loss tests below read
     /// the same numbers they read with three.
@@ -173,11 +177,11 @@ impl Ladder {
         let s = h * (big_g * big_g * big_g * self.s[0] + big_g * big_g * self.s[1] + big_g * self.s[2] + self.s[3]);
         let reach = g4 * LADDER_SAT;
         let (lo, hi) = (s - reach, s + reach);
-        let y0 = (2.0 * self.y1 - self.y2).clamp(lo, hi);
+        let y0 = (2.0 * self.y1 - self.y2).max(lo).min(hi);
         let t = fast_tanh((x - k * y0) * (1.0 / LADDER_SAT));
         let dudy = -k * (1.0 - t * t);
         let f = g4 * LADDER_SAT * t + s - y0;
-        let y = (y0 - f / (g4 * dudy - 1.0)).clamp(lo, hi);
+        let y = (y0 - f / (g4 * dudy - 1.0)).max(lo).min(hi);
         // The stages' input: the tanh at the corrected y, to first order.
         let mut u = LADDER_SAT * t + dudy * (y - y0);
         for st in &mut self.s {
@@ -249,6 +253,187 @@ pub fn sem_damp(dial: f32) -> f32 {
 #[inline]
 pub fn ladder_k(dial: f32) -> f32 {
     LADDER_K_MAX * dial.clamp(0.0, 1.0)
+}
+
+// ── the filters in lanes ────────────────────────────────────────────────────
+//
+// **The same arithmetic, `L` voices wide.** Each of these holds the state
+// of `L` filters as arrays and runs the scalar tick above as a loop over
+// the lane index — no intrinsics, no `cfg(target_arch)`: a plain loop
+// over fixed-size arrays with no branch in its body is what LLVM's loop
+// vectoriser turns into NEON on arm64 and SSE on x86_64 by itself, so
+// there is ONE definition and the six shipped artifacts compute the same
+// numbers. The body is the scalar body verbatim, so a lane's output is
+// the scalar filter's output bit for bit, and a test holds it to that.
+//
+// Why lanes at all: the scalar substep is a chain of dependent operations
+// about a hundred cycles long, and a chain's cost is its latency. Eight
+// chains side by side in vector registers cost about what one does.
+
+/// [`Cutoff`] for `L` voices.
+#[derive(Clone, Copy, Debug)]
+pub struct CutoffLanes<const L: usize> {
+    big_g: [f32; L],
+    h: [f32; L],
+    g4: [f32; L],
+    g: [f32; L],
+    sem_inv: [f32; L],
+}
+
+impl<const L: usize> Default for CutoffLanes<L> {
+    fn default() -> Self {
+        Self {
+            big_g: [0.0; L],
+            h: [1.0; L],
+            g4: [0.0; L],
+            g: [0.0; L],
+            sem_inv: [1.0; L],
+        }
+    }
+}
+
+impl<const L: usize> CutoffLanes<L> {
+    /// Lane `l` takes a cutoff computed the scalar way.
+    #[inline]
+    pub fn set(&mut self, l: usize, c: &Cutoff) {
+        self.big_g[l] = c.big_g;
+        self.h[l] = c.h;
+        self.g4[l] = c.g4;
+        self.g[l] = c.g;
+        self.sem_inv[l] = c.sem_inv;
+    }
+}
+
+/// [`Ladder`] for `L` voices.
+#[derive(Clone, Copy, Debug)]
+pub struct LadderLanes<const L: usize> {
+    s: [[f32; L]; 4],
+    y1: [f32; L],
+    y2: [f32; L],
+}
+
+impl<const L: usize> Default for LadderLanes<L> {
+    fn default() -> Self {
+        Self {
+            s: [[0.0; L]; 4],
+            y1: [0.0; L],
+            y2: [0.0; L],
+        }
+    }
+}
+
+impl<const L: usize> LadderLanes<L> {
+    /// One sample for every lane: [`Ladder::tick`], `L` wide.
+    #[inline]
+    pub fn tick(&mut self, x: &[f32; L], c: &CutoffLanes<L>, k: &[f32; L], out: &mut [f32; L]) {
+        for l in 0..L {
+            let big_g = c.big_g[l];
+            let h = c.h[l];
+            let g4 = c.g4[l];
+            let kk = k[l];
+            let s = h
+                * (big_g * big_g * big_g * self.s[0][l]
+                    + big_g * big_g * self.s[1][l]
+                    + big_g * self.s[2][l]
+                    + self.s[3][l]);
+            let reach = g4 * LADDER_SAT;
+            let (lo, hi) = (s - reach, s + reach);
+            let y0 = (2.0 * self.y1[l] - self.y2[l]).max(lo).min(hi);
+            let t = fast_tanh((x[l] - kk * y0) * (1.0 / LADDER_SAT));
+            let dudy = -kk * (1.0 - t * t);
+            let f = g4 * LADDER_SAT * t + s - y0;
+            let y = (y0 - f / (g4 * dudy - 1.0)).max(lo).min(hi);
+            let mut u = LADDER_SAT * t + dudy * (y - y0);
+            for st in 0..4 {
+                let o = big_g * u + h * self.s[st][l];
+                self.s[st][l] = 2.0 * o - self.s[st][l];
+                u = o;
+            }
+            self.y2[l] = self.y1[l];
+            self.y1[l] = u;
+            out[l] = u;
+        }
+    }
+
+    pub fn clear_lane(&mut self, l: usize) {
+        for st in 0..4 {
+            self.s[st][l] = 0.0;
+        }
+        self.y1[l] = 0.0;
+        self.y2[l] = 0.0;
+    }
+
+    pub fn copy_lane(&mut self, from: usize, to: usize) {
+        for st in 0..4 {
+            self.s[st][to] = self.s[st][from];
+        }
+        self.y1[to] = self.y1[from];
+        self.y2[to] = self.y2[from];
+    }
+
+    /// Lane `l` of `other` into lane `l` of this: how a state crosses
+    /// from one group to another.
+    pub fn take_lane(&mut self, other: &Self, l: usize) {
+        for st in 0..4 {
+            self.s[st][l] = other.s[st][l];
+        }
+        self.y1[l] = other.y1[l];
+        self.y2[l] = other.y2[l];
+    }
+}
+
+/// [`Sem`] for `L` voices.
+#[derive(Clone, Copy, Debug)]
+pub struct SemLanes<const L: usize> {
+    s1: [f32; L],
+    s2: [f32; L],
+}
+
+impl<const L: usize> Default for SemLanes<L> {
+    fn default() -> Self {
+        Self {
+            s1: [0.0; L],
+            s2: [0.0; L],
+        }
+    }
+}
+
+impl<const L: usize> SemLanes<L> {
+    /// One sample for every lane: [`Sem::tick`], `L` wide, one mode.
+    #[inline]
+    pub fn tick(&mut self, x: &[f32; L], c: &CutoffLanes<L>, damp: &[f32; L], mode: f32, out: &mut [f32; L]) {
+        for l in 0..L {
+            let g = c.g[l];
+            let hp = (x[l] - (damp[l] + g) * self.s1[l] - self.s2[l]) * c.sem_inv[l];
+            let v1 = g * hp;
+            let bp = v1 + self.s1[l];
+            self.s1[l] = bp + v1;
+            let v2 = g * bp;
+            let lp = v2 + self.s2[l];
+            self.s2[l] = lp + v2;
+            out[l] = if mode <= 0.5 {
+                lp + 2.0 * mode * hp
+            } else {
+                (2.0 - 2.0 * mode) * lp + hp
+            };
+        }
+    }
+
+    pub fn clear_lane(&mut self, l: usize) {
+        self.s1[l] = 0.0;
+        self.s2[l] = 0.0;
+    }
+
+    pub fn copy_lane(&mut self, from: usize, to: usize) {
+        self.s1[to] = self.s1[from];
+        self.s2[to] = self.s2[from];
+    }
+
+    /// Lane `l` of `other` into lane `l` of this.
+    pub fn take_lane(&mut self, other: &Self, l: usize) {
+        self.s1[l] = other.s1[l];
+        self.s2[l] = other.s2[l];
+    }
 }
 
 // ── the 4× pair, polyphase ──────────────────────────────────────────────────
@@ -618,6 +803,52 @@ mod tests {
             .collect();
         let level = db(goertzel_hann(&x[n / 2..], 1_000.0, SR) / 0.5);
         assert!(level.abs() < 0.1, "1 kHz through the pair: {level:+.3} dB");
+    }
+
+    /// **The lanes are the scalar filters, bit for bit.** Eight lanes fed
+    /// eight different signals, cutoffs and feedbacks against eight scalar
+    /// filters fed the same — every sample equal, not close. The lane
+    /// bodies are the scalar bodies verbatim and Rust contracts nothing,
+    /// so any difference is a transcription error, and this is where it
+    /// would show.
+    #[test]
+    fn the_laned_filters_are_the_scalar_filters_bit_for_bit() {
+        const L: usize = 8;
+        let mut scalar_l: Vec<Ladder> = (0..L).map(|_| Ladder::new()).collect();
+        let mut scalar_s: Vec<Sem> = (0..L).map(|_| Sem::new()).collect();
+        let mut lanes_l = LadderLanes::<L>::default();
+        let mut lanes_s = SemLanes::<L>::default();
+        let mut cl = CutoffLanes::<L>::default();
+        let mut k = [0.0_f32; L];
+        let mut damp = [0.0_f32; L];
+        let mut cuts = Vec::new();
+        for l in 0..L {
+            let hz = 200.0 * 1.7_f32.powi(l as i32);
+            k[l] = ladder_k(0.1 + 0.12 * l as f32);
+            damp[l] = sem_damp(0.1 + 0.12 * l as f32);
+            let c = Cutoff::new(hz, SR4, damp[l]);
+            cl.set(l, &c);
+            cuts.push(c);
+        }
+        let n = (SR4 * 0.25) as usize;
+        let mut x = [0.0_f32; L];
+        let mut out_l = [0.0_f32; L];
+        let mut out_s = [0.0_f32; L];
+        for i in 0..n {
+            for l in 0..L {
+                x[l] = 0.6 * ((i as f32) * (0.011 + 0.003 * l as f32)).sin();
+            }
+            lanes_l.tick(&x, &cl, &k, &mut out_l);
+            lanes_s.tick(&x, &cl, &damp, 0.3, &mut out_s);
+            for l in 0..L {
+                let a = scalar_l[l].tick(x[l], &cuts[l], k[l]);
+                let b = scalar_s[l].tick(x[l], &cuts[l], damp[l], 0.3);
+                assert!(a.to_bits() == out_l[l].to_bits(), "ladder lane {l} sample {i}: {a} vs {}", out_l[l]);
+                assert!(b.to_bits() == out_s[l].to_bits(), "SEM lane {l} sample {i}: {b} vs {}", out_s[l]);
+            }
+        }
+        // And the lanes did something: not silence.
+        assert!(out_l.iter().any(|v| v.abs() > 1e-3));
     }
 
     /// The rational tanh keeps its slope at zero and its rails, and sits

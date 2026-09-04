@@ -256,6 +256,86 @@ fn perf() {
         }
         y
     }));
+    // The filter across sixteen voices: scalar, interleaved as the frame
+    // does it, against lanes of 4, 8 and 16 — the same arithmetic in a
+    // data layout the compiler vectorises. Per voice-sample, 4 substeps.
+    {
+        use analog::filter::{CutoffLanes, LadderLanes, SemLanes};
+        let n = 200_000usize;
+        let s4: Vec<f32> = (0..n * 4).map(|i| (i as f32 * 0.0327).sin() * 0.5).collect();
+        let cuts: Vec<Cutoff> = (0..16).map(|v| Cutoff::new(400.0 + 300.0 * v as f32, 4.0 * RATE, 0.5)).collect();
+        let ks: Vec<f32> = (0..16).map(|v| 1.0 + 0.2 * v as f32).collect();
+        let report = |label: &str, ns: f64, acc: f32| println!("  {label:<38} {ns:7.1} ns   (acc {acc:.3e})");
+        // Scalar, sixteen voices interleaved per substep.
+        {
+            let mut ls: Vec<Ladder> = (0..16).map(|_| Ladder::new()).collect();
+            let mut acc = 0.0_f32;
+            let t0 = std::time::Instant::now();
+            for i in 0..n {
+                for j in 0..4 {
+                    let x = s4[i * 4 + j];
+                    for v in 0..16 {
+                        acc += ls[v].tick(x, &cuts[v], ks[v]);
+                    }
+                }
+            }
+            report("ladder x16 scalar, interleaved", t0.elapsed().as_secs_f64() * 1e9 / (n * 16) as f64, acc);
+        }
+        macro_rules! lanes {
+            ($L:expr, $label:expr) => {{
+                const L: usize = $L;
+                let groups = 16 / L;
+                let mut lanes: Vec<LadderLanes<L>> = (0..groups).map(|_| LadderLanes::default()).collect();
+                let mut cls: Vec<CutoffLanes<L>> = (0..groups).map(|_| CutoffLanes::default()).collect();
+                let mut kl = vec![[0.0_f32; L]; groups];
+                for v in 0..16 {
+                    cls[v / L].set(v % L, &cuts[v]);
+                    kl[v / L][v % L] = ks[v];
+                }
+                let mut acc = 0.0_f32;
+                let mut x = [0.0_f32; L];
+                let mut out = [0.0_f32; L];
+                let t0 = std::time::Instant::now();
+                for i in 0..n {
+                    for j in 0..4 {
+                        x.fill(s4[i * 4 + j]);
+                        for g in 0..groups {
+                            lanes[g].tick(&x, &cls[g], &kl[g], &mut out);
+                            acc += out[0] + out[L - 1];
+                        }
+                    }
+                }
+                report($label, t0.elapsed().as_secs_f64() * 1e9 / (n * 16) as f64, acc);
+            }};
+        }
+        lanes!(4, "ladder x16 in lanes of 4");
+        lanes!(8, "ladder x16 in lanes of 8");
+        lanes!(16, "ladder x16 in lanes of 16");
+        {
+            const L: usize = 8;
+            let mut lanes: Vec<SemLanes<L>> = (0..2).map(|_| SemLanes::default()).collect();
+            let mut cls: Vec<CutoffLanes<L>> = (0..2).map(|_| CutoffLanes::default()).collect();
+            let mut dl = [[0.5_f32; L]; 2];
+            for v in 0..16 {
+                cls[v / L].set(v % L, &cuts[v]);
+                dl[v / L][v % L] = 0.5;
+            }
+            let mut acc = 0.0_f32;
+            let mut x = [0.0_f32; L];
+            let mut out = [0.0_f32; L];
+            let t0 = std::time::Instant::now();
+            for i in 0..n {
+                for j in 0..4 {
+                    x.fill(s4[i * 4 + j]);
+                    for g in 0..2 {
+                        lanes[g].tick(&x, &cls[g], &dl[g], 0.0, &mut out);
+                        acc += out[0];
+                    }
+                }
+            }
+            report("SEM x16 in lanes of 8", t0.elapsed().as_secs_f64() * 1e9 / (n * 16) as f64, acc);
+        }
+    }
     time("tpt_g (tan)", Box::new(move |i| tpt_g(100.0 + (i % 1000) as f32, 4.0 * RATE)));
     time("exp2", Box::new(move |i| ((i % 100) as f32 * 0.01).exp2()));
     time("fast_tanh", Box::new(move |i| analog::filter::fast_tanh((i % 100) as f32 * 0.03 - 1.5)));
@@ -281,30 +361,77 @@ fn perf() {
         println!("  {:<38} {ns:7.1} ns", "one voice, Voice::render");
     }
 
-    // The whole instrument.
-    let mut synth = Analog::new(RATE);
-    synth.set_all(&[(P_VOICES as u32, 1.0), (P_ENSEMBLE as u32, 0.67), (P_MIX_O2 as u32, 0.6)]);
-    for k in [36u8, 40, 43, 47, 48, 52, 55, 59, 60, 64, 67, 71, 72, 76, 79, 83] {
-        synth.note_on(k, 0.9);
+    // The whole instrument, both roads.
+    for laned in [false, true] {
+        let mut synth = Analog::new(RATE);
+        synth.set_laned(laned);
+        synth.set_all(&[(P_VOICES as u32, 1.0), (P_ENSEMBLE as u32, 0.67), (P_MIX_O2 as u32, 0.6)]);
+        for k in [36u8, 40, 43, 47, 48, 52, 55, 59, 60, 64, 67, 71, 72, 76, 79, 83] {
+            synth.note_on(k, 0.9);
+        }
+        let mut out = vec![0.0_f32; BLOCK * 2];
+        for _ in 0..20 {
+            synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+        }
+        let blocks = (RATE as usize) / BLOCK;
+        let t0 = std::time::Instant::now();
+        for _ in 0..blocks {
+            synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+        }
+        let secs = (blocks * BLOCK) as f32 / RATE;
+        let el = t0.elapsed().as_secs_f32();
+        let factor = secs / el;
+        println!(
+            "  {:<38} {:7.1} ns per voice-sample;  {factor:.1}x realtime — the brief's gate is 40x: {}",
+            if laned { "16 voices + ensemble, filters LANED" } else { "16 voices + ensemble, filters scalar" },
+            el * 1e9 / (blocks * BLOCK * 16) as f32,
+            if factor >= 40.0 { "MET" } else { "NOT MET" }
+        );
     }
-    let mut out = vec![0.0_f32; BLOCK * 2];
-    for _ in 0..20 {
-        synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+    // Where a voice-sample goes, sixteen voices interleaved as the frame
+    // does it: the three phases timed apart.
+    {
+        use analog::voice::TickCtx;
+        let synth = Analog::new(RATE);
+        let vp = synth.voice_params_for_bench();
+        let ctx = TickCtx::new(&vp, RATE);
+        let taps = Taps::new();
+        let mut vs: Vec<Voice> = (0..16).map(|i| Voice::new(i, RATE)).collect();
+        for (i, v) in vs.iter_mut().enumerate() {
+            v.note_on(36 + 3 * i as u8, 0.9, i as u32, true, false);
+            v.prepare(&vp, RATE);
+        }
+        let reps = 20_000;
+        let (mut t_pre, mut t_sub, mut t_post) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let mut acc = 0.0_f32;
+        for r in 0..reps {
+            let lfo = (r as f32 * 0.001).sin();
+            let t0 = std::time::Instant::now();
+            for v in vs.iter_mut() {
+                v.pre(&vp, &taps, &ctx, lfo);
+            }
+            let t1 = std::time::Instant::now();
+            for j in 0..4 {
+                for v in vs.iter_mut() {
+                    v.substep(&vp, &ctx, j);
+                }
+            }
+            let t2 = std::time::Instant::now();
+            for v in vs.iter_mut() {
+                let (l, r) = v.post(&taps);
+                acc += l + r;
+            }
+            let t3 = std::time::Instant::now();
+            t_pre += (t1 - t0).as_secs_f64();
+            t_sub += (t2 - t1).as_secs_f64();
+            t_post += (t3 - t2).as_secs_f64();
+        }
+        let per = |t: f64| t * 1e9 / (reps * 16) as f64;
+        println!(
+            "  {:<38} pre {:5.1}  substeps {:5.1}  post {:5.1} ns   (acc {acc:.2e})",
+            "per voice-sample, 16 voices, scalar", per(t_pre), per(t_sub), per(t_post)
+        );
     }
-    let blocks = (RATE as usize) / BLOCK;
-    let t0 = std::time::Instant::now();
-    for _ in 0..blocks {
-        synth.render(&mut out, BLOCK, 2, &[], Transport::default());
-    }
-    let secs = (blocks * BLOCK) as f32 / RATE;
-    let el = t0.elapsed().as_secs_f32();
-    let factor = secs / el;
-    println!(
-        "  {:<38} {:7.1} ns per voice-sample;  {factor:.1}x realtime — the brief's gate is 40x: {}",
-        "16 voices + ensemble, whole synth",
-        el * 1e9 / (blocks * BLOCK * 16) as f32,
-        if factor >= 40.0 { "MET" } else { "NOT MET" }
-    );
 }
 
 /// A one-voice render with the dials set, `secs` long, mono: the report's
