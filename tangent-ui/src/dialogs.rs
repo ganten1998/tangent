@@ -5512,12 +5512,34 @@ fn draw_ir_level(
             .font(bold(10.0))
             .color(t.faint),
     );
+    // **What the ROAD says, if it has said anything.**
+    //
+    // The sweep and result pages have carried this line since they were
+    // written; the level page had none, so a tone that could not be played
+    // at all — no engine, because the band is shut or the device died —
+    // flipped the button to "Stop the tone ■" and left the meter to be read
+    // as a dead loop. It is the same refusal `start_ir_capture` prints one
+    // page later, and it belongs on the page where the button was pressed.
+    if !s.live.phase.is_empty() {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(s.live.phase.as_str())
+                .font(bold(10.5))
+                .color(t.text),
+        );
+    }
     // The warnings, in the order they matter.
     let warn = if peak > -0.5 {
         Some("CLIPPING - bring the unit's output (or the send) down.".to_owned())
     } else if peak > -6.0 {
         Some("Under 6 dB of headroom - the sweep will hit harder than this tone.".to_owned())
-    } else if s.tone_on && peak <= -200.0 {
+    } else if s.tone_on && peak <= -200.0 && s.live.phase.is_empty() {
+        // **Unless the road has already said why.** A return of −200 with the
+        // tone switched on is usually a cable, and this is the page where a
+        // cable can still be moved — but it is also what "there is no audio
+        // engine running" meters like, and the host says exactly that on the
+        // phase line above. Sending somebody to check a loop that is not the
+        // problem is worse than saying nothing.
         Some("Nothing is coming back - check the loop's cables and the unit's bypass.".to_owned())
     } else if s.tone_on && pl > -200.0 && pr <= -200.0 {
         Some(
@@ -16992,6 +17014,284 @@ at: None,
             (s.meter_peak + 60.0).abs() < 0.5,
             "the hold never came down: {:.1}",
             s.meter_peak
+        );
+    }
+
+    /// **The IR level meter as it is actually painted**: the bar's ground, the
+    /// filled part of it, every vertical stroke standing on it, and the words
+    /// underneath.
+    ///
+    /// The meter is drawn rather than built out of widgets — a `rect_filled`
+    /// for the ground, a second one for the RMS, a `line_segment` for the held
+    /// peak and another for the −6 dBFS mark — so a test that read only the
+    /// words would pass over a needle painted in the wrong place, or one that
+    /// was never painted at all. Everything here comes back in SCREEN
+    /// coordinates and is turned into dBFS by the bar's own geometry, which is
+    /// the arithmetic somebody's eye does when they look at it.
+    ///
+    /// Ten frames a tenth of a second apart, for the reason
+    /// [`painted_dialog`] gives: an `egui::Area` fades in, and a picture read
+    /// mid-fade is not the picture anybody looks at.
+    #[allow(clippy::type_complexity)]
+    fn painted_ir_meter(
+        state: IrWizardState,
+    ) -> (Option<Rect>, Vec<Rect>, Vec<f32>, Vec<String>) {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+            chrome: None,
+            surface: None,
+        };
+        let mut dialog = Some(Dialog::IrWizard { state: Box::new(state) });
+        let face = Color32::from_rgb(0xE3, 0xD9, 0xBD);
+        let (mut fills, mut lines, mut words) = (Vec::new(), Vec::new(), Vec::new());
+        for frame in 0..10 {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 520.0))),
+                    time: Some(f64::from(frame) * 0.1),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = show(ctx, &mut dialog, face, placement);
+                },
+            );
+            fills.clear();
+            lines.clear();
+            words.clear();
+            fn walk(
+                shape: &egui::epaint::Shape,
+                fills: &mut Vec<Rect>,
+                lines: &mut Vec<(Pos2, Pos2)>,
+                words: &mut Vec<String>,
+            ) {
+                match shape {
+                    egui::epaint::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => {
+                        fills.push(r.rect);
+                    }
+                    egui::epaint::Shape::LineSegment { points, .. } => {
+                        lines.push((points[0], points[1]));
+                    }
+                    egui::epaint::Shape::Text(t) => words.push(t.galley.text().to_owned()),
+                    egui::epaint::Shape::Vec(v) => {
+                        for s in v {
+                            walk(s, fills, lines, words);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for c in &out.shapes {
+                walk(&c.shape, &mut fills, &mut lines, &mut words);
+            }
+        }
+        // The meter row is 20 points tall and as wide as the dialog's column,
+        // which is the one shape on the page with those proportions. The
+        // WIDEST of them is the ground; anything narrower standing on the same
+        // row is the RMS fill.
+        let row = |r: &Rect| (r.height() - 20.0).abs() < 0.5 && r.width() > 200.0;
+        let ground = fills
+            .iter()
+            .filter(|r| row(r))
+            .max_by(|a, b| a.width().total_cmp(&b.width()))
+            .copied();
+        let inside: Vec<Rect> = match ground {
+            Some(g) => fills
+                .iter()
+                .filter(|r| row(r) && r.width() < g.width() - 0.5)
+                .copied()
+                .collect(),
+            None => Vec::new(),
+        };
+        // Every full-height vertical stroke on that row, as the dBFS the
+        // page's own scale puts at that x. −60..0 across the bar.
+        let ticks: Vec<f32> = match ground {
+            Some(g) => lines
+                .iter()
+                .filter(|(a, b)| {
+                    (a.x - b.x).abs() < 0.5
+                        && (b.y - a.y).abs() > 15.0
+                        && a.x >= g.left() - 1.0
+                        && a.x <= g.right() + 1.0
+                        && a.y >= g.top() - 1.0
+                        && b.y <= g.bottom() + 1.0
+                })
+                .map(|(a, _)| (a.x - g.left()) / g.width() * 60.0 - 60.0)
+                .collect(),
+            None => Vec::new(),
+        };
+        (ground, inside, ticks, words)
+    }
+
+    /// **A wizard nobody has pushed to reads SILENCE, and a picture with
+    /// signal in it puts the needle where the reading says.**
+    ///
+    /// The owner, on a build where the level page had gone dead: "also the
+    /// meters don't do anything on the ir wizard and they pick up silence —
+    /// i know they aren't silent it's nothing is being sent to them at all
+    /// during the test tone and after."
+    ///
+    /// The second half of that is the host's (`IrRoad::note_levels`, which
+    /// used to decide whether to publish the meter by reading the meter).
+    /// This is the first half: what the wizard paints when nothing has been
+    /// published to it yet. `IrLive` derived its `Default`, so the four dBFS
+    /// fields — whose own docs say −200 for silence — rested at 0.0, and 0.0
+    /// dBFS is not "nothing", it is FULL SCALE. Every wizard was built from
+    /// that default and then handed it, so the page opened with a bar pinned
+    /// hard right and
+    ///
+    /// ```text
+    ///   return: 0.0 dBFS peak  (-0.0 dB of headroom)   0.0 rms
+    ///   CLIPPING - bring the unit's output (or the send) down.
+    /// ```
+    ///
+    /// over a loop nobody had measured. It is the worst direction for this
+    /// particular readout to lie in, and it buried the one sentence the page
+    /// exists to say — "Nothing is coming back" — because the clipping
+    /// warning and the dead-loop warning are chosen by the same number.
+    ///
+    /// Read off the painted picture rather than off `meter_tick`, because the
+    /// needle is a `line_segment` in screen coordinates and a helper that
+    /// agreed with itself would prove nothing about where the line went.
+    ///
+    /// The third block is the sentence that had to follow: now that an
+    /// honest silence reaches the page, the page must not blame the cables
+    /// for a silence the road has already explained.
+    ///
+    /// Revert-checks (all four performed):
+    ///   * put `Default` back on the `IrLive` derive — the resting page
+    ///     paints a needle at 0 dBFS and says CLIPPING, and the first half
+    ///     goes red naming the needle.
+    ///   * make the page draw `s.live.peak_db` instead of `s.meter_peak`, or
+    ///     drop the needle entirely — the second half goes red.
+    ///   * delete the phase label from `draw_ir_level` — the third block goes
+    ///     red with the road's refusal swallowed.
+    ///   * drop `&& s.live.phase.is_empty()` from the dead-loop rung — red,
+    ///     with the page sending somebody to check cables that are not the
+    ///     problem.
+    #[test]
+    fn an_unpushed_ir_wizard_paints_silence_and_a_pushed_one_paints_its_needle() {
+        // ── nothing has been pushed to it: the rest position ──────────────
+        let (ground, fill, ticks, words) = painted_ir_meter(IrWizardState {
+            stage: IrStage::Level,
+            tone_on: true,
+            out_pairs: vec![(0, 1)],
+            in_pairs: vec![(0, 1)],
+            ..Default::default()
+        });
+        let bar = ground.expect("the level page painted no meter at all");
+        assert!(
+            fill.is_empty(),
+            "a wizard that has been handed nothing painted {} RMS bar(s) on a \
+             meter whose reading is silence: {fill:?} inside {bar:?}",
+            fill.len()
+        );
+        // The −6 dBFS headroom mark is always there; a NEEDLE is anything
+        // else standing on the bar.
+        let needles: Vec<f32> = ticks.iter().copied().filter(|db| (db + 6.0).abs() > 1.0).collect();
+        assert!(
+            needles.is_empty(),
+            "a wizard that has been handed nothing painted a needle at {needles:?} \
+             dBFS - that is a default being read as a measurement"
+        );
+        assert!(
+            words.iter().any(|w| w.contains("return: silence")),
+            "the resting page did not say the return was silent: {words:?}"
+        );
+        assert!(
+            words.iter().any(|w| w.contains("left silent") && w.contains("right silent")),
+            "the resting page did not call both jacks silent: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|w| w.starts_with("CLIPPING")),
+            "a wizard that has been handed NOTHING warned about clipping: {words:?}"
+        );
+        assert!(
+            words.iter().any(|w| w.starts_with("Nothing is coming back")),
+            "the page did not offer the one sentence a dead loop needs: {words:?}"
+        );
+
+        // ── and a picture with signal in it ───────────────────────────────
+        let (ground, fill, ticks, words) = painted_ir_meter(IrWizardState {
+            stage: IrStage::Level,
+            tone_on: true,
+            out_pairs: vec![(0, 1)],
+            in_pairs: vec![(0, 1)],
+            live: crate::ports::IrLive {
+                peak_db: -12.0,
+                peak_l_db: -12.0,
+                peak_r_db: -15.0,
+                rms_db: -15.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let bar = ground.expect("the level page painted no meter at all");
+        let needles: Vec<f32> = ticks.iter().copied().filter(|db| (db + 6.0).abs() > 1.0).collect();
+        assert_eq!(
+            needles.len(),
+            1,
+            "the peak needle is not on the bar exactly once: {needles:?}"
+        );
+        assert!(
+            (needles[0] + 12.0).abs() < 0.6,
+            "the needle stands at {:.2} dBFS on a return the host pushed as \
+             -12.0 - the picture and the reading disagree",
+            needles[0]
+        );
+        // And the RMS bar, which is a different number and has to be drawn as
+        // one: −15 dBFS is three quarters of a −60..0 scale.
+        assert_eq!(fill.len(), 1, "the RMS fill is not on the bar exactly once: {fill:?}");
+        let frac = fill[0].width() / bar.width();
+        assert!(
+            (frac - 0.75).abs() < 0.02,
+            "the RMS bar fills {frac:.3} of the meter on a -15 dBFS reading, \
+             which the page's own -60..0 scale puts at 0.75"
+        );
+        assert!(
+            words.iter().any(|w| w.contains("-12.")),
+            "the page did not print the pushed peak: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|w| w.contains("return: silence")),
+            "the page called a -12 dBFS return silence: {words:?}"
+        );
+
+        // ── and a silence the ROAD has already explained ──────────────────
+        // `-200` with the tone switched on is usually a cable, and this is
+        // the page where a cable can still be moved. It is also what "there
+        // is no audio engine running" meters like, and the host says so on
+        // the phase line (`desktop.rs`, the `R::IrTone` arm). Sending
+        // somebody to check a loop that is not the problem is worse than
+        // saying nothing.
+        let (_, _, _, words) = painted_ir_meter(IrWizardState {
+            stage: IrStage::Level,
+            tone_on: true,
+            out_pairs: vec![(0, 1)],
+            in_pairs: vec![(0, 1)],
+            live: crate::ports::IrLive {
+                phase: "no audio engine is running - open the band, or pick an \
+                        audio device in Setup"
+                    .to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert!(
+            words.iter().any(|w| w.starts_with("no audio engine is running")),
+            "the level page swallowed the road's own refusal: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|w| w.starts_with("Nothing is coming back")),
+            "the page sent somebody to check the cables of a loop that has no \
+             engine behind it: {words:?}"
         );
     }
 
