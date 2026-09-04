@@ -27,6 +27,15 @@ resolver = "2"
 # of everybody's audio.
 [patch.crates-io]
 cpal = { path = "tangent-record/vendor/cpal" }
+# **The save panel opened at HOME however real the directory it was given.**
+#
+# rfd 0.15.4's macOS `set_path` appends the suggested FILE NAME to the
+# starting directory and hands the result to `setDirectoryURL:` claiming it is
+# a directory. It is not — it is where the file is about to be written — so
+# AppKit discards the URL and the panel falls back to whatever NSSavePanel
+# last remembered. One line removed; the name field is still filled, by the
+# `set_file_name` call two lines below it. See `tangent/vendor/README.md`.
+rfd = { path = "tangent/vendor/rfd" }
 # **One line of difference, for a crate that refuses to build otherwise.**
 # `lv2-sys` selects pre-generated bindings with a cfg_attr table covering linux
 # and windows, and `compile_error!`s on anything else — so no LV2 host can exist

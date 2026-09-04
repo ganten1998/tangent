@@ -7336,6 +7336,7 @@ impl DesktopApp {
             Q::Save => ("Saving project", None),
             Q::Template(name) => ("Saving template", Some(name.clone())),
             Q::New | Q::NewKeeping | Q::NewDiscarding => ("New project", None),
+            Q::ResetTemplate => ("Resetting the template", None),
             // The overlay names the SOURCES, because that is what decides how
             // long this takes: stems re-instantiate the same racks and then
             // write one file per lane.
@@ -7371,6 +7372,47 @@ impl DesktopApp {
     /// whole because it owns the plugin states and the shelf.
     fn run_project_request(&mut self, ctx: &egui::Context, req: tangent_ui::ports::ProjectRequest) {
         match req {
+            // **Put the stencil back, and keep the kit.**
+            //
+            // The template is in the user's Projects folder, not in the
+            // bundle, so a template that has been written over survives every
+            // reinstall — which is why there had to be a row for this at all.
+            // What goes: the document, the plugin-state shelf beside it, and
+            // any whole PROJECT that has been copied inside it (Save-As nests
+            // into a folder that already exists, and the shelf always
+            // exists). What stays: `drumpad.json` and `media/`, because a
+            // person's default drum kit is theirs and is not what went wrong.
+            //
+            // `seed_template` then writes a fresh document from
+            // `Settings::default`, and the session adopts it, so the desk on
+            // screen is the one a fresh install would show.
+            tangent_ui::ports::ProjectRequest::ResetTemplate => {
+                let template = self.templates_dir().join("default");
+                let _ = std::fs::remove_file(tangent_ui::arrangement::doc_in(&template));
+                let _ = std::fs::remove_dir_all(template.join("state"));
+                // A project nested inside the stencil: any child directory
+                // that holds a document of its own. Named by shape rather
+                // than by the one name it happened to have.
+                if let Ok(entries) = std::fs::read_dir(&template) {
+                    for e in entries.flatten() {
+                        let dir = e.path();
+                        if dir.is_dir()
+                            && tangent_ui::arrangement::doc_in(&dir).is_file()
+                        {
+                            let _ = std::fs::remove_dir_all(&dir);
+                        }
+                    }
+                }
+                self.app.seed_template(&template);
+                // The same road a launch takes, so what lands on screen is
+                // exactly what a fresh install would show.
+                self.open_project_at_launch();
+                self.app.notify(
+                    Kind::Info,
+                    "The default template is back to the shipped desk. Its \
+                     drum kit and samples were kept.",
+                );
+            }
             tangent_ui::ports::ProjectRequest::Save => {
                 self.save_plugin_states();
                 self.copy_states_to_project();
@@ -14541,6 +14583,27 @@ mod tests {
                  moving mid-sweep"
             );
         }
+    }
+
+    /// **Two crates name one folder, and it has to be the same word.**
+    ///
+    /// The drum kits' preset drawer is spelled `DRUM_PRESET_FOLDER` here —
+    /// the host opens the Save Kit panel on it — and `dialogs::DRUMPAD_NAME`
+    /// over in tangent-ui, which is where the drumpad's explorer now lands
+    /// when nobody has chosen a folder. The firewall means neither can see
+    /// the other's constant, so the only thing holding them together is this.
+    ///
+    /// Getting it wrong is quiet: the panel would save kits into one drawer
+    /// and the browser would open on another, and both would look right.
+    ///
+    /// Revert-check: change either string and this goes red naming both.
+    #[test]
+    fn the_drum_drawer_is_spelled_the_same_on_both_sides() {
+        assert_eq!(
+            super::DRUM_PRESET_FOLDER,
+            tangent_ui::dialogs::DRUMPAD_NAME,
+            "the save panel and the drumpad's explorer name different folders"
+        );
     }
 
     /// **An interface re-syncing is not an interface that moved.**

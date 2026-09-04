@@ -1984,17 +1984,46 @@ pub enum ResetScope {
     Desk,
     Devices,
     Everything,
+    /// **The default TEMPLATE, on disk.** Appended at the END, this enum's
+    /// law — and the only scope that touches no setting at all.
+    ///
+    /// The template is what every launch opens and every New is cloned from,
+    /// and it lives in the user's Projects folder rather than in the app. So
+    /// a template that has been written over is not something a reinstall can
+    /// fix, and until this row there was no way to fix it from inside either.
+    /// The owner's had a whole four-track session saved into it and reported
+    /// the symptom: "startup project is NOT loaded from the default template,
+    /// but rather a stale state from earlier on."
+    ///
+    /// The doors that let that happen are shut now (see
+    /// `app::inside_template_shelf`), but shutting them does not heal a
+    /// template already written over — which is the answer to "will this be a
+    /// problem for testers upgrading from older versions": for anyone whose
+    /// template is already wrong, yes, and this row is what they do about it.
+    Template,
 }
 
 impl ResetScope {
     /// Every scope, in the order the menu offers them: the four narrow ones
     /// a person actually wants, then the one that used to be the only one.
-    pub const ALL: [ResetScope; 6] = [
+    pub const ALL: [ResetScope; 7] = [
         ResetScope::Colours,
         ResetScope::Layout,
         ResetScope::Playing,
         ResetScope::Desk,
         ResetScope::Devices,
+        // **Before `Everything`, though the VARIANT is appended after it.**
+        //
+        // This array is the order the MENU offers, not an identity — the
+        // enum's own order is the append-only one. `Everything` stays the
+        // last row because it is the nuclear one and
+        // `learning_block_sits_after_the_teach_block` pins it there, and a
+        // narrow scope listed below it would read as narrower still.
+        //
+        // It also does not belong INSIDE `Everything`: that row is defined as
+        // "all five of the above at once", it says so on screen, and a reset
+        // of the colours must never take somebody's template with it.
+        ResetScope::Template,
         ResetScope::Everything,
     ];
 
@@ -2019,6 +2048,7 @@ impl ResetScope {
             ResetScope::Desk => "The Desk...",
             ResetScope::Devices => "Devices and Folders...",
             ResetScope::Everything => "Everything...",
+            ResetScope::Template => "The Default Template...",
         }
     }
 
@@ -2031,6 +2061,7 @@ impl ResetScope {
             ResetScope::Desk => "Reset the Desk",
             ResetScope::Devices => "Reset Devices and Folders",
             ResetScope::Everything => "Reset Everything",
+            ResetScope::Template => "Reset the Default Template",
         }
     }
 
@@ -2064,6 +2095,12 @@ impl ResetScope {
             ResetScope::Everything => {
                 "This puts all five of the above back at once: colours, \
                  layout, playing, the desk, and your devices and folders."
+            }
+            ResetScope::Template => {
+                "Every launch opens the default template, and every New is a \
+                 copy of it. This puts its DESK back to the one Tangent \
+                 ships with. Use it if the app keeps starting on a session \
+                 you recognise instead of a clean one."
             }
         }
     }
@@ -2101,6 +2138,11 @@ impl ResetScope {
                 "Kept: your projects and recordings on disk, your taught \
                  chords, and your saved theme files. Nothing you have \
                  recorded is deleted."
+            }
+            ResetScope::Template => {
+                "Kept: the template's drum kit and its samples, and every \
+                 project you have ever saved. This changes no setting at \
+                 all - only the template's own desk."
             }
         }
     }
