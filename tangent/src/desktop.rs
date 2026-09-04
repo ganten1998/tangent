@@ -11532,7 +11532,17 @@ pub fn ir_test(arg: Option<String>) {
     //
     // Per JACK, because the pair's peak is the larger of the two and a loop
     // returning on one cable meters like a healthy one.
-    let sweep = ess::ess(10.0, 22_000.0f64.min(0.475 * rate), sweep_s, rate);
+    // `f2=<hz>` caps the top of the sweep. A device under test with a lower
+    // internal sample rate than the host FOLDS everything above its own
+    // Nyquist back down, and a descending alias is not a response the inverse
+    // filter can cancel — it lands in the recovered IR as a chirp.
+    let top_hz = parts
+        .iter()
+        .find_map(|p| p.strip_prefix("f2=").and_then(|v| v.parse::<f64>().ok()))
+        .unwrap_or(22_000.0)
+        .min(0.475 * rate)
+        .max(200.0);
+    let sweep = ess::ess(10.0, top_hz, sweep_s, rate);
     let pre = rate.round() as usize;
     let tail = (tail_s * rate).round() as usize;
     let level = 10.0f32.powf(level_db / 20.0);
@@ -11792,7 +11802,7 @@ pub fn ir_test(arg: Option<String>) {
         pre,
         rate,
         10.0,
-        22_000.0f64.min(0.475 * rate),
+        top_hz,
         sweep_s,
     );
     // A scratch copy of exactly what the wizard would keep, so the pair can
