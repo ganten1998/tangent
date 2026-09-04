@@ -4123,13 +4123,42 @@ impl DesktopApp {
                 // engine, the sweep math and `IRs/` all live on this side;
                 // the answers ride back on the pushed `IrLive`.
                 R::IrTone { out, inp, level_db, on } => {
-                    if let Some(e) = self.recorder.engine.as_mut() {
-                        if on {
-                            e.start_ir_tone(out, inp, level_db);
-                        } else {
-                            e.stop_ir();
+                    match self.recorder.engine.as_mut() {
+                        Some(e) => {
+                            if on {
+                                e.start_ir_tone(out, inp, level_db);
+                            } else {
+                                e.stop_ir();
+                            }
+                            // A live road narrates itself from `ir_tick`; what
+                            // is cleared here is a refusal left over from the
+                            // last time the tone was asked for without one.
+                            self.ir.live.phase = String::new();
+                        }
+                        // **A tone nobody can play has to SAY so.**
+                        //
+                        // The button flipped to "Stop the tone ■" and the
+                        // page went on metering an engine that is not there —
+                        // and now that the level page's picture is pushed
+                        // every frame (see `IrRoad::note_levels`) the meter
+                        // reads an honest silence, which the warning ladder
+                        // turns into "Nothing is coming back — check the
+                        // loop's cables". That sends somebody hunting a cable
+                        // fault that does not exist. `start_ir_capture` has
+                        // answered this on the capture page since it was
+                        // written; the tone is the same refusal one page
+                        // earlier, and the phase line is where the road
+                        // already says these things.
+                        None => {
+                            if on {
+                                self.ir.live.phase =
+                                    "no audio engine is running - open the band, \
+                                     or pick an audio device in Setup"
+                                        .to_owned();
+                            }
                         }
                     }
+                    self.app.set_ir_live(self.ir.live.clone());
                 }
                 R::IrCapture { out, inp, sweep_s, tail_s, level_db, reference } => {
                     self.start_ir_capture(out, inp, sweep_s, tail_s, level_db, reference);
@@ -4756,7 +4785,6 @@ impl DesktopApp {
     /// capture runs, a finished capture handed off to the worker thread, the
     /// worker's answer landed, and the whole picture pushed to the app.
     fn ir_tick(&mut self) {
-        let mut busy = self.ir.pending.is_some() || self.ir.worker.is_some();
         // Said through the notification queue rather than the wizard's phase
         // line, and collected here because the engine is borrowed below.
         // The phase line is where the road narrates itself and is gone the
@@ -4764,35 +4792,19 @@ impl DesktopApp {
         // numbers say it should not be trusted, has to survive that.
         let mut refused: Option<String> = None;
         let mut warned: Option<String> = None;
-        if let Some(e) = self.recorder.engine.as_mut() {
+        // **The road's own numbers, read before anything is borrowed
+        // mutably, and `None` when there is no engine to ask.** The writing
+        // of them — and the answer to "does this frame owe the wizard a
+        // picture" — is `IrRoad::note_levels`, which is where both rules can
+        // be driven by a test.
+        let reading = self.recorder.engine.as_ref().map(|e| {
             let (rms_db, peak_db) = e.ir_return_db();
             let (peak_l_db, peak_r_db) = e.ir_return_sides_db();
             let (done_f, total_f) = e.ir_progress();
-            if rms_db > -200.0 || total_f > 0 {
-                busy = true;
-            }
-            self.ir.live.rms_db = rms_db;
-            self.ir.live.peak_db = peak_db;
-            self.ir.live.peak_l_db = peak_l_db;
-            self.ir.live.peak_r_db = peak_r_db;
-            self.ir.live.progress = if total_f > 0 {
-                (done_f as f32 / total_f as f32).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            // **The settle narrates itself.** A pass waits for the loop to go
-            // quiet before it records anything, so a capture of a long reverb
-            // sits at zero frames for a few seconds first — and a progress
-            // bar that does not move is how somebody decides the button did
-            // not work. `total_f` is set the moment the job is accepted and
-            // `done_f` only moves once the recording starts, so the two
-            // together say exactly which phase this is. See
-            // `instrument::IrCaptureSpec::settle_frames`.
-            if total_f > 0 && done_f == 0 && self.ir.pending.is_some() {
-                self.ir.live.phase =
-                    "waiting for the loop to go quiet \u{2014} the noise floor is                      measured before the sweep"
-                        .to_owned();
-            }
+            IrReading { rms_db, peak_db, peak_l_db, peak_r_db, done_f, total_f }
+        });
+        let mut busy = self.ir.note_levels(reading, self.app.ir_wizard_open());
+        if let Some(e) = self.recorder.engine.as_mut() {
             if let Some((capture, complete, slipped)) = e.take_captured() {
                 busy = true;
                 if let Some(p) = self.ir.pending.take() {
@@ -4981,8 +4993,10 @@ impl DesktopApp {
         if let Some(said) = warned {
             self.app.notify(Kind::Info, said);
         }
-        // Pushed while anything moves, and once more as the road settles, so
-        // the wizard's last frame shows the road at rest rather than stale.
+        // Pushed while anything moves — and an open wizard counts as
+        // movement, see `IrRoad::note_levels` — and once more as the road
+        // settles, so the wizard's last frame shows the road at rest rather
+        // than stale.
         if busy || self.ir.was_busy {
             self.app.set_ir_live(self.ir.live.clone());
         }
@@ -10567,6 +10581,126 @@ struct IrRoad {
     last_saved: Option<std::path::PathBuf>,
 }
 
+/// **What the engine says the IR road is doing, read once a frame.**
+///
+/// A struct rather than six loose locals so [`IrRoad::note_levels`] can be
+/// handed a whole reading by a test — including the one reading the host
+/// cannot make, `None`, which is "there is no engine to ask".
+#[cfg(feature = "recorder")]
+struct IrReading {
+    rms_db: f32,
+    peak_db: f32,
+    peak_l_db: f32,
+    peak_r_db: f32,
+    done_f: u32,
+    total_f: u32,
+}
+
+#[cfg(feature = "recorder")]
+impl IrRoad {
+    /// **The road's own numbers written into the wizard's picture, and the
+    /// answer to "does this frame owe the wizard a push".**
+    ///
+    /// Lifted out of `ir_tick` so both rules below can be driven by a test.
+    /// Neither of them could be before: `ir_tick` needs a whole desktop, an
+    /// engine and a device, so the two decisions that broke the level page
+    /// were written where nothing could reach them.
+    ///
+    /// **RULE ONE: an open wizard is itself a reason the road is live.**
+    ///
+    /// The push used to be gated on the road MOVING, and "moving" was
+    /// decided — in part — by reading the very meter the push carries:
+    ///
+    /// ```text
+    ///     if rms_db > -200.0 || total_f > 0 { busy = true; }
+    /// ```
+    ///
+    /// A tone job carries an empty capture buffer, so `total_f` is zero all
+    /// the way through stage 2; `pending` is only set by a real capture; so
+    /// during the level tone the ONLY thing that could open the gate was the
+    /// return level itself. A loop that brings nothing back therefore made
+    /// the host decide nothing was happening and stop pushing — and the
+    /// wizard froze on whatever picture it last held, for the rest of the
+    /// session. The owner: "the meters don't do anything on the ir wizard
+    /// and they pick up silence — i know they aren't silent it's nothing is
+    /// being sent to them at all during the test tone and after."
+    ///
+    /// He was right about the mechanism. And the cruelty of it is that the
+    /// frozen case is the case the page exists for: a dead loop is the one
+    /// fault still fixable with the cable in your hand at the interface, the
+    /// page has a sentence ready for it ("Nothing is coming back — check the
+    /// loop's cables and the unit's bypass"), and that sentence is chosen by
+    /// a number the host had decided not to send. The meter reported itself
+    /// broken by going quiet, which is indistinguishable from the reading it
+    /// was supposed to be giving.
+    ///
+    /// So the level term is gone and the PANEL is the term instead. While
+    /// the wizard is on screen the picture crosses every frame whatever the
+    /// numbers say. It costs one `IrLive` clone per frame for as long as
+    /// that one dialog is open — a dozen scalars, a phase line that is
+    /// usually empty, and, once there is a finished capture to show, its 360
+    /// envelope points. That is the same price the capture path has always
+    /// paid, now paid for the page that needed it too.
+    ///
+    /// **RULE TWO: no engine is silence, not the last thing we heard.**
+    ///
+    /// `None` means the band is shut, or the device died, or the audio path
+    /// is between two opens. The old code simply skipped the write, so the
+    /// picture kept whatever levels the engine had published before it went
+    /// away — a meter still showing a return off a device that is no longer
+    /// there. Rest is `IR_SILENCE_DB`, the same floor every other reader on
+    /// this road already agrees on.
+    ///
+    /// Both rules are held by
+    /// `an_open_ir_wizard_is_pushed_to_even_when_the_loop_brings_nothing_back`,
+    /// and the picture's own rest position — which was the other half of the
+    /// same fault — by `ports::IrLive`'s hand-written `Default` and
+    /// `dialogs`'
+    /// `an_unpushed_ir_wizard_paints_silence_and_a_pushed_one_paints_its_needle`.
+    fn note_levels(
+        &mut self,
+        reading: Option<IrReading>,
+        wizard_open: bool,
+    ) -> bool {
+        let mut busy = self.pending.is_some() || self.worker.is_some() || wizard_open;
+        let Some(r) = reading else {
+            let rest = tangent_ui::ports::IR_SILENCE_DB;
+            self.live.rms_db = rest;
+            self.live.peak_db = rest;
+            self.live.peak_l_db = rest;
+            self.live.peak_r_db = rest;
+            self.live.progress = 0.0;
+            return busy;
+        };
+        if r.total_f > 0 {
+            busy = true;
+        }
+        self.live.rms_db = r.rms_db;
+        self.live.peak_db = r.peak_db;
+        self.live.peak_l_db = r.peak_l_db;
+        self.live.peak_r_db = r.peak_r_db;
+        self.live.progress = if r.total_f > 0 {
+            (f64::from(r.done_f) / f64::from(r.total_f)).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        // **The settle narrates itself.** A pass waits for the loop to go
+        // quiet before it records anything, so a capture of a long reverb
+        // sits at zero frames for a few seconds first — and a progress bar
+        // that does not move is how somebody decides the button did not
+        // work. `total_f` is set the moment the job is accepted and `done_f`
+        // only moves once the recording starts, so the two together say
+        // exactly which phase this is. See
+        // `instrument::IrCaptureSpec::settle_frames`.
+        if r.total_f > 0 && r.done_f == 0 && self.pending.is_some() {
+            self.live.phase =
+                "waiting for the loop to go quiet \u{2014} the noise floor is                      measured before the sweep"
+                    .to_owned();
+        }
+        busy
+    }
+}
+
 /// How many frames a browse request waits before the file panel is raised.
 ///
 /// **Two, and both of them are somebody's bug.** The IR face asks for the
@@ -15389,6 +15523,139 @@ mod tests {
             "the capture counter moved ahead of an early return: a pass the \
              host refused would advance the wizard onto the previous IR and \
              offer to save it under the new name"
+        );
+    }
+
+
+    /// **A wizard on screen is pushed to whatever the meter says, and a road
+    /// with no engine behind it rests at silence.**
+    ///
+    /// The owner, on the build this fixes: "also the meters don't do anything
+    /// on the ir wizard and they pick up silence — i know they aren't silent
+    /// it's nothing is being sent to them at all during the test tone and
+    /// after." He was right about the mechanism, and it is a circle:
+    /// `ir_tick` published the wizard's picture only while the road was
+    /// MOVING, and it decided the road was moving partly by reading the very
+    /// meter the picture carries —
+    ///
+    /// ```text
+    ///     if rms_db > -200.0 || total_f > 0 { busy = true; }
+    /// ```
+    ///
+    /// The stage-2 tone is a job with an EMPTY capture buffer, so `total_f`
+    /// is zero for the whole of the level page; `pending` is only ever set by
+    /// a real sweep. So during the tone the one thing that could open the
+    /// gate was the return level itself, and a loop bringing nothing back
+    /// therefore stopped the push — which froze the wizard on its last
+    /// picture for the rest of the session. The case that goes dark is
+    /// precisely the case the level page exists for: a dead loop is the one
+    /// fault still fixable with the cable in your hand, the page has a
+    /// sentence ready for it, and that sentence is chosen by a number the
+    /// host had decided not to send.
+    ///
+    /// Driven through [`IrRoad::note_levels`], which is why that function was
+    /// lifted out of `ir_tick` at all: the rule needed a whole desktop, an
+    /// engine and an interface to reach before, so neither half of it could
+    /// be pinned by anything.
+    ///
+    /// Revert-checks:
+    ///   * delete `|| wizard_open` from the `busy` seed — the dead-loop case
+    ///     goes red, because that is the only clause that can carry it.
+    ///   * put `|| r.rms_db > -200.0` back as the gate instead — still red,
+    ///     for the same reason: the return in that case IS −200.
+    ///   * delete the `None` arm's four writes — the last block goes red with
+    ///     a meter still reporting a device that is gone.
+    #[test]
+    fn an_open_ir_wizard_is_pushed_to_even_when_the_loop_brings_nothing_back() {
+        let silent = || IrReading {
+            rms_db: -200.0,
+            peak_db: -200.0,
+            peak_l_db: -200.0,
+            peak_r_db: -200.0,
+            done_f: 0,
+            total_f: 0,
+        };
+
+        // ── the level page, tone playing, nothing coming back ─────────────
+        let mut road = IrRoad::default();
+        assert!(
+            road.note_levels(Some(silent()), true),
+            "a wizard is on screen over a dead loop and the host owes it \
+             nothing - so the meter freezes on its last picture and the page \
+             never gets to say the loop is dead"
+        );
+        assert_eq!(road.live.peak_db, -200.0, "the dead loop was not written down");
+
+        // ── the same road with the panel shut ─────────────────────────────
+        // Nothing is looking, nothing is running: the push is not owed, and
+        // the wizard's close edge cancels the tone anyway.
+        let mut road = IrRoad::default();
+        assert!(
+            !road.note_levels(Some(silent()), false),
+            "the host pays for a live picture every frame of every session \
+             with no wizard anywhere on screen"
+        );
+
+        // ── a return that IS there ────────────────────────────────────────
+        let mut road = IrRoad::default();
+        road.note_levels(
+            Some(IrReading {
+                rms_db: -15.0,
+                peak_db: -12.0,
+                peak_l_db: -12.0,
+                peak_r_db: -18.0,
+                done_f: 0,
+                total_f: 0,
+            }),
+            true,
+        );
+        assert_eq!(road.live.rms_db, -15.0);
+        assert_eq!(road.live.peak_db, -12.0);
+        assert_eq!(
+            (road.live.peak_l_db, road.live.peak_r_db),
+            (-12.0, -18.0),
+            "the two jacks are the whole point of the pair of them - see \
+             `Shared::ir_peak_l`"
+        );
+
+        // ── a capture running, wizard or no wizard ────────────────────────
+        let mut road = IrRoad::default();
+        assert!(
+            road.note_levels(
+                Some(IrReading {
+                    rms_db: -20.0,
+                    peak_db: -14.0,
+                    peak_l_db: -14.0,
+                    peak_r_db: -15.0,
+                    done_f: 240,
+                    total_f: 960,
+                }),
+                false,
+            ),
+            "a capture is running and the host is not publishing its progress"
+        );
+        assert!(
+            (road.live.progress - 0.25).abs() < 1.0e-6,
+            "a quarter of the buffer is {} on the progress bar",
+            road.live.progress
+        );
+
+        // ── and then the engine goes away ─────────────────────────────────
+        // The band shut, the device died, the audio path is between two
+        // opens. Whatever the last engine published, the meter must not go
+        // on showing a return off a box that is not there.
+        assert!(!road.note_levels(None, false), "nothing is running and nothing is owed");
+        assert_eq!(
+            (
+                road.live.rms_db,
+                road.live.peak_db,
+                road.live.peak_l_db,
+                road.live.peak_r_db,
+                road.live.progress,
+            ),
+            (-200.0, -200.0, -200.0, -200.0, 0.0),
+            "the picture kept the dead engine's levels, so the wizard meters a \
+             device that is no longer open"
         );
     }
 

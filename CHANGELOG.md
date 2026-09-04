@@ -125,6 +125,33 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The IR wizard's level meter was frozen, and it opened pinned at full
+  scale.** Two faults on the same readout, and each one hid the other. The
+  host published the wizard's live picture only while the IR road was "doing
+  something", and it decided that partly by reading the very meter the picture
+  carries — a return at −200 dBFS made the host conclude nothing was happening
+  and stop pushing. The stage-2 tone runs with an empty capture buffer, so
+  during the whole of the level page that return level was the *only* thing
+  that could keep the picture flowing: a loop bringing nothing back froze the
+  wizard on whatever it last held, for the rest of the session. The case that
+  went dark is exactly the case the page exists for. A dead loop is the one
+  fault still fixable with the cable in your hand at the interface, the page
+  has a sentence ready for it — "Nothing is coming back — check the loop's
+  cables and the unit's bypass" — and that sentence is chosen by a number the
+  host had decided not to send. Underneath it, the resting picture itself was
+  wrong: `IrLive` derived its default, so four dBFS fields whose own
+  documentation says −200 for silence rested at 0.0, and on a dBFS scale 0.0 is
+  not "nothing", it is FULL SCALE. Every wizard is built from that default and
+  then handed it, so a freshly opened level page drew its bar hard right and
+  warned about clipping over a loop nobody had measured yet. The picture now
+  follows the PANEL rather than the signal — an open wizard is pushed to every
+  frame whatever the numbers say — silence rests at silence, and a road with no
+  engine behind it publishes silence rather than going on showing levels off a
+  device that is no longer open. The level page also carries the road's own
+  phase line now, the way the sweep and result pages always have, so a tone
+  asked for with no audio engine running says that instead of metering as a
+  dead loop and sending somebody to check cables that are not the problem.
+
 - **A full-speed export rendered every plugin at its last-saved knobs, not the
   ones the desk is playing.** An export builds a second engine and furnishes it
   by hand, and it filled every rack from the sidecar files on disk — which are
