@@ -376,7 +376,15 @@ const MENU_FONT_SIZE: f32 = 13.0;
 const PAD_X: f32 = 20.0; // Qt item padding 4px 20px
 const PAD_Y: f32 = 4.0;
 const SEP_H: f32 = 3.0; // 1px line + 1px margin above/below
-const SIZE_PERCENTS: [i64; 7] = [50, 75, 100, 125, 150, 175, 200];
+/// **Three rungs, at the owner's word**: "make only options 75%, 100%, and
+/// 125% available in the right click --> Window menu."
+///
+/// It was seven, from 50 to 200, and the ends were not sizes anybody chose
+/// twice — 50% is unreadable and 200% is off the side of the monitor the
+/// share is measured against. The middle moved with them: `BASE_OF_MONITOR`
+/// grew a quarter, so this 100% is the old 125% and this 125% is past
+/// anything the old list offered.
+const SIZE_PERCENTS: [i64; 3] = [75, 100, 125];
 /// Highest capo offered. Past this it stops being a capo and starts being a
 /// different instrument, and the list has to end somewhere.
 const CAPO_MAX: u8 = 9;
@@ -2383,18 +2391,17 @@ mod tests {
     /// Same intent as when this test was called `size_is_still_the_first_
     /// submenu...`, asserted against the new shape: "Size" could not become a
     /// child of "Window" (a submenu holds items, not submenus), so the percents
-    /// ARE Window's items. Still the first hover, still seven, still 100% third.
+    /// ARE Window's items. Still the first hover, and 100% is still the
+    /// MIDDLE one — there are three now rather than seven, at the owner's
+    /// word, and the ends of the old list were sizes nobody chose twice.
     #[test]
     fn the_size_percents_are_still_the_first_hover_and_still_read_the_same() {
         let subs = submenus(view());
         assert_eq!(subs[0].0, "Window");
-        assert_eq!(
-            subs[0].1[..7],
-            ["50%", "75%", "100%", "125%", "150%", "175%", "200%"]
-        );
-        assert_eq!(subs[0].2[2], MenuAction::SetSizePercent(100));
+        assert_eq!(subs[0].1[..3], ["75%", "100%", "125%"]);
+        assert_eq!(subs[0].2[1], MenuAction::SetSizePercent(100));
         // Borderless joined them rather than sitting loose at the top level.
-        assert_eq!(subs[0].1[7], "Borderless");
+        assert_eq!(subs[0].1[3], "Borderless");
     }
 
 

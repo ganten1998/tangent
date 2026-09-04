@@ -1179,7 +1179,9 @@ impl Layout {
         let lane_h = lanes_area.height()
             / (shown as f32
                 + auto_share
-                + if view.show_tempo_lane { TEMPO_LANE_SHARE } else { 0.0 }
+                // The tempo shares the MASTER's lane now, so it buys no
+                // height of its own — see the row push below.
+                + 0.0
                 + if view.show_master_row { MASTER_ROW_SHARE } else { 0.0 });
 
         // **The rows, stacked in order, and the arrays derived from them.**
@@ -1217,17 +1219,37 @@ impl Layout {
                 *y = bottom;
             }
         };
-        // The tempo lane sits ABOVE the tracks when it is showing: it is a
-        // property of the song, and a song-wide row below the channels would
-        // scroll away from the ruler it belongs to.
-        if view.show_tempo_lane {
-            push(RowKind::Tempo, lane_h * TEMPO_LANE_SHARE, &mut y, &mut rows);
-        }
         // **The master and the click, above the channels.** Half a track
         // each, so the two together take exactly one track's height and the
         // pair reads as one band rather than as two short tracks.
         if view.show_master_row {
             push(RowKind::Master, lane_h * MASTER_ROW_SHARE, &mut y, &mut rows);
+            // **The tempo draws in the MASTER's lane, not in a row of its
+            // own.**
+            //
+            // It used to take half a track above the master, and the row was
+            // wrong twice over: it needed no header, so the desk grew an
+            // unlabelled empty strip down the left, and it sat above the very
+            // thing it controls. The owner: "clicking the tempo arm currently
+            // opens its own lane above the master -- this is tacky because it
+            // controls the master, and doesn't have its own label (because it
+            // shouldn't) so theres just an empty strip. INSTEAD: clicking
+            // tempo arm reveals the tempo automation, BUT -- it uses the empty
+            // lane directly to the right of the master instead."
+            //
+            // The master's lane IS empty — a master carries no clips — so the
+            // curve moves in and costs no height at all. A row rather than a
+            // special case, and the SAME row kind, so every line that draws
+            // or hits the tempo goes on finding it by `RowKind::Tempo` and
+            // reading `row.lane`. Its header is deliberately `NOTHING`: there
+            // is no strip to label because there is no strip.
+            if view.show_tempo_lane {
+                if let Some(master) = rows.iter().rev().find(|r| r.kind == RowKind::Master)
+                {
+                    let lane = master.lane;
+                    rows.push(Row { kind: RowKind::Tempo, lane, header: Rect::NOTHING });
+                }
+            }
             // **Its automation hangs under it**, exactly as a track's does,
             // and by the same row kind — see `MASTER_LANE`.
             for slot in 0..view.master_automation.len() {
@@ -2591,7 +2613,10 @@ pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
     }
     for row in &l.rows {
         match row.kind {
-            RowKind::Tempo => push(row.header, Hit::TempoHeader),
+            // The tempo has no header to hang a node on any more — it
+            // draws in the master's lane. Its one control, flatten, is the
+            // right button over the curve; see `app`'s secondary-press arm.
+            RowKind::Tempo => {}
             RowKind::Master => {}
             RowKind::Automation(lane, slot) => {
                 let h = auto_cells(view, lane, row.header);
@@ -6124,8 +6149,9 @@ ArrangeView {
             .filter(|r| r.kind == RowKind::Master)
             .collect();
         assert_eq!(masters.len(), 1, "the master's row is not laid out once");
-        // Above every track, and below the tempo lane, which is a property
-        // of the song rather than a channel.
+        // Above every track. The tempo is not above it any more — it draws
+        // IN the master's lane, which is the empty half of a row that
+        // carries no clips.
         let first_track = l
             .rows
             .iter()
@@ -6136,7 +6162,15 @@ ArrangeView {
             .iter()
             .find(|r| r.kind == RowKind::Tempo)
             .expect("no tempo lane");
-        assert!(tempo.lane.bottom() <= masters[0].lane.top() + 0.5);
+        assert_eq!(
+            tempo.lane, masters[0].lane,
+            "the tempo does not draw in the master's lane"
+        );
+        assert!(
+            !tempo.header.is_positive(),
+            "the tempo took a header again - an unlabelled empty strip is \
+             the thing this layout exists to stop"
+        );
         assert!(masters[0].lane.bottom() <= first_track.lane.top() + 0.5);
 
         // **HALF a track's height**, at the owner's word. It went from half
@@ -6265,7 +6299,6 @@ ArrangeView {
             "Metronome",
             "Snap to grid",
             "Grid",
-            "Song tempo, flatten to one tempo",
             "KEYS volume",
             "KEYS routing",
             // **Not the insert BAYS.** At every header width this app
@@ -6278,6 +6311,9 @@ ArrangeView {
             // bug.
             "KEYS input",
             "Clip backing",
+            // "Song tempo, flatten to one tempo" is NOT here any more: the
+            // tempo lost its header when it moved into the master's lane,
+            // and flatten is the right button over the curve.
         ] {
             assert!(
                 nodes.iter().any(|n| n.label == want),
@@ -7389,13 +7425,20 @@ selected: false,
         }];
         let l = Layout::new(rect(), &v);
 
-        // The tempo row is first, above every track.
+        // The MASTER heads the stack now; the tempo shares its lane rather
+        // than buying a row above it.
         let first = l.rows.first().expect("no rows");
-        assert_eq!(first.kind, RowKind::Tempo);
+        assert_eq!(first.kind, RowKind::Master);
         assert!(
             first.lane.top() <= l.lane_rows[0].top() + 0.5,
-            "the tempo lane is not above the tracks"
+            "the master row is not above the tracks"
         );
+        let tempo = l
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Tempo)
+            .expect("no tempo row");
+        assert_eq!(tempo.lane, first.lane, "the tempo left the master's lane");
         // The automation row sits directly under the track it belongs to.
         let auto = l
             .rows
