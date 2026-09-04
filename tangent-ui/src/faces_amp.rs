@@ -185,9 +185,19 @@ pub fn draw_amp(
             // window the moment it is dragged in, and the amp half of the
             // owner's "cut off on the right". Cutting the WORD to the room
             // is the fix; the full name is on the hover, where it already
-            // was. `horizontal_wrapped` is the floor under that: if the room
-            // is too small even for an ellipsis, the board takes a second
-            // line rather than running off the end.
+            // was.
+            //
+            // **And the row never wraps.** It used to fall back to
+            // `horizontal_wrapped`, so a narrow window put six chips on one
+            // line and the seventh underneath — and a window being DRAGGED
+            // across that boundary flipped between the two layouts every
+            // frame. The owner: "Window starts with 6 pedals then another
+            // row below with 1 pedal. Resizing to any size will flash
+            // quickly between 6 on 1 and the proper 7 in a row." A
+            // pedalboard is an ORDER — signal goes left to right through it
+            // — so a second line is not a smaller version of the same
+            // picture, it is a different one. Seven across, cut to whatever
+            // room there is, and the hover carries the name.
             let room = (w - ui.spacing().button_padding.x * 2.0 - 2.0).max(0.0);
             let cut: Vec<String> = pedals
                 .iter()
@@ -200,7 +210,7 @@ pub fn draw_amp(
                     )
                 })
                 .collect();
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
                 for (pedal, tenant) in pedals.iter().enumerate() {
                     let empty = tenant.is_empty();
                     // **A THIRD look, because there is a third state.**
@@ -215,15 +225,23 @@ pub fn draw_amp(
                     // A bypassed chip sits in the WELL rather than on the
                     // raised surface — the kit's own recessed ground, which
                     // is what "not standing in the chain" looks like
-                    // everywhere else in this app — wears the quiet ink
-                    // measured against that well, and is struck through.
-                    // Three signals rather than one on purpose: the ground
-                    // and the ink are a theme's to derive and a theme with
-                    // a flat palette could bring them close, while a
-                    // strikethrough is the same mark on all sixteen. An
-                    // EMPTY seat is left exactly as it was, because empty
-                    // and bypassed are different answers and the quiet ink
-                    // alone was already carrying empty.
+                    // everywhere else in this app — and wears the quiet ink
+                    // measured against that well.
+                    //
+                    // **Two signals, and NOT a strikethrough.** It had one
+                    // for a while, on the reasoning that a flat palette
+                    // could bring the well and the raised surface close
+                    // while a line through the word reads the same on all
+                    // sixteen themes. The owner's ruling: "Do not cross out
+                    // the names to represent them being bypassed... Just do
+                    // what the tracks do with their bypassed inserts." The
+                    // tracks do exactly this pair — `mixer_panel` recesses
+                    // the bay's light to the mute colour and pulls the name
+                    // toward its ground — and a desk where one fact wears
+                    // two different marks in two places is a desk with two
+                    // grammars to learn. An EMPTY seat is left exactly as it
+                    // was, because empty and bypassed are different answers
+                    // and the quiet ink alone was already carrying empty.
                     let off = !empty && live_off.get(pedal).copied().unwrap_or(false);
                     let ground = if off { st.s.well } else { st.s.raised };
                     let mut word = egui::RichText::new(&cut[pedal])
@@ -238,9 +256,6 @@ pub fn draw_amp(
                         } else {
                             st.s.ink
                         });
-                    if off {
-                        word = word.strikethrough();
-                    }
                     let chip = ui.add_sized(
                         egui::Vec2::new(w, chip_h),
                         egui::Button::new(word).fill(ground),
@@ -423,6 +438,10 @@ mod tests {
         ink: egui::Color32,
         ground: egui::Color32,
         struck: bool,
+        /// Where the word was painted, so a test can ask about the LAYOUT
+        /// and not only the colours. See
+        /// `the_pedalboard_is_one_row_however_narrow_the_window_is`.
+        at: egui::Rect,
     }
 
     /// Every word one frame of the amp painted, with the look above.
@@ -483,7 +502,7 @@ mod tests {
                     let struck = section.is_some_and(|s| s.format.strikethrough.width > 0.0);
                     words.push((
                         t.galley.text().to_owned(),
-                        ChipLook { ink, ground, struck },
+                        ChipLook { ink, ground, struck, at: box_ },
                     ));
                 }
                 _ => {}
@@ -493,6 +512,79 @@ mod tests {
             walk(&cs.shape, &mut surfaces, &mut words);
         }
         words
+    }
+
+    /// **Seven chips, one row, at every width — and the same row at every
+    /// width, which is the half a static picture cannot fail.**
+    ///
+    /// The board used to fall back to `horizontal_wrapped`, so a narrow amp
+    /// window put six chips on one line and the seventh underneath. Worse
+    /// than the layout was the BOUNDARY: dragging the window across the
+    /// width where the wrap decided differently flipped between the two
+    /// pictures every frame. The owner: "Window starts with 6 pedals then
+    /// another row below with 1 pedal. Resizing to any size will flash
+    /// quickly between 6 on 1 and the proper 7 in a row. I need all 7 in a
+    /// row without formatting glitches."
+    ///
+    /// So this walks the width down through the region the wrap used to
+    /// happen in, one point at a time, and asks the same question at every
+    /// stop. A test at one width would pass on the wrapping code simply by
+    /// picking a wide enough number — the fault was never that no width
+    /// worked, it was that the answer CHANGED with the width.
+    ///
+    /// Revert-check performed: put `horizontal_wrapped` back and this goes
+    /// red, naming the first width that took a second line.
+    #[test]
+    fn the_pedalboard_is_one_row_however_narrow_the_window_is() {
+        let set = crate::settings::Settings::default();
+        let p = crate::recorder_panel::palette(&set);
+        let st = FaceStyle::new(p.bg, p.lcd, p.lcd_face);
+        let names = [
+            "comp", "wah", "drive", "chorus", "trem", "echo", "plate",
+        ];
+        for width in (150..=620).step_by(5).map(|w| w as f32) {
+            let mut live = FaceLive {
+                face: crate::ports::BuiltinFace {
+                    path: AMP_PATH.to_owned(),
+                    ..Default::default()
+                },
+                pedals: Some(std::array::from_fn(|i| names[i].to_owned())),
+                ..Default::default()
+            };
+            let words = chip_looks(&mut live, &st, width);
+            // The chips are whatever survived the cut of each name, so they
+            // are found by prefix rather than by the whole word — at 150
+            // points every one of them is an initial and an ellipsis.
+            let rows: Vec<f32> = names
+                .iter()
+                .filter_map(|n| {
+                    words
+                        .iter()
+                        .find(|(w, _)| {
+                            !w.is_empty()
+                                && n.starts_with(
+                                    w.trim_end_matches('\u{2026}').trim_end_matches("..."),
+                                )
+                        })
+                        .map(|(_, l)| l.at.center().y)
+                })
+                .collect();
+            assert_eq!(
+                rows.len(),
+                7,
+                "at {width} points the board painted {} chips, not seven",
+                rows.len()
+            );
+            let top = rows.iter().copied().fold(f32::MAX, f32::min);
+            let bottom = rows.iter().copied().fold(f32::MIN, f32::max);
+            assert!(
+                bottom - top < 4.0,
+                "at {width} points the pedalboard took more than one line - \
+                 the chips' rows span {:.1} points, so a window dragged \
+                 through this width flips between two pictures",
+                bottom - top
+            );
+        }
     }
 
     /// **A bypassed pedal chip does not look like a live one — or like an
@@ -514,12 +606,17 @@ mod tests {
     /// under the word, because that is the only way to ask what a word
     /// actually landed on.
     ///
-    /// Three claims, and the third is the one a single-signal design would
-    /// fail: a bypassed chip differs from a live one in ground AND in ink
-    /// AND by being struck through, so a theme whose well and raised
-    /// surfaces sit close together still says which pedals are out. Give the
-    /// bypassed chip back the live chip's fill and ink — or drop the
-    /// strikethrough — and this goes red.
+    /// A bypassed chip differs from a live one in GROUND and in INK, which
+    /// is the pair `mixer_panel` already uses for a bypassed bay — a
+    /// recessed light and a name pulled toward its ground. It is deliberately
+    /// NOT struck through: the owner ruled that out ("Do not cross out the
+    /// names... Just do what the tracks do with their bypassed inserts"), so
+    /// the absence of the mark is now part of what this pins, and putting it
+    /// back turns the first assert red rather than going unnoticed.
+    ///
+    /// The third claim is the one a single-signal design would fail: a
+    /// bypassed chip has to differ from an EMPTY one too, and with the
+    /// strikethrough gone the ground is what carries that.
     #[test]
     fn a_bypassed_pedal_chip_does_not_look_like_a_live_one() {
         let set = crate::settings::Settings::default();
@@ -562,14 +659,13 @@ mod tests {
         let off_chip = look("wah");
         let empty_chip = look("+");
         assert!(
-            !live_chip.struck && !empty_chip.struck,
-            "a chip that is in circuit is struck through: live {live_chip:?}, \
+            !live_chip.struck && !empty_chip.struck && !off_chip.struck,
+            "a chip is struck through - the desk says bypassed with a recessed \
+             ground and a quiet name, and nowhere with a line through the \
+             word: live {live_chip:?}, \
              empty {empty_chip:?}"
         );
-        assert!(
-            off_chip.struck,
-            "a bypassed chip is not struck through: {off_chip:?}"
-        );
+
         assert_ne!(
             off_chip.ground, live_chip.ground,
             "a bypassed chip stands on the same surface as a live one"
@@ -579,8 +675,7 @@ mod tests {
             "a bypassed chip wears the same ink as a live one"
         );
         assert_ne!(
-            (off_chip.ground, off_chip.struck),
-            (empty_chip.ground, empty_chip.struck),
+            off_chip.ground, empty_chip.ground,
             "a bypassed chip is indistinguishable from an EMPTY seat, which is \
              a different answer: one has a pedal in it"
         );

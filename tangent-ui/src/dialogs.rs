@@ -17870,6 +17870,80 @@ at: None,
         );
     }
 
+    /// **Init puts every control back, on whatever face is open.**
+    ///
+    /// The owner: "every plugin needs an initialize button." It lives on the
+    /// preset strip rather than on each face because that strip is the one
+    /// part every face wears — one button on sixteen units instead of
+    /// sixteen buttons — so this drives it through a real face and a real
+    /// press rather than calling anything directly.
+    ///
+    /// Two claims. It asks for EVERY parameter, not the ones the open face
+    /// happens to draw: a unit whose face shows five knobs and whose kernel
+    /// carries twenty-five must come back whole. And the values are the
+    /// PUSHED defaults, so the face holds no second opinion about what
+    /// shipped — change a `ParamSpec` and Init follows without being told.
+    ///
+    /// Revert-check performed: have the button send its own zeroes instead
+    /// of `p.default` and the second assert goes red naming the parameter.
+    #[test]
+    fn init_puts_every_control_back_to_what_the_unit_ships_with() {
+        let params: Vec<crate::ports::BuiltinFaceParam> = (0..9)
+            .map(|i| crate::ports::BuiltinFaceParam {
+                id: i,
+                symbol: format!("p{i}"),
+                name: format!("KNOB {i}"),
+                units: "%".to_owned(),
+                // Distinct from each other and from the value below, so a
+                // reset that wrote one number for all of them fails.
+                default: 0.1 * (i as f32 + 1.0),
+                reading: "50%".to_owned(),
+                choices: Vec::new(),
+                steps: 0,
+                value: 0.93,
+            })
+            .collect();
+        let mut slot = Slot::new(Dialog::InsertFace {
+            strip: 4,
+            slot: 1,
+            live: Box::new(crate::faces::FaceLive {
+                face: crate::ports::BuiltinFace {
+                    path: "@tangent-tape".to_owned(),
+                    params: params.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        });
+        let asked = slot.click("Init").expect("Init raised nothing at all");
+        match asked {
+            DialogAction::SetInsertParamsMany { strip, slot: bay, sets } => {
+                assert_eq!((strip, bay), (4, 1), "Init addressed the wrong bay");
+                assert_eq!(
+                    sets.len(),
+                    params.len(),
+                    "Init asked for {} of {} parameters",
+                    sets.len(),
+                    params.len()
+                );
+                for p in &params {
+                    let got = sets
+                        .iter()
+                        .find(|(id, _)| *id == p.id)
+                        .unwrap_or_else(|| panic!("Init skipped {}", p.symbol))
+                        .1;
+                    assert!(
+                        (got - p.default).abs() < 1e-6,
+                        "Init set {} to {got}, not the {} it ships at",
+                        p.symbol,
+                        p.default
+                    );
+                }
+            }
+            _ => panic!("Init raised something other than a run of sets"),
+        }
+    }
+
     /// **Every top the row offers is on ONE line, and the lowest one is
     /// reachable.**
     ///
