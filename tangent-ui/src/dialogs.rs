@@ -714,6 +714,11 @@ pub struct IrWizardState {
     pub sweep_choice: usize,
     /// Post-sweep capture window, seconds — at least the tail expected.
     pub tail_s: f64,
+    /// Index into [`IR_TOP_CHOICES`] — how high the sweep climbs. Appended
+    /// at the END of this struct, and defaulting to the last choice so a
+    /// wizard that has never been touched sweeps the whole band exactly as
+    /// it always did.
+    pub top_choice: usize,
     /// The host's per-frame push: levels, progress, result.
     pub live: crate::ports::IrLive,
     /// The Save field.
@@ -846,6 +851,33 @@ const METER_FALL_DB_S: f32 = 20.0;
 /// tails, 50 for the last few dB of noise floor.
 pub const IR_SWEEP_CHOICES: [f64; 3] = [5.0, 15.0, 50.0];
 
+/// **How high the sweep climbs**, in hertz, and why it is a choice at all.
+///
+/// A device whose own sample rate is below the host's folds everything the
+/// sweep plays above its Nyquist back down. A descending alias is not a
+/// linear response, so the inverse filter cannot cancel it, and it lands in
+/// the recovered IR as a tone sliding downward for as long as the capture
+/// window allows. The IR looks plausible, saves, loads, and puts a swept
+/// whistle behind everything it is used on.
+///
+/// The owner met it on an Alesis Quadraverb — a late-eighties box sampling
+/// near 31 kHz, so anything above about 15 kHz comes home folded — while the
+/// wizard swept to 20.9 kHz with no way to ask for less. Same rig, same
+/// minute, only this number changed:
+///
+/// ```text
+///     to 20.9 kHz   IR 5.48 s   tail fits a slide at R2 0.976 over 2.8 oct
+///     to 14   kHz   IR 2.85 s   R2 0.079 over 0.7 oct — no slide at all
+/// ```
+///
+/// FULL stays the default. It is right for a plugin, a room, a modern
+/// converter and most analogue outboard, and quietly sweeping less would
+/// throw away real bandwidth on all of them to spare one class of device.
+/// What was missing was not a lower default but any way to know: the result
+/// page now says when a capture folded and names this row. See
+/// `ports::IrFoldover`.
+pub const IR_TOP_CHOICES: [f64; 4] = [14_000.0, 16_000.0, 18_000.0, 22_000.0];
+
 impl Default for IrWizardState {
     fn default() -> Self {
         Self {
@@ -858,6 +890,7 @@ impl Default for IrWizardState {
             tone_on: false,
             sweep_choice: 1,
             tail_s: 10.0,
+            top_choice: IR_TOP_CHOICES.len() - 1,
             live: crate::ports::IrLive::default(),
             name: String::new(),
             armed: None,
@@ -881,6 +914,16 @@ impl IrWizardState {
 
     pub fn in_pair(&self) -> (usize, usize) {
         self.in_pairs.get(self.in_sel).copied().unwrap_or((0, 1))
+    }
+
+    /// The top of the sweep this wizard is set to, in hertz. Clamped through
+    /// the table so a state read from anywhere cannot name a band that is not
+    /// on the row.
+    pub fn top_hz(&self) -> f64 {
+        IR_TOP_CHOICES
+            .get(self.top_choice)
+            .copied()
+            .unwrap_or_else(|| IR_TOP_CHOICES[IR_TOP_CHOICES.len() - 1])
     }
 
     pub fn sweep_s(&self) -> f64 {
@@ -1528,6 +1571,9 @@ pub enum DialogAction {
         tail_s: f64,
         level_db: f32,
         reference: bool,
+        /// How high the sweep climbs, in hertz. Appended at the END of this
+        /// variant; see [`IR_TOP_CHOICES`].
+        top_hz: f64,
     },
     /// Stop whatever the IR road is doing. Also fired when the wizard
     /// closes, so a tone can never outlive its meter.
@@ -5632,6 +5678,30 @@ fn draw_ir_sweep(
             }
         }
     });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("TOP").font(bold(11.0)).color(t.text));
+        for (i, hz) in IR_TOP_CHOICES.iter().enumerate() {
+            let last = i + 1 == IR_TOP_CHOICES.len();
+            let label = if last {
+                "full".to_owned()
+            } else {
+                format!("{:.0}k", hz / 1000.0)
+            };
+            if ui
+                .selectable_label(s.top_choice == i, RichText::new(label).font(bold(11.0)))
+                .on_hover_text(
+                    "How high the sweep climbs. A device that samples lower \
+                     than this interface folds everything above its own \
+                     Nyquist back down, and the fold arrives in the IR as a \
+                     descending whistle. Vintage digital boxes want 14k or \
+                     16k; a plugin, a room or modern outboard wants full.",
+                )
+                .clicked()
+            {
+                s.top_choice = i;
+            }
+        }
+    });
     // **The tail is a hard ceiling on the IR, not a suggestion.** The
     // response to the sweep's last sample is only observed for as long as
     // the recording ran on afterwards, so nothing past this window was ever
@@ -5689,6 +5759,7 @@ fn draw_ir_sweep(
             tail_s: s.tail_s,
             level_db: s.level_db,
             reference: true,
+            top_hz: s.top_hz(),
         });
     }
     ui.add_space(6.0);
@@ -5718,6 +5789,7 @@ fn draw_ir_sweep(
             tail_s: s.tail_s,
             level_db: s.level_db,
             reference: false,
+            top_hz: s.top_hz(),
         });
     }
     if s.live.capturing {
@@ -5974,6 +6046,33 @@ fn draw_ir_result(
             )
             .font(bold(10.0))
             .color(t.text),
+        );
+    }
+    // **A capture that measured the device's ALIASING rather than its
+    // reverb, said before Save rather than discovered later.**
+    //
+    // A device sampling lower than this interface folds everything the sweep
+    // plays above its own Nyquist back down; the fold is not a linear
+    // response, the inverse filter cannot cancel it, and it lands in the IR
+    // as a tone sliding downward for the whole window. The file looks
+    // plausible, saves, loads, and puts a swept whistle behind everything it
+    // is ever used on — the owner's "odd descending chirpy artifacts", found
+    // only by ear and only after using it.
+    //
+    // Loud, because this is the one result here that makes the IR wrong
+    // rather than merely imperfect, and it names the remedy and the row that
+    // carries it. See `ports::IrFoldover` and `IR_TOP_CHOICES`.
+    if r.foldover == crate::ports::IrFoldover::Suspected {
+        ui.label(
+            RichText::new(
+                "This capture folded. The tail slides steadily downward, \
+                 which a decay cannot do — it is the sweep coming back off a \
+                 device that samples lower than this interface, not the \
+                 unit's reverb. Go back and set TOP to 14k or 16k, then \
+                 record another.",
+            )
+            .font(bold(10.0))
+            .color(IR_DANGER),
         );
     }
     // The sweep's free distortion probe. −200 means the window fell off the
@@ -14596,6 +14695,65 @@ at: None,
     /// and marked, and — because it may be ninety rows down — the mark is only
     /// worth anything if the list opens on it, which is what the `focus` flag
     /// also does. This runs the frame inline, the way a plugin editor draws it.
+    /// **A folded capture SAYS SO on the page that offers to save it.**
+    ///
+    /// The fault it announces: a device sampling lower than the interface
+    /// folds everything the sweep plays above its own Nyquist back down; the
+    /// fold is not a linear response, so the inverse filter cannot cancel it,
+    /// and it lands in the IR as a tone sliding downward for the whole
+    /// window. The file looks plausible, saves, loads, and puts a swept
+    /// whistle behind everything it is ever used on. The owner found his by
+    /// ear, after using it, and called it "odd descending chirpy artifacts".
+    ///
+    /// Measured off the painted frame rather than off `IrOutcome`, per the
+    /// house rule: a page that computed the verdict and printed nothing would
+    /// pass any test of the verdict itself.
+    ///
+    /// Revert-check: delete the `IrFoldover::Suspected` arm in
+    /// `draw_ir_result` and the first assert goes red.
+    #[test]
+    fn a_folded_capture_says_so_before_it_is_saved() {
+        let outcome = |fold: crate::ports::IrFoldover| crate::ports::IrOutcome {
+            seconds: 2.0,
+            usable_s: 1.8,
+            noise_floor_db: -80.0,
+            capture_peak_db: -6.0,
+            tail_range_db: 74.0,
+            envelope_db: vec![-6.0, -20.0, -40.0, -60.0],
+            foldover: fold,
+            ..Default::default()
+        };
+        let page = |fold: crate::ports::IrFoldover| -> Vec<String> {
+            let mut slot = Slot::new(Dialog::IrWizard {
+                state: Box::new(IrWizardState {
+                    stage: IrStage::Result,
+                    live: crate::ports::IrLive {
+                        result: Some(outcome(fold)),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            });
+            slot.settle().iter().map(|(_, _, w)| w.clone()).collect()
+        };
+        let folded = page(crate::ports::IrFoldover::Suspected).join(" ");
+        assert!(
+            folded.contains("folded"),
+            "a folded capture said nothing on the page that offers to save \
+             it; it said: {folded}"
+        );
+        assert!(
+            folded.contains("TOP"),
+            "the warning did not name the row that fixes it: {folded}"
+        );
+        // And a clean capture is not accused.
+        let clean = page(crate::ports::IrFoldover::None).join(" ");
+        assert!(
+            !clean.contains("folded"),
+            "a clean capture was told it folded: {clean}"
+        );
+    }
+
     #[test]
     fn the_loaded_plugin_opens_preselected_and_marked() {
         let bundles: Vec<(PathBuf, Option<String>, Option<String>)> = [

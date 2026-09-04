@@ -4170,8 +4170,18 @@ impl DesktopApp {
                     }
                     self.app.set_ir_live(self.ir.live.clone());
                 }
-                R::IrCapture { out, inp, sweep_s, tail_s, level_db, reference } => {
-                    self.start_ir_capture(out, inp, sweep_s, tail_s, level_db, reference);
+                R::IrCapture {
+                    out,
+                    inp,
+                    sweep_s,
+                    tail_s,
+                    level_db,
+                    reference,
+                    top_hz,
+                } => {
+                    self.start_ir_capture(
+                        out, inp, sweep_s, tail_s, level_db, reference, top_hz,
+                    );
                 }
                 R::IrCancel => {
                     if let Some(e) = self.recorder.engine.as_mut() {
@@ -4717,6 +4727,7 @@ impl DesktopApp {
         tail_s: f64,
         level_db: f32,
         reference: bool,
+        top_hz: f64,
     ) {
         let Some(e) = self.recorder.engine.as_mut() else {
             self.ir.live.phase = "no audio engine is running".to_owned();
@@ -4728,7 +4739,16 @@ impl DesktopApp {
         // of interest" (Muller) — up to 22 kHz or 95% of Nyquist, whichever
         // the rate can carry.
         let f1 = 10.0;
-        let f2 = 22_000.0f64.min(0.475 * rate);
+        // **The top the wizard asked for**, floored well clear of the first
+        // and ceilinged by what this rate can carry. A device that samples
+        // lower than the interface folds everything above its own Nyquist
+        // back down and the fold arrives in the IR as a descending whistle,
+        // which is why this is a control and not a constant — see
+        // `dialogs::IR_TOP_CHOICES`.
+        let f2 = top_hz
+            .max(f1 * 8.0)
+            .min(22_000.0)
+            .min(0.475 * rate);
         let sweep_s = if sweep_s.is_finite() { sweep_s.clamp(1.0, 120.0) } else { 15.0 };
         let tail_s = if tail_s.is_finite() { tail_s.clamp(1.0, 60.0) } else { 10.0 };
         let sweep = crate::units::sweep::ess(f1, f2, sweep_s, rate);
@@ -11870,30 +11890,6 @@ pub fn ir_test(arg: Option<String>) {
         top_hz,
         sweep_s,
     );
-    // A scratch copy of exactly what the wizard would keep, so the pair can
-    // be analysed outside the app. `save=<path>` in the arg list.
-    if let Some(dest) = parts.iter().find_map(|p| p.strip_prefix("save=")) {
-        let spec = tangent_record::wav::WavSpec {
-            sample_rate: rate as u32,
-            channels: 2,
-            format: tangent_record::wav::SampleFormat::Float32,
-        };
-        let bext = tangent_record::wav::Bext::new(
-            tangent_record::wav::Wallclock::from_unix(0, 0),
-            spec,
-        );
-        let mut inter = vec![0.0f32; l.len().min(r.len()) * 2];
-        for (i, c) in inter.chunks_exact_mut(2).enumerate() {
-            c[0] = l[i];
-            c[1] = r[i];
-        }
-        match tangent_record::wav::WavWriter::create(std::path::Path::new(dest), spec, &bext)
-            .and_then(|mut w| w.write_interleaved(&inter).and_then(|()| w.finish()))
-        {
-            Ok(()) => println!("\nsaved the pair to {dest}"),
-            Err(e) => println!("\ncould not save to {dest}: {e}"),
-        }
-    }
     // A scratch copy of exactly what the wizard would keep, so a capture can
     // be analysed outside the app. `save=<path>` in the arg list.
     if let Some(dest) = parts.iter().find_map(|p| p.strip_prefix("save=")) {
@@ -11927,6 +11923,14 @@ pub fn ir_test(arg: Option<String>) {
             tangent_ui::ports::IrLengthCut::Floor => "the decay meeting its own floor",
             tangent_ui::ports::IrLengthCut::Window =>
                 "NOTHING - this is the whole recorded window",
+        }
+    );
+    println!(
+        "foldover:      {}",
+        match out.foldover {
+            tangent_ui::ports::IrFoldover::Suspected =>
+                "SUSPECTED - the tail slides like the sweep coming back",
+            tangent_ui::ports::IrFoldover::None => "no",
         }
     );
     println!("capture peak:  {:.2} dBFS", out.capture_peak_db);
