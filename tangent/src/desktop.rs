@@ -8709,6 +8709,36 @@ impl DesktopApp {
             self.recorder.rate_watch = RateWatch::default();
             return;
         }
+        // **And an IR measurement outranks it for the same reason a take
+        // does.**
+        //
+        // A capture is a fifteen-second sweep whose deconvolution assumes the
+        // recording and the inverse filter share one clock. Reopening the
+        // audio path underneath one rebuilds the engine, drops the job with
+        // it, and — if the rate really did move — leaves a recording whose
+        // first half was played at one rate and whose second half was played
+        // at another. The inverse cannot cancel that, and what survives is a
+        // descending chirp across the whole tail, which is an IR that looks
+        // plausible, saves, loads, and puts a swept whistle behind everything
+        // it is ever used on.
+        //
+        // The owner found this the hard way: "i accidentally changed sample
+        // rate in the middle of your capture", and the IR that came out of
+        // that session measures as one and a bit seconds of real plate
+        // followed by six seconds of chirp — narrowband, log-linear, sliding
+        // down at very nearly the sweep's own 0.735 octaves a second, where
+        // the first second of the same file is four octaves wide like a plate
+        // should be.
+        //
+        // Standing aside rather than aborting: the wizard has no way to say
+        // "your capture was thrown away" that is better than letting the
+        // measurement finish and be judged on its numbers, and a capture is
+        // seconds while the device's new rate is not going anywhere. The
+        // reopen happens on the first poll after the road is clear.
+        if self.ir.pending.is_some() || self.ir.worker.is_some() || self.ir.live.capturing {
+            self.recorder.rate_watch = RateWatch::default();
+            return;
+        }
         let now = std::time::Instant::now();
         let due = self
             .recorder
@@ -11765,6 +11795,54 @@ pub fn ir_test(arg: Option<String>) {
         22_000.0f64.min(0.475 * rate),
         sweep_s,
     );
+    // A scratch copy of exactly what the wizard would keep, so the pair can
+    // be analysed outside the app. `save=<path>` in the arg list.
+    if let Some(dest) = parts.iter().find_map(|p| p.strip_prefix("save=")) {
+        let spec = tangent_record::wav::WavSpec {
+            sample_rate: rate as u32,
+            channels: 2,
+            format: tangent_record::wav::SampleFormat::Float32,
+        };
+        let bext = tangent_record::wav::Bext::new(
+            tangent_record::wav::Wallclock::from_unix(0, 0),
+            spec,
+        );
+        let mut inter = vec![0.0f32; l.len().min(r.len()) * 2];
+        for (i, c) in inter.chunks_exact_mut(2).enumerate() {
+            c[0] = l[i];
+            c[1] = r[i];
+        }
+        match tangent_record::wav::WavWriter::create(std::path::Path::new(dest), spec, &bext)
+            .and_then(|mut w| w.write_interleaved(&inter).and_then(|()| w.finish()))
+        {
+            Ok(()) => println!("\nsaved the pair to {dest}"),
+            Err(e) => println!("\ncould not save to {dest}: {e}"),
+        }
+    }
+    // A scratch copy of exactly what the wizard would keep, so a capture can
+    // be analysed outside the app. `save=<path>` in the arg list.
+    if let Some(dest) = parts.iter().find_map(|p| p.strip_prefix("save=")) {
+        let spec = tangent_record::wav::WavSpec {
+            sample_rate: rate as u32,
+            channels: 2,
+            format: tangent_record::wav::SampleFormat::Float32,
+        };
+        let bext = tangent_record::wav::Bext::new(
+            tangent_record::wav::Wallclock::from_unix(0, 0),
+            spec,
+        );
+        let mut inter = vec![0.0f32; l.len().min(r.len()) * 2];
+        for (i, c) in inter.chunks_exact_mut(2).enumerate() {
+            c[0] = l[i];
+            c[1] = r[i];
+        }
+        match tangent_record::wav::WavWriter::create(std::path::Path::new(dest), spec, &bext)
+            .and_then(|mut w| w.write_interleaved(&inter).and_then(|()| w.finish()))
+        {
+            Ok(()) => println!("\nsaved the pair to {dest}"),
+            Err(e) => println!("\ncould not save to {dest}: {e}"),
+        }
+    }
     println!("\n== what the wizard would show ==");
     println!("length:        {:.3} s  ({} samples)", out.seconds, l.len());
     println!("after peak:    {:.3} s", out.usable_s);
@@ -14273,6 +14351,60 @@ mod tests {
              a second opinion here is how the cover ended up under the export \
              window"
         );
+    }
+
+    /// **Nothing the device does to itself may be answered while a
+    /// measurement is in flight.**
+    ///
+    /// `follow_device_rate` reopens the audio path when the interface moves
+    /// on its own, which is the whole point of it. Three things must outrank
+    /// that, and the source is what says so: a take rolling, an IR capture,
+    /// and the deconvolution worker that follows one.
+    ///
+    /// A capture is the sharp case. The sweep and the inverse filter share
+    /// one clock by assumption, so a rate that moves halfway through leaves a
+    /// recording the inverse cannot cancel — and what survives is a
+    /// descending chirp across the tail. The owner produced exactly that: "i
+    /// accidentally changed sample rate in the middle of your capture", and
+    /// the file measures as 1.3 s of real plate (four octaves wide, as a
+    /// plate is) followed by six seconds of a narrowband tone sliding down at
+    /// 0.71 octaves a second against the sweep's own 0.735.
+    ///
+    /// A source scan, like its neighbours here, because reaching
+    /// `follow_device_rate` needs a `DesktopApp`, an engine and an interface.
+    /// What it pins is that all three refusals are present and that they come
+    /// BEFORE the poll — a guard after the reopen is not a guard.
+    ///
+    /// Revert-check: delete the `self.ir.pending` clause and this goes red
+    /// naming it.
+    #[test]
+    fn a_capture_in_flight_outranks_the_device_changing_its_own_rate() {
+        let src = include_str!("desktop.rs");
+        let at = src
+            .find("fn follow_device_rate")
+            .expect("the rate follower is still called that");
+        // The window is a sample size, not a claim: the doc paragraphs in
+        // this function are long and one more would push the poll past a
+        // tighter bound. What actually pins the ordering is the `before`
+        // slice below, which is cut at the poll itself.
+        let body = &src[at..src.len().min(at + 8_000)];
+        let poll = body
+            .find("default_output_rate")
+            .expect("the follower still asks the device");
+        let before = &body[..poll];
+        for (what, needle) in [
+            ("a take rolling", "self.recorder.session.state().is_active()"),
+            ("an armed capture", "self.ir.pending.is_some()"),
+            ("the deconvolution worker", "self.ir.worker.is_some()"),
+            ("a capture recording", "self.ir.live.capturing"),
+        ] {
+            assert!(
+                before.contains(needle),
+                "{what} does not stop the rate follower reopening the audio path \
+                 underneath it, so a measurement can be destroyed by the device \
+                 moving mid-sweep"
+            );
+        }
     }
 
     /// **An interface re-syncing is not an interface that moved.**

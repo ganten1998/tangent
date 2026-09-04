@@ -2832,6 +2832,17 @@ fn theory_pitches(hit: theory_panel::Hit) -> Vec<u8> {
 /// to be perfectly still would open the text field about half the time.
 const TAP_SLOP: f32 = 4.0;
 
+/// See [`TangentApp::open_project_keeping`]. Two words rather than a bool
+/// because the wrong one is a silent, permanent misfiling of somebody's work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepPath {
+    /// An ordinary open: this document is the session, write it down.
+    Write,
+    /// An adopting open: the caller is about to repoint somewhere else and
+    /// will write THAT path. Nothing touches the settings here.
+    Leave,
+}
+
 impl TangentApp {
     /// `ctx` rather than an `eframe::CreationContext`, because eframe is one of
     /// three things that can hand this app a context and the other two have
@@ -9758,7 +9769,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// materialises at the first thing worth keeping (a take, a kit edit,
     /// a Save), through `materialize_project_dir`.
     pub fn adopt_template(&mut self, template_dir: &std::path::Path, dir: &std::path::Path) {
-        self.open_project(&crate::arrangement::doc_in(template_dir));
+        // **`KeepPath::Leave`**: the settings must never name the template,
+        // not even for the two statements between here and the repoint below.
+        // See `open_project_keeping` for what one crash in that window costs.
+        self.open_project_keeping(&crate::arrangement::doc_in(template_dir), KeepPath::Leave);
         // **The kit's samples are still in the template**, and they stay
         // there until this scratch becomes real. See `media_source` for what
         // the repoint below does to a relative pad path without it.
@@ -9836,6 +9850,32 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     pub fn open_project(&mut self, doc: &std::path::Path) {
+        self.open_project_keeping(doc, KeepPath::Write);
+    }
+
+    /// **Whether an open may write the path it just opened into the settings.**
+    ///
+    /// `adopt_template` opens the TEMPLATE and then immediately repoints the
+    /// session at a scratch folder, so for the length of that call the
+    /// document IS the shipped template. `open_project` used to save the
+    /// settings in the middle of it, which put
+    /// `project_path = .../Projects/Templates/default/project.tan` on disk —
+    /// briefly, and then corrected.
+    ///
+    /// Briefly is enough. A crash, a force-quit or a power cut inside that
+    /// window leaves the settings pointing at the template, and from the next
+    /// launch onward the session IS the template: every kit save writes
+    /// `drumpad.json` into it, every media import writes into its `media/`,
+    /// and what a fresh install of Tangent ships with becomes whatever that
+    /// person happened to be working on. The owner asked the question that
+    /// found it — "is there a reason that my CR78.kit is loaded into the
+    /// default Drum Patch?" — and his template's kit is that kit, pad for
+    /// pad, seventeen samples with the same names.
+    ///
+    /// So the window is closed rather than made smaller: an adopting open
+    /// does not write the path at all, and the caller writes the scratch's
+    /// once it has repointed.
+    fn open_project_keeping(&mut self, doc: &std::path::Path, keep: KeepPath) {
         // An explicit open owns its own folder; nothing is borrowed from a
         // template. `adopt_template` sets this again immediately after,
         // which is why it is cleared here rather than by every caller.
@@ -9843,8 +9883,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let (arr, doc) = self.read_for_adoption(doc);
         self.arrangement = arr;
         self.project_doc = doc.clone();
-        self.settings.project_path = doc.to_string_lossy().into_owned();
-        self.save_settings();
+        if keep == KeepPath::Write {
+            self.settings.project_path = doc.to_string_lossy().into_owned();
+            self.save_settings();
+        }
         self.clips_dirty = true;
         // **The session's DESK arrives with it** — kinds, bays, names,
         // faders, tempo. Explicit opens only: the launch reopen goes
@@ -22105,6 +22147,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.splash_up = up;
     }
 
+    /// **The rate the OUTPUT is actually running at**, or `None` before an
+    /// engine exists.
+    ///
+    /// Read off the status the host pushes every frame rather than from the
+    /// SETTING, and the difference is the whole point: the setting says
+    /// "Device" far more often than it says a number, and a device is free to
+    /// be at 44100 while the number beside it reads 48000.
+    pub fn device_sample_rate(&self) -> Option<u32> {
+        self.audio_status
+            .output
+            .as_ref()
+            .map(|(_, s)| s.sample_rate)
+            .filter(|r| *r >= 8_000)
+    }
+
     pub fn set_audio_status(&mut self, status: recorder::AudioStatus) {
         // Also refreshed into an OPEN panel, or it would show whatever was true
         // at the moment it was opened and never change.
@@ -25830,6 +25887,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // A stale span from an earlier session of the dialog must
                 // not outlive the selection it named.
                 spec.span = None;
+                // **And the SAMPLE RATE opens on the device's own.**
+                //
+                // `ProjectExportSpec::default()` rests at 48000 and the
+                // remembered spec keeps whatever was last run, so the row
+                // read 48000 on a rig running 44100 — every time, until
+                // somebody noticed and changed it. An export at the wrong
+                // rate is not a wrong number on a screen, it is a resample
+                // nobody asked for in a file somebody keeps.
+                //
+                // The DEVICE and not the setting: the setting says "Device"
+                // more often than it says a number. Only when there is an
+                // engine to ask — before that the remembered value is the
+                // best answer anyone has, and the row is still a row.
+                //
+                // A realtime pass already ends up at the engine's rate
+                // whatever this says (the host overwrites `spec.rate` for
+                // one), so this aligns the OFFLINE pass and the screen with
+                // what the realtime pass was always going to do.
+                if let Some(rate) = self.device_sample_rate() {
+                    spec.rate = rate;
+                }
                 self.dialog = Some(dialogs::Dialog::ExportProject {
                     spec,
                     sel: self.time_sel.filter(|(a, b)| b > a),
@@ -32948,6 +33026,119 @@ mod tests {
             "a template somebody had arranged was overwritten"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Adopting the template must never write the template's path down.**
+    ///
+    /// Launch opens the shipped template and then repoints the session at a
+    /// scratch folder. For the length of that call the document IS the
+    /// template, and the open used to save the settings in the middle of it —
+    /// so `project_path` named the template on disk, briefly, and was then
+    /// corrected.
+    ///
+    /// Briefly is enough. One crash, force-quit or power cut inside that
+    /// window and the settings still name the template at the next launch;
+    /// from then on the session IS the template, every kit save writes
+    /// `drumpad.json` into it, and what a fresh install ships with becomes
+    /// whatever that person was working on. The owner found it by asking why
+    /// his CR78 kit was the default drum patch — his template's kit is that
+    /// kit, seventeen samples, name for name.
+    ///
+    /// Revert-check: pass `KeepPath::Write` in `adopt_template` and this goes
+    /// red with the template's own path in the message.
+    #[test]
+    fn adopting_the_template_never_writes_its_path_into_the_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-adopt-path-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(&template).expect("template dir");
+        crate::arrangement::Arrangement::default()
+            .save_to(&crate::arrangement::doc_in(&template));
+
+        let scratch = root.join("Untitled");
+        let (_ctx, mut app) = headless(Caps::PLUGIN);
+        app.adopt_template(&template, &scratch);
+
+        // The FINAL state, which is the easy half.
+        let path = std::path::Path::new(&app.settings.project_path);
+        assert!(
+            path.starts_with(&scratch),
+            "the settings should name the scratch, got {}",
+            app.settings.project_path
+        );
+
+        // And the kit a session saves lands in the scratch, never the shelf.
+        app.materialize_project_dir();
+        let sidecar = crate::drumpad::DrumpadDoc::sidecar(
+            app.project_doc().expect("a document"),
+        );
+        assert!(
+            sidecar.starts_with(&scratch),
+            "a kit saved now would land at {}, which is the template shelf",
+            sidecar.display()
+        );
+
+        // **And the TRANSIENT, which is the half that matters and the half a
+        // first draft of this test missed.**
+        //
+        // Asserting on the settled value cannot fail: `adopt_template`
+        // corrects the path two statements later whichever way the open
+        // behaved, so the test passed with the bug in place. The fault is
+        // that the template's path is written down AT ALL, for any length of
+        // time, so the thing to assert is that the adopting open does not
+        // touch `project_path` — which is observable directly.
+        let sentinel = "/nowhere/that/exists/project.tan";
+        app.settings.project_path = sentinel.to_owned();
+        app.open_project_keeping(
+            &crate::arrangement::doc_in(&template),
+            super::KeepPath::Leave,
+        );
+        assert_eq!(
+            app.settings.project_path, sentinel,
+            "an adopting open wrote the template's path into the settings; one \
+             crash in that window and every launch afterwards edits the shipped \
+             template instead of a project"
+        );
+        // The document itself DID move — the open still opened something.
+        assert!(
+            app.project_doc().is_some_and(|d| d.starts_with(&template)),
+            "the adopting open did not actually open the template"
+        );
+
+        // **And that `adopt_template` is the caller that asks for it.**
+        //
+        // The two assertions above pin the BEHAVIOUR of an adopting open, and
+        // they pin it directly, which is why they cannot also pin the WIRING:
+        // they call `open_project_keeping` themselves, so flipping the
+        // argument at the one call site that matters leaves them green. That
+        // was true of this test for one revision and the revert-check is what
+        // said so. A scan is the honest other half.
+        let src = include_str!("app.rs");
+        let at = src
+            .find("pub fn adopt_template")
+            .expect("the adopter is still called that");
+        // Comments stripped: the paragraph above that call site NAMES the
+        // variant it asks for, so a scan that reads its own explanation stays
+        // green through the very edit it exists to catch. That happened here
+        // once already, in the guard two files over.
+        let body: String = src[at..src.len().min(at + 1_200)]
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("KeepPath::Leave"),
+            "adopt_template no longer asks the open to leave the settings \
+             alone, so the template's own path is written down while the \
+             session is briefly standing on it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **A template's kit still plays before the scratch folder exists.**
