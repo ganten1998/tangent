@@ -4530,11 +4530,30 @@ impl TangentApp {
                 };
                 self.apply_mixer_hit(hit, recorder::gain_to_fader(to as f32));
             }
+            // **A send resets to DRY, on every strip, including the one that
+            // ships wet.**
+            //
+            // The fader and the pan ask `Settings::default()` because their
+            // shipped value IS what "put it back" means. The send is the one
+            // control where those two are different questions:
+            // `strip_sends[1]` is 1.0 so the DX7 arrives wired to the reverb
+            // on a fresh install, and reading the same table here made
+            // double-clicking track two's send restore full send while every
+            // other track's went to nothing. The owner: "the default of track
+            // two should not be 100 percent send... it should just initialize
+            // as 100, default set by dbl-click currently doesn't set it to 0
+            // like the other track."
+            //
+            // Those are two different defaults and both are wanted: the desk
+            // still OPENS with that send up, because that is a shipped
+            // arrangement and it comes from the settings table, and the DIAL
+            // still means one thing on all seventeen strips. Zero is spelled
+            // here rather than read from anywhere, so a future change to what
+            // ships wet cannot quietly change what a double-click does.
             H::Send(i) => {
                 let at = i.desk_index();
-                let to = d.strip_sends.get(at).copied().unwrap_or(0.0);
                 if let Some(slot) = self.settings.strip_sends.get_mut(at) {
-                    *slot = to;
+                    *slot = 0.0;
                 }
                 self.save_settings();
             }
@@ -16094,6 +16113,34 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         );
     }
 
+    /// **Hand an edit over NOW, for a gesture the release path cannot see.**
+    ///
+    /// The editor saves on release, and only when a DRAG was in flight:
+    /// `m.dirty && m.drag.is_some()`. That is right for the gestures it was
+    /// written for — draw, move, trim — and wrong for all three of the
+    /// double-click ones, every one of which clears `drag` and returns
+    /// before the release handler is reached. A note written with the pen up
+    /// therefore sat in `self.arrangement` with `clips_dirty` never raised,
+    /// so the ENGINE never got it: the roll drew the note, the transport
+    /// played silence, and clicking the note started a drag whose release
+    /// finally handed the clip over. That is exactly the shape the owner
+    /// reported — "in order to hear the playback of lets say a 5 note
+    /// sequence i just dbl click inputted, I STILL have to click on each
+    /// note to audition them before the playback will actually play" — and
+    /// the audition was never the thing that fixed it; the release under it
+    /// was.
+    ///
+    /// The same three lines as the release path, so there is one meaning of
+    /// "the editor changed something" and not two.
+    fn me_commit(&mut self) {
+        if self.midi_edit.as_ref().is_some_and(|m| m.dirty) {
+            self.arr_save_edits();
+            if let Some(st) = self.midi_edit.as_mut() {
+                st.dirty = false;
+            }
+        }
+    }
+
     /// The editor's EAR: on the DRUM LANE the keys are PADS, and every
     /// audition strikes the kit — one that reached the DX7 while editing
     /// drums was the owner's bug. Everywhere else, the ordinary audition.
@@ -16537,6 +16584,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     if let Some(st) = self.midi_edit.as_mut() {
                         st.drag = None;
                     }
+                    self.me_commit();
                     return;
                 }
                 // **A double-click puts a velocity head back**, which is the
@@ -16548,6 +16596,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     if let Some(st) = self.midi_edit.as_mut() {
                         st.drag = None;
                     }
+                    self.me_commit();
                     return;
                 }
                 // **A double-click on empty roll WRITES a note**, which is
@@ -16566,6 +16615,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         if let Some(st) = self.midi_edit.as_mut() {
                             st.drag = None;
                         }
+                        self.me_commit();
                         return;
                     }
                 }
@@ -32328,6 +32378,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A note written with the pen UP reaches the engine.**
+    ///
+    /// The editor hands its clip over on release, and only when a DRAG was
+    /// in flight (`m.dirty && m.drag.is_some()`). All three of its
+    /// double-click gestures clear `drag` and return before that handler is
+    /// reached, so a note written with the pen up changed
+    /// `self.arrangement` and never raised `clips_dirty` — the roll drew it,
+    /// the transport played silence, and clicking the note started a drag
+    /// whose RELEASE finally handed the clip over. The owner read that as
+    /// the audition being required: "in order to hear the playback of lets
+    /// say a 5 note sequence i just dbl click inputted, I STILL have to
+    /// click on each note to audition them before the playback will actually
+    /// play the midi note that's in the arrangement."
+    ///
+    /// Two halves, because they fail apart. The first is the property: a
+    /// mutation alone does not owe the engine anything, and `me_commit` is
+    /// what does. The second is that the three gestures actually call it —
+    /// a source scan, because driving three double-clicks through the roll
+    /// needs a frame, a clip, a grid and a pointer, and what would regress
+    /// is somebody adding a FOURTH double-click gesture beside them.
+    ///
+    /// Revert-check performed: drop `me_commit`'s body and the first half
+    /// goes red; delete any one of the three calls and the second names it.
+    #[test]
+    fn a_note_written_with_the_pen_up_reaches_the_engine() {
+        let root = project_scratch("penup");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 1,
+            path: String::new(),
+            start_s: 8.0,
+            offset_s: 0.0,
+            len_s: 16.0,
+            name: "MIDI".to_owned(),
+            ..Default::default()
+        });
+        app.open_midi_editor(id);
+        let _ = app.take_clips_dirty();
+
+        app.me_create_note(10.13, 64);
+        assert_eq!(app.arrangement.clips[0].notes.len(), 1, "no note was written");
+        assert!(
+            !app.take_clips_dirty(),
+            "writing a note owed the engine on its own - then the release \
+             path was never the thing carrying it and this test is measuring \
+             the wrong seam"
+        );
+        app.me_commit();
+        assert!(
+            app.take_clips_dirty(),
+            "the note is in the document and the engine was never told, so \
+             playback is silent until something else happens to save"
+        );
+
+        // And the three gestures that cannot reach the release path call it.
+        let src = include_str!("app.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        // Scoped to the ROLL's own handler: `button_double_clicked` appears
+        // on other surfaces too, and the first one in the file is the desk's.
+        let at = body
+            .find("fn midi_editor_input")
+            .expect("the roll's input is still called that");
+        // To the END of that function, not a character count: the three
+        // gestures are spread across nineteen thousand characters of it and
+        // any fixed window is a number that goes stale the next time
+        // somebody writes a paragraph.
+        let end = body[at..]
+            .find("\n    fn ")
+            .map_or(body.len(), |n| at + n);
+        let roll = &body[at..end];
+        assert!(
+            roll.contains("button_double_clicked"),
+            "the roll no longer watches for a double-click at all"
+        );
+        assert_eq!(
+            roll.matches("self.me_commit();").count(),
+            3,
+            "the roll's double-click gestures do not all commit - a note \
+             written, a note deleted and a velocity put back each change the \
+             document and each return before the release that would save it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **The editor's gestures edit the document, snapped and clamped.**
     /// Create lands on the grid one step long; move snaps the start and
     /// carries the pitch; resize stops at the clip's end; delete saves.
@@ -33834,6 +33971,64 @@ mod tests {
             "the band's dial reads {} where the desk reads {desk}",
             app.settings.knobs().gains.master
         );
+    }
+
+    /// **A send double-clicks to DRY on every strip, including the one that
+    /// ships wet — and still OPENS wet.**
+    ///
+    /// The two halves are the whole point, and they pull opposite ways.
+    /// `strip_sends[1]` is 1.0 so the built-in DX7 arrives wired to the
+    /// reverb on a fresh install; the reset used to read that same table, so
+    /// double-clicking track two's send restored FULL send while every other
+    /// track's went to nothing. The owner: "the default of track two should
+    /// not be 100 percent send... it should just initialize as 100, default
+    /// set by dbl-click currently doesn't set it to 0 like the other track."
+    ///
+    /// So the second assert is not decoration: a fix that made the dial
+    /// consistent by zeroing the shipped table would pass the first half and
+    /// take the reverb off the instrument a fresh install is meant to open
+    /// with.
+    ///
+    /// Revert-check performed: read `d.strip_sends` in the `H::Send` arm
+    /// again and the first half goes red on channel 1.
+    #[test]
+    fn a_send_resets_to_dry_on_every_strip_but_still_ships_wet() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::COLUMNS_FOR_TEST;
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+
+        // The desk OPENS with the instrument's send up - the half that must
+        // survive.
+        assert!(
+            (Settings::default().strip_sends[1] - 1.0).abs() < 1e-9,
+            "the shipped desk no longer opens with the instrument sending, \
+             which is a change to what a fresh install sounds like"
+        );
+
+        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
+            app.apply_mixer_hit(Hit::Send(col), 0.61);
+        }
+        assert!(
+            app.settings.strip_sends.iter().any(|v| *v > 0.5),
+            "nothing moved, so resetting proves nothing"
+        );
+        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
+            app.reset_mixer_hit(Hit::Send(col));
+        }
+        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
+            let at = col.desk_index();
+            // The master column has no send row of its own, so it indexes
+            // one past the table - it is the one strip this question does
+            // not apply to.
+            let Some(now) = app.settings.strip_sends.get(at).copied() else {
+                continue;
+            };
+            assert!(
+                now.abs() < 1e-9,
+                "strip {at} reset its send to {now}, not to dry - the dial \
+                 has to mean one thing on every strip"
+            );
+        }
     }
 
     /// **Double-click puts a fader back where it was shipped.**

@@ -287,11 +287,27 @@ struct StderrLogger(log::LevelFilter);
 /// pre-formatted `write_all` — no formatting and no flush loop inside the lock.
 static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
 
-/// What the file keeps no matter what `IVORY_LOG` says: warnings and errors.
+/// What the file keeps no matter what `IVORY_LOG` says.
+///
 /// The file exists for the field, where nobody has set an environment
-/// variable — a terminal quieted with `IVORY_LOG=off` must not also blind
-/// the one artifact a user can send after the fact.
-const FILE_LOG_FLOOR: log::LevelFilter = log::LevelFilter::Warn;
+/// variable — a terminal quieted with `IVORY_LOG=off` must not also blind the
+/// one artifact a user can send after the fact.
+///
+/// **INFO, not WARN, because the lines written to BE evidence are all INFO
+/// and the field never saw one.** `panel_start` logs which directory it
+/// handed a native panel and says out loud that it exists "so the next report
+/// carries evidence"; the audio road logs the rate and buffer it actually
+/// got; the IR road logs a device that moved on its own. Every one of those
+/// was invisible in a shipped build, and this was found the hard way — a save
+/// panel opening in the wrong folder was diagnosed twice from a log that had
+/// nothing in it but the startup banner, while the line that would have
+/// answered it existed and was being thrown away.
+///
+/// Nothing here is per-frame: the app's INFO records are edges (a device
+/// opened, a panel raised, a rate moved), and the ones that could repeat
+/// already say so in their own notes. Rotation is unchanged, so the ceiling
+/// on what this costs is still the documented ~1 MB.
+const FILE_LOG_FLOOR: log::LevelFilter = log::LevelFilter::Info;
 
 /// Rotate at half a megabyte. With exactly one predecessor kept, the pair is
 /// bounded near 1 MB total — attachable to an email, never worth a cleanup

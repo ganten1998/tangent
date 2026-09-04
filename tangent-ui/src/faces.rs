@@ -28,7 +28,7 @@ use crate::ports::{BuiltinFace, BuiltinFaceParam, PresetRow};
 /// same list; the PATH is the contract between them, exactly as
 /// `KEYS_PATCH_NAMES` documents for the keyboard.
 pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
-    ("@tangent-eq", "Tangent EQ", "5 bands, no more no less"),
+    ("@tangent-eq", "Tangent EQ", "5 bands - no more, no less"),
     (
         "@tangent-imager",
         "Tangent Imager",
@@ -551,6 +551,37 @@ fn preset_strip(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Optio
                 name: live.preset_name.trim().to_owned(),
             });
         }
+        // **INIT: every control back to what the unit ships with.**
+        //
+        // The owner asked for it on all of them — "every plugin needs an
+        // initialize button" — and it belongs here rather than on each face
+        // because this strip is the one part every face wears, so one button
+        // is one button on sixteen units instead of sixteen.
+        //
+        // The values come from the pushed parameters' own `default`, which is
+        // the unit's `ParamSpec` table arriving through `ports`. The face
+        // therefore holds no second opinion about what shipped — the same
+        // rule the EQ's double-click reset follows, and the reason both can
+        // be right when a default changes.
+        //
+        // One ask, not one per knob: `SetMany` exists for exactly this and
+        // the host applies the run through the same road a single set takes.
+        if ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new("Init").font(bold(10.0)).color(st.s.ink),
+                )
+                .fill(st.s.raised),
+            )
+            .on_hover_text("every control back to what this unit ships with")
+            .clicked()
+        {
+            let sets: Vec<(u32, f32)> =
+                live.face.params.iter().map(|p| (p.id, p.default)).collect();
+            if !sets.is_empty() {
+                action = Some(FaceAction::SetMany { sets });
+            }
+        }
     });
     action
 }
@@ -620,12 +651,19 @@ fn preset_parts(ui: &egui::Ui, w: f32) -> PresetParts {
     let gap = ui.spacing().item_spacing.x;
     let save = word("Save");
     let save_w = save.width() + pad;
+    // **And INIT, which is a fixed part like Save.** It was added to the
+    // strip and not to this arithmetic at first, and the two layout sweeps
+    // in this file caught it immediately: the shares still summed to a row
+    // that fit, the button pushed past it, and the face painted outside the
+    // window it had reserved room in.
+    let init_w = word("Init").width() + pad;
     let caption_w = word("PRESET").width();
     // The caption is the one part that is pure decoration, so it is the
     // first thing the budget spends: a narrow strip says what it is by
     // being a menu and a name field, which nobody mistakes for anything.
-    let captioned = w >= caption_w + gap + PRESET_MIN_PARTS;
-    let fixed = save_w + gap * 2.0 + if captioned { caption_w + gap } else { 0.0 };
+    let captioned = w >= caption_w + gap + init_w + gap + PRESET_MIN_PARTS;
+    let fixed =
+        save_w + init_w + gap * 3.0 + if captioned { caption_w + gap } else { 0.0 };
     let free = (w - fixed).max(PRESET_MIN_PARTS);
     // The menu takes a little over half of what is left; the field takes
     // the rest. Both stop growing well before the panel does — a preset
@@ -658,6 +696,13 @@ fn preset_parts(ui: &egui::Ui, w: f32) -> PresetParts {
         Some(combo_w),
         Some((name_w - pad).max(24.0) + TEXT_EDIT_MARGIN.x),
         Some(save_w),
+        // Init walks the same wrap as everything else on the row. Left out
+        // of this list it was left out of the HEIGHT, and the foot reserved
+        // one line for a strip that took two — which is a face painting
+        // below the window it was given, exactly what
+        // `the_foot_reserves_what_the_preset_strip_actually_takes` sweeps
+        // for.
+        Some(init_w),
     ]
     .into_iter()
     .flatten()
