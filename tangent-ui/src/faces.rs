@@ -51,7 +51,7 @@ pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
     // because they are the fixed chain's own effects made seatable.
     (
         "@tangent-denoise",
-        "Tangent Denoise",
+        "Tangent Denoise (Experimental)",
         "learns your noise, then takes exactly what you dial out",
     ),
     (
