@@ -454,18 +454,39 @@ impl Voice {
         self.up4 = self.os.up(taps, mix);
     }
 
-    /// Substep `j` of four at 4×: the feedback into the mixer, the
-    /// overload, the filter, and the amplifier on the fed-back copy.
+    /// Substep `j` of four at 4×, the way in: the feedback into the mixer
+    /// and the overload — what the filter is handed, whether the voice's
+    /// own filter or a lane of the frame's bank.
+    #[inline]
+    pub fn substep_in(&self, ctx: &TickCtx, j: usize) -> f32 {
+        let m = self.up4[j] + ctx.drive * self.fb;
+        MIX_CLIP * fast_tanh(m * (1.0 / MIX_CLIP))
+    }
+
+    /// Substep `j`, the way out: the filter's answer, and the amplifier on
+    /// the copy that feeds back.
+    #[inline]
+    pub fn substep_out(&mut self, j: usize, y: f32) {
+        self.fb = y * self.ae;
+        self.y4[j] = y;
+    }
+
+    /// Substep `j` through the voice's own filter: the scalar road.
     #[inline]
     pub fn substep(&mut self, p: &VoiceParams, ctx: &TickCtx, j: usize) {
-        let m = self.up4[j] + ctx.drive * self.fb;
-        let clipped = MIX_CLIP * fast_tanh(m * (1.0 / MIX_CLIP));
+        let clipped = self.substep_in(ctx, j);
         let y = match p.model {
             FilterModel::Ladder => self.ladder.tick(clipped, &self.cut, self.k),
             FilterModel::Sem => self.sem.tick(clipped, &self.cut, self.damp, p.sem_mode),
         };
-        self.fb = y * self.ae;
-        self.y4[j] = y;
+        self.substep_out(j, y);
+    }
+
+    /// This sample's cutoff coefficients, feedback and damping — what a
+    /// lane of the frame's filter bank takes from the voice.
+    #[inline]
+    pub fn filter_settings(&self) -> (&Cutoff, f32, f32) {
+        (&self.cut, self.k, self.damp)
     }
 
     /// The downsample, the amplifier, the pan: the sample's stereo output.
