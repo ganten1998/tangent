@@ -3217,12 +3217,22 @@ impl DesktopApp {
             }
             // Parented, for the reason `take_cartridge_request` gives: an
             // unparented panel can open behind the app on Windows.
-            let mut dialog = rfd::FileDialog::new()
+            //
+            // **And it always names a directory now.** This used to drop the
+            // request when `start_at` was gone, which reads as "let the OS
+            // decide" and is in practice the home directory anyway — see
+            // `panel_start`, which says so out loud and lands one level up
+            // from a folder that has been moved rather than at the top of
+            // the disk.
+            let start = Self::panel_start(
+                "choose a folder",
+                PanelDir::Remembered,
+                request.start_at.clone(),
+            );
+            let dialog = rfd::FileDialog::new()
                 .set_title(&request.title)
-                .set_parent(frame);
-            if let Some(start) = request.start_at.filter(|p| p.exists()) {
-                dialog = dialog.set_directory(start);
-            }
+                .set_parent(frame)
+                .set_directory(start);
             let picked = dialog.pick_folder();
             self.app.native_panel_closed();
             if let Some(dir) = picked {
@@ -4593,11 +4603,16 @@ impl DesktopApp {
             .set_parent(frame);
         // The IRs folder is where the wizard's own captures land, so it is
         // the one directory this gesture is certainly about — and a chooser
-        // opening wherever the OS last left it is a poor first frame.
-        let irs = self.app.irs_root();
-        if irs.is_dir() {
-            dialog = dialog.set_directory(&irs);
-        }
+        // opening wherever the OS last left it is a poor first frame. It is
+        // OURS, so a missing one is made rather than skipped: this used to
+        // drop the whole `set_directory` when the folder was not there, and
+        // "not there" is precisely the install that has never captured an IR.
+        let start = Self::panel_start(
+            "load an impulse response",
+            PanelDir::Ours,
+            Some(self.app.irs_root()),
+        );
+        dialog = dialog.set_directory(start);
         // **The reader's own list.** `wavread` speaks WAV — PCM 16/24/32 and
         // 32-bit float, plain or WAVE_FORMAT_EXTENSIBLE — and nothing else,
         // so those are the extensions offered. "All files" second, because a
@@ -5251,9 +5266,12 @@ impl DesktopApp {
         // any file". macOS puts an unparented panel in front regardless, which
         // is why this was invisible here.
         dialog = dialog.set_parent(frame);
-        if let Some(start) = request.start_at.filter(|p| p.exists()) {
-            dialog = dialog.set_directory(start);
-        }
+        // Always a real directory — see `panel_start`. The old form dropped
+        // the call when the remembered place had gone, which hands the choice
+        // to an OS whose answer is the home directory and says nothing.
+        let start =
+            Self::panel_start(&request.title, PanelDir::Remembered, request.start_at.clone());
+        dialog = dialog.set_directory(start);
         if !request.extensions.is_empty() {
             let exts: Vec<&str> = request.extensions.iter().map(String::as_str).collect();
             dialog = dialog.add_filter(&request.extension_label, &exts);
@@ -5342,30 +5360,31 @@ impl DesktopApp {
             return;
         }
         // **Start where the thing being saved LIVES**, and let the panel
-        // wander anywhere from there: the Projects folder for the project
-        // purposes — the owner's word — the drum kits' own preset drawer for
-        // a kit, and the exports folder for a `.mid`, which is where every
-        // other thing this app renders out of a session already goes. Both
-        // drawers are made here, on the way in, because this is the first
-        // save's lazy moment and a default directory that does not exist is
-        // a panel that opens somewhere arbitrary. The answered path is still
-        // honoured whole either way — with the one documented exception, a
-        // multi-track MIDI export, where it is honoured as a stem; see
+        // wander anywhere from there. Which folder that is per purpose is
+        // `save_start`'s, written out one arm at a time so a new purpose
+        // cannot inherit somebody else's folder by accident; making it real
+        // is `panel_start`'s, which every native panel in this file now goes
+        // through and which explains, at length, what a start directory the
+        // OS will not open actually does. The answered path is still
+        // honoured whole — with the one documented exception, a multi-track
+        // MIDI export, where it is honoured as a stem; see
         // `SavePurpose::ExportMidi`, and note that the panel's TITLE says so
         // before anybody clicks Save.
-        let start = match request.purpose {
-            tangent_ui::ports::SavePurpose::KitPreset => {
-                let dir = self.app.preset_root().join(DRUM_PRESET_FOLDER);
-                let _ = std::fs::create_dir_all(&dir);
-                dir
-            }
-            tangent_ui::ports::SavePurpose::ExportMidi => {
-                let dir = self.app.export_root();
-                let _ = std::fs::create_dir_all(&dir);
-                dir
-            }
-            _ => self.app.project_root(),
-        };
+        //
+        // **The panel is not handed this path unchanged, and that is worth
+        // knowing before the next hunt.** `rfd` 0.15.4's macOS backend
+        // (`set_path`) appends the suggested FILE NAME to the start
+        // directory and sets the pair as `setDirectoryURL:` — so what
+        // reaches AppKit here is `.../Projects/My Song copy`, a directory
+        // that does not exist. Measured: AppKit walks up to the nearest
+        // ancestor it can open, so this is harmless — but only while the
+        // ancestor is openable, which is exactly what `panel_start`
+        // guarantees and logs.
+        let start = Self::panel_start(
+            &request.title,
+            PanelDir::Ours,
+            Some(self.save_start(request.purpose)),
+        );
         let mut dialog = rfd::FileDialog::new()
             .set_title(&request.title)
             .set_file_name(&request.suggested)
@@ -5654,6 +5673,159 @@ impl DesktopApp {
         self.deferred_file = Some(request.clone());
         ctx.request_repaint();
         true
+    }
+
+    /// **Every native panel this app opens starts at a directory that
+    /// EXISTS, and this is the only road to one.**
+    ///
+    /// The fault this is here for: "Save and save as template options
+    /// reverted to opening a home directory rather than the used defaults
+    /// which exist." Measured on the owner's machine while chasing it, with
+    /// a small AppKit program that opens exactly the panel `rfd` opens —
+    /// same `setDirectoryURL:`, same name field, modeless and as a sheet:
+    ///
+    /// * `/Applications`, `/private/tmp/probedir`, a `/private/tmp` folder
+    ///   with spaces in its name, `~/Music`, `~/Music/Audio Music Apps`,
+    ///   `~/Documents` and a fresh folder under `~/Downloads` all opened
+    ///   where they were told;
+    /// * every path under `~/Documents` — the app's own media root included —
+    ///   opened at `/Users/<user>` instead;
+    /// * and a directory that DOES NOT EXIST is not what does it: a panel
+    ///   pointed at `/private/tmp/probedir/Untitled copy`, which was never
+    ///   created, opened at `probedir`. macOS walks up to the nearest
+    ///   ancestor it can open.
+    ///
+    /// **The shape of the failure is the point, and it is why this exists:
+    /// when the OS will not open the directory it is handed, it silently
+    /// opens at HOME.** No error, no return code, nothing in any log — the
+    /// call returns the file the user eventually chose and nothing else. So
+    /// the app cannot detect it after the fact and cannot correct it. All it
+    /// can do is never be the reason: hand over a real directory, every
+    /// time, by one road, and SAY which one it handed over.
+    ///
+    /// **And AppKit does keep a record, which is how the report was
+    /// confirmed rather than believed.** A closing panel writes where it was
+    /// as `NSOSPLastRootDirectory` in the app's own preference domain. On the
+    /// owner's machine `org.codeberg.ganten1998.tangent.plist` holds
+    /// `/Users/<user>`, written the minute he opened five panels to
+    /// demonstrate this; the previous identity's file,
+    /// `org.codeberg.ganten1998.ivory.plist`, still holds
+    /// `~/Documents/Tangent Media/Projects`. So it did work, it stopped, and
+    /// the boundary is the identity change rather than anything in this
+    /// function's history — `git log -L` over the old `match` shows the
+    /// project arm was `project_root()` from the day it was written.
+    ///
+    /// **What is NOT known, said plainly:** which permission macOS is
+    /// refusing on for `~/Documents/...`. The app holds an allowed
+    /// `kTCCServiceSystemPolicyDocumentsFolder` row whose requirement matches
+    /// the shipped signature, and no Documents authorisation request appears
+    /// in `tccd`'s log during either the owner's five panels or the
+    /// measurements above. So this is a floor, not a cure: it guarantees the
+    /// app is not the reason and it makes the next report carry evidence. If
+    /// the log line below says the folder exists and the panel STILL opens at
+    /// home, the fault is entirely the OS's and that is worth knowing in one
+    /// line instead of an afternoon.
+    ///
+    /// That is the pin. There were four native panels in this file and each
+    /// chose its own start directory its own way: the folder picker and the
+    /// file picker filtered on `exists()`, the IR browse on `is_dir()`, and
+    /// all three silently dropped `set_directory` when the filter failed —
+    /// which hands the choice to an OS whose answer is the home directory.
+    /// The save panel — the one that regressed — filtered on nothing at all
+    /// and created nothing for the project purposes. Four roads is how a
+    /// fifth gets written without the check. Now there is one, it cannot
+    /// return a path that is not a directory, and it prints a line naming
+    /// what it handed over.
+    ///
+    /// `what` is the panel, for the log line. See [`PanelDir`] for why the
+    /// app's own folders and a place somebody was last time are not treated
+    /// alike.
+    fn panel_start(
+        what: &str,
+        kind: PanelDir,
+        intended: Option<std::path::PathBuf>,
+    ) -> std::path::PathBuf {
+        let home = || dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let intended = intended.unwrap_or_else(home);
+        let was_there = intended.is_dir();
+        // **Ours are MADE, remembered ones never are.** A media folder that
+        // is not there yet is this app's own lazy moment and making it is
+        // the whole fix; a folder the user last opened a sysex from is not
+        // ours to recreate on a disk that no longer has it — that would put
+        // an empty directory on somebody's desk to explain a missing one.
+        if kind == PanelDir::Ours && !was_there {
+            let _ = std::fs::create_dir_all(&intended);
+        }
+        let at = if intended.is_dir() {
+            intended.clone()
+        } else {
+            // Up to the first ancestor that is real. A panel one level out
+            // is a panel somebody can still work from; the OS's own answer
+            // to the same question is the home directory, so that is the
+            // floor, and `/` is the floor under that.
+            intended
+                .ancestors()
+                .skip(1)
+                .find(|a| a.is_dir())
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(home)
+        };
+        log::info!(
+            "panel: {what} opens at {} - {}{}",
+            at.display(),
+            if at.is_dir() { "the directory exists" } else { "THE DIRECTORY DOES NOT EXIST" },
+            if at == intended {
+                if was_there { String::new() } else { " (made on the way in)".to_owned() }
+            } else {
+                format!(" - {} is not a directory", intended.display())
+            }
+        );
+        at
+    }
+
+    /// **Where the SAVE panel opens, one arm per purpose and NO wildcard.**
+    ///
+    /// The wildcard is the thing being removed, and it is the structural
+    /// half of the pin. This match used to read
+    ///
+    /// ```ignore
+    /// SavePurpose::KitPreset => { ...make it... }
+    /// SavePurpose::ExportMidi => { ...make it... }
+    /// _ => self.app.project_root(),
+    /// ```
+    ///
+    /// so the two purposes somebody had thought about created their folder
+    /// on the way in and everything else fell down a hole that named a
+    /// folder and guaranteed nothing about it. `ExportMidi` was added at the
+    /// end of `SavePurpose` and had to be remembered here by hand; the next
+    /// purpose would have been swallowed by the `_` arm and nobody would
+    /// have found out until a panel opened somewhere arbitrary. Written out
+    /// in full, the COMPILER refuses a new variant until somebody says where
+    /// its panel opens, and
+    /// `the_save_panels_folder_is_chosen_by_a_match_with_no_wildcard` refuses
+    /// a wildcard being put back.
+    ///
+    /// **Templates now open on the template shelf**, which is a change and a
+    /// correction: they land in `Projects/Templates/<name>` whatever the
+    /// panel was pointed at (see `SavePurpose::Template`), the menu row says
+    /// so out loud — "under Projects/Templates" — and opening one directory
+    /// up meant the panel showed the projects rather than the templates
+    /// somebody was about to overwrite. Saving one called `default` replaces
+    /// the session every New clones, so seeing the shelf first is the whole
+    /// point of the panel.
+    #[cfg(feature = "recorder")]
+    fn save_start(&self, purpose: tangent_ui::ports::SavePurpose) -> std::path::PathBuf {
+        use tangent_ui::ports::SavePurpose as P;
+        match purpose {
+            // Duplicate Project As: beside the other projects.
+            P::ProjectCopy => self.app.project_root(),
+            P::Template => self.app.project_root().join(PROJECT_TEMPLATE_FOLDER),
+            // The drum kits' own drawer under `Presets`, made lazily so an
+            // install that never saved a kit carries an empty `Presets`.
+            P::KitPreset => self.app.preset_root().join(DRUM_PRESET_FOLDER),
+            // Where every other thing this app renders out of a session goes.
+            P::ExportMidi => self.app.export_root(),
+        }
     }
 
     fn restore_fullscreen(&mut self, ctx: &egui::Context) {
@@ -9886,6 +10058,40 @@ fn mirror_sidecars(from: &std::path::Path, to: &std::path::Path) {
 /// beside [`preset_subfolder`] so the two spellings cannot drift apart.
 #[cfg(feature = "recorder")]
 const DRUM_PRESET_FOLDER: &str = "Tangent Drums";
+
+/// The shelf TEMPLATES live on, under `Projects/`.
+///
+/// `tangent-ui` spells this itself in `fresh_project_dir` and in
+/// `ProjectRequest::Template`'s landing — a template goes to
+/// `Projects/Templates/<name>` whatever the panel was pointed at — and the
+/// host needs the same word to open the panel there. Named rather than
+/// inlined for the reason [`DRUM_PRESET_FOLDER`] is: two spellings of one
+/// folder is how the save panel comes to open somewhere the app does not
+/// write.
+#[cfg(feature = "recorder")]
+const PROJECT_TEMPLATE_FOLDER: &str = "Templates";
+
+/// Whose folder a native panel is being pointed at.
+///
+/// The distinction is not decoration: [`DesktopApp::panel_start`] MAKES a
+/// folder that is missing, and making the wrong one is its own bug. Tangent's
+/// media folders are Tangent's to create — that is what `make_media_folders`
+/// does at launch and what this repeats at the panel, because a first save
+/// can happen after somebody has moved the folder out from under a running
+/// app. A directory the user was last in is somebody else's: an external disk
+/// that is not mounted, a sample library that has been reorganised. Making
+/// that one back would put an empty folder on their disk to stand in for the
+/// one they are looking for, and the panel would open on nothing and say
+/// nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelDir {
+    /// One of Tangent's own folders — takes, projects, exports, presets,
+    /// IRs, and the drawers under them. Made on the way in if it is missing.
+    Ours,
+    /// Somewhere the user was last time, or nowhere in particular. Used only
+    /// if it is still a directory; never created.
+    Remembered,
+}
 
 /// The folder one unit's presets live in, under `Presets/`.
 ///
@@ -15390,6 +15596,215 @@ mod tests {
              host refused would advance the wizard onto the previous IR and \
              offer to save it under the new name"
         );
+    }
+
+    // ── where a native panel opens ───────────────────────────────────────────
+
+    /// **Every native panel in this file starts at a directory that EXISTS,
+    /// and there is one road to one.**
+    ///
+    /// The report: "Save and save as template options reverted to opening a
+    /// home directory rather than the used defaults which exist. These system
+    /// prompts should not regress like that." What was found chasing it is
+    /// written out on `DesktopApp::panel_start` — the short version is that
+    /// when macOS will not open the directory a panel is handed it opens at
+    /// HOME instead, silently, with no error and no return code, so the app
+    /// cannot notice and cannot correct it. All it can do is never be the
+    /// reason.
+    ///
+    /// A source scan, for the reason
+    /// `the_ir_pickers_protocol_and_the_capture_counter_are_where_they_have_to_be`
+    /// gives: raising a panel is a nested OS run loop and cannot happen in a
+    /// test, and what is being pinned is what the NEXT panel does rather than
+    /// what any one of today's four does. This notices the road being left,
+    /// not a new picker being written in some other file.
+    ///
+    /// Revert-check performed: put `if let Some(start) =
+    /// request.start_at.filter(|p| p.exists())` back around the cartridge
+    /// picker's `set_directory` and this goes red on the counts.
+    #[test]
+    fn every_native_panel_starts_at_a_directory_that_exists() {
+        let whole = include_str!("desktop.rs");
+        // Everything above this module, so the spellings below do not find
+        // themselves.
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        let sets = src.matches(".set_directory(").count();
+        assert!(
+            sets >= 4,
+            "the file used to raise four native panels and now raises {sets}: \
+             if a panel was removed this count comes down with it on purpose, \
+             so that somebody reads this test rather than deleting it"
+        );
+        assert_eq!(
+            src.matches(".set_directory(start)").count(),
+            sets,
+            "a native panel takes its start directory from something other \
+             than `start` - every one of them has to be handed the value \
+             `Self::panel_start` returned, because that is the only thing \
+             that guarantees a directory which exists"
+        );
+        assert_eq!(
+            src.matches("Self::panel_start(").count(),
+            sets,
+            "there are {sets} `set_directory` calls and a different number of \
+             `Self::panel_start` calls: a panel is choosing its own start \
+             directory again, which is how the save panel came to open at the \
+             home folder"
+        );
+        // And the guarantee itself, which is what makes the road worth having.
+        let start = {
+            let a = src.find("fn panel_start(").expect("`panel_start` is gone");
+            let b = src[a..].find("\n    /// ").expect("the end of `panel_start`");
+            &src[a..a + b]
+        };
+        for (needle, why) in [
+            (
+                "std::fs::create_dir_all(&intended)",
+                "a folder of ours that is not there yet is no longer made, so \
+                 the first save of a fresh install opens wherever the OS feels \
+                 like - which is the home directory",
+            ),
+            (
+                ".ancestors()",
+                "nothing walks up to a directory that does exist, so a media \
+                 folder somebody moved leaves the panel with a path the OS \
+                 will silently swap for the home directory",
+            ),
+            (
+                "log::info!",
+                "the panel no longer says where it is opening, so the next \
+                 report of this arrives as a description instead of evidence",
+            ),
+        ] {
+            assert!(start.contains(needle), "`panel_start` no longer has `{needle}`: {why}");
+        }
+    }
+
+    /// **The save panel's folder is chosen one purpose at a time, and a
+    /// wildcard is not allowed back.**
+    ///
+    /// The arm that regressed was `_ => self.app.project_root()`: two
+    /// purposes somebody had thought about made their folder on the way in
+    /// and everything else fell through a hole that named a folder and
+    /// guaranteed nothing about it. `SavePurpose` is append-only, so the
+    /// wildcard would swallow every purpose added after it in silence.
+    ///
+    /// Written out in full, the COMPILER refuses a new variant until
+    /// somebody says where its panel opens — that is the structural half and
+    /// it needs no test. This is the other half: it refuses a `_` arm being
+    /// put back to make the compiler quiet again.
+    ///
+    /// Revert-check performed: replace the `P::ExportMidi` arm with
+    /// `_ => self.app.export_root()` and this goes red.
+    #[test]
+    fn the_save_panels_folder_is_chosen_by_a_match_with_no_wildcard() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        let body = {
+            let a = src.find("fn save_start(").expect("`save_start` is gone");
+            let b = src[a..].find("\n    fn ").expect("the end of `save_start`");
+            &src[a..a + b]
+        };
+        assert!(
+            !body.contains("_ =>"),
+            "`save_start` has a wildcard arm again: a purpose added to the end \
+             of `SavePurpose` will inherit somebody else's folder instead of \
+             failing to compile until it is given one"
+        );
+        for arm in ["P::ProjectCopy", "P::Template", "P::KitPreset", "P::ExportMidi"] {
+            assert!(
+                body.contains(arm),
+                "`save_start` no longer answers for `{arm}` - either the \
+                 purpose is gone or it has been folded in with another one"
+            );
+        }
+        // And the panel asks it rather than deciding for itself again.
+        let panel = {
+            let a = src.find("fn take_save_panel(").expect("the save panel is gone");
+            let b = src[a..].find("\n    /// ").expect("the end of `take_save_panel`");
+            &src[a..a + b]
+        };
+        assert!(
+            panel.contains("self.save_start(request.purpose)"),
+            "the save panel picks its own start directory again instead of \
+             asking `save_start`, so the match above no longer decides anything"
+        );
+    }
+
+    /// **A folder of ours that is missing is MADE; one that is somebody
+    /// else's is not; and neither road can hand a panel a path that is not a
+    /// directory.**
+    ///
+    /// This is the runtime half of the pin, and the three cases are the three
+    /// ways the old code went wrong:
+    ///
+    /// * a media folder that does not exist yet — the first save on a fresh
+    ///   install, or one where the folder was moved out from under a running
+    ///   app — used to be handed over as-is by the save panel;
+    /// * a remembered folder that has gone (an external disk, a reorganised
+    ///   sample library) used to make the pickers drop `set_directory`
+    ///   altogether, which reads as "let the OS choose" and is the home
+    ///   directory in practice;
+    /// * and nothing at all asked for is still a panel that has to open
+    ///   somewhere.
+    ///
+    /// The parent-is-a-file case is not a curiosity: `create_dir_all` fails
+    /// there, and it is the shape a settings override pointing at a FILE
+    /// takes. Whatever comes back, `is_dir()` holds.
+    ///
+    /// Revert-check performed: delete the `create_dir_all` from `panel_start`
+    /// and this goes red on the first assert, naming the folder that was not
+    /// made.
+    #[test]
+    fn a_panel_never_starts_at_a_path_that_is_not_a_directory() {
+        use super::{DesktopApp, PanelDir};
+        let root = std::env::temp_dir().join(format!(
+            "tangent-panel-start-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp dir");
+
+        // Ours, and three levels of it are missing: made on the way in.
+        let deep = root.join("Tangent Media").join("Projects").join("Templates");
+        let at = DesktopApp::panel_start("test", PanelDir::Ours, Some(deep.clone()));
+        assert_eq!(at, deep, "the panel did not open at the folder it was given");
+        assert!(
+            at.is_dir(),
+            "a media folder of ours was not made on the way in: {} - a start \
+             directory the OS will not open is a panel that opens at HOME",
+            at.display()
+        );
+
+        // Somebody else's, and it has gone: never recreated, and the panel
+        // lands on the nearest real ancestor rather than on nothing.
+        let gone = root.join("an external disk").join("that is not mounted");
+        let at = DesktopApp::panel_start("test", PanelDir::Remembered, Some(gone.clone()));
+        assert!(
+            !gone.exists(),
+            "a remembered folder was created: an empty directory now stands \
+             in for the one the user is actually looking for"
+        );
+        assert_eq!(at, root, "the walk up stopped somewhere other than the first real ancestor");
+        assert!(at.is_dir());
+
+        // Ours, but it CANNOT be made, because its parent is a file.
+        let file = root.join("not-a-folder");
+        std::fs::write(&file, b"x").expect("write");
+        let at = DesktopApp::panel_start("test", PanelDir::Ours, Some(file.join("Projects")));
+        assert_eq!(
+            at, root,
+            "a folder that cannot be made did not fall back past the file in \
+             its path"
+        );
+        assert!(at.is_dir());
+
+        // Nothing asked for at all is still a directory.
+        let at = DesktopApp::panel_start("test", PanelDir::Remembered, None);
+        assert!(at.is_dir(), "a panel with no preference got {}", at.display());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **Clicking the IR face's name field loads a file from anywhere, and
