@@ -1076,6 +1076,24 @@ pub struct TangentApp {
     dialog_serial: u64,
     /// The gesture in flight on the arrangement, if any.
     arr_drag: Option<ArrDrag>,
+    /// **Where the hand was last seen while an arrange drag is in flight.**
+    ///
+    /// egui hands out `interact_pos` and takes it away again the moment the
+    /// cursor leaves the window: winit turns `CursorLeft` into
+    /// `Event::PointerGone` whether or not a button is down, and the next
+    /// pass recycles `interact_pos` from a `latest_pos` that is now `None`.
+    /// The whole drag block is gated on having a position, so a hand parked
+    /// just below the sill — which is exactly how somebody asks the view to
+    /// keep scrolling — took the gesture out of the loop entirely: no edge
+    /// scroll, and therefore no `request_repaint_after`, so the app fell back
+    /// to its idle tick and the drag FROZE rather than slowing down. It came
+    /// back only because macOS keeps delivering `mouseDragged` outside the
+    /// window while a button is held, so a hand that kept wiggling recovered
+    /// and a hand that stopped did not.
+    ///
+    /// So the last position is kept for as long as the button is. Cleared
+    /// when the drag ends, and never consulted when there is no drag.
+    arr_drag_at: Option<Pos2>,
     /// Where a dropped file would land — lane and seconds — tracked WHILE it
     /// hovers rather than read on the frame it lands.
     ///
@@ -3166,6 +3184,7 @@ impl TangentApp {
             clipboard_stamp: None,
             dialog_serial: 0,
             arr_drag: None,
+            arr_drag_at: None,
             arr_drop: None,
             arr_drop_hover: false,
             drag_pointer: None,
@@ -6222,7 +6241,19 @@ impl TangentApp {
         //
         // Losing focus counts too. A press that leaves for another application
         // never delivers its release here at all.
-        let ended = ctx.input(|i| i.pointer.any_released() || !i.focused);
+        // **And a native window drag, which egui cannot see the end of.**
+        //
+        // For as long as AppKit is moving a window it delivers no mouse
+        // events to the content view at all — so the press that started a
+        // borderless drag on the piano or the band reaches egui and the
+        // release never does. `any_released` stays false forever, focus is
+        // never lost because the app still has it, and the note goes on
+        // sounding after the window has been put down. `macwin` reads the
+        // buttons globally and can still answer; `mouse_known` is what says
+        // its answer may be believed, because every host that cannot tell
+        // reports "up" by default and would end every gesture at once.
+        let ended = ctx.input(|i| i.pointer.any_released() || !i.focused)
+            || self.hand_is_provably_up();
         if ended && !self.clicked.is_empty() {
             self.clicked.clear();
             // And the place it was clicked, which only lasts as long as the
@@ -18401,7 +18432,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let arr_secondary_down = ctx.input(|i| i.pointer.secondary_down());
         let arr_holding = pointer_down
             || (arr_secondary_down && matches!(self.arr_drag, Some(ArrDrag::ClipBand)));
-        if let (Some(drag), Some(p), true) = (self.arr_drag, pointer, arr_holding) {
+        // The hand's last known place stands in for one egui has forgotten;
+        // see `arr_drag_at`. Dropped the moment there is no drag, so it can
+        // never be read as a position belonging to a later gesture.
+        if self.arr_drag.is_none() {
+            self.arr_drag_at = None;
+        }
+        let held = pointer.or(self.arr_drag_at);
+        if let (Some(drag), Some(p), true) = (self.arr_drag, held, arr_holding) {
+            self.arr_drag_at = Some(p);
             // **The view follows a clip dragged off the edge — BEFORE the
             // pointer is asked what it means.** `t_at` below, and the
             // `lane_at` inside `ArrDrag::Move`, are both read against the
@@ -18511,13 +18550,52 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // well as along them — a MIDI item moves to another
                     // MIDI channel, an audio one to any lane that takes
                     // audio.
+                    // **The NEAREST drawn lane, not the one the pointer is
+                    // strictly inside.**
+                    //
+                    // This used to ask `r.contains(p)`, which answers `None`
+                    // for a pointer that is not inside a drawn TRACK row on
+                    // BOTH axes — and `None` here means "keep the lane it is
+                    // on". Almost everywhere the hand goes during a vertical
+                    // drag is such a place: the tempo lane and the master row
+                    // are pushed in above the stack and are not in
+                    // `lane_rows`, an open automation curve is not either,
+                    // and neither is the empty space past the bottom of the
+                    // window. Meanwhile the edge scroll happily runs over all
+                    // of them. So the view kept moving while the clip's lane
+                    // was frozen, and the clip was left behind — above if the
+                    // hand went down, below if it went up, and working only
+                    // in the narrow band where the two domains happened to
+                    // agree. The owner: "the clip lag behind the scroll
+                    // unless in a 'goldilocks' zone... make it so even if
+                    // your mouse goes to below the window while scrolling
+                    // this way, it's a smooth ride."
+                    //
+                    // Vertical distance only, and zero when the pointer is
+                    // inside: the rows span the whole width, so a hand that
+                    // wanders off the left or right edge is still pointing at
+                    // a lane, and one parked below the sill is pointing at
+                    // the bottom one. There is no position left that means
+                    // "nowhere" while any lane is on screen.
                     let lane_at = {
                         let clips = self.arr_clip_views();
                         let view = self.arrange_view(&clips);
                         let l = crate::arrangement_panel::Layout::new(rect, &view);
+                        let gap = |r: &egui::Rect| -> f32 {
+                            if p.y < r.top() {
+                                r.top() - p.y
+                            } else if p.y > r.bottom() {
+                                p.y - r.bottom()
+                            } else {
+                                0.0
+                            }
+                        };
                         l.lane_rows
                             .iter()
-                            .position(|r| r.is_positive() && r.contains(p))
+                            .enumerate()
+                            .filter(|(_, r)| r.is_positive())
+                            .min_by(|(_, a), (_, b)| gap(a).total_cmp(&gap(b)))
+                            .map(|(i, _)| i)
                     };
                     self.arr_move(id, t_at, dt, lane_at);
                 }
@@ -20644,6 +20722,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     pub fn open_dialog(&self) -> Option<&dialogs::Dialog> {
         self.dialog.as_ref()
+    }
+
+    /// **The window manager says the hand has let go, and it is entitled to
+    /// be believed.**
+    ///
+    /// Only ever true where the host can actually tell — see
+    /// `host::Gesture::mouse_known`, which is false everywhere that reports
+    /// "up" merely because it has no idea. Used to end gestures egui watched
+    /// begin and will never watch finish: for the whole of a native window
+    /// drag AppKit delivers no mouse events to the content view, so a
+    /// borderless grab on the piano or the band left a note sounding and
+    /// `pressed_on` latched once the window was put down.
+    fn hand_is_provably_up(&self) -> bool {
+        self.host_gesture.mouse_known && !self.host_gesture.mouse_down
     }
 
     /// Whether the open dialog owns the POINTER this frame, so the desk
@@ -31050,7 +31142,7 @@ impl TangentApp {
         // fader's release has to reach the mixer for that same frame, which is
         // the whole fault this field exists for. By the next frame the hand is
         // free and hover decides again.
-        if !ctx.input(|i| i.pointer.any_down()) {
+        if !ctx.input(|i| i.pointer.any_down()) || self.hand_is_provably_up() {
             self.pressed_on = None;
         }
 
@@ -44869,6 +44961,204 @@ mod tests {
             "the clip is drawn {now} points into the hand instead of \
              {held_at} — it is lagging the view, which means the scroll is \
              running after the pointer has been read"
+        );
+    }
+
+
+
+    /// **A gesture whose release AppKit swallowed still ends.**
+    ///
+    /// For the whole of a native window drag AppKit delivers no mouse events
+    /// to the content view — recorded in `macwin.rs` beside the global read
+    /// that works around it. So a borderless grab that starts on the piano or
+    /// the band reaches egui as a press and NEVER as a release: `any_released`
+    /// stays false, focus is never lost because the app still has it, and the
+    /// note goes on sounding with the window already put down. It is the
+    /// second half of the owner's "dragging windows around is laggy and drunk
+    /// feeling" — the half that outlives the drag.
+    ///
+    /// The two halves are tested apart because they fail apart: `clicked`
+    /// carries the sounding note, `pressed_on` carries which surface owns the
+    /// hand, and they are cleared in different functions a thousand lines
+    /// from each other.
+    ///
+    /// **And a host that cannot tell must change nothing**, which is the
+    /// third block. `mouse_down` is false by default everywhere that has no
+    /// answer — the plugin, Windows, Linux — so believing it there would end
+    /// every gesture the moment it began. `mouse_known` is the bit that says
+    /// the answer is real.
+    ///
+    /// Revert-checks, all three performed: drop `|| self.hand_is_provably_up()`
+    /// from the `ended` test and the first block goes red with a note still
+    /// sounding; drop it from the `pressed_on` clear and the second does;
+    /// make `hand_is_provably_up` ignore `mouse_known` and the third goes red
+    /// with a plugin that cannot hold a note down.
+    #[test]
+    fn a_release_appkit_swallowed_still_ends_the_gesture() {
+        let gone = crate::host::Gesture {
+            live_resize: false,
+            mouse_down: false,
+            resize_known: true,
+            mouse_known: true,
+        };
+        let holding = crate::host::Gesture { mouse_down: true, ..gone };
+
+        // ── the sounding note ────────────────────────────────────────────
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.set_host_gesture(holding);
+        app.clicked.insert(60);
+        hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        assert!(
+            !app.clicked.is_empty(),
+            "the note was dropped while the hand was still down"
+        );
+        app.set_host_gesture(gone);
+        hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        assert!(
+            app.clicked.is_empty(),
+            "the window was put down and the note is still sounding - egui \
+             never saw the release and nothing else was watching"
+        );
+
+        // ── and the surface that owns the hand ───────────────────────────
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.set_host_gesture(holding);
+        // A REAL press, so egui is holding the button too — otherwise the
+        // ordinary `any_down` clause clears the latch on its own and this
+        // block would pass whatever the new one does.
+        press(&ctx, &mut app, Pos2::new(400.0, 400.0));
+        hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        assert!(
+            app.pressed_on.is_some(),
+            "the press was forgotten while the hand was still down"
+        );
+        app.set_host_gesture(gone);
+        hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        assert!(
+            app.pressed_on.is_none(),
+            "`pressed_on` is still latched after the drag ended, so the desk \
+             stays out from under every later press"
+        );
+
+        // ── a host with no answer changes nothing ────────────────────────
+        // `Gesture::default()` is all-false, which is what the plugin and
+        // every non-macOS build hand over. Believing its "up" would end this
+        // gesture on the first frame.
+        let (ctx, mut app) = headless_with_band(Caps::PLUGIN);
+        app.set_host_gesture(crate::host::Gesture::default());
+        app.clicked.insert(60);
+        hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        assert!(
+            !app.clicked.is_empty(),
+            "a host that cannot say whether a button is down was believed \
+             when it said no, so nothing can be held anywhere but macOS"
+        );
+    }
+
+    /// **A dragged clip keeps up with the scroll everywhere, including off
+    /// the bottom of the window and out of egui's sight altogether.**
+    ///
+    /// The owner: "drag to scroll up and down on a clip has the clip lag
+    /// behind the scroll unless in a 'goldilocks' zone -- make it so even if
+    /// your mouse goes to below the window while scrolling this way, it's a
+    /// smooth ride wherein the clip always draws on the next empty channel
+    /// draw and doesn't get 'left behind' higher or lower."
+    ///
+    /// Two faults, and the goldilocks band is where they happened not to
+    /// overlap.
+    ///
+    /// The lane query asked `lane_rows[i].contains(p)` — strict containment
+    /// on BOTH axes over TRACK rows only. The tempo lane and the master row
+    /// are pushed in above the stack, an open automation curve sits inside
+    /// it, and none of the three are in `lane_rows`; neither is the empty
+    /// space past the bottom of the field. All of those answer `None`, and
+    /// `None` here means "keep the lane you are on" — while the edge scroll,
+    /// which takes the whole `lanes_area` as its zone and saturates past the
+    /// rail, went on moving the view. So the view walked and the clip stood
+    /// still. Now the NEAREST drawn lane wins, measured vertically, so there
+    /// is no position left that means "nowhere".
+    ///
+    /// And past the sill the gesture did not slow down, it STOPPED: winit
+    /// turns `CursorLeft` into `PointerGone` whether or not a button is
+    /// down, egui recycles `interact_pos` to `None` on the next pass, and the
+    /// drag block is gated on having a position — so the edge scroll never
+    /// ran, and with it the `request_repaint_after` that keeps the hold
+    /// ticking. See `arr_drag_at`.
+    ///
+    /// Revert-checks, both performed: put `position(|r| r.is_positive() &&
+    /// r.contains(p))` back and the first block goes red with the clip on
+    /// the lane it started on; drop the `.or(self.arr_drag_at)` and the
+    /// second goes red with a stack that stopped moving.
+    #[test]
+    fn a_clip_dragged_off_the_bottom_is_not_left_behind() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.arr_visible = 8;
+        // Deliberately MANY more lanes than the eight on screen. The second
+        // block below asks whether the hold keeps ticking with the pointer
+        // gone, and that question is only answerable while there is still
+        // somewhere to scroll TO — against a short stack it hits the rail in
+        // the first block and every later frame is a legitimate no-op, which
+        // is a test that cannot fail.
+        for n in 0..40 {
+            app.add_bare_track(n);
+        }
+        let (rect, id) = arrangement_with_a_clip(&ctx, &mut app);
+        let grab = arr_clip_centre(&app, rect, id);
+        let from_lane = app.arrangement.clips[0].lane;
+        press(&ctx, &mut app, grab);
+        let lanes = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            crate::arrangement_panel::Layout::new(rect, &view).lanes_area
+        };
+
+        // ── BELOW the field entirely, which is where he said it broke ────
+        // Not "hard against the bottom" — past it, off the window, where
+        // `contains` cannot answer and the old code kept the lane.
+        move_to(&ctx, &mut app, Pos2::new(lanes.center().x, lanes.bottom() + 120.0));
+        for _ in 0..10 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        assert!(app.arr_lane_scroll > 0, "the stack did not move at all");
+        assert_ne!(
+            app.arrangement.clips[0].lane, from_lane,
+            "the view scrolled and the clip stayed on lane {from_lane} - it \
+             was left behind, which is the whole report"
+        );
+        // And it is standing on a lane that is actually DRAWN, which is what
+        // "always draws on the next empty channel draw" asks for.
+        let drawn: Vec<usize> = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            (0..crate::recorder::CHANNELS)
+                .filter(|&i| l.lane_rows[i].is_positive())
+                .collect()
+        };
+        assert!(
+            drawn.contains(&app.arrangement.clips[0].lane),
+            "the clip is on lane {}, which is not one of the lanes on screen \
+             ({drawn:?})",
+            app.arrangement.clips[0].lane
+        );
+
+        // ── and with the pointer GONE, the hold still ticks ──────────────
+        // The hand has not let go; the window has simply stopped being told
+        // where it is. macOS does this the instant the cursor crosses the
+        // sill.
+        let was = app.arr_lane_scroll;
+        let rail = app.active_channels().saturating_sub(app.arr_visible());
+        assert!(was < rail, "the fixture is already at the rail, so the rest \
+                             of this test cannot fail");
+        pointer_frame(&ctx, &mut app, vec![egui::Event::PointerGone]);
+        for _ in 0..10 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        assert!(
+            app.arr_lane_scroll > was,
+            "the stack stopped the moment egui forgot where the pointer was: \
+             {was} -> {}",
+            app.arr_lane_scroll
         );
     }
 
