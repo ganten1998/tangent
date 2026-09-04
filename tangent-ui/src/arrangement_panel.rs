@@ -665,7 +665,7 @@ pub const MASTER_COLUMN: usize = CHANNELS + 1;
 /// "heighten the loop/timereadout strip" for exactly that reason. The ruler
 /// has to grow with it or the bar numbers and the clock below lose the room
 /// the strip takes.
-const RULER_H: (f32, f32, f32) = (0.075, 20.0, 30.0);
+const RULER_H: (f32, f32, f32) = (0.085, 22.0, 34.0);
 
 /// The size the ruler strip's words are set at, from the strip's height.
 ///
@@ -1160,7 +1160,12 @@ impl Layout {
         // Always: the flags and the chips share it, and a song has no
         // markers until somebody right-clicks the strip to make one.
         let meter_strip = {
-            let h = (ruler_h * 0.46).clamp(12.0, 17.0).min(ruler_h * 0.55);
+            // **A smaller SHARE of a taller ruler.** At 46% the strip read
+            // as half the band and the owner's word for it was "tight" —
+            // the bar numbers and the clock were pressed into what was
+            // left. 40% of 34 points is the same 13-point strip, with a
+            // third of the ruler given back to the two rows underneath.
+            let h = (ruler_h * 0.40).clamp(12.0, 16.0).min(ruler_h * 0.5);
             Rect::from_min_max(ruler.min, Pos2::new(ruler.right(), ruler.top() + h))
         };
         let lanes_area = Rect::from_min_max(

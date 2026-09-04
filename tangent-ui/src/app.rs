@@ -12997,6 +12997,38 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// What a SECONDARY press on the arrangement opens the ruler menu on,
+    /// if anything.
+    ///
+    /// A function rather than a `match` inside the input pass, so the
+    /// decision can be driven by a test with a `Hit` in hand: the arm that
+    /// says "a chip answers about itself" is the whole reason "Edit time
+    /// sig." exists, and while it lived inside a `ctx`-driven pass the only
+    /// way to check it was to assert on `hit_test` and on `flag_menu_rows`
+    /// separately — which is two halves and no bridge.
+    ///
+    /// **The whole ruler opens it, not its top sliver.** The chips and the
+    /// flags live in the top band, so `hit_test` answers `MeterStrip` only
+    /// there; a right-click on the bar numbers or the clock used to fall
+    /// through to the app menu, which meant aiming at a thirteen-point strip
+    /// to make a marker. The owner: "the whole time strip needs to be right
+    /// clickable -- not just the top half." Only the secondary press is
+    /// widened — `Hit::Ruler` is what LOCATES the playhead on a left press,
+    /// and that keeps working exactly where it works now.
+    fn flag_menu_subject(hit: Option<crate::arrangement_panel::Hit>) -> Option<FlagMenuOn> {
+        use crate::arrangement_panel::Hit as H;
+        match hit {
+            Some(H::Flag(i)) => Some(FlagMenuOn::Flag(i)),
+            // **A chip answers about ITSELF.** It used to fall in with the
+            // bare strip and offer "New time sig." on top of a signature
+            // that was already there, which is how a change could be made
+            // and never taken back off.
+            Some(H::MeterChip(bar)) => Some(FlagMenuOn::Sig(bar)),
+            Some(H::MeterStrip(_) | H::Ruler(_)) => Some(FlagMenuOn::Strip),
+            _ => None,
+        }
+    }
+
     /// Which row of the flag menu anchored at `at` the pointer is on.
     ///
     /// The rectangles come from the same `clip_menu_rows` the painter lays
@@ -17815,23 +17847,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let on_flag = {
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
-                    match crate::arrangement_panel::hit_test(rect, &view, p) {
-                        Some(crate::arrangement_panel::Hit::Flag(i)) => {
-                            Some(FlagMenuOn::Flag(i))
-                        }
-                        // **A chip answers about ITSELF now.** It used to
-                        // fall in with the bare strip and offer "New time
-                        // sig." on top of a signature that was already
-                        // there, which is how a change could be made and
-                        // never taken back off.
-                        Some(crate::arrangement_panel::Hit::MeterChip(bar)) => {
-                            Some(FlagMenuOn::Sig(bar))
-                        }
-                        Some(crate::arrangement_panel::Hit::MeterStrip(_)) => {
-                            Some(FlagMenuOn::Strip)
-                        }
-                        _ => None,
-                    }
+                    Self::flag_menu_subject(crate::arrangement_panel::hit_test(rect, &view, p))
                 };
                 if let Some(on) = on_flag {
                     self.arr_flag_menu = Some((on, p));
@@ -34397,6 +34413,67 @@ mod tests {
         let ctx = egui::Context::default();
         let app = TangentApp::new(&ctx, settings, caps);
         (ctx, app)
+    }
+
+    /// **The three things you can right-click on the ruler, and the "Edit"
+    /// row that was reported missing.**
+    ///
+    /// The owner's report was "there is no Edit option at all". It was
+    /// there — but reaching it needed a signature chip on screen, and a
+    /// signature could not be MADE, because `NumEdit::push` took a slash for
+    /// the band's song-wide box and not for the ruler's per-bar one (see
+    /// `a_name_takes_letters_and_a_per_bar_signature_takes_a_slash`). One
+    /// bug hid the other. This is the half that says the road from a press
+    /// to those words is real, driven from a `Hit` rather than asserted
+    /// about `flag_menu_rows` in isolation.
+    ///
+    /// Revert-checks, all four performed: fold `MeterChip` back in with
+    /// `MeterStrip` and the chip block goes red; drop the `Ruler` arm and
+    /// the whole-ruler block goes red; drop the `Flag` arm and the flag
+    /// block goes red; return `Some` for a clip and the last line goes red.
+    #[test]
+    fn every_part_of_the_ruler_opens_the_menu_it_should() {
+        use crate::arrangement_panel::Hit as H;
+        let rows = |on: FlagMenuOn| -> Vec<String> {
+            TangentApp::flag_menu_rows(on)
+                .into_iter()
+                .map(|(l, _)| l)
+                .collect()
+        };
+
+        // A signature chip answers about ITSELF — this is the "Edit" road.
+        let on = TangentApp::flag_menu_subject(Some(H::MeterChip(4)));
+        assert_eq!(on, Some(FlagMenuOn::Sig(4)));
+        assert!(
+            rows(on.unwrap()).iter().any(|w| w == "Edit time sig."),
+            "a right-click on a signature chip offers no Edit: {:?}",
+            rows(on.unwrap())
+        );
+
+        // **The whole ruler**, not just the band the chips live in: the bar
+        // numbers and the clock open the same menu the strip does.
+        for h in [H::MeterStrip(0), H::Ruler(0.0), H::Ruler(7.5)] {
+            assert_eq!(
+                TangentApp::flag_menu_subject(Some(h)),
+                Some(FlagMenuOn::Strip),
+                "{h:?} did not open the ruler menu"
+            );
+        }
+        assert!(
+            rows(FlagMenuOn::Strip).iter().any(|w| w == "New marker"),
+            "the ruler menu cannot make a marker"
+        );
+
+        // A flag still wins over the strip it is drawn on.
+        assert_eq!(
+            TangentApp::flag_menu_subject(Some(H::Flag(2))),
+            Some(FlagMenuOn::Flag(2))
+        );
+
+        // And nothing else on the arrangement opens it.
+        assert_eq!(TangentApp::flag_menu_subject(Some(H::ClipBody(1))), None);
+        assert_eq!(TangentApp::flag_menu_subject(Some(H::Lane(0, 4.0))), None);
+        assert_eq!(TangentApp::flag_menu_subject(None), None);
     }
 
     /// **The flag menu says the owner's words, and a press does the thing
