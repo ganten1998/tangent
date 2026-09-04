@@ -2271,6 +2271,127 @@ mod tests {
     }
 
 
+    /// **A double-click puts the whole band back where it shipped — the
+    /// HANDLE as well as the curve.**
+    ///
+    /// It used to set the on-switch to zero and nothing else, so the wave
+    /// flattened and the node stayed wherever the hand had left it: hollow,
+    /// silent, and floating twelve dB above a curve it was no longer part
+    /// of. The owner: "dbl click reset node should make the node jump back
+    /// to its default position, right now only the wave moves down when
+    /// reset, leaving the node stranded above/below."
+    ///
+    /// Every knob, not only the two that make the position, because "reset"
+    /// has one meaning and a band left on a shape and a width somebody
+    /// dialled in is not reset. The values come from the pushed parameters'
+    /// own `default`, so the face never holds a second opinion about what
+    /// shipped.
+    ///
+    /// Revert-check performed: send `Set { id: base, value: 0.0 }` alone
+    /// again and this goes red on the gain, which is the axis the owner
+    /// could see the node stranded on.
+    #[test]
+    fn a_double_click_puts_the_whole_band_back_where_it_shipped() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(470.0, 470.0));
+        let mut live = a_face_of(25);
+        live.face.path = "@tangent-eq".to_owned();
+        for band in 0..5 {
+            let base = band * 5;
+            live.face.params[base].value = f32::from(u8::from(band == 0));
+            live.face.params[base].default = 0.0;
+            live.face.params[base + 1].choices =
+                ["bell", "lo-shelf", "hi-shelf"].map(str::to_owned).to_vec();
+            live.face.params[base + 1].steps = 3;
+            for k in 1..5 {
+                live.face.params[base + k].value = 0.5;
+                live.face.params[base + k].default = 0.5;
+            }
+        }
+        // Band one, dialled well away from where it shipped: up in level and
+        // along in frequency, which is what a used EQ looks like.
+        live.face.params[2].value = 0.72;
+        live.face.params[3].value = 0.86;
+        live.face.params[4].value = 0.19;
+
+        let press = |p: egui::Pos2, down: bool| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: down,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut frame = |events: Vec<egui::Event>, live: &mut crate::faces::FaceLive| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                        ctx,
+                        |ui| {
+                            let act = crate::faces::draw(ui, &st, live);
+                            let mut apply = |id: u32, value: f32| {
+                                if let Some(p) =
+                                    live.face.params.iter_mut().find(|p| p.id == id)
+                                {
+                                    p.value = value;
+                                }
+                            };
+                            match act {
+                                Some(crate::faces::FaceAction::Set { id, value }) => {
+                                    apply(id, value);
+                                }
+                                Some(crate::faces::FaceAction::SetMany { sets }) => {
+                                    for (id, value) in sets {
+                                        apply(id, value);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        },
+                    );
+                },
+            );
+        };
+        // Where the handle actually is, from the numbers above: the curve's
+        // own mapping over its inner rect.
+        let inner = Rect::from_min_size(egui::pos2(6.0, 6.0), Vec2::new(458.0, 178.0));
+        let at = egui::pos2(
+            hz_to_x(inner, CURVE_LO_HZ * (CURVE_HI_HZ / CURVE_LO_HZ).powf(0.72)),
+            db_to_y(inner, (0.86 * 2.0 - 1.0) * CURVE_DB),
+        );
+        frame(Vec::new(), &mut live);
+        frame(vec![egui::Event::PointerMoved(at)], &mut live);
+        // Two clicks in consecutive frames, which is well inside egui's
+        // double-click window.
+        for _ in 0..2 {
+            frame(vec![press(at, true)], &mut live);
+            frame(vec![press(at, false)], &mut live);
+        }
+        let value = |id: u32| -> f32 {
+            live.face.params.iter().find(|p| p.id == id).map_or(-1.0, |p| p.value)
+        };
+        assert_eq!(value(0), 0.0, "the double-click did not take the band out");
+        assert!(
+            (value(3) - 0.5).abs() < 1e-6,
+            "the node is still stranded at gain {:.2} over a curve it left",
+            value(3)
+        );
+        assert!(
+            (value(2) - 0.5).abs() < 1e-6,
+            "the node did not go home along the frequency axis: {:.2}",
+            value(2)
+        );
+        assert!(
+            (value(4) - 0.5).abs() < 1e-6,
+            "the width somebody dialled in survived a reset: {:.2}",
+            value(4)
+        );
+    }
+
     /// **The three things the owner asked of the EQ, measured through
     /// `faces::draw` rather than argued about.**
     ///

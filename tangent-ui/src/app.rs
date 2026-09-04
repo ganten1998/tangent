@@ -25787,6 +25787,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.set_insert_param(seat, bay, id_a, value_a);
                 self.set_insert_param(seat, bay, id_b, value_b);
             }
+            // In order, through the one road a single one takes, so a run is
+            // exactly N of the same thing and not a second way to set a
+            // parameter.
+            DialogAction::SetInsertParamsMany { strip, slot, sets } => {
+                let (seat, bay) = recorder::seat_bay(strip, slot);
+                for (id, value) in sets {
+                    self.set_insert_param(seat, bay, id, value);
+                }
+            }
             DialogAction::FaceSavePreset { strip, slot, name } => {
                 let (seat, bay) = recorder::seat_bay(strip, slot);
                 if let Some(face) = self.builtin_face(seat, bay) {
@@ -30316,6 +30325,30 @@ impl TangentApp {
                 self.undo();
             } else if redo_key {
                 self.redo();
+            }
+            // **Ctrl/Cmd+S — keep the session**, from anywhere a letter is
+            // not being typed, on the same gate and in the same block as
+            // undo because it is the same kind of thing: a chord every desk
+            // has that belongs to no one surface.
+            //
+            // The bare `S` is the supporter key and stays that way — the
+            // table `keys::pressed` reads refuses any modified press
+            // outright, so the two cannot collide.
+            //
+            // `named` goes true for the reason `DialogAction::ProjectSave`
+            // sets it: a save a hand asked for is the session being KEPT,
+            // and a scratch that has been deliberately saved is no longer a
+            // scratch for launch to reclaim. The receipt is raised where the
+            // WRITE happens (`desktop`'s `ProjectRequest::Save`) rather than
+            // here, so it says a thing that has actually been done.
+            if ctx.input(|i| {
+                (i.modifiers.ctrl || i.modifiers.command)
+                    && !i.modifiers.shift
+                    && !i.modifiers.alt
+                    && i.key_pressed(egui::Key::S)
+            }) {
+                self.arrangement.named = true;
+                self.project_request = Some(crate::ports::ProjectRequest::Save);
             }
             // **Shift+1/2/3: theory, arrange, mixer** — the ctrl chords
             // retired because Windows' Ctrl+V is PASTE and a view key on
@@ -44965,6 +44998,76 @@ mod tests {
     }
 
 
+
+    /// **Ctrl/Cmd+S keeps the session, and the bare S still does not.**
+    ///
+    /// The chord the owner asked for — "Ctrl/CMD + S to save should summon a
+    /// notif card like 'ir x deleted' does" — and the collision it has to
+    /// survive: `S` alone is the supporter key. They cannot fight, because
+    /// `keys::pressed` refuses ANY modified press before it reaches the
+    /// table, but that is a fact about another function and this is the
+    /// place it is worth being sure of.
+    ///
+    /// The RECEIPT is raised where the write happens, in the host's
+    /// `ProjectRequest::Save` arm, so it reports a file that exists rather
+    /// than one that was asked for. What this can measure is the ask, and
+    /// that it carries `named` with it: a scratch somebody deliberately
+    /// saved is no longer a scratch for launch to reclaim.
+    ///
+    /// Revert-checks, both performed: delete the chord block and the first
+    /// half goes red with no request raised; drop the `!i.modifiers.shift`
+    /// guard and the redo leg goes red, because Cmd+Shift+S would then save
+    /// as well.
+    #[test]
+    fn ctrl_s_keeps_the_session_and_bare_s_does_not() {
+        let chord = |mods: egui::Modifiers| -> (Option<crate::ports::ProjectRequest>, bool) {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.arrangement.named = false;
+            let _ = app.take_project_request();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(1300.0, 900.0),
+                    )),
+                    modifiers: mods,
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::S,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: mods,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            (app.take_project_request(), app.arrangement.named)
+        };
+
+        let cmd = egui::Modifiers::COMMAND;
+        let (asked, named) = chord(cmd);
+        assert!(
+            matches!(asked, Some(crate::ports::ProjectRequest::Save)),
+            "Cmd+S raised {asked:?} instead of a save"
+        );
+        assert!(named, "a save somebody pressed for did not mark the session kept");
+
+        // The bare letter is the supporter key and must stay it.
+        let (asked, _) = chord(egui::Modifiers::NONE);
+        assert!(
+            !matches!(asked, Some(crate::ports::ProjectRequest::Save)),
+            "the bare S saved the project - it is the supporter key"
+        );
+
+        // And the redo chord is not a save. Cmd+Shift+Z shares the hand
+        // shape; Cmd+Shift+S must not be a second way to do this.
+        let (asked, _) = chord(egui::Modifiers { shift: true, ..cmd });
+        assert!(
+            !matches!(asked, Some(crate::ports::ProjectRequest::Save)),
+            "Cmd+Shift+S saved, so the chord does not check its modifiers"
+        );
+    }
 
     /// **A gesture whose release AppKit swallowed still ends.**
     ///

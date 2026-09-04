@@ -188,6 +188,12 @@ features = [
     "NSString",
     "NSThread",
     "NSURL",
+    # TANGENT: the save panel's directory has to be re-asserted once the
+    # panel is on screen. See `Panel::hold_directory`.
+    "NSDate",
+    "NSRunLoop",
+    "NSTimer",
+    "block2",
 ]
 default-features = false
 

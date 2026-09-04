@@ -6,7 +6,7 @@ use block2::Block;
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSModalResponse, NSOpenPanel, NSSavePanel, NSWindow, NSWindowLevel};
-use objc2_foundation::{NSArray, NSString, NSURL};
+use objc2_foundation::{NSArray, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer, NSURL};
 use raw_window_handle::RawWindowHandle;
 
 use super::super::{
@@ -60,6 +60,58 @@ impl Panel {
             parent: parent.map(window_from_raw_window_handle),
             _focus_manager,
             _policy_manager,
+        }
+    }
+
+    /// **TANGENT: put the start directory back, once the panel is up.**
+    ///
+    /// `NSSavePanel` accepts `setDirectoryURL:` and then MOVES, and this was
+    /// measured rather than guessed. A small AppKit program that reads the
+    /// panel's own `directoryURL` back — before it is shown and again after —
+    /// says, on the owner's machine:
+    ///
+    /// ```text
+    ///     SAVE  before show /Users/x/Documents/Tangent Media/Projects
+    ///           AFTER  show /Users/x                        *** MOVED ***
+    ///     OPEN  before show /Users/x/Documents/Tangent Media/Projects
+    ///           AFTER  show /Users/x/Documents/Tangent Media/Projects  HELD
+    /// ```
+    ///
+    /// So it is not the directory, not the file name, not this crate's
+    /// shielding window level, and not the ORDER any of them are set in — all
+    /// four were varied and all four moved. `NSOpenPanel` holds the same URL
+    /// in the same program. What differs is that a save panel restores the
+    /// app's remembered location — `NSOSPLastRootDirectory`, a bookmark in
+    /// the app's own preference domain — over the one it was handed, and for
+    /// a user who has never saved anywhere that location is HOME.
+    ///
+    /// That is why the owner reported this as a per-build wildcard that
+    /// "never has been consistently applied": whether it looks broken depends
+    /// on what the panel last remembered, so it comes and goes with no code
+    /// change at all.
+    ///
+    /// The remedy is to say it again once the restore has happened. Also
+    /// measured: re-asserting on the next run-loop turn is too early and
+    /// still moves; 30 ms holds, and so does everything later. Three shots
+    /// inside 200 ms covers a slower machine and is far quicker than anyone
+    /// can navigate a panel, so it can never take a folder away from a hand
+    /// that chose it.
+    ///
+    /// The timers go into the COMMON modes: a modal panel spins the run loop
+    /// in `NSModalPanelRunLoopMode`, and a timer left in the default mode
+    /// alone would not fire until the panel had already closed.
+    fn hold_directory(&self, url: Retained<NSURL>) {
+        for after in [0.03_f64, 0.08, 0.18] {
+            let panel = self.panel.clone();
+            let url = url.clone();
+            let block = block2::RcBlock::new(move |_t: core::ptr::NonNull<NSTimer>| unsafe {
+                panel.setDirectoryURL(Some(&url));
+            });
+            let timer =
+                unsafe { NSTimer::timerWithTimeInterval_repeats_block(after, false, &block) };
+            unsafe {
+                NSRunLoop::currentRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
+            }
         }
     }
 
@@ -229,7 +281,19 @@ impl Panel {
             panel.set_can_create_directories(can);
         }
 
-        Self::new(panel, opt.parent.as_ref())
+        let built = Self::new(panel, opt.parent.as_ref());
+        // TANGENT: and it has to be said again after the panel is up. The
+        // SAVE panel only — `NSOpenPanel` holds what it is given, so this
+        // would be three timers doing nothing there. See `hold_directory`.
+        if let Some(path) = &opt.starting_directory {
+            if let Some(path) = path.to_str() {
+                let url = unsafe {
+                    NSURL::fileURLWithPath_isDirectory(&NSString::from_str(path), true)
+                };
+                built.hold_directory(url);
+            }
+        }
+        built
     }
 
     pub fn build_pick_folder(opt: &FileDialog, mtm: MainThreadMarker) -> Self {

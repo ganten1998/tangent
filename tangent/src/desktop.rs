@@ -7490,6 +7490,23 @@ impl DesktopApp {
                 self.save_plugin_states();
                 self.copy_states_to_project();
                 self.app.save_project_doc();
+                // **A receipt, because a save is invisible otherwise.**
+                //
+                // Every other thing this app does to a file on disk says so
+                // — an impulse deleted, a kit written, MIDI exported — and
+                // the one people press most often said nothing at all, so
+                // Ctrl+S was a chord you had to take on faith. The owner
+                // asked for it in those terms: "Ctrl/CMD + S to save should
+                // summon a notif card like 'ir x deleted' does."
+                //
+                // Raised HERE and not at the keypress, so it reports a write
+                // that has happened rather than one that was asked for — and
+                // it therefore covers the menu's Save row too, which is the
+                // same request arriving by another door.
+                self.app.notify(
+                    tangent_ui::notify::Kind::Success,
+                    format!("Project saved - {}", self.app.project_name()),
+                );
             }
             tangent_ui::ports::ProjectRequest::Template(name) => {
                 // Everything written down first, so the copy IS the session.
