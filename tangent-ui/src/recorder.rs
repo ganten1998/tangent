@@ -2911,6 +2911,11 @@ pub enum NumField {
     /// reads. `+15`, `-7.5`, `0`. Typing 115 for fifteen percent up would be
     /// the field disagreeing with the readout directly above it.
     Varispeed,
+    /// **A marker's NAME**, by index into the document's markers. Appended
+    /// at the END, this enum's law. The only field here whose value is a
+    /// word rather than a number — the machinery is the same, and a second
+    /// inline-typing system for one field would be the thing to explain.
+    MarkerName(usize),
 }
 
 /// A time typed into a trim field, in seconds.

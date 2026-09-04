@@ -2697,6 +2697,9 @@ fn num_field_key(f: NumField) -> usize {
         // per bar, and two controls that answer `true` to `is_same_control`
         // are two controls a drag can slide between.
         NumField::MeterAt(bar) => 1_000 + bar as usize,
+        // Past every bar a song can have, so a flag's field and a
+        // signature's can never share an id.
+        NumField::MarkerName(i) => 2_000_000 + i,
         NumField::Fx(fx) => 200 + fx.index(),
     }
 }
