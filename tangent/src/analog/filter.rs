@@ -438,30 +438,47 @@ impl<const L: usize> SemLanes<L> {
 
 // ── the 4× pair, polyphase ──────────────────────────────────────────────────
 
-/// A dot product the compiler will vectorise: sixteen taps per step as
-/// four four-lane accumulators, each lane an explicit `mul_add` — Rust
-/// does not contract `a * b + c` into a fused multiply-add on its own,
-/// and the first version compiled to two-lane multiplies and adds behind
-/// a call. Four accumulators cut the loop-carried chain to a quarter;
-/// the pair's cost is latency, not multiplies. `b` must be at least `N`
-/// long and `N` a multiple of 16.
+/// A dot product the compiler will vectorise, in an order the laned form
+/// ([`dot_lanes`]) can repeat exactly: eight accumulators, tap `t` into
+/// accumulator `t % 8`, each an explicit `mul_add` — Rust does not
+/// contract `a * b + c` into a fused multiply-add on its own — and the
+/// same sum tree at the end. Eight because the pair's cost is latency:
+/// eight independent chains of `N/8` fused adds each. `b` must be at
+/// least `N` long and `N` a multiple of 8.
 #[inline(always)]
 fn dot<const N: usize>(a: &[f32; N], b: &[f32]) -> f32 {
-    let (ac, _) = a.as_chunks::<16>();
-    let (bc, _) = b[..N].as_chunks::<16>();
-    let mut acc = [[0.0_f32; 4]; 4];
+    let (ac, _) = a.as_chunks::<8>();
+    let (bc, _) = b[..N].as_chunks::<8>();
+    let mut acc = [0.0_f32; 8];
     for (x, y) in ac.iter().zip(bc) {
-        for k in 0..4 {
-            for l in 0..4 {
-                acc[k][l] = x[4 * k + l].mul_add(y[4 * k + l], acc[k][l]);
+        for k in 0..8 {
+            acc[k] = x[k].mul_add(y[k], acc[k]);
+        }
+    }
+    ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
+}
+
+/// [`dot`] for `L` voices at once: `w[t][l]` is tap `t`'s window sample
+/// for lane `l`. Tap by tap, accumulator `t % 8`, lanes side by side —
+/// one vector operation per tap for every lane, and the same order as
+/// the scalar dot, so a lane's result is the scalar result by bits.
+#[inline(always)]
+fn dot_lanes<const L: usize, const N: usize>(a: &[f32; N], w: &[[f32; L]], out: &mut [f32; L]) {
+    let w = &w[..N];
+    let mut acc = [[0.0_f32; L]; 8];
+    let (ac, _) = a.as_chunks::<8>();
+    let (wc, _) = w.as_chunks::<8>();
+    for (x, y) in ac.iter().zip(wc) {
+        for k in 0..8 {
+            for l in 0..L {
+                acc[k][l] = x[k].mul_add(y[k][l], acc[k][l]);
             }
         }
     }
-    let mut s = [0.0_f32; 4];
-    for l in 0..4 {
-        s[l] = (acc[0][l] + acc[1][l]) + (acc[2][l] + acc[3][l]);
+    for l in 0..L {
+        out[l] = ((acc[0][l] + acc[1][l]) + (acc[2][l] + acc[3][l]))
+            + ((acc[4][l] + acc[5][l]) + (acc[6][l] + acc[7][l]));
     }
-    (s[0] + s[1]) + (s[2] + s[3])
 }
 
 /// The two tap sets, designed once per instrument and shared by every
@@ -576,16 +593,16 @@ impl Oversampler {
     pub fn up(&mut self, taps: &Taps, x: f32) -> [f32; 4] {
         self.up_a.push(x);
         let w = self.up_a.window();
-        let a0 = 2.0 * dot(&taps.a_even, w);
-        let a1 = 2.0 * dot(&taps.a_odd, w);
+        let a0 = dot(&taps.a_even, w) * 2.0;
+        let a1 = dot(&taps.a_odd, w) * 2.0;
         self.up_b.push(a0);
         let w = self.up_b.window();
-        let b0 = 2.0 * dot(&taps.b_even, w);
-        let b1 = 2.0 * dot(&taps.b_odd, w);
+        let b0 = dot(&taps.b_even, w) * 2.0;
+        let b1 = dot(&taps.b_odd, w) * 2.0;
         self.up_b.push(a1);
         let w = self.up_b.window();
-        let b2 = 2.0 * dot(&taps.b_even, w);
-        let b3 = 2.0 * dot(&taps.b_odd, w);
+        let b2 = dot(&taps.b_even, w) * 2.0;
+        let b3 = dot(&taps.b_odd, w) * 2.0;
         [b0, b1, b2, b3]
     }
 
@@ -614,6 +631,138 @@ impl Oversampler {
 impl Default for Oversampler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// [`History`] for `L` voices: each row is one sample of every lane, so a
+/// tap's window entry for all lanes is one contiguous `[f32; L]`. Written
+/// twice, `H` rows apart, for the same reason the scalar one is.
+#[derive(Clone, Copy, Debug)]
+pub struct HistLanes<const L: usize, const H: usize, const H2: usize> {
+    z: [[f32; L]; H2],
+    pos: usize,
+}
+
+impl<const L: usize, const H: usize, const H2: usize> HistLanes<L, H, H2> {
+    pub const fn new() -> Self {
+        Self {
+            z: [[0.0; L]; H2],
+            pos: 0,
+        }
+    }
+    #[inline]
+    fn push(&mut self, x: &[f32; L]) {
+        self.pos = if self.pos == 0 { H - 1 } else { self.pos - 1 };
+        self.z[self.pos] = *x;
+        self.z[self.pos + H] = *x;
+    }
+    #[inline]
+    fn window(&self) -> &[[f32; L]] {
+        &self.z[self.pos..self.pos + H]
+    }
+    fn clear_lane(&mut self, l: usize) {
+        for row in &mut self.z {
+            row[l] = 0.0;
+        }
+    }
+    /// Lane `fl` of `from` into lane `tl` of this, realigned: the two
+    /// groups' write positions differ, so the copy walks both windows
+    /// from their own heads and writes both mirror rows.
+    fn take_lane(&mut self, from: &Self, fl: usize, tl: usize) {
+        for k in 0..H {
+            let v = from.z[from.pos + k][fl];
+            let idx = (self.pos + k) % H;
+            self.z[idx][tl] = v;
+            self.z[idx + H][tl] = v;
+        }
+    }
+}
+
+/// [`Oversampler`] for `L` voices.
+#[derive(Clone, Copy, Debug)]
+pub struct PairLanes<const L: usize> {
+    up_a: HistLanes<L, 32, 64>,
+    up_b: HistLanes<L, 16, 32>,
+    dn_b: HistLanes<L, 32, 64>,
+    dn_a: HistLanes<L, 64, 128>,
+}
+
+impl<const L: usize> Default for PairLanes<L> {
+    fn default() -> Self {
+        Self {
+            up_a: HistLanes::new(),
+            up_b: HistLanes::new(),
+            dn_b: HistLanes::new(),
+            dn_a: HistLanes::new(),
+        }
+    }
+}
+
+impl<const L: usize> PairLanes<L> {
+    /// [`Oversampler::up`], `L` wide: one base-rate sample per lane in,
+    /// four 4× samples per lane out.
+    #[inline]
+    pub fn up(&mut self, taps: &Taps, x: &[f32; L], out: &mut [[f32; L]; 4]) {
+        let mut a0 = [0.0_f32; L];
+        let mut a1 = [0.0_f32; L];
+        self.up_a.push(x);
+        {
+            let w = self.up_a.window();
+            dot_lanes(&taps.a_even, w, &mut a0);
+            dot_lanes(&taps.a_odd, w, &mut a1);
+        }
+        for l in 0..L {
+            a0[l] *= 2.0;
+            a1[l] *= 2.0;
+        }
+        self.up_b.push(&a0);
+        {
+            let w = self.up_b.window();
+            dot_lanes(&taps.b_even, w, &mut out[0]);
+            dot_lanes(&taps.b_odd, w, &mut out[1]);
+        }
+        self.up_b.push(&a1);
+        {
+            let w = self.up_b.window();
+            dot_lanes(&taps.b_even, w, &mut out[2]);
+            dot_lanes(&taps.b_odd, w, &mut out[3]);
+        }
+        for o in out.iter_mut() {
+            for l in 0..L {
+                o[l] *= 2.0;
+            }
+        }
+    }
+
+    /// [`Oversampler::down`], `L` wide.
+    #[inline]
+    pub fn down(&mut self, taps: &Taps, y: &[[f32; L]; 4], out: &mut [f32; L]) {
+        let mut d = [0.0_f32; L];
+        self.dn_b.push(&y[0]);
+        self.dn_b.push(&y[1]);
+        dot_lanes(&taps.b_full, self.dn_b.window(), &mut d);
+        self.dn_a.push(&d);
+        self.dn_b.push(&y[2]);
+        self.dn_b.push(&y[3]);
+        dot_lanes(&taps.b_full, self.dn_b.window(), &mut d);
+        self.dn_a.push(&d);
+        dot_lanes(&taps.a_full, self.dn_a.window(), out);
+    }
+
+    pub fn clear_lane(&mut self, l: usize) {
+        self.up_a.clear_lane(l);
+        self.up_b.clear_lane(l);
+        self.dn_b.clear_lane(l);
+        self.dn_a.clear_lane(l);
+    }
+
+    /// Lane `fl` of `from` into lane `tl` of this, every history
+    /// realigned.
+    pub fn take_lane(&mut self, from: &Self, fl: usize, tl: usize) {
+        self.up_a.take_lane(&from.up_a, fl, tl);
+        self.up_b.take_lane(&from.up_b, fl, tl);
+        self.dn_b.take_lane(&from.dn_b, fl, tl);
+        self.dn_a.take_lane(&from.dn_a, fl, tl);
     }
 }
 
@@ -849,6 +998,70 @@ mod tests {
         }
         // And the lanes did something: not silence.
         assert!(out_l.iter().any(|v| v.abs() > 1e-3));
+    }
+
+    /// **The laned pair is the scalar pair, bit for bit** — including
+    /// after a lane is copied across groups mid-stream, which is what a
+    /// steal does to it.
+    #[test]
+    fn the_laned_pair_is_the_scalar_pair_bit_for_bit() {
+        const L: usize = 8;
+        let taps = Taps::new();
+        let mut scalar: Vec<Oversampler> = (0..L).map(|_| Oversampler::new()).collect();
+        let mut lanes = PairLanes::<L>::default();
+        let mut other = PairLanes::<L>::default();
+        let n = 3_000;
+        let mut x = [0.0_f32; L];
+        let mut up = [[0.0_f32; L]; 4];
+        let mut down = [0.0_f32; L];
+        for i in 0..n {
+            for l in 0..L {
+                x[l] = 0.7 * ((i as f32) * (0.02 + 0.005 * l as f32)).sin();
+            }
+            lanes.up(&taps, &x, &mut up);
+            let mut y4 = [[0.0_f32; L]; 4];
+            for j in 0..4 {
+                for l in 0..L {
+                    // Something nonlinear between, as the filter is.
+                    y4[j][l] = fast_tanh(up[j][l] * 1.5);
+                }
+            }
+            lanes.down(&taps, &y4, &mut down);
+            for l in 0..L {
+                let u = scalar[l].up(&taps, x[l]);
+                for j in 0..4 {
+                    assert!(u[j].to_bits() == up[j][l].to_bits(), "up lane {l} sample {i} phase {j}");
+                }
+                let y = [fast_tanh(u[0] * 1.5), fast_tanh(u[1] * 1.5), fast_tanh(u[2] * 1.5), fast_tanh(u[3] * 1.5)];
+                let d = scalar[l].down(&taps, y);
+                assert!(d.to_bits() == down[l].to_bits(), "down lane {l} sample {i}: {d} vs {}", down[l]);
+            }
+            // Halfway: lane 2 moves to lane 5 of another group whose head
+            // sits elsewhere, and from then on that lane must read the
+            // same as scalar 2.
+            if i == n / 2 {
+                for _ in 0..7 {
+                    other.up(&taps, &[0.0; L], &mut [[0.0; L]; 4]);
+                    other.down(&taps, &[[0.0; L]; 4], &mut [0.0; L]);
+                }
+                other.take_lane(&lanes, 2, 5);
+            }
+            if i > n / 2 {
+                let mut x2 = [0.0_f32; L];
+                x2[5] = x[2];
+                let mut up2 = [[0.0_f32; L]; 4];
+                other.up(&taps, &x2, &mut up2);
+                assert!(up2[0][5].to_bits() == up[0][2].to_bits(), "moved lane, sample {i}");
+                let mut y2 = [[0.0_f32; L]; 4];
+                for j in 0..4 {
+                    y2[j][5] = y4[j][2];
+                }
+                let mut d2 = [0.0_f32; L];
+                other.down(&taps, &y2, &mut d2);
+                assert!(d2[5].to_bits() == down[2].to_bits(), "moved lane down, sample {i}");
+            }
+        }
+        assert!(down.iter().any(|v| v.abs() > 1e-3));
     }
 
     /// The rational tanh keeps its slope at zero and its rails, and sits

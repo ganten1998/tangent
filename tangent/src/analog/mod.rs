@@ -46,7 +46,7 @@ pub mod voice;
 
 use arp::{rate_index, Arp, ArpMode, ArpOut, ArpParams, Transport};
 use ensemble::{Ensemble, EnsembleMode};
-use filter::{CutoffLanes, FilterModel, LadderLanes, SemLanes, Taps, CUTOFF_HZ, OVERSAMPLER_LATENCY};
+use filter::{CutoffLanes, FilterModel, LadderLanes, PairLanes, SemLanes, Taps, CUTOFF_HZ, OVERSAMPLER_LATENCY};
 use osc::{blep_table, Lfo, LfoWave, Osc, Wave, RANGE_OCTAVES};
 use voice::{TickCtx, Voice, VoiceParams, CHUNK};
 
@@ -355,6 +355,8 @@ struct FilterBank {
     cut: [CutoffLanes<LANE>; GROUPS],
     k: [[f32; LANE]; GROUPS],
     damp: [[f32; LANE]; GROUPS],
+    /// The 4× pair, likewise: each group's up and down histories.
+    pair: [PairLanes<LANE>; GROUPS],
 }
 
 impl FilterBank {
@@ -365,11 +367,13 @@ impl FilterBank {
             cut: [CutoffLanes::default(); GROUPS],
             k: [[0.0; LANE]; GROUPS],
             damp: [[1.0; LANE]; GROUPS],
+            pair: [PairLanes::default(); GROUPS],
         }
     }
     fn clear_lane(&mut self, g: usize, l: usize) {
         self.ladder[g].clear_lane(l);
         self.sem[g].clear_lane(l);
+        self.pair[g].clear_lane(l);
     }
     /// Lane `from` into lane `to`, across groups: through a copy of the
     /// source group with the lane moved into the target's position, then
@@ -383,6 +387,8 @@ impl FilterBank {
         let mut sem = self.sem[fg];
         sem.copy_lane(fl, tl);
         self.sem[tg].take_lane(&sem, tl);
+        let pair = self.pair[fg];
+        self.pair[tg].take_lane(&pair, fl, tl);
     }
     fn clear(&mut self) {
         *self = Self::new();
@@ -1044,20 +1050,16 @@ impl Analog {
         let mode = vp.sem_mode;
         for i in 0..len {
             let lfo = self.lfo_buf[from + i];
-            for &v in live {
-                self.voices[usize::from(v)].pre(vp, taps, &ctx, lfo);
-            }
-            for &c in dead {
-                self.corpses[usize::from(c)].voice.pre(vp, taps, &ctx, lfo);
-            }
             if self.laned {
-                // The voices' settings into their lanes, then each
-                // substep: gather the inputs, tick the groups that have
-                // anyone in them, scatter the answers.
+                // Everything before the upsample per voice, then the
+                // mixes into their lanes and up through the bank's pair.
                 let mut used = [false; GROUPS];
+                let mut mix = [[0.0_f32; LANE]; GROUPS];
                 for &v in live {
                     let (g, l) = voice_lane(usize::from(v));
-                    let (cut, k, damp) = self.voices[usize::from(v)].filter_settings();
+                    let voice = &mut self.voices[usize::from(v)];
+                    mix[g][l] = voice.pre_mix(vp, &ctx, lfo);
+                    let (cut, k, damp) = voice.filter_settings();
                     self.bank.cut[g].set(l, cut);
                     self.bank.k[g][l] = k;
                     self.bank.damp[g][l] = damp;
@@ -1065,12 +1067,30 @@ impl Analog {
                 }
                 for &c in dead {
                     let (g, l) = corpse_lane(usize::from(c));
-                    let (cut, k, damp) = self.corpses[usize::from(c)].voice.filter_settings();
+                    let voice = &mut self.corpses[usize::from(c)].voice;
+                    mix[g][l] = voice.pre_mix(vp, &ctx, lfo);
+                    let (cut, k, damp) = voice.filter_settings();
                     self.bank.cut[g].set(l, cut);
                     self.bank.k[g][l] = k;
                     self.bank.damp[g][l] = damp;
                     used[g] = true;
                 }
+                let mut up = [[[0.0_f32; LANE]; 4]; GROUPS];
+                for g in 0..GROUPS {
+                    if used[g] {
+                        self.bank.pair[g].up(taps, &mix[g], &mut up[g]);
+                    }
+                }
+                for &v in live {
+                    let (g, l) = voice_lane(usize::from(v));
+                    self.voices[usize::from(v)].set_up4([up[g][0][l], up[g][1][l], up[g][2][l], up[g][3][l]]);
+                }
+                for &c in dead {
+                    let (g, l) = corpse_lane(usize::from(c));
+                    self.corpses[usize::from(c)].voice.set_up4([up[g][0][l], up[g][1][l], up[g][2][l], up[g][3][l]]);
+                }
+                // Each substep: gather the inputs, tick the groups that
+                // have anyone in them, scatter the answers.
                 for j in 0..4 {
                     let mut x = [[0.0_f32; LANE]; GROUPS];
                     let mut y = [[0.0_f32; LANE]; GROUPS];
@@ -1104,14 +1124,68 @@ impl Analog {
                         self.corpses[usize::from(c)].voice.substep_out(j, y[g][l]);
                     }
                 }
-            } else {
-                for j in 0..4 {
-                    for &v in live {
-                        self.voices[usize::from(v)].substep(vp, &ctx, j);
+                // Down through the pair, then the amplifier and pan.
+                let mut y4 = [[[0.0_f32; LANE]; 4]; GROUPS];
+                for &v in live {
+                    let (g, l) = voice_lane(usize::from(v));
+                    let y = self.voices[usize::from(v)].y4();
+                    for j in 0..4 {
+                        y4[g][j][l] = y[j];
                     }
-                    for &c in dead {
-                        self.corpses[usize::from(c)].voice.substep(vp, &ctx, j);
+                }
+                for &c in dead {
+                    let (g, l) = corpse_lane(usize::from(c));
+                    let y = self.corpses[usize::from(c)].voice.y4();
+                    for j in 0..4 {
+                        y4[g][j][l] = y[j];
                     }
+                }
+                let mut down = [[0.0_f32; LANE]; GROUPS];
+                for g in 0..GROUPS {
+                    if used[g] {
+                        self.bank.pair[g].down(taps, &y4[g], &mut down[g]);
+                    }
+                }
+                let (mut l, mut r) = (0.0_f32, 0.0_f32);
+                for &v in live {
+                    let (g, ln) = voice_lane(usize::from(v));
+                    let (a, b) = self.voices[usize::from(v)].post_with(down[g][ln]);
+                    l += a;
+                    r += b;
+                }
+                for &c in dead {
+                    let ci = usize::from(c);
+                    let (g, ln) = corpse_lane(ci);
+                    let c = &mut self.corpses[ci];
+                    if c.left > 0 {
+                        let fade = c.left as f32 / c.total as f32;
+                        let (a, b) = c.voice.post_with(down[g][ln]);
+                        l += a * fade;
+                        r += b * fade;
+                        c.left -= 1;
+                        if c.left == 0 {
+                            c.voice.vacate();
+                            self.bank.clear_lane(g, ln);
+                        }
+                    }
+                }
+                self.scratch[(from + i) * 2] += l;
+                self.scratch[(from + i) * 2 + 1] += r;
+                continue;
+            }
+            // The scalar road: each voice through its own pair and filter.
+            for &v in live {
+                self.voices[usize::from(v)].pre(vp, taps, &ctx, lfo);
+            }
+            for &c in dead {
+                self.corpses[usize::from(c)].voice.pre(vp, taps, &ctx, lfo);
+            }
+            for j in 0..4 {
+                for &v in live {
+                    self.voices[usize::from(v)].substep(vp, &ctx, j);
+                }
+                for &c in dead {
+                    self.corpses[usize::from(c)].voice.substep(vp, &ctx, j);
                 }
             }
             let (mut l, mut r) = (0.0_f32, 0.0_f32);
@@ -1131,8 +1205,6 @@ impl Analog {
                     c.left -= 1;
                     if c.left == 0 {
                         c.voice.vacate();
-                        let (bg, bl) = corpse_lane(ci);
-                        self.bank.clear_lane(bg, bl);
                     }
                 } else {
                     let _ = c.voice.post(taps);
@@ -1682,22 +1754,22 @@ mod tests {
     /// times real time.
     const CPU_GATE: f32 = 40.0;
     /// The floor this wave holds: an optimised build under this has
-    /// broken something. Measured 12.7x at the wave's end on an M5 Pro
-    /// (three runs, identical to a decimal, on a quiet machine); the floor
-    /// sits at half that because a busy machine parks the test thread on
-    /// an efficiency core and halves the figure. Half still catches the
-    /// shapes that matter: the wave began at 4.4x, and the voice-major
-    /// loop the interleave replaced read 6.3x.
-    const CPU_FLOOR: f32 = 6.0;
+    /// broken something. Measured 23.7x with the filters and the pair in
+    /// lanes (three runs, to a decimal, quiet machine, M5 Pro); the
+    /// floor sits at half that because a busy machine parks the test
+    /// thread on an efficiency core and halves the figure. Half still
+    /// catches every shape this instrument has been through: 4.4x at the
+    /// start, 6.3x voice-major, 13.8x on the scalar road.
+    const CPU_FLOOR: f32 = 11.0;
 
     /// **The CPU number, printed either way**, and held to a floor that
     /// catches a regression in an optimised build. The brief's gate is
-    /// the next test, which is ignored because it is NOT MET: per-voice
-    /// scalar code runs the 4× pair and the Newton ladder in a dependent
-    /// chain, about 95 ns per voice-sample against a 32 ns budget.
-    /// The path to it is lockstep processing of voices in lanes, which is
-    /// a structural change to `voice.rs` and a decision for the owner, not
-    /// this wave. See `docs/ANALOG-BRIEF.md` §9 and the bench's `perf`.
+    /// the next test, which is ignored because it is NOT MET: with the
+    /// filters and the 4× pair in lanes the synth costs about 55 ns per
+    /// voice-sample against a 32 ns budget, and what remains is the
+    /// oscillators (a branch per discontinuity, which will not lane), the
+    /// contours and the per-voice glue. See `docs/ANALOG-BRIEF.md` §9
+    /// and the bench's `perf`, which prints both roads and the phases.
     #[test]
     fn sixteen_voices_with_ensemble_render_above_the_regression_floor() {
         let factor = realtime_factor();
@@ -1709,7 +1781,7 @@ mod tests {
     /// The brief's own gate, kept as written so nobody forgets it exists.
     /// Run it with `--ignored`.
     #[test]
-    #[ignore = "the brief's 40x CPU gate is NOT MET by this wave (12.7x at HEAD on an M5 Pro); see the test above"]
+    #[ignore = "the brief's 40x CPU gate is NOT MET (23.7x at HEAD on an M5 Pro, filters and pair in lanes); see the test above"]
     fn sixteen_voices_with_ensemble_meet_the_briefs_forty_times_gate() {
         let factor = realtime_factor();
         assert!(factor >= CPU_GATE, "16 voices render at {factor:.1}x realtime against the brief's {CPU_GATE}x");
