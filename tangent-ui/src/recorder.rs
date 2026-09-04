@@ -3023,9 +3023,37 @@ impl NumEdit {
     /// that has focus — cannot end up in the box.
     pub fn push(&mut self, ch: char) {
         const MAX: usize = 8;
+        /// A marker's name is a WORD, so it gets room a number never needs.
+        /// Long enough for "Chorus (reprise)"; short enough that a flag
+        /// cannot grow wider than the ruler it sits on.
+        const NAME_MAX: usize = 24;
+        // **A NAME takes letters**, and it is the only field here that does.
+        //
+        // Every other branch of this function exists to keep a letter OUT —
+        // the app's single-key shortcuts are live while a field has focus,
+        // so a stray `d` must not land in a number. `MarkerName` arrived
+        // after all of that and fell through to the numeric filter, which
+        // dropped every letter it was given: the owner could not type a
+        // marker name AT ALL. Anything printable goes in; a control
+        // character does not.
+        if matches!(self.field, NumField::MarkerName(_)) {
+            if !ch.is_control() && self.text.chars().count() < NAME_MAX {
+                let at = self.caret.min(self.text.len());
+                self.text.insert(at, ch);
+                self.caret = at + ch.len_utf8();
+            }
+            return;
+        }
         // A signature is two numbers and a slash, and nothing else: no minus,
         // no decimal point. Handled first so those two cannot creep in.
-        if self.field == NumField::Meter {
+        //
+        // **`MeterAt` as well as `Meter`, which is the bug that shipped.**
+        // This read `== NumField::Meter`, so the band's song-wide box took a
+        // slash and the RULER's per-bar chip — the one the whole marker
+        // system opens — did not. Every character of "3/4" but the slash
+        // went in, `TimeSignature::parse` refused what was left, and the
+        // owner's report was that time signatures were "dead too".
+        if matches!(self.field, NumField::Meter | NumField::MeterAt(_)) {
             let ok = ch.is_ascii_digit() || (ch == '/' && !self.text.contains('/'));
             if ok && self.text.len() < MAX {
                 let at = self.caret.min(self.text.len());
@@ -3416,6 +3444,65 @@ pub fn disk_text(minutes: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A name takes letters, and a per-bar signature takes a slash.**
+    ///
+    /// Two reports from one function. `NumEdit` is a NUMBER field and every
+    /// branch of `push` exists to keep letters out — the app's single-key
+    /// shortcuts stay live while a field has focus, so a stray `d` must not
+    /// land in a gain box. Two fields arrived afterwards and fell through to
+    /// that filter:
+    ///
+    /// - `MarkerName` is a WORD. Every letter was dropped, so the owner
+    ///   could not type a marker name at all — the field opened, took the
+    ///   keystrokes, and stayed empty.
+    /// - `MeterAt` is the RULER's per-bar signature. The slash was allowed
+    ///   for `Meter`, the band's song-wide box, by an `==` that named one
+    ///   field; "3/4" arrived as "34", `TimeSignature::parse` refused it,
+    ///   and time signatures were "dead too". It also hid a third report —
+    ///   with no chip on screen there was no way to reach "Edit time sig."
+    ///
+    /// The numeric fields are checked in the same test, because the reason
+    /// this filter exists is that they must keep refusing letters.
+    ///
+    /// Revert-checks, all four performed: send `MarkerName` back to the
+    /// numeric branch; put the slash rule back to `== NumField::Meter`;
+    /// let `NAME_MAX` grow unbounded; and allow a second slash.
+    #[test]
+    fn a_name_takes_letters_and_a_per_bar_signature_takes_a_slash() {
+        let typed = |field: NumField, s: &str| {
+            let mut e = NumEdit::new(field);
+            for ch in s.chars() {
+                e.push(ch);
+            }
+            e.text
+        };
+
+        // A name is a word.
+        assert_eq!(typed(NumField::MarkerName(0), "Chorus"), "Chorus");
+        assert_eq!(typed(NumField::MarkerName(3), "Verse 2 (alt)"), "Verse 2 (alt)");
+        // Long enough for a real name, and bounded so a flag cannot outgrow
+        // the ruler it sits on.
+        let long = typed(NumField::MarkerName(0), &"x".repeat(80));
+        assert_eq!(long.chars().count(), 24, "the name field is unbounded");
+        // A control character is still not a character.
+        assert_eq!(typed(NumField::MarkerName(0), "a\u{7}b"), "ab");
+
+        // **Both signature fields take the slash**, which is the half that
+        // shipped broken.
+        for f in [NumField::Meter, NumField::MeterAt(0), NumField::MeterAt(9)] {
+            assert_eq!(typed(f, "3/4"), "3/4", "{f:?} would not take a slash");
+            assert_eq!(typed(f, "7/8"), "7/8", "{f:?} would not take a slash");
+            // One slash, and no letters: a signature is two numbers.
+            assert_eq!(typed(f, "3//4"), "3/4", "{f:?} took a second slash");
+            assert_eq!(typed(f, "3x/4"), "3/4", "{f:?} took a letter");
+            assert_eq!(typed(f, "-3.5/4"), "35/4", "{f:?} took a sign or a point");
+        }
+
+        // And the numeric fields still refuse what this filter is for.
+        assert_eq!(typed(NumField::Tempo, "12d0"), "120", "a letter reached a number");
+        assert_eq!(typed(NumField::Tempo, "1/20"), "120", "a slash reached a number");
+    }
     /// **Every pad of every channel gets its own seat, and no old seat moved.**
     ///
     /// A drum instrument loads a full instance per channel, so the pad racks
