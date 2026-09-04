@@ -7653,10 +7653,31 @@ impl DesktopApp {
             // **A refusal is an answer, and has to be remembered as one.**
             // Nothing else records it: a file that will not decode is absent
             // from the cache exactly like one nobody has tried yet.
-            Err(_) if !pads => {
+            //
+            // **This used to say `Err(_) if !pads`, and the pads arm below
+            // threw the answer away.** The comment above stated the rule and
+            // the code kept it for clips only, which cost the owner an
+            // unusable app: a launch adopts the template in memory and points
+            // at a scratch folder that is deliberately never created, so a
+            // template carrying a KIT resolves every pad into a directory
+            // that does not exist. Seventeen decodes fail, none is
+            // remembered, `queue_warm` re-queues all seventeen because a
+            // refused file is absent from `pad_cache` exactly like an untried
+            // one, and round it goes — spawning seventeen `afconvert`
+            // children a pass, on the UI thread, for ever. What he saw was a
+            // loading splash that never ended, a sample counter climbing past
+            // three hundred against a kit with seventeen pads in it, and a
+            // window too starved to draw. Sampled at 86% of the main thread
+            // inside `poll`, waiting on children.
+            //
+            // The two halves differ only in what a retry may cost, and both
+            // answers are the same: remember it. See `queue_warm`, which now
+            // skips a refused pad, and `reload_pads`, which is the road that
+            // paints the pad red — it decodes on its own and is unaffected by
+            // this set, so a file that comes back still lights.
+            Err(_) => {
                 self.warm_refused.insert(path);
             }
-            Err(_) => {}
         }
         // A file a frame only advances if frames arrive.
         ctx.request_repaint();
@@ -7698,7 +7719,14 @@ impl DesktopApp {
                 .collect();
             for lane in lanes {
                 for path in self.app.drumpad_paths_of(lane).into_iter().flatten() {
-                    if self.pad_cache.contains_key(&path) || !seen.insert(path.clone()) {
+                    // `warm_refused` is what stops the queue rebuilding a
+                    // file that has already answered "no". Without it a
+                    // missing sample is re-queued every pass for ever; see
+                    // the refusal arm in `run_warm` for what that cost.
+                    if self.pad_cache.contains_key(&path)
+                        || self.warm_refused.contains(&path)
+                        || !seen.insert(path.clone())
+                    {
                         continue;
                     }
                     self.warm.push_back(Warm::Pad(path));
@@ -7903,9 +7931,27 @@ impl DesktopApp {
                     .any(|c| tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path) == *path)
             };
             self.track_cache.retain(|path, _| referenced(path));
-            // A refusal outlives its clip no longer than a decode does, so
-            // re-importing a file that has been fixed on disk tries again.
-            self.warm_refused.retain(referenced);
+            // **The refusal set holds PADS as well as clips, so this sweep
+            // has to ask both.**
+            //
+            // It asked only the clips, which was true while only clips could
+            // be refused. Now that a pad's refusal is remembered too — see
+            // the arm in `run_warm` and what dropping it cost — a sweep that
+            // knows nothing about pads would throw every pad refusal away on
+            // the next clip reload, `queue_warm` would re-queue all of them,
+            // and the spawn-for-ever loop would be back with one extra step
+            // in it. Collected first because the closure below borrows the
+            // app while `retain` borrows the set.
+            let live_pads: Vec<std::path::PathBuf> = (0..tangent_ui::recorder::CHANNELS)
+                .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+                .flat_map(|lane| self.app.drumpad_paths_of(lane))
+                .flatten()
+                .collect();
+            // A refusal outlives the thing that referenced it no longer than
+            // a decode does, so a file fixed on disk and pointed at again
+            // tries again.
+            self.warm_refused
+                .retain(|path| referenced(path) || live_pads.iter().any(|p| p == path));
         }
         // And the stretched renders with them — including every ratio a drag
         // passed through on its way to the one that stuck. A drag across a
@@ -14298,15 +14344,63 @@ mod tests {
             "queue_warm has to skip what the decoder already refused, or it \
              refills forever and clips_owed is never answered"
         );
+        // **And the PADS half, which is where this went wrong a second
+        // time.** The refusal arm used to read `Err(_) if !pads`, so a pad
+        // that would not decode was forgotten the instant it answered. The
+        // owner's launch adopted a template whose kit pointed at a scratch
+        // folder that is deliberately never created: seventeen samples
+        // missing, none remembered, all seventeen re-queued every pass, an
+        // `afconvert` spawned for each, on the UI thread, for ever. He saw a
+        // loading splash that never ended and a counter climbing past three
+        // hundred on a kit with seventeen pads; the main thread sampled at
+        // 86% inside `poll`, waiting on children.
+        // Comments stripped for this one, because the paragraph above the
+        // arm QUOTES the shape it is forbidding — a scan that reads its own
+        // explanation is a scan that fails on the fix.
+        let code: String = body
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("Err(_) if !pads"),
+            "the refusal arm is gated on the file being a CLIP again, so a \
+             pad that cannot decode is re-queued for ever"
+        );
+        let pads_block = body
+            .find("if self.pads_owed {")
+            .map(|at| &body[at..body.len().min(at + 1_400)])
+            .expect("queue_warm still has a pads arm");
+        assert!(
+            pads_block.contains("self.warm_refused.contains(&path)"),
+            "the pad queue has to skip what the decoder already refused"
+        );
+        // The sweep that expires a refusal has to ask the pads too, or it
+        // throws every pad refusal away on the next clip reload and the loop
+        // comes back with one more step in it.
+        assert!(
+            body.contains("live_pads.iter().any(|p| p == path)"),
+            "the refusal sweep has to keep a pad's refusal while the pad \
+             still references the file"
+        );
         // And the memory must not outlive its reason, or a file fixed on
         // disk is refused for the rest of the session.
         assert!(
             body.contains("self.warm_refused.clear();"),
             "a project switch has to forget every refusal"
         );
+        // **It used to read `retain(referenced)`, and `referenced` asks the
+        // CLIPS.** That was the whole truth while only a clip could be
+        // refused. Now that a pad's refusal is remembered too, a sweep that
+        // asked the clips alone would drop every pad refusal on the next clip
+        // reload, `queue_warm` would rebuild them, and the spawn-for-ever
+        // loop would be back with one more step in it. Both halves, or
+        // neither.
         assert!(
-            body.contains("self.warm_refused.retain(referenced);"),
-            "a refusal has to leave with the clip that caused it"
+            code.contains("self.warm_refused")
+                && code.contains("referenced(path) || live_pads.iter().any(|p| p == path)"),
+            "a refusal has to leave with the clip OR THE PAD that caused it"
         );
     }
 

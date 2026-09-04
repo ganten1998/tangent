@@ -844,6 +844,23 @@ pub struct TangentApp {
     /// Where the document lives (`…/project.tangent`). Empty until the host
     /// bootstraps; every clip path resolves against it.
     project_doc: std::path::PathBuf,
+    /// **Where a not-yet-real project's MEDIA still lives** — the folder its
+    /// document was adopted from, or `None` for a project that owns its own.
+    ///
+    /// A launch adopts the template IN MEMORY and points `project_doc` at a
+    /// scratch folder that is deliberately never created ("no creating
+    /// folders called untitled PERIOD"). A pad stores its sample as
+    /// `media/Kick.wav`, relative, and `drumpad::resolve` joins it to the
+    /// document's own directory — so from the moment the repoint happens,
+    /// every sample in the kit resolves into a directory that does not
+    /// exist. A template with an EMPTY kit never noticed. The owner built a
+    /// seventeen-pad kit into his on 2 September, and after that every
+    /// launch had seventeen missing samples in it.
+    ///
+    /// Runtime only, never serialised: it is a fact about how THIS session
+    /// started, and a settings file that carried it would point the next
+    /// session at a template it may not have adopted.
+    media_source: Option<std::path::PathBuf>,
     /// The document's clips changed: the host should re-decode, re-push the
     /// engine's schedule, and rebuild the band's picture. Taken once.
     clips_dirty: bool,
@@ -2997,6 +3014,7 @@ impl TangentApp {
             menu_ate_press: false,
             arrangement: crate::arrangement::Arrangement::default(),
             project_doc: std::path::PathBuf::new(),
+            media_source: None,
             clips_dirty: false,
             save_request: None,
             midi_export: Vec::new(),
@@ -7703,6 +7721,30 @@ impl TangentApp {
     }
 
     /// The open document's path, for the host to resolve clip paths against.
+    /// **The document a pad's relative sample resolves against**, which is
+    /// not always the project's own.
+    ///
+    /// While a scratch adopted from a template has not been written yet, its
+    /// folder does not exist and the samples are still in the template — so
+    /// that is where they are read from. The moment the folder is real the
+    /// project owns them, because `materialize_project_dir` brings them
+    /// across; from then on this answers the project and the template is out
+    /// of the picture.
+    ///
+    /// One `is_dir` per call, not per pad: the callers ask once and fan out
+    /// over a hundred and twenty-eight slots.
+    fn kit_doc(&self) -> Option<std::path::PathBuf> {
+        let doc = self.project_doc()?;
+        let real = doc.parent().is_some_and(std::path::Path::is_dir);
+        if real {
+            return Some(doc.to_path_buf());
+        }
+        match self.media_source.as_ref() {
+            Some(src) => Some(crate::arrangement::doc_in(src)),
+            None => Some(doc.to_path_buf()),
+        }
+    }
+
     pub fn project_doc(&self) -> Option<&std::path::Path> {
         (!self.project_doc.as_os_str().is_empty()).then_some(self.project_doc.as_path())
     }
@@ -9686,6 +9728,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// a Save), through `materialize_project_dir`.
     pub fn adopt_template(&mut self, template_dir: &std::path::Path, dir: &std::path::Path) {
         self.open_project(&crate::arrangement::doc_in(template_dir));
+        // **The kit's samples are still in the template**, and they stay
+        // there until this scratch becomes real. See `media_source` for what
+        // the repoint below does to a relative pad path without it.
+        self.media_source = Some(template_dir.to_path_buf());
         // Repoint at the prospective home - unwritten - and make sure the
         // template can never be edited in place through this session.
         self.arrangement.named = false;
@@ -9699,8 +9745,44 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// writer that is about to put something in it. Cheap when it already
     /// exists.
     pub fn materialize_project_dir(&self) {
-        if let Some(dir) = self.project_doc.parent() {
-            let _ = std::fs::create_dir_all(dir.join("media"));
+        let Some(dir) = self.project_doc.parent() else {
+            return;
+        };
+        let already = dir.is_dir();
+        let _ = std::fs::create_dir_all(dir.join("media"));
+        // **The kit's samples come with it, once and only on the way in.**
+        //
+        // Until this moment a scratch adopted from a template read its pads
+        // out of the template — see `kit_doc`. The moment the folder is real
+        // `kit_doc` starts answering the project instead, so anything the kit
+        // still references has to BE here or the pads go missing at exactly
+        // the point somebody recorded their first take.
+        //
+        // Only on the transition (`already` is false), only files the kit
+        // actually names, and never over one that is already there: a project
+        // whose folder exists owns its media, and copying into it on every
+        // call would let a stale template quietly overwrite an edited sample.
+        // Relative paths only, because an absolute one is somebody's own file
+        // somewhere else and is not ours to duplicate.
+        if already {
+            return;
+        }
+        let Some(src) = self.media_source.as_ref() else {
+            return;
+        };
+        for slot in self.drumpad().pads.iter() {
+            let rel = std::path::Path::new(&slot.path);
+            if slot.path.is_empty() || rel.is_absolute() {
+                continue;
+            }
+            let (from, to) = (src.join(rel), dir.join(rel));
+            if to.exists() || !from.is_file() {
+                continue;
+            }
+            if let Some(parent) = to.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::copy(&from, &to);
         }
     }
 
@@ -9723,6 +9805,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     pub fn open_project(&mut self, doc: &std::path::Path) {
+        // An explicit open owns its own folder; nothing is borrowed from a
+        // template. `adopt_template` sets this again immediately after,
+        // which is why it is cleared here rather than by every caller.
+        self.media_source = None;
         let (arr, doc) = self.read_for_adoption(doc);
         self.arrangement = arr;
         self.project_doc = doc.clone();
@@ -15469,8 +15555,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if slot.path.is_empty() {
                 return None;
             }
-            self.project_doc()
-                .map(|doc| crate::drumpad::resolve(doc, &slot.path))
+            self.kit_doc()
+                .map(|doc| crate::drumpad::resolve(&doc, &slot.path))
         })
     }
 
@@ -15482,12 +15568,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     pub fn drumpad_paths(&self) -> [Option<std::path::PathBuf>; recorder::DRUM_PADS] {
+        // `kit_doc`, like its per-lane twin: a scratch that has not been
+        // written yet still reads its samples out of the template.
+        let doc = self.kit_doc();
         std::array::from_fn(|i| {
             let slot = &self.drumpad().pads[i];
             if slot.path.is_empty() {
                 return None;
             }
-            self.project_doc()
+            doc.as_ref()
                 .map(|doc| crate::drumpad::resolve(doc, &slot.path))
         })
     }
@@ -32682,6 +32771,78 @@ mod tests {
             "a template somebody had arranged was overwritten"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A template's kit still plays before the scratch folder exists.**
+    ///
+    /// A launch adopts the template IN MEMORY and points the document at a
+    /// folder that is deliberately never created — the owner: "no creating
+    /// folders called untitled PERIOD". A pad stores its sample relative
+    /// (`media/Kick.wav`), and `drumpad::resolve` joins it to the document's
+    /// own directory, so from the instant of that repoint every sample
+    /// resolved into a directory that did not exist.
+    ///
+    /// A template with an empty kit never noticed. The owner built a
+    /// seventeen-pad kit into his on 2 September, and after that every launch
+    /// had seventeen missing files in it — which, with the refusal being
+    /// dropped on the host side, was an `afconvert` spawned per pad per pass
+    /// for ever and a loading splash that never ended.
+    ///
+    /// Revert-check: make `kit_doc` return `project_doc` unconditionally and
+    /// the first half goes red; delete the copy loop in
+    /// `materialize_project_dir` and the second does.
+    #[test]
+    fn an_adopted_kit_reads_from_the_template_until_the_project_is_real() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-adopt-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(template.join("media")).expect("template media");
+        std::fs::write(template.join("media").join("Kick.wav"), b"RIFFxxxxWAVE")
+            .expect("a sample in the template");
+        crate::arrangement::Arrangement::default()
+            .save_to(&crate::arrangement::doc_in(&template));
+        // A kit that names it, relative, exactly as the sidecar stores one.
+        let mut kit = crate::drumpad::DrumpadDoc::default();
+        kit.pads[36].path = "media/Kick.wav".to_owned();
+        kit.save_beside(&crate::arrangement::doc_in(&template));
+
+        let scratch = root.join("Untitled");
+        let (_ctx, mut app) = headless(Caps::PLUGIN);
+        app.adopt_template(&template, &scratch);
+        assert!(!scratch.exists(), "adopting a template must create nothing");
+
+        // The pad resolves into the TEMPLATE, and that file is really there.
+        let at = app.drumpad_paths()[36]
+            .clone()
+            .expect("the adopted kit still names its sample");
+        assert!(
+            at.is_file(),
+            "an adopted kit's sample resolved to {} , which does not exist -              the pads are all missing on every launch",
+            at.display()
+        );
+        assert!(at.starts_with(&template), "it should be read from the template");
+
+        // And once the scratch is real, the sample comes with it: from here
+        // on `kit_doc` answers the project, so the file has to BE there.
+        app.materialize_project_dir();
+        let at = app.drumpad_paths()[36]
+            .clone()
+            .expect("the kit still names its sample");
+        assert!(
+            at.starts_with(&scratch),
+            "a real project should own its media, got {}",
+            at.display()
+        );
+        assert!(
+            at.is_file(),
+            "materialising lost the sample: {} does not exist, so every pad              goes missing the moment somebody records a take",
+            at.display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, TangentApp) {
