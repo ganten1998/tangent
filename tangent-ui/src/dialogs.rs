@@ -860,15 +860,32 @@ pub const IR_SWEEP_CHOICES: [f64; 3] = [5.0, 15.0, 50.0];
 /// window allows. The IR looks plausible, saves, loads, and puts a swept
 /// whistle behind everything it is used on.
 ///
-/// The owner met it on an Alesis Quadraverb — a late-eighties box sampling
-/// near 31 kHz, so anything above about 15 kHz comes home folded — while the
-/// wizard swept to 20.9 kHz with no way to ask for less. Same rig, same
-/// minute, only this number changed:
+/// The owner met it on an Alesis Quadraverb. Walking the top down his own
+/// send and return, fifteen-second sweep each time, the tail's straight-line
+/// fit says exactly where his rig starts folding:
 ///
 /// ```text
-///     to 20.9 kHz   IR 5.48 s   tail fits a slide at R2 0.976 over 2.8 oct
-///     to 14   kHz   IR 2.85 s   R2 0.079 over 0.7 oct — no slide at all
+///     top      R2     tail slope   sweep runs
+///      6 kHz  0.46      +1.05        0.62      no
+///      8 kHz  0.01      -0.09        0.64      no
+///     10 kHz  0.26      -0.42        0.66      no
+///     12 kHz  0.95      -0.85        0.68      FOLDED
+///     14 kHz  1.00      -0.65        0.70      FOLDED
+///     21 kHz  0.99      -0.72        0.74      FOLDED
 /// ```
+///
+/// So 14 kHz — the lowest chip this row first shipped with — does NOT save
+/// that box, and 10 kHz is why the row now starts where it does. An earlier
+/// reading here claimed 14 kHz came back clean; it was taken with the unit
+/// bypassed and a return at −65 dBFS, so it measured the noise floor and not
+/// the device. A capture whose loop is not demonstrably live cannot clear
+/// anything.
+///
+/// The slope column is also HOW the verdict is known to be about the sweep
+/// rather than the room. Doubling the sweep to thirty seconds halves the
+/// rate the tail descends at — 0.649 → 0.314, R² 0.996 both times — and a
+/// reverb whose highs die first would have kept its own rate. See
+/// `units::sweep::tail_is_foldover`, which is where that comparison lives.
 ///
 /// FULL stays the default. It is right for a plugin, a room, a modern
 /// converter and most analogue outboard, and quietly sweeping less would
@@ -876,7 +893,8 @@ pub const IR_SWEEP_CHOICES: [f64; 3] = [5.0, 15.0, 50.0];
 /// What was missing was not a lower default but any way to know: the result
 /// page now says when a capture folded and names this row. See
 /// `ports::IrFoldover`.
-pub const IR_TOP_CHOICES: [f64; 4] = [14_000.0, 16_000.0, 18_000.0, 22_000.0];
+pub const IR_TOP_CHOICES: [f64; 5] =
+    [10_000.0, 14_000.0, 16_000.0, 18_000.0, 22_000.0];
 
 impl Default for IrWizardState {
     fn default() -> Self {
@@ -17584,6 +17602,59 @@ at: None,
             y("Capture dry reference") < y("Capture IR"),
             "the capture is offered above the reference it divides by"
         );
+    }
+
+    /// **Every top the row offers is on ONE line, and the lowest one is
+    /// reachable.**
+    ///
+    /// The row grew from four chips to five when the owner's Quadraverb
+    /// turned out to fold at 12 kHz — below the 14 kHz that was the lowest
+    /// thing on offer, so the control existed and could not save him. The
+    /// ladder that established it is in [`IR_TOP_CHOICES`]'s own doc.
+    ///
+    /// Read off the painted frame in both directions: the labels are there,
+    /// they share a line rather than wrapping under it, and pressing the
+    /// lowest one is what makes `top_hz` say 10 kHz. Drop the chip, or let
+    /// the row spill onto a second line, and this goes red.
+    #[test]
+    fn the_top_row_offers_ten_k_on_one_line() {
+        let mut slot = Slot::new(Dialog::IrWizard {
+            state: Box::new(IrWizardState {
+                stage: IrStage::Sweep,
+                ..Default::default()
+            }),
+        });
+        let words = slot.settle();
+        let band = |want: &str| {
+            words
+                .iter()
+                .find(|(_, _, s)| s == want)
+                .unwrap_or_else(|| {
+                    let all: Vec<&str> = words.iter().map(|(_, _, s)| s.as_str()).collect();
+                    panic!("the TOP row does not offer {want:?}; the page says {all:?}")
+                })
+                .0
+        };
+        let row = band("TOP").center().y;
+        for chip in ["10k", "14k", "16k", "18k", "full"] {
+            let at = band(chip).center().y;
+            assert!(
+                (at - row).abs() < 6.0,
+                "{chip:?} sits {:.0} px off the TOP row - the row wrapped",
+                at - row
+            );
+        }
+        // And the lowest chip is what it says it is, all the way to the
+        // number the host is handed.
+        slot.click("10k");
+        match &slot.dialog {
+            Some(Dialog::IrWizard { state }) => assert_eq!(
+                state.top_hz(),
+                10_000.0,
+                "the lowest chip does not sweep to 10 kHz"
+            ),
+            _ => panic!("the wizard left while a chip was pressed"),
+        }
     }
 
     /// **The dialog slot is handed from one window in this file to another,
