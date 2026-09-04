@@ -799,6 +799,16 @@ pub enum ProjectRequest {
     /// The same pass, but every used lane lands in its own WAV under
     /// `<project>/export/stems/`.
     ExportStems,
+    /// **Put the default template's DESK back to the one Tangent ships
+    /// with.** Appended at the END, this enum's law.
+    ///
+    /// The template lives in the user's Projects folder, not in the app, so
+    /// a template that has been written over survives every reinstall. The
+    /// host deletes the stencil's document and its plugin-state shelf — and
+    /// any whole project that has been copied inside it — and lets
+    /// `seed_template` write a fresh one. The kit and its samples stay: a
+    /// person's default drum kit is theirs and is not what went wrong.
+    ResetTemplate,
 }
 
 /// What the host found in the scratch project New would reclaim.
