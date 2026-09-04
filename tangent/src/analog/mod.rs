@@ -1479,15 +1479,19 @@ mod tests {
     /// times real time.
     const CPU_GATE: f32 = 40.0;
     /// The floor this wave holds: an optimised build under this has
-    /// broken something. Measured 8x at the wave's end on an M5 Pro; the
-    /// floor sits at half that so a noisy machine does not fail it.
-    const CPU_FLOOR: f32 = 4.0;
+    /// broken something. Measured 12.7x at the wave's end on an M5 Pro
+    /// (three runs, identical to a decimal, on a quiet machine); the floor
+    /// sits at half that because a busy machine parks the test thread on
+    /// an efficiency core and halves the figure. Half still catches the
+    /// shapes that matter: the wave began at 4.4x, and the voice-major
+    /// loop the interleave replaced read 6.3x.
+    const CPU_FLOOR: f32 = 6.0;
 
     /// **The CPU number, printed either way**, and held to a floor that
     /// catches a regression in an optimised build. The brief's gate is
     /// the next test, which is ignored because it is NOT MET: per-voice
     /// scalar code runs the 4× pair and the Newton ladder in a dependent
-    /// chain about 170 ns long per voice-sample against a 32 ns budget.
+    /// chain, about 95 ns per voice-sample against a 32 ns budget.
     /// The path to it is lockstep processing of voices in lanes, which is
     /// a structural change to `voice.rs` and a decision for the owner, not
     /// this wave. See `docs/ANALOG-BRIEF.md` §9 and the bench's `perf`.
@@ -1502,7 +1506,7 @@ mod tests {
     /// The brief's own gate, kept as written so nobody forgets it exists.
     /// Run it with `--ignored`.
     #[test]
-    #[ignore = "the brief's 40x CPU gate is NOT MET by this wave (about 8x at HEAD); see the test above"]
+    #[ignore = "the brief's 40x CPU gate is NOT MET by this wave (12.7x at HEAD on an M5 Pro); see the test above"]
     fn sixteen_voices_with_ensemble_meet_the_briefs_forty_times_gate() {
         let factor = realtime_factor();
         assert!(factor >= CPU_GATE, "16 voices render at {factor:.1}x realtime against the brief's {CPU_GATE}x");
