@@ -419,6 +419,176 @@ pub fn inverse_filter(f1: f64, f2: f64, duration: f64, sample_rate: f64) -> Vec<
 
 // ── deconvolution drivers ───────────────────────────────────────────────────
 
+/// **What a recovered IR's TAIL is doing in frequency over time** — the
+/// measurement that tells a reverb decaying from a device folding.
+///
+/// # The fault this exists to catch
+///
+/// An exponential sweep deconvolves cleanly only against a device that
+/// answers it linearly. A device whose own sample rate is BELOW the host's
+/// does not: everything the sweep plays above that device's Nyquist comes
+/// home as an alias, and an alias climbs DOWN while the excitation climbs
+/// up. That is not a linear response to the sweep, so the inverse filter
+/// cannot cancel it, and what lands in the recovered IR is a copy of the
+/// inverse — a narrowband tone sliding downward, at the inverse's own rate,
+/// for as long as the capture window allows.
+///
+/// The owner met this on an Alesis Quadraverb, a late-eighties box sampling
+/// near 31 kHz, with the wizard sweeping to 20.9 kHz. He called it "odd
+/// descending chirpy artifacts". Measured on his file: the head fits
+/// log-frequency against time at R² 0.124 — modes, jumping about — and the
+/// tail at **R² 0.987 across 3.6 octaves, sliding at 0.734 octaves a second
+/// against the inverse filter's own 0.736**. Capping the sweep at 14 kHz on
+/// the same rig in the same minute took the tail to R² 0.079 and the IR from
+/// 5.48 s to 2.85 s.
+///
+/// # Why the fit, and not the bandwidth
+///
+/// A real reverb NARROWS as it decays: its top modes die first, so the
+/// surviving energy is both quieter and darker, and a bandwidth test alone
+/// calls that a chirp. The thing a plate cannot do is SLIDE — its modes are
+/// at fixed frequencies. So the discriminator is not how narrow the tail is
+/// but how straight it is: a coherent line in log-frequency against time,
+/// over octaves, is an excitation that did not cancel.
+///
+/// `None` when there is not enough tail to say anything, which is the honest
+/// answer for a short IR and is never a verdict.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TailChirp {
+    /// Octaves per second, signed. Negative is descending, which is the sign
+    /// a foldover has.
+    pub slope_oct_s: f64,
+    /// How well a straight line fits, 0..1. A plate's tail sits near zero.
+    pub r2: f64,
+    /// Octaves the fit covers. A slide of half an octave is noise finding a
+    /// direction; three octaves is not.
+    pub span_oct: f64,
+}
+
+/// How wide a window the tail fit uses, and how far it steps. 8192 points is
+/// 186 ms at 44.1 kHz — long enough to resolve a few hundred hertz, short
+/// enough that a slide of three quarters of an octave a second moves less
+/// than a fifth of an octave inside one window and is not smeared away.
+const CHIRP_WIN: usize = 8192;
+
+/// Fit the tail of `ir` from `from_s` onward. See [`TailChirp`].
+pub fn tail_chirp(ir: &[f32], sample_rate: f64, from_s: f64) -> Option<TailChirp> {
+    if sample_rate <= 0.0 || !from_s.is_finite() || from_s < 0.0 {
+        return None;
+    }
+    let start = (from_s * sample_rate) as usize;
+    let tail = ir.get(start..)?;
+    // A window the tail can actually hold, and never bigger than the one the
+    // frequency resolution was chosen for.
+    let win = CHIRP_WIN.min(next_pow2(tail.len() / 4).max(256));
+    if !win.is_power_of_two() || tail.len() < win * 3 {
+        return None;
+    }
+    let hop = win / 2;
+    let taper: Vec<f64> = (0..win)
+        .map(|i| {
+            0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / win as f64).cos()
+        })
+        .collect();
+    // The band a fit is allowed to live in: above the lowest bin a window
+    // this long can resolve, below anything a converter is doing on its own.
+    let lo_bin = ((100.0 * win as f64 / sample_rate) as usize).max(2);
+    let hi_bin = (((18_000.0 * win as f64 / sample_rate) as usize) + 1).min(win / 2);
+    if hi_bin <= lo_bin + 1 {
+        return None;
+    }
+    let (mut ts, mut fs) = (Vec::new(), Vec::new());
+    let mut at = 0usize;
+    while at + win <= tail.len() {
+        let mut re = vec![0.0f64; win];
+        let mut im = vec![0.0f64; win];
+        for i in 0..win {
+            re[i] = f64::from(tail[at + i]) * taper[i];
+        }
+        fft64(&mut re, &mut im, false);
+        let mut best = (0usize, 0.0f64);
+        for k in lo_bin..hi_bin {
+            let p = re[k] * re[k] + im[k] * im[k];
+            if p > best.1 {
+                best = (k, p);
+            }
+        }
+        if best.1 > 0.0 {
+            ts.push((at + win / 2) as f64 / sample_rate);
+            fs.push((best.0 as f64 * sample_rate / win as f64).log2());
+        }
+        at += hop;
+    }
+    if ts.len() < 4 {
+        return None;
+    }
+    let n = ts.len() as f64;
+    let (st, sf) = (ts.iter().sum::<f64>(), fs.iter().sum::<f64>());
+    let stt = ts.iter().map(|v| v * v).sum::<f64>();
+    let stf = ts.iter().zip(&fs).map(|(a, b)| a * b).sum::<f64>();
+    let denom = n * stt - st * st;
+    if denom.abs() < 1.0e-12 {
+        return None;
+    }
+    let slope = (n * stf - st * sf) / denom;
+    let icept = (sf - slope * st) / n;
+    let ss_res: f64 = ts
+        .iter()
+        .zip(&fs)
+        .map(|(a, b)| (b - (slope * a + icept)).powi(2))
+        .sum();
+    let mean = sf / n;
+    let ss_tot: f64 = fs.iter().map(|v| (v - mean).powi(2)).sum();
+    let r2 = if ss_tot > 1.0e-12 {
+        1.0 - ss_res / ss_tot
+    } else {
+        0.0
+    };
+    let (lo, hi) = fs
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+    Some(TailChirp {
+        slope_oct_s: slope,
+        r2,
+        span_oct: hi - lo,
+    })
+}
+
+/// **Does this tail look like the excitation coming back uncancelled?**
+///
+/// Three conditions, all of them, and the reason for each is on
+/// [`TailChirp`]: the line has to FIT (a plate's does not), it has to cover
+/// real ground (half an octave of wandering is not a slide), and it has to
+/// descend at the rate the INVERSE FILTER descends at — which is the sweep's
+/// own rate, since the inverse is the sweep reversed.
+///
+/// The rate tolerance is generous on purpose. What is being distinguished is
+/// a coherent slide from no slide at all, and the peak track is a coarse
+/// instrument: on the owner's file the same tail fitted −0.734 by this route
+/// and −0.710 by a Hilbert phase derivative. Being within a quarter of the
+/// expected rate is a long way from anything a plate produces.
+pub fn tail_is_foldover(fit: TailChirp, f1: f64, f2: f64, duration: f64) -> bool {
+    if !(f1 > 0.0 && f2 > f1 && duration > 0.0) {
+        return false;
+    }
+    let want = -((f2 / f1).log2() / duration);
+    fit.r2 >= FOLDOVER_R2
+        && fit.span_oct >= FOLDOVER_SPAN_OCT
+        && (fit.slope_oct_s - want).abs() <= want.abs() * FOLDOVER_RATE_TOLERANCE
+}
+
+/// How straight, how far, and how close to the inverse's own rate a tail has
+/// to be before the wizard will call it a foldover.
+///
+/// Measured against both sides of the case that produced them. His folded
+/// capture fits at R² 0.987 over 3.6 octaves; the same rig with the sweep
+/// capped fits at 0.079 over less than one. A synthetic plate fits at 0.124.
+/// 0.85 sits in the wide gap between those, and nothing in the material
+/// argues for a tighter number.
+const FOLDOVER_R2: f64 = 0.85;
+const FOLDOVER_SPAN_OCT: f64 = 1.5;
+const FOLDOVER_RATE_TOLERANCE: f64 = 0.25;
+
 /// Linear (zero-padded) FFT convolution in f64, the driver everything here
 /// shares. Full length `a + b − 1`; no wrap, so negative-time content such
 /// as harmonic pre-responses keeps its honest place ahead of the peak.
@@ -1872,6 +2042,98 @@ mod tests {
             "only {:.1}% of the energy landed inside +-5 ms of the click",
             100.0 * near / total
         );
+    }
+
+    /// **A folding device is told apart from a decaying plate.**
+    ///
+    /// The fault: a device whose own sample rate is below the host's folds
+    /// everything the sweep plays above its Nyquist back down, and a
+    /// descending alias is not a linear response the inverse filter can
+    /// cancel. It lands in the recovered IR as a narrowband tone sliding
+    /// downward at the inverse's own rate, and the owner heard it as "odd
+    /// descending chirpy artifacts" on a Quadraverb sampling near 31 kHz
+    /// while the wizard swept to 20.9 kHz.
+    ///
+    /// The control matters as much as the case. A real plate NARROWS and
+    /// DARKENS as it decays — its top modes die first — so a bandwidth test
+    /// alone calls that a chirp too. What a plate cannot do is slide: its
+    /// modes are at fixed frequencies. Both are built here, and the fit has
+    /// to separate them.
+    ///
+    /// Numbers from the owner's own rig, same minute, only the sweep's top
+    /// changed: folded, R² 0.987 over 3.6 octaves at −0.734 oct/s against
+    /// the inverse's −0.736; capped at 14 kHz, R² 0.079 over less than one.
+    ///
+    /// Revert-check: drop `FOLDOVER_R2` to 0.05 and the plate is called a
+    /// foldover; raise it past 0.99 and the chirp stops being one.
+    #[test]
+    fn a_folding_device_is_told_apart_from_a_plate_decaying() {
+        let sr = 44_100.0f64;
+        let (f1, f2, dur) = (10.0, 20_947.5f64, 15.0);
+        let want = (f2 / f1).log2() / dur; // the sweep's rate, +0.736
+
+        // (a) A FOLDOVER: the inverse filter coming back uncancelled. That is
+        // a tone descending from the top of the band at the sweep's own rate.
+        let n = (6.0 * sr) as usize;
+        let mut chirp = vec![0.0f32; n];
+        let mut phase = 0.0f64;
+        for (i, v) in chirp.iter_mut().enumerate() {
+            let t = i as f64 / sr;
+            let hz = f2 * 2.0f64.powf(-want * t);
+            phase += std::f64::consts::TAU * hz / sr;
+            // −6 dB an octave, as the inverse's own envelope is.
+            *v = (phase.sin() * 2.0f64.powf(-want * t)) as f32;
+        }
+        let fit = tail_chirp(&chirp, sr, 0.5).expect("six seconds is enough tail");
+        assert!(
+            fit.r2 > 0.9,
+            "a pure chirp did not fit a line: R2 {:.3}",
+            fit.r2
+        );
+        assert!(
+            (fit.slope_oct_s + want).abs() < want * 0.25,
+            "a chirp at {:+.3} oct/s was measured at {:+.3}",
+            -want,
+            fit.slope_oct_s
+        );
+        assert!(
+            tail_is_foldover(fit, f1, f2, dur),
+            "the foldover was not called one: {fit:?}"
+        );
+
+        // (b) THE CONTROL: a plate. Decaying noise, low-passed harder as it
+        // goes, so it narrows and darkens exactly as a real one does — and
+        // still must not be called a foldover, because nothing slides.
+        let mut seed = 0x9E37_79B9u32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let mut plate = vec![0.0f32; n];
+        let mut lp = 0.0f32;
+        for (i, v) in plate.iter_mut().enumerate() {
+            let t = i as f32 / sr as f32;
+            // The corner falls with time: 8 kHz down to a few hundred hertz.
+            let a = 1.0 - (-std::f32::consts::TAU * (8_000.0 * (-t / 2.0).exp() + 200.0)
+                / sr as f32)
+                .exp();
+            lp += a * (rnd() - lp);
+            *v = lp * (-t / 1.2).exp();
+        }
+        let fit = tail_chirp(&plate, sr, 0.5).expect("six seconds is enough tail");
+        assert!(
+            !tail_is_foldover(fit, f1, f2, dur),
+            "a plate narrowing as it decays was called a foldover: {fit:?}"
+        );
+
+        // (c) Silence says nothing rather than something wrong.
+        assert!(tail_chirp(&vec![0.0f32; n], sr, 0.5).is_none_or(
+            |f| !tail_is_foldover(f, f1, f2, dur)
+        ));
+        // (d) Too short to judge is None, never a verdict.
+        assert!(tail_chirp(&vec![0.1f32; 64], sr, 0.0).is_none());
     }
 
     /// **Set normalization preserves relative gain.** Two IRs at 1.0 and

@@ -11346,8 +11346,31 @@ fn process_ir_capture(
             0.0
         }
     };
+    // **Is this tail a decay, or the sweep coming home?**
+    //
+    // A device sampling below the host folds everything above its own
+    // Nyquist back down, and a descending alias is not a linear response the
+    // inverse can cancel — so it lands here as a slide. Judged from 1.5 s in,
+    // which is past the part of a plate that is still dense enough to fit a
+    // line through by accident, and on the louder channel because a foldover
+    // is in both and the quieter one has less to fit. See
+    // `units::sweep::tail_chirp`, and the plate its test has to spare.
+    let judged = if l.iter().map(|v| v.abs()).sum::<f32>()
+        >= r.iter().map(|v| v.abs()).sum::<f32>()
+    {
+        &l
+    } else {
+        &r
+    };
+    let foldover = match ess::tail_chirp(judged, rate, 1.5) {
+        Some(fit) if ess::tail_is_foldover(fit, f1, f2, duration) => {
+            tangent_ui::ports::IrFoldover::Suspected
+        }
+        _ => tangent_ui::ports::IrFoldover::None,
+    };
     let outcome = tangent_ui::ports::IrOutcome {
         envelope_db: ir_envelope_db(&l, &r),
+        foldover,
         seconds,
         usable_s,
         noise_floor_db: floor_db,
