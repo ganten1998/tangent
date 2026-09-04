@@ -352,6 +352,17 @@ impl Voice {
         self.sustained = false;
     }
 
+    /// The filter, the pair and the feedback back to nothing: what a
+    /// voice woken for a new note starts from, on both roads. An idle
+    /// voice's filter holds whatever it held when the voice stopped being
+    /// ticked, frozen mid-waveform; a new note should not inherit it.
+    pub fn fresh_filter(&mut self) {
+        self.ladder.clear();
+        self.sem.clear();
+        self.os.clear();
+        self.fb = 0.0;
+    }
+
     /// Everything off, phases included left alone: the instrument's clear.
     pub fn clear(&mut self) {
         self.vacate();

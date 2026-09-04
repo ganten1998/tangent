@@ -336,19 +336,29 @@ struct Corpse {
     total: u32,
 }
 
-/// Lanes per group of the filter bank, and the groups: voices 0..8,
-/// voices 8..16, and the corpses. Eight because a corpse pool is eight
-/// and two groups cover the poly side; the lane arithmetic is the same
-/// at four or sixteen (measured), so the count is the pool's shape.
+/// Lanes per group of the filter bank, and the groups. Eight lanes is
+/// one vector-width multiple that measured the same at four and sixteen;
+/// three groups is sixteen voices plus eight corpses, so a lane always
+/// exists for whoever is sounding.
 const LANE: usize = 8;
 const GROUPS: usize = 3;
-const CORPSE_GROUP: usize = 2;
+const LANES: usize = LANE * GROUPS;
+const NO_LANE: u8 = u8::MAX;
 
-/// **The filters of every voice, in lanes.** The voice computes its own
-/// cutoff, feedback and damping and hands them here each sample; the
-/// bank runs one group's eight filters as one vectorised tick. The
-/// state lives here rather than in the voice, so a steal copies a lane
-/// and a vacated slot clears one. See `filter::LadderLanes`.
+/// **The filters and the 4× pair of every sounding voice, in lanes.**
+/// A voice computes its own cutoff, feedback and damping and hands them
+/// to its lane each sample; the bank runs one group's eight filters as
+/// one vectorised tick. The state lives here rather than in the voice.
+///
+/// **Lanes belong to whoever is sounding, not to slots.** A voice takes
+/// the lowest free lane when it wakes and gives it back when its contour
+/// ends, so the groups fill from the bottom: three notes cost one
+/// group's tick, not two, and a group nobody is in is skipped. A steal
+/// hands the dying voice's lane to its corpse — the state goes with the
+/// sound, nothing is copied — and the woken voice takes a fresh one.
+/// The scalar road clears the voice's own filter at the same moment
+/// (`Voice::fresh_filter`), which is what keeps the two roads bit for
+/// bit. See `filter::LadderLanes`.
 struct FilterBank {
     ladder: [LadderLanes<LANE>; GROUPS],
     sem: [SemLanes<LANE>; GROUPS],
@@ -357,6 +367,8 @@ struct FilterBank {
     damp: [[f32; LANE]; GROUPS],
     /// The 4× pair, likewise: each group's up and down histories.
     pair: [PairLanes<LANE>; GROUPS],
+    /// Which lanes are taken.
+    owned: [bool; LANES],
 }
 
 impl FilterBank {
@@ -368,41 +380,37 @@ impl FilterBank {
             k: [[0.0; LANE]; GROUPS],
             damp: [[1.0; LANE]; GROUPS],
             pair: [PairLanes::default(); GROUPS],
+            owned: [false; LANES],
         }
     }
-    fn clear_lane(&mut self, g: usize, l: usize) {
-        self.ladder[g].clear_lane(l);
-        self.sem[g].clear_lane(l);
-        self.pair[g].clear_lane(l);
+    /// The lowest free lane, cleared and marked taken. The pool is sized
+    /// for every voice and every corpse at once, so this cannot run out;
+    /// if arithmetic ever says otherwise it hands out lane zero rather
+    /// than a lane that is not there.
+    fn acquire(&mut self) -> u8 {
+        let l = self.owned.iter().position(|o| !*o).unwrap_or(0);
+        self.owned[l] = true;
+        let (g, ln) = split(l as u8);
+        self.ladder[g].clear_lane(ln);
+        self.sem[g].clear_lane(ln);
+        self.pair[g].clear_lane(ln);
+        l as u8
     }
-    /// Lane `from` into lane `to`, across groups: through a copy of the
-    /// source group with the lane moved into the target's position, then
-    /// taken lane-wise, so two groups are never borrowed at once.
-    fn copy_lane(&mut self, from: (usize, usize), to: (usize, usize)) {
-        let (fg, fl) = from;
-        let (tg, tl) = to;
-        let mut ladder = self.ladder[fg];
-        ladder.copy_lane(fl, tl);
-        self.ladder[tg].take_lane(&ladder, tl);
-        let mut sem = self.sem[fg];
-        sem.copy_lane(fl, tl);
-        self.sem[tg].take_lane(&sem, tl);
-        let pair = self.pair[fg];
-        self.pair[tg].take_lane(&pair, fl, tl);
+    fn release(&mut self, l: u8) {
+        if l != NO_LANE {
+            self.owned[usize::from(l)] = false;
+        }
     }
     fn clear(&mut self) {
         *self = Self::new();
     }
 }
 
-/// The bank lane a voice slot or corpse index lives in.
+/// A lane number into its group and position.
 #[inline]
-fn voice_lane(slot: usize) -> (usize, usize) {
-    (slot / LANE, slot % LANE)
-}
-#[inline]
-fn corpse_lane(c: usize) -> (usize, usize) {
-    (CORPSE_GROUP, c)
+fn split(l: u8) -> (usize, usize) {
+    let l = usize::from(l);
+    (l / LANE, l % LANE)
 }
 
 /// The instrument.
@@ -432,6 +440,9 @@ pub struct Analog {
     transport: Transport,
     scratch: [f32; CHUNK * 2],
     bank: FilterBank,
+    /// The lane each voice slot and each corpse holds, or `NO_LANE`.
+    voice_lane: [u8; MAX_VOICES],
+    corpse_lane: [u8; CORPSES],
     /// Whether the filters run in the bank's lanes or in each voice — the
     /// two roads produce the same samples, and a test holds them to it;
     /// the scalar road is the reference the lanes are measured against.
@@ -470,6 +481,8 @@ impl Analog {
             transport: Transport::default(),
             scratch: [0.0; CHUNK * 2],
             bank: FilterBank::new(),
+            voice_lane: [NO_LANE; MAX_VOICES],
+            corpse_lane: [NO_LANE; CORPSES],
             laned: true,
             out_x1: [0.0; 2],
             out_dc: [0.0; 2],
@@ -532,6 +545,8 @@ impl Analog {
             v.clear();
         }
         self.bank.clear();
+        self.voice_lane = [NO_LANE; MAX_VOICES];
+        self.corpse_lane = [NO_LANE; CORPSES];
         for c in &mut self.corpses {
             c.left = 0;
         }
@@ -633,6 +648,25 @@ impl Analog {
         }
     }
 
+    /// A voice about to sound that is not sounding: its filter and pair
+    /// start from nothing on both roads, and on the laned road it takes
+    /// a lane. A voice already sounding is left exactly as it is — that
+    /// is the restrike.
+    fn wake(&mut self, slot: usize) {
+        if self.voices[slot].active() {
+            return;
+        }
+        self.voices[slot].fresh_filter();
+        if self.voice_lane[slot] == NO_LANE {
+            self.voice_lane[slot] = self.bank.acquire();
+        } else {
+            let (g, ln) = split(self.voice_lane[slot]);
+            self.bank.ladder[g].clear_lane(ln);
+            self.bank.sem[g].clear_lane(ln);
+            self.bank.pair[g].clear_lane(ln);
+        }
+    }
+
     /// The allocator.
     fn play(&mut self, key: u8, vel: f32) {
         self.age = self.age.wrapping_add(1);
@@ -647,6 +681,7 @@ impl Analog {
                     return;
                 }
                 let slot = self.free_slot().unwrap_or_else(|| self.steal());
+                self.wake(slot);
                 let v = &mut self.voices[slot];
                 v.detune_cents = 0.0;
                 v.pan = POSITIONS[slot];
@@ -663,6 +698,7 @@ impl Analog {
                 let retrig = self.retrigger();
                 for i in 0..n {
                     let (det, pos) = unison_place(i, n);
+                    self.wake(i);
                     let v = &mut self.voices[i];
                     v.detune_cents = det;
                     v.pan = pos;
@@ -771,13 +807,18 @@ impl Analog {
         let c = (0..self.corpses.len())
             .min_by_key(|&i| self.corpses[i].left)
             .unwrap_or(0);
+        // The corpse slot may still be fading someone else: that lane
+        // goes back first. Then the stolen voice's lane, state and all,
+        // becomes the corpse's, and the slot is left silent with no lane;
+        // `wake` gives it a fresh one.
+        self.bank.release(self.corpse_lane[c]);
         let corpse = &mut self.corpses[c];
         corpse.voice = self.voices[slot];
         corpse.total = ((CORPSE_FADE_MS * 0.001 * self.rate) as u32).max(1);
         corpse.left = corpse.total;
-        self.bank.copy_lane(voice_lane(slot), corpse_lane(c));
+        self.corpse_lane[c] = self.voice_lane[slot];
+        self.voice_lane[slot] = NO_LANE;
         self.voices[slot].vacate();
-        self.bank.clear_lane(slot / LANE, slot % LANE);
         self.round_robin = (slot + 1) % n;
         slot
     }
@@ -1056,7 +1097,7 @@ impl Analog {
                 let mut used = [false; GROUPS];
                 let mut mix = [[0.0_f32; LANE]; GROUPS];
                 for &v in live {
-                    let (g, l) = voice_lane(usize::from(v));
+                    let (g, l) = split(self.voice_lane[usize::from(v)]);
                     let voice = &mut self.voices[usize::from(v)];
                     mix[g][l] = voice.pre_mix(vp, &ctx, lfo);
                     let (cut, k, damp) = voice.filter_settings();
@@ -1066,7 +1107,7 @@ impl Analog {
                     used[g] = true;
                 }
                 for &c in dead {
-                    let (g, l) = corpse_lane(usize::from(c));
+                    let (g, l) = split(self.corpse_lane[usize::from(c)]);
                     let voice = &mut self.corpses[usize::from(c)].voice;
                     mix[g][l] = voice.pre_mix(vp, &ctx, lfo);
                     let (cut, k, damp) = voice.filter_settings();
@@ -1082,11 +1123,11 @@ impl Analog {
                     }
                 }
                 for &v in live {
-                    let (g, l) = voice_lane(usize::from(v));
+                    let (g, l) = split(self.voice_lane[usize::from(v)]);
                     self.voices[usize::from(v)].set_up4([up[g][0][l], up[g][1][l], up[g][2][l], up[g][3][l]]);
                 }
                 for &c in dead {
-                    let (g, l) = corpse_lane(usize::from(c));
+                    let (g, l) = split(self.corpse_lane[usize::from(c)]);
                     self.corpses[usize::from(c)].voice.set_up4([up[g][0][l], up[g][1][l], up[g][2][l], up[g][3][l]]);
                 }
                 // Each substep: gather the inputs, tick the groups that
@@ -1095,11 +1136,11 @@ impl Analog {
                     let mut x = [[0.0_f32; LANE]; GROUPS];
                     let mut y = [[0.0_f32; LANE]; GROUPS];
                     for &v in live {
-                        let (g, l) = voice_lane(usize::from(v));
+                        let (g, l) = split(self.voice_lane[usize::from(v)]);
                         x[g][l] = self.voices[usize::from(v)].substep_in(&ctx, j);
                     }
                     for &c in dead {
-                        let (g, l) = corpse_lane(usize::from(c));
+                        let (g, l) = split(self.corpse_lane[usize::from(c)]);
                         x[g][l] = self.corpses[usize::from(c)].voice.substep_in(&ctx, j);
                     }
                     for g in 0..GROUPS {
@@ -1116,25 +1157,25 @@ impl Analog {
                         }
                     }
                     for &v in live {
-                        let (g, l) = voice_lane(usize::from(v));
+                        let (g, l) = split(self.voice_lane[usize::from(v)]);
                         self.voices[usize::from(v)].substep_out(j, y[g][l]);
                     }
                     for &c in dead {
-                        let (g, l) = corpse_lane(usize::from(c));
+                        let (g, l) = split(self.corpse_lane[usize::from(c)]);
                         self.corpses[usize::from(c)].voice.substep_out(j, y[g][l]);
                     }
                 }
                 // Down through the pair, then the amplifier and pan.
                 let mut y4 = [[[0.0_f32; LANE]; 4]; GROUPS];
                 for &v in live {
-                    let (g, l) = voice_lane(usize::from(v));
+                    let (g, l) = split(self.voice_lane[usize::from(v)]);
                     let y = self.voices[usize::from(v)].y4();
                     for j in 0..4 {
                         y4[g][j][l] = y[j];
                     }
                 }
                 for &c in dead {
-                    let (g, l) = corpse_lane(usize::from(c));
+                    let (g, l) = split(self.corpse_lane[usize::from(c)]);
                     let y = self.corpses[usize::from(c)].voice.y4();
                     for j in 0..4 {
                         y4[g][j][l] = y[j];
@@ -1148,14 +1189,14 @@ impl Analog {
                 }
                 let (mut l, mut r) = (0.0_f32, 0.0_f32);
                 for &v in live {
-                    let (g, ln) = voice_lane(usize::from(v));
+                    let (g, ln) = split(self.voice_lane[usize::from(v)]);
                     let (a, b) = self.voices[usize::from(v)].post_with(down[g][ln]);
                     l += a;
                     r += b;
                 }
                 for &c in dead {
                     let ci = usize::from(c);
-                    let (g, ln) = corpse_lane(ci);
+                    let (g, ln) = split(self.corpse_lane[ci]);
                     let c = &mut self.corpses[ci];
                     if c.left > 0 {
                         let fade = c.left as f32 / c.total as f32;
@@ -1165,7 +1206,8 @@ impl Analog {
                         c.left -= 1;
                         if c.left == 0 {
                             c.voice.vacate();
-                            self.bank.clear_lane(g, ln);
+                            self.bank.release(self.corpse_lane[ci]);
+                            self.corpse_lane[ci] = NO_LANE;
                         }
                     }
                 }
@@ -1205,6 +1247,8 @@ impl Analog {
                     c.left -= 1;
                     if c.left == 0 {
                         c.voice.vacate();
+                        self.bank.release(self.corpse_lane[ci]);
+                        self.corpse_lane[ci] = NO_LANE;
                     }
                 } else {
                     let _ = c.voice.post(taps);
@@ -1212,6 +1256,15 @@ impl Analog {
             }
             self.scratch[(from + i) * 2] += l;
             self.scratch[(from + i) * 2 + 1] += r;
+        }
+        // Whoever stopped sounding inside the span gives its lane back,
+        // before the next event can wake anyone.
+        for &v in live {
+            let v = usize::from(v);
+            if !self.voices[v].active() {
+                self.bank.release(self.voice_lane[v]);
+                self.voice_lane[v] = NO_LANE;
+            }
         }
     }
 }
@@ -1409,6 +1462,43 @@ mod tests {
             let first = a.iter().zip(&b).position(|(x, y)| x.to_bits() != y.to_bits());
             assert!(first.is_none(), "model {model}: laned and scalar differ first at frame {}", first.unwrap() / 2);
         }
+    }
+
+    /// **Lanes follow the sound.** Three notes take lanes 0, 1, 2 and no
+    /// lane of the second group, so three notes cost one group's tick;
+    /// when their releases end every lane is free again; and a steal
+    /// hands the stolen voice's lane to its corpse, state and all, while
+    /// the woken voice takes the lowest free one.
+    #[test]
+    fn lanes_fill_from_the_bottom_and_go_back_when_the_sound_ends() {
+        let mut synth = Analog::new(SR);
+        synth.set_all(&[(P_A_RELEASE as u32, 0.0), (P_F_RELEASE as u32, 0.0)]);
+        let mut out = vec![0.0_f32; BLOCK * 2];
+        for k in [60u8, 64, 67] {
+            synth.note_on(k, 0.8);
+        }
+        synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+        let owned: Vec<usize> = (0..LANES).filter(|&l| synth.bank.owned[l]).collect();
+        assert_eq!(owned, vec![0, 1, 2], "three notes hold lanes {owned:?}");
+        for k in [60u8, 64, 67] {
+            synth.note_off(k);
+        }
+        for _ in 0..40 {
+            synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+        }
+        assert!(synth.bank.owned.iter().all(|o| !*o), "lanes still held after the sound ended");
+        assert!(synth.voice_lane.iter().all(|&l| l == NO_LANE));
+        // The steal: nine keys into eight voices.
+        for k in [48u8, 50, 52, 53, 55, 57, 59, 60] {
+            synth.note_on(k, 0.8);
+        }
+        let victim = synth.voices.iter().position(|v| v.key == 48 && v.gate).unwrap();
+        let victims_lane = synth.voice_lane[victim];
+        synth.note_on(72, 0.8);
+        let corpse = synth.corpses.iter().position(|c| c.left > 0).unwrap();
+        assert_eq!(synth.corpse_lane[corpse], victims_lane, "the corpse did not inherit the lane");
+        assert_ne!(synth.voice_lane[victim], victims_lane, "the woken voice kept the corpse's lane");
+        assert_eq!(synth.voice_lane[victim], 8, "the woken voice did not take the lowest free lane");
     }
 
     /// **Drift determinism**: the same score twice is the same audio, bit

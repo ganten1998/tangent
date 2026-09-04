@@ -388,6 +388,31 @@ fn perf() {
             if factor >= 40.0 { "MET" } else { "NOT MET" }
         );
     }
+    // The cost against notes sounding, laned road: what a polyphony dial
+    // buys, and whether an idle lane is free.
+    {
+        println!("  cost against notes sounding (laned road), per sample and as a share of one core at 48 kHz:");
+        for n in [1usize, 2, 3, 4, 8, 9, 12, 16] {
+            let mut synth = Analog::new(RATE);
+            synth.set_all(&[(P_VOICES as u32, 1.0), (P_ENSEMBLE as u32, 0.0)]);
+            for k in 0..n {
+                synth.note_on(36 + 3 * k as u8, 0.9);
+            }
+            let mut out = vec![0.0_f32; BLOCK * 2];
+            for _ in 0..20 {
+                synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+            }
+            let blocks = (RATE as usize) / BLOCK / 2;
+            let t0 = std::time::Instant::now();
+            for _ in 0..blocks {
+                synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+            }
+            let el = t0.elapsed().as_secs_f64();
+            let per_sample = el * 1e9 / (blocks * BLOCK) as f64;
+            let share = el / ((blocks * BLOCK) as f64 / f64::from(RATE)) * 100.0;
+            println!("    {n:2} voices: {per_sample:7.0} ns per sample   {share:5.2} % of a core");
+        }
+    }
     // Where a voice-sample goes, sixteen voices interleaved as the frame
     // does it: the three phases timed apart.
     {
