@@ -1127,7 +1127,32 @@ pub enum IrLengthCut {
 /// The wizard's live picture, pushed by the host once per frame while the
 /// IR road is doing anything: return levels during the tone and the sweep,
 /// capture progress, and the finished result when there is one.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// **`Default` is written out below rather than derived, and that is the
+/// whole of one fault.** Four of these fields are dBFS readings whose own
+/// docs say −200 for silence, and a derived `Default` gave them 0.0 — which
+/// on a dBFS scale is not "nothing", it is FULL SCALE. The wizard is built
+/// from `Default` every time it opens and then handed this picture, so
+/// before the host's first push the level page read
+///
+/// ```text
+///   return: 0.0 dBFS peak  (-0.0 dB of headroom)   0.0 rms
+///     left 0.0   right 0.0
+///   CLIPPING - bring the unit's output (or the send) down.
+/// ```
+///
+/// over a loop nobody had measured yet. It is the worst direction for a
+/// readout to lie in: the page's whole job is to say how hard the box is
+/// being driven, and it opened by claiming the return was already over the
+/// rail. It also hid the one sentence the page exists to say — "Nothing is
+/// coming back — check the loop's cables" — behind a clipping warning,
+/// because that warning is chosen by the same number.
+///
+/// [`IrWizardState`](crate::dialogs::IrWizardState)'s own `Default` has said
+/// −200 for its three held meter readings since the ballistics were added;
+/// this is the other half of the same resting state finally agreeing with
+/// it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct IrLive {
     /// Return RMS of the chosen input pair, dBFS. −200 when silent/idle.
     pub rms_db: f32,
@@ -1195,6 +1220,37 @@ pub struct IrLive {
     /// which is the last page where a cable can still be moved.
     pub peak_l_db: f32,
     pub peak_r_db: f32,
+}
+
+/// **A dBFS reading nobody has taken yet is SILENCE**, which is −200 here
+/// and not zero. See the note on [`IrLive`] for what zero painted.
+///
+/// The number itself is the one every reader already agrees on:
+/// `Engine::ir_return_db` answers −200 for a silent cell, the page tests
+/// `peak <= -200.0` for "return: silence", and `IrWizardState`'s held
+/// readings start there. This is the rest position of a picture that has
+/// been pushed nothing, and it has to be the same rest position the road
+/// itself publishes — otherwise "the host has not spoken yet" and "the host
+/// says the loop is dead" look different on screen when they are the same
+/// news to whoever is holding the cable.
+pub const IR_SILENCE_DB: f32 = -200.0;
+
+impl Default for IrLive {
+    fn default() -> Self {
+        Self {
+            rms_db: IR_SILENCE_DB,
+            peak_db: IR_SILENCE_DB,
+            capturing: false,
+            progress: 0.0,
+            phase: String::new(),
+            has_reference: false,
+            result: None,
+            capture_id: 0,
+            saves: 0,
+            peak_l_db: IR_SILENCE_DB,
+            peak_r_db: IR_SILENCE_DB,
+        }
+    }
 }
 
 #[cfg(test)]

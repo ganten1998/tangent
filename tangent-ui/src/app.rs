@@ -21510,6 +21510,29 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.ir_live = live;
     }
 
+    /// **Is the IR wizard on screen?** The host's `ir_tick` asks, because
+    /// somebody looking at the meter is itself a reason to keep pushing.
+    ///
+    /// The push used to be gated on whether the ROAD was moving, and "the
+    /// road is moving" was decided partly by reading the very meter the
+    /// push carries: a return at −200 made the host decide nothing was
+    /// happening and stop pushing, so the wizard froze on whatever picture
+    /// it last held. That is the owner's report word for word — "the meters
+    /// don't do anything on the ir wizard and they pick up silence… it's
+    /// nothing is being sent to them at all during the test tone and after"
+    /// — and the cruelty of it is that the frozen case is exactly the case
+    /// the level page exists for. A loop that returns nothing is the one
+    /// fault a level page can still fix, standing at the interface with the
+    /// cable in your hand, and it was the one fault that could never reach
+    /// the screen.
+    ///
+    /// So the picture follows the PANEL and not the signal. An open wizard
+    /// is pushed every frame whatever the numbers say; silence arrives as
+    /// silence, and "nothing is coming back" gets to be said out loud.
+    pub fn ir_wizard_open(&self) -> bool {
+        matches!(self.dialog, Some(dialogs::Dialog::IrWizard { .. }))
+    }
+
     /// Open the IR wizard with the device lists snapshotted NOW — the
     /// `AudioSetup` bargain: channel counts come from the stored widths the
     /// host pushed, never from a per-frame enumeration.
@@ -45624,6 +45647,15 @@ mod folder_tests {
             }
             other => panic!("the wizard did not open: {:?}", other.is_some()),
         }
+        // **And the host can SEE that it is open**, which is what keeps the
+        // live picture flowing to it — see [`TangentApp::ir_wizard_open`] for
+        // the frozen meter that answering this wrong produces. Asked of the
+        // app rather than of the dialog, because the host has no dialog.
+        assert!(
+            a.ir_wizard_open(),
+            "the wizard is on screen and the host cannot tell, so its meter is \
+             pushed only while the road happens to be moving"
+        );
 
         use recorder::RecorderRequest as R;
         a.apply_dialog_action(dialogs::DialogAction::IrTone {
@@ -45682,6 +45714,14 @@ mod folder_tests {
         // The open wizard reads this frame's copy in the frame path; here
         // the latch itself is the contract.
         assert!(a.ir_live.capturing);
+        // And a shut wizard is shut: the host stops paying for a picture
+        // nobody is looking at the moment the panel goes.
+        a.dialog = None;
+        assert!(
+            !a.ir_wizard_open(),
+            "a closed wizard still reads as open, so the host pushes a live \
+             picture at a panel that is not on screen for the rest of the session"
+        );
 
         // A mono input device still offers a loop.
         assert_eq!(TangentApp::ir_channel_pairs(1), vec![(0, 0)]);
