@@ -12049,22 +12049,12 @@ pub fn ir_test(arg: Option<String>) {
 /// actually decaying falls far more than this. It is a verdict for the
 /// RESULT page rather than a gate — the capture still happens, it is just no
 /// longer reported as if its numbers were measurements.
-#[cfg(feature = "recorder")]
+// NOT gated: `process_ir_capture` reads it and is compiled in every build,
+// so a gate here is a Minimal build that does not compile. The firewall's
+// `cargo check --no-default-features` is what says so.
 const PRE_ROLL_FLAT_DB: f64 = 6.0;
 
 
-/// **What the DEVICE says its rate and buffer are, once a second, while you
-/// change them somewhere else.**
-///
-/// The fourth developer probe, and the one that answers a question no unit
-/// test can: whether this app is holding an interface's sample rate against
-/// its owner. The owner's report was that Focusrite Control 2 cannot move his
-/// Scarlett off 48 kHz while Tangent is running, and can the moment it quits.
-///
-/// `--device-watch [seconds][,open]` — with `open`, it starts the engine the
-/// way the app does before watching, so the two runs differ in exactly one
-/// thing: whether Tangent has a stream on the device.
-#[cfg(feature = "recorder")]
 /// **Move the default device's nominal rate to `want`, and answer what it
 /// actually landed on.**
 ///
@@ -12093,6 +12083,18 @@ fn force_device_rate(want: u32) -> Option<u32> {
     got
 }
 
+/// **What the DEVICE says its rate and buffer are, once a second, while you
+/// change them somewhere else.**
+///
+/// The fourth developer probe, and the one that answers a question no unit
+/// test can: whether this app is holding an interface's sample rate against
+/// its owner. The owner's report was that Focusrite Control 2 cannot move his
+/// Scarlett off 48 kHz while Tangent is running, and can the moment it quits.
+///
+/// `--device-watch [seconds][,open]` — with `open`, it starts the engine the
+/// way the app does before watching, so the two runs differ in exactly one
+/// thing: whether Tangent has a stream on the device.
+#[cfg(feature = "recorder")]
 pub fn device_watch(arg: Option<String>) {
     use cpal::traits::{DeviceTrait, HostTrait};
     let parts: Vec<String> = arg
@@ -12968,6 +12970,7 @@ impl DesktopApp {
             browse_extensions: Vec::new(),
             #[cfg(feature = "recorder")]
             track_cache: std::collections::HashMap::new(),
+            #[cfg(feature = "recorder")]
             warm_refused: std::collections::HashSet::new(),
             #[cfg(feature = "recorder")]
             stretch_cache: std::collections::HashMap::new(),

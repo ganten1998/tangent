@@ -893,6 +893,12 @@ pub const IR_SWEEP_CHOICES: [f64; 3] = [5.0, 15.0, 50.0];
 /// What was missing was not a lower default but any way to know: the result
 /// page now says when a capture folded and names this row. See
 /// `ports::IrFoldover`.
+/// Above this, in dB against the linear response, the result page stops
+/// reporting harmonics as trivia and calls them clipping. The reasoning is
+/// at the use site; the short version is that the owner's rig sat at −27.8
+/// dB when driven and −64.1 dB when not, and there is nothing in between.
+pub const IR_THD_LOUD: f32 = -40.0;
+
 pub const IR_TOP_CHOICES: [f64; 5] =
     [10_000.0, 14_000.0, 16_000.0, 18_000.0, 22_000.0];
 
@@ -6086,8 +6092,9 @@ fn draw_ir_result(
                 "This capture folded. The tail slides steadily downward, \
                  which a decay cannot do — it is the sweep coming back off a \
                  device that samples lower than this interface, not the \
-                 unit's reverb. Go back and set TOP to 14k or 16k, then \
-                 record another.",
+                 unit's reverb. Go back, set TOP one step LOWER than you \
+                 used, and record another - keep stepping down until this \
+                 stops saying so.",
             )
             .font(bold(10.0))
             .color(IR_DANGER),
@@ -6096,14 +6103,43 @@ fn draw_ir_result(
     // The sweep's free distortion probe. −200 means the window fell off the
     // buffer, which a short capture can do; say nothing rather than a lie.
     if r.thd2_db > -200.0 {
+        // **Loud once the harmonics stop being a footnote.**
+        //
+        // The number was already here, in the faint colour everything else
+        // on this page is measured in, and it read as trivia. It is not:
+        // Farina's method sends the harmonics to negative time so they leave
+        // the IR, and what stays behind is a response the unit never
+        // actually had. An IR taken through a clipping input sounds thin and
+        // brittle and there is nothing in the file to blame.
+        //
+        // Where −40 comes from: on the owner's Quadraverb, at the wizard's
+        // own −18 dBFS default the third harmonic came back at −27.8 dB and
+        // the box measurably stopped taking more send. Six dB down, at −24,
+        // the same rig gave −64.1 dB — a 36 dB cliff between one chip and
+        // the next, for 5 dB of tail range. −40 sits in the middle of that
+        // gap with room on both sides, which is the most any single number
+        // here is asked to do.
+        let gritty = r.thd2_db.max(r.thd3_db) > IR_THD_LOUD;
         ui.label(
             RichText::new(format!(
                 "distortion: 2nd {:+.0} dB, 3rd {:+.0} dB against the linear response",
                 r.thd2_db, r.thd3_db
             ))
             .font(bold(10.0))
-            .color(t.faint),
+            .color(if gritty { IR_DANGER } else { t.faint }),
         );
+        if gritty {
+            ui.label(
+                RichText::new(
+                    "That is the unit clipping, not its sound. Go back to \
+                     LEVELS, lower the SEND about 6 dB, and record another - \
+                     a driven input costs far more than the tail range it \
+                     buys.",
+                )
+                .font(bold(10.0))
+                .color(IR_DANGER),
+            );
+        }
     }
     ui.add_space(8.0);
     // The caveats list — what an IR can NEVER carry, said before Save.
@@ -17616,6 +17652,71 @@ at: None,
     /// they share a line rather than wrapping under it, and pressing the
     /// lowest one is what makes `top_hz` say 10 kHz. Drop the chip, or let
     /// the row spill onto a second line, and this goes red.
+    /// **A capture taken through a clipping input is told so, and one that
+    /// was not is left alone.**
+    ///
+    /// The harmonics were always printed here, in the same faint colour as
+    /// every other measurement, and the owner's own captures at the
+    /// wizard's default send came back at −27.8 dB third harmonic with
+    /// nothing on the page suggesting that was bad. Farina's method pushes
+    /// harmonics to negative time, so they leave the IR and what remains is
+    /// a response the unit never had — the file is wrong, not merely
+    /// imperfect, which is the same class as a fold.
+    ///
+    /// Read off the painted frame at both ends of [`IR_THD_LOUD`], because
+    /// a warning that fires on everything is the same failure as one that
+    /// fires on nothing.
+    #[test]
+    fn a_driven_capture_is_told_apart_from_a_clean_one() {
+        let page = |thd: f32| -> Vec<String> {
+            let mut slot = Slot::new(Dialog::IrWizard {
+                state: Box::new(IrWizardState {
+                    stage: IrStage::Result,
+                    live: crate::ports::IrLive {
+                        result: Some(crate::ports::IrOutcome {
+                            seconds: 2.0,
+                            usable_s: 1.8,
+                            noise_floor_db: -80.0,
+                            capture_peak_db: -9.0,
+                            tail_range_db: 70.0,
+                            envelope_db: vec![-9.0, -20.0, -40.0, -60.0],
+                            thd2_db: thd - 10.0,
+                            thd3_db: thd,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            });
+            slot.settle().iter().map(|(_, _, w)| w.clone()).collect()
+        };
+        // His own two numbers, either side of the line.
+        let driven = page(-27.8).join(" ");
+        assert!(
+            driven.contains("clipping"),
+            "a capture with -27.8 dB third harmonic was not called driven; \
+             the page said: {driven}"
+        );
+        assert!(
+            driven.contains("SEND"),
+            "the warning did not name the control that fixes it: {driven}"
+        );
+        let clean = page(-64.1).join(" ");
+        assert!(
+            !clean.contains("clipping"),
+            "a clean capture was accused of clipping: {clean}"
+        );
+        // And the measurement itself is still reported either way - the
+        // warning is an addition to the number, not a replacement for it.
+        for (page, what) in [(&driven, "driven"), (&clean, "clean")] {
+            assert!(
+                page.contains("distortion:"),
+                "the {what} capture stopped reporting its harmonics at all"
+            );
+        }
+    }
+
     #[test]
     fn the_top_row_offers_ten_k_on_one_line() {
         let mut slot = Slot::new(Dialog::IrWizard {
