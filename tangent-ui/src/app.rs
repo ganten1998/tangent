@@ -1027,7 +1027,7 @@ pub struct TangentApp {
     /// `Some(i)` over a flag, where the rows act on the marker under the
     /// hand. One field rather than two because it is one menu with two
     /// shapes, and two would be two things to remember to close.
-    arr_flag_menu: Option<(Option<usize>, egui::Pos2)>,
+    arr_flag_menu: Option<(FlagMenuOn, egui::Pos2)>,
     /// The arrange header BAY's right-click menu: (lane, bay, where).
     /// Two rows — Delete FX, Replace FX — the mixer's insert menu, here.
     arr_fx_menu: Option<(usize, usize, egui::Pos2)>,
@@ -1779,6 +1779,21 @@ enum ClipMenuAction {
     ExportMidi,
 }
 
+/// What the ruler's menu was opened ON.
+///
+/// Three subjects, not two: empty strip, a marker flag, and a SIGNATURE
+/// CHIP. The chip is the one that was missing — a signature could be made
+/// and then only changed by emptying its field, which is a gesture nobody
+/// finds. The owner: "delete or rightclick option to delete".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlagMenuOn {
+    /// Bare ruler: nothing under the hand but the strip itself.
+    Strip,
+    Flag(usize),
+    /// A time-signature chip, by the bar it starts.
+    Sig(u32),
+}
+
 /// What a row of the RULER's flag menu means.
 ///
 /// The same bargain [`ClipMenuAction`] struck, for the same reason and one
@@ -1797,6 +1812,12 @@ enum FlagMenuAction {
     /// A signature starting at the bar this MARKER is in — which is what
     /// makes the two share a place and read as "Name (4/4)".
     NewSigAtMarker(usize),
+    /// Open an existing signature's field on its own bar.
+    EditSig(u32),
+    /// Take a signature change out. Never offered on bar 0 — a song has a
+    /// signature from its first bar and there is nothing there to remove,
+    /// only something to change.
+    DeleteSig(u32),
 }
 
 /// A gesture in flight on the arrangement. What the press grabbed, and the
@@ -12957,6 +12978,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let bar = self.arr_marker_bar(i);
                 self.arr_edit_meter(bar);
             }
+            FlagMenuAction::EditSig(bar) => self.arr_edit_meter(bar),
+            // **The road out.** Emptying the field also clears a change and
+            // always did, but that is a gesture you have to be told about;
+            // this is the one somebody finds. Any field open on the chip
+            // goes with it, for the same reason `arr_delete_marker` closes
+            // one — a field pointing at a signature that no longer exists
+            // would write it straight back on the next Enter.
+            FlagMenuAction::DeleteSig(bar) => {
+                if matches!(
+                    self.num_edit.as_ref().map(|e| e.field),
+                    Some(recorder::NumField::MeterAt(b)) if b == bar
+                ) {
+                    self.num_edit = None;
+                }
+                self.set_meter_at(bar, None);
+            }
         }
     }
 
@@ -12967,7 +13004,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// is the whole press decision in one place a test can actually drive —
     /// which is the point. A helper that resolved a row from the row index
     /// would be a helper that cannot be wrong.
-    fn flag_menu_hit(on: Option<usize>, at: Pos2, pointer: Option<Pos2>) -> Option<FlagMenuAction> {
+    fn flag_menu_hit(on: FlagMenuOn, at: Pos2, pointer: Option<Pos2>) -> Option<FlagMenuAction> {
         let list = Self::flag_menu_rows(on);
         let rows = Self::clip_menu_rows(at, list.len());
         let p = pointer?;
@@ -12975,17 +13012,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         list.get(n).map(|(_, a)| *a)
     }
 
-    fn flag_menu_rows(on: Option<usize>) -> Vec<(String, FlagMenuAction)> {
+    fn flag_menu_rows(on: FlagMenuOn) -> Vec<(String, FlagMenuAction)> {
         use FlagMenuAction as A;
         match on {
-            None => vec![
+            FlagMenuOn::Strip => vec![
                 ("New marker".to_owned(), A::New),
                 ("New time sig.".to_owned(), A::NewSigAtPlayhead),
             ],
-            Some(i) => vec![
+            FlagMenuOn::Flag(i) => vec![
                 ("Delete".to_owned(), A::Delete(i)),
                 ("Rename".to_owned(), A::Rename(i)),
                 ("New time sig.".to_owned(), A::NewSigAtMarker(i)),
+            ],
+            // **Bar zero is offered no Delete.** `set_meter_at` refuses it
+            // and says why — a song must have a signature from its first
+            // bar — so a row that could only ever do nothing is worse than
+            // no row: it reads as a broken button rather than as a rule.
+            FlagMenuOn::Sig(0) => vec![("Edit time sig.".to_owned(), A::EditSig(0))],
+            FlagMenuOn::Sig(bar) => vec![
+                ("Edit time sig.".to_owned(), A::EditSig(bar)),
+                ("Delete time sig.".to_owned(), A::DeleteSig(bar)),
             ],
         }
     }
@@ -17770,11 +17816,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
                     match crate::arrangement_panel::hit_test(rect, &view, p) {
-                        Some(crate::arrangement_panel::Hit::Flag(i)) => Some(Some(i)),
-                        Some(
-                            crate::arrangement_panel::Hit::MeterStrip(_)
-                            | crate::arrangement_panel::Hit::MeterChip(_),
-                        ) => Some(None),
+                        Some(crate::arrangement_panel::Hit::Flag(i)) => {
+                            Some(FlagMenuOn::Flag(i))
+                        }
+                        // **A chip answers about ITSELF now.** It used to
+                        // fall in with the bare strip and offer "New time
+                        // sig." on top of a signature that was already
+                        // there, which is how a change could be made and
+                        // never taken back off.
+                        Some(crate::arrangement_panel::Hit::MeterChip(bar)) => {
+                            Some(FlagMenuOn::Sig(bar))
+                        }
+                        Some(crate::arrangement_panel::Hit::MeterStrip(_)) => {
+                            Some(FlagMenuOn::Strip)
+                        }
                         _ => None,
                     }
                 };
@@ -34359,23 +34414,45 @@ mod tests {
     /// marker and its signature never share a place and the "Name (4/4)"
     /// label can never happen.
     ///
-    /// Revert-checks, all four performed: swap "Delete" and "Rename" in
+    /// The chip's own two rows are here too — "Edit time sig." and "Delete
+    /// time sig." — because until they existed the only way to remove a
+    /// signature was to open its field and empty it, which is a gesture
+    /// nobody finds.
+    ///
+    /// Revert-checks, all seven performed: swap "Delete" and "Rename" in
     /// `flag_menu_rows` and the word list goes red; give the empty-strip
     /// shape a third row and it goes red again; make `New` do nothing and
     /// the first press goes red; point `NewSigAtMarker` at bar 0 instead of
-    /// the flag's bar and the last block goes red.
+    /// the flag's bar and that block goes red; make `DeleteSig` do nothing,
+    /// or let it leave the chip's open field behind, and the chip block goes
+    /// red each way; and give `Sig(0)` a Delete row and the word list goes
+    /// red on the bar that has nothing to delete.
     #[test]
     fn the_flag_menu_reads_and_acts_the_way_the_owner_asked() {
         use recorder::NumField as F;
         let (_ctx, mut app) = headless(Caps::DESKTOP);
-        let words = |on| -> Vec<String> {
+        let words = |on: FlagMenuOn| -> Vec<String> {
             TangentApp::flag_menu_rows(on)
                 .into_iter()
                 .map(|(l, _)| l)
                 .collect()
         };
-        assert_eq!(words(None), vec!["New marker", "New time sig."]);
-        assert_eq!(words(Some(0)), vec!["Delete", "Rename", "New time sig."]);
+        assert_eq!(
+            words(FlagMenuOn::Strip),
+            vec!["New marker", "New time sig."]
+        );
+        assert_eq!(
+            words(FlagMenuOn::Flag(0)),
+            vec!["Delete", "Rename", "New time sig."]
+        );
+        // **A signature chip answers about itself**, and bar 0 is offered no
+        // Delete because `set_meter_at` refuses it — a row that could only
+        // ever do nothing reads as a broken button rather than as a rule.
+        assert_eq!(
+            words(FlagMenuOn::Sig(4)),
+            vec!["Edit time sig.", "Delete time sig."]
+        );
+        assert_eq!(words(FlagMenuOn::Sig(0)), vec!["Edit time sig."]);
 
         // **Pressed at a PIXEL**, resolved by the same road the handler
         // takes — the half a list-only assertion would miss. The point is
@@ -34383,28 +34460,28 @@ mod tests {
         // resolver as a bare position, so the two lists have to agree for
         // this to come back right.
         let at = Pos2::new(200.0, 40.0);
-        let press = |on: Option<usize>, row: usize| {
+        let press = |on: FlagMenuOn, row: usize| {
             let rows = TangentApp::clip_menu_rows(at, TangentApp::flag_menu_rows(on).len());
             TangentApp::flag_menu_hit(on, at, Some(rows[row].center()))
         };
         // A press off the menu does nothing at all, which is the state the
         // "eat it" arm depends on.
         assert_eq!(
-            TangentApp::flag_menu_hit(None, at, Some(Pos2::new(0.0, 0.0))),
+            TangentApp::flag_menu_hit(FlagMenuOn::Strip, at, Some(Pos2::new(0.0, 0.0))),
             None,
             "a press beside the menu picked a row"
         );
 
         // Empty strip, row 0: a marker appears at the playhead.
         app.arrangement.markers.clear();
-        let new = press(None, 0).expect("the first row of the strip menu");
+        let new = press(FlagMenuOn::Strip, 0).expect("the first row of the strip menu");
         assert_eq!(new, FlagMenuAction::New);
         app.apply_flag_menu(new);
         assert_eq!(app.arrangement.markers.len(), 1, "\"New marker\" made nothing");
 
         // A flag, row 0 and row 1: his two verbs, in his order.
-        assert_eq!(press(Some(0), 0), Some(FlagMenuAction::Delete(0)));
-        assert_eq!(press(Some(0), 1), Some(FlagMenuAction::Rename(0)));
+        assert_eq!(press(FlagMenuOn::Flag(0), 0), Some(FlagMenuAction::Delete(0)));
+        assert_eq!(press(FlagMenuOn::Flag(0), 1), Some(FlagMenuAction::Rename(0)));
 
         // **The signature row on a flag opens the FLAG's bar.** Put the
         // marker somewhere the playhead is not, so "it opened a signature"
@@ -34421,7 +34498,36 @@ mod tests {
             mark_bar, head_bar,
             "the fixture put the flag on the playhead's own bar, so this proves nothing"
         );
-        let action = press(Some(0), 2).expect("the third row of a flag menu");
+        // **A signature can be taken back off.** Until this row existed the
+        // only way out was to open the chip's field and empty it, which is a
+        // gesture nobody finds — the owner asked for "delete or rightclick
+        // option to delete". Driven through the applier, on a change that is
+        // really in the map.
+        app.set_meter_at(6, Some(recorder::TimeSignature { beats: 5, unit: 4 }));
+        assert!(
+            app.live_meter_map().points().iter().any(|pt| pt.at_bar == 6),
+            "the fixture never made a signature to delete"
+        );
+        let del = press(FlagMenuOn::Sig(6), 1).expect("the second row of a chip menu");
+        assert_eq!(del, FlagMenuAction::DeleteSig(6));
+        app.apply_flag_menu(del);
+        assert!(
+            !app.live_meter_map().points().iter().any(|pt| pt.at_bar == 6),
+            "Delete time sig. left the change standing: {:?}",
+            app.live_meter_map().points()
+        );
+        // And a field open on the chip does not outlive it, or the next
+        // Enter would write the signature straight back.
+        app.set_meter_at(6, Some(recorder::TimeSignature { beats: 5, unit: 4 }));
+        app.arr_edit_meter(6);
+        assert_eq!(app.num_edit.as_ref().map(|e| e.field), Some(F::MeterAt(6)));
+        app.apply_flag_menu(FlagMenuAction::DeleteSig(6));
+        assert!(
+            app.num_edit.is_none(),
+            "a field is still open on a signature that no longer exists"
+        );
+
+        let action = press(FlagMenuOn::Flag(0), 2).expect("the third row of a flag menu");
         assert_eq!(action, FlagMenuAction::NewSigAtMarker(0));
         app.apply_flag_menu(action);
         assert_eq!(
