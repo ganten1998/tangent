@@ -6520,10 +6520,25 @@ impl DesktopApp {
                 for lane in 0..tangent_ui::recorder::CHANNELS {
                     // Only lanes with something to say — see the offline
                     // twin below for the reasoning.
-                    let sounds = doc.clips.iter().any(|c| c.lane == lane)
-                        || (0..tangent_ui::recorder::INSERTS)
-                            .any(|b| self.app.insert(lane, b).is_some());
-                    if !sounds {
+                    // **A stem is worth writing when something REACHES the
+                    // lane, not when something is loaded on it.**
+                    //
+                    // This used to keep any lane with an insert in a bay,
+                    // which writes a silent file for every instrument track
+                    // that has no part yet — the shipped desk alone has one,
+                    // so a fresh session exported a stem of nothing every
+                    // time. The owner: "export stems either way should
+                    // ignore tracks with no clips or sends going to them."
+                    //
+                    // Two ways to be reached, and a folder is the second
+                    // one: it carries its children's audio and has no clips
+                    // of its own, so counting only clips would drop exactly
+                    // the buses somebody grouped in order to bounce them.
+                    let has_clips = doc.clips.iter().any(|c| c.lane == lane);
+                    let collects = self.app.is_folder(lane)
+                        && (0..tangent_ui::recorder::CHANNELS)
+                            .any(|c| self.app.folder_of(c) == Some(lane));
+                    if !has_clips && !collects {
                         continue;
                     }
                     let name: String = self

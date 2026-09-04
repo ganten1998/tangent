@@ -516,7 +516,7 @@ pub const STRIP_COLORS: [(u8, u8, u8); 708] = [
     // is why several of these are not the theme's accent: a palette already
     // CONTAINS its theme's hues, so the accent collides with the tracks by
     // construction and the honest answer is the nearest colour that does not.
-    (0x0a, 0x5f, 0xc2), // 300  Default
+    (0xB0, 0x2A, 0x37), // 300  Default
     (0xbd, 0x0f, 0x58), // 301  Valentine
     (0x81, 0x5a, 0x0e), // 302  Hydra
     (0x91, 0x4c, 0x08), // 303  Navi

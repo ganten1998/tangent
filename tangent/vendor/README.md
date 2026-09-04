@@ -77,15 +77,29 @@ wrong depends on where it last was. Varying the file name, the shielding
 window level, and the order the two are set in changed nothing; all four
 variants moved.
 
-So `Panel::hold_directory` says it again once the restore has happened: three
-one-shot `NSTimer`s at 30, 80 and 180 ms, added to the run loop in the COMMON
-modes because a modal panel spins in `NSModalPanelRunLoopMode` and a timer in
-the default mode alone would not fire until the panel had closed. Also
+So `Panel::hold_directory` says it again once the restore has happened. Also
 measured: re-asserting on the next run-loop turn is too early and still moves;
-30 ms holds. Three shots inside 200 ms covers a slower machine and is far
+30 ms holds. Four shots inside 320 ms cover a slower machine and are far
 quicker than anyone can navigate a panel, so it can never take a folder away
 from a hand that chose it. It is on the SAVE panel only — the open panel holds
 what it is given.
+
+**And it goes on the main QUEUE, which the first attempt got wrong.** That
+attempt used `NSTimer`s in `NSRunLoopCommonModes`, on the reasoning that a
+modal panel spins in `NSModalPanelRunLoopMode`. It holds in a standalone
+AppKit program — measured, three shots, all three fired — and it did NOT hold
+inside Tangent, where the panel runs as a sheet nested inside winit's own
+event loop. The app logged that it handed the panel a real directory and the
+panel still opened at home:
+
+```
+panel: Save Kit opens at ~/Documents/Tangent Media/Presets/Tangent Drums - the directory exists
+```
+
+Which run-loop modes are common under a nested event loop is not a thing to
+reason about from a vendored dialog crate. The main queue has no such
+question: it is drained while a modal panel is up regardless of mode, and it
+is what the original measurement used.
 
 ## Dropping this copy
 
