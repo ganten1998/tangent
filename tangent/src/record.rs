@@ -1094,6 +1094,10 @@ pub struct Session {
     /// goes with the take, and the two deliver into different slots.
     window: Option<camera::CameraStream>,
     window_error: Option<String>,
+    /// The region the capture was last told, and the one seen the sample
+    /// before — see `set_window_region`.
+    window_applied: Option<camera::WindowRegion>,
+    window_seen: Option<camera::WindowRegion>,
     midi_clock: SourceClock,
     midi: MidiTake,
     state: RecordState,
@@ -1163,6 +1167,36 @@ pub struct Session {
     finished: Option<(std::path::PathBuf, Manifest)>,
 }
 
+/// **Which region, if any, to hand the screen capture this sample.**
+///
+/// The window's rectangle is sampled every painted frame and was handed to
+/// `AVCaptureScreenInput.cropRect` every time — 240 sets a second on the
+/// owner's display. Measured 2026-09-05 with a probe (`AVCaptureScreenInput`,
+/// 1600x1000 at 30 fps, `tools`-style, not kept): a set to the SAME rect is
+/// free — 898 of them in four seconds, thirty frames a second delivered — but
+/// a set that CHANGES the rect costs about 100 ms of no frames, and a rect
+/// changed every few milliseconds delivers nothing at all: 228 changes in
+/// four seconds, zero frames, and delivery resumed only once the changes
+/// stopped. So a drag of the window mid-take was a video frozen for the
+/// length of the drag, and every one of those sets was the picture the take
+/// wanted anyway.
+///
+/// The rule: a region is applied when it differs from the one applied and
+/// matches the sample before it — held still for one sample. A drag applies
+/// nothing until the hand pauses, then follows in one set; a window that
+/// never moves costs nothing. Pure, so the sequence is tested without a
+/// display.
+fn settle_region(
+    applied: Option<camera::WindowRegion>,
+    seen: Option<camera::WindowRegion>,
+    sample: camera::WindowRegion,
+) -> Option<camera::WindowRegion> {
+    if applied == Some(sample) {
+        return None;
+    }
+    (seen == Some(sample)).then_some(sample)
+}
+
 impl Session {
     /// A session with no device open. Opening one is [`open_input`], which the
     /// app calls when the band appears rather than when Record is pressed.
@@ -1180,6 +1214,8 @@ impl Session {
             camera_error: None,
             window: None,
             window_error: None,
+            window_applied: None,
+            window_seen: None,
             midi_clock: SourceClock::new(MIDIR_SCALE_NS, MIDI_SETTLE_NS),
             midi: MidiTake::new(),
             state: RecordState::Idle,
@@ -1642,6 +1678,8 @@ impl Session {
     pub fn open_window_capture(&mut self, region: camera::WindowRegion, fps: f64) {
         self.window = None;
         self.window_error = None;
+        self.window_applied = Some(region);
+        self.window_seen = Some(region);
         match camera::open_window_capture(region, fps, self.timebase) {
             Ok(stream) => self.window = Some(stream),
             Err(camera::CameraError::Unsupported) => {}
@@ -1652,12 +1690,20 @@ impl Session {
     pub fn close_window_capture(&mut self) {
         self.window = None;
         self.window_error = None;
+        self.window_applied = None;
+        self.window_seen = None;
     }
 
-    /// The window moved or resized: the capture follows.
-    pub fn set_window_region(&self, region: camera::WindowRegion) {
-        if let Some(w) = self.window.as_ref() {
-            w.set_region(region);
+    /// The window moved or resized: the capture follows — **once the region
+    /// has held still for a sample.** See [`settle_region`] for why.
+    pub fn set_window_region(&mut self, region: camera::WindowRegion) {
+        let apply = settle_region(self.window_applied, self.window_seen, region);
+        self.window_seen = Some(region);
+        if let Some(r) = apply {
+            self.window_applied = Some(r);
+            if let Some(w) = self.window.as_ref() {
+                w.set_region(r);
+            }
         }
     }
 
@@ -2753,6 +2799,28 @@ pub fn record_test(seconds: Option<String>) {
 
 #[cfg(test)]
 mod tests {
+    /// **A moving region applies nothing; a region held for a sample applies
+    /// once.** Revert-check, performed: return `Some(sample)` whenever it
+    /// differs from `applied` and the drag row applies every sample.
+    #[test]
+    fn the_capture_follows_the_window_once_it_has_held_still_for_a_sample() {
+        use super::settle_region;
+        use super::camera::WindowRegion;
+        let r = |x: f32| WindowRegion { x, y: 0.0, w: 100.0, h: 50.0, scale: 1.0 };
+        // Never moved: nothing to apply, sample after sample.
+        assert_eq!(settle_region(Some(r(0.0)), Some(r(0.0)), r(0.0)), None);
+        // A drag: every sample differs from the last, none is applied.
+        assert_eq!(settle_region(Some(r(0.0)), Some(r(0.0)), r(1.0)), None);
+        assert_eq!(settle_region(Some(r(0.0)), Some(r(1.0)), r(2.0)), None);
+        assert_eq!(settle_region(Some(r(0.0)), Some(r(2.0)), r(3.0)), None);
+        // The hand pauses: the same region twice, applied once.
+        assert_eq!(settle_region(Some(r(0.0)), Some(r(3.0)), r(3.0)), Some(r(3.0)));
+        assert_eq!(settle_region(Some(r(3.0)), Some(r(3.0)), r(3.0)), None);
+        // Nothing applied yet (no capture open): the first held sample counts.
+        assert_eq!(settle_region(None, None, r(5.0)), None);
+        assert_eq!(settle_region(None, Some(r(5.0)), r(5.0)), Some(r(5.0)));
+    }
+
 
     /// **The manifest reports the rate the file was WRITTEN at.**
     ///

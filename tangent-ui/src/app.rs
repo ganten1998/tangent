@@ -44790,6 +44790,126 @@ mod tests {
         }
     }
 
+    /// Throwaway probe, the reconcile probe's shape (see desktop.rs): what
+    /// the painted frame costs with the analyzer in the band's camera box,
+    /// with a camera in it instead, and with the band closed. Ignored by
+    /// default and only meaningful in `--release`:
+    /// `cargo test -p tangent-ui --release the_frame_costs -- --ignored --nocapture`.
+    ///
+    /// Three numbers a frame: the scope feed (the analyzer's FFT lives in
+    /// it), the UI pass, and tessellation — everything the window thread
+    /// pays before the GPU sees a frame. The audio is a three-note chord,
+    /// 200 stereo frames a tick, which is one UI frame of a 240 Hz display
+    /// at 48 kHz; the analyzer's cost does not depend on how much arrives,
+    /// only on whether it is on screen.
+    ///
+    /// **Measured 2026-09-05 on the M5 Pro, release, a first-launch desk,
+    /// window 900 tall** (mean per frame; p95 within 10%):
+    ///
+    /// | pane                 | feed | ui  | tessellate | total  | shapes |
+    /// |----------------------|------|-----|------------|--------|--------|
+    /// | analyzer in the band | 63   | 99  | 201        | 363 µs | 1623   |
+    /// | camera in the band   | 0    | 79  | 101        | 180 µs | 1498   |
+    /// | band closed          | 0    | 35  | 62         | 97 µs  | 1025   |
+    ///
+    /// The analyzer is 0.18 ms a frame over a camera — 4% of the 4.17 ms a
+    /// 240 Hz display allows, 1% of a 60 Hz frame — and two thirds of that
+    /// is tessellating its glow line, not the FFT. It was the suspect for
+    /// "dropped frames in takes with the analyzer" and "the camera is laggy
+    /// now"; it is not the cause, and this table is why the search moved to
+    /// the log, where the engine was being rebuilt every few seconds (see
+    /// `instrument::StallRecovery`).
+    #[test]
+    #[ignore = "a measurement; run in --release with --nocapture"]
+    fn the_frame_costs_this_much_with_the_analyzer_the_camera_and_neither() {
+        use std::time::{Duration, Instant};
+        const FRAMES: usize = 400;
+        const PER_FRAME: usize = 200;
+        const RATE: f32 = 48_000.0;
+        let mut scenario = |name: &str, setup: &dyn Fn(&egui::Context, &mut TangentApp)| {
+            let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::first_launch());
+            app.settings.show_camera_pane = false;
+            setup(&ctx, &mut app);
+            let w = main_width(&app.settings);
+            let input = || egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, 900.0))),
+                ..Default::default()
+            };
+            let mut phase = 0usize;
+            let mut buf = vec![0.0f32; PER_FRAME * 2];
+            let mut fill = |buf: &mut [f32]| {
+                for i in 0..PER_FRAME {
+                    let t = (phase + i) as f32 / RATE;
+                    let v = 0.3
+                        * ((std::f32::consts::TAU * 220.0 * t).sin()
+                            + (std::f32::consts::TAU * 277.18 * t).sin()
+                            + (std::f32::consts::TAU * 329.63 * t).sin());
+                    buf[i * 2] = v;
+                    buf[i * 2 + 1] = v;
+                }
+                phase += PER_FRAME;
+            };
+            // Warm: fonts, atlases, the first layout.
+            for _ in 0..20 {
+                fill(&mut buf);
+                app.scope_feed(&buf, PER_FRAME as f32 / RATE, RATE);
+                let out = ctx.run(input(), |ctx| app.frame(ctx));
+                let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
+            }
+            let (mut feed, mut ui, mut tess) = (Vec::new(), Vec::new(), Vec::new());
+            let mut shapes = 0usize;
+            for _ in 0..FRAMES {
+                fill(&mut buf);
+                let t0 = Instant::now();
+                app.scope_feed(&buf, PER_FRAME as f32 / RATE, RATE);
+                let t1 = Instant::now();
+                let out = ctx.run(input(), |ctx| app.frame(ctx));
+                let t2 = Instant::now();
+                shapes = out.shapes.len();
+                let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
+                let t3 = Instant::now();
+                feed.push(t1 - t0);
+                ui.push(t2 - t1);
+                tess.push(t3 - t2);
+            }
+            let stat = |v: &mut Vec<Duration>| {
+                v.sort();
+                let mean = v.iter().sum::<Duration>() / v.len() as u32;
+                (mean.as_micros(), v[v.len() * 95 / 100].as_micros())
+            };
+            let (fm, fp) = stat(&mut feed);
+            let (um, up) = stat(&mut ui);
+            let (tm, tp) = stat(&mut tess);
+            println!(
+                "{name:<22} feed {fm:>5} us (p95 {fp:>5})   ui {um:>5} us (p95 {up:>5})   tessellate {tm:>5} us (p95 {tp:>5})   total {:>5} us   shapes {shapes}",
+                fm + um + tm
+            );
+        };
+        scenario("analyzer in the band", &|_, app| {
+            assert!(app.analyzer_showing());
+        });
+        scenario("camera in the band", &|ctx, app| {
+            let handle = ctx.load_texture(
+                "bench-camera",
+                egui::ColorImage::from_rgba_unmultiplied([1280, 720], &vec![0u8; 1280 * 720 * 4]),
+                egui::TextureOptions::LINEAR,
+            );
+            app.recorder.camera_name = Some("Bench Camera".to_owned());
+            app.recorder.preview = Some(recorder::Preview {
+                texture: handle.id(),
+                size: Vec2::new(1280.0, 720.0),
+            });
+            // The handle is what keeps the texture allocated; the probe has
+            // no field for it, so it lives for the process.
+            std::mem::forget(handle);
+            assert!(!app.analyzer_showing());
+        });
+        scenario("band closed", &|_, app| {
+            app.settings.show_recorder = false;
+            assert!(!app.analyzer_showing());
+        });
+    }
+
     /// **With no camera chosen, the pane IS the spectrum analyzer** — and
     /// its scale is on screen, on both edges, with the camera tag in the
     /// corner and the old placeholder gone. Read off the painted frame: a
