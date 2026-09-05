@@ -12,20 +12,20 @@
 //! parameters, because the layout IS the design and a knob that moved
 //! because a parameter was inserted would be a different panel.
 //!
-//! **The dial is the house's, in the Moog dress.** `recorder_panel::
+//! **The dial is the house's, in a silver dress.** `recorder_panel::
 //! draw_knob` is the reference: the name above the control, the reading
 //! below it, the sweep centred on UP so the tick skirt arcs over the top
 //! where a hand on the knob is not covering it, the ticks outside the body
 //! because they are a mark on the panel the knob is mounted through. The
-//! derivation is followed, not the numbers. What is dressed is the black
-//! moulded body, the inset cap, and a full screwdriver-slot pointer
-//! straight through the centre — a short pointer at one edge is a dot at
-//! this size. What is THEMED is the panel ground, the engraved legends and
-//! the cap colour, one accent per section derived from the theme's own
-//! accent and walked dark enough that the house's light slot reads on
-//! every one of them; the slot itself is never themed, so it reads on
-//! every cap. Ink is a property of the surface it lands on and nothing
-//! here inherits one from a role.
+//! derivation is followed, not the numbers. The dress is the owner's, from
+//! the first build he held: a thin black outline, a grey face turned with
+//! the concentric rings of a spun aluminium cap, and a black pointer that
+//! sits in the outline and points at the level — no slot, no coloured
+//! cap. The dials are small and the words around them are not: the name
+//! and the reading are what a panel is read by. Nothing on a dial is
+//! themed, so the same knob is on every theme's panel; what is themed is
+//! the ground and the engraved legends. Ink is a property of the surface
+//! it lands on and nothing here inherits one from a role.
 //!
 //! **A stepped dial is a dial**, because a range switch on the original
 //! was a rotary switch and reads as one: it turns in detents, a click
@@ -46,13 +46,13 @@
 //! included; rows give up their AIR before anything else and never their
 //! dials, the amp's rule. `the_analog_is_whole_at_its_own_window_on_every_
 //! font` holds it, and this file's other tests hold the ink on every theme,
-//! the slot on every cap, the dead dial, and a real drag through egui's
-//! own input rather than a helper the painter calls.
+//! the pointer on the dial's face, the dead dial, and a real drag through
+//! egui's own input rather than a helper the painter calls.
 
 use crate::face::{self, FaceStyle};
 use crate::faces::{FaceAction, FaceLive};
 use crate::fonts;
-use crate::recorder_panel::{contrast_ratio, luminance};
+use crate::recorder_panel::contrast_ratio;
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 /// The sentinel, spelled here as the contract with the engine's
@@ -203,7 +203,11 @@ const fn low(id: u32, label: &'static str, kind: Kind, row: usize, x: f32, w: f3
     Ctl { id, label, kind, area: Area::Lower { row, x, w } }
 }
 
-/// The five upper sections: caption, and how many dial columns wide.
+/// The five upper sections: caption, and how many dial columns wide. The
+/// oscillator bank's first column holds only oscillator three's keyboard
+/// switch, at the left of the row it belongs to, the way the 1970 panel
+/// puts its oscillator-three control; the Range, Wave and Tune columns
+/// then line up down all three rows.
 const SECTIONS: [(&str, usize); 5] = [
     ("CONTROLLERS", 2),
     ("OSCILLATOR BANK", 4),
@@ -233,42 +237,47 @@ const CONTROLS: &[Ctl] = &[
     up(P_MOD_DEPTH, "Depth", Kind::Knob, 0, 1, 1),
     up(P_BEND_RANGE, "Bend", Kind::Stepped(13), 0, 2, 0),
     up(P_PRESSURE, "Pressure", Kind::Knob, 0, 2, 1),
-    // OSCILLATOR BANK
-    up(P_O1_RANGE, "Range 1", Kind::Stepped(6), 1, 0, 0),
-    up(P_O1_WAVE, "Wave 1", Kind::Stepped(6), 1, 0, 1),
-    up(P_SYNC, "SYNC", Kind::Toggle, 1, 0, 2),
-    up(P_O2_RANGE, "Range 2", Kind::Stepped(6), 1, 1, 0),
-    up(P_O2_TUNE, "Tune 2", Kind::Knob, 1, 1, 1),
+    // OSCILLATOR BANK: column 0 is the switch column, then Range, Wave,
+    // and Tune (SYNC sits where oscillator one's tune would be, since it
+    // has none).
+    up(P_O1_RANGE, "Range 1", Kind::Stepped(6), 1, 0, 1),
+    up(P_O1_WAVE, "Wave 1", Kind::Stepped(6), 1, 0, 2),
+    up(P_SYNC, "SYNC", Kind::Toggle, 1, 0, 3),
+    up(P_O2_RANGE, "Range 2", Kind::Stepped(6), 1, 1, 1),
     up(P_O2_WAVE, "Wave 2", Kind::Stepped(6), 1, 1, 2),
-    up(P_O3_RANGE, "Range 3", Kind::Stepped(6), 1, 2, 0),
-    up(P_O3_TUNE, "Tune 3", Kind::Knob, 1, 2, 1),
+    up(P_O2_TUNE, "Tune 2", Kind::Knob, 1, 1, 3),
+    up(P_O3_TRACK, "KBD", Kind::Toggle, 1, 2, 0),
+    up(P_O3_RANGE, "Range 3", Kind::Stepped(6), 1, 2, 1),
     up(P_O3_WAVE, "Wave 3", Kind::Stepped(6), 1, 2, 2),
-    up(P_O3_TRACK, "KBD", Kind::Toggle, 1, 2, 3),
-    up(P_PWM, "PWM", Kind::Knob, 1, 3, 0),
-    up(P_OSC_DRIFT, "Osc Drift", Kind::Knob, 1, 3, 1),
-    // MIXER
+    up(P_O3_TUNE, "Tune 3", Kind::Knob, 1, 2, 3),
+    up(P_PWM, "PWM", Kind::Knob, 1, 3, 1),
+    up(P_OSC_DRIFT, "Osc Drift", Kind::Knob, 1, 3, 2),
+    // MIXER: the three oscillators' levels in one column, beside their
+    // rows in the bank; the noise under them with its colour switch
+    // beside it; the drive at the top of the second column.
     up(P_MIX_O1, "Osc 1", Kind::Knob, 2, 0, 0),
-    up(P_MIX_O2, "Osc 2", Kind::Knob, 2, 0, 1),
-    up(P_MIX_O3, "Osc 3", Kind::Knob, 2, 1, 0),
-    up(P_MIX_NOISE, "Noise", Kind::Knob, 2, 1, 1),
-    up(P_NOISE_COLOUR, "PINK", Kind::Toggle, 2, 2, 0),
-    up(P_DRIVE, "Drive", Kind::Knob, 2, 2, 1),
-    // MODIFIERS
+    up(P_MIX_O2, "Osc 2", Kind::Knob, 2, 1, 0),
+    up(P_MIX_O3, "Osc 3", Kind::Knob, 2, 2, 0),
+    up(P_MIX_NOISE, "Noise", Kind::Knob, 2, 3, 0),
+    up(P_DRIVE, "Drive", Kind::Knob, 2, 0, 1),
+    up(P_NOISE_COLOUR, "PINK", Kind::Toggle, 2, 3, 1),
+    // MODIFIERS: the filter, its contour, the loudness contour, and the
+    // keyboard and velocity amounts along the bottom.
     up(P_CUTOFF, "Cutoff", Kind::Knob, 3, 0, 0),
     up(P_EMPHASIS, "Emphasis", Kind::Knob, 3, 0, 1),
     up(P_SEM_MODE, "Mode", Kind::Knob, 3, 0, 2),
     up(P_CONTOUR, "Contour", Kind::Knob, 3, 0, 3),
-    up(P_KEYTRACK, "Keyboard", Kind::Knob, 3, 1, 0),
-    up(P_VEL_FILTER, "Vel>Flt", Kind::Knob, 3, 1, 1),
-    up(P_VEL_AMP, "Velocity", Kind::Knob, 3, 1, 2),
-    up(P_F_ATTACK, "F Attack", Kind::Knob, 3, 2, 0),
-    up(P_F_DECAY, "F Decay", Kind::Knob, 3, 2, 1),
-    up(P_F_SUSTAIN, "F Sustain", Kind::Knob, 3, 2, 2),
-    up(P_F_RELEASE, "F Release", Kind::Knob, 3, 2, 3),
-    up(P_A_ATTACK, "Attack", Kind::Knob, 3, 3, 0),
-    up(P_A_DECAY, "Decay", Kind::Knob, 3, 3, 1),
-    up(P_A_SUSTAIN, "Sustain", Kind::Knob, 3, 3, 2),
-    up(P_A_RELEASE, "Release", Kind::Knob, 3, 3, 3),
+    up(P_F_ATTACK, "F Attack", Kind::Knob, 3, 1, 0),
+    up(P_F_DECAY, "F Decay", Kind::Knob, 3, 1, 1),
+    up(P_F_SUSTAIN, "F Sustain", Kind::Knob, 3, 1, 2),
+    up(P_F_RELEASE, "F Release", Kind::Knob, 3, 1, 3),
+    up(P_A_ATTACK, "Attack", Kind::Knob, 3, 2, 0),
+    up(P_A_DECAY, "Decay", Kind::Knob, 3, 2, 1),
+    up(P_A_SUSTAIN, "Sustain", Kind::Knob, 3, 2, 2),
+    up(P_A_RELEASE, "Release", Kind::Knob, 3, 2, 3),
+    up(P_KEYTRACK, "Keyboard", Kind::Knob, 3, 3, 0),
+    up(P_VEL_FILTER, "Vel>Flt", Kind::Knob, 3, 3, 1),
+    up(P_VEL_AMP, "Velocity", Kind::Knob, 3, 3, 2),
     // OUTPUT
     up(P_VOLUME, "Volume", Kind::Knob, 4, 0, 0),
     up(P_SPREAD, "Spread", Kind::Knob, 4, 0, 1),
@@ -300,28 +309,43 @@ const CONTROLS: &[Ctl] = &[
 // ── the geometry ────────────────────────────────────────────────────────────
 
 /// The header band: the model name and the badge.
-const HEADER_H: f32 = 22.0;
+const HEADER_H: f32 = 24.0;
 /// The engraved section captions' band.
-const CAPTION_H: f32 = 13.0;
+const CAPTION_H: f32 = 15.0;
 /// A row of dials, tallest and shortest. The shortest still holds a dial a
-/// hand can turn and the two lines of text around it on JetBrains Mono.
-const ROW_MAX: f32 = 92.0;
-const ROW_MIN: f32 = 46.0;
+/// hand can turn and the two lines of larger text around it.
+const ROW_MAX: f32 = 96.0;
+const ROW_MIN: f32 = 50.0;
 /// The panel's inset from the window, and the air between the two bands.
 const MARGIN: f32 = 4.0;
 const BAND_AIR: f32 = 6.0;
-/// The name and reading lines around a dial, as a share of the row.
-const NAME_H: f32 = 11.0;
-const READING_H: f32 = 11.0;
+/// The name and reading lines around a dial: the words a panel is read
+/// by, so they take the room and the dial takes what is left.
+const NAME_H: f32 = 14.0;
+const READING_H: f32 = 14.0;
+/// The text sizes, nominal; each word fits itself down from here.
+const NAME_PT: f32 = 10.5;
+const READING_PT: f32 = 10.5;
+const CAPTION_PT: f32 = 10.0;
+const TITLE_PT: f32 = 12.0;
+/// How much of the room left between the two words the dial's body takes,
+/// ticks included: small, so the words can grow.
+const DIAL_SHARE: f32 = 0.86;
 /// How far a drag turns a dial per point, and with shift held.
 const DRAG_PER_PT: f32 = 0.006;
 const FINE_PER_PT: f32 = 0.0015;
 /// Points of drag per detent on a stepped dial.
 const STEP_PTS: f32 = 14.0;
-/// The house's light slot, and the moulded body: the two things on a dial
-/// that are NOT themed, so the pointer reads on every cap.
-const SLOT: Color32 = Color32::from_rgb(0xd8, 0xe4, 0xf2);
-const BODY: Color32 = Color32::from_rgb(0x14, 0x12, 0x12);
+/// The dial's dress, un-themed so it is the same knob on every panel: a
+/// thin black outline, the grey of a spun aluminium face, the darker and
+/// lighter greys of its rings, and the black pointer.
+const OUTLINE: Color32 = Color32::from_rgb(0x10, 0x10, 0x10);
+const FACE: Color32 = Color32::from_rgb(0xb4, 0xb6, 0xba);
+const RING_DARK: Color32 = Color32::from_rgb(0x9c, 0x9e, 0xa3);
+const RING_LIGHT: Color32 = Color32::from_rgb(0xc9, 0xcb, 0xcf);
+const POINTER: Color32 = Color32::from_rgb(0x10, 0x10, 0x10);
+/// Rings turned into the face, inward from the outline.
+const RINGS: usize = 6;
 /// The sweep, centred on up: three quarters of a turn.
 const SWEEP: f32 = std::f32::consts::PI * 1.5;
 const TICKS: usize = 11;
@@ -395,98 +419,6 @@ impl Layout {
 
 }
 
-// ── the theme, applied ──────────────────────────────────────────────────────
-
-/// The five sections' cap colours, from the theme's own accent: five hues
-/// around it, each walked until the house's light slot clears it by a
-/// reading margin and the cap still stands off the black body. One
-/// derivation, so the caps are the theme's and never a plate of paint
-/// somebody chose once for one theme.
-fn caps(st: &FaceStyle) -> [Color32; 5] {
-    let (h, s, l) = hsl(st.lcd);
-    let turns = [0.0_f32, 0.11, 0.22, 0.55, 0.72];
-    std::array::from_fn(|i| legible_cap(from_hsl((h + turns[i]).fract(), s.max(0.45), l)))
-}
-
-/// Walk a cap dark until the slot reads on it at 3:1 and it still reads
-/// against the body at 1.4:1 — the dead-zone law applied to a dial: when
-/// the ink cannot move, the surface does.
-fn legible_cap(c: Color32) -> Color32 {
-    let (h, s, mut l) = hsl(c);
-    l = l.clamp(0.14, 0.42);
-    let mut out = from_hsl(h, s, l);
-    let mut guard = 0;
-    while contrast_ratio(SLOT, out) < 3.0 && guard < 40 {
-        l = (l - 0.02).max(0.05);
-        out = from_hsl(h, s, l);
-        guard += 1;
-    }
-    guard = 0;
-    while contrast_ratio(out, BODY) < 1.4 && guard < 40 {
-        l = (l + 0.02).min(0.42);
-        out = from_hsl(h, s, l);
-        guard += 1;
-    }
-    out
-}
-
-fn hsl(c: Color32) -> (f32, f32, f32) {
-    let (r, g, b) = (
-        f32::from(c.r()) / 255.0,
-        f32::from(c.g()) / 255.0,
-        f32::from(c.b()) / 255.0,
-    );
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let l = (max + min) * 0.5;
-    if (max - min).abs() < 1e-6 {
-        return (0.0, 0.0, l);
-    }
-    let d = max - min;
-    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
-    let h = if max == r {
-        (g - b) / d + if g < b { 6.0 } else { 0.0 }
-    } else if max == g {
-        (b - r) / d + 2.0
-    } else {
-        (r - g) / d + 4.0
-    } / 6.0;
-    (h, s, l)
-}
-
-fn from_hsl(h: f32, s: f32, l: f32) -> Color32 {
-    let hue = |p: f32, q: f32, t: f32| {
-        let t = t.rem_euclid(1.0);
-        if t < 1.0 / 6.0 {
-            p + (q - p) * 6.0 * t
-        } else if t < 0.5 {
-            q
-        } else if t < 2.0 / 3.0 {
-            p + (q - p) * (2.0 / 3.0 - t) * 6.0
-        } else {
-            p
-        }
-    };
-    let (r, g, b) = if s <= 0.0 {
-        (l, l, l)
-    } else {
-        let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
-        let p = 2.0 * l - q;
-        (hue(p, q, h + 1.0 / 3.0), hue(p, q, h), hue(p, q, h - 1.0 / 3.0))
-    };
-    let ch = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    Color32::from_rgb(ch(r), ch(g), ch(b))
-}
-
-/// The section a control's cap comes from: its own upstairs, and the
-/// nearest relative downstairs.
-fn cap_section(c: &Ctl) -> usize {
-    match c.area {
-        Area::Upper { section, .. } => section,
-        Area::Lower { row, .. } => [4, 3, 0][row.min(2)],
-    }
-}
-
 // ── the panel ───────────────────────────────────────────────────────────────
 
 /// The pushed value of `id`, or the dial's rest if the host has not pushed
@@ -517,7 +449,6 @@ pub fn draw_analog(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Op
     let (body, _) = ui.allocate_exact_size(Vec2::new(avail.x, body_h), Sense::hover());
     let lay = Layout::new(body);
     let painter = ui.painter_at(body);
-    let caps = caps(st);
     let bold = |size: f32| FontId::new(size, fonts::courier_bold());
     let mut out: Option<FaceAction> = None;
 
@@ -526,7 +457,7 @@ pub fn draw_analog(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Op
         Pos2::new(lay.header.left() + 2.0, lay.header.center().y),
         Align2::LEFT_CENTER,
         "TANGENT ANALOG",
-        bold(11.0),
+        bold(TITLE_PT),
         st.s.ink,
     );
     let badge = Rect::from_center_size(
@@ -549,7 +480,7 @@ pub fn draw_analog(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Op
             Pos2::new(s.center().x, s.top() + CAPTION_H * 0.5),
             Align2::CENTER_CENTER,
             *name,
-            bold(9.0),
+            bold(CAPTION_PT),
             st.s.faint,
         );
         if i > 0 {
@@ -576,10 +507,9 @@ pub fn draw_analog(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Op
             continue;
         };
         let dead = c.id == P_SEM_MODE && ladder;
-        let cap = caps[cap_section(c)];
         let asked = match c.kind {
-            Kind::Knob => knob(ui, &painter, st, c, cell, v, default, reading, cap, dead, None),
-            Kind::Stepped(n) => knob(ui, &painter, st, c, cell, v, default, reading, cap, false, Some(n)),
+            Kind::Knob => knob(ui, &painter, st, c, cell, v, default, reading, dead, None),
+            Kind::Stepped(n) => knob(ui, &painter, st, c, cell, v, default, reading, false, Some(n)),
             Kind::Toggle => toggle(ui, &painter, st, c, cell, v),
             Kind::Segmented(words) => segmented(ui, &painter, st, c, cell, v, words),
         };
@@ -616,7 +546,7 @@ fn word(painter: &Painter, at: Pos2, anchor: Align2, width: f32, text: &str, nom
 }
 
 /// One dial: the name above, the reading below, the body between, the
-/// ticks outside, the slot through the cap. `steps` makes it a rotary
+/// ticks outside, the pointer in the outline. `steps` makes it a rotary
 /// switch: detents, a click to walk, the reading its position's word.
 #[allow(clippy::too_many_arguments)]
 fn knob(
@@ -628,7 +558,6 @@ fn knob(
     v: f32,
     default: f32,
     reading: &str,
-    cap: Color32,
     dead: bool,
     steps: Option<i32>,
 ) -> Option<f32> {
@@ -639,9 +568,10 @@ fn knob(
         Some(ui.interact(cell, id, Sense::click_and_drag()))
     };
     let turning = resp.as_ref().is_some_and(|r| r.dragged());
-    // The name on top, the reading at the bottom, the dial in what is left.
-    let name_h = NAME_H.min(cell.height() * 0.25);
-    let reading_h = READING_H.min(cell.height() * 0.25);
+    // The words first: the name on top, the reading at the bottom, and
+    // the dial in what is left between them.
+    let name_h = NAME_H.min(cell.height() * 0.3);
+    let reading_h = READING_H.min(cell.height() * 0.3);
     let text_w = cell.width() - 4.0;
     word(
         painter,
@@ -649,7 +579,7 @@ fn knob(
         Align2::CENTER_TOP,
         text_w,
         c.label,
-        9.0,
+        NAME_PT,
         fonts::courier_bold(),
         st.s.faint,
     );
@@ -659,7 +589,7 @@ fn knob(
         Align2::CENTER_BOTTOM,
         text_w,
         reading,
-        9.0,
+        READING_PT,
         egui::FontFamily::Monospace,
         if turning { st.s.ink } else { st.s.faint },
     );
@@ -668,8 +598,8 @@ fn knob(
         Pos2::new(cell.right(), cell.bottom() - reading_h - 1.0),
     );
     // The ticks stand outside the body, so the body is sized to leave
-    // them room inside the cell.
-    let rad = (dial.width().min(dial.height()) * 0.5 / 1.32).max(4.0);
+    // them room inside the dial's box.
+    let rad = (dial.width().min(dial.height()) * 0.5 * DIAL_SHARE / 1.32).max(4.0);
     let centre = dial.center();
     let t = v.clamp(0.0, 1.0);
     if !dead {
@@ -680,12 +610,22 @@ fn knob(
             painter.line_segment([centre + d * (rad * 1.09), centre + d * (rad * 1.26)], tick);
         }
     }
-    painter.circle_filled(centre, rad, BODY);
-    let cap_r = rad * 0.64;
-    painter.circle_filled(centre, cap_r, if dead { st.s.well } else { cap });
-    if !dead {
-        // A stepped dial sits on its detent; a continuous one wherever it
-        // was left.
+    // The face: grey, turned — rings inward from the outline, alternately
+    // a shade darker and lighter, the way a spun cap catches light — and a
+    // thin black outline around it. A dead dial is a well with no face.
+    if dead {
+        painter.circle_filled(centre, rad, st.s.well);
+        painter.circle_stroke(centre, rad, Stroke::new((rad * 0.06).max(1.0), st.s.edge));
+    } else {
+        painter.circle_filled(centre, rad, FACE);
+        for k in 1..=RINGS {
+            let r = rad * (1.0 - k as f32 / (RINGS as f32 + 1.0));
+            let shade = if k % 2 == 0 { RING_LIGHT } else { RING_DARK };
+            painter.circle_stroke(centre, r, Stroke::new((rad * 0.045).max(0.6), shade));
+        }
+        painter.circle_stroke(centre, rad, Stroke::new((rad * 0.07).max(1.0), OUTLINE));
+        // The pointer: in the outline, pointing at the level. A stepped
+        // dial sits on its detent; a continuous one wherever it was left.
         let shown = match steps {
             Some(n) => step_of(t, n) as f32 / (n.max(2) - 1) as f32,
             None => t,
@@ -693,8 +633,8 @@ fn knob(
         let angle = (shown - 0.5) * SWEEP;
         let d = Vec2::new(angle.sin(), -angle.cos());
         painter.line_segment(
-            [centre - d * cap_r * 0.92, centre + d * cap_r * 0.92],
-            Stroke::new((cap_r * 0.30).max(1.0), SLOT),
+            [centre + d * (rad * 0.55), centre + d * (rad * 1.02)],
+            Stroke::new((rad * 0.16).max(1.5), POINTER),
         );
     }
     let resp = resp?;
@@ -774,7 +714,7 @@ fn toggle(ui: &mut egui::Ui, painter: &Painter, st: &FaceStyle, c: &Ctl, cell: R
         Align2::CENTER_CENTER,
         w - 6.0,
         c.label,
-        9.0,
+        NAME_PT,
         fonts::courier_bold(),
         ink,
     );
@@ -796,14 +736,14 @@ fn segmented(
 ) -> Option<f32> {
     let n = words.len().max(2);
     let at = step_of(v, n as i32);
-    let caption_h = NAME_H.min(cell.height() * 0.25);
+    let caption_h = NAME_H.min(cell.height() * 0.3);
     word(
         painter,
         Pos2::new(cell.center().x, cell.top() + 1.0),
         Align2::CENTER_TOP,
         cell.width() - 4.0,
         c.label,
-        9.0,
+        NAME_PT,
         fonts::courier_bold(),
         st.s.faint,
     );
@@ -830,7 +770,7 @@ fn segmented(
             Align2::CENTER_CENTER,
             seg_w - 4.0,
             w,
-            8.5,
+            NAME_PT - 0.5,
             fonts::courier_bold(),
             if chosen { st.s.ink } else { st.s.faint },
         );
@@ -987,30 +927,14 @@ mod tests {
         assert!(bad.is_empty(), "unreadable on:\n  {}", bad.join("\n  "));
     }
 
-    /// **The slot reads on every section's cap, on every theme**: the one
-    /// un-themed ink on the panel against the five themed grounds it lands
-    /// on, and each cap against the body it is inset in.
+    /// **The pointer reads on the dial's face, and the face on the black
+    /// outline** — the one un-themed picture on the panel, held the same
+    /// way the themed ones are.
     #[test]
-    fn the_slot_reads_on_every_cap_on_every_theme() {
-        let mut bad: Vec<String> = Vec::new();
-        for theme in crate::theme::factory() {
-            for dark in [false, true] {
-                let mut set = crate::settings::Settings::default();
-                theme.apply(&mut set);
-                set.dark_mode = dark;
-                let p = crate::recorder_panel::palette(&set);
-                let st = FaceStyle::new(p.bg, p.lcd, p.lcd_face);
-                for (i, cap) in caps(&st).iter().enumerate() {
-                    let slot = contrast_ratio(SLOT, *cap);
-                    let body = contrast_ratio(*cap, BODY);
-                    if slot < 3.0 || body < 1.4 {
-                        bad.push(format!("{} {}: section {i} slot {slot:.2}:1 body {body:.2}:1", theme.name, dark));
-                    }
-                }
-                assert!(luminance(SLOT) > 0.5, "the slot is not the light one");
-            }
-        }
-        assert!(bad.is_empty(), "a cap the slot cannot read on:\n  {}", bad.join("\n  "));
+    fn the_pointer_reads_on_the_dial_face() {
+        assert!(contrast_ratio(POINTER, FACE) >= 4.5, "{}", contrast_ratio(POINTER, FACE));
+        assert!(contrast_ratio(FACE, OUTLINE) >= 4.5);
+        assert!(contrast_ratio(RING_DARK, FACE) >= 1.05 && contrast_ratio(RING_LIGHT, FACE) >= 1.05, "the rings do not show");
     }
 
     /// The badge is the icon's nine numbers: three nodes at the scaled
