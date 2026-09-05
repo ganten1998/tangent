@@ -438,13 +438,53 @@ impl<const L: usize> SemLanes<L> {
 
 // ── the 4× pair, polyphase ──────────────────────────────────────────────────
 
+/// A multiply-add: fused where the machine fuses, a multiply and an add
+/// where it does not. Every tap of the pair goes through this.
+///
+/// **Why the pair does not call `mul_add` directly — "Analog only runs on
+/// the Mac".** `f32::mul_add` is the `llvm.fma` intrinsic. On arm64 that is
+/// one `fmadd` and the loops below vectorise around it. On x86-64 the app
+/// is built for the 2003 baseline — no FMA, so every processor can run it —
+/// and LLVM cannot inline the intrinsic there: each one becomes a CALL into
+/// compiler-builtins' `fmaf`, which picks the FMA3 instruction or a
+/// software fallback through a function pointer at run time. The pair is
+/// 218 of those per voice-sample (63 + 23 taps, up and down, polyphase).
+///
+/// Measured 2026-09-05 on `tools/analogrig perf`, same source, three
+/// builds (the x86 ones under Rosetta, so read the RATIOS and not the
+/// times): arm64 pre 42 / post 27 ns per voice-sample; x86-64 baseline pre
+/// 357 / post 295, ONE voice at 30% of a core; x86-64 with `+fma` pre 118 /
+/// post 50. The Linux x86-64 disassembly shows `fmaf` linked in and called
+/// from `Oversampler::up` and `down` where the arm64 build has a fused
+/// multiply per tap. That is the distortion on the void box and the Windows
+/// box with a handful of notes, and why a plugin with its own x86 code
+/// paths runs full polyphony on the same machines.
+///
+/// With a plain multiply and add the loop vectorises on SSE2 and the pair
+/// costs what a FIR costs. The rounding differs from the fused form in the
+/// last bit, which is why the scalar and laned roads share THIS function
+/// rather than the intrinsic: the bit-identity the tests hold is between
+/// the two roads on one machine, never between machines.
+#[inline(always)]
+fn fma(a: f32, b: f32, c: f32) -> f32 {
+    #[cfg(any(target_arch = "aarch64", target_feature = "fma"))]
+    {
+        a.mul_add(b, c)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_feature = "fma")))]
+    {
+        a * b + c
+    }
+}
+
 /// A dot product the compiler will vectorise, in an order the laned form
 /// ([`dot_lanes`]) can repeat exactly: eight accumulators, tap `t` into
-/// accumulator `t % 8`, each an explicit `mul_add` — Rust does not
-/// contract `a * b + c` into a fused multiply-add on its own — and the
-/// same sum tree at the end. Eight because the pair's cost is latency:
-/// eight independent chains of `N/8` fused adds each. `b` must be at
-/// least `N` long and `N` a multiple of 8.
+/// accumulator `t % 8`, each an explicit [`fma`] — Rust does not contract
+/// `a * b + c` into a fused multiply-add on its own, and the fused form is
+/// only wanted where it is an instruction, see there — and the same sum
+/// tree at the end. Eight because the pair's cost is latency: eight
+/// independent chains of `N/8` adds each. `b` must be at least `N` long
+/// and `N` a multiple of 8.
 #[inline(always)]
 fn dot<const N: usize>(a: &[f32; N], b: &[f32]) -> f32 {
     let (ac, _) = a.as_chunks::<8>();
@@ -452,7 +492,7 @@ fn dot<const N: usize>(a: &[f32; N], b: &[f32]) -> f32 {
     let mut acc = [0.0_f32; 8];
     for (x, y) in ac.iter().zip(bc) {
         for k in 0..8 {
-            acc[k] = x[k].mul_add(y[k], acc[k]);
+            acc[k] = fma(x[k], y[k], acc[k]);
         }
     }
     ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
@@ -471,7 +511,7 @@ fn dot_lanes<const L: usize, const N: usize>(a: &[f32; N], w: &[[f32; L]], out: 
     for (x, y) in ac.iter().zip(wc) {
         for k in 0..8 {
             for l in 0..L {
-                acc[k][l] = x[k].mul_add(y[k][l], acc[k][l]);
+                acc[k][l] = fma(x[k], y[k][l], acc[k][l]);
             }
         }
     }
