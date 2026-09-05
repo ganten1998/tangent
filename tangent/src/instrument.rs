@@ -10036,6 +10036,23 @@ impl Engine {
         })
     }
 
+    /// **The rate the engine's OWN device reports right now**, asked of the
+    /// device object the stream plays through — no host, no enumeration, no
+    /// driver loaded or released. Under ASIO that is one `ASIOGetSampleRate`
+    /// on the driver already in use, which the SDK allows at any time after
+    /// init and which is the only way the rate may be asked on that system:
+    /// the rate follower's poll thread asks through a host of its own, and a
+    /// second host loading an ASIO driver is the teardown the crate's notes
+    /// keep warning about. `None` offline, or when the device will not say.
+    pub fn device_rate_now(&self) -> Option<u32> {
+        self.out_device_obj
+            .as_ref()?
+            .default_output_config()
+            .ok()
+            .map(|c| c.sample_rate().0)
+            .filter(|r| (8_000..=768_000).contains(r))
+    }
+
     pub fn start_sized(
         out_device: Option<&str>,
         timebase: Timebase,

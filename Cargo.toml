@@ -5,7 +5,7 @@ members = ["tangent-core", "tangent-ui", "tangent", "tangent-record", "tangent-h
 # to be either a member or excluded, and excluded is what it should be: it must
 # stay byte-comparable to upstream 0.3.5, which means no workspace lints and no
 # `cargo test --workspace` opinions about someone else's code.
-exclude = ["tangent-record/vendor/linuxvideo", "tangent-record/vendor/cpal", "tangent-record/vendor/jack-sys", "tangent-host/vendor/lv2-sys", "tangent-host/vendor/lilv", "tangent-host/vendor/livi"]
+exclude = ["tangent-record/vendor/linuxvideo", "tangent-record/vendor/cpal", "tangent-record/vendor/jack-sys", "tangent-record/vendor/asio-sys", "tangent-host/vendor/lv2-sys", "tangent-host/vendor/lilv", "tangent-host/vendor/livi"]
 resolver = "2"
 
 # **A patched cpal, for one host that upstream does not have.**
@@ -27,6 +27,14 @@ resolver = "2"
 # of everybody's audio.
 [patch.crates-io]
 cpal = { path = "tangent-record/vendor/cpal" }
+# **One ASIO driver guard for the whole process.** asio-sys 0.2.6 keeps its
+# "which driver is loaded" guard inside each `Asio` value, while the SDK it
+# wraps keeps the driver itself in process globals — so a second instance on
+# a second thread tears down the first one's driver, and the first one, mid
+# `ASIOInit`, reads a null back and dies. The crash the Windows tester hit on
+# 2026-09-05, symbolised; the guard is a `static` now. One block of
+# difference, in `src/bindings/mod.rs`; see `tangent-record/vendor/README.md`.
+asio-sys = { path = "tangent-record/vendor/asio-sys" }
 # **The save panel opened at HOME however real the directory it was given.**
 #
 # rfd 0.15.4's macOS `set_path` appends the suggested FILE NAME to the
