@@ -101,11 +101,46 @@ reason about from a vendored dialog crate. The main queue has no such
 question: it is drained while a modal panel is up regardless of mode, and it
 is what the original measurement used.
 
+## The third change: the panel says when it moves, and is put back
+
+The second change did not hold either, and the owner reported it for the
+fourth time. The app's log for that morning has it handing over the right
+folder — `panel: Save the project as opens at ~/Documents/Tangent Media/Projects
+- the directory exists` — and the app's own preference domain has the panel
+closing at `/Users/<user>`.
+
+Measured again on 2026-09-05, with a standalone program opening exactly this
+panel as a sheet and reading `directoryURL` back:
+
+* `~/Documents`, `~/Desktop`, `~/Music` and `/private/tmp/probedir` all HELD;
+  `~/Documents/Tangent Media/Projects` MOVED to home. A folder UNDER
+  `~/Documents` is refused.
+* It moved with `NSOSPLastRootDirectory` pointing at home, pointing at the
+  wanted folder, and deleted — all three. So the remembered location, which
+  the second change's note blamed, is not what does it.
+* `panel:didChangeToDirectoryURL:` fires for the move, once, with the home
+  directory, before any hand has touched the panel.
+* `setDirectoryURL:` said again AFTER that call holds — read back three
+  seconds later, still there.
+* The main queue is blocked during the panel's own setup: every block queued
+  for 10 through 320 ms ran together at 325 ms. In the probe that fell after
+  the move, which is why the timed shots "held" there; in the app they fired
+  before it and changed nothing.
+
+So `Panel::_steer` is an `NSOpenSavePanelDelegate` (`Steer` in
+`panel_ffi.rs`): on a change to a directory other than the one the panel was
+built with, within three seconds of building it and at most twice, it says the
+directory again from a main-queue block 30 ms on. The timed shots stay as a
+fallback and are now GUARDED — they re-assert only when the panel is not
+already where it was told — so neither mechanism can take a folder away from a
+hand that chose one.
+
 ## Dropping this copy
 
 Delete `tangent/vendor/rfd`, remove the `rfd` line from the root
 `[patch.crates-io]`, and confirm on macOS that a Save As opens in the Projects
 folder rather than at home. The INFO line above is still emitted and still says
-which directory was asked for. Note that dropping this copy brings BOTH faults
-back, and the second one is invisible to that log line — the app will still
-report handing over the right directory while the panel opens somewhere else.
+which directory was asked for. Note that dropping this copy brings ALL THREE faults
+back, and the second and third are invisible to that log line — the app will
+still report handing over the right directory while the panel opens somewhere
+else.

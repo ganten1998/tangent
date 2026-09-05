@@ -759,6 +759,22 @@ pub enum SavePurpose {
     /// copied here: a stems folder is the app's own and an export folder is
     /// the user's.
     ExportMidi,
+    /// **The FIRST save of a session nobody has saved yet.** Appended at the
+    /// END, this enum's law.
+    ///
+    /// Not a copy: the session has no home, and the answer is where it will
+    /// live. The app moves the scratch there whole — document, `media/`,
+    /// the kit's sidecar, the plugin-state shelf — so nothing called
+    /// Untitled is left behind to be reclaimed or to litter; see
+    /// `TangentApp::save_project_first`. The owner's rule: a new project's
+    /// Save AND Save As open the system panel until the project has been
+    /// saved once, and only then does Save write in place.
+    ///
+    /// The host opens the panel among the projects, as it does for
+    /// [`Self::ProjectCopy`] — see `DesktopApp::save_start` — and covers
+    /// the move the way it covers the copy, since a rename refused across
+    /// volumes falls back to copying every take.
+    ProjectFirst,
 }
 
 /// A project action the HOST must run whole — it owns the plugin states

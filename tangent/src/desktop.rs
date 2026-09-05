@@ -2780,6 +2780,18 @@ impl DesktopApp {
         // — and, first time through, the shelf's launch scan.
         if !self.ir.scanned {
             self.ir.scanned = true;
+            // **The shipped packs first**, so the first scan a fresh install
+            // ever makes already finds something on the shelf, and the first
+            // Load Kit panel opens on a drawer with kits in it. Once, ever,
+            // per file — see `shipped`.
+            let irs = crate::shipped::seed(&self.app.irs_root(), crate::shipped::IRS);
+            let kits = crate::shipped::seed(
+                &self.app.preset_root().join(DRUM_PRESET_FOLDER),
+                crate::shipped::KITS,
+            );
+            if irs + kits > 0 {
+                log::info!("shipped: {irs} impulse response(s) and {kits} kit(s) put on the shelves");
+            }
             self.push_ir_rows();
         }
         self.ir_tick();
@@ -5574,12 +5586,20 @@ impl DesktopApp {
         // and this crate must not walk the folder itself to invent a total it
         // cannot then advance. See `busy::Progress::Indeterminate`: a block
         // cannot report and must not pretend to.
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty());
         if request.purpose == tangent_ui::ports::SavePurpose::ProjectCopy {
-            let name = file
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .filter(|n| !n.is_empty());
             self.announce(ctx, "Duplicating project", name, Chore::SaveCopy(file));
+            return;
+        }
+        // **The first save is covered for the same reason.** It is a rename
+        // when the OS allows one — instant — and a copy of every take when
+        // it does not (another volume), and the plugin states are asked for
+        // either way; see `Chore::SaveFirst`.
+        if request.purpose == tangent_ui::ports::SavePurpose::ProjectFirst {
+            self.announce(ctx, "Saving project", name, Chore::SaveFirst(file));
             return;
         }
         self.app.finish_save_choice(request.purpose, &file);
@@ -6028,6 +6048,9 @@ impl DesktopApp {
         match purpose {
             // Duplicate Project As: beside the other projects.
             P::ProjectCopy => self.app.project_root(),
+            // The first save of an unsaved session: the same shelf, since
+            // that is where it would have materialised as Untitled.
+            P::ProjectFirst => self.app.project_root(),
             P::Template => self.app.project_root().join(PROJECT_TEMPLATE_FOLDER),
             // The drum kits' own drawer under `Presets`, made lazily so an
             // install that never saved a kit carries an empty `Presets`.
@@ -12845,7 +12868,7 @@ fn ir_envelope_db(l: &[f32], r: &[f32]) -> Vec<f32> {
 /// comes off each WAV's header alone — a shelf of fifty files costs fifty
 /// header reads and no decoding — and junk is skipped without a word, the
 /// preset folder's own rule.
-fn scan_ir_rows(root: &std::path::Path) -> Vec<tangent_ui::ports::IrRow> {
+pub(crate) fn scan_ir_rows(root: &std::path::Path) -> Vec<tangent_ui::ports::IrRow> {
     let mut rows: Vec<tangent_ui::ports::IrRow> = Vec::new();
     let wavs = |dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>| {
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -14605,6 +14628,11 @@ enum Chore {
     /// Duplicate Project As: the whole session folder, `media/` included,
     /// copied to the answered path and then opened. See `take_save_panel`.
     SaveCopy(std::path::PathBuf),
+    /// **The first save of a session nobody has saved**: the scratch moves
+    /// to the answered path whole and the plugin states are shelved there,
+    /// then the receipt every save raises. See `SavePurpose::ProjectFirst`
+    /// and `TangentApp::save_project_first`.
+    SaveFirst(std::path::PathBuf),
     /// The realtime pass landed: copy it out, run the format pass, say where.
     FinishBounce {
         folder: String,
@@ -14893,9 +14921,36 @@ impl DesktopApp {
             }
             Chore::WriteExport => self.write_export(),
             Chore::RescanPlugins => self.rescan_plugins(),
-            Chore::SaveCopy(path) => self
-                .app
-                .finish_save_choice(tangent_ui::ports::SavePurpose::ProjectCopy, &path),
+            Chore::SaveCopy(path) => {
+                self.app
+                    .finish_save_choice(tangent_ui::ports::SavePurpose::ProjectCopy, &path);
+                // **And the plugins' knobs go with the copy.** The app copies
+                // the document and `media/`; the state shelf is the host's,
+                // and a copy without one opened with every plugin at its
+                // defaults — `copy_states_from_project` mirrors an EMPTY
+                // shelf, deliberately, so a missing shelf is a cleared desk.
+                // Shelved the way a Save shelves them, into the project that
+                // is now open, which is the copy.
+                self.save_plugin_states();
+                self.copy_states_to_project();
+            }
+            Chore::SaveFirst(path) => {
+                self.app
+                    .finish_save_choice(tangent_ui::ports::SavePurpose::ProjectFirst, &path);
+                // The same three things a Save does, in the same order, now
+                // that the session has a folder to shelve into. `named` is
+                // the app's word that the move happened — a refused save
+                // (the template shelf) leaves it false and says nothing here,
+                // having said why already.
+                if self.app.arrangement().named {
+                    self.save_plugin_states();
+                    self.copy_states_to_project();
+                    self.app.notify(
+                        tangent_ui::notify::Kind::Success,
+                        format!("Project saved - {}", self.app.project_name()),
+                    );
+                }
+            }
             Chore::FinishBounce {
                 folder,
                 problem,
@@ -17079,7 +17134,13 @@ mod tests {
              of `SavePurpose` will inherit somebody else's folder instead of \
              failing to compile until it is given one"
         );
-        for arm in ["P::ProjectCopy", "P::Template", "P::KitPreset", "P::ExportMidi"] {
+        for arm in [
+            "P::ProjectCopy",
+            "P::Template",
+            "P::KitPreset",
+            "P::ExportMidi",
+            "P::ProjectFirst",
+        ] {
             assert!(
                 body.contains(arm),
                 "`save_start` no longer answers for `{arm}` - either the \
