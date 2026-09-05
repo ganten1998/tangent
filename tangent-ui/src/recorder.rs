@@ -2977,6 +2977,23 @@ pub struct NumEdit {
     /// Where the next character lands — chars, not bytes; the field only
     /// ever holds ASCII digits and punctuation.
     pub caret: usize,
+    /// **The seed is still standing, so the next character REPLACES it.**
+    ///
+    /// Two of the owner's rules met here and disagreed. `new`'s: a field
+    /// opens empty "because typing over a selected value is what every DAW
+    /// does and what the fingers expect: the first digit replaces, it does
+    /// not append." `prefilled`'s: "the field opens looking exactly like the
+    /// readout, and the arrows walk the digits." Every field opened by
+    /// clicking uses `prefilled`, so the first rule was quietly lost — the
+    /// signature field opened on "4/4", somebody typed 6/8, and the box held
+    /// "4/46/8", which `TimeSignature::parse` refuses. Nothing happened, and
+    /// the report was "I cannot change to a signature other than 4/4".
+    ///
+    /// Both rules hold with a flag: the box opens looking like the readout,
+    /// and the first thing TYPED clears it. Backspace and the arrows put it
+    /// down instead, because reaching for those says you meant to edit what
+    /// is there rather than replace it.
+    pub seeded: bool,
 }
 
 impl NumEdit {
@@ -2991,6 +3008,7 @@ impl NumEdit {
             field,
             text: String::new(),
             caret: 0,
+            seeded: false,
         }
     }
 
@@ -2999,14 +3017,16 @@ impl NumEdit {
     /// readout, and the arrows walk the digits.
     pub fn prefilled(field: NumField, seed: String) -> Self {
         let caret = seed.len();
-        Self { field, text: seed, caret }
+        Self { field, text: seed, caret, seeded: true }
     }
 
     pub fn left(&mut self) {
+        self.seeded = false;
         self.caret = self.caret.saturating_sub(1);
     }
 
     pub fn right(&mut self) {
+        self.seeded = false;
         self.caret = (self.caret + 1).min(self.text.len());
     }
 
@@ -3021,31 +3041,33 @@ impl NumEdit {
     /// Silently drops anything that cannot be part of a number so that a
     /// stray letter — the app's own single-key shortcuts, typed at a field
     /// that has focus — cannot end up in the box.
-    pub fn push(&mut self, ch: char) {
-        const MAX: usize = 8;
+    /// Whether `ch` may join `text` in this field, and how long the field
+    /// may get.
+    ///
+    /// Split out of `push` so the answer can be asked BEFORE the seed is
+    /// cleared. Deciding acceptance against the text that is about to be
+    /// thrown away is what makes a refused keystroke — one of the app's own
+    /// single-key shortcuts, typed at a field that has focus — empty the box
+    /// on its way to being dropped. A guard caught exactly that.
+    fn accepts(field: NumField, text: &str, caret: usize, ch: char) -> Option<usize> {
         /// A marker's name is a WORD, so it gets room a number never needs.
         /// Long enough for "Chorus (reprise)"; short enough that a flag
         /// cannot grow wider than the ruler it sits on.
         const NAME_MAX: usize = 24;
+        const MAX: usize = 8;
         // **A NAME takes letters**, and it is the only field here that does.
         //
-        // Every other branch of this function exists to keep a letter OUT —
-        // the app's single-key shortcuts are live while a field has focus,
-        // so a stray `d` must not land in a number. `MarkerName` arrived
-        // after all of that and fell through to the numeric filter, which
-        // dropped every letter it was given: the owner could not type a
-        // marker name AT ALL. Anything printable goes in; a control
-        // character does not.
-        if matches!(self.field, NumField::MarkerName(_)) {
-            if !ch.is_control() && self.text.chars().count() < NAME_MAX {
-                let at = self.caret.min(self.text.len());
-                self.text.insert(at, ch);
-                self.caret = at + ch.len_utf8();
-            }
-            return;
+        // Every other branch exists to keep a letter OUT — the app's
+        // single-key shortcuts are live while a field has focus, so a stray
+        // `d` must not land in a number. `MarkerName` arrived after all of
+        // that and fell through to the numeric filter, which dropped every
+        // letter it was given: the owner could not type a marker name AT
+        // ALL. Anything printable goes in; a control character does not.
+        if matches!(field, NumField::MarkerName(_)) {
+            return (!ch.is_control() && text.chars().count() < NAME_MAX).then_some(NAME_MAX);
         }
         // A signature is two numbers and a slash, and nothing else: no minus,
-        // no decimal point. Handled first so those two cannot creep in.
+        // no decimal point.
         //
         // **`MeterAt` as well as `Meter`, which is the bug that shipped.**
         // This read `== NumField::Meter`, so the band's song-wide box took a
@@ -3053,41 +3075,60 @@ impl NumEdit {
         // system opens — did not. Every character of "3/4" but the slash
         // went in, `TimeSignature::parse` refused what was left, and the
         // owner's report was that time signatures were "dead too".
-        if matches!(self.field, NumField::Meter | NumField::MeterAt(_)) {
-            let ok = ch.is_ascii_digit() || (ch == '/' && !self.text.contains('/'));
-            if ok && self.text.len() < MAX {
-                let at = self.caret.min(self.text.len());
-                self.text.insert(at, ch);
-                self.caret = at + 1;
-            }
-            return;
+        if matches!(field, NumField::Meter | NumField::MeterAt(_)) {
+            let ok = ch.is_ascii_digit() || (ch == '/' && !text.contains('/'));
+            return (ok && text.len() < MAX).then_some(MAX);
         }
         let ok = ch.is_ascii_digit()
             // One dot, and a minus only in front. Neither check is about
             // rejecting bad input for its own sake: `.parse()` will do that
             // anyway. They stop the field from showing something it will then
             // silently refuse to accept.
-            || (ch == '.' && !self.text.contains('.'))
-            || (ch == '-' && self.text.is_empty() && self.caret == 0)
+            || (ch == '.' && !text.contains('.'))
+            || (ch == '-' && text.is_empty() && caret == 0)
             // The filters read in hertz and "20k" is how anybody writes
             // twenty thousand of them. Only there: a percent field showing a
             // k it will refuse is the trap the filter exists to stop.
             || (matches!(ch, 'k' | 'K')
                 && matches!(
-                    self.field,
-                    NumField::Fx(
-                        crate::recorder_panel::Fx::Hpf | crate::recorder_panel::Fx::Lpf
-                    )
+                    field,
+                    NumField::Fx(crate::recorder_panel::Fx::Hpf | crate::recorder_panel::Fx::Lpf)
                 )
-                && !self.text.to_ascii_lowercase().contains('k'));
-        if ok && self.text.len() < MAX {
-            let at = self.caret.min(self.text.len());
-            self.text.insert(at, ch);
-            self.caret = at + 1;
+                && !text.to_ascii_lowercase().contains('k'));
+        (ok && text.len() < MAX).then_some(MAX)
+    }
+
+    /// Accept a typed character, or ignore it.
+    ///
+    /// Silently drops anything that cannot be part of this field's value, so
+    /// that a stray letter — the app's own single-key shortcuts, typed at a
+    /// field that has focus — cannot end up in the box.
+    pub fn push(&mut self, ch: char) {
+        // **The first character typed replaces the seed.** See `seeded`.
+        // Asked against an EMPTY text when the seed is standing, because
+        // that is what the field is about to hold — and asked BEFORE
+        // anything is cleared, so a refused character leaves the reading
+        // exactly as it found it.
+        let (text, caret): (&str, usize) = if self.seeded {
+            ("", 0)
+        } else {
+            (self.text.as_str(), self.caret)
+        };
+        if Self::accepts(self.field, text, caret, ch).is_none() {
+            return;
         }
+        if self.seeded {
+            self.seeded = false;
+            self.text.clear();
+            self.caret = 0;
+        }
+        let at = self.caret.min(self.text.len());
+        self.text.insert(at, ch);
+        self.caret = at + ch.len_utf8();
     }
 
     pub fn pop(&mut self) {
+        self.seeded = false;
         let at = self.caret.min(self.text.len());
         if at > 0 {
             self.text.remove(at - 1);
@@ -3444,6 +3485,72 @@ pub fn disk_text(minutes: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A field opens on its reading, and the first thing typed replaces
+    /// it.**
+    ///
+    /// The owner: "fix the fact that I cannot change to a signature other
+    /// than 4/4 -- try 6/8 on a new time sig." Nothing was wrong with 6/8.
+    /// The chip's field opens PREFILLED with the current signature and the
+    /// caret at its end, so typing 6/8 left "4/46/8" in the box,
+    /// `TimeSignature::parse` refused it, and the commit did nothing at all
+    /// — which is indistinguishable from a signature the app will not
+    /// accept. Every field opened by clicking had it; the signature is
+    /// where it bites hardest, because a bar number can survive a wrong
+    /// digit and a signature cannot parse at all.
+    ///
+    /// Both of the owner's rules hold now: the box opens looking like the
+    /// readout and the arrows walk its digits, AND the first character
+    /// typed clears it, "because typing over a selected value is what every
+    /// DAW does and what the fingers expect".
+    ///
+    /// Revert-checks, all four performed: drop the `seeded` clear from
+    /// `push` and the first block goes red on "4/46/8"; set `seeded` false
+    /// in `prefilled` and the arrow block goes red because the seed is
+    /// wiped by an edit that meant to keep it; drop the clear from `pop`
+    /// and backspace wipes the whole reading; drop it from `left`/`right`
+    /// and walking to a digit then typing throws the rest away.
+    #[test]
+    fn a_field_opens_on_its_reading_and_the_first_keystroke_replaces_it() {
+        let typed = |mut e: NumEdit, s: &str| {
+            for ch in s.chars() {
+                e.push(ch);
+            }
+            e.text
+        };
+        // **The report, exactly.** Open on 4/4, type 6/8, get 6/8.
+        let open = || NumEdit::prefilled(NumField::MeterAt(4), "4/4".to_owned());
+        assert_eq!(typed(open(), "6/8"), "6/8", "typing over the reading appended to it");
+        assert_eq!(typed(open(), "12/8"), "12/8");
+        assert_eq!(typed(open(), "3/4"), "3/4");
+        assert!(
+            TimeSignature::parse(&typed(open(), "6/8")).is_some_and(|s| s.is_valid()),
+            "what the field holds after typing 6/8 does not parse"
+        );
+
+        // An EMPTY field still just appends — nothing to replace.
+        assert_eq!(typed(NumEdit::new(NumField::MeterAt(4)), "6/8"), "6/8");
+
+        // **Backspace EDITS the reading rather than wiping it**, because
+        // reaching for backspace says you meant to keep what is there.
+        let mut e = open();
+        e.pop();
+        assert_eq!(e.text, "4/", "backspace threw the whole reading away");
+        e.push('8');
+        assert_eq!(e.text, "4/8", "a character after backspace replaced the edit");
+
+        // And so do the arrows.
+        let mut e = open();
+        e.left();
+        e.push('8');
+        assert_eq!(e.text, "4/84", "walking the digits then typing wiped them");
+
+        // The seed survives a character the field REFUSES, so a stray
+        // shortcut key cannot empty a box on its way to being dropped.
+        let mut e = open();
+        e.push('x');
+        assert_eq!(e.text, "4/4", "a refused character cleared the reading");
+    }
 
     /// **A name takes letters, and a per-bar signature takes a slash.**
     ///

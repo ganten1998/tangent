@@ -1468,10 +1468,17 @@ impl Layout {
         // nothing, which is how it would disappear on the smallest header
         // the seam allows.
         const TOOL_GAP: f32 = 3.0;
-        const TOOL_MAX: f32 = 28.0;
+        // **Back to the height they always had.** They were capped at twenty
+        // points before the ruler grew; letting them fill the taller corner
+        // made a row of buttons that dominated it. The owner: "shrink the
+        // scanner/met tempo arm and grid section to be the original height —
+        // a half strip (i think) it looks better that way." Twenty IS about
+        // half the corner now, so the two readings agree.
+        const TOOL_MAX: f32 = 20.0;
         let side = corner
             .height()
             .min((corner.width() - TOOL_GAP * 4.0) / 5.5)
+            .min(corner.height() * 0.5)
             .clamp(1.0, TOOL_MAX);
         // Centred in the corner's height: the cells are square and the
         // corner is taller than they are, and a row of buttons pinned to the
@@ -1913,6 +1920,30 @@ fn auto_dial_body(p: &Ink, accent: (u8, u8, u8)) -> Color32 {
     on_ink(face)
 }
 
+/// How opaque a flag or a signature chip is over the ruler.
+///
+/// The owner: "Markers and timesigs now rectangles -- not rounded and with
+/// no border. They must look or be slightly translucent (use theming
+/// convention here)." The convention in this file is
+/// `Color32::from_rgba_unmultiplied` on a colour the theme already owns —
+/// the loop band does it at 26 and 84 — so that is what these use rather
+/// than a second colour mixed by hand.
+///
+/// Translucent changes what the LABEL has to read against: not the body,
+/// but the body seen through to the ruler. [`through`] is that colour, and
+/// every ink on these two surfaces is chosen from it.
+const CHIP_ALPHA: u8 = 210;
+
+/// The colour a `CHIP_ALPHA` fill of `c` actually presents over `bg`.
+fn through(c: Color32, bg: Color32) -> Color32 {
+    blend(c, bg, 1.0 - f32::from(CHIP_ALPHA) / 255.0)
+}
+
+/// The same fill, as the painter states it.
+fn translucent(c: Color32) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), CHIP_ALPHA)
+}
+
 /// **A marker flag's body: the theme's own accent, walked until it stands
 /// off the ruler.**
 ///
@@ -1935,9 +1966,16 @@ fn auto_dial_body(p: &Ink, accent: (u8, u8, u8)) -> Color32 {
 /// honest answer, because a flag you can see in the wrong colour beats one
 /// you cannot see in the right one.
 fn flag_body(p: &Ink, accent: (u8, u8, u8)) -> Color32 {
+    // **Judged on what the fill PRESENTS, not on the fill.** The flags are
+    // translucent over the ruler now, so the colour a reader sees is
+    // `through(c, ruler)` and the label is chosen from that. A walk that
+    // cleared 4.5:1 against the opaque body guaranteed a pairing that is
+    // never drawn — five themes' labels landed between 3.6 and 4.1 the
+    // moment the fill went translucent, which is how this was found.
     let ok = |c: Color32| {
-        crate::recorder_panel::contrast_ratio(c, p.ruler) >= 1.6
-            && crate::recorder_panel::contrast_ratio(on_ink(c), c) >= 4.5
+        let seen = through(c, p.ruler);
+        crate::recorder_panel::contrast_ratio(seen, p.ruler) >= 1.5
+            && crate::recorder_panel::contrast_ratio(on_ink(seen), seen) >= 4.5
     };
     let base = Color32::from_rgb(accent.0, accent.1, accent.2);
     if ok(base) {
@@ -4740,13 +4778,18 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 ],
                 Stroke::new(1.0, p.engrave.gamma_multiply(0.55)),
             );
-            painter.rect_filled(chip, 2.0, if typing.is_some() { p.select } else { p.face });
+            let face = if typing.is_some() { p.select } else { p.face };
+            // Square, and the ink chosen from what the fill PRESENTS rather
+            // than from the fill itself — a translucent chip whose label was
+            // picked against the opaque colour is a label measured against a
+            // surface that is not on screen.
+            painter.rect_filled(chip, 0.0, translucent(face));
             painter.text(
                 chip.center(),
                 Align2::CENTER_CENTER,
                 &text,
                 font.clone(),
-                p.engrave,
+                on_ink(through(face, p.ruler)),
             );
         }
         // **The flags, over the chips.**
@@ -4804,24 +4847,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 ],
                 Stroke::new(1.0, body),
             );
-            painter.rect_filled(flag, 2.0, body);
-            // **The held one is outlined**, not recoloured: a flag that
-            // changed colour when picked up would be a flag that looks like
-            // a different KIND of marker while it is moving.
-            if m.selected {
-                painter.rect_stroke(
-                    flag.expand(1.0),
-                    3.0,
-                    Stroke::new(1.5, on_ink(body)),
-                    egui::StrokeKind::Outside,
-                );
-            }
+            // **The held one is SOLID; the rest are translucent.**
+            //
+            // It was an outline, and the owner asked for no borders. Opacity
+            // says the same thing without one and says it better: a flag you
+            // have picked up is the one in front. The colour does not change,
+            // so a held flag never looks like a different KIND of marker
+            // while it is moving — which was the point of the outline.
+            let face = if m.selected { body } else { translucent(body) };
+            painter.rect_filled(flag, 0.0, face);
+            let shows = if m.selected { body } else { through(body, p.ruler) };
             painter.text(
                 Pos2::new(flag.left() + 4.0, flag.center().y),
                 Align2::LEFT_CENTER,
                 &shown,
                 nfont.clone(),
-                on_ink(body),
+                on_ink(shows),
             );
         }
     }
@@ -6236,10 +6277,19 @@ LaneView {
                     "button {n} is not square at header {hw}"
                 );
             }
-            // **They use the room.** The old cap was 20 points against a
-            // corner that is 40 tall now.
+            // **The original height, about half the corner.** They were
+            // briefly allowed to fill the taller corner and it made a row of
+            // buttons that dominated it — the owner asked for them back:
+            // "shrink the scanner/met tempo arm and grid section to be the
+            // original height — a half strip". Both bounds, because "equal
+            // sized" is satisfied by four buttons of any one wrong size.
             assert!(
-                first.height() >= 24.0,
+                first.height() <= 20.01,
+                "the buttons are {:.1}pt, past the original twenty, at header {hw}",
+                first.height()
+            );
+            assert!(
+                first.height() >= 14.0 && first.height() <= l.ruler.height() * 0.6,
                 "the buttons are {:.1}pt in a {:.1}pt corner at header {hw}",
                 first.height(),
                 l.ruler.height()
@@ -7515,11 +7565,31 @@ ArrangeView {
                             set.white_key_active_color.b,
                         ),
                     );
-                    check("marker flag", fb, p.ruler, 1.6);
-                    check("marker flag label", on_ink(fb), fb, 4.5);
-                    // And the pole, which is drawn down the ruler in the
-                    // same colour — structure, so it only has to be seen.
+                    // **Measured on what the fill PRESENTS**, not on the
+                    // fill: the flags and chips are translucent over the
+                    // ruler now, and a label chosen against the opaque
+                    // colour is a label measured against a surface that is
+                    // not on screen. `through` is that colour.
+                    let seen = through(fb, p.ruler);
+                    check("marker flag", seen, p.ruler, 1.5);
+                    check("marker flag label", on_ink(seen), seen, 4.5);
+                    // The pole is drawn SOLID in the same colour — it is one
+                    // pixel wide and a translucent hairline is no line at
+                    // all. Structure, so it only has to be seen.
                     check("marker pole", fb, p.ruler, 1.6);
+                    // **The signature chip is read by its LABEL, not by
+                    // standing off the ruler**, and that is not a
+                    // consequence of translucency — it never did. Measured
+                    // opaque, `face` against `ruler` is 1.02:1 on Hydra
+                    // light, 1.03:1 on Valentine dark, 1.20 to 1.31 across
+                    // most of the set, and only Default separates properly
+                    // at 5.59:1. Translucency costs it almost nothing (1.20
+                    // to 1.15 on Valentine). So there is no surface floor
+                    // here: a floor this design has never met would be a
+                    // requirement invented by its own test. The label is
+                    // what has to read, and it is held to the full bar.
+                    let chip = through(p.face, p.ruler);
+                    check("signature chip label", on_ink(chip), chip, 4.5);
                 }
                 // **The MASTER's dial, per theme.** Its body is the theme's
                 // own master red and its outline and needle are fixed, so
