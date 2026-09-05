@@ -84,13 +84,17 @@
 
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
-use objc2::{sel, ClassType};
+use objc2::runtime::{AnyClass, AnyObject, Bool, NSObject, NSObjectProtocol, ProtocolObject, Sel};
+use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSEvent, NSFloatingWindowLevel, NSNormalWindowLevel, NSView, NSWindow,
+    NSApplication, NSEvent, NSFloatingWindowLevel, NSModalResponse, NSModalResponseOK,
+    NSNormalWindowLevel, NSOpenPanel, NSOpenSavePanelDelegate, NSTextField, NSView, NSWindow,
     NSWindowLevel, NSWindowOrderingMode,
 };
-use objc2_foundation::{MainThreadMarker, NSSize};
+use objc2_foundation::{
+    MainThreadMarker, NSDictionary, NSError, NSLocalizedDescriptionKey, NSPoint, NSRect, NSSize,
+    NSString, NSURL,
+};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// What the host can see, for [`tangent_ui::host::Gesture`] and the aspect lock.
@@ -1253,9 +1257,9 @@ pub fn keep_content_size(frame: &eframe::Frame, w: f64, h: f64) -> bool {
     // The window's TOP edge stays put, which is what a title bar appearing or
     // disappearing looks like to a person: the picture does not jump.
     let top = now.origin.y + now.size.height;
-    let wanted_content = objc2_foundation::NSRect::new(
-        objc2_foundation::NSPoint::new(content.origin.x, content.origin.y),
-        objc2_foundation::NSSize::new(w, h),
+    let wanted_content = NSRect::new(
+        NSPoint::new(content.origin.x, content.origin.y),
+        NSSize::new(w, h),
     );
     let mut want = window.frameRectForContentRect(wanted_content);
     want.origin.y = top - want.size.height;
@@ -1263,4 +1267,334 @@ pub fn keep_content_size(frame: &eframe::Frame, w: f64, h: f64) -> bool {
     // finite rect derived from the window's own geometry.
     unsafe { window.setFrame_display(want, true) };
     true
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The save panel
+// ───────────────────────────────────────────────────────────────────────────
+
+/// **What is about to be written under the typed name**, so the panel can
+/// refuse a name that is already taken. The standard save panel's "Replace?"
+/// was this question; the answer here is never yes, because nothing this
+/// app saves through a panel is something it should write over blind — a
+/// project folder holds takes, a kit holds samples.
+#[derive(Debug, Clone, Copy)]
+pub enum Taken {
+    /// A FOLDER named for the typed name — a project. `strip` is the list
+    /// of extensions a hand may have typed out of habit and the caller will
+    /// remove (`.tangent`), so `Bossa.tangent` and `Bossa` collide alike.
+    Folder {
+        noun: &'static str,
+        strip: &'static [&'static str],
+    },
+    /// A file `<name>.<ext>`, the extension appended by the caller when the
+    /// hand did not type it.
+    File { ext: &'static str, noun: &'static str },
+    /// Nothing to refuse: the caller honours the name alone and overwrites
+    /// on purpose (a template).
+    Never,
+}
+
+impl Taken {
+    /// Why `dir/<name>` cannot be written, said to the user; `None` when it
+    /// can. `name` is already [`clean`].
+    fn problem(self, dir: &std::path::Path, name: &str) -> Option<String> {
+        match self {
+            Taken::Never => None,
+            Taken::Folder { noun, strip } => {
+                let stem = strip
+                    .iter()
+                    .find_map(|ext| {
+                        name.strip_suffix(&format!(".{ext}")).filter(|s| !s.is_empty())
+                    })
+                    .unwrap_or(name);
+                dir.join(stem).exists().then(|| {
+                    format!(
+                        "A {noun} called \u{201c}{stem}\u{201d} is already here. \
+                         Choose another name, or another folder."
+                    )
+                })
+            }
+            Taken::File { ext, noun } => {
+                let file = if std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+                {
+                    name.to_owned()
+                } else {
+                    format!("{name}.{ext}")
+                };
+                dir.join(&file).exists().then(|| {
+                    format!(
+                        "A {noun} called \u{201c}{file}\u{201d} is already here. \
+                         Choose another name, or another folder."
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// A typed name as a file name: no control characters, no path separators,
+/// no leading or trailing space — the same cleaning `rename_project` gives
+/// the Project window's field, so a name is one thing everywhere.
+fn clean(typed: &str) -> String {
+    typed
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != ':')
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// What a save panel is asked for. See [`save_panel`].
+pub struct SaveAsk<'a> {
+    /// The line above the browser: "Save the project", "Save Kit".
+    pub title: &'a str,
+    /// What the name field opens with.
+    pub suggested: &'a str,
+    /// The folder the panel opens on. `panel_start` makes it exist.
+    pub start: &'a std::path::Path,
+    /// What the caller will write under the name, for the refusal.
+    pub taken: Taken,
+}
+
+struct CheckIvars {
+    field: objc2::rc::Retained<NSTextField>,
+    taken: Taken,
+}
+
+define_class!(
+    // SAFETY:
+    // - NSObject has no subclassing requirements.
+    // - The class does not implement `Drop`.
+    #[unsafe(super(NSObject))]
+    // Main-thread-only because `NSOpenSavePanelDelegate` requires it, and
+    // the panel only ever calls it from the thread it runs on.
+    #[thread_kind = MainThreadOnly]
+    // No fixed `#[name]`, for the reason tangent-record's camera delegate
+    // gives: this crate can be loaded twice into one process.
+    #[ivars = CheckIvars]
+    struct SaveCheck;
+
+    unsafe impl NSObjectProtocol for SaveCheck {}
+
+    unsafe impl NSOpenSavePanelDelegate for SaveCheck {
+        // The raw shape of an `error:` method — `BOOL` back, `NSError **`
+        // out — because `define_class!` in this objc2 has no `error:_`
+        // sugar for a protocol method the way `extern_methods!` does.
+        #[unsafe(method(panel:validateURL:error:))]
+        fn validate(
+            &self,
+            _sender: &AnyObject,
+            url: &NSURL,
+            error: *mut *mut NSError,
+        ) -> Bool {
+            match self.refusal(url) {
+                None => Bool::YES,
+                Some(text) => {
+                    if !error.is_null() {
+                        // Autoreleased, as the convention wants: the caller
+                        // owns nothing it did not retain.
+                        let err = refusal(&text);
+                        // SAFETY: `error` is the out-pointer AppKit hands a
+                        // validate method, checked non-null above.
+                        unsafe { *error = objc2::rc::Retained::autorelease_return(err) };
+                    }
+                    Bool::NO
+                }
+            }
+        }
+    }
+);
+
+impl SaveCheck {
+    fn new(mtm: MainThreadMarker, ivars: CheckIvars) -> objc2::rc::Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ivars);
+        // SAFETY: `init` on a freshly allocated NSObject subclass whose ivars
+        // have been set, which is exactly the initialiser contract.
+        unsafe { msg_send![super(this), init] }
+    }
+
+    /// Why the Save button must not go through, or `None`.
+    fn refusal(&self, folder: &NSURL) -> Option<String> {
+        let iv = self.ivars();
+        let name = clean(&iv.field.stringValue().to_string());
+        if name.is_empty() {
+            return Some("Type a name to save under.".to_owned());
+        }
+        let dir = std::path::PathBuf::from(folder.path()?.to_string());
+        iv.taken.problem(&dir, &name)
+    }
+}
+
+/// An `NSError` the panel shows as a sheet and stays open behind.
+fn refusal(text: &str) -> objc2::rc::Retained<NSError> {
+    let message = NSString::from_str(text);
+    let value: &AnyObject = &message;
+    // SAFETY: a `static` from AppKit, read only.
+    let key: &NSString = unsafe { NSLocalizedDescriptionKey };
+    let info = NSDictionary::<NSString, AnyObject>::from_slices(&[key], &[value]);
+    // SAFETY: the dictionary is keyed by the string constants the method
+    // documents, and the domain is this app's own.
+    unsafe {
+        NSError::errorWithDomain_code_userInfo(
+            &NSString::from_str("org.codeberg.ganten1998.tangent"),
+            1,
+            Some(&info),
+        )
+    }
+}
+
+/// **Where to save, asked with an OPEN panel.** `Some(folder/name)` when the
+/// hand pressed Save; `None` on Cancel.
+///
+/// **Why not `NSSavePanel`.** On the owner's machine the save panel refuses
+/// any folder under `~/Documents` — the app's whole media root — and opens
+/// at home instead, silently. Measured on 2026-09-05 with the programs in
+/// `tools/panelprobe`, photographing the panel rather than trusting its
+/// `directoryURL`, which reads back whatever was last set while the panel
+/// shows something else:
+///
+/// * `~/Documents`, `~/Desktop`, `~/Music`, a folder under Desktop, under
+///   Downloads, under Music: all shown as asked;
+/// * a folder under `~/Documents`, new or old, with the folder at 700 or
+///   755, given as a path, a `..` path, a firmlink path, a file-reference
+///   URL or a symlink from elsewhere: home, every time, with the delegate
+///   reporting the move at 280 ms;
+/// * saying the directory again — 30 ms on, 1 s on, 2 s on — changes the
+///   property and not the panel;
+/// * and `NSOpenPanel` in choose-a-folder mode, on the very same folder,
+///   opens IN it, listing the projects.
+///
+/// Neither TCC (the app holds the Documents grant, requirement matching)
+/// nor iCloud (Desktop & Documents is not relocating the folder) explains
+/// it, and nothing in the unified log names it. The open panels this app
+/// already raises — Open Project, Load Kit — have never misbehaved, which is
+/// the owner's own report. So the save panel is one of those: a folder
+/// chooser with a "Save As" field in its accessory view, "Save" on the
+/// button, and a delegate that refuses an empty name or one that is taken
+/// (the standard panel's "Replace?", answered no — see [`Taken`]). The
+/// answer is `<chosen folder>/<typed name>`, the shape the callers already
+/// expect from `rfd`'s save panel, extension handling included.
+///
+/// Run as a sheet on the main window and then `runModal`, exactly the pair
+/// `rfd` uses for the pickers that work.
+pub fn save_panel(frame: &eframe::Frame, ask: &SaveAsk<'_>) -> Option<std::path::PathBuf> {
+    let mtm = MainThreadMarker::new()?;
+    let parent = resolve(frame);
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setCanChooseDirectories(true);
+    panel.setCanChooseFiles(false);
+    panel.setCanCreateDirectories(true);
+    panel.setAllowsMultipleSelection(false);
+    panel.setPrompt(Some(&NSString::from_str("Save")));
+    panel.setMessage(Some(&NSString::from_str(ask.title)));
+    if let Some(start) = ask.start.to_str() {
+        let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(start), true);
+        panel.setDirectoryURL(Some(&url));
+    }
+    // The name field, in the accessory view, disclosed from the start: an
+    // open panel has no name field of its own.
+    let accessory = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(480.0, 40.0)),
+    );
+    let label = NSTextField::labelWithString(&NSString::from_str("Save As:"), mtm);
+    label.setFrameOrigin(NSPoint::new(10.0, 10.0));
+    label.setFrameSize(NSSize::new(70.0, 22.0));
+    let field = NSTextField::initWithFrame(
+        NSTextField::alloc(mtm),
+        NSRect::new(NSPoint::new(85.0, 8.0), NSSize::new(380.0, 24.0)),
+    );
+    field.setStringValue(&NSString::from_str(ask.suggested));
+    field.setEditable(true);
+    field.setBezeled(true);
+    accessory.addSubview(&label);
+    accessory.addSubview(&field);
+    panel.setAccessoryView(Some(&accessory));
+    panel.setAccessoryViewDisclosed(true);
+    let check = SaveCheck::new(
+        mtm,
+        CheckIvars {
+            field: field.clone(),
+            taken: ask.taken,
+        },
+    );
+    // SAFETY: a delegate of the protocol the panel asks for, kept alive
+    // (`check`) for as long as the panel runs, and taken off again below.
+    unsafe { panel.setDelegate(Some(ProtocolObject::from_ref(&*check))) };
+    let response: NSModalResponse = match parent {
+        Some(window) => {
+            let done = block2::StackBlock::new(|_: NSModalResponse| {});
+            panel.beginSheetModalForWindow_completionHandler(&window, &done);
+            // The name selected for typing over, as the save panel does.
+            let _ = panel.makeFirstResponder(Some(&field));
+            panel.runModal()
+        }
+        None => panel.runModal(),
+    };
+    // SAFETY: as above; the panel outlives nothing here, but a weak
+    // delegate is still tidier taken off than left dangling.
+    unsafe { panel.setDelegate(None) };
+    if response != NSModalResponseOK {
+        return None;
+    }
+    let folder = std::path::PathBuf::from(panel.URL()?.path()?.to_string());
+    let name = clean(&field.stringValue().to_string());
+    if name.is_empty() {
+        return None;
+    }
+    Some(folder.join(name))
+}
+
+#[cfg(test)]
+mod save_panel_tests {
+    use super::{clean, Taken};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-save-panel-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch");
+        root
+    }
+
+    /// **A name that is taken is refused with the reason, and one that is
+    /// free goes through** — for a project folder, with or without the
+    /// extension a hand types out of habit, and for a file with its
+    /// extension appended or already there.
+    #[test]
+    fn a_taken_name_is_refused_and_a_free_one_is_not() {
+        let root = scratch("taken");
+        std::fs::create_dir_all(root.join("Bossa")).expect("a project");
+        std::fs::write(root.join("Room.kit"), b"kit").expect("a kit");
+        let project = Taken::Folder {
+            noun: "project",
+            strip: &["tangent", "tan"],
+        };
+        assert!(project.problem(&root, "Bossa").is_some_and(|m| m.contains("Bossa")));
+        assert!(project.problem(&root, "Bossa.tangent").is_some(), "the typed extension hid the folder");
+        assert!(project.problem(&root, "Nocturne").is_none());
+        let kit = Taken::File {
+            ext: "kit",
+            noun: "kit",
+        };
+        assert!(kit.problem(&root, "Room").is_some_and(|m| m.contains("Room.kit")));
+        assert!(kit.problem(&root, "Room.kit").is_some());
+        assert!(kit.problem(&root, "room.KIT").is_some(), "the extension is not case-blind");
+        assert!(kit.problem(&root, "Hall").is_none());
+        assert!(Taken::Never.problem(&root, "Bossa").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_typed_name_is_cleaned_the_way_the_project_window_cleans_one() {
+        assert_eq!(clean("  My Song  "), "My Song");
+        assert_eq!(clean("a/b:c\u{7}"), "abc");
+        assert_eq!(clean("   "), "");
+    }
 }

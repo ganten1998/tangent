@@ -5556,12 +5556,31 @@ impl DesktopApp {
             PanelDir::Ours,
             Some(self.save_start(request.purpose)),
         );
-        let mut dialog = rfd::FileDialog::new()
-            .set_title(&request.title)
-            .set_file_name(&request.suggested)
-            .set_directory(start);
-        dialog = dialog.set_parent(frame);
-        let file = dialog.save_file();
+        // **On macOS this is an OPEN panel.** `NSSavePanel` refuses any
+        // folder under ~/Documents on the owner's machine and opens at home
+        // — silently, whatever it is told and however often — while the open
+        // panel honours the same folder. `macwin::save_panel` carries the
+        // measurements; `save_taken` says what the panel must refuse in the
+        // standard panel's place.
+        #[cfg(target_os = "macos")]
+        let file = crate::macwin::save_panel(
+            frame,
+            &crate::macwin::SaveAsk {
+                title: &request.title,
+                suggested: &request.suggested,
+                start: &start,
+                taken: Self::save_taken(request.purpose),
+            },
+        );
+        #[cfg(not(target_os = "macos"))]
+        let file = {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title(&request.title)
+                .set_file_name(&request.suggested)
+                .set_directory(start);
+            dialog = dialog.set_parent(frame);
+            dialog.save_file()
+        };
         self.app.native_panel_closed();
         self.restore_fullscreen(ctx);
         let Some(file) = file else { return };
@@ -6057,6 +6076,42 @@ impl DesktopApp {
             P::KitPreset => self.app.preset_root().join(DRUM_PRESET_FOLDER),
             // Where every other thing this app renders out of a session goes.
             P::ExportMidi => self.app.export_root(),
+        }
+    }
+
+    /// **What the save panel must refuse under a typed name**, one arm per
+    /// purpose and NO wildcard, for the reason [`Self::save_start`] gives:
+    /// a purpose added to the end of `SavePurpose` must say what it writes
+    /// before it can be saved through a panel at all.
+    ///
+    /// The standard save panel asked "Replace?" for a taken name; the open
+    /// panel that stands in for it on macOS refuses instead — see
+    /// `macwin::Taken` for why the answer is never yes.
+    #[cfg(all(feature = "recorder", target_os = "macos"))]
+    fn save_taken(purpose: tangent_ui::ports::SavePurpose) -> crate::macwin::Taken {
+        use crate::macwin::Taken;
+        use tangent_ui::ports::SavePurpose as P;
+        match purpose {
+            // A project is a FOLDER named for the name, with or without the
+            // extension a hand may have typed; `save_project_as` strips it.
+            P::ProjectCopy | P::ProjectFirst => Taken::Folder {
+                noun: "project",
+                strip: tangent_ui::ports::PROJECT_EXTENSIONS,
+            },
+            // Only the name is honoured and a template called `default`
+            // replaces the shipped one on purpose — the row says so.
+            P::Template => Taken::Never,
+            // `KitPreset::save` appends the extension.
+            P::KitPreset => Taken::File {
+                ext: "kit",
+                noun: "kit",
+            },
+            // `write_midi_export` appends `.mid` to a bare name; siblings of
+            // a multi-track export are never clobbered by its own rule.
+            P::ExportMidi => Taken::File {
+                ext: "mid",
+                noun: "MIDI file",
+            },
         }
     }
 
@@ -17157,6 +17212,33 @@ mod tests {
             panel.contains("self.save_start(request.purpose)"),
             "the save panel picks its own start directory again instead of \
              asking `save_start`, so the match above no longer decides anything"
+        );
+    }
+
+    /// The macOS save panel's refusal rule is chosen the same way its start
+    /// folder is — one arm per purpose, no wildcard — so a new purpose fails
+    /// to compile until somebody says what it writes.
+    #[test]
+    fn the_save_panels_refusal_is_chosen_by_a_match_with_no_wildcard() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        let body = {
+            let a = src.find("fn save_taken(").expect("`save_taken` is gone");
+            let b = src[a..].find("\n    fn ").expect("the end of `save_taken`");
+            &src[a..a + b]
+        };
+        assert!(!body.contains("_ =>"), "`save_taken` has a wildcard arm");
+        for arm in ["P::ProjectCopy", "P::ProjectFirst", "P::Template", "P::KitPreset", "P::ExportMidi"] {
+            assert!(body.contains(arm), "`save_taken` no longer answers for `{arm}`");
+        }
+        let panel = {
+            let a = src.find("fn take_save_panel(").expect("the save panel is gone");
+            let b = src[a..].find("\n    /// ").expect("the end of `take_save_panel`");
+            &src[a..a + b]
+        };
+        assert!(
+            panel.contains("crate::macwin::save_panel(") && panel.contains("Self::save_taken(request.purpose)"),
+            "the macOS save panel no longer goes through `macwin::save_panel` with `save_taken`'s rule"
         );
     }
 

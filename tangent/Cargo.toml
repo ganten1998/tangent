@@ -285,11 +285,34 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     # nothing but compile time: it pulls only objc2-foundation sub-features
     # already in the tree.
     "NSGraphics",
+    # **The save panel is an OPEN panel on macOS.** `NSSavePanel` refuses any
+    # folder under ~/Documents on the owner's machine and opens at home; the
+    # open panel honours the same folder. So `macwin::save_panel` builds one
+    # in choose-a-folder mode with a name field in its accessory view, and
+    # a delegate that refuses an empty or taken name. Measured with
+    # `tools/panelprobe`; the story is in `tangent/vendor/README.md`.
+    "NSOpenPanel",
+    "NSSavePanel",
+    "NSPanel",
+    "NSAccessibilityProtocols",
+    "NSTextField",
+    "NSControl",
+    "block2",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSGeometry",
+    # For the save panel above: the folder as an `NSURL`, the name as an
+    # `NSString`, and the refusal as an `NSError` with a description.
+    "NSString",
+    "NSURL",
+    "NSError",
+    "NSDictionary",
 ] }
+# The completion block `beginSheetModalForWindow:` takes. Already in the lock
+# at 0.6.2 through rfd; named here because a transitive dependency is not a
+# nameable one. See `macwin::save_panel`.
+block2 = "0.6"
 # eframe does NOT re-export this, and the trait has to be nameable to be used.
 # Already in the lock at 0.6.2, the same copy eframe itself resolves.
 raw-window-handle = "0.6"

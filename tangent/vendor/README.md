@@ -144,6 +144,24 @@ telling its delegate; with the delegate's line and the panel still at home,
 the re-assert is what stopped holding. Either way the next hunt starts with
 evidence rather than a theory.
 
+## The fourth change is not in this copy: Tangent stopped using the save panel
+
+The third change did not hold in the app either. The delegate fired, the
+repair was said, the log recorded both, and the panel stayed at home. Two
+more probes (`tools/panelprobe/panelapp.m`, `openprobe.m`) then photographed
+the panel instead of reading `directoryURL` back, and the property turned
+out to read whatever was last set while the panel showed home — every "HELD"
+from a re-assert above was that. Photographed: `NSSavePanel` refuses a folder
+under `~/Documents` in every form it can be given, and `NSOpenPanel` on the
+same folder opens in it, listing the projects.
+
+So on macOS Tangent's save panels are open panels in choose-a-folder mode
+with a name field in the accessory view — `macwin::save_panel` in the app,
+not this crate — and `rfd`'s save panel is only used on Linux and Windows,
+where nothing of this has ever been reported. `Steer` and `hold_directory`
+stay in this copy, harmless and idle, for the day a save panel is opened
+through it again; their log lines say what they saw.
+
 ## Dropping this copy
 
 Delete `tangent/vendor/rfd`, remove the `rfd` line from the root
