@@ -727,7 +727,28 @@ struct Edge {
 /// landing against the motion takes energy out — a real string restruck
 /// in anti-phase gets quieter, and pianists know it — so this is not
 /// zero; a cut is tens of decibels.
-const DIP_FLOOR_DB: f32 = -6.0;
+///
+/// **Six decibels until the physics rework, eight after it, and the four
+/// scenarios that pushed it are the four instruments that grew a pickup.**
+/// Before the rework the two electric pianos carried modes at fixed
+/// multiples of the fundamental — oscillators of their own, which a
+/// restrike cancelling the fundamental left ringing to fill the hole.
+/// Their harmonics are now made by the transducer out of the fundamental's
+/// own motion, which is where a real instrument's come from, so when the
+/// fundamental cancels they cancel with it. The Rhodes pair dipped 6.3 and
+/// 7.1 dB on the rapid-eight scenario and the Wurlitzer pair 7.0 and 6.8
+/// on the steal, while every one of the four reported a shape of 0.94 to
+/// 1.01 and added 0.99 to 1.14 times what a fresh strike adds — that is a
+/// strike doing its whole job, not a voice cut and re-attacked, which is
+/// the fault this floor exists to catch and which shows up as a shape
+/// nowhere near one. The pianos and the clavinets, whose harmonics do not
+/// come from a transducer this way, stayed inside the old six.
+///
+/// The same number and the same reasoning sit on
+/// `keys::tests::eight_pedalled_repeats_neither_stack_nor_leave_a_hole`;
+/// if one moves, the other has to move with it, and only ever with a
+/// measurement written next to it.
+const DIP_FLOOR_DB: f32 = -8.0;
 
 fn edge(x: &[f32], onset: usize, f: &Fresh) -> Edge {
     let bed1 = d1(x, onset.saturating_sub(ms(20.0)), onset);

@@ -276,7 +276,7 @@ const EP_PARAMS: [ParamSpec; MAX_PARAMS] = [
     },
     ParamSpec {
         name: "Bark",
-        about: "how hard the tine leans on the pickup",
+        about: "the tine-height screw: how near the tip rests to the magnet",
         default: 0.5,
     },
     ParamSpec {
@@ -322,7 +322,7 @@ const EP_SUITCASE_PARAMS: [ParamSpec; MAX_PARAMS] = [
     },
     ParamSpec {
         name: "Bark",
-        about: "how hard the tine leans on the pickup",
+        about: "the tine-height screw: how near the tip rests to the magnet",
         default: 0.5,
     },
     ParamSpec {
@@ -370,7 +370,7 @@ const CLAV_PARAMS: [ParamSpec; MAX_PARAMS] = [
     },
     ParamSpec {
         name: "Snap",
-        about: "the spit of the string when the key lifts",
+        about: "how much of the muted length rejoins the string at release",
         default: 0.5,
     },
     ParamSpec {
@@ -415,7 +415,7 @@ const CLAV_WAH_PARAMS: [ParamSpec; MAX_PARAMS] = [
     },
     ParamSpec {
         name: "Snap",
-        about: "the spit of the string when the key lifts",
+        about: "how much of the muted length rejoins the string at release",
         default: 0.5,
     },
     ParamSpec {
@@ -453,7 +453,7 @@ const WURLI_PARAMS: [ParamSpec; MAX_PARAMS] = [
     },
     ParamSpec {
         name: "Growl",
-        about: "how hard the reed leans into the plate",
+        about: "the reed's regulation: where it rests in the plate's field",
         default: 0.5,
     },
     ParamSpec {
@@ -498,7 +498,7 @@ const WURLI140_PARAMS: [ParamSpec; MAX_PARAMS] = [
     },
     ParamSpec {
         name: "Growl",
-        about: "how hard the reed leans into the plate",
+        about: "the reed's regulation: where it rests in the plate's field",
         default: 0.62,
     },
     ParamSpec {
@@ -580,8 +580,15 @@ pub struct EpKnobs {
     pub decay: f32,
     /// Scale on the bell mode's weight against the fundamental.
     pub bell: f32,
-    /// Scale on how far the tine swings, which is the pickup's nonlinearity
-    /// and therefore the bark.
+    /// The tine-height screw: where the tip rests in the magnet's field,
+    /// on the knob's 0.43..2.3 around a centre of 1 that is the base's own
+    /// regulation (half a gap on the Mk.1, 0.45 on the suitcase). Nearer
+    /// the pole is dirtier, because the flux curve is steeper there and a
+    /// steeper curve makes more harmonics out of the same swing; it is the
+    /// adjustment a technician makes with a screwdriver, and it is clamped
+    /// away from the axis itself, where the transfer goes even and the note
+    /// would play an octave up. Read at the strike, and a note already
+    /// ringing glides to the new regulation rather than stepping to it.
     pub bark: f32,
     /// Shifts the bell partial up or down the series, in partials.
     pub chime: f32,
@@ -635,7 +642,14 @@ pub struct ClavKnobs {
     pub pickup: f32,
     /// The rockers, 0 soft to 1 brilliant.
     pub tone: f32,
-    /// Scale on the release spit.
+    /// How much of the non-speaking length rejoins the string when the
+    /// tangent lifts, on the knob's 0..2 around a centre of 1 that is the
+    /// paper's measured three semitones for the whole keyboard. The
+    /// release is not a click any more: the two halves of the string
+    /// become one longer string, the pitch drops, and the yarn takes the
+    /// whole thing over a few milliseconds later. Zero releases at pitch,
+    /// which is a damper and not a clavinet; two drops the better part of
+    /// an octave.
     pub snap: f32,
     /// Multiplier on the yarn's choke time.
     pub release: f32,
@@ -824,23 +838,29 @@ impl Mechanism {
                 &PianoKnobs::from_params(params),
                 &string::PianoBase::CONCERT,
             ),
-            Patch::EpMk1 => {
-                self.ep
-                    .strike_knobs(pitch, velocity, &EpKnobs::from_params(params));
-            }
-            Patch::EpSuitcase => self.ep.strike_knobs(
+            Patch::EpMk1 => self.ep.strike_based(
+                pitch,
+                velocity,
+                &EpKnobs::from_params(params),
+                &tine::TineBase::MK1,
+            ),
+            Patch::EpSuitcase => self.ep.strike_based(
                 pitch,
                 velocity,
                 &EpKnobs::from_params_suitcase(params),
+                &tine::TineBase::SUITCASE,
             ),
-            Patch::Clav => {
-                self.clav
-                    .strike_knobs(pitch, velocity, &ClavKnobs::from_params(params));
-            }
-            Patch::ClavWah => self.clav.strike_knobs(
+            Patch::Clav => self.clav.strike_based(
+                pitch,
+                velocity,
+                &ClavKnobs::from_params(params),
+                &clav::ClavBase::DRY,
+            ),
+            Patch::ClavWah => self.clav.strike_based(
                 pitch,
                 velocity,
                 &ClavKnobs::from_params_wah(params),
+                &clav::ClavBase::WAH,
             ),
             Patch::Wurli200 => self.wurli.strike_knobs(
                 pitch,
@@ -1472,7 +1492,22 @@ impl Keys {
                     let lvl = (left.abs() + right.abs()) * 0.5;
                     let coeff = if lvl > self.wah_env { wah_atk } else { wah_rel };
                     self.wah_env += (lvl - self.wah_env) * coeff;
-                    let drive = (self.wah_env * 5.5).clamp(0.0, 1.0);
+                    // **The sensitivity was 5.5 and is 35 since the physics
+                    // rework, and the pedal did not get more sensitive — the
+                    // instrument in front of it changed shape.** This
+                    // follower is a mean-of-absolute detector, and the
+                    // clavinet's pickup now tilts its spectrum six decibels
+                    // an octave, which raises the crest factor: the same
+                    // peak arrives with less area under it, so the old
+                    // constant read a mezzo strike as a soft one and left
+                    // the filter shut on the first chop of a run. Refitted
+                    // so a fresh mezzo strike opens the wah about as far as
+                    // it opened on the instrument this was voiced against
+                    // (its peak 0.29 against the old 0.38, where leaving
+                    // the constant alone gave 0.13), with the sweep across
+                    // a run kept — a first chop still arrives under an
+                    // eighth one, by four decibels rather than one.
+                    let drive = (self.wah_env * 35.0).clamp(0.0, 1.0);
                     let oct = 1.0 + 2.6 * wah_sens;
                     let fc = (240.0 * 2.0_f32.powf(oct * drive))
                         .clamp(180.0, 4_800.0);
@@ -2120,6 +2155,30 @@ mod tests {
             // floor is not zero. A voice cut to silence and re-attacked is
             // tens of decibels down, and one capped into cancellation — the
             // fault this test was written for — was ten.
+            //
+            // **The floor moved from six decibels to eight in the physics
+            // rework, and the reason is the rework itself.** Before it, the
+            // two electric pianos carried modes at fixed multiples of the
+            // fundamental, oscillators of their own; a restrike that
+            // cancelled the fundamental left those ringing on, and they
+            // filled the hole. Now the harmonics are made by the pickup out
+            // of the fundamental's own motion, which is where a real
+            // instrument's harmonics come from — so when the fundamental
+            // cancels they cancel with it, and nothing is left to mask it.
+            // Measured here, deepest dip of the seven restrikes per patch:
+            //
+            //   Rhodes suitcase  -6.5    Wurlitzer 140  -5.5
+            //   Rhodes Mk.1      -6.4    Wurlitzer 200  -5.1
+            //   both pianos, both clavs: nothing past -3.4
+            //
+            // It is exactly the four instruments that got a transducer, and
+            // the two that did not are untouched — which is why this reads
+            // as the transducer's signature and not as one mechanism's bug.
+            // Eight decibels keeps a decibel and a half of margin under the
+            // measurement and stays two clear of the fault. The number is
+            // empirical, as the six was; it is written down here with what
+            // it was measured against so the next person does not have to
+            // guess which it is.
             for &o in &onsets[1..] {
                 let before = rms(&x, o.saturating_sub(ms(4.0)), o);
                 if before <= 1.0e-3 {
@@ -2132,7 +2191,7 @@ mod tests {
                     a += ms(1.0);
                 }
                 assert!(
-                    worst >= before * 0.5,
+                    worst >= before * 0.40,
                     "{patch:?} lost {:.1} dB of the note it was struck on",
                     20.0 * (worst / before).log10()
                 );
@@ -2163,18 +2222,21 @@ mod tests {
         }
         // One patch per mechanism: piano, tine, tangent, reed.
         //
-        // Piano 1 and Wurli 200 were re-pinned in the physics rework's wave
-        // B, which is what §5.3 of its brief asks for: the piano's hammer
-        // became a mass in contact with the string, its soundboard grew a
-        // modal plate, the sympathetic harp now answers this very render
-        // (it is pedalled from the first block), and the reed's plate
-        // became a capacitive transducer. The tine and the tangent are
-        // untouched so far and their hashes are the ones they have always
-        // had — which is the point of holding four.
+        // All four were re-pinned in the physics rework's wave B, which is
+        // what §5.3 of its brief asks for: the piano's hammer became a mass
+        // in contact with the string, its soundboard grew a modal plate,
+        // the sympathetic harp now answers this very render (it is pedalled
+        // from the first block), the reed's plate and the tine's magnet and
+        // the tangent's coil all became real transducers, and the tine's
+        // overtones and the tangent's inharmonicity came off a beam and a
+        // measured table instead of two schedules that ran the wrong way.
+        // Four hashes rather than one because a change meant for a single
+        // mechanism must not move the other three, and through this whole
+        // wave each moved only when its own lane landed.
         for (patch, want) in [
             (Patch::Piano1, 9_716_706_827_468_578_744),
-            (Patch::EpMk1, 12_512_648_127_811_904_030),
-            (Patch::Clav, 12_849_073_543_764_444_369),
+            (Patch::EpMk1, 2_473_640_801_493_132_588),
+            (Patch::Clav, 2_978_964_749_555_077_687),
             (Patch::Wurli200, 5_464_813_605_215_517_892),
         ] {
             let x = script(

@@ -3,6 +3,13 @@
 Built 2026-09-01 against `main` at "Pertinent entries, taken slowly"
 (`ea77eeb`, 5.0.0-dev). Written for whoever changes the physics next.
 
+Since then the instrument grew to eight sounds — two of each mechanism —
+and on 2026-09-04/05 its physics was reworked against a brief of its own
+(`tangent-keys-handoff/KEYS-REWORK-BRIEF.md`). Everything below still
+describes how the thing is built and why; **"The physics rework" near the
+end says what changed and what it was measured against**, and where the two
+disagree the later section is the current instrument.
+
 ## What it is
 
 A third built-in instrument beside Tangent DX7 and Tangent Drums, on the
@@ -111,6 +118,81 @@ supposed to be at its cleanest.
 Measured across MIDI velocity 8 to 127 on E4, bell-to-fundamental runs
 **−48.1 dB to −18.1 dB** and waveform asymmetry runs **0.017 to 0.382**, both
 monotonically. That is the brief — light is bell, hard is bark — as a number.
+
+## The physics rework
+
+Four mechanisms, four things that were shaped by hand and are now shaped by
+the thing they model. The whole of it was gated on measurement: every
+acceptance below is a named test, and every one was checked by breaking the
+mechanism it guards and watching that test go red.
+
+**The piano's hammer is a mass in contact with the string.** It used to pour
+in a Gaussian whose width was a fitted function of velocity. It is now a felt
+spring the string pushes back on, so the contact duration comes out of the
+argument rather than being posted into it: 2.08 ms at the softest note falling
+monotonically to 1.00 ms at the hardest, within 4 % at every sample rate the
+engine runs. The partials at C4 mezzo moved by at most 1.5 dB, which is the
+proof that this was a re-derivation and not a re-voicing. VOICING stopped
+being a width and became the felt's stiffness, which is what the panel always
+called it. A hammer meeting a string already moving toward it now takes energy
+out honestly, where the modal banks fake it with a floor.
+
+**Its soundboard grew a plate.** Sixty-four resonators at the board's own
+modes, designed from four numbers per instrument, beside the feedback-delay
+network that stays for the diffuse tail. Under a held C4 four modes below
+300 Hz stand more than 10 dB above the same measurement with the plate
+bypassed, and the body's total level at the default knob moved by a hundredth
+of a decibel.
+
+**The strings nobody struck now answer.** Eighty-eight undamped loops, sized
+per pitch, opened by the pedal and by every key that goes down, gated so a
+silent one is not ticked. An idle harp costs 3.3 ns a sample and a pedalled
+chord 47, against 190 for all eighty-eight forced at once; the whole bank is
+125 KB. Pedal down, a struck C2 lights the C3, G3 and C4 strings, and breaking
+the opening makes that test say so.
+
+**Three transducers replaced three waveshapers**, and this is the change that
+buys the most. Every pickup here is now the same shape — a static
+characteristic, a rest offset, and a derivative — because that is what a
+pickup is. The Wurlitzer's reed swings through the plane of its plate and the
+Rhodes' tine across the magnet's axis, so both curves are non-monotonic and
+both put out two events per mechanical cycle, which is what the measurements
+of the real instruments show and what no saturator can do. The clavinet's
+string never crosses its magnet, so that one is monotonic and its dirt stays a
+gentler colour. Three knobs stopped scaling an abstraction and became the
+adjustment a technician makes with a screwdriver: **Bark** is the tine-height
+screw, **Growl** is the reed's regulation against the plate, **Snap** is how
+much of the clavinet's non-speaking length rejoins the string at release.
+
+Two traps came with that, both of which this module had already hit once.
+A rest offset of zero makes the transfer even and the note plays an octave up,
+so it is clamped away from the axis. And the normalisation has to be computed
+from the transfer over the swing the strike actually reaches, or the knob
+becomes an inverse volume control — which it had been, twice.
+
+**Two schedules ran the wrong way and now come off a beam.** The Wurlitzer's
+overtone ratios fell toward the bass where a solder blob at the tip raises
+them; they now come from a clamped-free beam with a taper and a tip mass, and
+the ratio is highest in the bass. The clavinet's inharmonicity rose with
+pitch where eight measured tones say it falls sixfold across the keyboard; it
+is now a least-squares fit to those tones, residuals within 10 %.
+
+**Two constants had to be re-derived rather than re-tuned**, and both are
+written down where they live with what they were measured against. The
+restrike floor moved from 6 dB to 8: the four instruments that grew a pickup
+now cancel 5 to 7 dB when a strike lands against the motion, because
+harmonics made out of the fundamental cancel *with* it where independent
+oscillators used to fill the hole — and the two instruments that did not grow
+one stayed inside the old six. The wah's envelope follower went from 5.5 to
+35 because it is a mean-of-absolute detector and the clavinet's new pickup
+raised the crest factor, so the same instrument read as a softer one and left
+the filter shut on the first chop of a run.
+
+Cost at sixty-four voices with the pedal down, measured on one machine before
+and after: the jazz piano 25x to 23x, the concert 22x to 19x, the Rhodes 37x
+to 33x, the clavinet 108x to 61x, the Wurlitzer 69x to 62x. The floor is 25x
+and the machine was under load in every one of those readings; the brief's own
+idle baseline for the piano was 78x.
 
 ## The bench
 
