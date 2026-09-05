@@ -63,10 +63,27 @@ fn idle_colors(s: &Settings) -> (Color32, Color32) {
     // for a pure inversion to ivory on black and that is what it gives. But a
     // theme that names its own dark keyboard means it, and a theme is allowed
     // to disagree with the transform — that is what naming a colour is for.
-    (
-        s.dark_role("white_key").map_or(black, |c| c.to_color32()),
-        s.dark_role("black_key").map_or(white, |c| c.to_color32()),
-    )
+    let naturals = s.dark_role("white_key").map_or(black, |c| c.to_color32());
+    let sharps = s.dark_role("black_key").map_or(white, |c| c.to_color32());
+    // **And then the same lift the light mode gets, because a theme is
+    // allowed to disagree with the transform and is not allowed to hand back
+    // a keyboard with no keys in it.**
+    //
+    // This used to stop at the line above, on the argument that dark mode has
+    // an escape a theme can actually reach — `dark.white_key` and
+    // `dark.black_key`, which the two dark-designed themes both name on
+    // purpose to sit at their own quieter level. The argument was wrong in
+    // one specific way: naming a colour says where a theme wants its keys,
+    // not that the pair it named can still be told apart. Nocturne and
+    // Phosphor named two near-blacks, and measured they were 1.81:1 and
+    // 2.09:1 apart on grounds they cleared by 2.65:1 and 2.75:1 — against
+    // every other theme in either mode at 9.34:1 or better. That is the
+    // owner's "dark mode only mask over the piano", reported for the third
+    // time, and it is the same fault the light mode already fixes by the
+    // same means. A theme that is already clear is returned untouched, which
+    // is every other theme in the set, so this is inert on thirty-two of the
+    // thirty-four theme-and-mode pairs.
+    (naturals, keys_apart(naturals, sharps))
 }
 
 /// **How far apart the two idle key colours have to be** for a keyboard to
@@ -559,14 +576,26 @@ mod tests {
     /// written to catch exactly this shape, in the one mode where it was not
     /// happening. It walks both now.
     ///
-    /// The floor is the codebase's 2:1-ish "this large object is visible on
-    /// its ground" reading rather than the 3:1 large-object bar, because on a
-    /// 0x05–0x0d ground a key light enough for 3:1 crosses into the dead zone
-    /// where its own note name stops clearing 4.5:1 (the sweep above). At
-    /// least one idle key must clear the ground, and the two key colours must
-    /// differ enough to tell one key from the next. It is a FLOOR and not a
-    /// target: seventeen themes clear it five times over in both modes, and
-    /// the two that sit near it in dark mode do so by their own design.
+    /// **The floor was 2:1 and 1.25:1, and those numbers were what let the
+    /// fault come back a third time.** They were chosen when the dark-mode
+    /// lift did not exist, on the reading that a theme naming its own dark
+    /// keyboard had spoken and that a key light enough for 3:1 on a
+    /// 0x05–0x0d ground would cross into the dead zone where its own note
+    /// name stops clearing 4.5:1 (the sweep above). The first half was
+    /// wrong — naming a colour says where a theme wants its keys, not that
+    /// the pair it named can be told apart — and it left Nocturne and
+    /// Phosphor sitting at 2.65:1 and 2.75:1 on their grounds with 1.81:1
+    /// and 2.09:1 between the keys, passing a test written for exactly this
+    /// shape while the owner photographed the mask a third time. The second
+    /// half is answered by the note-name sweep, which runs on the lifted
+    /// colours and would say so.
+    ///
+    /// So the floor is now where the themes actually are. Every one of the
+    /// seventeen, in both modes, clears 9.34:1 on its ground and 9.34:1
+    /// between its keys — Sandstone is the narrowest and Iris the widest at
+    /// 15.29:1 — and the bar sits at half of that. It is still a FLOOR and
+    /// not a target: nothing in the set is near it, and anything that
+    /// arrives near it is a keyboard somebody cannot see.
     #[test]
     fn every_theme_keeps_a_legible_keyboard_in_both_modes() {
         use crate::recorder_panel::contrast_ratio;
@@ -583,7 +612,7 @@ mod tests {
             let shows =
                 contrast_ratio(naturals, ground).max(contrast_ratio(sharps, ground));
             let distinct = contrast_ratio(naturals, sharps);
-            if shows < 2.0 || distinct < 1.25 {
+            if shows < 4.5 || distinct < 3.0 {
                 bad.push(format!(
                     "{} {}: keyboard {shows:.2}:1 on its ground, keys {distinct:.2}:1 apart",
                     theme.name,
