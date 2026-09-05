@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use super::{
     CameraError, CameraInfo, CameraStats, FormatWish, FrameSlot, PermissionStatus, VideoSource,
+    WindowRegion,
 };
 use crate::audio::Timebase;
 
@@ -40,6 +41,21 @@ pub(super) fn cameras() -> Result<Vec<CameraInfo>, CameraError> {
 pub(super) fn open(
     _uid: &str,
     _wish: &FormatWish,
+    _timebase: Timebase,
+    _slot: Arc<FrameSlot>,
+    _stats: Arc<CameraStats>,
+) -> Result<Box<dyn VideoSource>, CameraError> {
+    Err(CameraError::Unsupported)
+}
+
+/// The window capture, which this platform does not have yet.
+///
+/// [`CameraError::Unsupported`] and not a panic, for the reason `open` gives:
+/// the UI prints it as a sentence and the take goes on with the composited
+/// video it always had.
+pub(super) fn open_window(
+    _region: WindowRegion,
+    _fps: f64,
     _timebase: Timebase,
     _slot: Arc<FrameSlot>,
     _stats: Arc<CameraStats>,

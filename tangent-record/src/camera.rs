@@ -1230,6 +1230,12 @@ trait VideoSource {
     /// the one that was asked for.
     fn format(&self) -> Format;
 
+    /// Move the capture region — the window capture's only control, a no-op
+    /// on a camera, which has no region to move. Called from the UI thread
+    /// once a frame while a take is rolling, so the picture follows the
+    /// window when the window is dragged.
+    fn set_region(&self, _region: WindowRegion) {}
+
     /// Polled, not pushed. macOS answers it from `AVCaptureSession.isRunning`
     /// and `AVCaptureDevice.isConnected` rather than by subscribing to
     /// `AVCaptureSessionRuntimeErrorNotification`, because a poll the UI already
@@ -1241,6 +1247,75 @@ trait VideoSource {
 // ───────────────────────────────────────────────────────────────────────────
 // Public entry points
 // ───────────────────────────────────────────────────────────────────────────
+
+/// **Where the window is on its display**, in POINTS with the origin at the
+/// top-left of the main display — the space egui reports a viewport in — plus
+/// the display's backing scale, which is what turns those points into the
+/// pixels the capture delivers.
+///
+/// Points rather than pixels because that is what the UI has: winit hands the
+/// window's outer rectangle to egui in points, and every conversion this crate
+/// does from them is done once, in the backend, against the display it is
+/// actually capturing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowRegion {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub scale: f32,
+}
+
+impl WindowRegion {
+    /// The region's size in pixels, rounded to an even number each way,
+    /// because H.264 wants even dimensions and an encoder handed 1439 rows
+    /// refuses in a way that reads as a broken take.
+    pub fn pixels(&self) -> (u32, u32) {
+        let even = |v: f32| ((v.max(2.0) as u32) / 2) * 2;
+        (even(self.w * self.scale), even(self.h * self.scale))
+    }
+}
+
+/// **The window itself, captured as if it were a camera.**
+///
+/// The owner's call: "the camera is the window is now literal, and anything
+/// process related or the cursor is presented in the capture, whether that's
+/// me turning a knob with cursor, or my tweaking plugins with their windows
+/// open or me using the midi editor." The offscreen compositor could never
+/// show any of that — it repaints the bands from their state, and a plug-in's
+/// window, the cursor and a drag in progress are not state it has. A screen
+/// capture of the window's own rectangle is the only thing that shows what
+/// the person saw, and on macOS `AVCaptureScreenInput` delivers exactly that
+/// down the same pipe a camera does: a running session, BGRA frames, one
+/// delegate. So it IS a camera here, as far as everything above this seam is
+/// concerned, and the take's video is whatever was on screen.
+///
+/// `fps` is the take's frame rate and becomes the input's minimum frame
+/// duration. Only the main display is captured: a window dragged onto a
+/// second monitor records black until it comes back, which is stated here
+/// rather than discovered.
+pub fn open_window_capture(
+    region: WindowRegion,
+    fps: f64,
+    timebase: Timebase,
+) -> Result<CameraStream, CameraError> {
+    let stats = Arc::new(CameraStats::new());
+    let slot = Arc::new(FrameSlot::new(Arc::clone(&stats)));
+    let source = backend::open_window(
+        region,
+        fps,
+        timebase,
+        Arc::clone(&slot),
+        Arc::clone(&stats),
+    )?;
+    Ok(CameraStream {
+        source,
+        slot,
+        stats,
+        latency_ns: AtomicI64::new(0),
+        latency_measured: AtomicU8::new(0),
+    })
+}
 
 /// This process's camera permission.
 ///
@@ -1365,6 +1440,12 @@ impl CameraStream {
     }
 
     /// A `Send` handle onto the same slot, for a thread that is not this one.
+    /// See [`VideoSource::set_region`]: the window capture follows the
+    /// window; a camera ignores it.
+    pub fn set_region(&self, region: WindowRegion) {
+        self.source.set_region(region);
+    }
+
     pub fn reader(&self) -> FrameReader {
         FrameReader {
             slot: Arc::clone(&self.slot),

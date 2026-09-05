@@ -50,10 +50,12 @@ use objc2::{define_class, msg_send, AnyThread, DefinedClass};
 use objc2_av_foundation::{
     AVAuthorizationStatus, AVCaptureConnection, AVCaptureDevice, AVCaptureDeviceDiscoverySession,
     AVCaptureDeviceFormat, AVCaptureDeviceInput, AVCaptureDevicePosition, AVCaptureDeviceType,
-    AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureOutput, AVCaptureSession,
-    AVCaptureVideoDataOutput, AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaType,
-    AVMediaTypeVideo,
+    AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureOutput, AVCaptureScreenInput,
+    AVCaptureSession, AVCaptureVideoDataOutput, AVCaptureVideoDataOutputSampleBufferDelegate,
+    AVMediaType, AVMediaTypeVideo,
 };
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_graphics::{CGDisplayBounds, CGMainDisplayID};
 // Deprecated since macOS 14 and imported anyway; see `video_device_types` for
 // why the deprecation is the reason to use it rather than a reason not to. The
 // allow has to sit on the `use` as well as on the call site, because naming a
@@ -75,7 +77,7 @@ use objc2_foundation::{
 
 use super::{
     bgra_to_rgba, pick_format, CameraError, CameraInfo, CameraStats, Format, FormatWish, Frame,
-    FrameSlot, PermissionStatus, VideoSource,
+    FrameSlot, PermissionStatus, VideoSource, WindowRegion,
 };
 use crate::audio::{DeviceState, Timebase};
 use crate::clock::Nanos;
@@ -990,5 +992,165 @@ mod tests {
             .expect("the pixel format key");
         let number: &NSNumber = value.downcast_ref().expect("an NSNumber");
         assert_eq!(number.as_u32(), kCVPixelFormatType_32BGRA);
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The window, as a camera
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A running screen capture of one rectangle of the main display: the app's
+/// own window, cursor included. See [`super::open_window_capture`] for why it
+/// exists and why it is a camera as far as everything above it is concerned.
+struct MacScreen {
+    session: Retained<AVCaptureSession>,
+    input: Retained<AVCaptureScreenInput>,
+    output: Retained<AVCaptureVideoDataOutput>,
+    _delegate: Retained<FrameDelegate>,
+    _queue: DispatchRetained<DispatchQueue>,
+    format: Format,
+}
+
+/// The crop rectangle AVFoundation wants for `region`.
+///
+/// **Two conversions, both of which are easy to get backwards.** egui hands
+/// the window's rectangle in points with the origin at the display's top-left;
+/// `AVCaptureScreenInput.cropRect` is in the display's own coordinate space,
+/// whose origin is the bottom-left — so the y axis flips through the display's
+/// height, which `CGDisplayBounds` answers in the same points. And the width
+/// and height stay in points: the input's `scaleFactor` is left at its default
+/// of one, which means "no scaling", and on a Retina display the buffers that
+/// arrive are the region at the backing scale — which is what
+/// [`WindowRegion::pixels`] reports as the format.
+fn crop_rect(region: WindowRegion) -> CGRect {
+    // SAFETY: two plain CoreGraphics reads with no preconditions.
+    let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+    let display_h = bounds.size.height;
+    let x = f64::from(region.x.max(0.0));
+    let w = f64::from(region.w.max(1.0));
+    let h = f64::from(region.h.max(1.0));
+    let y_top = f64::from(region.y.max(0.0));
+    CGRect {
+        origin: CGPoint {
+            x,
+            y: (display_h - (y_top + h)).max(0.0),
+        },
+        size: CGSize { width: w, height: h },
+    }
+}
+
+pub(super) fn open_window(
+    region: WindowRegion,
+    fps: f64,
+    timebase: Timebase,
+    slot: Arc<FrameSlot>,
+    stats: Arc<CameraStats>,
+) -> Result<Box<dyn VideoSource>, CameraError> {
+    // SAFETY: `new` on an AVCaptureSession has no requirements (see `open`);
+    // `initWithDisplayID:` validates the display and answers nil for one that
+    // cannot be captured, which is turned into an error below rather than
+    // unwrapped. Screen recording permission is the one thing this cannot
+    // check in advance — macOS gates it per app under Privacy & Security >
+    // Screen Recording, and an app without it gets a running session that
+    // delivers the desktop's wallpaper with no windows on it, or nothing. The
+    // silence detector above this seam (`camera_silent`) is what reports that
+    // case, the same way it reports a camera that was denied.
+    let session = unsafe { AVCaptureSession::new() };
+    let (input, output, queue, delegate) = unsafe {
+        let input = AVCaptureScreenInput::initWithDisplayID(
+            AVCaptureScreenInput::alloc(),
+            CGMainDisplayID(),
+        )
+        .ok_or_else(|| CameraError::Open("the main display cannot be captured".into()))?;
+        // The cursor and the clicks are the whole point: a knob being turned
+        // is a cursor on a knob, and a click that shows is a click somebody
+        // watching can follow.
+        input.setCapturesCursor(true);
+        input.setCapturesMouseClicks(true);
+        input.setCropRect(crop_rect(region));
+        // The take's rate, as a minimum frame duration: AVFoundation may
+        // deliver slower when nothing on screen changed, and
+        // `removesDuplicateFrames` is left at its default so it does.
+        let fps = fps.max(1.0);
+        input.setMinFrameDuration(CMTime::new(1, fps.round() as i32));
+
+        session.beginConfiguration();
+        let built = (|| -> Result<Retained<AVCaptureVideoDataOutput>, CameraError> {
+            if !session.canAddInput(&input) {
+                return Err(CameraError::Open("the screen input was refused".into()));
+            }
+            session.addInput(&input);
+            let output = AVCaptureVideoDataOutput::new();
+            output.setVideoSettings(Some(&bgra_video_settings()));
+            output.setAlwaysDiscardsLateVideoFrames(true);
+            if !session.canAddOutput(&output) {
+                return Err(CameraError::Open("the video output was refused".into()));
+            }
+            session.addOutput(&output);
+            Ok(output)
+        })();
+        session.commitConfiguration();
+        let output = built?;
+
+        let queue = DispatchQueue::new(QUEUE_LABEL, None);
+        let delegate = FrameDelegate::new(DelegateIvars {
+            slot,
+            stats,
+            timebase,
+        });
+        output.setSampleBufferDelegate_queue(
+            Some(ProtocolObject::from_ref(&*delegate)),
+            Some(&queue),
+        );
+        session.startRunning();
+        (input, output, queue, delegate)
+    };
+    let (width, height) = region.pixels();
+    Ok(Box::new(MacScreen {
+        session,
+        input,
+        output,
+        _delegate: delegate,
+        _queue: queue,
+        format: Format {
+            width,
+            height,
+            fps,
+        },
+    }))
+}
+
+impl VideoSource for MacScreen {
+    fn format(&self) -> Format {
+        self.format
+    }
+
+    fn state(&self) -> DeviceState {
+        // A display is never unplugged from under its own window, so there is
+        // no `Lost` here: it runs, or the session stopped on its own.
+        // SAFETY: a documented thread-safe property read.
+        if unsafe { self.session.isRunning() } {
+            DeviceState::Running
+        } else {
+            DeviceState::Errored
+        }
+    }
+
+    fn set_region(&self, region: WindowRegion) {
+        // SAFETY: `cropRect` is documented settable on a running input; the
+        // change takes effect on the next delivered frame.
+        unsafe { self.input.setCropRect(crop_rect(region)) };
+    }
+}
+
+impl Drop for MacScreen {
+    fn drop(&mut self) {
+        // The same order `MacCamera` uses, for the same reason: stop first, so
+        // no frame can arrive after the delegate is detached.
+        // SAFETY: documented, thread-safe teardown calls.
+        unsafe {
+            self.session.stopRunning();
+            self.output.setSampleBufferDelegate_queue(None, None);
+        }
     }
 }

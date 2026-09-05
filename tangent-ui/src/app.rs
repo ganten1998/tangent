@@ -1625,6 +1625,12 @@ pub struct TangentApp {
     /// host does it: `macwin::keep_content_size`.
     decor_keep_content: Option<Vec2>,
     main_inner_origin: Pos2,
+    /// The window's OUTER rectangle in points, top-left origin on the main
+    /// display, and the display's backing scale — read every frame while the
+    /// app owns its window, for the window capture to follow. `None` in a
+    /// plug-in, whose window is the host's.
+    window_outer: Option<Rect>,
+    window_scale: f32,
     /// Whether `main_inner_origin` has ever been reported by the platform.
     /// Until it has, it is (0, 0) — which is a real position, not a missing
     /// one, so anything that centres on it lands in the corner of the screen.
@@ -3403,6 +3409,8 @@ impl TangentApp {
             decor_nudge_until: None,
             decor_keep_content: None,
             main_inner_origin: Pos2::ZERO,
+            window_outer: None,
+            window_scale: 1.0,
             main_origin_known: false,
             monitor_size: None,
             offscreen_checked: false,
@@ -24728,6 +24736,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         spec
     }
 
+    /// **Where the window is right now**, for the window capture: its content
+    /// rectangle in points, top-left origin on the main display, and the
+    /// backing scale that turns those points into the pixels the capture
+    /// delivers. `None` until the first frame has said, and always `None` in
+    /// a plug-in, whose window belongs to the host.
+    pub fn window_frame(&self) -> Option<(Rect, f32)> {
+        self.window_outer
+            .filter(|r| r.is_positive())
+            .map(|r| (r, self.window_scale.max(0.5)))
+    }
+
     /// Put the sheet music in the band if it is not there.
     ///
     /// Every control that changes what the staff SHOWS calls this: turning the
@@ -29218,6 +29237,15 @@ impl TangentApp {
             self.main_origin_known = true;
         }
         self.monitor_size = monitor;
+        // For the window capture: where the window is, in the space the
+        // display measures it in. The INNER rect — the content — rather than
+        // the outer one, because the title bar is chrome and the capture is
+        // of the app; a capture that starts a title bar down is a capture
+        // of what the person was looking at.
+        if self.caps.window_sizing {
+            self.window_outer = inner_rect;
+            self.window_scale = ctx.pixels_per_point();
+        }
         // Rescue a window restored onto a monitor that is no longer there.
         // A remembered position is the classic way for an app to launch
         // invisibly, so this runs once, as soon as the monitor is known.
@@ -44380,7 +44408,7 @@ mod tests {
     #[test]
     fn the_heart_on_centennial_always_wears_a_dark_edge() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
-        let dark_fill = Color32::from_rgb(0x30, 0x10, 0x10);
+        let dark_fill = egui::Color32::from_rgb(0x30, 0x10, 0x10);
         app.settings.theme_name = "Default".to_owned();
         assert_eq!(
             app.heart_border(dark_fill),
@@ -44389,14 +44417,14 @@ mod tests {
         );
         assert_ne!(
             recorder_panel::heart_border(dark_fill),
-            Color32::from_rgb(0x2b, 0x2b, 0x2e),
+            egui::Color32::from_rgb(0x2b, 0x2b, 0x2e),
             "the fixture's fill has to be one the measurement would edge in white"
         );
         app.settings.theme_name = "Centennial".to_owned();
-        for fill in [dark_fill, Color32::from_rgb(0xe0, 0x40, 0x40), Color32::WHITE] {
+        for fill in [dark_fill, egui::Color32::from_rgb(0xe0, 0x40, 0x40), egui::Color32::WHITE] {
             assert_eq!(
                 app.heart_border(fill),
-                Color32::from_rgb(0x2b, 0x2b, 0x2e),
+                egui::Color32::from_rgb(0x2b, 0x2b, 0x2e),
                 "on Centennial a {fill:?} heart lost its charcoal edge"
             );
         }

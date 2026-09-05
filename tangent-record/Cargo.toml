@@ -103,6 +103,15 @@ objc2-av-foundation = { version = "0.3", default-features = false, features = [
     "AVCaptureVideoDataOutput",
     "AVMediaFormat",
     "AVVideoSettings",
+    # The window capture: `AVCaptureScreenInput` is generated without a
+    # feature, but the two methods that matter on it are not — its
+    # initialiser takes a `CGDirectDisplayID` (objc2-core-graphics) and its
+    # crop rect a `CGRect` (objc2-core-foundation). Both crates are ALREADY
+    # in the binary's tree by way of eframe (arboard, objc2-app-kit), so
+    # switching these on changes no licence and adds no crate; it only lets
+    # this one see two types it was already linking.
+    "objc2-core-foundation",
+    "objc2-core-graphics",
     # `AVAudioSettings` is enabled for completeness, but note that the crate
     # generates NOTHING for it: the settings-dictionary keys the AAC input
     # needs (`AVFormatIDKey` and friends) have no bindings, so `encode/macos.rs`
@@ -115,6 +124,18 @@ objc2-av-foundation = { version = "0.3", default-features = false, features = [
     # CoreVideo dep, and their absence reads as "no method named
     # appendPixelBuffer" rather than as a missing feature.
     "objc2-core-video",
+] }
+# See the note on objc2-av-foundation's features above: both already in the
+# tree, neither new to the licence list.
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFCGTypes",
+] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "CGDirectDisplay",
+    "CGGeometry",
 ] }
 objc2-core-media = { version = "0.3", default-features = false, features = [
     "std",
