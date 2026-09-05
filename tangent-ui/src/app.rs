@@ -43753,6 +43753,7 @@ mod tests {
                 field,
                 text: "-6".to_owned(),
                 caret: 0,
+                seeded: false,
             });
             app.commit_number();
             assert!(app.num_edit.is_none(), "{field:?} stayed open");
@@ -43771,6 +43772,7 @@ mod tests {
             field: recorder::NumField::Tempo,
             text: "132".to_owned(),
             caret: 0,
+            seeded: false,
         });
         app.commit_number();
         assert!((app.settings.record_export.tempo_bpm - 132.0).abs() < 1e-9);
@@ -43790,6 +43792,7 @@ mod tests {
                 field: recorder::NumField::Tempo,
                 text: junk.to_owned(),
                 caret: 0,
+                seeded: false,
             });
             app.commit_number();
             assert!(app.num_edit.is_none(), "{junk:?} left the field open");
@@ -43812,6 +43815,7 @@ mod tests {
             field: recorder::NumField::Tempo,
             text: "144".to_owned(),
             caret: 0,
+            seeded: false,
         };
 
         app.num_edit = Some(typed());
