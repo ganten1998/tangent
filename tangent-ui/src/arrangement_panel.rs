@@ -665,7 +665,7 @@ pub const MASTER_COLUMN: usize = CHANNELS + 1;
 /// "heighten the loop/timereadout strip" for exactly that reason. The ruler
 /// has to grow with it or the bar numbers and the clock below lose the room
 /// the strip takes.
-const RULER_H: (f32, f32, f32) = (0.10, 18.0, 44.0);
+const RULER_H: (f32, f32, f32) = (0.115, 18.0, 52.0);
 
 /// **The ruler strip is two rows: names on top, signatures under them.**
 ///
@@ -697,6 +697,37 @@ fn sig_row(strip: Rect) -> Rect {
     Rect::from_min_max(
         Pos2::new(strip.left(), strip.top() + strip.height() * 0.55),
         strip.max,
+    )
+}
+
+/// **The bar numbers' row: the band under the strip, upper half.**
+///
+/// The ruler carries four rows now — marker names, signatures, bar numbers,
+/// the clock — and until this existed the bottom two were positioned by
+/// hand from opposite edges: the number from the strip's foot downward, the
+/// clock from the ruler's foot upward. Whatever was left in the middle was
+/// whatever was left, and once the strip grew to carry two rows of its own
+/// there was nothing left: the two overlapped by nearly nine points on
+/// every theme. The owner: "the timecode text has the beats overlapping the
+/// seconds. they need a tiny bit of breathing room."
+///
+/// Bands rather than edges, so the gap is a fact of the layout instead of
+/// an accident of two fonts. The numbers get the larger share: bars answer
+/// "where in the music", which is the ruler's first job.
+fn number_row(ruler: Rect, strip: Rect) -> Rect {
+    let below = Rect::from_min_max(Pos2::new(ruler.left(), strip.bottom()), ruler.max);
+    Rect::from_min_max(
+        below.min,
+        Pos2::new(below.right(), below.top() + below.height() * 0.54),
+    )
+}
+
+/// The clock's row: the ruler's foot. See [`number_row`].
+fn clock_row(ruler: Rect, strip: Rect) -> Rect {
+    let below = Rect::from_min_max(Pos2::new(ruler.left(), strip.bottom()), ruler.max);
+    Rect::from_min_max(
+        Pos2::new(below.left(), below.top() + below.height() * 0.54),
+        below.max,
     )
 }
 
@@ -1203,7 +1234,7 @@ impl Layout {
             // caught it. The band shrinks with the ruler instead; at a size
             // where the strip cannot carry two readable rows, nothing else
             // on this view is readable either.
-            let h = (ruler_h * 0.55).clamp(8.0, 28.0);
+            let h = (ruler_h * 0.50).clamp(8.0, 28.0);
             Rect::from_min_max(ruler.min, Pos2::new(ruler.right(), ruler.top() + h))
         };
         let lanes_area = Rect::from_min_max(
@@ -4126,7 +4157,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     let step = bar_step(view, l.lanes_area.width());
     let first = (bar_of(view, view.view_start_s) / step) * step;
     let last = bar_of(view, view.view_start_s + view.view_len_s).saturating_add(step);
-    let font = FontId::new((l.ruler.height() * 0.55).clamp(8.0, 12.0), crate::fonts::courier());
+    let nums = number_row(l.ruler, l.meter_strip);
+    let font = FontId::new((nums.height() * 0.76).clamp(7.0, 12.0), crate::fonts::courier());
     // **Bounded.** The step is chosen so this is a few dozen iterations, and
     // the bound is here because a hand-edited map with a one-beat bar in it
     // could otherwise ask the UI thread for millions.
@@ -4166,22 +4198,32 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // would be printed behind the signature chips — which is a bar
         // number you cannot read on exactly the songs that have the most to
         // say about their bars.
+        // **Ink measured on the RULER, not `faint`.**
+        //
+        // `faint` is a blend toward the strip face, and on three themes it
+        // lands almost exactly on the ruler's own tone: 1.29:1 on Default
+        // light, 1.57:1 on Centennial dark, 1.65:1 on Porcelain dark, where
+        // the clock beside it reads 4.4:1 or better. The owner reported it
+        // on Centennial — "the beats are way too light and illegible
+        // compared to the seconds" — and Default, the theme that ships, was
+        // the worst of the three. So the fix is the derivation and not one
+        // palette: the same `on_ink(p.ruler)` the clock already uses, held
+        // one notch STRONGER than the clock, because bars are what this
+        // ruler is for and the seconds are the second opinion.
         painter.text(
-            Pos2::new(x + 3.0, l.ruler.top() + 1.0 + l.meter_strip.height().max(0.0)),
+            Pos2::new(x + 3.0, nums.top()),
             Align2::LEFT_TOP,
             format!("{}", n.saturating_add(1)),
             font.clone(),
-            p.faint,
+            quiet(on_ink(p.ruler), p.ruler, 0.08),
         );
     }
     // **The clock row: h:mm:ss along the ruler's foot** — the owner's
     // ask: bars answer "where in the music", this answers "where in the
     // afternoon". The interval widens as the view does.
     {
-        let font = FontId::new(
-            (l.ruler.height() * 0.34).clamp(7.0, 9.5),
-            crate::fonts::courier(),
-        );
+        let clk = clock_row(l.ruler, l.meter_strip);
+        let font = FontId::new((clk.height() * 0.74).clamp(6.5, 10.0), crate::fonts::courier());
         let steps: [f64; 12] = [
             1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
         ];
@@ -4202,7 +4244,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     format!("{}:{:02}", secs / 60, secs % 60)
                 };
                 painter.text(
-                    Pos2::new(x + 3.0, l.ruler.bottom() - 1.0),
+                    Pos2::new(x + 3.0, clk.bottom() - 1.0),
                     Align2::LEFT_BOTTOM,
                     word,
                     font.clone(),
@@ -6222,6 +6264,178 @@ LaneView {
         }
     }
 
+    /// Every word painted BELOW the ruler's chip strip, with the ink it was
+    /// actually drawn in and the box it actually occupies.
+    ///
+    /// Classified by CONTENT, never by where it landed — a clock word has a
+    /// colon in it and a bar number does not. The first version of this
+    /// sorted the two by which band their centre fell into, which is
+    /// circular when the thing being measured is whether one has grown into
+    /// the other's band: an oversized bar number was counted as a clock
+    /// word and the overlap measured itself away. All three reverts passed.
+    fn ruler_words(v: &ArrangeView<'_>) -> Vec<(String, Rect, Color32)> {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let r = rect();
+        let l = Layout::new(r, v);
+        let (strip, ruler) = (l.meter_strip, l.ruler);
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(r), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(r);
+                    draw(ui.painter(), r, v);
+                });
+            },
+        );
+        let mut got = Vec::new();
+        for s in &out.shapes {
+            let egui::Shape::Text(t) = &s.shape else { continue };
+            let b = t.visual_bounding_rect();
+            // In the RULER and under its chip strip. Without the ruler
+            // test this harvested the track headers and the clip names
+            // too — twenty-five "bar numbers" on a ruler that shows a
+            // dozen, and a gap of minus three hundred points.
+            if !ruler.contains(b.center()) || b.center().y < strip.bottom() {
+                continue;
+            }
+            let Some(ink) = t
+                .override_text_color
+                .or_else(|| t.galley.job.sections.first().map(|s| s.format.color))
+            else {
+                continue;
+            };
+            got.push((t.galley.text().to_owned(), b, ink));
+        }
+        got
+    }
+
+    /// **The bar numbers and the clock do not touch, measured as INK.**
+    ///
+    /// They overlapped by nearly nine points on every theme. The two were
+    /// positioned from opposite edges — the number down from the strip's
+    /// foot, the clock up from the ruler's — so whatever sat between them
+    /// was whatever happened to be left, and once the strip grew to carry
+    /// marker names AND signatures there was nothing left. The owner: "the
+    /// timecode text has the beats overlapping the seconds. they need a
+    /// tiny bit of breathing room."
+    ///
+    /// Two rectangles that do not overlap prove nothing if the glyphs
+    /// inside them do, so this compares the lowest painted bar number with
+    /// the highest painted clock word.
+    ///
+    /// Revert-check performed: anchor the clock below its band again and
+    /// the gap goes negative.
+    ///
+    /// **What this does NOT cover, stated because it was tried:** sizing the
+    /// number from `ruler.height() * 0.55` again leaves it GREEN. A twelve
+    /// point number still fits inside a thirteen point band, so the font was
+    /// never what made the two collide — the anchoring was, and a doc
+    /// comment claiming otherwise would be describing a guard nobody has.
+    /// The floors below are what stop the opposite cheat: a spacing test can
+    /// always be satisfied by shrinking the text until it fits, so the words
+    /// have to stay readable while they stay apart.
+    #[test]
+    fn the_bar_numbers_and_the_clock_have_room_between_them() {
+        let clips: Vec<ClipView<'_>> = Vec::new();
+        let v = a_view(&clips);
+        let words = ruler_words(&v);
+        let numbers: Vec<&(String, Rect, Color32)> = words
+            .iter()
+            .filter(|(w, ..)| w.chars().all(|c| c.is_ascii_digit()) && !w.is_empty())
+            .collect();
+        let clocks: Vec<&(String, Rect, Color32)> =
+            words.iter().filter(|(w, ..)| w.contains(':')).collect();
+        assert!(!numbers.is_empty(), "no bar numbers were painted: {words:?}");
+        assert!(!clocks.is_empty(), "no clock words were painted: {words:?}");
+
+        let lowest = numbers.iter().fold(f32::NEG_INFINITY, |a, (.., r, _)| a.max(r.bottom()));
+        let highest = clocks.iter().fold(f32::INFINITY, |a, (.., r, _)| a.min(r.top()));
+        assert!(
+            highest - lowest >= 1.0,
+            "the beats and the seconds are {:.1}pt apart — {} numbers, {} clock words",
+            highest - lowest,
+            numbers.len(),
+            clocks.len()
+        );
+        // **And both are still worth reading.** Room between two words is
+        // trivially bought by making them smaller, so the floors travel with
+        // the gap rather than in a test somebody could satisfy separately.
+        let shortest = |set: &[&(String, Rect, Color32)]| {
+            set.iter().fold(f32::INFINITY, |a, (.., r, _)| a.min(r.height()))
+        };
+        // **Measured as painted INK, which is the glyph box and not the
+        // font size**: a 9.9-point digit paints 7.0 points of actual mark.
+        // The first floors here were written against font sizes and failed
+        // on correct code, which is its own small lesson about measuring the
+        // frame — measure it, then calibrate to what it says.
+        assert!(
+            shortest(&numbers) >= 6.5,
+            "the bar numbers paint {:.1}pt of ink",
+            shortest(&numbers)
+        );
+        assert!(
+            shortest(&clocks) >= 5.5,
+            "the clock paints {:.1}pt of ink",
+            shortest(&clocks)
+        );
+    }
+
+    /// **The bar numbers can be READ, on every theme, in the ink the
+    /// painter actually used.**
+    ///
+    /// They were `faint` — a blend toward the strip face — which on three
+    /// themes landed almost exactly on the ruler's own tone: 1.29:1 on
+    /// Default light, 1.57:1 on Centennial dark, 1.65:1 on Porcelain dark,
+    /// against a clock beside them reading 4.4:1 or better. The owner saw it
+    /// on Centennial: "the beats are way too light and illegible compared to
+    /// the seconds." The theme that SHIPS was the worst of the three, which
+    /// is why the answer was the derivation and not one palette's colour.
+    ///
+    /// **Harvested from the frame, not recomputed.** The first version of
+    /// this asked the audit to work out `quiet(on_ink(p.ruler), …)` for
+    /// itself and compare that against the ruler — which is true whatever
+    /// the painter does, so putting `faint` back left it green. Reading the
+    /// ink off the painted glyph is the only version that knows what was
+    /// drawn.
+    ///
+    /// Revert-check performed: put `p.faint` back and this goes red on
+    /// Default light at 1.29:1.
+    #[test]
+    fn the_bar_numbers_are_legible_on_every_theme() {
+        let clips: Vec<ClipView<'_>> = Vec::new();
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                let mut v = a_view(&clips);
+                v.dark_mode = dark;
+                v.wood = (set.recorder_bg_color.r, set.recorder_bg_color.g, set.recorder_bg_color.b);
+                v.fx_strip = (set.fx_strip_color.r, set.fx_strip_color.g, set.fx_strip_color.b);
+                v.meter_bg = (set.meter_bg_color.r, set.meter_bg_color.g, set.meter_bg_color.b);
+                let ruler = ink(&v).ruler;
+                let mode = if dark { "dark" } else { "light" };
+                let words = ruler_words(&v);
+                let mut seen = false;
+                for (w, _, tint) in &words {
+                    if w.is_empty() || !w.chars().all(|c| c.is_ascii_digit()) {
+                        continue;
+                    }
+                    seen = true;
+                    let r = crate::recorder_panel::contrast_ratio(*tint, ruler);
+                    if r < 4.0 {
+                        bad.push(format!("{} {mode}: bar number {r:.2}:1", theme.name));
+                        break;
+                    }
+                }
+                assert!(seen, "{} {mode}: no bar number was painted", theme.name);
+            }
+        }
+        assert!(bad.is_empty(), "unreadable bar numbers:\n  {}", bad.join("\n  "));
+    }
+
     /// **The strip is tall enough to read, and its words are one size.**
     ///
     /// The owner asked to "heighten the loop/timereadout strip" because at
@@ -7278,6 +7492,13 @@ ArrangeView {
                 // And the needle drawn ACROSS it has to read on it.
                 check("automation needle", p.clip_ink, cap, 1.9);
                 }
+                // **The ruler's bar numbers are NOT audited here.** They
+                // were, briefly, by working out the same `quiet(on_ink(...))`
+                // this file's painter uses and measuring that — which is
+                // true whatever the painter actually does, so putting the
+                // old `faint` back left it green. See
+                // `the_bar_numbers_are_legible_on_every_theme`, which reads
+                // the ink off the painted glyph instead.
                 // **A marker flag, per theme.** Its body is the theme's own
                 // accent and its label is whatever ink that body can carry,
                 // so both pairings move together on all sixteen — and the
