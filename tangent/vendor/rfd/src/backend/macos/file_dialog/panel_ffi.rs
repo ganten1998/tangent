@@ -192,6 +192,21 @@ impl Steer {
             return;
         };
         iv.steers.set(iv.steers.get() + 1);
+        // **Evidence, at INFO, because the app's log file keeps INFO and this
+        // fault has been diagnosed four times from a log with nothing in
+        // it.** One line per repair: where the panel went, where it is being
+        // put, and which repair this is. If a fifth report arrives with these
+        // lines absent, the delegate never heard the move; with them present
+        // and the panel still at home, the re-assert is what stopped holding.
+        let went = now.and_then(|u| u.path()).map(|p| p.to_string());
+        log::info!(
+            "panel: the save panel moved itself to {} {:?} ms after opening; putting it back on {} (repair {} of {})",
+            went.as_deref().unwrap_or("(no directory)"),
+            iv.opened.elapsed().as_millis(),
+            iv.wanted.path().map(|p| p.to_string()).unwrap_or_default(),
+            iv.steers.get(),
+            Self::MAX,
+        );
         let carry = OnMain(panel.retain(), iv.wanted.clone());
         let when = dispatch2::DispatchTime::try_from(std::time::Duration::from_millis(
             Self::SETTLE_MS,
@@ -299,11 +314,16 @@ impl Panel {
                 // delegate's doing, or the panel never having moved — must
                 // say nothing, or four shots become four chances to take a
                 // folder away from a hand. See `Steer`.
-                let held = carry
-                    .0
-                    .directoryURL()
-                    .is_some_and(|d| same_dir(Some(&d), &carry.1));
+                let at = carry.0.directoryURL();
+                let held = at.as_deref().is_some_and(|d| same_dir(Some(d), &carry.1));
                 if !held {
+                    // The same evidence the delegate leaves, so the log says
+                    // which of the two mechanisms did the work.
+                    log::info!(
+                        "panel: the {after} ms shot found the save panel at {}; saying {} again",
+                        at.and_then(|u| u.path()).map(|p| p.to_string()).unwrap_or_else(|| "(no directory)".to_owned()),
+                        carry.1.path().map(|p| p.to_string()).unwrap_or_default(),
+                    );
                     carry.0.setDirectoryURL(Some(&carry.1));
                 }
             });
