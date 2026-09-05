@@ -135,6 +135,15 @@ fallback and are now GUARDED — they re-assert only when the panel is not
 already where it was told — so neither mechanism can take a folder away from a
 hand that chose one.
 
+Both leave a line in Tangent's log file (`~/.config/tangent/tangent.log`,
+which keeps INFO) when they act: `panel: the save panel moved itself to
+/Users/<user> 340 ms after opening; putting it back on ... (repair 1 of 2)`
+from the delegate, and `panel: the 320 ms shot found the save panel at ...`
+from a shot. A fifth report with neither line means the panel moved without
+telling its delegate; with the delegate's line and the panel still at home,
+the re-assert is what stopped holding. Either way the next hunt starts with
+evidence rather than a theory.
+
 ## Dropping this copy
 
 Delete `tangent/vendor/rfd`, remove the `rfd` line from the root
