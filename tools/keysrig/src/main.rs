@@ -136,6 +136,23 @@ fn build(name: &str) -> Score {
             note(&mut ev, t + 1.0, 3.0, 79, 26);
             Score { events: ev, tail: 5.0 }
         }
+        // The ceiling. Sixty-four keys, pedal down, struck twenty
+        // milliseconds apart and let go — the pedal holds every one — so by
+        // the end of the run the whole pool is sounding at once and stays
+        // that way for the tail. The realtime factor this prints IS the
+        // instrument's CPU budget: the brief measured the piano at 78x here
+        // before the physics rework and set 25x as the floor with the
+        // sympathetic harp on top. Sixty-four is `keys::VOICES`; the
+        // sixty-fifth strike would steal, which is a different measurement.
+        "stress" => {
+            ev.push((0.0, Ev::Pedal(true)));
+            let mut t = 0.05;
+            for p in 30u8..94 {
+                note(&mut ev, t, 0.10, p, 96);
+                t += 0.02;
+            }
+            Score { events: ev, tail: 6.0 }
+        }
         _ => {
             note(&mut ev, 0.0, 2.0, 60, 100);
             Score { events: ev, tail: 4.0 }
