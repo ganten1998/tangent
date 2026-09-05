@@ -203,6 +203,10 @@ pub enum MenuAction {
     /// confirmation — see [`crate::settings::ResetScope`], which is also
     /// where the words on the rows live.
     Reset(crate::settings::ResetScope),
+    /// One row of the spectrum analyzer's menu: advance that choice. The
+    /// rows print their current value, so a press is "the next one" and
+    /// the label says what that was.
+    Analyzer(crate::analyzer::Param),
 }
 
 /// Everything the menu needs to know to render its labels.
@@ -324,6 +328,10 @@ pub struct MenuView {
     /// click — dark mode, the fretboard — would stop working depending on
     /// where they clicked.
     pub recorder_first: bool,
+    /// The analyzer's current choices while the camera pane is showing it,
+    /// so its rows can print them; `None` hides the category, because a
+    /// menu for an instrument that is not on screen is a menu for nothing.
+    pub analyzer: Option<crate::analyzer::Config>,
     /// The GLOBAL cut of the menu: Project, Plugin folders, MIDI input,
     /// Window, Colors and the tail — nothing about the piano, the theory
     /// band or the neck. What a right-click on the ARRANGEMENT or the MIDI
@@ -1229,6 +1237,23 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         }
         push_category(&mut band, "Plugin folders", plugins);
     }
+    // ── The analyzer ───────────────────────────────────────────────────────
+    // Only while it is on screen. Every row is a choice printed with its
+    // current value; a press advances it, which is one row per parameter
+    // rather than a submenu per parameter — `Entry::Submenu` is the last
+    // level, and eleven parameters as eleven hovers would be a menu nobody
+    // finishes reading.
+    if let Some(cfg) = view.analyzer {
+        let rows: Vec<SubItem> = crate::analyzer::Param::ALL
+            .iter()
+            .map(|p| SubItem {
+                label: cfg.row_label(*p),
+                action: MenuAction::Analyzer(*p),
+                enabled: true,
+            })
+            .collect();
+        push_category(&mut band, "Analyzer", rows);
+    }
 
     // ── The rows that are not a category ───────────────────────────────────
     // Three one-shot actions and the supporter pair. None of them groups with
@@ -1395,7 +1420,7 @@ fn move_recorder_to_the_front(e: &mut Vec<Entry>) {
     // and Count-in all left the menu — show/hide is `V` and the rest are behind
     // the cog — so the band's business up here is the one category that could
     // not become either: where its instruments are found.
-    const OURS: [&str; 2] = ["Project", "Plugin folders"];
+    const OURS: [&str; 3] = ["Project", "Plugin folders", "Analyzer"];
     let mut moved: Vec<Entry> = Vec::new();
     // Kept in the order OURS lists, which is the order they already appear in —
     // so this is a move, not a re-sort, and adding a fifth category to the
@@ -2101,6 +2126,7 @@ mod tests {
             count_in_bars: 1,
             count_in_in_take: false,
             recorder_first: false,
+            analyzer: None,
             global_only: false,
             metronome_on: false,
             metronome_in_take: false,
@@ -2285,6 +2311,33 @@ mod tests {
     }
 
     /// The hover labels, in menu order — what the top level READS as.
+    /// **The analyzer's menu is there while the analyzer is, and not
+    /// otherwise**, and its rows print the choice they would advance — so a
+    /// person reads "Tilt: 4.5 dB/oct" and knows what a press does to it.
+    /// On the band it leads, with the band's other categories.
+    #[test]
+    fn the_analyzer_category_follows_the_pane() {
+        let mut v = view();
+        assert!(
+            !category_names(v.clone()).iter().any(|c| c == "Analyzer"),
+            "an analyzer menu with no analyzer on screen"
+        );
+        let mut cfg = crate::analyzer::Config::default();
+        cfg.tilt = crate::analyzer::Tilt::Three;
+        v.analyzer = Some(cfg);
+        v.recorder_first = true;
+        let cats = category_names(v.clone());
+        assert!(cats.iter().any(|c| c == "Analyzer"), "no Analyzer category: {cats:?}");
+        assert!(
+            cats.iter().position(|c| c == "Analyzer") < cats.iter().position(|c| c == "Window"),
+            "the analyzer does not lead on the band: {cats:?}"
+        );
+        let rows = all_rows(v);
+        assert!(rows.iter().any(|(l, ..)| l == "Tilt: 3 dB/oct"), "the tilt row does not say its value");
+        assert!(rows.iter().any(|(l, ..)| l == "Mode: Curve"));
+        assert!(rows.iter().any(|(l, a, _)| l == "Reset peaks" && matches!(a, MenuAction::Analyzer(crate::analyzer::Param::ResetPeaks))));
+    }
+
     fn category_names(v: MenuView) -> Vec<String> {
         submenus(v).into_iter().map(|(n, ..)| n).collect()
     }
@@ -3245,6 +3298,7 @@ mod tests {
         let elsewhere = MenuView {
             recorder_on: true,
             recorder_first: false,
+            analyzer: None,
             global_only: false,
             ..view()
         };

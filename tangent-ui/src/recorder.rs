@@ -216,6 +216,17 @@ pub struct RecorderView<'a> {
     /// The band's oscilloscope — session state owned by the app; the view
     /// borrows it the way it borrows every string here.
     pub scope: &'a crate::scope::Scope,
+    /// The band's spectrum analyzer, which fills the camera pane while no
+    /// camera is chosen. Session state owned by the app, like the scope.
+    pub analyzer: &'a crate::analyzer::Analyzer,
+    /// Where the hand is over the band, in the band's own space, for the
+    /// analyzer's readout under the pointer. `None` on the compositor's copy
+    /// — a hairline following the cursor is not something to bake into a
+    /// recording.
+    pub pointer: Option<egui::Pos2>,
+    /// How the analyzer spells an accidental: the same preference the staff
+    /// and the keys already follow.
+    pub prefer_flats: bool,
     pub state: RecordState,
     /// Seconds since the take started writing. Zero in `Idle` and during
     /// pre-roll.
@@ -364,6 +375,9 @@ impl RecorderView<'_> {
     pub fn empty() -> RecorderView<'static> {
         RecorderView {
             scope: resting_scope(),
+            analyzer: resting_analyzer(),
+            pointer: None,
+            prefer_flats: false,
             input_monitor: false,
             state: RecordState::Idle,
             elapsed_s: 0.0,
@@ -1398,6 +1412,9 @@ impl RecorderState {
         };
         RecorderView {
             scope: resting_scope(),
+            analyzer: resting_analyzer(),
+            pointer: None,
+            prefer_flats: false,
             input_monitor: false,
             scrub: ScrubView::default(),
             state: self.state,
@@ -5090,4 +5107,10 @@ mod missing_tests {
 fn resting_scope() -> &'static crate::scope::Scope {
     static SCOPE: std::sync::OnceLock<crate::scope::Scope> = std::sync::OnceLock::new();
     SCOPE.get_or_init(|| crate::scope::Scope::new(48_000.0))
+}
+
+/// A silent analyzer for the same views: its scale and nothing on it.
+fn resting_analyzer() -> &'static crate::analyzer::Analyzer {
+    static A: std::sync::OnceLock<crate::analyzer::Analyzer> = std::sync::OnceLock::new();
+    A.get_or_init(|| crate::analyzer::Analyzer::new(48_000.0))
 }

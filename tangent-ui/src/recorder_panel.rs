@@ -3255,15 +3255,31 @@ pub fn hit_test(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<Hit> {
         .map(|(r, k)| k.hit(r, pos))
 }
 
-/// The CENTRE of the camera pane — the part that still PICKS a camera
-/// while the pane is empty and the borderless drag owns the rest of it.
-/// A third each way, which is where the empty pane's own hint sits.
+/// The tag in the pane's top-right corner that still PICKS a camera while
+/// the pane is empty and the borderless drag owns the rest of it.
+///
+/// It was the pane's centre, a third each way, because that is where the
+/// empty pane's hint stood; the hint is gone — the pane is the analyzer now
+/// — and a picker with nothing painted on it is a gesture nobody finds. So
+/// the target moved to where a word can be printed without covering the
+/// instrument, and the word is printed there: see `draw_camera`.
 pub fn camera_chip(rect: Rect, view: &RecorderView<'_>) -> Rect {
     let l = Layout::new(rect, view);
     if !l.preview.is_positive() {
         return Rect::NOTHING;
     }
-    Rect::from_center_size(l.preview.center(), l.preview.size() * 0.34)
+    camera_tag(l.preview)
+}
+
+/// The tag's rectangle inside a pane: a short pill, top right, under the
+/// analyzer's own head row so the two never print over each other.
+fn camera_tag(pane: Rect) -> Rect {
+    let h = (pane.height() * 0.09).clamp(11.0, 16.0);
+    let w = (h * 4.2).min(pane.width() * 0.4);
+    Rect::from_min_size(
+        Pos2::new(pane.right() - w - 4.0, pane.top() + h * 1.3),
+        Vec2::new(w, h),
+    )
 }
 
 /// The seek fraction a pointer at `pos` means, X ONLY.
@@ -3435,28 +3451,73 @@ pub fn draw_camera_pane(
     camera: DeviceLabel<'_>,
     surround: Color32,
     s: &Settings,
+    analyzer: &crate::analyzer::Analyzer,
 ) {
     // The band it SITS in, not the band it came from. The letterbox bars round
     // a 4:3 camera are the theory panel's own background, so the row reads as
     // one band with a camera in it rather than as a hole cut in the window.
     let mut p = palette(s);
     p.bg = surround;
-    draw_camera(painter, rect, preview, camera, &p);
+    // The compositor's copy: the analyzer it is handed, and no pointer — a
+    // hairline that follows the cursor does not belong in a recording.
+    draw_camera(painter, rect, preview, camera, &p, analyzer, None, s.prefer_flats);
 }
 
 fn draw_preview(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette) {
-    draw_camera(painter, l.preview, view.preview, view.camera, p);
+    draw_camera(
+        painter,
+        l.preview,
+        view.preview,
+        view.camera,
+        p,
+        view.analyzer,
+        view.pointer,
+        view.prefer_flats,
+    );
 }
 
 /// One camera box, wherever it is.
+#[allow(clippy::too_many_arguments)]
 fn draw_camera(
     painter: &Painter,
     r: Rect,
     preview: Option<Preview>,
     camera: DeviceLabel<'_>,
     p: &Palette,
+    analyzer: &crate::analyzer::Analyzer,
+    pointer: Option<Pos2>,
+    prefer_flats: bool,
 ) {
     if !r.is_positive() {
+        return;
+    }
+    // **No camera chosen: the pane is the spectrum analyzer.** The owner's
+    // condition for it — "this is a TOOL and has to be useful to be
+    // justified" — is what `analyzer.rs` answers; this is only where it
+    // stands. It wears the cluster's LCD pair, so on Centennial it is the
+    // scope's gold on black, and it takes the WHOLE pane: the words that
+    // used to stand here said what to click, and the click is now a small
+    // tag in the corner (`camera_chip`) that says the same thing in one
+    // word without covering the instrument.
+    if preview.is_none() && matches!(camera, DeviceLabel::None) {
+        let style = crate::scope::ScopeStyle::themed(p.lcd, p.lcd_face);
+        analyzer.draw(painter, r, &style, pointer, prefer_flats);
+        let chip = camera_tag(r);
+        if chip.is_positive() {
+            painter.rect_filled(chip, 2.0, p.lcd_face.gamma_multiply(0.85));
+            painter.rect_stroke(chip, 2.0, Stroke::new(1.0, p.lcd.gamma_multiply(0.5)), StrokeKind::Inside);
+            let size = fit_text(chip.shrink(3.0), "CAMERA", chip.height() * 0.62);
+            if size >= MIN_TEXT {
+                painter.text(
+                    chip.center(),
+                    Align2::CENTER_CENTER,
+                    "CAMERA",
+                    font_light(size),
+                    p.lcd.gamma_multiply(0.8),
+                );
+            }
+        }
+        painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
         return;
     }
     match preview {
@@ -9638,6 +9699,9 @@ mod tests {
                         for edit in typing_states() {
                             let v = RecorderView {
                                 scope: RecorderView::empty().scope,
+                                analyzer: RecorderView::empty().analyzer,
+                                pointer: None,
+                                prefer_flats: false,
                                 project_dest: "",
                                 export_dest: "",
                                 preset_dest: "",

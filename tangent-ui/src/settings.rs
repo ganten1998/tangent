@@ -983,6 +983,11 @@ pub struct Settings {
     /// `preset_dir` is: an IR library is the kind of folder people already
     /// keep somewhere, and pointing Tangent at it beats copying it.
     pub irs_dir: Option<String>,
+    /// The spectrum analyzer's choices, in `analyzer::Config::to_key` form —
+    /// one key because it is one object, the way a theme is one name. Empty
+    /// is the shipped analyzer, and is not written, so a settings file that
+    /// never opened the menu keeps its byte-for-byte shape.
+    pub analyzer: String,
     /// Whether this file has been through the move to `Documents/Tangent
     /// Media`.
     ///
@@ -1790,6 +1795,7 @@ impl Default for Settings {
             export_dir: None,
             preset_dir: None,
             irs_dir: None,
+            analyzer: String::new(),
             media_root_v20: false,
             reader_mode_v20: false,
             master_mono: false,
@@ -3305,6 +3311,10 @@ impl Settings {
         take_opt_str(&mut map, "preset_dir", &mut s.preset_dir);
         // And the IRs' folder, which joined after the presets'.
         take_opt_str(&mut map, "irs_dir", &mut s.irs_dir);
+        // The analyzer's choices, which joined after the IRs' folder.
+        if let Some(v) = map.shift_remove("analyzer").and_then(|v| v.as_str().map(str::to_owned)) {
+            s.analyzer = v;
+        }
 
         // Whatever is left, in the order the FILE had it.
         //
@@ -4536,6 +4546,12 @@ impl Settings {
         // only when somebody chose one — the `preset_dir` rule exactly.
         if let Some(v) = self.irs_dir.as_ref().filter(|v| !v.is_empty()) {
             map.insert("irs_dir".into(), Value::String(v.clone()));
+        }
+        // The analyzer, at the END like every additive key, and only when
+        // somebody has opened its menu — the shipped analyzer is the empty
+        // string and is not written.
+        if !self.analyzer.is_empty() {
+            map.insert("analyzer".into(), Value::String(self.analyzer.clone()));
         }
         // The bypassed bays, at the END like every additive key, and only
         // when somebody has taken something out of circuit — so a desk that

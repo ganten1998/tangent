@@ -1169,6 +1169,14 @@ pub struct TangentApp {
     export_project_spec: crate::ports::ProjectExportSpec,
     /// The band's oscilloscope: the speakers' mix without the click.
     scope: crate::scope::Scope,
+    /// The spectrum analyzer that fills the camera pane while no camera is
+    /// chosen. Reads the scope's ring — the same tap — so it shows what the
+    /// speakers get, minus the metronome. See `analyzer.rs`.
+    analyzer: crate::analyzer::Analyzer,
+    /// Where the hand was over the band this frame, for the analyzer's
+    /// readout. Sampled once at the top of `frame` so every view built in
+    /// the frame agrees, and `None` whenever the hand is elsewhere.
+    band_pointer: Option<Pos2>,
     /// The INSERT tap's ring: the audio at whichever bay the one open
     /// plugin face armed — the EQ's analyzer and the imager's vectorscope
     /// both read it. Fed by the host through `insert_tap_feed`.
@@ -2986,6 +2994,8 @@ impl TangentApp {
     /// MIDI source at all; a host that picks its own attaches one with
     /// `set_ports`, and one that is handed its notes never does.
     pub fn new(ctx: &egui::Context, mut settings: Settings, caps: Caps) -> Self {
+        // Read before `settings` moves into the struct below.
+        let analyzer_cfg = crate::analyzer::Config::from_key(&settings.analyzer);
         // **A screen reader takes the dialogs into the canvas.** eframe 0.33
         // adapts the ROOT viewport only, so a dialog in a child window is a
         // dialog a reader cannot see; drawing it inline is the road the
@@ -3284,6 +3294,12 @@ impl TangentApp {
             browsed_dir: None,
             export_project_spec: crate::ports::ProjectExportSpec::default(),
             scope: crate::scope::Scope::new(48_000.0),
+            analyzer: {
+                let mut a = crate::analyzer::Analyzer::new(48_000.0);
+                a.cfg = analyzer_cfg;
+                a
+            },
+            band_pointer: None,
             tapring: crate::tapring::TapRing::new(48_000.0),
             time_sel: None,
             menu_rows_cache: None,
@@ -5903,6 +5919,9 @@ impl TangentApp {
             scrub: self.scrub_view(),
             input_monitor: self.input_monitor,
             scope: &self.scope,
+            analyzer: &self.analyzer,
+            pointer: self.band_pointer,
+            prefer_flats: self.settings.prefer_flats,
             // **From the settings, not from a copy on `recorder`.** The dial
             // is a persisted preference like the eight beside it; a second
             // copy is a second thing to keep in step.
@@ -6094,6 +6113,7 @@ impl TangentApp {
             fret_note_names: self.settings.show_fret_note_names,
             guitar_intervals: self.settings.guitar_intervals,
             recorder_first: self.menu_over_recorder && self.settings.show_recorder,
+            analyzer: self.analyzer_showing().then_some(self.analyzer.cfg),
             global_only: false,
             staff_first: self.menu_over_staff,
             staff_key: self.settings.staff_key,
@@ -6176,6 +6196,22 @@ impl TangentApp {
     /// that have no band, which is a recorder turned off and a recorder torn
     /// off into its own window alike. The condition is `recorder_h > 0.0`'s,
     /// and it is written out rather than derived so the two cannot drift.
+    /// **The heart's outline, by theme.** Measured against the fill
+    /// everywhere — see `recorder_panel::heart_border` — except on
+    /// Centennial, where the owner asked for "a dark either gray or black or
+    /// charcoal border around the heart always": the measured pick goes
+    /// white on that theme's reds, and white is the one thing the heart on
+    /// that particular panel must not wear. Charcoal rather than black so it
+    /// reads as an edge on the wave's darkest colours too, and always,
+    /// whichever mode.
+    fn heart_border(&self, fill: egui::Color32) -> egui::Color32 {
+        if self.settings.theme_name == "Centennial" {
+            egui::Color32::from_rgb(0x2b, 0x2b, 0x2e)
+        } else {
+            recorder_panel::heart_border(fill)
+        }
+    }
+
     fn strip_heart_color(&self) -> Option<egui::Color32> {
         let band_in_window = self.settings.show_recorder && !self.settings.recorder_detached;
         (!band_in_window).then(|| self.heart_color(0.0)).flatten()
@@ -24559,6 +24595,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn scope_feed(&mut self, samples: &[f32], dt: f32, rate: f32) {
         self.scope.set_rate(rate);
         self.scope.tick(samples, dt);
+        // The analyzer reads the ring the scope just filled — but only while
+        // it is on screen: an FFT a frame is cheap and still not free, and
+        // a pane showing a camera has nothing to do with it.
+        if self.analyzer_showing() {
+            self.analyzer.set_rate(rate);
+            self.analyzer.tick(&self.scope, dt);
+        }
+    }
+
+    /// Whether the camera pane is on screen with no camera in it — which is
+    /// when it is the analyzer. One predicate for the feed, the painter and
+    /// the menu, so the three cannot disagree about what the pane is.
+    pub fn analyzer_showing(&self) -> bool {
+        self.settings.show_camera_pane
+            && self.recorder.preview.is_none()
+            && matches!(self.recorder.camera_label(), recorder::DeviceLabel::None)
     }
 
     /// The engine's INSERT tap, drained by the host once a frame while a
@@ -26075,6 +26127,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             MenuAction::ShowAbout => self.dialog = Some(Dialog::About),
             MenuAction::Reset(scope) => self.ask_before_resetting(scope),
+            // **A press advances the choice and the file remembers it** —
+            // except the two verbs, which are about this session's picture
+            // and not about how the analyzer is set up.
+            MenuAction::Analyzer(p) => {
+                if p == crate::analyzer::Param::ResetPeaks {
+                    self.analyzer.reset_peaks();
+                } else if self.analyzer.cfg.press(p) {
+                    self.settings.analyzer = self.analyzer.cfg.to_key();
+                    self.save_settings();
+                }
+            }
         }
     }
 
@@ -27849,19 +27912,21 @@ fn default_arr_visible(settings: &Settings, pane: Vec2) -> usize {
     let w = pane.x.max(1.0).trunc();
     let recorder = band_sizes_at(settings, w).recorder_h;
     let avail = (pane.y - recorder).max(0.0);
-    // **Twelve is the most a DEFAULT opens with**, at the owner's word:
-    // "Track counts can be 12 default now at 100 Percent and up, and 10 at
-    // 75 percent." The derivation still does the work — it is what makes 75%
-    // land on ten and a small display land lower still — and the ceiling is
-    // what stops a big window opening on sixteen or twenty-four lanes
-    // nobody asked for. Somebody who wants more sets it; this is only where
-    // an untouched install starts.
+    // **Ten is the most a DEFAULT opens with**, at the owner's word. It was
+    // a dozen — "12 default now at 100 Percent and up, and 10 at 75
+    // percent" — and he came back to it: "we didn't successfully set 100
+    // percent window size to 10 tracks — when selected that option yields 12
+    // still." The derivation still does the work; it is what makes a small
+    // display land lower than ten. The ceiling is what stops a big window
+    // opening on twelve, sixteen or twenty-four lanes nobody asked for.
+    // Somebody who wants more sets it; this is only where an untouched
+    // install starts.
     //
     // Measured on his 2560x1378 desk, which is the display every number in
     // this area was chosen against: at `COMFY_LANE_H` the quotient is 9.29
-    // at 75%, 12.42 at 100% and 15.52 at 125%, so the ladder lands on 10,
-    // 12 and 16 and the cap takes the last one back to a dozen.
-    sensible_visible_count(avail, COMFY_LANE_H, 4, 12)
+    // at 75%, 12.42 at 100% and 15.52 at 125%, so the ladder lands on 10, 12
+    // and 16 and the cap takes the last two back to ten.
+    sensible_visible_count(avail, COMFY_LANE_H, 4, 10)
 }
 
 /// **The mixer's default visible-STRIP count for this WINDOW.**
@@ -28304,6 +28369,12 @@ impl TangentApp {
     /// the shape they share. `shell::viewport_ui` is the one bridge, and its
     /// test is what proves the central panel never grew a margin.
     pub fn frame(&mut self, ctx: &egui::Context) {
+        // Where the hand is over the band, for the analyzer's readout: read
+        // once here against last frame's band rectangle, which is the one
+        // the hand was actually over.
+        self.band_pointer = ctx
+            .input(|i| i.pointer.hover_pos())
+            .filter(|p| self.last_band.contains(*p));
         // The input chips' words, refreshed before anything borrows a view.
         self.input_chip_texts = (0..crate::recorder::CHANNELS)
             .map(|ch| self.input_chip_text(ch))
@@ -28515,6 +28586,9 @@ impl TangentApp {
                     // is being typed into and no hand is on a knob, because
                     // there is no pointer in a video frame.
                     scope: &self.scope,
+                    analyzer: &self.analyzer,
+                    pointer: None,
+                    prefer_flats: self.settings.prefer_flats,
                     // **The varispeed and the loudness, from the same two
                     // places the window reads them.**
                     //
@@ -28574,6 +28648,7 @@ impl TangentApp {
                     self.recorder.camera_label(),
                     theory_panel::band_bg(&s),
                     &s,
+                    &self.analyzer,
                 );
             }
         }
@@ -29883,14 +29958,14 @@ impl TangentApp {
                         );
                         chord_strip::draw_heart_wave(ui.painter(), hr, &|phase| {
                             let fill = self.heart_wave(phase, now);
-                            (fill, recorder_panel::heart_border(fill))
+                            (fill, self.heart_border(fill))
                         });
                     } else {
                         chord_strip::draw_heart_bordered(
                             ui.painter(),
                             hr,
                             c,
-                            Some(recorder_panel::heart_border(c)),
+                            Some(self.heart_border(c)),
                         );
                     }
                     // The hover rect is the GLYPH's own pixels — the drawn
@@ -29929,6 +30004,7 @@ impl TangentApp {
                 self.recorder.camera_label(),
                 theory_panel::band_bg(&self.settings),
                 &self.settings,
+                &self.analyzer,
             );
         }
         if chord_h > 0.0 && mixer_rect.is_none() {
@@ -44296,6 +44372,116 @@ mod tests {
         }
     }
 
+    /// **The heart on Centennial wears charcoal, whatever its fill.** The
+    /// owner's word: "a dark either gray or black or charcoal border around
+    /// the heart in centennial always". Everywhere else the outline is the
+    /// measured pick, which on a dark fill is white — so the check is that
+    /// a fill that would take white anywhere else takes charcoal here.
+    #[test]
+    fn the_heart_on_centennial_always_wears_a_dark_edge() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let dark_fill = Color32::from_rgb(0x30, 0x10, 0x10);
+        app.settings.theme_name = "Default".to_owned();
+        assert_eq!(
+            app.heart_border(dark_fill),
+            recorder_panel::heart_border(dark_fill),
+            "off Centennial the outline is the measured pick"
+        );
+        assert_ne!(
+            recorder_panel::heart_border(dark_fill),
+            Color32::from_rgb(0x2b, 0x2b, 0x2e),
+            "the fixture's fill has to be one the measurement would edge in white"
+        );
+        app.settings.theme_name = "Centennial".to_owned();
+        for fill in [dark_fill, Color32::from_rgb(0xe0, 0x40, 0x40), Color32::WHITE] {
+            assert_eq!(
+                app.heart_border(fill),
+                Color32::from_rgb(0x2b, 0x2b, 0x2e),
+                "on Centennial a {fill:?} heart lost its charcoal edge"
+            );
+        }
+    }
+
+    /// **With no camera chosen, the pane IS the spectrum analyzer** — and
+    /// its scale is on screen, on both edges, with the camera tag in the
+    /// corner and the old placeholder gone. Read off the painted frame: a
+    /// pane that laid the analyzer out and then drew the words over it would
+    /// pass any test that asked the state.
+    ///
+    /// Revert-check, performed: route `DeviceLabel::None` back to the text
+    /// branch in `draw_camera` and this names NO CAMERA on screen.
+    #[test]
+    fn the_empty_camera_pane_is_the_analyzer() {
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::first_launch());
+        // The pane is a choice (`show_camera_pane`); with it on and no camera
+        // chosen, the pane is the analyzer.
+        app.settings.show_camera_pane = true;
+        assert!(app.analyzer_showing(), "an empty pane does not show the analyzer");
+        let w = main_width(&app.settings);
+        let band =
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(w, recorder_panel::band_height(w)));
+        // The pane, from the chip: the tag sits inside the pane's top-right
+        // corner, and everything the analyzer prints is left of and below it.
+        let chip = recorder_panel::camera_chip(band, &app.recorder_layout_view());
+        assert!(chip.is_positive(), "no camera pane on the band");
+        let pane = Rect::from_min_max(
+            Pos2::new(band.left(), band.top()),
+            Pos2::new(chip.right() + 4.0, band.bottom()),
+        );
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, 900.0))),
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        let mut words: Vec<(Rect, String)> = Vec::new();
+        fn walk(shape: &egui::epaint::Shape, words: &mut Vec<(Rect, String)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => words.push((
+                    Rect::from_min_size(t.pos, t.galley.rect.size()),
+                    t.galley.text().to_owned(),
+                )),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|sh| walk(sh, words)),
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            walk(&c.shape, &mut words);
+        }
+        let in_pane: Vec<&(Rect, String)> =
+            words.iter().filter(|(r, _)| pane.contains(r.center())).collect();
+        let says = |w: &str| in_pane.iter().any(|(_, s)| s == w);
+        assert!(
+            !says("NO CAMERA") && !says("Select Camera"),
+            "the placeholder is still on the pane: {:?}",
+            in_pane.iter().map(|(_, s)| s).collect::<Vec<_>>()
+        );
+        assert!(says("CAMERA"), "the camera tag is not on the pane");
+        let left: Vec<&String> = in_pane
+            .iter()
+            .filter(|(r, _)| r.center().x < pane.left() + pane.width() * 0.2)
+            .map(|(_, s)| s)
+            .collect();
+        let right: Vec<&String> = in_pane
+            .iter()
+            .filter(|(r, _)| r.center().x > pane.right() - pane.width() * 0.2)
+            .map(|(_, s)| s)
+            .collect();
+        for side in [&left, &right] {
+            assert!(
+                side.iter().any(|s| s.as_str() == "0") && side.iter().any(|s| s.as_str() == "90"),
+                "the scale is missing from one edge of the pane: {side:?}"
+            );
+        }
+        // The tag is the chip: the one spot on an empty pane that still
+        // picks a camera under the borderless drag.
+        assert!(
+            in_pane.iter().any(|(r, s)| s == "CAMERA" && chip.contains(r.center())),
+            "the CAMERA word is not inside the chip it stands for"
+        );
+    }
+
     /// **The empty band's big panels yield to the borderless drag.** The
     /// press handler turns PickCamera into a window drag when the pane has
     /// no picture (except its centre chip, which keeps picking) and
@@ -50449,10 +50635,14 @@ mod aspect_snap_tests {
 
         app.arrangement_open = true;
         let (lanes, pitch) = painted_lanes(&ctx, &mut app, win, monitor, Fills::No);
+        // **Ten at 100%**, the owner's second word on it — "we didn't
+        // successfully set 100 percent window size to 10 tracks". The
+        // derivation lands on 12.42 here and the cap in `default_arr_visible`
+        // is what takes it to ten.
         assert_eq!(
-            lanes, 12,
+            lanes, 10,
             "the timeline opened {lanes} lanes at 100% on 2560x1378, not the \
-             dozen he asked for"
+             ten he asked for"
         );
         // **And ten at 75%**, the other half of the same sentence: "Track
         // counts can be 12 default now at 100 Percent and up, and 10 at 75
@@ -50471,13 +50661,13 @@ mod aspect_snap_tests {
         let (max_lanes, max_pitch) =
             painted_lanes(&ctx, &mut app, usable, monitor, Fills::Maximised);
         assert_eq!(
-            max_lanes, 12,
-            "maximised gave {max_lanes} lanes, not a dozen"
+            max_lanes, 10,
+            "maximised gave {max_lanes} lanes, not ten"
         );
         let (fs_lanes, _) = painted_lanes(&ctx, &mut app, monitor, monitor, Fills::FullScreen);
         assert_eq!(
-            fs_lanes, 12,
-            "full screen gave {fs_lanes} lanes, not a dozen — and full screen is 62 points \
+            fs_lanes, 10,
+            "full screen gave {fs_lanes} lanes, not ten — and full screen is 62 points \
              taller than maximised, which is exactly the gap a density has to swallow"
         );
         // **And the point of showing fewer is that each one is TALLER.** The
@@ -50636,11 +50826,11 @@ mod aspect_snap_tests {
         // the desk folded itself into two rows of sixteen, which cost every
         // fader and every meter half its length and is gone.
         let table = [
-            (1920i64, 1030i64, 10usize, 10usize, 12usize, 16usize),
-            (3840, 2100, 12, 16, 12, 16),
+            (1920i64, 1030i64, 10usize, 10usize, 10usize, 16usize),
+            (3840, 2100, 10, 16, 10, 16),
             (1280, 648, 6, 6, 8, 10),
-            (5120, 2800, 12, 16, 12, 16),
-            (3440, 1400, 12, 16, 12, 16),
+            (5120, 2800, 10, 16, 10, 16),
+            (3440, 1400, 10, 16, 10, 16),
         ];
         let chans = crate::recorder::CHANNELS;
         for (w, h, lanes_win, strips_win, lanes_full, strips_full) in table {

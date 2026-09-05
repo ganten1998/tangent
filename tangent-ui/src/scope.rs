@@ -129,6 +129,20 @@ impl Scope {
         self.env = (self.env * (-dt / 0.35).exp()).max(peak).max(ENV_FLOOR);
     }
 
+    /// How many frames the ring holds, saturating at its capacity.
+    pub fn frames(&self) -> usize {
+        self.filled
+    }
+
+    /// Stereo frame `i` frames BEHIND the newest — the analyzer's read,
+    /// which needs both sides for its mid and side channels where the
+    /// trace only ever needed the sum.
+    pub fn stereo_back(&self, i: usize) -> [f32; 2] {
+        let idx = (self.head + CAPACITY - 1 - (i % CAPACITY)) % CAPACITY;
+        let at = idx * CHANNELS;
+        [self.buf[at], self.buf[at + 1]]
+    }
+
     /// Mono frame `i` frames BEHIND the newest.
     fn mono_back(&self, i: usize) -> f32 {
         let idx = (self.head + CAPACITY - 1 - i) % CAPACITY;
