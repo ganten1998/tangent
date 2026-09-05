@@ -12514,6 +12514,23 @@ impl Engine {
         (self.is_running(), self.callbacks())
     }
 
+    /// **Start the output's IO again on whatever device the unit is on now.**
+    ///
+    /// The answer to a stall on macOS — see [`StallRecovery`] for the
+    /// afternoon that decided it. cpal's stream remembers that it is playing
+    /// and makes a second `play` a no-op, so this is a stop and a start:
+    /// `AudioOutputUnitStop` then `AudioOutputUnitStart`, which is what makes
+    /// the default-following unit try its current device again. Not for
+    /// ASIO: a stop and a start on a driver the SDK has unloaded is the null
+    /// read the Windows crash of 2026-09-05 was made of, and the caller keeps
+    /// this behind `cfg(target_os = "macos")` for exactly that reason.
+    pub fn restart_output(&self) -> Result<(), String> {
+        use cpal::traits::StreamTrait;
+        let stream = self.stream.as_ref().ok_or("no output stream to start")?;
+        stream.pause().map_err(|e| format!("stop: {e}"))?;
+        stream.play().map_err(|e| format!("start: {e}"))
+    }
+
     /// The device the output stream is playing through, for ASIO duplex: the
     /// input MUST open on this same object or the driver's single buffer set
     /// is rebuilt out from under the running output. See `out_device_obj`.
@@ -14445,6 +14462,85 @@ impl Default for StallWatch {
     }
 }
 
+/// **What to do about a stall before rebuilding the engine: start the
+/// output again, a few times.**
+///
+/// The stall watch was written for ASIO, where a stream that stops serving
+/// callbacks has lost its driver and a rebuild is the only road back. On
+/// macOS the same reading has a different cause, and the rebuild was the
+/// disease.
+///
+/// The output opens on the platform default with no device named, and cpal
+/// answers that with CoreAudio's *default output* unit — the one that follows
+/// the system default on its own. That is the follow `follow_device_rate`'s
+/// doc relies on: "a device that moves under a running engine does not stop
+/// it — CoreAudio's output unit keeps its stream format and converts". What
+/// the doc did not know is what the follow does when it lands on a device
+/// that will not start. The owner's Bluetooth speaker (ULT FIELD 5) spent the
+/// afternoon of 2026-09-05 connecting and dropping, and macOS moved the
+/// default output to it and back each time. The unified log, 15:12:22 local:
+/// the unit's HAL listener stopped IO on the built-in speakers ("Exitted
+/// PerformIO early - thread hasBeenStopped"), re-selected the speaker, and
+/// `StartIOProc` on it answered 'nope' (1852797029). The unit stayed
+/// "running" with its IO stopped, the callback count sat still, and two
+/// seconds later the watch called it dead: "the audio output went quiet
+/// (device stopped serving audio)". Thirty-six of those between 14:56 and
+/// 16:08, on every device the owner tried — the rebuild reopens on the same
+/// following unit, the default flaps again, and the loop is closed. Every
+/// rebuild reloads every plugin, so the window froze for a second each time,
+/// the take's video pump missed its ticks, and the camera pane lagged: the
+/// "regressions in takes" reported that day, none of them the analyzer's.
+///
+/// So on macOS a stall is answered with `Engine::restart_output` first — a
+/// stop and a start of the unit, which makes it try the device it is on NOW,
+/// the way the listener's own start did — and only when that has been tried
+/// `TRIES` times without the count moving is the engine rebuilt. A flap that
+/// has already flapped back starts on the first try; a default parked on a
+/// dead device keeps failing and the rebuild follows ten seconds later, as
+/// before. A stall hours after a successful restart gets a fresh budget:
+/// the count having moved since the last try is what says the last try
+/// worked. Pure — fed the callback count — so it is tested without a device.
+#[derive(Debug, Clone, Copy)]
+pub struct StallRecovery {
+    tries: u8,
+    /// The callback count at the last try.
+    at: Option<u64>,
+}
+
+impl StallRecovery {
+    /// Restarts before a rebuild. Five is ten seconds at the watch's two,
+    /// which is longer than any flap measured and shorter than anybody would
+    /// wait for sound.
+    pub const TRIES: u8 = 5;
+
+    pub fn new() -> Self {
+        Self { tries: 0, at: None }
+    }
+
+    /// On a stall, with the callback count now: `Some(n)` says try a restart
+    /// (the n-th of the run), `None` says the budget is spent and the engine
+    /// should be rebuilt.
+    pub fn restart_wanted(&mut self, callbacks: u64) -> Option<u8> {
+        if self.at.is_some_and(|at| callbacks > at) {
+            // The count moved since the last try: that restart worked, and
+            // this is a new stall with a budget of its own.
+            self.tries = 0;
+        }
+        self.at = Some(callbacks);
+        if self.tries >= Self::TRIES {
+            return None;
+        }
+        self.tries += 1;
+        Some(self.tries)
+    }
+}
+
+impl Default for StallRecovery {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -14476,6 +14572,25 @@ mod tests {
     use super::*;
 
     // ── the output stall watchdog ──────────────────────────────────────────
+
+    /// **A stall is answered with a restart five times, then a rebuild** —
+    /// and a stall after the count has moved gets a fresh five. Revert-check,
+    /// performed: drop the reset on a moved count and the second block's
+    /// first try answers `None`.
+    #[test]
+    fn a_stall_is_restarted_five_times_before_the_engine_is_rebuilt() {
+        let mut r = StallRecovery::new();
+        // The count never moves: five tries, then the budget is spent.
+        for n in 1..=StallRecovery::TRIES {
+            assert_eq!(r.restart_wanted(100), Some(n), "try {n}");
+        }
+        assert_eq!(r.restart_wanted(100), None, "the sixth stall is the rebuild");
+        assert_eq!(r.restart_wanted(100), None, "and it stays spent while nothing moves");
+        // A restart that worked: the count climbed, and a later stall is a
+        // new one with its own budget.
+        assert_eq!(r.restart_wanted(5_000), Some(1));
+        assert_eq!(r.restart_wanted(5_000), Some(2));
+    }
 
     #[test]
     fn a_climbing_callback_count_is_never_a_stall() {

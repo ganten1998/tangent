@@ -154,6 +154,9 @@ struct Recorder {
     /// Notices the output going quiet without an error — the ASIO
     /// dead-driver case. Reset whenever the engine is (re)made.
     engine_watch: crate::instrument::StallWatch,
+    /// Restarts before a rebuild on a stall — the macOS follow-the-default
+    /// unit landing on a device that will not start. Reset with the watch.
+    stall_recovery: crate::instrument::StallRecovery,
     /// The auto recheck — the owner's ask after the yank test. Alive while
     /// the engine is down, and while it runs on the fallback below; see
     /// `Reprobe`.
@@ -2545,6 +2548,48 @@ impl DesktopApp {
                 self.recorder
                     .engine_watch
                     .note(running, callbacks, std::time::Instant::now());
+            // **On macOS a stall is started again before it is rebuilt.** The
+            // output is CoreAudio's default-following unit, and a follow that
+            // lands on a device that will not start leaves it "running" with
+            // its IO stopped — the Bluetooth afternoon of 2026-09-05, thirty-six
+            // rebuilds in an hour, every one reloading every plugin. A stop and
+            // a start makes the unit try its current device again; the rebuild
+            // waits until that has failed `StallRecovery::TRIES` times. See
+            // `StallRecovery` for the log lines. Not on the other platforms:
+            // there the watch's customer is a driver that is gone, and a
+            // start on it is the crash the rate poll used to cause.
+            #[cfg(target_os = "macos")]
+            let stalled = if stalled && fault.is_none() {
+                match self.recorder.stall_recovery.restart_wanted(callbacks) {
+                    Some(try_n) => {
+                        let outcome = engine.restart_output();
+                        let line = match &outcome {
+                            Ok(()) => format!(
+                                "the audio output went quiet (device stopped serving audio) - \
+                                 started it again on the device it is on now (try {try_n} of {}); \
+                                 a rebuild follows if it stays quiet",
+                                crate::instrument::StallRecovery::TRIES
+                            ),
+                            Err(e) => format!(
+                                "the audio output went quiet and would not start again (try \
+                                 {try_n} of {}: {e}) - another try in a moment, then a rebuild",
+                                crate::instrument::StallRecovery::TRIES
+                            ),
+                        };
+                        // The first try is the event; the rest are its progress.
+                        if try_n == 1 {
+                            log::warn!("{line}");
+                        } else {
+                            log::info!("{line}");
+                        }
+                        self.recorder.engine_watch = crate::instrument::StallWatch::new();
+                        false
+                    }
+                    None => true,
+                }
+            } else {
+                stalled
+            };
             if fault.is_some() || stalled {
                 let why = match fault {
                     Some(f) => {
@@ -9546,6 +9591,7 @@ impl DesktopApp {
                 self.recorder.engine_error = None;
                 self.recorder.engine_retry = None;
                 self.recorder.engine_watch = crate::instrument::StallWatch::new();
+                self.recorder.stall_recovery = crate::instrument::StallRecovery::new();
                 // The old sender's tap came from the engine just replaced;
                 // drop it so `reconcile_reastream` takes a fresh one from this
                 // engine. Its thread stops when the socket and consumer drop.
@@ -13541,6 +13587,7 @@ impl DesktopApp {
                 engine: None,
                 engine_error: None,
                 engine_watch: crate::instrument::StallWatch::new(),
+                stall_recovery: crate::instrument::StallRecovery::new(),
                 reprobe: None,
                 fallback: None,
                 reastream: None,
@@ -16850,11 +16897,15 @@ mod tests {
         // the paragraph that says why the line above it prints two requests
         // and no measurement; the cache invalidation this is looking for then
         // sat just outside the sample and the test went red for a reason that
-        // had nothing to do with tempo maps. The number is a sample size, not
-        // a claim — what actually pins the invalidation in place is the
-        // ordering assertion below, which holds it between the two sibling
-        // resets whatever the function's length.
-        let body = &src[start..src.len().min(start + 6_000)];
+        // had nothing to do with tempo maps. 6_000 lasted until the ASIO
+        // fallback block (2026-09-05) grew the function by three thousand
+        // characters and nobody ran this suite after it; the line sat at
+        // 7,189 and the test was red for the rest of the day without anybody
+        // seeing it. The number is a sample size, not a claim — what actually
+        // pins the invalidation in place is the ordering assertion below,
+        // which holds it between the two sibling resets whatever the
+        // function's length.
+        let body = &src[start..src.len().min(start + 8_000)];
         assert!(
             body.contains("self.pushed_maps = None;"),
             "`start_engine` does not invalidate the tempo-map cache, so the new \
