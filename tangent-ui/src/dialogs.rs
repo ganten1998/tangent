@@ -2377,7 +2377,14 @@ const AUDIO_H: f32 = 580.0;
 /// `the_welcome_card_fits_its_own_text` now demands [`WELCOME_SLACK`] on top of
 /// what it can measure.
 const WELCOME_W: f32 = 470.0;
-const WELCOME_H: f32 = 486.0;
+/// **560 since the faces were scaled to a common x-height.** The card's text
+/// is measured, and the measurement grew about a fifth when Courier and
+/// Terminess started being drawn at the size they look like (see
+/// `fonts::face_scale`): 465 points of text against the 486 the card had,
+/// before the 60 points of slack below. Sized for the tallest of the three
+/// faces, because the card is a fixed window and the font can change under
+/// it.
+const WELCOME_H: f32 = 560.0;
 /// How much more than the measurable text the Welcome card must have.
 ///
 /// The chrome this test cannot see: a checkbox's real height against the 22 it
@@ -2960,7 +2967,15 @@ const PLUGIN_NOTE_PT: f32 = 9.0;
 /// where only Esc can reach it. The test
 /// `the_notes_under_the_list_fit_the_space_reserved_for_them` measures the real
 /// strings against this rather than trusting the arithmetic.
-const PLUGIN_FOOTER_H: f32 = 60.0;
+///
+/// **72 since the faces were scaled to a common x-height.** Courier and
+/// Terminess are drawn about a fifth larger than their nominal size now (see
+/// `fonts::face_scale`), so two wrapped notes that measured 57 points measure
+/// 63, and 60 was no longer enough for the face that needs the most. The band
+/// is sized for the worst of the three faces, not the current one — it is
+/// reserved space, and a reservation that changes with the typeface would
+/// walk the button row under the cursor when somebody switches font.
+const PLUGIN_FOOTER_H: f32 = 72.0;
 
 /// What the None row says. Not just "None": what choosing it DOES is the part
 /// worth spelling out, exactly as on [`DeviceKind::none_row`].
@@ -10536,8 +10551,14 @@ fn show_on(
                 ctx,
                 placement,
                 "IR Wizard",
-                Vec2::new(540.0, 560.0),
-                Vec2::new(460.0, 430.0),
+                // **Wider and taller since the three faces were scaled to a
+                // common x-height** (`fonts::face_scale`): every string on
+                // the longest page in the app grew about a fifth, and at
+                // 540x560 the capture page's button row lost the way back —
+                // the one control that returns the capture to the panel that
+                // asked for it.
+                Vec2::new(640.0, 640.0),
+                Vec2::new(540.0, 500.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.visuals_mut().extreme_bg_color = t.field_bg;
