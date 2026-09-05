@@ -24612,11 +24612,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    /// Whether the camera pane is on screen with no camera in it — which is
+    /// Whether a camera box is on screen with no camera in it — which is
     /// when it is the analyzer. One predicate for the feed, the painter and
-    /// the menu, so the three cannot disagree about what the pane is.
+    /// the menu, so the three cannot disagree about what the box is.
+    ///
+    /// **Two boxes, not one.** The recorder band carries its own preview box
+    /// whenever the band is open, and the camera PANE beside the theory
+    /// band is a separate, optional surface. This asked only about the pane,
+    /// so with the pane off the band's box drew the analyzer's scale every
+    /// frame and the feed never ticked it — the owner's "spectrum analyzer
+    /// not responding to audio". Either box showing is the analyzer showing.
     pub fn analyzer_showing(&self) -> bool {
-        self.settings.show_camera_pane
+        (self.settings.show_recorder || self.settings.show_camera_pane)
             && self.recorder.preview.is_none()
             && matches!(self.recorder.camera_label(), recorder::DeviceLabel::None)
     }
@@ -44441,21 +44448,21 @@ mod tests {
     #[test]
     fn the_empty_camera_pane_is_the_analyzer() {
         let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::first_launch());
-        // The pane is a choice (`show_camera_pane`); with it on and no camera
-        // chosen, the pane is the analyzer.
-        app.settings.show_camera_pane = true;
-        assert!(app.analyzer_showing(), "an empty pane does not show the analyzer");
+        // The BAND's own box, with the optional pane off — the shape the
+        // owner reported "not responding to audio" in. The band is open on a
+        // first launch and no camera is chosen, so this is the analyzer.
+        app.settings.show_camera_pane = false;
+        assert!(
+            app.analyzer_showing(),
+            "the band's empty camera box does not count as the analyzer showing, so the feed would never tick it"
+        );
         let w = main_width(&app.settings);
         let band =
             Rect::from_min_size(Pos2::ZERO, Vec2::new(w, recorder_panel::band_height(w)));
-        // The pane, from the chip: the tag sits inside the pane's top-right
-        // corner, and everything the analyzer prints is left of and below it.
-        let chip = recorder_panel::camera_chip(band, &app.recorder_layout_view());
-        assert!(chip.is_positive(), "no camera pane on the band");
-        let pane = Rect::from_min_max(
-            Pos2::new(band.left(), band.top()),
-            Pos2::new(chip.right() + 4.0, band.bottom()),
-        );
+        // The pane IS the chip now — the whole box picks — so its rectangle
+        // is the chip's.
+        let pane = recorder_panel::camera_chip(band, &app.recorder_layout_view());
+        assert!(pane.is_positive(), "no camera pane on the band");
         let out = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, 900.0))),
@@ -44481,11 +44488,10 @@ mod tests {
             words.iter().filter(|(r, _)| pane.contains(r.center())).collect();
         let says = |w: &str| in_pane.iter().any(|(_, s)| s == w);
         assert!(
-            !says("NO CAMERA") && !says("Select Camera"),
-            "the placeholder is still on the pane: {:?}",
+            !says("NO CAMERA") && !says("Select Camera") && !says("CAMERA"),
+            "a placeholder or a button is still on the pane: {:?}",
             in_pane.iter().map(|(_, s)| s).collect::<Vec<_>>()
         );
-        assert!(says("CAMERA"), "the camera tag is not on the pane");
         let left: Vec<&String> = in_pane
             .iter()
             .filter(|(r, _)| r.center().x < pane.left() + pane.width() * 0.2)
@@ -44502,23 +44508,19 @@ mod tests {
                 "the scale is missing from one edge of the pane: {side:?}"
             );
         }
-        // The tag is the chip: the one spot on an empty pane that still
-        // picks a camera under the borderless drag.
-        assert!(
-            in_pane.iter().any(|(r, s)| s == "CAMERA" && chip.contains(r.center())),
-            "the CAMERA word is not inside the chip it stands for"
-        );
     }
 
-    /// **The empty band's big panels yield to the borderless drag.** The
-    /// press handler turns PickCamera into a window drag when the pane has
-    /// no picture (except its centre chip, which keeps picking) and
-    /// DismissClip into one while no clip is latched. This pins the
-    /// geography that translation relies on: the pane's corner IS a
-    /// PickCamera hit, the chip excludes it, and the chip's own centre
-    /// still picks.
+    /// **The empty camera pane is a control, not a window handle.** It used
+    /// to yield to the borderless drag everywhere but a chip at its centre,
+    /// because an empty grey box was unoccupied space and the owner's rule
+    /// is that unoccupied space moves the window. It is the spectrum
+    /// analyzer now — occupied, hovered, right-clicked — so the whole box
+    /// picks a camera on a press, which is what `camera_chip` answers, and
+    /// the press handler's carve-out has nothing left to carve. The VU's
+    /// DismissClip still yields while no clip is latched; that half is
+    /// unchanged.
     #[test]
-    fn the_empty_camera_pane_is_mostly_window_handle() {
+    fn the_empty_camera_pane_picks_everywhere() {
         let (_ctx, app) = headless_with(Caps::DESKTOP, Settings::first_launch());
         let w = main_width(&app.settings);
         let band =
@@ -44527,21 +44529,15 @@ mod tests {
         assert!(view.preview.is_none(), "a fresh install grew a camera");
         assert!(!view.meters.clipped, "a fresh install came up clipped");
         let chip = recorder_panel::camera_chip(band, &view);
-        assert!(chip.is_positive(), "the empty pane lost its picker chip");
-        assert_eq!(
-            recorder_panel::hit_test(band, &view, chip.center()),
-            Some(recorder_panel::Hit::PickCamera),
-            "the chip's centre stopped picking"
-        );
-        // A point in the pane, left of the chip: a PickCamera hit the
-        // handler will hand to the window.
-        let corner = Pos2::new(chip.left() - chip.width() * 0.5, chip.center().y);
-        assert_eq!(
-            recorder_panel::hit_test(band, &view, corner),
-            Some(recorder_panel::Hit::PickCamera),
-            "the pane's corner is no longer the camera target - update the translation"
-        );
-        assert!(!chip.contains(corner), "the chip swallowed the corner");
+        assert!(chip.is_positive(), "the empty pane lost its picker");
+        for at in [chip.center(), chip.left_top() + Vec2::splat(2.0), chip.right_bottom() - Vec2::splat(2.0)] {
+            assert_eq!(
+                recorder_panel::hit_test(band, &view, at),
+                Some(recorder_panel::Hit::PickCamera),
+                "a press at {at:?} on the empty pane does not pick a camera"
+            );
+            assert!(chip.contains(at), "the picker does not cover its own pane at {at:?}");
+        }
     }
 
     /// **A controller chord reads at CONCERT PITCH, whatever the
