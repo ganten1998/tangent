@@ -33,6 +33,7 @@
 pub mod beam;
 pub mod board;
 pub mod clav;
+pub mod hammer;
 pub mod pickup;
 pub mod reed;
 pub mod string;

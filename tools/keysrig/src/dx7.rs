@@ -15,12 +15,13 @@ pub mod synth;
 #[path = "../../../tangent/src/dx7/voice.rs"]
 pub mod voice;
 
-/// **What the synth's demo test names at the crate root, stood in for.**
-/// `synth.rs`'s ignored `dx7_demo_wav` reaches `super::super::Cartridge`,
-/// which in the app is `crate::dx7::Cartridge` and in this bench is the
-/// crate root — so the bench's TEST build had been broken since the crate
-/// rename on 2026-08-28 without anyone running it here (the app's own
-/// `cargo test` covered the keys tests meanwhile). The real reader drags
+/// **What the synth's demo test names beside it, stood in for.**
+/// `synth.rs`'s ignored `dx7_demo_wav` reaches `super::super::Cartridge`:
+/// two levels up from its test module is `crate::dx7`, which in the app is
+/// the directory holding the real reader and in this bench is this file —
+/// so the bench's TEST build had been broken since the crate rename on
+/// 2026-08-28 without anyone running it here (the app's own `cargo test`
+/// covered the keys tests meanwhile). The real reader drags
 /// the editor and the factory bank in behind it, none of which a bench
 /// that strikes keys needs, so this is a shape with the three fields the
 /// test reads and a `load` that says no. The test is ignored in the app
