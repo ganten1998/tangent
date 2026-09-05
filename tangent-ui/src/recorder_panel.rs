@@ -3255,31 +3255,24 @@ pub fn hit_test(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<Hit> {
         .map(|(r, k)| k.hit(r, pos))
 }
 
-/// The tag in the pane's top-right corner that still PICKS a camera while
-/// the pane is empty and the borderless drag owns the rest of it.
+/// The part of an empty camera pane that PICKS a camera rather than
+/// yielding to the borderless window drag: all of it.
 ///
-/// It was the pane's centre, a third each way, because that is where the
-/// empty pane's hint stood; the hint is gone — the pane is the analyzer now
-/// — and a picker with nothing painted on it is a gesture nobody finds. So
-/// the target moved to where a word can be printed without covering the
-/// instrument, and the word is printed there: see `draw_camera`.
+/// It was the pane's centre, a third each way, when an empty pane was a
+/// grey box with a hint in the middle — unoccupied space, which the
+/// owner's rule hands to the window. Then briefly a tag in the corner. The
+/// pane is the spectrum analyzer now: a surface that is hovered for its
+/// readout and right-clicked for its menu is occupied space, and a press on
+/// it does what a press on it always did, which is open the camera list.
+/// So the chip is the pane, the press handler's carve-out finds nothing to
+/// carve, and there is no button to look for — the owner's word: "camera
+/// button should not be there".
 pub fn camera_chip(rect: Rect, view: &RecorderView<'_>) -> Rect {
     let l = Layout::new(rect, view);
     if !l.preview.is_positive() {
         return Rect::NOTHING;
     }
-    camera_tag(l.preview)
-}
-
-/// The tag's rectangle inside a pane: a short pill, top right, under the
-/// analyzer's own head row so the two never print over each other.
-fn camera_tag(pane: Rect) -> Rect {
-    let h = (pane.height() * 0.09).clamp(11.0, 16.0);
-    let w = (h * 4.2).min(pane.width() * 0.4);
-    Rect::from_min_size(
-        Pos2::new(pane.right() - w - 4.0, pane.top() + h * 1.3),
-        Vec2::new(w, h),
-    )
+    l.preview
 }
 
 /// The seek fraction a pointer at `pos` means, X ONLY.
@@ -3495,28 +3488,15 @@ fn draw_camera(
     // condition for it — "this is a TOOL and has to be useful to be
     // justified" — is what `analyzer.rs` answers; this is only where it
     // stands. It wears the cluster's LCD pair, so on Centennial it is the
-    // scope's gold on black, and it takes the WHOLE pane: the words that
-    // used to stand here said what to click, and the click is now a small
-    // tag in the corner (`camera_chip`) that says the same thing in one
-    // word without covering the instrument.
+    // scope's gold on black, and it takes the WHOLE pane.
     if preview.is_none() && matches!(camera, DeviceLabel::None) {
+        // **And nothing else on it.** The first cut printed a CAMERA tag in
+        // the corner so the picker had a word; the owner's answer was that
+        // the button should not be there. The whole box is the picker — a
+        // press anywhere on it opens the camera list, as it always did — and
+        // the tooltip on the box says so.
         let style = crate::scope::ScopeStyle::themed(p.lcd, p.lcd_face);
         analyzer.draw(painter, r, &style, pointer, prefer_flats);
-        let chip = camera_tag(r);
-        if chip.is_positive() {
-            painter.rect_filled(chip, 2.0, p.lcd_face.gamma_multiply(0.85));
-            painter.rect_stroke(chip, 2.0, Stroke::new(1.0, p.lcd.gamma_multiply(0.5)), StrokeKind::Inside);
-            let size = fit_text(chip.shrink(3.0), "CAMERA", chip.height() * 0.62);
-            if size >= MIN_TEXT {
-                painter.text(
-                    chip.center(),
-                    Align2::CENTER_CENTER,
-                    "CAMERA",
-                    font_light(size),
-                    p.lcd.gamma_multiply(0.8),
-                );
-            }
-        }
         painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
         return;
     }
