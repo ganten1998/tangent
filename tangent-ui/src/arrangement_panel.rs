@@ -3867,7 +3867,7 @@ fn tempo_x_of(rect: Rect, view: &ArrangeView<'_>, lane: Rect, at_beat: f64) -> f
 
 /// Where a bar LINE falls, in seconds. Bars count from zero here and from
 /// one on the ruler, the way musicians write them.
-fn bar_at(view: &ArrangeView<'_>, bar: u32) -> f64 {
+pub(crate) fn bar_at(view: &ArrangeView<'_>, bar: u32) -> f64 {
     view.tempo.seconds_at_beat(view.meter.quarter_at_bar(bar))
 }
 
