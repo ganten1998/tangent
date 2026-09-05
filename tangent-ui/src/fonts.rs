@@ -55,12 +55,20 @@ pub fn courier_bold() -> FontFamily {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum FontChoice {
     Courier,
-    /// **The one a fresh install wears**, at the owner's word. Courier Prime
-    /// was the default from the beginning and stays in the list — a settings
-    /// file that names it keeps it, so nobody's desk changes typeface under
-    /// them; only an install that has never chosen gets this.
-    #[default]
     Terminess,
+    /// **The one a fresh install wears**, at the owner's word — Courier Prime
+    /// was the default from the beginning and Terminess after it, and both
+    /// stay in the list: a settings file that names one keeps it, so nobody's
+    /// desk changes typeface under them. Only an install that has never
+    /// chosen gets this.
+    ///
+    /// It is also the largest of the three on its own em — cap 0.730 against
+    /// Terminess' 0.645 and Courier Prime's 0.580 — so a fresh install now
+    /// opens on the face that reads biggest at a given size, which is the
+    /// difference the owner measured by eye and the reason the other two were
+    /// briefly scaled up to meet it. Shipping this one instead is the same
+    /// answer without a scale factor between a named size and a drawn one.
+    #[default]
     JetBrains,
 }
 
@@ -126,77 +134,18 @@ impl FontChoice {
     }
 }
 
-/// **How much bigger each face is drawn than its nominal size, so that all
-/// three read as the same size of type.**
-///
-/// A point is not a height. It is the height of the EM, and how much of that
-/// em a face fills is the face's own decision — measured off the three files
-/// this app ships, per em:
-///
-/// | | cap height | x-height | advance |
-/// |---|---|---|---|
-/// | JetBrains Mono | 0.730 | 0.550 | 0.600 |
-/// | Terminess | 0.645 | 0.458 | 0.500 |
-/// | Courier Prime | 0.580 | 0.451 | 0.600 |
-///
-/// So at one nominal size JetBrains stands about a fifth taller than either
-/// of the others and a fifth wider than Terminess, which is the owner's "the
-/// jetbrains text is consistently taller and wider than the other two
-/// fonts". The scales below are the ratio of x-heights, which is the measure
-/// that governs how big text LOOKS: it puts Courier within 2 % of JetBrains
-/// and Terminess within 2 %, where matching cap heights instead would need
-/// two very different numbers (1.26 and 1.13) and matching advances would
-/// need a third pair again.
-///
-/// **What this costs, stated because it is a real trade.** Courier already
-/// matched JetBrains' advance exactly, so scaling it for height makes its
-/// lines about a fifth wider than JetBrains' — one mismatch traded for its
-/// opposite. That is the right trade here: the complaint is about how big the
-/// letters look, every panel in this app lays out from measured text rather
-/// than from an assumed column count, and the fit sweeps in `face::fit` are
-/// what prove a widened face still lands inside its furniture.
-///
-/// Applied through egui's own `FontTweak`, so a size named anywhere in the
-/// app keeps meaning one thing: nothing has to know which face is loaded, and
-/// there is no second size table to keep in step with the first.
-const fn face_scale(choice: FontChoice) -> f32 {
-    match choice {
-        // 0.550 / 0.451
-        FontChoice::Courier => 1.219,
-        // 0.550 / 0.458
-        FontChoice::Terminess => 1.201,
-        // The face the other two are being matched TO.
-        FontChoice::JetBrains => 1.0,
-    }
-}
-
-/// The face as egui should draw it: its bytes, scaled by [`face_scale`].
-fn face(bytes: &'static [u8], scale: f32) -> Arc<FontData> {
-    Arc::new(FontData::from_static(bytes).tweak(egui::FontTweak {
-        scale,
-        ..Default::default()
-    }))
-}
-
 /// Install the font families on the context. Call at startup and again if the
 /// font choice or `custom_font_path` changes (e.g. settings reset).
 pub fn install(ctx: &egui::Context, choice: FontChoice, custom_font_path: Option<&str>) {
     let mut defs = FontDefinitions::default();
-    let scale = face_scale(choice);
 
-    // Courier Prime is both a CHOICE and the glyph fallback under every other
-    // choice, and it takes its OWN scale in both jobs. That is not a special
-    // case: the scale answers "how big does this face draw", which is a
-    // property of the file and not of the menu, so a degree sign borrowed
-    // from Courier lands the same height as the Terminess text around it.
-    let courier = face_scale(FontChoice::Courier);
     defs.font_data.insert(
         "CourierPrime-Regular".to_owned(),
-        face(COURIER_PRIME_REGULAR, courier),
+        Arc::new(FontData::from_static(COURIER_PRIME_REGULAR)),
     );
     defs.font_data.insert(
         "CourierPrime-Bold".to_owned(),
-        face(COURIER_PRIME_BOLD, courier),
+        Arc::new(FontData::from_static(COURIER_PRIME_BOLD)),
     );
 
     // Egui's default fonts, appended as glyph fallback (Δ is covered by
@@ -220,8 +169,14 @@ pub fn install(ctx: &egui::Context, choice: FontChoice, custom_font_path: Option
         FontChoice::JetBrains => Some(("JetBrainsMono", JETBRAINS_REGULAR, JETBRAINS_BOLD)),
         FontChoice::Courier => None,
     } {
-        defs.font_data.insert(format!("{name}-Regular"), face(reg, scale));
-        defs.font_data.insert(format!("{name}-Bold"), face(bold_bytes, scale));
+        defs.font_data.insert(
+            format!("{name}-Regular"),
+            Arc::new(FontData::from_static(reg)),
+        );
+        defs.font_data.insert(
+            format!("{name}-Bold"),
+            Arc::new(FontData::from_static(bold_bytes)),
+        );
         regular.insert(0, format!("{name}-Regular"));
         // Real bold face, so a chosen font does not flatten the menus and
         // About to a single weight.
@@ -250,12 +205,9 @@ pub fn install(ctx: &egui::Context, choice: FontChoice, custom_font_path: Option
     // minor of D flat read "bb" and a key signature read "2b". It costs
     // nothing: the face is compiled in already for the third typeface option.
     if !matches!(choice, FontChoice::JetBrains) {
-        // The accidentals' fallback, at JetBrains' own scale of 1.0 — it is
-        // already the tallest face on its em, so a flat sign borrowed from it
-        // sits right beside text that has been scaled up to meet it.
         defs.font_data.insert(
             "JetBrainsMono-Fallback".to_owned(),
-            face(JETBRAINS_REGULAR, face_scale(FontChoice::JetBrains)),
+            Arc::new(FontData::from_static(JETBRAINS_REGULAR)),
         );
         regular.push("JetBrainsMono-Fallback".to_owned());
         bold.push("JetBrainsMono-Fallback".to_owned());
@@ -297,55 +249,6 @@ pub fn apply_text_styles(ctx: &egui::Context) {
 }
 
 #[cfg(test)]
-
-    /// **The three faces read as the same size of type.**
-    ///
-    /// A point is the height of the em, and how much of that em a face fills
-    /// is the face's own decision — so at one nominal size JetBrains Mono
-    /// stood about a fifth taller than Courier Prime and Terminess, and a
-    /// fifth wider than Terminess. The owner measured it by eye: "the
-    /// jetbrains text is consistently taller and wider than the other two
-    /// fonts."
-    ///
-    /// [`face_scale`] closes it on x-height, which is the measure that
-    /// governs how big text LOOKS, and this is the check that it did: a
-    /// lowercase letter's ink, laid out through the real context at one size,
-    /// within a few percent across all three. Cap height and advance are
-    /// deliberately NOT held here — matching cap heights would need two very
-    /// different numbers and matching advances a third pair again, and
-    /// x-height is the one that answers the complaint.
-    ///
-    /// Revert-check, performed: set either scale to 1.0 and this reports the
-    /// face that shrank, about 18 % adrift.
-    #[test]
-    fn the_three_faces_read_at_the_same_size() {
-        let mut heights: Vec<(&str, f32)> = Vec::new();
-        for (name, choice) in [
-            ("Courier", FontChoice::Courier),
-            ("Terminess", FontChoice::Terminess),
-            ("JetBrains", FontChoice::JetBrains),
-        ] {
-            let ctx = crate::face::fit::a_ctx(choice);
-            let _ = ctx.run(egui::RawInput::default(), |_| {});
-            let id = egui::FontId::new(12.0, courier());
-            // "x" rather than a cap or a digit: the x-height is what these
-            // scales were fitted on, and it is what the eye reads as size.
-            let g = ctx.fonts_mut(|f| {
-                f.layout_no_wrap("x".to_owned(), id.clone(), egui::Color32::WHITE)
-            });
-            let ink = g
-                .rows
-                .first()
-                .map_or(0.0, |r| r.visuals.mesh_bounds.height());
-            heights.push((name, ink));
-        }
-        let lo = heights.iter().map(|(_, h)| *h).fold(f32::MAX, f32::min);
-        let hi = heights.iter().map(|(_, h)| *h).fold(0.0_f32, f32::max);
-        assert!(
-            lo > 0.0 && hi / lo <= 1.08,
-            "the faces still read at different sizes: {heights:?}"
-        );
-    }
 mod tests {
 
     /// **Every font size is a whole number, at every window width.**

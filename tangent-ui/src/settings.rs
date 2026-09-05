@@ -1697,11 +1697,12 @@ impl Default for Settings {
             input_chip_color: Rgb::new(0xE3, 0xD9, 0xBD),
             fretboard_color: Rgb::new(0x4a, 0x2b, 0x22),
             string_color: Rgb::new(0xC9, 0xC4, 0xBC),
-            // **Centennial ships**, at the owner's word. "Default" stays in
-            // the list and a settings file that names it keeps it: only an
-            // install that has never chosen gets this, the same rule the
-            // typeface default follows.
-            theme_name: "Centennial".to_owned(),
+            // **The struct's own answer, which is the DEFAULT theme's** —
+            // every colour role above is that theme's, and a name that did
+            // not match them would be a desk labelled one thing and painted
+            // another. What SHIPS is Centennial, and it is applied in
+            // [`Settings::first_launch`] where the roles move with the name.
+            theme_name: "Default".to_owned(),
             routes: crate::routing::Routes::default(),
             insert_keys: crate::routing::KeyEdges::default(),
             insert_bypass: BypassBays::default(),
@@ -2352,6 +2353,19 @@ impl Settings {
             show_recorder: true,
             ..Self::default()
         };
+        // **Centennial ships, at the owner's word — applied, not named.**
+        // Nothing re-reads `theme_name` to paint a desk: the roles ARE the
+        // settings and the name is the label beside them, so setting the
+        // name alone would open a Default-coloured desk calling itself
+        // Centennial. Applying it here means the one place that answers
+        // "what does a fresh install wear" also answers "what does Reset
+        // everything go back to" — `Settings::reset` takes its values from
+        // this function — which is what the owner asked for in the same
+        // breath. Dark mode comes from `default` above and survives, because
+        // a theme names colours and not which of the two sets is showing.
+        if let Some(t) = crate::theme::by_name("Centennial") {
+            t.apply(&mut s);
+        }
         // The built-in needs no seeding here: the default desk already
         // carries it, in channel 1's first bay. One definition of "the
         // instrument that ships", and `Settings::default` is it.
@@ -4726,6 +4740,14 @@ impl Settings {
         self.custom_font_path = fresh.custom_font_path.clone();
         self.font_choice = fresh.font_choice.clone();
         self.varispeed_color = fresh.varispeed_color;
+        // **Two roles no scope could put back.** A theme names them and the
+        // reset never copied them, so "Reset everything" left whatever the
+        // last theme had written. Invisible while the shipped settings and
+        // the shipped theme agreed on their values; the moment a theme was
+        // applied at first launch, `the_scopes_together_are_everything` said
+        // so — which is exactly what that test is for.
+        self.velocity_loud_color = fresh.velocity_loud_color;
+        self.velocity_quiet_color = fresh.velocity_quiet_color;
     }
 
     /// Which bands are showing, where the windows are, how big they are, and
@@ -6925,13 +6947,23 @@ mod tests {
         // can SEE, not a second set of preferences to keep in step. Everything
         // listed here is visible; anything else appearing in this list would
         // mean a first launch had grown a preference of its own.
+        // **The DEFAULTS, plus what somebody can see, plus the theme that
+        // ships.** A first launch applies Centennial (see `first_launch`),
+        // which writes colour roles — so the comparison is against the
+        // defaults with that same theme applied, and what this still pins is
+        // that a first launch grows no preference of its OWN beyond the
+        // three visible panels.
         let same = Settings {
             show_fretboard: false,
             theory_order: String::new(),
             show_recorder: false,
             ..first.clone()
         };
-        assert_eq!(same, Settings::default());
+        let mut shipped = Settings::default();
+        crate::theme::by_name("Centennial")
+            .expect("the shipped theme is in the factory list")
+            .apply(&mut shipped);
+        assert_eq!(same, shipped);
 
         // An unreadable file is not a first launch.
         let dir = std::env::temp_dir().join(format!("tangent-firstrun-{}", std::process::id()));
@@ -7053,7 +7085,20 @@ mod tests {
         // names something else still wins, which is what `theme_name` in the
         // round-trip tests is for.
         assert!(s.dark_mode && s.arr_dark && s.me_dark);
-        assert_eq!(s.theme_name, "Centennial");
+        // The struct's own name matches the roles beside it; the SHIPPED
+        // theme is Centennial and is applied in `first_launch`, which is
+        // also what `reset` goes back to.
+        assert_eq!(s.theme_name, "Default");
+        let fresh = Settings::first_launch();
+        assert_eq!(fresh.theme_name, "Centennial");
+        assert!(fresh.dark_mode && fresh.arr_dark && fresh.me_dark);
+        let mut reset = Settings::default();
+        reset.theme_name = "Iris".to_owned();
+        reset.dark_mode = false;
+        reset.reset(ResetScope::Everything);
+        assert_eq!(reset.theme_name, "Centennial", "Reset everything left the theme");
+        assert!(reset.dark_mode, "Reset everything came back light");
+        assert_eq!(reset.font_choice, crate::fonts::FontChoice::default().key());
         assert_eq!(s.white_key_idle_color.to_hex(), "#e8dcc0");
         assert_eq!(s.black_key_idle_color.to_hex(), "#1a1a1a");
         assert_eq!(s.white_key_active_color.to_hex(), "#6c9bd2");
