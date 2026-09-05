@@ -18,10 +18,11 @@
 //! where a hand on the knob is not covering it, the ticks outside the body
 //! because they are a mark on the panel the knob is mounted through. The
 //! derivation is followed, not the numbers. The dress is the owner's, from
-//! the first build he held: a thin black outline, a grey face turned with
-//! the concentric rings of a spun aluminium cap, and a black pointer that
-//! sits in the outline and points at the level — no slot, no coloured
-//! cap. The dials are small and the words around them are not: the name
+//! the mockups he chose from: a black outline a fifth of the radius wide,
+//! a grey face turned with nine fine rings like a spun aluminium cap, and
+//! a black pointer that sits in the outline and points at the level — no
+//! slot, no coloured cap. The dials are small and the words around them
+//! are not, eleven points at his word: the name
 //! and the reading are what a panel is read by. Nothing on a dial is
 //! themed, so the same knob is on every theme's panel; what is themed is
 //! the ground and the engraved legends. Ink is a property of the surface
@@ -207,12 +208,14 @@ const fn low(id: u32, label: &'static str, kind: Kind, row: usize, x: f32, w: f3
 /// oscillator bank's first column holds only oscillator three's keyboard
 /// switch, at the left of the row it belongs to, the way the 1970 panel
 /// puts its oscillator-three control; the Range, Wave and Tune columns
-/// then line up down all three rows.
+/// then line up down all three rows. The modifiers' first column holds
+/// only the filter's keyboard tracking, at the left of the envelope it
+/// scales, where that panel puts its keyboard-control switches.
 const SECTIONS: [(&str, usize); 5] = [
     ("CONTROLLERS", 2),
     ("OSCILLATOR BANK", 4),
     ("MIXER", 2),
-    ("MODIFIERS", 4),
+    ("MODIFIERS", 5),
     ("OUTPUT", 2),
 ];
 /// Rows in the upper grid.
@@ -220,7 +223,7 @@ const UPPER_ROWS: usize = 4;
 /// Rows in the lower band.
 const LOWER_ROWS: usize = 3;
 /// Dial columns across the whole panel: the sections' widths summed.
-const COLS: usize = 2 + 4 + 2 + 4 + 2;
+const COLS: usize = 2 + 4 + 2 + 5 + 2;
 
 const VOICE_WORDS: &[&str] = &["MONO", "UNISON", "POLY"];
 const PRIO_WORDS: &[&str] = &["LOW", "LAST", "HIGH"];
@@ -246,7 +249,7 @@ const CONTROLS: &[Ctl] = &[
     up(P_O2_RANGE, "Range 2", Kind::Stepped(6), 1, 1, 1),
     up(P_O2_WAVE, "Wave 2", Kind::Stepped(6), 1, 1, 2),
     up(P_O2_TUNE, "Tune 2", Kind::Knob, 1, 1, 3),
-    up(P_O3_TRACK, "KBD", Kind::Toggle, 1, 2, 0),
+    up(P_O3_TRACK, "OSC 3 KBD", Kind::Toggle, 1, 2, 0),
     up(P_O3_RANGE, "Range 3", Kind::Stepped(6), 1, 2, 1),
     up(P_O3_WAVE, "Wave 3", Kind::Stepped(6), 1, 2, 2),
     up(P_O3_TUNE, "Tune 3", Kind::Knob, 1, 2, 3),
@@ -261,21 +264,22 @@ const CONTROLS: &[Ctl] = &[
     up(P_MIX_NOISE, "Noise", Kind::Knob, 2, 3, 0),
     up(P_DRIVE, "Drive", Kind::Knob, 2, 0, 1),
     up(P_NOISE_COLOUR, "PINK", Kind::Toggle, 2, 3, 1),
-    // MODIFIERS: the filter, its contour, the loudness contour, and the
-    // keyboard and velocity amounts along the bottom.
-    up(P_CUTOFF, "Cutoff", Kind::Knob, 3, 0, 0),
-    up(P_EMPHASIS, "Emphasis", Kind::Knob, 3, 0, 1),
-    up(P_SEM_MODE, "Mode", Kind::Knob, 3, 0, 2),
+    // MODIFIERS: the filter row, the filter contour with the keyboard
+    // tracking at its left, the loudness contour, and the two velocity
+    // amounts along the bottom.
+    up(P_CUTOFF, "Cutoff", Kind::Knob, 3, 0, 1),
+    up(P_EMPHASIS, "Emphasis", Kind::Knob, 3, 0, 2),
     up(P_CONTOUR, "Contour", Kind::Knob, 3, 0, 3),
-    up(P_F_ATTACK, "F Attack", Kind::Knob, 3, 1, 0),
-    up(P_F_DECAY, "F Decay", Kind::Knob, 3, 1, 1),
-    up(P_F_SUSTAIN, "F Sustain", Kind::Knob, 3, 1, 2),
-    up(P_F_RELEASE, "F Release", Kind::Knob, 3, 1, 3),
-    up(P_A_ATTACK, "Attack", Kind::Knob, 3, 2, 0),
-    up(P_A_DECAY, "Decay", Kind::Knob, 3, 2, 1),
-    up(P_A_SUSTAIN, "Sustain", Kind::Knob, 3, 2, 2),
-    up(P_A_RELEASE, "Release", Kind::Knob, 3, 2, 3),
-    up(P_KEYTRACK, "Keyboard", Kind::Knob, 3, 3, 0),
+    up(P_SEM_MODE, "Mode", Kind::Knob, 3, 0, 4),
+    up(P_KEYTRACK, "Keyboard", Kind::Knob, 3, 1, 0),
+    up(P_F_ATTACK, "F Attack", Kind::Knob, 3, 1, 1),
+    up(P_F_DECAY, "F Decay", Kind::Knob, 3, 1, 2),
+    up(P_F_SUSTAIN, "F Sustain", Kind::Knob, 3, 1, 3),
+    up(P_F_RELEASE, "F Release", Kind::Knob, 3, 1, 4),
+    up(P_A_ATTACK, "Attack", Kind::Knob, 3, 2, 1),
+    up(P_A_DECAY, "Decay", Kind::Knob, 3, 2, 2),
+    up(P_A_SUSTAIN, "Sustain", Kind::Knob, 3, 2, 3),
+    up(P_A_RELEASE, "Release", Kind::Knob, 3, 2, 4),
     up(P_VEL_FILTER, "Vel>Flt", Kind::Knob, 3, 3, 1),
     up(P_VEL_AMP, "Velocity", Kind::Knob, 3, 3, 2),
     // OUTPUT
@@ -309,43 +313,45 @@ const CONTROLS: &[Ctl] = &[
 // ── the geometry ────────────────────────────────────────────────────────────
 
 /// The header band: the model name and the badge.
-const HEADER_H: f32 = 24.0;
+const HEADER_H: f32 = 26.0;
 /// The engraved section captions' band.
-const CAPTION_H: f32 = 15.0;
+const CAPTION_H: f32 = 16.0;
 /// A row of dials, tallest and shortest. The shortest still holds a dial a
 /// hand can turn and the two lines of larger text around it.
 const ROW_MAX: f32 = 96.0;
-const ROW_MIN: f32 = 50.0;
+const ROW_MIN: f32 = 52.0;
 /// The panel's inset from the window, and the air between the two bands.
 const MARGIN: f32 = 4.0;
 const BAND_AIR: f32 = 6.0;
 /// The name and reading lines around a dial: the words a panel is read
 /// by, so they take the room and the dial takes what is left.
-const NAME_H: f32 = 14.0;
-const READING_H: f32 = 14.0;
+const NAME_H: f32 = 16.0;
+const READING_H: f32 = 16.0;
 /// The text sizes, nominal; each word fits itself down from here.
-const NAME_PT: f32 = 10.5;
-const READING_PT: f32 = 10.5;
-const CAPTION_PT: f32 = 10.0;
-const TITLE_PT: f32 = 12.0;
+const NAME_PT: f32 = 11.0;
+const READING_PT: f32 = 11.0;
+const CAPTION_PT: f32 = 11.0;
+const TITLE_PT: f32 = 13.0;
 /// How much of the room left between the two words the dial's body takes,
 /// ticks included: small, so the words can grow.
-const DIAL_SHARE: f32 = 0.86;
+const DIAL_SHARE: f32 = 0.74;
 /// How far a drag turns a dial per point, and with shift held.
 const DRAG_PER_PT: f32 = 0.006;
 const FINE_PER_PT: f32 = 0.0015;
 /// Points of drag per detent on a stepped dial.
 const STEP_PTS: f32 = 14.0;
 /// The dial's dress, un-themed so it is the same knob on every panel: a
-/// thin black outline, the grey of a spun aluminium face, the darker and
+/// black outline a fifth of the radius wide (the owner's pick, "B", from
+/// a mockup of three), the grey of a spun aluminium face, the darker and
 /// lighter greys of its rings, and the black pointer.
 const OUTLINE: Color32 = Color32::from_rgb(0x10, 0x10, 0x10);
+const OUTLINE_SHARE: f32 = 0.19;
 const FACE: Color32 = Color32::from_rgb(0xb4, 0xb6, 0xba);
 const RING_DARK: Color32 = Color32::from_rgb(0x9c, 0x9e, 0xa3);
-const RING_LIGHT: Color32 = Color32::from_rgb(0xc9, 0xcb, 0xcf);
+const RING_LIGHT: Color32 = Color32::from_rgb(0xcb, 0xcd, 0xd1);
 const POINTER: Color32 = Color32::from_rgb(0x10, 0x10, 0x10);
-/// Rings turned into the face, inward from the outline.
-const RINGS: usize = 6;
+/// Rings turned into the face, inward from the outline: nine, fine.
+const RINGS: usize = 9;
 /// The sweep, centred on up: three quarters of a turn.
 const SWEEP: f32 = std::f32::consts::PI * 1.5;
 const TICKS: usize = 11;
@@ -618,12 +624,14 @@ fn knob(
         painter.circle_stroke(centre, rad, Stroke::new((rad * 0.06).max(1.0), st.s.edge));
     } else {
         painter.circle_filled(centre, rad, FACE);
+        let inner = rad * (1.0 - OUTLINE_SHARE);
         for k in 1..=RINGS {
-            let r = rad * (1.0 - k as f32 / (RINGS as f32 + 1.0));
-            let shade = if k % 2 == 0 { RING_LIGHT } else { RING_DARK };
-            painter.circle_stroke(centre, r, Stroke::new((rad * 0.045).max(0.6), shade));
+            let r = inner * (1.0 - k as f32 / (RINGS as f32 + 1.0));
+            let shade = if k % 2 == 1 { RING_LIGHT } else { RING_DARK };
+            painter.circle_stroke(centre, r, Stroke::new((rad * 0.035).max(0.5), shade));
         }
-        painter.circle_stroke(centre, rad, Stroke::new((rad * 0.07).max(1.0), OUTLINE));
+        let outline_w = (rad * OUTLINE_SHARE).max(1.5);
+        painter.circle_stroke(centre, rad - outline_w * 0.5, Stroke::new(outline_w, OUTLINE));
         // The pointer: in the outline, pointing at the level. A stepped
         // dial sits on its detent; a continuous one wherever it was left.
         let shown = match steps {
@@ -634,7 +642,7 @@ fn knob(
         let d = Vec2::new(angle.sin(), -angle.cos());
         painter.line_segment(
             [centre + d * (rad * 0.55), centre + d * (rad * 1.02)],
-            Stroke::new((rad * 0.16).max(1.5), POINTER),
+            Stroke::new((rad * 0.17).max(1.5), POINTER),
         );
     }
     let resp = resp?;
