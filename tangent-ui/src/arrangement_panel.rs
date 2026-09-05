@@ -3426,7 +3426,50 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
     let grid = separate(lane, 0.115);
     let empty_ground = separate(lane, 0.16);
     let seam = separate(lane, 0.24);
-    let ruler = blend(wood, lane, 0.55);
+    // **The ruler carries the markers now, so it has to read as its own
+    // surface against the band above it — and it did not.**
+    //
+    // A 55% blend of the band's wood and the lane field is a colour BETWEEN
+    // its two neighbours, which is the one place a third surface cannot be
+    // seen. On a dark theme both neighbours are near-black and the blend is
+    // near-black with them: measured across all seventeen themes in both
+    // modes the strip sat between 1.00:1 and 2.29:1 against the band, and
+    // fourteen of the thirty-four pairs were under 1.10 — Valentine and
+    // Blueprint in dark mode were EXACTLY the same colour, 1.00:1. The
+    // owner: "there are some where i can barely discern it from the
+    // recorder color, it should be legibly separate."
+    //
+    // So the blend is where the ruler's character comes from and `separate`
+    // is what makes it a surface: away from the band, toward white on a dark
+    // one and toward black on a pale one, then checked and pushed further if
+    // that was not enough. The step is the same shape the grid, the seam and
+    // the alternating stripe already use ten lines above, for the same
+    // reason and against the same problem.
+    let ruler = {
+        const APART: f32 = 1.35;
+        // **Through `legible_surface` at every step, because moving a
+        // surface is exactly how a surface lands in the dead zone.** The
+        // band at ~0.12-0.22 luminance is where neither ink clears 4.5:1,
+        // and the bar numbers take their ink FROM this colour: the first cut
+        // of this walk pushed Centennial's dark ruler straight into it and
+        // dropped the numbers to 3.68:1, which its own test said so. The
+        // surface moves, the ink follows, and the surface has to stay
+        // somewhere an ink can live.
+        let mut r = crate::recorder_panel::legible_surface(
+            separate(blend(wood, lane, 0.55), 0.10),
+        );
+        // A blend can land on the far side of its neighbour, so the walk is
+        // measured rather than assumed. Bounded: nine steps of 0.06 is a
+        // little over half the way to the extreme, past which a "ruler" is a
+        // white bar and the theme is gone.
+        for _ in 0..9 {
+            if crate::recorder_panel::contrast_ratio(r, wood) >= APART {
+                break;
+            }
+            r = crate::recorder_panel::legible_surface(separate(r, 0.06));
+        }
+        r
+    };
 
     // Ink follows the surface it lands on — the rule this app has now had to
     // learn six times. The headers wear the strip face; the lanes wear the
@@ -6691,6 +6734,64 @@ LaneView {
             })
             .collect()
     }
+    /// **The marker strip is its own surface, on every theme, in both
+    /// modes.**
+    ///
+    /// It is drawn in the ruler's colour and it sits directly under the
+    /// band, so if the two match there is no strip — just a taller band with
+    /// flags floating in it. That is what shipped: a 55% blend of the band's
+    /// wood and the lane field is a colour BETWEEN its two neighbours, and on
+    /// a dark theme both neighbours are near-black. Measured, fourteen of the
+    /// thirty-four theme-and-mode pairs sat under 1.10:1 against the band and
+    /// two — Valentine and Blueprint in dark mode — were the same colour to
+    /// the byte. The owner: "i can barely discern it from the recorder
+    /// color, it should be legibly separate."
+    ///
+    /// 1.3:1 is a floor for two large adjacent FIELDS, not for ink on a
+    /// ground: it is the point where an edge between two fills reads as an
+    /// edge rather than as a seam you have to look for. The whole set clears
+    /// 1.35 now and the widest is Porcelain dark at 2.77, so this is a floor
+    /// with the set above it rather than a bar drawn around the worst case.
+    ///
+    /// Revert-check: take the `separate` walk out of `ink`'s `ruler` and
+    /// this names fourteen pairs, the first of them at 1.00:1.
+    #[test]
+    fn the_marker_strip_is_legibly_separate_from_the_band() {
+        use crate::recorder_panel::contrast_ratio;
+        let clips: Vec<ClipView<'_>> = Vec::new();
+        let mut bad: Vec<String> = Vec::new();
+        for (theme, dark) in crate::theme::factory()
+            .into_iter()
+            .flat_map(|t| [(t.clone(), false), (t, true)])
+        {
+            let mut st = crate::settings::Settings::default();
+            theme.apply(&mut st);
+            st.dark_mode = dark;
+            let mut v = a_view(&clips);
+            v.dark_mode = dark;
+            let c = st.recorder_bg_color;
+            v.wood = (c.r, c.g, c.b);
+            let c = st.fx_strip_color;
+            v.fx_strip = (c.r, c.g, c.b);
+            let c = st.meter_bg_color;
+            v.meter_bg = (c.r, c.g, c.b);
+            let band = Color32::from_rgb(v.wood.0, v.wood.1, v.wood.2);
+            let r = contrast_ratio(ink(&v).ruler, band);
+            if r < 1.3 {
+                bad.push(format!(
+                    "{} {}: strip {r:.2}:1 against the band",
+                    theme.name,
+                    if dark { "dark" } else { "light" }
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "the marker strip disappears into the band:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
     pub(super) fn a_view<'a>(clips: &'a [ClipView<'a>]) -> ArrangeView<'a> {
 ArrangeView {
             master_gain: 1.0,
