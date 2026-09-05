@@ -1858,6 +1858,19 @@ enum ArrDrag {
     /// the order they were made and nothing re-sorts them; that is why this
     /// carries a plain index where `TempoPoint` cannot.
     Flag { index: usize, grab_dt: f64 },
+    /// A signature chip being carried along the ruler.
+    ///
+    /// Carries the bar it started on rather than an index, because a meter
+    /// map is keyed by bar and a drag that lands on an occupied bar merges
+    /// with it — after which an index would name a point that is no longer
+    /// there. `grab_dt` is the same offset a flag carries and for the same
+    /// reason: the chip must not jump its own width to the pointer.
+    ///
+    /// A signature can only ever start at a BAR LINE, so this drag is
+    /// quantised whatever the gridbox says — the snap below rounds to the
+    /// grid first and the bar second, so with the magnet on the chip lands
+    /// on the bar the grid line belongs to.
+    MeterChip { bar: u32, grab_dt: f64 },
     /// A tempo point being carried, by index — re-derived after every move
     /// for the reason above it: dragging one past its neighbour re-sorts the
     /// map and the old index would name somebody else's point.
@@ -10666,7 +10679,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // the lanes that are drawn, so today a carry simply cannot reach one
         // that is not.
         let on_header = matches!(drag, ArrDrag::ReorderLane { .. });
-        if !on_lanes && !on_header {
+        // **The strip travels sideways only.** A flag and a signature chip
+        // live on the ruler, which has one row and no vertical extent to
+        // scroll along — but they are carried along the SAME timeline the
+        // clips are, so a drag that reaches the edge has to bring the song
+        // with it exactly as a clip's does, or a marker can only ever be
+        // moved as far as the window already shows.
+        let on_strip = matches!(drag, ArrDrag::Flag { .. } | ArrDrag::MeterChip { .. });
+        if !on_lanes && !on_header && !on_strip {
             return;
         }
         let (zone, axes) = {
@@ -10675,6 +10695,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let l = crate::arrangement_panel::Layout::new(rect, &view);
             if on_lanes {
                 (l.lanes_area, EdgeAxes::Both)
+            } else if on_strip {
+                // The lanes' own rectangle, not the strip's: the strip is a
+                // couple of dozen points tall and a pointer dragging along
+                // it is inside the vertical edge zone at every moment, so
+                // the zone that decides the SPEED has to be the field the
+                // song scrolls through. The axis mask is what keeps it
+                // horizontal.
+                (l.lanes_area, EdgeAxes::X)
             } else {
                 (l.header, EdgeAxes::Y)
             }
@@ -11940,15 +11968,69 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// it lived inside the `ctx` loop the only reachable thing to test was
     /// the arithmetic beside it.
     fn arr_drag_marker(&mut self, index: usize, grab_dt: f64, t: f64) {
+        // **The magnet applies here too, and it did not before.** A marker
+        // names a place in the music, and the places worth naming are the
+        // ones the grid already draws — so with the gridbox on, a flag lands
+        // on a line exactly as a clip does. `arr_snap_t` is the whole rule:
+        // off, it returns the time unchanged, which is what this used to do
+        // in every case.
+        let to = self.arr_snap_t(t + grab_dt);
         let Some(m) = self.arrangement.markers.get_mut(index) else {
             return;
         };
-        let to = (t + grab_dt).max(0.0);
+        let to = to.max(0.0);
         if (m.at_s - to).abs() <= f64::EPSILON {
             return;
         }
         m.at_s = to;
         self.arr_save_edits();
+    }
+
+    /// **Carry a signature to another bar.** Returns the bar it now starts
+    /// on, so the drag can keep naming it.
+    ///
+    /// A signature is keyed by BAR, so the pointer's time is snapped — by
+    /// the gridbox first, if it is on, and then to the bar line whatever it
+    /// says, because there is nowhere else a signature can begin. Bar zero
+    /// is refused as a destination and as a subject: a song has a signature
+    /// from its first bar, `set_meter_at` will not clear it, and dragging
+    /// the first chip away would leave the map with no answer at bar one.
+    ///
+    /// Landing on a bar that already carries a change REPLACES it, which is
+    /// what dropping one thing on another means everywhere else on this
+    /// timeline.
+    fn arr_drag_meter(&mut self, bar: u32, grab_dt: f64, t: f64) -> Option<u32> {
+        if bar == 0 {
+            return None;
+        }
+        let to = self.arr_snap_t(t + grab_dt).max(0.0);
+        let tempo = self.live_tempo_map();
+        let meter = self.live_meter_map();
+        let q = tempo.beat_at_seconds(to);
+        // The bar the pointer is in, and the NEXT one if it is more than
+        // halfway through: a chip follows the bar line it is nearest, the
+        // way a clip follows the grid line it is nearest, rather than the
+        // one it happens to be standing after.
+        let (in_bar, beat) = meter.bar_beat_at_quarter(q);
+        let to_bar = if beat > meter.quarters_in_bar(in_bar) * 0.5 {
+            in_bar + 1
+        } else {
+            in_bar
+        };
+        if to_bar == 0 || to_bar == bar {
+            return None;
+        }
+        let sig = meter.sig_at_bar(bar);
+        self.set_meter_at(bar, None);
+        self.set_meter_at(to_bar, Some(sig));
+        // A field open on the chip travels with it, or the next Enter would
+        // write the signature back to the bar it just left.
+        if let Some(e) = self.num_edit.as_mut() {
+            if e.field == recorder::NumField::MeterAt(bar) {
+                e.field = recorder::NumField::MeterAt(to_bar);
+            }
+        }
+        Some(to_bar)
     }
 
     /// **Put the playhead on a marker.** What a named place is for.
@@ -12070,7 +12152,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         let mut pts = self.live_meter_map().points().to_vec();
         match sig {
-            Some(sig) => pts.push(crate::tempo::MeterPoint { at_bar: bar, sig }),
+            // **The bar is CLEARED before the new point goes on, and that
+            // is the whole of the owner's "I cannot change a signature".**
+            // This pushed unconditionally, so setting a bar that already
+            // carried a change left two points on the same bar — and
+            // `MeterMap::sanitised` keeps the first of a duplicate pair, so
+            // the OLD one won every time. A signature could therefore be
+            // created on a bar that had none and never changed afterwards:
+            // open the chip, type 6/8, press Enter, and the strip still
+            // reads what it read before. Nothing said no; the new value was
+            // simply dropped on the floor one call later.
+            Some(sig) => {
+                pts.retain(|p| p.at_bar != bar);
+                pts.push(crate::tempo::MeterPoint { at_bar: bar, sig });
+            }
             None => pts.retain(|p| p.at_bar != bar),
         }
         self.arrangement.meter = crate::tempo::MeterMap::sanitised(pts);
@@ -18225,6 +18320,24 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.arr_drag = None;
                     return;
                 }
+                // **The strip's two kinds open their value on a DOUBLE
+                // click**, because a single one now carries them: the
+                // owner's rule for the whole strip, "left click drags them,
+                // double click on their value should edit". A flag opens
+                // its name, a chip opens its signature, and the drag the
+                // first press started is dropped so the double does not
+                // also move what it opened.
+                if let Some(A::Flag(i)) = hit {
+                    self.arr_drag = None;
+                    self.arr_marker_sel = Some(i);
+                    self.arr_rename_marker(i);
+                    return;
+                }
+                if let Some(A::MeterChip(bar)) = hit {
+                    self.arr_drag = None;
+                    self.arr_edit_meter(bar);
+                    return;
+                }
                 // **And an automation row's dial**, which puts the lane's
                 // BASE back where the control would rest with no curve on it
                 // — see `auto_base`. Not to zero: the base is a level, and
@@ -18471,7 +18584,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // a map somebody spent an evening on is not something to
                     // lose to a mis-click on a header.
                     Some(A::TempoHeader) => self.arr_ask_flatten_tempo(),
-                    Some(A::MeterChip(bar)) => self.arr_edit_meter(bar),
+                    // **A press on a chip PICKS IT UP, and the double-click
+                    // above is what opens its field** — the owner's rule for
+                    // the strip, the same one the flags already followed:
+                    // "left click drags them, double click on their value
+                    // should edit". A single press used to open the field,
+                    // which left no gesture at all for moving a signature and
+                    // meant every reach for one re-seeded the box.
+                    Some(A::MeterChip(bar)) => {
+                        let dt = {
+                            let tempo = self.live_tempo_map();
+                            let meter = self.live_meter_map();
+                            tempo.seconds_at_beat(meter.quarter_at_bar(bar)) - t_at
+                        };
+                        self.arr_drag = Some(ArrDrag::MeterChip { bar, grab_dt: dt });
+                    }
                     // **A press on a flag PICKS IT UP.** The owner's rule:
                     // "No left click should do anything to a marker but
                     // select and click to drag." It used to locate, which
@@ -18947,6 +19074,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         crate::arrangement_panel::time_at(rect, &view, p.x)
                     };
                     self.arr_drag_marker(index, grab_dt, t);
+                }
+                ArrDrag::MeterChip { bar, grab_dt } => {
+                    let rect = self.arrangement_rect.unwrap_or(Rect::NOTHING);
+                    let t = {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        crate::arrangement_panel::time_at(rect, &view, p.x)
+                    };
+                    if let Some(to) = self.arr_drag_meter(bar, grab_dt, t) {
+                        self.arr_drag = Some(ArrDrag::MeterChip { bar: to, grab_dt });
+                    }
                 }
                 // The same two functions the drawing uses, for the reason
                 // `AutoPoint` gives above.
@@ -23543,7 +23681,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             | A::AutoMenu(_)
             | A::TempoPoint(_)
             | A::TempoLane(..)
-            | A::MeterChip(_)
             | A::MeterChip(_) => {}
         }
     }
@@ -34639,6 +34776,129 @@ mod tests {
         assert_eq!(TangentApp::flag_menu_subject(Some(H::ClipBody(1))), None);
         assert_eq!(TangentApp::flag_menu_subject(Some(H::Lane(0, 4.0))), None);
         assert_eq!(TangentApp::flag_menu_subject(None), None);
+    }
+
+    /// **The strip's two kinds are carried, and open their value on a
+    /// double click.**
+    ///
+    /// The owner's four rules for markers and signatures, each driven
+    /// rather than asserted about: a left drag MOVES one, the gridbox
+    /// magnetises the drop the same way it magnetises a clip, a double
+    /// click opens the value, and a signature can only ever land on a bar
+    /// line.
+    ///
+    /// The snap half is checked BOTH ways from one position, because
+    /// "it landed on a line" proves nothing on its own — a drop that was
+    /// never going to move is on a line too. The same pointer time with the
+    /// magnet off has to land somewhere the magnet would not have left it.
+    ///
+    /// Revert-checks, all five performed: drop the `arr_snap_t` from
+    /// `arr_drag_marker` and the snapped drop reads the raw time; make it
+    /// snap unconditionally and the magnet-off drop moves to a line; take
+    /// the halfway rounding out of `arr_drag_meter` and the chip lands a
+    /// bar short; let `arr_drag_meter` accept bar zero and the song loses
+    /// its opening signature; and remove either double-click arm and the
+    /// field it opens is `None`.
+    #[test]
+    fn a_flag_and_a_chip_are_carried_and_open_on_a_double_click() {
+        use recorder::NumField as F;
+        let (_ctx, mut app) = headless_with_band(Caps::DESKTOP);
+
+        // A marker to carry, and a grid to carry it onto.
+        app.arrangement.markers.push(crate::arrangement::ArrMarker {
+            at_s: 1.0,
+            name: "verse".to_owned(),
+        });
+        app.settings.arr_grid_exp = 0;
+
+        // **The magnet on.** Dropped a hair off a line, it lands on one.
+        app.settings.arr_snap = true;
+        let line = app.arr_snap_t(2.0);
+        app.arr_drag_marker(0, 0.0, line + 0.031);
+        let snapped = app.arrangement.markers[0].at_s;
+        assert!(
+            (snapped - line).abs() < 1.0e-9,
+            "with the gridbox on a flag dropped at {} landed at {snapped}, not on {line}",
+            line + 0.031
+        );
+
+        // **The magnet off.** The same drop keeps the time it was given, so
+        // the assertion above is about the magnet and not about the grid
+        // happening to be where the pointer was.
+        app.settings.arr_snap = false;
+        app.arr_drag_marker(0, 0.0, line + 0.031);
+        let free = app.arrangement.markers[0].at_s;
+        assert!(
+            (free - (line + 0.031)).abs() < 1.0e-9,
+            "with the gridbox off a flag landed at {free} rather than where it was dropped"
+        );
+        assert!(
+            (free - snapped).abs() > 1.0e-6,
+            "the two drops are the same place, so this proves nothing about the magnet"
+        );
+
+        // **A signature is carried to a BAR**, wherever inside one it is
+        // dropped: two thirds of the way through bar four is bar five.
+        app.set_meter_at(4, Some(recorder::TimeSignature { beats: 3, unit: 4 }));
+        let bar_s = |app: &TangentApp, bar: u32| -> f64 {
+            let tempo = app.live_tempo_map();
+            let meter = app.live_meter_map();
+            tempo.seconds_at_beat(meter.quarter_at_bar(bar))
+        };
+        let (four, five) = (bar_s(&app, 4), bar_s(&app, 5));
+        let landed = app.arr_drag_meter(4, 0.0, four + (five - four) * 0.67);
+        assert_eq!(landed, Some(5), "the chip did not follow the nearer bar line");
+        assert_eq!(
+            app.live_meter_map().sig_at_bar(5),
+            recorder::TimeSignature { beats: 3, unit: 4 },
+            "the signature did not arrive at bar 5: {:?}",
+            app.live_meter_map().points()
+        );
+        assert!(
+            !app.live_meter_map().points().iter().any(|pt| pt.at_bar == 4),
+            "the signature is in two places at once: {:?}",
+            app.live_meter_map().points()
+        );
+
+        // **Bar zero is not draggable**, because a song has a signature
+        // from its first bar and there is nowhere for that one to go.
+        let before = app.live_meter_map().sig_at_bar(0);
+        assert_eq!(app.arr_drag_meter(0, 0.0, five), None);
+        assert_eq!(
+            app.live_meter_map().sig_at_bar(0),
+            before,
+            "dragging bar zero moved the song's own signature"
+        );
+
+        // **The double click opens the value**, one kind at a time.
+        app.num_edit = None;
+        app.arr_rename_marker(0);
+        assert_eq!(
+            app.num_edit.as_ref().map(|e| (e.field, e.text.clone())),
+            Some((F::MarkerName(0), "verse".to_owned())),
+            "a double click on a flag did not open its name on the name it has"
+        );
+        app.num_edit = None;
+        app.arr_edit_meter(5);
+        assert_eq!(
+            app.num_edit.as_ref().map(|e| (e.field, e.text.clone())),
+            Some((F::MeterAt(5), "3/4".to_owned())),
+            "a double click on a chip did not open its signature"
+        );
+
+        // And what the field is for: 6/8 goes in and 6/8 comes out. The
+        // owner's report was that it could not be done at all.
+        for ch in "6/8".chars() {
+            if let Some(e) = app.num_edit.as_mut() {
+                e.push(ch);
+            }
+        }
+        app.commit_number();
+        assert_eq!(
+            app.live_meter_map().sig_at_bar(5),
+            recorder::TimeSignature { beats: 6, unit: 8 },
+            "typing 6/8 into an open chip did not take"
+        );
     }
 
     /// **The flag menu says the owner's words, and a press does the thing
