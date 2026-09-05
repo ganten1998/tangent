@@ -154,9 +154,19 @@ struct Recorder {
     /// Notices the output going quiet without an error — the ASIO
     /// dead-driver case. Reset whenever the engine is (re)made.
     engine_watch: crate::instrument::StallWatch,
-    /// The auto recheck — the owner's ask after the yank test. Alive only
-    /// while the engine is down; see `Reprobe`.
+    /// The auto recheck — the owner's ask after the yank test. Alive while
+    /// the engine is down, and while it runs on the fallback below; see
+    /// `Reprobe`.
     reprobe: Option<Reprobe>,
+    /// **The system the SETTING names while the engine runs on the platform
+    /// default instead** — `Some("ASIO")` for the session in which the
+    /// interface was unplugged, `None` whenever the engine is on the system
+    /// that was chosen. The owner's ruling, after the Windows tester's
+    /// unplugged launches: "fallback to wasapi is sensical." The setting is
+    /// never rewritten — this is a fact about the session, not a preference
+    /// — and the reprobe keeps watching for the interface so the chosen
+    /// system comes back the moment it does. See `start_engine`.
+    fallback: Option<String>,
     /// The ReaStream sender, alive while the engine is and streaming while the
     /// setting is on. Dropped when the engine restarts so the next one hands it
     /// a fresh tap; see `reconcile_reastream`.
@@ -1934,6 +1944,17 @@ struct Reprobe {
 /// while somebody waits. Reasoned from the code and the tester's log, not
 /// measured on the Windows machine; the tester's next unplugged launch is
 /// the measurement.
+/// **Which chosen systems fall back to the platform default when they have
+/// no working output**: ASIO, and only ASIO. Its device list is a registry
+/// of drivers, not of hardware, so "chosen and absent" is an everyday state
+/// there — an interface unplugged — and not a misconfiguration. JACK with no
+/// server is already answered a level down (`build_host`), and the platform
+/// default has nothing to fall back to.
+#[cfg(feature = "recorder")]
+fn fallback_wanted(chosen: Option<&str>) -> bool {
+    chosen == Some("ASIO")
+}
+
 #[cfg(feature = "recorder")]
 fn hardware_back(asio: bool, baseline: &[String], outputs: &[String], default_alive: bool) -> bool {
     if asio {
@@ -1945,16 +1966,18 @@ fn hardware_back(asio: bool, baseline: &[String], outputs: &[String], default_al
 
 #[cfg(feature = "recorder")]
 impl Reprobe {
-    fn spawn() -> Self {
+    /// `asio`: watch for a plug event rather than a live default output —
+    /// decided by the caller from the SETTING, since on the fallback the
+    /// process-global system is the platform default while the interface
+    /// being waited for is ASIO's. Decided once, here: the system the
+    /// engine is waiting on cannot change without `path_changed` reopening
+    /// the path, which drops this probe with the engine it makes.
+    fn spawn(asio: bool) -> Self {
         use std::sync::atomic::{AtomicBool, Ordering};
         let stop = Arc::new(AtomicBool::new(false));
         let live = Arc::new(AtomicBool::new(false));
         let stop_t = Arc::clone(&stop);
         let live_t = Arc::clone(&live);
-        // Decided once, here: the system the engine is waiting on cannot
-        // change without `path_changed` reopening the path, which drops this
-        // probe with the engine it makes.
-        let asio = tangent_record::audio::system_is_asio();
         let spawned = std::thread::Builder::new()
             .name("audio-reprobe".to_owned())
             .spawn(move || {
@@ -2567,7 +2590,10 @@ impl DesktopApp {
         // return, and the one UI-thread reopen happens the frame it is seen.
         // The probe flag flips between frames, so ask for a wakeup rather
         // than trusting the next paint to somebody moving the mouse.
-        if self.recorder.engine.is_some() {
+        // **On the fallback the probe stays alive with the engine**: the
+        // engine is up, on the platform default, and the interface it is
+        // standing in for is exactly what the probe is watching for.
+        if self.recorder.engine.is_some() && self.recorder.fallback.is_none() {
             self.recorder.reprobe = None;
         } else if self
             .recorder
@@ -2590,10 +2616,21 @@ impl DesktopApp {
         } else if self.recorder.reprobe.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         } else if self.app.recorder_band_open()
-            && self.recorder.engine_error.is_some()
-            && self.recorder.engine_retry.is_none()
+            && ((self.recorder.engine_error.is_some() && self.recorder.engine_retry.is_none())
+                || self.recorder.fallback.is_some())
+            // **Not while a reopen is already owed.** The replug above asks
+            // for the open through `announce`, which runs it a frame later;
+            // on that one frame the engine is still down and this arm spawned
+            // a SECOND probe, which announced "waiting for an interface" in
+            // the same breath as the open that ended the wait. The tester
+            // read it as the wait restarting.
+            && self.chore.is_none()
         {
-            self.recorder.reprobe = Some(Reprobe::spawn());
+            // By the SETTING, not the process-global system: on the fallback
+            // the global says "platform default" while the interface being
+            // waited for is ASIO's.
+            let watch_plug = fallback_wanted(self.app.audio_system().as_deref());
+            self.recorder.reprobe = Some(Reprobe::spawn(watch_plug));
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
@@ -9144,6 +9181,12 @@ impl DesktopApp {
             return;
         }
         self.recorder.audio_path_deferred = false;
+        // **The CHOSEN system first, every time.** A session running on the
+        // fallback has the process-global system set to the platform default;
+        // a reopen — the interface back, a setting changed — must try what
+        // was chosen before settling for anything less. `start_engine` falls
+        // back again if it has to.
+        tangent_record::audio::set_system(self.app.audio_system().as_deref());
         self.recorder.session.close_input();
         self.start_engine(ctx);
         self.reconcile_audio(true);
@@ -9402,13 +9445,71 @@ impl DesktopApp {
         // then given the rate this actually got, which is what keeps the two
         // halves on one clock. See `engine_rate` and `input_rate`.
         let rate = self.engine_rate();
-        match crate::instrument::Engine::start_sized(
+        let chosen = self.app.audio_system();
+        let mut started = crate::instrument::Engine::start_sized(
             None,
             self.recorder.session.timebase(),
             self.app.buffer_frames(),
             rate,
-        ) {
+        );
+        // **The fallback, for this session only.** ASIO chosen and no
+        // working output through it — the interface unplugged, or a driver
+        // registered for hardware that never came — used to be silence plus
+        // an error in the band until the interface returned. The owner:
+        // "fallback to wasapi is sensical." So the platform default is
+        // opened instead, the setting is left exactly as it was, the band
+        // says why, and the reprobe watches for the interface so the chosen
+        // system comes back on its own. Only ASIO: it is the one system whose
+        // device list is a registry of drivers rather than of hardware, and
+        // the one the Windows tester's machine has.
+        if let Err(e) = &started {
+            if fallback_wanted(chosen.as_deref()) && self.recorder.fallback.is_none() {
+                log::warn!(
+                    "no audio output through ASIO: {e} - opening the platform default for \
+                     this session instead; the setting stays ASIO and the interface is \
+                     watched for"
+                );
+                tangent_record::audio::set_system(None);
+                started = crate::instrument::Engine::start_sized(
+                    None,
+                    self.recorder.session.timebase(),
+                    self.app.buffer_frames(),
+                    rate,
+                );
+                match &started {
+                    Ok(e) => {
+                        self.recorder.fallback = chosen.clone();
+                        self.app.notify(
+                            tangent_ui::notify::Kind::Error,
+                            format!(
+                                "ASIO has no working output - is the interface plugged in? \
+                                 Using {} through the system's own audio until it is back.",
+                                e.output().device
+                            ),
+                        );
+                    }
+                    // Nothing to fall back on either: the chosen system is
+                    // put back for the retries below, so a returning
+                    // interface is met on the road that was asked for.
+                    Err(_) => tangent_record::audio::set_system(chosen.as_deref()),
+                }
+            }
+        }
+        match started {
             Ok(e) => {
+                // **Back on the chosen system, said out loud.** The fallback
+                // note above promised the interface would be watched for;
+                // this is the promise kept, and the one line that tells a
+                // person the ASIO they chose is what is playing again.
+                if tangent_record::audio::system().is_some() {
+                    if let Some(was) = self.recorder.fallback.take() {
+                        log::info!("audio: back on {was} - {}", e.output().device);
+                        self.app.notify(
+                            tangent_ui::notify::Kind::Success,
+                            format!("Back on {was} - {}", e.output().device),
+                        );
+                    }
+                }
                 // **What was asked for, and what the device actually gave**,
                 // in one line, at INFO. Written because the owner had no way
                 // to tell the two apart from inside the app: "Tangent does not
@@ -9541,15 +9642,27 @@ impl DesktopApp {
                 // whose speakers work is a sentence that needs the next
                 // clause: the CHOSEN system had none, and the platform default
                 // is not consulted while one is chosen.
-                log::warn!(
-                    "no audio output through {}: {e}",
-                    self.app
-                        .audio_system()
-                        .unwrap_or_else(|| "the platform default".to_owned())
-                );
                 self.recorder.engine_error = Some(format!("no audio output: {e}"));
                 // Try again shortly, a few times. See `engine_retry`.
                 let left = self.recorder.engine_retry.map_or(ENGINE_TRIES, |(_, n)| n);
+                // **Said twice, not six times.** The first failure at WARN,
+                // with the system named, since "no audio output" on a
+                // machine whose speakers work needs the next clause; then
+                // one line when the retries are spent, saying so and how
+                // many there were. The tester's log had the same sentence
+                // six times over three seconds, which reads as six faults.
+                let system = self
+                    .app
+                    .audio_system()
+                    .unwrap_or_else(|| "the platform default".to_owned());
+                if left == ENGINE_TRIES {
+                    log::warn!("no audio output through {system}: {e}");
+                } else if left == 0 {
+                    log::info!(
+                        "still no audio output through {system} after {ENGINE_TRIES} more \
+                         tries; the reprobe watches for the hardware from here"
+                    );
+                }
                 self.recorder.engine_retry = (left > 0).then(|| {
                     (
                         std::time::Instant::now() + ENGINE_RETRY_AFTER,
@@ -13429,6 +13542,7 @@ impl DesktopApp {
                 engine_error: None,
                 engine_watch: crate::instrument::StallWatch::new(),
                 reprobe: None,
+                fallback: None,
                 reastream: None,
                 pads_retry: false,
                 inserts_loaded: vec![None; tangent_ui::recorder::INSERT_SPACE],
@@ -17295,6 +17409,40 @@ mod tests {
             panel.contains("self.save_start(request.purpose)"),
             "the save panel picks its own start directory again instead of \
              asking `save_start`, so the match above no longer decides anything"
+        );
+    }
+
+    /// **Only ASIO falls back to the platform default**, and the road that
+    /// does it restores the chosen system before every reopen and keeps the
+    /// probe alive on the fallback — pinned at each end, because a fallback
+    /// that never comes back is a setting silently lost, which is the one
+    /// thing the owner's ruling forbade.
+    #[test]
+    fn the_asio_fallback_is_for_the_session_and_comes_back() {
+        assert!(super::fallback_wanted(Some("ASIO")));
+        assert!(!super::fallback_wanted(Some("JACK")));
+        assert!(!super::fallback_wanted(None));
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        let reopen = {
+            let a = src.find("fn open_audio_path_now(").expect("the reopen road is gone");
+            let b = src[a..].find("\n    fn ").expect("its end");
+            &src[a..a + b]
+        };
+        let restore = reopen.find("set_system(self.app.audio_system().as_deref())").expect("the reopen no longer restores the chosen system");
+        let start = reopen.find("self.start_engine(ctx)").expect("the reopen no longer starts the engine");
+        assert!(restore < start, "the chosen system is restored AFTER the engine starts, so a reopen on the fallback stays on it");
+        let engine = {
+            let a = src.find("fn start_engine(").expect("`start_engine` is gone");
+            let b = src[a..].find("\n    fn ").expect("its end");
+            &src[a..a + b]
+        };
+        assert!(engine.contains("fallback_wanted(chosen.as_deref())"), "the fallback no longer asks `fallback_wanted`");
+        assert!(engine.contains("self.recorder.fallback = chosen.clone()"), "the fallback no longer records what it stands in for");
+        assert!(!engine.contains("audio_system = "), "the fallback writes the SETTING, which the ruling forbade");
+        assert!(
+            src.contains("self.recorder.engine.is_some() && self.recorder.fallback.is_none()"),
+            "the probe is dropped while the engine runs on the fallback, so the interface is never noticed coming back"
         );
     }
 

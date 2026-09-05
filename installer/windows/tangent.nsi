@@ -87,6 +87,10 @@ VIAddVersionKey "LegalCopyright" "MIT"
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
+; The one choice an uninstall offers: whether the settings go too. Off by
+; default, and a page rather than a question box so the words can be read
+; before anything is ticked. See the two uninstall sections below.
+!insertmacro MUI_UNPAGE_COMPONENTS
 !insertmacro MUI_UNPAGE_INSTFILES
 
 !insertmacro MUI_LANGUAGE "English"
@@ -141,7 +145,8 @@ Function .onInit
   ${EndIf}
 FunctionEnd
 
-Section "Uninstall"
+Section "un.Tangent" SEC_UN_APP
+  SectionIn RO
   RMDir /r "$COMMONFILES64\VST3\Tangent.vst3"
   Delete "$SMPROGRAMS\Tangent\Tangent.lnk"
   Delete "$SMPROGRAMS\Tangent\Uninstall Tangent.lnk"
@@ -149,7 +154,26 @@ Section "Uninstall"
   RMDir /r "$INSTDIR"
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Tangent"
   DeleteRegKey HKLM "Software\Tangent"
-  ; Settings are deliberately NOT removed. They live in %USERPROFILE%\.config\ivory
-  ; and include taught chord names and a supporter key, none of which the user
-  ; asked to throw away by uninstalling a program.
+  ; Settings are deliberately NOT removed here. They live in
+  ; %USERPROFILE%\.config\tangent and include taught chord names and a
+  ; supporter key, none of which the user asked to throw away by uninstalling
+  ; a program. The section below is the one place they go, and it is off
+  ; unless ticked.
 SectionEnd
+
+; **Off by default, and its own tick.** A settings file survives an
+; uninstall on purpose (above) - but a settings file that has gone wrong
+; survives it too, and then re-breaks the next install "between updates",
+; which is how a Windows tester met an audio system that could not open
+; and could not be escaped by reinstalling. The way out is offered where a
+; person looking for it would look, and it takes a deliberate tick.
+Section /o "un.Also remove my settings and taught chords" SEC_UN_SETTINGS
+  RMDir /r "$PROFILE\.config\tangent"
+SectionEnd
+
+!insertmacro MUI_UNFUNCTION_DESCRIPTION_BEGIN
+  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_UN_APP} \
+    "The program, its plug-in and its shortcuts. Always removed."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SEC_UN_SETTINGS} \
+    "Everything under %USERPROFILE%\.config\tangent: settings, taught chord names, the supporter key, logs. Leave this off to keep them for the next install."
+!insertmacro MUI_UNFUNCTION_DESCRIPTION_END
