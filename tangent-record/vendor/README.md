@@ -292,3 +292,32 @@ these copies is that each one stays diffable against its upstream tarball,
 byte for byte outside the declared patch, and stripping packaging files would
 make every such diff open with noise instead of nothing. Do not tidy them
 away.
+
+# Vendored `asio-sys`
+
+`asio-sys/` is [`asio-sys` 0.2.6](https://github.com/RustAudio/cpal) (Apache-2.0)
+with **one change**: the "which driver is loaded" guard is a process-wide
+`static` instead of a field of each `Asio` value. Everything else is
+byte-identical to the crates.io copy (`Cargo.toml.orig` and `.cargo_vcs_info`
+left out). Regenerate the diff with:
+
+    diff -ru ~/.cargo/registry/src/*/asio-sys-0.2.6/src tangent-record/vendor/asio-sys/src
+
+## Why
+
+The Steinberg SDK keeps the loaded driver in process globals —
+`theAsioDriver`, `asioDrivers->curIndex` — and `AsioDrivers::loadDriver`
+begins with `removeCurrentDriver()`. Upstream asio-sys guards against loading a
+second driver with a `Weak` **per `Asio` instance**, so a second instance, on
+a second thread, starts with an empty guard and goes straight to the loader,
+which releases the first instance's driver from under its running stream.
+
+That is what the Windows tester's machine was doing on 2026-09-05: Tangent's
+rate poll thread asked the chosen host for its rate once a second through a
+host of its own, the UI thread's ASIO stream went quiet three seconds after
+every open, the app reopened it, and the two threads' `ASIOInit` calls raced
+until the UI thread read the SDK's driver pointer back null — the crash at
+`ASIOInit+0x17`, `mov rax, [rcx]` with `rcx` = 0, named by the build's PDB.
+Tangent no longer asks the chosen host from that thread at all
+(`desktop::RatePoll`); this change is the belt to that brace, so that no
+second instance can ever do it again.

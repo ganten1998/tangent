@@ -1208,6 +1208,22 @@ pub fn set_system(name: Option<&str>) {
         .map(str::to_owned);
 }
 
+/// **Whether the chosen system is ASIO**, the one system whose driver state
+/// is a set of PROCESS GLOBALS rather than a property of the `Host` value.
+///
+/// The question a second thread has to ask before it touches the chosen host
+/// at all. Loading an ASIO driver — which is what enumerating devices does —
+/// from any thread but the one the stream runs on releases the stream's
+/// driver underneath it, and racing the UI thread's own `ASIOInit` with it
+/// is a null read in the SDK. That was the Windows tester's crash on
+/// 2026-09-05 and the "went quiet every three seconds" loop before it; see
+/// `desktop::RatePoll`. `false` for the platform default and every other
+/// system, where a per-thread host is exactly as safe as this crate's own
+/// `HOST_CACHE` note says.
+pub fn system_is_asio() -> bool {
+    system().as_deref() == Some("ASIO")
+}
+
 /// The chosen system's name, or `None` for the platform default.
 pub fn system() -> Option<String> {
     match SYSTEM.lock() {

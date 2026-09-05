@@ -451,6 +451,13 @@ WINZIP="${WINSTAGE}.zip"
 rm -rf "$WINSTAGE" "$WINZIP"
 mkdir -p "$WINSTAGE"
 cp target/x86_64-pc-windows-msvc/release/tangent.exe "$WINSTAGE/"
+# **The symbols, beside the deliverables and never inside them.** lld-link
+# writes a PDB of public symbols even for the stripped release, and it is
+# what turned a Windows Error Reporting offset into a function name in one
+# command on 2026-09-05 (`llvm-symbolizer --obj=tangent.exe 0x1400c6d417`).
+# Kept per build under the build's own name, because an offset is only
+# meaningful against the exact binary that faulted.
+cp target/x86_64-pc-windows-msvc/release/tangent.pdb "dist/tangent-${VERSION}-windows-x86_64.pdb" 2>/dev/null || true
 scripts/sign-windows.sh "$WINSTAGE/tangent.exe"
 # Steinberg's required notice, when the ASIO backend rode in.
 if [ -n "${CPAL_ASIO_DIR:-}" ]; then

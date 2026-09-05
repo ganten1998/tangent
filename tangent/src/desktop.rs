@@ -1749,7 +1749,25 @@ impl RatePoll {
             .name("tangent-rate-watch".to_owned())
             .spawn(move || loop {
                 let Some(cell) = weak.upgrade() else { return };
-                let hz = crate::instrument::Engine::default_output_rate(None).unwrap_or(0);
+                // **Never the chosen host under ASIO.** `default_output_rate`
+                // goes through `with_host`, which is per THREAD — so on this
+                // thread it built a second ASIO host, whose empty driver guard
+                // sent every ask straight to the SDK loader. The SDK's loader
+                // begins by releasing whatever driver is current, which was
+                // the UI thread's stream: the output went quiet three seconds
+                // after every open (the stall watch), reopened, and went
+                // quiet again, for as long as the app ran — and when this
+                // thread's `ASIOInit` raced the UI thread's, the UI thread
+                // read the SDK's driver pointer back null and died. Windows,
+                // 2026-09-05, symbolised against the build's own PDB. Under
+                // ASIO the follower asks the engine's own device on the UI
+                // thread instead (`Engine::device_rate_now`), and this thread
+                // reports nothing.
+                let hz = if tangent_record::audio::system_is_asio() {
+                    0
+                } else {
+                    crate::instrument::Engine::default_output_rate(None).unwrap_or(0)
+                };
                 cell.store(hz, Ordering::Relaxed);
                 // Dropped BEFORE the sleep, so the last owner going away is
                 // noticed within one tick rather than being held alive by
@@ -9220,8 +9238,15 @@ impl DesktopApp {
         }
         self.recorder.rate_asked = Some(now);
         ctx.request_repaint_after(RATE_ASK_EVERY);
-        // Read, not asked: the asking happens on `RatePoll`'s thread.
-        let device_at = self.recorder.rate_poll.rate();
+        // Read, not asked: the asking happens on `RatePoll`'s thread —
+        // except under ASIO, where that thread must not touch the driver and
+        // the engine's own device is asked here, on the thread it lives on.
+        // See `RatePoll::start` for the crash that decided it.
+        let device_at = if tangent_record::audio::system_is_asio() {
+            self.recorder.engine.as_ref().and_then(|e| e.device_rate_now())
+        } else {
+            self.recorder.rate_poll.rate()
+        };
         if !self.recorder.rate_watch.note(engine_at, opened_at, device_at) {
             return;
         }
@@ -17212,6 +17237,33 @@ mod tests {
             panel.contains("self.save_start(request.purpose)"),
             "the save panel picks its own start directory again instead of \
              asking `save_start`, so the match above no longer decides anything"
+        );
+    }
+
+    /// **The rate poll's thread never asks the chosen host under ASIO**, and
+    /// the follower asks the engine's own device there instead. The Windows
+    /// crash of 2026-09-05 was this thread loading ASIO drivers through a
+    /// host of its own; the rule is pinned at both ends so neither half can
+    /// quietly come back.
+    #[test]
+    fn the_rate_poll_never_loads_the_chosen_driver_from_its_thread() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        let thread = {
+            let a = src.find("fn start() -> Self {").expect("`RatePoll::start` is gone");
+            let b = src[a..].find("\n    fn ").expect("the end of `RatePoll::start`");
+            &src[a..a + b]
+        };
+        let guard = thread.find("system_is_asio()").expect("the poll thread no longer asks which system it is on");
+        let ask = thread.find("default_output_rate(None)").expect("the poll thread no longer asks the rate");
+        assert!(guard < ask, "the ASIO check comes after the ask, so the driver is loaded first");
+        let follower = {
+            let a = src.find("rate_poll.rate()").expect("the follower no longer reads the poll");
+            &src[a.saturating_sub(400)..a]
+        };
+        assert!(
+            follower.contains("system_is_asio()") && follower.contains("device_rate_now()"),
+            "under ASIO the follower no longer asks the engine's own device on the UI thread"
         );
     }
 
