@@ -1049,6 +1049,18 @@ pub struct Settings {
     pub record_input_channels: Vec<String>,
     /// Device keys the multichannel auto-expose has seeded, once each.
     pub auto_exposed: Vec<String>,
+    /// **Why the settings on disk could not be read**, when they could not —
+    /// carried to the app's first frame and said there, then dropped. Never
+    /// written to the file: it is a report about the file. `None` on every
+    /// ordinary launch.
+    ///
+    /// A Windows tester rewrote `settings.json` with PowerShell, which put a
+    /// byte-order mark in front of it; the loader set the file aside as it
+    /// always has, started from a first launch, and said NOTHING — not in
+    /// the log, not on screen — so a whole desk looked to have been lost on
+    /// its own. The mark is tolerated now (see `parse_object`), and every
+    /// other way a file can be unreadable is named.
+    pub unreadable: Option<String>,
     /// The inputs open BESIDE the first, as the host's own opaque uids.
     ///
     /// **Opaque here for the same reason `record_audio_device` is**: the
@@ -1660,6 +1672,32 @@ const MAX_GAIN: f64 = 16.0;
 /// window wants to be legible, not to mirror the keyboard's proportions.
 pub const DETACHED_DEFAULT: egui::Vec2 = egui::Vec2::new(460.0, 150.0);
 
+/// **The settings text as a JSON object, or why not.**
+///
+/// A byte-order mark in front of the text is stripped rather than refused:
+/// PowerShell's `Set-Content -Encoding utf8` writes one, Notepad used to,
+/// and serde will not look past it — so a hand-edited file was a "corrupt"
+/// file, set aside and replaced with a first launch, over three invisible
+/// bytes. Anything else that fails is named, with serde's line and column.
+fn parse_object(text: &str) -> Result<Map<String, Value>, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(map)) => Ok(map),
+        Ok(other) => Err(format!(
+            "the file holds {} where an object was expected",
+            match other {
+                Value::Null => "null",
+                Value::Bool(_) => "a boolean",
+                Value::Number(_) => "a number",
+                Value::String(_) => "a string",
+                Value::Array(_) => "an array",
+                Value::Object(_) => "an object",
+            }
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -1807,6 +1845,7 @@ impl Default for Settings {
             record_audio_device: None,
             record_input_channels: Vec::new(),
             auto_exposed: Vec::new(),
+            unreadable: None,
             record_extra_inputs: Vec::new(),
             record_input_off: false,
             record_count_in_beats: 4,
@@ -2292,17 +2331,43 @@ impl Settings {
         // above is right that quietly rearranging somebody's window is worse
         // than not — but their arrangement is gone either way at this point,
         // and a usable app beats a half-empty one.
-        let Some(mut s) = Self::try_load_from(&path) else {
-            let aside = path.with_extension("json.unreadable");
-            let _ = std::fs::rename(&path, &aside);
-            let mut s = Self::first_launch();
-            s.video_default_applied = true;
-            s.shows_default_applied = true;
-            // Nothing on disk to keep and nothing wrong written down yet, so
-            // both one-shots are done before they start.
-            s.media_root_v20 = true;
-            s.reader_mode_v20 = true;
-            return s;
+        let mut s = match Self::load_report(&path) {
+            Ok(s) => s,
+            Err(why) => {
+                let aside = path.with_extension("json.unreadable");
+                // **Said, in both places.** The log line is for the report
+                // that arrives a week later; the note is for the person
+                // sitting in front of a desk that has just reset itself.
+                let moved = std::fs::rename(&path, &aside).is_ok();
+                log::warn!(
+                    "settings: {} could not be read ({why}); {} - starting from a first launch",
+                    path.display(),
+                    if moved {
+                        format!("set aside as {}", aside.display())
+                    } else {
+                        "and it could not be set aside either".to_owned()
+                    }
+                );
+                let mut s = Self::first_launch();
+                s.video_default_applied = true;
+                s.shows_default_applied = true;
+                // Nothing on disk to keep and nothing wrong written down yet, so
+                // both one-shots are done before they start.
+                s.media_root_v20 = true;
+                s.reader_mode_v20 = true;
+                s.unreadable = Some(format!(
+                    "Your settings file could not be read ({why}). {} Starting from a fresh desk.",
+                    if moved {
+                        format!(
+                            "It was set aside as {} beside it.",
+                            aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                        )
+                    } else {
+                        "It could not be set aside, so the next save replaces it.".to_owned()
+                    }
+                ));
+                return s;
+            }
         };
         s.apply_video_default();
         s.apply_shows_default();
@@ -2386,11 +2451,14 @@ impl Settings {
     /// cannot read" is somebody's settings that must not be written over. See
     /// [`Settings::load`].
     fn try_load_from(path: &std::path::Path) -> Option<Self> {
-        let text = std::fs::read_to_string(path).ok()?;
-        let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) else {
-            return None;
-        };
-        Some(Self::from_map(map))
+        Self::load_report(path).ok()
+    }
+
+    /// The same, saying WHY when it cannot: the read error or the parse
+    /// error, in serde's own words with the line and column.
+    fn load_report(path: &std::path::Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        Ok(Self::from_map(parse_object(&text)?))
     }
 
     /// Round-trip through the same JSON the settings file holds.
@@ -2410,9 +2478,9 @@ impl Settings {
     /// refuses to open a project over a settings blob is worse than one that
     /// opens it looking wrong.
     pub fn from_json(text: &str) -> Self {
-        match serde_json::from_str::<Value>(text) {
-            Ok(Value::Object(map)) => Self::from_map(map),
-            _ => Self::default(),
+        match parse_object(text) {
+            Ok(map) => Self::from_map(map),
+            Err(_) => Self::default(),
         }
     }
 
@@ -6374,6 +6442,40 @@ mod tests {
     /// simply wrong. They are true now.
     static SETTINGS_PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// **A byte-order mark is not corruption.** PowerShell's `Set-Content
+    /// -Encoding utf8` writes one; a Windows tester's hand edit came back as
+    /// a first launch because of three bytes serde will not look past.
+    ///
+    /// Revert-check performed: drop the `strip_prefix` from `parse_object`
+    /// and the first assert fails with serde's "expected value at line 1
+    /// column 1".
+    #[test]
+    fn a_byte_order_mark_in_front_of_the_settings_is_read_past() {
+        let map = super::parse_object("\u{feff}{ \"transpose\": 3 }")
+            .expect("a file with a byte-order mark was refused");
+        assert_eq!(map.get("transpose").and_then(|v| v.as_i64()), Some(3));
+        // And through the file loader, which is the road that mattered: the
+        // file is read, nothing is set aside, nothing is reported.
+        let dir = std::env::temp_dir().join(format!("tangent-bom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "\u{feff}{ \"transpose\": -28, \"audio_system\": \"ASIO\" }").unwrap();
+        let _env = SETTINGS_PATH_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock above is what makes this single-threaded.
+        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+        let s = Settings::load();
+        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        assert_eq!(s.transpose, -28, "the marked file was not read");
+        assert_eq!(s.audio_system(), Some("ASIO"));
+        assert!(s.unreadable.is_none(), "a readable file was reported as unreadable");
+        assert!(!dir.join("settings.json.unreadable").exists(), "a readable file was set aside");
+        // Not an object at all: named as such rather than as a parse error.
+        let why = super::parse_object("[1, 2]").expect_err("an array was accepted as settings");
+        assert!(why.contains("an array"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **A settings file that will not parse is preserved, not overwritten.**
     ///
     /// The failure this prevents: `load_from` answers an unreadable file with
@@ -6409,6 +6511,12 @@ mod tests {
             std::fs::read_to_string(&aside).unwrap().contains("the disk died"),
             "what was preserved is not what was there"
         );
+        // **And it SAYS so**, naming serde's reason and the file it made,
+        // for the first frame to show. A Windows tester lost a desk to a
+        // byte-order mark and had no line anywhere to tell him why.
+        let why = s.unreadable.as_deref().expect("the unreadable file was not reported");
+        assert!(why.contains("settings.json.unreadable"), "the note does not name the aside: {why}");
+        assert!(why.contains("line 1"), "the note does not carry serde's position: {why}");
         // And what came up is usable rather than a half-empty window.
         assert!(s.show_recorder && s.show_fretboard);
         // The default desk: the kit in channel 0's first bay, the DX7 in

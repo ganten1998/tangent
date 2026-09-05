@@ -1917,6 +1917,32 @@ struct Reprobe {
     live: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// **Whether the hardware the engine is waiting for is back**, as a pure
+/// rule over what the platform default host can see.
+///
+/// Two rules, because the platform default is not the chosen system when
+/// ASIO is. Under the platform default the question is the old one: does
+/// the default output report a working config. Under ASIO that question is
+/// always yes on a laptop — the Realtek never goes anywhere — and answering
+/// it with "reopen" sent the app back into the ASIO driver every two
+/// seconds while the interface stayed unplugged, each try loading both
+/// Focusrite drivers and stalling the window for as long as their init took.
+/// So under ASIO the evidence is a PLUG EVENT: the list of outputs the
+/// platform default host names has changed since the probe began. An
+/// interface arriving shows up there ("Speakers (Focusrite USB Audio)") the
+/// moment Windows has it, and nothing else on the machine changes that list
+/// while somebody waits. Reasoned from the code and the tester's log, not
+/// measured on the Windows machine; the tester's next unplugged launch is
+/// the measurement.
+#[cfg(feature = "recorder")]
+fn hardware_back(asio: bool, baseline: &[String], outputs: &[String], default_alive: bool) -> bool {
+    if asio {
+        outputs != baseline
+    } else {
+        default_alive
+    }
+}
+
 #[cfg(feature = "recorder")]
 impl Reprobe {
     fn spawn() -> Self {
@@ -1925,29 +1951,51 @@ impl Reprobe {
         let live = Arc::new(AtomicBool::new(false));
         let stop_t = Arc::clone(&stop);
         let live_t = Arc::clone(&live);
+        // Decided once, here: the system the engine is waiting on cannot
+        // change without `path_changed` reopening the path, which drops this
+        // probe with the engine it makes.
+        let asio = tangent_record::audio::system_is_asio();
         let spawned = std::thread::Builder::new()
             .name("audio-reprobe".to_owned())
             .spawn(move || {
                 use cpal::traits::{DeviceTrait, HostTrait};
+                // **The platform default host, never the chosen one**: under
+                // ASIO the chosen host loads drivers, and loading them from
+                // this thread is the teardown `RatePoll` was doing.
+                let outputs = || -> Vec<String> {
+                    cpal::default_host()
+                        .output_devices()
+                        .map(|ds| ds.filter_map(|d| d.name().ok()).collect())
+                        .unwrap_or_default()
+                };
+                let baseline = if asio { outputs() } else { Vec::new() };
+                if asio {
+                    log::info!(
+                        "audio: ASIO is the chosen system and it has no working output; \
+                         waiting for an interface to be plugged in (the platform default \
+                         is not used while ASIO is chosen)"
+                    );
+                }
                 loop {
-                    if stop_t.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let alive = cpal::default_host()
-                        .default_output_device()
-                        .and_then(|d| d.default_output_config().ok())
-                        .is_some_and(|c| c.channels() > 0);
-                    if alive {
-                        live_t.store(true, Ordering::Relaxed);
-                        return;
-                    }
                     // 2 s between probes, checked in slices so a stop signal
-                    // lands within a tenth of a second.
+                    // lands within a tenth of a second. Before the first probe
+                    // too: the baseline above IS the first look, and a probe
+                    // in the same instant would only re-see it.
                     for _ in 0..20 {
                         if stop_t.load(Ordering::Relaxed) {
                             return;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    let default_alive = !asio
+                        && cpal::default_host()
+                            .default_output_device()
+                            .and_then(|d| d.default_output_config().ok())
+                            .is_some_and(|c| c.channels() > 0);
+                    let now = if asio { outputs() } else { Vec::new() };
+                    if hardware_back(asio, &baseline, &now, default_alive) {
+                        live_t.store(true, Ordering::Relaxed);
+                        return;
                     }
                 }
             });
@@ -9489,6 +9537,16 @@ impl DesktopApp {
                 ctx.request_repaint();
             }
             Err(e) => {
+                // Named by system, because "no audio output" on a machine
+                // whose speakers work is a sentence that needs the next
+                // clause: the CHOSEN system had none, and the platform default
+                // is not consulted while one is chosen.
+                log::warn!(
+                    "no audio output through {}: {e}",
+                    self.app
+                        .audio_system()
+                        .unwrap_or_else(|| "the platform default".to_owned())
+                );
                 self.recorder.engine_error = Some(format!("no audio output: {e}"));
                 // Try again shortly, a few times. See `engine_retry`.
                 let left = self.recorder.engine_retry.map_or(ENGINE_TRIES, |(_, n)| n);
@@ -17238,6 +17296,29 @@ mod tests {
             "the save panel picks its own start directory again instead of \
              asking `save_start`, so the match above no longer decides anything"
         );
+    }
+
+    /// **Under ASIO the reprobe waits for a plug event, not for a default
+    /// output that is always alive.** The Realtek answers "alive" for ever;
+    /// the interface arriving changes the output list.
+    ///
+    /// Revert-check performed: make `hardware_back` answer `default_alive`
+    /// regardless and the second assert names the storm.
+    #[test]
+    fn under_asio_the_reprobe_waits_for_the_output_list_to_change() {
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let laptop = names(&["Speaker (Realtek(R) Audio)"]);
+        let plugged = names(&["Speaker (Realtek(R) Audio)", "Speakers (Focusrite USB Audio)"]);
+        // The platform default: the old rule, untouched.
+        assert!(super::hardware_back(false, &[], &[], true));
+        assert!(!super::hardware_back(false, &[], &[], false));
+        // ASIO: an alive Realtek is not the interface coming back.
+        assert!(
+            !super::hardware_back(true, &laptop, &laptop, true),
+            "the reprobe would retry ASIO every two seconds on a laptop's own speakers"
+        );
+        assert!(super::hardware_back(true, &laptop, &plugged, true), "the interface arriving was missed");
+        assert!(super::hardware_back(true, &plugged, &laptop, false), "an unplug is a change too");
     }
 
     /// **The rate poll's thread never asks the chosen host under ASIO**, and

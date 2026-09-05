@@ -3431,6 +3431,13 @@ impl TangentApp {
         // with routes has to arrive with them already rendered — otherwise
         // the strips are invisible until the first edit.
         me.refresh_route_labels();
+        // **A settings file that could not be read is said on the first
+        // frame**, not just in a log nobody opens: the desk that has just
+        // reset itself is in front of somebody, and "why" belongs with it.
+        // See `Settings::unreadable`.
+        if let Some(why) = me.settings.unreadable.take() {
+            me.notify(crate::notify::Kind::Error, why);
+        }
         me
     }
 
