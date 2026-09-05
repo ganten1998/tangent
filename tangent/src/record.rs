@@ -1088,6 +1088,12 @@ pub struct Session {
     /// thread.
     camera: Option<camera::CameraStream>,
     camera_error: Option<String>,
+    /// The window capture, open only while a video take with the window in
+    /// it is rolling. A second stream rather than a mode on the camera's,
+    /// because the camera stays open for the pane while this one comes and
+    /// goes with the take, and the two deliver into different slots.
+    window: Option<camera::CameraStream>,
+    window_error: Option<String>,
     midi_clock: SourceClock,
     midi: MidiTake,
     state: RecordState,
@@ -1172,6 +1178,8 @@ impl Session {
             audio_error: None,
             camera: None,
             camera_error: None,
+            window: None,
+            window_error: None,
             midi_clock: SourceClock::new(MIDIR_SCALE_NS, MIDI_SETTLE_NS),
             midi: MidiTake::new(),
             state: RecordState::Idle,
@@ -1624,6 +1632,52 @@ impl Session {
             // device on a platform that HAS a camera) still surface.
             Err(camera::CameraError::Unsupported) => {}
             Err(e) => self.camera_error = Some(e.to_string()),
+        }
+    }
+
+    /// Open the window capture for a take. See
+    /// `camera::open_window_capture`; a platform without one is not an error
+    /// to nag about, for the reason `open_camera` gives — the take goes on
+    /// with the composited video and `window_running` says which it got.
+    pub fn open_window_capture(&mut self, region: camera::WindowRegion, fps: f64) {
+        self.window = None;
+        self.window_error = None;
+        match camera::open_window_capture(region, fps, self.timebase) {
+            Ok(stream) => self.window = Some(stream),
+            Err(camera::CameraError::Unsupported) => {}
+            Err(e) => self.window_error = Some(e.to_string()),
+        }
+    }
+
+    pub fn close_window_capture(&mut self) {
+        self.window = None;
+        self.window_error = None;
+    }
+
+    /// The window moved or resized: the capture follows.
+    pub fn set_window_region(&self, region: camera::WindowRegion) {
+        if let Some(w) = self.window.as_ref() {
+            w.set_region(region);
+        }
+    }
+
+    pub fn window_running(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| w.state().is_running())
+    }
+
+    pub fn window_error(&self) -> Option<&str> {
+        self.window_error.as_deref()
+    }
+
+    /// The window capture's newest frame, consuming and newest-wins, like
+    /// `next_frame` for the camera.
+    pub fn next_window_frame(&self) -> Option<camera::Frame> {
+        self.window.as_ref()?.latest()
+    }
+
+    pub fn recycle_window_frame(&self, pixels: Vec<u8>) {
+        if let Some(w) = self.window.as_ref() {
+            w.recycle(pixels);
         }
     }
 

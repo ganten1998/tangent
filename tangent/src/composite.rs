@@ -629,10 +629,46 @@ impl Compositor {
         )
     }
 
+    /// **A frame that is the window itself**: the screen capture, uploaded
+    /// like a camera frame and painted to fill the video, letterboxed on
+    /// black rather than cropped — a window's edges are its controls, and a
+    /// crop that loses the master fader is not a recording of the window.
+    /// Goes through the same pipeline as every other frame, by way of the
+    /// painting hook below, so the readback, the pacing and the encoder see
+    /// nothing new.
+    pub fn frame_window(
+        &mut self,
+        app: &TangentApp,
+        pixels: &[u8],
+        w: u32,
+        h: u32,
+        pts_ns: i64,
+    ) -> Result<Option<i64>, String> {
+        self.upload_camera(pixels, w, h)?;
+        let Some((id, size)) = self.camera.as_ref().map(|c| (c.id, c.size)) else {
+            return Err("the window frame did not upload".to_owned());
+        };
+        let paint = move |painter: &egui::Painter, pane: egui::Rect| {
+            painter.rect_filled(pane, 0.0, egui::Color32::BLACK);
+            paint_window(painter, pane, id, size);
+        };
+        self.frame_painting(
+            app,
+            Layout::CameraFull,
+            DisplayShows::default(),
+            true,
+            false,
+            None,
+            pts_ns,
+            Some(&paint),
+        )
+    }
+
     /// [`Compositor::frame`], with the option of painting something else.
     ///
-    /// `paint` is `None` everywhere in the app. It exists so a test can put one
-    /// pure painter through the identical pipeline the take uses — see
+    /// `paint` is `None` everywhere in the app but one place — the window
+    /// capture, see [`Compositor::frame_window`]. It exists so a test can put
+    /// one pure painter through the identical pipeline the take uses — see
     /// `shot::mixer`.
     #[allow(clippy::too_many_arguments)]
     fn frame_painting(
@@ -933,6 +969,27 @@ impl Compositor {
         );
         Ok(())
     }
+}
+
+/// Paint the window capture into its pane, whole, letterboxed.
+///
+/// The opposite choice from [`paint_camera`] for the opposite reason: a
+/// webcam's edges are the wall, a window's edges are its controls.
+fn paint_window(painter: &egui::Painter, pane: egui::Rect, id: egui::TextureId, size: (u32, u32)) {
+    if !pane.is_positive() || size.0 == 0 || size.1 == 0 {
+        return;
+    }
+    let src = size.0 as f32 / size.1 as f32;
+    let dst = pane.width() / pane.height();
+    let fitted = if src > dst {
+        let h = pane.width() / src;
+        egui::Rect::from_center_size(pane.center(), egui::vec2(pane.width(), h))
+    } else {
+        let w = pane.height() * src;
+        egui::Rect::from_center_size(pane.center(), egui::vec2(w, pane.height()))
+    };
+    let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0));
+    painter.add(egui::Shape::image(id, fitted, uv, egui::Color32::WHITE));
 }
 
 /// Paint the camera into its pane, filling it and cropping the overflow.

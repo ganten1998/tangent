@@ -37,7 +37,7 @@ use std::thread::JoinHandle;
 
 use super::{
     pick_format, CameraError, CameraInfo, CameraStats, Format, FormatWish, FrameSlot,
-    PermissionStatus, VideoSource, BYTES_PER_PIXEL,
+    PermissionStatus, VideoSource, WindowRegion, BYTES_PER_PIXEL,
 };
 use crate::audio::{DeviceState, Timebase};
 
@@ -465,4 +465,19 @@ vcodec=mjpeg min s=1280x720 fps=30 max s=1280x720 fps=30";
         let hd = modes.iter().find(|m| m.format.height == 720).unwrap();
         assert!(hd.codec == Codec::Mjpeg);
     }
+}
+
+/// The window capture, which this platform does not have yet.
+///
+/// [`CameraError::Unsupported`] and not a panic, for the reason `open` gives:
+/// the UI prints it as a sentence and the take goes on with the composited
+/// video it always had.
+pub(super) fn open_window(
+    _region: WindowRegion,
+    _fps: f64,
+    _timebase: Timebase,
+    _slot: Arc<FrameSlot>,
+    _stats: Arc<CameraStats>,
+) -> Result<Box<dyn VideoSource>, CameraError> {
+    Err(CameraError::Unsupported)
 }

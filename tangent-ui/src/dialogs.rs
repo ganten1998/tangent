@@ -2440,6 +2440,9 @@ const EXPORT_FOOTER_H: f32 = 46.0;
 /// `a_take_recorded_without_a_camera_can_never_gain_one` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rederivable {
+    /// The window capture. Live only: it is the screen as it was, and there
+    /// is no screen to re-read after the take.
+    pub window: bool,
     /// The camera tick, the video modes that imply a camera, and "Match
     /// camera" — the resolution of a camera that is no longer running.
     pub camera: bool,
@@ -2460,6 +2463,7 @@ pub struct Rederivable {
 impl Rederivable {
     /// Before a take, nothing has happened yet, so nothing is fixed.
     pub const EVERYTHING: Rederivable = Rederivable {
+        window: true,
         camera: true,
         layout: true,
         display: true,
@@ -2501,6 +2505,7 @@ pub fn rederivable(post_take: bool, had_camera: bool) -> Rederivable {
         return Rederivable::EVERYTHING;
     }
     Rederivable {
+        window: false,
         // False either way, and the reason differs: a take with no camera has
         // no frames to composite, and a take WITH one has frames that were
         // already composited and encoded. Neither can be re-made.
@@ -12120,8 +12125,26 @@ fn show_on(
                                     // specifically.
                                     let video_on = spec.video.wants_video();
                                     ui.add_space(6.0);
+                                    // **The window itself, first, because
+                                    // when it is on it is the whole video.**
+                                    // The two layers under it are what a take
+                                    // gets when it is off, or when the
+                                    // platform cannot capture a screen; they
+                                    // stay live so that fallback has its
+                                    // settings, and so a person can see what
+                                    // the video would be without the window.
                                     ui.horizontal(|ui| {
                                         export_label(ui, &t, "Composite contains", true);
+                                        export_check(
+                                            ui,
+                                            &t,
+                                            video_on && can.window,
+                                            &mut spec.composite.window,
+                                            "The window itself (cursor, plug-ins, editor)",
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        export_label(ui, &t, "", true);
                                         export_check(
                                             ui,
                                             &t,

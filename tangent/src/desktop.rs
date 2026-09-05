@@ -270,6 +270,13 @@ struct Recorder {
     /// EVER delivered a frame, and this one delivered exactly one. Only the
     /// age of the picture in hand answers the question.
     camera_rgba: Option<(Vec<u8>, u32, u32, std::time::Instant)>,
+    /// The window capture's newest frame, for a take that records the window
+    /// itself. Kept — not aged out like the camera's — because the screen
+    /// input only delivers when the screen changes: a still window sends
+    /// nothing, and the video has to keep showing it. `dirty` says whether
+    /// the picture is new since the last tick that encoded it.
+    window_rgba: Option<(Vec<u8>, u32, u32)>,
+    window_dirty: bool,
     /// When to try starting the monitor output again, and how many tries are
     /// left.
     ///
@@ -2235,6 +2242,25 @@ impl DesktopApp {
                         egui::TextureOptions::LINEAR,
                     ));
                 }
+            }
+        }
+
+        // **The window capture, while a take has it.** Its newest frame lands
+        // in its own slot, and the region follows the window so a drag mid-take
+        // is a drag in the video and not a slide off its edge.
+        if self.recorder.video.as_ref().is_some_and(|v| v.window) {
+            if let Some(region) = self.window_region() {
+                self.recorder.session.set_window_region(region);
+            }
+            if let Some(frame) = self.recorder.session.next_window_frame() {
+                let spent = self
+                    .recorder
+                    .window_rgba
+                    .replace((frame.pixels, frame.width, frame.height));
+                if let Some((pixels, ..)) = spent {
+                    self.recorder.session.recycle_window_frame(pixels);
+                }
+                self.recorder.window_dirty = true;
             }
         }
 
@@ -13150,6 +13176,8 @@ impl DesktopApp {
                 video: None,
                 video_tried: false,
                 camera_rgba: None,
+                window_rgba: None,
+                window_dirty: false,
                 engine_retry: None,
                 audio_path_deferred: false,
                 armed_downbeat: None,
@@ -13741,6 +13769,9 @@ struct TakeVideo {
     shows: tangent_ui::recorder::DisplayShows,
     camera: bool,
     display: bool,
+    /// The video is the window capture: every tick encodes the newest screen
+    /// frame, and the layers are not painted at all.
+    window: bool,
     path: std::path::PathBuf,
     /// Frames the compositor or the encoder refused, so the summary can say so
     /// rather than the user counting them in the finished file.
@@ -13803,12 +13834,39 @@ impl DesktopApp {
             .session
             .camera_format()
             .map(|f| (f.width, f.height));
-        let (w, h) = spec.resolution.pixels().or(cam).unwrap_or((1920, 1080));
+        // **The window first.** With the window in the spec and a window to
+        // point at, the take's video is a screen capture of it — opened here,
+        // at the take's own frame rate, and closed in `end_video`. If the
+        // platform has no screen capture the stream simply is not running
+        // and the layers below are what the take gets, which is also what
+        // the spec's own `produces_video` promises.
+        let mut window = false;
+        let mut window_px: Option<(u32, u32)> = None;
+        if spec.video.has_composite() && spec.composite.window {
+            if let Some(region) = self.window_region() {
+                self.recorder
+                    .session
+                    .open_window_capture(region, f64::from(spec.fps.max(1)));
+                if self.recorder.session.window_running() {
+                    window = true;
+                    window_px = Some(region.pixels());
+                } else if let Some(e) = self.recorder.session.window_error() {
+                    log::warn!("window capture unavailable, taking the layers instead: {e}");
+                }
+            }
+        }
+        // The window's own pixel size when it is the video; the chosen or the
+        // camera's size otherwise.
+        let (w, h) = window_px
+            .or_else(|| spec.resolution.pixels())
+            .or(cam)
+            .unwrap_or((1920, 1080));
         let want_camera = spec.composite.camera && self.recorder.session.camera_running();
         let want_display = spec.composite.display && spec.composite.shows.any();
-        if !spec.produces_video(self.recorder.session.camera_running()) {
+        if !window && !(want_camera || want_display) {
+            self.recorder.session.close_window_capture();
             self.recorder.engine_error =
-                Some("the video has neither the camera nor the display in it".to_owned());
+                Some("the video has neither the window, the camera nor the display in it".to_owned());
             return;
         }
         let video = tangent_record::encode::VideoSpec {
@@ -13859,6 +13917,7 @@ impl DesktopApp {
             shows: spec.composite.shows,
             camera: want_camera,
             display: want_display,
+            window,
             path,
             failed: 0,
             padded: 0,
@@ -13948,6 +14007,48 @@ impl DesktopApp {
                 continue;
             }
             let pts = (v.next as i64 * 1_000_000_000) / i64::from(v.fps);
+            // **A window take: the screen frame, or the last one again.** The
+            // screen input delivers only when the screen changes, so a still
+            // window sends nothing and the tick pads with the frame already
+            // encoded — the same route the stride takes — rather than
+            // re-uploading the same pixels.
+            if v.window {
+                if !self.recorder.window_dirty {
+                    if let Some(last) = v.compositor.last_frame() {
+                        if v.encoder.push(last, pts).is_err() {
+                            v.failed += 1;
+                        }
+                        v.padded += 1;
+                        v.next += 1;
+                        continue;
+                    }
+                }
+                let Some((px, w, h)) = self.recorder.window_rgba.as_ref() else {
+                    // Nothing has arrived yet: a black first frame would be
+                    // a wrong picture; waiting a tick is a late one.
+                    break;
+                };
+                self.recorder.window_dirty = false;
+                match v.compositor.frame_window(&self.app, px, *w, *h, pts) {
+                    Ok(Some(ready)) => {
+                        let pushed = v
+                            .compositor
+                            .last_frame()
+                            .is_some_and(|bgra| v.encoder.push(bgra, ready).is_ok());
+                        if !pushed {
+                            v.failed += 1;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => v.failed += 1,
+                }
+                v.next += 1;
+                made += 1;
+                if pump_started.elapsed() > BUDGET {
+                    break;
+                }
+                continue;
+            }
             // Only a picture that is still true — see `camera_rgba`. The
             // sweep above drops a stale one, and this is the second half of
             // the same rule for the window frames in between.
@@ -14017,7 +14118,27 @@ impl DesktopApp {
     }
 
     /// Close the video file. Must happen, or the container has no index.
+    /// The window's content rectangle as the capture wants it: points on the
+    /// main display with the top-left origin egui uses, and the backing
+    /// scale. `None` until the window has said where it is.
+    fn window_region(&self) -> Option<tangent_record::camera::WindowRegion> {
+        let (r, scale) = self.app.window_frame()?;
+        Some(tangent_record::camera::WindowRegion {
+            x: r.left(),
+            y: r.top(),
+            w: r.width(),
+            h: r.height(),
+            scale,
+        })
+    }
+
     fn end_video(&mut self) {
+        // The window capture lives exactly as long as the take. Closed even
+        // when there was no video to end, so a stream left open by a take
+        // that failed to start does not keep recording the screen.
+        self.recorder.session.close_window_capture();
+        self.recorder.window_rgba = None;
+        self.recorder.window_dirty = false;
         let Some(mut v) = self.recorder.video.take() else {
             return;
         };

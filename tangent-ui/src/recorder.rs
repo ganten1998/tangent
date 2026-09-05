@@ -2512,6 +2512,19 @@ impl DisplayShows {
 /// What the composited video contains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Composite {
+    /// **The window itself, captured off the screen, cursor and all** — and
+    /// when it is on, it IS the video: the camera and the display layers are
+    /// already in the picture, because the picture is the window they are
+    /// drawn in. The owner's call: "the camera is the window is now literal,
+    /// and anything process related or the cursor is presented in the
+    /// capture, whether that's me turning a knob with cursor, or my tweaking
+    /// plugins with their windows open or me using the midi editor." The
+    /// composited layers below cannot show any of that: they are repainted
+    /// from the app's state, and a plug-in's window, the cursor and a drag in
+    /// progress are not state the app has. Ships on. Off gives the composite
+    /// back, which is also what a platform with no screen capture falls back
+    /// to on its own.
+    pub window: bool,
     pub camera: bool,
     pub display: bool,
     /// The performance audio, muxed into the video as well as written to the
@@ -2526,6 +2539,7 @@ pub struct Composite {
 impl Default for Composite {
     fn default() -> Self {
         Self {
+            window: true,
             camera: true,
             display: true,
             audio: true,
@@ -2606,7 +2620,9 @@ impl ExportSpec {
         if !self.audio && !self.midi {
             return Some(SpecProblem::NothingToWrite);
         }
-        if self.video.has_composite() {
+        // A window capture is a whole picture on its own; the two layers
+        // are only asked about when it is off.
+        if self.video.has_composite() && !self.composite.window {
             if !self.composite.camera && !self.composite.display {
                 return Some(SpecProblem::EmptyComposite);
             }
@@ -2647,6 +2663,12 @@ impl ExportSpec {
     pub fn produces_video(&self, camera_running: bool) -> bool {
         if !self.video.wants_video() {
             return false;
+        }
+        // The window is a picture whether or not a camera is open. The host
+        // still falls back to the layers if the platform has no screen
+        // capture, which is why they are still consulted below it.
+        if self.video.has_composite() && self.composite.window {
+            return true;
         }
         let camera = self.composite.camera && camera_running;
         let display = self.composite.display && self.composite.shows.any();
@@ -2738,6 +2760,7 @@ impl ExportSpec {
         m.insert("video".into(), Value::String(self.video.key().into()));
         m.insert("camera".into(), Value::Bool(self.composite.camera));
         m.insert("display".into(), Value::Bool(self.composite.display));
+        m.insert("window".into(), Value::Bool(self.composite.window));
         m.insert(
             "composite_audio".into(),
             Value::Bool(self.composite.audio),
@@ -2781,6 +2804,7 @@ impl ExportSpec {
         b("midi", &mut s.midi);
         b("camera", &mut s.composite.camera);
         b("display", &mut s.composite.display);
+        b("window", &mut s.composite.window);
         b("composite_audio", &mut s.composite.audio);
         b("show_piano", &mut s.composite.shows.piano);
         b("show_chord", &mut s.composite.shows.chord);
@@ -4108,9 +4132,18 @@ mod tests {
             ..Default::default()
         };
         assert!(s.is_valid());
+        // The layer rules are asked only with the window OFF: with it on
+        // the picture is the window and the layers are already in it.
+        s.composite.window = false;
+        assert!(s.is_valid());
         s.composite.camera = false;
         s.composite.display = false;
         assert_eq!(s.problem(), Some(SpecProblem::EmptyComposite));
+        // **And the window on its own is a whole video.** The owner's
+        // "the camera is the window is now literal": with nothing else
+        // ticked there is still something to record, and it is the window.
+        s.composite.window = true;
+        assert!(s.is_valid(), "a window capture with no layers was refused");
     }
 
     /// The subtle one: the display layer is on, so the composite is not empty,
@@ -4121,6 +4154,7 @@ mod tests {
         let s = ExportSpec {
             video: VideoMode::Composite,
             composite: Composite {
+                window: false,
                 camera: false,
                 display: true,
                 shows: DisplayShows {
@@ -4165,6 +4199,7 @@ mod tests {
             tempo_bpm: 92.5,
             video: VideoMode::Both,
             composite: Composite {
+                window: false,
                 camera: false,
                 display: true,
                 audio: false,
@@ -4255,6 +4290,7 @@ mod tests {
         .produces_video(true));
         assert!(!ExportSpec {
             composite: Composite {
+                window: false,
                 camera: false,
                 display: false,
                 ..Default::default()
@@ -4262,10 +4298,24 @@ mod tests {
             ..Default::default()
         }
         .produces_video(true));
+        // The window alone is a video, camera or no camera — which is the
+        // whole reason a take on a machine with no webcam has a picture now.
+        assert!(ExportSpec {
+            composite: Composite {
+                window: true,
+                camera: false,
+                display: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .produces_video(false));
 
-        // Camera-only, no camera: nothing to encode.
+        // Camera-only, no camera: nothing to encode. The window off, or it
+        // would be a window-only take, which is the case two blocks up.
         let cam_only = ExportSpec {
             composite: Composite {
+                window: false,
                 display: false,
                 ..Default::default()
             },
