@@ -364,15 +364,56 @@ struct Palette {
 /// working. But a THEME is the user saying "paint the whole app", and a
 /// fretboard that ignored it was the one panel left behind. So: Default wears
 /// its wood, every other theme paints the neck.
+/// **The theme paints the neck; the STRINGS still come off the neck.**
+///
+/// This took both colours straight from the theme, and the two are chosen
+/// independently — a pale board role and a pale string role are each
+/// reasonable on their own and together they are a string you cannot see.
+/// It went unnoticed while the shipped theme was Default, which is the one
+/// theme this function declines to touch; the moment Centennial shipped, a
+/// maple neck had light strings lying on pale wood.
+///
+/// So the board is the theme's and the string is whichever of the two
+/// candidates — the theme's own, or the wood's, which was picked against
+/// wood of this lightness — actually reads on it, and if neither does it is
+/// walked away from the board until it clears. The rule this module keeps
+/// re-learning: ink is a property of the surface it lands on, never of the
+/// role it was named in.
 fn themed_board(s: &Settings, wood_board: Color32, wood_string: Color32) -> (Color32, Color32) {
     if s.theme_name == "Default" {
-        (wood_board, wood_string)
-    } else {
-        (
-            s.fretboard_color.to_color32(),
-            s.string_color.to_color32(),
-        )
+        return (wood_board, wood_string);
     }
+    /// A string is a thin object on a broad field, so it needs more than the
+    /// 1.3 two adjacent fills would: this is the codebase's "a small thing is
+    /// visible on its ground" reading.
+    const APART: f32 = 3.0;
+    use crate::recorder_panel::contrast_ratio;
+    let board = s.fretboard_color.to_color32();
+    let themed = s.string_color.to_color32();
+    let mut string = if contrast_ratio(themed, board) >= contrast_ratio(wood_string, board) {
+        themed
+    } else {
+        wood_string
+    };
+    // Bounded, and toward whichever end the board is not at — a dark board
+    // takes a pale string and a pale board a dark one, which is also what
+    // makes the direction come out right on maple against rosewood.
+    let toward = if crate::recorder_panel::wants_light_ink(board) {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
+    for _ in 0..12 {
+        if contrast_ratio(string, board) >= APART {
+            break;
+        }
+        string = Color32::from_rgb(
+            (f32::from(string.r()) + (f32::from(toward.r()) - f32::from(string.r())) * 0.18) as u8,
+            (f32::from(string.g()) + (f32::from(toward.g()) - f32::from(string.g())) * 0.18) as u8,
+            (f32::from(string.b()) + (f32::from(toward.b()) - f32::from(string.b())) * 0.18) as u8,
+        );
+    }
+    (board, string)
 }
 
 fn palette(s: &Settings, wood: Wood) -> Palette {
@@ -1398,7 +1439,16 @@ mod tests {
         assert_eq!(Wood::from_key(""), Wood::Rosewood);
         // Maple is the pale one, and it is the reason the palette is per-wood
         // rather than one fill colour: light strings vanish on blonde wood.
-        let s = Settings::default();
+        //
+        // **On the Default theme, because that is the one theme that lets the
+        // WOOD paint the neck** — see `themed_board`. Every other theme
+        // paints all three boards its own colour, so a wood comparison under
+        // one of them is comparing a thing to itself. This read
+        // `Settings::default()`, which was the same thing until Centennial
+        // became the shipped theme.
+        let mut s = Settings::default();
+        s.theme_name = "Default".to_owned();
+        let s = s;
         let maple = palette(&s, Wood::Maple);
         let rose = palette(&s, Wood::Rosewood);
         assert!(
@@ -1415,6 +1465,28 @@ mod tests {
             lum(rose.board) < lum(rose.string),
             "rosewood: light strings on a dark board"
         );
+        // **And under a theme, where the board is the theme's, the strings
+        // still read on it.** The theme names a board colour and a string
+        // colour independently, and two reasonable pale choices make a
+        // string nobody can see; `themed_board` derives the string from the
+        // board it lies on instead. Every theme, every wood.
+        {
+            use crate::recorder_panel::contrast_ratio;
+            let mut bad: Vec<String> = Vec::new();
+            for theme in crate::theme::factory() {
+                let mut ts = Settings::default();
+                theme.apply(&mut ts);
+                ts.theme_name = theme.name.clone();
+                for w in Wood::ALL {
+                    let p = palette(&ts, w);
+                    let r = contrast_ratio(p.string, p.board);
+                    if r < 3.0 {
+                        bad.push(format!("{} {:?}: strings {r:.2}:1 on the board", theme.name, w));
+                    }
+                }
+            }
+            assert!(bad.is_empty(), "strings you cannot see:\n  {}", bad.join("\n  "));
+        }
         assert!(
             lum(palette(&s, Wood::Ebony).board) < lum(rose.board),
             "ebony is the darkest"

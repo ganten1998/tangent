@@ -40632,10 +40632,18 @@ mod tests {
             app.settings.arr_dark,
         );
         assert_eq!(app.face_under(at), field);
-        assert_ne!(
-            app.settings.arr_dark, app.settings.dark_mode,
-            "the fixture no longer separates the timeline's switch from the app's"
+        // **The two switches are separate, and the fixture has to prove it
+        // rather than rely on the defaults disagreeing.** They both ship
+        // `true` now, so this moves one and checks the other stays put; the
+        // old assertion was only ever testing that the shipped values
+        // happened to differ.
+        let was = app.settings.dark_mode;
+        app.settings.arr_dark = !app.settings.arr_dark;
+        assert_eq!(
+            app.settings.dark_mode, was,
+            "the timeline's switch moved the app's"
         );
+        app.settings.arr_dark = !app.settings.arr_dark;
 
         // Four faces and not one repeated: a test that could not tell them
         // apart would pass with `face_under` returning a constant.
@@ -46051,10 +46059,12 @@ mod tests {
             app.open_unit_face(0, 0);
             pointer_frame(&ctx, &mut app, Vec::new());
             let all = crate::theme::factory();
-            assert_eq!(
-                app.settings.theme_name, all[0].name,
-                "the test assumes a fresh install wears the first theme"
-            );
+            // Wherever the shipped theme sits in the list — it is Centennial
+            // now, and this used to assume the first entry.
+            let from = all
+                .iter()
+                .position(|t| t.name == app.settings.theme_name)
+                .expect("the shipped theme is in the factory list");
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
@@ -46072,10 +46082,10 @@ mod tests {
             );
             pointer_frame(&ctx, &mut app, Vec::new());
             assert_eq!(
-                app.settings.theme_name, all[1].name,
+                app.settings.theme_name, all[(from + 1) % all.len()].name,
                 "{label}: one T inside the face did not cycle exactly once \
                  (from {} the next theme is {})",
-                all[0].name, all[1].name
+                all[from].name, all[(from + 1) % all.len()].name
             );
             assert!(
                 matches!(app.dialog, Some(dialogs::Dialog::InsertFace { .. })),
@@ -46100,8 +46110,15 @@ mod tests {
             !app.dialog_blocks_keys(&ctx),
             "a plugin window took the main window's keys while it was focused"
         );
+        // **From wherever the shipped theme sits, not from the top of the
+        // list.** The default moved to Centennial and this read `all[1]`,
+        // which was only ever right while Default shipped first.
+        let from = all
+            .iter()
+            .position(|t| t.name == app.settings.theme_name)
+            .expect("the shipped theme is in the factory list");
         app.apply_key_action(&ctx, keys::KeyAction::CycleTheme);
-        assert_eq!(app.settings.theme_name, all[1].name);
+        assert_eq!(app.settings.theme_name, all[(from + 1) % all.len()].name);
         assert!(matches!(app.dialog, Some(dialogs::Dialog::InsertFace { .. })));
         // A question, and the gate closes as it always did.
         app.dialog = Some(dialogs::Dialog::About);

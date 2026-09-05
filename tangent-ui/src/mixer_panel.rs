@@ -782,7 +782,16 @@ impl Palette {
     /// is a hand-pickable swatch and the migration target for desks written
     /// before the palettes existed.
     pub fn master(&self) -> usize {
-        self.master_at
+        // **One red, on every theme, at the owner's word.** Each palette
+        // still CARRIES its own master in `master_at` — the field is written
+        // into saved desks and the runs are append-only history — but the
+        // desk asks for the master's colour here, and the answer is the
+        // crimson that sits above the channel colours' chroma ceiling. A
+        // master tuned to each theme's vividness is another dark rose in a
+        // rack of them; the one channel you look for should not have to be
+        // found. Its dials go with it: see `dial_ink`.
+        let _ = self.master_at;
+        MASTER_COLOR
     }
 }
 
@@ -2472,12 +2481,12 @@ fn strip(
             );
         };
         let (sv, sk, sl) = carve(l.send);
-        send_knob(painter, sk, v.send, p);
+        send_knob(painter, sk, v.send, p, v.strip.is_none());
         word(painter, sv, &format!("{:.0}%", v.send.clamp(0.0, 1.0) * 100.0), true);
         word(painter, sl, "SEND", false);
         if l.pan.is_positive() {
             let (pv, pk, pl) = carve(l.pan);
-            pan_knob(painter, pk, v.pan, p);
+            pan_knob(painter, pk, v.pan, p, v.strip.is_none());
             let w = (v.pan.clamp(-1.0, 1.0) * 50.0).round() as i32;
             let pw = if w == 0 {
                 "C".to_owned()
@@ -2935,9 +2944,38 @@ fn meter(
 
 }
 
+/// **The master's dials, un-themed, the same on every desk.**
+///
+/// The owner asked for the master to be the one strip you cannot mistake:
+/// its colour red on every theme, and its dials the black-outlined silver
+/// cap the Analog's panel wears — "black outlined silver dial with black
+/// strip". So the master's knobs are dressed here rather than from the
+/// palette: an outer ring of near-black, a spun-grey face inside it, and a
+/// pointer in the same near-black, whichever theme is loaded and whatever it
+/// has done to everything around them. The channels keep the theme's own
+/// dress, which is what makes the master read as the odd one out — the whole
+/// point of it.
+const MASTER_DIAL_RING: Color32 = Color32::from_rgb(0x10, 0x10, 0x10);
+const MASTER_DIAL_FACE: Color32 = Color32::from_rgb(0xb4, 0xb6, 0xba);
+
+/// The master's dress, or the theme's, by which strip this is.
+fn dial_ink(p: &Ink, master: bool) -> (Color32, Color32, Color32, Color32) {
+    if master {
+        (
+            MASTER_DIAL_RING,
+            MASTER_DIAL_FACE,
+            MASTER_DIAL_RING,
+            MASTER_DIAL_RING,
+        )
+    } else {
+        (p.track, p.cap, p.lit, p.faint)
+    }
+}
+
 /// A knob, drawn as an arc rather than a dial: it is a percentage, and an arc
 /// says how much where a pointer says where.
-fn send_knob(painter: &Painter, r: Rect, amount: f32, p: &Ink) {
+fn send_knob(painter: &Painter, r: Rect, amount: f32, p: &Ink, master: bool) {
+    let (track, cap, lit, faint) = dial_ink(p, master);
     // **Smaller than the cell it sits in.** The first version filled the row
     // and read as the biggest thing on the channel, which a send that is
     // usually at zero has no business being.
@@ -2946,39 +2984,40 @@ fn send_knob(painter: &Painter, r: Rect, amount: f32, p: &Ink) {
         return;
     }
     let c = Pos2::new(r.center().x, r.center().y);
-    painter.circle_filled(c, d * 0.5, p.track);
+    painter.circle_filled(c, d * 0.5, track);
     let t = amount.clamp(0.0, 1.0);
     // A quarter-turn short of each stop, like a real pot.
     let sweep = std::f32::consts::PI * 1.5;
     let start = std::f32::consts::PI * 0.75;
     let angle = start + sweep * t;
     let tip = Pos2::new(c.x + angle.cos() * d * 0.42, c.y + angle.sin() * d * 0.42);
-    painter.circle_filled(c, d * 0.42, p.cap);
+    painter.circle_filled(c, d * 0.42, cap);
     painter.line_segment(
         [c, tip],
-        Stroke::new((d * 0.09).max(1.0), if t > 0.001 { p.lit } else { p.faint }),
+        Stroke::new((d * 0.09).max(1.0), if t > 0.001 { lit } else { faint }),
     );
 }
 
 /// The pan knob: the send's twin, its pointer straight up at centre.
-fn pan_knob(painter: &Painter, r: Rect, pan: f32, p: &Ink) {
+fn pan_knob(painter: &Painter, r: Rect, pan: f32, p: &Ink, master: bool) {
+    let (track, cap, lit, faint) = dial_ink(p, master);
     let d = r.height().min(r.width() * 0.72) * 0.78;
     if d <= 2.0 || !r.is_positive() {
         return;
     }
     let c = Pos2::new(r.center().x, r.center().y);
-    painter.circle_filled(c, d * 0.5, p.track);
+    painter.circle_filled(c, d * 0.5, track);
     let t = (pan.clamp(-1.0, 1.0) + 1.0) * 0.5;
     // Straight UP at centre; three-quarters of a turn lock to lock.
     let sweep = std::f32::consts::PI * 1.5;
     let angle = -std::f32::consts::FRAC_PI_2 - sweep * 0.5 + sweep * t;
     let tip = Pos2::new(c.x + angle.cos() * d * 0.42, c.y + angle.sin() * d * 0.42);
-    painter.circle_filled(c, d * 0.42, p.cap);
+    painter.circle_filled(c, d * 0.42, cap);
     painter.line_segment(
         [c, tip],
         Stroke::new(
             (d * 0.09).max(1.0),
-            if pan.abs() > 0.01 { p.lit } else { p.faint },
+            if pan.abs() > 0.01 { lit } else { faint },
         ),
     );
 }
@@ -4677,54 +4716,63 @@ mod tests {
             assert!(split >= 20.0, "{}: click and master are {split:.1} apart", pal.name);
         }
     }
-
-    /// **Every palette's master is its OWN**, which is the whole of the
-    /// change — they used to share one crimson.
+    /// **One master red, on every theme, and it stands off every palette.**
     ///
-    /// Three floors, because dropping any one of them puts the old problem
-    /// back in a new costume: the ivory ink has to win on each (the rule
-    /// every colour in this table follows), each has to stand off its own
-    /// palette's tracks (a master that reads as track seventeen is no
-    /// master — the test above), and they have to stand off EACH OTHER.
+    /// The desk used to derive a master per palette, so each theme's master
+    /// was tuned to its own vividness. The owner reversed it: "make the
+    /// master strip and track in mixer to be red", on every theme. A master
+    /// tuned to each theme's palette is another dark rose in a rack of
+    /// them, and the one channel you always look for should not have to be
+    /// found.
     ///
-    /// That last one is the one worth having. Sixteen palettes derived from
-    /// sixteen themes converge: the theme's accent is already IN its
-    /// palette, so "use the accent" collides with the tracks, and what is
-    /// left over is the same brick red every time. Without this floor the
-    /// sixteen masters came out as six reds and looked exactly like the one
-    /// shared crimson they replaced.
+    /// Each palette still CARRIES a master slot — `master_at` is written
+    /// into saved desks and the runs are append-only history — and this is
+    /// why the check is on `master()`, the thing the desk actually asks.
+    ///
+    /// Two of the three old floors survive and are the ones that matter:
+    /// the ivory ink has to land on it, and it has to stand off every
+    /// palette's own sixteen tracks, or a master that reads as track
+    /// seventeen is no master. The third — that the masters differ from each
+    /// other — is what has been deliberately given up.
     #[test]
-    fn each_palette_brings_its_own_master() {
+    fn one_red_master_stands_off_every_palette() {
         const INK: Color32 = crate::recorder_panel::INK_LIGHT;
-        let mut seen: Vec<(&str, usize)> = Vec::new();
+        let slot = PALETTES[0].master();
         for pal in &PALETTES {
-            let slot = pal.master();
-            assert!(slot < STRIP_COLORS.len(), "{} runs off the table", pal.name);
-            assert!(
-                slot >= MANUAL_COLORS,
-                "{}'s master is inside the hand-picked swatches",
+            assert_eq!(
+                pal.master(),
+                slot,
+                "{} brought a master of its own",
                 pal.name
             );
-            // Nobody else's.
-            if let Some((other, _)) = seen.iter().find(|(_, s)| *s == slot) {
-                panic!("{} and {other} share a master slot", pal.name);
-            }
-            // The ink lands on it.
-            let ratio = crate::recorder_panel::contrast_ratio(INK, rgb(slot));
-            assert!(
-                ratio >= 4.5,
-                "{}'s master reads at {ratio:.2}:1 under the ink",
-                pal.name
-            );
-            seen.push((pal.name, slot));
         }
-        // And they are sixteen colours rather than one repeated.
-        for (i, (an, a)) in seen.iter().enumerate() {
-            for (bn, b) in seen.iter().skip(i + 1) {
-                let d = delta_e(rgb(*a), rgb(*b));
-                assert!(d >= 7.0, "{an} and {bn} have the same master: {d:.1} apart");
+        assert!(slot < STRIP_COLORS.len(), "the master runs off the table");
+        assert!(
+            slot >= MANUAL_COLORS,
+            "the master is inside the hand-picked swatches"
+        );
+        let ratio = crate::recorder_panel::contrast_ratio(INK, rgb(slot));
+        assert!(
+            ratio >= 4.5,
+            "the master reads at {ratio:.2}:1 under the ink"
+        );
+        // **And it is not any palette's track.** The floor that made the
+        // per-palette masters worth having in the first place; one shared
+        // red has to clear it against all sixteen sets, not just its own.
+        let mut close: Vec<String> = Vec::new();
+        for pal in &PALETTES {
+            for i in 0..crate::recorder::CHANNELS {
+                let d = delta_e(rgb(slot), rgb(pal.slot(i)));
+                if d < 7.0 {
+                    close.push(format!("{} track {i}: {d:.1} apart", pal.name));
+                }
             }
         }
+        assert!(
+            close.is_empty(),
+            "the master reads as somebody's track:\n  {}",
+            close.join("\n  ")
+        );
     }
 
     /// **Appending is the contract.** The hand-pickable swatches are the first

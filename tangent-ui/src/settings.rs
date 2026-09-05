@@ -1658,7 +1658,13 @@ pub const DETACHED_DEFAULT: egui::Vec2 = egui::Vec2::new(460.0, 150.0);
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            dark_mode: false,
+            // **Dark out of the box, on every view.** The owner's ruling:
+            // a fresh install opens dark, and the three flags that carry it
+            // — this one for the theory surfaces, `arr_dark` for the
+            // arrangement field, `me_dark` for the MIDI editor — agree from
+            // the first launch rather than one of them differing until
+            // somebody presses D.
+            dark_mode: true,
             desk_state_shift_v13: false,
             desk_state_shift_v14: false,
             pad_state_shift_v18: false,
@@ -1691,7 +1697,11 @@ impl Default for Settings {
             input_chip_color: Rgb::new(0xE3, 0xD9, 0xBD),
             fretboard_color: Rgb::new(0x4a, 0x2b, 0x22),
             string_color: Rgb::new(0xC9, 0xC4, 0xBC),
-            theme_name: "Default".to_owned(),
+            // **Centennial ships**, at the owner's word. "Default" stays in
+            // the list and a settings file that names it keeps it: only an
+            // install that has never chosen gets this, the same rule the
+            // typeface default follows.
+            theme_name: "Centennial".to_owned(),
             routes: crate::routing::Routes::default(),
             insert_keys: crate::routing::KeyEdges::default(),
             insert_bypass: BypassBays::default(),
@@ -7038,7 +7048,12 @@ mod tests {
     #[test]
     fn defaults_match_spec_table() {
         let s = Settings::default();
-        assert!(!s.dark_mode);
+        // **Dark, and Centennial, out of the box** — the owner's ruling. The
+        // three dark flags agree from the first launch; a settings file that
+        // names something else still wins, which is what `theme_name` in the
+        // round-trip tests is for.
+        assert!(s.dark_mode && s.arr_dark && s.me_dark);
+        assert_eq!(s.theme_name, "Centennial");
         assert_eq!(s.white_key_idle_color.to_hex(), "#e8dcc0");
         assert_eq!(s.black_key_idle_color.to_hex(), "#1a1a1a");
         assert_eq!(s.white_key_active_color.to_hex(), "#6c9bd2");
@@ -7401,7 +7416,7 @@ mod tests {
             _ => unreachable!(),
         };
         let s = Settings::from_map(map);
-        assert!(!s.dark_mode); // wrong type => default
+        assert!(s.dark_mode); // wrong type => default, which now ships dark
         assert_eq!(s.window_size_percent, 150);
         assert_eq!(s.detached_chord_height, -3);
         assert_eq!(s.detached_height_for_use(), 50.0); // D-UI-1 fallback
