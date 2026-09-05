@@ -11,6 +11,9 @@
 #[cfg(feature = "recorder")]
 mod composite;
 mod desktop;
+/// What the app ships onto the user's shelves — impulse responses and drum
+/// kits — and the once-only seeding that puts them there at launch.
+mod shipped;
 /// How much of the screen the OS leaves for a window. One number, asked of
 /// the platform, so the layout can be made to FIT a laptop rather than run
 /// off the bottom of it.

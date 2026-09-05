@@ -4,8 +4,11 @@ use std::path::PathBuf;
 
 use block2::Block;
 use objc2::rc::Retained;
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSModalResponse, NSOpenPanel, NSSavePanel, NSWindow, NSWindowLevel};
+use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2_app_kit::{
+    NSModalResponse, NSOpenPanel, NSOpenSavePanelDelegate, NSSavePanel, NSWindow, NSWindowLevel,
+};
 use objc2_foundation::{NSArray, NSString, NSURL};
 use raw_window_handle::RawWindowHandle;
 
@@ -26,6 +29,10 @@ pub struct Panel {
     parent: Option<Retained<NSWindow>>,
     _focus_manager: FocusManager,
     _policy_manager: PolicyManager,
+    /// TANGENT: the save panel's delegate, which is a WEAK property on the
+    /// panel and so has to be owned here for as long as the panel is. See
+    /// [`Steer`].
+    _steer: Option<Retained<Steer>>,
 }
 
 impl AsModal for Panel {
@@ -60,6 +67,145 @@ unsafe impl Send for OnMain {}
 // SAFETY: as above — never observed from any thread but the main one.
 unsafe impl Sync for OnMain {}
 
+/// TANGENT: whether a panel's directory is the one it was given.
+///
+/// By PATH, because `NSURL` equality is by string and AppKit hands back the
+/// same folder with and without a trailing slash.
+fn same_dir(now: Option<&NSURL>, wanted: &NSURL) -> bool {
+    let path = |u: &NSURL| u.path().map(|p| p.to_string());
+    match (now.and_then(path), path(wanted)) {
+        (Some(a), Some(b)) => a.trim_end_matches('/') == b.trim_end_matches('/'),
+        _ => false,
+    }
+}
+
+/// TANGENT: what the save panel's delegate remembers.
+struct SteerIvars {
+    /// The directory the panel was built with.
+    wanted: Retained<NSURL>,
+    /// How many times the panel has been put back; see [`Steer::MAX`].
+    steers: std::cell::Cell<u8>,
+    /// When the panel was built; see [`Steer::GRACE`].
+    opened: std::time::Instant,
+}
+
+define_class!(
+    // SAFETY:
+    // - NSObject has no subclassing requirements.
+    // - The class does not implement `Drop`.
+    #[unsafe(super(NSObject))]
+    // Main-thread-only because `NSOpenSavePanelDelegate` requires it, and
+    // every call here is the panel's, on the thread it runs on.
+    #[thread_kind = MainThreadOnly]
+    // Deliberately NOT `#[name = "..."]`: objc2 derives a runtime name from
+    // the module path and the crate version, and registering a fixed name
+    // twice in one process is a hard failure. Tangent ships as an app AND a
+    // VST3, and a host can load the plug-in into a process that already
+    // holds this crate.
+    #[ivars = SteerIvars]
+    struct Steer;
+
+    unsafe impl NSObjectProtocol for Steer {}
+
+    unsafe impl NSOpenSavePanelDelegate for Steer {
+        #[unsafe(method(panel:didChangeToDirectoryURL:))]
+        fn did_change_to_directory(&self, sender: &AnyObject, url: Option<&NSURL>) {
+            self.steer(sender, url);
+        }
+    }
+);
+
+/// **TANGENT: the SAVE panel's delegate, which puts the panel back on the
+/// directory it was given when the panel walks off it by itself.**
+///
+/// The third attempt at one fault, and the first that is driven by the
+/// event rather than by a clock. The fault, measured on the owner's machine
+/// on 2026-09-05 with a standalone AppKit program that opens exactly the
+/// panel this crate opens (`beginSheetModalForWindow:` then `runModal`) and
+/// reads `directoryURL` back:
+///
+/// ```text
+///   ~/Documents                          HELD
+///   ~/Desktop                            HELD
+///   ~/Music                              HELD
+///   /private/tmp/probedir                HELD
+///   ~/Documents/Tangent Media/Projects   *** MOVED *** to /Users/<user>
+/// ```
+///
+/// A folder UNDER `~/Documents` is refused and the panel falls back to home
+/// — with `NSOSPLastRootDirectory` pointing at home, pointing at the wanted
+/// folder, and DELETED, all three. So it is not the remembered location,
+/// which is what the previous note believed; it is the panel refusing that
+/// directory, silently, and nothing this side of AppKit can say why.
+///
+/// What the same program did establish:
+///
+/// * the delegate HEARS it — `panel:didChangeToDirectoryURL:` fires once,
+///   with the home directory, before any hand has touched the panel;
+/// * `setDirectoryURL:` said again AFTER that call holds, and holds for as
+///   long as the panel was watched (three seconds);
+/// * and the main queue is BLOCKED during the panel's own setup — every
+///   block queued for 10 through 320 ms ran together at 325 ms — which is
+///   the timed shots of the previous attempt firing in a bunch at a moment
+///   that happened to fall after the move in the probe and, this morning
+///   in the app, fell before it: the app logged the right folder at
+///   13:28:03Z, the panel opened at home, and the app's own preference
+///   domain recorded `/Users/<user>` as where it closed.
+///
+/// So the panel is asked to say when it moves, and when the move is not to
+/// the wanted directory it is put back — from a main-queue block rather
+/// than inside the callback, and 30 ms on, the margin the first measurement
+/// found. [`Self::MAX`] and [`Self::GRACE`] are what keep this from ever
+/// fighting a hand: two repairs at most, and none after three seconds,
+/// when whatever is changing the directory is the user. The timed shots
+/// stay as a guarded fallback — see [`Panel::hold_directory`] — and do
+/// nothing once the delegate has done its work.
+impl Steer {
+    /// Repairs per panel. One is the measured need; the second is for a
+    /// panel that refuses the first re-assert too.
+    const MAX: u8 = 2;
+    /// No repairs after this: a change this late is a hand navigating.
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+    /// After the callback returns, and past the margin measured to hold.
+    const SETTLE_MS: u64 = 30;
+
+    fn new(mtm: MainThreadMarker, wanted: Retained<NSURL>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(SteerIvars {
+            wanted,
+            steers: std::cell::Cell::new(0),
+            opened: std::time::Instant::now(),
+        });
+        // SAFETY: `init` on a freshly allocated NSObject subclass whose ivars
+        // have been set, which is exactly the initialiser contract.
+        unsafe { msg_send![super(this), init] }
+    }
+
+    fn steer(&self, sender: &AnyObject, now: Option<&NSURL>) {
+        let iv = self.ivars();
+        if same_dir(now, &iv.wanted) {
+            return;
+        }
+        if iv.steers.get() >= Self::MAX || iv.opened.elapsed() > Self::GRACE {
+            return;
+        }
+        let Some(panel) = sender.downcast_ref::<NSSavePanel>() else {
+            return;
+        };
+        iv.steers.set(iv.steers.get() + 1);
+        let carry = OnMain(panel.retain(), iv.wanted.clone());
+        let when = dispatch2::DispatchTime::try_from(std::time::Duration::from_millis(
+            Self::SETTLE_MS,
+        ));
+        let Ok(when) = when else { return };
+        let _ = dispatch2::DispatchQueue::main().after(when, move || {
+            // The whole wrapper crosses; see `hold_directory` for why it is
+            // named once as itself.
+            let carry = carry;
+            carry.0.setDirectoryURL(Some(&carry.1));
+        });
+    }
+}
+
 impl Panel {
     fn as_open_panel(&self) -> Option<&NSOpenPanel> {
         self.panel.downcast_ref::<NSOpenPanel>()
@@ -76,6 +222,7 @@ impl Panel {
             parent: parent.map(window_from_raw_window_handle),
             _focus_manager,
             _policy_manager,
+            _steer: None,
         }
     }
 
@@ -96,26 +243,24 @@ impl Panel {
     /// So it is not the directory, not the file name, not this crate's
     /// shielding window level, and not the ORDER any of them are set in — all
     /// four were varied and all four moved. `NSOpenPanel` holds the same URL
-    /// in the same program. What differs is that a save panel restores the
-    /// app's remembered location — `NSOSPLastRootDirectory`, a bookmark in
-    /// the app's own preference domain — over the one it was handed, and for
-    /// a user who has never saved anywhere that location is HOME.
+    /// in the same program.
     ///
-    /// That is why the owner reported this as a per-build wildcard that
-    /// "never has been consistently applied": whether it looks broken depends
-    /// on what the panel last remembered, so it comes and goes with no code
-    /// change at all.
+    /// **What moves it was misread here once, and the correction is on
+    /// [`Steer`].** This note used to say the panel restores the app's
+    /// remembered location — `NSOSPLastRootDirectory` — over the one it was
+    /// handed. Measured on 2026-09-05: with that key deleted, and with it
+    /// pointing at the wanted folder, the panel moved just the same. It is
+    /// the panel refusing a folder under `~/Documents`, and the reason is
+    /// not visible from this side of AppKit.
     ///
-    /// The remedy is to say it again once the restore has happened. Also
-    /// measured: re-asserting on the next run-loop turn is too early and
-    /// still moves; 30 ms holds, and so does everything later. Three shots
-    /// inside 200 ms covers a slower machine and is far quicker than anyone
-    /// can navigate a panel, so it can never take a folder away from a hand
-    /// that chose it.
-    ///
-    /// The timers go into the COMMON modes: a modal panel spins the run loop
-    /// in `NSModalPanelRunLoopMode`, and a timer left in the default mode
-    /// alone would not fire until the panel had already closed.
+    /// What did hold: saying it again AFTER the move. Measured first as "the
+    /// next run-loop turn is too early and 30 ms holds", which was the truth
+    /// of a probe whose main queue was blocked by the panel's own setup until
+    /// the move had happened; in the app the same shots fired before it and
+    /// changed nothing. So the delegate is what listens for the move now,
+    /// and these shots are its fallback, GUARDED so that a shot landing on a
+    /// panel that already stands where it was told does nothing — otherwise
+    /// four shots would be four chances to take a folder away from a hand.
     fn hold_directory(&self, url: Retained<NSURL>) {
         // **On the MAIN QUEUE, not on a run-loop timer.**
         //
@@ -149,7 +294,18 @@ impl Panel {
                 // the `Send` on the wrapper applied to nothing. Naming it
                 // once as itself is what puts the wrapper in the capture.
                 let carry = carry;
-                unsafe { carry.0.setDirectoryURL(Some(&carry.1)) };
+                // **Guarded, since the delegate arrived.** A shot that lands
+                // while the panel already stands where it was told — the
+                // delegate's doing, or the panel never having moved — must
+                // say nothing, or four shots become four chances to take a
+                // folder away from a hand. See `Steer`.
+                let held = carry
+                    .0
+                    .directoryURL()
+                    .is_some_and(|d| same_dir(Some(&d), &carry.1));
+                if !held {
+                    carry.0.setDirectoryURL(Some(&carry.1));
+                }
             });
         }
     }
@@ -320,15 +476,19 @@ impl Panel {
             panel.set_can_create_directories(can);
         }
 
-        let built = Self::new(panel, opt.parent.as_ref());
+        let mut built = Self::new(panel, opt.parent.as_ref());
         // TANGENT: and it has to be said again after the panel is up. The
         // SAVE panel only — `NSOpenPanel` holds what it is given, so this
-        // would be three timers doing nothing there. See `hold_directory`.
+        // would be three timers doing nothing there. See `hold_directory`,
+        // and `Steer` for the half that listens rather than counts.
         if let Some(path) = &opt.starting_directory {
             if let Some(path) = path.to_str() {
                 let url = unsafe {
                     NSURL::fileURLWithPath_isDirectory(&NSString::from_str(path), true)
                 };
+                let steer = Steer::new(mtm, url.clone());
+                unsafe { built.panel.setDelegate(Some(ProtocolObject::from_ref(&*steer))) };
+                built._steer = Some(steer);
                 built.hold_directory(url);
             }
         }

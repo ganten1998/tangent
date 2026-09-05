@@ -41,10 +41,18 @@ pub enum Dialog {
     /// The project menu behind the band's folder button: the session's
     /// name, and the five things you do with sessions.
     Project {
+        /// The name the field is staging. EMPTY for a session nobody has
+        /// saved — the owner: "No more occupied track title by default" —
+        /// so the window does not present "Untitled" as a name somebody
+        /// chose. See `saved`.
         name: String,
         /// The "Create Project Subdirectory" tick, mirrored from settings so
         /// the box moves under the pointer before the app answers.
         subdir: bool,
+        /// Whether the session has been saved on purpose. Until it has,
+        /// Save and Save As are the same door — the system's save panel —
+        /// and the rows say so; once it has, Save writes in place.
+        saved: bool,
     },
     /// The TRACK menu behind a right-click on a strip or a lane header:
     /// remove it, paint it, or choose the auto-palette everybody unpainted
@@ -1391,8 +1399,12 @@ pub enum DialogAction {
         /// renaming the session if it differs — no panel in between.
         name: String,
     },
-    /// Duplicate the whole session somewhere and open the copy.
-    ProjectSaveAs,
+    /// Duplicate the whole session somewhere and open the copy — or, for a
+    /// session that has never been saved, ask where it should live, with
+    /// the field's name as the panel's suggestion.
+    ProjectSaveAs {
+        name: String,
+    },
     /// Save the session as a template under `Projects/Templates`.
     ProjectTemplate,
     TrackRemove(usize),
@@ -3004,7 +3016,14 @@ const PLUGIN_NONE_ROW: &str = "None  -  no instrument; unloads the one that is l
 pub const BUILTIN_PATH: &str = "@tangent-dx7";
 
 /// What the built-in calls itself in the picker.
-pub const BUILTIN_NAME: &str = "Tangent DX7";
+///
+/// **"(Experimental)" is on the name, by the owner's word, and it is the
+/// same suffix the denoiser wears** — `EXPERIMENTAL_SUFFIX` in `app.rs`, which
+/// is also what takes it off again on a bay's chip, so the standing shows
+/// where the unit is CHOSEN and not on a forty-point label. The preset
+/// folder is not touched by it: `preset_subfolder` derives from the path,
+/// never from this string.
+pub const BUILTIN_NAME: &str = "Tangent DX7 (Experimental)";
 /// The drumpad's sentinel path: the sixteen-pad sampler as a bay-1
 /// instrument. Like [`BUILTIN_PATH`] it rides the bay so it can be picked,
 /// saved and named by the same code, but the ENGINE strikes the pads in
@@ -9064,8 +9083,9 @@ fn show_on(
             )
         }
 
-        Dialog::Project { name, subdir } => {
+        Dialog::Project { name, subdir, saved } => {
             let t = theme(face);
+            let saved = *saved;
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -9094,16 +9114,25 @@ fn show_on(
                             // typed white-on-white.
                             ui.style_mut().visuals.extreme_bg_color =
                                 egui::Color32::from_rgb(0x1A, 0x16, 0x12);
+                            // **Empty until the session is saved.** The
+                            // field used to open on "Untitled", which read
+                            // as a name somebody had given the session and
+                            // let Save write an Untitled folder without a
+                            // panel ever asking. A hint in the well says
+                            // what the empty field means; it is not a value.
                             ui.add(
                                 egui::TextEdit::singleline(name)
                                     .font(bold(13.0))
                                     .text_color(egui::Color32::WHITE)
+                                    .hint_text(if saved { "" } else { "unsaved" })
                                     .desired_width(f32::INFINITY),
                             );
                             ui.label(
-                                RichText::new(
-                                    "the open session - audio takes and the kit write themselves; Save writes the rest, under this name",
-                                )
+                                RichText::new(if saved {
+                                    "the open session - audio takes and the kit write themselves; Save writes the rest, under this name"
+                                } else {
+                                    "no home yet - Save and Save As both ask where; a name typed here is the panel's suggestion"
+                                })
                                 .font(plain(9.0))
                                 .color(dim),
                             );
@@ -9129,13 +9158,28 @@ fn show_on(
                             if row(ui, "Open...", "") {
                                 action = Some(DialogAction::ProjectOpen);
                             }
-                            if row(ui, "Save", "desk, document and plugin settings, now") {
+                            // The two rows say which door they are: in
+                            // place once the session has a home, the panel
+                            // until it does. See `Dialog::Project::saved`.
+                            let save_hint = if saved {
+                                "desk, document and plugin settings, now"
+                            } else {
+                                "asks where to keep the session, this first time"
+                            };
+                            if row(ui, "Save", save_hint) {
                                 action = Some(DialogAction::ProjectSave {
                                     name: name.clone(),
                                 });
                             }
-                            if row(ui, "Save As...", "copy the whole session and open the copy") {
-                                action = Some(DialogAction::ProjectSaveAs);
+                            let save_as_hint = if saved {
+                                "copy the whole session and open the copy"
+                            } else {
+                                "the same panel - there is nothing to copy yet"
+                            };
+                            if row(ui, "Save As...", save_as_hint) {
+                                action = Some(DialogAction::ProjectSaveAs {
+                                    name: name.clone(),
+                                });
                             }
                             // **A checkbox rather than a row**, because it
                             // does not DO anything on click - it changes what

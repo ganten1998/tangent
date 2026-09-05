@@ -10244,24 +10244,56 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    /// Copy the WHOLE project — document and `media/` — to `target` and
-    /// open the copy. `target` is what the save panel answered; with or
-    /// without the `.tangent` the panel's filter appended, it names the new
-    /// project DIRECTORY.
-    pub fn save_project_as(&mut self, target: &std::path::Path) {
-        // **Not onto the template shelf.**
-        //
-        // A project saved there is not a project any more, it is what every
-        // fresh install and every New is made from — and with
-        // `project_subdir` on, Save-As NESTS into a folder that already
-        // exists, which the shelf always is. The owner ended an evening with
-        // `Templates/default/default/`: a whole session copied inside the
-        // stencil it was cloned from. See [`inside_template_shelf`] for the
-        // second road and what the pair of them did to his launches.
-        //
-        // Refused rather than redirected, and named: Save as a Template is
-        // one row away in the same menu, it takes a NAME rather than a
-        // place, and it is the road that knows a template is a stencil.
+    /// **Ask where an unsaved session should live.** What Save, Save As,
+    /// Ctrl+S and the unsaved-changes prompt's Save all become while the
+    /// session has no home — the owner's rule, quoted at
+    /// `DialogAction::ProjectSave`. `typed` is the Project window's field:
+    /// cleaned the way `rename_project` cleans a name, it is the panel's
+    /// suggestion, and an empty field suggests "Untitled" for the hand to
+    /// overwrite rather than a blank the panel refuses.
+    fn ask_where_to_keep(&mut self, typed: &str) {
+        let clean: String = typed
+            .chars()
+            .filter(|c| !c.is_control() && *c != '/' && *c != ':')
+            .collect::<String>()
+            .trim()
+            .to_owned();
+        self.native_panel_up = true;
+        self.save_request = Some(crate::ports::SaveRequest {
+            title: "Save the project".to_owned(),
+            suggested: if clean.is_empty() { "Untitled".to_owned() } else { clean },
+            purpose: crate::ports::SavePurpose::ProjectFirst,
+        });
+    }
+
+    /// **The directory a save panel's answer names**, for both roads that
+    /// take one — Save As and the first save — so the two cannot disagree
+    /// about the shelf or the wrap. `None` is a refusal, already said.
+    ///
+    /// **Not onto the template shelf.**
+    ///
+    /// A project saved there is not a project any more, it is what every
+    /// fresh install and every New is made from — and with
+    /// `project_subdir` on, Save-As NESTS into a folder that already
+    /// exists, which the shelf always is. The owner ended an evening with
+    /// `Templates/default/default/`: a whole session copied inside the
+    /// stencil it was cloned from. See [`inside_template_shelf`] for the
+    /// second road and what the pair of them did to his launches.
+    ///
+    /// Refused rather than redirected, and named: Save as a Template is
+    /// one row away in the same menu, it takes a NAME rather than a
+    /// place, and it is the road that knows a template is a stencil.
+    ///
+    /// **The wrap, and why it is on by default.** A project is a
+    /// DIRECTORY - `project.tangent`, `media/`, the kit's sidecar - and a
+    /// save panel pointed at a folder that already exists would otherwise
+    /// scatter those parts among whatever is already in it. With the box
+    /// ticked, an existing folder gets a folder of its own inside it,
+    /// named `wrap`; a name that does not exist yet already IS its own
+    /// folder, so nothing is nested twice. `wrap` is the project's name for
+    /// a copy and the panel's own file name for a first save, which has no
+    /// name yet but the one just typed.
+    fn chosen_project_dir(&mut self, target: &std::path::Path, wrap: &str) -> Option<std::path::PathBuf> {
         if inside_template_shelf(target, &self.project_root()) {
             self.notify(
                 crate::notify::Kind::Error,
@@ -10269,7 +10301,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                  stencil there — saving a project into it makes every new \
                  session a copy of this one.",
             );
-            return;
+            return None;
         }
         let chosen = if target
             .extension()
@@ -10279,18 +10311,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         } else {
             target.to_path_buf()
         };
-        // **The wrap, and why it is on by default.** A project is a
-        // DIRECTORY - `project.tangent`, `media/`, the kit's sidecar - and a
-        // save panel pointed at a folder that already exists would otherwise
-        // scatter those parts among whatever is already in it. With the box
-        // ticked, an existing folder gets a folder of its own inside it,
-        // named for the project; a name that does not exist yet already IS
-        // its own folder, so nothing is nested twice.
-        let dir = if self.settings.project_subdir && chosen.is_dir() {
+        Some(if self.settings.project_subdir && chosen.is_dir() {
             let name = {
-                let n = self.project_name();
-                let n = n.trim();
-                if n.is_empty() { "Untitled".to_owned() } else { n.to_owned() }
+                let n = wrap.trim();
+                if n.is_empty() { "Untitled" } else { n }
             };
             // Never a path: a project called `../..` must not climb out of
             // the folder the user chose.
@@ -10301,13 +10325,97 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             chosen.join(safe.trim())
         } else {
             chosen
+        })
+    }
+
+    /// **The FIRST save of a session: the panel names its home, and the
+    /// session moves there whole.** `true` when it did.
+    ///
+    /// Not a copy, deliberately. A scratch that has recorded takes is a
+    /// real folder called Untitled, and copying it would leave that folder
+    /// standing with every take in it — for the next New to reclaim, or for
+    /// the launch sweep to weigh, or simply to be the "untitled 1 2 3" the
+    /// owner hates seeing build up. So a materialised scratch is RENAMED to
+    /// the chosen place, which is instant and leaves nothing behind; a
+    /// rename the OS refuses — another volume — falls back to the copy a
+    /// Save As makes. A scratch that never materialised has nothing to
+    /// move: the folder is born at the chosen place, and the kit's samples
+    /// come out of the template with it on that transition, exactly as
+    /// `materialize_project_dir` would have done under Untitled.
+    ///
+    /// The undo line survives, unlike a Save As: it is the same document in
+    /// a new home, and "unsaved" is re-based by `save_project_doc`.
+    pub fn save_project_first(&mut self, target: &std::path::Path) -> bool {
+        let stem = target
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let wrap = if stem.trim().is_empty() { "Untitled".to_owned() } else { stem };
+        let Some(dir) = self.chosen_project_dir(target, &wrap) else {
+            return false;
+        };
+        let src = self
+            .project_doc()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let moved = src.as_ref().is_some_and(|s| {
+            s.is_dir() && *s != dir && !dir.exists() && std::fs::rename(s, &dir).is_ok()
+        });
+        let doc = crate::arrangement::doc_in(&dir);
+        self.project_doc = doc.clone();
+        self.settings.project_path = doc.to_string_lossy().into_owned();
+        // Born here when it was not moved in — and the kit's samples with
+        // it, on the transition and only then.
+        self.materialize_project_dir();
+        if !moved {
+            if let Some(s) = src.as_ref().filter(|s| s.is_dir() && **s != dir) {
+                if let Ok(entries) = std::fs::read_dir(s.join("media")) {
+                    for entry in entries.flatten() {
+                        let from = entry.path();
+                        if from.is_file() {
+                            let _ = std::fs::copy(&from, dir.join("media").join(entry.file_name()));
+                        }
+                    }
+                }
+            }
+        }
+        // A name somebody CHOSE: kept, never a scratch a new session may
+        // reclaim — set before the write so the document carries it.
+        self.arrangement.named = true;
+        self.save_project_doc();
+        self.save_settings();
+        crate::drumpad::DrumpadDoc::save_all_beside(&self.drumpad_kits, self.drumpad_lane, &doc);
+        // The engine's schedule is unchanged — same clips, new home — but
+        // the paths the host resolves against moved with the document.
+        self.clips_dirty = true;
+        self.drumpad_dirty = true;
+        true
+    }
+
+    /// Copy the WHOLE project — document and `media/` — to `target` and
+    /// open the copy. `target` is what the save panel answered; with or
+    /// without the `.tangent` the panel's filter appended, it names the new
+    /// project DIRECTORY. `true` when the copy was made; the shelf refuses,
+    /// see `chosen_project_dir`.
+    pub fn save_project_as(&mut self, target: &std::path::Path) -> bool {
+        // The copy's wrap is named for the project it copies.
+        let wrap = {
+            let n = self.project_name();
+            let n = n.trim().to_owned();
+            if n.is_empty() { "Untitled".to_owned() } else { n }
+        };
+        let Some(dir) = self.chosen_project_dir(target, &wrap) else {
+            return false;
         };
         let Some(src_dir) = self.project_doc().and_then(std::path::Path::parent) else {
-            return;
+            return false;
         };
         let src_dir = src_dir.to_path_buf();
         if std::fs::create_dir_all(dir.join("media")).is_err() {
-            return;
+            return false;
         }
         // The media copies first, the document last — a copy interrupted
         // halfway is a directory that opens with silent lanes, not a
@@ -10340,6 +10448,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.clips_dirty = true;
         self.drumpad_dirty = true;
         self.undo_reset();
+        true
     }
 
     /// The save panel the app is waiting on, if any. Same drain-once pattern
@@ -20264,11 +20373,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.native_panel_up = false;
         match purpose {
             crate::ports::SavePurpose::ProjectCopy => {
-                self.save_project_as(path);
                 // If a save prompt was standing in front of something, this
                 // is the answer it was waiting for — carry on with it now
-                // that the work is somewhere safe.
-                self.resume_after_save();
+                // that the work is somewhere safe. **Only if it IS safe**:
+                // a copy refused (the template shelf) must leave the prompt's
+                // pending action pending, or a Save As that was declined
+                // quits out from under the session it was meant to keep.
+                if self.save_project_as(path) {
+                    self.resume_after_save();
+                }
+            }
+            crate::ports::SavePurpose::ProjectFirst => {
+                if self.save_project_first(path) {
+                    self.resume_after_save();
+                }
             }
             crate::ports::SavePurpose::Template => {
                 // Only the NAME is honoured — templates have one home.
@@ -23810,9 +23928,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // question — and a menu row can show none of that.
             Hit::OpenSetup => self.setup_open = true,
             Hit::ProjectMenu => {
+                // **Blank until the session is saved.** The field carried
+                // "Untitled" — the scratch's prospective folder — which read
+                // as a name somebody chose and let Save write it down without
+                // a panel ever asking where. The owner: "No more occupied
+                // track title by default." See `Dialog::Project::saved` for
+                // what the two save rows become while it is blank.
+                let saved = self.arrangement.named;
                 self.dialog = Some(dialogs::Dialog::Project {
-                    name: self.project_name(),
+                    name: if saved { self.project_name() } else { String::new() },
                     subdir: self.settings.project_subdir,
+                    saved,
                 });
             }
             Hit::StreamToObs => {
@@ -26866,6 +26992,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // All four answers end the same way: either the thing that was
             // interrupted happens, or it does not. Nothing here half-does it.
             DialogAction::SaveChangesSave => {
+                // **A session with no home is asked where, here too.** The
+                // pending action waits on the panel exactly as Save As
+                // below; a session that has been kept once saves in place
+                // and carries straight on. See `DialogAction::ProjectSave`.
+                if !self.arrangement.named {
+                    self.ask_where_to_keep("");
+                    return;
+                }
                 self.save_project_doc();
                 self.resume_after_save();
             }
@@ -26874,6 +27008,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // `finish_save_choice` resumes it once a place is chosen,
                 // and a cancelled panel leaves it pending rather than
                 // quitting out from under somebody who backed out.
+                if !self.arrangement.named {
+                    self.ask_where_to_keep("");
+                    return;
+                }
                 self.native_panel_up = true;
                 let name = self.project_name();
                 self.save_request = Some(crate::ports::SaveRequest {
@@ -26937,14 +27075,32 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             DialogAction::ProjectSave { name } => {
                 self.dialog = None;
+                // **The owner's rule, in one branch.** "New project --> open
+                // save options --> no name in field and leave empty --> save
+                // AND save as will now open their system dialog locations
+                // ... unless a project is open which HAS been saved -- then
+                // saving works like normal." A session that has never been
+                // saved has no home to write into, so its Save is the panel
+                // — with whatever was typed as the suggestion — and only a
+                // saved session's Save writes in place.
+                if !self.arrangement.named {
+                    self.ask_where_to_keep(&name);
+                    return;
+                }
                 self.rename_project(&name);
                 // A save a hand asked for is the session being KEPT: the
                 // name — staged or standing — is one somebody chose.
                 self.arrangement.named = true;
                 self.project_request = Some(crate::ports::ProjectRequest::Save);
             }
-            DialogAction::ProjectSaveAs => {
+            DialogAction::ProjectSaveAs { name } => {
                 self.dialog = None;
+                // Nothing to copy until the session has been kept once; see
+                // the Save row above. The same panel, the same purpose.
+                if !self.arrangement.named {
+                    self.ask_where_to_keep(&name);
+                    return;
+                }
                 self.native_panel_up = true;
                 self.save_request = Some(crate::ports::SaveRequest {
                     title: "Save the project as".to_owned(),
@@ -31347,8 +31503,15 @@ impl TangentApp {
                     && !i.modifiers.alt
                     && i.key_pressed(egui::Key::S)
             }) {
-                self.arrangement.named = true;
-                self.project_request = Some(crate::ports::ProjectRequest::Save);
+                // **And the chord obeys the Project window's rule**: a
+                // session nobody has saved is asked where it should live
+                // rather than written into an Untitled folder. See
+                // `DialogAction::ProjectSave`.
+                if self.arrangement.named {
+                    self.project_request = Some(crate::ports::ProjectRequest::Save);
+                } else {
+                    self.ask_where_to_keep("");
+                }
             }
             // **Ctrl/Cmd+R — the ARRANGEMENT's record**, which is not the
             // take machine and deliberately does not care whether one is
@@ -36452,6 +36615,125 @@ mod tests {
         assert!(app.project_name().starts_with("Untitled"));
         assert_ne!(app.project_name(), "Nocturne");
         assert!(app.arrangement().clips.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **An unsaved session's Save is the panel, and its first save MOVES
+    /// the scratch; a saved session's Save writes in place.** The owner:
+    /// "New project --> open save options --> no name in field and leave
+    /// empty --> save AND save as will now open their system dialog
+    /// locations ... unless a project is open which HAS been saved -- then
+    /// saving works like normal."
+    ///
+    /// Revert-check performed: put `name: self.project_name()` back in
+    /// `Hit::ProjectMenu` and the first assert names the "Untitled" in the
+    /// field; drop the `named` branch from `ProjectSave` and the next finds
+    /// no panel where one was owed.
+    #[test]
+    fn an_unsaved_session_saves_by_the_panel_and_a_saved_one_in_place() {
+        use crate::ports::{ProjectRequest, SavePurpose};
+        use dialogs::{Dialog, DialogAction};
+        let root = project_scratch("first-save");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.set_record_dir(root.clone());
+        app.set_project_dir(root.join("Projects"));
+        app.bootstrap_project(&root.join("Projects"));
+        assert!(!app.arrangement().named, "a fresh session came up saved");
+        let scratch = root.join("Projects").join("Untitled");
+        assert!(scratch.is_dir(), "the fresh road did not stand the scratch up");
+
+        // The window opens blank, and says the session has no home.
+        app.apply_recorder_hit(recorder_panel::Hit::ProjectMenu);
+        let Some(Dialog::Project { name, saved, .. }) = app.dialog.as_ref() else {
+            panic!("the Project window did not open");
+        };
+        assert_eq!(name, "", "the field opened occupied");
+        assert!(!saved, "an unsaved session was shown as saved");
+
+        // Save with the field empty: a panel, not a write.
+        app.apply_dialog_action(DialogAction::ProjectSave { name: String::new() });
+        let req = app.take_save_request().expect("Save did not open the panel");
+        assert_eq!(req.purpose, SavePurpose::ProjectFirst);
+        assert_eq!(req.suggested, "Untitled");
+        assert!(app.native_panel_up(), "the dialogs were not stood down for the panel");
+        assert!(app.take_project_request().is_none(), "Save also wrote in place");
+        app.native_panel_closed();
+
+        // A typed name is the panel's suggestion, and Save As is the same door.
+        app.apply_dialog_action(DialogAction::ProjectSave { name: "Bossa".to_owned() });
+        assert_eq!(app.take_save_request().expect("no panel").suggested, "Bossa");
+        app.native_panel_closed();
+        app.apply_dialog_action(DialogAction::ProjectSaveAs { name: String::new() });
+        let req = app.take_save_request().expect("Save As did not open the panel");
+        assert_eq!(req.purpose, SavePurpose::ProjectFirst);
+        app.native_panel_closed();
+
+        // The panel answers: the scratch MOVES there, whole, and is kept.
+        app.finish_save_choice(
+            SavePurpose::ProjectFirst,
+            &root.join("Projects").join("Bossa.tangent"),
+        );
+        assert_eq!(app.project_name(), "Bossa");
+        assert!(app.arrangement().named, "the first save did not keep the session");
+        let doc = app.project_doc().expect("a document").to_path_buf();
+        assert!(doc.is_file(), "the document was not written: {doc:?}");
+        assert!(doc.starts_with(root.join("Projects").join("Bossa")), "{doc:?}");
+        assert!(!scratch.exists(), "the Untitled scratch was left behind: {scratch:?}");
+        assert!(!app.project_dirty(), "a just-saved session reads unsaved");
+        assert!(
+            crate::arrangement::Arrangement::load_from(&doc).named,
+            "the document on disk does not say it was kept"
+        );
+
+        // Saved: the window carries the name, Save writes in place, Save As
+        // copies.
+        app.apply_recorder_hit(recorder_panel::Hit::ProjectMenu);
+        let Some(Dialog::Project { name, saved, .. }) = app.dialog.as_ref() else {
+            panic!("the Project window did not open again");
+        };
+        assert_eq!(name, "Bossa");
+        assert!(saved);
+        app.apply_dialog_action(DialogAction::ProjectSave { name: "Bossa".to_owned() });
+        assert_eq!(app.take_project_request(), Some(ProjectRequest::Save));
+        assert!(app.take_save_request().is_none(), "a saved session's Save opened a panel");
+        app.apply_dialog_action(DialogAction::ProjectSaveAs { name: "Bossa".to_owned() });
+        let req = app.take_save_request().expect("Save As lost its panel");
+        assert_eq!(req.purpose, SavePurpose::ProjectCopy);
+        assert_eq!(req.suggested, "Bossa copy");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The unsaved-changes prompt's Save asks where an unsaved session
+    /// goes, and the answered panel carries the interrupted quit through.**
+    /// A cancelled panel leaves the quit pending, which is the prompt's
+    /// standing rule for Save As and now holds for Save.
+    #[test]
+    fn the_prompts_save_asks_where_an_unsaved_session_goes_then_quits() {
+        use crate::ports::SavePurpose;
+        use dialogs::DialogAction;
+        let root = project_scratch("prompt-first-save");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.set_record_dir(root.clone());
+        app.set_project_dir(root.join("Projects"));
+        app.bootstrap_project(&root.join("Projects"));
+        app.undo_reset();
+        app.settings.master_gain = 0.3;
+        app.arr_save_edits();
+        assert!(app.project_dirty(), "the edit did not dirty the session");
+        assert!(app.intercept_quit(), "quitting did not ask");
+        app.apply_dialog_action(DialogAction::SaveChangesSave);
+        let req = app
+            .take_save_request()
+            .expect("the prompt's Save wrote an Untitled instead of asking where");
+        assert_eq!(req.purpose, SavePurpose::ProjectFirst);
+        assert!(!app.take_quit_now(), "it quit before the panel answered");
+        app.native_panel_closed();
+        app.finish_save_choice(
+            SavePurpose::ProjectFirst,
+            &root.join("Projects").join("Kept.tangent"),
+        );
+        assert_eq!(app.project_name(), "Kept");
+        assert!(app.take_quit_now(), "the answered panel did not carry the quit through");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -46860,20 +47142,27 @@ mod tests {
     ///
     /// The RECEIPT is raised where the write happens, in the host's
     /// `ProjectRequest::Save` arm, so it reports a file that exists rather
-    /// than one that was asked for. What this can measure is the ask, and
-    /// that it carries `named` with it: a scratch somebody deliberately
-    /// saved is no longer a scratch for launch to reclaim.
+    /// than one that was asked for. What this can measure is the ask —
+    /// and WHICH ask: a kept session's chord writes in place, and a session
+    /// nobody has saved is asked where it should live instead, the Project
+    /// window's own rule (`DialogAction::ProjectSave`). `named` then comes
+    /// from the panel's answer, not from the chord.
     ///
-    /// Revert-checks, both performed: delete the chord block and the first
-    /// half goes red with no request raised; drop the `!i.modifiers.shift`
-    /// guard and the redo leg goes red, because Cmd+Shift+S would then save
-    /// as well.
+    /// Revert-checks, all performed: delete the chord block and the first
+    /// half goes red with no request raised; drop the `named` branch and
+    /// the unsaved leg finds a write where a panel was owed; drop the
+    /// `!i.modifiers.shift` guard and the redo leg goes red, because
+    /// Cmd+Shift+S would then save as well.
     #[test]
     fn ctrl_s_keeps_the_session_and_bare_s_does_not() {
-        let chord = |mods: egui::Modifiers| -> (Option<crate::ports::ProjectRequest>, bool) {
+        let chord = |mods: egui::Modifiers, named: bool| -> (
+            Option<crate::ports::ProjectRequest>,
+            Option<crate::ports::SavePurpose>,
+        ) {
             let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
-            app.arrangement.named = false;
+            app.arrangement.named = named;
             let _ = app.take_project_request();
+            let _ = app.take_save_request();
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(
@@ -46892,31 +47181,48 @@ mod tests {
                 },
                 |ctx| app.frame(ctx),
             );
-            (app.take_project_request(), app.arrangement.named)
+            (
+                app.take_project_request(),
+                app.take_save_request().map(|r| r.purpose),
+            )
         };
 
         let cmd = egui::Modifiers::COMMAND;
-        let (asked, named) = chord(cmd);
+        // A kept session: the chord writes in place, and opens nothing.
+        let (asked, panel) = chord(cmd, true);
         assert!(
             matches!(asked, Some(crate::ports::ProjectRequest::Save)),
             "Cmd+S raised {asked:?} instead of a save"
         );
-        assert!(named, "a save somebody pressed for did not mark the session kept");
+        assert!(panel.is_none(), "a kept session's Cmd+S opened a panel");
 
-        // The bare letter is the supporter key and must stay it.
-        let (asked, _) = chord(egui::Modifiers::NONE);
-        assert!(
-            !matches!(asked, Some(crate::ports::ProjectRequest::Save)),
-            "the bare S saved the project - it is the supporter key"
+        // A session nobody has saved: the chord asks where, and writes
+        // nothing until the panel answers.
+        let (asked, panel) = chord(cmd, false);
+        assert!(asked.is_none(), "Cmd+S on an unsaved session wrote in place: {asked:?}");
+        assert_eq!(
+            panel,
+            Some(crate::ports::SavePurpose::ProjectFirst),
+            "Cmd+S on an unsaved session did not ask where it should live"
         );
 
-        // And the redo chord is not a save. Cmd+Shift+Z shares the hand
-        // shape; Cmd+Shift+S must not be a second way to do this.
-        let (asked, _) = chord(egui::Modifiers { shift: true, ..cmd });
-        assert!(
-            !matches!(asked, Some(crate::ports::ProjectRequest::Save)),
-            "Cmd+Shift+S saved, so the chord does not check its modifiers"
-        );
+        // The bare letter is the supporter key and must stay it; and the
+        // redo chord is not a save — Cmd+Shift+Z shares the hand shape, and
+        // Cmd+Shift+S must not be a second way to do this. Neither writes
+        // and neither asks, kept or not.
+        for (mods, what) in [
+            (egui::Modifiers::NONE, "the bare S"),
+            (egui::Modifiers { shift: true, ..cmd }, "Cmd+Shift+S"),
+        ] {
+            for named in [true, false] {
+                let (asked, panel) = chord(mods, named);
+                assert!(
+                    !matches!(asked, Some(crate::ports::ProjectRequest::Save)),
+                    "{what} saved the project (named: {named})"
+                );
+                assert!(panel.is_none(), "{what} asked where to save (named: {named})");
+            }
+        }
     }
 
     /// **No key starts, ends or cancels a TAKE. The button is the whole
