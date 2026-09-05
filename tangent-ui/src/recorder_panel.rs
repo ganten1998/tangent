@@ -9775,6 +9775,7 @@ mod tests {
                     field,
                     text: text.to_owned(),
                     caret: 0,
+                    seeded: false,
                 }));
             }
         }
