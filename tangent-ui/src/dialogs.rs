@@ -2377,13 +2377,11 @@ const AUDIO_H: f32 = 580.0;
 /// `the_welcome_card_fits_its_own_text` now demands [`WELCOME_SLACK`] on top of
 /// what it can measure.
 const WELCOME_W: f32 = 470.0;
-/// **560 since the faces were scaled to a common x-height.** The card's text
-/// is measured, and the measurement grew about a fifth when Courier and
-/// Terminess started being drawn at the size they look like (see
-/// `fonts::face_scale`): 465 points of text against the 486 the card had,
-/// before the 60 points of slack below. Sized for the tallest of the three
-/// faces, because the card is a fixed window and the font can change under
-/// it.
+/// **560 since JetBrains Mono became the shipped face**, which fills more of
+/// its em than the two before it: the card's measured text went from under
+/// 426 points to 465, and with [`WELCOME_SLACK`] on top that no longer fits
+/// 486. Sized for the largest of the three, because the card is a fixed
+/// window and the font can change under it.
 const WELCOME_H: f32 = 560.0;
 /// How much more than the measurable text the Welcome card must have.
 ///
@@ -2968,13 +2966,13 @@ const PLUGIN_NOTE_PT: f32 = 9.0;
 /// `the_notes_under_the_list_fit_the_space_reserved_for_them` measures the real
 /// strings against this rather than trusting the arithmetic.
 ///
-/// **72 since the faces were scaled to a common x-height.** Courier and
-/// Terminess are drawn about a fifth larger than their nominal size now (see
-/// `fonts::face_scale`), so two wrapped notes that measured 57 points measure
-/// 63, and 60 was no longer enough for the face that needs the most. The band
-/// is sized for the worst of the three faces, not the current one — it is
-/// reserved space, and a reservation that changes with the typeface would
-/// walk the button row under the cursor when somebody switches font.
+/// **72 since JetBrains Mono became the shipped face.** It fills more of its
+/// em than the two before it — cap 0.730 against Terminess' 0.645 — so the
+/// same two wrapped notes measure 63 points where they measured 57, and 60
+/// was no longer enough. Sized for the largest of the three faces, not the
+/// current one: it is reserved space, and a reservation that moved with the
+/// typeface would walk the button row under the cursor when somebody
+/// switches font.
 const PLUGIN_FOOTER_H: f32 = 72.0;
 
 /// What the None row says. Not just "None": what choosing it DOES is the part
@@ -10551,12 +10549,14 @@ fn show_on(
                 ctx,
                 placement,
                 "IR Wizard",
-                // **Wider and taller since the three faces were scaled to a
-                // common x-height** (`fonts::face_scale`): every string on
-                // the longest page in the app grew about a fifth, and at
-                // 540x560 the capture page's button row lost the way back —
-                // the one control that returns the capture to the panel that
-                // asked for it.
+                // **Wider and taller since JetBrains Mono became the shipped
+                // face**, which fills more of its em than the two before it:
+                // every string on the longest page in this app grew with it,
+                // and at 540x560 the capture page's button row lost the way
+                // back — the one control that returns a capture to the panel
+                // that asked for it. Sized for the largest of the three
+                // faces, because a fixed window cannot re-size itself when
+                // somebody switches font.
                 Vec2::new(640.0, 640.0),
                 Vec2::new(540.0, 500.0),
                 |ui, result| {
