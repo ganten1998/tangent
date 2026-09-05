@@ -30,7 +30,10 @@
 //! callback. `render` allocates nothing, locks nothing, and calls into no
 //! system service. See `crate::instrument` for who calls it and when.
 
+pub mod beam;
+pub mod board;
 pub mod clav;
+pub mod pickup;
 pub mod reed;
 pub mod string;
 pub mod tine;

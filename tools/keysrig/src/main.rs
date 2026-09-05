@@ -22,6 +22,9 @@ mod analyze;
 mod wav;
 
 mod dx7;
+// See `dx7.rs`: the synth's demo test names the cartridge at the crate root.
+#[cfg(test)]
+use dx7::Cartridge;
 
 use keys::{Keys, Patch};
 
