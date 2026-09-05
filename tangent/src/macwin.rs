@@ -253,6 +253,7 @@ pub fn publish(
     refresh_curve(height_at, w_floor);
     let hooked = install(&window);
     adopt_floating(&window);
+    guard_child_frames(&window);
     Facts {
         gesture: tangent_ui::host::Gesture {
             live_resize: window.inLiveResize(),
@@ -789,6 +790,135 @@ fn adopt_floating(main: &NSWindow) {
         if window.parentWindow().is_some_and(|p| is_main(&p)) {
             window.setLevel(NSNormalWindowLevel);
         }
+    }
+}
+
+/// How many times a child window was put back where it was. Diagnostics,
+/// like `REBUILDS`: a number that climbs on somebody's machine says the
+/// window manager is fighting, which is the thing to know before anything is
+/// changed.
+pub static REPAIRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// After this many consecutive repairs the new frame is accepted. A window
+/// AppKit insists on moving — one it deems off-screen, say — would otherwise
+/// be moved twice a frame for ever; three is enough to undo a jump and not
+/// enough to be a fight.
+const MAX_REPAIRS: u8 = 3;
+
+/// **A plugin's window moves only under a hand or with its parent.**
+///
+/// The owner: "if I open a plugin window and tab to another workspace/out,
+/// the plugin window should NOT spawn back at the bottom right of my
+/// screen. It currently moves there." The editors are adopted as children of
+/// the main window (`adopt_floating`), and somewhere between a Space switch
+/// and the return AppKit puts a child down somewhere nobody put it. Which
+/// call does it could not be watched from here, and a rule that names the
+/// call would be wrong on the next macOS anyway. So the rule is about the
+/// window instead: a child's frame is remembered, and a frame that changes
+/// while no mouse button is down, the parent has not moved and the window is
+/// not in a live resize is a move nobody asked for — and it is put back.
+/// The window's own resize is not a move: only the origin is guarded, and
+/// only while the size stands.
+///
+/// Bounded by [`MAX_REPAIRS`], read back through [`REPAIRS`], and keyed by
+/// bare address the way `adopt_floating` keys its edge — an address reused
+/// by a new window is one wrong anchor for one frame.
+fn guard_child_frames(main: &NSWindow) {
+    use objc2_foundation::NSRect;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    if !adoption_armed() {
+        return;
+    }
+    thread_local! {
+        static LAST_MAIN: Cell<Option<NSRect>> = const { Cell::new(None) };
+        static ANCHORS: RefCell<HashMap<usize, (NSRect, u8)>> = RefCell::new(HashMap::new());
+    }
+    let main_now = main.frame();
+    let main_moved = LAST_MAIN.with(|m| {
+        let moved = m.get().is_some_and(|prev| !same_rect(prev, main_now));
+        m.set(Some(main_now));
+        moved
+    });
+    let hand = NSEvent::pressedMouseButtons() != 0;
+    let Some(children) = main.childWindows() else {
+        ANCHORS.with(|a| a.borrow_mut().clear());
+        return;
+    };
+    let mut seen: Vec<usize> = Vec::new();
+    for i in 0..children.count() {
+        let window = children.objectAtIndex(i);
+        let addr = objc2::rc::Retained::as_ptr(&window) as usize;
+        seen.push(addr);
+        let now = window.frame();
+        let busy = hand || main_moved || window.inLiveResize();
+        ANCHORS.with(|a| {
+            let mut a = a.borrow_mut();
+            match a.get_mut(&addr) {
+                None => {
+                    a.insert(addr, (now, 0));
+                }
+                Some((anchor, repairs)) => {
+                    if busy {
+                        *anchor = now;
+                        *repairs = 0;
+                    } else if unrequested_move(*anchor, now) {
+                        if *repairs < MAX_REPAIRS {
+                            window.setFrameOrigin(anchor.origin);
+                            *repairs += 1;
+                            REPAIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            *anchor = now;
+                            *repairs = 0;
+                        }
+                    } else {
+                        *anchor = now;
+                    }
+                }
+            }
+        });
+    }
+    ANCHORS.with(|a| a.borrow_mut().retain(|k, _| seen.contains(k)));
+}
+
+fn same_rect(a: objc2_foundation::NSRect, b: objc2_foundation::NSRect) -> bool {
+    let close = |x: f64, y: f64| (x - y).abs() < 0.5;
+    close(a.origin.x, b.origin.x)
+        && close(a.origin.y, b.origin.y)
+        && close(a.size.width, b.size.width)
+        && close(a.size.height, b.size.height)
+}
+
+/// A frame that moved without resizing: the one shape a Space switch
+/// leaves and a hand does not, since a hand is a pressed button and a resize
+/// changes the size.
+fn unrequested_move(anchor: objc2_foundation::NSRect, now: objc2_foundation::NSRect) -> bool {
+    let close = |x: f64, y: f64| (x - y).abs() < 0.5;
+    close(anchor.size.width, now.size.width)
+        && close(anchor.size.height, now.size.height)
+        && !(close(anchor.origin.x, now.origin.x) && close(anchor.origin.y, now.origin.y))
+}
+
+#[cfg(test)]
+mod frame_guard_tests {
+    use super::*;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
+        NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    }
+
+    /// The rule as a table: a jump is a move nobody asked for, a resize is
+    /// not, a sub-pixel wobble is not, and the same frame is not.
+    #[test]
+    fn a_jump_without_a_resize_is_a_move_nobody_asked_for() {
+        let home = rect(100.0, 200.0, 640.0, 480.0);
+        assert!(unrequested_move(home, rect(1800.0, 0.0, 640.0, 480.0)));
+        assert!(!unrequested_move(home, rect(100.0, 200.0, 800.0, 480.0)), "a resize is not a move");
+        assert!(!unrequested_move(home, rect(90.0, 200.0, 800.0, 600.0)), "a resize from the top-left is not a move");
+        assert!(!unrequested_move(home, rect(100.3, 199.8, 640.0, 480.0)), "a wobble under a pixel is not a move");
+        assert!(!unrequested_move(home, home));
+        assert!(same_rect(home, rect(100.2, 200.0, 640.1, 480.0)));
     }
 }
 

@@ -13367,33 +13367,83 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.open_insert_face(strip, bay);
             return;
         }
-        // **The swap first, because it is the aimed one.** A drop onto a
-        // LOADED bay is unambiguous: the hand picked one unit up and put it
-        // down on another, and the only thing that could mean is trade.
-        // Nothing is written here for `CopyInsert`'s reason, doubled — see
-        // `RecorderRequest::SwapInserts`.
+        // **A drop ON A BAY means that bay**, and there are three things it
+        // can mean, decided by what is there and where it is. The owner's
+        // three sentences, in his order: "drag slot 1 into unoccupied slot
+        // two? it moves. drag slot 1 into OCCUPIED slot 2? they swap" — and,
+        // on another channel, the older meaning, copy, but "per slot": into
+        // the bay the hand chose and not the first empty one. Nothing is
+        // written here for `CopyInsert`'s reason, tripled: every one of the
+        // three carries the unit's live state, and only the host can ask a
+        // running plugin for it.
         if let Some((to_strip, to_bay)) = onto {
-            if (to_strip, to_bay) != (strip, bay) && self.insert(to_strip, to_bay).is_some() {
-                self.request_recorder(recorder::RecorderRequest::SwapInserts {
+            if (to_strip, to_bay) == (strip, bay) {
+                // Dropped where it was picked up: nothing at all.
+                return;
+            }
+            let req = if self.insert(to_strip, to_bay).is_some() {
+                recorder::RecorderRequest::SwapInserts {
                     a_strip: strip,
                     a_bay: bay,
                     b_strip: to_strip,
                     b_bay: to_bay,
-                });
-                return;
-            }
+                }
+            } else if to_strip == strip {
+                recorder::RecorderRequest::MoveInsert {
+                    strip,
+                    from_bay: bay,
+                    to_bay,
+                }
+            } else {
+                recorder::RecorderRequest::CopyInsert {
+                    from_strip: strip,
+                    from_bay: bay,
+                    to_strip,
+                    to_bay: Some(to_bay),
+                }
+            };
+            self.request_recorder(req);
+            return;
         }
-        // **Nothing is written here.** The target BAY is the host's to
-        // choose — the next free one — and the copy is only worth having
-        // with the plugin's live settings beside it, which is host-side
-        // too. See `RecorderRequest::CopyInsert`.
+        // **On a channel's paint or its header there is no bay to mean**, so
+        // the host picks the next free one — the gesture's oldest meaning,
+        // kept for the surface that has nothing finer to aim at.
         if let Some(to) = to.filter(|t| *t != strip) {
             self.request_recorder(recorder::RecorderRequest::CopyInsert {
                 from_strip: strip,
                 from_bay: bay,
                 to_strip: to,
+                to_bay: None,
             });
         }
+    }
+
+    /// **A unit's window follows the unit.** The owner: "the old plugin
+    /// window stays up -- it needs to despawn and respawn the NEW instances
+    /// window when that happens, otherwise i'm tweaking track 2 when i just
+    /// dragged and copied to slot 3." The host closes the native editor and
+    /// arms `open_insert_on_load` for the new seat, which the reconcile
+    /// consumes the moment the new instance lands — the same road a fresh
+    /// pick's window takes. This is the app's half: a kit-drawn face open on
+    /// the old seat re-points to the new one, so the panel is the instance
+    /// the hand just made and not the one it left.
+    pub fn follow_insert_face(&mut self, from: (usize, usize), to: (usize, usize)) {
+        if self.open_insert_on_load == Some(from) {
+            self.open_insert_on_load = Some(to);
+        }
+        if let Some(dialogs::Dialog::InsertFace { strip, slot, .. }) = self.dialog.as_mut() {
+            if (*strip, *slot) == from {
+                *strip = to.0;
+                *slot = to.1;
+            }
+        }
+    }
+
+    /// Arm the window to open when THIS bay's plugin next lands — the flag
+    /// `take_open_insert_on_load` answers. The host arms it after a copy, a
+    /// move or a swap whose source had its window up.
+    pub fn open_insert_when_loaded(&mut self, strip: usize, bay: usize) {
+        self.open_insert_on_load = Some((strip, bay));
     }
 
     /// The chip that follows the hand while an insert is being carried.
@@ -42022,7 +42072,8 @@ mod tests {
                 Some(recorder::RecorderRequest::CopyInsert {
                     from_strip: 0,
                     from_bay: 1,
-                    to_strip: 4
+                    to_strip: 4,
+                    to_bay: None,
                 })
             ),
             "{req:?}"
@@ -42101,14 +42152,27 @@ mod tests {
             })
         ));
 
-        // **An EMPTY bay is not a trade**, and the older meaning still
-        // stands: the copy goes to the channel and the host picks the bay.
+        // **An EMPTY bay on another channel is a copy INTO THAT BAY** — the
+        // owner's "per slot freedom", against the first version that copied
+        // to the channel and let the host pick the first free one.
         app.set_insert(4, 2, None);
         app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
         app.land_bay_carry(Some(4), Some((4, 2)));
         assert!(matches!(
             app.take_recorder_request(),
-            Some(recorder::RecorderRequest::CopyInsert { to_strip: 4, .. })
+            Some(recorder::RecorderRequest::CopyInsert { to_strip: 4, to_bay: Some(2), .. })
+        ));
+
+        // **An EMPTY bay on the SAME channel is a move** — "drag slot 1
+        // into unoccupied slot two? it moves." Not a copy, which would be a
+        // second instance of one effect on one channel, and not nothing,
+        // which is what this channel-shaped drop used to get.
+        assert!(app.insert(0, 2).is_none());
+        app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
+        app.land_bay_carry(Some(0), Some((0, 2)));
+        assert!(matches!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::MoveInsert { strip: 0, from_bay: 1, to_bay: 2 })
         ));
 
         // And a drop on the bay it started in is nothing at all.

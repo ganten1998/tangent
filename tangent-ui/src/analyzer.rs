@@ -77,6 +77,15 @@ const PEAK_FALL_DB_S: f32 = 12.0;
 /// Below −140 the FFT is reading its own rounding.
 const FLOOR_DB: f32 = -140.0;
 
+/// How long the printed peak holds before it takes a new measurement.
+/// Three readings a second is what a person can follow; sixty is a blur.
+const READOUT_HOLD_S: f32 = 0.35;
+
+/// A new peak this much louder than the held one is shown at once: a hit
+/// is an event, and a readout that sat on the old number through it would be
+/// holding the wrong thing.
+const READOUT_JUMP_DB: f32 = 6.0;
+
 /// The dB below full scale a spectrum reads as silence, for the resting
 /// picture: the scope draws a flat line, this draws its scale and nothing
 /// else.
@@ -383,6 +392,15 @@ pub fn note_of(hz: f32, prefer_flats: bool) -> String {
     }
 }
 
+/// The nearest note to `hz` without its cents: "A4". The peak readout's
+/// spelling, where the cents would be a held number pretending to be live.
+pub fn note_name(hz: f32, prefer_flats: bool) -> String {
+    match note_of(hz, prefer_flats).split_once(' ') {
+        Some((name, _)) => name.to_owned(),
+        None => note_of(hz, prefer_flats),
+    }
+}
+
 /// A frequency printed the way an analyzer prints it: "440", "1.2k", "20k".
 pub fn hz_label(hz: f32) -> String {
     if hz >= 1000.0 {
@@ -413,9 +431,19 @@ pub struct Analyzer {
     third_peak: Vec<f32>,
     octave: Vec<f32>,
     octave_peak: Vec<f32>,
-    /// The loudest display bin last frame, for the readout.
+    /// The loudest thing last frame, refined — the measurement.
     loud_hz: f32,
     loud_db: f32,
+    /// **What the readout prints, which is not the measurement every
+    /// frame.** A peak that is re-read sixty times a second on real music
+    /// hops between two partials and flickers its last digit, and the
+    /// owner's word for that was "unreadable". So the printed peak HOLDS for
+    /// [`READOUT_HOLD_S`] and then takes the current measurement — unless a
+    /// peak arrives that is louder by [`READOUT_JUMP_DB`], which is a new
+    /// event and is shown at once. A held reading is a reading somebody can
+    /// read; the hairline under the pointer is still live.
+    readout: Option<(f32, f32)>,
+    readout_age: f32,
     /// Whether the window that fed the last FFT touched full scale.
     clipped: bool,
     /// Whether anything has been read at all.
@@ -438,6 +466,8 @@ impl Analyzer {
             octave_peak: vec![FLOOR_DB; OCTAVE_HZ.len()],
             loud_hz: 0.0,
             loud_db: FLOOR_DB,
+            readout: None,
+            readout_age: 0.0,
             clipped: false,
             fed: false,
             re: Vec::new(),
@@ -461,9 +491,10 @@ impl Analyzer {
         }
     }
 
-    /// The loudest thing on screen: frequency and dB below full scale.
+    /// The loudest thing on screen as the readout shows it: frequency and
+    /// dB below full scale, held — see `readout`.
     pub fn loudest(&self) -> Option<(f32, f32)> {
-        (self.fed && self.loud_db > SILENT_DB).then_some((self.loud_hz, self.loud_db))
+        self.readout.filter(|_| self.fed)
     }
 
     /// The frequency of display bin `i` on the current scale.
@@ -582,6 +613,14 @@ impl Analyzer {
         }
         self.loud_hz = loud.0;
         self.loud_db = loud.1;
+        // The printed peak: held, then refreshed; jumped for a louder event.
+        self.readout_age += dt.max(0.0);
+        let now = (loud.1 > SILENT_DB).then_some(loud);
+        let jump = matches!((self.readout, now), (Some((_, held)), Some((_, db))) if db > held + READOUT_JUMP_DB);
+        if self.readout.is_none() || self.readout_age >= READOUT_HOLD_S || jump || now.is_none() {
+            self.readout = now;
+            self.readout_age = 0.0;
+        }
 
         // **The bars: the ENERGY in each band**, which is the RTA's meaning
         // and not the curve's. A third-octave band at 1 kHz is 231 Hz wide
@@ -870,11 +909,17 @@ impl Analyzer {
             let head_y = r.top() + head_h * 0.5;
             // The loudest thing on screen, with its note: the answer to the
             // question this instrument is asked most.
+            // Shorter than it was — "PEAK 995 Hz  B5 +12  7 dB" took a
+            // third of a narrow pane. The word is gone (it is the only
+            // number on the head row, so it needs no name), the unit is
+            // gone (the foot says Hz), and the cents are gone from this one:
+            // a held reading cannot show tuning drift, and the hairline
+            // under the pointer still prints them.
             if let Some((hz, db)) = self.loudest() {
                 let words = format!(
-                    "PEAK {} Hz  {}  {:.0} dB",
+                    "{}  {}  {:.0} dB",
                     hz_label(hz),
-                    note_of(hz, prefer_flats),
+                    note_name(hz, prefer_flats),
                     -db
                 );
                 painter.text(
@@ -902,13 +947,17 @@ impl Analyzer {
                     format!("{}/OCT", self.cfg.tilt.label().trim_end_matches(" dB/oct"))
                 }
             );
-            painter.text(
-                Pos2::new(plot.right() - 4.0, head_y),
-                Align2::RIGHT_CENTER,
-                tags,
-                FontId::new(font_h * 0.9, crate::fonts::courier()),
-                dim,
-            );
+            // Only where they fit beside the readout: on a narrow pane the
+            // tags are what is given up, since the menu prints all of them.
+            if plot.width() >= 360.0 {
+                painter.text(
+                    Pos2::new(plot.right() - 4.0, head_y),
+                    Align2::RIGHT_CENTER,
+                    tags,
+                    FontId::new(font_h * 0.9, crate::fonts::courier()),
+                    dim,
+                );
+            }
         }
         if let Some(p) = pointer.filter(|p| plot.contains(*p)) {
             let x = (p.x - plot.left()) / plot.width();
@@ -1102,6 +1151,38 @@ mod tests {
         }
     }
 
+    /// **The printed peak holds still, and jumps for a hit.** Two sines
+    /// alternating frame to frame would flicker a live readout; held, it
+    /// shows one of them for the hold and then the other. A peak six
+    /// decibels louder is shown at once. The owner's "unreadable at current
+    /// update speed" is what this is for.
+    #[test]
+    fn the_peak_readout_holds_and_jumps() {
+        let a = fed(0.5, sine(440.0, 0.3));
+        let b = fed(0.5, sine(880.0, 0.3));
+        let loud = fed(0.5, sine(1760.0, 0.9));
+        let mut an = Analyzer::new(RATE);
+        an.cfg.average = Average::Off;
+        an.cfg.peak = Peak::Off;
+        an.cfg.tilt = Tilt::Zero;
+        an.tick(&a, 0.016);
+        let first = an.loudest().expect("a sine reads").0;
+        assert!((first - 440.0).abs() < 2.0);
+        // Alternating for a tenth of a second: the readout does not move.
+        for i in 0..6 {
+            an.tick(if i % 2 == 0 { &b } else { &a }, 0.016);
+            assert!((an.loudest().unwrap().0 - 440.0).abs() < 2.0, "the readout flickered on tick {i}");
+        }
+        // Past the hold it takes the current measurement.
+        an.tick(&b, READOUT_HOLD_S);
+        assert!((an.loudest().unwrap().0 - 880.0).abs() < 4.0, "the readout never refreshed");
+        // A much louder peak is an event and shows at once.
+        an.tick(&loud, 0.016);
+        assert!((an.loudest().unwrap().0 - 1760.0).abs() < 8.0, "a hit was held back");
+        assert_eq!(note_name(440.0, false), "A4");
+        assert_eq!(note_name(445.0, false), "A4", "the short name carries no cents");
+    }
+
     /// The note readout: A4, the accidental in whichever spelling, and the
     /// cents with their sign.
     #[test]
@@ -1186,8 +1267,8 @@ mod tests {
             assert!(foot.iter().any(|s| s.as_str() == want), "no {want} along the foot: {foot:?}");
         }
         assert!(
-            texts.iter().any(|(_, s)| s.starts_with("PEAK ") && s.contains("1k Hz") && s.contains("6 dB")),
-            "no peak readout: {:?}",
+            texts.iter().any(|(_, s)| s.starts_with("1k  ") && s.contains("6 dB") && !s.contains('+')),
+            "no peak readout, or the long form of it: {:?}",
             texts.iter().map(|(_, s)| s).collect::<Vec<_>>()
         );
     }
