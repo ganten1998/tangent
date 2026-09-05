@@ -3961,11 +3961,14 @@ impl DesktopApp {
                     }
                 }
                 R::NormalizeClips(ids) => self.normalize_clips(&ids),
-                R::CopyInsert { from_strip, from_bay, to_strip } => {
-                    self.copy_insert(from_strip, from_bay, to_strip);
+                R::CopyInsert { from_strip, from_bay, to_strip, to_bay } => {
+                    self.copy_insert(from_strip, from_bay, to_strip, to_bay);
                 }
                 R::SwapInserts { a_strip, a_bay, b_strip, b_bay } => {
                     self.swap_inserts(a_strip, a_bay, b_strip, b_bay);
+                }
+                R::MoveInsert { strip, from_bay, to_bay } => {
+                    self.move_insert(strip, from_bay, to_bay);
                 }
                 R::ResetLoudness => {
                     if let Some(e) = self.recorder.engine.as_ref() {
@@ -8657,7 +8660,13 @@ impl DesktopApp {
     /// the first, which is the kind of thing that gets reported as "it
     /// sometimes forgets".
     #[cfg(feature = "recorder")]
-    fn copy_insert(&mut self, from_strip: usize, from_bay: usize, to_strip: usize) {
+    fn copy_insert(
+        &mut self,
+        from_strip: usize,
+        from_bay: usize,
+        to_strip: usize,
+        to_bay: Option<usize>,
+    ) {
         let Some(bundle) = self.app.insert(from_strip, from_bay).map(str::to_owned) else {
             return;
         };
@@ -8665,14 +8674,33 @@ impl DesktopApp {
             return;
         }
         let bays = tangent_ui::recorder::INSERTS;
-        let Some(to_bay) = (0..bays).find(|b| self.app.insert(to_strip, *b).is_none()) else {
-            // **Every bay full is a refusal with a reason.** Silently
-            // replacing one would be throwing away an effect somebody dialled
-            // in, from a gesture that says "copy".
-            let where_to = self.app.channel_display_name(to_strip);
-            self.app
-                .notify(Kind::Error, format!("{where_to} has no free insert bay"));
-            return;
+        // **The bay the hand chose, or the next free one where it chose a
+        // channel.** An aimed bay that is occupied is a refusal, not a
+        // silent replacement — the drop rules send a loaded target to the
+        // swap, so this is the case of a bay that filled between the pick
+        // and the drop, and the message says which.
+        let to_bay = match to_bay {
+            Some(b) if self.app.insert(to_strip, b).is_none() => b,
+            Some(b) => {
+                let where_to = self.app.channel_display_name(to_strip);
+                self.app.notify(
+                    Kind::Error,
+                    format!("{where_to}'s bay {} is no longer free", b + 1),
+                );
+                return;
+            }
+            None => match (0..bays).find(|b| self.app.insert(to_strip, *b).is_none()) {
+                Some(b) => b,
+                None => {
+                    // **Every bay full is a refusal with a reason.** Silently
+                    // replacing one would be throwing away an effect somebody
+                    // dialled in, from a gesture that says "copy".
+                    let where_to = self.app.channel_display_name(to_strip);
+                    self.app
+                        .notify(Kind::Error, format!("{where_to} has no free insert bay"));
+                    return;
+                }
+            },
         };
         // The state it is playing at, not the one on disk: a plugin somebody
         // has been turning knobs on has not written a sidecar since it
@@ -8686,6 +8714,63 @@ impl DesktopApp {
             write_insert_state(to_strip, to_bay, &bundle, &state);
         }
         self.app.set_insert(to_strip, to_bay, Some(&bundle));
+        self.follow_insert_window((from_strip, from_bay), (to_strip, to_bay));
+    }
+
+    /// **The window follows the unit.** The owner: "the old plugin window
+    /// stays up -- it needs to despawn and respawn the NEW instances window
+    /// when that happens, otherwise i'm tweaking track 2 when i just dragged
+    /// and copied to slot 3." If the source bay's native editor is up it is
+    /// closed here, and the app is armed to open the destination's the
+    /// moment its instance lands — the reconcile loads one bay a frame and
+    /// consumes `take_open_insert_on_load` right after `load_insert`, which
+    /// is the road a fresh pick's window already takes. A kit-drawn face is
+    /// re-pointed by the app in the same call.
+    #[cfg(feature = "recorder")]
+    fn follow_insert_window(&mut self, from: (usize, usize), to: (usize, usize)) {
+        let was_up = self
+            .recorder
+            .engine
+            .as_ref()
+            .is_some_and(|e| e.insert_editor_open(from.0, from.1));
+        if was_up {
+            if let Some(e) = self.recorder.engine.as_mut() {
+                e.close_insert_editor(from.0, from.1);
+            }
+            self.app.open_insert_when_loaded(to.0, to.1);
+        }
+        self.app.follow_insert_face(from, to);
+    }
+
+    /// **Carry a unit to an empty bay of its own rack**, state and window
+    /// with it. The verb between copy and swap: see
+    /// `RecorderRequest::MoveInsert`. A loaded target is handed to the swap,
+    /// which is what a drop on a loaded bay means everywhere.
+    #[cfg(feature = "recorder")]
+    fn move_insert(&mut self, strip: usize, from_bay: usize, to_bay: usize) {
+        if from_bay == to_bay {
+            return;
+        }
+        let Some(bundle) = self.app.insert(strip, from_bay).map(str::to_owned) else {
+            return;
+        };
+        if self.app.insert(strip, to_bay).is_some() {
+            self.swap_inserts(strip, from_bay, strip, to_bay);
+            return;
+        }
+        // Its live state, written under the bay that is going to read it —
+        // `copy_insert`'s ordering rule, for its reason.
+        if let Some(state) = self
+            .recorder
+            .engine
+            .as_ref()
+            .and_then(|e| e.save_insert_state(strip, from_bay))
+        {
+            write_insert_state(strip, to_bay, &bundle, &state);
+        }
+        self.app.set_insert(strip, to_bay, Some(&bundle));
+        self.app.set_insert(strip, from_bay, None);
+        self.follow_insert_window((strip, from_bay), (strip, to_bay));
     }
 
 
@@ -8739,8 +8824,29 @@ impl DesktopApp {
         if let Some(state) = b_state {
             write_insert_state(a_strip, a_bay, &b, &state);
         }
+        // Which side had its window up, read BEFORE the bays are re-pointed
+        // and the reconcile tears both instances down.
+        let (a_up, b_up) = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or((false, false), |e| {
+                (
+                    e.insert_editor_open(a_strip, a_bay),
+                    e.insert_editor_open(b_strip, b_bay),
+                )
+            });
         self.app.set_insert(a_strip, a_bay, Some(&b));
         self.app.set_insert(b_strip, b_bay, Some(&a));
+        // The window follows its unit across the trade. One flag, so with
+        // both up the one that was picked up wins — it is the one the hand
+        // is thinking about.
+        if b_up {
+            self.follow_insert_window((b_strip, b_bay), (a_strip, a_bay));
+        }
+        if a_up {
+            self.follow_insert_window((a_strip, a_bay), (b_strip, b_bay));
+        }
     }
 
     fn save_plugin_states(&mut self) {

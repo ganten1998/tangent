@@ -2359,19 +2359,17 @@ impl Settings {
             show_recorder: true,
             ..Self::default()
         };
-        // **Centennial ships, at the owner's word — applied, not named.**
-        // Nothing re-reads `theme_name` to paint a desk: the roles ARE the
-        // settings and the name is the label beside them, so setting the
-        // name alone would open a Default-coloured desk calling itself
-        // Centennial. Applying it here means the one place that answers
-        // "what does a fresh install wear" also answers "what does Reset
-        // everything go back to" — `Settings::reset` takes its values from
-        // this function — which is what the owner asked for in the same
-        // breath. Dark mode comes from `default` above and survives, because
-        // a theme names colours and not which of the two sets is showing.
-        if let Some(t) = crate::theme::by_name("Centennial") {
-            t.apply(&mut s);
-        }
+        // **The Default theme ships**, and this is where a shipped theme
+        // would be APPLIED if it were another one: nothing re-reads
+        // `theme_name` to paint a desk — the roles ARE the settings and the
+        // name is the label beside them — so a different shipped theme has
+        // to be applied here, where "what does a fresh install wear" and
+        // "what does Reset everything go back to" are the same answer
+        // (`Settings::reset` takes its values from this function). It was
+        // Centennial for a day; the owner: "change the default theme back
+        // to the original Default theme. Also make sure reset all sets it as
+        // well." Default's roles are the struct's own, so there is nothing
+        // to apply. Dark mode is unchanged and ships on.
         // The built-in needs no seeding here: the default desk already
         // carries it, in channel 1's first bay. One definition of "the
         // instrument that ships", and `Settings::default` is it.
@@ -6963,23 +6961,13 @@ mod tests {
         // can SEE, not a second set of preferences to keep in step. Everything
         // listed here is visible; anything else appearing in this list would
         // mean a first launch had grown a preference of its own.
-        // **The DEFAULTS, plus what somebody can see, plus the theme that
-        // ships.** A first launch applies Centennial (see `first_launch`),
-        // which writes colour roles — so the comparison is against the
-        // defaults with that same theme applied, and what this still pins is
-        // that a first launch grows no preference of its OWN beyond the
-        // three visible panels.
         let same = Settings {
             show_fretboard: false,
             theory_order: String::new(),
             show_recorder: false,
             ..first.clone()
         };
-        let mut shipped = Settings::default();
-        crate::theme::by_name("Centennial")
-            .expect("the shipped theme is in the factory list")
-            .apply(&mut shipped);
-        assert_eq!(same, shipped);
+        assert_eq!(same, Settings::default());
 
         // An unreadable file is not a first launch.
         let dir = std::env::temp_dir().join(format!("tangent-firstrun-{}", std::process::id()));
@@ -7106,13 +7094,17 @@ mod tests {
         // also what `reset` goes back to.
         assert_eq!(s.theme_name, "Default");
         let fresh = Settings::first_launch();
-        assert_eq!(fresh.theme_name, "Centennial");
+        assert_eq!(fresh.theme_name, "Default", "a fresh install wears the Default theme");
         assert!(fresh.dark_mode && fresh.arr_dark && fresh.me_dark);
+        // **Reset everything goes back to Default, dark**, from a theme and
+        // a mode somebody chose — driven, because "the defaults are right"
+        // and "the reset reaches them" are two different claims.
         let mut reset = Settings::default();
-        reset.theme_name = "Iris".to_owned();
+        crate::theme::by_name("Iris").expect("Iris is a factory theme").apply(&mut reset);
         reset.dark_mode = false;
         reset.reset(ResetScope::Everything);
-        assert_eq!(reset.theme_name, "Centennial", "Reset everything left the theme");
+        assert_eq!(reset.theme_name, "Default", "Reset everything left the theme");
+        assert_eq!(reset.background_color, Settings::default().background_color, "Reset everything left Iris's colours");
         assert!(reset.dark_mode, "Reset everything came back light");
         assert_eq!(reset.font_choice, crate::fonts::FontChoice::default().key());
         assert_eq!(s.white_key_idle_color.to_hex(), "#e8dcc0");

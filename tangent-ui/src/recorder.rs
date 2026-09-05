@@ -1811,13 +1811,16 @@ pub enum RecorderRequest {
     /// its state and lays it beside the target bay so the new instance comes
     /// up already dialled in.
     ///
-    /// The target BAY is the host's to choose — the next free one — for the
-    /// reason the owner gave: a drop that landed on an occupied insert
-    /// should still work rather than refusing or overwriting.
+    /// The target BAY is the hand's when the drop landed on one, and the
+    /// host's — the next free — when it landed on a channel's paint or its
+    /// header, where there is no bay under the hand to mean. The owner, on
+    /// the first version choosing for him every time: "it always takes the
+    /// first empty slot -- change this to be per slot freedom."
     CopyInsert {
         from_strip: usize,
         from_bay: usize,
         to_strip: usize,
+        to_bay: Option<usize>,
     },
     /// Bring these clips up so their loudest point sits just under full
     /// scale.
@@ -2033,6 +2036,18 @@ pub enum RecorderRequest {
         a_bay: usize,
         b_strip: usize,
         b_bay: usize,
+    },
+    /// **Carry a unit to an EMPTY bay of the same rack.** The owner: "drag
+    /// slot 1 into unoccupied slot two? it moves." A swap needs two units
+    /// and a copy is a second instance of the same effect on one channel,
+    /// which is never what dragging within a rack means; this is the third
+    /// verb, and the one that lets a rack be re-ordered when there is a gap
+    /// to move into. Host-side for `CopyInsert`'s reason: the unit's live
+    /// state travels with it.
+    MoveInsert {
+        strip: usize,
+        from_bay: usize,
+        to_bay: usize,
     },
 }
 
