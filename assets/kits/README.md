@@ -14,10 +14,10 @@ the "Roland CR-78 Sample Pack" and the "LinnDrum Sample Pack", each described
 there as "sampled from an original drum machine" and "totally free to
 download". The site publishes no licence and no terms of use beyond a
 site-wide "All Rights Reserved" notice, so the right to redistribute the
-samples inside these kits has not been granted in writing; permission has
-been asked of hello@drumkito.com. Until it is answered, treat the kits as
-the owner's own presets rather than as a pack anyone may take out of the
-app and pass on.
+samples inside these kits has not been granted in writing. Permission is
+the owner's to ask, at hello@drumkito.com; until it is answered, treat the
+kits as the owner's own presets rather than as a pack anyone may take out of
+the app and pass on.
 
 | File | Size |
 | --- | --- |
