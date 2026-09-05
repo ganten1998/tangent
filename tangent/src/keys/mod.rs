@@ -37,6 +37,7 @@ pub mod hammer;
 pub mod pickup;
 pub mod reed;
 pub mod string;
+pub mod symp;
 pub mod tine;
 
 /// How many notes can ring at once.
@@ -528,7 +529,11 @@ fn bipolar(v: f32, octaves: f32) -> f32 {
 /// The piano's knobs in the units `PianoVoice` actually uses.
 #[derive(Clone, Copy)]
 pub struct PianoKnobs {
-    /// 0 mellow, 1 bright: the hammer's contact width.
+    /// 0 mellow, 1 bright: the hammer's felt, needled soft to lacquered
+    /// hard — a stiffness, `string::VOICING_STIFFNESS` at either end, and
+    /// the contact width follows from it. Not a width curve any more: the
+    /// felt is a spring the string pushes back on, and how long the two
+    /// touch is what that argument settles, per strike.
     pub voicing: f32,
     /// Multiplier on every partial's t60. 0.38 to 2.6.
     pub decay: f32,
@@ -678,7 +683,13 @@ pub struct WurliKnobs {
     pub decay: f32,
     /// Scale on the bar overtones' weight.
     pub reed: f32,
-    /// Scale on the plate's asymmetry.
+    /// The reed's rest offset from the plate plane, on the knob's 0..2:
+    /// 1 is the base's own regulation (0.5 gap on the 200, 0.48 on the
+    /// 140), and each unit moves the reed 0.08 gap — UP is nearer the
+    /// plane and dirtier, the service manual's "harsh" direction; down
+    /// passes the curve's inflection where the octave nulls and the tone
+    /// goes odd-led and hollow. Read at the strike; a ringing note keeps
+    /// the regulation it was struck with. See `reed::GROWL_REACH`.
     pub growl: f32,
     /// Multiplier on the damper's time constant.
     pub release: f32,
@@ -973,6 +984,10 @@ pub struct Keys {
     /// strings that answers a pedalled note. One per instrument, not one per
     /// voice, because in the real thing there is one soundboard.
     body: string::Body,
+    /// The strings nobody struck: the sympathetic harp that answers the
+    /// bridge sum under the pedal. One per instrument, like the board,
+    /// because there is one harp. See `symp`.
+    harp: symp::Harp,
     /// The AMP side of the patches that have one — per instrument, not per
     /// voice, because the suitcase has one pair of speakers and the reed
     /// piano one output stage however many keys are down. A shared LFO
@@ -999,6 +1014,7 @@ impl Keys {
             sounding: 0,
             strikes: 0,
             body: string::Body::new(rate),
+            harp: symp::Harp::new(rate),
             trem_phase: 0.0,
             wah_env: 0.0,
             wah_low: [0.0; 2],
@@ -1061,6 +1077,18 @@ impl Keys {
         }
         self.sounding = 0;
         self.body.set_patch(patch);
+        // The harp is strung for the patch's instrument and starts silent;
+        // its pedal is re-synced because the electric patches did not
+        // forward the pedal while they were loaded.
+        self.harp.clear();
+        match patch {
+            Patch::Piano1 => self.harp.set_base(&string::PianoBase::JAZZ),
+            Patch::Piano2 => self.harp.set_base(&string::PianoBase::CONCERT),
+            _ => {}
+        }
+        if self.has_harp() {
+            self.harp.set_pedal(self.pedal);
+        }
         self.trem_phase = 0.0;
         self.wah_env = 0.0;
         self.wah_low = [0.0; 2];
@@ -1181,6 +1209,9 @@ impl Keys {
         if was_done {
             self.sounding += 1;
         }
+        if self.has_harp() {
+            self.harp.key_down(pitch);
+        }
     }
 
     fn free_slot(&self) -> Option<usize> {
@@ -1250,6 +1281,17 @@ impl Keys {
                 n.mech.release(pedal);
             }
         }
+        if self.has_harp() {
+            self.harp.key_up(pitch);
+        }
+    }
+
+    /// Only the pianos have undamped strings to answer the bridge. The
+    /// electric patches' harp stays cleared and is never asked anything,
+    /// so a loop it woke could never be left ticking with nobody to tick
+    /// it, holding the instrument awake.
+    fn has_harp(&self) -> bool {
+        matches!(self.patch, Patch::Piano1 | Patch::Piano2)
     }
 
     /// The sustain pedal, CC 64.
@@ -1271,6 +1313,9 @@ impl Keys {
             }
         }
         self.body.set_pedal(down);
+        if self.has_harp() {
+            self.harp.set_pedal(down);
+        }
     }
 
     /// Everything off, immediately. Not a pedal lift: this damps held keys too.
@@ -1280,6 +1325,7 @@ impl Keys {
             n.mech.damp();
         }
         self.body.reset();
+        self.harp.clear();
     }
 
     /// Add `frames` of interleaved audio into `out`.
@@ -1311,6 +1357,7 @@ impl Keys {
         // whatever is already ringing — turn the throb up under a held
         // chord and the chord throbs, which is what the real switch does.
         let patch = self.patch;
+        let harp = self.has_harp();
         let (trem_depth, trem_hz) = match patch {
             Patch::EpSuitcase => ((self.params[5] * 0.85).clamp(0.0, 0.85), 5.0),
             Patch::Wurli200 | Patch::Wurli140 => {
@@ -1370,6 +1417,19 @@ impl Keys {
             // The soundboard/tonebar knob rides here rather than inside the
             // body, so the board's own decay is untouched and only how much
             // of it reaches the bus moves.
+            // The harp: the undamped strings hear the bridge sum and give
+            // back what they carry. Heard like any string — on the bus at
+            // centre, and into the board through the same drive — and
+            // ticked AFTER the voices and corpses so it hears the bridge
+            // and not itself: eighty-eight strings feeding each other
+            // through a one-sample loop would be a resonator with nothing
+            // to bound it.
+            if harp {
+                let h = self.harp.tick(drive);
+                drive += h;
+                left += h;
+                right += h;
+            }
             let (bl, br) = self.body.tick(drive);
             left += bl * body_amt;
             right += br * body_amt;
@@ -1457,6 +1517,11 @@ impl Keys {
         let mut live = 0usize;
         for n in &mut self.notes {
             if n.pitch.is_some() && n.mech.finished() {
+                // The struck string was the voice's from the strike; the
+                // harp takes it back now that nothing is sounding it.
+                if let (true, Some(p)) = (harp, n.pitch) {
+                    self.harp.voice_done(p);
+                }
                 n.pitch = None;
                 n.held = false;
             } else if n.pitch.is_some() {
@@ -1476,6 +1541,9 @@ impl Keys {
         }
         self.sounding = live;
         if self.body.ringing() {
+            self.sounding += 1;
+        }
+        if self.harp.active() {
             self.sounding += 1;
         }
     }
@@ -1710,12 +1778,13 @@ mod tests {
             "the reed's loudest upper partial sits at {r:.2} x f0 — growl \
              is harmonic, this is not"
         );
-        // And its one inharmonic voice — the solder-dropped bar overtone —
+        // And its one inharmonic voice — the bar's second mode, where the
+        // beam puts it for this base's taper and solder blob at C4 —
         // stays attack colour: well under the fundamental even in the
         // attack window, where it is at its loudest.
         let fund = goertzel_hann(&out, f0, 48_000.0).max(1.0e-12);
-        let drop = 1.0 - 0.06 * ((60.0_f32 - 33.0) / 40.0).clamp(0.0, 1.0);
-        let over1 = peak_near(&out, f0 * 4.4 * drop).1;
+        let over = f0 * reed::WurliBase::TWO_HUNDRED.overtones(60.0).f2;
+        let over1 = peak_near(&out, over).1;
         let over_db = 20.0 * (over1 / fund).max(1.0e-12).log10();
         assert!(
             over_db < -35.0,
@@ -2093,11 +2162,20 @@ mod tests {
             h
         }
         // One patch per mechanism: piano, tine, tangent, reed.
+        //
+        // Piano 1 and Wurli 200 were re-pinned in the physics rework's wave
+        // B, which is what §5.3 of its brief asks for: the piano's hammer
+        // became a mass in contact with the string, its soundboard grew a
+        // modal plate, the sympathetic harp now answers this very render
+        // (it is pedalled from the first block), and the reed's plate
+        // became a capacitive transducer. The tine and the tangent are
+        // untouched so far and their hashes are the ones they have always
+        // had — which is the point of holding four.
         for (patch, want) in [
-            (Patch::Piano1, 13_384_888_044_078_809_756),
+            (Patch::Piano1, 9_716_706_827_468_578_744),
             (Patch::EpMk1, 12_512_648_127_811_904_030),
             (Patch::Clav, 12_849_073_543_764_444_369),
-            (Patch::Wurli200, 17_503_137_568_396_613_258),
+            (Patch::Wurli200, 5_464_813_605_215_517_892),
         ] {
             let x = script(
                 patch,

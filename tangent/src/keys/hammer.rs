@@ -67,46 +67,127 @@ pub struct HammerBase {
 }
 
 impl HammerBase {
-    /// The jazz grand's hammer, fitted at C4 against three unison strings of
-    /// 2.33 N s/m each (see `tests::IdealString`) so that the first contact
-    /// runs 2.1 ms at MIDI 8 and 1.0 ms at MIDI 127.
+    /// The jazz grand's hammer, fitted at C4 against three unison strings
+    /// of 2.33 N s/m each — first on `tests::IdealString`, then on the real
+    /// loop in `string.rs`, which agree on the contact to the third
+    /// decimal — so that the first contact runs 2.1 ms at MIDI 8 and 1.0 ms
+    /// at MIDI 127 through [`velocity_of_midi`].
     ///
-    /// **The mass is an effective mass, and it is light.** A C4 hammer HEAD
-    /// weighs about eight grams and the simulation literature uses around
-    /// three; this one is a gram. It has to be, because in this model the
-    /// loud-end contact is a bounce on the string segment between hammer
-    /// and agraffe, whose stiffness is `3 T / x0` — about 30 kN/m here —
-    /// and a half period of one millisecond on that spring is only reached
-    /// by a gram. Three grams lands at 1.3 ms. Either the effective mass a
-    /// bending shank presents really is that low, or the 1.0 ms target
-    /// (which was the old Gaussian's truncation width, not a measurement)
-    /// wants re-baselining; the fit is honest about which number it kept.
+    /// **The felt is at the soft end of the measured range, and the
+    /// partial table put it there.** With both ends of the contact pinned,
+    /// the exponent is the one free parameter, and it sets how fast the
+    /// contact collapses between them: a stiff power law (p 3) is down to a
+    /// millisecond by mezzo-forte, a soft one (p 2.2) still at 1.08 there.
+    /// `string::tests::scan_hammers` measured the C4 mezzo partials against
+    /// the signed-off table for p from 2.2 to 3.5 and the whole row lands
+    /// within 1.5 dB only at 2.2; at 3.0 the sixth and seventh partials are
+    /// 9 and 13 dB hot, because a felt pulse's spectrum has a power-law
+    /// tail where the Gaussian it replaces fell as `exp(-f^2)`, and the
+    /// stiffer the felt the fatter the tail. The stiffness follows from the
+    /// exponent and the soft-end contact; 4.57e7 N/m^2.2 is not a felt
+    /// constant anyone would quote, because `K delta^p` with p 2.2 wants a
+    /// different K than with p 3 for the same force at the same
+    /// compression (0.3 mm here gives 8 N either way).
+    ///
+    /// **The mass is an effective mass, and it is light — decided, not
+    /// doubted.** A C4 hammer head weighs about eight grams and the
+    /// simulation literature uses around three; this one is a gram. It has
+    /// to be, because in this model the loud-end contact is a bounce on
+    /// the string segment between hammer and agraffe, whose stiffness is
+    /// `3 T / x0` — about 30 kN/m here — and a half period of one
+    /// millisecond on that spring is only reached by a gram. The scan
+    /// measured the alternative: two and three grams at any exponent land
+    /// the fortissimo contact at 1.17 to 1.40 ms, outside the 1.0 ms the
+    /// instrument was signed off with, and their mezzo tables are 4 to 9 dB
+    /// louder at the fundamental for the same arrival speed, which is the
+    /// level calibration moving under the felt. So a gram it is; if the
+    /// 1.0 ms target (the old Gaussian's truncation width, not a
+    /// measurement) is ever re-baselined toward 1.3, three grams becomes
+    /// the physical choice and this paragraph says where to look.
+    ///
+    /// **The fortissimo pulse is asymmetric, and stays so.** It rises
+    /// fast, peaks early and carries the agraffe reflection out as a
+    /// shoulder (`tests::loud_pulse_peaks_early`), and on the bench that
+    /// reads as waveform asymmetry 0.20 at MIDI 127 where the Gaussian's
+    /// was 0.08. The gamma pulse that failed before the Gaussian failed at
+    /// 0.44 on the QUIET notes — a thump on every pianissimo — and the felt
+    /// pulse at pianissimo is a symmetric hump measuring 0.045 there,
+    /// under the Gaussian's 0.048. The asymmetry lives only where a real
+    /// hammer's does.
     pub const JAZZ: HammerBase = HammerBase {
         mass: 1.0e-3,
-        stiffness: 1.0e10,
-        exponent: 3.0,
+        stiffness: 4.57e7,
+        exponent: 2.2,
         hysteresis: 0.03,
     };
-    /// The concert instrument's hammer: a tenth heavier, felt voiced harder
-    /// and more nonlinear — a wider sweep from whisper to bark out of the
-    /// same mechanism, which is what a hall instrument is regulated for.
+    /// The concert instrument's hammer: a tenth heavier on felt of the same
+    /// exponent, 30% stiffer, fitted the same way against Piano 2's own
+    /// signed-off tables — its mezzo partials land within 1.2 dB. The
+    /// contact runs 2.0 ms at MIDI 8, a hair under the jazz hammer's, and
+    /// the same 1.0 ms at 127: the loud end is the agraffe segment's
+    /// bounce on either instrument, and a heavier head cannot shorten it.
+    /// The first draft voiced this felt harder and more nonlinear (p 3.3)
+    /// for "a wider sweep from whisper to bark"; measured, that sweep is
+    /// 17 dB of extra brightness through the middle of the keyboard's
+    /// dynamic range and nothing like the instrument, so the concert
+    /// grand's difference is its mass, its plate, its wire and its ring,
+    /// not a different felt.
     pub const CONCERT: HammerBase = HammerBase {
         mass: 1.1e-3,
-        stiffness: 1.6e11,
-        exponent: 3.3,
+        stiffness: 5.94e7,
+        exponent: 2.2,
         hysteresis: 0.03,
     };
+
+    /// The peak force this hammer would reach at `velocity` against a
+    /// wall: all of its energy into the felt, `1/2 M v^2 = K d^(p+1) /
+    /// (p+1)`, and `F = K d^p` at that compression. Against a string that
+    /// gives way the true peak is lower, and with the rate term on the
+    /// loading leg it can run a little over; this is the ceiling to within
+    /// that, and it is what the piano seeds its level follower with before
+    /// the hammer has said anything (see `PianoVoice::strike_full`).
+    pub fn free_peak_force(&self, velocity: f32) -> f32 {
+        let v = velocity.max(0.0);
+        let p = self.exponent;
+        let d = ((p + 1.0) * self.mass * v * v / (2.0 * self.stiffness)).powf(1.0 / (p + 1.0));
+        self.stiffness * d.powf(p)
+    }
 }
+
+/// The fortissimo hammer: 6 m/s, the top of the range Askenfelt and
+/// Jansson measured on pianists (JASA 88, 1990: pianissimo near 0.5 m/s,
+/// fortissimo 5 to 7).
+pub const V_FF: f32 = 6.0;
+
+/// The action's curve from MIDI velocity to hammer speed, as an exponent
+/// on the MIDI fraction: 1.0 is proportional. See [`velocity_of_midi`].
+pub const MAP_EXPONENT: f32 = 0.92;
 
 /// Hammer velocity in metres per second for a MIDI velocity given as a
 /// fraction of 127 (the unit `Keys::note_on` already speaks).
 ///
-/// Linear, from 0.5 m/s at the bottom of the scale to 6 m/s at the top:
-/// the range Askenfelt and Jansson measured on pianists from pianissimo to
-/// fortissimo. The curve from key speed to hammer speed is the ACTION's
-/// business and is not modelled; this is the hammer's arrival speed.
+/// **This is the action's map, and the action is not modelled**, so the
+/// map is fitted to the one thing already signed off: the instrument's
+/// dynamic range. The top is physical, [`V_FF`]; below it the speed is
+/// `V_FF * m^MAP_EXPONENT`, a power law a shade under proportional. The
+/// first fit was linear with an offset, `0.5 + 5.5 m`, so that MIDI 1
+/// still arrived at Askenfelt's pianissimo — and it took ten decibels out
+/// of the instrument. A hammer's impulse is close to linear in its arrival
+/// speed (`M v` on the way in and most of it again on the rebound at
+/// pianissimo, half of it at fortissimo —
+/// `energy_is_conserved_without_hysteresis` prints the figures), so the
+/// peak level runs with the speed, and a hammer that cannot arrive slower
+/// than 0.85 m/s at MIDI 8 gives 26 dB of peak from MIDI 8 to 127 where
+/// the bench's velocity table has 35.7. MIDI is not a physical unit; the
+/// exponent is the one that keeps every row of that table within 2 dB of
+/// the signed-off one after a single gain (`string::tests::scan_hammers`
+/// measured 0.90 to 0.95 passing and 1.0 not, on the mezzo partials), and
+/// it puts MIDI 8 at 0.47 m/s — Askenfelt and Jansson's pianissimo, which
+/// is a happier place for the softest note a keyboard sends than the
+/// 0.38 a proportional map gives. `the_velocity_table_keeps_its_shape`
+/// holds it.
 pub fn velocity_of_midi(v: f32) -> f32 {
-    0.5 + 5.5 * v.clamp(0.0, 1.0)
+    V_FF * v.clamp(0.0, 1.0).powf(MAP_EXPONENT)
 }
 
 /// How far below the point of first touch the hammer must have retreated
@@ -123,11 +204,11 @@ const CHECK_DIST: f32 = 3.0e-3;
 const FLIGHT_LIMIT: f32 = 5.0e-3;
 
 /// A contact longer than this is not physics. The slowest hammer the tests
-/// throw (0.05 m/s, a tenth of any pianissimo) leaves in eight
-/// milliseconds; forty is a guard against a caller feeding a NaN or an
-/// absurd scale, and it never fires in any test —
-/// `force_is_smooth_and_hammer_always_leaves` asserts the contact ended
-/// well inside it.
+/// throw (0.05 m/s, a tenth of any pianissimo) leaves in 4.6 ms on the
+/// felt this file ships (`force_is_smooth_and_hammer_always_leaves` prints
+/// the whole ladder); forty is a guard against a caller feeding a NaN or an
+/// absurd scale, and it never fires in any test — that test asserts every
+/// contact ended well inside it.
 const CONTACT_LIMIT: f32 = 40.0e-3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -215,6 +296,35 @@ impl Hammer {
 
     pub fn in_contact(&self) -> bool {
         self.state == State::Contact
+    }
+
+    /// The hammer's velocity right now, metres per second, positive toward
+    /// the string. After a contact this is the rebound: how hard the
+    /// string threw it back.
+    pub fn velocity(&self) -> f32 {
+        self.eta_dot
+    }
+
+    /// On the backcheck: nothing to tick, nothing that a `clear` would
+    /// cut short. The opposite of "busy" — armed, in contact, or in flight
+    /// within the string's reach all count as busy, because each of them
+    /// still has a force to deliver.
+    pub fn idle(&self) -> bool {
+        self.state == State::Idle
+    }
+
+    /// `strike`, on a hammer that may have been re-voiced since it was
+    /// built. The base is taken only while the hammer is on its check: a
+    /// felt that changed stiffness mid-contact would be a step of force —
+    /// the pop the superposition law forbids — and a strike arriving inside
+    /// the previous one's contact is a sequencer's doing, not a hand's, so
+    /// that strike keeps the felt it landed on and takes only the new
+    /// velocity, exactly as `strike` does.
+    pub fn strike_with(&mut self, base: HammerBase, velocity: f32) {
+        if matches!(self.state, State::Idle | State::Armed) {
+            self.base = base;
+        }
+        self.strike(velocity);
     }
 
     /// One sample of the hammer. `string_disp` is the string's displacement
@@ -609,6 +719,7 @@ mod tests {
             assert!(!h.in_contact(), "stuck in contact at {v} m/s");
             assert!(h.state == State::Idle, "still airborne at {v} m/s");
             let secs = h.contact_secs();
+            println!("{v} m/s: contact {:.2} ms, peak {peak:.2} N", secs * 1e3);
             assert!(secs > 0.0 && secs < 0.010, "contact {secs} s at {v} m/s");
             // Released by physics, not by the guard.
             assert!(secs < CONTACT_LIMIT * 0.5);
@@ -732,10 +843,13 @@ mod tests {
     }
 
     #[test]
-    fn midi_velocity_map_is_linear_and_bounded() {
-        assert_eq!(velocity_of_midi(0.0), 0.5);
-        assert_eq!(velocity_of_midi(1.0), 6.0);
-        assert_eq!(velocity_of_midi(2.0), 6.0);
-        assert!((velocity_of_midi(0.5) - 3.25).abs() < 1e-6);
+    fn midi_velocity_map_is_proportional_and_bounded() {
+        assert_eq!(velocity_of_midi(0.0), 0.0);
+        assert_eq!(velocity_of_midi(1.0), V_FF);
+        assert_eq!(velocity_of_midi(2.0), V_FF);
+        assert!((velocity_of_midi(0.5) - V_FF * 0.5_f32.powf(MAP_EXPONENT)).abs() < 1e-6);
+        // MIDI 8 is under Askenfelt's pianissimo, and above nothing.
+        let soft = velocity_of_midi(8.0 / 127.0);
+        assert!(soft > 0.1 && soft < 0.5, "MIDI 8 arrives at {soft} m/s");
     }
 }

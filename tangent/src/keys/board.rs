@@ -97,9 +97,13 @@ pub enum Plate {
 }
 
 /// Room for the resonators. A fixed count so the state is a handful of
-/// flat arrays and `tick` never branches on how many a plate designed: an
-/// unused lane holds zero coefficients and costs the same as a used one,
-/// which is cheaper than a loop bound the compiler cannot see through.
+/// flat arrays; `tick` runs the lanes a plate designed rounded up to a
+/// multiple of eight (`lanes`), so the fold below stays whole and the
+/// bound is a loop invariant the compiler can still vectorise across. The
+/// first draft ran all sixty-four on the argument that an unused lane
+/// costs the same as a used one; measured, the fifty-six the plates use
+/// cost a fifth less (23 ns a sample against 30), which is real money on
+/// a bill that is mostly this loop.
 const MAX_MODES: usize = 64;
 
 /// The four inputs a plate is designed from.
@@ -186,9 +190,11 @@ fn uniform(state: &mut u64) -> f64 {
 pub struct Board {
     plate: Plate,
     rate: f32,
-    /// How many lanes the plate designed. The loop runs all of them
-    /// regardless; this is for `modes()`.
+    /// How many lanes the plate designed, for `modes()`.
     n: usize,
+    /// How many lanes `tick` runs: `n` rounded up to a multiple of eight,
+    /// never zero.
+    lanes: usize,
     /// The designed centre frequencies, for the tests and the bench.
     freq: [f32; MAX_MODES],
     /// The state-variable filter's three coefficients, per lane.
@@ -216,6 +222,7 @@ impl Board {
             plate,
             rate: if sample_rate.is_finite() { sample_rate.max(8_000.0) } else { 48_000.0 },
             n: 0,
+            lanes: 8,
             freq: [0.0; MAX_MODES],
             a1: [0.0; MAX_MODES],
             a2: [0.0; MAX_MODES],
@@ -295,6 +302,7 @@ impl Board {
             f += mean * s;
         }
         self.n = n;
+        self.lanes = n.div_ceil(8).max(1) * 8;
     }
 
     /// One sample: the bridge sum in, the board's radiation out, left and
@@ -306,7 +314,8 @@ impl Board {
         let x = if drive.is_finite() { drive } else { 0.0 };
         let mut bl = [0.0_f32; MAX_MODES];
         let mut br = [0.0_f32; MAX_MODES];
-        for i in 0..MAX_MODES {
+        let lanes = self.lanes.min(MAX_MODES);
+        for i in 0..lanes {
             let v3 = x - self.ic2[i];
             let v1 = self.a1[i] * self.ic1[i] + self.a2[i] * v3;
             let v2 = self.ic2[i] + self.a2[i] * self.ic1[i] + self.a3[i] * v3;
@@ -315,8 +324,8 @@ impl Board {
             bl[i] = v1 * self.gl[i];
             br[i] = v1 * self.gr[i];
         }
-        let l = fold(&bl);
-        let r = fold(&br);
+        let l = fold(&bl[..lanes]);
+        let r = fold(&br[..lanes]);
         // The follower: quick up so a fresh strike counts as ringing on the
         // block it lands in, slow down so it tracks the decay rather than
         // the waveform.
@@ -360,7 +369,7 @@ impl Board {
 /// independent partials are eight chains it can run side by side, and the
 /// last seven adds are the only serial part.
 #[inline]
-fn fold(v: &[f32; MAX_MODES]) -> f32 {
+fn fold(v: &[f32]) -> f32 {
     let mut acc = [0.0_f32; 8];
     for lane in v.chunks_exact(8) {
         for j in 0..8 {
