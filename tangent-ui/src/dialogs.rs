@@ -2850,7 +2850,14 @@ impl DeviceKind {
     /// output device's own clock.
     fn none_row(self) -> &'static str {
         match self {
-            DeviceKind::Camera => "None  -  record without video",
+            // **The analyzer is the choice, not the absence of one.** With no
+            // camera the pane is the spectrum analyzer, and a person choosing
+            // that should see it offered in the list rather than deduce it
+            // from "None". It is still the None row underneath — nothing is
+            // opened, no light comes on — which is exactly the owner's spec:
+            // "it doesn't need to instantiate itself as an actual system
+            // video device".
+            DeviceKind::Camera => "Spectrum analyzer  -  no camera; the analyzer fills the pane",
             DeviceKind::AudioInput => "None  -  record the instrument, not an input",
             DeviceKind::ExtraInput(_) => "None  -  leave this channel empty",
         }

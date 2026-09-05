@@ -37,6 +37,7 @@ pub mod piano;
 pub mod ports;
 pub mod preset;
 pub mod recorder;
+pub mod analyzer;
 pub mod scope;
 /// The mixer view: every source in the app, drawn as a channel strip.
 pub mod mixer_panel;

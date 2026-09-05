@@ -2454,7 +2454,7 @@ pub fn analyzer_tick(
 /// In-place radix-2, power-of-two length. The forty lines, kept here rather
 /// than a crate for the reason `stretch.rs` wrote down: a dependency costs a
 /// THIRD-PARTY-LICENSES diff at release time and this does not.
-fn fft(re: &mut [f32], im: &mut [f32]) {
+pub(crate) fn fft(re: &mut [f32], im: &mut [f32]) {
     let n = re.len();
     debug_assert!(n.is_power_of_two());
     let mut j = 0usize;
