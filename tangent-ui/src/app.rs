@@ -27781,6 +27781,7 @@ const COMFY_LANE_H: f32 = 65.0;
 /// See [`default_mixer_visible`].
 const COMFY_STRIP_PITCH: f32 = 105.0;
 
+
 /// **Snap a raw "how many items fit" to a sensible default count.**
 ///
 /// `span_px` is the run the items share — lane heights stacked down the
@@ -27879,13 +27880,16 @@ fn default_arr_visible(settings: &Settings, pane: Vec2) -> usize {
 /// see [`TangentApp::count_pane`]. At the opening width the two agree exactly,
 /// so nothing about a launch changed.
 ///
-/// **What the desk does with a big number is not this function's business.**
-/// Past 32 active channels the desk folds itself into two rows of sixteen when
-/// the height allows (`mixer_panel`'s `two_rows`), and that fold is what puts
-/// all thirty-two on a full screen — the owner's "the switch to the 32 mixer
-/// layout is fine here". It does not consult this count and must not: a single
-/// pitch that gave ten strips in a 1280-point window would have to give
-/// thirty-two in a 2560-point one, and 2560 is not 3.2 times 1280.
+/// **A window with the room for the whole desk opens showing the whole
+/// desk.** The owner: "make the default at full screen or max size 16 in one
+/// row." The comfortable pitch alone never got there — sixteen of them plus
+/// the two pinned columns is 1910 points of pane, which is a large external
+/// display and not a maximised laptop — so a window that can carry all
+/// sixteen at the comfortable pitch takes them, by way of the ceiling this
+/// hands `sensible_visible_count`, and everything narrower falls back to the
+/// ladder. There is no fold to reach for any more: it was
+/// removed with this change, having cost every fader and every meter half
+/// its length to do the same job.
 ///
 /// Takes no `Settings`: unlike the timeline, which has to know how tall the
 /// recorder band is before it knows what is left, the desk's answer depends on
@@ -27894,7 +27898,18 @@ fn default_mixer_visible(pane: Vec2) -> usize {
     // 20 = the desk's two 10-point edge margins; `2.0 * COMFY_STRIP_PITCH` =
     // the two pinned columns that never scroll.
     let run = (pane.x - 20.0 - 2.0 * COMFY_STRIP_PITCH).max(0.0);
-    sensible_visible_count(run, COMFY_STRIP_PITCH, 4, crate::recorder::CHANNELS)
+    // **The ceiling is SIXTEEN, and that is what puts the whole desk on a
+    // full screen.** It was `CHANNELS`, the supporter's thirty-two, which no
+    // width could reach comfortably — thirty-two at this pitch wants 3400
+    // points of run — so the ladder answered 24 on a big display and the
+    // fold was what actually showed a whole desk. With the fold gone the
+    // ceiling does the work: a maximised window on a 2560-point screen has
+    // about 2330 points of run, which is 22 comfortable strips, and the
+    // clamp turns that into all sixteen in one row. A smaller window still
+    // lands on the ladder — the owner's dozen at 100% is a 1490-point pane,
+    // twelve strips, untouched. A supporter's upper sixteen scroll into
+    // view, which is what the scroll is for.
+    sensible_visible_count(run, COMFY_STRIP_PITCH, 4, crate::recorder::FREE_CHANNELS)
 }
 
 /// Initial fixed window size for the ViewportBuilder, computed from settings
@@ -41699,57 +41714,36 @@ mod tests {
             "the columns did not close ranks: {shut_x} vs {open_x}"
         );
     }
-
-    /// **The note button is a channel's alone.** A folder cannot carry its
-    /// own MIDI - the owner's capitals - so its strip lays out no theory
-    /// button; a plain track's sits at the foot, left edge on the inserts'.
-    /// **If the desk folds, a folded strip is a WHOLE strip.**
+    /// **The desk stays one row however tall the window is.**
     ///
-    /// The sixteen-over-sixteen fold used to be gated on the window being
-    /// fullscreen or maximised, and the height test beside it was set at less
-    /// than half what a strip needs — the flag was doing all the work. That
-    /// flag is never set on macOS (egui #3494), so the fold could not happen
-    /// there at all; on Windows it IS set for a laptop maximised against a
-    /// taskbar, which is how a tester got sixteen over sixteen in a band with
-    /// no room for them. The flag is gone and the height is the whole test,
-    /// so the height has to be true.
-    ///
-    /// The note button is the canary: it is the last thing laid out and it
-    /// sheds silently when the seven points under the switch row are not
-    /// there. If a strip's furniture ever grows, this fails and
-    /// `TWO_ROW_MIN_H` gets measured again.
+    /// The fold — sixteen over sixteen — is gone at the owner's word, and
+    /// this is the app-level half of saying so: driven through a real
+    /// `mixer_view` with tracks on it, at the height the fold used to fire
+    /// at and well past it. The note button is still the canary: it is the
+    /// last thing laid out and it sheds silently when the seven points under
+    /// the switch row are not there, so a strip that lost its height would
+    /// show up here as a missing button rather than as a wrong number.
     #[test]
-    fn a_folded_strip_keeps_every_control() {
+    fn the_desk_stays_one_row_at_any_height() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         for n in 0..3 {
             app.add_bare_track(n);
         }
         let view = app.mixer_view();
-        let folded_at = |h: f32| {
+        for h in [560.0_f32, 904.0, 1400.0] {
             let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, h));
             let l = crate::mixer_panel::Layout::new(r, &view);
-            // Two rows means channel 0 and the channel a half-desk later sit
-            // at different tops; one row means every channel shares one.
             let half = view.active.div_ceil(2);
-            let folded = l.strips[half].panel.is_positive()
-                && (l.strips[half].panel.top() - l.strips[0].panel.top()).abs() > 1.0;
-            (folded, l.strips[0].theory.is_positive())
-        };
-
-        // Just under the threshold: one scrolling row, which is the right
-        // answer for a laptop and was NOT what a maximised one got.
-        let (folded, _) = folded_at(crate::mixer_panel::two_row_min_h() * 2.0);
-        assert!(!folded, "the desk folded into rows too short for a strip");
-
-        // Comfortably over it: the fold happens, and every strip in it is
-        // still a whole strip.
-        let tall = crate::mixer_panel::two_row_min_h() * 2.0 + 40.0;
-        let (folded, whole) = folded_at(tall);
-        assert!(folded, "a desk with the room for two rows stayed on one");
-        assert!(
-            whole,
-            "a folded strip lost its note button: the fold threshold is a lie"
-        );
+            assert!(
+                !(l.strips[half].panel.is_positive()
+                    && (l.strips[half].panel.top() - l.strips[0].panel.top()).abs() > 1.0),
+                "the desk folded into two rows at {h} points tall"
+            );
+            assert!(
+                l.strips[0].theory.is_positive(),
+                "a strip lost its note button at {h} points tall"
+            );
+        }
     }
 
     #[test]
@@ -50495,17 +50489,18 @@ mod aspect_snap_tests {
             "the desk opened {strips} strips at 100% on 2560x1378, not the \
              dozen he asked for"
         );
-        // **Thirty-two on a full screen, and not because a count says so.**
-        // The desk folds into two rows of sixteen once it has the height for
-        // it (`mixer_panel`'s `two_rows`), which is the "32 mixer layout" he
-        // called fine. No pitch could have produced it: ten strips in 1280
-        // points and thirty-two in 2560 is not the same density twice.
+        // **The whole desk on a full screen, in ONE row.** The fold that
+        // used to do this — sixteen over sixteen — is gone at the owner's
+        // word, because it paid for the extra channels with half of every
+        // fader and every meter. `default_mixer_visible` answers it instead:
+        // a window that can carry all sixteen at `ALL_STRIPS_PITCH` opens
+        // showing all sixteen, and this is the shape of window that can.
         for (how, pane) in [(Fills::Maximised, usable), (Fills::FullScreen, monitor)] {
             let full_strips = painted_strips(&ctx, &mut app, pane, monitor, how);
             assert_eq!(
                 full_strips,
-                crate::recorder::CHANNELS,
-                "the filled desk painted {full_strips} strips, not the folded thirty-two"
+                crate::recorder::FREE_CHANNELS,
+                "the filled desk painted {full_strips} strips, not the whole sixteen"
             );
         }
     }
@@ -50615,16 +50610,20 @@ mod aspect_snap_tests {
     fn the_default_track_counts_stay_sane_on_other_displays() {
         // display w, usable h, lanes windowed, strips windowed, lanes full,
         // strips full.
-        // **Re-measured when the default became a dozen.** The lane column
-        // tops out at 12 everywhere now — `default_arr_visible` caps it, at
-        // the owner's word — while the STRIP column still climbs to the full
-        // desk, which is the mixer's own layout and was left alone.
+        // **Re-measured when the default became a dozen**, and again when
+        // the desk's fold was removed. The lane column tops out at 12
+        // everywhere — `default_arr_visible` caps it, at the owner's word —
+        // and the strip column now tops out at 16, which is his "make the
+        // default at full screen or max size 16 in one row". It used to read
+        // 32 on the four big rows: not because a count said so but because
+        // the desk folded itself into two rows of sixteen, which cost every
+        // fader and every meter half its length and is gone.
         let table = [
             (1920i64, 1030i64, 10usize, 10usize, 12usize, 16usize),
-            (3840, 2100, 12, 32, 12, 32),
+            (3840, 2100, 12, 16, 12, 16),
             (1280, 648, 6, 6, 8, 10),
-            (5120, 2800, 12, 32, 12, 32),
-            (3440, 1400, 12, 32, 12, 32),
+            (5120, 2800, 12, 16, 12, 16),
+            (3440, 1400, 12, 16, 12, 16),
         ];
         let chans = crate::recorder::CHANNELS;
         for (w, h, lanes_win, strips_win, lanes_full, strips_full) in table {

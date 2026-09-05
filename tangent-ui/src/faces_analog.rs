@@ -347,7 +347,20 @@ const STEP_PTS: f32 = 14.0;
 const OUTLINE: Color32 = Color32::from_rgb(0x10, 0x10, 0x10);
 const OUTLINE_SHARE: f32 = 0.19;
 const FACE: Color32 = Color32::from_rgb(0xb4, 0xb6, 0xba);
-const RING_DARK: Color32 = Color32::from_rgb(0x9c, 0x9e, 0xa3);
+/// **The dark ring is the GROOVE, and it was too shy to be one.** It sat
+/// 1.32:1 off the face against the highlight's 1.28:1 — a pair of nearly
+/// equal whispers either side of the grey, which is why the turning read as
+/// a texture rather than as rings. The owner: "i love the current analog
+/// knobs, just that their rings are a little subtle, if the rings themselves
+/// could have a darker shade, it would be great."
+///
+/// So the groove goes down and the highlight stays where it is. That is the
+/// asymmetry a real spun cap has — a cut catches shadow far harder than its
+/// land catches light — and it is why deepening one of the two reads as
+/// machining where deepening both would just read as a darker knob. At
+/// 1.95:1 the groove is half again the separation the highlight has, and the
+/// face is still the same aluminium the owner picked.
+const RING_DARK: Color32 = Color32::from_rgb(0x7e, 0x80, 0x85);
 const RING_LIGHT: Color32 = Color32::from_rgb(0xcb, 0xcd, 0xd1);
 const POINTER: Color32 = Color32::from_rgb(0x10, 0x10, 0x10);
 /// Rings turned into the face, inward from the outline: nine, fine.
@@ -942,7 +955,27 @@ mod tests {
     fn the_pointer_reads_on_the_dial_face() {
         assert!(contrast_ratio(POINTER, FACE) >= 4.5, "{}", contrast_ratio(POINTER, FACE));
         assert!(contrast_ratio(FACE, OUTLINE) >= 4.5);
-        assert!(contrast_ratio(RING_DARK, FACE) >= 1.05 && contrast_ratio(RING_LIGHT, FACE) >= 1.05, "the rings do not show");
+        // **The groove is asked for more than the highlight**, which is
+        // the whole of the owner's note about the rings being subtle: both
+        // used to clear 1.05 and both looked like nothing. A cut catches
+        // shadow harder than its land catches light, so the dark ring
+        // carries the reading and the pale one is the glint beside it.
+        assert!(
+            contrast_ratio(RING_DARK, FACE) >= 1.8,
+            "the groove is too shy to read as a ring: {:.2}:1",
+            contrast_ratio(RING_DARK, FACE)
+        );
+        assert!(
+            contrast_ratio(RING_LIGHT, FACE) >= 1.05,
+            "the highlight does not show"
+        );
+        // And the face is still a face: a groove dark enough to be mistaken
+        // for the outline would turn nine rings into nine black lines.
+        assert!(
+            contrast_ratio(RING_DARK, OUTLINE) >= 3.0,
+            "the groove is closing on the outline: {:.2}:1",
+            contrast_ratio(RING_DARK, OUTLINE)
+        );
     }
 
     /// The badge is the icon's nine numbers: three nodes at the scaled
