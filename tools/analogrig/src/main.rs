@@ -10,6 +10,8 @@
 //!   cargo run --release -- report      every gate in the brief's §9, as
 //!                                      numbers, plus what each stage costs
 //!   cargo run --release -- perf        the per-stage costs alone
+//!   cargo run --release -- presets [dir]   every factory preset to a WAV,
+//!                                      with its peak
 //!
 //! `ANALOGRIG_PARAMS="31=0.5,32=0.9"` turns dials by id without a UI.
 
@@ -725,11 +727,44 @@ fn report() {
     perf();
 }
 
+/// **Every factory preset, auditioned**: a chord or a line through each,
+/// two seconds, one WAV per preset in `dir`, and a table of peaks — the
+/// number the level test holds, printed so voicing can be argued in dB.
+fn presets(dir: &str) {
+    use analog::presets::FACTORY;
+    let _ = std::fs::create_dir_all(dir);
+    println!("{:<18} {:>10}  {}", "preset", "peak", "about");
+    for f in &FACTORY {
+        let mut synth = Analog::new(RATE);
+        synth.set_all(&f.by_id());
+        let mono = f.values().iter().any(|(s, v)| *s == "voice_mode" && *v < 0.25);
+        let mut ev = Vec::new();
+        if mono {
+            for (i, k) in [45u8, 52, 48, 57].iter().enumerate() {
+                note(&mut ev, i as f32 * 0.4, if i == 3 { 1.2 } else { 0.4 }, *k, 108);
+            }
+        } else {
+            chord(&mut ev, 0.0, 2.0, &[48, 55, 60, 64, 67], 108);
+        }
+        let score = Score { events: ev, tail: 1.0, setup: f.by_id() };
+        let (out, _) = render(&score);
+        let pk = measure::peak(&out);
+        let stem: String = f.name.chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+        let path = format!("{dir}/{stem}.wav");
+        wav::write24(&path, RATE as u32, 2, &out).expect("write wav");
+        println!("{:<18} {:>+6.1} dBFS  {}", f.name, measure::db(pk), f.about);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let perf_name = args.get(1).cloned().unwrap_or_else(|| "single".into());
     if perf_name == "perf" {
         perf();
+        return;
+    }
+    if perf_name == "presets" {
+        presets(args.get(2).map(String::as_str).unwrap_or("presets"));
         return;
     }
     if perf_name == "report" {

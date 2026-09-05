@@ -16,6 +16,7 @@
 //! - [`voice`] — one voice: the signal path from oscillators to pan.
 //! - [`ensemble`] — the three-line bucket brigade.
 //! - [`arp`] — the arpeggiator and the transport it reads.
+//! - [`presets`] — the twenty-four factory sounds, by symbol.
 //! - [`measure`] — the ruler the tests and the bench share.
 //!
 //! **Real-time contract.** Everything the audio thread touches is
@@ -42,6 +43,7 @@ pub mod env;
 pub mod filter;
 pub mod measure;
 pub mod osc;
+pub mod presets;
 pub mod voice;
 
 use arp::{rate_index, Arp, ArpMode, ArpOut, ArpParams, Transport};
@@ -235,12 +237,17 @@ pub const OSC_TUNE_SEMIS: f32 = 7.0;
 /// Unison detune at the top of the dial: the spread between the two
 /// outermost voices, cents.
 pub const DETUNE_CENTS: f32 = 50.0;
-/// The Volume dial's top as linear gain, square-law. Calibrated on the
-/// bench: an eight-voice forte chord at the shipped defaults peaks near
-/// −8 dBFS, two under the brief's ceiling, and a single note at a
-/// middling velocity sits some eighteen decibels under that — as it does
-/// on every polysynth whose level does not know how many keys are down.
-pub const VOLUME_MAX: f32 = 1.3;
+/// The Volume dial's top as linear gain, on a QUARTIC taper. The shipped
+/// 0.7 lands at a gain of 0.64, calibrated on the bench so an eight-voice
+/// forte chord at the defaults peaks near −8 dBFS, two under the brief's
+/// ceiling; that number did not move when the law changed from a square
+/// to a fourth power — the top did. A mono lead is one voice where the
+/// chord is eight, eighteen decibels under it at the same setting, and
+/// the square law's top was two decibels over the default, so no single
+/// voice could reach the mix. The fourth power keeps the default's gain
+/// and puts +12 dB at the end of the travel, the taper a real volume pot
+/// has: `VOLUME_MAX · v⁴`.
+pub const VOLUME_MAX: f32 = 2.666;
 /// The output saturation's ceilings, positive and negative: gentle and
 /// asymmetric, for a little even harmonic at the top of a chord.
 pub const OUT_CLIP: (f32, f32) = (1.0, 0.85);
@@ -1038,7 +1045,7 @@ impl Analog {
         self.ensemble
             .process(&mut self.scratch, len, mode, self.smooth[P_ENS_WIDTH]);
         let vol = self.smooth[P_VOLUME];
-        let gain = VOLUME_MAX * vol * vol;
+        let gain = VOLUME_MAX * vol * vol * vol * vol;
         for i in 0..len {
             let mut lr = [self.scratch[2 * i] * gain, self.scratch[2 * i + 1] * gain];
             for (ch, v) in lr.iter_mut().enumerate() {

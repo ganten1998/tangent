@@ -4422,6 +4422,16 @@ impl DesktopApp {
     /// a delete know, from the file alone, whose list to refresh.
     fn push_preset_rows(&mut self, unit: &str) {
         let dir = self.unit_preset_dir(unit);
+        // **The analog's factory sounds arrive as ordinary files, once.**
+        // The first time its folder is asked for and is not there, it is
+        // made and the twenty-four are written into it; from then on they
+        // are the user's — renamed, deleted, saved over — and a deleted
+        // file stays deleted, because the rule is "folder absent", not "file
+        // absent", which is what lets it need no settings key and no
+        // marker. Delete the whole folder and the set comes back.
+        if unit == crate::builtin_fx::ANALOG_PATH && !dir.exists() {
+            seed_factory_presets(unit, &dir);
+        }
         let mut rows: Vec<tangent_ui::ports::PresetRow> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&dir) {
             let mut paths: Vec<std::path::PathBuf> = entries
@@ -10395,6 +10405,47 @@ enum PanelDir {
 /// for — a newer build's unit — still gets a stable folder of its own: the
 /// sanitized identity, `@` shed. Never raw user text: everything joined
 /// onto the root here has been through a table lookup or the sanitizer.
+/// **Write the analog's factory presets into `dir`**, one file each, in the
+/// same format a save from the face writes, with a `factory` line so a
+/// reader (or a person with `head`) can tell them from the user's own.
+/// Every value of every dial goes in, by symbol — a preset is a whole
+/// sound, and `Factory::values` fills in the defaults. A file that already
+/// exists is left alone, so this is safe to call on a folder that is only
+/// half seeded. Quiet on failure: a preset folder that cannot be written is
+/// a folder with no factory sounds in it, which the panel shows honestly as
+/// an empty list, and the save road will say the same thing louder.
+#[cfg(feature = "recorder")]
+fn seed_factory_presets(unit: &str, dir: &std::path::Path) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    for f in &crate::analog::presets::FACTORY {
+        let stem = tangent_ui::preset::safe_stem(f.name);
+        let path = dir.join(format!("{stem}.{}", tangent_ui::preset::PRESET_EXT));
+        if path.exists() {
+            continue;
+        }
+        let mut extra = serde_json::Map::new();
+        extra.insert("factory".to_owned(), serde_json::Value::from(true));
+        extra.insert("about".to_owned(), serde_json::Value::from(f.about));
+        let preset = tangent_ui::preset::Preset {
+            version: tangent_ui::preset::PRESET_VERSION,
+            unit: unit.to_owned(),
+            name: f.name.to_owned(),
+            values: f
+                .values()
+                .into_iter()
+                .map(|(s, v)| (s.to_owned(), f64::from(v)))
+                .collect(),
+            extra,
+        };
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, preset.to_json()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
 #[cfg(feature = "recorder")]
 fn preset_subfolder(unit: &str) -> String {
     if unit == "keys" || unit.starts_with("keys:") {
@@ -15530,6 +15581,44 @@ mod tests {
     /// sound. A path in one and not the other is a face over an empty bay
     /// or a bay no picker can reach — both silent, both fatal to the whole
     /// idea, so the build refuses instead.
+    /// **The factory sounds seed as real preset files, once, whole, and
+    /// never over a user's.** Twenty-four files that parse as presets for
+    /// the analog with every dial spelled by symbol; a second seeding
+    /// changes nothing; a user's edit to one of them survives it.
+    #[test]
+    fn the_analogs_factory_presets_seed_into_an_empty_folder_and_stay_the_users() {
+        let dir = std::env::temp_dir().join(format!("tangent-analog-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        seed_factory_presets(crate::builtin_fx::ANALOG_PATH, &dir);
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("the folder was made")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(tangent_ui::preset::PRESET_EXT))
+            .collect();
+        files.sort();
+        assert_eq!(files.len(), crate::analog::presets::FACTORY.len(), "{files:?}");
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::ANALOG_PATH).unwrap();
+        for path in &files {
+            let text = std::fs::read_to_string(path).unwrap();
+            let p = tangent_ui::preset::Preset::from_json(&text).expect("a preset");
+            assert_eq!(p.unit, crate::builtin_fx::ANALOG_PATH);
+            assert!(crate::analog::presets::FACTORY.iter().any(|f| f.name == p.name), "{} is not a factory name", p.name);
+            assert_eq!(p.values.len(), spec.params.len(), "{}: not every dial is spelled", p.name);
+            for (s, _) in &p.values {
+                assert!(spec.params.iter().any(|q| q.symbol == s), "{}: {s} is not a dial", p.name);
+            }
+            assert_eq!(p.extra.get("factory"), Some(&serde_json::Value::from(true)));
+        }
+        // A user's edit survives a second seeding.
+        let mine = &files[0];
+        std::fs::write(mine, "not a preset any more").unwrap();
+        seed_factory_presets(crate::builtin_fx::ANALOG_PATH, &dir);
+        assert_eq!(std::fs::read_to_string(mine).unwrap(), "not a preset any more");
+        let again = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(again, files.len(), "a second seeding added files");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_suite_faces_and_the_suite_units_are_the_same_list() {
         for (path, name, about) in tangent_ui::faces::SUITE_UNITS {
