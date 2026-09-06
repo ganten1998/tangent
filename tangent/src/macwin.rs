@@ -1598,3 +1598,57 @@ mod save_panel_tests {
         assert_eq!(clean("   "), "");
     }
 }
+
+/// **Tell macOS this process is doing work that cannot be scheduled late.**
+///
+/// Nothing in this app has ever said so. With no declared activity the system
+/// is free to apply App Nap to it — priority reduction, TIMER THROTTLING and
+/// I/O throttling, per Apple's own Energy Efficiency Guide — and to coalesce
+/// its timers with everybody else's. The CoreAudio IO thread is real-time and
+/// safe from that, but nothing else here is: the take writer and the capture
+/// ring drain both poll on a four-millisecond loop (`record::POLL`) at default
+/// QoS, and a coalesced four-millisecond timer is a ring that overruns.
+///
+/// `NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical`
+/// and deliberately not plain `NSActivityUserInitiated`: the plain one carries
+/// `NSActivityIdleSystemSleepDisabled`, which would stop the Mac idle-sleeping
+/// for as long as Tangent is open. That is a visible change to somebody's
+/// machine and it is not what is being asked for here — what is being asked
+/// for is to not be napped and not be coalesced.
+///
+/// **OFF unless `TANGENT_ACTIVITY=1`.** This ships as an experiment, not a
+/// behaviour change: with it unset the process behaves exactly as every build
+/// before it, on every macOS version, so the build carries it without
+/// carrying its risk. Run it from a terminal to try it:
+///
+/// ```text
+/// TANGENT_ACTIVITY=1 /Applications/Tangent.app/Contents/MacOS/tangent
+/// ```
+///
+/// The token is leaked on purpose: an activity ends when its token is
+/// released, and this one is meant to last as long as the process.
+pub fn hold_latency_critical() {
+    if std::env::var("TANGENT_ACTIVITY").as_deref() != Ok("1") {
+        return;
+    }
+    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+    // `NSActivityUserInitiated` is `0x00FFFFFF | NSActivityIdleSystemSleepDisabled`,
+    // and the "allowing idle system sleep" spelling is that with the sleep bit
+    // masked back out — so it is exactly the low three bytes. Written as the
+    // literal the headers define rather than assembled from the flag set,
+    // because the flag this must NOT carry is the one it would be assembled
+    // from.
+    const USER_INITIATED_ALLOWING_IDLE_SLEEP: u64 = 0x00FF_FFFF;
+    const LATENCY_CRITICAL: u64 = 0xFF00_0000_00;
+    let options =
+        NSActivityOptions(USER_INITIATED_ALLOWING_IDLE_SLEEP | LATENCY_CRITICAL);
+    let reason = NSString::from_str("Tangent is running an audio engine");
+    let token = unsafe {
+        NSProcessInfo::processInfo().beginActivityWithOptions_reason(options, &reason)
+    };
+    std::mem::forget(token);
+    log::info!(
+        "TANGENT_ACTIVITY=1: told macOS this process is latency-critical \
+         (App Nap and timer coalescing off; idle sleep still allowed)"
+    );
+}

@@ -443,6 +443,60 @@ fn rotate_log(path: &std::path::Path, max_len: u64) {
 ///
 /// Every failure in here is shrugged off: a read-only home costs the log
 /// file, never the launch.
+/// **Which macOS this is**, for the log header.
+///
+/// `std::env::consts::OS` says `macos` and stops, which is how a mailed-in
+/// log answered "on what" with a word that covers eleven releases. A crackle
+/// reported on Sonoma and not reproducible on Tahoe is the kind of thing that
+/// costs a day when the log will not say which one it came from, and the
+/// header exists precisely so the answer arrives with the report.
+///
+/// `kern.osproductversion` rather than the Darwin number: it is the version
+/// a person would say out loud ("14.7.1"), and it needs no framework — libc
+/// is already here for `_exit`. Empty where it cannot be read, and empty on
+/// every other platform, so the header keeps its old shape rather than
+/// growing an "unknown".
+#[cfg(target_os = "macos")]
+fn os_release() -> String {
+    let name = c"kern.osproductversion";
+    let mut len: usize = 0;
+    // SAFETY: the documented two-call shape — the first asks for the size
+    // with a null buffer, the second fills a buffer of exactly that size.
+    // Both are checked, and a non-zero status leaves the string empty.
+    unsafe {
+        if libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+            || len == 0
+        {
+            return String::new();
+        }
+        let mut buf = vec![0u8; len];
+        if libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return String::new();
+        }
+        // The value is NUL-terminated and `len` counts the terminator.
+        buf.truncate(len.saturating_sub(1));
+        String::from_utf8(buf).map_or_else(|_| String::new(), |v| format!(" {v}"))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn os_release() -> String {
+    String::new()
+}
+
 fn attach_log_file() {
     let dir = tangent_core::config::dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -457,11 +511,12 @@ fn attach_log_file() {
     use std::io::Write as _;
     let _ = writeln!(
         file,
-        "[{}] tangent {} starting ({} {})",
+        "[{}] tangent {} starting ({} {}{})",
         utc_timestamp(unix_now()),
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
-        std::env::consts::ARCH
+        std::env::consts::ARCH,
+        os_release(),
     );
     if let Ok(mut slot) = LOG_FILE.lock() {
         *slot = Some(file);
@@ -789,6 +844,12 @@ fn main() {
     // The earliest legal moment — see the ordering comment above and the one
     // on the function. Everything the logger says from here on is on disk.
     attach_log_file();
+
+    // **After the log is on disk**, so the line it writes is kept, and before
+    // anything opens a device. Off unless `TANGENT_ACTIVITY=1`; see the
+    // function for what it declares and what it deliberately does not.
+    #[cfg(target_os = "macos")]
+    macwin::hold_latency_critical();
 
     if !acquire_single_instance() {
         // **The terminal first**, as the panic hook does. A message box on

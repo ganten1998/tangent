@@ -308,6 +308,11 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSURL",
     "NSError",
     "NSDictionary",
+    # `NSProcessInfo`, for two things the OS will not tell us any other way:
+    # which macOS this is (the log header), and that this process is doing
+    # latency-critical work (`macwin::hold_latency_critical`). Bindings only —
+    # this adds no crate to the tree and no line to THIRD-PARTY-LICENSES.
+    "NSProcessInfo",
 ] }
 # The completion block `beginSheetModalForWindow:` takes. Already in the lock
 # at 0.6.2 through rfd; named here because a transitive dependency is not a
