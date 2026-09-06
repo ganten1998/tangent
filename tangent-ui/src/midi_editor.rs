@@ -48,6 +48,38 @@ const EDGE_W: f32 = 7.0;
 /// resize is reached from just outside instead.
 const EDGE_SLOP: f32 = 4.0;
 
+/// Where the clip's name starts, in from the strip's left edge.
+const NAME_X: f32 = 8.0;
+
+/// **The name's reserve**: the room the strip keeps for the clip's name
+/// before the navigator is allowed any. Fifteen characters of the strip's
+/// monospace, about — enough to say "Piano verse 2" — and the navigator is
+/// what gives way on an editor too narrow for both, because a clip you
+/// cannot name is worse than a clip you cannot scroll: the wheel still
+/// scrolls it.
+const NAV_NAME_RESERVE: f32 = 110.0;
+
+/// The narrowest navigator worth laying out. Under this the box is a line
+/// with a window a few points wide on it, and a hand cannot tell the
+/// window from its own edges — the arrangement drops its own at one and a
+/// half cells for the same reason.
+const NAV_MIN_W: f32 = 72.0;
+
+/// **The navigator's share of the strip**, and its ceiling. Four tenths,
+/// because the box IS the control's resolution: a second of the clip is
+/// the box's width over the clip's length, and on a four-minute part a
+/// hundred-point box gives a hand under half a second a point, which is
+/// coarser than the notes it is trying to reach. The ceiling stops it
+/// running away with a wide window's title bar.
+const NAV_SHARE: f32 = 0.40;
+const NAV_MAX_W: f32 = 560.0;
+
+/// **How narrow the navigator's window may draw.** The band's viewport and
+/// the arrangement's inner box both floor at three points, for the same
+/// reason: a two-second window on a ten-minute clip is a fraction of a
+/// point wide, and a thing you cannot see is a thing you cannot grab.
+const NAV_WINDOW_MIN_W: f32 = 3.0;
+
 /// Everything the editor draws, pushed in. Times are ABSOLUTE timeline
 /// seconds — the clip's own trim (`offset_s`) is paid at the boundary, so
 /// the roll and the arrangement agree where a bar stands.
@@ -64,6 +96,17 @@ pub struct MidiEditView<'a> {
     /// The window, absolute seconds.
     pub view_start_s: f64,
     pub view_len_s: f64,
+    /// **The navigator's world**, absolute seconds: what the strip's
+    /// miniature spans end to end. The app computes it — the clip with the
+    /// pad `me_fit_clip` gives it, stretched to hold the window whenever the
+    /// wheel has put the window outside that — and freezes it for the life
+    /// of a navigator drag, so the box's scale cannot change under a hand
+    /// that is holding something drawn on it. Pushed in as data rather than
+    /// derived here, because the pad's own formula lives in the app beside
+    /// the three other places that use it, and a second copy of it in this
+    /// file would be the copy that drifts.
+    pub nav_start_s: f64,
+    pub nav_len_s: f64,
     /// The (fractional) key whose row TOP sits at the roll's top edge.
     pub top_key: f32,
     /// How many keys (semitones) the roll shows top to bottom — Shift+wheel
@@ -134,6 +177,17 @@ pub enum Hit {
     Ruler(f64),
     /// The velocity lane at `absolute seconds` — the app finds the note.
     Vel(f64),
+    /// **The strip's navigator, by its parts** — the band's overview strip
+    /// brought to the roll, scaled to the clip. The lit WINDOW is the part
+    /// of the clip the roll is showing: drag it to pan. The window's two
+    /// edges resize it, which is the zoom. Anywhere else in the box is the
+    /// clip itself, at `absolute seconds`: a press there is a locate, and the
+    /// locate follows the hand while it is held, exactly as a press on the
+    /// band's timeline does.
+    NavWindow,
+    NavLeft,
+    NavRight,
+    NavField(f64),
 }
 
 pub struct Layout {
@@ -151,6 +205,10 @@ pub struct Layout {
     pub tool_triplet: Rect,
     /// **DRAW MODE's switch**: the pencil. See `MidiEditView::draw_mode`.
     pub tool_draw: Rect,
+    /// **The navigator**: the whole clip in miniature, in the strip's room
+    /// between the clip's name and the pencil. `NOTHING` when the strip has
+    /// no room for one worth having — see [`NAV_MIN_W`].
+    pub tool_nav: Rect,
     pub keys: Rect,
     pub roll: Rect,
 }
@@ -170,6 +228,7 @@ impl Layout {
                 tool_swing: Rect::NOTHING,
                 tool_draw: Rect::NOTHING,
                 tool_triplet: Rect::NOTHING,
+                tool_nav: Rect::NOTHING,
                 keys: Rect::NOTHING,
                 roll: Rect::NOTHING,
             };
@@ -198,6 +257,34 @@ impl Layout {
         // this strip is read against, so it sits at the end of the row where
         // the eye finishes rather than in among the grid chips.
         let tool_draw = cell(side * 1.3);
+        // **The NAVIGATOR, in the strip's own room.** The editor is already
+        // a tool strip, a ruler, the roll and a velocity lane, and every row
+        // added to that stack is height the roll loses — so the miniature
+        // goes where the arrangement put its navigator: among the tools, in
+        // the space the strip was not using. The strip's middle was empty
+        // between the clip's name and the pencil on any editor wider than a
+        // few hundred points, and a box the chips' height is exactly what
+        // the arrangement's corner holds.
+        //
+        // It sits at the PENCIL's shoulder and walks left from there, so it
+        // reads with the tools rather than with the title, and the gap
+        // before it is wider than the chips' own so it does not read as one
+        // more chip. The name keeps its reserve first (`NAV_NAME_RESERVE`),
+        // the navigator takes its share of the strip out of what is left,
+        // and under `NAV_MIN_W` it is not laid out at all: a box that
+        // narrow is a line, and a hand cannot find a window on a line.
+        let nav_right = tool_draw.left() - pad * 2.0;
+        let nav_left_limit = strip.left() + NAME_X + NAV_NAME_RESERVE + pad;
+        let nav_w = (nav_right - nav_left_limit)
+            .min((strip.width() * NAV_SHARE).clamp(NAV_MIN_W, NAV_MAX_W));
+        let tool_nav = if nav_w >= NAV_MIN_W {
+            Rect::from_min_max(
+                Pos2::new(nav_right - nav_w, strip.top() + pad),
+                Pos2::new(nav_right, strip.bottom() - pad),
+            )
+        } else {
+            Rect::NOTHING
+        };
         // Strip, then the RULER, then keys+roll, then the VELOCITY lane.
         let ruler = Rect::from_min_size(
             Pos2::new(rect.left(), strip.bottom()),
@@ -226,6 +313,7 @@ impl Layout {
             tool_swing,
             tool_draw,
             tool_triplet,
+            tool_nav,
             keys,
             roll,
         }
@@ -257,6 +345,54 @@ pub fn key_at(l: &Layout, view: &MidiEditView<'_>, y: f32) -> f32 {
 /// The TOP edge of `key`'s row.
 pub fn y_of(l: &Layout, view: &MidiEditView<'_>, key: f32) -> f32 {
     l.roll.top() + (view.top_key - key) * key_h(l, view.keys_shown)
+}
+
+// ── the navigator's axis ───────────────────────────────────────────────────
+//
+// The box IS the clip: its left edge is `nav_start_s`, its right edge is
+// `nav_start_s + nav_len_s`, and the two functions below are the only
+// mapping between the two. The painter, the hit test and the app's drag all
+// go through them, which is what the roll's own axis learned the hard way:
+// a drag that did its own arithmetic would be a third mapping, and the
+// third mapping is the one that drifts.
+
+/// Where absolute second `t` stands on the navigator.
+pub fn nav_x_of(l: &Layout, view: &MidiEditView<'_>, t: f64) -> f32 {
+    let f = (t - view.nav_start_s) / view.nav_len_s.max(1.0e-9);
+    l.tool_nav.left() + l.tool_nav.width() * f as f32
+}
+
+/// The absolute second under `x` on the navigator. Unclamped: a hand that
+/// has wandered off the box while holding the window is still holding it,
+/// and it is the app's rails that decide where the window may go.
+pub fn nav_time_at(l: &Layout, view: &MidiEditView<'_>, x: f32) -> f64 {
+    let w = f64::from(l.tool_nav.width().max(1.0));
+    view.nav_start_s + f64::from(x - l.tool_nav.left()) / w * view.nav_len_s
+}
+
+/// **The navigator's WINDOW** — where the roll's view stands on the box.
+///
+/// One function for the picture and the grab, the band's rule for its own
+/// viewport, so the rectangle a hand picks up is the rectangle it can see.
+/// Clamped into the box, because a window the wheel has pushed past the
+/// clip is drawn where the box ends rather than off it, and never narrower
+/// than [`NAV_WINDOW_MIN_W`]. `NOTHING` where there is no navigator.
+pub fn nav_window(l: &Layout, view: &MidiEditView<'_>) -> Rect {
+    let b = l.tool_nav;
+    if !b.is_positive() {
+        return Rect::NOTHING;
+    }
+    let x0 = nav_x_of(l, view, view.view_start_s).clamp(b.left(), b.right());
+    let x1 = nav_x_of(l, view, view.view_start_s + view.view_len_s).clamp(b.left(), b.right());
+    // The floor is paid on the RIGHT, and the pair is pushed back in only
+    // if that overran the box — so a window at the clip's very end still
+    // ends at the box's edge.
+    let x1 = x1.max(x0 + NAV_WINDOW_MIN_W);
+    let shove = (x1 - b.right()).max(0.0);
+    Rect::from_min_max(
+        Pos2::new(x0 - shove, b.top() + 1.5),
+        Pos2::new(x1 - shove, b.bottom() - 1.5),
+    )
 }
 
 // ── the grid ───────────────────────────────────────────────────────────────
@@ -658,13 +794,28 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     // ── the strip ─────────────────────────────────────────────────────────
     let font = |size: f32| FontId::monospace(size);
     painter.rect_filled(l.strip, 4.0, Color32::from_rgba_premultiplied(0, 0, 0, 60));
-    painter.text(
-        Pos2::new(l.strip.left() + 8.0, l.strip.center().y),
-        Align2::LEFT_CENTER,
-        view.name,
-        font(STRIP_H * 0.45),
-        ink,
-    );
+    // **The name stops where the navigator starts.** It used to run on
+    // under the chips unchecked, which nobody noticed while the strip's
+    // middle was empty; with a box drawn there a long name would print
+    // straight through the miniature. Cut with the arrangement's own
+    // ellipsis, to the pencil when there is no navigator.
+    {
+        let name_font = font(STRIP_H * 0.45);
+        let wall = if l.tool_nav.is_positive() {
+            l.tool_nav.left()
+        } else {
+            l.tool_draw.left()
+        };
+        let room = wall - 6.0 - (l.strip.left() + NAME_X);
+        let name = crate::arrangement_panel::cut_to(painter, room.max(0.0), view.name, &name_font);
+        painter.text(
+            Pos2::new(l.strip.left() + NAME_X, l.strip.center().y),
+            Align2::LEFT_CENTER,
+            name,
+            name_font,
+            ink,
+        );
+    }
     let chip = |painter: &Painter, r: Rect, word: &str, lit: bool| {
         if !r.is_positive() {
             return;
@@ -745,6 +896,127 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             Rect::from_min_size(Pos2::new(c.x - a * 0.3, c.y - a), Vec2::splat(a * 1.3)),
             1.0,
             Stroke::new(1.2, ink),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    // ── the navigator: the whole clip in miniature, the window lit ───────
+    //
+    // The band's overview strip, scaled to the clip: a recessed box that
+    // spans the navigator's world, the notes drawn small inside it so the
+    // shape of the part shows, the roll's window as a lit rectangle a hand
+    // can pick up, and the playhead. Drawn whether or not the whole clip
+    // already fits the roll — at the fit the window fills the box, and
+    // that is a true statement about the view rather than furniture: its
+    // two edges are still the way IN, and a navigator that appeared only
+    // once you had zoomed with the wheel would be no way to zoom without
+    // the wheel, which is the thing it is for.
+    if l.tool_nav.is_positive() {
+        let b = l.tool_nav;
+        painter.rect_filled(b, 2.0, Color32::from_rgba_premultiplied(0, 0, 0, 70));
+        // The clip's own span, a shade lighter than the pad either side of
+        // it, so the picture says where the clip begins and ends the way the
+        // roll's veil does.
+        let cx0 = nav_x_of(&l, view, view.clip_start_s).clamp(b.left(), b.right());
+        let cx1 = nav_x_of(&l, view, view.clip_start_s + view.clip_len_s).clamp(b.left(), b.right());
+        if cx1 > cx0 {
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(cx0, b.top()), Pos2::new(cx1, b.bottom())),
+                0.0,
+                ink.gamma_multiply(0.07),
+            );
+        }
+        // **The notes, against their OWN pitch span.** The box is eighteen
+        // points tall and a keyboard is a hundred and twenty-eight keys, so
+        // a miniature drawn against the whole keyboard would be one flat
+        // line whatever the part did. Spread across the notes' actual range
+        // — never less than an octave, so a one-note part is not a line
+        // through the middle either — the marks rise and fall with the
+        // tune, which is the shape the owner wants to see. An impression,
+        // not a score: a mark is one point tall at most spans.
+        let (lo, hi) = view.notes.iter().fold((127u8, 0u8), |(lo, hi), n| {
+            (lo.min(n.key), hi.max(n.key))
+        });
+        if lo <= hi {
+            let range = f32::from(hi - lo) + 1.0;
+            let span = range.max(12.0);
+            // The key the box's floor stands on: the lowest note, or the
+            // octave centred on the part when the part spans less than one.
+            let base = f32::from(lo) - (span - range) * 0.5;
+            let inner = b.shrink2(Vec2::new(0.0, 1.0));
+            let mark_h = (inner.height() / span).max(1.0);
+            // The same cull the roll uses, for the same reason: a part
+            // dense enough to be worth a navigator is a part with far more
+            // notes than the box has columns. A note narrower than a column
+            // in a column already holding that key IS the mark already
+            // there. See [`Coverage`].
+            let scale = f64::from(b.width()) / view.nav_len_s.max(1.0e-9);
+            let mut seen = coverage(b.width(), view.notes.len());
+            for (i, n) in view.notes.iter().enumerate() {
+                let t0 = view.clip_start_s + (n.at_s - view.offset_s);
+                let x0 = nav_x_of(&l, view, t0);
+                let x1 = nav_x_of(&l, view, t0 + n.dur_s.max(0.02)).max(x0 + 1.0);
+                if x1 < b.left() || x0 > b.right() {
+                    continue;
+                }
+                let picked = view.selected.binary_search(&i).is_ok();
+                if let Some(seen) = seen.as_mut() {
+                    if n.dur_s.max(0.02) * scale < 1.0
+                        && !seen.claim(x0, b.left(), usize::from(n.key), picked)
+                    {
+                        continue;
+                    }
+                }
+                let y1 = inner.bottom() - (f32::from(n.key) - base) / span * inner.height();
+                let r = Rect::from_min_max(
+                    Pos2::new(x0.max(b.left()), (y1 - mark_h).max(inner.top())),
+                    Pos2::new(x1.min(b.right()), y1.min(inner.bottom())),
+                );
+                if r.is_positive() {
+                    painter.rect_filled(
+                        r,
+                        0.0,
+                        if picked { ink } else { ink.gamma_multiply(0.55) },
+                    );
+                }
+            }
+        }
+        // The window, and its two handles. Drawn from `nav_window`, which is
+        // the rectangle the hit test answers for, so the grab and the picture
+        // cannot drift.
+        let w = nav_window(&l, view);
+        if w.is_positive() {
+            painter.rect_filled(w, 1.5, ink.gamma_multiply(0.20));
+            painter.rect_stroke(
+                w,
+                1.5,
+                Stroke::new(1.0, ink.gamma_multiply(0.85)),
+                egui::StrokeKind::Inside,
+            );
+            // The edges are the zoom, so they are drawn as something to take
+            // hold of: a bar two points wide at each end, the same weight a
+            // selected note's rim carries.
+            for x in [w.left(), w.right() - 2.0] {
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x, w.top()), Pos2::new(x + 2.0, w.bottom())),
+                    0.0,
+                    ink.gamma_multiply(0.9),
+                );
+            }
+        }
+        // The playhead, in the roll's own red, so a scrub on the box shows
+        // where it put the transport before the roll has scrolled to it.
+        let px = nav_x_of(&l, view, view.playhead_s);
+        if px >= b.left() && px <= b.right() {
+            painter.line_segment(
+                [Pos2::new(px, b.top()), Pos2::new(px, b.bottom())],
+                Stroke::new(1.0, Color32::from_rgb(0xE8, 0x3A, 0x4E)),
+            );
+        }
+        painter.rect_stroke(
+            b,
+            2.0,
+            Stroke::new(1.0, ink.gamma_multiply(0.4)),
             egui::StrokeKind::Inside,
         );
     }
@@ -1174,6 +1446,41 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
             return Some(hit);
         }
     }
+    // **The navigator, by its parts.** The window is tested on X alone and
+    // the box on Y, because the window is inset a point and a half from the
+    // box's top and bottom and a press on that inset is a press on the
+    // window — the band's viewport answers over its whole height for the
+    // same reason. The edges follow a NOTE's rule exactly: `EDGE_W` inside a
+    // window wide enough to keep a body, nothing inside one that is not, and
+    // `EDGE_SLOP` outside either way — so a two-second window on a ten-minute
+    // clip, three points wide, still moves when it is grabbed and still
+    // zooms from just beside it.
+    if l.tool_nav.is_positive() && l.tool_nav.contains(pos) {
+        let w = nav_window(&l, view);
+        if w.is_positive() {
+            let edge = if w.width() >= 14.0 {
+                EDGE_W.min(w.width() * 0.3)
+            } else {
+                0.0
+            };
+            if pos.x >= w.left() && pos.x <= w.right() {
+                if edge > 0.0 && pos.x >= w.right() - edge {
+                    return Some(Hit::NavRight);
+                }
+                if edge > 0.0 && pos.x <= w.left() + edge {
+                    return Some(Hit::NavLeft);
+                }
+                return Some(Hit::NavWindow);
+            }
+            if pos.x > w.right() && pos.x <= w.right() + EDGE_SLOP {
+                return Some(Hit::NavRight);
+            }
+            if pos.x < w.left() && pos.x >= w.left() - EDGE_SLOP {
+                return Some(Hit::NavLeft);
+            }
+        }
+        return Some(Hit::NavField(nav_time_at(&l, view, pos.x)));
+    }
     if l.strip.contains(pos) {
         return None;
     }
@@ -1513,6 +1820,11 @@ mod tests {
             marquee: None,
             view_start_s: 6.0,
             view_len_s: 20.0,
+            // The window as it opens: the whole clip and its pad, so the
+            // navigator's window fills its box here. Tests that want a
+            // window with somewhere to go narrow `view_len_s` themselves.
+            nav_start_s: 6.0,
+            nav_len_s: 20.0,
             top_key: 72.0,
             keys_shown: KEYS_SHOWN,
             snap_on: true,
@@ -1823,6 +2135,231 @@ mod tests {
             let _ = Layout::new(r);
             let _ = hit_test(r, &v, r.center());
         }
+    }
+
+    /// **The navigator is laid out, and every part of it answers a press.**
+    ///
+    /// The strip's box is drawn from `tool_nav` and the window inside it
+    /// from `nav_window`, and this is the pairing this codebase keeps
+    /// catching: a cell that is laid out and painted and answers nothing
+    /// when pressed. So each part is asked in turn — the window's face, its
+    /// two edges from inside and from just outside (a note's own allowance,
+    /// and for the same reason), the inset above the window that is still
+    /// the window, and the clip either side of it — and the axis is asked to
+    /// round-trip, because the app's drag reads `nav_time_at` for a point the
+    /// painter put down with `nav_x_of`.
+    ///
+    /// Revert check performed: take the navigator branch out of `hit_test`
+    /// and the first assertion on the window goes red with `None`.
+    #[test]
+    fn the_navigator_is_laid_out_and_every_part_of_it_answers_a_press() {
+        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 96 }];
+        let mut v = view(&notes);
+        // A window with somewhere to go: four seconds of the twenty.
+        v.view_start_s = 8.0;
+        v.view_len_s = 4.0;
+        let r = rect();
+        let l = Layout::new(r);
+        assert!(l.tool_nav.is_positive(), "a 900-point editor has no navigator");
+        assert!(
+            l.tool_nav.right() < l.tool_draw.left(),
+            "the navigator runs under the pencil"
+        );
+        assert!(
+            l.tool_nav.left() >= l.strip.left() + NAME_X + NAV_NAME_RESERVE,
+            "the navigator took the name's room"
+        );
+        for t in [6.0, 8.0, 17.5, 26.0] {
+            let x = nav_x_of(&l, &v, t);
+            assert!((nav_time_at(&l, &v, x) - t).abs() < 1.0e-4, "{t} did not round-trip");
+        }
+        let w = nav_window(&l, &v);
+        assert!(w.is_positive(), "the window drew nowhere");
+        assert!((w.left() - nav_x_of(&l, &v, 8.0)).abs() < 0.01);
+        assert!((w.right() - nav_x_of(&l, &v, 12.0)).abs() < 0.01);
+        assert!(w.width() >= 14.0, "the fixture's window is too narrow to have edges");
+        let y = l.tool_nav.center().y;
+        assert_eq!(hit_test(r, &v, Pos2::new(w.center().x, y)), Some(Hit::NavWindow));
+        assert_eq!(hit_test(r, &v, Pos2::new(w.left() + 2.0, y)), Some(Hit::NavLeft));
+        assert_eq!(hit_test(r, &v, Pos2::new(w.right() - 2.0, y)), Some(Hit::NavRight));
+        assert_eq!(
+            hit_test(r, &v, Pos2::new(w.right() + 2.0, y)),
+            Some(Hit::NavRight),
+            "just past the window's end is still its end"
+        );
+        assert_eq!(
+            hit_test(r, &v, Pos2::new(w.left() - 2.0, y)),
+            Some(Hit::NavLeft),
+            "just before the window's start is still its start"
+        );
+        // The inset between the box's top and the window's is the window:
+        // X alone decides, the band's rule for its viewport.
+        assert_eq!(
+            hit_test(r, &v, Pos2::new(w.center().x, l.tool_nav.top() + 0.5)),
+            Some(Hit::NavWindow)
+        );
+        // Past the allowance, the clip itself, at the second under the hand.
+        match hit_test(r, &v, Pos2::new(nav_x_of(&l, &v, 20.0), y)) {
+            Some(Hit::NavField(t)) => assert!((t - 20.0).abs() < 0.05, "the clip read as {t}"),
+            other => panic!("the clip on the navigator answered {other:?}"),
+        }
+        // And the strip beside the box is nobody's, as it always was.
+        assert_eq!(hit_test(r, &v, Pos2::new(l.tool_nav.left() - 2.0, y)), None);
+    }
+
+    /// **When the whole clip fits the roll, the window fills the box and its
+    /// edges still answer.**
+    ///
+    /// The question was whether to draw a navigator at all for a view that
+    /// cannot move. It is drawn, because it can still ZOOM — the edges are
+    /// the way in — and a navigator that only appeared once the wheel had
+    /// been used would be no way to zoom without the wheel. What that
+    /// decision needs is for the full window's edges to be reachable at the
+    /// box's own edges, which is what is pinned here.
+    #[test]
+    fn the_navigators_window_fills_its_box_when_the_clip_fits_and_its_edges_still_answer() {
+        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 96 }];
+        // The fixture as it stands: the window IS the world.
+        let v = view(&notes);
+        let r = rect();
+        let l = Layout::new(r);
+        let b = l.tool_nav;
+        let w = nav_window(&l, &v);
+        assert!((w.left() - b.left()).abs() < 0.01, "the full window starts at {}", w.left());
+        assert!((w.right() - b.right()).abs() < 0.01, "the full window ends at {}", w.right());
+        let y = b.center().y;
+        assert_eq!(hit_test(r, &v, Pos2::new(b.left() + 2.0, y)), Some(Hit::NavLeft));
+        assert_eq!(hit_test(r, &v, Pos2::new(b.right() - 2.0, y)), Some(Hit::NavRight));
+        assert_eq!(hit_test(r, &v, Pos2::new(b.center().x, y)), Some(Hit::NavWindow));
+    }
+
+    /// **A narrow window keeps its whole face and finds its edges outside**
+    /// — a note's rule, for a note's reason. Two seconds of a ten-minute
+    /// clip is a fraction of a point on the box, floored to three; a
+    /// window that thin with edge zones inside it would be all edge and
+    /// could never be slid.
+    ///
+    /// Revert check performed: drop the floor in `nav_window` and the width
+    /// assertion goes red at a fraction of a point.
+    #[test]
+    fn a_narrow_navigator_window_keeps_its_face_and_finds_its_edges_outside() {
+        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 96 }];
+        let mut v = view(&notes);
+        v.view_start_s = 10.0;
+        v.view_len_s = 0.02;
+        let r = rect();
+        let l = Layout::new(r);
+        let w = nav_window(&l, &v);
+        assert!(
+            w.width() >= NAV_WINDOW_MIN_W - 0.01 && w.width() < 14.0,
+            "the window is {} points wide",
+            w.width()
+        );
+        let y = l.tool_nav.center().y;
+        assert_eq!(
+            hit_test(r, &v, Pos2::new(w.center().x, y)),
+            Some(Hit::NavWindow),
+            "a narrow window lost its body"
+        );
+        assert_eq!(hit_test(r, &v, Pos2::new(w.left() - 2.0, y)), Some(Hit::NavLeft));
+        assert_eq!(hit_test(r, &v, Pos2::new(w.right() + 2.0, y)), Some(Hit::NavRight));
+    }
+
+    /// **The navigator gives way to the name, and is not laid out at all on
+    /// a strip too narrow to hold one worth having.** On a wide strip it
+    /// takes its share and stops at its ceiling.
+    ///
+    /// Revert check performed: lay the box out whatever its width and the
+    /// narrow editor's assertion goes red with a box a few points wide.
+    #[test]
+    fn the_navigator_stands_down_when_the_strip_has_no_room_for_it() {
+        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 96 }];
+        let v = view(&notes);
+        let narrow = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(380.0, 300.0));
+        let l = Layout::new(narrow);
+        assert!(!l.tool_nav.is_positive(), "a 380-point strip grew a navigator");
+        // And the strip's middle answers nothing there, as before.
+        let mid = Pos2::new(l.strip.left() + NAME_X + NAV_NAME_RESERVE + 10.0, l.strip.center().y);
+        assert!(l.strip.contains(mid) && !l.tool_draw.contains(mid));
+        assert_eq!(hit_test(narrow, &v, mid), None);
+        let wide = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(2000.0, 600.0));
+        let l = Layout::new(wide);
+        assert!(
+            (l.tool_nav.width() - NAV_MAX_W).abs() < 0.01,
+            "on a 2000-point strip the navigator is {} wide",
+            l.tool_nav.width()
+        );
+    }
+
+    /// **The miniature draws every note inside the box, higher pitches
+    /// higher.** Read off the painted shapes rather than trusted: a mark
+    /// drawn against the whole keyboard instead of the part's own span
+    /// would be a flat line, and one drawn with the axis upside down would
+    /// be a mirror — neither is a shape you can read the tune from.
+    ///
+    /// Two assertions, because one was not enough. Against a 128-key span
+    /// the two marks still come out in the right order — three points
+    /// apart, huddled in the middle of the box — so pitch rising alone
+    /// would have passed the flat line it was written to reject. The part
+    /// has to FILL the box: a two-octave part's marks stand most of the
+    /// box's height apart.
+    ///
+    /// Revert checks performed: draw the marks against a 128-key span and
+    /// the span assertion goes red at three points; measure `y` from the
+    /// box's top instead of its floor and the ordering assertion goes red.
+    #[test]
+    fn the_miniature_draws_the_notes_inside_the_box_with_pitch_rising() {
+        let notes = [
+            ArrNote { at_s: 2.0, dur_s: 1.0, key: 48, vel: 96 },
+            ArrNote { at_s: 10.0, dur_s: 1.0, key: 72, vel: 96 },
+        ];
+        let v = view(&notes);
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("nav-mini"));
+        let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+        let r = rect();
+        let l = Layout::new(r);
+        draw(&painter, r, &v);
+        // The marks: filled rects inside the box no taller than half of it,
+        // which leaves out the box, the clip's span, the window and its
+        // handles, all of which run the box's height.
+        let mut marks: Vec<Rect> = ctx.graphics(|g| {
+            g.get(layer)
+                .map(|list| {
+                    list.all_entries()
+                        .filter_map(|c| match &c.shape {
+                            egui::Shape::Rect(q)
+                                if l.tool_nav.contains_rect(q.rect)
+                                    && q.rect.height() <= l.tool_nav.height() * 0.5 =>
+                            {
+                                Some(q.rect)
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        marks.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        assert_eq!(marks.len(), 2, "two notes drew {} marks: {marks:?}", marks.len());
+        let (low, high) = (marks[0], marks[1]);
+        assert!((low.left() - nav_x_of(&l, &v, 10.0)).abs() < 1.5, "C3 is at {}", low.left());
+        assert!((high.left() - nav_x_of(&l, &v, 18.0)).abs() < 1.5, "C5 is at {}", high.left());
+        assert!(
+            high.bottom() < low.top(),
+            "C5 drew at y {} and C3 at y {}: the higher note is not higher",
+            high.center().y,
+            low.center().y
+        );
+        let apart = low.bottom() - high.top();
+        assert!(
+            apart >= l.tool_nav.height() * 0.75,
+            "two octaves stand {apart} points apart in a box {} tall: the part is not \
+             drawn against its own range",
+            l.tool_nav.height()
+        );
     }
 
     /// **The swing fraction is the view's, not a constant** — the SWG menu

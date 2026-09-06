@@ -12,6 +12,23 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **The MIDI editor has the band's scrubber.** The strip along the top of the
+  piano roll now carries the whole clip in miniature, between the clip's name
+  and the pencil: a recessed box the width of the clip and its pad, the notes
+  drawn small inside it against their own pitch range so the shape of the
+  part shows, the playhead in the roll's red, and the part of the clip the
+  roll is showing as a lit window with a handle at each end. Drag the window
+  to pan; drag either handle to zoom, the other end standing still; press on
+  the clip outside the window to put the playhead there, snapped as a press
+  on the ruler is, and keep the button down to scrub it along. The window
+  stops at the clip's own edges, the same wall the edge-scroll stops at, and
+  never zooms narrower than the wheel's quarter second; a window the wheel
+  has pushed past the clip stretches the box to hold it rather than falling
+  off. The whole thing takes no height from the roll — it lives in room the
+  strip was not using — and steps aside on an editor too narrow to hold both
+  it and the name. It is drawn whether or not the clip already fits the roll:
+  at the fit the window fills the box, and its two handles are the way in.
+
 - **The DX7's bank menu is a bank builder.** The instrument's window is two
   numbered panes now. On the left, the loaded cartridge: thirty-two rows, read
   off a `.syx` by "Load bank...", and never written to. On the right, the

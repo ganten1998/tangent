@@ -2145,6 +2145,32 @@ enum MeDrag {
         anchor: f64,
         orig: Vec<(usize, f64, f64)>,
     },
+    /// **The strip's navigator, held by its WINDOW.** `grab_s` is how far
+    /// into the window the hand took hold, in seconds, so the window's start
+    /// is always the hand's second minus that — the band's viewport grab, in
+    /// the roll's own units rather than points. A press never makes the
+    /// window jump to meet the pointer, which is the contract every other
+    /// drag in this app keeps.
+    ///
+    /// `dom` is the navigator's world at the press — `(start, len)` in
+    /// absolute seconds — frozen for the gesture's life. See
+    /// `me_nav_domain` for why it cannot be read live under a hand.
+    NavPan { grab_s: f64, dom: (f64, f64) },
+    /// The window's LEFT edge: the start follows the hand and the end
+    /// stands still. The zoom, from the near side. `grab_s` is the hand's
+    /// second minus the edge's at the press — the edge zone is seven points
+    /// wide and an edge that snapped to the hand would jump by that much on
+    /// the press frame.
+    NavLeft { grab_s: f64, dom: (f64, f64) },
+    /// The window's RIGHT edge: the end follows the hand and the start
+    /// stands still. `grab_s` on the same terms.
+    NavRight { grab_s: f64, dom: (f64, f64) },
+    /// A press on the navigator OUTSIDE its window: a locate, and the
+    /// locate follows the hand for as long as the button is down — the
+    /// band's scrub on the band's own strip. `last` is the second the
+    /// transport was last sent to, so a hand that has not crossed a grid
+    /// line does not send it there again every frame.
+    NavScrub { dom: (f64, f64), last: f64 },
 }
 
 /// Where the media explorer wakes up: the user's home, or the root.
@@ -14945,22 +14971,94 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **The air either side of a clip in the roll**: eight per cent of its
+    /// length, or half a bar, whichever is more. The one formula behind the
+    /// window the editor opens on, `Z`'s fit, the edge-scroll's far rail and
+    /// the navigator's world — it was written out at three of those sites
+    /// before the fourth arrived, and four copies of `0.08` is how a rail
+    /// and a fit come to disagree about where the clip ends.
+    fn me_clip_pad_s(&self, clip: &crate::arrangement::ArrClip) -> f64 {
+        (clip.len_s * 0.08).max(self.arr_bar_s() * 0.5)
+    }
+
+    /// **The navigator's world**, `(start, len)` in absolute seconds: the
+    /// clip with its pad — exactly what `me_fit_clip` shows — stretched to
+    /// hold the window whenever the wheel or the keys have put the window
+    /// outside that.
+    ///
+    /// Stretched rather than clamped, for the reason the arrangement's
+    /// `nav_domain_s` gives: a window the roll is showing has to be
+    /// somewhere ON the box, or the box is lying about where you are. And
+    /// the rails in `me_steer` are this world's edges, so the navigator's
+    /// own gestures can never push the window OUT of the fit — they can only
+    /// bring one back, which is the walk the edge-scroll's rails allow and
+    /// the yank they forbid.
+    ///
+    /// Read live only between gestures. The value a drag works against is
+    /// the one it captured at the press: the live world shrinks as an
+    /// outside window comes home, and a box that rescaled under the hand
+    /// would carry the handle away from the finger holding it.
+    fn me_nav_domain(&self, st: &MidiEdit, clip: &crate::arrangement::ArrClip) -> (f64, f64) {
+        let pad = self.me_clip_pad_s(clip);
+        let lo = (clip.start_s - pad).max(0.0).min(st.view_start_s.max(0.0));
+        let hi = (clip.start_s + clip.len_s + pad).max(st.view_start_s + st.view_len_s);
+        (lo, (hi - lo).max(1.0))
+    }
+
+    /// The world the navigator is DRAWN against: the one a drag in flight
+    /// captured at its press, or the live one between gestures. See
+    /// `me_nav_domain` for why the two are not the same thing.
+    fn me_nav_domain_for(
+        &self,
+        st: &MidiEdit,
+        clip: &crate::arrangement::ArrClip,
+    ) -> (f64, f64) {
+        match &st.drag {
+            Some(
+                MeDrag::NavPan { dom, .. }
+                | MeDrag::NavLeft { dom, .. }
+                | MeDrag::NavRight { dom, .. }
+                | MeDrag::NavScrub { dom, .. },
+            ) => *dom,
+            _ => self.me_nav_domain(st, clip),
+        }
+    }
+
+    /// **The navigator's ONE clamp.** Every gesture on it — the window
+    /// slid, either edge pulled, and nothing else — writes the window
+    /// through here, so the three cannot disagree about where the window
+    /// may stand. `dom` is the world the gesture was pressed in.
+    ///
+    /// The length floors at the wheel's own quarter-second and cannot exceed
+    /// the world; the start stays inside the world and at or after zero,
+    /// which is the rail every writer of `view_start_s` in this file
+    /// already keeps. The world's far edge is `me_fit_clip`'s wall, the
+    /// same wall the edge-scroll stops at.
+    fn me_steer(&mut self, start: f64, len: f64, dom: (f64, f64)) {
+        let (lo, world) = dom;
+        let len = len.clamp(0.25, world.max(0.25));
+        let max_start = (lo + world - len).max(lo);
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.view_start_s = start.clamp(lo, max_start).max(0.0);
+            st.view_len_s = len;
+        }
+    }
+
     /// Fit the window back around the clip — the way it opened.
     fn me_fit_clip(&mut self) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
         };
         let id = st.id;
-        let Some((start, len)) = self
+        let Some((start, len, pad)) = self
             .arrangement
             .clips
             .iter()
             .find(|c| c.id == id)
-            .map(|c| (c.start_s, c.len_s))
+            .map(|c| (c.start_s, c.len_s, self.me_clip_pad_s(c)))
         else {
             return;
         };
-        let pad = (len * 0.08).max(self.arr_bar_s() * 0.5);
         if let Some(st) = self.midi_edit.as_mut() {
             st.view_start_s = (start - pad).max(0.0);
             st.view_len_s = (len + pad * 2.0).max(1.0);
@@ -15106,6 +15204,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         clip: &'a crate::arrangement::ArrClip,
     ) -> crate::midi_editor::MidiEditView<'a> {
         let sig = self.time_signature();
+        let nav = self.me_nav_domain_for(st, clip);
         crate::midi_editor::MidiEditView {
             draw_mode: self.settings.midi_draw_mode,
             fx_strip: {
@@ -15142,6 +15241,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             marquee: st.marquee,
             view_start_s: st.view_start_s,
             view_len_s: st.view_len_s,
+            // **Frozen while a hand is on the navigator.** The live domain
+            // stretches to hold a window the wheel pushed past the clip and
+            // shrinks back as the window returns, and a box whose scale
+            // changed under a drag would move the handle away from the hand
+            // holding it. The drag carries the world it was pressed in — the
+            // arrangement's `Nav` keeps `px_w` for the same reason — and the
+            // picture is drawn from that same world until the release, so
+            // what the hand holds and what the eye sees are one rectangle.
+            nav_start_s: nav.0,
+            nav_len_s: nav.1,
             top_key: st.top_key,
             keys_shown: self.midi_keys_visible(),
             snap_on: self.settings.midi_snap,
@@ -15197,7 +15306,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if clip.kind != crate::arrangement::ClipKind::Midi {
             return;
         }
-        let pad = (clip.len_s * 0.08).max(self.arr_bar_s() * 0.5);
+        let pad = self.me_clip_pad_s(clip);
         let centre = if clip.notes.is_empty() {
             60.0
         } else {
@@ -17386,11 +17495,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         if pressed || secondary {
             if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
-                let hit = {
+                // The navigator's two numbers ride along with the hit: the
+                // second under the hand on the box, and the box's world.
+                // Read here, from the same view the hit was read from, so a
+                // navigator press is priced against the picture it landed
+                // on and not against one recomputed a line later.
+                let (hit, nav_at, nav_dom) = {
                     let st = self.midi_edit.as_ref().unwrap();
                     let clip = self.arrangement.clips.iter().find(|c| c.id == id).unwrap();
                     let view = self.midi_edit_view(st, clip);
-                    crate::midi_editor::hit_test(rect, &view, p)
+                    let l = crate::midi_editor::Layout::new(rect);
+                    (
+                        crate::midi_editor::hit_test(rect, &view, p),
+                        crate::midi_editor::nav_time_at(&l, &view, p.x),
+                        (view.nav_start_s, view.nav_len_s),
+                    )
                 };
                 use crate::midi_editor::Hit as H;
                 match hit {
@@ -17449,6 +17568,50 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         let to = self.me_snap(t);
                         self.request_recorder(recorder::RecorderRequest::Locate(to));
                     }
+                    // **The navigator.** Its world is captured HERE, at the
+                    // press, and carried by the drag — see `me_nav_domain`.
+                    // The window is picked up by wherever the hand landed on
+                    // it: the band's viewport grab, so the window never
+                    // jumps to centre itself under the pointer.
+                    Some(H::NavWindow) if pressed => {
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = Some(MeDrag::NavPan {
+                                grab_s: nav_at - st.view_start_s,
+                                dom: nav_dom,
+                            });
+                        }
+                    }
+                    Some(H::NavLeft) if pressed => {
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = Some(MeDrag::NavLeft {
+                                grab_s: nav_at - st.view_start_s,
+                                dom: nav_dom,
+                            });
+                        }
+                    }
+                    Some(H::NavRight) if pressed => {
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = Some(MeDrag::NavRight {
+                                grab_s: nav_at - (st.view_start_s + st.view_len_s),
+                                dom: nav_dom,
+                            });
+                        }
+                    }
+                    Some(H::NavField(t)) if pressed => {
+                        // A locate, snapped as the ruler's is, and the
+                        // scrub: the hand keeps the transport until the
+                        // button comes up. The selection is left alone —
+                        // this is the transport's strip, not the roll.
+                        let to = self.me_snap(t);
+                        self.request_recorder(recorder::RecorderRequest::Locate(to));
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = Some(MeDrag::NavScrub { dom: nav_dom, last: to });
+                        }
+                    }
+                    // The right button means nothing on the navigator, and
+                    // it must not fall through to the arm below, which would
+                    // read a press on the strip as a press on empty roll.
+                    Some(H::NavWindow | H::NavLeft | H::NavRight | H::NavField(_)) => {}
                     Some(H::Vel(t)) if pressed => {
                         if let Some(st) = self.midi_edit.as_mut() {
                             st.drag = Some(MeDrag::Vel);
@@ -17723,7 +17886,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // because `me_move_selection` already refuses to
                             // put a note outside the clip, so there is
                             // nothing out there to drag to.
-                            let pad = (clip.len_s * 0.08).max(self.arr_bar_s() * 0.5);
+                            let pad = self.me_clip_pad_s(clip);
                             (
                                 crate::midi_editor::time_at(&l, &view, 1.0) - a,
                                 crate::midi_editor::key_h(&l, view.keys_shown),
@@ -17759,7 +17922,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                 }
             }
-            let (t_at, key_at) = {
+            // `nav_t` is the hand's second on the NAVIGATOR's axis, which
+            // is not the roll's: the box spans the clip, the roll spans the
+            // window. Read through the panel's own mapping, from a view
+            // whose world is the one the drag captured.
+            let (t_at, key_at, nav_t) = {
                 let st = self.midi_edit.as_ref().unwrap();
                 let clip = self.arrangement.clips.iter().find(|c| c.id == id).unwrap();
                 let view = self.midi_edit_view(st, clip);
@@ -17767,6 +17934,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 (
                     crate::midi_editor::time_at(&l, &view, p.x),
                     crate::midi_editor::key_at(&l, &view, p.y).ceil(),
+                    crate::midi_editor::nav_time_at(&l, &view, p.x),
                 )
             };
             match drag {
@@ -17840,6 +18008,60 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     if let Some(st) = self.midi_edit.as_mut() {
                         if let Some((a, _)) = st.marquee {
                             st.marquee = Some((a, p));
+                        }
+                    }
+                }
+                // **The navigator, ridden.** Three writers, one clamp:
+                // every arm here goes out through `me_steer`. The hand's
+                // second is read wherever the hand is — off the strip, off
+                // the editor, off the window — because a drag keeps its
+                // grab wherever the hand wanders, and it is the rails and
+                // not the box's edge that say where the window stops.
+                MeDrag::NavPan { grab_s, dom } => {
+                    let len = self.midi_edit.as_ref().map_or(1.0, |m| m.view_len_s);
+                    self.me_steer(nav_t - grab_s, len, dom);
+                }
+                // **An edge stops at the world's wall BEFORE the clamp sees
+                // it.** `me_steer` caps the length at the world and then
+                // fits the start to what is left, which is right for a slid
+                // window and wrong for a pulled edge: a right edge dragged
+                // past the box asked for a length longer than the world, was
+                // capped to the whole of it, and the start was pushed back to
+                // the world's beginning to make it fit — the end you were
+                // holding still and the end you were NOT holding both moved.
+                // The test for "the start stands still" caught it on the
+                // first run. So the moving end is pinned to the wall here, in
+                // the arm that owns the promise, and the clamp has nothing
+                // left to correct.
+                MeDrag::NavLeft { grab_s, dom } => {
+                    // The END stands still: the new length is measured back
+                    // from it, and the start is wherever that leaves it —
+                    // so pushing past the end pins the window to its
+                    // quarter-second floor against the end, not the hand.
+                    let end = self
+                        .midi_edit
+                        .as_ref()
+                        .map_or(0.0, |m| m.view_start_s + m.view_len_s);
+                    let start = (nav_t - grab_s).max(dom.0);
+                    let len = (end - start).max(0.25);
+                    self.me_steer(end - len, len, dom);
+                }
+                MeDrag::NavRight { grab_s, dom } => {
+                    let start = self.midi_edit.as_ref().map_or(0.0, |m| m.view_start_s);
+                    let end = (nav_t - grab_s).min(dom.0 + dom.1);
+                    self.me_steer(start, (end - start).max(0.25), dom);
+                }
+                MeDrag::NavScrub { dom, last } => {
+                    // The band's scrub: the transport follows the hand for
+                    // as long as the press is held, snapped as the press
+                    // was. Only when the snapped second CHANGES — a locate
+                    // is cheap, but a stream of identical ones every frame
+                    // is a queue the host has to drain for nothing.
+                    let to = self.me_snap(nav_t);
+                    if (to - last).abs() > 1.0e-9 {
+                        self.request_recorder(recorder::RecorderRequest::Locate(to));
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = Some(MeDrag::NavScrub { dom, last: to });
                         }
                     }
                 }
@@ -48041,6 +48263,281 @@ mod tests {
             "the roll stopped at {} s, short of the wall at {wall} s",
             start + len
         );
+    }
+
+    /// The navigator as the app sees it, for the roll `midi_editor_zoomed_in`
+    /// drew: its box, its window, and the box's scale in seconds per point.
+    /// Through the panel's own functions, so a test that presses "the
+    /// window" is pressing the rectangle the painter put down.
+    fn me_nav(app: &TangentApp, rect: Rect, id: u64) -> (Rect, Rect, f64) {
+        let st = app.midi_edit.as_ref().expect("the editor closed");
+        let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+        let view = app.midi_edit_view(st, clip);
+        let l = crate::midi_editor::Layout::new(rect);
+        assert!(l.tool_nav.is_positive(), "the editor has no navigator");
+        (
+            l.tool_nav,
+            crate::midi_editor::nav_window(&l, &view),
+            view.nav_len_s / f64::from(l.tool_nav.width()),
+        )
+    }
+
+    /// The roll's window, `(start, len)`.
+    fn me_window(app: &TangentApp) -> (f64, f64) {
+        let st = app.midi_edit.as_ref().expect("the editor closed");
+        (st.view_start_s, st.view_len_s)
+    }
+
+    /// **The navigator's window rides under the hand at the offset it was
+    /// taken hold of, keeps its grab wherever the hand wanders, and stops at
+    /// the clip's own walls.**
+    ///
+    /// The band's viewport gesture on the roll's strip. Three things are
+    /// pinned because three things could go wrong separately: the press
+    /// must not move the window (a grab that centres the window on the
+    /// pointer is a jump, and no drag in this app jumps); the window must
+    /// move by exactly the hand's travel in the box's own scale, whether or
+    /// not the hand is still over the strip; and the far rail must be
+    /// `me_fit_clip`'s wall, the same wall the edge-scroll stops at, with
+    /// the near rail at the world's start and never before zero.
+    ///
+    /// Revert check performed: steer to `nav_t` instead of `nav_t - grab_s`
+    /// and the press assertion goes red on the press frame itself — the
+    /// window jumps to put its start under the hand before the hand has
+    /// moved at all, which is exactly the jump the offset exists to prevent.
+    #[test]
+    fn the_navigators_window_rides_under_the_hand_and_stops_at_the_clips_walls() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, id) = midi_editor_zoomed_in(&ctx, &mut app);
+        // The fixture: the clip at 4..12 with a one-second pad, the window
+        // 4..6 — so the world is 3..13 and there is room both ways.
+        assert_eq!(me_window(&app), (4.0, 2.0));
+        let (b, w, s_per_px) = me_nav(&app, rect, id);
+        // A third of the way in, not the centre: the OFFSET is under test.
+        let grab = Pos2::new(w.left() + w.width() * 0.3, b.center().y);
+        press(&ctx, &mut app, grab);
+        assert!(
+            matches!(app.midi_edit.as_ref().unwrap().drag, Some(MeDrag::NavPan { .. })),
+            "the press did not pick the window up"
+        );
+        assert_eq!(
+            me_window(&app),
+            (4.0, 2.0),
+            "the press moved the window: it jumped to meet the pointer"
+        );
+        move_to(&ctx, &mut app, Pos2::new(grab.x + 50.0, grab.y));
+        let (s1, l1) = me_window(&app);
+        assert!(
+            (s1 - (4.0 + 50.0 * s_per_px)).abs() < 1.0e-3,
+            "fifty points along moved the window to {s1}"
+        );
+        assert_eq!(l1, 2.0, "a pan changed the zoom");
+        // Off the strip entirely, down in the roll: the grab holds.
+        let roll = crate::midi_editor::Layout::new(rect).roll;
+        move_to(&ctx, &mut app, Pos2::new(grab.x + 100.0, roll.center().y));
+        let (s2, _) = me_window(&app);
+        assert!(
+            (s2 - (4.0 + 100.0 * s_per_px)).abs() < 1.0e-3,
+            "the hand left the strip and the window stopped at {s2}"
+        );
+        // The far wall: the clip's end plus its pad, the edge-scroll's rail.
+        move_to(&ctx, &mut app, Pos2::new(1290.0, grab.y));
+        let (s3, l3) = me_window(&app);
+        let (wall, floor) = {
+            let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+            let pad = app.me_clip_pad_s(clip);
+            (clip.start_s + clip.len_s + pad, (clip.start_s - pad).max(0.0))
+        };
+        assert!(
+            (s3 + l3 - wall).abs() < 1.0e-6,
+            "the window sailed to {} against a wall at {wall}",
+            s3 + l3
+        );
+        // And the near one: the world's start.
+        move_to(&ctx, &mut app, Pos2::new(5.0, grab.y));
+        let (s4, _) = me_window(&app);
+        assert!((s4 - floor).abs() < 1.0e-6, "the window went to {s4}; the world starts at {floor}");
+        release(&ctx, &mut app, Pos2::new(5.0, grab.y));
+        assert!(app.midi_edit.as_ref().unwrap().drag.is_none(), "the release did not let go");
+    }
+
+    /// **The navigator's edges zoom the window, and the far end stands
+    /// still.** Pull the right edge and the start does not move; pull the
+    /// left edge and the end does not; push either through the other and the
+    /// window pins to the wheel's quarter-second floor against the end that
+    /// stayed. And an edge dragged past the box stops at the world's wall,
+    /// which is the zoom OUT — the way back to seeing the whole clip.
+    ///
+    /// This test earned its keep on its first run. The first cut let each
+    /// edge ask `me_steer` for whatever length the hand implied, and the
+    /// clamp — which caps the length at the world and then fits the start
+    /// to what is left — answered a right edge dragged past the box by
+    /// pushing the START back to the world's beginning. The wall assertion
+    /// below is the one that went red with "the zoom out moved the start
+    /// to 3"; the edges now pin themselves to the wall before the clamp
+    /// sees them.
+    ///
+    /// Revert check performed: steer the right edge through
+    /// `me_steer(nav_t - grab_s, len, dom)` — the pan's arithmetic — and the
+    /// window is carried off on the press frame, its start put where its end
+    /// was; the "press moved the edge" assertion goes red before the drag
+    /// begins.
+    #[test]
+    fn the_navigators_edges_zoom_the_window_and_the_far_end_stands_still() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, id) = midi_editor_zoomed_in(&ctx, &mut app);
+        let (b, w, s_per_px) = me_nav(&app, rect, id);
+        // The RIGHT edge, from just outside it — a note's allowance, and the
+        // press that works whether the window is wide or three points.
+        let right = Pos2::new(w.right() + 2.0, b.center().y);
+        press(&ctx, &mut app, right);
+        assert!(
+            matches!(app.midi_edit.as_ref().unwrap().drag, Some(MeDrag::NavRight { .. })),
+            "the press beside the window's end did not take the edge"
+        );
+        assert_eq!(me_window(&app), (4.0, 2.0), "the press moved the edge to meet the pointer");
+        move_to(&ctx, &mut app, Pos2::new(right.x - 25.0, right.y));
+        let (s, l) = me_window(&app);
+        assert!((s - 4.0).abs() < 1.0e-9, "pulling the right edge moved the start to {s}");
+        assert!(
+            (l - (2.0 - 25.0 * s_per_px)).abs() < 1.0e-3,
+            "twenty-five points off the end left {l} s"
+        );
+        // Through the start and out the other side: the floor, against it.
+        move_to(&ctx, &mut app, Pos2::new(5.0, right.y));
+        assert_eq!(me_window(&app), (4.0, 0.25));
+        // And out past the box: the wall. The zoom out.
+        move_to(&ctx, &mut app, Pos2::new(1290.0, right.y));
+        let (s, l) = me_window(&app);
+        let wall = {
+            let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+            clip.start_s + clip.len_s + app.me_clip_pad_s(clip)
+        };
+        assert!((s - 4.0).abs() < 1.0e-9, "the zoom out moved the start to {s}");
+        assert!((s + l - wall).abs() < 1.0e-6, "the end went to {}, the wall is {wall}", s + l);
+        release(&ctx, &mut app, Pos2::new(1290.0, right.y));
+
+        // The LEFT edge of that wide window, pushed a hundred points in:
+        // the END stands still.
+        let (b, w, s_per_px) = me_nav(&app, rect, id);
+        let end = s + l;
+        let left = Pos2::new(w.left() - 2.0, b.center().y);
+        press(&ctx, &mut app, left);
+        assert!(
+            matches!(app.midi_edit.as_ref().unwrap().drag, Some(MeDrag::NavLeft { .. })),
+            "the press beside the window's start did not take the edge"
+        );
+        move_to(&ctx, &mut app, Pos2::new(left.x + 100.0, left.y));
+        let (s, l) = me_window(&app);
+        assert!(
+            (s - (4.0 + 100.0 * s_per_px)).abs() < 1.0e-3,
+            "a hundred points in put the start at {s}"
+        );
+        assert!((s + l - end).abs() < 1.0e-6, "pulling the left edge moved the end to {}", s + l);
+        // Through the end: the floor, against the end.
+        move_to(&ctx, &mut app, Pos2::new(1290.0, left.y));
+        let (s, l) = me_window(&app);
+        assert!((l - 0.25).abs() < 1.0e-9, "the window is {l} s wide");
+        assert!((s + l - end).abs() < 1.0e-6, "the end moved to {}", s + l);
+        release(&ctx, &mut app, Pos2::new(1290.0, left.y));
+    }
+
+    /// **A press on the navigator's clip, outside the window, is a locate —
+    /// snapped as the ruler's is — and the locate follows the hand while the
+    /// button is down.** The band's scrub, on the roll's strip. The window
+    /// and the selection are left where they were: this is the transport's
+    /// gesture, not the roll's.
+    ///
+    /// The transport is sent for only when the snapped second changes. A hand
+    /// that wobbles without crossing a grid line sends nothing, so the queue
+    /// the host drains is not filled with a locate a frame to the same place.
+    ///
+    /// Revert check performed: drop the `NavScrub` arm from the drag block
+    /// and the second locate never arrives; drop its `last` comparison and
+    /// the press frame itself sends two — the arm runs in the same frame as
+    /// the press and re-sends what the press just sent — which the first
+    /// assertion rejects before the wobble is ever reached.
+    #[test]
+    fn a_press_on_the_navigators_clip_locates_and_the_locate_follows_the_hand() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.midi_snap = true;
+        // An eighth note at 120 bpm: a quarter of a second, the grid the
+        // fixtures in this file are written around.
+        app.settings.midi_grid_exp = -3;
+        let (rect, id) = midi_editor_zoomed_in(&ctx, &mut app);
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.selected = vec![0];
+        }
+        let locates = |app: &mut TangentApp| -> Vec<f64> {
+            let mut out = Vec::new();
+            while let Some(r) = app.take_recorder_request() {
+                if let recorder::RecorderRequest::Locate(t) = r {
+                    out.push(t);
+                }
+            }
+            out
+        };
+        let _ = locates(&mut app);
+        let x_of = |app: &TangentApp, t: f64| -> Pos2 {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+            let view = app.midi_edit_view(st, clip);
+            let l = crate::midi_editor::Layout::new(rect);
+            Pos2::new(crate::midi_editor::nav_x_of(&l, &view, t), l.tool_nav.center().y)
+        };
+        // Ten seconds in: on the box, well clear of the 4..6 window.
+        let at = x_of(&app, 10.0);
+        press(&ctx, &mut app, at);
+        assert!(
+            matches!(app.midi_edit.as_ref().unwrap().drag, Some(MeDrag::NavScrub { .. })),
+            "the press on the clip did not arm the scrub"
+        );
+        let got = locates(&mut app);
+        assert!(
+            got.len() == 1 && (got[0] - 10.0).abs() < 1.0e-6,
+            "the press asked for {got:?}, not one locate at 10.0"
+        );
+        assert_eq!(me_window(&app), (4.0, 2.0), "a locate moved the window");
+        assert_eq!(app.midi_edit.as_ref().unwrap().selected, vec![0], "a locate touched the selection");
+        // The hand moves on and the transport follows, on the grid.
+        let on = x_of(&app, 11.3);
+        move_to(&ctx, &mut app, on);
+        let got = locates(&mut app);
+        assert!(
+            got.len() == 1 && (got[0] - 11.25).abs() < 1.0e-6,
+            "the scrub asked for {got:?}, not one locate at 11.25"
+        );
+        // A wobble that crosses no grid line sends nothing again.
+        move_to(&ctx, &mut app, Pos2::new(on.x, on.y + 3.0));
+        assert!(locates(&mut app).is_empty(), "the scrub re-sent a locate to the same second");
+        release(&ctx, &mut app, on);
+        assert!(app.midi_edit.as_ref().unwrap().drag.is_none(), "the release did not end the scrub");
+    }
+
+    /// **The navigator's world is the fit, and stretches to hold a window
+    /// the wheel has put outside it.** A window the roll is showing has to
+    /// be somewhere on the box, or the box is lying about where you are.
+    #[test]
+    fn the_navigators_world_is_the_fit_and_stretches_to_hold_a_window_outside_it() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (_rect, id) = midi_editor_zoomed_in(&ctx, &mut app);
+        let world = |app: &mut TangentApp, start: f64, len: f64| -> (f64, f64) {
+            if let Some(st) = app.midi_edit.as_mut() {
+                st.view_start_s = start;
+                st.view_len_s = len;
+            }
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+            let v = app.midi_edit_view(st, clip);
+            (v.nav_start_s, v.nav_len_s)
+        };
+        // Inside the fit: the fit, and it does not chase the window.
+        assert_eq!(world(&mut app, 4.0, 2.0), (3.0, 10.0));
+        assert_eq!(world(&mut app, 9.0, 3.0), (3.0, 10.0));
+        // Before it: the world starts where the window does.
+        assert_eq!(world(&mut app, 0.0, 2.0), (0.0, 13.0));
+        // Past it: the world ends where the window does.
+        assert_eq!(world(&mut app, 11.0, 4.0), (3.0, 12.0));
     }
 
     /// The arrangement, one MIDI clip on lane 0, snap off, one frame drawn.
