@@ -12,6 +12,7 @@
 
 pub mod algorithms;
 pub mod edit;
+pub mod staging;
 pub mod synth;
 pub mod sysex;
 pub mod voice;

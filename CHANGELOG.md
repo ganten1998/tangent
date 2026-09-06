@@ -12,6 +12,27 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **The DX7's bank menu is a bank builder.** The instrument's window is two
+  numbered panes now. On the left, the loaded cartridge: thirty-two rows, read
+  off a `.syx` by "Load bank...", and never written to. On the right, the
+  STAGED bank: thirty-two numbered slots, empty until something is put in one.
+  Drag a row across and it lands in the slot it was dropped on; right-click
+  rows to mark several and drag one of them, or press Stage, and they cross
+  together; Remove empties a slot; click a staged row to hear it. Load another
+  cartridge and the staged bank stays, so a bank can be mixed from any number
+  of files ("stage their perfect bank", in the owner's words), and "Save
+  bank..." writes it out as an ordinary cartridge that Dexed and a real DX7
+  will open. Both panels open on `Documents/Tangent Media/SYSEX/`, and the
+  save panel suggests `default.syx`, because that file is now the bank the
+  instrument opens on: a strip that names no cartridge of its own plays
+  `default.syx` from the shelf if there is one and the bank in the binary if
+  not, so the bank you built comes back every session. "Factory" reads
+  "Default" for the same reason, and re-reads the file. "Patch..." stays at
+  the top: it edits what is playing, and its Save now puts the patch into the
+  staged bank (back into its own slot, when it came from one) rather than
+  appending to a file beside the settings that nothing ever showed. Choosing a
+  patch lets an unsaved edit go, so Patch... opens on what was just picked.
+
 - **The log says which macOS it is, and whether an input is open.** "macos
   aarch64" covers eleven releases, and one report cost a day to the difference
   between Sonoma and Tahoe; the header carries the product version now. And
@@ -134,6 +155,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   ships, this stops being a note and becomes something the loader has to do.
 
 ### Fixed
+
+- **The DX7 picker opens lit on the patch the strip is playing.** It had been
+  lighting the row for exactly one frame: the host's answer to the open, the
+  same call that fills the list after a load, cleared the selection on the
+  argument that belongs only to a freshly loaded bank. The row that is lit is
+  now the row the strip's setting names, in both cases.
 
 - **An audio system that opens and then plays nothing is set aside instead of
   being tried for ever.** A driver that refuses to open is easy — the open

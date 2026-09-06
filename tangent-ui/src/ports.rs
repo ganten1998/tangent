@@ -657,14 +657,18 @@ pub struct CartridgeInfo {
     /// Why the last attempt failed, if it did. Empty on success, and on
     /// failure everything above is left as it was.
     pub error: String,
-    /// This IS the bank that ships in the binary.
+    /// The strip is on its DEFAULT bank: the one an empty setting selects,
+    /// which is `default.syx` on the SYSEX shelf when the user has saved one
+    /// there and the bank compiled into the binary when they have not.
     ///
-    /// A flag rather than comparing `bank` to a known string: the shipped bank
-    /// has a name like any other, so an empty name does not mean "the factory
-    /// one" and never did. The picker uses it to decide whether there is
-    /// anything to go back FROM — and `tangent-ui` may not name the constant,
-    /// which lives on the other side of the firewall.
-    pub factory: bool,
+    /// A flag rather than comparing `bank` to a known string: the shipped
+    /// bank has a name like any other, the user's default is called whatever
+    /// its file is called, and an empty name never meant either. The picker
+    /// uses it to decide whether there is anything to go back FROM — and
+    /// `tangent-ui` may not name the constant, which lives on the other side
+    /// of the firewall. It was called `factory` until the shelf existed; the
+    /// old name became a lie the moment a user's own file could be the answer.
+    pub on_default: bool,
 }
 
 /// Why a file is being asked for.
@@ -775,6 +779,19 @@ pub enum SavePurpose {
     /// the move the way it covers the copy, since a rename refused across
     /// volumes falls back to copying every take.
     ProjectFirst,
+    /// **Write the DX7 picker's staged bank out as a `.syx`.** Appended at
+    /// the END, this enum's law.
+    ///
+    /// The panel opens on the SYSEX shelf under the media root and suggests
+    /// `default.syx`, because that is the file the instrument opens on when
+    /// a strip names no bank of its own — see `dialogs::DEFAULT_BANK_FILE`.
+    /// Overwriting is ALLOWED, on purpose and unlike a kit: replacing the
+    /// default bank with a better one is the whole workflow, and a panel that
+    /// refused the name would send the owner to the Finder to delete the old
+    /// file first. The host appends `.syx` to a bare name; the whole path is
+    /// honoured otherwise, and the answer comes back to the host as
+    /// `RecorderRequest::SaveBank` for the strip whose picker asked.
+    Bank,
 }
 
 /// A project action the HOST must run whole — it owns the plugin states

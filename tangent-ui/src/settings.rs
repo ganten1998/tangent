@@ -5176,8 +5176,32 @@ impl Settings {
         Self::chosen(&self.irs_dir).unwrap_or_else(|| self.media_root().join("IRs"))
     }
 
+    /// Where DX7 BANKS are kept: what the picker's Save bank writes, where
+    /// its Load bank opens when a strip names no bank of its own, and where
+    /// `default.syx` — the bank the instrument opens on in that case — is
+    /// looked for. The owner's words: "Default save area AND where the
+    /// default bank is stored and loaded from now". No override key, unlike
+    /// its five siblings: the owner named the folder, and a second place for
+    /// the default bank to be is a second place for it not to be found.
+    ///
+    /// Upper case because that is how the owner spelled it, and a folder's
+    /// name is the one thing about it a person types. The host spells the
+    /// same word in `dx7::staging::SYSEX_FOLDER`, and a test there holds the
+    /// two together.
+    ///
+    /// **Not one of [`Self::media_roots`], and not made at launch.** Both
+    /// panels that open on it go through the host's `panel_start` as one of
+    /// OUR folders, which makes it on the way in — the same lazy moment the
+    /// per-unit preset drawers have. A sixth root would be made under the
+    /// real `Documents` by the roots test, which overrides the other five
+    /// into a scratch folder and has no override for this one.
+    pub fn sysex_root(&self) -> PathBuf {
+        self.media_root().join("SYSEX")
+    }
+
     /// **The five folders Tangent keeps things in**, in the order the cog
-    /// card lists them: takes, projects, exports, presets, IRs.
+    /// card lists them: takes, projects, exports, presets, IRs. (The SYSEX
+    /// shelf is not among them — see [`Self::sysex_root`].)
     ///
     /// Named in one place because the host creates them at launch and the
     /// SHOW buttons open them, and a caller that forgot one of them is
@@ -5612,6 +5636,10 @@ mod tests {
     /// so choosing where takes went silently moved the documents too, and
     /// there was no answer at all to "where are my exports". Presets joined
     /// as the fourth: the recipes people keep, beside the work they made.
+    fn roots_contain(roots: &[PathBuf], p: &PathBuf) -> bool {
+        roots.iter().any(|r| r == p)
+    }
+
     #[test]
     fn the_four_media_folders_are_separate_and_default_under_documents() {
         let s = super::Settings::default();
@@ -5628,6 +5656,11 @@ mod tests {
         // The IRs joined as the fifth: captured hardware, kept beside the
         // presets it behaves like.
         assert_eq!(s.irs_root(), root.join("IRs"));
+        // And the SYSEX shelf beside them: DX7 banks, spelled the way the
+        // owner spelled it, with the default bank in it. Never overridable,
+        // and not a root — it is made by the panels that open on it.
+        assert_eq!(s.sysex_root(), root.join("SYSEX"));
+        assert!(!roots_contain(&s.media_roots(), &s.sysex_root()));
         // All five are DIFFERENT places, which is the whole point.
         let roots = s.media_roots();
         for (i, a) in roots.iter().enumerate() {

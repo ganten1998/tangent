@@ -2049,6 +2049,46 @@ pub enum RecorderRequest {
         from_bay: usize,
         to_bay: usize,
     },
+    // ── the DX7 bank builder ────────────────────────────────────────────
+    //
+    // Appended at the END, this enum's law. The picker's right-hand pane is
+    // a bank being BUILT out of patches from any number of cartridges — see
+    // `dx7::staging` on the host — and every move the pane makes is a
+    // request here, because the voices live on the host and the pane holds
+    // nothing but their names. The host answers each one with
+    // `TangentApp::set_staged_bank`, the way `LoadStripCartridge` is
+    // answered with `set_cartridge`.
+    /// Copy patches `indices` of `slot`'s own cartridge — the picker's LEFT
+    /// pane — into the staged bank: from slot `at` on, overwriting, when a
+    /// drop named one; into the first empty slots when the Stage button or
+    /// the right-click road did not.
+    StagePatches {
+        slot: usize,
+        indices: Vec<usize>,
+        at: Option<usize>,
+    },
+    /// Empty these staged slots. The rest keep their numbers.
+    UnstagePatches { slots: Vec<usize> },
+    /// Exchange two staged slots — a drag within the right pane, which is
+    /// also how a patch moves into an empty one.
+    SwapStaged { a: usize, b: usize },
+    /// Play staged slot `index` through `slot`'s built-in, now. Auditioning,
+    /// exactly as `ChoosePatch` is — but nothing is written to the settings,
+    /// because a staged patch is in no file until Save bank puts it in one.
+    ChooseStaged { slot: usize, index: usize },
+    /// Open the patch editor on staged slot `index`, for `slot`'s strip, so
+    /// that its Save goes back INTO that slot rather than into the next
+    /// empty one. `EditPatch` remains the road in from the left pane.
+    EditStaged { slot: usize, index: usize },
+    /// Write the staged bank to `path` and make it `strip`'s cartridge — the
+    /// same thing loading the file would do, so what was just built is what
+    /// the picker shows and what the strip plays from now on. A path with no
+    /// extension gets `.syx`. Saved onto the shelf's `default.syx`, it is
+    /// also the bank every strip with no bank of its own opens on next time.
+    SaveBank {
+        strip: usize,
+        path: std::path::PathBuf,
+    },
 }
 
 /// How hard an auditioned note is struck.

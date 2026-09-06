@@ -509,7 +509,7 @@ pub struct SurfaceSpec<'a> {
     /// so a dialog that ends up behind the main window is an app that has
     /// frozen with nothing on screen saying why — that failure has been fixed
     /// twice already. But a floating dialog also floats above the OS's own file
-    /// panel, which is parented to the MAIN window, and then "Load .syx..."
+    /// panel, which is parented to the MAIN window, and then "Load bank..."
     /// appears to do nothing at all. So it is a flag rather than a constant,
     /// and the one moment it goes false is the one moment it must.
     pub on_top: bool,
