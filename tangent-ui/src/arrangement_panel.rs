@@ -6024,7 +6024,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     }
 }
 
-fn cut_to(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
+pub(crate) fn cut_to(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
     let measure = |t: &str| {
         painter
             .layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE)
