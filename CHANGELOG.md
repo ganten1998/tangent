@@ -135,6 +135,23 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A part recorded on an armed lane played back without the plugins it was
+  recorded through.** There is one insert rack per channel and it is clocked
+  once a block, so when the control room is monitoring an input it claims that
+  channel's rack and the timeline's own pass stands aside. The claim was made
+  for *any* armed channel, monitoring or not — and monitoring ships off, so the
+  ordinary state of an armed channel was a rack claimed by a room that was not
+  listening, whose entire output was then removed from the speakers again by
+  the monitor gate. The lane stood aside for nothing and its audio went to the
+  bus dry: record a part, leave the lane armed, press play, and the compressor
+  or amp you recorded through is not on it. Nothing platform-specific — every
+  desk did it. The rack now goes to whichever path can use it. If the room is
+  listening it keeps it and takes the lane's own audio through it as well, so
+  one run serves both. If the room is not listening and the lane holds audio,
+  the timeline takes it. If the room is not listening and the lane holds
+  nothing, the room keeps it exactly as before, so tracking through an amp sim
+  while the interface does the monitoring still reaches the take wet.
+
 - **The rate follower was building two AudioUnits a second, forever.** cpal's
   macOS `default_output_config` instantiates an AUHAL just to read a device's
   buffer range, and the poll that watches for a sample-rate change called it
