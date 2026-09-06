@@ -135,6 +135,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **An audio system that opens and then plays nothing is set aside instead of
+  being tried for ever.** A driver that refuses to open is easy — the open
+  fails, Tangent falls back, and the band says why. The expensive case is a
+  driver that says yes and does nothing: the stream is "running", the watchdog
+  declares it dead two seconds later, the rebuild opens the same driver, it says
+  yes again, and the app oscillates between silence and rebuilding for as long
+  as anybody leaves it there. Nothing in that loop is an error, so nothing in it
+  ever fell back. Windows has a stock example — Realtek ships a generic ASIO
+  wrapper, so a machine with no interface still presents "an ASIO device", and a
+  tester's log has Tangent announcing it was back on ASIO and playing silence.
+  An engine torn down having served zero callbacks never worked at all; two of
+  those in a row is a driver rather than a pulled cable, and the system is set
+  aside for the session in favour of one that plays. Plugging the interface in
+  gives it another turn, so the set-aside can never be permanent. No driver is
+  named or matched by name: the test is whether audio came out.
+
 - **The ASIO fallback was a one-shot, so the second time it was needed the app
   went silent for the session.** With `audio_system` set to ASIO and no
   interface plugged in, Tangent opens the platform default instead and says so.
