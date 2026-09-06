@@ -6264,6 +6264,13 @@ impl Renderer {
         // And no channel's RACK belongs to the room until this pass says so,
         // cleared here for the same reason and by the same single writer.
         // See `Renderer::room_rack`.
+        //
+        // **The OLD claim is kept first, because it is the one the lane pass
+        // has already acted on.** This pass runs after `mix_channels` in the
+        // chunk, so the mask the lane walk read a moment ago is the one being
+        // cleared here — and both the rack run and the clip merge below have
+        // to agree with what that walk did, not with what the next one will.
+        let stood_aside = self.room_rack;
         self.room_rack = 0;
         // A ring arriving, or being taken away. `try_lock`, never `lock`.
         // **A layout change for the ring already held.** Read before the
@@ -6573,11 +6580,8 @@ impl Renderer {
         // control-room question and the answer is the same for the whole room;
         // how loud each source is, and whether it is in the take at all, is a
         // question per channel and has a strip per channel.
-        let room_target = if self.shared.monitor_on.load(Ordering::Relaxed) {
-            1.0
-        } else {
-            0.0
-        };
+        let monitoring = self.shared.monitor_on.load(Ordering::Relaxed);
+        let room_target = if monitoring { 1.0 } else { 0.0 };
         let frames_got = got / ch_in;
         let n = frames.min(frames_got);
         if let Some(dry) = self.input_dry.get_mut(..frames * TAP_CHANNELS) {
@@ -6722,11 +6726,46 @@ impl Renderer {
             // Anything wider is folded down by taking the first two, which is
             // what a monitor is for — hearing that something is arriving, not
             // auditioning a surround mix.
+            // Whether this lane holds any timeline audio at all. A
+            // whole-timeline answer, not a per-block one, so nothing below it
+            // can flicker chunk to chunk and hole the audio at a clip's edge.
+            let clip_on_lane = self.clip_lanes & (1u32 << lane.min(CHANNELS - 1)) != 0;
+            // **This pass runs the rack only for a seat the lane walk has
+            // already stood aside for**, which is what keeps one chain on one
+            // clock across a chunk where the claim changes: the walk read the
+            // mask a moment ago, and the claim being built now is for next
+            // time. Without it, the chunk monitoring is switched on runs the
+            // lane's chain twice.
+            let takes_rack = stood_aside & (1u32 << strip.index().min(31)) != 0;
+            // **The timeline's audio on this lane joins the input, ahead of
+            // the rack**, when the room is the one holding that rack.
+            //
+            // This is what lets one chain serve two sources: what somebody is
+            // playing and what the lane is playing back. It is exact where it
+            // matters — a room that is listening has `room_target` at 1, so
+            // the `keep_out` subtrahend below is zero and none of the clip is
+            // taken back out of the speakers. While the room's gain is still
+            // RAMPING a share is briefly subtracted; that lasts as long as a
+            // monitoring toggle's fade and no longer.
+            //
+            // The clip takes `monitor_gain` exactly as the input does, so the
+            // fader sits in the same place for both — ahead of the rack, which
+            // is where this pass has always put it.
+            let merge_clip = takes_rack && clip_on_lane && monitoring;
             for i in 0..n {
                 self.monitor_gain[input] += (target - self.monitor_gain[input]) * self.gain_coeff;
                 for c in 0..TAP_CHANNELS {
-                    let lane = dev_col(c.min(width - 1));
-                    let src = self.monitor_scratch[i * ch_in + lane] * self.monitor_gain[input];
+                    let col = dev_col(c.min(width - 1));
+                    let clip = if merge_clip {
+                        self.clip_lane
+                            .get(i * CHANNELS * 2 + lane * 2 + c.min(1))
+                            .copied()
+                            .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    let src =
+                        (self.monitor_scratch[i * ch_in + col] + clip) * self.monitor_gain[input];
                     if let Some(dst) = self.fx_in.get_mut(c) {
                         dst[i] = src;
                     }
@@ -6805,11 +6844,60 @@ impl Renderer {
                             .map_or(&[][..], Vec::as_slice)
                     });
                 if !is_folder {
-                    // **The room's claim on this seat's rack.** See
-                    // `Renderer::room_rack`: the lane pass reads this next
-                    // chunk and stands aside, so one chain is clocked once.
-                    self.room_rack |= 1u32 << strip.index().min(31);
-                    run_rack(
+                    // ── WHO GETS THIS SEAT'S RACK ─────────────────────────
+                    //
+                    // One rack per seat, clocked once a chunk, and two paths
+                    // want it: the room, carrying what somebody is playing,
+                    // and the lane, carrying what the timeline holds. The
+                    // claim is how they take turns — `mix_channels` reads it
+                    // and stands aside — and it used to be made for ANY armed
+                    // strip.
+                    //
+                    // That is the fault. `monitor_on` ships OFF, so the usual
+                    // state of an armed channel was a rack claimed by a room
+                    // that was not listening, whose whole output the
+                    // subtrahend below then removed from the speakers again.
+                    // The lane stood aside for nothing and the timeline went
+                    // to the bus DRY: record a part, leave the lane armed,
+                    // press play, and the plugin you recorded through is not
+                    // on it. A tester met it on Windows; every desk did it.
+                    //
+                    // So the seat goes to whoever can use it:
+                    //
+                    // - **Room listening.** It keeps the rack and takes the
+                    //   lane's clip through it as well (`merge_clip` above) —
+                    //   one run, both sources, and with the room open the
+                    //   subtrahend is zero so none of the clip is taken back.
+                    // - **Room not listening, lane has no audio of its own.**
+                    //   Nothing is competing; the room keeps it exactly as
+                    //   before, so tracking a DI through an amp sim while the
+                    //   interface does the monitoring still reaches the take
+                    //   wet.
+                    // - **Room not listening, lane HAS audio.** The timeline
+                    //   takes it. This is the case that was broken, and the
+                    //   trade is stated rather than hidden: the live input
+                    //   reaches the take without THIS lane's bays. It was not
+                    //   audible through them either — the room is off — so the
+                    //   desk's own rule holds, "if the effects were audible
+                    //   while it was recorded, they are in the take".
+                    //
+                    // Serving both in that third case needs the chain run
+                    // twice over different sums, and a stateful chain run
+                    // twice is two INSTANCES of every plugin on the lane.
+                    // That is the real price, and it is not worth paying here.
+                    if monitoring || !clip_on_lane {
+                        self.room_rack |= 1u32 << strip.index().min(31);
+                    }
+                    // **Still inside the `!is_folder` arm opened above**, and
+                    // it has to be: a folder's rack belongs to `fold_folders`,
+                    // which runs it once over the whole group, and a second
+                    // run here would process the group's audio twice a block.
+                    // Named again this close to the call because the checklist
+                    // in `no_writer_runs_a_folders_rack_except_the_fold` looks
+                    // for exactly that word within sight of every `run_rack` —
+                    // and the paragraph above pushed the guard out of sight.
+                    if takes_rack {
+                        run_rack(
                         &mut self.racks[strip.index()],
                         &mut self.fx_in,
                         n,
@@ -6822,8 +6910,9 @@ impl Renderer {
                         // NOT a key pass: an input strip's seat is fed by
                         // the lane pass in `mix_channels`; this is its
                         // monitor run. See `KeyFeed`.
-                        None,
-                    );
+                            None,
+                        );
+                    }
                 }
             }
             let mut room = room_from;
@@ -8623,7 +8712,18 @@ impl Renderer {
             // and it is the only shape in which a lane can carry an
             // instrument AND a clip without one of them being quietly
             // discarded.
+            // **Whether the ROOM owns this seat's rack this chunk**, set by
+            // the monitor pass at the end of the last one. Read here rather
+            // than at the rack gate below because the SEEDING needs it too.
+            let room_owns = self.room_rack & (1u32 << ch.min(31)) != 0;
             {
+                // **A clip the ROOM has taken is not seeded here.** When this
+                // lane's rack belongs to the room, the monitor pass sums this
+                // same clip into its own pre-rack input and folds it wet — so
+                // seeding it here as well would put it on the bus twice, once
+                // wet and once dry. The lane keeps everything else it carries:
+                // its instrument, its notes, its fader, its meter.
+                let clip_here = has_audio && !room_owns;
                 // Disjoint fields borrow disjointly, which is the only
                 // reason this can be written as a copy rather than a
                 // per-sample method call.
@@ -8632,7 +8732,7 @@ impl Renderer {
                     let Some(dst) = fx.get_mut(c) else {
                         continue;
                     };
-                    if has_audio {
+                    if clip_here {
                         for f in 0..frames {
                             dst[f] = clip
                                 .get(f * CHANNELS * 2 + ch * 2 + c)
@@ -8732,7 +8832,6 @@ impl Renderer {
             // subtrahend taken from an input-only pass — two runs of a
             // non-linear chain to separate what one run mixed — and that is
             // a bigger piece of work than the regression it would close.
-            let room_owns = self.room_rack & (1u32 << ch.min(31)) != 0;
             if rack_live && !is_folder && !room_owns {
                 // ── THE PEDALBOARD ─────────────────────────────────────────
                 // **A bay holding the amp arms the channel's seven pedal
@@ -18828,6 +18927,114 @@ mod tests {
             "the master came out at {comped} with a deep compressor on the \
              clip's own lane and {bare} without it — the bay is not in the mix"
         );
+    }
+
+    /// **A recorded part plays back through its own plugins, whether or not
+    /// its lane is still armed.**
+    ///
+    /// One rack per seat, clocked once a chunk — so when the room is
+    /// monitoring an input it claims that seat's rack and the lane pass stands
+    /// aside. The claim used to be made for any ARMED strip, monitoring or
+    /// not, and the lane pass stood aside for it either way. Record a part on
+    /// an armed lane, leave it armed, press play: the timeline's own audio
+    /// went to the bus DRY. The owner's tester, on Windows: they could hear
+    /// the plugin and open its window, and the clip they had just recorded had
+    /// none of it. Nothing platform-specific about it — every desk did this.
+    ///
+    /// Two halves, and they fail apart:
+    ///
+    /// - **Monitoring OFF**, which is how the app ships. The room is not
+    ///   listening, so there is nothing to share and the claim is not made at
+    ///   all; the lane keeps its own rack.
+    /// - **Monitoring ON.** The room does need the rack, so it keeps it — and
+    ///   takes the lane's clip through it alongside the input. One run, both
+    ///   sources, and the clip comes out wet.
+    ///
+    /// The measurement is the one `the_master_mix_hears_a_clip_lanes_inserts`
+    /// makes, with the desk the old code could not survive: a constant clip
+    /// far over a fast deep compressor's threshold, on an ARMED lane with an
+    /// input open. The input itself is silence, so the master's peak is the
+    /// clip and nothing else, and the compressor either reduces it or the
+    /// clip never reached the bay.
+    ///
+    /// Revert check performed: restore the unconditional claim and the
+    /// monitoring-off half goes red; drop the clip merge in `mix_monitor` and
+    /// the monitoring-on half goes red. Neither alone covers both.
+    #[test]
+    fn a_clip_reaches_its_rack_on_an_armed_lane_the_room_is_holding() {
+        const CH: usize = 3;
+        const FRAMES: usize = 512;
+        let peak = |comp: bool, monitoring: bool| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            if comp {
+                let state = fast_deep_comp_state();
+                e.load_insert(
+                    CH,
+                    0,
+                    Some(Path::new(crate::builtin_fx::COMP_PATH)),
+                    Some(&state),
+                )
+                .expect("the comp loads")
+                .expect("the bay reports it");
+            }
+            e.set_channel_gain(CH, 1.0);
+            e.set_master_gain(1.0);
+            e.set_midi_off(1 << CH);
+            // **Armed with an input open** — the state a lane is left in the
+            // moment a record finishes, and the whole point of the fixture.
+            e.set_armed(1 << CH);
+            e.set_pick_strips([None, None, None, Some(CH)]);
+            e.set_monitor_on(monitoring);
+            let (mut jack, ring) = RingBuffer::<f32>::new(1 << 15);
+            e.set_monitor(Some((
+                ring,
+                1,
+                [0, 0, 0, 1],
+                FRAMES as u32,
+                tangent_record::audio::Picks::EVERYTHING,
+            )));
+            e.set_clips(vec![flat_clip(CH, 0.9)]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut out = vec![0.0f32; FRAMES * 2];
+            let mut push_silence = |jack: &mut rtrb::Producer<f32>| {
+                for _ in 0..FRAMES {
+                    let _ = jack.push(0.0);
+                }
+            };
+            // Settle: the lane fader slews only while the clips roll, and the
+            // comp needs a moment over a constant. Identical in every run.
+            for _ in 0..12 {
+                push_silence(&mut jack);
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            let mut peak = 0.0f32;
+            for _ in 0..8 {
+                push_silence(&mut jack);
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+            }
+            peak
+        };
+
+        for monitoring in [false, true] {
+            let bare = peak(false, monitoring);
+            assert!(
+                bare > 0.5,
+                "monitoring {monitoring}: the clip never reached the master at \
+                 all ({bare}), so the comparison below would prove nothing"
+            );
+            let comped = peak(true, monitoring);
+            assert!(
+                comped < bare * 0.5,
+                "monitoring {monitoring}: the master came out at {comped} with a \
+                 deep compressor on the clip's own lane and {bare} without it — \
+                 an armed lane's recorded audio is going to the bus dry, which \
+                 is a part played back without the plugin it was recorded through"
+            );
+        }
     }
 
     /// **A clip is delay-compensated like every other source, and PER LANE.**
