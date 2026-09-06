@@ -2089,6 +2089,25 @@ pub enum RecorderRequest {
         strip: usize,
         path: std::path::PathBuf,
     },
+    /// **Strip `strip` is holding `key` down, or is holding nothing.** The
+    /// DX7 picker's press-and-hold audition, and the one note in this enum
+    /// that says WHICH strip it is for. Appended at the END, this enum's law.
+    ///
+    /// [`RecorderRequest::Audition`] is the other note road and it names no
+    /// strip on purpose: it goes through the engine's MIDI in and reaches
+    /// every lane the desk's routing admits, which is exactly right for the
+    /// on-screen keyboard and exactly wrong for a picker. That window is
+    /// about one strip's built-in instrument, and that strip is as often as
+    /// not neither armed nor selected — so a picker's note down that road
+    /// sounds on whatever the desk happens to be pointing at, or on nothing.
+    ///
+    /// **A LEVEL, not an edge**, all the way to the audio thread. `key` is
+    /// what is being held, not a thing that has happened, so the release is
+    /// not a message that can go missing: the sender says "nothing" as often
+    /// as it likes and the engine converges on it. Every previous held note
+    /// in this app has been an on paired with an off somebody had to remember
+    /// to send, and two of them have shipped ringing for ever.
+    AuditionStrip { strip: usize, key: Option<u8> },
 }
 
 /// How hard an auditioned note is struck.
@@ -2097,6 +2116,19 @@ pub enum RecorderRequest {
 /// usually its harshest, and this is a note somebody asked to hear rather than
 /// one they played.
 pub const AUDITION_VELOCITY: u8 = 88;
+
+/// The note an auditioned PATCH speaks — middle C, which this app spells C4
+/// wherever it writes a pitch down (see `dialogs::pitch_name`, where MIDI 60
+/// reading back as C4 is asserted rather than assumed).
+///
+/// One pitch and not the one under the pointer, because the picker's rows are
+/// names and not keys: what a patch sounds like is a question about the patch,
+/// and asking it at the same pitch every time is what makes two answers
+/// comparable. Middle C because a DX7 bank is voiced around it — the operator
+/// levels, the keyboard scaling breakpoints and the rate scaling all read from
+/// there, so it is the pitch a patch was almost certainly auditioned at when
+/// it was made.
+pub const AUDITION_NOTE: u8 = 60;
 
 // ── The export contract ─────────────────────────────────────────────────────
 

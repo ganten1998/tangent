@@ -12,6 +12,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **Press and hold a DX7 patch name to hear it.** The instrument's picker
+  sounds the patch under your finger at middle C, on the strip the window
+  belongs to, for as long as the button is down. It works in both panes, on
+  the loaded cartridge's rows and on the staged bank's slots, and on the
+  built-in row at the top; the click it is layered on still means what it
+  meant, so a press that ends in a click leaves the strip on that patch and
+  writes it down, and a press that wanders off or turns into a drag puts the
+  strip back on the row the picker is lighting. Auditioning was always what
+  this window did, but only in the sense that it LOADED the patch: hearing one
+  meant having a keyboard under your other hand, which is no use for browsing
+  a thirty-two voice bank. The note goes to the picker's own strip rather than
+  wherever the desk's MIDI is pointing, so it works on a strip that is neither
+  armed nor selected, which is the state a picker is opened in as often as
+  not, and it stays out of the take: a bank browsed over a rolling recording
+  puts nothing in the part.
+
 - **The MIDI editor has the band's scrubber.** The strip along the top of the
   piano roll now carries the whole clip in miniature, between the clip's name
   and the pencil: a recessed box the width of the clip and its pad, the notes
