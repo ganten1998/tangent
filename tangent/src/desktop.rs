@@ -370,6 +370,17 @@ struct Recorder {
     /// noise" against an app log with zero backend errors. Off Linux it
     /// answers `None` forever and starts no thread.
     graph_dropouts: tangent_record::audio::GraphDropouts,
+    /// **CoreAudio's own "a block was late", on the device the engine opened.**
+    ///
+    /// The macOS counterpart to `graph_dropouts`, and the reason it exists:
+    /// on this platform BOTH existing counters are structurally blind.
+    /// `Engine::xruns` matches a string only cpal's ALSA and JACK hosts emit,
+    /// and `GraphDropouts` is a PipeWire reader compiled only on Linux — so
+    /// `merge_dropouts` was handed `None` and `0` on every Mac and the panel
+    /// said zero while somebody was listening to it crackle. Re-armed on the
+    /// same edge that builds an engine, since a new stream is a new count and
+    /// possibly a new device. See `outpath::OverloadWatch`.
+    overload: crate::outpath::OverloadWatch,
     /// The graph's floor, refreshed on the same edge that reopens the streams.
     ///
     /// Cached because reading it costs a process (`pw-metadata`), and a panel
@@ -1728,6 +1739,28 @@ const CLIPS_OWED_DEADLINE: std::time::Duration = std::time::Duration::from_milli
 
 const RATE_ASK_EVERY: std::time::Duration = std::time::Duration::from_millis(1_000);
 
+/// **Take the old AUHAL road back**, for an A/B on a machine that crackles.
+///
+/// `TANGENT_RATE_POLL=auhal` and nothing else; any other value, or none, is
+/// the HAL property read. Read once and cached, because this is asked on a
+/// poll thread once a second and an environment lookup per tick would be a
+/// smaller version of the very cost it exists to measure.
+#[cfg(target_os = "macos")]
+fn legacy_rate_poll() -> bool {
+    use std::sync::OnceLock;
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        let on = std::env::var("TANGENT_RATE_POLL").as_deref() == Ok("auhal");
+        if on {
+            log::warn!(
+                "TANGENT_RATE_POLL=auhal: the rate follower is building two \
+                 AudioUnits a second again (the pre-5.0 road, kept for A/B)"
+            );
+        }
+        on
+    })
+}
+
 /// **The device's rate, asked on a thread of its own.**
 ///
 /// `Engine::default_output_rate` looks cheap and is not: it takes the cpal
@@ -1776,10 +1809,38 @@ impl RatePoll {
                 // ASIO the follower asks the engine's own device on the UI
                 // thread instead (`Engine::device_rate_now`), and this thread
                 // reports nothing.
+                // **On macOS the rate is READ, not manufactured.**
+                //
+                // `Engine::default_output_rate` goes through cpal, and cpal's
+                // macOS `default_output_config` answers by BUILDING AN AUHAL
+                // (`audio_unit_from_device`) — twice per tick here, once
+                // inside `output_is_live` and once for the rate. Measured on
+                // the owner's Mac, 40 samples: 21 ms at the median, 32 ms at
+                // p95, 42 ms a second, for the life of the process, on a
+                // machine whose audio server every other application on the
+                // device is also using. `outpath::nominal_rate` is one
+                // `AudioObjectGetPropertyData` and returns the same number —
+                // pinned by `the_hal_rate_agrees_with_the_audio_unit_it_replaces`.
+                //
+                // The ASIO guard above still covers both arms, and ASIO is a
+                // Windows system, so the crash of 2026-09-05 cannot reach the
+                // macOS road at all. Set `TANGENT_RATE_POLL=auhal` to take
+                // the old road back for an A/B on a machine that is misbehaving.
                 let hz = if tangent_record::audio::system_is_asio() {
                     0
                 } else {
-                    crate::instrument::Engine::default_output_rate(None).unwrap_or(0)
+                    #[cfg(target_os = "macos")]
+                    {
+                        if legacy_rate_poll() {
+                            crate::instrument::Engine::default_output_rate(None).unwrap_or(0)
+                        } else {
+                            crate::outpath::nominal_rate(None).unwrap_or(0)
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        crate::instrument::Engine::default_output_rate(None).unwrap_or(0)
+                    }
                 };
                 cell.store(hz, Ordering::Relaxed);
                 // Dropped BEFORE the sleep, so the last owner going away is
@@ -2523,11 +2584,24 @@ impl DesktopApp {
             // Merged, not preferred: each counter has been measured blind on
             // one of the two paths this ships on, in opposite directions —
             // `merge_dropouts`'s doc carries both measurements.
-            let xruns = tangent_record::audio::merge_dropouts(
-                self.recorder.graph_dropouts.latest(),
-                engine.xruns(),
-            )
-            .unwrap_or(0);
+            // **Three counters now, each blind somewhere.** The two above
+            // are both blind on macOS — see `Recorder::overload` — so the
+            // HAL's own overload count is merged in the same way they are
+            // merged with each other: the best lower bound anyone could see,
+            // and `None` only where NOBODY could. Off macOS the watch answers
+            // `None` and this is the arithmetic it always was.
+            let xruns = match (
+                tangent_record::audio::merge_dropouts(
+                    self.recorder.graph_dropouts.latest(),
+                    engine.xruns(),
+                ),
+                self.recorder.overload.count(),
+            ) {
+                (Some(seen), Some(hal)) => seen.max(hal),
+                (Some(seen), None) => seen,
+                (None, Some(hal)) => hal,
+                (None, None) => 0,
+            };
             // A reopen makes NEW nodes with fresh counters, so the number can
             // legitimately fall; chase it down rather than hiding every
             // dropout the new stream has until it beats the old one's total.
@@ -2604,6 +2678,28 @@ impl DesktopApp {
                 self.recorder.engine_error = Some(why);
                 self.recorder.inserts_loaded =
                     vec![None; tangent_ui::recorder::INSERT_SPACE];
+                // **Engine-scoped like the resets above**, and placed AFTER
+                // them on purpose: `a_restarted_engine_is_told_the_tempo_map_again`
+                // samples a fixed window over this function to check those
+                // three stay together, and that window has already had to
+                // grow twice for people who added lines above them. Adding
+                // here costs it nothing. Watched by the name the output
+                // ACTUALLY opened with — a fallback lands on another device
+                // and a watch on the wrong one never moves. See
+                // `Recorder::overload`.
+                let opened_on = self
+                    .recorder
+                    .engine
+                    .as_ref()
+                    .map(|e| e.output().device.clone());
+                self.recorder.overload =
+                    crate::outpath::OverloadWatch::watch(opened_on.as_deref());
+                // `xruns_seen` is deliberately NOT reset with it. On Linux
+                // `graph_dropouts` is a cumulative process-wide count that
+                // survives an engine rebuild, so zeroing the high-water mark
+                // here would re-announce the whole backlog as "+48 just now"
+                // after every reopen. The chase-down below already handles a
+                // counter that legitimately falls, which is the macOS case.
                 // **No timed retries here — the reprobe thread owns recovery.**
                 // The yank test proved why: a watchdog-declared death is
                 // usually GONE HARDWARE, and `Engine::start` against a dead
@@ -10363,6 +10459,55 @@ impl DesktopApp {
                 if let Some(tap) = self.recorder.session.take_monitor() {
                     self.recorder.pending_monitor = Some(tap);
                 }
+                // **The input half of the path, in the log at last.**
+                //
+                // Nothing on this road logged at info level, so a mailed-in
+                // log described the output in detail and did not say an input
+                // existed — on a build where the Recorder band cannot be
+                // hidden, which means the stream is ALWAYS open, its callback
+                // is always running the monitor racks, and on macOS it asks
+                // for a QUARTER of the path's buffer whenever the microphone
+                // is a second box (`audio::input_ask_frames`). Three facts
+                // that decide how much work is happening, none of them
+                // visible. The same shape as the `audio out:` line, including
+                // its honesty about which numbers are wishes.
+                match self.recorder.session.audio_device_name() {
+                    Some(name) => {
+                        let out = self
+                            .recorder
+                            .engine
+                            .as_ref()
+                            .map(|e| e.output().device.clone());
+                        // What `is_second_device` decides, decided here the
+                        // same way, so the log says whether the quarter rule
+                        // is in play rather than leaving it to be inferred.
+                        let second = out.as_deref().is_some_and(|o| o != name);
+                        log::info!(
+                            "audio in: {} - {} ch, asked {} Hz, path buffer {} \
+                             frames ({}) - not yet measured",
+                            name,
+                            self.recorder.session.device_channels().unwrap_or(0),
+                            rate.map_or_else(
+                                || "the device's own".to_owned(),
+                                |r| r.to_string()
+                            ),
+                            buffer.map_or_else(
+                                || "the device's own".to_owned(),
+                                |b| b.to_string()
+                            ),
+                            if second {
+                                "a second box, so macOS asks a quarter of it"
+                            } else {
+                                "the output's own device, so both halves ask the same"
+                            },
+                        );
+                    }
+                    None => {
+                        if let Some(err) = self.recorder.session.audio_error() {
+                            log::warn!("audio in: the input would not open: {err}");
+                        }
+                    }
+                }
             }
             // The user picked "None - record MIDI only". Mapping that to the
             // system default (which is what happened before `explicit` existed)
@@ -13620,6 +13765,7 @@ impl DesktopApp {
                 out_block_logged: None,
                 rate_asked: None,
                 #[cfg(feature = "recorder")]
+                overload: crate::outpath::OverloadWatch::default(),
                 rate_poll: RatePoll::start(),
                 xruns_seen: 0,
                 graph_dropouts: tangent_record::audio::GraphDropouts::start(),

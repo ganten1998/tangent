@@ -83,6 +83,35 @@ pub fn probe(_device: Option<&str>) -> OutputPath {
     OutputPath::default()
 }
 
+/// **The default output's nominal rate, without building an AudioUnit.**
+///
+/// Off macOS there is no HAL to ask and the caller keeps its own road; see the
+/// macOS twin for why that road was worth leaving.
+#[cfg(not(target_os = "macos"))]
+pub fn nominal_rate(_device: Option<&str>) -> Option<u32> {
+    None
+}
+
+/// The stand-in on every platform without a CoreAudio HAL: it watches
+/// nothing and says so, so `count()` stays `None` and the merge that reads it
+/// is byte-for-byte the arithmetic it was before this type existed.
+#[cfg(not(target_os = "macos"))]
+#[derive(Default)]
+pub struct OverloadWatch;
+
+#[cfg(not(target_os = "macos"))]
+impl OverloadWatch {
+    pub fn watch(_device: Option<&str>) -> Self {
+        Self
+    }
+    pub fn count(&self) -> Option<u64> {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use mac::{nominal_rate, OverloadWatch};
+
 #[cfg(target_os = "macos")]
 pub use mac::probe;
 
@@ -114,6 +143,14 @@ mod mac {
     const LATENCY: u32 = fourcc(b"ltnc");
     const SAFETY_OFFSET: u32 = fourcc(b"saft");
     const STREAMS: u32 = fourcc(b"stm#");
+
+    /// `kAudioDevicePropertyNominalSampleRate`. A plain `Float64` read on the
+    /// device object — the same number cpal returns from
+    /// `default_output_config`, at none of the price. See [`nominal_rate`].
+    const NOMINAL_RATE: u32 = fourcc(b"nsrt");
+    /// `kAudioDeviceProcessorOverload`. Not a value: the HAL POSTS this when
+    /// an IO cycle on the device missed its deadline. See [`OverloadWatch`].
+    const PROCESSOR_OVERLOAD: u32 = fourcc(b"over");
 
     const T_VIRTUAL: u32 = fourcc(b"virt");
     const T_AGGREGATE: u32 = fourcc(b"grup");
@@ -154,7 +191,27 @@ mod mac {
             io_size: *mut u32,
             out_data: *mut c_void,
         ) -> OSStatus;
+        fn AudioObjectAddPropertyListener(
+            id: AudioObjectID,
+            address: *const PropertyAddress,
+            listener: ListenerProc,
+            client_data: *mut c_void,
+        ) -> OSStatus;
+        fn AudioObjectRemovePropertyListener(
+            id: AudioObjectID,
+            address: *const PropertyAddress,
+            listener: ListenerProc,
+            client_data: *mut c_void,
+        ) -> OSStatus;
     }
+
+    /// `AudioObjectPropertyListenerProc`, exactly as the header declares it.
+    type ListenerProc = unsafe extern "C" fn(
+        AudioObjectID,
+        u32,
+        *const PropertyAddress,
+        *mut c_void,
+    ) -> OSStatus;
 
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
@@ -332,6 +389,161 @@ mod mac {
         }
     }
 
+    /// **The device's nominal sample rate, for the price of a property read.**
+    ///
+    /// The rate follower asked this question through cpal, and cpal's macOS
+    /// `default_output_config` answers it by BUILDING AN AUHAL — 
+    /// `audio_unit_from_device` instantiates an `AudioUnit`, sets its current
+    /// device and reads the buffer-frame range back, only for the caller to
+    /// throw all of that away and keep one `Float64`. Measured on this Mac,
+    /// 40 samples: 21 ms at the median, 32 ms at p95, and the follower calls
+    /// it TWICE a second for the life of the process — once through
+    /// `output_is_live` and once for the rate itself.
+    ///
+    /// This is the same number by the road the HAL means for it: resolve the
+    /// device, read `kAudioDevicePropertyNominalSampleRate`, done. No
+    /// component instantiated, nothing registered with the audio server,
+    /// nothing for a running IO proc to contend with.
+    ///
+    /// `None` where the HAL will not answer, which the follower already reads
+    /// as "not evidence of a move" (`RateWatch::note`) — so a machine whose
+    /// HAL is unhappy gets a follower that does nothing rather than a
+    /// follower that reopens the audio path on a guess.
+    pub fn nominal_rate(device: Option<&str>) -> Option<u32> {
+        let id = resolve(device)?;
+        let hz: f64 = get(id, &PropertyAddress::global(NOMINAL_RATE))?;
+        // The same sanity window `Engine::default_output_rate` applies, so the
+        // two roads cannot disagree about what counts as a rate at all.
+        (hz.is_finite() && (8_000.0..=768_000.0).contains(&hz)).then_some(hz as u32)
+    }
+
+    /// **CoreAudio's own answer to "did a block arrive late".**
+    ///
+    /// Tangent could not report a dropout on macOS at all. `Engine::xruns`
+    /// counts a `BackendSpecific` error whose description starts with
+    /// `"xrun"`, and that string exists only in cpal's ALSA and JACK hosts —
+    /// CoreAudio never emits it. `GraphDropouts` is a PipeWire reader and is
+    /// `#[cfg(target_os = "linux")]`. So `merge_dropouts` was handed `None`
+    /// and `0` on every Mac, answered `None`, and the warn line that exists
+    /// to be grepped after "it crackled" could never fire — while the Audio
+    /// Status panel told the user, confidently, zero.
+    ///
+    /// `kAudioDeviceProcessorOverload` is the signal that was there the whole
+    /// time: the HAL posts it on the DEVICE when an IO cycle overruns. It
+    /// costs nothing when nothing overruns — there is no polling here, only a
+    /// listener the HAL calls — and it sees overloads caused by anyone on the
+    /// device, which is the right scope for a fault the user hears in other
+    /// applications too.
+    ///
+    /// A watch that could not resolve its device answers `None`, not `0`:
+    /// "nobody could see" and "nobody was late" are the distinction the whole
+    /// merge is built on, and collapsing them here would re-tell the same lie
+    /// in a new place.
+    pub struct OverloadWatch {
+        /// `None` when the device could not be resolved — nothing was
+        /// installed and there is nothing to remove.
+        device: Option<AudioObjectID>,
+        counter: &'static std::sync::atomic::AtomicU64,
+    }
+
+    /// The listener the HAL calls, on its own notification thread.
+    ///
+    /// # Safety
+    ///
+    /// `client_data` is the pointer handed to `AudioObjectAddPropertyListener`
+    /// below, which is always a `&'static AtomicU64`.
+    unsafe extern "C" fn on_overload(
+        _id: AudioObjectID,
+        _count: u32,
+        _addresses: *const PropertyAddress,
+        client_data: *mut c_void,
+    ) -> OSStatus {
+        if !client_data.is_null() {
+            // SAFETY: the only pointer ever installed with this listener is a
+            // leaked `Box<AtomicU64>`, which outlives every watch.
+            let counter = unsafe { &*client_data.cast::<std::sync::atomic::AtomicU64>() };
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        0
+    }
+
+    impl OverloadWatch {
+        /// Start watching the device the engine actually opened, by the name
+        /// it reported — the same name-is-the-identity rule [`resolve`] uses
+        /// for the panel, and the same one cpal itself has on this platform.
+        pub fn watch(device: Option<&str>) -> Self {
+            // **Leaked on purpose, and it is eight bytes.**
+            //
+            // `AudioObjectRemovePropertyListener` does not promise that a
+            // listener already running on the HAL's thread has returned by
+            // the time it does, so freeing this on `Drop` would be a
+            // use-after-free with a window nobody can close from here. A
+            // watch is made once per engine open; a session that reopened the
+            // path a thousand times would leak eight kilobytes.
+            let counter: &'static std::sync::atomic::AtomicU64 =
+                Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+            let Some(id) = resolve(device) else {
+                return Self { device: None, counter };
+            };
+            let address = PropertyAddress::global(PROCESSOR_OVERLOAD);
+            // SAFETY: `address` is a live borrow for the length of the call,
+            // and `counter` is `'static`, so the pointer stays valid for as
+            // long as the HAL can call back through it.
+            let status = unsafe {
+                AudioObjectAddPropertyListener(
+                    id,
+                    &address,
+                    on_overload,
+                    (counter as *const std::sync::atomic::AtomicU64 as *mut std::sync::atomic::AtomicU64).cast(),
+                )
+            };
+            if status != 0 {
+                log::debug!(
+                    "the overload listener would not install on this device \
+                     (status {status}); dropouts will read as unknown"
+                );
+                return Self { device: None, counter };
+            }
+            Self { device: Some(id), counter }
+        }
+
+        /// Overloads since this watch started, or `None` where nothing could
+        /// be watched.
+        pub fn count(&self) -> Option<u64> {
+            self.device
+                .map(|_| self.counter.load(std::sync::atomic::Ordering::Relaxed))
+        }
+    }
+
+    impl Default for OverloadWatch {
+        /// A watch over nothing, for the moment before an engine exists.
+        fn default() -> Self {
+            Self {
+                device: None,
+                counter: Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0))),
+            }
+        }
+    }
+
+    impl Drop for OverloadWatch {
+        fn drop(&mut self) {
+            let Some(id) = self.device else { return };
+            let address = PropertyAddress::global(PROCESSOR_OVERLOAD);
+            // SAFETY: the same three arguments this watch installed with.
+            // The counter is `'static` and deliberately not freed here.
+            unsafe {
+                AudioObjectRemovePropertyListener(
+                    id,
+                    &address,
+                    on_overload,
+                    (self.counter as *const std::sync::atomic::AtomicU64
+                        as *mut std::sync::atomic::AtomicU64)
+                        .cast(),
+                );
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -356,6 +568,8 @@ mod mac {
                 (STREAMS, 0x7374_6d23),         // 'stm#'
                 (T_VIRTUAL, 0x7669_7274),       // 'virt'
                 (T_AGGREGATE, 0x6772_7570),     // 'grup'
+                (NOMINAL_RATE, 0x6e73_7274),    // 'nsrt'
+                (PROCESSOR_OVERLOAD, 0x6f76_6572), // 'over'
             ] {
                 assert_eq!(got, want, "a selector does not match the header");
             }
@@ -382,6 +596,63 @@ mod mac {
             // A name nothing is called resolves to nothing, and must not
             // resolve to the default by accident.
             assert!(!probe(Some("\u{1}no such device\u{1}")).known);
+        }
+
+        /// **The cheap road and the expensive road must return the same
+        /// number**, or the rate follower would start reopening the audio
+        /// path on a disagreement between two ways of asking one question.
+        ///
+        /// This is the whole no-regression case for [`nominal_rate`]: it is
+        /// allowed to be faster, it is not allowed to be different. Skips
+        /// where either side cannot answer — a build machine with no audio
+        /// device is not a machine with a bug — and that is honest, because
+        /// the follower treats `None` from either road identically.
+        #[test]
+        fn the_hal_rate_agrees_with_the_audio_unit_it_replaces() {
+            use cpal::traits::{DeviceTrait, HostTrait};
+            let Some(device) = cpal::default_host().default_output_device() else {
+                eprintln!("skipping: no default output on this machine");
+                return;
+            };
+            let Some(via_unit) = device
+                .default_output_config()
+                .ok()
+                .map(|c| c.sample_rate().0)
+                .filter(|r| (8_000..=768_000).contains(r))
+            else {
+                eprintln!("skipping: the default output would not report a config");
+                return;
+            };
+            let Some(via_hal) = nominal_rate(None) else {
+                eprintln!("skipping: the HAL would not report a nominal rate");
+                return;
+            };
+            assert_eq!(
+                via_hal, via_unit,
+                "the HAL read and cpal's AudioUnit disagree about the default \
+                 output's rate - the rate follower would reopen the path forever"
+            );
+        }
+
+        /// A watch installs, answers a number, and comes back down without
+        /// taking the process with it. It cannot assert an overload HAPPENED
+        /// — that needs a machine in trouble — but "installed, readable,
+        /// removable" is what would break silently.
+        #[test]
+        fn an_overload_watch_installs_and_removes() {
+            let watch = OverloadWatch::watch(None);
+            match watch.count() {
+                // A machine with a working default output: the listener took,
+                // and a fresh watch has seen nothing yet.
+                Some(n) => assert_eq!(n, 0, "a new watch starts at zero"),
+                // No default output, or the HAL refused: `None` is the honest
+                // answer and the merge treats it as "nobody could see".
+                None => eprintln!("skipping: nothing to watch on this machine"),
+            }
+            drop(watch);
+            // A watch over nothing must also be safe to make and drop.
+            assert!(OverloadWatch::watch(Some("\u{1}no such device\u{1}")).count().is_none());
+            assert!(OverloadWatch::default().count().is_none());
         }
     }
 }
