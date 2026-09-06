@@ -337,11 +337,29 @@ impl StderrLogger {
     }
 }
 
+/// **wgpu's GL backend logs a normal code path as an error, once per
+/// video frame.** `AdapterShared::get_buffer_sub_data` (wgpu-hal 29,
+/// `gles/adapter.rs`) has two ways to read a buffer back; when the context
+/// lacks `GET_BUFFER_SUB_DATA` it uses `map_buffer_range` instead and says
+/// `log::error!("Fake map")` on the way — a debugging aid somebody left in,
+/// on the path every compositor readback takes on a Mesa EGL context. The
+/// owner's Void box (Ivy Bridge, HD 4000) wrote 231 of those lines during a
+/// fifteen-second take, fifteen a second, and the take's own lines — the
+/// ones that say what the take lost — were buried in them. The picture is
+/// fine; the line is noise; it is dropped before either sink sees it. Only
+/// that one message from that one crate, so a real GL error still lands.
+fn is_fake_map_noise(target: &str, message: &str) -> bool {
+    target.starts_with("wgpu_hal::gles") && message == "Fake map"
+}
+
 impl log::Log for StderrLogger {
     fn enabled(&self, m: &log::Metadata<'_>) -> bool {
         m.level() <= self.ceiling()
     }
     fn log(&self, r: &log::Record<'_>) {
+        if is_fake_map_noise(r.target(), &r.args().to_string()) {
+            return;
+        }
         if r.level() <= self.0 {
             eprintln!("[{}] {}: {}", r.level(), r.target(), r.args());
         }
@@ -1291,5 +1309,21 @@ mod diagnosability_tests {
         assert_eq!(window_title("", true), "Tangent", "no project, nothing to be dirty");
         assert_eq!(window_title("First Song", false), "First Song - Tangent");
         assert_eq!(window_title("First Song", true), "First Song * - Tangent");
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::is_fake_map_noise;
+
+    /// **wgpu's "Fake map" is dropped, and nothing else is.** The same crate
+    /// saying anything else, or another crate saying those words, still
+    /// reaches the log. Revert-check, performed: make the helper answer on
+    /// the target alone and the second assertion goes red.
+    #[test]
+    fn wgpus_fake_map_line_is_dropped_and_real_gl_errors_are_kept() {
+        assert!(is_fake_map_noise("wgpu_hal::gles::adapter", "Fake map"));
+        assert!(!is_fake_map_noise("wgpu_hal::gles::adapter", "GL error: out of memory"));
+        assert!(!is_fake_map_noise("tangent::desktop", "Fake map"));
     }
 }
