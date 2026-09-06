@@ -9582,7 +9582,39 @@ impl DesktopApp {
         // device list is a registry of drivers rather than of hardware, and
         // the one the Windows tester's machine has.
         if let Err(e) = &started {
-            if fallback_wanted(chosen.as_deref()) && self.recorder.fallback.is_none() {
+            // **May I fall back?** is not the same question as **what am I
+            // standing in for?**, and asking the second one for both made the
+            // fallback a ONE-SHOT that never re-armed.
+            //
+            // `recorder.fallback` is the marker: it names the system being
+            // stood in for, keeps the reprobe alive while the stand-in runs
+            // (see the probe's own guard) and carries the "back on ASIO" line
+            // when the interface returns. It is cleared in exactly one place —
+            // the `Ok` arm below, and only once `system()` is `Some` again.
+            // While the stand-in is running `system()` is `None`, by this
+            // block's own hand, so the marker cannot be cleared: it stays
+            // `Some` for the rest of the session.
+            //
+            // Gating the fallback on it therefore meant the FIRST ASIO failure
+            // fell back and every later one did not. Drop the engine for any
+            // reason — an output that went quiet, a band closed and reopened —
+            // and the rebuild restores the chosen system, fails on it again,
+            // finds the marker still `Some`, and does not fall back. It spends
+            // its retries on the absent interface and gives up. Permanent
+            // silence, on a machine where choosing WASAPI by hand works
+            // perfectly. A Windows tester's log caught it: one "opening the
+            // platform default" line, then thirteen bare failures with no
+            // second one.
+            //
+            // So the question asked here is only the first one. The marker is
+            // still written below, and still does its two real jobs.
+            if fallback_wanted(chosen.as_deref()) {
+                // **Said once per stand-in, not once per rebuild.** The log
+                // keeps every line — it is the evidence trail that found this
+                // — but a rebuild storm must not put the same red toast up
+                // thirteen times. A stand-in that ends restores the marker to
+                // `None`, so the next genuine fallback speaks again.
+                let already_standing_in = self.recorder.fallback.is_some();
                 log::warn!(
                     "no audio output through ASIO: {e} - opening the platform default for \
                      this session instead; the setting stays ASIO and the interface is \
@@ -9598,14 +9630,16 @@ impl DesktopApp {
                 match &started {
                     Ok(e) => {
                         self.recorder.fallback = chosen.clone();
-                        self.app.notify(
-                            tangent_ui::notify::Kind::Error,
-                            format!(
-                                "ASIO has no working output - is the interface plugged in? \
-                                 Using {} through the system's own audio until it is back.",
-                                e.output().device
-                            ),
-                        );
+                        if !already_standing_in {
+                            self.app.notify(
+                                tangent_ui::notify::Kind::Error,
+                                format!(
+                                    "ASIO has no working output - is the interface plugged in? \
+                                     Using {} through the system's own audio until it is back.",
+                                    e.output().device
+                                ),
+                            );
+                        }
                     }
                     // Nothing to fall back on either: the chosen system is
                     // put back for the retries below, so a returning
@@ -17123,20 +17157,23 @@ mod tests {
         let start = src
             .find("fn start_engine")
             .expect("the engine starter is still called that");
-        // **A window over the function, and it has had to grow.** 4_000 was
-        // enough until `start_engine` gained the buffer-measurement reset and
-        // the paragraph that says why the line above it prints two requests
-        // and no measurement; the cache invalidation this is looking for then
-        // sat just outside the sample and the test went red for a reason that
-        // had nothing to do with tempo maps. 6_000 lasted until the ASIO
-        // fallback block (2026-09-05) grew the function by three thousand
-        // characters and nobody ran this suite after it; the line sat at
-        // 7,189 and the test was red for the rest of the day without anybody
-        // seeing it. The number is a sample size, not a claim — what actually
-        // pins the invalidation in place is the ordering assertion below,
-        // which holds it between the two sibling resets whatever the
-        // function's length.
-        let body = &src[start..src.len().min(start + 8_000)];
+        // **The WHOLE function, found by its end rather than by a character
+        // count.** This was a fixed window and the count had to be raised
+        // three times: 4_000 when `start_engine` gained the buffer-measurement
+        // reset, 6_000 when the ASIO fallback block arrived and left the test
+        // red for a day that nobody noticed, 8_000 when the fallback learned
+        // to re-arm. Every one of those was a red test that had nothing to do
+        // with tempo maps, and every one cost somebody the time to find that
+        // out. A sample size is not a claim: what pins the invalidation in
+        // place is the ORDERING assertion below, which holds it between its
+        // two siblings whatever the function's length — so the sample may as
+        // well be the function, and then it cannot go stale again. The same
+        // `\n    fn ` end-marker the other source scans in this file use.
+        let body = {
+            let rest = &src[start..];
+            let end = rest.find("\n    fn ").unwrap_or(rest.len());
+            &rest[..end]
+        };
         assert!(
             body.contains("self.pushed_maps = None;"),
             "`start_engine` does not invalidate the tempo-map cache, so the new \
@@ -17776,6 +17813,84 @@ mod tests {
         assert!(
             src.contains("self.recorder.engine.is_some() && self.recorder.fallback.is_none()"),
             "the probe is dropped while the engine runs on the fallback, so the interface is never noticed coming back"
+        );
+        // **And the fallback RE-ARMS.** See the test below for the whole of
+        // why; asserted here too because this is the test that reads the
+        // fallback block, and a future edit to it lands in both.
+        let block = {
+            let a = engine.find("if let Err(e) = &started {").expect("the fallback block is gone");
+            let b = engine[a..].find("\n        match started {").expect("its end");
+            &engine[a..a + b]
+        };
+        assert!(
+            !block.contains("self.recorder.fallback.is_none()"),
+            "the fallback is gated on its own marker again - a one-shot that \
+             never re-arms; see `an_asio_fallback_re_arms_after_the_engine_is_dropped`"
+        );
+    }
+
+    /// **The ASIO fallback re-arms.** It was a one-shot, and the second time
+    /// it was needed the app went silent for the rest of the session.
+    ///
+    /// `recorder.fallback` names the system being stood in for. It does two
+    /// real jobs — it keeps the reprobe alive while the stand-in runs, and it
+    /// carries the "back on ASIO" line when the interface returns — and it was
+    /// doing a third it could not do: deciding whether a fallback may happen
+    /// at all. It cannot, because it is cleared in exactly one place, the `Ok`
+    /// arm of `start_engine`, and only once `tangent_record::audio::system()`
+    /// is `Some` again. The stand-in itself sets that to `None`. So once set
+    /// the marker stays set, and `fallback.is_none()` is false for the rest of
+    /// the session.
+    ///
+    /// What that cost, from a Windows tester's log: a laptop with the
+    /// interface unplugged and `audio_system = "ASIO"` falls back once and
+    /// plays. The output goes quiet — these litter that log — the engine is
+    /// dropped, the rebuild restores ASIO, ASIO fails, the marker is still
+    /// `Some`, no fallback runs, and the retries are spent on hardware that is
+    /// not there. Silence until the setting is changed by hand, on a machine
+    /// where picking WASAPI works perfectly.
+    ///
+    /// A source check and not a behavioural one because the road it guards
+    /// opens real devices: reproducing it needs a Windows box with ASIO
+    /// registered and no interface on it. What can be pinned here is the
+    /// SHAPE — that the decision to fall back does not consult the marker, and
+    /// that the marker is still written for the two jobs it does have.
+    ///
+    /// Revert check performed: put `&& self.recorder.fallback.is_none()` back
+    /// on the guard and the first assert names it.
+    #[test]
+    fn an_asio_fallback_re_arms_after_the_engine_is_dropped() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        let engine = {
+            let a = src.find("fn start_engine(").expect("`start_engine` is gone");
+            let b = src[a..].find("\n    fn ").expect("its end");
+            &src[a..a + b]
+        };
+        let block = {
+            let a = engine.find("if let Err(e) = &started {").expect("the fallback block is gone");
+            let b = engine[a..].find("\n        match started {").expect("its end");
+            &engine[a..a + b]
+        };
+        assert!(
+            !block.contains("self.recorder.fallback.is_none()"),
+            "the fallback asks its own marker for permission again. The marker \
+             cannot be cleared while the stand-in runs, so this is a one-shot: \
+             the first failure falls back and every later one goes silent"
+        );
+        assert!(
+            block.contains("fallback_wanted(chosen.as_deref())"),
+            "the fallback no longer asks the one question it should"
+        );
+        // The two jobs the marker DOES have, still done.
+        assert!(
+            block.contains("self.recorder.fallback = chosen.clone()"),
+            "the stand-in no longer records what it stands in for, so the \
+             reprobe stops watching and nothing announces the way back"
+        );
+        assert!(
+            engine.contains("if let Some(was) = self.recorder.fallback.take()"),
+            "nothing clears the marker when the chosen system comes back"
         );
     }
 

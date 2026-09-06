@@ -135,6 +135,21 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The ASIO fallback was a one-shot, so the second time it was needed the app
+  went silent for the session.** With `audio_system` set to ASIO and no
+  interface plugged in, Tangent opens the platform default instead and says so.
+  It marks what it is standing in for — the mark keeps the reprobe watching for
+  the interface and carries the "back on ASIO" line when it returns — and it was
+  also, wrongly, being asked whether a fallback was allowed at all. It cannot
+  answer that: the mark is cleared in one place, and only once the chosen system
+  is back, which the stand-in itself rules out. So it stayed set. Drop the
+  engine for any reason — an output that went quiet, a band closed and reopened
+  — and the rebuild restored ASIO, failed on it, found the mark still set,
+  refused to fall back a second time, and spent its retries on hardware that was
+  not there. Permanent silence, on a machine where choosing WASAPI by hand
+  worked perfectly. The decision to fall back no longer consults the mark; the
+  toast is still shown once per stand-in rather than once per rebuild.
+
 - **A part recorded on an armed lane played back without the plugins it was
   recorded through.** There is one insert rack per channel and it is clocked
   once a block, so when the control room is monitoring an input it claims that
