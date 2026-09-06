@@ -2678,28 +2678,6 @@ impl DesktopApp {
                 self.recorder.engine_error = Some(why);
                 self.recorder.inserts_loaded =
                     vec![None; tangent_ui::recorder::INSERT_SPACE];
-                // **Engine-scoped like the resets above**, and placed AFTER
-                // them on purpose: `a_restarted_engine_is_told_the_tempo_map_again`
-                // samples a fixed window over this function to check those
-                // three stay together, and that window has already had to
-                // grow twice for people who added lines above them. Adding
-                // here costs it nothing. Watched by the name the output
-                // ACTUALLY opened with — a fallback lands on another device
-                // and a watch on the wrong one never moves. See
-                // `Recorder::overload`.
-                let opened_on = self
-                    .recorder
-                    .engine
-                    .as_ref()
-                    .map(|e| e.output().device.clone());
-                self.recorder.overload =
-                    crate::outpath::OverloadWatch::watch(opened_on.as_deref());
-                // `xruns_seen` is deliberately NOT reset with it. On Linux
-                // `graph_dropouts` is a cumulative process-wide count that
-                // survives an engine rebuild, so zeroing the high-water mark
-                // here would re-announce the whole backlog as "+48 just now"
-                // after every reopen. The chase-down below already handles a
-                // counter that legitimately falls, which is the macOS case.
                 // **No timed retries here — the reprobe thread owns recovery.**
                 // The yank test proved why: a watchdog-declared death is
                 // usually GONE HARDWARE, and `Engine::start` against a dead
@@ -9710,6 +9688,40 @@ impl DesktopApp {
                 // reconcile below to fill the bays again.
                 self.recorder.inserts_loaded =
                     vec![None; tangent_ui::recorder::INSERT_SPACE];
+                // **Engine-scoped like the resets above**, and AFTER all three
+                // of them on purpose: `a_restarted_engine_is_told_the_tempo_map_again`
+                // samples a fixed window over this function to check
+                // reastream/pushed_maps/inserts_loaded stay together, and that
+                // window has already had to grow twice for people who added
+                // lines above them. Adding below the last of them costs it
+                // nothing.
+                //
+                // **And it must be THIS function, which is the whole reason
+                // `the_overload_watch_is_armed_where_an_engine_is_born` exists.**
+                // The first draft of this landed on the identical
+                // `inserts_loaded` reset in `fill_recorder_state`'s fault
+                // branch — three lines after `self.recorder.engine = None`, so
+                // `opened_on` was always `None`, the watch armed on the system
+                // default instead of the engine's device, and it armed only
+                // when the engine had just DIED and never when one was born.
+                // It compiled, every test passed, and the counter was dead.
+                //
+                // Watched by the name the output ACTUALLY opened with: a
+                // fallback lands on another device and a watch on the wrong
+                // one never moves. See `Recorder::overload`.
+                let opened_on = self
+                    .recorder
+                    .engine
+                    .as_ref()
+                    .map(|e| e.output().device.clone());
+                self.recorder.overload =
+                    crate::outpath::OverloadWatch::watch(opened_on.as_deref());
+                // `xruns_seen` is deliberately NOT reset with it. On Linux
+                // `graph_dropouts` is a cumulative process-wide count that
+                // survives an engine rebuild, so zeroing the high-water mark
+                // here would re-announce the whole backlog as "+48 just now"
+                // after every reopen. `path_changed` already resets it on the
+                // edge where a genuinely new counter appears.
                 // **The tap belongs to the ENGINE, so it is taken when the
                 // engine starts.**
                 //
@@ -17139,6 +17151,57 @@ mod tests {
             reastream < maps && maps < inserts,
             "the map invalidation drifted away from the other engine-scoped \
              resets; keep them together or the next one is forgotten too"
+        );
+    }
+
+    /// **The overload watch is armed where an engine is BORN, not where one
+    /// dies**, and this test exists because the first draft did the latter and
+    /// nothing noticed.
+    ///
+    /// `self.recorder.inserts_loaded = vec![None; INSERT_SPACE]` appears four
+    /// times in this file. A patch anchored on that line landed the arming in
+    /// `fill_recorder_state`'s FAULT branch, three lines after
+    /// `self.recorder.engine = None` — so `opened_on` was unconditionally
+    /// `None`, the watch armed on the system default rather than the device
+    /// the engine had opened, and it armed only when the engine had just been
+    /// torn down and never when one was built. On a healthy session the field
+    /// stayed at `OverloadWatch::default()`, which reports `None`, which sends
+    /// `merge_dropouts` straight back to the blind arithmetic the watch was
+    /// added to fix.
+    ///
+    /// It compiled. Every test passed. The counter was dead and the panel went
+    /// on saying zero. Nothing in the suite could see it, because the unit test
+    /// beside `OverloadWatch` tests the TYPE and nothing tested the WIRING —
+    /// so this tests the wiring.
+    #[test]
+    fn the_overload_watch_is_armed_where_an_engine_is_born() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        assert_eq!(
+            src.matches("OverloadWatch::watch").count(),
+            1,
+            "the overload watch is armed in more than one place; there is one \
+             engine and it is born once"
+        );
+        let start = src.find("fn start_engine(").expect("`start_engine` is gone");
+        let end = start
+            + src[start..]
+                .find("\n    fn ")
+                .expect("the end of `start_engine`");
+        let body = &src[start..end];
+        let armed = body
+            .find("OverloadWatch::watch")
+            .expect("the overload watch is no longer armed in `start_engine`");
+        // And after the engine is seated, or `opened_on` reads `None` off a
+        // field that has not been filled in yet and the watch lands on the
+        // system default instead of the device this engine opened.
+        let seated = body
+            .find("self.recorder.engine = Some(e);")
+            .expect("`start_engine` no longer seats the engine");
+        assert!(
+            seated < armed,
+            "the watch is armed before the engine is seated, so it can only \
+             ever read `None` for the device it is supposed to be watching"
         );
     }
 
