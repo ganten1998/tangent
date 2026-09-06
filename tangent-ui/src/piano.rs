@@ -94,6 +94,15 @@ fn idle_colors(s: &Settings) -> (Color32, Color32) {
 /// Sandstone at 9.34:1 and the widest Iris at 15.29:1, so a derived pair that
 /// clears 9 lands at the bottom of the band everybody else is already in
 /// rather than at a bar of its own.
+///
+/// **A target the walk may not reach, and deliberately stops short of.** Where
+/// the naturals are themselves middling — Nocturne's and Phosphor's dark
+/// naturals sit at 0.099 and 0.093 luminance — nothing the sharps can become
+/// clears 9:1, so the walk used to run out of steps at pure white and miss the
+/// bar anyway. It now stops at the desk's own pale ink instead, which reads
+/// without glaring; the floor those two actually have to meet is the 3:1 in
+/// `every_theme_keeps_a_legible_keyboard_in_both_modes`, and they clear it by
+/// a wide margin. See `keys_apart`.
 const KEYS_APART: f32 = 9.0;
 
 /// **The sharps, lifted clear of the naturals when the theme could not do it
@@ -134,10 +143,30 @@ fn keys_apart(natural: Color32, sharp: Color32) -> Color32 {
     // Away from the naturals: a dark keyboard gets pale sharps and a pale one
     // dark sharps. `luminance` rather than a channel average, because what is
     // being escaped is a contrast ratio and that is what a ratio is made of.
+    // **Toward the desk's own ink, not toward the screen's limit.**
+    //
+    // This walked to pure `WHITE`, and on the two themes it exists for the
+    // walk ran all twenty steps and arrived there: Nocturne and Phosphor
+    // hand it naturals at 0.099 and 0.093 luminance, from which nothing —
+    // not even white — reaches `KEYS_APART`, so the loop below fell out at
+    // `k = 20` every time. The keyboard was legible again and the owner's
+    // next word on it was that the pale keys are "too bright": a key at
+    // luminance 1.000 beside a natural at 0.099, where every other theme's
+    // pale key sits at 0.88 or below.
+    //
+    // `INK_LIGHT` and `INK_DARK` are the two the rest of this app already
+    // paints with — a bone and a near-black, chosen to read rather than to
+    // shine — so a saturated walk now lands on the same pale this desk uses
+    // everywhere else instead of on the brightest thing a monitor can do.
+    // The ratio it reaches is lower for those two themes and that is the
+    // trade being made knowingly: measured, they go from 7.05:1 at pure
+    // white — which never met the bar anyway — to a little under it in a
+    // colour that does not glare. Every theme that could already clear
+    // `KEYS_APART` returns above this line untouched.
     let away = if crate::recorder_panel::luminance(natural) < 0.18 {
-        Color32::WHITE
+        crate::recorder_panel::INK_LIGHT
     } else {
-        Color32::BLACK
+        crate::recorder_panel::INK_DARK
     };
     // Toward it in twentieths, keeping as much of the theme's own hue as the
     // ratio allows: the first step that clears is the one taken.
@@ -596,6 +625,65 @@ mod tests {
     /// 15.29:1 — and the bar sits at half of that. It is still a FLOOR and
     /// not a target: nothing in the set is near it, and anything that
     /// arrives near it is a keyboard somebody cannot see.
+    /// **A key the piano DERIVES never glares.**
+    ///
+    /// The lift walks the sharps away from the naturals until they are far
+    /// enough apart, and it used to walk toward pure white. On the two themes
+    /// it exists for, no amount of white is far enough — their dark naturals
+    /// sit at about 0.095 luminance — so the walk ran every step and arrived
+    /// at `#ffffff`, a key at the screen's limit beside a middling ground.
+    /// The owner, on the build that finally had a visible keyboard on those
+    /// themes: "their white key colors are too bright".
+    ///
+    /// So a derived key is capped at the pale this desk already paints with.
+    /// Only a DERIVED one: a theme that named its own pale key keeps it, and
+    /// Centennial's sits above this line on purpose.
+    ///
+    /// Revert check performed: walk toward `Color32::WHITE` again and both
+    /// dark-designed themes name themselves here.
+    #[test]
+    fn a_derived_key_is_never_brighter_than_the_desks_own_ink() {
+        use crate::recorder_panel::{luminance, INK_LIGHT};
+        let ceiling = luminance(INK_LIGHT);
+        let mut loud: Vec<String> = Vec::new();
+        for (theme, dark) in crate::theme::factory()
+            .into_iter()
+            .flat_map(|t| [(t.clone(), false), (t, true)])
+        {
+            let mut s = Settings::default();
+            theme.apply(&mut s);
+            s.dark_mode = dark;
+            // What the theme NAMED for the sharps in this mode, before the
+            // lift: the light mode's own field, the dark mode's role or the
+            // swap it falls back to.
+            let named = if dark {
+                s.dark_role("black_key")
+                    .map_or(s.white_key_idle_color, |c| c)
+                    .to_color32()
+            } else {
+                s.black_key_idle_color.to_color32()
+            };
+            let (_, painted) = idle_colors(&s);
+            if painted == named {
+                continue;
+            }
+            if luminance(painted) > ceiling + 1.0e-6 {
+                loud.push(format!(
+                    "{} {}: derived key at {:.3} luminance, past the desk's own {:.3}",
+                    theme.name,
+                    if dark { "dark" } else { "light" },
+                    luminance(painted),
+                    ceiling
+                ));
+            }
+        }
+        assert!(
+            loud.is_empty(),
+            "the piano derived a key brighter than anything else it paints:\n  {}",
+            loud.join("\n  ")
+        );
+    }
+
     #[test]
     fn every_theme_keeps_a_legible_keyboard_in_both_modes() {
         use crate::recorder_panel::contrast_ratio;
