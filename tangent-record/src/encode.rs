@@ -578,4 +578,101 @@ mod tests {
             .expect("a packet count");
         assert_eq!(packets, written, "the file holds a different number of frames");
     }
+
+    /// **A pad must not cost a real frame**, which for one day it did.
+    ///
+    /// The take pump has two clocks. `Compositor::frame` is pipelined one deep:
+    /// it submits tick `n` and hands back tick `n - 1`, so a composited push
+    /// carries a pts one tick BEHIND the pump's own counter — while a pad,
+    /// which composites nothing, carried the counter itself. Interleave them
+    /// and the timestamps go backwards over every pad: pad at `n`, then the
+    /// next real frame arrives carrying `n - 1`, and [`Encoder::push`] refuses
+    /// it as out of order and answers `Ok`. Nothing above heard about it. A
+    /// window take pads whenever the screen holds still, so one of the owner's
+    /// takes asked for 306 frames, padded 43, and its mp4 held 263 — expected
+    /// minus padded, exactly.
+    ///
+    /// The fix is that the file's clock is the ENCODER's own count and never
+    /// the tick's: every tick pushes exactly one frame, so counting pushes and
+    /// counting ticks give the same clock and this one cannot run backwards.
+    /// Replayed here against the real platform encoder, both ways round.
+    #[test]
+    #[ignore = "writes a real video file with the platform encoder"]
+    fn a_padded_tick_never_costs_the_frame_that_follows_it() {
+        const W: u32 = 320;
+        const H: u32 = 240;
+        const FPS: u32 = 30;
+        const TICKS: u64 = 60;
+        // The ticks the screen held still on, the way a window take pads.
+        const PADS: [u64; 3] = [10, 25, 40];
+
+        /// One take, driven exactly as the pump drives it. `pump_clock` picks
+        /// which of the two clocks assigns the timestamps.
+        fn run(dir: &std::path::Path, name: &str, pump_clock: bool) -> (u64, u64) {
+            let path = dir.join(name);
+            let spec = VideoSpec { width: W, height: H, fps: FPS };
+            let mut enc = Encoder::create(&path, spec, None).expect("create");
+            let frame = vec![0x80u8; (W * H * 4) as usize];
+            let pts_of = |n: u64| (n as i64 * 1_000_000_000) / i64::from(FPS);
+            // What the compositor is holding: the tick submitted last, handed
+            // back on the next composite. `None` before the first one.
+            let mut in_flight: Option<u64> = None;
+            let mut encoded: u64 = 0;
+            for tick in 0..TICKS {
+                if PADS.contains(&tick) {
+                    // A pad composites nothing and repeats the last frame.
+                    let pts = if pump_clock { pts_of(tick) } else { pts_of(encoded) };
+                    if enc.push(&frame, pts).is_ok() {
+                        encoded += 1;
+                    }
+                    continue;
+                }
+                if let Some(ready) = in_flight.replace(tick) {
+                    let pts = if pump_clock { pts_of(ready) } else { pts_of(encoded) };
+                    if enc.push(&frame, pts).is_ok() {
+                        encoded += 1;
+                    }
+                }
+            }
+            if let Some(ready) = in_flight.take() {
+                let pts = if pump_clock { pts_of(ready) } else { pts_of(encoded) };
+                if enc.push(&frame, pts).is_ok() {
+                    encoded += 1;
+                }
+            }
+            let out_of_order = enc.out_of_order();
+            let written = enc.frames_written();
+            enc.finish().expect("finish");
+            assert!(path.is_file(), "no file was written");
+            (written, out_of_order)
+        }
+
+        let dir = std::env::temp_dir().join(format!("tangent-encode-pad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // The tick's clock: every pad is followed by a real frame carrying an
+        // earlier timestamp, and the encoder throws each one away.
+        let (old_written, old_refused) = run(&dir, "tick-clock.mp4", true);
+        assert_eq!(
+            old_refused,
+            PADS.len() as u64,
+            "the fault this test exists for did not reproduce - one refusal per pad"
+        );
+        assert_eq!(
+            old_written,
+            TICKS - PADS.len() as u64,
+            "the tick clock lost one frame per pad, which is the whole bug"
+        );
+
+        // The encoder's own clock: every tick reaches the file.
+        let (written, refused) = run(&dir, "encoder-clock.mp4", false);
+        assert_eq!(refused, 0, "a timestamp still went backwards");
+        assert_eq!(
+            written, TICKS,
+            "{written} of {TICKS} ticks reached the file; a pad is still \
+             eating the real frame behind it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

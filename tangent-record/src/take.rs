@@ -1171,6 +1171,14 @@ pub struct VideoReport {
     /// Frames REPEATED to hold constant frame rate over a gap — a freeze, not
     /// a hole. The band names these "repeated"; the file stays complete.
     pub frames_padded: u64,
+    /// Frames repeated because the SCREEN DID NOT CHANGE — a window take only.
+    ///
+    /// Kept apart from `frames_padded` because it is not a fault and must not
+    /// be read as one. A screen capture delivers on change, so a window that
+    /// held still sends nothing and the take repeats the frame it already
+    /// has: the picture is exactly right and no machine was late. A take of a
+    /// quiet passage is mostly this.
+    pub frames_still: u64,
 }
 
 impl VideoReport {
@@ -1190,6 +1198,9 @@ impl VideoReport {
             ("frames_dropped_late", Json::Int(self.frames_dropped_late as i64)),
             ("frames_encoder_dropped", Json::Int(self.frames_encoder_dropped as i64)),
             ("frames_padded", Json::Int(self.frames_padded as i64)),
+            // Appended, and appended LAST: a manifest reader that predates
+            // this key must still find every key it knows where it was.
+            ("frames_still", Json::Int(self.frames_still as i64)),
         ])
     }
 }

@@ -125,6 +125,67 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A take's video was short by exactly the number of frames it repeated.** The
+  pump has two clocks and until now it used both. `Compositor::frame` is
+  pipelined one deep — it submits tick *n* and hands back tick *n − 1* — so a
+  composited frame arrived carrying a timestamp one tick behind the pump's own
+  counter, while a repeated frame, which composites nothing, carried the
+  counter itself. Interleave the two and time runs backwards over every repeat:
+  the encoder refuses a frame whose timestamp is not past the last one, counts
+  it in a field that reached no manifest and no toast, and answers *fine*. One
+  repeat cost exactly one real frame, invisibly, with the mp4 the only place it
+  showed: a 10-second window take asked for 306 frames, repeated 43, and its
+  file held 263. The file's clock is the encoder's own count now, which cannot
+  run backwards by construction, and a frame the encoder will not take is
+  counted as a frame the encoder dropped — so this class of fault can never be
+  silent again.
+
+- **A window take of a quiet moment ended on a red warning about a video with
+  nothing wrong with it.** A screen capture delivers only when the screen
+  changes, so a still window sends nothing and the take repeats the frame it
+  already has — the picture is exactly right and no machine was late. Those
+  repeats were counted beside the ones a machine that cannot composite in time
+  makes, and every take that held still asked the owner to "lower the video
+  size in Export", which could not have helped. They are counted apart now
+  (`frames_still` in `take.json`), and only a real shortfall speaks.
+
+- **The cursor wore a ring in every window take.** `capturesMouseClicks` is a
+  different thing from capturing the pointer: it paints macOS's own click
+  decoration, a hard ring that swells around the cursor on every press, into
+  the frame — several times a bar over somebody playing, and burnt in with no
+  way to take it out afterwards. The pointer is still in the picture; the
+  decoration is not.
+
+- **A window take was encoded at a bit rate meant for a camera.** macOS was the
+  only backend with no compression settings at all, so AVFoundation picked its
+  own average rate: a measured 1600×1040 take came out at 1.4 Mbit/s. Video of
+  a room survives that; a video of the app's own window is thin lines, small
+  labels and a waveform, which is the first detail a starved encoder throws
+  away. Takes are now given a rate scaled to their size and frame rate, High
+  profile rather than the default, and a keyframe every two seconds so scrubbing
+  through one is not a decode of the whole passage. Linux and Windows never had
+  this: `ffmpeg` runs x264 against a quality target and spends what the picture
+  needs.
+
+- **Every double-click gesture worked once and then went dead under a hand that
+  stayed put.** egui counts a run of clicks in one place 1, 2, 3, 3, 3…: from
+  the third onward it reports a *triple*, and the double-click flag every
+  gesture on this desk read answers false until the hand pauses for six tenths
+  of a second or moves more than six points away. Tangent pairs the clicks
+  itself now and spends each pair, so the next two make another.
+
+- **A note would not go in near the playhead, on either side of it.** Two faults
+  meeting. A note's edges are spread wide so a hand can catch them and pull —
+  seven points inside the note and four outside — and that band answered for
+  double-clicks too, which have no meaning on a resize handle: eleven points
+  around every note border where a double-click did nothing at all. And the
+  band lands on the playhead, because a click with the pen up locates, snapped,
+  and the double-click that follows writes its note from the same snapped grid
+  line: the new note's border and the playhead are the same pixel. A click
+  reads past the resize zones now — on the note it is the note, past it is the
+  empty roll it looks like. The arrangement's clips had the same fault at their
+  resize ends and fade corners, where a double-click would not open a MIDI item.
+
 - **The IR wizard's level meter was frozen, and it opened pinned at full
   scale.** Two faults on the same readout, and each one hid the other. The
   host published the wizard's live picture only while the IR road was "doing

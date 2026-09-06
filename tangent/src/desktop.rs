@@ -14184,6 +14184,29 @@ fn window_device(_frame: &eframe::Frame) -> Option<&egui_wgpu::RenderState> {
     None
 }
 
+/// **The one place a take's video frame is given a timestamp.**
+///
+/// The compositor's most recent frame at the pts the encoder's own clock has
+/// reached — see [`TakeVideo::encoded`] for why that is not the tick's. `false`
+/// when the encoder refused it, and when the compositor has nothing to hand
+/// over yet; every caller has already checked for the second.
+#[cfg(feature = "recorder")]
+fn encode_last(v: &mut TakeVideo) -> bool {
+    let pts = (v.encoded as i64 * 1_000_000_000) / i64::from(v.fps);
+    // Disjoint fields of the same borrow: the frame is read out of the
+    // compositor while the encoder is held mutably, which is the same split
+    // the call sites used to make with a closure.
+    let encoder = &mut v.encoder;
+    let took = v
+        .compositor
+        .last_frame()
+        .is_some_and(|bgra| encoder.push(bgra, pts).is_ok());
+    if took {
+        v.encoded += 1;
+    }
+    took
+}
+
 #[cfg(feature = "recorder")]
 struct TakeVideo {
     compositor: crate::composite::Compositor,
@@ -14192,6 +14215,24 @@ struct TakeVideo {
     /// frame `n` is presented at `n / fps` seconds after the take started,
     /// whatever the camera has managed to deliver by then.
     next: u64,
+    /// The next frame index to ENCODE, which is not `next`.
+    ///
+    /// **The readback is one frame deep, and that is what made the two
+    /// numbers differ.** `Compositor::frame` submits tick `n` and hands back
+    /// tick `n - 1`, so a composited push carries a pts one tick BEHIND
+    /// `next` — while a pad, which composites nothing, used to carry `next`
+    /// itself. Interleave the two and the timestamps go backwards: pad at
+    /// `n`, then the next real frame arrives carrying `n - 1`, and the
+    /// encoder drops it as out of order (`Encoder::push` counts that in
+    /// `out_of_order` and returns `Ok`, so nothing above ever heard about
+    /// it). One pad cost exactly one real frame, silently, in the mp4 and
+    /// nowhere else — a window take, whose still screen pads constantly, lost
+    /// one frame for every pad it made.
+    ///
+    /// So the pts is the ENCODER's own count and not the tick's: every tick
+    /// pushes exactly one frame, so counting pushes and counting ticks give
+    /// the same clock, and this one cannot run backwards by construction.
+    encoded: u64,
     fps: u32,
     layout: tangent_ui::recorder::Layout,
     shows: tangent_ui::recorder::DisplayShows,
@@ -14208,6 +14249,16 @@ struct TakeVideo {
     /// not composite in real time. The video stays on the wall clock; this is
     /// the honest count of how much of it is a freeze-frame.
     padded: u64,
+    /// Ticks filled by repeating the previous frame because the SCREEN did not
+    /// change — a window take only, and not a fault at all.
+    ///
+    /// Separate from `padded` because the two have opposite meanings and only
+    /// one of them is worth telling anybody about. A pad says the machine was
+    /// late; a still says the picture was already correct and the screen input
+    /// had nothing new to send, which is how `AVCaptureScreenInput` behaves on
+    /// every still window. Counted, reported in the manifest, and never
+    /// raised as a problem.
+    still: u64,
     /// Ticks the take's own clock has passed, whether or not one was produced.
     ///
     /// **Not `next`.** `next` is the timeline position and it can fall behind:
@@ -14340,6 +14391,8 @@ impl DesktopApp {
             compositor,
             encoder,
             next: 0,
+            encoded: 0,
+            still: 0,
             fps: video.fps,
             layout: spec.composite.layout,
             shows: spec.composite.shows,
@@ -14424,9 +14477,8 @@ impl DesktopApp {
             // Behind, and composing only every `stride`th tick: pad this one
             // and move on without paying for a frame nobody asked for.
             if v.stride > 1 && !v.next.is_multiple_of(u64::from(v.stride)) {
-                if let Some(last) = v.compositor.last_frame() {
-                    let pts = (v.next as i64 * 1_000_000_000) / i64::from(v.fps);
-                    if v.encoder.push(last, pts).is_err() {
+                if v.compositor.last_frame().is_some() {
+                    if !encode_last(&mut v) {
                         v.failed += 1;
                     }
                     v.padded += 1;
@@ -14434,6 +14486,9 @@ impl DesktopApp {
                 v.next += 1;
                 continue;
             }
+            // The tick's own time, which the compositor carries through its
+            // pipeline. **Not the timestamp the file gets** — that is
+            // `encode_last`, and the difference is `TakeVideo::encoded`.
             let pts = (v.next as i64 * 1_000_000_000) / i64::from(v.fps);
             // **A window take: the screen frame, or the last one again.** The
             // screen input delivers only when the screen changes, so a still
@@ -14442,11 +14497,19 @@ impl DesktopApp {
             // re-uploading the same pixels.
             if v.window {
                 if !self.recorder.window_dirty {
-                    if let Some(last) = v.compositor.last_frame() {
-                        if v.encoder.push(last, pts).is_err() {
+                    if v.compositor.last_frame().is_some() {
+                        if !encode_last(&mut v) {
                             v.failed += 1;
                         }
-                        v.padded += 1;
+                        // **A STILL, not a pad.** The screen input delivers
+                        // only when the screen changes, so a window that sat
+                        // there is a repeated frame that is exactly right —
+                        // nothing was lost and no machine was late. Counting
+                        // it beside the machine-is-behind pads is what made
+                        // every window take of a quiet moment end on "lower
+                        // the video size in Export", advice that cannot help
+                        // because nothing was over budget.
+                        v.still += 1;
                         v.next += 1;
                         continue;
                     }
@@ -14458,12 +14521,13 @@ impl DesktopApp {
                 };
                 self.recorder.window_dirty = false;
                 match v.compositor.frame_window(&self.app, px, *w, *h, pts) {
-                    Ok(Some(ready)) => {
-                        let pushed = v
-                            .compositor
-                            .last_frame()
-                            .is_some_and(|bgra| v.encoder.push(bgra, ready).is_ok());
-                        if !pushed {
+                    // A frame from one tick ago is now readable. What it is
+                    // NOT is its own timestamp: the pipeline hands back the
+                    // pts it was submitted with, one tick behind, and mixing
+                    // that with a pad's cost this take one real frame per pad
+                    // — see `TakeVideo::encoded`.
+                    Ok(Some(_ready)) => {
+                        if !encode_last(&mut v) {
                             v.failed += 1;
                         }
                     }
@@ -14489,15 +14553,13 @@ impl DesktopApp {
             match v.compositor.frame(
                 &self.app, v.layout, v.shows, v.camera, v.display, frame, pts,
             ) {
-                // A frame from one tick ago is now readable, carrying its own
-                // pts. The readback is pipelined so the UI thread never waits
-                // on the rasteriser — see `composite`'s module docs.
-                Ok(Some(ready)) => {
-                    let pushed = v
-                        .compositor
-                        .last_frame()
-                        .is_some_and(|bgra| v.encoder.push(bgra, ready).is_ok());
-                    if !pushed {
+                // A frame from one tick ago is now readable. The readback is
+                // pipelined so the UI thread never waits on the rasteriser —
+                // see `composite`'s module docs — and the pts it hands back is
+                // the one it was SUBMITTED with, which is why the file's clock
+                // is `encode_last`'s and not this. See `TakeVideo::encoded`.
+                Ok(Some(_ready)) => {
+                    if !encode_last(&mut v) {
                         v.failed += 1;
                     }
                 }
@@ -14531,10 +14593,9 @@ impl DesktopApp {
         // duplicates, and the deficit carries to the next pump.
         if v.next < due {
             let target = due.min(v.next + u64::from(v.fps));
-            if let Some(last) = v.compositor.last_frame() {
+            if v.compositor.last_frame().is_some() {
                 while v.next < target {
-                    let pts = (v.next as i64 * 1_000_000_000) / i64::from(v.fps);
-                    if v.encoder.push(last, pts).is_err() {
+                    if !encode_last(&mut v) {
                         v.failed += 1;
                     }
                     v.next += 1;
@@ -14574,14 +14635,8 @@ impl DesktopApp {
         // there is always exactly one composited frame that has been submitted
         // and not yet read; without this the last frame of every take is lost.
         // See `composite`'s module docs.
-        if let Ok(Some(pts)) = v.compositor.flush() {
-            let pushed = v
-                .compositor
-                .last_frame()
-                .is_some_and(|bgra| v.encoder.push(bgra, pts).is_ok());
-            if !pushed {
-                v.failed += 1;
-            }
+        if matches!(v.compositor.flush(), Ok(Some(_))) && !encode_last(&mut v) {
+            v.failed += 1;
         }
         // One last drain, for the samples the writer flushed at Stop. Without
         // it the video's audio is a poll interval shorter than the `.wav`.
@@ -14590,7 +14645,14 @@ impl DesktopApp {
                 let _ = v.encoder.push_audio(&chunk.samples, chunk.first_frame);
             }
         }
-        let dropped = v.encoder.dropped_not_ready() + v.failed;
+        // **`out_of_order` is in this sum, and it was not.** The encoder
+        // refuses a frame whose timestamp is not past the last one and answers
+        // `Ok`, counting it in a field that reached no manifest and no toast —
+        // so when the pump's two clocks fell out of step, every pad quietly
+        // cost a real frame and the only trace was that the mp4 held fewer
+        // frames than the take asked for. A frame the encoder would not take
+        // is a frame the encoder dropped, whichever of its own reasons it had.
+        let dropped = v.encoder.dropped_not_ready() + v.encoder.out_of_order() + v.failed;
         let path = v.path.clone();
         match v.encoder.finish() {
             Ok(()) => {
@@ -14627,6 +14689,16 @@ impl DesktopApp {
                         ),
                     );
                 } else if dropped > 0 || v.padded > 0 {
+                    // **`v.still` is not in here, and that is the point.** A
+                    // window take repeats a frame every time the screen holds
+                    // still, which is most of a quiet passage — and every one
+                    // of those takes used to end on a red "N repeated - lower
+                    // the video size in Export" for a video with nothing
+                    // wrong with it and a machine that was never over budget.
+                    // Only the two real faults speak: a frame the encoder
+                    // could not take, and a tick the compositor could not
+                    // make in time.
+                    //
                     // Both numbers, because they are different failures: a
                     // dropped frame is a hole, a padded one is a freeze —
                     // and both mean the same advice about this machine.
@@ -14713,6 +14785,7 @@ impl DesktopApp {
                         // the counter the tester watched.
                         frames_encoder_dropped: dropped,
                         frames_padded: v.padded,
+                        frames_still: v.still,
                     },
                     &file_name,
                 );

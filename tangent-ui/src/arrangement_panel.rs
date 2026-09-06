@@ -2528,6 +2528,32 @@ fn draw_note_miniature(
 /// The resize strip's width — REAPER's splitter, hover-lit, its own cursor.
 const GRIP_W: f32 = 7.0;
 
+/// The same hit, with a clip's resize and fade AFFORDANCES resolved away —
+/// what a CLICK is on, as opposed to what a drag would grab.
+///
+/// A clip wears four grab zones: `EDGE_W` at each end for the resize, and an
+/// `FADE_W` corner at each top for the fade handle. They exist so a hand can
+/// catch a border and pull, and they are right for a drag. They are wrong for a
+/// double-click, which has exactly one meaning on a MIDI item — open it — and
+/// no meaning at all on its edges: an item grabbed anywhere in those zones
+/// simply would not open, and the zones are the two ends and both top corners,
+/// which is most of a short clip's face.
+///
+/// The roll has the same fault around a note's borders, for the same reason and
+/// with the same fix — see `midi_editor::click_hit`, and the owner's report
+/// that took us to both.
+pub fn click_hit(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
+    match hit_test(rect, view, pos) {
+        Some(Hit::ClipLeft(id) | Hit::ClipRight(id) | Hit::FadeIn(id) | Hit::FadeOut(id)) => {
+            // Every one of those zones is INSIDE the clip's own rectangle —
+            // there is no allowance pass here reaching across empty lane — so
+            // the hand is on the clip whichever of them answered.
+            Some(Hit::ClipBody(id))
+        }
+        other => other,
+    }
+}
+
 pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     let l = Layout::new(rect, view);
 
