@@ -18396,18 +18396,34 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // Replace FX, the mixer's offer — before the header's
                 // track menu can claim the press. An empty bay stays the
                 // header's.
+                //
+                // **The MASTER's bays answer too, and they did not.** This
+                // matched `HdrBay` alone — the channel headers — so every
+                // rack on this view had the menu except the one at the
+                // bottom of the mixer, and the owner found the master's six
+                // bays with no way to delete or replace what was in them.
+                // A bay is a bay: the only thing that differs is which seat
+                // the slot resolves to, and `seat_bay` already knows both
+                // answers. `BusBay` carries the master's column rather than
+                // a channel index, which is why it is `STRIPS` here and `n`
+                // above — the same split the left-click has always made.
                 let bay_hit = {
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
                     match crate::arrangement_panel::hit_test(rect, &view, p) {
                         Some(crate::arrangement_panel::Hit::HdrBay(n, b)) => Some((n, b)),
+                        Some(crate::arrangement_panel::Hit::BusBay(_, b)) => {
+                            Some((crate::recorder::STRIPS, b))
+                        }
                         _ => None,
                     }
                 };
                 if let Some((n, b)) = bay_hit {
-                    // Slots 3..5 are a FOLDER's second rack: resolve to the
-                    // seat HERE, so the menu's delete and replace act on the
-                    // bay that was clicked and never the neighbour's.
+                    // Slots 3..5 are a FOLDER's second rack — and the
+                    // MASTER's first three are its extra rack, seated past
+                    // the drum pads. Resolve to the seat HERE, so the menu's
+                    // delete and replace act on the bay that was clicked and
+                    // never the neighbour's.
                     let (seat, bay) = crate::recorder::seat_bay(n, b);
                     if self.insert(seat, bay).is_some() {
                         self.arr_fx_menu = Some((seat, bay, p));
@@ -38777,6 +38793,68 @@ mod tests {
             "the double-click did not open the editor (midi_edit = {:?})",
             app.midi_edit.as_ref().map(|m| m.id)
         );
+    }
+
+    /// **The MASTER's bays offer their menu, like every other rack.**
+    ///
+    /// The arrangement's right-click matched `HdrBay` alone — the channel
+    /// headers — so every rack on that view had Delete FX and Replace FX
+    /// except the one at the foot of the desk. The owner found the master's
+    /// six bays with nothing behind the right button: a plugin could go in
+    /// and never come out without going to the mixer for it.
+    ///
+    /// Both racks are asserted, because the master's are not one rack. Its
+    /// first three slots are its EXTRA seat, out past the drum pads, and its
+    /// last three are its original one; a fix that resolved the seat wrong
+    /// would open a menu pointed at somebody else's plugin, which is worse
+    /// than no menu at all.
+    ///
+    /// Revert check performed: drop the `BusBay` arm and both halves go red
+    /// with `arr_fx_menu` still None.
+    #[test]
+    fn a_right_click_on_a_master_bay_offers_delete_and_replace() {
+        for slot in [0usize, 3] {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.keytoggle_enabled = false;
+            app.arrangement_open = true;
+            let _ = run_frame(&ctx, &mut app);
+            // A LOADED bay — an empty one is the header's press, by design.
+            let (seat, bay) = crate::recorder::seat_bay(crate::recorder::STRIPS, slot);
+            app.set_insert(seat, bay, Some("@tangent-comp"));
+            let _ = run_frame(&ctx, &mut app);
+
+            let rect = app.arrangement_rect.expect("arrangement did not open");
+            let p = {
+                let clips = app.arr_clip_views();
+                let v = app.arrange_view(&clips);
+                let l = crate::arrangement_panel::Layout::new(rect, &v);
+                let cell = l.master_row.bays[slot];
+                assert!(cell.is_positive(), "master bay {slot} drew nowhere");
+                cell.center()
+            };
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    events: vec![
+                        egui::Event::PointerMoved(p),
+                        egui::Event::PointerButton {
+                            pos: p,
+                            button: egui::PointerButton::Secondary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            assert_eq!(
+                app.arr_fx_menu.map(|(s, b, _)| (s, b)),
+                Some((seat, bay)),
+                "slot {slot} of the master gave no FX menu, or gave one pointed at \
+                 the wrong seat - its two racks are seated far apart"
+            );
+        }
     }
 
     #[test]

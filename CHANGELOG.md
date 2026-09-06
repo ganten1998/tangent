@@ -192,6 +192,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The master's FX bays had no right-click menu in the arrangement.** Every
+  other rack on that view offers Delete FX and Replace FX; the master's six bays
+  offered nothing, because the right-click matched the channel headers' bays
+  alone and never the bus row's. A plugin could go into the master there and
+  only come out by going to the mixer for it. Both of the master's racks answer
+  now — its first three slots and its last three are seated far apart, so the
+  menu resolves the seat the same way the left-click always has and cannot open
+  pointed at a neighbour's plugin.
+
 - **Analog could take the whole app down from the audio thread.** Letting go of
   a key in mono or unison falls back onto a key still held and, with
   multi-trigger on, re-attacks the whole voice stack. That road was the one
