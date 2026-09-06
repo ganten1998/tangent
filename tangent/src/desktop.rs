@@ -670,6 +670,19 @@ pub struct DesktopApp {
     /// per-lane, "heard as it is turned" needs an address.
     #[cfg(feature = "recorder")]
     editing_strip: usize,
+    /// The staged slot the editor was opened FROM, if it was opened from
+    /// the picker's right pane: a Save goes back into that slot rather than
+    /// into the next empty one, so editing a staged patch does not breed a
+    /// copy of it per press. `None` when the editor opened on what the strip
+    /// plays out of its cartridge — the first Save then finds a slot, and
+    /// records it here so the second Save is an overwrite too.
+    #[cfg(feature = "recorder")]
+    editing_slot: Option<usize>,
+    /// The bank being built in the picker's right pane. Session-long and
+    /// shared by every strip, because it is a bank and not a lane's state;
+    /// the UI holds its names, this holds its voices. See `dx7::staging`.
+    #[cfg(feature = "recorder")]
+    staging: crate::dx7::staging::Staging,
     /// The window was fullscreen when a picker was asked for, so it comes out
     /// of fullscreen, opens the picker next frame, and goes back after. See
     /// `picker_needs_windowed`.
@@ -1685,14 +1698,14 @@ fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate
 fn cartridge_info(
     cart: &crate::dx7::Cartridge,
     error: &str,
-    factory: bool,
+    on_default: bool,
 ) -> tangent_ui::ports::CartridgeInfo {
     tangent_ui::ports::CartridgeInfo {
         bank: cart.name.clone(),
         bad_checksum: !cart.checksum_ok,
         voices: cart.names(),
         error: error.to_owned(),
-        factory,
+        on_default,
     }
 }
 
@@ -3996,11 +4009,16 @@ impl DesktopApp {
         }
 
 
-        // **The shipped bank, put back.** The same call a first launch makes,
-        // which is the point: there is one definition of "the cartridge that
-        // ships" and both paths read it.
-        if let Some(strip) = self.app.take_factory_cartridge() {
-            let cart = crate::dx7::factory();
+        // **The default bank, put back.** The same reading a first launch
+        // makes, which is the point: there is one definition of "the bank an
+        // empty setting means" — `cartridge_at("")` — and both paths read
+        // it. Re-read rather than served from the cache: the shelf's
+        // `default.syx` may have been replaced by hand since launch, and
+        // "put me back on the default" is the one moment somebody expects
+        // the file on disk to win over what was read an hour ago.
+        if let Some(strip) = self.app.take_default_bank() {
+            self.cartridges.remove("");
+            let cart = self.cartridge_at("").clone();
             self.app.set_cartridge(cartridge_info(&cart, "", true));
             // **And the sound changes now — on the strip that asked.**
             // Refilling the list without changing what is playing is a button
@@ -4349,13 +4367,23 @@ impl DesktopApp {
                     // means by "edit this patch". An edit in flight belongs
                     // to the strip it was opened on; opening the editor on a
                     // different strip starts from that strip's own sound.
+                    // (And choosing a patch lets the edit go — see
+                    // `ChoosePatch` — so "Patches..., pick, Patch..." opens
+                    // on the pick and not on the edit it interrupted.)
                     if self.editing_strip != slot {
                         self.editing = None;
+                        self.editing_slot = None;
                     }
                     self.editing_strip = slot;
                     let v = match self.editing {
                         Some(v) => v,
-                        None => self.voice_for_strip(slot),
+                        None => {
+                            // A fresh edit: its first Save finds a slot of
+                            // its own rather than the one a previous edit
+                            // landed in.
+                            self.editing_slot = None;
+                            self.voice_for_strip(slot)
+                        }
                     };
                     self.editing = Some(v);
                     self.push_patch_edit(None);
@@ -4388,6 +4416,19 @@ impl DesktopApp {
                     self.push_patch_edit(Some(said));
                 }
                 R::ChoosePatch { slot, index } => {
+                    // **Choosing a sound is choosing what "Patch..." opens
+                    // on next.** The editor resumed an edit in flight on the
+                    // same strip however many patches had been picked since,
+                    // which made "modify selected sounds" — the owner's
+                    // words — impossible for any sound but the first: pick,
+                    // press Patch..., and the last edit came up instead. The
+                    // editor was closed to get here; a hand that picks a new
+                    // sound has said what it wants next, and an edit worth
+                    // keeping is one press away in the staged bank.
+                    if self.editing_strip == slot {
+                        self.editing = None;
+                        self.editing_slot = None;
+                    }
                     // `usize::MAX` is the built-in row. Anything else indexes
                     // the STRIP's own cartridge, and a stale index from a
                     // settings file written against a cartridge that has
@@ -4409,11 +4450,136 @@ impl DesktopApp {
                     // engine — names are the UI's business, and the sound
                     // changes when a name is clicked, not when a list fills.
                     let path = self.app.dx7_choice_of(strip).0.to_owned();
-                    let is_factory = path.is_empty();
+                    let on_default = path.is_empty();
                     let cart = self.cartridge_at(&path).clone();
                     self.app
-                        .set_cartridge(cartridge_info(&cart, "", is_factory));
+                        .set_cartridge(cartridge_info(&cart, "", on_default));
                     self.cartridge = Some(cart);
+                }
+                // ── the bank builder ────────────────────────────────────
+                //
+                // The picker's right pane, move by move. Every one of these
+                // ends in `push_staged`, because the pane holds names and
+                // only the host can say what the names are after a move.
+                R::StagePatches { slot, indices, at } => {
+                    // The LEFT pane is the strip's own cartridge, so the
+                    // indices are into that — resolved here, on the only
+                    // side that has the voices. A stale index finds nothing
+                    // and stages nothing, rather than a neighbour.
+                    let path = self.app.dx7_choice_of(slot).0.to_owned();
+                    let cart = self.cartridge_at(&path);
+                    let voices: Vec<crate::dx7::Voice> = indices
+                        .iter()
+                        .filter_map(|&i| cart.voices.get(i).copied())
+                        .collect();
+                    self.staging.stage(&voices, at);
+                    self.push_staged();
+                }
+                R::UnstagePatches { slots } => {
+                    self.staging.unstage(&slots);
+                    self.push_staged();
+                }
+                R::SwapStaged { a, b } => {
+                    self.staging.swap(a, b);
+                    self.push_staged();
+                }
+                R::ChooseStaged { slot, index } => {
+                    // Auditioning, exactly as `ChoosePatch`: the sound
+                    // changes now and nothing is written down, because a
+                    // staged patch is in no file yet. And, as there, the
+                    // edit in flight on this strip is let go of — what the
+                    // hand just picked is what "Patch..." means next.
+                    if self.editing_strip == slot {
+                        self.editing = None;
+                        self.editing_slot = None;
+                    }
+                    if let (Some(v), Some(e)) = (
+                        self.staging.get(index).copied(),
+                        self.recorder.engine.as_mut(),
+                    ) {
+                        e.set_builtin_voice(slot, v);
+                    }
+                }
+                R::EditStaged { slot, index } => {
+                    // From the right pane: the editor starts on THAT slot's
+                    // voice, never on an edit in flight, and remembers the
+                    // slot so its Save goes back into it.
+                    if let Some(v) = self.staging.get(index).copied() {
+                        self.editing_strip = slot;
+                        self.editing = Some(v);
+                        self.editing_slot = Some(index);
+                        self.push_patch_edit(None);
+                    }
+                }
+                R::SaveBank { strip, path } => {
+                    // A bare name gets the extension here: on macOS the
+                    // panel is an open panel with a name field
+                    // (`macwin::save_panel`) and refuses nothing for this
+                    // purpose, so "default" typed by hand has to become
+                    // `default.syx` somewhere, and this is the one place
+                    // that knows what is being written.
+                    let mut path = path;
+                    if path.extension().is_none() {
+                        path.set_extension("syx");
+                    }
+                    let stem = path.file_stem().map_or_else(
+                        || "bank".to_owned(),
+                        |s| s.to_string_lossy().into_owned(),
+                    );
+                    let cart = self.staging.to_cartridge(&stem);
+                    match cart.save(&path) {
+                        Ok(()) => {
+                            let is_default = path
+                                == self
+                                    .app
+                                    .sysex_root()
+                                    .join(tangent_ui::dialogs::DEFAULT_BANK_FILE);
+                            let key = path.to_string_lossy().into_owned();
+                            // **The cache first, under both names it can be
+                            // asked for.** `cartridges` is keyed by path and
+                            // never evicted; a save that did not replace the
+                            // entry would leave every strip on the OLD
+                            // default until relaunch, which is a Save bank
+                            // that appears to have done nothing.
+                            self.cartridges.insert(key.clone(), cart.clone());
+                            if is_default {
+                                self.cartridges.insert(String::new(), cart.clone());
+                            }
+                            // **Then the strip, then the picker** — the
+                            // setting before the names, because the picker
+                            // lights the row the strip's patch index names
+                            // and `set_dx7_cartridge_of` is what puts that
+                            // at 0. The strip goes on `""` when the file IS
+                            // the default: that is what "on the default
+                            // bank" means, it is what a fresh strip reads,
+                            // and it keeps the Default button honest. Then
+                            // patch 0 sounds, as it does after a load: what
+                            // was just built is what the strip plays now.
+                            self.app.set_dx7_cartridge_of(
+                                strip,
+                                if is_default { String::new() } else { key },
+                            );
+                            if let Some(v) = cart.voices.first().copied() {
+                                if let Some(e) = self.recorder.engine.as_mut() {
+                                    e.set_builtin_voice(strip, v);
+                                }
+                            }
+                            let n = self.staging.count();
+                            self.app.set_cartridge(cartridge_info(&cart, "", is_default));
+                            let name = path.file_name().map_or_else(
+                                || path.display().to_string(),
+                                |n| n.to_string_lossy().into_owned(),
+                            );
+                            self.app.set_bank_note(format!(
+                                "Saved {n} patch{} to {name}.{}",
+                                if n == 1 { "" } else { "es" },
+                                if is_default { " It is the default bank now." } else { "" }
+                            ));
+                            log::info!("dx7: saved a {n}-patch bank to {}", path.display());
+                            self.cartridge = Some(cart);
+                        }
+                        Err(e) => self.app.set_bank_note(format!("Could not save: {e}")),
+                    }
                 }
                 // An insert's own window. Same one-row-two-names bargain as an
                 // instrument's: press it again and the window that is up goes
@@ -5487,21 +5653,30 @@ impl DesktopApp {
         self.push_ir_rows();
     }
 
-    /// The patch the settings point at, if the cartridge has one there.
-    ///
     /// The cartridge at `path`, loaded at most once and kept. `""`, or a
-    /// file that has since gone missing, is the bank that ships — the same
-    /// reading launch has always made, so a strip whose cartridge walked off
-    /// a disk still makes a sound.
+    /// file that has since gone missing, is the DEFAULT bank — the same
+    /// reading launch makes, so a strip whose cartridge walked off a disk
+    /// still makes a sound.
+    ///
+    /// **The default bank is the shelf's file before the binary's**, and
+    /// this is the one definition of it: `default.syx` on the SYSEX shelf if
+    /// the user has saved one there, the bank compiled in if not. Launch,
+    /// the Default button and every strip that names nothing all come
+    /// through here — see `dx7::staging::default_bank_at` — so a reading
+    /// that reached for `factory()` directly would be a strip that ignored
+    /// the owner's chosen bank.
     fn cartridge_at(&mut self, path: &str) -> &crate::dx7::Cartridge {
-        self.cartridges.entry(path.to_owned()).or_insert_with(|| {
-            if path.is_empty() {
-                crate::dx7::factory()
+        if !self.cartridges.contains_key(path) {
+            let shelf = self.app.sysex_root();
+            let cart = if path.is_empty() {
+                crate::dx7::staging::default_bank_at(&shelf).0
             } else {
                 crate::dx7::Cartridge::load(std::path::Path::new(path))
-                    .unwrap_or_else(|_| crate::dx7::factory())
-            }
-        })
+                    .unwrap_or_else(|_| crate::dx7::staging::default_bank_at(&shelf).0)
+            };
+            self.cartridges.insert(path.to_owned(), cart);
+        }
+        &self.cartridges[path]
     }
 
     /// The patch strip `strip`'s DX7 should play, out of its own cartridge.
@@ -5520,101 +5695,110 @@ impl DesktopApp {
             .unwrap_or_default()
     }
 
-    /// Where a patch made here is written.
-    ///
-    /// **Beside the settings, not in them.** It is a SysEx bank: an ordinary
-    /// one, which Dexed and a real DX7 will both open. A patch editor whose
-    /// work could only be read back by this app would be a worse deal than the
-    /// hardware offered in 1983.
-    fn user_bank_path() -> std::path::PathBuf {
-        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        tangent_core::config::file("my-patches.syx")
-    }
-
-    /// Hand the editor what it is editing.
+    /// Hand the editor what it is editing, and where its Save would land.
     fn push_patch_edit(&mut self, note: Option<String>) {
         let Some(v) = self.editing else { return };
-        let path = Self::user_bank_path();
-        let edit = crate::dx7::edit::to_edit(&v, &path.to_string_lossy());
+        // In words, for the editor to say: the slot it came from, or the
+        // first empty one, or the fact that there is none.
+        let destination = match self.editing_slot.or_else(|| self.staging.first_free()) {
+            Some(s) => format!("staged bank, slot {}", s + 1),
+            None => "the staged bank, which is full".to_owned(),
+        };
+        let edit = crate::dx7::edit::to_edit(&v, &destination);
         self.app.set_patch_edit(edit, note);
     }
 
-    /// Write the patch being edited into the user's own bank.
+    /// The staged bank's names, to the picker's right pane.
+    fn push_staged(&mut self) {
+        self.app.set_staged_bank(self.staging.names());
+    }
+
+    /// Write the patch being edited into the STAGED bank, and say where.
     ///
-    /// **Appended, never overwritten.** A save that replaced the last one
-    /// would lose the version somebody was happy with an hour ago, and a bank
-    /// holds thirty-two: the oldest is dropped only once it is truly full, and
-    /// the message says so.
+    /// **Into the picker's right pane, not into a file.** This used to
+    /// append to `my-patches.syx` beside the settings, a bank nothing in the
+    /// app ever showed. The owner's ask for the picker was "modify selected
+    /// sounds and save them there to the bank", and the bank being built is
+    /// the one there is: a patch opened from a staged slot goes back INTO
+    /// that slot, a patch opened from the cartridge takes the first empty
+    /// slot — and remembers it, so pressing Save twice overwrites rather
+    /// than filling two slots with the same sound. Save bank then writes
+    /// the lot as an ordinary cartridge, which Dexed and a real DX7 will
+    /// both open; a patch editor whose work could only be read back by this
+    /// app would be a worse deal than the hardware offered in 1983.
+    ///
+    /// A full bank refuses rather than evicting: the old road dropped the
+    /// oldest patch silently, and a slot somebody filled by hand is not
+    /// this code's to empty.
     fn save_patch(&mut self) -> String {
         let Some(v) = self.editing else {
             return String::new();
         };
-        let path = Self::user_bank_path();
-        let mut voices: Vec<crate::dx7::Voice> = crate::dx7::Cartridge::load(&path)
-            .map(|c| c.voices)
-            .unwrap_or_default();
-        // Everything after the last patch anybody saved is the padding this
-        // wrote last time. Trimming it is what makes "append" mean append.
-        while voices.last() == Some(&crate::dx7::Voice::default()) {
-            voices.pop();
-        }
-        let full = voices.len() >= 32;
-        if full {
-            voices.remove(0);
-        }
-        voices.push(v);
-        let cart = crate::dx7::Cartridge::of("my-patches", voices);
-        match cart.save(&path) {
-            Ok(()) => {
-                let where_to = path.file_name().map_or_else(
-                    || path.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                );
-                if full {
-                    format!("Saved to {where_to}. The bank was full, so the oldest went.")
-                } else {
-                    format!("Saved \"{}\" to {where_to}.", v.display_name())
-                }
-            }
-            Err(e) => format!("Could not save: {e}"),
-        }
+        let Some(slot) = self.editing_slot.or_else(|| self.staging.first_free()) else {
+            return "The staged bank is full: remove a patch from it first.".to_owned();
+        };
+        self.staging.set(slot, v);
+        self.editing_slot = Some(slot);
+        self.push_staged();
+        format!(
+            "Put \"{}\" in staged slot {}. Save bank writes it out.",
+            v.display_name(),
+            slot + 1
+        )
     }
 
     /// Read the cartridge named in the settings, if it is still there.
     ///
-    /// Failure is not reported: see the call site. The built-in patch always
+    /// Failure is not reported: see the call site. The default bank always
     /// sounds, so the worst case is the sound somebody would have had on a
     /// fresh install.
     fn load_cartridge_at_launch(&mut self) {
         let path = self.app.dx7_choice().0.to_owned();
-        // **No cartridge chosen means the one that ships**, not silence and not
-        // a single patch. Sixteen electric pianos and sixteen jazz guitars are
-        // in the binary; a fresh install has them all without opening a file
-        // dialog, and "Load .syx..." is for somebody who wants somebody else's.
-        let mut is_factory = path.is_empty();
+        // **No cartridge chosen means the DEFAULT bank**, not silence and not
+        // a single patch: `default.syx` on the SYSEX shelf if the user has
+        // saved one there — the owner's ask, "so the user can have their
+        // chosen load every time" — and otherwise the sixteen electric
+        // pianos and sixteen jazz guitars in the binary, which a fresh
+        // install has without opening a file dialog. "Load bank..." is for
+        // somebody who wants somebody else's. One reading of "default", and
+        // it is `cartridge_at`'s; this only says which it found.
+        let shelf = self.app.sysex_root();
+        let mut on_default = path.is_empty();
         let cart = if path.is_empty() {
-            crate::dx7::factory()
+            let (cart, from_file) = crate::dx7::staging::default_bank_at(&shelf);
+            log::info!(
+                "dx7: the default bank is {}",
+                if from_file {
+                    shelf
+                        .join(tangent_ui::dialogs::DEFAULT_BANK_FILE)
+                        .display()
+                        .to_string()
+                } else {
+                    "the one in the binary".to_owned()
+                }
+            );
+            cart
         } else {
-            // A path that has moved falls back to the shipped bank rather than
-            // to nothing: cartridges live in sample folders that get
-            // reorganised, and an app that goes silent because a file moved is
-            // an app that looks broken.
+            // A path that has moved falls back to the default bank rather
+            // than to nothing: cartridges live in sample folders that get
+            // reorganised, and an app that goes silent because a file moved
+            // is an app that looks broken.
             crate::dx7::Cartridge::load(std::path::Path::new(&path)).unwrap_or_else(|_| {
-                // The remembered file has gone. What is playing IS the shipped
-                // bank now, and the picker must say so rather than offering to
-                // go back to the bank it is already on.
-                is_factory = true;
-                crate::dx7::factory()
+                // The remembered file has gone. What is playing IS the
+                // default bank now, and the picker must say so rather than
+                // offering to go back to the bank it is already on.
+                on_default = true;
+                crate::dx7::staging::default_bank_at(&shelf).0
             })
         };
         self.app
-            .set_cartridge(cartridge_info(&cart, "", is_factory));
+            .set_cartridge(cartridge_info(&cart, "", on_default));
         // Into the cache under the path the strips will ask for it by. No
         // voice is pushed here any more: at launch there is no engine to
         // hear it, and the per-frame lane sync ships every strip's own
         // voice the moment its instance lands.
         self.cartridges
-            .insert(if is_factory { String::new() } else { path }, cart.clone());
+            .insert(if on_default { String::new() } else { path }, cart.clone());
         self.cartridge = Some(cart);
     }
 
@@ -6043,8 +6227,12 @@ impl DesktopApp {
                 // DX7 plays its first patch now.
                 let strip = self.app.cartridge_pick_strip();
                 let path = file.to_string_lossy().into_owned();
-                self.app.set_cartridge(cartridge_info(&cart, "", false));
+                // The setting BEFORE the names: the picker lights the row
+                // the strip's setting points at, and this is the call that
+                // points it at patch 0 of the new bank. The other way round
+                // it lit whatever index the old bank had left behind.
                 self.app.set_dx7_cartridge_of(strip, path.clone());
+                self.app.set_cartridge(cartridge_info(&cart, "", false));
                 if let Some(v) = cart.voices.first().copied() {
                     if let Some(e) = self.recorder.engine.as_mut() {
                         e.set_builtin_voice(strip, v);
@@ -6301,11 +6489,21 @@ impl DesktopApp {
                     self.app.preset_root().join(DRUM_PRESET_FOLDER)
                 })),
             ),
-            // Somebody else's folders, every one of them: the sysex library,
-            // the click they picked last time, a backing track, a project,
-            // a sample being dropped on a bay. Remembered, never made.
-            P::Cartridge
-            | P::ClickSample
+            // A cartridge: the folder the strip's own bank came from, when
+            // it names one — people keep cartridges in one folder ten
+            // thousand files deep, and that folder is theirs to have moved.
+            // When it names none, OUR shelf, made on the way in: the SYSEX
+            // folder is where Save bank writes and where `default.syx` is
+            // looked for, and a fresh install must open there rather than
+            // wherever the OS last left a panel.
+            P::Cartridge => match request.start_at.clone() {
+                Some(at) => (PanelDir::Remembered, Some(at)),
+                None => (PanelDir::Ours, Some(self.app.sysex_root())),
+            },
+            // Somebody else's folders, every one of them: the click they
+            // picked last time, a backing track, a project, a sample being
+            // dropped on a bay. Remembered, never made.
+            P::ClickSample
             | P::BackingTrack
             | P::Project
             | P::InsertMedia(_) => (PanelDir::Remembered, request.start_at.clone()),
@@ -6327,6 +6525,11 @@ impl DesktopApp {
             P::KitPreset => self.app.preset_root().join(DRUM_PRESET_FOLDER),
             // Where every other thing this app renders out of a session goes.
             P::ExportMidi => self.app.export_root(),
+            // The SYSEX shelf: where the DX7's default bank lives and where
+            // its Load bank opens for a strip that names none, so a bank
+            // saved here is a bank the next launch finds. Made on the way
+            // in, like the kit drawer.
+            P::Bank => self.app.sysex_root(),
         }
     }
 
@@ -6363,6 +6566,12 @@ impl DesktopApp {
                 ext: "mid",
                 noun: "MIDI file",
             },
+            // **Overwriting is the point.** The bank somebody is saving is
+            // very often `default.syx` again, one patch better than last
+            // time; a panel that refused the name would send them to the
+            // Finder to delete the old one first. `SaveBank` appends the
+            // extension to a bare name. Same bargain as a template.
+            P::Bank => Taken::Never,
         }
     }
 
@@ -13934,6 +14143,10 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             editing_strip: 0,
             #[cfg(feature = "recorder")]
+            editing_slot: None,
+            #[cfg(feature = "recorder")]
+            staging: crate::dx7::staging::Staging::new(),
+            #[cfg(feature = "recorder")]
             refullscreen: false,
             #[cfg(feature = "recorder")]
             panel_armed: false,
@@ -17825,6 +18038,7 @@ mod tests {
             "P::KitPreset",
             "P::ExportMidi",
             "P::ProjectFirst",
+            "P::Bank",
         ] {
             assert!(
                 body.contains(arm),
@@ -18070,7 +18284,7 @@ mod tests {
             &src[a..a + b]
         };
         assert!(!body.contains("_ =>"), "`save_taken` has a wildcard arm");
-        for arm in ["P::ProjectCopy", "P::ProjectFirst", "P::Template", "P::KitPreset", "P::ExportMidi"] {
+        for arm in ["P::ProjectCopy", "P::ProjectFirst", "P::Template", "P::KitPreset", "P::ExportMidi", "P::Bank"] {
             assert!(body.contains(arm), "`save_taken` no longer answers for `{arm}`");
         }
         let panel = {
@@ -20365,6 +20579,132 @@ mod tests {
         assert!(rows.iter().all(|r| (r.seconds - 0.5).abs() < 0.01));
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// **A saved bank replaces what the cache holds, under both names it
+    /// can be asked for, and the strip is pointed at it BEFORE the picker is
+    /// told.** `cartridges` is keyed by path and never evicted, so a save
+    /// that did not replace the entry would leave every strip on the OLD
+    /// default until relaunch — a Save bank that appears to do nothing. And
+    /// the picker lights the row the strip's patch index names, which
+    /// `set_dx7_cartridge_of` is what resets, so the order of those two
+    /// calls is the difference between "patch 1 lit" and "whatever the old
+    /// bank left behind lit". The load road keeps the same order for the
+    /// same reason; both are pinned.
+    ///
+    /// A shape test because `DesktopApp` needs an engine and a window.
+    /// Revert-check performed: swap the two calls in the SaveBank arm and
+    /// the ordering assertion reddens; drop the `String::new()` insert and
+    /// the cache assertion names it.
+    #[test]
+    fn a_saved_bank_replaces_the_cached_default_and_names_the_strip_before_the_picker() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        let arm = {
+            let a = src
+                .find("R::SaveBank { strip, path } =>")
+                .expect("the SaveBank arm is gone");
+            let b = src[a..]
+                .find("Err(e) => self.app.set_bank_note")
+                .expect("the end of the SaveBank arm");
+            &src[a..a + b]
+        };
+        assert!(
+            arm.contains("self.cartridges.insert(key.clone(), cart.clone())"),
+            "the saved bank no longer replaces the cache entry under its path"
+        );
+        assert!(
+            arm.contains("self.cartridges.insert(String::new(), cart.clone())"),
+            "a bank saved as default.syx no longer replaces the cached default, \
+             so every strip on \"\" plays the old one until relaunch"
+        );
+        let setting = arm
+            .find("self.app.set_dx7_cartridge_of(")
+            .expect("the strip is no longer pointed at the saved bank");
+        let names = arm
+            .find("self.app.set_cartridge(")
+            .expect("the picker is no longer told about the saved bank");
+        assert!(
+            setting < names,
+            "the picker is told before the strip's setting is reset, so it \
+             lights the old bank's patch index"
+        );
+        let load = {
+            let a = src
+                .find("match crate::dx7::Cartridge::load(file) {")
+                .expect("the cartridge load arm is gone");
+            let b = src[a..]
+                .find("Err(e) => self.app.set_cartridge(")
+                .expect("the end of the cartridge load arm");
+            &src[a..a + b]
+        };
+        let setting = load
+            .find("set_dx7_cartridge_of(")
+            .expect("a loaded bank is no longer written to the strip");
+        let names = load
+            .find("set_cartridge(cartridge_info(")
+            .expect("a loaded bank is no longer shown");
+        assert!(
+            setting < names,
+            "the load road tells the picker before the setting, the fault \
+             the save road is pinned against"
+        );
+    }
+
+    /// **An empty setting means the SHELF before the binary, and there is
+    /// one reading of it.** `default.syx` on the SYSEX shelf is the owner's
+    /// "chosen load every time"; a road that reached for `factory()`
+    /// directly would be a strip, or a launch, or a Default button, that
+    /// ignored it. The three roads are pinned to `default_bank_at`, the
+    /// Default button to re-reading the file, and the load panel to opening
+    /// on the shelf when the strip names no bank.
+    ///
+    /// Revert-check performed: `crate::dx7::factory()` back in
+    /// `cartridge_at`'s empty-path branch reddens the first loop.
+    #[test]
+    fn an_empty_setting_reads_the_shelf_before_the_binary_in_one_place() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        for (name, start) in [
+            ("cartridge_at", "fn cartridge_at("),
+            ("load_cartridge_at_launch", "fn load_cartridge_at_launch("),
+        ] {
+            let a = src.find(start).unwrap_or_else(|| panic!("`{name}` is gone"));
+            let b = src[a..]
+                .find("\n    /// ")
+                .unwrap_or_else(|| panic!("the end of `{name}`"));
+            let body = &src[a..a + b];
+            assert!(
+                body.contains("default_bank_at("),
+                "`{name}` no longer asks the shelf for the default bank"
+            );
+            assert!(
+                !body.contains("crate::dx7::factory()"),
+                "`{name}` reaches for the binary's bank directly, so a \
+                 default.syx on the shelf is ignored on this road"
+            );
+        }
+        let a = src
+            .find("self.app.take_default_bank()")
+            .expect("the Default button is no longer answered");
+        let b = src[a..]
+            .find("self.cartridge = Some(cart);")
+            .expect("the end of the Default button's arm");
+        assert!(
+            src[a..a + b].contains("self.cartridges.remove(\"\")"),
+            "the Default button serves the cached default rather than \
+             re-reading the shelf, so a default.syx replaced by hand is not \
+             seen until relaunch"
+        );
+        let a = src.find("fn load_start(").expect("`load_start` is gone");
+        let b = src[a..].find("\n    /// ").expect("the end of `load_start`");
+        assert!(
+            src[a..a + b].contains("None => (PanelDir::Ours, Some(self.app.sysex_root()))"),
+            "the Load bank panel no longer opens on the SYSEX shelf for a \
+             strip that names no bank, so a fresh install opens wherever the \
+             OS last left a panel"
+        );
+    }
+
 }
 
 // ───────────────────────────────────────────────────────────────────────────

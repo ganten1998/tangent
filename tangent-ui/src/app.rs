@@ -1152,12 +1152,14 @@ pub struct TangentApp {
     /// because the panel is parented to the main window and cannot be put in
     /// front of a floating dialog by any other means.
     native_panel_up: bool,
-    /// The user pressed Factory in the patch picker. Taken by the host.
-    /// `Some(strip)` when that strip asked for the shipped cartridge back.
-    factory_cartridge: Option<usize>,
-    /// Which strip a raised cartridge file panel belongs to. Remembered
-    /// here because the panel is asynchronous and its answer arrives with a
-    /// path and no memory of who asked.
+    /// The user pressed Default in the patch picker. Taken by the host.
+    /// `Some(strip)` when that strip asked for its default bank back — the
+    /// shelf's `default.syx` if there is one, the shipped cartridge if not.
+    default_bank: Option<usize>,
+    /// Which strip a raised cartridge panel belongs to — the Load bank file
+    /// panel and the Save bank save panel alike. Remembered here because a
+    /// panel is asynchronous and its answer arrives with a path and no
+    /// memory of who asked.
     cartridge_pick_strip: usize,
     file_request: Option<crate::ports::FileRequest>,
     /// The in-app browser's three messages to the host: list this, I chose a
@@ -1242,6 +1244,13 @@ pub struct TangentApp {
     /// Patch names of the cartridge the host has loaded, for the picker. The
     /// app never reads a `.syx`: this is pushed in after the host parses one.
     cartridge: crate::ports::CartridgeInfo,
+    /// The staged bank's thirty-two slot names — the picker's right pane —
+    /// `None` where a slot is empty. Pushed by the host after every move,
+    /// exactly as `cartridge` is: the voices live over there, and this crate
+    /// holds nothing about a patch but what it is called. Session-long and
+    /// shared by every strip's picker, because it is a bank being built and
+    /// not a fact about a lane.
+    staged: Vec<Option<String>>,
     /// The host's scan of each unit's preset folder, keyed by unit identity
     /// ("@tangent-eq", "keys:2"). Pushed like the cartridge above; the app
     /// never opens the folder itself.
@@ -3313,7 +3322,7 @@ impl TangentApp {
             open_insert_on_load: None,
             mixer_rect: None,
             native_panel_up: false,
-            factory_cartridge: None,
+            default_bank: None,
             cartridge_pick_strip: 0,
             file_request: None,
             browse_request: None,
@@ -3343,6 +3352,7 @@ impl TangentApp {
             lcd_drag: None,
             input_width: 0,
             cartridge: crate::ports::CartridgeInfo::default(),
+            staged: vec![None; dialogs::CARTRIDGE_VOICES],
             preset_rows: std::collections::HashMap::new(),
             preset_loaded: None,
             ir_rows: Vec::new(),
@@ -7530,13 +7540,13 @@ impl TangentApp {
         std::mem::take(&mut self.plugin_rescan)
     }
 
-    /// The user asked for the shipped cartridge back — on this strip.
+    /// The user asked for the default bank back — on this strip.
     ///
     /// The strip travels with the flag now, because every strip owns its own
-    /// DX7: the bank is still in the binary and the host still knows how to
-    /// reach it, but WHOSE sound changes stopped being obvious.
-    pub fn take_factory_cartridge(&mut self) -> Option<usize> {
-        self.factory_cartridge.take()
+    /// DX7: the bank is on the shelf or in the binary and the host knows how
+    /// to reach either, but WHOSE sound changes stopped being obvious.
+    pub fn take_default_bank(&mut self) -> Option<usize> {
+        self.default_bank.take()
     }
 
     /// Which strip the cartridge file panel that is up was raised for.
@@ -7749,7 +7759,7 @@ impl TangentApp {
                         })
                         .collect(),
                 }],
-                bank_path: "~/.config/tangent/my-patches.syx".to_owned(),
+                bank_path: "staged bank, slot 1".to_owned(),
             },
             group: 0,
             name: "E.PIANO 1".to_owned(),
@@ -20530,6 +20540,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             crate::ports::SavePurpose::KitPreset => self.write_kit_preset(path),
             crate::ports::SavePurpose::ExportMidi => self.write_midi_export(path),
+            crate::ports::SavePurpose::Bank => {
+                // To the host, whole: it has the voices, it writes the file,
+                // and it makes the saved bank the strip's cartridge. The
+                // strip is the one whose picker raised the panel — remembered
+                // in `cartridge_pick_strip`, since the answer does not say.
+                let strip = self.cartridge_pick_strip;
+                self.request_recorder(recorder::RecorderRequest::SaveBank {
+                    strip,
+                    path: path.to_path_buf(),
+                });
+            }
         }
     }
 
@@ -22575,12 +22596,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// scroll position and the filter survive loading a bank.
     pub fn set_cartridge(&mut self, info: crate::ports::CartridgeInfo) {
         self.cartridge = info;
+        // **The row that is lit is the row the strip's SETTING names**, read
+        // before the dialog is borrowed. This used to clear the selection on
+        // every answer, on the argument that a new bank makes the old index
+        // a different sound — true of a bank somebody just loaded, but the
+        // same call answers the picker OPENING (`LoadStripCartridge`), and
+        // so the picker lit the strip's patch on its first frame and went
+        // dark on its second, for every strip, every time. The setting is
+        // the one fact both cases share: a load puts it at 0 (the host does
+        // that before pushing the names, and plays patch 0), and an open
+        // leaves it at whatever the strip was remembered on.
+        let playing = match &self.dialog {
+            Some(dialogs::Dialog::PatchPicker { slot, .. }) => Some(self.dx7_choice_of(*slot).1),
+            _ => None,
+        };
         let Some(dialogs::Dialog::PatchPicker {
             bank,
             bad_checksum,
-            factory,
+            on_default,
             voices,
             selected,
+            staged_selected,
             filter,
             error,
             ..
@@ -22597,14 +22633,47 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         error.clear();
         bank.clone_from(&self.cartridge.bank);
         *bad_checksum = self.cartridge.bad_checksum;
-        // So pressing Factory makes the button that did it disappear, which is
-        // the honest report: there is nowhere left to go back to.
-        *factory = self.cartridge.factory;
+        // So pressing Default makes the button that did it disappear, which
+        // is the honest report: there is nowhere left to go back to.
+        *on_default = self.cartridge.on_default;
         voices.clone_from(&self.cartridge.voices);
-        // A new bank means the old selection is a different patch. Nothing is
-        // selected until somebody picks, and until then the built-in plays.
-        *selected = None;
+        *selected = playing.filter(|p| *p < voices.len());
+        // The strip plays out of its cartridge now, not out of the staged
+        // bank: a staged row left lit would be a row that is not sounding.
+        *staged_selected = None;
         filter.clear();
+    }
+
+    /// The host has applied a move to the staged bank. Show it.
+    ///
+    /// The same road as `set_cartridge`, for the right pane: names in, the
+    /// open picker refilled in place. A selection or a mark on a slot the
+    /// host has since emptied is dropped, so nothing points at a hole.
+    pub fn set_staged_bank(&mut self, names: Vec<Option<String>>) {
+        self.staged = names;
+        self.staged.resize(dialogs::CARTRIDGE_VOICES, None);
+        let Some(dialogs::Dialog::PatchPicker {
+            staged,
+            staged_marked,
+            staged_selected,
+            ..
+        }) = self.dialog.as_mut()
+        else {
+            return;
+        };
+        staged.clone_from(&self.staged);
+        staged_marked.retain(|&i| staged.get(i).is_some_and(Option::is_some));
+        if staged_selected.is_some_and(|i| !staged.get(i).is_some_and(Option::is_some)) {
+            *staged_selected = None;
+        }
+    }
+
+    /// What the last Save bank did, in the picker's own words. Good or bad:
+    /// "Saved 12 patches to default.syx." or why it could not.
+    pub fn set_bank_note(&mut self, said: String) {
+        if let Some(dialogs::Dialog::PatchPicker { note, .. }) = self.dialog.as_mut() {
+            *note = said;
+        }
     }
 
     // ── presets ─────────────────────────────────────────────────────────────
@@ -23344,7 +23413,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn open_patch_picker(&mut self, slot: usize) {
         // The list must be THIS strip's cartridge. The host owns the files,
         // so ask it; the names arrive next frame and the open dialog refills,
-        // the same road the Factory button has always taken.
+        // the same road the Default button has always taken. The staged bank
+        // needs no asking: it is one bank for the whole session, and the
+        // mirror is whatever the host last pushed.
         self.request_recorder(recorder::RecorderRequest::LoadStripCartridge { strip: slot });
         let (_, patch) = self.dx7_choice_of(slot);
         let selected = (!self.cartridge.voices.is_empty()
@@ -23354,9 +23425,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             slot,
             self.cartridge.bank.clone(),
             self.cartridge.bad_checksum,
-            self.cartridge.factory,
+            self.cartridge.on_default,
             self.cartridge.voices.clone(),
             selected,
+            self.staged.clone(),
         ));
     }
 
@@ -24434,6 +24506,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// and the shelf's scan both go through the host, which asks here.
     pub fn irs_root(&self) -> std::path::PathBuf {
         self.settings.irs_root()
+    }
+
+    /// Where DX7 BANKS live, resolved: the picker's Save bank panel opens
+    /// here, its Load bank panel opens here for a strip that names no bank,
+    /// and `default.syx` in it is the bank such a strip plays. The host
+    /// asks here for all three. See `Settings::sysex_root`.
+    pub fn sysex_root(&self) -> std::path::PathBuf {
+        self.settings.sysex_root()
     }
 
     /// The typed take name, if any.
@@ -27740,12 +27820,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             DialogAction::SavePatch => {
                 self.request_recorder(recorder::RecorderRequest::SavePatch);
             }
-            DialogAction::UseFactoryCartridge { slot } => {
+            DialogAction::UseDefaultBank { slot } => {
                 // **The setting is what selects it.** An empty path is what a
-                // fresh strip has and what the host reads as "the one that
-                // ships", so putting the cartridge back is putting the
-                // STRIP's setting back — and the host then loads exactly what
-                // a fresh lane would.
+                // fresh strip has and what the host reads as "the default
+                // bank" — the shelf's `default.syx`, or the one that ships —
+                // so putting the bank back is putting the STRIP's setting
+                // back, and the host then loads exactly what a fresh lane
+                // would.
                 if let Some(p) = self.settings.strip_dx7_cartridge.get_mut(slot) {
                     p.clear();
                 }
@@ -27753,7 +27834,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     *p = 0;
                 }
                 self.save_settings();
-                self.factory_cartridge = Some(slot);
+                self.default_bank = Some(slot);
             }
             DialogAction::LoadCartridge { slot } => {
                 if !self.caps.native_file_dialogs {
@@ -27775,6 +27856,66 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     extension_label: "DX7 cartridge".to_owned(),
                     purpose: crate::ports::FilePurpose::Cartridge,
                     multi: false,
+                });
+            }
+            // ── the bank builder ────────────────────────────────────────
+            //
+            // Every move of the picker's right pane is a request to the
+            // host, which holds the voices and answers with the names — see
+            // `RecorderRequest`'s own section. Nothing here touches the
+            // settings: a staged bank is in no file until Save bank puts it
+            // in one, and the strip's own cartridge and patch are what the
+            // settings remember.
+            DialogAction::StagePatches { slot, indices, at } => {
+                self.request_recorder(recorder::RecorderRequest::StagePatches {
+                    slot,
+                    indices,
+                    at,
+                });
+            }
+            DialogAction::UnstagePatches { slots } => {
+                self.request_recorder(recorder::RecorderRequest::UnstagePatches { slots });
+            }
+            DialogAction::SwapStaged { a, b } => {
+                self.request_recorder(recorder::RecorderRequest::SwapStaged { a, b });
+            }
+            DialogAction::ChooseStaged { slot, index } => {
+                self.request_recorder(recorder::RecorderRequest::ChooseStaged { slot, index });
+            }
+            DialogAction::EditStaged { slot, index } => {
+                // Opened empty and filled by the host next frame, exactly as
+                // `EditPatch` is; the only difference travels in the request.
+                self.dialog = Some(dialogs::Dialog::PatchEditor {
+                    slot,
+                    patch: crate::ports::PatchEdit::default(),
+                    group: 0,
+                    name: String::new(),
+                    note: String::new(),
+                });
+                self.request_recorder(recorder::RecorderRequest::EditStaged { slot, index });
+            }
+            DialogAction::SaveBank { slot } => {
+                // **Gated on the host being able to raise a panel at all**,
+                // and SAYING SO when it cannot, for the drumpad's reason: the
+                // button is painted in the plugin too, and a control that
+                // takes a press in silence is worse than one that is missing.
+                if !self.caps.native_file_dialogs {
+                    self.set_bank_note(
+                        "there is no file panel in a plugin — save this bank from \
+                         the Tangent app"
+                            .to_owned(),
+                    );
+                    return;
+                }
+                self.native_panel_up = true;
+                self.cartridge_pick_strip = slot;
+                // `default.syx`, because that is the bank the instrument
+                // opens on: saving over it is how "your chosen bank every
+                // time" is arranged, and the panel says so by suggesting it.
+                self.save_request = Some(crate::ports::SaveRequest {
+                    title: "Save bank".to_owned(),
+                    suggested: dialogs::DEFAULT_BANK_FILE.to_owned(),
+                    purpose: crate::ports::SavePurpose::Bank,
                 });
             }
             DialogAction::ChooseDevice { kind, uid } => {
@@ -32781,7 +32922,7 @@ mod tests {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, settings);
         assert_eq!(app.dx7_choice_of(2), ("/somewhere/ROM1A.syx", 17));
 
-        app.apply_dialog_action(DialogAction::UseFactoryCartridge { slot: 2 });
+        app.apply_dialog_action(DialogAction::UseDefaultBank { slot: 2 });
         assert_eq!(
             app.dx7_choice_of(2),
             ("", 0),
@@ -32791,12 +32932,12 @@ mod tests {
         // that stayed set would reload the bank on every frame, and one with
         // no lane on it would re-voice somebody else's track.
         assert_eq!(
-            app.take_factory_cartridge(),
+            app.take_default_bank(),
             Some(2),
             "the host was never told"
         );
         assert!(
-            app.take_factory_cartridge().is_none(),
+            app.take_default_bank().is_none(),
             "the flag latched on"
         );
     }
@@ -37651,7 +37792,7 @@ mod tests {
         app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(1), 0), 0.0);
 
         app.set_cartridge(crate::ports::CartridgeInfo {
-            factory: false,
+            on_default: false,
             bank: "ROM1A".to_owned(),
             bad_checksum: true,
             voices: (0..32).map(|i| format!("PATCH {i}")).collect(),
@@ -37672,8 +37813,12 @@ mod tests {
         assert!(*bad_checksum, "a bad checksum has to be shown, not hidden");
         assert_eq!(voices.len(), 32);
         assert!(error.is_empty());
-        // Nothing is selected: patch 12 of the old bank is a different sound.
-        assert_eq!(*selected, None);
+        // Patch 1 is lit, and not patch 12 of the old bank: the strip's
+        // setting says 0 after a load (`set_dx7_cartridge_of` puts it there,
+        // and the host plays it), and the row that is lit is the row the
+        // setting names. See `set_cartridge` for the frame this used to go
+        // dark on.
+        assert_eq!(*selected, Some(0));
     }
 
     /// **A file that will not parse must not cost you the one that did.** The
@@ -37684,13 +37829,13 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(1), 0), 0.0);
         app.set_cartridge(crate::ports::CartridgeInfo {
-            factory: false,
+            on_default: false,
             bank: "ROM1A".to_owned(),
             voices: (0..32).map(|i| format!("PATCH {i}")).collect(),
             ..Default::default()
         });
         app.set_cartridge(crate::ports::CartridgeInfo {
-            factory: false,
+            on_default: false,
             error: "this is a single-voice dump, not a 32-voice cartridge".to_owned(),
             ..Default::default()
         });
@@ -37748,6 +37893,174 @@ mod tests {
         let r = app.take_file_request().expect("the desktop asks");
         assert_eq!(r.purpose, crate::ports::FilePurpose::Cartridge);
         assert!(r.extensions.iter().any(|e| e.eq_ignore_ascii_case("syx")));
+    }
+
+    /// **The staged bank is the host's, and the right pane is its mirror.**
+    /// Every move goes over as a request and comes back as names; a
+    /// selection the host has since emptied is dropped; and the bank
+    /// outlives the window, because it is one bank for the session and not
+    /// a fact about the lane whose picker happened to be open.
+    #[test]
+    fn staging_moves_go_to_the_host_and_the_pane_refills_in_place() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.apply_dialog_action(dialogs::DialogAction::ShowPatches { slot: 1 });
+        while app.take_recorder_request().is_some() {}
+        app.apply_dialog_action(dialogs::DialogAction::StagePatches {
+            slot: 1,
+            indices: vec![2, 5],
+            at: Some(7),
+        });
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::StagePatches {
+                slot: 1,
+                indices: vec![2, 5],
+                at: Some(7),
+            })
+        );
+        let mut names = vec![None; dialogs::CARTRIDGE_VOICES];
+        names[7] = Some("KEEP A".to_owned());
+        names[8] = Some("KEEP B".to_owned());
+        app.set_staged_bank(names.clone());
+        let Some(dialogs::Dialog::PatchPicker { staged, .. }) = &app.dialog else {
+            panic!("the picker closed when the staged bank arrived")
+        };
+        assert_eq!(staged, &names);
+
+        // Auditioning a staged slot is a request and NOT a setting: nothing
+        // on disk holds that patch yet, so there is nothing to remember.
+        app.apply_dialog_action(dialogs::DialogAction::ChooseStaged { slot: 1, index: 7 });
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::ChooseStaged { slot: 1, index: 7 })
+        );
+        assert_eq!(app.settings.strip_dx7_patch[1], 0);
+
+        // Removing goes the same road, and a selection or a mark on a slot
+        // the host has since emptied is dropped rather than left pointing at
+        // a hole.
+        if let Some(dialogs::Dialog::PatchPicker {
+            staged_selected,
+            staged_marked,
+            ..
+        }) = app.dialog.as_mut()
+        {
+            *staged_selected = Some(8);
+            staged_marked.extend([7, 8]);
+        }
+        app.apply_dialog_action(dialogs::DialogAction::UnstagePatches { slots: vec![8] });
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::UnstagePatches { slots: vec![8] })
+        );
+        names[8] = None;
+        app.set_staged_bank(names.clone());
+        let Some(dialogs::Dialog::PatchPicker {
+            staged_selected,
+            staged_marked,
+            ..
+        }) = &app.dialog
+        else {
+            panic!("the picker closed")
+        };
+        assert_eq!(*staged_selected, None, "a selection points at an empty slot");
+        assert_eq!(staged_marked, &vec![7], "a mark points at an empty slot");
+
+        // The bank outlives the window: close it, open it on another strip,
+        // and what was built is still there.
+        app.dialog = None;
+        app.apply_dialog_action(dialogs::DialogAction::ShowPatches { slot: 3 });
+        let Some(dialogs::Dialog::PatchPicker { staged, slot, .. }) = &app.dialog else {
+            panic!("the picker did not open")
+        };
+        assert_eq!(*slot, 3);
+        assert_eq!(staged, &names, "the staged bank was lost with the window");
+    }
+
+    /// Save bank raises the save panel on the desktop, suggesting the file
+    /// the instrument opens on, and the answer goes to the host for the
+    /// strip that asked; in a plugin, which has no panel, the press is
+    /// answered in words rather than in silence.
+    #[test]
+    fn save_bank_asks_for_a_panel_on_the_desktop_and_says_so_in_a_plugin() {
+        let (_, mut app) = headless(Caps::PLUGIN);
+        app.apply_dialog_action(dialogs::DialogAction::ShowPatches { slot: 1 });
+        app.apply_dialog_action(dialogs::DialogAction::SaveBank { slot: 1 });
+        assert!(app.take_save_request().is_none(), "a plugin has no panel to raise");
+        let Some(dialogs::Dialog::PatchPicker { note, .. }) = &app.dialog else {
+            panic!("the picker closed")
+        };
+        assert!(note.contains("plugin"), "the press was taken in silence: {note:?}");
+
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.apply_dialog_action(dialogs::DialogAction::SaveBank { slot: 2 });
+        let req = app.take_save_request().expect("the desktop asks");
+        assert_eq!(req.purpose, crate::ports::SavePurpose::Bank);
+        assert_eq!(req.suggested, dialogs::DEFAULT_BANK_FILE);
+        assert!(app.native_panel_up(), "the dialogs went on floating over the panel");
+        let path = std::path::Path::new("/m/Tangent Media/SYSEX/default.syx");
+        app.finish_save_choice(crate::ports::SavePurpose::Bank, path);
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::SaveBank {
+                strip: 2,
+                path: path.to_path_buf(),
+            })
+        );
+        assert!(!app.native_panel_up());
+    }
+
+    /// **The picker opens lit on the row the strip plays.** It did not: the
+    /// host's answer to the open cleared the selection one frame after
+    /// `open_patch_picker` had set it, on the argument that belongs to a
+    /// freshly LOADED bank. See `set_cartridge`.
+    ///
+    /// Revert-check performed: `*selected = None` back in `set_cartridge`
+    /// reddens this on the second assertion.
+    #[test]
+    fn the_picker_opens_lit_on_the_patch_the_strip_plays() {
+        let mut settings = Settings::default();
+        settings.strip_dx7_cartridge[1] = "/somewhere/ROM1A.syx".to_owned();
+        settings.strip_dx7_patch[1] = 12;
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, settings);
+        while app.take_recorder_request().is_some() {}
+        app.apply_dialog_action(dialogs::DialogAction::ShowPatches { slot: 1 });
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::LoadStripCartridge { strip: 1 })
+        );
+        // The host's answer, as `LoadStripCartridge` gives it.
+        app.set_cartridge(crate::ports::CartridgeInfo {
+            bank: "ROM1A".to_owned(),
+            voices: (0..32).map(|i| format!("PATCH {i}")).collect(),
+            ..Default::default()
+        });
+        let Some(dialogs::Dialog::PatchPicker { selected, .. }) = &app.dialog else {
+            panic!("the picker closed")
+        };
+        assert_eq!(
+            *selected,
+            Some(12),
+            "the picker went dark on the frame the host answered the open"
+        );
+    }
+
+    /// Patch... on a staged row opens the editor the same way it opens on a
+    /// cartridge row, and the request says which slot, so a Save goes back
+    /// into it.
+    #[test]
+    fn editing_a_staged_patch_opens_the_editor_on_that_slot() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        while app.take_recorder_request().is_some() {}
+        app.apply_dialog_action(dialogs::DialogAction::EditStaged { slot: 1, index: 4 });
+        assert!(matches!(
+            app.dialog,
+            Some(dialogs::Dialog::PatchEditor { slot: 1, .. })
+        ));
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::EditStaged { slot: 1, index: 4 })
+        );
     }
 
     /// The cog opens the take-settings popup, and the popup can be dismissed.

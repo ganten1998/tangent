@@ -128,7 +128,7 @@ pub enum Dialog {
         current: Option<String>,
     },
     /// Choose a patch for the built-in FM instrument, and the cartridge it
-    /// comes from.
+    /// comes from — and BUILD a bank out of any number of cartridges.
     ///
     /// **Selecting is auditioning.** Every other picker in this file waits for
     /// a Load button, because loading a VST3 costs a second and running
@@ -137,6 +137,19 @@ pub enum Dialog {
     /// sound at once and the only button is Done. Dialing in a patch means
     /// playing while you move down the list, and a picker that made you confirm
     /// each one would make that impossible.
+    ///
+    /// **Two panes.** The left is the strip's loaded cartridge, thirty-two
+    /// numbered rows read off a disk and never written to. The right is the
+    /// STAGED bank: thirty-two numbered slots, empty until something is put
+    /// in one, and the only thing Save bank ever writes. The owner's ask was
+    /// a way to "mix and match patches from different banks and stage their
+    /// perfect bank": load one cartridge, drag the six rows worth keeping
+    /// across, load another, drag two more, save. A drop onto a slot lands
+    /// there; the Stage button and the right-click marks take the first
+    /// empty slots. Names only, on this side of the firewall — the voices
+    /// live on the host, which applies the same moves to them (see
+    /// `dx7::staging`) and pushes the names back through
+    /// `TangentApp::set_staged_bank`.
     PatchPicker {
         /// The instrument slot the built-in is in, carried so the action can
         /// name it without the app having to look it up again.
@@ -144,21 +157,47 @@ pub enum Dialog {
         /// What the loaded cartridge calls itself, or empty for the patch that
         /// is compiled in.
         bank: String,
-        /// The loaded bank is the one that ships, so there is nowhere to go
-        /// back to and no Factory button.
-        factory: bool,
+        /// The strip is on its DEFAULT bank — the shelf's `default.syx` or
+        /// the one that ships — so there is nowhere to go back to and no
+        /// Default button. See `ports::CartridgeInfo::on_default`.
+        on_default: bool,
         /// The cartridge failed its own checksum. Shown, never refused — see
         /// `Cartridge::parse`.
         bad_checksum: bool,
         /// The patch names, in cartridge order. Empty until one is loaded, and
         /// that is the state a fresh install is in.
         voices: Vec<String>,
+        /// The left row that is playing, if the strip plays out of its
+        /// cartridge. `None` with `staged_selected` also `None` is the
+        /// built-in patch.
         selected: Option<usize>,
         filter: String,
         focus: bool,
         /// What went wrong with the last cartridge somebody chose. The whole
         /// point of the lenient parser is that this is rare and specific.
         error: String,
+        /// The staged bank's slot names, `None` where a slot is empty. Always
+        /// [`CARTRIDGE_VOICES`] long: the pane numbers every slot whether or
+        /// not it holds anything, because that is what somebody drops onto.
+        staged: Vec<Option<String>>,
+        /// Left rows MARKED by a right-click, in bank order. A drag that
+        /// starts on a marked row carries all of them; the Stage button
+        /// takes them when there are any and the playing row when not.
+        marked: Vec<usize>,
+        /// Staged slots marked by a right-click, the Remove button's set.
+        staged_marked: Vec<usize>,
+        /// The staged slot that is playing, if the strip plays out of the
+        /// staged bank. Never written to the settings: a staged patch is in
+        /// no file until Save bank puts it in one.
+        staged_selected: Option<usize>,
+        /// A drag in flight: what was picked up and which pane it came from.
+        /// Set on the frame the pointer moves past the click threshold,
+        /// cleared on the frame the button comes up — the drop, if the
+        /// pointer was over a staged slot then, is decided on that frame.
+        drag: Option<BankDrag>,
+        /// What the last Save bank said, good or bad — "Saved 12 patches to
+        /// default.syx." or the reason it could not.
+        note: String,
     },
     /// Which instrument the modelled keyboard is being right now.
     ///
@@ -1595,9 +1634,13 @@ pub enum DialogAction {
     LoadCartridge {
         slot: usize,
     },
-    /// Put the shipped cartridge back on one strip. The dialog stays open
-    /// and refills with its thirty-two names, exactly as loading a file does.
-    UseFactoryCartridge {
+    /// Put one strip back on its DEFAULT bank — `default.syx` on the SYSEX
+    /// shelf if the user has saved one there, the shipped cartridge if not.
+    /// The dialog stays open and refills with its thirty-two names, exactly
+    /// as loading a file does. Was `UseFactoryCartridge` until the shelf
+    /// existed; see `ports::CartridgeInfo::on_default` for why the name had
+    /// to change with the meaning.
+    UseDefaultBank {
         slot: usize,
     },
     /// Open the patch editor on whatever the built-in is playing.
@@ -1752,6 +1795,32 @@ pub enum DialogAction {
     /// enum's law. See [`crate::faces::FaceAction::SetMany`] — the EQ's
     /// double-click reset puts a whole band back and that is five of them.
     SetInsertParamsMany { strip: usize, slot: usize, sets: Vec<(u32, f32)> },
+    // ── the DX7 bank builder ────────────────────────────────────────────
+    // Appended at the END, this enum's law. Six asks from the picker's
+    // right pane; the app maps each onto a `RecorderRequest` of the same
+    // name, because the voices they move live on the host.
+    /// Copy left rows `indices` of `slot`'s cartridge into the staged bank:
+    /// from slot `at` on, overwriting, when a drop named one; into the first
+    /// empty slots when the Stage button or the right-click road did not.
+    StagePatches {
+        slot: usize,
+        indices: Vec<usize>,
+        at: Option<usize>,
+    },
+    /// Empty these staged slots. The rest keep their numbers.
+    UnstagePatches { slots: Vec<usize> },
+    /// Exchange two staged slots — a drag within the right pane.
+    SwapStaged { a: usize, b: usize },
+    /// Play staged slot `index` through `slot`'s built-in, now. Auditioning,
+    /// as `ChoosePatch` is; nothing is written to the settings.
+    ChooseStaged { slot: usize, index: usize },
+    /// Open the patch editor on staged slot `index`, so that its Save goes
+    /// back into that slot. `EditPatch` is the road in from the left pane.
+    EditStaged { slot: usize, index: usize },
+    /// Ask where to write the staged bank. The app raises a save panel on
+    /// the SYSEX shelf suggesting `default.syx`; the answer goes to the host
+    /// as `RecorderRequest::SaveBank` for `slot`'s strip.
+    SaveBank { slot: usize },
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -3870,24 +3939,97 @@ pub const CARTRIDGE_VOICES: usize = 32;
 /// The row shown when no cartridge is loaded: the patch compiled into the app.
 pub const BUILTIN_PATCH_ROW: &str = "E.PIANO 1  (built in)";
 
+/// **The bank the instrument opens on**, by name: `default.syx` on the SYSEX
+/// shelf (`Settings::sysex_root`). What Save bank suggests, and what the
+/// host looks for when a strip names no cartridge of its own — the owner's
+/// "called default.syx by default so the user can have their chosen load
+/// every time". The host reads this constant rather than spelling the name
+/// again; `dx7::staging` has the test that holds the two crates together.
+pub const DEFAULT_BANK_FILE: &str = "default.syx";
+
+/// What an empty staged slot says after its number. Faint, and words
+/// rather than nothing: a numbered row with nothing beside it reads as a
+/// patch with no name, which the format allows and this must not look like.
+pub const STAGED_EMPTY_ROW: &str = "(empty)";
+
 /// What the buttons on the cartridge row need between them.
 ///
 /// Reserved rather than measured: measuring means laying the row out twice,
-/// and the failure it prevents is a bank name running under "Edit...".
-const BANK_BUTTONS_W: f32 = 176.0;
+/// and the failure it prevents is a bank name running under "Patch...".
+/// Two buttons always — "Load bank..." and "Patch..." — at 11pt Courier
+/// with the button padding either side.
+const BANK_BUTTONS_W: f32 = 184.0;
 
 /// Clear air between the bank name and the first button.
 ///
 /// Without it the name is allowed to fill every remaining point and ends up
-/// touching "Edit...", which reads as a layout bug even though nothing is
+/// touching "Patch...", which reads as a layout bug even though nothing is
 /// overlapping. The shipped bank's own name is long enough to do it.
 const BANK_NAME_GAP: f32 = 14.0;
 
-/// And what "Factory" needs, on top, when there is a cartridge to leave.
-const FACTORY_BUTTON_W: f32 = 74.0;
+/// And what "Default" needs, on top, when there is a bank to leave.
+const DEFAULT_BUTTON_W: f32 = 74.0;
 
-const PATCH_DIALOG_W: f32 = 520.0;
-const PATCH_DIALOG_H: f32 = 470.0;
+/// The column between the two panes: the Stage and Remove buttons, and the
+/// air either side of them.
+const BANK_MID_W: f32 = 100.0;
+
+/// Wide enough for two panes of ten-character names with their numbers,
+/// and the button column between; tall enough that a pane shows about
+/// fifteen of its thirty-two rows before scrolling.
+const PATCH_DIALOG_W: f32 = 760.0;
+const PATCH_DIALOG_H: f32 = 520.0;
+
+/// A drag in flight between the picker's panes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BankDrag {
+    /// Picked up in the staged pane (a move within it) rather than in the
+    /// loaded bank (a copy across).
+    pub from_staged: bool,
+    /// What is being carried, in bank order. One row unless the drag began
+    /// on a marked row, in which case every marked row travels — see
+    /// [`drag_rows`].
+    pub rows: Vec<usize>,
+}
+
+/// One row of either pane: the mark, the number from 1, the name.
+///
+/// Numbered as the instrument does, from 1: every DX7 cartridge sheet ever
+/// printed says A1 through B16, and none of them start at zero. Two columns
+/// wide so 9 and 10 line up. The mark is an asterisk rather than a glyph
+/// Courier Prime may not carry.
+pub fn bank_row(marked: bool, i: usize, name: &str) -> String {
+    format!("{}{:>2}. {name}", if marked { "*" } else { " " }, i + 1)
+}
+
+/// What a drag that began on row `grabbed` carries.
+///
+/// **The marks travel together, and only when one of them is picked up.** A
+/// right-click marks rows; dragging one of the marked rows drags the set,
+/// in bank order, so six patches can cross in one gesture. Dragging an
+/// UNMARKED row carries that row alone and leaves the marks standing — the
+/// alternative, where any drag empties the marks, made marking three rows
+/// and then absent-mindedly dragging a fourth cost the three.
+pub fn drag_rows(marked: &[usize], grabbed: usize) -> Vec<usize> {
+    if marked.contains(&grabbed) {
+        let mut rows = marked.to_vec();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    } else {
+        vec![grabbed]
+    }
+}
+
+/// Toggle a right-click mark, keeping the set in bank order.
+fn toggle_mark(marks: &mut Vec<usize>, i: usize) {
+    if let Some(at) = marks.iter().position(|&m| m == i) {
+        marks.remove(at);
+    } else {
+        marks.push(i);
+        marks.sort_unstable();
+    }
+}
 
 impl Dialog {
     /// Open the patch picker for the built-in in `slot`.
@@ -3895,19 +4037,27 @@ impl Dialog {
     /// `voices` empty means no cartridge: the dialog still opens, because the
     /// button that loads one is inside it and a picker you can only reach after
     /// loading a cartridge is a picker nobody finds.
+    ///
+    /// `staged` is the app's mirror of the host's staged bank, which outlives
+    /// the dialog: close the picker, open it on another strip, and the bank
+    /// being built is still there. Padded to [`CARTRIDGE_VOICES`] so the pane
+    /// always has every slot to drop onto.
     pub fn patch_picker(
         slot: usize,
         bank: String,
         bad_checksum: bool,
-        factory: bool,
+        on_default: bool,
         voices: Vec<String>,
         selected: Option<usize>,
+        staged: Vec<Option<String>>,
     ) -> Dialog {
+        let mut staged = staged;
+        staged.resize(CARTRIDGE_VOICES, None);
         Dialog::PatchPicker {
             slot,
             bank,
             bad_checksum,
-            factory,
+            on_default,
             // A cartridge is 32 voices or it is not a cartridge, but this comes
             // from outside and indexes an array.
             selected: selected.filter(|i| *i < voices.len()),
@@ -3915,6 +4065,12 @@ impl Dialog {
             filter: String::new(),
             focus: true,
             error: String::new(),
+            staged,
+            marked: Vec::new(),
+            staged_marked: Vec::new(),
+            staged_selected: None,
+            drag: None,
+            note: String::new(),
         }
     }
 }
@@ -7318,7 +7474,7 @@ fn show_on(
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if ui
                                         .add(Button::new(
-                                            RichText::new("Save to my bank")
+                                            RichText::new("Save to bank")
                                                 .font(bold(11.0))
                                                 .color(t.text),
                                         ))
@@ -7526,12 +7682,18 @@ fn show_on(
             slot,
             bank,
             bad_checksum,
-            factory,
+            on_default,
             voices,
             selected,
             filter,
             focus,
             error,
+            staged,
+            marked,
+            staged_marked,
+            staged_selected,
+            drag,
+            note,
         } => {
             let t = theme(face);
             let slot = *slot;
@@ -7540,7 +7702,7 @@ fn show_on(
                 placement,
                 "Tangent DX7",
                 Vec2::new(PATCH_DIALOG_W, PATCH_DIALOG_H),
-                Vec2::new(360.0, 300.0),
+                Vec2::new(600.0, 380.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.visuals_mut().extreme_bg_color = t.bg;
@@ -7548,6 +7710,19 @@ fn show_on(
                     let bold = |size: f32| FontId::new(size, fonts::courier_bold());
                     let faint = t.text.gamma_multiply(0.72);
                     let first_frame = *focus;
+                    // **The pointer, read once for both panes.** A drop is
+                    // "the button came up while a staged row contained the
+                    // pointer": the row that contains it is drawn in the
+                    // right pane, the drag it ends began in the left, and
+                    // one reading serves both so the two halves cannot
+                    // disagree about which frame the release was on. `held`
+                    // is the safety net under `released`: a button let go
+                    // outside the window arrives as the pointer being gone
+                    // rather than as a release, and a drag that outlived its
+                    // button would follow the pointer for ever.
+                    let released = ui.input(|i| i.pointer.any_released());
+                    let held = ui.input(|i| i.pointer.any_down());
+                    let pointer = ui.input(|i| i.pointer.interact_pos());
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::same(PLUGIN_MARGIN))
                         .show(ui, |ui| {
@@ -7557,15 +7732,15 @@ fn show_on(
                                 // name is placed.** A bank can be called
                                 // anything, and the one that ships is called
                                 // something long: a label sized to its own
-                                // text ran straight under "Edit...".
-                                // The Factory button is only there when there
-                                // is a loaded cartridge to leave, so the room
-                                // it takes is conditional too — a permanent
+                                // text ran straight under "Patch...".
+                                // The Default button is only there when there
+                                // is a loaded bank to leave, so the room it
+                                // takes is conditional too — a permanent
                                 // reservation would crop the bank name on the
                                 // one row that never has the button.
                                 let buttons = BANK_BUTTONS_W
                                     + BANK_NAME_GAP
-                                    + if *factory { 0.0 } else { FACTORY_BUTTON_W };
+                                    + if *on_default { 0.0 } else { DEFAULT_BUTTON_W };
                                 let room = (ui.available_width() - buttons).max(40.0);
                                 // **The width has to be ALLOCATED, not merely
                                 // asked for.** `add_sized` reserves the space
@@ -7585,9 +7760,9 @@ fn show_on(
                                         ui.add(
                                             egui::Label::new(
                                                 RichText::new(if bank.is_empty() {
-                                                    "No cartridge loaded".to_owned()
+                                                    "No bank loaded".to_owned()
                                                 } else {
-                                                    format!("Cartridge: {bank}")
+                                                    format!("Bank: {bank}")
                                                 })
                                                 .font(bold(12.0))
                                                 .color(t.text),
@@ -7599,7 +7774,7 @@ fn show_on(
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if ui
                                         .add(Button::new(
-                                            RichText::new("Load .syx...")
+                                            RichText::new("Load bank...")
                                                 .font(bold(11.0))
                                                 .color(t.text),
                                         ))
@@ -7609,38 +7784,43 @@ fn show_on(
                                     }
                                     // **The way back, which there was not
                                     // one of.** Loading somebody else's bank
-                                    // was a one-way door: the shipped
-                                    // cartridge is only reached at startup
-                                    // from an empty setting, so getting it
-                                    // back meant quitting the app. Offered
-                                    // only while there IS a cartridge to
-                                    // leave, so the row stays two buttons
-                                    // wide on a fresh install.
-                                    if !*factory
+                                    // was a one-way door: the default bank
+                                    // is only reached at startup from an
+                                    // empty setting, so getting it back meant
+                                    // quitting the app. Offered only while
+                                    // there IS a bank to leave, so the row
+                                    // stays two buttons wide on a fresh
+                                    // install.
+                                    if !*on_default
                                         && ui
                                             .add(Button::new(
-                                                RichText::new("Factory")
+                                                RichText::new("Default")
                                                     .font(bold(11.0))
                                                     .color(t.text),
                                             ))
                                             .clicked()
                                     {
-                                        action = Some(DialogAction::UseFactoryCartridge { slot });
+                                        action = Some(DialogAction::UseDefaultBank { slot });
                                     }
                                     // **Edit what is playing**, which is the
-                                    // only patch anybody wants to start from.
-                                    // Beside Load, because between them they
-                                    // are the two ways a patch gets here: off
-                                    // a cartridge, or out of your own hands.
+                                    // only patch anybody wants to start from
+                                    // — the owner's "modify selected sounds".
+                                    // Kept at the top, his words again. A
+                                    // staged row that is playing is edited IN
+                                    // ITS SLOT, so the editor's Save goes back
+                                    // there rather than into a fresh one.
                                     if ui
                                         .add(Button::new(
-                                            RichText::new("Edit...")
+                                            RichText::new("Patch...")
                                                 .font(bold(11.0))
                                                 .color(t.text),
                                         ))
                                         .clicked()
                                     {
-                                        action = Some(DialogAction::EditPatch { slot });
+                                        action = Some(match *staged_selected {
+                                            Some(index) => DialogAction::EditStaged { slot, index },
+                                            None => DialogAction::EditPatch { slot },
+                                        });
                                     }
                                 });
                             });
@@ -7664,6 +7844,13 @@ fn show_on(
                                         .color(t.text),
                                 );
                             }
+                            if !note.is_empty() {
+                                ui.label(
+                                    RichText::new(note.as_str())
+                                        .font(bold(PLUGIN_NOTE_PT))
+                                        .color(faint),
+                                );
+                            }
                             ui.add_space(4.0);
                             if !voices.is_empty() {
                                 ui.horizontal(|ui| {
@@ -7685,100 +7872,384 @@ fn show_on(
                                 *focus = false;
                             }
 
-                            // ── the patches ─────────────────────────────────
-                            let bottom_h = 52.0;
-                            let list_h = (ui.available_height() - bottom_h).max(40.0);
+                            // ── the two panes ───────────────────────────────
+                            //
+                            // Left, the loaded bank; right, the bank being
+                            // built; between them the two buttons that move
+                            // rows without a drag. Same height, same width,
+                            // so a row on one side lines up with the slot it
+                            // would land in on the other.
+                            let bottom_h = 64.0;
+                            let panes_h = (ui.available_height() - bottom_h).max(60.0);
+                            let pane_w = ((ui.available_width() - BANK_MID_W) / 2.0).max(120.0);
+                            let list_h = (panes_h - 20.0).max(40.0);
                             let visible = visible_patches(voices, filter);
-                            egui::ScrollArea::vertical()
-                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                                .max_height(list_h)
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    // The built-in patch, always first and never
-                                    // filtered: it is the sound a fresh install
-                                    // makes, and getting back to it has to not
-                                    // depend on still having the cartridge that
-                                    // replaced it.
-                                    if ui
-                                        .selectable_label(
-                                            selected.is_none(),
-                                            RichText::new(format!("  {BUILTIN_PATCH_ROW}"))
-                                                .font(bold(12.0))
-                                                .color(t.text),
-                                        )
-                                        .clicked()
-                                        && selected.is_some()
-                                    {
-                                        *selected = None;
-                                        action = Some(DialogAction::ChoosePatch {
-                                            slot,
-                                            index: usize::MAX,
+                            // A drag that began THIS frame, and the staged
+                            // slot under the pointer this frame. Both are
+                            // read after the panes, because the source is
+                            // drawn before the target and the answer needs
+                            // both.
+                            let mut grab: Option<BankDrag> = None;
+                            let mut drop: Option<usize> = None;
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(pane_w, panes_h),
+                                    Layout::top_down(Align::Min),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new("LOADED BANK")
+                                                .font(bold(10.0))
+                                                .color(faint),
+                                        );
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("dx7-loaded")
+                                            .scroll_bar_visibility(
+                                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                            )
+                                            .max_height(list_h)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                // The built-in patch, always
+                                                // first and never filtered: it
+                                                // is the sound a fresh install
+                                                // makes, and getting back to it
+                                                // has to not depend on still
+                                                // having the cartridge that
+                                                // replaced it.
+                                                let on_builtin =
+                                                    selected.is_none() && staged_selected.is_none();
+                                                if ui
+                                                    .selectable_label(
+                                                        on_builtin,
+                                                        RichText::new(format!("  {BUILTIN_PATCH_ROW}"))
+                                                            .font(bold(12.0))
+                                                            .color(t.text),
+                                                    )
+                                                    .clicked()
+                                                    && !on_builtin
+                                                {
+                                                    *selected = None;
+                                                    *staged_selected = None;
+                                                    action = Some(DialogAction::ChoosePatch {
+                                                        slot,
+                                                        index: usize::MAX,
+                                                    });
+                                                }
+                                                for &i in &visible {
+                                                    let Some(name) = voices.get(i) else { continue };
+                                                    // **Click AND drag on one
+                                                    // row.** A selectable label
+                                                    // senses clicks; the drag
+                                                    // is added after, and egui
+                                                    // keeps them apart — a
+                                                    // press that moves past
+                                                    // the threshold is a drag
+                                                    // and never a click, so
+                                                    // dragging a row across
+                                                    // does not also audition
+                                                    // it.
+                                                    let resp = ui
+                                                        .selectable_label(
+                                                            *selected == Some(i),
+                                                            RichText::new(bank_row(
+                                                                marked.contains(&i),
+                                                                i,
+                                                                name,
+                                                            ))
+                                                            .font(bold(12.0))
+                                                            .color(t.text),
+                                                        )
+                                                        .interact(egui::Sense::click_and_drag());
+                                                    // One click, one sound.
+                                                    // See the variant.
+                                                    if resp.clicked() {
+                                                        *selected = Some(i);
+                                                        *staged_selected = None;
+                                                        action = Some(DialogAction::ChoosePatch {
+                                                            slot,
+                                                            index: i,
+                                                        });
+                                                    }
+                                                    // The owner's "right click
+                                                    // select multiple": a mark
+                                                    // per press, toggled.
+                                                    if resp.secondary_clicked() {
+                                                        toggle_mark(marked, i);
+                                                    }
+                                                    if resp.drag_started() {
+                                                        grab = Some(BankDrag {
+                                                            from_staged: false,
+                                                            rows: drag_rows(marked, i),
+                                                        });
+                                                    }
+                                                    if first_frame && *selected == Some(i) {
+                                                        resp.scroll_to_me(Some(Align::Center));
+                                                    }
+                                                }
+                                                if voices.is_empty() {
+                                                    ui.add_space(6.0);
+                                                    ui.label(
+                                                        RichText::new(
+                                                            "Load a DX7 cartridge to get thirty-two \
+                                                             more patches. Any .syx bank will do.",
+                                                        )
+                                                        .font(bold(11.0))
+                                                        .color(t.text),
+                                                    );
+                                                } else if visible.is_empty() {
+                                                    ui.add_space(6.0);
+                                                    ui.label(
+                                                        RichText::new(
+                                                            "Nothing matches that. Clear the filter \
+                                                             to see them all.",
+                                                        )
+                                                        .font(bold(11.0))
+                                                        .color(t.text),
+                                                    );
+                                                }
+                                            });
+                                    },
+                                );
+                                // ── between them ────────────────────────────
+                                //
+                                // The no-drag road, for a trackpad, a plugin
+                                // canvas, or a hand that marked six rows and
+                                // wants them across in one press. Stage takes
+                                // the marks, or the playing row when nothing
+                                // is marked; Remove is its mirror.
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(BANK_MID_W, panes_h),
+                                    Layout::top_down(Align::Center),
+                                    |ui| {
+                                        ui.add_space(panes_h * 0.36);
+                                        let to_stage: Vec<usize> = if marked.is_empty() {
+                                            selected.iter().copied().collect()
+                                        } else {
+                                            marked.clone()
+                                        };
+                                        if ui
+                                            .add_enabled(
+                                                !to_stage.is_empty(),
+                                                Button::new(
+                                                    RichText::new("Stage >")
+                                                        .font(bold(11.0))
+                                                        .color(t.text),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            action = Some(DialogAction::StagePatches {
+                                                slot,
+                                                indices: to_stage,
+                                                at: None,
+                                            });
+                                        }
+                                        ui.add_space(6.0);
+                                        let to_remove: Vec<usize> = if staged_marked.is_empty() {
+                                            staged_selected.iter().copied().collect()
+                                        } else {
+                                            staged_marked.clone()
+                                        };
+                                        if ui
+                                            .add_enabled(
+                                                !to_remove.is_empty(),
+                                                Button::new(
+                                                    RichText::new("< Remove")
+                                                        .font(bold(11.0))
+                                                        .color(t.text),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            action = Some(DialogAction::UnstagePatches {
+                                                slots: to_remove,
+                                            });
+                                        }
+                                    },
+                                );
+                                // ── the staged bank ─────────────────────────
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(pane_w, panes_h),
+                                    Layout::top_down(Align::Min),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new("STAGED BANK")
+                                                .font(bold(10.0))
+                                                .color(faint),
+                                        );
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("dx7-staged")
+                                            .scroll_bar_visibility(
+                                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                            )
+                                            .max_height(list_h)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                for (i, name) in staged.iter().enumerate() {
+                                                    let name = name.as_deref();
+                                                    let text = match name {
+                                                        Some(n) => {
+                                                            bank_row(staged_marked.contains(&i), i, n)
+                                                        }
+                                                        None => bank_row(false, i, STAGED_EMPTY_ROW),
+                                                    };
+                                                    let resp = ui
+                                                        .selectable_label(
+                                                            *staged_selected == Some(i),
+                                                            RichText::new(text).font(bold(12.0)).color(
+                                                                if name.is_some() { t.text } else { faint },
+                                                            ),
+                                                        )
+                                                        .interact(egui::Sense::click_and_drag());
+                                                    // **`contains_pointer`, not
+                                                    // `hovered`.** Hover is
+                                                    // false for every widget
+                                                    // while another is being
+                                                    // dragged, which is exactly
+                                                    // when a drop target needs
+                                                    // to know. Every slot is a
+                                                    // target, empty or not.
+                                                    if drag.is_some() && resp.contains_pointer() {
+                                                        drop = Some(i);
+                                                        ui.painter().rect_stroke(
+                                                            resp.rect,
+                                                            2.0,
+                                                            Stroke::new(1.5, t.text),
+                                                            egui::StrokeKind::Inside,
+                                                        );
+                                                    }
+                                                    if name.is_none() {
+                                                        continue;
+                                                    }
+                                                    if resp.clicked() {
+                                                        *staged_selected = Some(i);
+                                                        *selected = None;
+                                                        action = Some(DialogAction::ChooseStaged {
+                                                            slot,
+                                                            index: i,
+                                                        });
+                                                    }
+                                                    if resp.secondary_clicked() {
+                                                        toggle_mark(staged_marked, i);
+                                                    }
+                                                    if resp.drag_started() {
+                                                        grab = Some(BankDrag {
+                                                            from_staged: true,
+                                                            rows: vec![i],
+                                                        });
+                                                    }
+                                                }
+                                            });
+                                    },
+                                );
+                            });
+
+                            // ── the drag, in flight ─────────────────────────
+                            if let Some(g) = grab {
+                                *drag = Some(g);
+                            }
+                            if let Some(d) = drag.as_ref() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                // A tag beside the pointer saying what is in
+                                // hand, on the tooltip layer so it rides over
+                                // both panes. Nothing is picked up visually
+                                // from the row itself: the row stays where it
+                                // is because, for a copy across, it IS staying.
+                                if let Some(p) = pointer {
+                                    let what = match (d.rows.len(), d.from_staged) {
+                                        (1, true) => staged
+                                            .get(d.rows[0])
+                                            .cloned()
+                                            .flatten()
+                                            .unwrap_or_default(),
+                                        (1, false) => voices.get(d.rows[0]).cloned().unwrap_or_default(),
+                                        (n, _) => format!("{n} patches"),
+                                    };
+                                    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                                        egui::Order::Tooltip,
+                                        egui::Id::new("dx7-bank-drag"),
+                                    ));
+                                    let galley = painter.layout_no_wrap(what, bold(12.0), t.text);
+                                    let at = p + Vec2::new(14.0, 10.0);
+                                    let tag = egui::Rect::from_min_size(at, galley.size()).expand(4.0);
+                                    painter.rect_filled(tag, 3.0, t.bg);
+                                    painter.rect_stroke(
+                                        tag,
+                                        3.0,
+                                        Stroke::new(1.0, t.text),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    painter.galley(at, galley, t.text);
+                                }
+                                // **The drop.** Onto a staged slot from the
+                                // left: a copy, landing there. From the right:
+                                // a swap, which is also how a patch moves into
+                                // an empty slot. Released anywhere else:
+                                // nothing, and nothing to undo.
+                                if released {
+                                    if let Some(to) = drop {
+                                        action = Some(if d.from_staged {
+                                            DialogAction::SwapStaged {
+                                                a: d.rows[0],
+                                                b: to,
+                                            }
+                                        } else {
+                                            DialogAction::StagePatches {
+                                                slot,
+                                                indices: d.rows.clone(),
+                                                at: Some(to),
+                                            }
                                         });
                                     }
-                                    for &i in &visible {
-                                        let Some(name) = voices.get(i) else { continue };
-                                        let resp = ui.selectable_label(
-                                            *selected == Some(i),
-                                            // Numbered as the instrument does,
-                                            // from 1: every DX7 cartridge sheet
-                                            // ever printed says A1 through B16,
-                                            // and none of them start at zero.
-                                            RichText::new(format!("{:>3}. {name}", i + 1))
-                                                .font(bold(12.0))
-                                                .color(t.text),
-                                        );
-                                        // One click, one sound. See the variant.
-                                        if resp.clicked() {
-                                            *selected = Some(i);
-                                            action =
-                                                Some(DialogAction::ChoosePatch { slot, index: i });
-                                        }
-                                        if first_frame && *selected == Some(i) {
-                                            resp.scroll_to_me(Some(Align::Center));
-                                        }
-                                    }
-                                    if voices.is_empty() {
-                                        ui.add_space(6.0);
-                                        ui.label(
-                                            RichText::new(
-                                                "Load a DX7 cartridge to get thirty-two more \
-                                                 patches. Any .syx bank will do.",
-                                            )
-                                            .font(bold(11.0))
-                                            .color(t.text),
-                                        );
-                                    } else if visible.is_empty() {
-                                        ui.add_space(6.0);
-                                        ui.label(
-                                            RichText::new(
-                                                "Nothing matches that. Clear the filter to see \
-                                                 them all.",
-                                            )
-                                            .font(bold(11.0))
-                                            .color(t.text),
-                                        );
-                                    }
-                                });
+                                }
+                            }
+                            if released || !held {
+                                *drag = None;
+                            }
 
+                            // ── the bottom ──────────────────────────────────
                             ui.add_space(4.0);
                             ui.label(
                                 RichText::new(
-                                    "Play while you click: each patch sounds as you pick it.",
+                                    "Click to hear a patch. Drag it to the staged bank, or \
+                                     right-click to mark several, then Stage.",
+                                )
+                                .font(bold(PLUGIN_NOTE_PT))
+                                .color(faint),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "Save bank writes the staged bank as a .syx; saved as \
+                                     default.syx it is the bank that opens every time.",
                                 )
                                 .font(bold(PLUGIN_NOTE_PT))
                                 .color(faint),
                             );
                             ui.add_space((ui.available_height() - 30.0).max(0.0));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                // One button, and it does not undo anything.
-                                // There is no Cancel because there is nothing to
-                                // cancel: the patch is already playing, and the
-                                // way back is the row at the top of the list.
+                                // Done does not undo anything. There is no
+                                // Cancel because there is nothing to cancel:
+                                // the patch is already playing, the staged
+                                // bank outlives the window, and the way back
+                                // is the row at the top of the list.
                                 if ui
                                     .add(Button::new(RichText::new("Done").color(t.text)))
                                     .clicked()
                                 {
                                     result.close = true;
+                                }
+                                // Only with something to write: a save panel
+                                // for thirty-two INIT VOICEs is a file nobody
+                                // meant to make.
+                                let filled = staged.iter().filter(|s| s.is_some()).count();
+                                if ui
+                                    .add_enabled(
+                                        filled > 0,
+                                        Button::new(RichText::new("Save bank...").color(t.text)),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::SaveBank { slot });
                                 }
                             });
                         });
@@ -17166,6 +17637,203 @@ at: None,
             let at = self.word_at(word);
             self.press_at(at, egui::PointerButton::Primary)
         }
+
+        /// A primary drag from `from` to `to`: press, a move well past the
+        /// click threshold, arrive, and release — with a frame of standing
+        /// still at the target, because egui hit-tests this frame's pointer
+        /// against LAST frame's rectangles, and a drop decided on the frame
+        /// the pointer arrived would be decided against where it was.
+        fn drag(&mut self, from: Pos2, to: Pos2) -> Option<DialogAction> {
+            let mid = from + (to - from) * 0.5;
+            let mut asked = None;
+            for events in [
+                vec![egui::Event::PointerMoved(from)],
+                vec![egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: self.mods,
+                }],
+                vec![egui::Event::PointerMoved(mid)],
+                vec![egui::Event::PointerMoved(to)],
+                vec![egui::Event::PointerMoved(to)],
+                vec![egui::Event::PointerButton {
+                    pos: to,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: self.mods,
+                }],
+            ] {
+                if let (Some(a), _) = self.frame(events) {
+                    asked = Some(a);
+                }
+            }
+            let _ = self.frame(Vec::new());
+            asked
+        }
+    }
+
+    // ── the DX7 bank builder ────────────────────────────────────────────
+
+    /// A picker on strip 1 with a named bank of thirty-two rows and an
+    /// empty staged pane, the way the app opens it.
+    fn bank_picker() -> Dialog {
+        Dialog::patch_picker(
+            1,
+            "ROM1A".to_owned(),
+            false,
+            false,
+            (0..CARTRIDGE_VOICES).map(|i| format!("VOICE {i}")).collect(),
+            Some(0),
+            Vec::new(),
+        )
+    }
+
+    /// The marks travel together, and only when one of them is picked up;
+    /// and a row reads as the instrument numbers it, from 1 and two wide.
+    ///
+    /// Revert-check performed: returning the marks whenever there are any
+    /// reddens the third assertion — a drag on an unmarked row would carry
+    /// somebody else's marks.
+    #[test]
+    fn a_drag_carries_the_marks_only_when_it_starts_on_one() {
+        assert_eq!(drag_rows(&[], 4), vec![4]);
+        assert_eq!(drag_rows(&[7, 2, 7], 2), vec![2, 7]);
+        assert_eq!(drag_rows(&[7, 2], 4), vec![4]);
+        assert_eq!(bank_row(false, 0, "E.PIANO 1"), "  1. E.PIANO 1");
+        assert_eq!(bank_row(true, 9, "TUB BELLS"), "*10. TUB BELLS");
+    }
+
+    /// **Right-click marks, Stage moves the marks, and a click still
+    /// auditions.** Through the real widgets, because the click-versus-mark
+    /// split is egui's `secondary_clicked` on a label that also senses
+    /// drags, and nothing short of the events proves the three stay apart.
+    #[test]
+    fn right_click_marks_rows_and_stage_moves_the_marks_to_the_first_empty_slots() {
+        let mut slot = Slot::new(bank_picker());
+        // A click auditions, and asks for nothing else.
+        assert!(
+            matches!(
+                slot.click("  3. VOICE 2"),
+                Some(DialogAction::ChoosePatch { slot: 1, index: 2 })
+            ),
+            "a click did not audition the row"
+        );
+        // A right-click marks, asks nothing of the app, and shows the mark;
+        // a second one on the same row takes it off again.
+        slot.right_click("  5. VOICE 4");
+        slot.right_click("  9. VOICE 8");
+        assert!(slot.says("* 5. VOICE 4"), "the mark is not shown");
+        assert!(slot.says("* 9. VOICE 8"));
+        slot.right_click("* 9. VOICE 8");
+        assert!(!slot.says("* 9. VOICE 8"), "a second right-click did not unmark");
+        slot.right_click("  9. VOICE 8");
+        // Stage takes the marks, in bank order, to the first empty slots —
+        // `at: None` is the whole difference from a drop.
+        assert!(
+            matches!(
+                slot.click("Stage >"),
+                Some(DialogAction::StagePatches { slot: 1, ref indices, at: None })
+                    if indices == &[4, 8]
+            ),
+            "Stage did not take the two marks to the first empty slots"
+        );
+        match &slot.dialog {
+            Some(Dialog::PatchPicker { marked, selected, .. }) => {
+                assert_eq!(marked, &vec![4, 8], "staging cleared the marks");
+                assert_eq!(*selected, Some(2), "the click was lost");
+            }
+            _ => panic!("the picker closed"),
+        }
+        // Nothing staged, nothing to save: the button is greyed, so the
+        // press asks for nothing.
+        assert!(slot.click("Save bank...").is_none(), "an empty bank was offered for saving");
+    }
+
+    /// **A drag from the loaded bank onto a staged slot asks for exactly
+    /// that slot**, through the real widgets: press on a row, move past the
+    /// click threshold, release over a slot in the other pane. The drag is
+    /// kept apart from the click — nothing was auditioned on the way — a
+    /// release over nothing asks for nothing, and a drag within the staged
+    /// pane is a swap.
+    ///
+    /// Revert-check performed: never recording the grab (`let _ = grab;` in
+    /// place of `*drag = Some(g)`) reddens the first assertion. And a check
+    /// that did NOT redden, worth knowing: `hovered()` in place of
+    /// `contains_pointer()` still lands the drop, because egui has let go of
+    /// its own drag id by the release frame — so `contains_pointer` is there
+    /// for the highlight on the frames BEFORE, where hover is off for every
+    /// widget but the one in hand.
+    #[test]
+    fn dragging_a_row_onto_a_staged_slot_stages_it_there() {
+        let mut slot = Slot::new(bank_picker());
+        let from = slot.word_at("  3. VOICE 2");
+        let to = slot.word_at("  7. (empty)");
+        assert!(
+            matches!(
+                slot.drag(from, to),
+                Some(DialogAction::StagePatches { slot: 1, ref indices, at: Some(6) })
+                    if indices == &[2]
+            ),
+            "the drop did not land row 3 on slot 7"
+        );
+        match &slot.dialog {
+            Some(Dialog::PatchPicker { drag, selected, .. }) => {
+                assert!(drag.is_none(), "the drag outlived its button");
+                assert_eq!(*selected, Some(0), "the drag auditioned the row it picked up");
+            }
+            _ => panic!("the picker closed"),
+        }
+        // Let go over the button column: nothing, and nothing to undo.
+        let nowhere = slot.word_at("Stage >");
+        assert!(slot.drag(from, nowhere).is_none(), "a release over nothing asked for something");
+        // Within the staged pane, once there is something to move, the
+        // same gesture is a swap — which is also how a patch moves into an
+        // empty slot.
+        if let Some(Dialog::PatchPicker { staged, .. }) = slot.dialog.as_mut() {
+            staged[6] = Some("VOICE 2".to_owned());
+        }
+        let from = slot.word_at("  7. VOICE 2");
+        let to = slot.word_at("  2. (empty)");
+        assert!(
+            matches!(slot.drag(from, to), Some(DialogAction::SwapStaged { a: 6, b: 1 })),
+            "a drag within the staged pane is not a swap"
+        );
+    }
+
+    /// A staged row that is playing is edited IN ITS SLOT: Patch... asks
+    /// for that slot, and for the strip's own patch when nothing staged is
+    /// lit. Save bank asks once something is staged.
+    #[test]
+    fn patch_edits_the_staged_row_that_is_playing_and_save_bank_needs_a_row() {
+        let mut slot = Slot::new(bank_picker());
+        assert!(matches!(slot.click("Patch..."), Some(DialogAction::EditPatch { slot: 1 })));
+        if let Some(Dialog::PatchPicker { staged, .. }) = slot.dialog.as_mut() {
+            staged[4] = Some("MINE".to_owned());
+        }
+        assert!(
+            matches!(
+                slot.click("  5. MINE"),
+                Some(DialogAction::ChooseStaged { slot: 1, index: 4 })
+            ),
+            "a click on a staged row did not audition it"
+        );
+        assert!(
+            matches!(
+                slot.click("Patch..."),
+                Some(DialogAction::EditStaged { slot: 1, index: 4 })
+            ),
+            "Patch... did not open on the staged row that is playing"
+        );
+        assert!(matches!(slot.click("Save bank..."), Some(DialogAction::SaveBank { slot: 1 })));
+        // Remove takes the lit staged row when nothing is marked.
+        assert!(
+            matches!(
+                slot.click("< Remove"),
+                Some(DialogAction::UnstagePatches { ref slots }) if slots == &[4]
+            ),
+            "Remove did not take the staged row that is playing"
+        );
     }
 
     /// The amp's face over channel 0's first bay, with one pedal dressed
@@ -18708,7 +19376,7 @@ at: None,
             ),
             (
                 "PatchPicker",
-                Dialog::patch_picker(0, String::new(), false, true, Vec::new(), None),
+                Dialog::patch_picker(0, String::new(), false, true, Vec::new(), None, Vec::new()),
             ),
             (
                 "PatchEditor",
