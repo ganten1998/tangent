@@ -1409,6 +1409,40 @@ fn amp_board_to_seed(
 /// silence the NEXT plugin to land there — so a flag written first would be
 /// wiped by the very write that puts the pedal in the seat.
 #[cfg(feature = "recorder")]
+/// Copy a chosen click sound into Tangent's own config directory and answer
+/// where it landed. See the caller for why the file is kept rather than
+/// pointed at.
+///
+/// The name is preserved so the metronome panel can show something a person
+/// recognises, and the directory holds ONE click: choosing a new one replaces
+/// the old, because this is a preference and not a collection.
+/// The directory is a PARAMETER so this can be tested against a scratch path.
+/// It empties what it is given, and a test that had to hand it the real
+/// config directory would delete the click the person running the suite had
+/// chosen — which is the exact loss this function exists to prevent.
+#[cfg(feature = "recorder")]
+fn keep_click_sample_in(
+    dir: &std::path::Path,
+    file: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    // Emptied rather than added to, so the directory cannot grow a copy for
+    // every sound anybody ever auditioned.
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir)?;
+    let name = file
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+    let dst = dir.join(name);
+    std::fs::copy(file, &dst)?;
+    Ok(dst)
+}
+
+/// [`keep_click_sample_in`] against the one directory the app actually uses.
+#[cfg(feature = "recorder")]
+fn keep_click_sample(file: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    keep_click_sample_in(&tangent_core::config::dir().join("click"), file)
+}
+
 fn seed_amp_board(app: &mut tangent_ui::app::TangentApp, seat: usize) {
     // The SEAT the amp landed in, which for a group's bays 3..5 is not its
     // channel — `amp_board_to_seed` is the one place that translates, and it
@@ -6211,11 +6245,41 @@ impl DesktopApp {
             return;
         }
         if purpose == tangent_ui::ports::FilePurpose::ClickSample {
-            // Only the PATH is stored — the decode happens on the flag below
-            // this frame, on the same road the bundled asset takes, so a file
-            // that has since moved falls back to the built-in click rather
-            // than to silence.
-            self.app.set_click_sample(&file.to_string_lossy());
+            // **The FILE is kept, not just a path to it.**
+            //
+            // This used to store the path the panel answered with and nothing
+            // else, and said so: "a file that has since moved falls back to
+            // the built-in click rather than to silence". That is a click
+            // chosen once and silently lost later — the user renames a
+            // folder, empties a Downloads directory, unplugs the drive it was
+            // on, and the metronome is back to the shipped one with nothing
+            // saying why. The owner asked for the opposite: "not just storing
+            // the path but the actual file so it doesn't reset".
+            //
+            // So the chosen file is copied into Tangent's own config
+            // directory and the copy is what the setting names. It survives
+            // the original being moved, and it travels with the settings that
+            // point at it. One slot, overwritten each time: this is a
+            // preference and not a library, and a folder that grew a copy per
+            // audition would be a leak nobody asked for.
+            //
+            // A copy that fails is not a refusal — the original path still
+            // works today, and a click that plays now and may not next month
+            // beats no click at all — so it falls through to the old
+            // behaviour and says so in the log.
+            let kept = keep_click_sample(file);
+            let path = match &kept {
+                Ok(p) => p.clone(),
+                Err(e) => {
+                    log::warn!(
+                        "the click sound could not be copied into the config \
+                         directory ({e}) - using it where it lies, which means \
+                         it goes back to the built-in click if it ever moves"
+                    );
+                    file.to_path_buf()
+                }
+            };
+            self.app.set_click_sample(&path.to_string_lossy());
             return;
         }
         match crate::dx7::Cartridge::load(file) {
@@ -18104,6 +18168,64 @@ mod tests {
             "the fallback is gated on its own marker again - a one-shot that \
              never re-arms; see `an_asio_fallback_re_arms_after_the_engine_is_dropped`"
         );
+    }
+
+    /// **A chosen click sound is KEPT, not pointed at.**
+    ///
+    /// The old code stored the path the file panel answered with and nothing
+    /// else, and its own comment admitted the consequence: "a file that has
+    /// since moved falls back to the built-in click". That is a preference
+    /// chosen once and silently lost later — a folder renamed, a Downloads
+    /// directory emptied, a drive unplugged — with the metronome quietly back
+    /// on the shipped click and nothing saying why. The owner asked for the
+    /// file itself to be kept "so it doesn't reset".
+    ///
+    /// Three properties, and the third is the one that needs a test rather
+    /// than a reading: the copy exists and plays after the original is GONE,
+    /// it keeps the original's name so the panel can show something a person
+    /// recognises, and choosing a second sound REPLACES the first instead of
+    /// leaving the directory to grow a copy per audition.
+    #[test]
+    fn a_chosen_click_sound_outlives_the_file_it_came_from() {
+        let root = std::env::temp_dir().join(format!("tangent-click-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("from");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        let kept = root.join("kept");
+
+        let one = src.join("rim.wav");
+        std::fs::write(&one, b"RIFFone").expect("write");
+        let got = super::keep_click_sample_in(&kept, &one).expect("the copy failed");
+        assert_eq!(
+            got.file_name().and_then(|n| n.to_str()),
+            Some("rim.wav"),
+            "the copy lost the name, so the panel has nothing to show"
+        );
+
+        // **The original goes away and the click still plays.** This is the
+        // whole point; with a stored path it would be gone.
+        std::fs::remove_file(&one).expect("rm");
+        assert_eq!(
+            std::fs::read(&got).expect("the kept file is gone"),
+            b"RIFFone",
+            "the click did not survive its original being deleted"
+        );
+
+        // **A second choice replaces the first.** A preference, not a library.
+        let two = src.join("cowbell.wav");
+        std::fs::write(&two, b"RIFFtwo").expect("write");
+        let got2 = super::keep_click_sample_in(&kept, &two).expect("the copy failed");
+        assert_eq!(std::fs::read(&got2).expect("read"), b"RIFFtwo");
+        let left: Vec<String> = std::fs::read_dir(&kept)
+            .expect("read_dir")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(
+            left,
+            vec!["cowbell.wav".to_owned()],
+            "the click directory kept the old sound as well as the new one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **The dead-on-arrival watch is wired to all four of its edges.**

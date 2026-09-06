@@ -7043,8 +7043,10 @@ mod tests {
             "the beat count acted like a button"
         );
         let sound = super::MetLayout::cells(l.rows[4], 2);
-        assert_eq!(met_hit_test(screen, anchor, sound[0].center()), Some(MetHit::SoundPick));
-        assert_eq!(met_hit_test(screen, anchor, sound[1].center()), Some(MetHit::SoundReset));
+        // Default is the FIRST of the two and Custom the second — the order
+        // the owner asked for, and the one the drawing paints.
+        assert_eq!(met_hit_test(screen, anchor, sound[0].center()), Some(MetHit::SoundReset));
+        assert_eq!(met_hit_test(screen, anchor, sound[1].center()), Some(MetHit::SoundPick));
         assert_eq!(met_hit_test(screen, anchor, l.close.center()), Some(MetHit::Close));
 
         // The tempo answers along its whole ROW, not just the two-point well
@@ -11177,12 +11179,17 @@ pub fn met_hit_test(screen: Rect, anchor: Rect, pos: Pos2) -> Option<MetHit> {
             return Some(MetHit::Div(d));
         }
     }
+    // **DEFAULT first, CUSTOM second**, which is the owner's order and the
+    // one that reads. The row used to be the other way round and its two
+    // words were "built-in" and "default" — the same thing said twice, so
+    // there was no way to tell which one was the click you were on and which
+    // was the way back to it.
     let sound = MetLayout::cells(l.rows[4], 2);
     if sound.first().is_some_and(|c| c.contains(pos)) {
-        return Some(MetHit::SoundPick);
+        return Some(MetHit::SoundReset);
     }
     if sound.get(1).is_some_and(|c| c.contains(pos)) {
-        return Some(MetHit::SoundReset);
+        return Some(MetHit::SoundPick);
     }
     None
 }
@@ -11327,19 +11334,28 @@ pub fn draw_met(
     if row.is_positive() {
         label(row, "SOUND");
         let cells = MetLayout::cells(row, 2);
-        if let [pick, reset] = cells.as_slice() {
-            // The file's own NAME, not its path: a panel this wide cannot
-            // show a path and a truncated one names nothing.
+        if let [reset, pick] = cells.as_slice() {
+            // **Two words that are not the same word.** This row used to read
+            // "built-in | default" with nothing chosen — one control naming
+            // the click you were on and one naming the click you would go
+            // back to, which are the same click, so neither told you what
+            // pressing it would do.
+            //
+            // Default is the one that ships. Custom raises the file panel,
+            // and once something is chosen it wears that file's own NAME
+            // rather than the word — a panel this wide cannot show a path,
+            // a truncated path names nothing, and the name is the only part
+            // anybody recognises. The lit one is the click that is playing.
             let name = if v.sample.is_empty() {
-                "built-in".to_owned()
+                "custom".to_owned()
             } else {
                 std::path::Path::new(v.sample)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| v.sample.to_owned())
             };
-            cell(*pick, &name, !v.sample.is_empty());
             cell(*reset, "default", v.sample.is_empty());
+            cell(*pick, &name, !v.sample.is_empty());
         }
     }
 }
