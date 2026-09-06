@@ -202,6 +202,22 @@ pub enum Dialog {
         /// inside the window rather than as a dialog in front of it. See
         /// [`BankQuestion`].
         question: Option<BankQuestion>,
+        /// **The row under a pressed button, RIGHT NOW**, which is the row
+        /// being sounded — see [`PatchHold`]. Written from the panes' own
+        /// responses every single frame the picker draws, and never from an
+        /// event: what is on it is the answer to "is a hand on a row", asked
+        /// afresh, and not the residue of a press somebody hoped to match
+        /// with a release.
+        ///
+        /// That is the whole guarantee against a note that rings for ever.
+        /// A button let go anywhere, a drag starting instead of a click, the
+        /// window losing the pointer, another row taken, the picker closing —
+        /// none of them is a road that has to remember to close anything,
+        /// because on the next frame this is simply `None` and
+        /// `TangentApp::patch_audition_tick` makes the strip agree with it.
+        /// The two held notes this app has shipped ringing were both an
+        /// early `return` past the line that would have closed them.
+        audition: Option<PatchHold>,
     },
     /// Which instrument the modelled keyboard is being right now.
     ///
@@ -4019,6 +4035,21 @@ pub enum BankQuestion {
     Clear,
 }
 
+/// **A picker row a hand is pressing on**, and therefore sounding.
+///
+/// Which PANE as well as which row, because the two panes number their rows
+/// independently and slot 5 of the staged bank is not row 5 of the cartridge.
+/// The same pair `BankDrag` carries, for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatchHold {
+    /// Pressed in the STAGED pane rather than in the loaded bank.
+    pub from_staged: bool,
+    /// The row, in that pane's own numbering. `usize::MAX` is the loaded
+    /// pane's built-in row — `ChoosePatch`'s own sentinel, so that the one
+    /// row with no cartridge behind it auditions like every other.
+    pub index: usize,
+}
+
 /// A drag in flight between the picker's panes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BankDrag {
@@ -4111,6 +4142,7 @@ impl Dialog {
             drag: None,
             note: String::new(),
             question: None,
+            audition: None,
         }
     }
 }
@@ -7743,6 +7775,7 @@ fn show_on(
             drag,
             note,
             question,
+            audition,
         } => {
             let t = theme(face);
             let slot = *slot;
@@ -8031,6 +8064,12 @@ fn show_on(
                             // both.
                             let mut grab: Option<BankDrag> = None;
                             let mut drop: Option<usize> = None;
+                            // **The row a button is down on, asked fresh every frame** —
+                            // the audition's whole state, and the reason it cannot be left
+                            // sounding. Collected from the panes' responses like `grab` and
+                            // `drop` above it, and read after both, because either pane can
+                            // hold it.
+                            let mut holding: Option<PatchHold> = None;
                             ui.horizontal(|ui| {
                                 ui.allocate_ui_with_layout(
                                     Vec2::new(pane_w, panes_h),
@@ -8058,16 +8097,24 @@ fn show_on(
                                                 // replaced it.
                                                 let on_builtin =
                                                     selected.is_none() && staged_selected.is_none();
-                                                if ui
-                                                    .selectable_label(
-                                                        on_builtin,
-                                                        RichText::new(format!("  {BUILTIN_PATCH_ROW}"))
-                                                            .font(bold(12.0))
-                                                            .color(t.text),
-                                                    )
-                                                    .clicked()
-                                                    && !on_builtin
-                                                {
+                                                let resp = ui.selectable_label(
+                                                    on_builtin,
+                                                    RichText::new(format!("  {BUILTIN_PATCH_ROW}"))
+                                                        .font(bold(12.0))
+                                                        .color(t.text),
+                                                );
+                                                // Held like any other row, and held even when it is
+                                                // already the one playing: "what does the patch in
+                                                // the binary sound like" is as fair a question as
+                                                // any, and the click below rightly asks the app for
+                                                // nothing when the answer would change nothing.
+                                                if resp.is_pointer_button_down_on() {
+                                                    holding = Some(PatchHold {
+                                                        from_staged: false,
+                                                        index: usize::MAX,
+                                                    });
+                                                }
+                                                if resp.clicked() && !on_builtin {
                                                     *selected = None;
                                                     *staged_selected = None;
                                                     action = Some(DialogAction::ChoosePatch {
@@ -8100,6 +8147,23 @@ fn show_on(
                                                             .color(t.text),
                                                         )
                                                         .interact(egui::Sense::click_and_drag());
+                                                    // **Press and hold, one
+                                                    // sound**, for as long as the
+                                                    // button is down. The audition
+                                                    // this dialog has always talked
+                                                    // about was a patch LOADED,
+                                                    // which you heard only if you
+                                                    // had a keyboard under your
+                                                    // other hand. The owner: "let
+                                                    // it trigger the instrument, as
+                                                    // middle C when you click/hold
+                                                    // a patch name."
+                                                    if resp.is_pointer_button_down_on() {
+                                                        holding = Some(PatchHold {
+                                                            from_staged: false,
+                                                            index: i,
+                                                        });
+                                                    }
                                                     // One click, one sound.
                                                     // See the variant.
                                                     if resp.clicked() {
@@ -8273,6 +8337,12 @@ fn show_on(
                                                     if name.is_none() {
                                                         continue;
                                                     }
+                                                    if resp.is_pointer_button_down_on() {
+                                                        holding = Some(PatchHold {
+                                                            from_staged: true,
+                                                            index: i,
+                                                        });
+                                                    }
                                                     if resp.clicked() {
                                                         *staged_selected = Some(i);
                                                         *selected = None;
@@ -8358,13 +8428,34 @@ fn show_on(
                             if released || !held {
                                 *drag = None;
                             }
+                            // **What is sounding, said as a state.**
+                            //
+                            // Written unconditionally, every frame, which is the point:
+                            // there is no path out of this dialog that has to remember to
+                            // silence anything, because the next frame either says a row is
+                            // held or says none is, and the app makes the strip agree. The
+                            // picker closing does not even need a frame — the whole `Dialog`
+                            // is gone, and the app reads that as nothing held.
+                            //
+                            // `held` is the same safety net it is for the drag two lines up:
+                            // a button let go outside this window arrives as the pointer
+                            // being GONE rather than as a release, and a note that waited
+                            // for the release would still be ringing.
+                            //
+                            // And a drag is not a press. egui has already decided which this
+                            // gesture is by now, and the moment it says drag the sound stops
+                            // and the strip goes back to the row the picker has lit, which is
+                            // what keeps "dragging a row across does not audition it" true
+                            // after all this.
+                            *audition = holding.filter(|_| held && drag.is_none());
 
                             // ── the bottom ──────────────────────────────────
                             ui.add_space(4.0);
                             ui.label(
                                 RichText::new(
-                                    "Click to hear a patch. Drag it to the staged bank, or \
-                                     right-click to mark several, then Stage.",
+                                    "Press and hold a patch to hear it; click to keep it. \
+                                     Drag it to the staged bank, or right-click to mark \
+                                     several, then Stage.",
                                 )
                                 .font(bold(PLUGIN_NOTE_PT))
                                 .color(faint),
@@ -17909,6 +18000,43 @@ at: None,
             asked
         }
 
+        /// **Press, and STAY down**, at the word's centre — the gesture an
+        /// audition is, and the one thing `click` cannot express, because it
+        /// always lets go. Answers where the press landed, so the release
+        /// can be aimed at the same place a hand would leave it.
+        ///
+        /// A still frame at the end because egui decides press-versus-drag
+        /// on movement: a button down that has not moved is a press, and it
+        /// stays one for as long as it stays still.
+        fn press_and_hold(&mut self, word: &str) -> Pos2 {
+            let at = self.word_at(word);
+            let _ = self.frame(vec![egui::Event::PointerMoved(at)]);
+            let _ = self.frame(vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: self.mods,
+            }]);
+            let _ = self.frame(Vec::new());
+            at
+        }
+
+        /// Let the held button go where it stands, and answer what that
+        /// asked the app for.
+        fn let_go(&mut self, at: Pos2) -> Option<DialogAction> {
+            let mut asked = None;
+            if let (Some(a), _) = self.frame(vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: self.mods,
+            }]) {
+                asked = Some(a);
+            }
+            let _ = self.frame(Vec::new());
+            asked
+        }
+
         /// One key, pressed and released, as a hand would.
         fn key(&mut self, key: egui::Key) -> Option<DialogAction> {
             let mut asked = None;
@@ -18126,6 +18254,154 @@ at: None,
             ),
             "Remove did not take the staged row that is playing"
         );
+    }
+
+    /// What the picker says is sounding this frame.
+    fn sounding(slot: &Slot) -> Option<PatchHold> {
+        match slot.dialog.as_ref() {
+            Some(Dialog::PatchPicker { audition, .. }) => *audition,
+            _ => None,
+        }
+    }
+
+    /// **A press on a patch name holds it, a still frame keeps holding it,
+    /// and the button coming up lets it go — while the click that press ends
+    /// in still selects the row.** Both panes and the built-in row, because
+    /// the two panes number themselves independently and the built-in row is
+    /// the one with no cartridge behind it.
+    ///
+    /// Through the real widgets, because the whole claim is about what egui
+    /// makes of a button that is down: `is_pointer_button_down_on` against
+    /// `clicked()`, on a label that also senses drags, and nothing short of
+    /// the events proves those three stay apart.
+    ///
+    /// Revert-check performed: writing the hold as `holding.or(*audition)` —
+    /// a latch, which is what every stuck note in this app has been — leaves
+    /// the row sounding after the release and reddens the fourth assertion,
+    /// while every other assertion here stays green. That is the point of
+    /// asserting the empty state at all.
+    #[test]
+    fn pressing_a_patch_name_sounds_it_until_the_button_comes_up() {
+        let mut slot = Slot::new(bank_picker());
+        assert_eq!(sounding(&slot), None, "a picker nobody has touched is sounding");
+        let at = slot.press_and_hold("  3. VOICE 2");
+        assert_eq!(
+            sounding(&slot),
+            Some(PatchHold { from_staged: false, index: 2 }),
+            "a press on a row did not sound it"
+        );
+        // A frame with nothing in it: the button is still down, so the row
+        // is still held. A hand can rest on a name for a whole second.
+        let _ = slot.frame(Vec::new());
+        assert_eq!(
+            sounding(&slot),
+            Some(PatchHold { from_staged: false, index: 2 }),
+            "the hold did not survive a frame with no events in it"
+        );
+        // And up. The click is unchanged — it still selects and still asks
+        // the app for the patch — and nothing is left sounding.
+        assert!(
+            matches!(
+                slot.let_go(at),
+                Some(DialogAction::ChoosePatch { slot: 1, index: 2 })
+            ),
+            "the release stopped selecting the row"
+        );
+        assert_eq!(sounding(&slot), None, "the row was left sounding after the release");
+
+        // The built-in row, which has no cartridge behind it and is spelled
+        // with `ChoosePatch`'s own sentinel.
+        let builtin = format!("  {BUILTIN_PATCH_ROW}");
+        let at = slot.press_and_hold(&builtin);
+        assert_eq!(
+            sounding(&slot),
+            Some(PatchHold { from_staged: false, index: usize::MAX }),
+            "the built-in row does not audition"
+        );
+        let _ = slot.let_go(at);
+        assert_eq!(sounding(&slot), None);
+
+        // The STAGED pane, whose slot 5 is not the cartridge's row 5.
+        if let Some(Dialog::PatchPicker { staged, .. }) = slot.dialog.as_mut() {
+            staged[4] = Some("MINE".to_owned());
+        }
+        let at = slot.press_and_hold("  5. MINE");
+        assert_eq!(
+            sounding(&slot),
+            Some(PatchHold { from_staged: true, index: 4 }),
+            "a press on a staged row did not sound it"
+        );
+        assert!(
+            matches!(
+                slot.let_go(at),
+                Some(DialogAction::ChooseStaged { slot: 1, index: 4 })
+            ),
+            "the release stopped selecting the staged row"
+        );
+        assert_eq!(sounding(&slot), None, "the staged row was left sounding");
+
+        // An EMPTY staged slot has nothing to sound.
+        let at = slot.press_and_hold("  8. (empty)");
+        assert_eq!(sounding(&slot), None, "an empty staged slot auditioned something");
+        let _ = slot.let_go(at);
+    }
+
+    /// **Every other way out of the gesture also lets go.** The release above
+    /// is the one road that was always going to work; these are the three
+    /// that have stranded a note in this app before.
+    ///
+    /// A button let go OUTSIDE the window never arrives as a release at all —
+    /// it arrives as the pointer being gone — which is the shape that left a
+    /// drag following the cursor for ever before `held` was put under it. A
+    /// press that becomes a DRAG is not a press any more, and the picker has
+    /// been careful since the bank builder that dragging a row does not
+    /// change the sound. And a picker that is CLOSED takes its whole state
+    /// with it, which is the strongest case of all: there is nothing left to
+    /// read, so there is nothing held.
+    ///
+    /// Revert-check performed: writing the hold as a latch
+    /// (`holding.or(*audition)`) reddens the pointer-gone assertion, and
+    /// dropping `drag.is_none()` reddens the drag one.
+    ///
+    /// What this CANNOT catch is the `held &&` term, and it is worth saying
+    /// so rather than implying a guard that is not guarded. egui's own
+    /// `is_pointer_button_down_on` goes false when the pointer goes, so in a
+    /// headless context the term changes nothing and dropping it reddens
+    /// nothing. It is kept for the reason the drag two lines above it keeps
+    /// the same term: a real window can lose a button in ways a synthesised
+    /// event stream does not model, and one reading of "is a button down"
+    /// serving both the drag and the note is cheaper than finding out which
+    /// of the two was right.
+    #[test]
+    fn a_held_patch_is_let_go_by_the_pointer_going_by_a_drag_and_by_the_window() {
+        let mut slot = Slot::new(bank_picker());
+        // The pointer, gone: a button released over another window.
+        slot.press_and_hold("  3. VOICE 2");
+        assert!(sounding(&slot).is_some(), "the press did not take");
+        let _ = slot.frame(vec![egui::Event::PointerGone]);
+        assert_eq!(
+            sounding(&slot),
+            None,
+            "a button let go outside the window left the row sounding"
+        );
+
+        // A drag. The press sounds the row, and the moment egui calls it a
+        // drag instead, the sound stops — which is what keeps a row dragged
+        // into the staged bank from changing what the strip plays.
+        let from = slot.press_and_hold("  3. VOICE 2");
+        assert!(sounding(&slot).is_some(), "the press did not take");
+        let to = from + Vec2::new(0.0, 220.0);
+        let _ = slot.frame(vec![egui::Event::PointerMoved(from + Vec2::new(0.0, 110.0))]);
+        let _ = slot.frame(vec![egui::Event::PointerMoved(to)]);
+        assert_eq!(sounding(&slot), None, "a drag went on sounding the row it picked up");
+        let _ = slot.let_go(to);
+
+        // And the window. Nothing here has to remember to close a note: the
+        // dialog is the only thing that ever said one was open.
+        slot.press_and_hold("  3. VOICE 2");
+        assert!(sounding(&slot).is_some(), "the press did not take");
+        slot.dialog = None;
+        assert_eq!(sounding(&slot), None, "a closed picker was still sounding a row");
     }
 
     /// **The slot under a drag is outlined before the button comes up.**

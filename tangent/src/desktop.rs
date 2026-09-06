@@ -4624,6 +4624,26 @@ impl DesktopApp {
                         Err(e) => self.app.set_bank_note(format!("Could not save: {e}")),
                     }
                 }
+                // **The picker's ear.** A hand is on a patch name, or it is
+                // not; the request says which and the engine's own reconcile
+                // does the rest — see `Engine::set_audition`, which is the
+                // one note door in the engine that names a strip, and
+                // `Shared::audition` for why it takes a state rather than an
+                // edge. Nothing here has to be paired with anything: this arm
+                // cannot leave a note down, because what it stores is not
+                // "start" but "this is what is being held".
+                //
+                // Deliberately NOT through `send_midi` the way `R::Audition`
+                // and `R::PadHit` go, and deliberately not into the take's
+                // `.mid` either. Those two are performances — a pad tapped
+                // over a rolling take is playing — and browsing a bank is
+                // not: thirty-two note-ons in the recorded part, one per name
+                // somebody listened to, is a take somebody has to clean up.
+                R::AuditionStrip { strip, key } => {
+                    if let Some(e) = self.recorder.engine.as_ref() {
+                        e.set_audition(strip, key);
+                    }
+                }
                 // An insert's own window. Same one-row-two-names bargain as an
                 // instrument's: press it again and the window that is up goes
                 // away.
@@ -20919,6 +20939,58 @@ mod tests {
             src[a..a + 1200].contains("self.editing = None;"),
             "the one place that lets an edit go is not `park_edit`"
         );
+    }
+
+    /// **The picker's audition reaches the strip's own door, and reaches
+    /// nothing else** — not the engine's MIDI in, and not the recording.
+    ///
+    /// Two claims in one arm, and both of them are about roads NOT taken.
+    /// `R::Audition` and `R::PadHit` both go in through `send_midi` and both
+    /// are captured into the take's `.mid` and offered to the arrangement's
+    /// recorder, on the argument that a note somebody played is a note
+    /// somebody played, however they played it. That argument is right for
+    /// the on-screen keyboard and for a tapped pad, and wrong here: a bank
+    /// browsed while a take rolls would put one middle C in the part per name
+    /// somebody listened to, and `send_midi` names no strip, so the note
+    /// would sound whatever the desk's routing happens to admit rather than
+    /// the picker's own instrument.
+    ///
+    /// A source check because the difference is a call that is not made, and
+    /// there is no state to interrogate for a thing that did not happen. The
+    /// arm's own COMMENTS are stripped first: they name all three of the
+    /// wrong roads, in the course of explaining why none of them is taken,
+    /// and a scan that read them would fail on the explanation.
+    ///
+    /// Revert-check performed: writing the arm the way `R::PadHit` is
+    /// written — a stamp off the timebase, `e.send_midi(at, &ev)` and
+    /// `capture_app_midi` — reddens it on the first assertion, the door that
+    /// is no longer reached, with all three roads it took instead standing
+    /// behind that one.
+    #[test]
+    fn an_audition_reaches_the_strip_and_never_the_recording() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        let a = src
+            .find("R::AuditionStrip { strip, key } =>")
+            .expect("the audition arm is gone");
+        let b = src[a..].find("\n                R::").expect("the next arm");
+        let code: String = src[a..a + b]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("set_audition(strip, key)"),
+            "the audition no longer reaches the strip's own door"
+        );
+        for road in ["send_midi", "capture_app_midi", "note_event"] {
+            assert!(
+                !code.contains(road),
+                "the audition went out through `{road}`, which either aims it \
+                 by the desk's routing instead of at the picker's strip or \
+                 writes a browsed bank into the take"
+            );
+        }
     }
 
     /// **The staged bank reaches the disk on every change, comes back at

@@ -1691,6 +1691,16 @@ pub struct TangentApp {
     /// See [`PedalStack`] for the invariant that makes a second dialog slot
     /// safe in an app that writes the first one in seventy places.
     pedal_stack: Option<PedalStack>,
+    /// **The DX7 patch row this app currently has SOUNDING, and the strip it
+    /// is sounding on.** Appended at the END, this struct's law.
+    ///
+    /// What [`TangentApp::patch_audition_tick`] last told the host, kept only
+    /// so that it can tell when the picker's own hold has moved and say
+    /// nothing on the frames where it has not. It is a record of what was
+    /// SAID and never the source of truth — the truth is the dialog's, asked
+    /// afresh every frame — which is the difference between this and a latch
+    /// somebody has to remember to clear.
+    patch_audition: Option<(usize, dialogs::PatchHold)>,
 }
 
 /// **One pedal's window, and the amp face it is standing on.**
@@ -3486,6 +3496,7 @@ impl TangentApp {
             gesture_until: None,
             inner_size_sends: 0,
             pedal_stack: None,
+            patch_audition: None,
         };
         // The panels draw from the rendered labels, so a session that loads
         // with routes has to arrive with them already rendered — otherwise
@@ -23827,6 +23838,158 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         ));
     }
 
+    /// The patch picker, in whichever of the app's two dialog slots it is
+    /// standing in.
+    ///
+    /// Both are asked because the app has two — the desk's own, and the one a
+    /// pedal window stands in — and although the picker only ever opens in
+    /// the first today, asking both costs a `matches!` and cannot go stale
+    /// the day somebody opens it in the second.
+    fn patch_picker_open(&self) -> Option<&Dialog> {
+        [
+            self.dialog.as_ref(),
+            self.pedal_stack.as_ref().and_then(|st| st.dialog.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|d| matches!(d, Dialog::PatchPicker { .. }))
+    }
+
+    /// **The row the picker has LIT**, which is the patch the strip is
+    /// supposed to be playing whenever nothing is being auditioned.
+    ///
+    /// There is always one when the picker is open: a staged slot, a
+    /// cartridge row, or — when neither is lit — the patch compiled into the
+    /// binary, which `ChoosePatch` has always spelled `usize::MAX`. The
+    /// staged pane wins where both somehow held a number, which is the same
+    /// order the picker's own "Patch..." reads them in.
+    fn patch_lit(&self) -> Option<(usize, dialogs::PatchHold)> {
+        match self.patch_picker_open()? {
+            Dialog::PatchPicker {
+                slot,
+                selected,
+                staged_selected,
+                ..
+            } => Some((
+                *slot,
+                match (*staged_selected, *selected) {
+                    (Some(i), _) => dialogs::PatchHold {
+                        from_staged: true,
+                        index: i,
+                    },
+                    (None, Some(i)) => dialogs::PatchHold {
+                        from_staged: false,
+                        index: i,
+                    },
+                    (None, None) => dialogs::PatchHold {
+                        from_staged: false,
+                        index: usize::MAX,
+                    },
+                },
+            )),
+            _ => None,
+        }
+    }
+
+    /// Put strip `slot`'s built-in on this row — **the sound only, with
+    /// nothing written down**.
+    ///
+    /// The same two requests a click sends, and deliberately not the
+    /// `DialogAction` road: `apply_dialog_action` also writes the strip's
+    /// patch into the settings, and an audition is not a choice. What a
+    /// press changes is what the strip is playing this second; what a CLICK
+    /// changes is what it opens on tomorrow, and only the click may do that.
+    fn sound_patch(&mut self, slot: usize, hold: dialogs::PatchHold) {
+        self.request_recorder(if hold.from_staged {
+            recorder::RecorderRequest::ChooseStaged {
+                slot,
+                index: hold.index,
+            }
+        } else {
+            recorder::RecorderRequest::ChoosePatch {
+                slot,
+                index: hold.index,
+            }
+        });
+    }
+
+    /// **Make the strip agree with the hand**: the patch picker's
+    /// press-and-hold audition, reconciled once a frame from state.
+    ///
+    /// The owner asked for this in one line — "let it trigger the instrument,
+    /// as middle C when you click/hold a patch name. auditioning dx7 patches
+    /// is a really good thing" — and the whole difficulty of it is the fault
+    /// class underneath: a note opened by a gesture and closed by whatever
+    /// path the gesture happens to take out. This app has shipped that twice.
+    /// A double-click in the MIDI editor cleared its drag and returned past
+    /// the release that would have let its preview go, so the note rang for
+    /// ever on the Analog synth; a drum pad did the same thing before it.
+    /// Both were fixed the same way, and it is the way this is built: the
+    /// press writes down what is being held, `me_preview_tick`-style, and
+    /// something asks once a frame whether the world agrees with it.
+    ///
+    /// So there is no road out of this that has to remember anything. The
+    /// dialog is the only writer of the hold, and it writes it unconditionally
+    /// from the pane responses every frame it draws; a release, a drag
+    /// starting, a button let go outside the window, another row taken, the
+    /// picker closing — every one of them reaches the next frame as "nothing
+    /// held", and the note is let go here. The picker being GONE is the
+    /// strongest case of all: there is nothing left to read, so there is
+    /// nothing held, so the note goes off.
+    ///
+    /// **What the press displaces, the release puts back.** A press has to
+    /// LOAD the patch to sound it — the strip's built-in plays one voice and
+    /// that voice is the audition — and the click that selects a row does not
+    /// happen until the button comes up. So the audition is a loan: when it
+    /// ends, the strip goes back to whatever the picker has lit, unless the
+    /// picker has meanwhile lit the very row that was auditioned, which is
+    /// exactly what a genuine click does. That is what keeps a DRAG from
+    /// changing the sound, which this picker has been careful about since the
+    /// bank builder was written, and it is why the lit row and the sound
+    /// cannot come apart. (A picker CLOSED mid-press has nothing lit to go
+    /// back to, and the strip keeps what it was last asked to play — the same
+    /// place a click and an immediate Done leaves it.)
+    ///
+    /// The repaint is the last piece: a hand can hold a button perfectly
+    /// still for a second, and a window with nothing else to draw would not
+    /// come back until it moved. The release itself always arrives as an
+    /// event and would wake it anyway; this is so that a note is never
+    /// waiting on one.
+    fn patch_audition_tick(&mut self, ctx: &egui::Context) {
+        let want = self
+            .patch_picker_open()
+            .and_then(|d| match d {
+                Dialog::PatchPicker { slot, audition, .. } => audition.map(|h| (*slot, h)),
+                _ => None,
+            });
+        if want != self.patch_audition {
+            if let Some((slot, held)) = self.patch_audition {
+                self.request_recorder(recorder::RecorderRequest::AuditionStrip {
+                    strip: slot,
+                    key: None,
+                });
+                // The loan, returned. Skipped where the picker has lit the
+                // row that was being held, which is what a click has just
+                // done and which would otherwise be undone here.
+                match self.patch_lit() {
+                    Some((on, lit)) if on == slot && lit != held => self.sound_patch(slot, lit),
+                    _ => {}
+                }
+            }
+            if let Some((slot, held)) = want {
+                self.sound_patch(slot, held);
+                self.request_recorder(recorder::RecorderRequest::AuditionStrip {
+                    strip: slot,
+                    key: Some(recorder::AUDITION_NOTE),
+                });
+            }
+            self.patch_audition = want;
+        }
+        if want.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
     /// What the audio path is doing, from the host that owns the devices.
     ///
     /// Pushed every frame rather than pulled, for the same reason the recorder
@@ -32866,6 +33029,16 @@ impl TangentApp {
                 self.pedal_stack = None;
             }
         }
+        // **After BOTH windows have drawn, and after both have had their say.**
+        //
+        // The DX7 picker's press-and-hold audition is reconciled from the
+        // dialog's own state rather than driven by an action, so it has to
+        // run where that state is freshest — which is here, one line past the
+        // last thing that can change it. Placed after `apply_dialog_action`
+        // on purpose and not by accident: a click's `ChoosePatch` moves the
+        // lit row, and the note being let go has to see the row it moved TO,
+        // or it would put the strip back on the one the hand just left.
+        self.patch_audition_tick(&ctx);
         // **The tap follows the window being worked in.** One tap, two
         // faces: `open_pedal_window` points it at the pedal when its window
         // opens, and when that window closes the amp underneath is still up
@@ -38356,6 +38529,130 @@ mod tests {
             })
         );
         assert_eq!(app.settings.strip_dx7_patch[1], 0);
+    }
+
+    /// Put a hand on one of the open picker's rows, or take it off.
+    fn hold_patch_row(app: &mut TangentApp, on: Option<dialogs::PatchHold>) {
+        let Some(dialogs::Dialog::PatchPicker { audition, .. }) = app.dialog.as_mut() else {
+            panic!("the picker is not open")
+        };
+        *audition = on;
+    }
+
+    /// **A held patch row sounds its own strip, says so once, and is put back
+    /// when the hand lifts.**
+    ///
+    /// The picker's press-and-hold audition, end to end on this side of the
+    /// firewall: what the app says to the host, and — the part that matters —
+    /// what it says when the gesture ends in each of the ways it can end.
+    ///
+    /// Four claims. A press LOADS the row and then holds middle C on that
+    /// strip, in that order, because the strip's built-in plays one voice and
+    /// the note has to find the right one already there. A hand that stays
+    /// still says nothing further, so the host is not told the same thing
+    /// sixty times a second. A hand that lifts always lets the note go, and
+    /// puts the strip back on the row the picker has LIT — unless the click
+    /// has just lit the row that was held, which is the ordinary case and the
+    /// one where putting anything back would undo the click. And a picker
+    /// that has GONE lets the note go with nothing left to read.
+    ///
+    /// Revert-check performed: reconciling only the note (dropping both
+    /// `sound_patch` calls) reddens the first assertion — the note sounds
+    /// whatever patch the strip was already on, which is the wrong patch —
+    /// and putting the loan back unconditionally (dropping the `lit != held`
+    /// guard) reddens the click case, where the strip is dragged off the row
+    /// the hand just chose.
+    #[test]
+    fn a_held_patch_row_sounds_its_strip_and_is_put_back_when_the_hand_lifts() {
+        let ctx = egui::Context::default();
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(1), 0), 0.0);
+        app.set_cartridge(crate::ports::CartridgeInfo {
+            on_default: false,
+            bank: "ROM1A".to_owned(),
+            voices: (0..32).map(|i| format!("PATCH {i}")).collect(),
+            ..Default::default()
+        });
+        while app.take_recorder_request().is_some() {}
+        let row = |index| dialogs::PatchHold { from_staged: false, index };
+
+        // Down on row 4. The patch first, the note second.
+        hold_patch_row(&mut app, Some(row(4)));
+        app.patch_audition_tick(&ctx);
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::ChoosePatch { slot: 1, index: 4 }),
+            "the held row was never loaded, so the note would sound the wrong patch"
+        );
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::AuditionStrip {
+                strip: 1,
+                key: Some(recorder::AUDITION_NOTE)
+            }),
+            "the held row did not sound"
+        );
+        // Still down, and still nothing more to say.
+        app.patch_audition_tick(&ctx);
+        app.patch_audition_tick(&ctx);
+        assert_eq!(
+            app.take_recorder_request(),
+            None,
+            "a hand resting on a name is filling the host's queue"
+        );
+
+        // Up, with the picker's lit row where it was: the note goes off and
+        // the strip goes back to what the picker says it is playing. Row 0 is
+        // what `bank_picker`'s selection is here, from the strip's own
+        // setting.
+        hold_patch_row(&mut app, None);
+        app.patch_audition_tick(&ctx);
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::AuditionStrip { strip: 1, key: None }),
+            "the note was not let go"
+        );
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::ChoosePatch { slot: 1, index: 0 }),
+            "the strip was left on a patch the picker is not lighting"
+        );
+
+        // A CLICK: the hand goes down, and comes up on a frame where the
+        // dialog has already moved its lit row to the very row that was held.
+        // Nothing to put back — putting it back would undo the click.
+        hold_patch_row(&mut app, Some(row(9)));
+        app.patch_audition_tick(&ctx);
+        while app.take_recorder_request().is_some() {}
+        if let Some(dialogs::Dialog::PatchPicker { selected, .. }) = app.dialog.as_mut() {
+            *selected = Some(9);
+        }
+        hold_patch_row(&mut app, None);
+        app.patch_audition_tick(&ctx);
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::AuditionStrip { strip: 1, key: None })
+        );
+        assert_eq!(
+            app.take_recorder_request(),
+            None,
+            "the release dragged the strip off the row the click had just chosen"
+        );
+
+        // And the picker, gone. There is nothing left to read, so nothing is
+        // held, so the note goes off — with no road out of the dialog having
+        // had to remember anything.
+        hold_patch_row(&mut app, Some(row(12)));
+        app.patch_audition_tick(&ctx);
+        while app.take_recorder_request().is_some() {}
+        app.dialog = None;
+        app.patch_audition_tick(&ctx);
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::AuditionStrip { strip: 1, key: None }),
+            "a picker that closed under a held row left the note sounding"
+        );
+        assert_eq!(app.take_recorder_request(), None);
     }
 
     /// A plugin host never raises a file panel, so it never asks for one.

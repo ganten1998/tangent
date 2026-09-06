@@ -2213,6 +2213,32 @@ struct Shared {
     /// draining frees nothing, `Voice` being 155 inline numbers, so the
     /// callback stays allocation-free in both directions.
     pending_voices: std::sync::Mutex<Vec<(usize, crate::dx7::Voice)>>,
+    /// **The key one lane is being HELD on for an audition**, or `u32::MAX`
+    /// where nothing is held. The DX7 picker's press-and-hold, and the only
+    /// note path in this engine that names a STRIP.
+    ///
+    /// Every other note in the app arrives through [`Engine::send_midi`] and
+    /// is broadcast to every lane `midi_off` admits, which is the right
+    /// arrangement for a keyboard and the wrong one for a picker: that window
+    /// is about ONE strip's instrument, and that strip is very often neither
+    /// armed nor selected, so a note down the ordinary road sounds on
+    /// somebody else's synth or on nothing at all. Arranging the mask around
+    /// the picker instead — the trick the MIDI editor plays — would have
+    /// pointed the user's own keyboard at the picker's strip for the length
+    /// of the press, put the auditioned note into the take's `.mid`, and left
+    /// the release to be chopped by the force-quiet below rather than played.
+    ///
+    /// **A LEVEL and not an edge, which is the whole of why a note held here
+    /// cannot be stranded.** A pair of on/off messages can lose its second
+    /// half — to a full ring, to a window that never sees the release, to a
+    /// branch that returns early — and what is left is a note ringing for
+    /// ever, which is a fault this app has now shipped twice. What the UI
+    /// writes here is not "start" or "stop" but "this is what is being held",
+    /// and the renderer's whole job is to make the instrument agree with it.
+    /// A write that is late is a note that is late; there is no write whose
+    /// loss leaves a note down, because the last write always says what is
+    /// true.
+    audition: [AtomicU32; CHANNELS],
     running: AtomicBool,
     callbacks: AtomicU64,
     swaps: AtomicU64,
@@ -2474,6 +2500,10 @@ impl Shared {
             midi_dropped: AtomicU64::new(0),
             pedal_dropped: AtomicU64::new(0),
             pending_voices: std::sync::Mutex::new(Vec::new()),
+            // Nothing held anywhere. `u32::MAX` and not a key, so that the
+            // zeroed word a lazier sentinel would have used cannot read as
+            // "this lane is holding C-1".
+            audition: std::array::from_fn(|_| AtomicU32::new(u32::MAX)),
             running: AtomicBool::new(false),
             callbacks: AtomicU64::new(0),
             xruns: AtomicU64::new(0),
@@ -3943,6 +3973,19 @@ struct Renderer {
     keys_incoming: Consumer<(usize, Option<Box<crate::keys::Keys>>)>,
     keys_retiring: Producer<(usize, Option<Box<crate::keys::Keys>>)>,
     keys_scratch: Vec<f32>,
+    /// **What each lane's audition has actually been TOLD**, which is what
+    /// `Shared::audition` is reconciled against once a block. `None` where
+    /// the lane has been told nothing.
+    audition_on: [Option<u8>; CHANNELS],
+    /// **This lane has sounded an audition and is not finished with it.**
+    ///
+    /// Kept apart from `audition_on` because letting go of the key is not the
+    /// end of the note: a DX7 release can run for seconds, and the walk below
+    /// force-quiets any lane that is unarmed, carries no clips and has an
+    /// empty note list — which, one block after the button comes up, is
+    /// exactly this lane. Without this flag the tail was cut dead the instant
+    /// the hand lifted, on precisely the patches somebody browses a bank for.
+    audition_rang: [bool; CHANNELS],
     /// Where each general channel's fader has slewed to. Per channel, because
     /// the eight move independently — the same treatment every fader gets.
     channel_gain: [f32; CHANNELS],
@@ -4596,6 +4639,26 @@ impl Renderer {
             });
         }
         swapped
+    }
+
+    /// Whether lane `ch`'s own instrument still has anything sounding — a key
+    /// held, or a release that has not finished ringing.
+    ///
+    /// Asked of the INSTRUMENT rather than of the note list, for the reason
+    /// the keyboard's own force-quiet gives a few hundred lines down: a
+    /// pedalled chord, or a patch with a long release, is still making sound
+    /// long after the last note-off went in. It is how an audition knows when
+    /// it is finally done with the lane it borrowed.
+    fn lane_instrument_active(&self, ch: usize) -> bool {
+        self.dx7s
+            .get(ch)
+            .and_then(Option::as_ref)
+            .is_some_and(|d| d.active())
+            || self
+                .keys_lanes
+                .get(ch)
+                .and_then(Option::as_ref)
+                .is_some_and(|k| k.active())
     }
 
     /// Collect the events that belong to `[block_start, block_start + frames)`.
@@ -8542,6 +8605,61 @@ impl Renderer {
                     .any(|m| m.strip.min(CHANNELS - 1) == ch);
             }
 
+            // ── the AUDITION, reconciled ────────────────────────────────
+            //
+            // `Shared::audition` is a LEVEL — it says what this lane is being
+            // held on, never that something happened — so the work here is a
+            // comparison and not a delivery: what the lane has been told
+            // against what it should have been told, with only the difference
+            // pushed. See the field for why that is the shape.
+            //
+            // **The pair goes in together or not at all.** A push refused for
+            // want of room used to be the "withheld, not dropped" lesson the
+            // clip walk above learned the hard way, and here it would be
+            // worse than a lost note: an OFF dropped while `audition_on` moved
+            // on is a note nothing will ever think to close again. So the room
+            // for both is checked first, and a block with no room simply
+            // leaves the level alone and reconciles on the next one — which
+            // costs a note one buffer and can strand nothing.
+            //
+            // LAST in the list on purpose, for the reason the clip walk's own
+            // "offs first" gives: a clip note ending on this very pitch this
+            // block would otherwise silence the audition a sample after it
+            // spoke.
+            let want = u8::try_from(self.shared.audition[ch].load(Ordering::Relaxed))
+                .ok()
+                .filter(|k| *k < 128);
+            if want != self.audition_on[ch] && lane_notes.len() + 2 <= lane_notes.capacity() {
+                if let Some(old) = self.audition_on[ch] {
+                    lane_notes.push(Note {
+                        offset: 0,
+                        pitch: i16::from(old),
+                        velocity: 0.0,
+                        on: false,
+                    });
+                }
+                if let Some(new) = want {
+                    lane_notes.push(Note {
+                        offset: 0,
+                        pitch: i16::from(new),
+                        velocity: f32::from(tangent_ui::recorder::AUDITION_VELOCITY) / 127.0,
+                        on: true,
+                    });
+                }
+                self.audition_on[ch] = want;
+            }
+            // **Still speaking**: the key is down, or it has been let go and
+            // the instrument has not finished with it. Either keeps the lane
+            // out of the force-quiet below and keeps it rendering, which is
+            // the whole difference between an audition that releases and one
+            // that is guillotined.
+            if want.is_some() {
+                self.audition_rang[ch] = true;
+            } else if self.audition_rang[ch] && !self.lane_instrument_active(ch) {
+                self.audition_rang[ch] = false;
+            }
+            let auditioning = self.audition_rang[ch];
+
             // The DRUMPAD lane: every note here is a pad strike — the same
             // sixteen one-shots the drumpad window plays, so the editor's
             // roll and a MIDI keyboard trigger exactly what a finger does.
@@ -8604,7 +8722,12 @@ impl Renderer {
             // both — and it goes quiet only when neither is speaking for it.
             if is_builtin {
                 if let Some(d) = self.dx7s[ch].as_mut() {
-                    if lane_notes.is_empty() && !armed && !lane_has_clips && d.active() {
+                    if lane_notes.is_empty()
+                        && !armed
+                        && !lane_has_clips
+                        && !auditioning
+                        && d.active()
+                    {
                         d.all_notes_off();
                     } else {
                         for n in &lane_notes {
@@ -8628,7 +8751,12 @@ impl Renderer {
             // still sounding long after the last note-off.
             if is_keys {
                 if let Some(k) = self.keys_lanes[ch].as_mut() {
-                    if lane_notes.is_empty() && !armed && !lane_has_clips && k.active() {
+                    if lane_notes.is_empty()
+                        && !armed
+                        && !lane_has_clips
+                        && !auditioning
+                        && k.active()
+                    {
                         k.all_notes_off();
                     } else {
                         for n in &lane_notes {
@@ -8674,7 +8802,8 @@ impl Renderer {
             // to walk the fold, or the timeline goes silent the moment the
             // last plugin is pulled out of the strip.
             let has_audio = self.clip_lanes & (1u32 << ch.min(CHANNELS - 1)) != 0;
-            let feeds = armed || lane_has_clips || has_audio || !lane_notes.is_empty();
+            let feeds =
+                armed || lane_has_clips || has_audio || !lane_notes.is_empty() || auditioning;
             if !feeds || (!is_builtin && !is_keys && !rack_live && !has_audio) {
                 // **The gain is advanced whether or not anything renders.** A
                 // fader moved during a rest has to have arrived by the next
@@ -10552,6 +10681,8 @@ impl Engine {
             dx7s: (0..CHANNELS).map(|_| None).collect(),
             dx7_incoming,
             dx7_retiring,
+            audition_on: [None; CHANNELS],
+            audition_rang: [false; CHANNELS],
             keys_lanes: (0..CHANNELS).map(|_| None).collect(),
             keys_incoming,
             keys_retiring,
@@ -12033,6 +12164,30 @@ impl Engine {
         if let Ok(mut g) = self.shared.pending_voices.lock() {
             g.retain(|(lane, _)| *lane != ch);
             g.push((ch, voice));
+        }
+    }
+
+    /// **Hold `key` down on lane `ch`'s own instrument, or let go of it.**
+    ///
+    /// The one note door in this engine that names a strip. [`Engine::send_midi`]
+    /// is the other, and it names none: a note down that road reaches every
+    /// lane the desk's `midi_off` mask admits, which is what a keyboard wants
+    /// and the opposite of what the DX7 picker wants — a window about ONE
+    /// strip's built-in, opened as often as not on a strip that is neither
+    /// armed nor selected and would therefore have heard nothing at all.
+    ///
+    /// Takes the whole STATE and not an edge, and the argument for that is
+    /// written on [`Shared::audition`]: a held note that can be stranded is a
+    /// note that eventually is, and the way to make stranding unrepresentable
+    /// is to stop sending events. `None` is not "stop the note" so much as
+    /// "nothing is being held", which is a thing the caller can say again and
+    /// again at no cost and which is true from the moment the hand comes up.
+    ///
+    /// A `ch` past the desk is dropped rather than wrapped: a bad index here
+    /// would sound a note on somebody else's instrument.
+    pub fn set_audition(&self, ch: usize, key: Option<u8>) {
+        if let Some(cell) = self.shared.audition.get(ch) {
+            cell.store(key.map_or(u32::MAX, u32::from), Ordering::Relaxed);
         }
     }
 
@@ -16149,6 +16304,8 @@ mod tests {
             dx7s: (0..CHANNELS).map(|_| None).collect(),
             dx7_incoming: RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(2).1,
             dx7_retiring: RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(2).0,
+            audition_on: [None; CHANNELS],
+            audition_rang: [false; CHANNELS],
             keys_lanes: (0..CHANNELS).map(|_| None).collect(),
             keys_incoming: RingBuffer::<(usize, Option<Box<crate::keys::Keys>>)>::new(2).1,
             keys_retiring: RingBuffer::<(usize, Option<Box<crate::keys::Keys>>)>::new(2).0,
@@ -17346,6 +17503,172 @@ mod tests {
             peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
         }
         peak
+    }
+
+    /// An engine with ONE built-in DX7, on `lane`, and the desk's routing
+    /// shut against every note — which is what `live_midi_off` leaves a strip
+    /// that is neither armed nor selected, and the state a patch picker is
+    /// opened in as often as not.
+    ///
+    /// The point of building it deaf is that there is then exactly one way
+    /// for a note to reach that synth, and it is the door under test.
+    fn a_deaf_desk_with_one_synth(lane: usize) -> (Engine, Vec<f32>) {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_channel_gain(lane, 1.0);
+        e.set_master_gain(1.0);
+        e.set_builtin_strips(1 << lane);
+        e.sync_instrument_lanes(1 << lane, 0);
+        e.set_midi_off(u64::MAX);
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; 1024 * 2];
+        // Warm-up, to drain the instrument hand-off rings.
+        for _ in 0..3 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        (e, out)
+    }
+
+    fn block_peak(out: &[f32]) -> f32 {
+        out.iter().fold(0.0f32, |a, v| a.max(v.abs()))
+    }
+
+    /// **An audition sounds the strip it NAMES, and no other, on a desk whose
+    /// routing admits nothing.**
+    ///
+    /// This is the whole reason the door exists. Every other note in the app
+    /// goes in through `send_midi` and comes out of every lane `midi_off`
+    /// admits, which is right for a keyboard and useless for the DX7 picker:
+    /// that window is about one strip's built-in, and it is opened on a strip
+    /// that is neither armed nor selected as often as not. Down the ordinary
+    /// road the picker's note would sound somebody else's synth, or nothing.
+    ///
+    /// The rig has ONE synth and the note is aimed at a DIFFERENT lane, so a
+    /// door that reached every lane would be audible here rather than merely
+    /// suspected.
+    ///
+    /// Revert-check performed: storing the key into every lane's cell in
+    /// `set_audition` (`for cell in &self.shared.audition`) reddens the leak
+    /// assertion; aiming it at lane 0 reddens the second.
+    #[test]
+    fn an_audition_sounds_the_strip_it_names_and_no_other() {
+        const SYNTH: usize = 2;
+        const ELSEWHERE: usize = 5;
+        let (mut e, mut out) = a_deaf_desk_with_one_synth(SYNTH);
+        let note = tangent_ui::recorder::AUDITION_NOTE;
+
+        // A hand on a row of ANOTHER strip's picker.
+        e.set_audition(ELSEWHERE, Some(note));
+        let mut leaked = 0.0f32;
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            leaked = leaked.max(block_peak(&out));
+        }
+        assert!(
+            leaked < 1.0e-6,
+            "an audition on strip {ELSEWHERE} sounded strip {SYNTH}'s synth: {leaked}"
+        );
+        e.set_audition(ELSEWHERE, None);
+
+        // And on its own.
+        e.set_audition(SYNTH, Some(note));
+        out.fill(0.0);
+        e.render_offline(&mut out);
+        let struck = block_peak(&out);
+        assert!(
+            struck > 1.0e-4,
+            "an audition on the strip that HOLDS the synth made no sound: {struck}"
+        );
+    }
+
+    /// **A held audition goes on sounding for as long as it is held, and its
+    /// release is played rather than guillotined.**
+    ///
+    /// The note reaches this lane through neither of the two things the walk
+    /// has always understood — the lane is not armed and it carries no clips
+    /// — so on the block after the note-on its list is empty again and every
+    /// clause of the force-quiet is satisfied. `all_notes_off` is a hard cut:
+    /// it zeroes the voices. Without the audition counted as a THIRD thing
+    /// that speaks for a lane, a press would have made one buffer of sound
+    /// and then silence, and a release would have been chopped off at the
+    /// instant the hand lifted, on exactly the patches somebody browses a
+    /// bank for.
+    ///
+    /// A slow release is loaded on purpose: the INIT VOICE is documented as
+    /// "gone the moment it is up", which would make the tail unmeasurable
+    /// whether or not it was being cut.
+    ///
+    /// Revert-check performed, three ways, and they separate cleanly.
+    /// Dropping `|| auditioning` from `feeds` reddens the HELD assertion at
+    /// zero — the lane stops rendering the block after the strike. Dropping
+    /// `!auditioning` from the built-in's force-quiet reddens the same one,
+    /// also at zero, by the other road: the voices are wiped rather than the
+    /// render skipped. And writing `auditioning` as `want.is_some()` — the
+    /// obvious form, with no memory of a note let go — leaves both of those
+    /// green and reddens the TAIL at zero, which is exactly the case the
+    /// `audition_rang` flag exists for and nothing else here catches.
+    #[test]
+    fn a_held_audition_keeps_sounding_and_its_release_is_not_cut_short() {
+        const SYNTH: usize = 2;
+        let (mut e, mut out) = a_deaf_desk_with_one_synth(SYNTH);
+        // Full while the key is down, as the INIT VOICE is, but with a
+        // release you can hear.
+        let mut slow = crate::dx7::Voice::default();
+        for op in &mut slow.ops {
+            op.rate[3] = 60;
+        }
+        e.set_builtin_voice(SYNTH, slow);
+        out.fill(0.0);
+        e.render_offline(&mut out);
+
+        e.set_audition(SYNTH, Some(tangent_ui::recorder::AUDITION_NOTE));
+        out.fill(0.0);
+        e.render_offline(&mut out);
+        let struck = block_peak(&out);
+        assert!(struck > 1.0e-4, "the audition never spoke: {struck}");
+        // Held. Eight blocks in which nothing at all is said to the engine.
+        let mut quietest = f32::MAX;
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            quietest = quietest.min(block_peak(&out));
+        }
+        assert!(
+            quietest > struck * 0.5,
+            "the held note died after the block it spoke in: {quietest} against {struck}"
+        );
+
+        // The hand lifts. The block the off lands in still has the note list
+        // to keep it alive; the one AFTER it has nothing but the tail, and
+        // the tail is the thing being claimed.
+        e.set_audition(SYNTH, None);
+        out.fill(0.0);
+        e.render_offline(&mut out);
+        out.fill(0.0);
+        e.render_offline(&mut out);
+        let tail = block_peak(&out);
+        assert!(
+            tail > 1.0e-5,
+            "the release was cut off the block after the hand lifted: {tail}"
+        );
+
+        // And it does stop. A tail that never ends is the fault this whole
+        // design is built against.
+        // The LAST block of the run, not the loudest of them: the decay is
+        // supposed to pass through every level between the two, and the
+        // question here is only whether it arrives.
+        let mut after = 0.0f32;
+        for _ in 0..128 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            after = block_peak(&out);
+        }
+        assert!(
+            after < struck * 0.01,
+            "the note was still sounding nearly three seconds after the hand \
+             came up: {after} against the {struck} it spoke at"
+        );
     }
 
     /// **A folder's amp hears its pedalboard.** The owner's ask, and the
