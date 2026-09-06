@@ -157,6 +157,11 @@ struct Recorder {
     /// Restarts before a rebuild on a stall — the macOS follow-the-default
     /// unit landing on a device that will not start. Reset with the watch.
     stall_recovery: crate::instrument::StallRecovery,
+    /// **Whether the chosen audio system opens and then serves nothing.**
+    /// See `DeadOnArrival`: a driver that says yes and does nothing is not an
+    /// error anywhere, so without this the app oscillates between silence and
+    /// rebuilding it for ever.
+    doa: crate::instrument::DeadOnArrival,
     /// The auto recheck — the owner's ask after the yank test. Alive while
     /// the engine is down, and while it runs on the fallback below; see
     /// `Reprobe`.
@@ -2665,6 +2670,23 @@ impl DesktopApp {
                 stalled
             };
             if fault.is_some() || stalled {
+                // **Did this engine ever serve a single callback?** A run of
+                // opens that served none is a chosen system that cannot play
+                // on this machine — see `DeadOnArrival`. Counted only while
+                // we are ON the chosen system: a stand-in dying says nothing
+                // about the system it stands in for, and counting it would
+                // strike the interface out for the platform default's faults.
+                if self.recorder.fallback.is_none()
+                    && self.recorder.doa.engine_died(callbacks)
+                {
+                    log::warn!(
+                        "the chosen audio system opened and never served a callback, \
+                         {} times running - setting it aside for this session and using \
+                         the platform default; it is tried again the moment the \
+                         hardware list changes",
+                        crate::instrument::DeadOnArrival::STRIKES
+                    );
+                }
                 let why = match fault {
                     Some(f) => {
                         format!("audio output failed: {f} - will reopen when the device is back")
@@ -2730,6 +2752,13 @@ impl DesktopApp {
             // replug land together.
             if self.app.recorder_band_open() {
                 self.recorder.reprobe = None;
+                // **The hardware list changed, so a system set aside for
+                // serving nothing gets another turn.** This is the event that
+                // makes it worth trying again — under ASIO the probe fires on
+                // the output list CHANGING, which is an interface arriving —
+                // and without it the set-aside would be permanent, which is
+                // the fault `DeadOnArrival` exists to avoid rather than cause.
+                self.recorder.doa.hardware_changed();
                 self.open_audio_path(ctx);
             }
         } else if self.recorder.reprobe.is_some() {
@@ -9565,6 +9594,18 @@ impl DesktopApp {
         // halves on one clock. See `engine_rate` and `input_rate`.
         let rate = self.engine_rate();
         let chosen = self.app.audio_system();
+        // **A system that has proved it opens and serves nothing is not asked
+        // again this session.** See `DeadOnArrival`. The open below would
+        // SUCCEED — that is the whole difficulty — so there is no error for
+        // the fallback beneath to catch, and the only way out is not to ask.
+        // Setting the system aside here rather than opening it and throwing
+        // the engine away also spares the seconds a dead driver takes to
+        // answer, which on ASIO is the "Not Responding" the reprobe exists to
+        // keep off the UI thread.
+        let set_aside = fallback_wanted(chosen.as_deref()) && self.recorder.doa.given_up();
+        if set_aside {
+            tangent_record::audio::set_system(None);
+        }
         let mut started = crate::instrument::Engine::start_sized(
             None,
             self.recorder.session.timebase(),
@@ -9581,6 +9622,27 @@ impl DesktopApp {
         // system comes back on its own. Only ASIO: it is the one system whose
         // device list is a registry of drivers rather than of hardware, and
         // the one the Windows tester's machine has.
+        // The set-aside road reaches the same end as the fallback below —
+        // standing in for the chosen system, marker set so the reprobe keeps
+        // watching and the way back is announced — but it arrives without an
+        // error, so it says so for itself.
+        if set_aside {
+            if let Ok(e) = &started {
+                let already_standing_in = self.recorder.fallback.is_some();
+                self.recorder.fallback = chosen.clone();
+                if !already_standing_in {
+                    self.app.notify(
+                        tangent_ui::notify::Kind::Error,
+                        format!(
+                            "ASIO opened but played nothing - using {} through the \
+                             system's own audio. Plug the interface in and it is \
+                             tried again.",
+                            e.output().device
+                        ),
+                    );
+                }
+            }
+        }
         if let Err(e) = &started {
             // **May I fall back?** is not the same question as **what am I
             // standing in for?**, and asking the second one for both made the
@@ -13778,6 +13840,7 @@ impl DesktopApp {
                 engine: None,
                 engine_error: None,
                 engine_watch: crate::instrument::StallWatch::new(),
+                doa: crate::instrument::DeadOnArrival::new(),
                 stall_recovery: crate::instrument::StallRecovery::new(),
                 reprobe: None,
                 fallback: None,
@@ -17826,6 +17889,56 @@ mod tests {
             !block.contains("self.recorder.fallback.is_none()"),
             "the fallback is gated on its own marker again - a one-shot that \
              never re-arms; see `an_asio_fallback_re_arms_after_the_engine_is_dropped`"
+        );
+    }
+
+    /// **The dead-on-arrival watch is wired to all four of its edges.**
+    ///
+    /// `DeadOnArrival`'s own test proves the state machine. What it cannot
+    /// prove is that anything asks it anything, and every one of these edges
+    /// is a road that only exists on a Windows machine with a lying driver —
+    /// so the wiring is checked against the source, in the same style as the
+    /// fallback checklist above, and each assert says what breaks without it.
+    ///
+    /// Revert check performed: delete any one of the four and its own assert
+    /// names it.
+    #[test]
+    fn the_dead_on_arrival_watch_is_asked_and_answered() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        assert!(
+            src.contains("self.recorder.doa.engine_died(callbacks)"),
+            "nothing feeds the watch, so a driver that opens and serves nothing \
+             is never noticed at all"
+        );
+        assert!(
+            src.contains("self.recorder.fallback.is_none()\n                    && self.recorder.doa.engine_died(callbacks)"),
+            "the watch is fed while standing in on the fallback too, so the \
+             platform default's own faults strike out the chosen system"
+        );
+        assert!(
+            src.contains("self.recorder.doa.given_up()"),
+            "nothing reads the watch, so a system it has set aside is still \
+             opened - and it OPENS, which is the whole difficulty"
+        );
+        assert!(
+            src.contains("self.recorder.doa.hardware_changed()"),
+            "nothing clears the watch, so plugging the interface in never \
+             brings the chosen system back and the set-aside is permanent"
+        );
+        // And the set-aside road really does stop asking for the system,
+        // rather than opening it and hoping the fallback below catches it —
+        // the open SUCCEEDS on a lying driver, so there is nothing to catch.
+        let engine = {
+            let a = src.find("fn start_engine(").expect("`start_engine` is gone");
+            let b = src[a..].find("\n    fn ").expect("its end");
+            &src[a..a + b]
+        };
+        let aside = engine.find("let set_aside =").expect("the set-aside is gone");
+        let open = engine.find("let mut started =").expect("the open is gone");
+        assert!(
+            aside < open,
+            "the chosen system is set aside AFTER it has already been opened"
         );
     }
 

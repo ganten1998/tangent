@@ -14640,8 +14640,135 @@ impl Default for StallRecovery {
     }
 }
 
+/// **A chosen audio system that OPENS and then serves nothing.**
+///
+/// A driver that refuses to open is easy: the open errors, the caller falls
+/// back, and somebody is told why. The expensive case is a driver that says
+/// yes and then does nothing at all — the stream is "running", the watchdog
+/// declares it dead two seconds later, the rebuild opens the same driver, it
+/// says yes again, and the app oscillates between silence and rebuilding for
+/// as long as anybody leaves it there. Nothing in that loop is an error, so
+/// nothing in it ever falls back.
+///
+/// Windows has a stock example. Realtek ships a **generic ASIO wrapper**, so a
+/// machine with no interface at all still presents "an ASIO device"; the
+/// codebase already refuses to pick ASIO by itself for exactly this reason
+/// (see `audio::host_for`), but somebody who has CHOSEN ASIO in settings —
+/// because they own an interface that is currently unplugged — is handed the
+/// wrapper, and it opens. A tester's log has the app announcing
+/// `back on ASIO - Speaker (Realtek(R) Audio)` and playing nothing.
+///
+/// The signature is the same whoever the driver is, and it needs no name list
+/// to recognise: **an engine that was torn down having served ZERO callbacks
+/// never worked at all.** One of those is a plug pulled at the wrong moment.
+/// A run of them is a system that cannot serve audio on this machine, and the
+/// honest thing is to stop asking it for the rest of the session and open
+/// something that does.
+///
+/// Pure — fed the callback count — so the whole state machine is tested
+/// without a driver, which matters here because nobody on this end has the
+/// hardware that produces the fault.
+#[derive(Debug, Clone, Copy)]
+pub struct DeadOnArrival {
+    strikes: u8,
+}
+
+impl DeadOnArrival {
+    /// How many dead-on-arrival opens before the chosen system is set aside.
+    ///
+    /// Two, not one. A single zero-callback teardown is also what a device
+    /// unplugged in the second between opening and serving looks like, and
+    /// setting a working interface aside because somebody knocked a cable
+    /// would be a worse fault than the one this fixes. Two in a row, with no
+    /// working open between them, is a driver rather than an accident.
+    pub const STRIKES: u8 = 2;
+
+    pub fn new() -> Self {
+        Self { strikes: 0 }
+    }
+
+    /// An engine on the chosen system has just been torn down. `callbacks` is
+    /// what it served in its life. Answers whether the chosen system should
+    /// now be set aside.
+    ///
+    /// A teardown that served anything at all CLEARS the count: the system
+    /// works and this was a device event, which is what the reprobe is for.
+    pub fn engine_died(&mut self, callbacks: u64) -> bool {
+        if callbacks > 0 {
+            self.strikes = 0;
+            return false;
+        }
+        self.strikes = self.strikes.saturating_add(1);
+        self.given_up()
+    }
+
+    /// Whether the chosen system has earned its way out of the session.
+    pub fn given_up(&self) -> bool {
+        self.strikes >= Self::STRIKES
+    }
+
+    /// **The hardware list changed, so the ground did too.** An interface
+    /// arriving is exactly the event that makes a system worth trying again,
+    /// and it is what the reprobe already watches for under ASIO. Without
+    /// this, plugging the interface in would never bring the chosen system
+    /// back and the set-aside would be permanent, which is the failure this
+    /// type exists to avoid rather than to cause.
+    pub fn hardware_changed(&mut self) {
+        self.strikes = 0;
+    }
+}
+
+impl Default for DeadOnArrival {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// **A system that opens and serves nothing is set aside, and only that.**
+    ///
+    /// The whole point of `DeadOnArrival` is to tell a driver that lies from a
+    /// device that was unplugged, so the four things asserted here are the four
+    /// ways it could get that wrong: give up too early, never give up, count a
+    /// working system's device event against it, or set a system aside for ever
+    /// once the hardware is back.
+    ///
+    /// Pure on purpose. The fault it exists for lives on a Windows machine with
+    /// Realtek's generic ASIO wrapper and no interface attached — nobody on
+    /// this end can reproduce it, so the state machine is what gets tested and
+    /// the wiring is checked separately.
+    #[test]
+    fn a_system_that_serves_no_callbacks_is_set_aside_until_the_hardware_moves() {
+        use super::DeadOnArrival;
+
+        // One dead open is an accident — a cable pulled in the second between
+        // opening and serving looks exactly like this.
+        let mut d = DeadOnArrival::new();
+        assert!(!d.engine_died(0), "one dead open gave up already");
+        assert!(!d.given_up());
+        // A run of them is a driver.
+        assert!(d.engine_died(0), "a run of dead opens never gave up");
+        assert!(d.given_up());
+
+        // **A teardown that served ANYTHING clears the count.** The system
+        // plainly works; this was a device event, which the reprobe owns.
+        let mut d = DeadOnArrival::new();
+        assert!(!d.engine_died(0));
+        assert!(!d.engine_died(4_096), "a working open did not clear the strike");
+        assert!(!d.engine_died(0), "the strike survived a working open");
+        assert!(!d.given_up());
+
+        // **And the hardware arriving gives it another turn.** Without this
+        // the set-aside is permanent and plugging the interface in would never
+        // bring the chosen system back — a worse fault than the one this fixes.
+        let mut d = DeadOnArrival::new();
+        assert!(d.engine_died(0) || d.engine_died(0));
+        assert!(d.given_up());
+        d.hardware_changed();
+        assert!(!d.given_up(), "the interface came back and was still refused");
+    }
 
     /// **The mono fold sums to the MEAN, not the sum.**
     ///
