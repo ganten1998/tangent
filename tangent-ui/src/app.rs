@@ -4810,12 +4810,15 @@ impl TangentApp {
             self.apply_mixer_hit_one(hit, value);
             return;
         };
-        // **Alt on an arm means THAT lane and nothing else**, which includes
-        // nothing else in the selection. Every other control on this desk
-        // spreads across the selected strips, and spreading here would arm
-        // the very tracks the gesture exists to stand down — so it goes
-        // straight to the one strip, ahead of the spread.
-        if self.alt_down && matches!(hit, H::Arm(_)) {
+        // **A MODIFIED arm touches one lane, not the selection.** Every
+        // other control on this desk spreads across the selected strips, and
+        // that is right for a fader, a mute or a solo — but both of the arm's
+        // modifiers are about picking lanes out one at a time. Alt would
+        // otherwise arm the very tracks it exists to stand down, and shift
+        // would flip a whole selection when the hand meant one of it. The
+        // plain press still spreads, which is what keeps a selected group
+        // arming together.
+        if (self.alt_down || self.shift_down) && matches!(hit, H::Arm(_)) {
             self.apply_mixer_hit_one(hit, value);
             return;
         }
@@ -5131,10 +5134,33 @@ impl TangentApp {
                     // were already on turned back off. Taking one out again
                     // is the plain press, which is the only gesture here that
                     // can disarm without disarming everything.
+                    // **Both modifiers can UNDO themselves**, which is the
+                    // owner's follow-up: "shift multi works but should also
+                    // be able to turn them off as well ... the same should go
+                    // for alt clicking". A gesture that can only ever add is
+                    // a gesture you have to leave to undo, and leaving it
+                    // means reaching for the plain press with a modifier
+                    // still held — which does something else.
+                    //
+                    // ALT is exclusive, so its own undo is the state it
+                    // makes: this lane alone. Alt on the lane that is ALREADY
+                    // alone stands everything down, so the same key both
+                    // arrives at one lane and leaves with none.
+                    //
+                    // SHIFT toggles within the set. It used to only ever add,
+                    // so a hand sweeping back across a lane could not take it
+                    // out again and had to drop the key first. Sweeping now
+                    // flips whatever it crosses, which is what every other
+                    // multi-select on this desk does.
+                    //
+                    // Shift and a plain press share this arithmetic and are
+                    // still not the same gesture: what shift changes is that
+                    // it touches ONE lane, where a plain press carries the
+                    // whole strip selection with it. See the guard in
+                    // `apply_mixer_hit`.
+                    let only_this = self.armed == 1 << n;
                     if self.alt_down {
-                        self.armed = 1 << n;
-                    } else if self.shift_down {
-                        self.armed |= 1 << n;
+                        self.armed = if only_this { 0 } else { 1 << n };
                     } else {
                         self.armed ^= 1 << n;
                     }
@@ -9020,9 +9046,14 @@ impl TangentApp {
             return;
         };
         let (tops, subs) = self.input_menu_rects(m);
-        let face = egui::Color32::from_rgb(0xE3, 0xD9, 0xBD);
-        let ink = egui::Color32::from_rgb(0x24, 0x20, 0x1A);
-        let lit = egui::Color32::from_rgb(0xCF, 0xC2, 0x9E);
+        // **The same three literals the clip menu wore**, and the same fix —
+        // see `menu_surface`. These three were the SHIPPED theme's face, its
+        // ink and its lit row written out by hand, so this menu was a warm
+        // cream card on all sixteen themes and unreadable on several. A
+        // surface derives its parts; it does not carry one theme's answer
+        // into another theme's window.
+        let surface = self.menu_surface();
+        let (face, ink, lit) = (surface.bg, surface.ink, surface.hover);
         let column = |painter: &egui::Painter, rows: &[egui::Rect]| {
             if let (Some(a), Some(b)) = (rows.first(), rows.last()) {
                 let field = a.union(*b).expand(2.0);
@@ -13674,11 +13705,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             Pos2::new(p.x + 12.0, p.y - 10.0),
             egui::vec2(w.min(220.0), 20.0),
         );
-        painter.rect_filled(r, 3.0, egui::Color32::from_rgb(0xEE, 0xE6, 0xCE));
+        // The same hardcoded pair the menus wore, and the same fix — see
+        // `menu_surface`. A name tag that ignores the theme is as wrong on a
+        // dark desk as a menu is.
+        let face = self.menu_surface();
+        painter.rect_filled(r, 3.0, face.bg);
         painter.rect_stroke(
             r,
             3.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x24, 0x20, 0x1A)),
+            egui::Stroke::new(1.0, face.edge),
             egui::StrokeKind::Inside,
         );
         painter.text(
@@ -13686,7 +13721,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             egui::Align2::LEFT_CENTER,
             &name,
             font,
-            egui::Color32::from_rgb(0x24, 0x20, 0x1A),
+            face.ink,
         );
     }
 
@@ -13804,6 +13839,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// The labels come off [`Self::clip_menu_rows_for`], which is the same
     /// list the press handler hit-tests against, so a row cannot be painted
     /// with one meaning and pressed with another.
+    /// **The paper these little menus are drawn on, and its ink.**
+    ///
+    /// They were a hardcoded cream and a hardcoded near-black — the shipped
+    /// theme's own two colours, written out as literals — so on every one of
+    /// the other fifteen themes the arrangement's menus were a pale card
+    /// sitting on a dark desk, and on the dark themes they glared. The
+    /// owner: "the delete replace right clicks aren't per-themed".
+    ///
+    /// `surface_of` is the rule this file already keeps everywhere else: a
+    /// surface DERIVES its parts. The face is the theme's panel colour, the
+    /// ground is moved if that face sits in the dead zone where neither ink
+    /// clears 4.5:1, and the ink is a property of the ground rather than a
+    /// role inherited from somewhere else — which is the mistake this
+    /// codebase has now found seven times, every one of them by looking at a
+    /// screenshot rather than by running a test.
+    fn menu_surface(&self) -> crate::recorder_panel::Surface {
+        let c = self.settings.fx_strip_color;
+        crate::recorder_panel::surface_of(egui::Color32::from_rgb(c.r, c.g, c.b))
+    }
+
     fn draw_clip_menu(&self, painter: &egui::Painter) {
         let (at, labels) = if let Some((id, at)) = self.arr_clip_menu {
             (
@@ -13835,11 +13890,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         else {
             return;
         };
-        painter.rect_filled(frame, 3.0, egui::Color32::from_rgb(0xEE, 0xE6, 0xCE));
+        let face = self.menu_surface();
+        painter.rect_filled(frame, 3.0, face.bg);
         painter.rect_stroke(
             frame,
             3.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x24, 0x20, 0x1A)),
+            egui::Stroke::new(1.0, face.edge),
             egui::StrokeKind::Inside,
         );
         for (r, label) in rows.iter().zip(&labels) {
@@ -13848,7 +13904,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 egui::Align2::LEFT_CENTER,
                 label,
                 egui::FontId::new(11.0, crate::fonts::courier_bold()),
-                egui::Color32::from_rgb(0x24, 0x20, 0x1A),
+                face.ink,
             );
         }
         // The hairline under Delete, which is the only row here worth
@@ -13862,10 +13918,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     Pos2::new(frame.left() + 4.0, second.top()),
                     Pos2::new(frame.right() - 4.0, second.top()),
                 ],
-                egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgb(0x24, 0x20, 0x1A).gamma_multiply(0.25),
-                ),
+                egui::Stroke::new(1.0, face.faint),
             );
         }
     }
@@ -37945,24 +37998,35 @@ mod tests {
         app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
         assert_eq!(app.armed_mask(), 2 | (1 << 2), "the toggle took the wrong lanes");
 
-        // …SHIFT ADDS, and adds rather than flips: sweeping it across lanes
-        // that are already armed leaves them armed. A toggle here would turn
-        // half of a deliberate multi-lane take back off under the hand, which
-        // is the opposite of "multiselecting different arms".
+        // …SHIFT builds a set AND takes lanes back out of it. The owner:
+        // "shift multi works but should also be able to turn them off as
+        // well". A gesture that can only add is one you have to drop the key
+        // to undo, and the plain press with shift still held is a different
+        // gesture — it carries the selection.
         app.shift_down = true;
         app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
-        app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
         assert_eq!(
             app.armed_mask(),
             2 | (1 << 2) | (1 << 3),
-            "shift+arm did not build a set - it flipped one back off"
+            "shift+arm did not add a lane"
+        );
+        app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
+        assert_eq!(
+            app.armed_mask(),
+            2 | (1 << 2),
+            "shift+arm on an armed lane could not take it back out"
         );
         app.shift_down = false;
 
-        // …and ALT is THIS LANE ALONE.
+        // …ALT is THIS LANE ALONE…
         app.alt_down = true;
         app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
         assert_eq!(app.armed_mask(), 1 << 2, "alt+arm did not stand the rest down");
+
+        // …and alt on the lane that is ALREADY alone stands everything down,
+        // so the one key both arrives at one lane and leaves with none.
+        app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
+        assert_eq!(app.armed_mask(), 0, "alt+arm could not undo itself");
         app.alt_down = false;
     }
 
@@ -38002,6 +38066,18 @@ mod tests {
             1 << 2,
             "alt+arm spread across the selection, arming the lanes it exists to \
              stand down"
+        );
+
+        // And SHIFT is one lane too: picking arms out one at a time is what
+        // it is for, so a three-strip selection must not flip together.
+        app.armed = 0;
+        app.shift_down = true;
+        app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
+        app.shift_down = false;
+        assert_eq!(
+            app.armed_mask(),
+            1 << 3,
+            "shift+arm flipped the whole selection when the hand meant one of it"
         );
     }
 
@@ -39033,6 +39109,60 @@ mod tests {
     ///
     /// Revert check performed: drop the `BusBay` arm and both halves go red
     /// with `arr_fx_menu` still None.
+    /// **The little menus wear the theme, and their ink reads on it.**
+    ///
+    /// The clip menu, the FX menu, the input menu and the bay drag chip all
+    /// painted a hardcoded cream with hardcoded near-black ink — the SHIPPED
+    /// theme's own two colours written out as literals. On the other fifteen
+    /// themes that is a pale card on a dark desk, and on the dark ones it
+    /// glares. The owner: "the delete replace right clicks aren't
+    /// per-themed".
+    ///
+    /// Two halves. The colours must MOVE with the theme, which a literal
+    /// cannot; and whatever they move to must stay legible, which is the rule
+    /// `surface_of` keeps and the reason the fix is that function rather than
+    /// a second hand-picked pair. The sweep runs the full range of faces a
+    /// palette can produce, including the dead zone at ~0.12-0.22 luminance
+    /// where neither ink clears 4.5:1 on the face itself and the GROUND has
+    /// to move instead — the case this codebase has been caught by before.
+    ///
+    /// Revert check performed: put either literal back in `menu_surface` and
+    /// the first half reddens.
+    #[test]
+    fn the_arrangement_menus_take_their_colours_from_the_theme() {
+        use crate::recorder_panel::contrast_ratio;
+        let (_, mut app) = headless(Caps::DESKTOP);
+
+        // It MOVES: two different faces cannot give one answer.
+        app.settings.fx_strip_color = crate::settings::Rgb::new(0xE3, 0xD9, 0xBD);
+        let pale = app.menu_surface();
+        app.settings.fx_strip_color = crate::settings::Rgb::new(0x14, 0x16, 0x1A);
+        let dark = app.menu_surface();
+        assert_ne!(
+            (pale.bg, pale.ink),
+            (dark.bg, dark.ink),
+            "the menu paints the same colours on a cream theme and a near-black \
+             one, so it is still carrying one theme's answer into every window"
+        );
+
+        // And it READS, everywhere — including the luminances where the face
+        // itself cannot carry either ink.
+        for r in (0u8..=255).step_by(17) {
+            for g in (0u8..=255).step_by(51) {
+                for b in (0u8..=255).step_by(51) {
+                    app.settings.fx_strip_color = crate::settings::Rgb::new(r, g, b);
+                    let s = app.menu_surface();
+                    let ratio = contrast_ratio(s.bg, s.ink);
+                    assert!(
+                        ratio >= 4.5,
+                        "a menu on face #{r:02x}{g:02x}{b:02x} draws ink at {ratio:.2}:1 \
+                         on its own paper - a row nobody can read"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_right_click_on_a_master_bay_offers_delete_and_replace() {
         for slot in [0usize, 3] {
