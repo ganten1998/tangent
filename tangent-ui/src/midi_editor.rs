@@ -1258,6 +1258,48 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
     Some(Hit::Cell(time_at(&l, view, pos.x), key as u8))
 }
 
+/// The same hit, with the resize AFFORDANCES resolved away — what a CLICK is
+/// on, as opposed to what a drag would grab.
+///
+/// **An edge zone is a drag thing.** It exists so a hand can catch a border and
+/// pull it, and [`hit_test`] spreads it wide on purpose: `EDGE_W` inside the
+/// note and `EDGE_SLOP` outside it, an eleven-point band straddling every
+/// border. A double-click is not a drag, and letting that band answer for one
+/// left eleven points around every note edge where a double-click meant
+/// nothing at all — no note written, no note removed, no feedback.
+///
+/// That band lands in the worst possible place. With the pen up a click on
+/// empty roll LOCATES, snapped; the double-click that follows writes a note
+/// from the same snapped grid line — so the note's left border, and the
+/// playhead, end up on exactly the same pixel. Enter one note and the next
+/// eleven points around the playhead are dead, four of them in the empty cell
+/// on the far side. The owner's "unable to dbl click input if its near the
+/// playhead (on either side of it)": either side is literal, and the playhead
+/// is the marker rather than the cause.
+///
+/// So a click resolves the zone by where the hand really is. Inside the note it
+/// is the note — a double-click removes it, the same as its middle. Outside it,
+/// in the slop the allowance reached across, it is the empty roll it looks
+/// like, and a double-click writes a note there.
+pub fn click_hit(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
+    let hit = hit_test(rect, view, pos);
+    let (Hit::NoteLeft(i) | Hit::NoteRight(i)) = hit? else {
+        return hit;
+    };
+    let l = Layout::new(rect);
+    let inside = view.notes.get(i).is_some_and(|n| {
+        let r = note_rect(&l, view, n);
+        r.is_positive() && r.contains(pos)
+    });
+    if inside {
+        return Some(Hit::NoteBody(i));
+    }
+    let key = key_at(&l, view, pos.y).ceil();
+    (0.0..=127.0)
+        .contains(&key)
+        .then(|| Hit::Cell(time_at(&l, view, pos.x), key as u8))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1650,6 +1692,65 @@ mod tests {
         }
         // Outside the panel: nobody's.
         assert_eq!(hit_test(rect(), &v, Pos2::new(2.0, 2.0)), None);
+    }
+
+    /// **A resize zone must not decide what a CLICK is on.**
+    ///
+    /// `hit_test` spreads a note's edges wide so a hand can catch them:
+    /// `EDGE_W` inside the note, `EDGE_SLOP` outside it, an eleven-point band
+    /// straddling every border. That is right for a drag and wrong for
+    /// everything else — the roll's double-click block answers for `NoteBody`,
+    /// `Vel` and `Cell` and has no case for an edge, so the whole band was
+    /// eleven points where a double-click did nothing at all.
+    ///
+    /// Which would be a curiosity if the band landed anywhere. It lands on the
+    /// PLAYHEAD: a pen-up click locates, snapped, and the double-click that
+    /// follows writes a note from the same snapped grid line, so the new note's
+    /// left border and the playhead are the same pixel. The owner: "unable to
+    /// dbl click input if its near the playhead (on either side of it)."
+    ///
+    /// Revert check performed: return `hit_test`'s answer unchanged from
+    /// `click_hit` and both halves go red.
+    #[test]
+    fn a_click_reads_past_a_notes_resize_zone() {
+        let notes = [crate::arrangement::ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 100 }];
+        let v = view(&notes);
+        let r = rect();
+        let l = Layout::new(r);
+        let nr = note_rect(&l, &v, &notes[0]);
+        assert!(nr.width() >= 14.0, "the fixture's note is too narrow to have edges");
+        let y = nr.center().y;
+
+        // Just INSIDE the left border: a drag would resize the head, and a
+        // click is on the note, which is what a double-click removes.
+        let inside = Pos2::new(nr.left() + 2.0, y);
+        assert_eq!(hit_test(r, &v, inside), Some(Hit::NoteLeft(0)));
+        assert_eq!(
+            click_hit(r, &v, inside),
+            Some(Hit::NoteBody(0)),
+            "a click on the note's own face answered as a resize handle"
+        );
+
+        // Just OUTSIDE the right border, in the allowance: a drag reaches back
+        // for the border, and a click is on the empty cell it looks like —
+        // which is the next note in a run, and the one that would not go in.
+        let outside = Pos2::new(nr.right() + EDGE_SLOP - 1.0, y);
+        assert_eq!(hit_test(r, &v, outside), Some(Hit::NoteRight(0)));
+        match click_hit(r, &v, outside) {
+            Some(Hit::Cell(t, key)) => {
+                assert_eq!(key, 60, "the cell beside the note is on its own row");
+                assert!(
+                    t > v.clip_start_s + notes[0].at_s,
+                    "the cell beside the note read as {t}, at or before the note itself"
+                );
+            }
+            other => panic!("the empty cell beside a note answered {other:?}"),
+        }
+
+        // And everything that is not an edge is left exactly as it was.
+        for p in [nr.center(), Pos2::new(l.roll.center().x, l.roll.bottom() - 4.0)] {
+            assert_eq!(click_hit(r, &v, p), hit_test(r, &v, p));
+        }
     }
 
     /// **A note's edge answers from just OUTSIDE it too**, and a note too

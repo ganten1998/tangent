@@ -3577,6 +3577,7 @@ mod tests {
                 // Windows camera take surfaced.
                 frames_encoder_dropped: 5,
                 frames_padded: 2,
+                frames_still: 7,
             },
             "2026-08-15_143207_filmed.mp4",
         );
@@ -3592,6 +3593,10 @@ mod tests {
             "the manifest did not record the frames the band reported lost: {after:#}"
         );
         assert_eq!(after["video"]["frames_padded"], 2);
+        // The repeats a still screen made, kept APART from the ones a late
+        // machine made: only the second is a fault, and only the second
+        // raises the take's "lower the video size" note.
+        assert_eq!(after["video"]["frames_still"], 7);
         assert!(
             after["files"]
                 .as_array()
@@ -3630,6 +3635,7 @@ mod tests {
                 frames_dropped_late: 0,
                 frames_encoder_dropped: 0,
                 frames_padded: 0,
+                frames_still: 0,
             },
             "2026-08-15_143207_second.mp4",
         );

@@ -64,6 +64,15 @@ extern "C" {
     static AVSampleRateKey: Option<&'static NSString>;
     static AVNumberOfChannelsKey: Option<&'static NSString>;
     static AVEncoderBitRateKey: Option<&'static NSString>;
+    // And the VIDEO half of the same story: `AVVideoSettings.h` is not
+    // generated either. All four have been in the SDK since 10.7-10.10, which
+    // is far below anything this app runs on.
+    static AVVideoCompressionPropertiesKey: Option<&'static NSString>;
+    static AVVideoAverageBitRateKey: Option<&'static NSString>;
+    static AVVideoMaxKeyFrameIntervalKey: Option<&'static NSString>;
+    static AVVideoExpectedSourceFrameRateKey: Option<&'static NSString>;
+    static AVVideoProfileLevelKey: Option<&'static NSString>;
+    static AVVideoProfileLevelH264HighAutoLevel: Option<&'static NSString>;
 }
 
 /// AAC at 192 kbit/s stereo.
@@ -73,6 +82,28 @@ extern "C" {
 /// a held chord is exactly what a low-rate AAC encoder throws away first. The
 /// `.wav` beside it is still the master; this is the copy people will upload.
 const AAC_BITRATE: u32 = 192_000;
+
+/// Bits per pixel per frame the H.264 track is given.
+///
+/// **Chosen rather than defaulted, and chosen for a SCREEN.** AVAssetWriter
+/// with no `AVVideoCompressionPropertiesKey` picks its own average bit rate,
+/// and that default is tuned for camera pictures: a measured 1600x1040 window
+/// take came out at 1.4 Mbit/s, which is 0.028 bits per pixel. Photographic
+/// video survives that. A screen does not — the take's picture is the app's own
+/// window, which is thin lines, small labels and a waveform, exactly the
+/// high-frequency detail a starved encoder spends its bits last on. The owner
+/// read the result as "seems less quality than before", and before was a camera.
+///
+/// 0.12 bpp puts the same 1600x1040 at 30 into about 6 Mbit/s, which is where
+/// screen text stops smearing. The Linux and Windows side never had this
+/// problem: `ffmpeg.rs` runs x264 at its default CRF, which is a QUALITY target
+/// and spends whatever the picture needs. This is the nearest thing a
+/// bitrate-controlled encoder has to that.
+const VIDEO_BITS_PER_PIXEL: f64 = 0.12;
+/// The floor and the ceiling on that arithmetic: a tiny take still gets enough
+/// to be worth watching, and a huge one cannot ask for a bit rate no disk wants.
+const VIDEO_BITRATE_MIN: f64 = 2_000_000.0;
+const VIDEO_BITRATE_MAX: f64 = 24_000_000.0;
 
 /// `kAudioFormatMPEG4AAC`, and `kAudioFormatLinearPCM`.
 const FORMAT_AAC: u32 = u32::from_be_bytes(*b"aac ");
@@ -341,25 +372,79 @@ impl Encoder {
     }
 }
 
-/// `{AVVideoCodecKey: h264, AVVideoWidthKey: w, AVVideoHeightKey: h}`.
+/// The average bit rate a frame of this size and rate is worth, in bits per
+/// second. See [`VIDEO_BITS_PER_PIXEL`].
+fn video_bitrate(spec: super::VideoSpec) -> u32 {
+    let pixels_per_second =
+        f64::from(spec.width) * f64::from(spec.height) * f64::from(spec.fps.max(1));
+    (pixels_per_second * VIDEO_BITS_PER_PIXEL).clamp(VIDEO_BITRATE_MIN, VIDEO_BITRATE_MAX) as u32
+}
+
+/// `{AVVideoCodecKey: h264, AVVideoWidthKey: w, AVVideoHeightKey: h,
+/// AVVideoCompressionPropertiesKey: {bit rate, High profile, keyframe every two
+/// seconds, source rate}}`.
 fn video_settings(spec: super::VideoSpec) -> Result<Retained<NSDictionary<NSString, AnyObject>>, String> {
     let codec_key = unsafe { AVVideoCodecKey }.ok_or("AVVideoCodecKey is missing")?;
     let width_key = unsafe { AVVideoWidthKey }.ok_or("AVVideoWidthKey is missing")?;
     let height_key = unsafe { AVVideoHeightKey }.ok_or("AVVideoHeightKey is missing")?;
+    let props_key =
+        unsafe { AVVideoCompressionPropertiesKey }.ok_or("AVVideoCompressionPropertiesKey is missing")?;
     let h264 = unsafe { AVVideoCodecTypeH264 }.ok_or("AVVideoCodecTypeH264 is missing")?;
     let w = NSNumber::new_u32(spec.width);
     let h = NSNumber::new_u32(spec.height);
+    let props = compression_properties(spec)?;
     // H.264 and not HEVC: it plays everywhere, including in the browser and in
     // every editor a pianist is likely to open the file in. HEVC would halve
     // the file and cost the user an afternoon finding out why Premiere will not
     // import it.
     Ok(unsafe {
         NSDictionary::from_slices::<NSString>(
-            &[codec_key, width_key, height_key],
+            &[codec_key, width_key, height_key, props_key],
             &[
                 &*(h264 as &NSString as &AnyObject as *const AnyObject as *const AnyObject),
                 &*(&*w as &AnyObject as *const AnyObject),
                 &*(&*h as &AnyObject as *const AnyObject),
+                &*(&*props as &AnyObject as *const AnyObject),
+            ],
+        )
+    })
+}
+
+/// What the H.264 encoder is actually asked for.
+///
+/// **High profile, not the default.** Baseline has no CABAC and no 8x8
+/// transform, and both of those are worth several dB on a picture made of type
+/// and thin lines — which is what a window take is. `AutoLevel` lets the
+/// encoder pick the level for the size, and Apple's own note on it is that
+/// `AVVideoExpectedSourceFrameRateKey` should be set alongside or the encoder
+/// may drop frames to stay inside a level it guessed at, so it is set here.
+///
+/// **A keyframe every two seconds**, because the default is far longer and a
+/// take is a thing people scrub through: seeking inside a twenty-second GOP
+/// means decoding twenty seconds of video to show one frame.
+fn compression_properties(
+    spec: super::VideoSpec,
+) -> Result<Retained<NSDictionary<NSString, AnyObject>>, String> {
+    let rate_key = unsafe { AVVideoAverageBitRateKey }.ok_or("AVVideoAverageBitRateKey is missing")?;
+    let gop_key =
+        unsafe { AVVideoMaxKeyFrameIntervalKey }.ok_or("AVVideoMaxKeyFrameIntervalKey is missing")?;
+    let src_key = unsafe { AVVideoExpectedSourceFrameRateKey }
+        .ok_or("AVVideoExpectedSourceFrameRateKey is missing")?;
+    let profile_key = unsafe { AVVideoProfileLevelKey }.ok_or("AVVideoProfileLevelKey is missing")?;
+    let high = unsafe { AVVideoProfileLevelH264HighAutoLevel }
+        .ok_or("AVVideoProfileLevelH264HighAutoLevel is missing")?;
+    let fps = spec.fps.max(1);
+    let rate = NSNumber::new_u32(video_bitrate(spec));
+    let gop = NSNumber::new_u32(fps * 2);
+    let src = NSNumber::new_u32(fps);
+    Ok(unsafe {
+        NSDictionary::from_slices::<NSString>(
+            &[rate_key, gop_key, src_key, profile_key],
+            &[
+                &*(&*rate as &AnyObject as *const AnyObject),
+                &*(&*gop as &AnyObject as *const AnyObject),
+                &*(&*src as &AnyObject as *const AnyObject),
+                &*(high as &NSString as &AnyObject as *const AnyObject),
             ],
         )
     })

@@ -1177,6 +1177,18 @@ pub struct TangentApp {
     /// readout. Sampled once at the top of `frame` so every view built in
     /// the frame agrees, and `None` whenever the hand is elsewhere.
     band_pointer: Option<Pos2>,
+    /// **Did this frame's primary click complete a PAIR?** See
+    /// `decide_primary_pair`, which is the only writer, and which every
+    /// double-click gesture in this app reads instead of egui's own flag.
+    primary_paired: bool,
+    /// The click that is waiting for a partner: when it landed and where.
+    /// `None` between pairs and whenever the last click was too far or too
+    /// late to be one.
+    click_anchor: Option<(f64, Pos2)>,
+    /// The pass `click_anchor` was last decided on. The decision CONSUMES the
+    /// anchor, so making it twice in one pass would swallow the pair — the
+    /// same once-a-pass guard `shell` and `dialogs` keep, for the same reason.
+    click_pass: Option<u64>,
     /// The INSERT tap's ring: the audio at whichever bay the one open
     /// plugin face armed — the EQ's analyzer and the imager's vectorscope
     /// both read it. Fed by the host through `insert_tap_feed`.
@@ -3306,6 +3318,9 @@ impl TangentApp {
                 a
             },
             band_pointer: None,
+            primary_paired: false,
+            click_anchor: None,
+            click_pass: None,
             tapring: crate::tapring::TapRing::new(48_000.0),
             time_sel: None,
             menu_rows_cache: None,
@@ -6688,9 +6703,7 @@ impl TangentApp {
                 // slider row ever arms it, so the stepped rows and the
                 // panel chrome cannot reset by accident.
                 if let Some(key) = self.fx_drag {
-                    let double = ui.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                    });
+                    let double = self.primary_paired;
                     if double {
                         self.settings.effect_params.shift_remove(key);
                         self.save_settings();
@@ -16061,11 +16074,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             } else {
                 // **A click on the NUMBER types it; a DOUBLE on the track
-                // resets it** — judged HERE because `button_double_clicked`
-                // fires on the second release, never at a press. A single
-                // motionless click on the track means nothing at all.
-                let double = ctx
-                    .input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+                // resets it** — judged HERE because the pair is closed by the
+                // second release, never by a press. A single motionless click
+                // on the track means nothing at all.
+                let double = self.primary_paired;
                 self.drumpad_grab = None;
                 if !grab.moved && !grab.on_number && double {
                     self.drumpad_set(grab.param, grab.param.default_value());
@@ -17167,19 +17179,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The band's machinery takes it from here.
             return;
         }
-        // **Double-clicks first, on egui's own terms**: the flag fires on
-        // the second RELEASE, which the press branch below never sees —
-        // the arrangement's 4.54 landmine, and this roll had the same
-        // check sitting inside `if pressed`, unreachable. **A double-click
-        // REMOVES the note** — beside the right-click erase. The second
-        // press armed a Move; stand it down with the note.
-        if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
+        // **Double-clicks first**: the pair closes on the second RELEASE,
+        // which the press branch below never sees — the arrangement's 4.54
+        // landmine, and this roll had the same check sitting inside
+        // `if pressed`, unreachable. **A double-click REMOVES the note** —
+        // beside the right-click erase. The second press armed a Move; stand
+        // it down with the note.
+        //
+        // `primary_paired` and not egui's own flag: see `decide_primary_pair`
+        // for why every gesture here worked exactly once.
+        if self.primary_paired {
             if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
+                // **`click_hit` and not `hit_test`**: the resize zones are a
+                // drag affordance and this is not a drag. See `click_hit` for
+                // the eleven dead points they used to put around every note
+                // border — and around the playhead, which lands on the same
+                // pixel as the border of the note the last double-click wrote.
                 let hit = {
                     let st = self.midi_edit.as_ref().unwrap();
                     let clip = self.arrangement.clips.iter().find(|c| c.id == id).unwrap();
                     let view = self.midi_edit_view(st, clip);
-                    crate::midi_editor::hit_test(rect, &view, p)
+                    crate::midi_editor::click_hit(rect, &view, p)
                 };
                 if let Some(crate::midi_editor::Hit::NoteBody(i)) = hit {
                     self.me_delete_note(i);
@@ -18497,12 +18517,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // MIDI editor was unreachable and the lane rename with it, checked
         // inside `if pressed`. The mixer has always handled its doubles out
         // here for exactly this reason.
-        if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
+        if self.primary_paired {
             if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
+                // **`click_hit` and not `hit_test`**: a clip's resize ends and
+                // fade corners are there for a drag to catch, and a
+                // double-click on a MIDI item means open it wherever on the
+                // item it landed. See `arrangement_panel::click_hit`.
                 let hit = {
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
-                    crate::arrangement_panel::hit_test(rect, &view, p)
+                    crate::arrangement_panel::click_hit(rect, &view, p)
                 };
                 use crate::arrangement_panel::Hit as A;
                 // **A double-click puts a dial back** — the desk's one rule,
@@ -19059,11 +19083,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         self.arr_selected = Some(id);
                         self.arr_resolve_len(id);
                         // The second click of a double-click OPENS a MIDI
-                        // item's editor instead of starting a drag.
-                        let double = ctx.input(|i| {
-                            i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                        });
-                        let _ = double;
+                        // item's editor instead of starting a drag — up in the
+                        // pair block, which returns before this runs.
                         if let Some(c) =
                             self.arrangement.clips.iter().find(|c| c.id == id)
                         {
@@ -28607,7 +28628,67 @@ impl TangentApp {
     /// and `nih_plug_egui`'s editor callback for the VST3 build — so this is
     /// the shape they share. `shell::viewport_ui` is the one bridge, and its
     /// test is what proves the central panel never grew a margin.
+    /// **A double-click that still works the fourth time.**
+    ///
+    /// egui counts a run of clicks in one place 1, 2, 3, 3, 3, 3… — from the
+    /// third onward it reports a TRIPLE, and `button_double_clicked` answers
+    /// false for ever after. It comes back only when the hand pauses longer
+    /// than twice `max_double_click_delay` or moves further than
+    /// `max_click_dist`, which is six points. Every double-click gesture in
+    /// this app hung off that flag, so each of them worked ONCE and then
+    /// stopped until the hand went somewhere else.
+    ///
+    /// The owner met it entering notes: "unable to dbl click input if its near
+    /// the playhead (on either side of it)". The playhead is not the cause, it
+    /// is the MARKER — with the pen up a click on empty roll locates, so the
+    /// playhead sits exactly where the hand last clicked, which is the six
+    /// points egui has stopped counting in. Measured with
+    /// `four_double_clicks_in_one_place_write_four_notes`: egui reported
+    /// `triple` and never `double` again, half a second of idle frames
+    /// between rounds included.
+    ///
+    /// So this app pairs the clicks itself and CONSUMES each pair: two clicks
+    /// close in time and place make a double, and the second one clears the
+    /// anchor so the next two make another. egui's own thresholds, read from
+    /// its options rather than copied, and egui's own click test — a press
+    /// that travelled or was held too long is not a click here either. A real
+    /// triple-click still fires exactly one double, as it did before.
+    fn decide_primary_pair(&mut self, ctx: &egui::Context) {
+        let pass = ctx.cumulative_pass_nr();
+        if self.click_pass == Some(pass) {
+            return;
+        }
+        self.click_pass = Some(pass);
+        self.primary_paired = false;
+        let (clicked, at, now) = ctx.input(|i| {
+            (
+                i.pointer.button_clicked(egui::PointerButton::Primary),
+                i.pointer.interact_pos(),
+                i.time,
+            )
+        });
+        let Some(at) = at.filter(|_| clicked) else {
+            return;
+        };
+        let (delay, dist) = ctx.options(|o| {
+            (
+                o.input_options.max_double_click_delay,
+                o.input_options.max_click_dist,
+            )
+        });
+        let paired = self
+            .click_anchor
+            .is_some_and(|(t0, p0)| now - t0 < delay && p0.distance(at) < dist);
+        // A pair that landed is spent; anything else becomes the anchor the
+        // next click is measured against.
+        self.click_anchor = (!paired).then_some((now, at));
+        self.primary_paired = paired;
+    }
+
     pub fn frame(&mut self, ctx: &egui::Context) {
+        // **Before anything reads it**: whether this frame's click closed a
+        // pair. One decision per frame, because it CONSUMES the anchor.
+        self.decide_primary_pair(ctx);
         // Where the hand is over the band, for the analyzer's readout: read
         // once here against last frame's band rectangle, which is the one
         // the hand was actually over.
@@ -30846,9 +30927,7 @@ impl TangentApp {
                     // reset by one. Typing has a target of its own now (the
                     // number at the end of a fader, the word over a knob), so
                     // there is nothing left for the tap to have meant.
-                    let double = ctx.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                    });
+                    let double = self.primary_paired;
                     if double {
                         if let Some(reset) = grab.hit.reset_to() {
                             self.apply_recorder_hit(reset);
@@ -31173,7 +31252,7 @@ impl TangentApp {
             // back to it by dragging is a hunt for a number rather than a
             // gesture. Read before the press, because the same frame carries
             // both and the press would grab it into a drag.
-            let double = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+            let double = self.primary_paired;
             // And RENAME is a double-click too, by the owner's word: a name
             // is the thing on a desk you touch least and mis-touch most, so
             // the single click stopped opening it. egui fires the double on
@@ -33514,8 +33593,8 @@ mod tests {
         // And the three gestures that cannot reach the release path call it.
         let src = include_str!("app.rs");
         let body = &src[..src.find("mod tests {").expect("the test module")];
-        // Scoped to the ROLL's own handler: `button_double_clicked` appears
-        // on other surfaces too, and the first one in the file is the desk's.
+        // Scoped to the ROLL's own handler: `primary_paired` is read on other
+        // surfaces too, and the first one in the file is the desk's.
         let at = body
             .find("fn midi_editor_input")
             .expect("the roll's input is still called that");
@@ -33528,7 +33607,7 @@ mod tests {
             .map_or(body.len(), |n| at + n);
         let roll = &body[at..end];
         assert!(
-            roll.contains("button_double_clicked"),
+            roll.contains("self.primary_paired"),
             "the roll no longer watches for a double-click at all"
         );
         assert_eq!(
@@ -46879,6 +46958,94 @@ mod tests {
         }
         let _ = run_frame(ctx, app);
         (app.midi_edit_rect.expect("the editor drew nowhere"), id)
+    }
+
+    /// **A double-click gesture that still works the fourth time.**
+    ///
+    /// egui counts a run of clicks in one place 1, 2, 3, 3, 3… : from the third
+    /// onward it reports a TRIPLE, and `button_double_clicked` answers false
+    /// until the hand pauses past twice `max_double_click_delay` or moves
+    /// further than `max_click_dist` — six points. Every double-click gesture
+    /// in this app read that flag, so each of them fired ONCE and then went
+    /// dead under a hand that stayed put.
+    ///
+    /// The owner met it entering notes with the pen up: "unable to dbl click
+    /// input if its near the playhead (on either side of it)". The playhead is
+    /// not the cause, it is the MARKER — a pen-up click LOCATES, so the
+    /// playhead ends up exactly where the hand last clicked, and the dead zone
+    /// is the six points around it, symmetric, on either side.
+    ///
+    /// **The same spot TOGGLES**, which is the roll's own documented rule: a
+    /// double-click on empty roll writes a note and a double-click on a note
+    /// removes it. So four of them in one place is write, remove, write,
+    /// remove — and it is the ALTERNATION that is the assertion here. With the
+    /// old flag the count went 1, 1, 1, 1: the first gesture landed and the
+    /// next three were never heard at all, half a second of idle frames
+    /// between them included, because egui's triple window is twice its double
+    /// one and the anchor chains from click to click.
+    ///
+    /// Revert check performed: point `decide_primary_pair` back at
+    /// `button_double_clicked` and the sequence goes flat at 1.
+    #[test]
+    fn four_double_clicks_in_one_place_are_all_heard() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        app.settings.midi_draw_mode = false;
+        let (rect, id) = midi_editor_zoomed_in(&ctx, &mut app);
+        let before = app.arrangement.clips[0].notes.len();
+        let l = crate::midi_editor::Layout::new(rect);
+        let p = Pos2::new(l.roll.center().x, l.roll.center().y + 40.0);
+        assert!(l.roll.contains(p), "the probe left the roll");
+        let _ = id;
+
+        let mut seen = Vec::new();
+        for _round in 0..4 {
+            for _ in 0..2 {
+                for pressed in [true, false] {
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1300.0, 900.0),
+                            )),
+                            events: vec![
+                                egui::Event::PointerMoved(p),
+                                egui::Event::PointerButton {
+                                    pos: p,
+                                    button: egui::PointerButton::Primary,
+                                    pressed,
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                        |ctx| app.frame(ctx),
+                    );
+                    // What the host does with a locate, which headless
+                    // otherwise never does: the playhead really does follow the
+                    // hand, which is why the owner read this as its fault.
+                    if let Some(recorder::RecorderRequest::Locate(to)) =
+                        app.take_recorder_request()
+                    {
+                        app.recorder.position_s = to;
+                    }
+                }
+            }
+            // Half a second of idle frames, the way a hand pauses between
+            // notes. It does not rescue the old flag.
+            for _ in 0..30 {
+                let _ = run_frame(&ctx, &mut app);
+            }
+            seen.push(app.arrangement.clips[0].notes.len() - before);
+        }
+
+        assert_eq!(
+            seen,
+            vec![1, 0, 1, 0],
+            "four double-clicks in one place went {seen:?}: the gesture is \
+             heard once and then goes dead under a hand that stays put, which \
+             is every double-click on this desk and not only the roll's"
+        );
     }
 
     /// Where the clip's only note is drawn, through the painter's own

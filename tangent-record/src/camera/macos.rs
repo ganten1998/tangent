@@ -1062,11 +1062,16 @@ pub(super) fn open_window(
             CGMainDisplayID(),
         )
         .ok_or_else(|| CameraError::Open("the main display cannot be captured".into()))?;
-        // The cursor and the clicks are the whole point: a knob being turned
-        // is a cursor on a knob, and a click that shows is a click somebody
-        // watching can follow.
+        // **The cursor, yes; the click HIGHLIGHT, no.** A knob being turned is
+        // a cursor on a knob, so the pointer itself has to be in the picture.
+        // `capturesMouseClicks` is a different thing from capturing the
+        // pointer: it paints macOS's own click decoration — a hard yellow ring
+        // that swells around the cursor on every press — into the frame. Over
+        // a take of somebody playing that is a ring flashing on the screen
+        // several times a bar, and it is burnt into the file with no way to
+        // take it out afterwards. The owner's "circle around cursor".
         input.setCapturesCursor(true);
-        input.setCapturesMouseClicks(true);
+        input.setCapturesMouseClicks(false);
         input.setCropRect(crop_rect(region));
         // The take's rate, as a minimum frame duration: AVFoundation may
         // deliver slower when nothing on screen changed, and
