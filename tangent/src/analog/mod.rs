@@ -758,7 +758,27 @@ impl Analog {
                             self.age = self.age.wrapping_add(1);
                             let age = self.age;
                             let retrig = self.retrigger();
-                            for v in &mut self.voices[..n] {
+                            for i in 0..n {
+                                // **Woken like any other voice that is about
+                                // to sound.** Every other road into
+                                // `note_on` goes through `wake`, which is
+                                // where a voice takes its lane; this one did
+                                // not, and a voice made to sound without a
+                                // lane is `NO_LANE` — `u8::MAX` — carried
+                                // into `split`, which answers group 31 of
+                                // three. That is the owner's crash, from the
+                                // audio thread: "index out of bounds: the len
+                                // is 3 but the index is 31".
+                                //
+                                // The stack is what makes it reachable. A
+                                // dial turned mid-phrase widens `stack()`,
+                                // and the voices past the old width have
+                                // never sounded and hold no lane — but this
+                                // loop re-attacks all of them. `wake` returns
+                                // at once for a voice already sounding, so
+                                // the legato case pays nothing.
+                                self.wake(i);
+                                let v = &mut self.voices[i];
                                 v.legato_to(cur, glide);
                                 if retrig {
                                     v.note_on(cur, cur_vel, age, true, glide);
@@ -1077,10 +1097,23 @@ impl Analog {
         let taps = &self.taps;
         // Who is sounding, decided once per span: a voice that falls
         // silent inside it ticks on for a few samples of nothing.
+        //
+        // **And only what holds a LANE**, which is a guard and not a rule.
+        //
+        // `wake` gives every voice a lane before it sounds and a steal hands
+        // that lane to the corpse, so a sounding voice or a fading corpse
+        // without one is a bug upstream, not a state this is meant to serve.
+        // The reason it is checked anyway is what such a bug COSTS here:
+        // `NO_LANE` is `u8::MAX`, `split` answers group 31 of three, and the
+        // index below panics — on the audio thread, which takes the whole app
+        // and whatever was unsaved with it. That happened, from a release
+        // that re-attacked a widened stack without waking it; that road is
+        // fixed above, and this is what keeps the next one like it from being
+        // a crash rather than one silent voice for one block.
         let mut live = [0u8; MAX_VOICES];
         let mut n_live = 0usize;
         for (i, v) in self.voices.iter().enumerate() {
-            if v.active() {
+            if v.active() && self.voice_lane[i] != NO_LANE {
                 live[n_live] = i as u8;
                 n_live += 1;
             }
@@ -1089,7 +1122,7 @@ impl Analog {
         let mut dead = [0u8; CORPSES];
         let mut n_dead = 0usize;
         for (i, c) in self.corpses.iter().enumerate() {
-            if c.left > 0 {
+            if c.left > 0 && self.corpse_lane[i] != NO_LANE {
                 dead[n_dead] = i as u8;
                 n_dead += 1;
             }
@@ -1474,6 +1507,110 @@ mod tests {
             assert!(first.is_none(), "model {model}: laned and scalar differ first at frame {}", first.unwrap() / 2);
         }
     }
+    /// **A laneless voice costs one silent block, not the app.**
+    ///
+    /// The guard beside `live`/`dead`, on its own terms. Nothing upstream is
+    /// supposed to produce this state — `wake` gives every voice a lane before
+    /// it sounds — so what is being pinned is the CONSEQUENCE of a bug rather
+    /// than a behaviour: a voice that reaches the render without a lane must
+    /// not index group 31 of three and panic the audio thread.
+    ///
+    /// The state is forced by hand because the one road that reached it
+    /// honestly is fixed in the test above, and a guard whose only proof is
+    /// the bug it was written for stops proving anything the moment that bug
+    /// is gone.
+    ///
+    /// Revert check performed: drop `!= NO_LANE` from either list and this
+    /// panics with the owner's message.
+    #[test]
+    fn a_voice_that_lost_its_lane_does_not_take_the_audio_thread_with_it() {
+        let mut synth = Analog::new(SR);
+        synth.set_laned(true);
+        let mut out = vec![0.0_f32; BLOCK * 2];
+        synth.note_on(60, 0.8);
+        synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+        assert!(synth.voices[0].active(), "the note never sounded");
+
+        // The state a missing `wake` leaves behind: sounding, and holding no
+        // lane. Also given to a corpse, which is the line the owner's crash
+        // report names.
+        synth.voice_lane[0] = NO_LANE;
+        synth.corpses[0].left = 8;
+        synth.corpse_lane[0] = NO_LANE;
+        synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+
+        // And the rest of the desk is unharmed: a second note still sounds.
+        synth.note_on(67, 0.8);
+        synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+        assert!(
+            out.iter().any(|s| s.abs() > 1.0e-6),
+            "the guard silenced the whole synth rather than the one bad voice"
+        );
+    }
+
+    /// **A voice re-triggered by a note-OFF takes a lane like any other.**
+    ///
+    /// The owner's crash, from the audio thread:
+    /// `index out of bounds: the len is 3 but the index is 31`, at the laned
+    /// render. `NO_LANE` is `u8::MAX`, and `split(255)` is `(31, 7)` — so 31
+    /// is not a wild number, it is the arithmetic of a lane that was never
+    /// taken, and 3 is `GROUPS`.
+    ///
+    /// Every road that makes a voice sound went through `wake`, which takes a
+    /// lane, except one: `release`'s legato retrigger. Letting a key go in
+    /// unison mode falls back onto a key still held and re-attacks
+    /// `voices[..stack()]` — and if the stack has GROWN since those voices
+    /// last sounded, the ones past the old width have no lane, are made
+    /// active anyway, and the next block indexes a group that is not there.
+    /// A synth dial turned mid-phrase, which is the ordinary way anybody uses
+    /// one.
+    ///
+    /// It also poisons a corpse: a laneless voice stolen later hands its
+    /// `NO_LANE` to `corpse_lane`, which is the exact line the owner's report
+    /// names.
+    ///
+    /// Revert check performed: remove the `wake` this adds and the test
+    /// panics with the owner's message, at his line.
+    #[test]
+    fn a_voice_woken_by_a_release_takes_a_lane() {
+        let mut synth = Analog::new(SR);
+        synth.set_laned(true);
+        // Unison, one voice wide to begin with.
+        synth.set_all(&[
+            (P_VOICE_MODE as u32, 1.0 / 3.0),
+            (P_VOICES as u32, 0.0),
+            // Multi-trigger: the release's legato re-attacks rather than
+            // only bending the pitch, which is the road with no `wake`.
+            (P_TRIGGER as u32, 1.0),
+        ]);
+        let mut out = vec![0.0_f32; BLOCK * 2];
+        synth.note_on(60, 0.8);
+        synth.note_on(64, 0.8);
+        synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+
+        // The stack widens under the hand — a dial turned while two keys are
+        // down. Voices 1.. have never sounded and hold no lane.
+        synth.set_all(&[(P_VOICES as u32, 4.0 / 15.0)]);
+        assert!(synth.stack() > 1, "the stack did not widen, so this proves nothing");
+
+        // Letting one key go falls back onto the other and re-attacks the
+        // whole stack. This is the road that skipped `wake`.
+        synth.note_off(64);
+
+        for (i, v) in synth.voices.iter().enumerate().take(synth.stack()) {
+            if v.active() {
+                assert_ne!(
+                    synth.voice_lane[i], NO_LANE,
+                    "voice {i} was made to sound by a release and has no lane, so the \
+                     next laned block indexes group 31 of 3 — the owner's crash"
+                );
+            }
+        }
+        // And the block itself runs, which is the thing that was panicking on
+        // the audio thread and taking the app with it.
+        synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+    }
+
 
     /// **Lanes follow the sound.** Three notes take lanes 0, 1, 2 and no
     /// lane of the second group, so three notes cost one group's tick;

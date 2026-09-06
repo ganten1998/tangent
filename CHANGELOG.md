@@ -179,6 +179,19 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **Analog could take the whole app down from the audio thread.** Letting go of
+  a key in mono or unison falls back onto a key still held and, with
+  multi-trigger on, re-attacks the whole voice stack. That road was the one
+  place a voice was made to sound without being woken first, and waking is where
+  a voice takes its filter lane — so any voice past the stack's old width, after
+  the Voices dial had been turned mid-phrase, sounded with no lane at all. The
+  render then asked for group 31 of three and panicked inside the CoreAudio
+  callback, which ends the process and whatever was unsaved with it. Those
+  voices are woken now, like every other voice that is about to sound. And
+  underneath that, a voice or a fading corpse that reaches the render without a
+  lane is left out of the block rather than indexed: nothing upstream should
+  produce one, but the cost of being wrong about that was the app.
+
 - **The Project dialog's Done button fell off the bottom edge.** It has done
   this twice. The stack was laid out straight down with Done as its last item
   and the window sized by hand to fit, so the first time a row was added the
