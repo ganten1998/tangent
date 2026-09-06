@@ -101,6 +101,19 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **Alt-click a record button to arm that track and nothing else; shift-click to
+  build a set.** The one-lane gesture was on shift, which is the multi-select
+  key everywhere else on this desk and therefore meant the opposite of what the
+  rest of the app teaches. Alt takes it over, and it ignores the strip selection
+  the way no other control does — spreading it would arm the very tracks the
+  gesture exists to stand down. Shift now ADDS rather than toggles, so sweeping
+  it across four lanes leaves four armed instead of turning back off whichever
+  were already on. A plain click still toggles one lane, which is the only
+  gesture here that can disarm without disarming everything. Both views, since
+  the arrangement's header and the mixer's strip have always shared one road.
+
+### Changed
+
 - **The DX7's built-in patch is INIT VOICE, and the tine piano is no longer
   called E.PIANO 1.** The "(built in)" row of the picker used to play a tine
   electric piano under that name. The numbers were always the app's own, typed

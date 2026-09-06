@@ -4784,6 +4784,15 @@ impl TangentApp {
             self.apply_mixer_hit_one(hit, value);
             return;
         };
+        // **Alt on an arm means THAT lane and nothing else**, which includes
+        // nothing else in the selection. Every other control on this desk
+        // spreads across the selected strips, and spreading here would arm
+        // the very tracks the gesture exists to stand down — so it goes
+        // straight to the one strip, ahead of the spread.
+        if self.alt_down && matches!(hit, H::Arm(_)) {
+            self.apply_mixer_hit_one(hit, value);
+            return;
+        }
         let others = self.selection_partners(n);
         if others.is_empty() {
             self.apply_mixer_hit_one(hit, value);
@@ -5074,16 +5083,32 @@ impl TangentApp {
             }
             H::Arm(i) => {
                 if let Some(Strip::Channel(n)) = i.strip() {
-                    // **A plain press TOGGLES, the way it always did** — the
-                    // owner vetoed the exclusive default the moment it
-                    // shipped ("I can now only arm one track at a time").
-                    // What stays exclusive is the SILENT arms: a track's
-                    // birth and its first bind stand the others down — that
-                    // invisible pile-up was the phantom multi-record, not
-                    // anybody's deliberate clicks. Shift+press is the
-                    // one-lane gesture: THIS lane alone, the rest disarmed.
-                    if self.shift_down {
+                    // **Three gestures, and the owner named all three.**
+                    //
+                    // A plain press TOGGLES, the way it always did — the
+                    // exclusive default was vetoed the moment it shipped ("I
+                    // can now only arm one track at a time"). What stays
+                    // exclusive without being asked is the SILENT arms: a
+                    // track's birth and its first bind stand the others down,
+                    // because that invisible pile-up was the phantom
+                    // multi-record and not anybody's deliberate clicks.
+                    //
+                    // ALT is the one-lane gesture now: "arm JUST THAT TRACK
+                    // and no others". It was shift, which put it on the same
+                    // key as every multi-select on this desk and therefore
+                    // meant the opposite of what the rest of the app teaches.
+                    //
+                    // SHIFT ADDS. "shift click is for holding and
+                    // multiselecting different arms" — so it sets the bit
+                    // rather than flipping it, and sweeping shift across four
+                    // lanes leaves four armed instead of leaving whichever
+                    // were already on turned back off. Taking one out again
+                    // is the plain press, which is the only gesture here that
+                    // can disarm without disarming everything.
+                    if self.alt_down {
                         self.armed = 1 << n;
+                    } else if self.shift_down {
+                        self.armed |= 1 << n;
                     } else {
                         self.armed ^= 1 << n;
                     }
@@ -37682,11 +37707,64 @@ mod tests {
         app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
         assert_eq!(app.armed_mask(), 2 | (1 << 2), "the toggle took the wrong lanes");
 
-        // …and Shift+press is THIS LANE ALONE.
+        // …SHIFT ADDS, and adds rather than flips: sweeping it across lanes
+        // that are already armed leaves them armed. A toggle here would turn
+        // half of a deliberate multi-lane take back off under the hand, which
+        // is the opposite of "multiselecting different arms".
         app.shift_down = true;
+        app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
         app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
-        assert_eq!(app.armed_mask(), 1 << 2, "shift+arm did not stand the rest down");
+        assert_eq!(
+            app.armed_mask(),
+            2 | (1 << 2) | (1 << 3),
+            "shift+arm did not build a set - it flipped one back off"
+        );
         app.shift_down = false;
+
+        // …and ALT is THIS LANE ALONE.
+        app.alt_down = true;
+        app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
+        assert_eq!(app.armed_mask(), 1 << 2, "alt+arm did not stand the rest down");
+        app.alt_down = false;
+    }
+
+    /// **Alt on an arm ignores the SELECTION**, which every other control on
+    /// this desk deliberately obeys.
+    ///
+    /// `apply_mixer_hit` spreads a control across the selected strips, and
+    /// that is right for a fader, a mute or a solo. It is wrong for the one
+    /// gesture whose whole meaning is "this lane and no others": spreading it
+    /// would arm the very strips the press exists to stand down, so a
+    /// three-strip selection would answer alt+arm with three armed lanes.
+    ///
+    /// Revert check performed: take the alt guard out of `apply_mixer_hit`
+    /// and the mask comes back with all three lanes set.
+    #[test]
+    fn alt_arm_beats_the_selection() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::Column;
+        let (_, mut app) = headless(Caps::DESKTOP);
+        for n in [2usize, 3, 4] {
+            app.set_channel_input_spec(n, "midi:all");
+        }
+        // Three strips selected together, the way a fader move would spread.
+        app.select_track(2, egui::Modifiers::NONE);
+        app.select_track(3, egui::Modifiers { shift: true, ..Default::default() });
+        app.select_track(4, egui::Modifiers { shift: true, ..Default::default() });
+        assert!(
+            !app.selection_partners(2).is_empty(),
+            "the strips are not selected together, so this proves nothing"
+        );
+
+        app.alt_down = true;
+        app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
+        app.alt_down = false;
+        assert_eq!(
+            app.armed_mask(),
+            1 << 2,
+            "alt+arm spread across the selection, arming the lanes it exists to \
+             stand down"
+        );
     }
 
     /// **The insert menu: delete deletes, replace opens the picker, and a
