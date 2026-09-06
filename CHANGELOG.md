@@ -209,6 +209,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **Phosphor's and Nocturne's pale piano keys stopped glaring.** The lift that
+  makes those two themes' keyboards visible walked the pale key away from the
+  naturals until the two were far enough apart — and toward pure white, which on
+  exactly those themes it always reached, because their dark naturals sit at
+  about 0.095 luminance and nothing can get far enough from that. So the walk
+  spent every step, arrived at the screen's limit, and still fell short of the
+  line it was aiming at. The pale key now stops at the bone this desk already
+  paints with everywhere else: dimmer than any other theme's pale key, still
+  more than five times the contrast of its own naturals, and no longer the
+  brightest thing on screen. Themes that name their own pale key keep it.
+
 - **The arrangement's little menus ignored the theme.** The clip menu, the FX
   menu, the input menu and the bay drag chip all painted a hardcoded cream with
   hardcoded near-black ink — the shipped theme's own colours, written out as
