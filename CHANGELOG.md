@@ -209,6 +209,16 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A folder dragged past its own children turned into one of them.** A folder
+  carries its rows, so dropping it below them names a target that is already
+  inside the block being carried. The move itself is then a no-op — the block
+  comes out and goes back where it was — but the membership decision that runs
+  first is not: it asks which folder the target row belongs to, gets the dragged
+  folder back, and writes that onto the folder itself. It stopped being a folder,
+  became a child of itself, the group flattened around it, and the row that had
+  been track 5 came back reading as track 6. That drop is refused whole now,
+  since nothing about it could ever have been meaningful.
+
 - **Phosphor's and Nocturne's pale piano keys stopped glaring.** The lift that
   makes those two themes' keyboards visible walked the pale key away from the
   naturals until the two were far enough apart — and toward pure white, which on
