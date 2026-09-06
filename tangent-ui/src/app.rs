@@ -4006,6 +4006,24 @@ impl TangentApp {
         out
     }
 
+    /// **Whether a reorder drop names a row that is already travelling.**
+    ///
+    /// A folder carries its children, so dropping it on one of them names a
+    /// target inside its own block. The move is then a no-op by construction
+    /// — `move_selection` lifts the block out and puts it back where it was —
+    /// but the membership decision that runs first is not: it reads the
+    /// target's folder, which IS the dragged folder, and so marks the folder
+    /// as living inside itself. `is_folder` comes off, `in_folder` goes on,
+    /// the group flattens around it and the row that was track 5 comes back
+    /// as track 6. The owner: "at that point it currently becomes track 6 and
+    /// numerically it doesn't make sense."
+    ///
+    /// Nothing about such a drop is meaningful, so the caller refuses it
+    /// whole rather than applying the half that is not a no-op.
+    fn drop_into_own_block(&self, from: usize, to: usize) -> bool {
+        self.drag_block(from).contains(&to)
+    }
+
     /// The tracks a reorder drag actually carries: the selection when the
     /// grabbed lane is part of one, otherwise just the lane.
     ///
@@ -20083,15 +20101,40 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // the block landed is what would dissolve the
                             // group: dropped outside, every child's flag came
                             // off and the folder arrived empty.
-                            let joins = self.folder_of(to);
-                            for n in self.reorder_group(from) {
-                                self.set_in_folder(n, joins.is_some());
-                                if joins.is_some() {
-                                    self.set_is_folder(n, false);
+                            // **A block cannot be dropped INTO ITSELF**, and
+                            // a folder dropped past its own children is
+                            // exactly that gesture.
+                            //
+                            // The block a folder carries is the folder and
+                            // its rows, so dropping it on one of those rows
+                            // names a target that is already travelling. The
+                            // move itself is then a no-op — `move_selection`
+                            // lifts the block out and puts it back where it
+                            // was — but the membership line above ran first
+                            // and read the target's folder, which is the
+                            // dragged folder. So it set the folder's own
+                            // `in_folder` and cleared its `is_folder`: the
+                            // folder became a child of itself, the group
+                            // flattened around it, and the row that had been
+                            // track 5 came back as track 6. The owner: "at
+                            // that point it currently becomes track 6 and
+                            // numerically it doesn't make sense."
+                            //
+                            // Nothing about the drop is meaningful in that
+                            // case — the order cannot change and the
+                            // membership must not — so it is refused whole
+                            // rather than half-applied.
+                            if !self.drop_into_own_block(from, to) {
+                                let joins = self.folder_of(to);
+                                for n in self.reorder_group(from) {
+                                    self.set_in_folder(n, joins.is_some());
+                                    if joins.is_some() {
+                                        self.set_is_folder(n, false);
+                                    }
                                 }
+                                self.move_selection(from, to);
+                                self.save_settings();
                             }
-                            self.move_selection(from, to);
-                            self.save_settings();
                         }
                     }
                 }
@@ -51823,6 +51866,60 @@ mod folder_tests {
         assert!(!a.is_folder(2));
         assert!(!a.in_folder(3) && !a.in_folder(4), "the children were orphaned");
         assert!(a.folder_children(2).is_empty());
+    }
+
+    /// **A folder cannot be dropped inside itself.**
+    ///
+    /// A folder carries its children, so dragging it past them names a target
+    /// that is already in the block it is carrying. The move is a no-op —
+    /// the block comes out and goes back where it was — but the membership
+    /// decision that runs first is not: it asks which folder the target is
+    /// in, gets the dragged folder back, and writes that onto the folder
+    /// itself. `is_folder` off, `in_folder` on: a folder living inside
+    /// itself, the group flattened around it, and a row that was track 5
+    /// reading as track 6 afterwards. The owner met it doing exactly this and
+    /// said the number stopped making sense.
+    ///
+    /// The refusal is `drop_into_own_block`, tested here, and the drop
+    /// handler is checked against the source for consulting it — the same
+    /// checklist shape the rack writers use, because the handler itself needs
+    /// a whole drag to drive and the property does not.
+    ///
+    /// Revert check performed: drop the `!` from the handler's guard and the
+    /// source assert names it; return `false` from the helper and the first
+    /// three asserts go.
+    #[test]
+    fn a_folder_dropped_on_its_own_child_is_refused() {
+        let mut a = app();
+        for n in 0..6 {
+            a.add_bare_track(n);
+        }
+        // 1 is a folder holding 2 and 3; 0, 4 and 5 are plain.
+        a.toggle_folder(1);
+        for n in [2, 3] {
+            a.set_in_folder(n, true);
+        }
+        assert_eq!(a.drag_block(1), vec![1, 2, 3], "the block is not what this is about");
+
+        // Every row the folder carries is a refusal, itself included.
+        assert!(a.drop_into_own_block(1, 2), "dropping onto its own first child");
+        assert!(a.drop_into_own_block(1, 3), "dropping past both children");
+        assert!(a.drop_into_own_block(1, 1), "dropping onto itself");
+        // And open ground is not.
+        assert!(!a.drop_into_own_block(1, 4), "a plain row below the group was refused");
+        assert!(!a.drop_into_own_block(1, 0), "a plain row above the group was refused");
+        // A row that carries only itself can never name its own block.
+        assert!(!a.drop_into_own_block(5, 4), "a plain drag was refused");
+
+        // The handler asks. It needs a whole drag to drive, so this is read
+        // off the source rather than acted out.
+        let whole = include_str!("app.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        assert!(
+            src.contains("if !self.drop_into_own_block(from, to) {"),
+            "the reorder drop no longer refuses a folder dropped into itself, so \
+             the membership line below it will make the folder its own child again"
+        );
     }
 
     /// **A folder drags its children with it.**
