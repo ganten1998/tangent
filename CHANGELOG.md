@@ -125,6 +125,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A note entered by double-click rang for ever on Analog.** Every preview in
+  the MIDI editor is gated by a hand — a press sounds it, the release quiets it
+  — except this one. A double-click writes its note on the second *release*, so
+  the note-on happens with the gesture already over and the release handler
+  that would have closed the gate already returned past. The note-off was never
+  sent at all: the note stood open until the next click anywhere in the roll.
+  That is inaudible on every instrument that decays, which is how it survived —
+  a piano, a Rhodes, a kit and most DX7 patches all fall silent on their own.
+  Analog does not: its envelope ships sustaining at 0.8 and holds for exactly as
+  long as the gate is open, so what was a silent leak everywhere else was an
+  endless note there. The written note is given a length now — its own, so what
+  you hear is what you drew — and underneath that, anything the editor is
+  sounding with no deadline and no hand on it is let go of the next frame,
+  which covers every early return in that file rather than only the one that
+  was found.
+
 - **A take's video was short by exactly the number of frames it repeated.** The
   pump has two clocks and until now it used both. `Compositor::frame` is
   pipelined one deep — it submits tick *n* and hands back tick *n − 1* — so a
