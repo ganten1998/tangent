@@ -824,8 +824,11 @@ mod tests {
 
     fn organ() -> Voice {
         // Algorithm 32: six carriers, no modulation. The one patch whose sound
-        // can be predicted without a DX7 in the room.
-        let mut v = Voice::default();
+        // can be predicted without a DX7 in the room. Built on the tine piano
+        // rather than on `Voice::default()`, as every fixture here is: the
+        // default became INIT VOICE, and these were written against the
+        // piano's detunes, scalings and velocities. Their pins must not move.
+        let mut v = Voice::electric_piano();
         v.algorithm = 31;
         v.feedback = 0;
         for op in &mut v.ops {
@@ -1130,13 +1133,20 @@ mod tests {
         );
     }
 
-    /// **The default patch has to still be sounding when the note is.** A patch
+    /// **The tine piano has to still be sounding when the note is.** A patch
     /// whose decay outruns the key is the bug this whole rate fit came from, and
     /// it is invisible in every test that only asks whether a sample is nonzero.
+    ///
+    /// It was "the default patch" when this was written. The default is INIT
+    /// VOICE now — a sine that holds for exactly as long as the key does, which
+    /// the last assertion here would rightly call a drone — so this strikes the
+    /// piano it was written against, and the test below it holds INIT VOICE to
+    /// its own contract.
     #[test]
-    fn the_default_patch_sustains_a_held_note() {
+    fn the_tine_piano_sustains_a_held_note_and_still_dies() {
         const SR: f32 = 48_000.0;
         let mut d = Dx7::new(SR);
+        d.set_voice(Voice::electric_piano());
         d.note_on(60, 0.85);
         let peak_over = |d: &mut Dx7, secs: f32| {
             let frames = (secs * SR) as usize;
@@ -1163,6 +1173,44 @@ mod tests {
         let _ = peak_over(&mut d, 8.0);
         let late = peak_over(&mut d, 1.0);
         assert!(late < attack * 0.01, "still at {late} after eleven seconds");
+    }
+
+    /// **INIT VOICE holds while the key is down and stops when it is up.**
+    /// Envelope levels 99/99/99/0 at rate 99 everywhere: the sine is at full
+    /// level two seconds in, and gone within a twentieth of a second of the
+    /// release. This is the contract the "(built in)" row now makes, and the
+    /// opposite of the piano's — which is why the two have a test each.
+    ///
+    /// Revert-check performed: OP1's fourth level at 99 (`level: [99; 4]`)
+    /// makes the release never come and the last assertion reddens.
+    #[test]
+    fn the_init_voice_holds_while_the_key_is_down_and_stops_when_it_is_up() {
+        const SR: f32 = 48_000.0;
+        let mut d = Dx7::new(SR);
+        assert_eq!(d.voice, Voice::init(), "the engine does not start on INIT VOICE");
+        d.note_on(60, 0.85);
+        let peak_over = |d: &mut Dx7, secs: f32| {
+            let frames = (secs * SR) as usize;
+            let mut b = vec![0.0_f32; frames * 2];
+            d.render(&mut b, frames, 2);
+            b.iter().fold(0.0_f32, |m, s| m.max(s.abs()))
+        };
+        let attack = peak_over(&mut d, 0.05);
+        assert!(attack > 0.05, "the attack is {attack}, which is inaudible");
+        let _ = peak_over(&mut d, 1.0);
+        let held = peak_over(&mut d, 1.0);
+        assert!(
+            held > attack * 0.9,
+            "two seconds in, a held INIT VOICE is at {:.0}% of its attack",
+            held / attack * 100.0
+        );
+        d.note_off(60);
+        let _ = peak_over(&mut d, 0.05);
+        let released = peak_over(&mut d, 0.05);
+        assert!(
+            released < attack * 0.01,
+            "a tenth of a second after the release, INIT VOICE is still at {released}"
+        );
     }
 
     /// Velocity has to matter, or every patch plays like a machine.
@@ -1258,7 +1306,7 @@ mod tests {
     /// whole character is six operators starting together, and therefore the
     /// one a re-key can most obviously get wrong.
     fn sync_bell() -> Voice {
-        let mut v = Voice::default();
+        let mut v = Voice::electric_piano();
         v.osc_sync = true;
         v.feedback = 6;
         for op in &mut v.ops {
@@ -1278,7 +1326,7 @@ mod tests {
     /// repeat lands on a voice that has NOT yet come up. It must keep
     /// climbing, not start over.
     fn free_pad() -> Voice {
-        let mut v = Voice::default();
+        let mut v = Voice::electric_piano();
         v.osc_sync = false;
         v.feedback = 0;
         for op in &mut v.ops {
@@ -1425,9 +1473,11 @@ mod tests {
     }
 
     /// **The first-strike pin.** One hash per shape of a strike from
-    /// silence — the shipped electric piano, a percussive sync patch with
-    /// feedback, a free-running pad — so a change meant for CONSECUTIVE
-    /// strikes cannot quietly retune the engine on its way past.
+    /// silence — the INIT VOICE that is the default, the tine piano that
+    /// used to be, a percussive sync patch with feedback, a free-running pad
+    /// — so a change meant for CONSECUTIVE strikes cannot quietly retune the
+    /// engine on its way past. The piano's hash is the one it has always
+    /// had: it lost its name, not its sound.
     #[test]
     fn a_first_strike_from_silence_is_unchanged() {
         fn fnv(x: &[f32]) -> u64 {
@@ -1441,7 +1491,8 @@ mod tests {
             h
         }
         for (name, v, want) in [
-            ("E.PIANO 1", Voice::default(), 15_203_663_575_639_289_799),
+            ("INIT VOICE", Voice::default(), 16_651_629_613_891_984_392),
+            ("TANGENT EP", Voice::electric_piano(), 15_203_663_575_639_289_799),
             ("SYNC BELL", sync_bell(), 5_675_424_527_636_297_463),
             ("FREE PAD", free_pad(), 4_397_977_957_930_456_023),
         ] {

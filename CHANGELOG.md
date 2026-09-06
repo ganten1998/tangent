@@ -30,8 +30,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   "Default" for the same reason, and re-reads the file. "Patch..." stays at
   the top: it edits what is playing, and its Save now puts the patch into the
   staged bank (back into its own slot, when it came from one) rather than
-  appending to a file beside the settings that nothing ever showed. Choosing a
-  patch lets an unsaved edit go, so Patch... opens on what was just picked.
+  appending to a file beside the settings that nothing ever showed. An unsaved
+  edit is never lost on the way: choosing another patch puts a changed one back
+  into its slot, or into the first empty slot with a line in the picker saying
+  so, and Patch... opens on what was just picked. The staged bank itself is
+  written down under `~/.config/tangent/` on every change and is back at the
+  next launch, so a quit throws nothing away. Delete or Backspace empties the
+  lit staged slots; Clear empties them all, after asking. Saving over a bank
+  that is already on the shelf asks first, in the picker on macOS and in the
+  panel elsewhere. The SYSEX folder is made at launch, and the patches the old
+  editor saved to `my-patches.syx` beside the settings are copied onto it once,
+  where Load bank can reach them; the original is left where it was.
 
 - **The log says which macOS it is, and whether an input is open.** "macos
   aarch64" covers eleven releases, and one report cost a day to the difference
@@ -91,6 +100,20 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Reverb, with the red jewel pilot lamp as the master.
 
 ### Changed
+
+- **The DX7's built-in patch is INIT VOICE, and the tine piano is no longer
+  called E.PIANO 1.** The "(built in)" row of the picker used to play a tine
+  electric piano under that name. The numbers were always the app's own, typed
+  in so that it would have a sound it could give away; the name was a Yamaha
+  factory voice's, and an original patch wearing it claimed to be that patch.
+  Now the row is the instrument's own INIT VOICE, the patch every DX7 starts
+  from: a sine at the fundamental, every other operator ready at level 0. A
+  short cartridge is padded with it and an empty staged slot is written as it,
+  which is what a real cartridge holds where nothing was stored. A fresh
+  install sounds exactly as it did, because what it plays is the first patch of
+  the bank in the binary, not the built-in row. The piano survives as the
+  engine's test fixture, named TANGENT EP, with its first strike pinned to the
+  hash it has always had.
 
 - **Nine dialogs that asked nothing stopped stopping you.** The take report,
   the MIDI errors, the startup notices, the no-free-channel refusal and the

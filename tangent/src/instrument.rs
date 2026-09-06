@@ -22851,7 +22851,7 @@ mod tests {
 
     #[test]
     fn choosing_a_patch_changes_what_comes_out() {
-        use crate::dx7::{Op, Voice};
+        use crate::dx7::Voice;
 
         let sound = |r: &mut Renderer, tx: &mut rtrb::Producer<MidiEvent>| {
             queue(tx, 0, [0x90, 60, 100]);
@@ -22864,42 +22864,37 @@ mod tests {
         };
 
         let (mut r, mut tx, _) = renderer_with_midi(2);
-        let piano = sound(&mut r, &mut tx);
+        // What the engine seeds a lane with: `Voice::default()`, the INIT
+        // VOICE — a sine that holds for as long as the key is down, and the
+        // key is down for the whole of `out`.
+        let init = sound(&mut r, &mut tx);
 
-        // An organ: every operator a carrier, so it holds where the piano
-        // decays and its spectrum is nothing like one.
-        let mut organ = Voice::default();
-        organ.algorithm = 31;
-        organ.feedback = 0;
-        organ.ops = [Op {
-            rate: [99, 99, 99, 80],
-            level: [99, 99, 99, 0],
-            output_level: 80,
-            coarse: 1,
-            detune: 7,
-            ..Op::default()
-        }; 6];
+        // The tine piano, which decays where the sine holds: at the end of
+        // the block the two cannot be confused, whatever free-running phase
+        // does to the start of it. (This test used to seed the piano and
+        // push an organ; the default became INIT VOICE and the roles swapped,
+        // which is the same proof the other way round.)
         // The path a click takes: through `Shared`, picked up by the renderer,
         // addressed to the lane the helper put the DX7 on.
         if let Ok(mut g) = r.shared.pending_voices.lock() {
-            g.push((0, organ));
+            g.push((0, Voice::electric_piano()));
         }
         let after = sound(&mut r, &mut tx);
 
         let peak = |v: &[f32]| v.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
         assert!(
-            peak(&piano) > 0.01 && peak(&after) > 0.01,
+            peak(&init) > 0.01 && peak(&after) > 0.01,
             "one of them was silent"
         );
         // Not "the buffers differ" — two renders of the SAME patch differ, on
-        // free-running phase alone. The organ sustains and the piano does not,
+        // free-running phase alone. The sine holds and the piano does not,
         // so the end of the block is where they cannot be confused.
         let tail = |v: &[f32]| peak(&v[v.len() * 3 / 4..]);
         assert!(
-            tail(&after) > tail(&piano) * 2.0,
-            "the patch never reached the audio thread: the tine piano ended at \
-             {:.4} and the organ at {:.4}, and an organ does not decay",
-            tail(&piano),
+            tail(&init) > tail(&after) * 2.0,
+            "the patch never reached the audio thread: the INIT VOICE ended at \
+             {:.4} and the tine piano at {:.4}, and a held sine does not decay",
+            tail(&init),
             tail(&after)
         );
     }
