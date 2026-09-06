@@ -8408,7 +8408,26 @@ impl TangentApp {
                 start_s: r.start_s.max(0.0),
                 offset_s: 0.0,
                 len_s: r.len_s,
-                loop_s: 0.0,
+                // **A recorded MIDI take is a LOOP, like a drawn one.**
+                //
+                // A MIDI item drawn on a lane has been pinned at its own
+                // length and looped from birth since it existed, so dragging
+                // its right edge lays down another pass. A RECORDED one was
+                // born at `0.0` and had nothing to repeat: dragging its edge
+                // revealed empty time instead, which is what the owner meant
+                // by "MIDI are still not clips" — the two ways of getting a
+                // part onto a lane behaved differently at the one gesture
+                // everybody uses on a part they like.
+                //
+                // Its own length is the pass, which is what the recording
+                // was: the loop is the take. An AUDIO take is left alone —
+                // there its file's remaining length is the cap and a repeat
+                // would be a different feature.
+                loop_s: if kind == crate::arrangement::ClipKind::Midi {
+                    r.len_s.max(0.05)
+                } else {
+                    0.0
+                },
                 fade_in_s: 0.0,
                 fade_out_s: 0.0,
                 name,
@@ -36684,7 +36703,7 @@ mod tests {
     }
 
     /// A scratch directory of this test's own, cleaned before and after.
-    fn project_scratch(tag: &str) -> std::path::PathBuf {
+    pub(super) fn project_scratch(tag: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "tangent-projtest-{tag}-{}",
             std::process::id()
@@ -51866,6 +51885,70 @@ mod folder_tests {
         assert!(!a.is_folder(2));
         assert!(!a.in_folder(3) && !a.in_folder(4), "the children were orphaned");
         assert!(a.folder_children(2).is_empty());
+    }
+
+    /// **A recorded MIDI take repeats when its right edge is pulled, like a
+    /// drawn one.**
+    ///
+    /// A MIDI item DRAWN on a lane has been pinned at its own length and
+    /// looped from birth since it existed, so dragging its right edge lays
+    /// down another pass. A RECORDED one was born with no loop at all, so the
+    /// same drag on the same kind of item revealed empty time instead — the
+    /// two roads onto a lane behaved differently at the one gesture everybody
+    /// uses on a part they like, which is what the owner meant by "MIDI are
+    /// still not clips".
+    ///
+    /// Audio is deliberately not looped: there the file's remaining length is
+    /// the cap `arr_trim_right` respects, and repeating it would be a
+    /// different feature rather than the same one.
+    ///
+    /// Revert check performed: put `loop_s: 0.0` back for MIDI and the first
+    /// assert names it; the notes assert goes with it, because `notes_in`
+    /// stops laying down a second pass.
+    #[test]
+    fn a_recorded_midi_take_loops_when_it_is_pulled_longer() {
+        use crate::arrangement::{ClipKind, RecordedClip};
+        // `add_recorded_clips` refuses without a project — a take has to have
+        // somewhere to land — so this one gets a scratch one.
+        let root = super::tests::project_scratch("midiloop");
+        let (_ctx, mut a) = headless(Caps::DESKTOP);
+        a.bootstrap_project(&root.join("Projects"));
+        a.add_recorded_clips(vec![RecordedClip {
+            lane: 0,
+            start_s: 0.0,
+            len_s: 2.0,
+            path: None,
+            notes: vec![crate::arrangement::ArrNote {
+                at_s: 0.25,
+                dur_s: 0.5,
+                key: 60,
+                vel: 100,
+            }],
+        }]);
+        let c = a.arrangement.clips.last().expect("the take landed");
+        assert_eq!(c.kind, ClipKind::Midi, "this is not the clip under test");
+        assert!(
+            (c.loop_s - 2.0).abs() < 1.0e-9,
+            "a recorded MIDI take was born with loop {} - its right edge will \
+             reveal empty time instead of another pass",
+            c.loop_s
+        );
+
+        // And the repeat is REAL: pulled to three passes, the notes come with
+        // it. `notes_in` is what the engine and the drawing both read.
+        let id = c.id;
+        if let Some(c) = a.arr_clip_mut(id) {
+            c.len_s = 6.0;
+        }
+        let clip = a.arrangement.clips.iter().find(|c| c.id == id).expect("the clip");
+        let notes = crate::arrangement::clip_notes_in_song_time(clip);
+        assert_eq!(
+            notes.len(),
+            3,
+            "pulled to three times its length a looping take gave {} notes, not \
+             three passes of one",
+            notes.len()
+        );
     }
 
     /// **A folder cannot be dropped inside itself.**

@@ -209,6 +209,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A recorded MIDI take now repeats when you pull its right edge, like a drawn
+  one.** A MIDI item drawn on a lane has been a loop from birth — drag its edge
+  and it lays down another pass — but a recorded take was born with no loop, so
+  the same drag on the same kind of item revealed empty time instead. The two
+  ways of getting a part onto a lane behaved differently at the one gesture
+  everybody uses on a part they like. The take's own length is its loop now.
+  Audio takes are untouched: there the file's remaining length is the limit, and
+  repeating it would be a different feature.
+
 - **A folder dragged past its own children turned into one of them.** A folder
   carries its rows, so dropping it below them names a target that is already
   inside the block being carried. The move itself is then a no-op — the block
