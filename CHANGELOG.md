@@ -209,6 +209,23 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The arrangement's little menus ignored the theme.** The clip menu, the FX
+  menu, the input menu and the bay drag chip all painted a hardcoded cream with
+  hardcoded near-black ink — the shipped theme's own colours, written out as
+  literals — so on the other fifteen themes they were a pale card on a dark desk,
+  and on the dark ones they glared. They derive their surface now, the way every
+  other painted panel here does: the paper comes from the theme's face, moves
+  itself when that face sits where neither ink would read, and the ink is a
+  property of the paper rather than a colour borrowed from somewhere else.
+
+- **Both arm modifiers can undo themselves.** Shift could add a lane to the
+  armed set and not take one back out, and alt could make a lane the only armed
+  one and not stand it down — so either gesture had to be abandoned mid-thought
+  to be reversed. Shift now flips whatever it crosses and alt on the lane that is
+  already alone disarms everything. A modified arm also touches one lane rather
+  than the whole strip selection, which is what both modifiers are for; a plain
+  press still carries the selection.
+
 - **The master's FX bays had no right-click menu in the arrangement.** Every
   other rack on that view offers Delete FX and Replace FX; the master's six bays
   offered nothing, because the right-click matched the channel headers' bays
