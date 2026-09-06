@@ -156,6 +156,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The metronome's sound row said the same thing twice, and a chosen click
+  could go missing.** With nothing chosen the two controls read "built-in" and
+  "default" — one naming the click you were on, one naming the click you would
+  go back to, which are the same click, so neither said what pressing it would
+  do. They are **Default** and **Custom** now, in that order, and Custom wears
+  the chosen file's own name once there is one. And the file is now KEPT rather
+  than pointed at: choosing a click copies it into Tangent's own folder and the
+  setting names the copy, so renaming a folder or emptying a Downloads
+  directory no longer drops the metronome silently back to the shipped click.
+  One slot, replaced each time — this is a preference, not a library.
+
 - **The DX7 picker opens lit on the patch the strip is playing.** It had been
   lighting the row for exactly one frame: the host's answer to the open, the
   same call that fills the list after a load, cleared the selection on the
