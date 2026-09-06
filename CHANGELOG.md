@@ -12,6 +12,16 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **The log says which macOS it is, and whether an input is open.** "macos
+  aarch64" covers eleven releases, and one report cost a day to the difference
+  between Sonoma and Tahoe; the header carries the product version now. And
+  there was no `audio in:` line at all, on a build whose Recorder band cannot be
+  hidden — so the input stream is always open and the log never once said so.
+
+- **`TANGENT_ACTIVITY=1` asks macOS to treat the process as latency-critical.**
+  Opt-in and off by default, so behaviour on every macOS version is unchanged
+  unless somebody is deliberately testing it.
+
 - **Stems export asks which stems: dry, or processed.** The export dialog's
   SOURCE row is joined by a STEMS row with two chips. *Processed* writes each
   lane through its own insert rack — the mix's own sound, one file per lane,
@@ -124,6 +134,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   ships, this stops being a note and becomes something the loader has to do.
 
 ### Fixed
+
+- **The rate follower was building two AudioUnits a second, forever.** cpal's
+  macOS `default_output_config` instantiates an AUHAL just to read a device's
+  buffer range, and the poll that watches for a sample-rate change called it
+  twice a second for the life of the process — 21 ms median, 32 ms at the 95th
+  percentile, measured, on a thread that exists to notice one number changing.
+  It reads that number directly now. `TANGENT_RATE_POLL=auhal` puts the old road
+  back for an A/B, and a test pins the two to the same answer.
+
+- **macOS could not report a dropout, so it always reported none.** Both
+  counters behind the panel's dropout figure are structurally blind on a Mac:
+  one matches an error string only ALSA and JACK produce, the other is compiled
+  for Linux. The merge of them answered "nothing" on every Mac ever shipped, so
+  the readout said zero to people who were listening to it crackle. CoreAudio's
+  own overload notification is a third source now. Off macOS the arithmetic is
+  byte-identical.
 
 - **A note entered by double-click rang for ever on Analog.** Every preview in
   the MIDI editor is gated by a hand — a press sounds it, the release quiets it
