@@ -6608,6 +6608,14 @@ fn confirm_ir_delete(strip: usize, slot: usize, path: &str, loaded: bool) -> Dia
 /// `the_project_export_dialog_fits_the_window_it_asks_for`, which finds the
 /// Export button in the painted frame. It bites at three hundred and forty,
 /// which is the budget the next row to be added here has to fit inside.
+/// Height reserved for the Project dialog's Done row.
+///
+/// Measured rather than guessed at: `the_project_dialogs_done_button_stays_on
+/// _screen` lays the real button out under the real theme and asserts this
+/// covers it, so a font change that makes the button taller reddens a test
+/// instead of hiding the button.
+const PROJECT_DONE_H: f32 = 30.0;
+
 const EXPORT_PROJECT_H: f32 = 446.0;
 /// The floor the same stack still fits in — and it does: the guard is green
 /// here too, with the band down to about twenty-five points.
@@ -9575,126 +9583,159 @@ fn show_on(
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::same(14))
                         .show(ui, |ui| {
-                            // The name is a FIELD: it stages what the
-                            // session should be called, and Save saves that
-                            // name — nobody has to meet a panel to name a
-                            // song.
-                            // The field's WELL is pinned dark so the white
-                            // ink reads in every theme — the inherited well
-                            // was light under system-light and the name
-                            // typed white-on-white.
-                            ui.style_mut().visuals.extreme_bg_color =
-                                egui::Color32::from_rgb(0x1A, 0x16, 0x12);
-                            // **Empty until the session is saved.** The
-                            // field used to open on "Untitled", which read
-                            // as a name somebody had given the session and
-                            // let Save write an Untitled folder without a
-                            // panel ever asking. A hint in the well says
-                            // what the empty field means; it is not a value.
-                            ui.add(
-                                egui::TextEdit::singleline(name)
-                                    .font(bold(13.0))
-                                    .text_color(egui::Color32::WHITE)
-                                    .hint_text(if saved { "" } else { "unsaved" })
-                                    .desired_width(f32::INFINITY),
-                            );
-                            ui.label(
-                                RichText::new(if saved {
-                                    "the open session - audio takes and the kit write themselves; Save writes the rest, under this name"
-                                } else {
-                                    "no home yet - Save and Save As both ask where; a name typed here is the panel's suggestion"
-                                })
-                                .font(plain(9.0))
-                                .color(dim),
-                            );
-                            ui.add_space(8.0);
-                            let mut row = |ui: &mut egui::Ui, word: &str, hint: &str| -> bool {
-                                let clicked = ui
-                                    .add_sized(
-                                        Vec2::new(ui.available_width(), 24.0),
-                                        Button::new(
-                                            RichText::new(word).font(plain(11.0)).color(t.text),
-                                        ),
-                                    )
-                                    .clicked();
-                                if !hint.is_empty() {
-                                    ui.label(RichText::new(hint).font(plain(8.5)).color(dim));
-                                }
-                                ui.add_space(4.0);
-                                clicked
-                            };
-                            if row(ui, "New", "a fresh session from the default template") {
-                                action = Some(DialogAction::ProjectNew);
-                            }
-                            if row(ui, "Open...", "") {
-                                action = Some(DialogAction::ProjectOpen);
-                            }
-                            // The two rows say which door they are: in
-                            // place once the session has a home, the panel
-                            // until it does. See `Dialog::Project::saved`.
-                            let save_hint = if saved {
-                                "desk, document and plugin settings, now"
-                            } else {
-                                "asks where to keep the session, this first time"
-                            };
-                            if row(ui, "Save", save_hint) {
-                                action = Some(DialogAction::ProjectSave {
-                                    name: name.clone(),
-                                });
-                            }
-                            let save_as_hint = if saved {
-                                "copy the whole session and open the copy"
-                            } else {
-                                "the same panel - there is nothing to copy yet"
-                            };
-                            if row(ui, "Save As...", save_as_hint) {
-                                action = Some(DialogAction::ProjectSaveAs {
-                                    name: name.clone(),
-                                });
-                            }
-                            // **A checkbox rather than a row**, because it
-                            // does not DO anything on click - it changes what
-                            // the next Save As does, which is what a tick is
-                            // for. Sits under Save As, the thing it changes.
-                            {
-                                let mut on = *subdir;
-                                if ui
-                                    .checkbox(
-                                        &mut on,
-                                        RichText::new("Create Project Subdirectory")
-                                            .font(plain(10.0))
-                                            .color(t.text),
-                                    )
-                                    .changed()
-                                {
-                                    *subdir = on;
-                                    action = Some(DialogAction::SetProjectSubdir(on));
-                                }
+                            // **The Done row is reserved before anything
+                            // else is drawn, and the rest scrolls.**
+                            //
+                            // This stack used to be laid out straight down
+                            // with Done as its last item and the window sized
+                            // by hand to fit. That has already failed once —
+                            // the note on the size above records it: "the row
+                            // went in without the window growing, and the Done
+                            // button fell off the bottom until somebody
+                            // resized" — and it failed again the next time a
+                            // row was added, because growing a number is not a
+                            // rule and the next person cannot see it.
+                            //
+                            // Reserving the button and scrolling the body is
+                            // the rule, and it is the one the Export dialog
+                            // already keeps a few hundred lines down. A row
+                            // added to this dialog can now push the body into
+                            // a scroll; it can no longer push the only way out
+                            // of the dialog past the bottom edge, where the
+                            // owner met it with nothing but Esc to reach.
+                            let bottom_h = PROJECT_DONE_H + 8.0;
+                            let body_h = (ui.available_height() - bottom_h).max(60.0);
+                            egui::ScrollArea::vertical()
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                )
+                                .max_height(body_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                // The name is a FIELD: it stages what the
+                                // session should be called, and Save saves that
+                                // name — nobody has to meet a panel to name a
+                                // song.
+                                // The field's WELL is pinned dark so the white
+                                // ink reads in every theme — the inherited well
+                                // was light under system-light and the name
+                                // typed white-on-white.
+                                ui.style_mut().visuals.extreme_bg_color =
+                                    egui::Color32::from_rgb(0x1A, 0x16, 0x12);
+                                // **Empty until the session is saved.** The
+                                // field used to open on "Untitled", which read
+                                // as a name somebody had given the session and
+                                // let Save write an Untitled folder without a
+                                // panel ever asking. A hint in the well says
+                                // what the empty field means; it is not a value.
+                                ui.add(
+                                    egui::TextEdit::singleline(name)
+                                        .font(bold(13.0))
+                                        .text_color(egui::Color32::WHITE)
+                                        .hint_text(if saved { "" } else { "unsaved" })
+                                        .desired_width(f32::INFINITY),
+                                );
                                 ui.label(
-                                    RichText::new(
-                                        "wrap the project in its own folder - media always \
-                                         travels inside it",
-                                    )
-                                    .font(plain(8.5))
+                                    RichText::new(if saved {
+                                        "the open session - audio takes and the kit write themselves; Save writes the rest, under this name"
+                                    } else {
+                                        "no home yet - Save and Save As both ask where; a name typed here is the panel's suggestion"
+                                    })
+                                    .font(plain(9.0))
                                     .color(dim),
                                 );
+                                ui.add_space(8.0);
+                                let mut row = |ui: &mut egui::Ui, word: &str, hint: &str| -> bool {
+                                    let clicked = ui
+                                        .add_sized(
+                                            Vec2::new(ui.available_width(), 24.0),
+                                            Button::new(
+                                                RichText::new(word).font(plain(11.0)).color(t.text),
+                                            ),
+                                        )
+                                        .clicked();
+                                    if !hint.is_empty() {
+                                        ui.label(RichText::new(hint).font(plain(8.5)).color(dim));
+                                    }
+                                    ui.add_space(4.0);
+                                    clicked
+                                };
+                                if row(ui, "New", "a fresh session from the default template") {
+                                    action = Some(DialogAction::ProjectNew);
+                                }
+                                if row(ui, "Open...", "") {
+                                    action = Some(DialogAction::ProjectOpen);
+                                }
+                                // The two rows say which door they are: in
+                                // place once the session has a home, the panel
+                                // until it does. See `Dialog::Project::saved`.
+                                let save_hint = if saved {
+                                    "desk, document and plugin settings, now"
+                                } else {
+                                    "asks where to keep the session, this first time"
+                                };
+                                if row(ui, "Save", save_hint) {
+                                    action = Some(DialogAction::ProjectSave {
+                                        name: name.clone(),
+                                    });
+                                }
+                                let save_as_hint = if saved {
+                                    "copy the whole session and open the copy"
+                                } else {
+                                    "the same panel - there is nothing to copy yet"
+                                };
+                                if row(ui, "Save As...", save_as_hint) {
+                                    action = Some(DialogAction::ProjectSaveAs {
+                                        name: name.clone(),
+                                    });
+                                }
+                                // **A checkbox rather than a row**, because it
+                                // does not DO anything on click - it changes what
+                                // the next Save As does, which is what a tick is
+                                // for. Sits under Save As, the thing it changes.
+                                {
+                                    let mut on = *subdir;
+                                    if ui
+                                        .checkbox(
+                                            &mut on,
+                                            RichText::new("Create Project Subdirectory")
+                                                .font(plain(10.0))
+                                                .color(t.text),
+                                        )
+                                        .changed()
+                                    {
+                                        *subdir = on;
+                                        action = Some(DialogAction::SetProjectSubdir(on));
+                                    }
+                                    ui.label(
+                                        RichText::new(
+                                            "wrap the project in its own folder - media always \
+                                             travels inside it",
+                                        )
+                                        .font(plain(8.5))
+                                        .color(dim),
+                                    );
+                                    ui.add_space(4.0);
+                                }
+                                if row(
+                                    ui,
+                                    "Save As Template...",
+                                    "under Projects/Templates - name it default to replace the default",
+                                ) {
+                                    action = Some(DialogAction::ProjectTemplate);
+                                }
                                 ui.add_space(4.0);
-                            }
-                            if row(
-                                ui,
-                                "Save As Template...",
-                                "under Projects/Templates - name it default to replace the default",
-                            ) {
-                                action = Some(DialogAction::ProjectTemplate);
-                            }
-                            ui.add_space(4.0);
-                            if row(
-                                ui,
-                                "Export...",
-                                "master and/or stems - full-speed render by default",
-                            ) {
-                                action = Some(DialogAction::ProjectExportOpen);
-                            }
+                                if row(
+                                    ui,
+                                    "Export...",
+                                    "master and/or stems - full-speed render by default",
+                                ) {
+                                    action = Some(DialogAction::ProjectExportOpen);
+                                }
+                                });
+                            // Pinned to the foot, so the button does not walk
+                            // up and down as the body's length changes.
+                            ui.add_space((ui.available_height() - PROJECT_DONE_H).max(0.0));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui
                                     .add(Button::new(RichText::new("Done").color(t.text)))
@@ -14674,6 +14715,59 @@ at: None,
         assert!(
             texts.iter().any(|(_, _, s)| s == "all 20, as one device"),
             "the channels row does not agree with the lines above it"
+        );
+    }
+
+    /// **The Project dialog's Done button stays on screen, whatever is added
+    /// above it.**
+    ///
+    /// It has fallen off the bottom twice. The size note on the dialog records
+    /// the first — "the row went in without the window growing, and the Done
+    /// button fell off the bottom until somebody resized" — and the fix was to
+    /// grow the window by hand, which is not a rule: the next row went in and
+    /// it fell off again, and the owner met a dialog whose only way out was
+    /// Esc.
+    ///
+    /// So the button is reserved and the body scrolls, and this measures the
+    /// reservation against the real button under the real theme rather than
+    /// trusting the number. Asserted at the dialog's MINIMUM height, which is
+    /// the worst case and the one nobody looks at.
+    ///
+    /// Revert check performed: drop `PROJECT_DONE_H` back into the body — that
+    /// is, take the `add_space` out so Done rides on the end of the stack —
+    /// and a dialog with one more row in it runs off the bottom again; shrink
+    /// the constant to 10 and this reddens directly.
+    #[test]
+    fn the_project_dialogs_done_button_stays_on_screen() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let t = theme(Color32::from_rgb(0x2a, 0x2a, 0x2a));
+        let mut got = 0.0_f32;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(340.0, 370.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                crate::shell::viewport_ui(ctx, |ui| {
+                    apply_theme(ui.style_mut(), &t);
+                    let r = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add(Button::new(RichText::new("Done").color(t.text)))
+                    });
+                    // The BUTTON's own rectangle, not the layout's: a
+                    // right-to-left layout allocated at the top of a viewport
+                    // fills its whole height, and measuring that would be
+                    // measuring the window.
+                    got = r.inner.rect.height();
+                });
+            },
+        );
+        assert!(got > 0.0, "the button drew nothing, so this measures nothing");
+        assert!(
+            got <= PROJECT_DONE_H,
+            "the Done row is {got}pt tall and {PROJECT_DONE_H}pt is reserved for it, \
+             so it hangs off the bottom of a dialog whose only other way out is Esc"
         );
     }
 

@@ -156,6 +156,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The Project dialog's Done button fell off the bottom edge.** It has done
+  this twice. The stack was laid out straight down with Done as its last item
+  and the window sized by hand to fit, so the first time a row was added the
+  button went past the bottom and the fix was to grow the window — which is not
+  a rule, and the next row put it back off the edge, leaving a dialog whose only
+  way out was Esc. The button is reserved at the foot now and the body scrolls
+  above it, the same shape the Export dialog already uses, so a row added later
+  can push the body into a scroll and can no longer push the way out off the
+  screen. The reservation is measured against the real button under the real
+  theme by a test, rather than being another number somebody has to remember.
+
 - **The metronome's sound row said the same thing twice, and a chosen click
   could go missing.** With nothing chosen the two controls read "built-in" and
   "default" — one naming the click you were on, one naming the click you would
