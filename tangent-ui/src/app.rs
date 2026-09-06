@@ -1993,6 +1993,15 @@ struct MidiEdit {
     down_key: Option<u8>,
     /// The pitch a move is previewing, so the ear follows the drag.
     preview_keys: Vec<u8>,
+    /// **When a preview nobody is HOLDING should stop**, or `None` for one a
+    /// hand is holding.
+    ///
+    /// Almost every preview in this editor is gated by the mouse: a press
+    /// sounds it and the release quiets it. The note a double-click WRITES is
+    /// the exception — it is struck on the second release, so the gesture that
+    /// asked for it is already over and there is no release left to close the
+    /// gate. It is given a length instead. See `me_preview_tick`.
+    preview_until: Option<Instant>,
     /// The velocity new notes are born with — the last one anybody set.
     last_vel: u8,
     /// A marquee in flight, both corners in screen space.
@@ -15171,6 +15180,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             dirty: false,
             down_key: None,
             preview_keys: Vec::new(),
+            preview_until: None,
             last_vel: DEFAULT_VELOCITY,
             marquee: None,
         });
@@ -16788,6 +16798,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if let Some(st) = self.midi_edit.as_mut() {
             st.down_key = None;
             st.preview_keys.clear();
+            st.preview_until = None;
         }
     }
 
@@ -16883,10 +16894,95 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .is_some_and(|(p, r)| r.contains(p))
     }
 
+    /// **The editor's preview, reconciled once a frame from the STATE rather
+    /// than at each mutation** — the same bargain `reconcile_sound` makes for
+    /// the lattice, and for the same reason: every path that can leave a note
+    /// sounding is covered by construction instead of by remembering to close
+    /// it.
+    ///
+    /// A preview here is gated by a HAND. A press on a note, on a piano key or
+    /// on empty roll with the pen down sounds it, and the release quiets it —
+    /// so with no button down and no drag in flight, nothing should be
+    /// sounding, and anything that is, is a gate somebody's early `return`
+    /// walked past.
+    ///
+    /// One did. **A double-click with the pen up writes its note on the second
+    /// RELEASE**, sounds it, and returns — past the release handler that would
+    /// have closed the gate. The note-on went to the instrument and the
+    /// note-off was never sent at all, so the note stood open until the next
+    /// click anywhere in the roll. Which is inaudible on every instrument that
+    /// decays — a piano, a Rhodes, a kit, most DX7 patches — and on Analog,
+    /// whose envelope ships with a sustain of 0.8 and therefore holds for as
+    /// long as the gate is open, it is a note that rings for ever. The owner:
+    /// "analog is the only plugin period that does the following ... dbl click
+    /// to enter a note or audition it -- infinite note ring". Only the
+    /// SYMPTOM was Analog's; the open gate was every instrument's.
+    ///
+    /// That note is the one preview with no hand behind it, so it carries a
+    /// deadline instead — the length it was drawn at, so what you hear is what
+    /// you wrote — and the repaint request is what makes an idle window come
+    /// back to close it rather than waiting for the next mouse twitch.
+    /// Sound the note a double-click just wrote for as long as it IS, and
+    /// then stop — see `me_preview_tick` for why this one cannot be let go of
+    /// by a hand.
+    ///
+    /// Its own length, so the ear is told what was written rather than a fixed
+    /// blip, and bounded at both ends: a thirty-second at speed is still worth
+    /// hearing, and a whole note at forty is not worth holding a preview
+    /// through.
+    fn me_hold_preview_for_the_note_just_written(&mut self) {
+        const SHORTEST: f64 = 0.15;
+        const LONGEST: f64 = 2.0;
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        if st.preview_keys.is_empty() {
+            return;
+        }
+        let secs = self
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id == st.id)
+            .and_then(|c| c.notes.last())
+            .map_or(SHORTEST, |n| n.dur_s.clamp(SHORTEST, LONGEST));
+        let until = Instant::now() + std::time::Duration::from_secs_f64(secs);
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.preview_until = Some(until);
+        }
+    }
+
+    fn me_preview_tick(&mut self, ctx: &egui::Context) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        if st.preview_keys.is_empty() && st.down_key.is_none() {
+            return;
+        }
+        if let Some(until) = st.preview_until {
+            let now = Instant::now();
+            if now < until {
+                ctx.request_repaint_after(until - now);
+            } else {
+                self.me_quiet_preview();
+            }
+            return;
+        }
+        // No deadline, so a hand owns it — and only while there is one.
+        let held = ctx.input(|i| i.pointer.any_down());
+        if !held && st.drag.is_none() {
+            self.me_quiet_preview();
+        }
+    }
+
     fn midi_editor_input(&mut self, ctx: &egui::Context) {
         if self.midi_edit.is_none() {
             return;
         }
+        // **Before every early return below it.** A menu opening over a
+        // sounding preview, a dialog taking the pointer, the drumpad claiming
+        // it — each of those used to return with the note still on.
+        self.me_preview_tick(ctx);
         if self.menu_state.is_some() || self.menu_ate_press || self.dialog_blocks_pointer(ctx) {
             // The menu owns the pointer — and the press that dismissed it
             // is spent, exactly as on the arrangement. A dialog owns it
@@ -17242,6 +17338,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         if let Some(st) = self.midi_edit.as_mut() {
                             st.drag = None;
                         }
+                        // **This one has no release coming.** The double-click
+                        // lands ON the second release, so the gesture is over
+                        // and `me_create_note`'s note-on has nothing left to
+                        // close it — give it a length. See `me_preview_tick`.
+                        self.me_hold_preview_for_the_note_just_written();
                         self.me_commit();
                         return;
                     }
@@ -47045,6 +47146,142 @@ mod tests {
             "four double-clicks in one place went {seen:?}: the gesture is \
              heard once and then goes dead under a hand that stays put, which \
              is every double-click on this desk and not only the roll's"
+        );
+    }
+
+    /// **A note written by a double-click is let go of.**
+    ///
+    /// Every preview in the roll is gated by a hand — a press sounds it, the
+    /// release quiets it — except this one. A double-click writes its note on
+    /// the second RELEASE, so `me_create_note`'s note-on happens with the
+    /// gesture already over and the release handler that would have closed the
+    /// gate already returned past. The note-off was never sent at all: the note
+    /// stood open until the next click anywhere in the roll.
+    ///
+    /// Inaudible on every instrument that decays, which is why it survived —
+    /// a piano, a Rhodes, a kit and most DX7 patches all fall silent on their
+    /// own. Analog does not: its envelope ships with a sustain of 0.8 and
+    /// holds for as long as the gate is open. The owner: "analog is the only
+    /// plugin period that does the following ... dbl click to enter a note or
+    /// audition it -- infinite note ring." Only the symptom belonged to
+    /// Analog; the open gate belonged to every instrument.
+    ///
+    /// Two halves, because they fail apart. The written note gets a LENGTH and
+    /// is released when it runs out; and any preview with no deadline and no
+    /// hand on it is released the next frame, which is the invariant that
+    /// covers every early `return` in this file rather than the one that was
+    /// found.
+    ///
+    /// Revert check performed: drop the `me_hold_preview_for_the_note_just_written`
+    /// call and the first half goes red at `preview_until`; drop
+    /// `me_preview_tick`'s no-deadline arm and the second half hangs the note.
+    #[test]
+    fn a_double_clicked_note_stops_sounding() {
+        /// Every note the app asked to be SILENCED this frame, whichever door
+        /// it used — a drum lane's pads and a pitched lane's audition are the
+        /// same gesture with different plumbing.
+        fn released(app: &mut TangentApp) -> Vec<u8> {
+            let mut off = Vec::new();
+            while let Some(r) = app.take_recorder_request() {
+                match r {
+                    recorder::RecorderRequest::Audition { notes, on: false } => off.extend(notes),
+                    recorder::RecorderRequest::PadHit { pad, on: false } => off.push(pad),
+                    _ => {}
+                }
+            }
+            off
+        }
+
+        /// A plain frame with no events. NOT `run_frame`, which pops one
+        /// request off the queue and throws it away — the note-off among them.
+        fn idle(ctx: &egui::Context, app: &mut TangentApp) {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        }
+
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        app.settings.midi_draw_mode = false;
+        let (rect, id) = midi_editor_zoomed_in(&ctx, &mut app);
+        let l = crate::midi_editor::Layout::new(rect);
+        let p = Pos2::new(l.roll.center().x, l.roll.center().y + 40.0);
+        let before = app.arrangement.clips[0].notes.len();
+
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                        events: vec![
+                            egui::Event::PointerMoved(p),
+                            egui::Event::PointerButton {
+                                pos: p,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ctx| app.frame(ctx),
+                );
+            }
+        }
+        assert_eq!(
+            app.arrangement.clips[0].notes.len(),
+            before + 1,
+            "the double-click did not write a note, so this test is measuring nothing"
+        );
+        let key = app.arrangement.clips[0].notes.last().expect("the note").key;
+        let _ = id;
+        let _ = released(&mut app);
+
+        // It is SOUNDING, and it has an end. Both halves matter: a note with
+        // no deadline would ring, and one released on the spot would never be
+        // heard at all.
+        {
+            let st = app.midi_edit.as_ref().expect("the editor closed");
+            assert_eq!(st.preview_keys, vec![key], "the written note is not sounding");
+            assert!(
+                st.preview_until.is_some(),
+                "the note was struck with no release coming and no deadline either - \
+                 it will ring until the next click, for ever on a patch that sustains"
+            );
+        }
+
+        // Wind the deadline back rather than sleeping through it: the
+        // mechanism under test is "when it runs out", not how long it is.
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.preview_until = Some(Instant::now() - std::time::Duration::from_millis(1));
+        }
+        idle(&ctx, &mut app);
+        assert_eq!(
+            released(&mut app),
+            vec![key],
+            "the deadline passed and the note was never let go of"
+        );
+        assert!(
+            app.midi_edit.as_ref().is_some_and(|m| m.preview_keys.is_empty()),
+            "the editor still believes it is sounding something"
+        );
+
+        // And the invariant underneath it: something sounding with no deadline
+        // and no hand on it is let go of, whichever early return left it.
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.preview_keys = vec![key];
+            st.preview_until = None;
+            st.drag = None;
+        }
+        idle(&ctx, &mut app);
+        assert_eq!(
+            released(&mut app),
+            vec![key],
+            "a preview with nothing holding it open was left sounding"
         );
     }
 
