@@ -7743,7 +7743,7 @@ impl TangentApp {
         self.dialog = Some(dialogs::Dialog::PatchEditor {
             slot: 0,
             patch: crate::ports::PatchEdit {
-                name: "E.PIANO 1".to_owned(),
+                name: "INIT VOICE".to_owned(),
                 algorithm: 4,
                 routing: [0, 1, 0, 3, 0, 5],
                 feedback_op: 6,
@@ -7762,7 +7762,7 @@ impl TangentApp {
                 bank_path: "staged bank, slot 1".to_owned(),
             },
             group: 0,
-            name: "E.PIANO 1".to_owned(),
+            name: "INIT VOICE".to_owned(),
             note: String::new(),
         });
     }
@@ -22676,6 +22676,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **The save panel answered with a bank that is already there.** Ask,
+    /// in the picker, before it is written over: the question is a line
+    /// with two buttons in the window the hand is already in, and the
+    /// answer comes back as `DialogAction::ReplaceBank` for `path` — the
+    /// file the host would write, extension and all. The picker raised the
+    /// panel, so it is open; if it is somehow not, it is opened again on
+    /// the strip that asked, because a question with nowhere to be drawn
+    /// is a Save that silently did nothing.
+    pub fn ask_bank_replace(&mut self, path: std::path::PathBuf) {
+        if !matches!(self.dialog, Some(dialogs::Dialog::PatchPicker { .. })) {
+            self.open_patch_picker(self.cartridge_pick_strip);
+        }
+        if let Some(dialogs::Dialog::PatchPicker { question, .. }) = self.dialog.as_mut() {
+            *question = Some(dialogs::BankQuestion::Replace(path));
+        }
+    }
+
     // ── presets ─────────────────────────────────────────────────────────────
     //
     // The app's half of the preset road. Same firewall as the cartridge
@@ -27917,6 +27934,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     suggested: dialogs::DEFAULT_BANK_FILE.to_owned(),
                     purpose: crate::ports::SavePurpose::Bank,
                 });
+            }
+            DialogAction::ReplaceBank { slot, path } => {
+                // The question's yes: the same request the panel's answer
+                // would have sent had the file not been there. The strip is
+                // the picker's own, so nothing has to be remembered.
+                self.request_recorder(recorder::RecorderRequest::SaveBank { strip: slot, path });
             }
             DialogAction::ChooseDevice { kind, uid } => {
                 // Written to settings AND pushed to the device object. The
@@ -38043,6 +38066,47 @@ mod tests {
             Some(12),
             "the picker went dark on the frame the host answered the open"
         );
+    }
+
+    /// **A bank already on the shelf is asked about, in the picker, and
+    /// Replace is the same request the panel's answer would have been.** The
+    /// question lands in the open picker, or reopens it on the strip that
+    /// asked when it has gone.
+    #[test]
+    fn a_bank_already_on_the_shelf_is_asked_about_before_it_is_written_over() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.apply_dialog_action(dialogs::DialogAction::ShowPatches { slot: 2 });
+        app.apply_dialog_action(dialogs::DialogAction::SaveBank { slot: 2 });
+        let _ = app.take_save_request();
+        while app.take_recorder_request().is_some() {}
+        let path = std::path::PathBuf::from("/m/Tangent Media/SYSEX/default.syx");
+        app.ask_bank_replace(path.clone());
+        let Some(dialogs::Dialog::PatchPicker { question, slot, .. }) = &app.dialog else {
+            panic!("the picker closed")
+        };
+        assert_eq!(*slot, 2);
+        assert_eq!(*question, Some(dialogs::BankQuestion::Replace(path.clone())));
+        assert!(app.take_recorder_request().is_none(), "the bank was written before the answer");
+        app.apply_dialog_action(dialogs::DialogAction::ReplaceBank {
+            slot: 2,
+            path: path.clone(),
+        });
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::SaveBank {
+                strip: 2,
+                path: path.clone(),
+            })
+        );
+        // With the picker gone, the question reopens it on the strip that
+        // raised the panel rather than being asked of nobody.
+        app.dialog = None;
+        app.ask_bank_replace(path.clone());
+        let Some(dialogs::Dialog::PatchPicker { question, slot, .. }) = &app.dialog else {
+            panic!("the question had nowhere to be drawn")
+        };
+        assert_eq!(*slot, 2);
+        assert_eq!(*question, Some(dialogs::BankQuestion::Replace(path)));
     }
 
     /// Patch... on a staged row opens the editor the same way it opens on a

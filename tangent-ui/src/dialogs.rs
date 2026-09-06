@@ -198,6 +198,10 @@ pub enum Dialog {
         /// What the last Save bank said, good or bad — "Saved 12 patches to
         /// default.syx." or the reason it could not.
         note: String,
+        /// A yes/no the picker is asking, drawn as a line with two buttons
+        /// inside the window rather than as a dialog in front of it. See
+        /// [`BankQuestion`].
+        question: Option<BankQuestion>,
     },
     /// Which instrument the modelled keyboard is being right now.
     ///
@@ -1821,6 +1825,15 @@ pub enum DialogAction {
     /// the SYSEX shelf suggesting `default.syx`; the answer goes to the host
     /// as `RecorderRequest::SaveBank` for `slot`'s strip.
     SaveBank { slot: usize },
+    /// **Yes, write over it.** The answer to [`BankQuestion::Replace`]: the
+    /// panel named a bank that is already on the shelf, the picker asked,
+    /// and the hand said replace. Appended at the END, this enum's law. The
+    /// path is the file the host would write — extension and all — so the
+    /// file asked about is the file written.
+    ReplaceBank {
+        slot: usize,
+        path: std::path::PathBuf,
+    },
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -3936,8 +3949,13 @@ fn draw_algorithm(painter: &egui::Painter, rect: Rect, patch: &crate::ports::Pat
 /// Voices in a DX7 cartridge. The format has exactly this many, always.
 pub const CARTRIDGE_VOICES: usize = 32;
 
-/// The row shown when no cartridge is loaded: the patch compiled into the app.
-pub const BUILTIN_PATCH_ROW: &str = "E.PIANO 1  (built in)";
+/// The row at the top of the loaded bank: the patch compiled into the app,
+/// which is the DX7's own INIT VOICE — the starting point, a sine at the
+/// fundamental — and not a finished sound. It was a tine piano called
+/// E.PIANO 1 until the owner asked for the instrument's own init patch
+/// there; the name was a Yamaha factory voice's, and a finished piano in
+/// the "start from nothing" row pretended to be a curated choice.
+pub const BUILTIN_PATCH_ROW: &str = "INIT VOICE  (built in)";
 
 /// **The bank the instrument opens on**, by name: `default.syx` on the SYSEX
 /// shelf (`Settings::sysex_root`). What Save bank suggests, and what the
@@ -3979,6 +3997,27 @@ const BANK_MID_W: f32 = 100.0;
 /// fifteen of its thirty-two rows before scrolling.
 const PATCH_DIALOG_W: f32 = 760.0;
 const PATCH_DIALOG_H: f32 = 520.0;
+
+/// A yes/no the picker asks before something that cannot be taken back.
+///
+/// **Asked in the window, not in front of it.** A `Dialog::Confirm` would
+/// replace the picker — one dialog slot — and a question in a second window
+/// is the modal-behind-its-parent class of fault this app has fixed twice.
+/// So it is a line with two buttons under the bank's name, drawn while it
+/// is being asked, and the panes wait beneath it. Keep is rightmost, the
+/// Confirm dialog's own rule: the safest answer is where the eye lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BankQuestion {
+    /// The save panel answered with a bank that is already on the shelf.
+    /// Windows and Linux ask this in the panel; on macOS the panel is ours
+    /// and, for a bank, refuses nothing, so it is asked here. Yes is
+    /// [`DialogAction::ReplaceBank`] for this path.
+    Replace(std::path::PathBuf),
+    /// Clear was pressed: empty every staged slot. Yes is an
+    /// [`DialogAction::UnstagePatches`] naming all of them — thirty-one
+    /// patches of assembly must not go to a slip of the hand.
+    Clear,
+}
 
 /// A drag in flight between the picker's panes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4071,6 +4110,7 @@ impl Dialog {
             staged_selected: None,
             drag: None,
             note: String::new(),
+            question: None,
         }
     }
 }
@@ -7702,6 +7742,7 @@ fn show_on(
             staged_selected,
             drag,
             note,
+            question,
         } => {
             let t = theme(face);
             let slot = *slot;
@@ -7858,6 +7899,97 @@ fn show_on(
                                         .font(bold(PLUGIN_NOTE_PT))
                                         .color(faint),
                                 );
+                            }
+                            // The occupied slots, and the set Remove — or
+                            // Delete — would take: the marks, or the lit
+                            // staged row when nothing is marked. Read once,
+                            // before anything this frame changes them.
+                            let filled: Vec<usize> = staged
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, s)| s.as_ref().map(|_| i))
+                                .collect();
+                            let to_remove: Vec<usize> = if staged_marked.is_empty() {
+                                staged_selected.iter().copied().collect()
+                            } else {
+                                staged_marked.clone()
+                            };
+                            // ── a question, while one is being asked ────────
+                            //
+                            // See `BankQuestion` for why it is a line in here
+                            // and not a dialog in front of here.
+                            if let Some(q) = question.clone() {
+                                let (ask, verb) = match &q {
+                                    BankQuestion::Replace(path) => (
+                                        format!(
+                                            "\u{201c}{}\u{201d} is already on the shelf. Replace it \
+                                             with the staged bank?",
+                                            path.file_name().map_or_else(
+                                                || path.display().to_string(),
+                                                |n| n.to_string_lossy().into_owned(),
+                                            )
+                                        ),
+                                        "Replace",
+                                    ),
+                                    BankQuestion::Clear => (
+                                        format!(
+                                            "Empty all {} staged slots? Nothing on the shelf is \
+                                             touched.",
+                                            filled.len()
+                                        ),
+                                        "Empty",
+                                    ),
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(ask).font(bold(11.0)).color(t.text));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui
+                                            .add(Button::new(
+                                                RichText::new("Keep").font(bold(11.0)).color(t.text),
+                                            ))
+                                            .clicked()
+                                        {
+                                            *question = None;
+                                        }
+                                        if ui
+                                            .add(Button::new(
+                                                RichText::new(verb).font(bold(11.0)).color(t.text),
+                                            ))
+                                            .clicked()
+                                        {
+                                            action = Some(match q {
+                                                BankQuestion::Replace(path) => {
+                                                    DialogAction::ReplaceBank { slot, path }
+                                                }
+                                                BankQuestion::Clear => DialogAction::UnstagePatches {
+                                                    slots: filled.clone(),
+                                                },
+                                            });
+                                            *question = None;
+                                        }
+                                    });
+                                });
+                            }
+                            // **Delete or Backspace empties the lit staged
+                            // slots** — the same set Remove takes. Not while a
+                            // text field has the keys, which the filter does
+                            // on the frame the picker opens and for as long
+                            // as somebody is typing in it: a Backspace meant
+                            // for the filter that emptied a slot would be the
+                            // worst kind of surprise. And never on the opening
+                            // frame, the plugin picker's trap — inline there
+                            // is one event queue, and the keystroke that
+                            // opened the picker is still in it.
+                            let delete = !first_frame
+                                && !ui.ctx().wants_keyboard_input()
+                                && ui.input(|i| {
+                                    i.key_pressed(egui::Key::Delete)
+                                        || i.key_pressed(egui::Key::Backspace)
+                                });
+                            if delete && !to_remove.is_empty() {
+                                action = Some(DialogAction::UnstagePatches {
+                                    slots: to_remove.clone(),
+                                });
                             }
                             ui.add_space(4.0);
                             if !voices.is_empty() {
@@ -8053,11 +8185,6 @@ fn show_on(
                                             });
                                         }
                                         ui.add_space(6.0);
-                                        let to_remove: Vec<usize> = if staged_marked.is_empty() {
-                                            staged_selected.iter().copied().collect()
-                                        } else {
-                                            staged_marked.clone()
-                                        };
                                         if ui
                                             .add_enabled(
                                                 !to_remove.is_empty(),
@@ -8070,8 +8197,25 @@ fn show_on(
                                             .clicked()
                                         {
                                             action = Some(DialogAction::UnstagePatches {
-                                                slots: to_remove,
+                                                slots: to_remove.clone(),
                                             });
+                                        }
+                                        ui.add_space(6.0);
+                                        // Clear asks first — see the question
+                                        // above the panes — and is offered
+                                        // only with something to empty.
+                                        if ui
+                                            .add_enabled(
+                                                !filled.is_empty(),
+                                                Button::new(
+                                                    RichText::new("Clear")
+                                                        .font(bold(11.0))
+                                                        .color(t.text),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            *question = Some(BankQuestion::Clear);
                                         }
                                     },
                                 );
@@ -8249,10 +8393,9 @@ fn show_on(
                                 // Only with something to write: a save panel
                                 // for thirty-two INIT VOICEs is a file nobody
                                 // meant to make.
-                                let filled = staged.iter().filter(|s| s.is_some()).count();
                                 if ui
                                     .add_enabled(
-                                        filled > 0,
+                                        !filled.is_empty(),
                                         Button::new(RichText::new("Save bank...").color(t.text)),
                                     )
                                     .clicked()
@@ -17765,6 +17908,61 @@ at: None,
             let _ = self.frame(Vec::new());
             asked
         }
+
+        /// One key, pressed and released, as a hand would.
+        fn key(&mut self, key: egui::Key) -> Option<DialogAction> {
+            let mut asked = None;
+            for pressed in [true, false] {
+                let events = vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: self.mods,
+                }];
+                if let (Some(a), _) = self.frame(events) {
+                    asked = Some(a);
+                }
+            }
+            let _ = self.frame(Vec::new());
+            asked
+        }
+
+        /// One frame with the given events, and every STROKED rectangle it
+        /// painted with its stroke width — the outline a drop target wears.
+        fn stroked_rects(&mut self, events: Vec<egui::Event>) -> Vec<(Rect, f32)> {
+            self.clock += 0.1;
+            let out = self.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0))),
+                    time: Some(self.clock),
+                    modifiers: self.mods,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = show(ctx, &mut self.dialog, self.face, Self::placement());
+                },
+            );
+            fn walk(shape: &egui::epaint::Shape, rects: &mut Vec<(Rect, f32)>) {
+                match shape {
+                    egui::epaint::Shape::Rect(r) if r.stroke.width > 0.0 => {
+                        rects.push((r.rect, r.stroke.width));
+                    }
+                    egui::epaint::Shape::Vec(v) => {
+                        for s in v {
+                            walk(s, rects);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut rects = Vec::new();
+            for c in &out.shapes {
+                walk(&c.shape, &mut rects);
+            }
+            rects
+        }
     }
 
     // ── the DX7 bank builder ────────────────────────────────────────────
@@ -17794,7 +17992,7 @@ at: None,
         assert_eq!(drag_rows(&[], 4), vec![4]);
         assert_eq!(drag_rows(&[7, 2, 7], 2), vec![2, 7]);
         assert_eq!(drag_rows(&[7, 2], 4), vec![4]);
-        assert_eq!(bank_row(false, 0, "E.PIANO 1"), "  1. E.PIANO 1");
+        assert_eq!(bank_row(false, 0, "INIT VOICE"), "  1. INIT VOICE");
         assert_eq!(bank_row(true, 9, "TUB BELLS"), "*10. TUB BELLS");
     }
 
@@ -17852,12 +18050,12 @@ at: None,
     /// pane is a swap.
     ///
     /// Revert-check performed: never recording the grab (`let _ = grab;` in
-    /// place of `*drag = Some(g)`) reddens the first assertion. And a check
-    /// that did NOT redden, worth knowing: `hovered()` in place of
-    /// `contains_pointer()` still lands the drop, because egui has let go of
-    /// its own drag id by the release frame — so `contains_pointer` is there
-    /// for the highlight on the frames BEFORE, where hover is off for every
-    /// widget but the one in hand.
+    /// place of `*drag = Some(g)`) reddens the first assertion. What this
+    /// cannot catch is `hovered()` in place of `contains_pointer()`: egui has
+    /// let go of its own drag id by the release frame, so the drop lands
+    /// either way. That change is caught by
+    /// `the_slot_under_a_drag_is_outlined_before_the_button_comes_up`, on the
+    /// frames before the release, where the two differ.
     #[test]
     fn dragging_a_row_onto_a_staged_slot_stages_it_there() {
         let mut slot = Slot::new(bank_picker());
@@ -17927,6 +18125,138 @@ at: None,
                 Some(DialogAction::UnstagePatches { ref slots }) if slots == &[4]
             ),
             "Remove did not take the staged row that is playing"
+        );
+    }
+
+    /// **The slot under a drag is outlined before the button comes up.**
+    /// This is what `contains_pointer` is for, and the check the release
+    /// frame cannot make: by the release egui has dropped its own drag id and
+    /// `hovered()` lands the drop just as well — but on the frames BEFORE,
+    /// hover is off for every widget but the one in hand, and a target
+    /// decided by `hovered()` shows nothing until it is too late to aim.
+    ///
+    /// Revert-check performed: `resp.hovered()` in place of
+    /// `resp.contains_pointer()` paints no outline and this reddens.
+    #[test]
+    fn the_slot_under_a_drag_is_outlined_before_the_button_comes_up() {
+        let mut slot = Slot::new(bank_picker());
+        let from = slot.word_at("  3. VOICE 2");
+        let to = slot.word_at("  7. (empty)");
+        let mid = from + (to - from) * 0.5;
+        for events in [
+            vec![egui::Event::PointerMoved(from)],
+            vec![egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerMoved(mid)],
+            vec![egui::Event::PointerMoved(to)],
+        ] {
+            let _ = slot.frame(events);
+        }
+        match &slot.dialog {
+            Some(Dialog::PatchPicker { drag, .. }) => assert!(drag.is_some(), "no drag in flight"),
+            _ => panic!("the picker closed"),
+        }
+        // Standing still over the slot with the button down: the frame that
+        // has to draw the outline.
+        let rects = slot.stroked_rects(vec![egui::Event::PointerMoved(to)]);
+        assert!(
+            rects.iter().any(|(r, w)| r.contains(to) && (*w - 1.5).abs() < 0.01),
+            "no outline on the slot under the pointer; stroked rects: {rects:?}"
+        );
+    }
+
+    /// **Delete and Backspace empty the lit staged slots — but not while the
+    /// filter has the keys.** The picker opens with the filter focused, so
+    /// the first Backspace anybody presses is meant for the filter; a click
+    /// on a staged row takes the focus off it, and Delete then does what
+    /// Remove does, marks first.
+    ///
+    /// Revert-check performed: dropping the `wants_keyboard_input` guard
+    /// reddens the first assertion — the Backspace meant for the filter
+    /// empties the lit slot.
+    #[test]
+    fn delete_empties_the_lit_staged_slot_but_not_while_the_filter_has_the_keys() {
+        let mut slot = Slot::new(bank_picker());
+        if let Some(Dialog::PatchPicker {
+            staged,
+            staged_selected,
+            ..
+        }) = slot.dialog.as_mut()
+        {
+            staged[4] = Some("MINE".to_owned());
+            staged[6] = Some("OTHER".to_owned());
+            // Lit by hand rather than by a click, so the filter keeps the
+            // keys it took on the opening frame.
+            *staged_selected = Some(4);
+        }
+        slot.settle();
+        assert!(
+            slot.key(egui::Key::Backspace).is_none(),
+            "a Backspace meant for the filter emptied a slot"
+        );
+        assert!(matches!(
+            slot.click("  7. OTHER"),
+            Some(DialogAction::ChooseStaged { slot: 1, index: 6 })
+        ));
+        assert!(
+            matches!(
+                slot.key(egui::Key::Delete),
+                Some(DialogAction::UnstagePatches { ref slots }) if slots == &[6]
+            ),
+            "Delete did not empty the lit slot once the filter had let the keys go"
+        );
+        slot.right_click("  5. MINE");
+        assert!(
+            matches!(
+                slot.key(egui::Key::Backspace),
+                Some(DialogAction::UnstagePatches { ref slots }) if slots == &[4]
+            ),
+            "the marks did not win over the lit row"
+        );
+    }
+
+    /// **Clear asks first, in the picker; Empty then takes every staged
+    /// slot; Keep asks nothing.** And the replace question answers with the
+    /// file it was asked about.
+    #[test]
+    fn clear_asks_first_and_empty_then_takes_every_staged_slot() {
+        let mut slot = Slot::new(bank_picker());
+        if let Some(Dialog::PatchPicker { staged, .. }) = slot.dialog.as_mut() {
+            staged[1] = Some("A".to_owned());
+            staged[7] = Some("B".to_owned());
+            staged[30] = Some("C".to_owned());
+        }
+        let ask = "Empty all 3 staged slots? Nothing on the shelf is touched.";
+        assert!(slot.click("Clear").is_none(), "Clear emptied the bank without asking");
+        assert!(slot.says(ask), "the question was not asked");
+        assert!(slot.click("Keep").is_none());
+        assert!(!slot.says(ask), "Keep did not put the question away");
+        assert!(slot.click("Clear").is_none());
+        assert!(
+            matches!(
+                slot.click("Empty"),
+                Some(DialogAction::UnstagePatches { ref slots }) if slots == &[1, 7, 30]
+            ),
+            "Empty did not take every staged slot"
+        );
+
+        let path = std::path::PathBuf::from("/m/SYSEX/default.syx");
+        if let Some(Dialog::PatchPicker { question, .. }) = slot.dialog.as_mut() {
+            *question = Some(BankQuestion::Replace(path.clone()));
+        }
+        assert!(slot.says(
+            "\u{201c}default.syx\u{201d} is already on the shelf. Replace it with the staged bank?"
+        ));
+        assert!(
+            matches!(
+                slot.click("Replace"),
+                Some(DialogAction::ReplaceBank { slot: 1, path: ref p }) if p == &path
+            ),
+            "Replace did not answer with the file it was asked about"
         );
     }
 

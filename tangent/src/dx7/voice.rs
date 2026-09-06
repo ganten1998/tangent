@@ -83,20 +83,35 @@ pub struct Voice {
 }
 
 impl Voice {
-    /// The patch a fresh install plays.
+    /// The tine piano the engine's tests strike — and the sound a fresh
+    /// install made before there was a bank in the binary.
     ///
-    /// **Written here rather than shipped as a cartridge**, and that is a
-    /// licensing decision as much as a size one. The factory ROMs are Yamaha's
-    /// and the banks people trade are their authors'; a patch typed into this
-    /// file is unambiguously the app's to give away, and it is 155 numbers.
+    /// **Test-only now, and renamed.** It was `Voice::default()`, the
+    /// picker's "(built in)" row, under the name E.PIANO 1 — which is the
+    /// name of a Yamaha factory ROM voice. The numbers were never Yamaha's:
+    /// they were typed into this file so that the app would have a sound
+    /// that was unambiguously its own to give away, and they still are. But
+    /// an original patch wearing the factory patch's name is an implied
+    /// claim to BE that patch, so it is TANGENT EP here; and the built-in
+    /// row is the instrument's own INIT VOICE — the owner's call, and the
+    /// honest one, because the row is where a patch is started from and a
+    /// finished piano there pretended to be a curated choice. See
+    /// [`Voice::init`].
+    ///
+    /// The fresh install lost nothing by it. What a fresh install plays is
+    /// the first patch of the bank compiled in — sixteen electric pianos and
+    /// sixteen jazz guitars, `sysex::factory` — and has been since that bank
+    /// existed; this patch was only ever reached by asking for the built-in
+    /// row. What keeps it here is the engine's first-strike pin and the
+    /// fixtures built on its four operators, whose sound must not move.
     ///
     /// A tine electric piano on algorithm 1, which is two carriers each with
     /// one modulator. OP2 at fourteen times the fundamental is the strike and
     /// dies in a fifth of a second; OP4 at the fundamental thickens the body.
     /// The carriers decay to nothing rather than sustaining, because that is
-    /// what a struck instrument does and a synth pad default would be the wrong
-    /// first impression for an app that draws a piano.
-    pub fn electric_piano() -> Self {
+    /// what a struck instrument does.
+    #[cfg(test)]
+    pub(crate) fn electric_piano() -> Self {
         let carrier = |level: u8| Op {
             rate: [99, 62, 21, 68],
             level: [99, 92, 0, 0],
@@ -145,7 +160,41 @@ impl Voice {
                 Op::default(),
                 Op::default(),
             ],
-            name: *b"E.PIANO  1",
+            name: *b"TANGENT EP",
+            ..Self::silent()
+        }
+    }
+
+    /// **The DX7's own starting point**, and what "(built in)" means now.
+    ///
+    /// Algorithm 1 with no feedback; OP1 a sine at the fundamental at full
+    /// level; the other five at rest but READY — the same envelope, the same
+    /// ratio, at output level 0 — so raising one in the editor modulates at
+    /// once, exactly as on the instrument. Envelopes at 99/99/99/0 with every
+    /// rate at 99: full while the key is down, gone the moment it is up. The
+    /// LFO runs at its factory speed and moves nothing until asked. This is
+    /// what the instrument's own INIT VOICE gives you, what a cartridge holds
+    /// where nothing was stored, and therefore what an empty staged slot is
+    /// written as.
+    ///
+    /// A sound — a sine is a sound — but not a first impression: nothing
+    /// plays this unless somebody asks for it. See [`Voice::default`].
+    pub fn init() -> Self {
+        let op = |output_level: u8| Op {
+            rate: [99; 4],
+            level: [99, 99, 99, 0],
+            output_level,
+            coarse: 1,
+            fine: 0,
+            detune: 7,
+            break_point: 39,
+            ..Op::default()
+        };
+        Self {
+            ops: [op(99), op(0), op(0), op(0), op(0), op(0)],
+            // The instrument's own setting for how far the LFO may reach the
+            // pitch; with the depth at zero it reaches nothing until asked.
+            pitch_mod_sens: 3,
             ..Self::silent()
         }
     }
@@ -174,11 +223,19 @@ impl Voice {
 }
 
 impl Default for Voice {
-    /// **A sound, not silence.** A default of all zeros is a patch that plays
-    /// nothing, which is what a fresh install did before there was a patch to
-    /// give it.
+    /// **The INIT VOICE** — a sound, a sine, and not silence: a default of
+    /// all zeros is a patch that plays nothing, which is what a fresh install
+    /// did before there was a patch to give it.
+    ///
+    /// This is NOT what a fresh install plays. It is what the picker's
+    /// "(built in)" row plays, what a short cartridge is padded with, what an
+    /// empty staged slot is written as, and what a lane sounds like in the
+    /// frames before its strip's own patch lands. The fresh install plays the
+    /// first patch of the bank compiled in — `sysex::factory` — and the tine
+    /// piano that used to sit here is the engine's test fixture now; see
+    /// [`Voice::electric_piano`] for why it moved, and why it lost its name.
     fn default() -> Self {
-        Self::electric_piano()
+        Self::init()
     }
 }
 
@@ -434,6 +491,43 @@ mod tests {
                 "the packed patch did not read back as itself"
             );
         }
+    }
+
+    /// **The built-in patch is the instrument's own starting point, and no
+    /// voice this file writes wears a factory ROM's name.** Two decisions,
+    /// one test: the shape of INIT VOICE as the DX7 defines it — OP1 alone
+    /// at full level, every operator ready at the fundamental, envelopes
+    /// full-while-held — and the name of the tine piano, which was E.PIANO 1
+    /// and is an original patch that must not claim to be Yamaha's.
+    ///
+    /// Revert-check performed: `E.PIANO  1` back in `electric_piano` reddens
+    /// the source scan; OP2 at output level 99 reddens the shape.
+    #[test]
+    fn the_default_is_init_voice_and_nothing_here_is_called_e_piano_1() {
+        let v = Voice::default();
+        assert_eq!(v, Voice::init());
+        assert_eq!(v.display_name(), "INIT VOICE");
+        assert_eq!(v.algorithm, 0, "INIT VOICE is algorithm 1");
+        assert_eq!(v.feedback, 0);
+        assert_eq!(v.ops[0].output_level, 99, "OP1 is the one operator heard");
+        for (i, op) in v.ops.iter().enumerate() {
+            assert_eq!(op.rate, [99; 4], "OP{} rates", i + 1);
+            assert_eq!(op.level, [99, 99, 99, 0], "OP{} levels", i + 1);
+            assert_eq!((op.coarse, op.fine, op.detune), (1, 0, 7), "OP{} at the fundamental", i + 1);
+            assert!(!op.fixed);
+            if i > 0 {
+                assert_eq!(op.output_level, 0, "OP{} is at rest", i + 1);
+            }
+        }
+        assert_eq!((v.lfo_pitch_depth, v.lfo_amp_depth), (0, 0), "the LFO moves nothing");
+        assert_eq!(v.transpose, 24);
+
+        assert_eq!(Voice::electric_piano().display_name(), "TANGENT EP");
+        let src = include_str!("voice.rs");
+        assert!(
+            !src.contains("b\"E.PIANO"),
+            "a voice written in this file is called after a Yamaha factory ROM voice"
+        );
     }
 
     /// A name is ten bytes of printable ASCII, whatever it is set from.

@@ -678,6 +678,11 @@ pub struct DesktopApp {
     /// records it here so the second Save is an overwrite too.
     #[cfg(feature = "recorder")]
     editing_slot: Option<usize>,
+    /// The edit in flight has been changed since it was opened or last
+    /// saved. What `park_edit` reads to tell an edit worth keeping from a
+    /// patch somebody merely looked at.
+    #[cfg(feature = "recorder")]
+    edit_dirty: bool,
     /// The bank being built in the picker's right pane. Session-long and
     /// shared by every strip, because it is a bank and not a lane's state;
     /// the UI holds its names, this holds its voices. See `dx7::staging`.
@@ -4398,24 +4403,24 @@ impl DesktopApp {
                 }
                 R::EditPatch { slot } => {
                     // Whatever THAT strip is playing, which is what somebody
-                    // means by "edit this patch". An edit in flight belongs
-                    // to the strip it was opened on; opening the editor on a
-                    // different strip starts from that strip's own sound.
-                    // (And choosing a patch lets the edit go — see
-                    // `ChoosePatch` — so "Patches..., pick, Patch..." opens
-                    // on the pick and not on the edit it interrupted.)
+                    // means by "edit this patch". An edit still open on this
+                    // strip is resumed — "Patches..." and straight back is
+                    // the same edit — and one on another strip is PARKED
+                    // first, which is never a drop: see `park_edit`. (A
+                    // choice in between parks too, so "Patches..., pick,
+                    // Patch..." opens on the pick.)
                     if self.editing_strip != slot {
-                        self.editing = None;
-                        self.editing_slot = None;
+                        self.park_edit();
                     }
                     self.editing_strip = slot;
                     let v = match self.editing {
                         Some(v) => v,
                         None => {
-                            // A fresh edit: its first Save finds a slot of
-                            // its own rather than the one a previous edit
-                            // landed in.
+                            // A fresh edit: clean, and its first Save finds
+                            // a slot of its own rather than the one a
+                            // previous edit landed in.
                             self.editing_slot = None;
+                            self.edit_dirty = false;
                             self.voice_for_strip(slot)
                         }
                     };
@@ -4429,6 +4434,7 @@ impl DesktopApp {
                 } => {
                     if let Some(v) = self.editing.as_mut() {
                         crate::dx7::edit::apply(v, group, index, value);
+                        self.edit_dirty = true;
                         let v = *v;
                         let strip = self.editing_strip;
                         // **Heard as it is turned.** An editor that only
@@ -4442,6 +4448,7 @@ impl DesktopApp {
                 R::SetPatchName(name) => {
                     if let Some(v) = self.editing.as_mut() {
                         v.set_name(&name);
+                        self.edit_dirty = true;
                         self.push_patch_edit(None);
                     }
                 }
@@ -4455,13 +4462,12 @@ impl DesktopApp {
                     // same strip however many patches had been picked since,
                     // which made "modify selected sounds" — the owner's
                     // words — impossible for any sound but the first: pick,
-                    // press Patch..., and the last edit came up instead. The
-                    // editor was closed to get here; a hand that picks a new
-                    // sound has said what it wants next, and an edit worth
-                    // keeping is one press away in the staged bank.
+                    // press Patch..., and the last edit came up instead. So
+                    // the edit is PARKED here — into the staged bank if it
+                    // was touched, let go if it was not, and in either case
+                    // never dropped in silence; see `park_edit`.
                     if self.editing_strip == slot {
-                        self.editing = None;
-                        self.editing_slot = None;
+                        self.park_edit();
                     }
                     // `usize::MAX` is the built-in row. Anything else indexes
                     // the STRIP's own cartridge, and a stale index from a
@@ -4521,11 +4527,10 @@ impl DesktopApp {
                     // Auditioning, exactly as `ChoosePatch`: the sound
                     // changes now and nothing is written down, because a
                     // staged patch is in no file yet. And, as there, the
-                    // edit in flight on this strip is let go of — what the
+                    // edit in flight on this strip is parked — what the
                     // hand just picked is what "Patch..." means next.
                     if self.editing_strip == slot {
-                        self.editing = None;
-                        self.editing_slot = None;
+                        self.park_edit();
                     }
                     if let (Some(v), Some(e)) = (
                         self.staging.get(index).copied(),
@@ -4535,27 +4540,31 @@ impl DesktopApp {
                     }
                 }
                 R::EditStaged { slot, index } => {
-                    // From the right pane: the editor starts on THAT slot's
-                    // voice, never on an edit in flight, and remembers the
-                    // slot so its Save goes back into it.
-                    if let Some(v) = self.staging.get(index).copied() {
-                        self.editing_strip = slot;
-                        self.editing = Some(v);
-                        self.editing_slot = Some(index);
+                    // From the right pane. The edit already open on this
+                    // very slot is resumed; any other is parked first. Then
+                    // the editor starts on the slot's own voice and remembers
+                    // the slot, so its Save goes back into it.
+                    let resume = self.editing.is_some()
+                        && self.editing_strip == slot
+                        && self.editing_slot == Some(index);
+                    if resume {
                         self.push_patch_edit(None);
+                    } else {
+                        self.park_edit();
+                        if let Some(v) = self.staging.get(index).copied() {
+                            self.editing_strip = slot;
+                            self.editing = Some(v);
+                            self.editing_slot = Some(index);
+                            self.edit_dirty = false;
+                            self.push_patch_edit(None);
+                        }
                     }
                 }
                 R::SaveBank { strip, path } => {
-                    // A bare name gets the extension here: on macOS the
-                    // panel is an open panel with a name field
-                    // (`macwin::save_panel`) and refuses nothing for this
-                    // purpose, so "default" typed by hand has to become
-                    // `default.syx` somewhere, and this is the one place
-                    // that knows what is being written.
-                    let mut path = path;
-                    if path.extension().is_none() {
-                        path.set_extension("syx");
-                    }
+                    // A bare name gets the extension — the same rule the
+                    // save panel applied before asking whether the file was
+                    // there, so the file asked about is the file written.
+                    let path = crate::dx7::staging::bank_file(path);
                     let stem = path.file_stem().map_or_else(
                         || "bank".to_owned(),
                         |s| s.to_string_lossy().into_owned(),
@@ -5742,9 +5751,79 @@ impl DesktopApp {
         self.app.set_patch_edit(edit, note);
     }
 
-    /// The staged bank's names, to the picker's right pane.
+    /// The staged bank's names, to the picker's right pane — and the bank
+    /// itself to disk.
+    ///
+    /// **Written on every change, here, because this is the one road every
+    /// change takes.** A drop, a Stage, a Remove, a Save from the editor, a
+    /// parked edit: each ends in this call, so a bank that reached the pane
+    /// has reached the disk, and a quit — or a crash, or a kill — between
+    /// two changes loses nothing. Under the config directory beside the
+    /// settings, never IN them: a settings file is a list of choices, and
+    /// four kilobytes of voice data in it would be the one line nobody
+    /// could read. A write that fails is logged and the session goes on;
+    /// the pane is right either way.
     fn push_staged(&mut self) {
         self.app.set_staged_bank(self.staging.names());
+        if let Err(e) = self.staging.save_to(&tangent_core::config::dir()) {
+            log::warn!("dx7: the staged bank was not written down: {e}");
+        }
+    }
+
+    /// The staged bank from last session, if one was written down.
+    ///
+    /// Into the host's own copy and the picker's mirror both, at launch,
+    /// before any picker has opened; nothing is written back here, so a
+    /// launch that reads a bank is not a launch that rewrites it.
+    fn restore_staged_bank(&mut self) {
+        if let Some(staged) = crate::dx7::staging::Staging::restore_from(&tangent_core::config::dir()) {
+            log::info!("dx7: the staged bank came back with {} patches in it", staged.count());
+            self.staging = staged;
+            self.app.set_staged_bank(self.staging.names());
+        }
+    }
+
+    /// The SYSEX shelf, made, with the old `my-patches.syx` copied onto it
+    /// once. See `dx7::staging::prepare_shelf` for both halves of why.
+    fn prepare_sysex_shelf(&self) {
+        let old = tangent_core::config::file(crate::dx7::staging::OLD_USER_BANK);
+        match crate::dx7::staging::prepare_shelf(&self.app.sysex_root(), &old) {
+            Ok(Some(dst)) => log::info!(
+                "dx7: {} copied onto the SYSEX shelf as {}, where Load bank can reach it",
+                old.display(),
+                dst.display()
+            ),
+            Ok(None) => {}
+            Err(e) => log::warn!("dx7: the SYSEX shelf could not be prepared: {e}"),
+        }
+    }
+
+    /// **An unsaved edit is never lost.** Called on every road away from an
+    /// edit in flight — a patch chosen, a staged row chosen, the editor
+    /// opened on another strip or another slot. What happens to it is
+    /// `dx7::staging::park_edit`'s decision, spelled out there; this applies
+    /// it: an edit that went somewhere is closed, one that could not go
+    /// anywhere stays open and dirty, and the picker is told either way it
+    /// had something to say. The one thing this is not is `self.editing =
+    /// None` written bare, which is the drop the first cut did in silence.
+    fn park_edit(&mut self) {
+        let parked = crate::dx7::staging::park_edit(
+            &mut self.staging,
+            self.editing,
+            self.edit_dirty,
+            self.editing_slot,
+        );
+        if !parked.kept_open {
+            self.editing = None;
+            self.editing_slot = None;
+            self.edit_dirty = false;
+        }
+        if let Some(note) = parked.note {
+            self.app.set_bank_note(note);
+        }
+        if parked.changed {
+            self.push_staged();
+        }
     }
 
     /// Write the patch being edited into the STAGED bank, and say where.
@@ -5773,6 +5852,7 @@ impl DesktopApp {
         };
         self.staging.set(slot, v);
         self.editing_slot = Some(slot);
+        self.edit_dirty = false;
         self.push_staged();
         format!(
             "Put \"{}\" in staged slot {}. Save bank writes it out.",
@@ -6089,6 +6169,23 @@ impl DesktopApp {
         if request.purpose == tangent_ui::ports::SavePurpose::ProjectFirst {
             self.announce(ctx, "Saving project", name, Chore::SaveFirst(file));
             return;
+        }
+        // **A bank about to be written over is asked about first.** On
+        // Windows and Linux the panel is rfd's own and asks "Replace?"
+        // itself, once, so nothing is asked again here. On macOS the panel
+        // is ours (`macwin::save_panel`) and, for a bank, refuses nothing —
+        // `save_taken` says why re-saving `default.syx` has to be possible —
+        // so the question goes to the picker, where it is drawn as a line
+        // with two buttons rather than as a dialog in front of the dialog,
+        // and the answer comes back as `DialogAction::ReplaceBank`. The
+        // file asked about is the file `SaveBank` would write: same
+        // extension rule, `bank_file`, applied here first.
+        if request.purpose == tangent_ui::ports::SavePurpose::Bank && cfg!(target_os = "macos") {
+            let target = crate::dx7::staging::bank_file(file.clone());
+            if target.exists() {
+                self.app.ask_bank_replace(target);
+                return;
+            }
         }
         self.app.finish_save_choice(request.purpose, &file);
     }
@@ -14209,6 +14306,8 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             editing_slot: None,
             #[cfg(feature = "recorder")]
+            edit_dirty: false,
+            #[cfg(feature = "recorder")]
             staging: crate::dx7::staging::Staging::new(),
             #[cfg(feature = "recorder")]
             refullscreen: false,
@@ -14248,8 +14347,17 @@ impl DesktopApp {
         // reorganised, and an error dialog at launch about a file somebody
         // loaded weeks ago is a worse outcome than quietly playing the built-in
         // patch, which is what a fresh install plays anyway.
+        // The SYSEX shelf first, because the cartridge load right after it
+        // looks there for `default.syx`, and so that the folder the manual
+        // points people at exists before they have pressed anything.
+        #[cfg(feature = "recorder")]
+        me.prepare_sysex_shelf();
         #[cfg(feature = "recorder")]
         me.load_cartridge_at_launch();
+        // And the staged bank from last time — thirty-two patches of
+        // assembly are not something a quit gets to throw away.
+        #[cfg(feature = "recorder")]
+        me.restore_staged_bank();
         #[cfg(feature = "recorder")]
         me.open_project_at_launch();
         // The one-launch sidecar shuffle, BEFORE any engine exists to load a
@@ -20769,6 +20877,99 @@ mod tests {
             setting < names,
             "the load road tells the picker before the setting, the fault \
              the save road is pinned against"
+        );
+    }
+
+    /// **Every road away from an edit in flight goes through `park_edit`**,
+    /// and nothing else lets an edit go. The first cut wrote `self.editing =
+    /// None` in two request arms and dropped an unsaved edit in silence; the
+    /// owner's rule is that an unsaved edit never vanishes without the user
+    /// being told, and the rule is only as good as the number of places that
+    /// can break it — so that number is pinned at one.
+    ///
+    /// Revert-check performed: a bare `self.editing = None;` back in the
+    /// `ChoosePatch` arm reddens the count; removing the `park_edit()` call
+    /// from `ChooseStaged` reddens the loop.
+    #[test]
+    fn every_road_away_from_an_edit_parks_it_and_only_park_edit_lets_one_go() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        for arm in [
+            "R::ChoosePatch { slot, index } =>",
+            "R::ChooseStaged { slot, index } =>",
+            "R::EditPatch { slot } =>",
+            "R::EditStaged { slot, index } =>",
+        ] {
+            let a = src.find(arm).unwrap_or_else(|| panic!("`{arm}` is gone"));
+            let b = src[a..].find("\n                R::").expect("the next arm");
+            assert!(
+                src[a..a + b].contains("self.park_edit()"),
+                "`{arm}` no longer parks the edit in flight, so an unsaved edit \
+                 can vanish on that road"
+            );
+        }
+        assert_eq!(
+            src.matches("self.editing = None;").count(),
+            1,
+            "an edit is let go somewhere other than `park_edit`, which is the \
+             one place that knows whether it was worth keeping"
+        );
+        let a = src.find("fn park_edit(&mut self)").expect("`park_edit` is gone");
+        assert!(
+            src[a..a + 1200].contains("self.editing = None;"),
+            "the one place that lets an edit go is not `park_edit`"
+        );
+    }
+
+    /// **The staged bank reaches the disk on every change, comes back at
+    /// launch, the shelf is made at launch, and a bank about to be written
+    /// over is asked about.** Four wirings, each a thing the owner reported
+    /// or ruled on, each invisible to a test that builds no `DesktopApp`.
+    ///
+    /// Revert-check performed: `push_staged` without its `save_to` reddens
+    /// the first assertion; the launch without `restore_staged_bank()` the
+    /// second.
+    #[test]
+    fn the_staged_bank_is_written_on_every_change_and_the_shelf_and_the_question_are_wired() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("mod tests {").expect("this module")];
+        let body = |start: &str| {
+            let a = src.find(start).unwrap_or_else(|| panic!("`{start}` is gone"));
+            let b = src[a..].find("\n    /// ").unwrap_or_else(|| panic!("the end of `{start}`"));
+            &src[a..a + b]
+        };
+        assert!(
+            body("fn push_staged(&mut self)").contains(".save_to(&tangent_core::config::dir())"),
+            "the staged bank no longer reaches the disk when it changes"
+        );
+        // `new` is long, carries doc comments of its own inside it, and is
+        // not the first `pub fn new(` in the file — so the three launch
+        // lines are found by their own text, and "inside `new`" means
+        // between the last `pub fn new(` before the cartridge load and the
+        // first four-space brace after it.
+        let cart = src
+            .find("me.load_cartridge_at_launch();")
+            .expect("the cartridge is no longer loaded at launch");
+        let born = src[..cart].rfind("pub fn new(").expect("`new` is gone");
+        let buried = cart + src[cart..].find("\n    }\n").expect("the end of `new`");
+        let line = |what: &str| {
+            let at = src.find(what).unwrap_or_else(|| panic!("`{what}` is gone from the host"));
+            assert!(born < at && at < buried, "`{what}` is not called from `new`");
+            at
+        };
+        let shelf = line("me.prepare_sysex_shelf();");
+        let staged = line("me.restore_staged_bank();");
+        assert!(shelf < cart, "the shelf is made after the cartridge load looks on it");
+        assert!(cart < staged, "the staged bank is restored before the default bank is read");
+        let panel = body("fn take_save_panel(");
+        assert!(
+            panel.contains("self.app.ask_bank_replace(target)"),
+            "a bank about to be written over is no longer asked about on macOS"
+        );
+        assert!(
+            body("fn save_taken(").contains("P::Bank => Taken::Never"),
+            "the macOS panel refuses a taken bank name again, so default.syx \
+             cannot be re-saved"
         );
     }
 
