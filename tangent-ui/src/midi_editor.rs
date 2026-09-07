@@ -9,7 +9,7 @@
 
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
-use crate::arrangement::ArrNote;
+use crate::arrangement::{ArrNote, ArrPedal};
 use crate::mixer_panel::STRIP_COLORS;
 
 /// The top strip's height: title, the grid tools, the ×.
@@ -97,6 +97,20 @@ pub struct MidiEditView<'a> {
     pub loop_s: f64,
     pub offset_s: f64,
     pub notes: &'a [ArrNote],
+    /// **The clip's pedal**, sorted by `at_s` and in the same source seconds
+    /// the notes speak. Drawn in the bottom lane when [`Self::pedal_lane`] is
+    /// on, and never anywhere else — a pedal is not a note and does not
+    /// belong on the roll.
+    pub pedal: &'a [ArrPedal],
+    /// **Which curve the bottom lane holds**: the pedal, or velocity.
+    ///
+    /// One lane rather than two. The editor is a tool strip, a ruler, the
+    /// roll and a lane, and every row added to that stack is height the roll
+    /// loses — the argument that put the navigator in the strip's unused
+    /// middle rather than on a row of its own. Both of these are a curve
+    /// under the notes, and neither is wanted at the same instant as the
+    /// other.
+    pub pedal_lane: bool,
     /// The SELECTED notes, sorted indices — the editor works on sets now.
     pub selected: &'a [usize],
     /// A marquee in flight, in screen space, drawn as a dashed box.
@@ -171,6 +185,8 @@ pub enum Hit {
     ToolTriplet,
     /// The pencil: draw mode on or off.
     ToolDraw,
+    /// **The PED chip**: swap the bottom lane between velocity and the pedal.
+    ToolPedal,
     /// A note's body — select and move. The index into the clip's notes.
     NoteBody(usize),
     /// A note's right edge — resize the tail.
@@ -185,6 +201,13 @@ pub enum Hit {
     Ruler(f64),
     /// The velocity lane at `absolute seconds` — the app finds the note.
     Vel(f64),
+    /// **The PEDAL lane**, at `(absolute seconds, value 0..=127)`.
+    ///
+    /// The value comes from the height of the press, which is what lets one
+    /// gesture do both jobs: a drag along the top paints the damper down,
+    /// and a drag along the BOTTOM paints it up, because a level of zero is
+    /// a pedal that is not pressed. There is no separate erase to find.
+    Pedal(f64, u8),
     /// **The strip's navigator, by its parts** — the band's overview strip
     /// brought to the roll, scaled to the clip. The lit WINDOW is the part
     /// of the clip the roll is showing: drag it to pan. The window's two
@@ -216,6 +239,8 @@ pub struct Layout {
     pub tool_triplet: Rect,
     /// **DRAW MODE's switch**: the pencil. See `MidiEditView::draw_mode`.
     pub tool_draw: Rect,
+    /// **The lane's switch**: PED. See `MidiEditView::pedal_lane`.
+    pub tool_pedal: Rect,
     /// **The navigator**: the whole clip in miniature, in the strip's room
     /// between the clip's name and the pencil. `NOTHING` when the strip has
     /// no room for one worth having — see [`NAV_MIN_W`].
@@ -238,6 +263,7 @@ impl Layout {
                 tool_grid: Rect::NOTHING,
                 tool_swing: Rect::NOTHING,
                 tool_draw: Rect::NOTHING,
+                tool_pedal: Rect::NOTHING,
                 tool_triplet: Rect::NOTHING,
                 tool_nav: Rect::NOTHING,
                 keys: Rect::NOTHING,
@@ -268,6 +294,11 @@ impl Layout {
         // this strip is read against, so it sits at the end of the row where
         // the eye finishes rather than in among the grid chips.
         let tool_draw = cell(side * 1.3);
+        // **PED, at the pencil's shoulder.** The two of them are the strip's
+        // MODE switches — one says what a press writes, the other says what
+        // the lane holds — so they sit together at the end of the row rather
+        // than in among the grid chips, which are all settings of one thing.
+        let tool_pedal = cell(side * 1.6);
         // **The NAVIGATOR, in the strip's own room.** The editor is already
         // a tool strip, a ruler, the roll and a velocity lane, and every row
         // added to that stack is height the roll loses — so the miniature
@@ -284,7 +315,7 @@ impl Layout {
         // the navigator takes its share of the strip out of what is left,
         // and under `NAV_MIN_W` it is not laid out at all: a box that
         // narrow is a line, and a hand cannot find a window on a line.
-        let nav_right = tool_draw.left() - pad * 2.0;
+        let nav_right = tool_pedal.left() - pad * 2.0;
         let nav_left_limit = strip.left() + NAME_X + NAV_NAME_RESERVE + pad;
         let nav_w = (nav_right - nav_left_limit)
             .min((strip.width() * NAV_SHARE).clamp(NAV_MIN_W, NAV_MAX_W));
@@ -323,6 +354,7 @@ impl Layout {
             tool_grid,
             tool_swing,
             tool_draw,
+            tool_pedal,
             tool_triplet,
             tool_nav,
             keys,
@@ -341,6 +373,35 @@ pub fn time_at(l: &Layout, view: &MidiEditView<'_>, x: f32) -> f64 {
 pub fn x_of(l: &Layout, view: &MidiEditView<'_>, t: f64) -> f32 {
     let f = (t - view.view_start_s) / view.view_len_s.max(1.0e-9);
     l.roll.left() + l.roll.width() * f as f32
+}
+
+/// **The pedal value a press at `y` means**: the lane's floor is 0 and its
+/// ceiling is 127.
+///
+/// Its own function because the painter and the hit test have to agree
+/// exactly — a shelf drawn at a height the hand cannot put it back at is a
+/// control that lies — and because the app reads it again while a drag is in
+/// flight, from outside this module.
+pub fn pedal_value_at(l: &Layout, y: f32) -> u8 {
+    let h = l.vel.height().max(1.0);
+    // **The rails, and they are not a nicety.** Fully down and fully up are
+    // the two values anybody actually wants from this lane — a pedal is
+    // mostly a switch and the sweep between is the rare case — and a strict
+    // pixel mapping makes those two the HARDEST to hit: the lane is sixty
+    // points for a hundred and twenty-eight values, so the top pixel reads
+    // 125 and only a hand exactly on the boundary reads 127. A press within
+    // a couple of points of either end means the end.
+    const RAIL: f32 = 2.5;
+    if y <= l.vel.top() + RAIL {
+        return 127;
+    }
+    if y >= l.vel.bottom() - RAIL {
+        return 0;
+    }
+    // Rounded and not truncated, so the value under the hand is the nearest
+    // one rather than the one below it — half a step of bias over the whole
+    // lane, which on a shelf drawn at that height is visible.
+    (((l.vel.bottom() - y) / h) * 127.0).round().clamp(0.0, 127.0) as u8
 }
 
 /// The key row height in points, for a roll showing `keys_shown` keys.
@@ -853,7 +914,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         let wall = if l.tool_nav.is_positive() {
             l.tool_nav.left()
         } else {
-            l.tool_draw.left()
+            l.tool_pedal.left()
         };
         let room = wall - 6.0 - (l.strip.left() + NAME_X);
         let name = crate::arrangement_panel::cut_to(painter, room.max(0.0), view.name, &name_font);
@@ -914,6 +975,11 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             Stroke::new(w * 0.5, c),
         );
     }
+    // **PED: what the bottom lane holds.** A word and not a glyph, like
+    // SNAP beside it — the strip is text-first, and a damper pedal has no
+    // icon anybody reads at sixteen points. Lit means the lane is showing
+    // the pedal; dark means velocity, which is how it ships.
+    chip(painter, l.tool_pedal, "PED", view.pedal_lane);
     chip(painter, l.tool_swing, "SWG", view.swing);
     chip(painter, l.tool_triplet, "TRP", view.triplet);
     // The magnet, as a word — the strip is text-first, and a lit chip
@@ -1307,8 +1373,132 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         }
     }
 
+    // ── the PEDAL lane, when the strip's PED chip is lit ────────────────
+    //
+    // **A step, not a curve.** The pedal is a controller that HOLDS its
+    // value: it stands where it was last put until something moves it, so
+    // between two edges the right picture is a flat shelf and a vertical
+    // riser, never a slope. A line drawn point-to-point would say the damper
+    // is easing off through a bar it is in fact holding flat — a picture of
+    // an interpolation nothing performs.
+    //
+    // Filled down to the floor rather than drawn as a bare line, because
+    // what a player wants from this lane at a glance is WHERE THE PEDAL IS
+    // DOWN, and a filled span answers that from across the room while a
+    // 2-point line has to be read.
+    if l.vel.is_positive() && view.pedal_lane {
+        painter.rect_filled(l.vel, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 70));
+        let vel_loud = Color32::from_rgb(view.vel_loud.0, view.vel_loud.1, view.vel_loud.2);
+        let vel_quiet =
+            Color32::from_rgb(view.vel_quiet.0, view.vel_quiet.1, view.vel_quiet.2);
+        // **The value's own colour, through the velocity lane's gradient.**
+        //
+        // Not `vel_loud` raw, and for two reasons. The colour then CARRIES
+        // the reading — a half-pedal is a different colour from a full one,
+        // which is a second telling of the half-pedalling this lane exists
+        // to keep — and `velocity_hue` is where the contrast guard already
+        // lives, so a theme whose hot end sits almost on the ground gets
+        // pushed off it instead of drawing a shelf nobody can see. A second
+        // colour path written here is how this file grows an eighth instance
+        // of the ink bug.
+        let hue = |v: u8| velocity_hue(vel_loud, vel_quiet, face, v);
+        let y_of_v = |v: u8| l.vel.bottom() - l.vel.height() * (f32::from(v.min(127)) / 127.0);
+        // **The clip's own span, which is as far as this lane's marks may
+        // go.** Past the clip's end the timeline releases the pedal whether
+        // or not anybody wrote a lift — see the engine's `clip_pedal_level`
+        // — so a shelf drawn to the lane's edge would be a picture
+        // disagreeing with the sound.
+        let cx0 = x_of(&l, view, view.clip_start_s).max(l.vel.left());
+        let cx1 = x_of(&l, view, view.clip_start_s + view.clip_len_s).min(l.vel.right());
+        // **The damper itself.** One walk, closing each shelf as the next
+        // edge opens — and the last shelf runs to the lane's right edge,
+        // because a pedal with no lift after it is held to the end of what
+        // is being shown. The clip releases it at its own end; that is the
+        // timeline's business and not a mark this lane can honestly draw.
+        let mut standing = 0_u8;
+        let mut last_x = cx0;
+        let shelf = |painter: &Painter, from: f32, to: f32, v: u8| {
+            let (a, b) = (from.max(cx0), to.min(cx1));
+            if v == 0 || b <= a {
+                return;
+            }
+            let r = Rect::from_min_max(Pos2::new(a, y_of_v(v)), Pos2::new(b, l.vel.bottom()));
+            if r.is_positive() {
+                painter.rect_filled(r, 0.0, hue(v).gamma_multiply(0.30));
+                // The shelf's own top line, at full strength: the fill says
+                // "held" and this says "held at THIS much", which is the
+                // half-pedalling the value exists to keep.
+                painter.line_segment(
+                    [Pos2::new(r.left(), r.top()), Pos2::new(r.right(), r.top())],
+                    Stroke::new(1.6, hue(v)),
+                );
+            }
+        };
+        for e in view.pedal.iter().filter(|e| e.cc == 64) {
+            let x = x_of(&l, view, view.clip_start_s + (e.at_s - view.offset_s));
+            shelf(painter, last_x, x, standing);
+            // The RISER: the vertical the step turns on. Drawn between the
+            // two levels rather than from the floor, so a sweep from 40 to
+            // 127 reads as one move and not as two separate presses.
+            // In the colour of whichever end is HIGHER, because that is the
+            // one the eye is following up or down.
+            if x > cx0 && x < cx1 && (standing > 0 || e.value > 0) {
+                painter.line_segment(
+                    [Pos2::new(x, y_of_v(standing)), Pos2::new(x, y_of_v(e.value))],
+                    Stroke::new(1.6, hue(standing.max(e.value))),
+                );
+            }
+            standing = e.value;
+            last_x = x;
+        }
+        shelf(painter, last_x, cx1, standing);
+
+        // **Sostenuto and soft, AFTER the damper and on top of it.**
+        //
+        // They ride along as thin marks because a part that uses them
+        // should not look like a part that does not — but they are not
+        // what the hand is drawing here, so they are two lines and not
+        // two more shelves.
+        //
+        // Drawn LAST, which is not tidiness: a damper held at 127 fills
+        // the lane to its own ceiling, and a rail two points below that
+        // ceiling was painted over by exactly the passages where a
+        // pianist is most likely to be using both feet.
+        for cc in [66_u8, 67] {
+            let y = if cc == 66 { l.vel.top() + 2.0 } else { l.vel.top() + 5.0 };
+            let rail = |painter: &Painter, from: f32, to: f32, v: u8| {
+                let (a, b) = (from.max(cx0), to.min(cx1));
+                if v == 0 || b <= a {
+                    return;
+                }
+                painter.line_segment(
+                    [Pos2::new(a, y), Pos2::new(b, y)],
+                    Stroke::new(1.5, ink.gamma_multiply(0.45)),
+                );
+            };
+            let mut standing = 0_u8;
+            let mut last_x = cx0;
+            for e in view.pedal.iter().filter(|e| e.cc == cc) {
+                let x = x_of(&l, view, view.clip_start_s + (e.at_s - view.offset_s));
+                rail(painter, last_x, x, standing);
+                standing = e.value;
+                last_x = x;
+            }
+            rail(painter, last_x, cx1, standing);
+        }
+        // A floor line, so an empty lane still reads as a lane rather than
+        // as a gap under the roll.
+        painter.line_segment(
+            [
+                Pos2::new(l.vel.left(), l.vel.bottom() - 0.5),
+                Pos2::new(l.vel.right(), l.vel.bottom() - 0.5),
+            ],
+            Stroke::new(1.0, ink.gamma_multiply(0.25)),
+        );
+    }
+
     // ── the velocity lane: one bar per note, selected ones lit ──────────
-    if l.vel.is_positive() {
+    if l.vel.is_positive() && !view.pedal_lane {
         painter.rect_filled(l.vel, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 70));
         let vel_loud = Color32::from_rgb(view.vel_loud.0, view.vel_loud.1, view.vel_loud.2);
         let vel_quiet =
@@ -1538,6 +1728,7 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
         (l.tool_swing, Hit::ToolSwing),
         (l.tool_triplet, Hit::ToolTriplet),
         (l.tool_draw, Hit::ToolDraw),
+        (l.tool_pedal, Hit::ToolPedal),
     ] {
         if r.is_positive() && r.contains(pos) {
             return Some(hit);
@@ -1592,6 +1783,25 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
             return Some(Hit::LoopBar);
         }
         return Some(Hit::Ruler(time_at(&l, view, pos.x)));
+    }
+    if l.vel.is_positive() && l.vel.contains(pos) && view.pedal_lane {
+        // **The pedal lane answers over its whole face, pen up or down.**
+        //
+        // The velocity lane below cannot, and the reason it cannot does not
+        // apply here: there, a press has to find ONE NOTE among the bars, so
+        // a lane that swallowed every press would be a lane you cannot click
+        // past. The pedal is not a set of objects to aim at — it is one
+        // continuous line across the whole clip, and there is nothing behind
+        // it to click past to.
+        //
+        // The HEIGHT of the press is the value, which is what lets one
+        // gesture do both jobs: along the top it paints the damper down,
+        // along the bottom it paints it up, because zero is a pedal nobody
+        // is pressing. There is no separate erase tool to go and find.
+        return Some(Hit::Pedal(
+            time_at(&l, view, pos.x),
+            pedal_value_at(&l, pos.y),
+        ));
     }
     if l.vel.is_positive() && l.vel.contains(pos) {
         // **With the pen down, anywhere in the lane sets a velocity.** With
@@ -1801,6 +2011,68 @@ mod tests {
         }
     }
 
+    /// **The PED chip swaps the lane, and the swapped lane answers with the
+    /// hand's HEIGHT as a value.**
+    ///
+    /// Two claims, because they are one feature. The chip has to be pressable
+    /// or the lane is unreachable; and the lane has to answer over its whole
+    /// face — which the velocity lane deliberately does not — because a pedal
+    /// is one continuous line across the clip rather than a row of objects to
+    /// aim at, and there is nothing behind it to click past to.
+    #[test]
+    fn the_ped_chip_swaps_the_lane_and_the_lane_reads_the_hands_height() {
+        let notes = [crate::arrangement::ArrNote { at_s: 0.5, dur_s: 0.25, key: 60, vel: 100 }];
+        let r = rect();
+        let mut v = view(&notes);
+        let l = Layout::new(r);
+
+        assert!(l.tool_pedal.is_positive(), "no PED chip on the strip");
+        assert_eq!(
+            hit_test(r, &v, l.tool_pedal.center()),
+            Some(Hit::ToolPedal),
+            "the PED chip cannot be pressed"
+        );
+        // It does not sit on top of the pencil, which is the other mode
+        // switch — two chips at one point is one chip nobody can reach.
+        assert!(
+            l.tool_pedal.right() <= l.tool_draw.left(),
+            "PED overlaps the pencil"
+        );
+
+        // A point well away from any note's velocity handle, with the pen UP
+        // — the case the velocity lane refuses.
+        let away = Pos2::new(l.vel.center().x + 60.0, l.vel.center().y);
+        assert!(l.vel.contains(away));
+        v.draw_mode = false;
+        v.pedal_lane = false;
+        assert!(
+            !matches!(hit_test(r, &v, away), Some(Hit::Vel(_))),
+            "the velocity lane answered a press with no note under it"
+        );
+        v.pedal_lane = true;
+        assert!(
+            matches!(hit_test(r, &v, away), Some(Hit::Pedal(..))),
+            "the pedal lane did not answer over its own face"
+        );
+
+        // **The height IS the value**, and the floor is zero — which is what
+        // makes one gesture both the draw and the erase.
+        let top = Pos2::new(away.x, l.vel.top() + 0.5);
+        let floor = Pos2::new(away.x, l.vel.bottom() - 0.5);
+        let Some(Hit::Pedal(_, hi)) = hit_test(r, &v, top) else {
+            panic!("no hit at the lane's top")
+        };
+        let Some(Hit::Pedal(_, lo)) = hit_test(r, &v, floor) else {
+            panic!("no hit at the lane's floor")
+        };
+        assert!(hi >= 126, "the top of the lane is {hi}, not the top of the range");
+        assert_eq!(lo, 0, "the floor of the lane is not pedal-up");
+        // And the painter and the hit test agree, which they must or a shelf
+        // is drawn at a height the hand cannot put it back at.
+        assert_eq!(pedal_value_at(&l, top.y), hi);
+        assert_eq!(pedal_value_at(&l, floor.y), lo);
+    }
+
     /// **Draw mode changes what a press MEANS, and it ships off.**
     ///
     /// The editor always drew a note wherever you pressed on empty roll,
@@ -1913,9 +2185,19 @@ mod tests {
         let src = include_str!("midi_editor.rs");
         let paints = concat!("velocity_hue(vel", "_loud, vel_quiet, face,");
         let fills = src.matches(paints).count();
+        // **Three callers, and the count is a proxy for the real claim.**
+        // What must stay true is that ONE function decides what a value looks
+        // like; callers of it are the point, not the danger. The three are
+        // the note fill, the velocity shaft, and the PEDAL lane's shelves —
+        // which reuse this gradient deliberately, so that a half-pedal is a
+        // different colour from a full one and so that the contrast push
+        // lives in one place. A FOURTH is worth a look; a second gradient
+        // function is the regression, and the assertion below is the one
+        // that catches it.
         assert_eq!(
-            fills, 2,
-            "the note fill and the shaft should be the only two callers, found {fills}"
+            fills, 3,
+            "the note fill, the velocity shaft and the pedal lane should be \
+             the only callers, found {fills}"
         );
         let retired = concat!("fn velocity", "_ink");
         assert!(
@@ -1929,6 +2211,8 @@ mod tests {
     pub(super) fn view<'a>(notes: &'a [ArrNote]) -> MidiEditView<'a> {
         MidiEditView {
             draw_mode: true,
+            pedal: &[],
+            pedal_lane: false,
             fx_strip: (0xE3, 0xD9, 0xBD),
             meter_bg: (0x0B, 0x0E, 0x0A),
             vel_loud: (0xff, 0x8d, 0x89),
