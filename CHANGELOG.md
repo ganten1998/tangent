@@ -225,6 +225,23 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **Phosphor's and Nocturne's keyboards were upside down.** Every other theme
+  paints pale naturals and dark sharps in light mode, and inverts in dark mode.
+  Those two did the opposite in each — light mode gave them a black keyboard and
+  dark mode a pale one — because a theme's naturals are pinned to its light
+  ground, and being dark-designed is exactly what those two are. Measured across
+  the set, the sixteen others put their light-mode naturals between 0.61 and
+  0.97 luminance; those two sat at 0.011 and 0.004. The polarity is decided by
+  the piano now rather than inherited from the ground: the naturals are the pale
+  key in light mode and the dark key in dark mode, on every theme. The two
+  colours themselves are untouched — only which key wears which.
+
+- **A held DX7 patch rings for the whole press.** The note stopped as soon as
+  the pointer moved six points, which a hand holding a button still does, so it
+  cut out part-way through a press that had not ended. The press is the gate
+  now, as on a piano key. Dragging a patch into the staged bank sounds it on the
+  way, which is the patch being chosen.
+
 - **A recorded MIDI take now repeats when you pull its right edge, like a drawn
   one.** A MIDI item drawn on a lane has been a loop from birth — drag its edge
   and it lays down another pass — but a recorded take was born with no loop, so

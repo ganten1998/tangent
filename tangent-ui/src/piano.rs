@@ -55,7 +55,7 @@ fn idle_colors(s: &Settings) -> (Color32, Color32) {
         // The naturals ARE the page's ground by design, so the SHARPS are
         // what make a keyboard visible. On a dark-designed theme they are
         // near-black on near-black; see [`keys_apart`].
-        return (white, keys_apart(white, black));
+        return keys_the_right_way_up(white, keys_apart(white, black), false);
     }
     // **What the theme SAYS, before what dark mode would derive.**
     //
@@ -83,7 +83,44 @@ fn idle_colors(s: &Settings) -> (Color32, Color32) {
     // same means. A theme that is already clear is returned untouched, which
     // is every other theme in the set, so this is inert on thirty-two of the
     // thirty-four theme-and-mode pairs.
-    (naturals, keys_apart(naturals, sharps))
+    keys_the_right_way_up(naturals, keys_apart(naturals, sharps), true)
+}
+
+/// **The naturals are the PALE key in light mode and the dark one in dark
+/// mode**, on every theme, whatever the theme named.
+///
+/// Sixteen of the eighteen themes get this for nothing: their light ground is
+/// pale, `white_key` is pinned to it, and the sharps come out near-black. The
+/// two dark-designed ones do not. Nocturne's and Phosphor's LIGHT grounds are
+/// 0.011 and 0.004 luminance — that is what makes them what they are — so
+/// their naturals came out near-black and the lift then made the sharps the
+/// pale ones. Measured across the set: every other theme paints naturals
+/// between 0.61 and 0.97 in light mode; those two painted 0.011 and 0.004.
+///
+/// A keyboard with black naturals and pale sharps is not a dim keyboard, it is
+/// an INVERTED one, and it was inverted in the mode where every other theme is
+/// the right way up — so on those two, and only those two, light mode looked
+/// like everybody else's dark mode and dark mode looked like everybody else's
+/// light. The owner: "they are the only themes with dark keyboards in light
+/// mode, and light keyboards in dark mode."
+///
+/// So the polarity is decided here rather than inherited. The two colours are
+/// kept exactly as they are — their contrast has already been earned by
+/// `keys_apart`, and swapping a pair cannot change how far apart it is — and
+/// only their ROLES are put the right way round.
+fn keys_the_right_way_up(
+    naturals: Color32,
+    sharps: Color32,
+    dark: bool,
+) -> (Color32, Color32) {
+    use crate::recorder_panel::luminance;
+    let naturals_paler = luminance(naturals) > luminance(sharps);
+    // Light mode wants pale naturals; dark mode wants dark ones.
+    if naturals_paler == dark {
+        (sharps, naturals)
+    } else {
+        (naturals, sharps)
+    }
 }
 
 /// **How far apart the two idle key colours have to be** for a keyboard to
@@ -625,6 +662,59 @@ mod tests {
     /// 15.29:1 — and the bar sits at half of that. It is still a FLOOR and
     /// not a target: nothing in the set is near it, and anything that
     /// arrives near it is a keyboard somebody cannot see.
+    /// **Every keyboard is the right way up, on every theme, in both modes.**
+    ///
+    /// Sixteen of the eighteen get this for nothing: a pale light ground makes
+    /// pale naturals and the sharps come out near-black. The two dark-designed
+    /// themes do not — Nocturne's and Phosphor's LIGHT grounds are 0.011 and
+    /// 0.004 luminance, which is what makes them what they are — so their
+    /// naturals were the dark key and the lift made the sharps the pale one.
+    ///
+    /// That is not a dim keyboard, it is an INVERTED one, and it was inverted
+    /// in the mode where all sixteen others are the right way up. The owner:
+    /// "they are the only themes with dark keyboards in light mode, and light
+    /// keyboards in dark mode. Please pay attention and compare them to the
+    /// other themes."
+    ///
+    /// Measured across the set before the fix: light-mode naturals ran 0.607
+    /// to 0.965 on the sixteen and 0.011 / 0.004 on those two. The rule is
+    /// asserted for all of them rather than for the pair, so a new
+    /// dark-designed theme cannot join them quietly.
+    ///
+    /// Revert check performed: return the pair unswapped from
+    /// `keys_the_right_way_up` and both themes name themselves in light mode.
+    #[test]
+    fn every_theme_paints_its_naturals_the_right_way_up() {
+        use crate::recorder_panel::luminance;
+        let mut wrong: Vec<String> = Vec::new();
+        for (theme, dark) in crate::theme::factory()
+            .into_iter()
+            .flat_map(|t| [(t.clone(), false), (t, true)])
+        {
+            let mut s = Settings::default();
+            theme.apply(&mut s);
+            s.dark_mode = dark;
+            let (naturals, sharps) = idle_colors(&s);
+            let naturals_paler = luminance(naturals) > luminance(sharps);
+            // Light mode: the naturals are the pale key. Dark mode: they are
+            // the dark one, which is the inversion the whole set already wears.
+            if naturals_paler == dark {
+                wrong.push(format!(
+                    "{} {}: naturals {:.3}, sharps {:.3}",
+                    theme.name,
+                    if dark { "dark" } else { "light" },
+                    luminance(naturals),
+                    luminance(sharps)
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "these keyboards are upside down against every other theme:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
     /// **A key the piano DERIVES never glares.**
     ///
     /// The lift walks the sharps away from the naturals until they are far
