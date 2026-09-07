@@ -179,6 +179,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   repeats. A clip whose loop has been turned off keeps it off — that door only
   opens once.
 
+- **Right-click a clip and untick Loop to stop it repeating.** The clip menu
+  has a Loop row with a checkmark beside it when the clip repeats: press it and
+  the loop goes, press it again and it comes back over the clip's whole length.
+  Turning it off leaves the clip exactly where and as long as it was — a clip
+  pulled out to four passes and then unlooped stays four bars on the timeline
+  and plays its material once, because the length is the timeline's business
+  and this row has no say in it. Like every other row in that menu it acts on
+  the whole selection, so a marquee over eight takes and a press on one of them
+  unloops all eight. Choosing how long a pass is remains the MIDI editor's loop
+  bar; this row is only the on and the off.
+
 - **Glue makes one clip that loops over the whole of what was glued.** It used
   to be the escape hatch from the loop — the way to turn several repeating
   items into one long pass — and it is now the same rule as everything else:
