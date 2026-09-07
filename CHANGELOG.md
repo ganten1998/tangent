@@ -225,6 +225,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A dragged folder now lands on the row it was dropped on.** A single track
+  dropped on row 7 ends up at row 7; a folder did not, and was always wrong by
+  exactly the number of children it carried, because the landing spot counted
+  only the rows that had not been lifted out. Drag a folder from row 4 past row
+  7 and it arrived three rows above where it was let go. The block's head is
+  what lands on the drop row now, its children follow it down, and the rows it
+  passed close up behind it — which is what a single track has always done and
+  what the arithmetic was written to match.
+
 - **Phosphor's and Nocturne's keyboards were upside down.** Every other theme
   paints pale naturals and dark sharps in light mode, and inverts in dark mode.
   Those two did the opposite in each — light mode gave them a black keyboard and

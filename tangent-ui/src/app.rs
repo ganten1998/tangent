@@ -9309,15 +9309,28 @@ impl TangentApp {
             return;
         }
         let rest: Vec<usize> = (0..CHANNELS).filter(|n| !group.contains(n)).collect();
-        // **Where a single track would have landed.** `move_channel` removes
-        // the lane and inserts at `to` in what is left, which puts a track
-        // dragged DOWN after the row it was dropped on and one dragged UP
-        // before it. The block has to land in the same place or dragging four
-        // tracks would answer differently from dragging one of them.
-        let at = rest
-            .iter()
-            .take_while(|n| if from < to { **n <= to } else { **n < to })
-            .count();
+        // **Where a single track would have landed — which is simply `to`.**
+        //
+        // `move_channel` removes the lane and inserts at `to` in what is left,
+        // so a single track ends up AT index `to` and nowhere else. The block
+        // has to land in the same place, or dragging four tracks answers
+        // differently from dragging one of them.
+        //
+        // This used to count how many of the remaining rows sat at or before
+        // `to`, which is the same number for a single track and is NOT for a
+        // block: every member above the target has already been lifted out of
+        // `rest`, so the count came up short by exactly that many and the
+        // block landed that many rows high. The folder's own children are
+        // always above it, so a folder was always wrong — drag one from row 4
+        // past row 7 and it arrived at 5 instead of 7, which the owner read
+        // off the track numbers as "it lands on 6 instead of 8".
+        //
+        // What lands at `to` is the block's HEAD, which is the folder itself:
+        // the rows it carries follow it down, and the rows it passed come up
+        // to fill the space it left. The owner's rule, in his words: the
+        // folder lands where it was dropped.
+        let at = to.min(rest.len());
+        let _ = from;
         let mut order = rest;
         for (k, g) in group.iter().enumerate() {
             order.insert(at + k, *g);
@@ -35180,14 +35193,28 @@ mod tests {
 
         app.move_selection(1, 6);
         let at = |n: usize| ((app.settings.channel_gains[n] - 0.1) * 10.0).round() as usize;
-        // 0, 4, 5, 6 keep their order; the block lands together behind them.
+        // **The block's HEAD lands on the row it was dropped on**, which is
+        // where a single track dragged the same distance lands: `move_channel`
+        // inserts at `to` and nothing else. So 1 is at index 6 with 2 and 3
+        // behind it, and the rows it passed have come up to fill the gap.
+        //
+        // This used to assert the head at 4 — the block's TAIL on the drop
+        // row — which is the same arithmetic being one short per carried
+        // member, and is what put a dragged folder three rows above where it
+        // was let go.
         assert_eq!(
-            (0..8).map(at).collect::<Vec<_>>(),
-            vec![0, 4, 5, 6, 1, 2, 3, 7],
-            "the block did not land in one piece"
+            (0..4).map(at).collect::<Vec<_>>(),
+            vec![0, 4, 5, 6],
+            "the rows the block passed did not close up behind it"
         );
-        // And the selection followed the tracks it names.
-        assert_eq!(app.selected_tracks, vec![4, 5, 6]);
+        assert_eq!(
+            (6..9).map(at).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the block did not land in one piece with its head on the drop row"
+        );
+        // And the selection followed the tracks it names, to where they now
+        // are — the head's own drop row and the two behind it.
+        assert_eq!(app.selected_tracks, vec![6, 7, 8]);
     }
 
     /// **Splitting a MIDI clip keeps every note, where it was.**
@@ -52248,6 +52275,68 @@ mod folder_tests {
         );
     }
 
+    /// **A dragged block lands where it was dropped, head first.**
+    ///
+    /// `move_channel` inserts a single track at `to` and nowhere else, so a
+    /// track dragged onto row 7 ends up AT row 7. A block is supposed to
+    /// answer the same — the comment on the arithmetic said so — and did not:
+    /// it counted the remaining rows at or before the target, which is the
+    /// same number for one track and short by one per CARRIED member for a
+    /// block. Every member a folder carries is below it, so a folder was
+    /// always wrong, and always by exactly the number of children it had.
+    ///
+    /// The owner, with a folder on row 4 holding rows 5 and 6: "dragging
+    /// Folder on track 4 to below 7 should make the folder land on 8. instead
+    /// it lands on 6 because children/folderness isn't taken into account."
+    /// Two children, two rows high.
+    ///
+    /// Revert check performed: count the rows at or before the target again
+    /// and the folder arrives at 5 instead of 7.
+    #[test]
+    fn a_dragged_folder_lands_on_the_row_it_was_dropped_on() {
+        let mut a = app();
+        for n in 0..10 {
+            a.add_bare_track(n);
+        }
+        // 4 is a folder holding 5 and 6; everything else is plain.
+        a.toggle_folder(4);
+        for n in [5, 6] {
+            a.set_in_folder(n, true);
+        }
+        assert_eq!(a.drag_block(4), vec![4, 5, 6], "the block is not what this is about");
+
+        // Levels the rows can be followed by, since a reorder renames nothing.
+        for n in 0..10 {
+            a.settings.channel_gains[n] = 0.05 + n as f64 * 0.05;
+        }
+        let at = |a: &TangentApp, n: usize| {
+            ((a.settings.channel_gains[n] - 0.05) * 20.0).round() as usize
+        };
+
+        a.selected_tracks = vec![4];
+        a.move_selection(4, 7);
+
+        assert_eq!(
+            at(&a, 7),
+            4,
+            "the folder did not land on the row it was dropped on"
+        );
+        assert_eq!(
+            (7..10).map(|n| at(&a, n)).collect::<Vec<_>>(),
+            vec![4, 5, 6],
+            "the children did not follow their folder down"
+        );
+        // The rows it passed closed up behind it, in order.
+        assert_eq!(
+            (0..7).map(|n| at(&a, n)).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 7, 8, 9],
+            "the rows the block passed did not close up"
+        );
+        // And it is still a folder, with those two still inside it.
+        assert!(a.is_folder(7), "it stopped being a folder on the way");
+        assert_eq!(a.folder_children(7), vec![8, 9]);
+    }
+
     /// **A folder cannot be dropped inside itself.**
     ///
     /// A folder carries its children, so dragging it past them names a target
@@ -52341,8 +52430,11 @@ mod folder_tests {
         a.selected_tracks = vec![1];
         a.move_selection(1, 4);
 
-        // The three moved together and kept their order.
-        let names: Vec<String> = (0..6).map(|n| name(&a, n)).collect();
+        // The three moved together and kept their order. Read across EIGHT
+        // rows, not six: the block's head now lands on the row it was dropped
+        // on rather than its tail, so the three sit lower than they used to
+        // and a six-row window ran off the end of them.
+        let names: Vec<String> = (0..8).map(|n| name(&a, n)).collect();
         let f = names.iter().position(|x| x == "t1").expect("the folder vanished");
         assert_eq!(
             &names[f..f + 3],
