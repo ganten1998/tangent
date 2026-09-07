@@ -14333,16 +14333,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             end = self.me_snap_ceil(start + Self::ME_LOOP_MIN_S);
             end = end.max(start + Self::ME_LOOP_MIN_S);
         }
-        let loop_s = end - start;
         let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
             return;
         };
-        let len_s = clip.len_s.max(loop_s);
-        if (clip.loop_s - loop_s).abs() < 1.0e-9 && (clip.len_s - len_s).abs() < 1.0e-9 {
+        // **The loop is CLAMPED to the clip; it does not grow it.**
+        //
+        // Dragging the bar past the clip's end used to widen the clip to meet
+        // it, on the reasoning that a pass whose tail falls outside `len_s` is
+        // a pass whose tail is silent — the schedule drops notes past the
+        // clip's end. True, and the owner's ruling is that the clip's length
+        // is the timeline's business and this handle has no licence over it:
+        // "clamp the loop to the clip. If they want extra silence, for now,
+        // draw a new item then glue them together making a new longer loop."
+        //
+        // So the bar stops at the clip's end. It can still be dragged there
+        // and no further, which is the same wall the roll's edge scroll keeps
+        // and reads the same way under the hand.
+        let loop_s = (end - start).min(clip.len_s);
+        if (clip.loop_s - loop_s).abs() < 1.0e-9 {
             return;
         }
         clip.loop_s = loop_s;
-        clip.len_s = len_s;
         if let Some(st) = self.midi_edit.as_mut() {
             st.dirty = true;
         }
@@ -17315,6 +17326,49 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **The loop bar says it can be grabbed.**
+    ///
+    /// A handle that looks like paint until you happen to press it is a
+    /// handle most people never find, and this one is a thin bar at the end
+    /// of a clip in a panel full of other thin things. The arrangement's own
+    /// resize grip already answers a hover with `ResizeHorizontal`; the roll
+    /// answered nothing anywhere, which is why the bar shipped without it —
+    /// but "nothing here sets a cursor" is a description of the panel, not a
+    /// reason, and the owner asked for it.
+    ///
+    /// Only while nothing is being dragged: mid-gesture the pointer belongs
+    /// to whatever it picked up, and a cursor that changed under a drag would
+    /// be reporting on a control the hand has already left.
+    fn me_loop_bar_cursor(&mut self, ctx: &egui::Context) {
+        let dragging = self
+            .midi_edit
+            .as_ref()
+            .is_some_and(|m| matches!(m.drag, Some(MeDrag::LoopBar { .. })));
+        let on_bar = dragging
+            || (self.midi_edit.as_ref().is_some_and(|m| m.drag.is_none())
+                && ctx
+                    .input(|i| i.pointer.hover_pos())
+                    .zip(self.midi_edit_rect)
+                    .is_some_and(|(p, rect)| {
+                        let Some(st) = self.midi_edit.as_ref() else {
+                            return false;
+                        };
+                        let Some(clip) =
+                            self.arrangement.clips.iter().find(|c| c.id == st.id)
+                        else {
+                            return false;
+                        };
+                        let view = self.midi_edit_view(st, clip);
+                        matches!(
+                            crate::midi_editor::hit_test(rect, &view, p),
+                            Some(crate::midi_editor::Hit::LoopBar)
+                        )
+                    }));
+        if on_bar {
+            ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+        }
+    }
+
     fn midi_editor_input(&mut self, ctx: &egui::Context) {
         if self.midi_edit.is_none() {
             return;
@@ -17323,6 +17377,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // sounding preview, a dialog taking the pointer, the drumpad claiming
         // it — each of those used to return with the note still on.
         self.me_preview_tick(ctx);
+        self.me_loop_bar_cursor(ctx);
         if self.menu_state.is_some() || self.menu_ate_press || self.dialog_blocks_pointer(ctx) {
             // The menu owns the pointer — and the press that dismissed it
             // is spent, exactly as on the arrangement. A dialog owns it
@@ -49274,14 +49329,24 @@ mod tests {
         };
         assert_eq!(passes, 2, "an eight-second clip over a four-second loop played {passes}");
 
-        // ── out, past the clip's own end: the clip grows to hold the pass ──
+        // ── out, past the clip's own end: the loop STOPS at the clip ──
+        //
+        // It used to grow the clip to meet the hand, on the reasoning that a
+        // pass whose tail falls outside `len_s` is a pass whose tail is
+        // silent. The owner's ruling is that the clip's length belongs to the
+        // timeline and this handle has no licence over it: "clamp the loop to
+        // the clip. If they want extra silence, for now, draw a new item then
+        // glue them together making a new longer loop."
         let at = Pos2::new(x_at(&app, 18.0) + 3.0, y);
         move_to(&ctx, &mut app, at);
         let (_, len, loop_s) = clip_of(&app);
-        assert!((loop_s - 14.0).abs() < 1.0e-6, "the loop went out to {loop_s}, not fourteen");
         assert!(
-            (len - loop_s).abs() < 1.0e-9,
-            "the clip is {len} long around a {loop_s} pass — its tail would not sound"
+            (loop_s - 8.0).abs() < 1.0e-6,
+            "the loop went out to {loop_s} — it should have stopped at the clip's own eight"
+        );
+        assert!(
+            (len - 8.0).abs() < 1.0e-9,
+            "the loop bar grew the clip to {len}; the clip's length is the timeline's"
         );
 
         // ── back through the clip's own head: a grid line, never nothing ──

@@ -258,6 +258,24 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The loop bar stops at the clip instead of stretching it.** Dragging the
+  loop's length past the end of the clip used to widen the clip to meet it. The
+  clip's length belongs to the timeline, so the bar now stops there. To get a
+  longer pass with silence in it, draw a second item and glue the two together.
+
+- **The loop bar says it can be grabbed.** It answers a hover with the resize
+  cursor, like the arrangement's own grip. The MIDI editor set no cursors
+  anywhere, which is a description of the panel rather than a reason.
+
+- **A strike's cost is asserted where the number means something.** The budget
+  behind it is a release budget — eight notes at a tenth of a millisecond is a
+  third of a 2.7 ms block — but `cargo test` builds unoptimised, so the figure
+  being checked was a debug one. Measured: 10.3 µs in release against 104–110 in
+  debug, a factor of ten, with nothing in the instrument changed. It passed for
+  months only because debug happened to sit under a bar it was never measuring
+  against, and went red when the machine got slower. The figure is still printed
+  in both builds; the gate is release-only.
+
 - **A dragged folder now lands on the row it was dropped on.** A single track
   dropped on row 7 ends up at row 7; a folder did not, and was always wrong by
   exactly the number of children it carried, because the landing spot counted

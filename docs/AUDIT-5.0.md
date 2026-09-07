@@ -2,6 +2,14 @@
 2026-08-25 · repo at ef2ab01 (v4.92.0) · 14-agent audit (5 repo sweeps, 7 research, 2 synthesis)
 · companion to the /code-review ultra run on the v4.82.0..HEAD diff
 
+> **Read as of its date.** This is a snapshot of the repo at `ef2ab01`, not a live
+> reference, and the gesture vocabulary has moved since. Notably: drawing a MIDI
+> item on a lane is CMD-drag (it was shift, and shift is now unbound there), the
+> exclusive arm is ALT rather than shift, and clips carry a loop with a draggable
+> length. `docs/ARRANGEMENT.md` and the in-app H cards are the live answer. The
+> body below is left as it was written — an audit that is quietly edited to match
+> a later repo stops being evidence of anything.
+
 > Owner's questions: (1) target audience · (2) excels/lacks · (3) category wins vs competitors
 > · (4) marketing & release plan · (5) proprietary candidates · (6) full feature draft
 > · (7) pace — answered separately in-session.

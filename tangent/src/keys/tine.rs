@@ -1875,6 +1875,26 @@ mod tests {
     /// so the figure is on the record, gated at a tenth of a millisecond:
     /// the callback has 2.7 ms per block and an eight-note chord in one
     /// block must not spend a third of it striking.
+    ///
+    /// **The gate is RELEASE-only, and it was not, which is why it went red
+    /// for a week over nothing.**
+    ///
+    /// The budget above is a release budget — 8 x 100 us is a third of a
+    /// 2.7 ms block, and release is what ships — but `cargo test` builds this
+    /// crate unoptimised, and there is no `[profile.test]` raising it. So the
+    /// number being compared was a DEBUG figure held against a release bar,
+    /// and it passed for months only because debug happened to land just
+    /// under it. Measured on one machine on 2026-09-07: 10.3 us in release
+    /// and 104-110 us in debug, a factor of ten. Nothing in `keys/` had
+    /// changed; the machine had merely got slower, and a bar that was never
+    /// measuring the right build finally noticed.
+    ///
+    /// A red test nobody can act on is worse than no test — it is what
+    /// teaches people to skim past a suite, which is how a dead overload
+    /// counter shipped green earlier the same week. So the figure is still
+    /// PRINTED in both builds, because it is worth having on the record and
+    /// worth eyeballing, and the assertion is made where its number means
+    /// something.
     #[test]
     fn a_strike_costs_well_under_a_tenth_of_a_millisecond() {
         use std::hint::black_box;
@@ -1892,6 +1912,9 @@ mod tests {
             best = best.min(t0.elapsed().as_secs_f64() * 1e6 / 200.0);
         }
         println!("strike: {best:.1} us (beam solve, pair solve, two calibrations)");
+        // Debug is roughly ten times release here and has no budget of its
+        // own to answer to; the block it has to fit in is a release block.
+        #[cfg(not(debug_assertions))]
         assert!(best < 100.0, "a strike costs {best:.0} us");
     }
 }

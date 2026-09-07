@@ -560,7 +560,8 @@ channels play back their clips and nothing else. "Ready to play" and
   dropped .mid) records instead of being silently skipped; an EMPTY
   take still CARVES what it covered (recording silence over a clip is
   an erase — the punch promised destruction); and a .mid landing on a
-  bare lane binds it midi:all, the shift-draw's own ritual. The
+  bare lane binds it midi:all, the cmd-draw's own ritual (that gesture
+  was shift until 2026-09-07 and shift is now unbound on a lane). The
   gridboxes are CLICK-THEN-DRAG steppers now (up = finer, ~14 px a
   notch; right-click steps coarser; wheels — fragile on the Linux
   box — still work). Defaults: 1/4 grid in both views, DARK arrange
@@ -616,10 +617,12 @@ channels play back their clips and nothing else. "Ready to play" and
   buffer, ASIO single-setting) and ALSA keep symmetric buffers. ONE
   ARM AT A TIME: arming one midi track recorded three — every lane
   still armed from its birth or first bind rode into the take. A
-  plain press on an arm is EXCLUSIVE now (the pile stands down),
-  Shift+arm keeps the additive toggle for a deliberate multi-lane
-  take, and binding an input arms that lane alone; both help cards
-  say so. AND THE DRIVES: off Windows the roots view was one bare
+  plain press on an arm TOGGLES one lane and carries the strip
+  selection with it; the exclusive "this lane alone" moved to ALT on
+  2026-09-07 (and alt again on the lane that is already alone stands
+  everything down), Shift+arm toggles ONE lane without the selection,
+  for building a set a lane at a time, and binding an input arms that
+  lane alone; both help cards say so. AND THE DRIVES: off Windows the roots view was one bare
   "/" — external disks sat three levels down where nobody looks. The
   roots view now lists every mount it can find (/Volumes, /media,
   /run/media, /mnt), skipping the boot volume's own alias.
