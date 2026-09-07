@@ -13423,7 +13423,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .filter(|c| ids.contains(&c.id) && c.kind == crate::arrangement::ClipKind::Midi)
             .cloned()
             .collect();
-        if picked.len() < 2 {
+        // **One clip is enough, if it repeats** — the owner's ruling:
+        // "gluing a single clip, if looped, removes the loop and converts it
+        // to a new loop containing all the previous displayed content."
+        //
+        // Glue's verb has always been *flatten what you can see*: the
+        // expansion below spells every source's repeats into literal notes
+        // and the weld takes one pass over the lot. Applied to a single
+        // repeating clip that is exactly the ask — C D E F looping to
+        // C D E F / C D becomes a clip holding those six notes, one pass, no
+        // seam — and it was refused only because the count was the whole
+        // test. So the rule is the count OR the seam, and the seam is the
+        // same one the picture draws: a clip is worth gluing alone when it
+        // shows more than one pass.
+        //
+        // A clip with no second pass is refused as before, and now says why
+        // in the same breath, because "select two or more" was a lie the
+        // moment one could be enough.
+        let one_worth_gluing = picked.len() == 1
+            && picked[0].loop_s > 1.0e-6
+            && picked[0].len_s > picked[0].loop_s + 1.0e-9;
+        if picked.len() < 2 && !one_worth_gluing {
             // **Not `report_take`.** These refusals went through the take
             // report because it was once the only way to say anything at all,
             // which meant they wore its title bar, and — worse — were
@@ -13431,7 +13451,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // receipt. A refusal to glue is neither a take nor a success.
             self.notify(
                 crate::notify::Kind::Info,
-                "Select two or more MIDI clips on one track to glue.",
+                "Glue needs two or more MIDI clips on one track, or one that \
+                 repeats — pull a clip's edge past its first pass and glue \
+                 welds the repeats into it.",
             );
             return;
         }
@@ -18353,6 +18375,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // quietly select notes nobody swept. Re-basing that anchor into
             // document space is a fair second job; selecting the wrong notes
             // silently is not a thing to ship in the meantime.
+            // **`LoopBar` joins the list**, the owner's "must have drag at
+            // edge to scroll logic". It has the same reach problem as the
+            // resize family and it is worse here: the bar sits at the END of
+            // the first pass, so on any clip longer than a window the handle
+            // and the place you want to put it are rarely on screen at once,
+            // and without this the only way to move it far is to zoom out,
+            // drag, and zoom back in. `EdgeAxes::X` and not `Both`: the bar
+            // is a time, it has no pitch, and scrolling the roll vertically
+            // under a hand that is setting a loop length moves the picture
+            // for no reason.
+            let axes = if matches!(drag, MeDrag::LoopBar { .. }) {
+                EdgeAxes::X
+            } else {
+                EdgeAxes::Both
+            };
             if matches!(
                 drag,
                 MeDrag::Move { .. }
@@ -18360,6 +18397,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     | MeDrag::ResizeLeft { .. }
                     | MeDrag::Stretch { .. }
                     | MeDrag::Create { .. }
+                    | MeDrag::LoopBar { .. }
             ) {
                 let l = crate::midi_editor::Layout::new(rect);
                 if l.roll.is_positive() {
@@ -18371,7 +18409,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // as long as the hold lasts. The old crawl already got
                     // this right; do not tidy the block to the end of the
                     // match.
-                    let step = edge_scroll_step(ctx, l.roll, p, EdgeAxes::Both);
+                    let step = edge_scroll_step(ctx, l.roll, p, axes);
                     if step != Vec2::ZERO {
                         // Points into the roll's own units through the
                         // functions the PAINTER uses. A drag that did its own
@@ -40952,6 +40990,103 @@ mod tests {
         );
     }
 
+    /// **Gluing ONE repeating clip flattens it** — the owner's worked
+    /// example, run as written.
+    ///
+    /// "if i play C D E F on each beat in a 1 bar clip, then stretch the clip
+    /// so it loops to C D E F / C D, and glue that clip alone, it becomes a
+    /// new loop with only C D E F C D visible, no seam. then drag that out,
+    /// and see the divot after the second D."
+    ///
+    /// So: four notes on the beats of a one-bar loop, the clip pulled to a
+    /// bar and a half. What the picture shows is six notes, because the
+    /// schedule drops a repeat that begins past the clip's end — and glue's
+    /// job is to make the document say what the picture already said. The
+    /// weld is one pass over the whole bar and a half, so it has no seam of
+    /// its own until its edge is pulled again, and the sound does not change
+    /// by a sample.
+    ///
+    /// The last two asserts are the "then drag that out" half: the flattened
+    /// clip's second pass has to start after the second D, which is what
+    /// makes the divot land where the owner said it would.
+    ///
+    /// Revert checks performed: refuse a single clip again (`picked.len() < 2`
+    /// alone) and the first assert names the clip that was not welded; set
+    /// the weld's `loop_s` to the SOURCE's bar and the no-seam assert names
+    /// it; drop the `at >= len_s` skip in `clip_notes_in_song_time` and the
+    /// note count comes back eight instead of six.
+    #[test]
+    fn gluing_one_repeating_clip_flattens_its_repeats_into_it() {
+        use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.settings.arr_snap = false;
+        let beat = 0.5;
+        let bar = beat * 4.0;
+        app.arrangement.clips.push(ArrClip {
+            id: 1,
+            lane: 0,
+            kind: ClipKind::Midi,
+            start_s: 0.0,
+            // A bar and a half: one whole pass, then C and D of the next.
+            len_s: bar * 1.5,
+            loop_s: bar,
+            notes: (0..4)
+                .map(|i| ArrNote {
+                    at_s: f64::from(i) * beat,
+                    dur_s: beat * 0.5,
+                    key: 60 + [0u8, 2, 4, 5][i as usize],
+                    vel: 100,
+                })
+                .collect(),
+            ..Default::default()
+        });
+        app.arr_selected = Some(1);
+        app.arr_glue_selection();
+
+        assert_eq!(app.arrangement.clips.len(), 1, "the clip was not welded");
+        let c = &app.arrangement.clips[0];
+        // C D E F C D — the six the picture showed, not the eight two whole
+        // passes would hold.
+        let keys: Vec<u8> = c.notes.iter().map(|n| n.key).collect();
+        assert_eq!(
+            keys,
+            vec![60, 62, 64, 65, 60, 62],
+            "the weld holds {keys:?}, not the C D E F C D that was on screen"
+        );
+        let ats: Vec<f64> = c.notes.iter().map(|n| n.at_s).collect();
+        for (i, a) in ats.iter().enumerate() {
+            let want = f64::from(i as u32) * beat;
+            assert!((a - want).abs() < 1.0e-9, "note {i} sits at {a}, not {want}");
+        }
+        // **No seam**: one pass, as long as the clip.
+        assert!(
+            (c.len_s - bar * 1.5).abs() < 1.0e-9 && (c.loop_s - c.len_s).abs() < 1.0e-9,
+            "the weld is {} long over a {} loop — it should be one pass of \
+             the whole of what it swallowed",
+            c.len_s,
+            c.loop_s
+        );
+
+        // **"then drag that out, and see the divot after the second D."**
+        let id = c.id;
+        app.settings.arr_snap = false;
+        app.arr_trim_right(id, bar * 3.0);
+        let c = app.arrangement.clips.iter().find(|c| c.id == id).expect("the weld");
+        assert!(
+            (c.loop_s - bar * 1.5).abs() < 1.0e-9,
+            "pulling the edge changed the pass to {}",
+            c.loop_s
+        );
+        // The second pass begins where the first ended: after the second D,
+        // which is the sixth note, at a bar and a half.
+        let second_pass_at = c.loop_s;
+        assert!(
+            (second_pass_at - (ats[5] + beat)).abs() < 1.0e-9,
+            "the repeat starts at {second_pass_at}, not after the second D at {}",
+            ats[5] + beat
+        );
+    }
+
     /// **Glue refuses clips on different tracks** rather than quietly welding
     /// whichever happen to share a lane.
     #[test]
@@ -49691,6 +49826,78 @@ mod tests {
         }
         let _ = run_frame(ctx, app);
         (app.midi_edit_rect.expect("the editor drew nowhere"), id)
+    }
+
+    /// **A loop bar held at the roll's edge takes the view with it** — the
+    /// owner's "must have drag at edge to scroll logic".
+    ///
+    /// The bar sits at the END of the first pass, so on any clip longer than
+    /// a window the handle and the place somebody wants to put it are rarely
+    /// on screen together: without this the only way to move a loop far is to
+    /// zoom out, drag, and zoom back in, which is the same "resize before you
+    /// can move it" the note drags were freed from.
+    ///
+    /// **Horizontally only.** A loop length is a time and has no pitch, so a
+    /// hand held near the top of the roll while setting one must not sail the
+    /// keys — that is asserted here as well as the travel, because `Both` was
+    /// the value every other drag in the list uses and copying it would have
+    /// been the easy mistake.
+    ///
+    /// Revert checks performed: take `LoopBar` back out of the `matches!` and
+    /// the travel assert names a view that did not move; set the axes to
+    /// `Both` and the vertical assert names the keys that scrolled.
+    #[test]
+    fn a_loop_bar_held_at_the_edge_scrolls_the_roll_sideways_only() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, id) = midi_editor_on_a_loop(&ctx, &mut app);
+        let l = crate::midi_editor::Layout::new(rect);
+        let bar_x = |app: &TangentApp| -> f32 {
+            let st = app.midi_edit.as_ref().expect("the editor closed");
+            let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+            let view = app.midi_edit_view(st, clip);
+            crate::midi_editor::loop_bar_x(&l, &view).expect("the loop drew no bar")
+        };
+        // Zoomed in AROUND the bar: it has to be on screen to be pressed,
+        // and the view has to have somewhere left to travel. The fixture is
+        // one eight-second pass from four, so the bar stands at twelve —
+        // a two-second window on eleven holds it with the whole clip to its
+        // left to scroll back over.
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.view_start_s = 11.0;
+            st.view_len_s = 2.0;
+        }
+        let at = Pos2::new(bar_x(&app), l.ruler.center().y);
+        press(&ctx, &mut app, at);
+        assert!(
+            matches!(app.midi_edit.as_ref().unwrap().drag, Some(MeDrag::LoopBar { .. })),
+            "the press on the bar picked up something else"
+        );
+
+        let before = {
+            let st = app.midi_edit.as_ref().unwrap();
+            (st.view_start_s, st.top_key)
+        };
+        // Held past the LEFT edge — the direction with room on this fixture —
+        // and high up it, so a `Both` axis would show in the keys as well as
+        // in the time.
+        move_to(&ctx, &mut app, Pos2::new(l.roll.left() - 20.0, l.roll.top() + 1.0));
+        for _ in 0..12 {
+            hold_frame(&ctx, &mut app, 1.0 / 60.0);
+        }
+        let after = {
+            let st = app.midi_edit.as_ref().unwrap();
+            (st.view_start_s, st.top_key)
+        };
+        assert!(
+            after.0 < before.0 - 0.1,
+            "twelve frames at the edge moved the view from {} to {}",
+            before.0,
+            after.0
+        );
+        assert_eq!(
+            after.1, before.1,
+            "the keys scrolled under a hand that was setting a loop LENGTH"
+        );
     }
 
     /// **The loop bar shortens the loop, lengthens it, and takes the clip
