@@ -2341,6 +2341,106 @@ fn loop_pass_w(full_x: (f32, f32), clip: &ClipView<'_>) -> f32 {
 /// Arithmetic and not a walk. The passes are evenly spaced, so the two that
 /// bound the rect invert directly, and a clip holding five hundred passes of
 /// which four are on screen costs four.
+/// **Does this clip show a seam at all?** — the loop question without the
+/// pixels, so the fill, the miniature's inset and `loop_seam_xs` cannot
+/// disagree about whether a clip is bitten.
+fn clip_has_seam(clip: &ClipView<'_>) -> bool {
+    clip.loop_s > 1.0e-6
+        && clip.loop_s.is_finite()
+        && clip.len_s.is_finite()
+        && clip.len_s > clip.loop_s + 1.0e-9
+}
+
+/// How deep a divot bites into the clip's top and bottom edge.
+///
+/// A tenth of the lane, floored at two points and capped at four. The tenth
+/// is not a taste: the waveform is drawn within forty per cent of the height
+/// either side of the middle, so a tenth is the most that can be taken
+/// without the bite reaching into it, and the miniature is inset by the same
+/// number for the same reason. Two points is the least that reads as a bite
+/// rather than as an artefact.
+fn clip_bite_d(r: Rect) -> f32 {
+    (r.height() * 0.10).clamp(2.0, 4.0)
+}
+
+/// The clip's own outline, with a triangular divot bitten out of the top and
+/// the bottom edge at every visible loop seam — the owner's "a small cutout
+/// in the CLIP shape -- no line".
+///
+/// **Convex pieces, one per pass, and that is not a stylistic choice.**
+/// epaint fills a closed path as a triangle fan from its first point, so a
+/// single polygon carrying a notch in its edge comes back with the notch
+/// filled in: the shape would be right in the point list and wrong on the
+/// screen. A pass between two seams is a rectangle with its corners
+/// chamfered, which is convex, and a fan over a convex polygon is exact.
+///
+/// The clip's OUTER corners keep their rounding — an arc where an inner end
+/// carries a chamfer — so a looped clip and an unlooped one are the same
+/// object, one of them with bites taken out. The previous seam was two
+/// strokes printed ON the clip; this takes the material away instead, which
+/// is why nothing here paints a colour of its own and nothing has to guess
+/// what colour the lane behind it is.
+///
+/// Each end's features are budgeted against the segment's OWN width, because
+/// `loop_seam_xs` may hand back a seam a single point inside the clip's edge
+/// and a chamfer wider than the piece it sits on turns a convex polygon
+/// inside out.
+fn notched_clip_pieces(r: Rect, seams: &[f32], round: f32) -> Vec<Vec<Pos2>> {
+    let d = clip_bite_d(r).min(r.height() * 0.5 - 0.5).max(0.0);
+    let w = d * 1.5;
+    let (top, bot) = (r.top(), r.bottom());
+    let mut bounds: Vec<f32> = Vec::with_capacity(seams.len() + 2);
+    bounds.push(r.left());
+    bounds.extend_from_slice(seams);
+    bounds.push(r.right());
+    let mut out: Vec<Vec<Pos2>> = Vec::with_capacity(bounds.len().saturating_sub(1));
+    for pair in bounds.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if !(b - a > 0.5) {
+            continue;
+        }
+        // Forty-five per cent each, so the two ends together can never claim
+        // more than the piece has.
+        let room = (b - a) * 0.45;
+        let (rad, bw) = (round.min(room), w.min(room));
+        let mut pts: Vec<Pos2> = Vec::with_capacity(12);
+        // Clockwise: the top edge left to right, then the bottom right to
+        // left. `0.293` is the 45-degree point of the quarter arc, which is
+        // all the rounding a three-point radius can show.
+        if a <= r.left() {
+            pts.push(Pos2::new(a, top + rad));
+            pts.push(Pos2::new(a + rad * 0.293, top + rad * 0.293));
+            pts.push(Pos2::new(a + rad, top));
+        } else {
+            pts.push(Pos2::new(a, top + d));
+            pts.push(Pos2::new(a + bw, top));
+        }
+        if b >= r.right() {
+            pts.push(Pos2::new(b - rad, top));
+            pts.push(Pos2::new(b - rad * 0.293, top + rad * 0.293));
+            pts.push(Pos2::new(b, top + rad));
+            pts.push(Pos2::new(b, bot - rad));
+            pts.push(Pos2::new(b - rad * 0.293, bot - rad * 0.293));
+            pts.push(Pos2::new(b - rad, bot));
+        } else {
+            pts.push(Pos2::new(b - bw, top));
+            pts.push(Pos2::new(b, top + d));
+            pts.push(Pos2::new(b, bot - d));
+            pts.push(Pos2::new(b - bw, bot));
+        }
+        if a <= r.left() {
+            pts.push(Pos2::new(a + rad, bot));
+            pts.push(Pos2::new(a + rad * 0.293, bot - rad * 0.293));
+            pts.push(Pos2::new(a, bot - rad));
+        } else {
+            pts.push(Pos2::new(a + bw, bot));
+            pts.push(Pos2::new(a, bot - d));
+        }
+        out.push(pts);
+    }
+    out
+}
+
 fn loop_seam_xs(r: Rect, full_x: (f32, f32), clip: &ClipView<'_>) -> Vec<f32> {
     let (fx0, fx1) = full_x;
     if !r.is_positive()
@@ -2415,6 +2515,38 @@ fn loop_seam_xs(r: Rect, full_x: (f32, f32), clip: &ClipView<'_>) -> Vec<f32> {
 /// The merge is the only place the picture moves, and it moves by less than
 /// a pixel. `mod tests` keeps the plain walk as the drawing this one has to
 /// agree with, cell by cell, at every zoom, with and without a held note.
+/// **The band a miniature's notes may occupy** — inside the border, under the
+/// title, and clear of the loop divots.
+///
+/// One function because there are two walks over these notes: the shipped
+/// one, which culls the passes that cannot reach the window, and the
+/// reference in the tests, which walks all of them. They exist to differ in
+/// the cull and in nothing else, so a band computed twice is a way for them
+/// to disagree about something the test was never watching.
+///
+/// The divot inset is vertical only. The bites are on the top and bottom
+/// edges, and narrowing the band sideways would move every note in the
+/// picture; a note bar drawn ACROSS a bite would hang in the lane outside its
+/// own clip, which is the one way this can look broken rather than merely cut.
+fn miniature_band(r: Rect, clip: &ClipView<'_>) -> Rect {
+    let base = r.shrink(2.0);
+    let base = if clip_has_seam(clip) {
+        let extra = (clip_bite_d(r) - 2.0).max(0.0);
+        Rect::from_min_max(
+            Pos2::new(base.left(), base.top() + extra),
+            Pos2::new(base.right(), base.bottom() - extra),
+        )
+    } else {
+        base
+    };
+    let band = clip_name_band(r);
+    if band > 0.0 && base.height() > band {
+        Rect::from_min_max(Pos2::new(base.left(), base.top() + band), base.max)
+    } else {
+        base
+    }
+}
+
 fn draw_note_miniature(
     painter: &Painter,
     r: Rect,
@@ -2467,16 +2599,8 @@ fn draw_note_miniature(
         }
     }
     let span = f32::from(hi - lo).max(1.0);
-    // **Under the title, not through it.** See `clip_name_band`.
-    let inner = {
-        let base = r.shrink(2.0);
-        let band = clip_name_band(r);
-        if band > 0.0 && base.height() > band {
-            Rect::from_min_max(Pos2::new(base.left(), base.top() + band), base.max)
-        } else {
-            base
-        }
-    };
+    // **Under the title, and clear of the bites.** See `miniature_band`.
+    let inner = miniature_band(r, clip);
     if !inner.is_positive() {
         return;
     }
@@ -3694,24 +3818,6 @@ fn separate(c: Color32, t: f32) -> Color32 {
     blend(c, toward, t)
 }
 
-/// **[`separate`]'s mirror**: move a colour further INTO itself — toward black
-/// when it is already dark, toward white when it is already light.
-///
-/// The other face of a recess. `separate` gives the face that always reads,
-/// because it moves away from the surface and so is visible on a near-black
-/// clip and on a bone one alike; this gives the face that falls the other way,
-/// which is what turns a pair of lines into a NOTCH rather than a double
-/// stripe. It is allowed to be nearly invisible at the ends of the range — a
-/// surface already at black has nowhere deeper to go — which is exactly why
-/// the reading half of the pair is the other one.
-fn deepen(c: Color32, t: f32) -> Color32 {
-    let toward = if crate::recorder_panel::wants_light_ink(c) {
-        Color32::BLACK
-    } else {
-        Color32::WHITE
-    };
-    blend(c, toward, t)
-}
 
 /// A transport red that can be SEEN on `bg`.
 ///
@@ -5071,19 +5177,38 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // printed inside the clip — name, staff, wave, fades, handles —
         // takes this ink, so the clip cannot half-agree with itself.
         let clip_ink = on_ink(color);
-        painter.rect_filled(r, 3.0, color);
         // The clip's UNCLAMPED pixel span, measured once: where the whole
-        // clip would stand if the viewport were not cutting it. Both the note
-        // miniature and the loop seams are mapped through it, and `x_of`
+        // clip would stand if the viewport were not cutting it. The note
+        // miniature and the loop seams are both mapped through it, and `x_of`
         // builds a `Layout` every time it is asked, so it is worth the
         // binding.
         //
-        // **Out of the MIDI branch it used to live in**, because the seams
-        // came out with it — see below.
+        // **Above the fill now**, because the fill needs the seams: the clip
+        // is not a rectangle any more when it repeats.
         let full_x = (
             x_of(rect, view, clip.start_s),
             x_of(rect, view, clip.start_s + clip.len_s),
         );
+        // ── the clip's own shape ──────────────────────────────────────────
+        //
+        // **A divot bitten out of the top and bottom edge at every seam**,
+        // the owner's "a simple shape change on the clip itself ... a small
+        // cutout in the CLIP shape -- no line". What stood here was two
+        // diagonal strokes printed on the surface, which is a picture OF a
+        // seam; a bite is the seam, and it needs no colour of its own and no
+        // guess about what the lane behind it is wearing.
+        //
+        // A clip with nothing to divide keeps the plain rounded rectangle it
+        // has always been — which is every clip in an old project, and every
+        // new one until its edge is pulled past its first pass.
+        let seams = loop_seam_xs(r, full_x, clip);
+        if seams.is_empty() {
+            painter.rect_filled(r, 3.0, color);
+        } else {
+            for piece in notched_clip_pieces(r, &seams, 3.0) {
+                painter.add(egui::Shape::convex_polygon(piece, color, Stroke::NONE));
+            }
+        }
         // A MIDI item draws its NOTES in miniature — the arrangement can
         // read what the editor will say. An empty item keeps the dashed
         // staff that says "MIDI, nothing played yet".
@@ -5161,63 +5286,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     [Pos2::new(x, y0.min(y1)), Pos2::new(x, y1.max(y0) + 0.5)],
                     Stroke::new(1.0, ink),
                 );
-            }
-        }
-        // ── the loop seams ────────────────────────────────────────────────
-        //
-        // **A diagonal recess where one pass ends and the next begins**, the
-        // owner's "make it such that theres a diagonal recess between loops".
-        // A looped clip is one bar drawn over and over, and there was nothing
-        // in the picture that said so: two bars and twenty bars of the same
-        // part were the same green box, and the only way to find out how many
-        // times it repeated was to open the editor and count. The notch is
-        // that fact, drawn.
-        //
-        // **Every clip, not only the MIDI ones.** This lived inside the
-        // `clip.midi` branch above, which was true of loops on the day it was
-        // written and stopped being true the day audio started repeating:
-        // `audio_clip_passes` lays a `Placed` down per pass and
-        // `looped_span_envelope` folds the waveform into the loop, so a
-        // four-bar drum take pulled over sixteen bars already SOUNDED like
-        // four passes and already DREW four passes of the same waveform —
-        // with nothing anywhere to say where one ended. Half of the picture's
-        // argument, applied to half the clips.
-        //
-        // **Cut into the clip's own surface rather than printed on it.**
-        // `separate` is what the panel already uses for the seam between two
-        // lanes — the surface moved away from itself, which reads on a
-        // near-black theme and on a bone one alike — and `deepen` is its
-        // mirror, so the pair is a groove and a land and not a double stripe.
-        // Neither is `clip_ink`: ink is for figures somebody has to READ, and
-        // a notch is not a figure. The boundary second sits between the two
-        // faces, so the recess straddles the turn rather than standing beside
-        // it.
-        //
-        // Drawn OVER the miniature AND over the wave, because a notch takes
-        // the material and whatever was printed on it — which is what moved
-        // it below the wave block rather than merely out of the branch; under
-        // the name and the fades, because a name should not be cut and a fade
-        // is the envelope rather than the material. The lean comes off the
-        // clip's own height so the diagonal holds its angle whatever the lane
-        // is worth, and is capped against the pass so a seam cannot lean into
-        // its neighbour on a clip zoomed down to a few points a pass.
-        let seams = loop_seam_xs(r, full_x, clip);
-        if !seams.is_empty() {
-            let lean = (r.height() * 0.30)
-                .clamp(2.0, 8.0)
-                .min(loop_pass_w(full_x, clip) * 0.5);
-            let (top, bot) = (r.top() + 1.0, r.bottom() - 1.0);
-            let faces = [(-0.75, deepen(color, 0.18)), (0.75, separate(color, 0.26))];
-            for x in seams {
-                for (dx, face) in faces {
-                    painter.line_segment(
-                        [
-                            Pos2::new(x + dx + lean * 0.5, top),
-                            Pos2::new(x + dx - lean * 0.5, bot),
-                        ],
-                        Stroke::new(1.0, face),
-                    );
-                }
             }
         }
         // The fades: translucent wedges from the top corners, their feet at
@@ -9271,15 +9339,7 @@ selected: false,
             }
         }
         let span = f32::from(hi - lo).max(1.0);
-        let inner = {
-            let base = r.shrink(2.0);
-            let band = clip_name_band(r);
-            if band > 0.0 && base.height() > band {
-                Rect::from_min_max(Pos2::new(base.left(), base.top() + band), base.max)
-            } else {
-                base
-            }
-        };
+        let inner = miniature_band(r, clip);
         if !inner.is_positive() {
             return;
         }
@@ -9633,6 +9693,72 @@ selected: false,
     /// here has none — and why this reads the whole `draw` rather than calling
     /// the seam pass on its own. A seam computed and not painted is the fault
     /// this exists to catch.
+    /// The convex pieces the clip's own fill was painted as, in paint order.
+    ///
+    /// `Shape::convex_polygon` lands as a `Shape::Path`, so a clip drawn as a
+    /// plain rounded rectangle contributes nothing here and a clip with
+    /// divots contributes one piece a pass. That asymmetry is the point: it
+    /// is what lets a test say "this clip is not a rectangle any more".
+    fn clip_pieces_in(v: &ArrangeView<'_>, r: Rect, fill: Color32) -> Vec<Vec<Pos2>> {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let area = rect();
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(area), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(area);
+                    draw(ui.painter(), area, v);
+                });
+            },
+        );
+        let mut got = Vec::new();
+        for s in &out.shapes {
+            let egui::Shape::Path(path) = &s.shape else {
+                continue;
+            };
+            if path.fill != fill || !path.closed {
+                continue;
+            }
+            if path.points.iter().any(|p| !r.expand(1.0).contains(*p)) {
+                continue;
+            }
+            got.push(path.points.clone());
+        }
+        got
+    }
+
+    /// The waveform's own columns inside `r`, as their top and bottom.
+    fn wave_columns_in(v: &ArrangeView<'_>, r: Rect) -> Vec<(f32, f32)> {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let area = rect();
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(area), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(area);
+                    draw(ui.painter(), area, v);
+                });
+            },
+        );
+        let mut got = Vec::new();
+        for s in &out.shapes {
+            let egui::Shape::LineSegment { points, .. } = &s.shape else {
+                continue;
+            };
+            let (a, b) = (points[0], points[1]);
+            // A wave column is VERTICAL and stands inside the clip.
+            if (a.x - b.x).abs() > 0.25 || !r.contains(a) || !r.contains(b) {
+                continue;
+            }
+            got.push((a.y.min(b.y), a.y.max(b.y)));
+        }
+        got
+    }
+
     fn diagonals_in(v: &ArrangeView<'_>, r: Rect) -> Vec<(Pos2, Pos2, Color32)> {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
@@ -9714,98 +9840,98 @@ selected: false,
             assert!((g - w).abs() < 0.5, "a seam at {g} belongs at {w}");
         }
 
-        // And they were painted. Two faces a seam — the groove and the land —
-        // so six lines, in pairs straddling each boundary.
-        let drawn = diagonals_in(&v, r);
+        // ── and the clip's SHAPE carries them ─────────────────────────
+        //
+        // Four passes, so the fill is four convex pieces rather than one
+        // rounded rectangle. The previous seam was two diagonal STROKES
+        // printed on the surface and this is deliberately not that: the
+        // owner asked for "a simple shape change on the clip itself ... a
+        // small cutout in the CLIP shape -- no line", so what is asserted
+        // here is the outline, and the absence of any line drawn along it.
+        let face = Color32::from_rgb(0x2E, 0x6B, 0x46);
+        let fill = crate::recorder_panel::legible_surface(face);
+        let pieces = clip_pieces_in(&v, r, fill);
         assert_eq!(
-            drawn.len(),
-            6,
-            "four passes painted {} diagonals, not the six a three-seam clip owes",
+            pieces.len(),
+            4,
+            "four passes were painted as {} pieces, not one a pass",
+            pieces.len()
+        );
+
+        // **Every seam is a bite out of the top edge AND the bottom edge.**
+        // At the boundary the outline stands `bite` inside the clip; a
+        // sixteenth of a pass either side of it, it is back on the edge. A
+        // notch that only dented one edge, or that leaned all the way across
+        // its pass, passes a presence check and fails this.
+        let d = clip_bite_d(r);
+        let on = |pts: &[Pos2], x: f32, y: f32| {
+            pts.iter().any(|p| (p.x - x).abs() < 0.75 && (p.y - y).abs() < 0.75)
+        };
+        // **The depth first, on its own.** Without this the apex checks below
+        // are satisfied by a bite of DEPTH ZERO — `top + 0.0` is the edge, so
+        // an outline that never leaves the edge answers "yes, there is a
+        // point there". A revert setting `clip_bite_d` to zero passed all
+        // three of these tests before this line existed.
+        assert!(d >= 2.0, "a bite {d} deep is not a bite");
+        for (n, x) in got.iter().enumerate() {
+            let left = &pieces[n];
+            let right = &pieces[n + 1];
+            assert!(
+                on(left, *x, r.top() + d) && on(right, *x, r.top() + d),
+                "seam {n} at {x} has no top bite: the pieces meet at full height"
+            );
+            assert!(
+                on(left, *x, r.bottom() - d) && on(right, *x, r.bottom() - d),
+                "seam {n} at {x} has no bottom bite"
+            );
+            // And the outline is AWAY from the edge there — the half that
+            // makes this a shape check rather than a point lookup.
+            assert!(
+                !on(left, *x, r.top()) && !on(right, *x, r.top()),
+                "seam {n} at {x} still meets the clip's top edge"
+            );
+            assert!(
+                !on(left, *x, r.bottom()) && !on(right, *x, r.bottom()),
+                "seam {n} at {x} still meets the clip's bottom edge"
+            );
+        }
+
+        // **The bite is shallow enough to leave the material alone.** A tenth
+        // of the lane, which is the band the waveform and the miniature are
+        // both kept out of — see `clip_bite_d` and `miniature_band`.
+        assert!(
+            d <= r.height() * 0.1 + 1.0e-3,
+            "a bite {d} deep eats into a {} lane's waveform",
+            r.height()
+        );
+
+        // **And nothing was STROKED.** The old seam drew six diagonals here.
+        let drawn = diagonals_in(&v, r);
+        assert!(
+            drawn.is_empty(),
+            "the seam is a shape, not a line, and {} were drawn",
             drawn.len()
         );
-        for (n, pair) in drawn.chunks(2).enumerate() {
-            let mid = (pair[0].0.x + pair[0].1.x + pair[1].0.x + pair[1].1.x) / 4.0;
-            assert!(
-                (mid - want[n]).abs() < 1.5,
-                "seam {n} was painted around {mid}, not at {}",
-                want[n]
-            );
-            // A RECESS leans: the top of the notch stands ahead of its foot.
-            for (top, bot, _) in pair {
-                assert!(
-                    top.x > bot.x + 1.0,
-                    "the seam is not on the diagonal: {top:?} over {bot:?}"
-                );
-            }
-        }
-
-        // **The notch is cut into the clip's own surface**, not printed on it
-        // in the clip's ink. The two faces sit either side of the lane's
-        // colour, and neither of them is the near-white or near-black that a
-        // figure would be drawn in — this is the house rule that keeps a
-        // hand-painted lane from wearing somebody else's seam.
-        let face = Color32::from_rgb(0x2E, 0x6B, 0x46);
-        let lum = |c: Color32| crate::recorder_panel::wants_light_ink(c);
-        let inks: Vec<Color32> = drawn.iter().map(|(_, _, c)| *c).collect();
-        for c in &inks {
-            let ratio = crate::recorder_panel::contrast_ratio(*c, face);
-            assert!(
-                ratio < 3.0,
-                "a seam face at {ratio:.2}:1 off the clip is a stripe, not a recess"
-            );
-            assert_ne!(*c, crate::recorder_panel::INK_LIGHT, "the seam took the ink");
-            assert_ne!(*c, crate::recorder_panel::INK_DARK, "the seam took the ink");
-        }
-        assert!(
-            inks.iter().any(|c| lum(*c) != lum(inks[0])) || inks.iter().any(|c| *c != inks[0]),
-            "both faces of the notch are the same colour, which is a line and not a groove"
-        );
-
-        // **And the same clip with its tail off the right of the window.**
-        // The seam range is arithmetic, and the arithmetic that bounds it at
-        // the viewport's edge is the half that only shows here: the last seam
-        // BEFORE the cut is at the boundary the floor lands on, and a bound
-        // that forgot the range is half-open drops it. Seen whole, the clip's
-        // own end supplies that bound and the fault hides.
-        let mut cut = a_view(&clips);
-        cut.view_start_s = 0.0;
-        cut.view_len_s = 5.0;
-        cut.song_s = 12.0;
-        let cr = clip_rect(area, &cut, &clips[0]);
-        let cut_full_x = (
-            x_of(area, &cut, clips[0].start_s),
-            x_of(area, &cut, clips[0].start_s + clips[0].len_s),
-        );
-        let want: Vec<f32> = [2.0, 4.0].iter().map(|t| x_of(area, &cut, *t)).collect();
-        let got = loop_seam_xs(cr, cut_full_x, &clips[0]);
-        assert_eq!(got.len(), want.len(), "cut off at 5s: seams at {got:?}, wanted {want:?}");
-        for (g, w) in got.iter().zip(&want) {
-            assert!((g - w).abs() < 0.5, "a seam at {g} belongs at {w}");
-        }
     }
 
-    /// **An AUDIO clip that loops is notched too.**
+    /// **An AUDIO clip that loops is bitten too, and the bite clears its
+    /// waveform.**
     ///
-    /// The seam pass lived inside the `clip.midi` branch, which was true of
-    /// loops on the day it was written and stopped being true the day audio
-    /// started repeating. A four-bar drum take pulled over sixteen bars
-    /// SOUNDS like four passes — `audio_clip_passes` lays a `Placed` down per
-    /// pass — and DRAWS four passes of the same waveform, because
-    /// `looped_span_envelope` folds the picture into the loop. The one thing
-    /// missing was any mark saying where one ended and the next began, which
-    /// is the whole of what the notch is for.
+    /// The seam pass lived inside the `clip.midi` branch until the day audio
+    /// started repeating, and it is now the clip's own outline rather than a
+    /// mark on it, so this has to hold for a clip whose material is a wave.
     ///
-    /// The fixture carries a real wave and no notes, so it goes down the
-    /// audio road through `draw` — and the wave is why the seam moved BELOW
-    /// the wave pass rather than merely out of the branch: a notch takes the
-    /// material and whatever was printed on it, and a notch printed before
-    /// the waveform would have the waveform drawn back over it.
+    /// The second half is the one a presence check cannot see. When the seam
+    /// was two strokes, the risk was ORDER — a notch printed before the
+    /// waveform had the waveform painted back over it. Now that the notch is
+    /// a hole, the risk is the mirror of that: the wave is drawn after the
+    /// fill and would hang in the lane outside its own clip if it reached
+    /// into a bite. So what is asserted is the CLEARANCE — every column of
+    /// the waveform stays inside the band the bites leave alone.
     ///
-    /// Revert checks performed: put the seam pass back inside `if clip.midi`
-    /// and this paints nothing; leave it out of the branch but above the wave
-    /// and the diagonals survive, so the order is asserted by shape INDEX
-    /// rather than by presence — the wave's own columns inside the same clip
-    /// must all come first.
+    /// Revert checks performed: return `0.0` from `clip_bite_d` and the bite
+    /// asserts name the missing divot; widen it to a third of the height and
+    /// the clearance assert names the column that reaches into it.
     #[test]
     fn a_looped_audio_clip_is_notched_where_each_pass_ends() {
         let bar_s = 2.0;
@@ -9830,79 +9956,53 @@ selected: false,
         let r = clip_rect(area, &v, &clips[0]);
         assert!(r.is_positive(), "the fixture clip is not on screen");
 
-        // Three boundaries inside four passes, two faces each.
+        // Three boundaries inside four passes, so four pieces.
         let want: Vec<f32> = [2.0, 4.0, 6.0].iter().map(|t| x_of(area, &v, *t)).collect();
-        let drawn = diagonals_in(&v, r);
+        let fill = crate::recorder_panel::legible_surface(Color32::from_rgb(0x2E, 0x6B, 0x46));
+        let pieces = clip_pieces_in(&v, r, fill);
         assert_eq!(
-            drawn.len(),
-            6,
-            "a looping AUDIO clip painted {} diagonals, not the six a \
-             three-seam clip owes",
-            drawn.len()
+            pieces.len(),
+            4,
+            "a looping AUDIO clip was painted as {} pieces, not one a pass",
+            pieces.len()
         );
-        for (n, pair) in drawn.chunks(2).enumerate() {
-            let mid = (pair[0].0.x + pair[0].1.x + pair[1].0.x + pair[1].1.x) / 4.0;
+        let d = clip_bite_d(r);
+        let on = |pts: &[Pos2], x: f32, y: f32| {
+            pts.iter().any(|p| (p.x - x).abs() < 0.75 && (p.y - y).abs() < 0.75)
+        };
+        assert!(d >= 2.0, "a bite {d} deep is not a bite");
+        for (n, x) in want.iter().enumerate() {
             assert!(
-                (mid - want[n]).abs() < 1.5,
-                "seam {n} was painted around {mid}, not at {}",
-                want[n]
+                on(&pieces[n], *x, r.top() + d) && on(&pieces[n + 1], *x, r.top() + d),
+                "seam {n} at {x} has no top bite"
+            );
+            assert!(
+                on(&pieces[n], *x, r.bottom() - d) && on(&pieces[n + 1], *x, r.bottom() - d),
+                "seam {n} at {x} has no bottom bite"
+            );
+            assert!(
+                !on(&pieces[n], *x, r.top()) && !on(&pieces[n + 1], *x, r.top()),
+                "seam {n} at {x} still meets the clip's top edge"
             );
         }
-
-        // **And it is cut into the wave, not under it.** The order is the
-        // half a presence assert cannot see: every vertical column of the
-        // waveform inside this clip has to be emitted BEFORE every diagonal
-        // of a seam, or the picture the notch was supposed to interrupt is
-        // painted straight back over it.
-        let (waves, seams) = shape_indices_in(&v, r);
-        assert!(!waves.is_empty(), "the fixture drew no waveform at all");
-        assert!(!seams.is_empty(), "the fixture drew no seam at all");
         assert!(
-            waves.iter().max() < seams.iter().min(),
-            "a waveform column at shape {:?} is painted after a seam at {:?}",
-            waves.iter().max(),
-            seams.iter().min()
+            diagonals_in(&v, r).is_empty(),
+            "the seam is a shape now, and a line was drawn"
         );
-    }
 
-    /// Where the waveform's columns and the loop's seams landed in the shape
-    /// list, as `(vertical indices, diagonal indices)` inside `r`.
-    ///
-    /// The same filter [`diagonals_in`] uses, kept apart from it because this
-    /// one is about ORDER and needs the verticals it throws away. The clip's
-    /// own rect bounds both, so the grid and the playhead — vertical, and
-    /// drawn across the whole panel — are excluded by the containment test
-    /// the same way they are there.
-    fn shape_indices_in(v: &ArrangeView<'_>, r: Rect) -> (Vec<usize>, Vec<usize>) {
-        let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
-        crate::fonts::apply_text_styles(&ctx);
-        let area = rect();
-        let out = ctx.run(
-            egui::RawInput { screen_rect: Some(area), ..Default::default() },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.set_clip_rect(area);
-                    draw(ui.painter(), area, v);
-                });
-            },
-        );
-        let (mut vert, mut diag) = (Vec::new(), Vec::new());
-        for (i, s) in out.shapes.iter().enumerate() {
-            let egui::Shape::LineSegment { points, .. } = &s.shape else {
-                continue;
-            };
-            let (a, b) = (points[0], points[1]);
-            if !r.contains(a) || !r.contains(b) {
-                continue;
-            }
-            if (a.x - b.x).abs() < 0.25 && (a.y - b.y).abs() > 0.25 {
-                vert.push(i);
-            } else if (a.x - b.x).abs() > 0.25 && (a.y - b.y).abs() > 0.25 {
-                diag.push(i);
-            }
+        // **The wave stays out of the bites.** Full-scale on every bucket, so
+        // this is the worst case the clip can offer.
+        let cols = wave_columns_in(&v, r);
+        assert!(!cols.is_empty(), "the fixture drew no waveform");
+        for (top, bot) in &cols {
+            assert!(
+                *top >= r.top() + d - 0.5 && *bot <= r.bottom() - d + 0.5,
+                "a waveform column runs {top}..{bot}, into a bite {d} deep on \
+                 a clip spanning {}..{}",
+                r.top(),
+                r.bottom()
+            );
         }
-        (vert, diag)
     }
 
     /// **Nothing that does not loop, and nothing too fine to place, is
