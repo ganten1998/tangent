@@ -8442,12 +8442,22 @@ fn show_on(
                             // being GONE rather than as a release, and a note that waited
                             // for the release would still be ringing.
                             //
-                            // And a drag is not a press. egui has already decided which this
-                            // gesture is by now, and the moment it says drag the sound stops
-                            // and the strip goes back to the row the picker has lit, which is
-                            // what keeps "dragging a row across does not audition it" true
-                            // after all this.
-                            *audition = holding.filter(|_| held && drag.is_none());
+                            // **A drag does NOT stop it.** It used to: the moment egui
+                            // called the gesture a drag the sound cut out, on the reasoning
+                            // that dragging a row across is not asking to hear it. The
+                            // reasoning was wrong in the hand. A mouse button held still is
+                            // held by a person, and a person's hand moves — six points is
+                            // nothing — so the note stopped a moment into a press that had
+                            // not ended and was never meant to be a drag. The owner: "make
+                            // the DX7 audition ring as long as the click lasts, like on the
+                            // piano."
+                            //
+                            // A piano key sounds while it is down, whatever the finger does
+                            // afterwards, and that is the whole rule here now: the press is
+                            // the gate. Dragging a patch to a staged slot sounds it on the
+                            // way, which is a better answer than silence anyway — it is the
+                            // patch you are choosing to keep.
+                            *audition = holding.filter(|_| held);
 
                             // ── the bottom ──────────────────────────────────
                             ui.add_space(4.0);
@@ -18385,15 +18395,31 @@ at: None,
             "a button let go outside the window left the row sounding"
         );
 
-        // A drag. The press sounds the row, and the moment egui calls it a
-        // drag instead, the sound stops — which is what keeps a row dragged
-        // into the staged bank from changing what the strip plays.
+        // **A drag goes on sounding**, and that is the point of the change
+        // that made it so. It used to stop the moment egui called the gesture
+        // a drag, which meant a hand holding still — six points is nothing —
+        // silenced a press that had not ended. A piano key sounds while it is
+        // down whatever the finger does after; so does this. Dragging a patch
+        // into the staged bank hears it on the way, which is the patch being
+        // chosen.
         let from = slot.press_and_hold("  3. VOICE 2");
         assert!(sounding(&slot).is_some(), "the press did not take");
         let to = from + Vec2::new(0.0, 220.0);
         let _ = slot.frame(vec![egui::Event::PointerMoved(from + Vec2::new(0.0, 110.0))]);
         let _ = slot.frame(vec![egui::Event::PointerMoved(to)]);
-        assert_eq!(sounding(&slot), None, "a drag went on sounding the row it picked up");
+        assert!(
+            sounding(&slot).is_some(),
+            "a drag silenced the row it picked up - the press is the gate, not the \
+             absence of movement"
+        );
+        // And letting go of it still stops it, which is the half that matters.
+        let _ = slot.frame(vec![egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert_eq!(sounding(&slot), None, "the drag's release left the row sounding");
         let _ = slot.let_go(to);
 
         // And the window. Nothing here has to remember to close a note: the
