@@ -206,10 +206,22 @@ channels play back their clips and nothing else. "Ready to play" and
   arm — and note-offs ride an active ledger that survives a jump landing
   exactly on a note.
 - Known slack in phase 4, written down on purpose: capture start is
-  block-quantised (no input-latency compensation yet); the sustain pedal is
-  not written into recorded MIDI clips (it rides the live path only); and a
-  recorded WAV's tail can be one device buffer short, because the tee
-  drains what has arrived when the record ends rather than waiting.
+  block-quantised (no input-latency compensation yet); and a recorded WAV's
+  tail can be one device buffer short, because the tee drains what has
+  arrived when the record ends rather than waiting.
+- **The sustain pedal is no longer on that list.** It was — "not written
+  into recorded MIDI clips, it rides the live path only" — and the symptom
+  was a part played with the damper down coming back dry, because the clip
+  kept only the instants the keys came up. All three pedals are now recorded
+  as `ArrPedal` edges beside the notes, at their raw values so half-pedalling
+  survives, and carried to the instrument at playback as a per-lane LEVEL
+  rather than a stream of events: `PlacedMidi::pedal` holds the loop-expanded
+  edges and `clip_pedal_level` answers where they stand at a frame, which is
+  what makes a locate into the middle of a held pedal land held. Outside a
+  clip the level is zero, so the end of a clip, a locate past it and a stop
+  all release the damper by one rule with no special case for any of them.
+  The rack is handed that lane's own control list rather than the live one,
+  which is what gives a VST3 instrument a door the clip's pedal can reach.
 - **Post-phase-4 batch SHIPPED (4.47.0)**, all owner-directed:
   - **Snap holds the playhead too**: clicking a lane or the ruler with the
     magnet on lands the locate exactly on the grid line.

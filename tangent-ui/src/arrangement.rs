@@ -265,7 +265,7 @@ fn clip_key_is_readable(key: &str, value: Option<&Value>) -> bool {
         "start_s" | "offset_s" | "len_s" | "fade_in_s" | "fade_out_s" | "stretch"
         | "loop_s" => v.is_number(),
         "follow_tempo" => v.is_boolean(),
-        "notes" => v.is_array(),
+        "notes" | "pedal" => v.is_array(),
         // A name not in the list is not a key this build claims, so nothing
         // is about to consume it either way.
         _ => true,
@@ -312,12 +312,13 @@ pub fn stretch_mode_label(key: &str) -> &'static str {
 /// read and `tangent-ui` cannot name a constant that lives with the DSP.
 pub const STRETCH_RATIO: (f64, f64) = (0.25, 4.0);
 
-const CLIP_KEYS: [&str; 17] = [
+const CLIP_KEYS: [&str; 18] = [
     "kind",
     "lane",
     "path",
     "name",
     "notes",
+    "pedal",
     "id",
     "start_s",
     "offset_s",
@@ -354,6 +355,33 @@ pub struct ArrNote {
     pub vel: u8,
 }
 
+/// **One pedal movement inside a MIDI clip**, in the same source seconds a
+/// note's `at_s` speaks.
+///
+/// A pedal is NOT a note and it is deliberately not folded into one. Baking
+/// the damper into note lengths — extending every `dur_s` to the lift — is
+/// the obvious cheap fix and it is the wrong one twice over: it throws away
+/// half-pedalling, which any decent digital piano sweeps through CC64's full
+/// range, and it destroys the difference between a chord ROLLED under the
+/// pedal and a chord HELD, which is a difference a pianist can hear and an
+/// editor should be able to show. `tangent-record`'s `.mid` writer already
+/// refuses that trade (see its header, "Why this does not reuse
+/// `MidiEvent`"); the arrangement was the one place that still made it.
+///
+/// The value is the raw controller number, 0..=127, NOT a boolean at 64. An
+/// instrument that only knows down-and-up collapses it at its own door,
+/// exactly as the live path does — see `mix_channels`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArrPedal {
+    pub at_s: f64,
+    /// Which pedal: 64 sustain, 66 sostenuto, 67 soft. The same three
+    /// `is_pedal` names in the binary, and the same three the take's `.mid`
+    /// snapshots.
+    pub cc: u8,
+    /// 0..=127, raw. Half-pedalling lives here.
+    pub value: u8,
+}
+
 /// What one lane RECORDED, handed over by the host when arrangement record
 /// stops. The host owns the files — it wrote the WAVs into `media/` — and
 /// the document work (the clip row, the save) is the app's.
@@ -368,6 +396,9 @@ pub struct RecordedClip {
     pub path: Option<String>,
     /// Clip-relative notes; empty on audio.
     pub notes: Vec<ArrNote>,
+    /// Clip-relative pedal movements; empty on audio, and on a take played
+    /// with no pedal under it.
+    pub pedal: Vec<ArrPedal>,
 }
 
 /// What a clip's position is measured against.
@@ -418,6 +449,15 @@ pub struct ArrClip {
     /// A MIDI clip's notes. Empty on audio clips, and on a MIDI item that
     /// was drawn but not yet played into.
     pub notes: Vec<ArrNote>,
+    /// **A MIDI clip's pedal movements**, sorted by `at_s`, in the same
+    /// source seconds the notes speak. Empty on audio, and on a part played
+    /// without a pedal.
+    ///
+    /// Its own list rather than a field on [`ArrNote`] because a pedal is a
+    /// property of the PERFORMANCE and not of any one note: it goes down
+    /// between two notes as often as under one, and it goes down when nothing
+    /// is sounding at all. See [`ArrPedal`].
+    pub pedal: Vec<ArrPedal>,
     /// Which lane it stands on. Lane 0 is the backing track's.
     pub lane: usize,
     /// The file it came from — `media/<file>` inside a project, or absolute.
@@ -543,6 +583,7 @@ impl Default for ArrClip {
         Self {
             kind: ClipKind::default(),
             notes: Vec::new(),
+            pedal: Vec::new(),
             lane: 0,
             path: String::new(),
             start_s: 0.0,
@@ -642,6 +683,87 @@ pub fn clip_notes_in_song_time(clip: &ArrClip) -> Vec<ArrNote> {
             });
         }
     }
+    out
+}
+
+/// **The twin of [`clip_notes_in_song_time`] for the pedal**, and it exists
+/// for the same reason: the loop is spelled out once, here, so that glue and
+/// the MIDI export cannot come to different opinions about what a repeating
+/// clip does.
+///
+/// Every pass restates the pedal it BEGINS at, not only the edges inside it.
+/// A loop whose pedal goes down in its second half and is never lifted holds
+/// the damper across the seam when it is played, so a flatten that emitted
+/// only the literal edges would come out drier than the clip it flattened —
+/// the second pass would open with the pedal up because nothing said
+/// otherwise.
+///
+/// The result is sorted and free of no-op repeats: a restatement equal to the
+/// level already standing is dropped, so a pedal held across four passes is
+/// one edge and not four.
+pub fn clip_pedal_in_song_time(clip: &ArrClip) -> Vec<ArrPedal> {
+    if clip.pedal.is_empty() {
+        return Vec::new();
+    }
+    let passes: usize = if clip.loop_s > 1.0e-6 {
+        ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 4_096)
+    } else {
+        1
+    };
+    let mut out: Vec<ArrPedal> = Vec::new();
+    // What each pedal stands at as the walk goes, so a restatement that
+    // changes nothing can be dropped.
+    let mut standing = [0_u8; 3];
+    let slot = |cc: u8| match cc {
+        66 => 1,
+        67 => 2,
+        _ => 0,
+    };
+    for pass in 0..passes {
+        let shift = clip.loop_s * pass as f64;
+        let pass_start = shift.max(0.0);
+        // The level this pass OPENS at: the last edge at or before its own
+        // start, which for pass zero is whatever preceded the trim.
+        for cc in [64_u8, 66, 67] {
+            let opens = clip
+                .pedal
+                .iter()
+                .filter(|e| e.cc == cc && e.at_s - clip.offset_s <= pass_start + 1.0e-9)
+                .next_back()
+                .map_or(0, |e| e.value);
+            if opens != standing[slot(cc)] && pass_start < clip.len_s - 1.0e-9 {
+                standing[slot(cc)] = opens;
+                out.push(ArrPedal {
+                    at_s: clip.start_s + pass_start,
+                    cc,
+                    value: opens,
+                });
+            }
+        }
+        for e in &clip.pedal {
+            let at = e.at_s - clip.offset_s + shift;
+            // Strictly after the pass's own start: an edge exactly there is
+            // the opening level, already stated above.
+            if at <= pass_start + 1.0e-9 {
+                continue;
+            }
+            // The same past-the-end rule the notes twin uses, and only for
+            // a loop, so the two cannot disagree about what a clip holds.
+            if clip.loop_s > 1.0e-6 && at >= clip.len_s - 1.0e-9 {
+                continue;
+            }
+            if e.value == standing[slot(e.cc)] {
+                continue;
+            }
+            standing[slot(e.cc)] = e.value;
+            out.push(ArrPedal {
+                at_s: clip.start_s + at,
+                cc: e.cc,
+                value: e.value,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
     out
 }
 
@@ -1299,9 +1421,41 @@ impl Arrangement {
                         });
                     }
                 }
+                // **The pedal, read like the notes and clamped like them.**
+                // Sorted on the way in rather than trusted: everything
+                // downstream binary-searches this list for the level at an
+                // instant, and a hand-edited document with its edges out of
+                // order would answer with the wrong one.
+                let mut pedal = Vec::new();
+                if let Some(Value::Array(list)) = c.get("pedal") {
+                    for e in list {
+                        let Value::Object(e) = e else { continue };
+                        let Some(at_s) = e.get("at_s").and_then(Value::as_f64) else {
+                            continue;
+                        };
+                        // An unnamed pedal is the sustain pedal: it is the
+                        // one anybody writing this by hand means, and the
+                        // only one the built-in instruments model.
+                        let cc = e.get("cc").and_then(Value::as_u64).unwrap_or(64);
+                        if !at_s.is_finite() || !matches!(cc, 64 | 66 | 67) {
+                            continue;
+                        }
+                        pedal.push(ArrPedal {
+                            at_s: at_s.max(0.0),
+                            cc: cc as u8,
+                            value: e
+                                .get("value")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0)
+                                .min(127) as u8,
+                        });
+                    }
+                    pedal.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+                }
                 let clip = ArrClip {
                     kind,
                     notes,
+                    pedal,
                     lane,
                     path: path.to_owned(),
                     start_s: secs(&c, "start_s"),
@@ -1675,6 +1829,37 @@ impl Arrangement {
                                             o.insert(
                                                 "vel".into(),
                                                 Value::Number(u64::from(n.vel).into()),
+                                            );
+                                            Value::Object(o)
+                                        })
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        // **Omitted when there is none**, like `notes` above
+                        // it: every document written before the pedal existed
+                        // stays byte-identical, which is what keeps undo's
+                        // `to_json(from_json(x)) == x` comparison honest.
+                        if !c.pedal.is_empty() {
+                            m.insert(
+                                "pedal".into(),
+                                Value::Array(
+                                    c.pedal
+                                        .iter()
+                                        .map(|e| {
+                                            let mut o = Map::new();
+                                            if let Some(x) =
+                                                serde_json::Number::from_f64(e.at_s)
+                                            {
+                                                o.insert("at_s".into(), Value::Number(x));
+                                            }
+                                            o.insert(
+                                                "cc".into(),
+                                                Value::Number(u64::from(e.cc).into()),
+                                            );
+                                            o.insert(
+                                                "value".into(),
+                                                Value::Number(u64::from(e.value).into()),
                                             );
                                             Value::Object(o)
                                         })
@@ -2128,6 +2313,7 @@ mod tests {
     fn a_loop_length_round_trips_and_absence_means_no_loop() {
         let mut arr = Arrangement::default();
         arr.add_clip(ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Midi,
             lane: 2,
             start_s: 1.0,
@@ -2155,6 +2341,7 @@ mod tests {
 
     fn a_clip(lane: usize, path: &str, start_s: f64) -> ArrClip {
         ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Audio,
             notes: Vec::new(),
             lane,
@@ -2185,6 +2372,7 @@ mod tests {
         let mut a = Arrangement::default();
         a.add_clip(a_clip(0, "media/backing.mp3", 0.0));
         let solo = ArrClip {
+            pedal: Vec::new(),
             offset_s: 1.25,
             len_s: 30.0,
             loop_s: 0.0,
@@ -2195,6 +2383,7 @@ mod tests {
         };
         a.add_clip(solo);
         let mut midi = ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Midi,
             path: String::new(),
             len_s: 8.0,
@@ -2252,10 +2441,12 @@ mod tests {
         let mut a = Arrangement::default();
         a.add_clip(a_clip(0, "/x/a.wav", 0.0)); // whole 100 s file
         a.add_clip(ArrClip {
+            pedal: Vec::new(),
             len_s: 10.0,
             ..a_clip(1, "/x/b.wav", 95.0) // ends at 105
         });
         a.add_clip(ArrClip {
+            pedal: Vec::new(),
             offset_s: 40.0,
             ..a_clip(2, "/x/a.wav", 30.0) // 100-40=60 long, ends at 90
         });
@@ -2484,6 +2675,7 @@ mod tests {
     fn a_clips_anchor_survives_and_costs_nothing_when_ordinary() {
         let mut a = Arrangement::default();
         a.add_clip(ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Midi,
             anchor: Anchor::Beat,
             follow_tempo: true,
@@ -2546,6 +2738,7 @@ mod tests {
         a.add_clip(ArrClip {
             kind: ClipKind::Midi,
             notes: vec![ArrNote { at_s: 0.5, dur_s: 1.0, key: 64, vel: 99 }],
+            pedal: vec![ArrPedal { at_s: 0.5, cc: 64, value: 127 }],
             lane: 2,
             path: String::new(),
             start_s: 3.0,
@@ -2592,6 +2785,84 @@ mod tests {
         assert!(
             Arrangement::from_json(&a.to_json()).clips[0].extra.is_empty(),
             "a clip claimed one of its own keys as a stranger's"
+        );
+    }
+
+    /// **The pedal survives the document**, values and all.
+    ///
+    /// And a document written before it existed reads back with an empty
+    /// list rather than a guess — an unpedalled part and a part whose pedal
+    /// was never recorded look the same on disk, and inventing a damper for
+    /// the second would change how the first sounds.
+    #[test]
+    fn a_clips_pedal_makes_the_round_trip() {
+        let mut a = Arrangement::default();
+        a.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 90 }],
+            // Half-pedalling: the values are the point, not a boolean at 64.
+            pedal: vec![
+                ArrPedal { at_s: 0.0, cc: 64, value: 127 },
+                ArrPedal { at_s: 1.0, cc: 64, value: 40 },
+                ArrPedal { at_s: 2.0, cc: 66, value: 100 },
+            ],
+            lane: 1,
+            len_s: 4.0,
+            ..Default::default()
+        });
+        let back = Arrangement::from_json(&a.to_json());
+        assert_eq!(back.clips[0].pedal, a.clips[0].pedal);
+        assert!(back.clips[0].extra.is_empty(), "the pedal read as a stranger");
+
+        // A document from before the pedal existed.
+        let older = r#"{"version":3,"clips":[{"kind":"midi","lane":0,"start_s":0.0,"len_s":4.0,"notes":[]}]}"#;
+        assert!(Arrangement::from_json(older).clips[0].pedal.is_empty());
+
+        // And a clip with no pedal writes no key, so every document written
+        // before this is still byte-identical through a round trip.
+        let mut plain = Arrangement::default();
+        plain.add_clip(ArrClip { kind: ClipKind::Midi, len_s: 1.0, ..Default::default() });
+        assert!(!plain.to_json().contains("pedal"));
+    }
+
+    /// **Every pass of a loop restates the pedal it opens with.**
+    ///
+    /// A clip whose pedal goes down halfway through and is never lifted holds
+    /// the damper across the seam when it plays, so a flatten that emitted
+    /// only the literal edges would come out drier than the clip it
+    /// flattened: the second pass would open with the pedal up because
+    /// nothing said otherwise.
+    ///
+    /// And a level that has not changed is not restated — a pedal held
+    /// across four passes is one edge, not four.
+    #[test]
+    fn each_pass_of_a_loop_opens_with_the_pedal_it_inherits() {
+        let clip = ArrClip {
+            kind: ClipKind::Midi,
+            pedal: vec![ArrPedal { at_s: 0.5, cc: 64, value: 127 }],
+            start_s: 10.0,
+            len_s: 3.0,
+            loop_s: 1.0,
+            ..Default::default()
+        };
+        let out = clip_pedal_in_song_time(&clip);
+        let at: Vec<f64> = out.iter().map(|e| e.at_s).collect();
+        assert_eq!(
+            at,
+            vec![10.5],
+            "the pedal was restated on a pass that already held it: {out:?}"
+        );
+
+        // The same clip, LIFTED at the end of its pass: now every pass has to
+        // press it again, because every pass ends with it up.
+        let mut chopped = clip.clone();
+        chopped.pedal.push(ArrPedal { at_s: 0.75, cc: 64, value: 0 });
+        let out = clip_pedal_in_song_time(&chopped);
+        let at: Vec<(f64, u8)> = out.iter().map(|e| (e.at_s, e.value)).collect();
+        assert_eq!(
+            at,
+            vec![(10.5, 127), (10.75, 0), (11.5, 127), (11.75, 0), (12.5, 127), (12.75, 0)],
+            "{out:?}"
         );
     }
 
@@ -2647,6 +2918,7 @@ mod tests {
         let mut extra = Map::new();
         extra.insert("a_newer_builds_key".into(), Value::from("kept"));
         a.add_clip(ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Midi,
             notes: vec![
                 ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 },
@@ -2670,6 +2942,7 @@ mod tests {
             extra,
         });
         a.add_clip(ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Audio,
             lane: 0,
             path: "media/take 1.wav".into(),

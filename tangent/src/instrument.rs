@@ -550,6 +550,22 @@ fn is_pedal(status: u8, data1: u8) -> bool {
     status >= 0x80 && status & 0xF0 == 0xB0 && matches!(data1, 64 | 66 | 67)
 }
 
+/// The three pedals, in the order every `[u8; 3]` pedal array here holds them.
+const PEDAL_CCS: [u8; 3] = [64, 66, 67];
+
+/// Which slot of a `[u8; 3]` pedal array a controller number owns.
+///
+/// `None` for everything else, which is what keeps a mod wheel out of the
+/// damper's seat.
+const fn pedal_slot(cc: u8) -> Option<usize> {
+    match cc {
+        64 => Some(0),
+        66 => Some(1),
+        67 => Some(2),
+        _ => None,
+    }
+}
+
 /// A channel of the mixer, and the bit it owns in `muted` / `soloed`.
 ///
 /// **The master is not here on purpose.** Muting the master is the same as
@@ -3014,6 +3030,17 @@ pub struct PlacedMidi {
     /// Frames the clip runs; nothing past this sounds.
     pub len: u64,
     pub notes: Arc<Vec<ClipNote>>,
+    /// **The pedal, as edges in clip-relative frames**, sorted by `at` and
+    /// with each pass of a loop already spelled out — the same treatment
+    /// `notes` gets, from the same expansion, so the two cannot disagree
+    /// about what a repeating clip does.
+    ///
+    /// Read as a LEVEL and not as a stream: the walk below asks "where does
+    /// this stand at frame N", which is the last edge at or before N. That
+    /// is what makes it immune to the two things that break a cursor — a
+    /// locate into the middle of a held pedal, and a loop wrap — without
+    /// either of them needing to know it exists.
+    pub pedal: Arc<Vec<ClipPedal>>,
 }
 
 /// One note of a MIDI clip, in frames from the clip's start.
@@ -3023,6 +3050,20 @@ pub struct ClipNote {
     pub dur: u64,
     pub key: u8,
     pub vel: u8,
+}
+
+/// One pedal movement of a MIDI clip, in frames from the clip's start.
+///
+/// The value is raw, 0..=127, exactly as [`tangent_ui::arrangement::ArrPedal`]
+/// holds it: a VST3 instrument is handed the number and a built-in one
+/// collapses it at 64, which is what the live path already does with a real
+/// pedal and is therefore the only rule either of them has to know.
+#[derive(Clone, Copy)]
+pub struct ClipPedal {
+    pub at: u64,
+    /// 64 sustain, 66 sostenuto, 67 soft.
+    pub cc: u8,
+    pub value: u8,
 }
 
 /// A clip note that is SOUNDING: where its off falls, and on which lane.
@@ -3844,6 +3885,40 @@ struct Renderer {
     /// Per-lane note scratch for one block: the live events (armed) and the
     /// clips' both, copied — the rack takes one slice.
     lane_notes: Vec<Note>,
+    /// **The controls twin of `lane_notes`**, and it exists for the reason
+    /// the notes one does: a lane's pedal is the live pedal, the pedal its
+    /// CLIPS are holding, or both, and a rack takes one slice.
+    ///
+    /// Before this, every rack on every channel was handed `&self.controls`
+    /// — the live list, and nothing else. A recorded pedal had no door into
+    /// an instrument even once the clip carried it.
+    lane_controls: Vec<tangent_host::Control>,
+    /// Where the three pedals stand on the LIVE input, as a level rather
+    /// than as the events that got them there.
+    ///
+    /// `self.controls` is a block's worth of CHANGES, so it says nothing at
+    /// all on the ninety-nine blocks out of a hundred where a held pedal
+    /// sends nothing — which was fine while the only consumer applied edges
+    /// as they arrived, and is not fine now that a lane has to combine the
+    /// live pedal with a clip's. Indexed by [`pedal_slot`].
+    live_pedal: [u8; 3],
+    /// What each lane was last TOLD its pedal was, so a level that has not
+    /// moved costs nothing and a level that has is stated exactly once.
+    ///
+    /// It is also what releases the pedal at a stop, at a locate out of a
+    /// clip, and at the end of a clip, with no special case for any of the
+    /// three: the level those all fall to is zero, which is a change, which
+    /// is an edge.
+    lane_pedal_sent: [[u8; 3]; CHANNELS],
+    /// This block's pedal MOVES, as `(lane, control)` — filled by the pass
+    /// that decides each lane's level and drained by the lane loop that
+    /// builds `lane_controls`.
+    ///
+    /// A queue rather than a direct push because the two passes are far
+    /// apart on purpose: the first needs `&mut` on the instruments, the
+    /// second needs the buffers borrowed, and the block's worth of pedal
+    /// moves is at most three per lane.
+    lane_pedal_out: Vec<(u8, tangent_host::Control)>,
     /// The transport's position in frames, advanced by `run_transport` and
     /// nothing else. Project frames, not clip frames: a clip positions itself
     /// as `pos - placed.start`.
@@ -4821,6 +4896,14 @@ impl Renderer {
                 // mapping; `Rendered::unmapped` is what counts the ones that
                 // did not, so `pedal_dropped` now means "this instrument has no
                 // pedal" rather than "we never tried".
+                // The LEVEL, kept beside the event — every path that
+                // delivers a pedal also records where it left it, exactly as
+                // `sounding` is kept beside the note push above. A lane that
+                // has to combine this with a clip's pedal cannot ask a list
+                // of changes where something stands.
+                if let Some(slot) = pedal_slot(event.data1 & 0x7F) {
+                    self.live_pedal[slot] = event.data2 & 0x7F;
+                }
                 if self.controls.len() < self.controls.capacity() {
                     self.controls.push(Control {
                         offset,
@@ -8248,6 +8331,51 @@ impl Renderer {
     /// Replaces `render_builtin`, and generalises exactly what that function
     /// already did for one synth: render into a private buffer, run the
     /// channel's rack, fold at the channel's fader and send, note the peak.
+    /// **Where a lane's clips hold the three pedals at frame `at`.**
+    ///
+    /// A LEVEL and not an event: the answer is the last edge at or before
+    /// `at` in every clip on this lane that the playhead currently stands
+    /// inside. That is what makes it right in the two cases a cursor gets
+    /// wrong — a locate that lands in the middle of a held pedal, and a loop
+    /// wrap — with neither of them needing to know the pedal exists.
+    ///
+    /// **Outside a clip is pedal UP**, which is the whole of the release
+    /// story: a clip ending, a locate past it and a stop all leave the
+    /// playhead outside, all answer zero, and zero is a change the caller
+    /// states like any other. There is no separate "lift the pedal" path to
+    /// forget on one of the three.
+    ///
+    /// Overlapping clips take the LOUDEST opinion. It is the same rule the
+    /// notes use — anything a clip asks to sound, sounds — and the
+    /// alternative, letting whichever clip is later in the list win, would
+    /// make the sound depend on the order the schedule happened to be built
+    /// in.
+    ///
+    /// `partition_point` and not a scan: this runs once per lane per block,
+    /// and a long take's pedal list is not short.
+    fn clip_pedal_level(clips: &[PlacedMidi], ch: usize, at: u64) -> [u8; 3] {
+        let mut out = [0_u8; 3];
+        for mc in clips {
+            if mc.strip.min(CHANNELS - 1) != ch {
+                continue;
+            }
+            if at < mc.start || at >= mc.start + mc.len {
+                continue;
+            }
+            let rel = at - mc.start;
+            // The edges are sorted by `at` across all three controllers
+            // together, so one search finds the end of the run at or before
+            // `rel` and each walk back picks its own controller's last.
+            let end = mc.pedal.partition_point(|e| e.at <= rel);
+            for (slot, cc) in PEDAL_CCS.into_iter().enumerate() {
+                if let Some(e) = mc.pedal[..end].iter().rev().find(|e| e.cc == cc) {
+                    out[slot] = out[slot].max(e.value);
+                }
+            }
+        }
+        out
+    }
+
     fn mix_channels(
         &mut self,
         frames: usize,
@@ -8344,6 +8472,9 @@ impl Renderer {
         let builtin_mask = self.shared.builtin_strips.load(Ordering::Relaxed);
         let keys_mask = self.shared.keys_strips.load(Ordering::Relaxed);
         let midi_off = self.shared.midi_off.load(Ordering::Relaxed);
+        // This block's pedal moves, refilled from scratch: it is a list of
+        // CHANGES and last block's are not this block's.
+        self.lane_pedal_out.clear();
         // Per-lane state, applied on the thread that owns the instruments: a
         // compare per block for the patch (`set_patch` returns immediately on
         // a match), two plain stores for the panel knobs — and CC 64, live
@@ -8354,6 +8485,31 @@ impl Renderer {
         for ch in 0..CHANNELS {
             let bit = 1u32 << ch.min(31);
             let armed_here = midi_off & u64::from(bit) == 0;
+            // **What this lane's PEDAL is, live and recorded together.**
+            //
+            // Live is a level now rather than the block's events (see
+            // `live_pedal`), and the clips' is read off the schedule as a
+            // level too, so the two combine by `max` and the answer is the
+            // same whether the pedal was pressed by a foot a moment ago or
+            // by a take recorded last week. `max` and not "live wins": a
+            // player resting a foot on the pedal must not be able to lift the
+            // damper out of somebody's recording, and a clip's pedal must not
+            // strand a live one.
+            //
+            // Asked once per lane per block and used by all three consumers
+            // below — the modelled keyboard, the DX7, and the rack.
+            let clip_pedal = if rolling {
+                Self::clip_pedal_level(&self.midi_clips, ch, at)
+            } else {
+                [0; 3]
+            };
+            let pedal_now: [u8; 3] = std::array::from_fn(|i| {
+                if armed_here {
+                    self.live_pedal[i].max(clip_pedal[i])
+                } else {
+                    clip_pedal[i]
+                }
+            });
             if keys_mask & bit != 0 {
                 if let Some(Some(k)) = self.keys_lanes.get_mut(ch) {
                     let want = self.shared.keys_patch[ch].load(Ordering::Relaxed) as usize;
@@ -8371,24 +8527,40 @@ impl Renderer {
                         );
                     }
                     k.set_params(&knobs);
-                    if armed_here {
-                        for c in &self.controls {
-                            if c.controller == 64 {
-                                k.set_pedal(c.value >= 64);
-                            }
-                        }
-                    }
+                    // **Every block, not only on an event.** `set_pedal`
+                    // early-returns on a level it already holds, so this is
+                    // a compare — and stating it unconditionally is what
+                    // lets a stop, a locate off the end of a clip and the
+                    // clip simply ending all release the damper through one
+                    // path instead of three.
+                    k.set_pedal(pedal_now[0] >= 64);
                 }
             }
             if builtin_mask & bit != 0 {
                 if let Some(Some(d)) = self.dx7s.get_mut(ch) {
-                    if armed_here {
-                        for c in &self.controls {
-                            if c.controller == 64 {
-                                d.set_pedal(c.value >= 64);
-                            }
-                        }
-                    }
+                    d.set_pedal(pedal_now[0] >= 64);
+                }
+            }
+            // **And the same level as a CONTROL, for whatever is in the
+            // rack.** A VST3 instrument has no `set_pedal`; the only door
+            // VST3 leaves open for a CC is a parameter change, which is what
+            // `Control` is. Stated only when it MOVES, because unlike
+            // `set_pedal` a control queue is a stream and a pedal restated
+            // every block would be five thousand parameter changes a minute.
+            //
+            // Channel 0: a clip has no wire and so no channel of its own. The
+            // live path keeps the channel it arrived on, and those events go
+            // in whole, further down.
+            for (slot, cc) in PEDAL_CCS.into_iter().enumerate() {
+                if self.lane_pedal_sent[ch][slot] == pedal_now[slot] {
+                    continue;
+                }
+                self.lane_pedal_sent[ch][slot] = pedal_now[slot];
+                if self.lane_pedal_out.len() < self.lane_pedal_out.capacity() {
+                    self.lane_pedal_out.push((
+                        ch as u8,
+                        Control::cc(0, 0, i16::from(cc), pedal_now[slot]),
+                    ));
                 }
             }
         }
@@ -8400,6 +8572,10 @@ impl Renderer {
         // The per-lane note list, taken out of `self` so the loop below can
         // read the live list and the clips while filling it.
         let mut lane_notes = std::mem::take(&mut self.lane_notes);
+        // Taken out of `self` for the same reason `lane_notes` is: the loop
+        // below reads the live list and the block's pedal moves while it
+        // fills this one.
+        let mut lane_controls = std::mem::take(&mut self.lane_controls);
         let coeff = self.gain_coeff;
         // **The earliest note still due this block.** The block's own start,
         // except straight after a LOOP WRAP, where the wrap kept its phase
@@ -8426,6 +8602,25 @@ impl Renderer {
             lane_notes.clear();
             if armed {
                 lane_notes.extend_from_slice(&self.notes);
+            }
+            // **This lane's controls: the live ones while armed, plus the
+            // pedal its clips moved this block.**
+            //
+            // The live events go in WHOLE rather than as the level computed
+            // earlier — they carry their own offset within the block and
+            // their own MIDI channel, and Pianoteq publishes a different
+            // parameter for each channel's CC64, so collapsing them would
+            // move the wrong piano.
+            lane_controls.clear();
+            if armed {
+                lane_controls.extend_from_slice(&self.controls);
+            }
+            for (lane, c) in &self.lane_pedal_out {
+                if usize::from(*lane) == ch
+                    && lane_controls.len() < lane_controls.capacity()
+                {
+                    lane_controls.push(*c);
+                }
             }
             if flush {
                 // The strands the jump or the stop left on THIS lane — swept
@@ -8987,7 +9182,15 @@ impl Renderer {
                 // immutable borrow of the whole of `self`, and the board
                 // above needs `&mut self` for the racks. Hoisted, it made
                 // the one call this refactor exists for uncompilable.
-                let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
+                // **This lane's own controls**, which is the pedal fix's
+                // last mile: a rack used to be handed `&self.controls`, the
+                // LIVE list, so a clip's pedal had no door into a VST3
+                // instrument even once the clip carried it. The arm gate
+                // moved inside — see where the list is filled — because a
+                // clip's pedal plays on an unarmed lane exactly as its notes
+                // do, and the arm is what the notes' own comment calls "the
+                // whole point of the arm".
+                let controls: &[tangent_host::Control] = &lane_controls;
                 // **This seat's own parameter queue, not the empty one.** Every rack
                 // outside the general channels used to be handed an empty queue,
                 // which was true while the only writer was an automation curve —
@@ -9197,6 +9400,7 @@ impl Renderer {
             }
         }
         self.lane_notes = lane_notes;
+        self.lane_controls = lane_controls;
 
     }
 
@@ -10632,6 +10836,11 @@ impl Engine {
             midi_cursor: Vec::new(),
             active_clip: Vec::with_capacity(256),
             lane_notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
+            // The live list plus at most three pedal moves of its own.
+            lane_controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
+            live_pedal: [0; 3],
+            lane_pedal_sent: [[0; 3]; CHANNELS],
+            lane_pedal_out: Vec::with_capacity(CHANNELS * 3),
             pos: 0,
             lane_gain: [1.0; CHANNELS],
             seen_req: 0,
@@ -16257,6 +16466,11 @@ mod tests {
             midi_cursor: Vec::new(),
             active_clip: Vec::with_capacity(256),
             lane_notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
+            // The live list plus at most three pedal moves of its own.
+            lane_controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
+            live_pedal: [0; 3],
+            lane_pedal_sent: [[0; 3]; CHANNELS],
+            lane_pedal_out: Vec::with_capacity(CHANNELS * 3),
             pos: 0,
             lane_gain: [1.0; CHANNELS],
             seen_req: 0,
@@ -17047,6 +17261,7 @@ mod tests {
     fn a_folder_sums_its_children_and_its_fader_governs_the_group() {
         use std::sync::Arc;
         let clip = |lane: usize| PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: lane,
             start: 0,
             len: 48_000,
@@ -17134,9 +17349,11 @@ mod tests {
         }
         e.set_midi_clips(vec![
             PlacedMidi { strip: 5, start: 0, len: 48_000,
-                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]) },
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+                pedal: Arc::new(Vec::new()) },
             PlacedMidi { strip: 6, start: 0, len: 48_000,
-                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]) },
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+                pedal: Arc::new(Vec::new()) },
         ]);
         e.set_transport(1, 0);
         e.set_rolling(true);
@@ -17190,6 +17407,7 @@ mod tests {
             e.render_offline(&mut out);
         }
         e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: 5,
             start: 0,
             len: 48_000,
@@ -17282,6 +17500,7 @@ mod tests {
         let quiet = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
         assert!(quiet < 1e-6, "a bay with no notes made sound: {quiet}");
         e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: CH,
             start: 0,
             len: 96_000,
@@ -17297,6 +17516,176 @@ mod tests {
             peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
         }
         assert!(peak > 0.005, "a note through the analog's bay made no sound: {peak}");
+    }
+
+    /// **A clip's pedal reaches the instrument, and the sound is the proof.**
+    ///
+    /// The end of the road this whole change lays: a MIDI clip carrying a
+    /// pedal-down and a SHORT note is played through the analog's bay, and
+    /// what is measured is the tail after the note's own off has fallen.
+    /// With no pedal the voice releases and the tail dies; with the pedal
+    /// down it rings on.
+    ///
+    /// Deliberately AUDIBLE rather than a look at `lane_pedal_out`. Every
+    /// link in the chain is a place this failed before — the clip had no
+    /// field to hold the pedal, the schedule had no field to carry it, and
+    /// the rack was handed `&self.controls`, the LIVE list, so even a clip
+    /// that carried one had no door into an instrument. A test that stopped
+    /// at any one of those would have passed over the next.
+    ///
+    /// Revert-check performed: handing the rack `&self.controls` again — the
+    /// line this change replaced — makes `held` fall to `dry` and fails.
+    #[test]
+    fn a_clips_pedal_holds_a_note_the_clip_already_let_go_of() {
+        use std::sync::Arc;
+        const CH: usize = 3;
+        // A note one block long, in a clip two seconds long: everything
+        // measured below happens after its note-off.
+        const NOTE: u64 = 1_024;
+
+        let tail = |pedal: Vec<ClipPedal>| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.load_insert(CH, 0, Some(Path::new(crate::builtin_fx::ANALOG_PATH)), None)
+                .expect("the analog must load")
+                .expect("a load reports what it seated");
+            e.set_channel_gain(CH, 0.5);
+            e.set_master_gain(1.0);
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 1024 * 2];
+            for _ in 0..3 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(vec![PlacedMidi {
+                strip: CH,
+                start: 0,
+                len: 96_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: NOTE, key: 48, vel: 110 }]),
+                pedal: Arc::new(pedal),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut peak = 0.0f32;
+            for b in 0..24 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                assert!(out.iter().all(|s| s.is_finite()));
+                // The first eight blocks carry the attack and the release
+                // either way. What separates a held note from a released one
+                // is what is still there afterwards.
+                if b >= 8 {
+                    peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+                }
+            }
+            peak
+        };
+
+        let dry = tail(Vec::new());
+        let held = tail(vec![ClipPedal { at: 0, cc: 64, value: 127 }]);
+        assert!(
+            held > dry * 4.0 && held > 0.005,
+            "a clip's pedal did not hold the note: {held} with it, {dry} without"
+        );
+    }
+
+    /// **A clip's pedal reaches the built-in KEYBOARD too**, which is the
+    /// road most piano parts actually take.
+    ///
+    /// The lane instruments have a `set_pedal` of their own and never see a
+    /// `Control` — they are fed from the pass at the head of `mix_channels`,
+    /// not from the rack's slice — so proving the rack road says nothing
+    /// about this one. "A piano without a damper pedal is not a piano" is
+    /// written at that pass, and until now it was only true of a live foot.
+    ///
+    /// Measured the same way and for the same reason: the tail after the
+    /// clip's own note-off, which is dry unless something is holding it.
+    #[test]
+    fn a_clips_pedal_reaches_the_built_in_keyboard() {
+        use std::sync::Arc;
+        const CH: usize = 1;
+        const NOTE: u64 = 1_024;
+
+        let tail = |pedal: Vec<ClipPedal>| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.sync_instrument_lanes(0, 1 << CH);
+            e.set_keys_strips(1 << CH);
+            e.set_channel_gain(CH, 1.0);
+            e.set_master_gain(1.0);
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 1024 * 2];
+            // The hand-off ring delivers the instance at the top of a render,
+            // so the warm-up is also what seats it.
+            for _ in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(vec![PlacedMidi {
+                strip: CH,
+                start: 0,
+                len: 192_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: NOTE, key: 60, vel: 110 }]),
+                pedal: Arc::new(pedal),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut peak = 0.0f32;
+            for b in 0..40 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                assert!(out.iter().all(|s| s.is_finite()));
+                if b >= 16 {
+                    peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+                }
+            }
+            peak
+        };
+
+        let dry = tail(Vec::new());
+        let held = tail(vec![ClipPedal { at: 0, cc: 64, value: 127 }]);
+        assert!(
+            held > dry * 2.0,
+            "the keyboard's damper ignored the clip: {held} with the pedal, {dry} without"
+        );
+    }
+
+    /// **The pedal is a LEVEL, so a locate into the middle of one lands with
+    /// the damper already down.**
+    ///
+    /// The case a cursor gets wrong, and the reason `clip_pedal_level`
+    /// searches rather than walks: dropping the playhead into bar three of a
+    /// passage whose pedal went down in bar one must not play it dry until
+    /// the next edge — there is no next edge.
+    #[test]
+    fn the_pedal_is_where_it_stands_and_not_where_it_last_moved() {
+        let clips = vec![PlacedMidi {
+            strip: 2,
+            start: 1_000,
+            len: 48_000,
+            notes: Arc::new(Vec::new()),
+            pedal: Arc::new(vec![
+                ClipPedal { at: 0, cc: 64, value: 127 },
+                ClipPedal { at: 24_000, cc: 64, value: 0 },
+                ClipPedal { at: 30_000, cc: 66, value: 100 },
+            ]),
+        }];
+        let at = |f: u64| Renderer::clip_pedal_level(&clips, 2, f);
+        // Before the clip: up. Nothing outside a clip holds a pedal.
+        assert_eq!(at(0), [0, 0, 0]);
+        assert_eq!(at(999), [0, 0, 0]);
+        // Landing anywhere inside the held span finds it held — including
+        // 20,000 frames after the last thing that happened.
+        assert_eq!(at(1_000), [127, 0, 0]);
+        assert_eq!(at(1_000 + 20_000), [127, 0, 0]);
+        // And after the lift, up again; the sostenuto that follows is its own
+        // slot and does not disturb the damper.
+        assert_eq!(at(1_000 + 24_000), [0, 0, 0]);
+        assert_eq!(at(1_000 + 30_000), [0, 100, 0]);
+        // **Past the clip's end is UP**, which is what releases the pedal at
+        // the end of a clip, at a locate past it, and at a stop — one rule,
+        // no special case for any of the three.
+        assert_eq!(at(1_000 + 48_000), [0, 0, 0]);
+        // Another lane's clip is not this lane's pedal.
+        assert_eq!(Renderer::clip_pedal_level(&clips, 3, 1_000), [0, 0, 0]);
     }
 
     /// **An untouched trim is a null through the real rack** — planar hand-in,
@@ -17382,6 +17771,7 @@ mod tests {
             e.render_offline(&mut out);
         }
         e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: CH,
             start: 0,
             len: 96_000,
@@ -17489,6 +17879,7 @@ mod tests {
             e.render_offline(&mut out);
         }
         e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: KID,
             start: 0,
             len: 96_000,
@@ -18119,6 +18510,7 @@ mod tests {
             }
             e.render_offline(&mut out);
             e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: CH,
                 start: 0,
                 len: 48_000,
@@ -18468,6 +18860,7 @@ mod tests {
             e.render_offline(&mut out);
         }
         e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: 5,
             start: 0,
             len: 48_000,
@@ -18558,6 +18951,7 @@ mod tests {
         }
         // Something to learn: the drum fixture, struck and ringing.
         e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: 5,
             start: 0,
             len: 48_000,
@@ -18753,6 +19147,7 @@ mod tests {
         let mut discard = Vec::new();
         e.drain_insert_tap(&mut discard);
         e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: 5,
             start: 0,
             len: 48_000,
@@ -19969,6 +20364,7 @@ mod tests {
                 e.render_offline(&mut out);
             }
             e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 3, start: 0, len: 48_000,
                 notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
             }]);
@@ -20023,6 +20419,7 @@ mod tests {
                 e.render_offline(&mut out);
             }
             e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 5, start: 0, len: 48_000,
                 notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
             }]);
@@ -20253,6 +20650,7 @@ mod tests {
                 e.render_offline(&mut out);
             }
             e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 5, start: 0, len: 48_000,
                 notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
             }]);
@@ -20377,6 +20775,7 @@ mod tests {
             // Then the first hit. Its FIRST block is what matters — that is
             // the one a stale fader plays at the wrong level.
             e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 5, start: 0, len: 48_000,
                 notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
             }]);
@@ -20422,6 +20821,7 @@ mod tests {
                 e.render_offline(&mut out);
             }
             e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 7, start: 0, len: 48_000,
                 notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
             }]);
@@ -20484,6 +20884,7 @@ mod tests {
                 e.render_offline(&mut out);
             }
             e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 5,
                 start: 0,
                 len: 48_000,
@@ -20557,6 +20958,7 @@ mod tests {
                 e.render_offline(&mut out);
             }
             e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 5,
                 start: 0,
                 len: 48_000,
@@ -20631,6 +21033,7 @@ mod tests {
                 e.render_offline(&mut out);
             }
             e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 5,
                 start: 0,
                 len: 48_000,
@@ -20703,6 +21106,7 @@ mod tests {
         use std::sync::Arc;
         // Lane 5 and lane 9, the same kit, a note on each.
         let clip = |lane: usize| PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: lane,
             start: 0,
             len: 48_000,
@@ -20804,6 +21208,7 @@ mod tests {
             lanes
                 .iter()
                 .map(|l| PlacedMidi {
+                    pedal: Arc::new(Vec::new()),
                     strip: *l,
                     start: 0,
                     len: 48_000,
@@ -21791,6 +22196,7 @@ mod tests {
         // built-in's lane.
         to_audio
             .push(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 0,
                 start: 0,
                 len: 96_000,
@@ -21881,6 +22287,7 @@ mod tests {
         let (mut to_audio, _from) = r.hijack_midi_rings();
         to_audio
             .push(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 0,
                 start: 0,
                 len: 96_000,
@@ -21956,6 +22363,7 @@ mod tests {
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
         e.set_pad_kit(7, test_kit(&[0], 4_800, 0.5));
         e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: 7,
             start: 0,
             len: 48_000,
@@ -21984,6 +22392,7 @@ mod tests {
         let mut quiet = Engine::offline(48_000, Timebase::new()).expect("offline");
         quiet.set_pad_kit(7, test_kit(&[0], 4_800, 0.5));
         quiet.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: 7,
             start: 0,
             len: 48_000,
@@ -22016,6 +22425,7 @@ mod tests {
         use std::sync::Arc;
         let clip = || {
             vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 7,
                 start: 0,
                 len: 48_000,
@@ -22081,6 +22491,7 @@ mod tests {
             kit.pads[0].trim_end = trim_end;
             e.set_pad_params(7, &kit);
             e.set_midi_clips(vec![PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 7,
                 start: 0,
                 len: 48_000,
@@ -22162,6 +22573,7 @@ mod tests {
         // played once and went quiet.
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
         e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: 0,
             start: 0,
             len: 96_000,
@@ -22293,6 +22705,7 @@ mod tests {
             })
             .collect();
         e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: 0,
             start: 0,
             len: 24_000,
@@ -22344,6 +22757,7 @@ mod tests {
         // copies of middle C now leaves ONE entry behind and never fills
         // anything. 128 keys is every pitch there is, hence the second lane.
         let fillers = |lane: usize| PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: lane,
             start: 0,
             len: 48_000,
@@ -22364,6 +22778,7 @@ mod tests {
             fillers(0),
             fillers(1),
             PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 2,
                 start: 0,
                 len: 48_000,
@@ -22417,6 +22832,7 @@ mod tests {
         // must be re-struck after it.
         r.midi_clips = (0..4)
             .map(|lane| PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: lane,
                 start: 0,
                 len: 48_000,
@@ -22485,6 +22901,7 @@ mod tests {
         // tracks looked broken.
         r.midi_clips = vec![
             PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 0,
                 start: 0,
                 len: 48_000,
@@ -22496,6 +22913,7 @@ mod tests {
                 }]),
             },
             PlacedMidi {
+                pedal: Arc::new(Vec::new()),
                 strip: 1,
                 start: 0,
                 len: 48_000,
@@ -22590,6 +23008,7 @@ mod tests {
             "the session's own overlap is not what this test thinks it is"
         );
         r.midi_clips = vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
             strip: 0,
             start: 0,
             len: f(8.205_128_205_128_206),

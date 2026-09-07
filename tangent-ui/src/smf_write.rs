@@ -62,7 +62,7 @@
 //! reader is the lossy half. Worth knowing before reading too much into the
 //! round-trip test at the bottom of this file.
 
-use crate::arrangement::ArrNote;
+use crate::arrangement::{ArrNote, ArrPedal};
 use crate::tempo::{MeterMap, TempoMap};
 
 /// Ticks per quarter note.
@@ -109,6 +109,7 @@ const RAMP_STEPS_MAX: usize = 512;
 pub fn write(
     track_name: &str,
     notes: &[ArrNote],
+    pedal: &[ArrPedal],
     end_s: f64,
     tempo: &TempoMap,
     meter: &MeterMap,
@@ -127,7 +128,7 @@ pub fn write(
         }
     };
 
-    let performance = performance_track(track_name, notes, &tick, tick(end_s));
+    let performance = performance_track(track_name, notes, pedal, &tick, tick(end_s));
     // The conductor runs to the same end as the performance, so a DAW that
     // takes its song length from track 0 agrees with the notes.
     let conductor = conductor_track(tempo, meter, performance.end);
@@ -316,6 +317,7 @@ fn tempo_meta(bpm: f64) -> Vec<u8> {
 fn performance_track(
     name: &str,
     notes: &[ArrNote],
+    pedal: &[ArrPedal],
     tick: &dyn Fn(f64) -> u64,
     end_s_tick: u64,
 ) -> Track {
@@ -323,11 +325,21 @@ fn performance_track(
     push_varlen(&mut body, 0);
     push_track_name(&mut body, name);
 
-    // `(tick, order, status, key, data)`. Order 0 is a note-OFF and order 1
-    // a note-ON, which is the whole of the offs-before-ons rule: at a shared
-    // tick the sort puts every off first, so a note that ends exactly where
-    // the next one of the same pitch begins is closed by its own off and not
-    // by the new note's.
+    // `(tick, order, status, key, data)`. Order 0 is a note-OFF, 1 the
+    // PEDAL and 2 a note-ON.
+    //
+    // Offs before ons is the old half of that rule: at a shared tick the sort
+    // puts every off first, so a note that ends exactly where the next one of
+    // the same pitch begins is closed by its own off and not by the new
+    // note's.
+    //
+    // The pedal between them is the new half, and it is `tangent_record`'s
+    // rule 3 read from the other end. A pedal-UP emitted BEFORE the offs at
+    // its tick makes any reader that models sustain re-release the notes that
+    // were meant to ring on — the invisible failure, where the piano roll
+    // looks right and the sound is dry. And a pedal-DOWN emitted AFTER the
+    // ons at its tick reaches a sampler a beat late for the attack it was
+    // pressed under. One slot, between the two, answers both.
     let mut evs: Vec<(u64, u8, u8, u8, u8)> = Vec::with_capacity(notes.len() * 2);
     for n in notes {
         let key = n.key.min(127);
@@ -340,8 +352,16 @@ fn performance_track(
         // **Velocity 0 is a note-OFF on the wire.** A note recorded or drawn
         // at zero would vanish as a note and leave a stray off behind it, so
         // the floor is 1 — the quietest thing MIDI can say.
-        evs.push((on, 1, 0x90, key, n.vel.clamp(1, 127)));
+        evs.push((on, 2, 0x90, key, n.vel.clamp(1, 127)));
         evs.push((off, 0, 0x80, key, 0x40));
+    }
+    // The pedal takes the middle slot. Its `key` byte is the controller
+    // number, which is what makes the sort stable across the three of them.
+    for e in pedal {
+        if !matches!(e.cc, 64 | 66 | 67) {
+            continue;
+        }
+        evs.push((tick(e.at_s), 1, 0xB0, e.cc, e.value.min(127)));
     }
     evs.sort_by_key(|(at, order, _, key, _)| (*at, *order, *key));
 
@@ -558,7 +578,7 @@ mod tests {
             note(4.0, 1.0, 72, 90),
             note(6.0, 2.0, 48, 1),
         ];
-        let bytes = write("Bass", &notes, 10.0, &tempo, &meter);
+        let bytes = write("Bass", &notes, &[], 10.0, &tempo, &meter);
         let got = crate::smf_read::read(&bytes).expect("the writer's own file was refused");
         assert_eq!(got.notes.len(), notes.len(), "{:?}", got.notes);
         for (want, back) in notes.iter().zip(&got.notes) {
@@ -591,7 +611,7 @@ mod tests {
         let tempo = TempoMap::constant(120.0);
         let meter = MeterMap::constant(TimeSignature { beats: 4, unit: 4 });
         // One note in the first second; the material runs to three.
-        let bytes = write("T", &[note(0.0, 0.5, 60, 100)], 3.0, &tempo, &meter);
+        let bytes = write("T", &[note(0.0, 0.5, 60, 100)], &[], 3.0, &tempo, &meter);
         // 3 s at 120 bpm is six quarters.
         let want = 6 * u64::from(PPQ);
         let ends = end_of_track_ticks(&bytes);
@@ -603,7 +623,7 @@ mod tests {
 
         // And the other direction: a note that outruns `end_s` pushes the
         // end out, because an EndOfTrack before an event is a broken file.
-        let bytes = write("T", &[note(0.0, 4.0, 60, 100)], 1.0, &tempo, &meter);
+        let bytes = write("T", &[note(0.0, 4.0, 60, 100)], &[], 1.0, &tempo, &meter);
         let ends = end_of_track_ticks(&bytes);
         assert!(
             ends.iter().all(|e| *e == 8 * u64::from(PPQ)),
@@ -642,7 +662,7 @@ mod tests {
         let tempo = TempoMap::constant(120.0);
         let meter = MeterMap::constant(TimeSignature { beats: 4, unit: 4 });
         let notes = vec![note(0.5, 0.5, 60, 100), note(0.0, 0.5, 60, 100)];
-        let bytes = write("T", &notes, 1.0, &tempo, &meter);
+        let bytes = write("T", &notes, &[], 1.0, &tempo, &meter);
 
         // 0.5 s at 120 bpm is one quarter: the shared tick.
         let shared = u64::from(PPQ);
@@ -694,7 +714,7 @@ mod tests {
         let meter = MeterMap::constant(TimeSignature { beats: 4, unit: 4 });
         let at = tempo.seconds_at_beat(4.0);
         assert!((at - 2.7726).abs() < 1.0e-3, "the fixture moved: {at}");
-        let bytes = write("T", &[note(at, 1.0, 60, 100)], at + 1.0, &tempo, &meter);
+        let bytes = write("T", &[note(at, 1.0, 60, 100)], &[], at + 1.0, &tempo, &meter);
         let got = crate::smf_read::read(&bytes).expect("refused its own file");
         assert!(
             (got.notes[0].at_s - at).abs() < 5.0e-3,
@@ -715,7 +735,7 @@ mod tests {
             MeterPoint { at_bar: 0, sig: TimeSignature { beats: 6, unit: 8 } },
             MeterPoint { at_bar: 2, sig: TimeSignature { beats: 3, unit: 4 } },
         ]);
-        let bytes = write("T", &[note(0.0, 0.5, 60, 100)], 8.0, &tempo, &meter);
+        let bytes = write("T", &[note(0.0, 0.5, 60, 100)], &[], 8.0, &tempo, &meter);
         // 6/8 → beats 6, power 3, 12 clocks per click, 8 thirty-seconds.
         let six_eight = [0xFFu8, 0x58, 0x04, 6, 3, 12, 8];
         let three_four = [0xFFu8, 0x58, 0x04, 3, 2, 24, 8];
@@ -750,5 +770,93 @@ mod tests {
         b.clear();
         push_varlen(&mut b, u64::MAX);
         assert_eq!(b, vec![0xFF, 0xFF, 0xFF, 0x7F]);
+    }
+}
+
+#[cfg(test)]
+mod pedal_tests {
+    use super::*;
+    use crate::recorder::TimeSignature;
+
+    fn note(at: f64, dur: f64, key: u8, vel: u8) -> ArrNote {
+        ArrNote { at_s: at, dur_s: dur, key, vel }
+    }
+
+    /// **The pedal makes the round trip through a real file**, at its own
+    /// value rather than as a switch — a half-pedalled 40 must not come back
+    /// as 0 or as 127.
+    #[test]
+    fn the_pedal_survives_a_file_and_keeps_its_value() {
+        let tempo = TempoMap::constant(120.0);
+        let meter = MeterMap::constant(TimeSignature { beats: 4, unit: 4 });
+        let notes = vec![note(0.0, 0.5, 60, 100), note(1.0, 0.5, 64, 90)];
+        let pedal = vec![
+            ArrPedal { at_s: 0.0, cc: 64, value: 127 },
+            ArrPedal { at_s: 0.75, cc: 64, value: 40 },
+            ArrPedal { at_s: 1.5, cc: 64, value: 0 },
+            ArrPedal { at_s: 2.0, cc: 66, value: 100 },
+            ArrPedal { at_s: 2.5, cc: 67, value: 64 },
+        ];
+        let bytes = write("Keys", &notes, &pedal, 4.0, &tempo, &meter);
+        let got = crate::smf_read::read(&bytes).expect("the writer's own file was refused");
+        assert_eq!(got.pedal.len(), pedal.len(), "{:?}", got.pedal);
+        for (want, back) in pedal.iter().zip(&got.pedal) {
+            assert!(
+                (want.at_s - back.at_s).abs() < 2.0e-3,
+                "{} came back at {}",
+                want.at_s,
+                back.at_s
+            );
+            assert_eq!(want.cc, back.cc);
+            assert_eq!(
+                want.value, back.value,
+                "the pedal came back as a switch rather than at its value"
+            );
+        }
+        // And the notes are untouched by the company they now keep.
+        assert_eq!(got.notes.len(), notes.len());
+    }
+
+    /// **A pedal-UP is written at or AFTER the note-offs at its tick, and a
+    /// pedal-DOWN before the note-ons.**
+    ///
+    /// `tangent_record::smf`'s rule 3, from the other end. An up emitted
+    /// first makes any reader that models sustain re-release the notes that
+    /// were meant to ring on — the invisible failure, where the piano roll
+    /// looks right and the sound is dry.
+    ///
+    /// The bytes are read directly rather than through `smf_read`, because
+    /// the claim IS the order and a reader that re-sorts would hide it.
+    #[test]
+    fn the_pedal_sits_between_the_offs_and_the_ons_at_a_shared_tick() {
+        let tempo = TempoMap::constant(120.0);
+        let meter = MeterMap::constant(TimeSignature { beats: 4, unit: 4 });
+        // A note ending at 1.0 and another starting at 1.0, with the pedal
+        // lifting on the same instant: all three land on one tick.
+        let notes = vec![note(0.0, 1.0, 60, 100), note(1.0, 1.0, 67, 100)];
+        let pedal = vec![ArrPedal { at_s: 1.0, cc: 64, value: 0 }];
+        let bytes = write("K", &notes, &pedal, 3.0, &tempo, &meter);
+        // Every three-byte channel message in the performance track, in
+        // order. The file has no running status by design, so a scan for the
+        // status bytes is exact.
+        let mut seen: Vec<u8> = Vec::new();
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            match bytes[i] {
+                s @ (0x80 | 0x90 | 0xB0) => {
+                    seen.push(s);
+                    i += 3;
+                }
+                _ => i += 1,
+            }
+        }
+        // off(60) … then the pedal … then on(67). The first on(60) precedes
+        // all of them.
+        let tail: Vec<u8> = seen.into_iter().skip(1).collect();
+        assert_eq!(
+            tail,
+            vec![0x80, 0xB0, 0x90, 0x80],
+            "the pedal is not between the offs and the ons at its tick"
+        );
     }
 }
