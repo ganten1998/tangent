@@ -12,18 +12,33 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
-- **A looping clip shows where every pass ends, audio and MIDI alike.** A
-  diagonal recess is cut into the clip at each turn of the loop — one notch per
-  multiple of the loop's length inside the clip, so a one-bar part dragged over
-  four bars reads as four bars of one part instead of as one green box, and a
+- **A looping clip shows where every pass ends, audio and MIDI alike.** The
+  clip stops being a rectangle: a triangular divot is taken out of its top and
+  bottom edge at each turn of the loop, so a one-bar part dragged over four
+  bars reads as four bars of one part instead of as one green box, and a
   four-bar drum take pulled over sixteen shows its four passes through the
-  waveform. The notch is cut into the clip's own colour rather than printed on
-  it in the clip's ink, a groove and a land either side of the boundary second,
-  so it says the same thing on a near-black theme and on a bone one. It is
-  dropped when a pass is too narrow to place — a hundred notches a point apart
-  is a moiré claiming to be structure, not a picture of a loop — and an empty
-  MIDI item that has not been played into yet gets it too, which is exactly
-  when it is most useful.
+  waveform. Nothing is drawn ON the clip — the material is taken AWAY — so it
+  says the same thing on a near-black theme and on a bone one with no colour to
+  choose. The bite is a tenth of the lane deep, which is the band the waveform
+  and the note miniature are both kept clear of, and it is dropped when a pass
+  is too narrow to place: a hundred notches a point apart is a moiré claiming
+  to be structure, not a picture of a loop. An empty MIDI item that has not
+  been played into yet gets it too, which is exactly when it is most useful.
+
+- **Glue flattens a clip that repeats, on its own.** Gluing used to need two
+  clips; one is enough now if it loops, and it welds that clip's own repeats
+  into it. A one-bar part playing C D E F, stretched until it shows C D E F /
+  C D, becomes a clip holding those six notes as one pass with no seam — what
+  was on screen is now what is in the document. Nothing sounds different by a
+  sample, and the next pull of its right edge repeats the whole six-note phrase
+  and puts a divot after the second D.
+
+- **The MIDI editor's loop bar scrolls the roll when you drag past its edge.**
+  The bar sits at the end of the first pass, so on a clip longer than the
+  window the handle and the place you want to put it were rarely on screen
+  together and the only way to move a loop far was to zoom out, drag, and zoom
+  back in. Sideways only: a loop length is a time and has no pitch, so the keys
+  stay put under a hand that is setting one.
 
 - **The MIDI editor has a loop bar.** The clip's right end carries a bar down
   the roll with a grip tab on the ruler above it: drag it left to shorten the

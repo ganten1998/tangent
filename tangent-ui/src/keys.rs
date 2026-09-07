@@ -581,7 +581,12 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             // "MIDI clips", because that is the truth: `arr_glue_selection`
             // filters to MIDI and refuses everything else — welding audio
             // means rendering, a different operation with a different cost.
-            ("C-G", "glue the selected MIDI clips into one"),
+            //
+            // **"or one that repeats"**, because one is now enough: glue on a
+            // single looped clip welds its own repeats into it. That half is
+            // the one nobody would guess from the word "glue", so it is the
+            // half that has to be on the card.
+            ("C-G", "glue the selected MIDI clips - or one that repeats - into one"),
             // C-S-N, not C-N: the handler requires shift, and only audio
             // comes up — a note's velocity is a performance, not a level.
             ("C-S-N", "normalise the selected audio clips"),

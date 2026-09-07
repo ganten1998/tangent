@@ -1222,6 +1222,30 @@ channels play back their clips and nothing else. "Ready to play" and
   gapped row spanning the LCD above it, with Stop standing exactly
   where it stood when a take starts.
 
+  LOOPS, 2026-09-07. Every clip is born a loop over its own length,
+  audio and MIDI alike, so the first pull of any clip's right edge
+  repeats it instead of revealing empty time or stopping at the end of
+  the file; a loop as long as its clip is one pass and sounds like no
+  loop at all, which is why arming it at birth costs nothing. The clip
+  menu's Loop row turns it off and back on, and turning it off leaves
+  the clip's LENGTH alone: eight bars pulled out and then unlooped
+  stays eight bars long and plays its material once. THE SEAM IS A
+  SHAPE, not a line: where one pass ends and the next begins, a
+  triangular divot is taken out of the clip's top and bottom edge — a
+  tenth of the lane deep, which is the band the waveform and the note
+  miniature are both kept clear of. It was two diagonal strokes for
+  one day and the owner asked for the cutout instead; taking the
+  material away also means there is no colour to choose and no guess
+  about the lane behind it. GLUE welds the selection into one clip
+  that loops over the whole of what it swallowed, and ONE clip is
+  enough if it repeats: gluing a single looped clip flattens its own
+  repeats into it, so C D E F looping to C D E F / C D becomes a clip
+  holding those six notes, one pass, no seam, and the next pull of its
+  edge puts a divot after the second D. The MIDI editor's loop bar
+  sets the pass length, clamped to the clip and never growing it, and
+  it edge-scrolls horizontally like every other drag on the roll —
+  horizontally only, because a loop length is a time and has no pitch.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
