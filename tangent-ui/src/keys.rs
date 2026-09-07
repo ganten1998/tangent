@@ -615,6 +615,17 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("ARROWS", "nudge: left/right a step · up/down a semitone"),
             ("Z", "fit the clip back in the window"),
             ("N", "draw mode"),
+            // **The pedal lane gets rows and no LETTER.** Every mnemonic
+            // worth having is spoken for — P is the note preference and the
+            // editor's own triplet row, N is the pencil — and the two
+            // letters actually free, X and Y, say nothing about a pedal. A
+            // shortcut nobody can guess is worse than none; the chip is the
+            // affordance, and these rows are what say it is there.
+            ("PED", "the chip: swap the bottom lane between pedal and velocity"),
+            (
+                "PDRG",
+                "in the pedal lane, drag to paint: high is down, the floor is up",
+            ),
             ("O", "swing grid on/off"),
             ("C-G", "glue the selected notes"),
             ("C-C/V", "copy · paste notes"),

@@ -12,6 +12,31 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **The MIDI editor has a pedal lane.** The chip marked PED, at the pencil's
+  shoulder, swaps the lane along the foot of the editor between velocity and
+  the sustain pedal. The pedal is drawn as a step — a shelf where it is held
+  and a riser where it moves, never a slope, because a controller holds its
+  value and a line sloping between two edges would be a picture of an
+  interpolation nothing performs. The shelf is filled down to the floor, so
+  where the damper is down reads from across the room, and it takes its colour
+  from the same gradient a velocity does: a half-pedal is a different colour
+  from a full one.
+
+  Drag in the lane to paint. The height of the hand is the value, which is what
+  lets one gesture do both jobs — along the top it paints the damper down,
+  along the floor it paints it up, because zero is a pedal nobody is pressing.
+  There is no separate erase to go and find. A press that does not travel
+  writes a single edge, "from here, this much". Strokes are bounded: what stood
+  after the span goes on standing, so painting four beats of damper in the
+  middle of a pedalled passage does not silently lift the pedal for the rest of
+  the clip.
+
+  One lane and not a new row: the editor is already a tool strip, a ruler, the
+  roll and a lane, and every row added to that stack is height the roll loses.
+  Sostenuto and soft ride above the damper as thin rails — a part that uses
+  them should not look like a part that does not — and they survive an edit
+  untouched.
+
 - **A looping clip shows where every pass ends, audio and MIDI alike.** The
   clip stops being a rectangle: a triangular divot is taken out of its top and
   bottom edge at each turn of the loop, so a one-bar part dragged over four

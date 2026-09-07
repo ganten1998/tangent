@@ -1501,6 +1501,20 @@ pub struct Settings {
     /// re-velocitied; the pencil on the strip — and `N` — puts the pen back
     /// in your hand.
     pub midi_draw_mode: bool,
+    /// **The bottom lane shows the PEDAL rather than velocity**, and it ships
+    /// off.
+    ///
+    /// One lane and not two, which is the whole argument: the editor is a
+    /// tool strip, a ruler, the roll and a lane, and every row added to that
+    /// stack is height the roll loses — the reason the navigator went into
+    /// the strip's unused middle instead of onto a row of its own. Velocity
+    /// and the pedal are both a curve under the notes and neither is wanted
+    /// at the same instant as the other, so the chip on the strip swaps what
+    /// the lane holds.
+    ///
+    /// Session-ish but persisted, exactly like `midi_draw_mode`: which lane
+    /// you work in is a habit rather than a property of any one song.
+    pub midi_pedal_lane: bool,
     /// **The MASTER's row on the timeline**, shown by default.
     ///
     /// `Cmd`/`Ctrl+M` hides it. It cannot be REMOVED — a session always has
@@ -1997,6 +2011,7 @@ impl Default for Settings {
             midi_swing_pct: 66.7,
             midi_triplet: false,
             midi_draw_mode: false,
+            midi_pedal_lane: false,
             arr_master_row: true,
             heart_animate: true,
             heart_slot: 0,
@@ -3334,6 +3349,7 @@ impl Settings {
         }
         take_bool(&mut map, "midi_triplet", &mut s.midi_triplet);
         take_bool(&mut map, "midi_draw_mode", &mut s.midi_draw_mode);
+        take_bool(&mut map, "midi_pedal_lane", &mut s.midi_pedal_lane);
         take_bool(&mut map, "arr_master_row", &mut s.arr_master_row);
         take_bool(&mut map, "heart_animate", &mut s.heart_animate);
         if let Some(v) = map.shift_remove("heart_slot") {
@@ -4625,6 +4641,13 @@ impl Settings {
         // bargain `insert_keys` and the folder overrides above make.
         if !self.insert_bypass.0.is_empty() {
             map.insert("insert_bypass".into(), self.insert_bypass.to_json());
+        }
+        // Which lane the MIDI editor's bottom strip holds, at the END like
+        // every additive key, and only when it is the pedal — velocity is
+        // how it ships, so an editor nobody has swapped keeps its
+        // byte-for-byte shape.
+        if self.midi_pedal_lane {
+            map.insert("midi_pedal_lane".into(), Value::Bool(true));
         }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());

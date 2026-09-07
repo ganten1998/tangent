@@ -2121,6 +2121,9 @@ mod shot {
         };
         let mut settings = tangent_ui::settings::Settings::default();
         settings.show_recorder = true;
+        // The bottom lane holds the PEDAL rather than velocity:
+        //   IVORY_SHOT_PEDAL=1 IVORY_SHOT=/tmp/x.png ...
+        settings.midi_pedal_lane = std::env::var("IVORY_SHOT_PEDAL").is_ok();
         let mut app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
         app.open_midi_editor_for_shot();
         let mut shoot = |app: &TangentApp| {

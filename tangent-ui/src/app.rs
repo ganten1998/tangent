@@ -2143,6 +2143,22 @@ enum MeDrag {
     Create { i: usize },
     /// The velocity lane: the bar under the hand follows it vertically.
     Vel,
+    /// **The PEDAL lane, being painted.**
+    ///
+    /// `from_s` is where the hand went down, in absolute seconds, and `base`
+    /// is the clip's whole pedal list AT THE PRESS. Every frame repaints
+    /// `base` from scratch rather than editing what the last frame left
+    /// behind, which is the only way a drag that reverses direction can undo
+    /// what it has already painted: an incremental paint would leave the
+    /// far end of the sweep written down after the hand had come back past
+    /// it, and the shelf would grow and never shrink.
+    ///
+    /// The same reason `Move` and `Resize` snapshot their `orig`. The list is
+    /// a few dozen edges at worst, cloned once per gesture.
+    Pedal {
+        from_s: f64,
+        base: Vec<crate::arrangement::ArrPedal>,
+    },
     /// **Alt-drag on a note's body**: its velocity follows the hand up and
     /// down, from wherever it stood at the press. Relative, like every other
     /// drag in this app — a press never makes a value jump to meet the
@@ -5717,6 +5733,22 @@ impl TangentApp {
                     let t = if n == 0 { 1.0 } else { i as f32 / n as f32 };
                     note.vel = (8.0 + t * 119.0).round().clamp(1.0, 127.0) as u8;
                 }
+                // **A pedal worth photographing**, for the same reason the
+                // velocities above ramp: a lane drawn from one flat value
+                // photographs a control without showing what it does. A
+                // press, a half-pedal, a lift, a second press left standing
+                // to the end, and a sostenuto riding above them — which is
+                // every shape this lane can draw, in one picture.
+                let len = clip.len_s.max(1.0);
+                clip.pedal = vec![
+                    crate::arrangement::ArrPedal { at_s: len * 0.08, cc: 64, value: 127 },
+                    crate::arrangement::ArrPedal { at_s: len * 0.30, cc: 64, value: 58 },
+                    crate::arrangement::ArrPedal { at_s: len * 0.45, cc: 64, value: 0 },
+                    crate::arrangement::ArrPedal { at_s: len * 0.62, cc: 64, value: 110 },
+                    crate::arrangement::ArrPedal { at_s: len * 0.20, cc: 66, value: 100 },
+                    crate::arrangement::ArrPedal { at_s: len * 0.55, cc: 66, value: 0 },
+                ];
+                clip.pedal.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
             }
         }
     }
@@ -15164,6 +15196,109 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **Paint the sustain pedal over `[a, b]` at `value`**, rebuilding the
+    /// clip's list from `base` — the state at the press.
+    ///
+    /// The edit is BOUNDED, which is the whole of the arithmetic here: what
+    /// stood after the painted span goes on standing. So the level in force
+    /// at the right-hand end is read out of `base` FIRST, the span is
+    /// cleared, the new level is written at its start, and that remembered
+    /// level is restated at its end. Without the restatement, painting four
+    /// beats of damper in the middle of a passage would silently lift the
+    /// pedal for the rest of the clip.
+    ///
+    /// A press that has not travelled paints no span at all and writes ONE
+    /// edge: "from here, this much". That is what a step envelope means by a
+    /// click, and it is how the pedal is lifted quickly — click along the
+    /// floor, where the value is zero.
+    ///
+    /// Only CC 64. Sostenuto and soft are drawn in the lane so a part that
+    /// uses them does not look like a part that does not, but the hand here
+    /// is on the damper: three controllers under one gesture would need a
+    /// selector nobody asked for, and the two rare ones survive a round trip
+    /// untouched.
+    fn me_paint_pedal(
+        &mut self,
+        base: &[crate::arrangement::ArrPedal],
+        a: f64,
+        b: f64,
+        value: u8,
+    ) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        // Snapped like everything else this editor writes, and at both ends:
+        // a pedal that lands a hair off the beat is the one thing in a part
+        // that cannot be seen to be wrong.
+        let (mut t0, mut t1) = (self.me_snap_floor(a.min(b)), self.me_snap_floor(a.max(b)));
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let (c0, c1, offset) = (clip.start_s, clip.start_s + clip.len_s, clip.offset_s);
+        t0 = t0.clamp(c0, c1);
+        t1 = t1.clamp(c0, c1);
+        // Source seconds, which is what a clip's own list speaks — the same
+        // conversion the notes make, and for the same reason: a trim moves
+        // `offset_s` and must not move what was played.
+        let s0 = offset + (t0 - c0);
+        let s1 = offset + (t1 - c0);
+        let value = value.min(127);
+        let painted = s1 - s0 > 1.0e-9;
+
+        // What stood at the far end BEFORE this stroke, so it can go on
+        // standing after it.
+        let after = base
+            .iter()
+            .filter(|e| e.cc == 64 && e.at_s <= s1 + 1.0e-9)
+            .next_back()
+            .map_or(0, |e| e.value);
+
+        let mut next: Vec<crate::arrangement::ArrPedal> = base
+            .iter()
+            .filter(|e| {
+                e.cc != 64
+                    || e.at_s < s0 - 1.0e-9
+                    || (painted && e.at_s > s1 + 1.0e-9)
+                    || (!painted && (e.at_s - s0).abs() > 1.0e-9)
+            })
+            .copied()
+            .collect();
+        next.push(crate::arrangement::ArrPedal { at_s: s0, cc: 64, value });
+        if painted && after != value {
+            next.push(crate::arrangement::ArrPedal { at_s: s1, cc: 64, value: after });
+        }
+        next.sort_by(|x, y| x.at_s.total_cmp(&y.at_s));
+        // **A level that has not changed is not an edge.** The walk keeps
+        // one standing value per controller and drops anything that restates
+        // it — so a stroke painting 127 over a passage already at 127 leaves
+        // the document exactly as it found it, and undo has nothing to undo.
+        let mut standing = [0_u8; 3];
+        let slot = |cc: u8| match cc {
+            66 => 1,
+            67 => 2,
+            _ => 0,
+        };
+        next.retain(|e| {
+            if e.value == standing[slot(e.cc)] {
+                return false;
+            }
+            standing[slot(e.cc)] = e.value;
+            true
+        });
+        // **Only when it actually MOVED.** A stroke that leaves the list
+        // exactly as it found it — painting a level over itself, or a click
+        // on the floor where the pedal is already up — must not mark the
+        // editor dirty: `me_commit` would then save, and the arrangement's
+        // undo would take a step for a gesture that changed nothing.
+        if clip.pedal != next {
+            clip.pedal = next;
+            if let Some(st) = self.midi_edit.as_mut() {
+                st.dirty = true;
+            }
+        }
+    }
+
     fn me_set_vel(&mut self, t: f64, vel: u8) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -15729,6 +15864,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let nav = self.me_nav_domain_for(st, clip);
         crate::midi_editor::MidiEditView {
             draw_mode: self.settings.midi_draw_mode,
+            pedal: &clip.pedal,
+            pedal_lane: self.settings.midi_pedal_lane,
             fx_strip: {
                 let c = self.settings.fx_strip_color;
                 (c.r, c.g, c.b)
@@ -18109,6 +18246,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         self.settings.midi_draw_mode = !self.settings.midi_draw_mode;
                         self.save_settings();
                     }
+                    Some(H::ToolPedal) if pressed => {
+                        self.settings.midi_pedal_lane = !self.settings.midi_pedal_lane;
+                        self.save_settings();
+                    }
                     Some(H::ToolTriplet) if pressed => {
                         self.settings.midi_triplet = !self.settings.midi_triplet;
                         if self.settings.midi_triplet {
@@ -18203,6 +18344,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // stands over the roll, and a right press there would open
                     // the app menu from a control that has no menu.
                     Some(H::LoopBar) => {}
+                    // **The pedal lane takes a press anywhere on its face.**
+                    // A click puts one edge down — "from here, this much" —
+                    // and a drag paints a span. Both are the same gesture at
+                    // different lengths, which is why there is one arm.
+                    Some(H::Pedal(t, v)) if pressed => {
+                        let base = self
+                            .arrangement
+                            .clips
+                            .iter()
+                            .find(|c| c.id == id)
+                            .map(|c| c.pedal.clone())
+                            .unwrap_or_default();
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = Some(MeDrag::Pedal { from_s: t, base: base.clone() });
+                        }
+                        self.me_paint_pedal(&base, t, t, v);
+                    }
+                    // The right button in the lane means nothing, and must
+                    // not fall through to the roll's arms below.
+                    Some(H::Pedal(..)) => {}
                     Some(H::Vel(t)) if pressed => {
                         if let Some(st) = self.midi_edit.as_mut() {
                             st.drag = Some(MeDrag::Vel);
@@ -18574,6 +18735,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         .unwrap_or(0.05)
                         .max(0.05);
                     self.me_resize_note_min(i, t_at, step);
+                }
+                // **The value follows the hand vertically as well as the
+                // span horizontally**, so the level can be chosen after the
+                // sweep has begun — the velocity lane's own contract, and
+                // the reason half-pedalling is drawable at all here.
+                MeDrag::Pedal { from_s, ref base } => {
+                    let base = base.clone();
+                    let v = {
+                        let l = crate::midi_editor::Layout::new(rect);
+                        crate::midi_editor::pedal_value_at(&l, p.y)
+                    };
+                    self.me_paint_pedal(&base, from_s, t_at, v);
                 }
                 MeDrag::Vel => {
                     let vel = {
@@ -35758,6 +35931,94 @@ mod tests {
         // And the selection followed the tracks it names, to where they now
         // are — the head's own drop row and the two behind it.
         assert_eq!(app.selected_tracks, vec![6, 7, 8]);
+    }
+
+    /// **Painting the pedal lane is a BOUNDED edit**: what stood after the
+    /// stroke goes on standing.
+    ///
+    /// The failure this exists to catch is silent and total. Paint four beats
+    /// of damper in the middle of a pedalled passage, forget to restate the
+    /// level at the far end, and the pedal is lifted for the whole rest of
+    /// the clip — a change nobody made, in a part of the roll nobody was
+    /// looking at, audible only as everything after the edit going dry.
+    ///
+    /// Revert-check performed: dropping the `after` restatement leaves the
+    /// clip with no edge past the painted span and fails the third
+    /// assertion.
+    #[test]
+    fn painting_the_pedal_lane_leaves_what_came_after_it_standing() {
+        use crate::arrangement::{ArrClip, ArrPedal, ClipKind};
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        // A clip at song time 0..16 with the damper down from 1s to 9s.
+        let id = app.arrangement.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            pedal: vec![
+                ArrPedal { at_s: 1.0, cc: 64, value: 127 },
+                ArrPedal { at_s: 9.0, cc: 64, value: 0 },
+            ],
+            lane: 0,
+            len_s: 16.0,
+            ..Default::default()
+        });
+        app.open_midi_editor(id);
+        app.settings.midi_snap = false;
+
+        // Paint HALF pedal across 3..5, inside the held passage.
+        let base = app.arrangement.clips[0].pedal.clone();
+        app.me_paint_pedal(&base, 3.0, 5.0, 64);
+        let got = app.arrangement.clips[0].pedal.clone();
+        // The press at 1s survives, the stroke is written, and — the claim —
+        // the level it interrupted is put back at 5s so the passage goes on
+        // being pedalled to 9s.
+        assert_eq!(
+            got,
+            vec![
+                ArrPedal { at_s: 1.0, cc: 64, value: 127 },
+                ArrPedal { at_s: 3.0, cc: 64, value: 64 },
+                ArrPedal { at_s: 5.0, cc: 64, value: 127 },
+                ArrPedal { at_s: 9.0, cc: 64, value: 0 },
+            ],
+            "the stroke lifted the pedal for the rest of the clip: {got:?}"
+        );
+
+        // **A click paints no span and writes one edge** — "from here, this
+        // much" — which is how the pedal is lifted quickly: click on the
+        // lane's floor, where the value is zero.
+        let base = got;
+        app.me_paint_pedal(&base, 7.0, 7.0, 0);
+        let got = app.arrangement.clips[0].pedal.clone();
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert_eq!(got[2], ArrPedal { at_s: 5.0, cc: 64, value: 127 });
+        assert_eq!(got[3], ArrPedal { at_s: 7.0, cc: 64, value: 0 });
+        // And the 9s lift is GONE, because by then the pedal was already up
+        // and an edge that restates a standing level is not an edge.
+
+        // **A stroke that changes nothing changes nothing**, and does not
+        // mark the editor dirty — or undo would take a step for a gesture
+        // that did not happen.
+        let base = got.clone();
+        app.midi_edit.as_mut().unwrap().dirty = false;
+        app.me_paint_pedal(&base, 5.5, 6.5, 127);
+        assert_eq!(app.arrangement.clips[0].pedal, got, "a null stroke moved the list");
+        assert!(
+            !app.midi_edit.as_ref().unwrap().dirty,
+            "a null stroke marked the editor dirty"
+        );
+
+        // Sostenuto and soft are not the damper and are not touched by it.
+        app.arrangement.clips[0]
+            .pedal
+            .push(ArrPedal { at_s: 2.0, cc: 66, value: 100 });
+        app.arrangement.clips[0].pedal.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+        let base = app.arrangement.clips[0].pedal.clone();
+        app.me_paint_pedal(&base, 0.5, 8.0, 127);
+        assert!(
+            app.arrangement.clips[0]
+                .pedal
+                .iter()
+                .any(|e| e.cc == 66 && e.value == 100),
+            "the damper's stroke ate the sostenuto"
+        );
     }
 
     /// **The blade divides the pedal too, and the tail inherits the level it
