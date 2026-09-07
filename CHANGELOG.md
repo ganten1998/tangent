@@ -157,6 +157,26 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **Every clip is a loop from the moment it is made, audio as well as MIDI.**
+  A drawn MIDI item and an imported `.mid` were already pinned at their own
+  length and looping from birth; a recorded take, a split's tail and every
+  audio clip in the app were not, so the same right-edge drag laid down another
+  pass on one and stopped at the end of the file on the next. It now lays down
+  another pass on all of them. A loop as long as the clip it sits on is one
+  pass and sounds like nothing at all — no repeat, no seam, no change to any
+  session — so what this actually buys is that pulling any clip's right edge
+  repeats it, which is the reason anybody records four bars of a groove. The
+  loop can be turned off per clip from the clip's own right-click menu.
+
+  An imported audio file is the one clip that cannot be given its loop where it
+  is made, because its length is the decoder's fact and not the app's: it gets
+  both numbers together the first time the file is decoded. The consequence for
+  a project saved before this, worth stating plainly: an audio clip still
+  carrying the whole-file length gains a loop the first time it is opened here,
+  and nothing about it sounds different, but its right edge now pulls out into
+  repeats. A clip whose loop has been turned off keeps it off — that door only
+  opens once.
+
 - **Draw a MIDI item with Cmd-drag on a lane, not shift-drag.** Shift is no
   longer bound to it at all. On this timeline shift already means "add to the
   selection" on a clip's body and "stretch" from a clip's edge, both of them a

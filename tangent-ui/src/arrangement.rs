@@ -431,15 +431,35 @@ pub struct ArrClip {
     /// the file"** — the file's length is the host's fact, filled in after
     /// the decode and saved, so a document written by hand still plays.
     pub len_s: f64,
-    /// **How long the looped section is**, for a MIDI clip. Zero means the
-    /// clip does not loop and its notes play once, which is what every
-    /// document written before this existed says.
+    /// **How long the looped section is.** Zero means the clip does not loop
+    /// and plays once, which is what every document written before this
+    /// existed says — and what the Loop row of the clip menu leaves behind
+    /// when it is unticked.
     ///
-    /// A MIDI clip is pinned at the length it was created and REPEATS beyond
-    /// it, so dragging its right edge lays down another pass instead of
-    /// revealing empty time. The notes are held once and expanded where they
-    /// are scheduled — a loop that copied its notes would drift out of step
-    /// with the take it came from the moment one of them was edited.
+    /// **Every clip is born with one, audio and MIDI alike**, the owner's
+    /// ruling: "the default behavior will be all clips audio or midi at time
+    /// of creation are loops". A clip is pinned at the length it was created
+    /// and REPEATS beyond it, so dragging its right edge lays down another
+    /// pass instead of revealing empty time — see `arr_trim_right`, which
+    /// drops the end-of-file cap for exactly this reason. A loop as long as
+    /// the clip it sits on is ONE pass and sounds like no loop at all; it is
+    /// the drag that makes it audible, which is why arming it at birth costs
+    /// nothing and asking for it afterwards would have been a second gesture
+    /// on every part anybody ever wanted twice.
+    ///
+    /// The material is held ONCE and expanded where it is scheduled — the
+    /// notes by [`clip_notes_in_song_time`], the audio by
+    /// `desktop::audio_clip_passes`, both of which read this field. A loop
+    /// that copied its notes would drift out of step with the take it came
+    /// from the moment one of them was edited, and a loop that copied its
+    /// samples would carry the file again once per pass.
+    ///
+    /// **An imported audio file cannot be given one at its construction
+    /// site**, because its length is the decoder's fact and `len_s` is still
+    /// the whole-file sentinel when the clip is made. It is learned with the
+    /// length instead — see `TangentApp::note_clip_len`, which is the host's
+    /// report after the decode and the one place a clip that has never been
+    /// measured gets both numbers at once.
     pub loop_s: f64,
     /// Seconds of ramp up from silence at the clip's head. Zero for none.
     pub fade_in_s: f64,
