@@ -87,6 +87,14 @@ pub struct MidiEditView<'a> {
     pub name: &'a str,
     pub clip_start_s: f64,
     pub clip_len_s: f64,
+    /// **How long ONE PASS of the clip is**, or zero for a clip that does not
+    /// loop. See `crate::arrangement::ArrClip::loop_s`.
+    ///
+    /// The roll draws the clip's notes ONCE — they are held once, and the
+    /// repeats are laid down where the clip is scheduled — so without this
+    /// the editor had no way to say where the part it is showing ends and the
+    /// repetition begins. It is what [`loop_bar_x`] stands on.
+    pub loop_s: f64,
     pub offset_s: f64,
     pub notes: &'a [ArrNote],
     /// The SELECTED notes, sorted indices — the editor works on sets now.
@@ -188,6 +196,9 @@ pub enum Hit {
     NavLeft,
     NavRight,
     NavField(f64),
+    /// **The LOOP BAR**: the clip's right end, dragged left to shorten the
+    /// loop and right to lengthen it. See [`loop_bar_x`].
+    LoopBar,
 }
 
 pub struct Layout {
@@ -345,6 +356,44 @@ pub fn key_at(l: &Layout, view: &MidiEditView<'_>, y: f32) -> f32 {
 /// The TOP edge of `key`'s row.
 pub fn y_of(l: &Layout, view: &MidiEditView<'_>, key: f32) -> f32 {
     l.roll.top() + (view.top_key - key) * key_h(l, view.keys_shown)
+}
+
+// ── the loop bar ───────────────────────────────────────────────────────────
+
+/// **How wide the loop bar is drawn**, in points. Thin: it is a boundary, not
+/// a wall, and the roll behind it has to stay readable through the column.
+const LOOP_BAR_W: f32 = 3.0;
+
+/// **How far either side of the bar a press still means it.**
+///
+/// Generous against the three points it is drawn at, because the thing being
+/// aimed at is a line — the same bargain `EDGE_SLOP` makes around a note's
+/// border. Symmetric, unlike a note's, because the bar sits at the clip's
+/// right END: half of the target a hand naturally aims at is on the empty side
+/// past the clip, where there is nothing else to hit.
+///
+/// `pub` for the app's own drag test, which measures the grab it presses at
+/// rather than restating the number.
+pub const LOOP_BAR_GRAB: f32 = 5.0;
+
+/// **Where the loop's right end stands on the roll**, or nothing.
+///
+/// `None` on a clip that does not loop — every audio clip, and every MIDI
+/// clip glued or written before looping existed — and `None` when that second
+/// is off the roll: a bar drawn where it cannot be seen is a bar a hand can
+/// never find, and one hit-tested off the roll would claim presses on the
+/// piano column or past the right edge.
+///
+/// The one authority for the bar, like every other pair in this file: the
+/// painter and the hit test both come here, so what is drawn is what answers.
+pub fn loop_bar_x(l: &Layout, view: &MidiEditView<'_>) -> Option<f32> {
+    // `is_finite` after the comparison and not instead of it: a NaN loop
+    // fails every comparison it is given, so `<=` alone lets it through.
+    if !l.roll.is_positive() || view.loop_s <= 1.0e-6 || !view.loop_s.is_finite() {
+        return None;
+    }
+    let x = x_of(l, view, view.clip_start_s + view.loop_s);
+    (x.is_finite() && x >= l.roll.left() && x <= l.roll.right()).then_some(x)
 }
 
 // ── the navigator's axis ───────────────────────────────────────────────────
@@ -1339,6 +1388,54 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0xff, 0xf4, 0xe0, 28));
     }
 
+    // ── the loop bar: the clip's right end, and it can be pulled ─────────
+    //
+    // The owner: "In midi editor, a bar on the right end of clip/loop will be
+    // draggable to right or left, shortening or lengthening the loop."
+    //
+    // Drawn LAST but one, over the roll and over the ruler both, because it
+    // is the one thing in this panel that says how long the part is: the roll
+    // shows a clip's notes once, and the repeats happen out on the timeline
+    // where this editor cannot see them, so without a mark at the turn the
+    // editor cannot tell a two-bar loop from a two-bar clip. Under the
+    // playhead, which stays the line that wins — the transport is where you
+    // ARE and this is where the part ends.
+    //
+    // The tab in the ruler is what says "pull me". A bare line through the
+    // roll reads as the clip's edge, which it also is, and an edge is not
+    // obviously a handle; a tab standing on the ruler is, and it puts a piece
+    // of the target in a band that no note can ever cover.
+    if let Some(x) = loop_bar_x(&l, view) {
+        let half = LOOP_BAR_W * 0.5;
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(x - half, l.roll.top()),
+                Pos2::new(x + half, l.roll.bottom()),
+            ),
+            0.0,
+            ink.gamma_multiply(0.55),
+        );
+        if l.ruler.is_positive() {
+            let tab = Rect::from_min_max(
+                Pos2::new(x - LOOP_BAR_GRAB, l.ruler.top() + 1.0),
+                Pos2::new(x + LOOP_BAR_GRAB, l.ruler.bottom() - 1.0),
+            );
+            painter.rect_filled(tab, 1.5, ink.gamma_multiply(0.75));
+            // Two grip lines down the tab, the ribbing every handle in this
+            // app wears, in the FACE so they read as cuts in the tab rather
+            // than as more ink beside it.
+            for dx in [-1.5, 1.5] {
+                painter.line_segment(
+                    [
+                        Pos2::new(x + dx, tab.top() + 2.0),
+                        Pos2::new(x + dx, tab.bottom() - 2.0),
+                    ],
+                    Stroke::new(1.0, face),
+                );
+            }
+        }
+    }
+
     // ── the playhead ─────────────────────────────────────────────────────
     let px = x_of(&l, view, view.playhead_s);
     if px >= l.roll.left() && px <= l.roll.right() {
@@ -1484,7 +1581,16 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
     if l.strip.contains(pos) {
         return None;
     }
+    // **The loop bar's TAB, before the ruler's locate.** Ten points of the
+    // ruler stop locating, which is the price of the one part of this handle
+    // that is guaranteed to be reachable: the roll below can be papered over
+    // with notes, and notes win there (see the roll pass), so a part dense at
+    // the turn would leave the bar drawn and ungrabbable if the tab did not
+    // answer here.
     if l.ruler.is_positive() && l.ruler.contains(pos) {
+        if loop_bar_x(&l, view).is_some_and(|x| (pos.x - x).abs() <= LOOP_BAR_GRAB) {
+            return Some(Hit::LoopBar);
+        }
         return Some(Hit::Ruler(time_at(&l, view, pos.x)));
     }
     if l.vel.is_positive() && l.vel.contains(pos) {
@@ -1557,6 +1663,22 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
         if pos.x < r.left() && pos.x >= r.left() - EDGE_SLOP {
             return Some(Hit::NoteLeft(i));
         }
+    }
+    // **The loop bar, on the roll — and AFTER the notes.** A loop's last note
+    // very often ends on the turn, so a bar that claimed its own column would
+    // put a ten-point dead band around the edge of the note anybody is most
+    // likely to be adjusting. Editing notes is what this panel is for; the
+    // bar gives way on any row a note occupies and answers on every row that
+    // is free, and its tab up in the ruler is the target that never gives way
+    // at all.
+    //
+    // The price, said out loud: with the pen down, the ten points at the turn
+    // stop writing notes. That is the one column where a note written by
+    // accident would land on the boundary itself — the first beat of the next
+    // pass, played by the pass before it — so of the two things that could
+    // live there, the handle is the one worth keeping.
+    if loop_bar_x(&l, view).is_some_and(|x| (pos.x - x).abs() <= LOOP_BAR_GRAB) {
+        return Some(Hit::LoopBar);
     }
     let key = key_at(&l, view, pos.y).ceil();
     if !(0.0..=127.0).contains(&key) {
@@ -1814,6 +1936,13 @@ mod tests {
             name: "MIDI",
             clip_start_s: 8.0,
             clip_len_s: 16.0,
+            // **No loop by default, deliberately.** The bar is a control that
+            // stands over the roll, and giving every fixture one would put it
+            // in the way of tests that are about notes — the loop tests below
+            // set their own. It is also a true state: an audio clip, a glued
+            // one and every document written before looping existed all say
+            // zero here.
+            loop_s: 0.0,
             offset_s: 0.0,
             notes,
             selected: &[],
@@ -2427,6 +2556,153 @@ mod tests {
         // the other spelling. Asserted side by side so the split is visible
         // as a decision rather than as a difference somebody has to notice.
         assert_eq!(crate::arrangement_panel::grid_label_text(-2, 4, 4), "1/4");
+    }
+
+    /// **The loop bar is drawn where the pass ends, and it answers a press
+    /// there** — the pair every painted control in this app owes.
+    ///
+    /// The owner asked for "a bar on the right end of clip/loop" that can be
+    /// dragged either way. This asserts the half that lives in the panel: the
+    /// bar's one authority (`loop_bar_x`) places it, the painter puts ink at
+    /// that column in both the roll and the ruler, and both of those columns
+    /// hit-test as the bar.
+    ///
+    /// The ruler's tab is checked separately from the roll's shaft on
+    /// purpose. It is the reachable half — the roll gives way to notes, so a
+    /// part dense at the turn would leave the bar drawn and ungrabbable if
+    /// the tab were ever to stop answering.
+    ///
+    /// Reverts performed, both red: return `None` from `loop_bar_x` and every
+    /// assert here goes; drop the ruler branch from `hit_test` and the tab
+    /// answers `Ruler` instead.
+    #[test]
+    fn the_loop_bar_is_drawn_at_the_pass_end_and_can_be_pressed_there() {
+        // A four-second loop inside a sixteen-second clip: the bar stands
+        // well inside the roll, so nothing here is testing an edge case of
+        // the clamp instead.
+        let notes: [ArrNote; 0] = [];
+        let v = MidiEditView { loop_s: 4.0, ..view(&notes) };
+        let r = rect();
+        let l = Layout::new(r);
+        let x = loop_bar_x(&l, &v).expect("a looping clip drew no bar");
+        assert!(
+            (x - x_of(&l, &v, v.clip_start_s + v.loop_s)).abs() < 0.01,
+            "the bar is at {x}, not at the end of the pass"
+        );
+
+        // It answers on the ruler's tab, and on the empty roll under it.
+        assert_eq!(
+            hit_test(r, &v, Pos2::new(x, l.ruler.center().y)),
+            Some(Hit::LoopBar),
+            "the tab on the ruler is not the bar"
+        );
+        assert_eq!(
+            hit_test(r, &v, Pos2::new(x, l.roll.center().y)),
+            Some(Hit::LoopBar),
+            "the bar over empty roll is not the bar"
+        );
+        // Either side of it, out to the grab, and no further: a point past
+        // the grab is the ruler's locate again.
+        for dx in [-LOOP_BAR_GRAB + 0.5, LOOP_BAR_GRAB - 0.5] {
+            assert_eq!(
+                hit_test(r, &v, Pos2::new(x + dx, l.ruler.center().y)),
+                Some(Hit::LoopBar),
+                "the bar does not reach {dx} points away"
+            );
+        }
+        assert!(
+            matches!(
+                hit_test(r, &v, Pos2::new(x + LOOP_BAR_GRAB + 3.0, l.ruler.center().y)),
+                Some(Hit::Ruler(_))
+            ),
+            "the bar swallowed the ruler past its grab"
+        );
+
+        // A clip that does not loop has no bar and gives the ruler back.
+        let flat = MidiEditView { loop_s: 0.0, ..view(&notes) };
+        assert!(loop_bar_x(&l, &flat).is_none(), "a clip with no loop drew a bar");
+        assert!(
+            matches!(hit_test(r, &flat, Pos2::new(x, l.ruler.center().y)), Some(Hit::Ruler(_))),
+            "a clip with no loop still claims the ruler"
+        );
+
+        // ── and it was PAINTED, in both bands ──
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("loop-bar"));
+        let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+        draw(&painter, r, &v);
+        let rects: Vec<Rect> = ctx.graphics(|g| {
+            g.get(layer)
+                .map(|list| {
+                    list.all_entries()
+                        .filter_map(|c| match &c.shape {
+                            egui::Shape::Rect(q) => Some(q.rect),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        let straddles = |q: &Rect, band: Rect| {
+            q.left() <= x + LOOP_BAR_GRAB
+                && q.right() >= x - LOOP_BAR_GRAB
+                && q.width() <= LOOP_BAR_GRAB * 2.5
+                && band.contains(q.center())
+        };
+        assert!(
+            rects.iter().any(|q| straddles(q, l.roll) && q.height() > l.roll.height() * 0.9),
+            "no shaft was painted down the roll at {x}"
+        );
+        assert!(
+            rects.iter().any(|q| straddles(q, l.ruler)),
+            "no tab was painted on the ruler at {x}"
+        );
+    }
+
+    /// **A note at the turn keeps its edges; the bar gives way.**
+    ///
+    /// A loop's last note very often ENDS on the loop's own end, so the bar
+    /// and that note's right edge land on the same column. Editing notes is
+    /// what this panel is for, so the note wins there — and the ruler's tab
+    /// is why that costs nothing.
+    ///
+    /// Revert performed: move the bar's roll branch above the note passes in
+    /// `hit_test` and the first assert reads `LoopBar` where the note's edge
+    /// belongs.
+    #[test]
+    fn a_note_ending_on_the_loop_keeps_its_edge() {
+        // A note ending exactly at the pass's end: clip starts at 8, the loop
+        // is 4, so a note from source second 2 running two seconds ends at
+        // absolute 12 — the bar's own column.
+        let notes = [ArrNote { at_s: 2.0, dur_s: 2.0, key: 72, vel: 96 }];
+        let v = MidiEditView { loop_s: 4.0, ..view(&notes) };
+        let r = rect();
+        let l = Layout::new(r);
+        let x = loop_bar_x(&l, &v).expect("a looping clip drew no bar");
+        let row = note_rect(&l, &v, &notes[0]);
+        assert!(row.is_positive(), "the fixture note is not on screen");
+        assert!(
+            (row.right() - x).abs() < 1.5,
+            "the fixture note ends at {} and the bar is at {x}",
+            row.right()
+        );
+        assert_eq!(
+            hit_test(r, &v, Pos2::new(x - 1.0, row.center().y)),
+            Some(Hit::NoteRight(0)),
+            "the loop bar ate the edge of the note that ends on it"
+        );
+        // One row away there is no note, and the bar answers again.
+        let free = Pos2::new(x, row.center().y + row.height() * 2.0);
+        assert!(l.roll.contains(free), "the fixture has no free row to test");
+        assert_eq!(
+            hit_test(r, &v, free),
+            Some(Hit::LoopBar),
+            "the bar is unreachable on a row with no note on it"
+        );
+        // And the tab, which never gives way at all.
+        assert_eq!(hit_test(r, &v, Pos2::new(x, l.ruler.center().y)), Some(Hit::LoopBar));
     }
 }
 

@@ -592,6 +592,11 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
         ]),
         HelpView::MidiEdit => rows.extend([
             ("DRAG", "draw a note · body moves the selection · edge resizes"),
+            // The loop bar is a HANDLE and nothing else — no key, no menu —
+            // so the card is the only place the app can say it is there. Its
+            // tab stands on the ruler, which is what the row names, because
+            // that is the half of it no note can ever cover.
+            ("LOOP", "the tab on the ruler at the clip's end: drag to set the loop"),
             ("S-EDG", "shift-drag a note's edge: stretch the selection to the grid"),
             ("S-CLK", "shift-click: add to the selection"),
             ("C-DRG", "cmd-drag empty room: rubber-band select"),
