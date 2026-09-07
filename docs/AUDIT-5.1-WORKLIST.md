@@ -16,10 +16,11 @@ Legend: `file.rs:NN` is where to go. **DONE WHEN** is the test that closes it.
 
 ### Tier 0 · irreplaceable
 
-- [ ] **W1 · Pull the supporter ledger off Fly.** It lives on one volume created the day of the
-  rename; the local `~/.tangent-signing/ledger.jsonl` has no email addresses. Everything else on
-  this list can be redone; the list of who paid cannot.
-  **DONE WHEN** a copy exists off Fly and outside Dropbox.
+- [X] **W1 · Pull the supporter ledger off Fly.** MOOT 2026-09-07, the owner's ruling. The finding
+  itself still reads true against the machine — `~/.tangent-signing/ledger.jsonl` carries sixteen
+  rows and no email addresses — but the loss it was guarding against is not one worth guarding.
+  Do not re-raise it; a future audit that finds the same shape has found the same non-problem.
+  W33 (the Dropbox backup lagging the live file) is a separate item and stays open.
 
 ### Tier 1 · silent correctness bugs, every user, every platform
 
