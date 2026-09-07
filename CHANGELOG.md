@@ -177,6 +177,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   repeats. A clip whose loop has been turned off keeps it off — that door only
   opens once.
 
+- **Glue makes one clip that loops over the whole of what was glued.** It used
+  to be the escape hatch from the loop — the way to turn several repeating
+  items into one long pass — and it is now the same rule as everything else:
+  the weld is a clip, and every clip is a loop over its own length. Nothing
+  about the result sounds different, because the sources' repeats are written
+  out into real notes as they always were and a loop as long as its clip is a
+  single pass. What changes is the right edge: pull it and the whole welded
+  phrase, silences and all, comes round again.
+
 - **Draw a MIDI item with Cmd-drag on a lane, not shift-drag.** Shift is no
   longer bound to it at all. On this timeline shift already means "add to the
   selection" on a clip's body and "stretch" from a clip's edge, both of them a
