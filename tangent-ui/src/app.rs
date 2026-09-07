@@ -1826,6 +1826,12 @@ struct Grab {
 enum ClipMenuAction {
     Delete,
     Copy,
+    /// Turn the acting set's loop off, or back on over the clip's own
+    /// length. The one row in this menu that shows a STATE as well as
+    /// offering a verb — see the third element of
+    /// [`TangentApp::clip_menu_rows_for`]'s rows, which is what puts a tick
+    /// beside it.
+    ToggleLoop,
     CycleStretch,
     ResetStretch,
     /// Write the acting set's MIDI clips out, one `.mid` per track.
@@ -13273,6 +13279,83 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_save_edits();
     }
 
+    /// **Does this clip repeat?** The Loop row's tick, and the one place the
+    /// question is asked.
+    ///
+    /// The same `> 1.0e-6` floor every reader of `loop_s` keeps — the two
+    /// expansions, the seams, the pass cull — rather than `> 0.0`, so a
+    /// microsecond of loop left behind by arithmetic somewhere cannot put a
+    /// tick beside a clip that is drawn and heard as one pass.
+    fn clip_loops(&self, id: u64) -> bool {
+        self.arrangement
+            .clips
+            .iter()
+            .any(|c| c.id == id && c.loop_s > 1.0e-6)
+    }
+
+    /// **Turn the acting set's loop off, or back on over each clip's own
+    /// length** — the clip menu's Loop row.
+    ///
+    /// The owner asked for one direction: "a right click checkmark to turn
+    /// off looping". A tick that cannot be put back is a broken control, so
+    /// it goes both ways, and the way back is the birthright every clip is
+    /// made with — a single pass as long as the clip.
+    ///
+    /// **Turning it OFF leaves the length alone**, which is the ruling and is
+    /// also load-bearing twice over. A clip pulled out to eight passes and
+    /// then unlooped stays eight bars long and plays its material once, which
+    /// is what "stop repeating" means; shortening it back to one pass would
+    /// be an edit nobody asked for and would take the seven bars of timeline
+    /// somebody laid out. And `note_clip_len` reads `len_s == 0.0` as "never
+    /// measured" to decide whether it may arm a loop, so an unloop that also
+    /// zeroed the length would hand the next decode a clip it was entitled to
+    /// re-arm.
+    ///
+    /// **The pass length is not remembered across an off/on.** Turning it
+    /// back on gives the clip's whole length, not whatever it was repeating
+    /// before, and there is nowhere honest to keep the old figure — a
+    /// document written by an older build carries no such key, so the memory
+    /// would work on clips made here and quietly not on clips opened from
+    /// anywhere else. Choosing a pass is the MIDI editor's loop bar, which is
+    /// where a length that matters is set.
+    ///
+    /// The whole SET, the rule every row in this menu follows: a marquee over
+    /// eight takes and a menu on one of them means all eight, and the clip
+    /// the menu was opened on decides which way they all go.
+    fn arr_toggle_loop(&mut self, id: u64) {
+        let on = !self.clip_loops(id);
+        let touched = self.arr_acting_on(id);
+        // The lengths FIRST. `clip_len_resolved` reads the host's file facts
+        // through `&self` and the write below holds the clip list mutably,
+        // and the whole-file sentinel is exactly the case that needs it: a
+        // clip that has never been dragged still carries `len_s == 0.0`, and
+        // a loop set from that would be a loop of nothing.
+        let lens: Vec<(u64, f64)> = self
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| touched.contains(&c.id))
+            .map(|c| (c.id, self.clip_len_resolved(c)))
+            .collect();
+        for c in &mut self.arrangement.clips {
+            if !touched.contains(&c.id) {
+                continue;
+            }
+            c.loop_s = if on {
+                lens.iter()
+                    .find(|(i, _)| *i == c.id)
+                    .map_or(c.len_s, |(_, l)| *l)
+            } else {
+                0.0
+            };
+        }
+        // The engine's schedule changes with it — a pass count is what
+        // `audio_clip_passes` and `midi_clip_notes` build from this — so the
+        // clips are dirty, exactly as they are for a stretch.
+        self.clips_dirty = true;
+        self.arr_save_edits();
+    }
+
     /// Put a clip back to its own speed.
     fn arr_reset_stretch(&mut self, id: u64) {
         let touched = self.arr_acting_on(id);
@@ -13485,18 +13568,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    /// What the clip menu offers for `id`: each row's label, and what it
-    /// DOES.
+    /// What the clip menu offers for `id`: each row's label, what it DOES,
+    /// and whether it is TICKED.
     ///
-    /// **Two rows for anything, two more on a stretched audio clip, and one
+    /// **Three rows for anything, two more on a stretched audio clip, and one
     /// more again when the set holds MIDI.** The stretch rows are not offered
     /// on a clip nobody has stretched: a menu that lists an algorithm for a
     /// clip playing at its own speed is a menu asking a question that has no
     /// answer. Export is not offered on a set with no MIDI in it, for the
-    /// same reason.
+    /// same reason. Loop is offered on everything, because every clip in this
+    /// app has one and the row is how it is given back.
     ///
-    /// **The action travels WITH the label, and that is the point of this
-    /// function.** It used to return `Vec<String>` and the press handler
+    /// **The action travels WITH the label, and so does the tick, and that is
+    /// the point of this function.** It used to return `Vec<String>` and the
+    /// press handler
     /// matched on `rows[0]`, `rows[1]`, `rows.get(2)`, `rows.get(3)` — a
     /// positional contract between two functions two hundred lines apart,
     /// with not one test on it anywhere. Every row here is conditional on
@@ -13509,7 +13594,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// Export goes LAST on purpose, under the separator's business end:
     /// Delete and Copy are the rows the hand already knows where to find,
-    /// and a row that comes and goes must not move them.
+    /// and a row that comes and goes must not move them. Loop goes directly
+    /// under Copy, above every conditional row, for the same reason: it is
+    /// offered on every clip, so it is a fixed landmark rather than another
+    /// thing that shifts what is beneath it.
     /// **What the flag menu offers, in the owner's words and his order.**
     ///
     /// Two shapes: the empty strip MAKES something, a flag ACTS on the one
@@ -13635,10 +13723,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
-    fn clip_menu_rows_for(&self, id: u64) -> Vec<(String, ClipMenuAction)> {
+    fn clip_menu_rows_for(&self, id: u64) -> Vec<(String, ClipMenuAction, bool)> {
         let mut out = vec![
-            ("Delete take".to_owned(), ClipMenuAction::Delete),
-            ("Copy take".to_owned(), ClipMenuAction::Copy),
+            ("Delete take".to_owned(), ClipMenuAction::Delete, false),
+            ("Copy take".to_owned(), ClipMenuAction::Copy, false),
+            // **The one row here that says what IS as well as what it will
+            // do**, and the reason a third element exists at all. The tick
+            // travels with the label and the action for exactly the argument
+            // this function's own note makes about the other two: a state
+            // asked for in the painter and answered from somewhere else is
+            // the pair that drifts, and this is a state the painter has to
+            // draw. See [`Self::draw_clip_menu`], which reads this and
+            // nothing else.
+            (
+                "Loop".to_owned(),
+                ClipMenuAction::ToggleLoop,
+                self.clip_loops(id),
+            ),
         ];
         let stretched = self.arrangement.clips.iter().find(|c| {
             c.id == id
@@ -13649,10 +13750,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             out.push((
                 crate::arrangement::stretch_mode_label(&c.stretch_mode).to_owned(),
                 ClipMenuAction::CycleStretch,
+                false,
             ));
             out.push((
                 format!("Reset stretch ({:.0}%)", c.stretch * 100.0),
                 ClipMenuAction::ResetStretch,
+                false,
             ));
         }
         // The SET, the rule every row in this menu follows: a marquee over
@@ -13679,10 +13782,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // points of left inset to spare.
             match lanes.len() {
                 0 => {}
-                1 => out.push(("Export MIDI".to_owned(), ClipMenuAction::ExportMidi)),
+                1 => out.push((
+                    "Export MIDI".to_owned(),
+                    ClipMenuAction::ExportMidi,
+                    false,
+                )),
                 n => out.push((
                     format!("Export MIDI ({n} tracks)"),
                     ClipMenuAction::ExportMidi,
+                    false,
                 )),
             }
         }
@@ -13707,7 +13815,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let rows = self.clip_menu_rows_for(id);
         let rects = Self::clip_menu_rows(at, rows.len());
         let i = rects.iter().position(|r| r.contains(p))?;
-        rows.get(i).map(|(_, action)| *action)
+        rows.get(i).map(|(_, action, _)| *action)
     }
 
     /// Let go of a carried insert bay over `to`, if anything.
@@ -14001,23 +14109,67 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         crate::recorder_panel::surface_of(egui::Color32::from_rgb(c.r, c.g, c.b))
     }
 
+    /// **A tick at the right end of a menu row**, for a row that reports a
+    /// state as well as offering a verb.
+    ///
+    /// Two strokes and not a glyph. The menus here are set in Courier Prime
+    /// and Terminess, neither of which is guaranteed to carry U+2713 — a
+    /// missing glyph is a tofu box or nothing at all, and "nothing at all" on
+    /// a row whose whole job is to say ON or OFF is the worst failure this
+    /// control has. It is also how the rest of this app draws its small
+    /// figures: the panel's dial needle, the seam in a looped clip, the fade
+    /// wedge's edge. A shape the painter emits is a shape a test can read
+    /// back, which a rasterised glyph is not.
+    ///
+    /// Right-aligned, because the label is left-aligned at the row's own
+    /// eight-point inset and a tick in front of it would either indent every
+    /// unticked row to match or make the ticked one jump sideways as it is
+    /// pressed. In the row's INK, unlike the loop seam it looks like: this is
+    /// a figure somebody has to read, and ink is exactly what figures take.
+    fn draw_tick(painter: &egui::Painter, row: Rect, ink: egui::Color32) {
+        // Off the row's height so it holds its proportion if the rows ever
+        // change size, and clamped so it can never be a smudge or a tick
+        // taller than the text beside it.
+        let h = (row.height() * 0.34).clamp(5.0, 9.0);
+        let right = row.right() - 8.0;
+        let mid = row.center().y;
+        // The elbow sits below the middle and the long leg rises above it,
+        // which is what makes the two strokes read as a check rather than as
+        // a chevron lying on its side.
+        let elbow = Pos2::new(right - h * 0.62, mid + h * 0.38);
+        let stroke = egui::Stroke::new(1.6, ink);
+        painter.line_segment(
+            [Pos2::new(right - h, mid - h * 0.05), elbow],
+            stroke,
+        );
+        painter.line_segment([elbow, Pos2::new(right, mid - h * 0.62)], stroke);
+    }
+
     fn draw_clip_menu(&self, painter: &egui::Painter) {
-        let (at, labels) = if let Some((id, at)) = self.arr_clip_menu {
+        // `(label, ticked)`. Only the clip menu has a row that carries a
+        // state; the FX and flag menus are pure verbs and tick nothing.
+        let (at, labels): (Pos2, Vec<(String, bool)>) = if let Some((id, at)) = self.arr_clip_menu {
             (
                 at,
                 self.clip_menu_rows_for(id)
                     .into_iter()
-                    .map(|(label, _)| label)
-                    .collect::<Vec<String>>(),
+                    .map(|(label, _, ticked)| (label, ticked))
+                    .collect(),
             )
         } else if let Some((.., at)) = self.arr_fx_menu {
-            (at, vec!["Delete FX".to_owned(), "Replace FX".to_owned()])
+            (
+                at,
+                vec![
+                    ("Delete FX".to_owned(), false),
+                    ("Replace FX".to_owned(), false),
+                ],
+            )
         } else if let Some((on, at)) = self.arr_flag_menu {
             (
                 at,
                 Self::flag_menu_rows(on)
                     .into_iter()
-                    .map(|(label, _)| label)
+                    .map(|(label, _)| (label, false))
                     .collect(),
             )
         } else {
@@ -14040,7 +14192,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             egui::Stroke::new(1.0, face.edge),
             egui::StrokeKind::Inside,
         );
-        for (r, label) in rows.iter().zip(&labels) {
+        for (r, (label, ticked)) in rows.iter().zip(&labels) {
             painter.text(
                 Pos2::new(r.left() + 8.0, r.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -14048,6 +14200,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 egui::FontId::new(11.0, crate::fonts::courier_bold()),
                 face.ink,
             );
+            if *ticked {
+                Self::draw_tick(painter, *r, face.ink);
+            }
         }
         // The hairline under Delete, which is the only row here worth
         // separating from the rest. Indexed rather than asked of the action
@@ -18812,6 +18967,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         }
                         self.arr_selected = Some(id);
                         self.arr_copy();
+                    }
+                    // **The tick, flipped.** The row shows the state and
+                    // presses to the other one — the whole acting set with
+                    // it, like every other row here.
+                    Some(ClipMenuAction::ToggleLoop) => {
+                        self.arr_toggle_loop(id);
                     }
                     // **The algorithm, cycled.** One press, one step — the
                     // gridbox's and the clef's gesture, and there is no room
@@ -41030,12 +41191,13 @@ mod tests {
         });
 
         let audio: Vec<ClipMenuAction> =
-            app.clip_menu_rows_for(2).into_iter().map(|(_, a)| a).collect();
+            app.clip_menu_rows_for(2).into_iter().map(|(_, a, _)| a).collect();
         assert_eq!(
             audio,
             vec![
                 ClipMenuAction::Delete,
                 ClipMenuAction::Copy,
+                ClipMenuAction::ToggleLoop,
                 ClipMenuAction::CycleStretch,
                 ClipMenuAction::ResetStretch,
             ],
@@ -41043,12 +41205,13 @@ mod tests {
         );
 
         let midi: Vec<ClipMenuAction> =
-            app.clip_menu_rows_for(1).into_iter().map(|(_, a)| a).collect();
+            app.clip_menu_rows_for(1).into_iter().map(|(_, a, _)| a).collect();
         assert_eq!(
             midi,
             vec![
                 ClipMenuAction::Delete,
                 ClipMenuAction::Copy,
+                ClipMenuAction::ToggleLoop,
                 ClipMenuAction::ExportMidi
             ],
             "Export must be LAST, under the rows the hand already knows"
@@ -41076,15 +41239,19 @@ mod tests {
         // test exists for is between the press handler and the row list, and
         // asserting on the list alone would leave the handler free to go on
         // using indices.
-        let rects = TangentApp::clip_menu_rows(at, 3);
+        // Derived from the list rather than counted by hand: this test has
+        // already been broken once by a row being added, which is precisely
+        // the event it exists to survive.
+        let rects = TangentApp::clip_menu_rows(at, midi.len());
+        let last = rects[midi.len() - 1];
         app.arr_clip_menu = Some((1, at));
         pointer_frame(
             &ctx,
             &mut app,
             vec![
-                egui::Event::PointerMoved(rects[2].center()),
+                egui::Event::PointerMoved(last.center()),
                 egui::Event::PointerButton {
-                    pos: rects[2].center(),
+                    pos: last.center(),
                     button: egui::PointerButton::Primary,
                     pressed: true,
                     modifiers: egui::Modifiers::NONE,
@@ -41097,7 +41264,7 @@ mod tests {
         );
         assert!(app.arr_clip_menu.is_none(), "the menu stayed up");
 
-        // Row ZERO is still Delete on a clip whose menu has three rows.
+        // Row ZERO is still Delete, whatever is beneath it.
         app.arr_clip_menu = Some((1, at));
         pointer_frame(
             &ctx,
@@ -41120,6 +41287,183 @@ mod tests {
             app.take_save_request().is_none(),
             "the top row exported instead of deleting"
         );
+    }
+
+    /// Every DIAGONAL line segment `draw_clip_menu` painted inside `r`.
+    ///
+    /// Diagonal is what isolates the tick from everything else this painter
+    /// emits: the frame is a rect, the labels are text, and the hairline
+    /// under Delete is horizontal. The whole menu is drawn rather than the
+    /// tick alone, because a tick computed and not painted — or painted
+    /// under the row above it — is the fault this exists to catch, and a
+    /// direct call to `draw_tick` could not see either.
+    fn menu_diagonals_in(ctx: &egui::Context, app: &TangentApp, r: Rect) -> usize {
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Pos2::ZERO,
+                    egui::vec2(1300.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.draw_clip_menu(ui.painter());
+                });
+            },
+        );
+        out.shapes
+            .iter()
+            .filter(|s| match &s.shape {
+                egui::epaint::Shape::LineSegment { points, .. } => {
+                    let (a, b) = (points[0], points[1]);
+                    (a.x - b.x).abs() > 0.25
+                        && (a.y - b.y).abs() > 0.25
+                        && r.contains(a)
+                        && r.contains(b)
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// **The clip menu's Loop row shows the state and flips it, and turning a
+    /// loop off leaves the clip's length alone.**
+    ///
+    /// The owner: "a right click checkmark to turn off looping." Every clip
+    /// in the app is a loop from the moment it is made, so the one gesture
+    /// that was missing was the way OUT of it — and a row that merely said
+    /// "Loop" without saying whether this clip does would be a switch with no
+    /// indicator, which on a menu that closes the instant it is pressed is a
+    /// switch nobody can read.
+    ///
+    /// Four things, and the third is the one worth the test:
+    ///
+    /// 1. The row is ticked when the clip loops and bare when it does not.
+    /// 2. The tick is PAINTED — two diagonal strokes inside that row's own
+    ///    rectangle and nowhere else. A state that is computed and not drawn
+    ///    is this codebase's oldest failure mode, and the menu is painted, so
+    ///    the strokes can be read straight back off the painter.
+    /// 3. Turning it off leaves `len_s` untouched. A clip pulled out to four
+    ///    passes and then unlooped stays four bars long and plays its
+    ///    material once, which is what "stop repeating" means — shortening it
+    ///    back would be an edit nobody asked for, and would also hand
+    ///    `note_clip_len` a clip it was entitled to re-arm.
+    /// 4. It acts on the whole selected SET, the rule every other row here
+    ///    follows.
+    ///
+    /// Reverts performed, each red on its own assert: return a constant
+    /// `false` from `clip_loops` and the tick asserts go; drop the
+    /// `if *ticked` arm from the painter and only the paint assert goes,
+    /// which is the pair that proves the two are not the same assert twice;
+    /// and set `c.len_s = 0.0` beside the unloop and the length assert names
+    /// it.
+    #[test]
+    fn the_clip_menus_loop_row_ticks_and_unticks_without_moving_the_clip() {
+        use crate::arrangement::{ArrClip, ClipKind};
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        for id in [1u64, 2] {
+            app.arrangement.clips.push(ArrClip {
+                id,
+                lane: 1,
+                kind: ClipKind::Audio,
+                start_s: 0.0,
+                // Four passes of one second: a clip somebody has already
+                // pulled out, which is the state the length assert is about.
+                len_s: 4.0,
+                loop_s: 1.0,
+                ..Default::default()
+            });
+        }
+        let at = Pos2::new(120.0, 300.0);
+        app.arr_clip_menu = Some((1, at));
+
+        let row_of = |app: &TangentApp| {
+            let rows = app.clip_menu_rows_for(1);
+            let i = rows
+                .iter()
+                .position(|(_, a, _)| *a == ClipMenuAction::ToggleLoop)
+                .expect("the menu offers no Loop row at all");
+            (rows[i].0.clone(), rows[i].2, TangentApp::clip_menu_rows(at, rows.len())[i])
+        };
+
+        // ── ticked, and the tick is on the paper ──
+        let (label, ticked, rect) = row_of(&app);
+        assert_eq!(label, "Loop", "the row is called {label:?}");
+        assert!(ticked, "a clip that repeats four times is not ticked");
+        assert_eq!(
+            menu_diagonals_in(&ctx, &app, rect),
+            2,
+            "the ticked row painted no check inside its own rectangle"
+        );
+        // And nowhere else: the whole menu owes exactly one tick, so the
+        // other rows are bare.
+        let whole = TangentApp::clip_menu_rows(at, app.clip_menu_rows_for(1).len())
+            .into_iter()
+            .reduce(|a, b| a.union(b))
+            .expect("the menu has rows");
+        assert_eq!(
+            menu_diagonals_in(&ctx, &app, whole),
+            2,
+            "a row that is not the Loop row was ticked too"
+        );
+
+        // ── pressed: the loop goes, the length stays, and the SET follows ──
+        assert_eq!(
+            app.clip_menu_hit(1, at, Some(rect.center())),
+            Some(ClipMenuAction::ToggleLoop),
+            "the Loop row's own rectangle hit-tests to something else"
+        );
+        app.arr_multi = vec![1, 2];
+        app.arr_toggle_loop(1);
+        for id in [1u64, 2] {
+            let c = app
+                .arrangement
+                .clips
+                .iter()
+                .find(|c| c.id == id)
+                .expect("the clip");
+            assert_eq!(c.loop_s, 0.0, "clip {id} still loops at {}", c.loop_s);
+            assert!(
+                (c.len_s - 4.0).abs() < 1.0e-9,
+                "unticking Loop pulled clip {id} in to {} - the length is the \
+                 timeline's business and this row has no licence over it",
+                c.len_s
+            );
+        }
+
+        // ── and the row now reads OFF, with nothing painted ──
+        let (_, ticked, rect) = row_of(&app);
+        assert!(!ticked, "the row still ticks a clip that no longer loops");
+        assert_eq!(
+            menu_diagonals_in(&ctx, &app, rect),
+            0,
+            "an unlooped clip's row is still wearing a check"
+        );
+
+        // ── pressed again: back on, over the clip's WHOLE length ──
+        //
+        // Not the one second it was repeating before. There is nowhere
+        // honest to keep that figure — a document from an older build
+        // carries no such key — so the way back is the birthright every clip
+        // is made with, and the MIDI editor's loop bar is where a pass that
+        // matters gets chosen.
+        app.arr_toggle_loop(1);
+        for id in [1u64, 2] {
+            let c = app
+                .arrangement
+                .clips
+                .iter()
+                .find(|c| c.id == id)
+                .expect("the clip");
+            assert!(
+                (c.loop_s - 4.0).abs() < 1.0e-9,
+                "clip {id} came back looping over {} rather than its own four \
+                 seconds",
+                c.loop_s
+            );
+        }
+        assert!(row_of(&app).1, "the row did not tick again");
     }
 
     /// **A selection with no MIDI in it says so, and asks for nothing.**
@@ -41337,7 +41681,7 @@ mod tests {
         app.arr_multi = vec![1, 2, 3];
 
         let rows: Vec<ClipMenuAction> =
-            app.clip_menu_rows_for(1).into_iter().map(|(_, a)| a).collect();
+            app.clip_menu_rows_for(1).into_iter().map(|(_, a, _)| a).collect();
         assert!(
             !rows.contains(&ClipMenuAction::ExportMidi),
             "the clip menu offered an export a plugin cannot answer: {rows:?}"
