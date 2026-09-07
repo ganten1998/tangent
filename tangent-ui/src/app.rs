@@ -2714,6 +2714,7 @@ fn kit_shortfall(report: &crate::drumpad::KitEmbedReport) -> String {
 /// the host reports back.
 fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::ArrClip {
     crate::arrangement::ArrClip {
+        pedal: Vec::new(),
         kind: crate::arrangement::ClipKind::Audio,
         notes: Vec::new(),
         lane,
@@ -5519,6 +5520,7 @@ impl TangentApp {
         // that builds clips the app cannot build is a fixture that will
         // eventually be used to prove something false.
         let backing = arr.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Audio,
             notes: Vec::new(),
             lane: 3,
@@ -5539,6 +5541,7 @@ impl TangentApp {
             gain: 1.0,
         });
         let take = arr.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Audio,
             notes: Vec::new(),
             lane: 2,
@@ -5559,6 +5562,7 @@ impl TangentApp {
             gain: 1.0,
         });
         let solo = arr.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Audio,
             notes: Vec::new(),
             lane: 2,
@@ -5595,6 +5599,7 @@ impl TangentApp {
         })
         .collect();
         arr.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             notes: phrase,
             lane: 1,
@@ -8300,6 +8305,7 @@ impl TangentApp {
             );
         }
         self.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: import.pedal,
             kind: crate::arrangement::ClipKind::Midi,
             notes: import.notes,
             lane: lane.min(crate::recorder::CHANNELS - 1),
@@ -8442,6 +8448,9 @@ impl TangentApp {
                 .and_then(|p| std::path::Path::new(p).file_stem().map(|n| n.to_string_lossy().into_owned()))
                 .unwrap_or_else(|| "take".to_owned());
             let id = self.arrangement.add_clip(crate::arrangement::ArrClip {
+                // **What the pedal foot did, kept with what the hands did.**
+                // Empty on audio, and on a part played without one.
+                pedal: r.pedal,
                 kind,
                 notes: r.notes,
                 lane: r.lane.min(crate::recorder::CHANNELS - 1),
@@ -13494,10 +13503,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         notes.sort_by(|a, b| {
             a.at_s.partial_cmp(&b.at_s).unwrap_or(std::cmp::Ordering::Equal)
         });
+        // **And the pedal, flattened by the same rule the notes were.**
+        // Gluing a pedalled passage and getting back a dry one would be the
+        // same bug as gluing a repeat and losing the repeats.
+        let mut pedal: Vec<crate::arrangement::ArrPedal> = Vec::new();
+        for c in &picked {
+            pedal.extend(
+                crate::arrangement::clip_pedal_in_song_time(c)
+                    .into_iter()
+                    .map(|e| crate::arrangement::ArrPedal { at_s: e.at_s - start, ..e }),
+            );
+        }
+        pedal.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
 
         let doomed: Vec<u64> = picked.iter().map(|c| c.id).collect();
         self.arrangement.clips.retain(|c| !doomed.contains(&c.id));
         self.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal,
             kind: crate::arrangement::ClipKind::Midi,
             notes,
             lane,
@@ -14447,7 +14469,45 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             for n in &mut c.notes {
                 n.dur_s = n.dur_s.min(cut - n.at_s).max(0.0);
             }
+            // **The pedal divides at the same blade, and the tail INHERITS
+            // the level it was cut at.**
+            //
+            // The edges alone are not enough, and the failure is the one
+            // `tangent-record`'s writer calls rule 8: a pedal pressed in bar
+            // one and lifted in bar three, cut at bar two, leaves the tail
+            // holding a lift with no cause and the head holding a press that
+            // never ends. So the tail is handed a restated level at its own
+            // start — one edge per pedal that was not already up — before the
+            // edges that genuinely fall inside it.
+            //
+            // Restated at `cut` rather than at zero because these are SOURCE
+            // times, exactly like the notes above: the tail's `offset_s` is
+            // `c.offset_s + head`, which IS `cut`.
+            let mut tail_pedal: Vec<crate::arrangement::ArrPedal> = Vec::new();
+            for cc in [64_u8, 66, 67] {
+                let at_cut = c
+                    .pedal
+                    .iter()
+                    .filter(|e| e.cc == cc && e.at_s < cut)
+                    .next_back()
+                    .map_or(0, |e| e.value);
+                if at_cut > 0 {
+                    tail_pedal.push(crate::arrangement::ArrPedal {
+                        at_s: cut,
+                        cc,
+                        value: at_cut,
+                    });
+                }
+            }
+            tail_pedal.extend(c.pedal.iter().filter(|e| e.at_s >= cut).copied());
+            tail_pedal.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+            // The head keeps only what happened before the blade. It needs no
+            // closing lift: a clip's pedal is released when the clip ends,
+            // which the timeline does for every clip whether or not anybody
+            // wrote it down. See `mix_channels`.
+            c.pedal.retain(|e| e.at_s < cut);
             tails.push(crate::arrangement::ArrClip {
+                pedal: tail_pedal,
                 kind: c.kind,
                 notes: tail_notes,
                 lane: c.lane,
@@ -20696,6 +20756,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         self.set_channel_input_spec(lane, "midi:all");
                     }
                     self.arrangement.add_clip(crate::arrangement::ArrClip {
+                        pedal: Vec::new(),
                         kind: crate::arrangement::ClipKind::Midi,
                         notes: Vec::new(),
                         lane,
@@ -21649,7 +21710,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let meter = self.live_meter_map();
         let mut by_lane: std::collections::BTreeMap<
             usize,
-            (Vec<crate::arrangement::ArrNote>, f64),
+            (
+                Vec<crate::arrangement::ArrNote>,
+                Vec<crate::arrangement::ArrPedal>,
+                f64,
+            ),
         > = std::collections::BTreeMap::new();
         for c in self
             .arrangement
@@ -21657,9 +21722,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .iter()
             .filter(|c| c.kind == crate::arrangement::ClipKind::Midi && ids.contains(&c.id))
         {
-            let entry = by_lane.entry(c.lane).or_insert_with(|| (Vec::new(), 0.0));
+            let entry = by_lane
+                .entry(c.lane)
+                .or_insert_with(|| (Vec::new(), Vec::new(), 0.0));
             entry.0.extend(crate::arrangement::clip_notes_in_song_time(c));
-            entry.1 = entry.1.max(c.start_s + c.len_s);
+            entry.1.extend(crate::arrangement::clip_pedal_in_song_time(c));
+            entry.2 = entry.2.max(c.start_s + c.len_s);
         }
         if by_lane.is_empty() {
             // The selection went away between the row and the answer — a
@@ -21679,12 +21747,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .unwrap_or_default();
         let mut written = 0usize;
         let mut failed: Vec<String> = Vec::new();
-        for (lane, (mut notes, end_s)) in by_lane {
+        for (lane, (mut notes, mut pedal, end_s)) in by_lane {
             notes.sort_by(|a, b| {
                 a.at_s.partial_cmp(&b.at_s).unwrap_or(std::cmp::Ordering::Equal)
             });
+            pedal.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
             let name = self.midi_export_stem(lane);
-            let bytes = crate::smf_write::write(&name, &notes, end_s, &tempo, &meter);
+            let bytes =
+                crate::smf_write::write(&name, &notes, &pedal, end_s, &tempo, &meter);
             let at = if several {
                 // A stem for all of them, the first included, and never over
                 // a file that is already there.
@@ -34306,6 +34376,7 @@ mod tests {
         };
         let rec = |lane: usize, len_s: f64, path: Option<&str>, notes: Vec<crate::arrangement::ArrNote>| {
             crate::arrangement::RecordedClip {
+                pedal: Vec::new(),
                 lane,
                 start_s: 4.0,
                 len_s,
@@ -34367,6 +34438,7 @@ mod tests {
             vel: 90,
         };
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             notes: vec![note(0.06, 60), note(1.02, 64), note(2.10, 67)],
             lane: 1,
@@ -34496,6 +34568,7 @@ mod tests {
             vel: 100,
         };
         app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             notes: vec![note(0.0), note(4.0), note(9.0)],
             lane: 0,
@@ -34516,6 +34589,7 @@ mod tests {
             gain: 1.0,
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
+            pedal: Vec::new(),
             lane: 0,
             start_s: 3.0,
             len_s: 4.0, // covers 3..7
@@ -34551,6 +34625,7 @@ mod tests {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
         app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             notes: vec![crate::arrangement::ArrNote {
                 at_s: 1.0,
@@ -34576,6 +34651,7 @@ mod tests {
             gain: 1.0,
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
+            pedal: Vec::new(),
             lane: 0,
             start_s: 2.0,
             len_s: 6.0, // covers 2..8, no notes played
@@ -34603,6 +34679,7 @@ mod tests {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
         let clip = |lane: usize, start: f64, len: f64| crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Audio,
             notes: Vec::new(),
             lane,
@@ -34630,6 +34707,7 @@ mod tests {
         app.arrangement.add_clip(clip(2, 0.0, 30.0));
 
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
+            pedal: Vec::new(),
             lane: 1,
             start_s: 5.0,
             len_s: 22.0, // covers 5..27
@@ -34662,6 +34740,7 @@ mod tests {
         // And the SPLIT: a punch strictly inside the tail clip (27..35)
         // leaves its two sides, the far one's trim paid into offset.
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
+            pedal: Vec::new(),
             lane: 1,
             start_s: 30.0,
             len_s: 2.0,
@@ -34848,6 +34927,7 @@ mod tests {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             notes: Vec::new(),
             lane: 1,
@@ -34918,6 +34998,7 @@ mod tests {
         // 120 bpm. That spacing was -4 under the old bar-fraction scheme.
         app.settings.midi_grid_exp = -3;
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             notes: Vec::new(),
             lane: 1,
@@ -35001,6 +35082,7 @@ mod tests {
         app.bootstrap_project(&root.join("Projects"));
         app.settings.midi_grid_exp = -3; // a quarter of a beat: 0.125 s
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             notes: Vec::new(),
             lane: 1,
@@ -35106,6 +35188,7 @@ mod tests {
         app.bootstrap_project(&root.join("Projects"));
         app.settings.midi_grid_exp = -3; // a quarter of a beat: 0.125 s
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             notes: Vec::new(),
             lane: 1,
@@ -35179,6 +35262,7 @@ mod tests {
         app.settings.strip_sends[at] = 0.75;
         app.set_insert(at, 0, Some("/x/Piano.vst3"));
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             notes: vec![crate::arrangement::ArrNote {
                 at_s: 1.0,
@@ -35289,6 +35373,7 @@ mod tests {
         // And with a CLIP selected the chord still means clips: the track
         // clipboard is not disturbed and the clip one fills.
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             notes: Vec::new(),
             lane: 1,
@@ -35328,6 +35413,7 @@ mod tests {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             notes: Vec::new(),
             lane: 1,
@@ -35674,6 +35760,72 @@ mod tests {
         assert_eq!(app.selected_tracks, vec![6, 7, 8]);
     }
 
+    /// **The blade divides the pedal too, and the tail inherits the level it
+    /// was cut at.**
+    ///
+    /// The edges alone are not enough. A pedal pressed in bar one and lifted
+    /// in bar three, cut at bar two, would leave the tail holding a lift with
+    /// no cause and the head holding a press that never ends — which is
+    /// `tangent_record::smf`'s rule 8 arriving by a different door. The tail
+    /// is handed a restated level at its own start.
+    ///
+    /// Trimmed on purpose, for the same reason its note-keeping twin below
+    /// is: the blade falls at `offset_s + head`, and an untrimmed clip is
+    /// exactly the case where confusing that with `head` hides.
+    ///
+    /// Revert-check performed: dropping the restatement loop and keeping only
+    /// `tail_pedal = c.pedal.iter().filter(at_s >= cut)` leaves the tail
+    /// opening with the damper up and fails on the first tail assertion.
+    #[test]
+    fn splitting_a_midi_clip_divides_its_pedal_and_the_tail_inherits_it() {
+        use crate::arrangement::{ArrClip, ArrNote, ArrPedal, ClipKind};
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        // Source times 2..6, shown from song time 10. The pedal goes down at
+        // source 2.5 and lifts at source 5.5 — either side of the cut.
+        app.arrangement.clips.push(ArrClip {
+            kind: ClipKind::Midi,
+            notes: vec![ArrNote { at_s: 2.0, dur_s: 0.5, key: 60, vel: 100 }],
+            pedal: vec![
+                ArrPedal { at_s: 2.5, cc: 64, value: 127 },
+                ArrPedal { at_s: 5.5, cc: 64, value: 0 },
+            ],
+            lane: 0,
+            start_s: 10.0,
+            offset_s: 2.0,
+            len_s: 4.0,
+            id: 7,
+            ..Default::default()
+        });
+        // Cut two seconds in: song time 12, SOURCE time 4.
+        app.recorder.position_s = 12.0;
+        app.arr_selected = Some(7);
+        app.arr_split_at_playhead();
+        assert_eq!(app.arrangement.clips.len(), 2, "the split did not make a tail");
+        let head = app.arrangement.clips.iter().find(|c| c.id == 7).unwrap().clone();
+        let tail = app.arrangement.clips.iter().find(|c| c.id != 7).unwrap().clone();
+
+        // The head keeps the press and nothing else. It needs no closing
+        // lift: a clip's pedal is released when the clip ENDS.
+        assert_eq!(
+            head.pedal,
+            vec![ArrPedal { at_s: 2.5, cc: 64, value: 127 }],
+            "{:?}",
+            head.pedal
+        );
+        // The tail OPENS held — restated at the cut, in source time, which is
+        // the tail's own `offset_s` — and then lifts where it always did.
+        assert_eq!(
+            tail.pedal,
+            vec![
+                ArrPedal { at_s: 4.0, cc: 64, value: 127 },
+                ArrPedal { at_s: 5.5, cc: 64, value: 0 },
+            ],
+            "the tail did not inherit the pedal it was cut under: {:?}",
+            tail.pedal
+        );
+        assert!((tail.offset_s - 4.0).abs() < 1e-9, "the restatement is not at the tail's zero");
+    }
+
     /// **Splitting a MIDI clip keeps every note, where it was.**
     ///
     /// A note's `at_s` is a time in the SOURCE, and every reader turns it into
@@ -35694,6 +35846,7 @@ mod tests {
         let note = |at: f64, dur: f64, key: u8| ArrNote { at_s: at, dur_s: dur, key, vel: 100 };
         // Source times 2..6; the clip shows source 2..6 starting at song time 10.
         let clip = ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Midi,
             notes: vec![
                 note(2.0, 0.5, 60),
@@ -39877,6 +40030,7 @@ mod tests {
         // A MIDI item on lane 0, squarely in view.
         app.set_channel_input_spec(0, "midi:all");
         app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             notes: Vec::new(),
             lane: 0,
@@ -40951,6 +41105,7 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         let mut mk = |id: u64, lane: usize, at: f64, len: f64, note_at: f64| {
             app.arrangement.clips.push(ArrClip {
+                pedal: Vec::new(),
                 id,
                 lane,
                 kind: ClipKind::Midi,
@@ -41023,6 +41178,7 @@ mod tests {
         let beat = 0.5;
         let bar = beat * 4.0;
         app.arrangement.clips.push(ArrClip {
+            pedal: Vec::new(),
             id: 1,
             lane: 0,
             kind: ClipKind::Midi,
@@ -41095,6 +41251,7 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         for (id, lane) in [(1u64, 0usize), (2, 1)] {
             app.arrangement.clips.push(ArrClip {
+                pedal: Vec::new(),
                 id,
                 lane,
                 kind: ClipKind::Midi,
@@ -41153,6 +41310,7 @@ mod tests {
             vec![String::new(), "Keys".to_owned(), "Bass".to_owned()];
         let mut mk = |id: u64, lane: usize, at: f64| {
             app.arrangement.clips.push(ArrClip {
+                pedal: Vec::new(),
                 id,
                 lane,
                 kind: ClipKind::Midi,
@@ -41248,6 +41406,7 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         for (id, at) in [(1u64, 0.0f64), (2, 2.0)] {
             app.arrangement.clips.push(ArrClip {
+                pedal: Vec::new(),
                 id,
                 lane: 3,
                 kind: ClipKind::Midi,
@@ -41305,6 +41464,7 @@ mod tests {
         use crate::arrangement::{ArrClip, ArrNote, ClipKind};
         let (ctx, mut app) = headless(Caps::DESKTOP);
         app.arrangement.clips.push(ArrClip {
+            pedal: Vec::new(),
             id: 1,
             lane: 1,
             kind: ClipKind::Midi,
@@ -41316,6 +41476,7 @@ mod tests {
         // A STRETCHED AUDIO clip: the four rows, and no Export — the stretch
         // rows must not be pushed around by a row that is not there.
         app.arrangement.clips.push(ArrClip {
+            pedal: Vec::new(),
             id: 2,
             lane: 2,
             kind: ClipKind::Audio,
@@ -41499,6 +41660,7 @@ mod tests {
         let (ctx, mut app) = headless(Caps::DESKTOP);
         for id in [1u64, 2] {
             app.arrangement.clips.push(ArrClip {
+                pedal: Vec::new(),
                 id,
                 lane: 1,
                 kind: ClipKind::Audio,
@@ -41620,6 +41782,7 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         fn mk(app: &mut TangentApp, id: u64, kind: ClipKind) {
             app.arrangement.clips.push(ArrClip {
+                pedal: Vec::new(),
                 id,
                 lane: 1,
                 kind,
@@ -41857,6 +42020,7 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         // A half-second loop dragged out to two seconds: four passes.
         app.arrangement.clips.push(ArrClip {
+            pedal: Vec::new(),
             id: 1,
             lane: 1,
             kind: ClipKind::Midi,
@@ -41894,6 +42058,7 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         let mut mk = |id: u64, lane: usize, at: f64| {
             app.arrangement.clips.push(crate::arrangement::ArrClip {
+                pedal: Vec::new(),
                 id,
                 lane,
                 start_s: at,
@@ -42564,6 +42729,7 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         app.settings.record_export.tempo_bpm = 120.0;
         app.arrangement.add_clip(ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Midi,
             notes: vec![ArrNote { at_s: 0.5, dur_s: 0.5, key: 60, vel: 100 }],
             lane: 0,
@@ -42584,6 +42750,7 @@ mod tests {
             gain: 1.0,
         });
         app.arrangement.add_clip(ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Audio,
             notes: Vec::new(),
             lane: 1,
@@ -42638,6 +42805,7 @@ mod tests {
             })
             .collect();
         app.arrangement.add_clip(ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Midi,
             notes,
             lane: 0,
@@ -44169,6 +44337,7 @@ mod tests {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         let mut add = |kind: ClipKind| {
             app.arrangement.add_clip(ArrClip {
+                pedal: Vec::new(),
                 kind,
                 notes: Vec::new(),
                 lane: 0,
@@ -49214,6 +49383,7 @@ mod tests {
         app.arrangement_open = true;
         let _ = run_frame(ctx, app);
         app.arrangement.add_clip(ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Midi,
             notes: vec![ArrNote { at_s: 0.5, dur_s: 1.0, key: 60, vel: 100 }],
             lane: 0,
@@ -49795,6 +49965,7 @@ mod tests {
         app.arrangement_open = true;
         let _ = run_frame(ctx, app);
         app.arrangement.add_clip(ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Midi,
             notes: vec![ArrNote { at_s: 0.5, dur_s: 1.0, key: 60, vel: 100 }],
             lane: 0,
@@ -50251,6 +50422,7 @@ mod tests {
         app.arrangement_open = true;
         app.settings.arr_snap = false;
         app.arrangement.add_clip(ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Midi,
             notes: Vec::new(),
             lane: 0,
@@ -51549,6 +51721,7 @@ mod velocity_selection_tests {
             })
             .collect();
         app.arrangement.add_clip(ArrClip {
+            pedal: Vec::new(),
             kind: ClipKind::Midi,
             notes,
             lane: 0,
@@ -51912,6 +52085,7 @@ mod folder_tests {
             // A real clip: an AUDIO clip with no path is dropped on read
             // as unusable, which is correct and is not what this measures.
             a.add_clip(crate::arrangement::ArrClip {
+                pedal: Vec::new(),
                 lane: 0,
                 start_s: 1.0,
                 len_s: 2.0,
@@ -53034,6 +53208,7 @@ mod folder_tests {
         std::fs::create_dir_all(&clips).unwrap();
         let mut arr = crate::arrangement::Arrangement::default();
         arr.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             lane: 0,
             kind: crate::arrangement::ClipKind::Midi,
             len_s: 4.0,
@@ -53430,6 +53605,7 @@ mod folder_tests {
         let (_ctx, mut a) = headless(Caps::DESKTOP);
         a.bootstrap_project(&root.join("Projects"));
         a.add_recorded_clips(vec![RecordedClip {
+            pedal: Vec::new(),
             lane: 0,
             start_s: 0.0,
             len_s: 2.0,
@@ -53475,6 +53651,7 @@ mod folder_tests {
         // is never opened — `add_recorded_clips` reads the path for a name
         // and nothing else — so a name is all this needs to be.
         a.add_recorded_clips(vec![RecordedClip {
+            pedal: Vec::new(),
             lane: 1,
             start_s: 0.0,
             len_s: 4.0,
@@ -53544,6 +53721,7 @@ mod folder_tests {
     fn an_imported_audio_clip_is_armed_by_the_decode_and_only_by_the_first_one() {
         let (_ctx, mut a) = headless(Caps::DESKTOP);
         a.arrangement.clips.push(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             id: 7,
             lane: 0,
             kind: crate::arrangement::ClipKind::Audio,
@@ -53603,6 +53781,7 @@ mod folder_tests {
         let (_ctx, mut a) = headless(Caps::DESKTOP);
         a.settings.arr_snap = false;
         a.arrangement.clips.push(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             id: 3,
             lane: 0,
             kind: crate::arrangement::ClipKind::Midi,
@@ -54171,6 +54350,7 @@ mod folder_tests {
     fn a_settled_session() -> TangentApp {
         let mut a = app();
         a.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
             lane: 1,
             len_s: 4.0,
@@ -54225,6 +54405,7 @@ mod folder_tests {
             })),
             ("a clip placed", Box::new(|a: &mut TangentApp| {
                 a.arrangement.add_clip(crate::arrangement::ArrClip {
+                    pedal: Vec::new(),
                     path: "media/take 2.wav".into(),
                     len_s: 3.0,
                     ..Default::default()
@@ -55259,6 +55440,7 @@ mod dirty_cost_probe {
         for lane in 0..8usize {
             for c in 0..16usize {
                 let mut clip = crate::arrangement::ArrClip {
+                    pedal: Vec::new(),
                     lane,
                     start_s: c as f64 * 4.0,
                     len_s: 4.0,

@@ -7,12 +7,16 @@
 //! file dragged out of a DAW or a download actually uses. SMPTE division
 //! is refused honestly rather than mis-timed.
 
-use crate::arrangement::ArrNote;
+use crate::arrangement::{ArrNote, ArrPedal};
 
 /// What a `.mid` file becomes: clip-relative notes and the span they
 /// cover, in the seconds everything else in the document speaks.
 pub struct MidiImport {
     pub notes: Vec<ArrNote>,
+    /// The three pedals, sorted. A file written by any DAW carries CC64 and
+    /// most piano parts lean on it; dropping it on the way in made an
+    /// imported part play drier than the file it came from.
+    pub pedal: Vec<ArrPedal>,
     pub len_s: f64,
 }
 
@@ -56,6 +60,8 @@ impl<'a> Cur<'a> {
 enum Ev {
     On { key: u8, vel: u8 },
     Off { key: u8 },
+    /// One of the three pedals, at its raw value — half-pedalling included.
+    Pedal { cc: u8, value: u8 },
     Tempo(u32),
 }
 
@@ -118,8 +124,17 @@ pub fn read(bytes: &[u8]) -> Option<MidiImport> {
                     let _vel = c.u8()?;
                     evs.push((at, Ev::Off { key: first & 0x7F }));
                 }
-                // Two-byte channel messages whose second byte must go.
-                0xA0 | 0xB0 | 0xE0 => {
+                // Two-byte channel messages. Aftertouch and pitch bend have
+                // nowhere to land in a clip; a control change might be a
+                // pedal, which does.
+                0xB0 => {
+                    let value = c.u8()? & 0x7F;
+                    let cc = first & 0x7F;
+                    if matches!(cc, 64 | 66 | 67) {
+                        evs.push((at, Ev::Pedal { cc, value }));
+                    }
+                }
+                0xA0 | 0xE0 => {
                     let _ = c.u8()?;
                 }
                 // One data byte, already taken as `first`.
@@ -160,12 +175,18 @@ pub fn read(bytes: &[u8]) -> Option<MidiImport> {
         (*at, match e {
             Ev::Tempo(_) => 0u8,
             Ev::Off { .. } => 1,
-            Ev::On { .. } => 2,
+            // **Before the ons at the same tick.** A pedal-down written on
+            // the beat belongs UNDER the chord that lands on it, not after
+            // it — the order a sampler hears decides whether the first
+            // attack is damped.
+            Ev::Pedal { .. } => 2,
+            Ev::On { .. } => 3,
         })
     });
 
     // Ticks to seconds by walking the tempo segments once.
     let mut notes: Vec<ArrNote> = Vec::new();
+    let mut pedal: Vec<ArrPedal> = Vec::new();
     let mut open: Vec<(u8, u8, f64)> = Vec::new(); // key, vel, start_s
     let mut us_per_qn: f64 = 500_000.0;
     let (mut tick0, mut s0) = (0u64, 0.0f64);
@@ -179,6 +200,7 @@ pub fn read(bytes: &[u8]) -> Option<MidiImport> {
                 s0 = s;
             }
             Ev::On { key, vel } => open.push((key, vel, s)),
+            Ev::Pedal { cc, value } => pedal.push(ArrPedal { at_s: s, cc, value }),
             Ev::Off { key } => {
                 if let Some(i) = open.iter().position(|(k, ..)| *k == key) {
                     let (_, vel, from) = open.swap_remove(i);
@@ -203,7 +225,8 @@ pub fn read(bytes: &[u8]) -> Option<MidiImport> {
         return None;
     }
     notes.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
-    Some(MidiImport { notes, len_s })
+    pedal.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+    Some(MidiImport { notes, pedal, len_s })
 }
 
 #[cfg(test)]

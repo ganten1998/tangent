@@ -315,6 +315,27 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The sustain pedal is recorded into the clip and played back.** A part
+  performed with the damper down came back dry: the take kept only the instants
+  the KEYS came up, the clip had nowhere to say the pedal was still down, and
+  playback dutifully cut every note at its key-up. All three pedals — sustain,
+  sostenuto and soft — are now written into the clip as they were played, at
+  their own values rather than as a switch, so half-pedalling survives; a pedal
+  already down when the red button is pressed is restated at the take's start,
+  so it is not released later by an event with no cause; and the clip's pedal
+  reaches the instrument at playback, whether that is the built-in keyboard,
+  the DX7, the analog, or a VST3 in a bay.
+
+  The notes themselves are untouched. Stretching them to the pedal lift is the
+  obvious cheap fix and it is the wrong one twice over: it throws away
+  half-pedalling, and it destroys the difference between a chord rolled under
+  the pedal and a chord held, which is a difference a pianist can hear.
+
+  The pedal travels with the clip everywhere the notes do — split (the tail
+  inherits the level it was cut under), glue, the loop (every pass opens with
+  the pedal it inherits), and the `.mid` export. A `.mid` dragged in carries
+  its pedal too, which it never did.
+
 - **The loop bar stops at the clip instead of stretching it.** Dragging the
   loop's length past the end of the clip used to widen the clip to meet it. The
   clip's length belongs to the timeline, so the bar now stops there. To get a

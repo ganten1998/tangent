@@ -405,6 +405,16 @@ struct Recorder {
     /// The red button is DOWN: armed lanes are being recorded into the
     /// arrangement. `None` the rest of the time.
     arr_rec: Option<ArrRec>,
+    /// **Where the three pedals stand RIGHT NOW**, kept whether or not a
+    /// record is running, by the always-on MIDI tap.
+    ///
+    /// This is `tangent_record::smf`'s rule 8 for the arrangement: the pedal
+    /// may already be down when the red button is pressed, and a clip that
+    /// only holds the edges that arrived AFTER T0 opens with the damper up
+    /// and then lifts it in bar three for no reason anybody can see. A take
+    /// begins by restating whatever this says. Indexed by
+    /// `ArrRec::pedal_slot`.
+    pedal_live: [u8; 3],
     /// An EXPORT in flight: the arrangement playing start-to-end into an
     /// audio-only take that lands in the project's `export/`.
     bounce: Option<Bounce>,
@@ -484,15 +494,40 @@ struct ArrRec {
     audio: Vec<(usize, usize, Vec<f32>)>,
     /// Finished notes, clip-relative seconds.
     notes: Vec<tangent_ui::arrangement::ArrNote>,
+    /// **Pedal movements, clip-relative seconds**, in arrival order — which
+    /// is already sorted, because they are stamped as they come off the tap.
+    pedal: Vec<tangent_ui::arrangement::ArrPedal>,
+    /// Where each of the three pedals STANDS, so an unchanged value is not
+    /// written down twice. A sustain pedal held through a phrase sends its
+    /// 127 once; a half-pedalling one sweeps, and every step of the sweep is
+    /// a real change and is kept. Indexed by `Self::pedal_slot`.
+    pedal_at: [u8; 3],
     /// Keys currently down: when they landed, and how hard.
     open: std::collections::HashMap<u8, (f64, u8)>,
 }
 
 #[cfg(feature = "recorder")]
 impl ArrRec {
+    /// Which of the three `pedal_at` slots a controller number owns.
+    const fn pedal_slot(cc: u8) -> Option<usize> {
+        match cc {
+            64 => Some(0),
+            66 => Some(1),
+            67 => Some(2),
+            _ => None,
+        }
+    }
+
     /// One raw MIDI event off the tap, stamped against the record's T0 on
-    /// the same clock the engine hears. Note edges only; the pedal rides the
-    /// live path and is not written down yet.
+    /// the same clock the engine hears.
+    ///
+    /// **Note edges AND the three pedals.** The pedal used to ride the live
+    /// path only and was never written down, which is why a take recorded
+    /// with the damper held came back dry: the notes carried the instant a
+    /// KEY was released, the clip had nowhere to say the damper was still
+    /// down, and playback dutifully cut every note at its key-up. The fix is
+    /// not to stretch the notes — see `ArrPedal` for why — it is to keep the
+    /// controller, which is what the take's own `.mid` has always done.
     fn note_event(&mut self, t: i64, bytes: &[u8]) {
         let [status, data1, data2] = *bytes else {
             return;
@@ -512,6 +547,26 @@ impl ArrRec {
                         vel,
                     });
                 }
+            }
+            0xB0 => {
+                let cc = data1 & 0x7F;
+                let value = data2 & 0x7F;
+                let Some(slot) = Self::pedal_slot(cc) else {
+                    return;
+                };
+                // **A value that changes nothing is not an event.** Some
+                // keyboards restate the pedal on every note; written down,
+                // that is one edge per note in a clip that binary-searches
+                // this list on the audio thread.
+                if self.pedal_at[slot] == value {
+                    return;
+                }
+                self.pedal_at[slot] = value;
+                self.pedal.push(tangent_ui::arrangement::ArrPedal {
+                    at_s: rel,
+                    cc,
+                    value,
+                });
             }
             _ => {}
         }
@@ -2245,6 +2300,47 @@ fn midi_clip_notes(
 }
 
 #[cfg(feature = "recorder")]
+/// **A MIDI clip's pedal, with its loop spelled out**, in clip-relative
+/// frames.
+///
+/// The twin of [`midi_clip_notes`], with the same two customers and the same
+/// argument for being one function: a schedule built twice is a schedule that
+/// eventually disagrees with itself, and the notes/pedal pair is exactly
+/// where that would be inaudible until somebody listened hard.
+///
+/// The pass expansion is NOT written again here. It is
+/// [`tangent_ui::arrangement::clip_pedal_in_song_time`], which glue and the
+/// MIDI export already share, and which knows the one thing that is easy to
+/// get wrong: every pass restates the level it OPENS at, so a loop whose
+/// pedal goes down in its second half still holds the damper across the seam.
+/// All this does is move it from song seconds to clip frames.
+fn midi_clip_pedal(
+    clip: &tangent_ui::arrangement::ArrClip,
+    rate: f64,
+) -> Vec<crate::instrument::ClipPedal> {
+    if clip.pedal.is_empty() {
+        return Vec::new();
+    }
+    let frames = |s: f64| frames_at(rate, s);
+    let mut out: Vec<crate::instrument::ClipPedal> =
+        tangent_ui::arrangement::clip_pedal_in_song_time(clip)
+            .into_iter()
+            .map(|e| crate::instrument::ClipPedal {
+                // Song seconds back to the clip's own zero. The expansion
+                // speaks the timeline because glue and the export do; the
+                // audio thread positions a clip as `pos - placed.start`, so
+                // it wants the other one.
+                at: frames((e.at_s - clip.start_s).max(0.0)),
+                cc: e.cc,
+                value: e.value,
+            })
+            .collect();
+    // `clip_pedal_level` binary-searches this.
+    out.sort_by_key(|e| e.at);
+    out
+}
+
+#[cfg(feature = "recorder")]
 /// **An audio clip's passes, with its loop spelled out**, one `Placed` each.
 ///
 /// The twin of [`midi_clip_notes`], and it exists for the same reason: two
@@ -3421,13 +3517,27 @@ impl DesktopApp {
         // here, at frame rate — exactly as fresh as the old mirror was.
         self.midi_lane.set_pads_live(self.app.drumpad_live());
         let mut arr = self.recorder.arr_rec.as_mut();
+        // Read out, mutated in the closure, written back: `arr` already holds
+        // a mutable borrow of `self.recorder`, and three bytes copied twice a
+        // frame is cheaper than restructuring the drain around it.
+        let mut pedal_live = self.recorder.pedal_live;
         self.recorder.session.pump_midi(|t, bytes| {
+            // Where the pedals stand, kept whether or not a take is running —
+            // so the NEXT press knows what it inherits. See `pedal_live`.
+            if let [status, data1, data2] = *bytes {
+                if status & 0xF0 == 0xB0 {
+                    if let Some(slot) = ArrRec::pedal_slot(data1 & 0x7F) {
+                        pedal_live[slot] = data2 & 0x7F;
+                    }
+                }
+            }
             // The arrangement's own collection: raw note edges, stamped
             // against the record's T0, on the clock the engine hears.
             if let Some(rec) = arr.as_deref_mut() {
                 rec.note_event(t, bytes);
             }
         });
+        self.recorder.pedal_live = pedal_live;
         // The capture rings, drained every frame a record is running — four
         // seconds of room in the engine, emptied sixty times a second.
         if let Some(rec) = self.recorder.arr_rec.as_mut() {
@@ -7047,12 +7157,28 @@ impl DesktopApp {
         if !self.recorder.transport.playing() {
             self.recorder.transport.toggle_play();
         }
+        // **What the foot was already doing at T0**, restated at the take's
+        // own zero. Rule 8: without it a pedal held from before the press is
+        // released, in the clip, by an edge with no cause.
+        let pedal_at = self.recorder.pedal_live;
+        let pedal = [64_u8, 66, 67]
+            .into_iter()
+            .enumerate()
+            .filter(|&(slot, _)| pedal_at[slot] > 0)
+            .map(|(slot, cc)| tangent_ui::arrangement::ArrPedal {
+                at_s: 0.0,
+                cc,
+                value: pedal_at[slot],
+            })
+            .collect();
         self.recorder.arr_rec = Some(ArrRec {
             start_s,
             start_ns,
             midi_lanes,
             audio,
             notes: Vec::new(),
+            pedal,
+            pedal_at,
             open: std::collections::HashMap::new(),
         });
     }
@@ -7104,6 +7230,13 @@ impl DesktopApp {
                     len_s,
                     path: None,
                     notes: rec.notes.clone(),
+                    // No closing lift is written: a clip's pedal is released
+                    // when the clip ENDS, which the timeline does for every
+                    // clip whether or not anybody wrote it down. Writing one
+                    // would also have to decide where — and the take is not
+                    // extended to fit a pedal, for the same reason the take's
+                    // `.mid` is not.
+                    pedal: rec.pedal.clone(),
                 });
             }
         }
@@ -7163,6 +7296,7 @@ impl DesktopApp {
                         len_s: seconds,
                         path: Some(format!("media/{name}")),
                         notes: Vec::new(),
+                        pedal: Vec::new(),
                     }),
                     Err(e) => {
                         self.app
@@ -7841,6 +7975,7 @@ impl DesktopApp {
                             start: frames(clip.start_s),
                             len: frames(clip.len_s),
                             notes: Arc::new(notes),
+                            pedal: Arc::new(midi_clip_pedal(clip, f64::from(rate))),
                         });
                     }
                     continue;
@@ -8971,6 +9106,11 @@ impl DesktopApp {
                         start: frames(clip.start_s),
                         len: frames(clip.len_s),
                         notes: Arc::new(notes),
+                        // The pedal rides with the notes, from the same
+                        // clip, on the same schedule — the two are one
+                        // performance and a swap that carried only half of
+                        // it is the bug this whole change is about.
+                        pedal: Arc::new(midi_clip_pedal(clip, f64::from(rate))),
                     });
                 }
                 continue;
@@ -14219,6 +14359,7 @@ impl DesktopApp {
                 pending_monitor: None,
                 input_names: std::array::from_fn(|_| String::new()),
                 arr_rec: None,
+            pedal_live: [0; 3],
                 bounce: None,
                 offline_bounce: None,
                 arr_rec_wait: false,
@@ -17284,6 +17425,7 @@ mod tests {
             source: std::path::PathBuf::from("a.wav"),
         });
         let clip = tangent_ui::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: tangent_ui::arrangement::ClipKind::Audio,
             notes: Vec::new(),
             lane: 0,
@@ -17337,6 +17479,7 @@ mod tests {
         assert!(Arc::ptr_eq(&got, &again), "the cache did not hold the copy");
         // And an unstretched clip passes through untouched.
         let plain = tangent_ui::arrangement::ArrClip {
+            pedal: Vec::new(),
             stretch: 1.0,
             ..clip
         };
@@ -17358,6 +17501,7 @@ mod tests {
     fn a_looped_audio_clip_is_spelled_out_into_passes() {
         use std::sync::Arc;
         let audio = |loop_s: f64, len_s: f64| tangent_ui::arrangement::ArrClip {
+            pedal: Vec::new(),
             kind: tangent_ui::arrangement::ClipKind::Audio,
             notes: Vec::new(),
             lane: 2,
@@ -22006,4 +22150,133 @@ pub fn denoise_test(arg: Option<String>) {
         std::process::exit(1);
     }
     println!("out:      {dst}  {out_frames} frames, latency {skip} trimmed off the head");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The pedal a take records
+// ───────────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "recorder"))]
+mod arr_pedal {
+    use super::*;
+
+    /// A record that began at T0 with nothing held.
+    fn rec() -> ArrRec {
+        ArrRec {
+            start_s: 0.0,
+            start_ns: 0,
+            midi_lanes: vec![0],
+            audio: Vec::new(),
+            notes: Vec::new(),
+            pedal: Vec::new(),
+            pedal_at: [0; 3],
+            open: std::collections::HashMap::new(),
+        }
+    }
+
+    /// One second, in the nanoseconds the tap stamps with.
+    const SEC: i64 = 1_000_000_000;
+
+    /// **The take keeps the pedal, which is the whole bug.**
+    ///
+    /// Before this, `note_event` matched `0x90` and `0x80` and let everything
+    /// else fall through a `_ => {}`. A part played with the damper down came
+    /// back holding only the instants the KEYS were released, so playback cut
+    /// every note at its key-up and the take was dry — the owner's "it
+    /// doesn't record pedal state into the clip, or doesn't play it back".
+    ///
+    /// Revert-check performed: restoring the `_ => {}` arm empties `pedal`
+    /// and fails the first assertion.
+    #[test]
+    fn the_pedal_is_written_down_with_the_notes() {
+        let mut r = rec();
+        r.note_event(0, &[0xB0, 64, 127]);
+        r.note_event(SEC / 2, &[0x90, 60, 100]);
+        r.note_event(SEC, &[0x80, 60, 0]);
+        r.note_event(2 * SEC, &[0xB0, 64, 0]);
+        assert_eq!(r.pedal.len(), 2, "{:?}", r.pedal);
+        assert_eq!(r.pedal[0].cc, 64);
+        assert_eq!(r.pedal[0].value, 127);
+        assert!((r.pedal[0].at_s - 0.0).abs() < 1e-9);
+        assert_eq!(r.pedal[1].value, 0);
+        assert!((r.pedal[1].at_s - 2.0).abs() < 1e-9);
+        // And the NOTE is untouched: it still ends where the key came up.
+        // The damper is the pedal's job, not a longer note's — see `ArrPedal`.
+        assert_eq!(r.notes.len(), 1);
+        assert!(
+            (r.notes[0].dur_s - 0.5).abs() < 1e-9,
+            "the note was stretched to the pedal lift: {:?}",
+            r.notes[0]
+        );
+    }
+
+    /// **All three pedals, and nothing else.** A mod wheel in the damper's
+    /// seat would sustain a phrase every time somebody leaned on it.
+    #[test]
+    fn sostenuto_and_soft_travel_and_a_mod_wheel_does_not() {
+        let mut r = rec();
+        r.note_event(0, &[0xB0, 64, 127]);
+        r.note_event(SEC, &[0xB0, 66, 64]);
+        r.note_event(2 * SEC, &[0xB0, 67, 10]);
+        r.note_event(3 * SEC, &[0xB0, 1, 127]);
+        r.note_event(4 * SEC, &[0xB0, 11, 90]);
+        let ccs: Vec<u8> = r.pedal.iter().map(|e| e.cc).collect();
+        assert_eq!(ccs, vec![64, 66, 67]);
+    }
+
+    /// **Half-pedalling survives.** The value is the controller's own number
+    /// and not a boolean at 64, so a sweep is a sweep. Collapsing it here
+    /// would be the exact trade `tangent_record::smf`'s header refuses.
+    #[test]
+    fn a_sweep_is_kept_as_a_sweep() {
+        let mut r = rec();
+        for (i, v) in [20_u8, 50, 80, 110, 127].into_iter().enumerate() {
+            r.note_event(i as i64 * SEC / 10, &[0xB0, 64, v]);
+        }
+        let vals: Vec<u8> = r.pedal.iter().map(|e| e.value).collect();
+        assert_eq!(vals, vec![20, 50, 80, 110, 127]);
+    }
+
+    /// **A value that changes nothing is not an event.** Some keyboards
+    /// restate CC64 with every note; written down, that is one edge per note
+    /// in a list the audio thread binary-searches.
+    #[test]
+    fn a_restated_pedal_is_not_a_second_edge() {
+        let mut r = rec();
+        for i in 0..64 {
+            r.note_event(i * SEC / 64, &[0xB0, 64, 127]);
+        }
+        assert_eq!(r.pedal.len(), 1, "{:?}", r.pedal);
+    }
+
+    /// **A pedal already DOWN when the red button is pressed is restated at
+    /// the take's own zero** — `tangent_record::smf`'s rule 8, which the
+    /// arrangement needed for the same reason the `.mid` did.
+    ///
+    /// Without it the clip holds only the LIFT, in bar three, released by an
+    /// event with no cause: the take opens dry and then goes drier.
+    ///
+    /// Constructed the way `start_arr_record` constructs it, from a live
+    /// level the always-on tap has been keeping.
+    #[test]
+    fn a_pedal_already_down_at_the_press_is_restated_at_zero() {
+        let pedal_at = [127_u8, 0, 0];
+        let pedal: Vec<tangent_ui::arrangement::ArrPedal> = [64_u8, 66, 67]
+            .into_iter()
+            .enumerate()
+            .filter(|&(slot, _)| pedal_at[slot] > 0)
+            .map(|(slot, cc)| tangent_ui::arrangement::ArrPedal {
+                at_s: 0.0,
+                cc,
+                value: pedal_at[slot],
+            })
+            .collect();
+        let mut r = ArrRec { pedal, pedal_at, ..rec() };
+        // The lift, two seconds in, is the only thing the tap ever sees.
+        r.note_event(2 * SEC, &[0xB0, 64, 0]);
+        assert_eq!(r.pedal.len(), 2, "{:?}", r.pedal);
+        assert!((r.pedal[0].at_s - 0.0).abs() < 1e-9);
+        assert_eq!(r.pedal[0].value, 127, "the take opened with the pedal up");
+        assert_eq!(r.pedal[1].value, 0);
+    }
 }
