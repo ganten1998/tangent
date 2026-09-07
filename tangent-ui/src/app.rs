@@ -1127,7 +1127,7 @@ pub struct TangentApp {
     drag_pointer: Option<Pos2>,
     /// A clip edit happened during the current gesture: save on release.
     arr_gesture_dirty: bool,
-    /// The MIDI item being drawn by shift-drag: lane, from, to (ordered).
+    /// The MIDI item being drawn by cmd-drag: lane, from, to (ordered).
     arr_pending: Option<(usize, f64, f64)>,
     /// Where the arrangement was last drawn, for hit tests.
     arrangement_rect: Option<Rect>,
@@ -1953,8 +1953,9 @@ enum ArrDrag {
     Send { lane: usize, from_y: f32, from: f32 },
     /// The header's pan dial, ditto — the value is the mixer's 0..1.
     HdrPan { lane: usize, from_y: f32, from: f32 },
-    /// Shift-drag: a MIDI item being drawn on a lane, anchored where the
-    /// press landed (snapped).
+    /// Cmd-drag (Ctrl off macOS): a MIDI item being drawn on a lane, anchored
+    /// where the press landed (snapped). Shift used to do this and no longer
+    /// does — see the `A::Lane` arm.
     CreateMidi { lane: usize, anchor: f64 },
     /// The ruler's vertical zoom, anchored at the second under the press.
     Zoom { anchor_s: f64, last_y: f32 },
@@ -8261,7 +8262,7 @@ impl TangentApp {
             return Err("no project is open".to_owned());
         };
         // A .mid landing on a BARE lane makes it a MIDI track — the
-        // shift-draw's own ritual, so the lane arms and records like one.
+        // lane-draw's own ritual, so the lane arms and records like one.
         // A lane that already IS something keeps its kind.
         if self.channel_kind(lane.min(crate::recorder::CHANNELS - 1)).is_none() {
             self.set_channel_input_spec(
@@ -19642,14 +19643,31 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         }
                     }
                     // Empty room: the playhead goes HERE and the selection
-                    // clears — the gesture Ableton taught everyone. WITH
-                    // SHIFT held, the press starts drawing a MIDI item
-                    // instead: on a MIDI lane, or an empty one, which
-                    // becomes MIDI on commit (safe — unlike audio, a MIDI
-                    // kind re-binds no interface input). An audio lane
-                    // refuses with one sentence.
+                    // clears — the gesture Ableton taught everyone. WITH THE
+                    // COMMAND KEY held, the press starts drawing a MIDI item
+                    // instead: on a MIDI lane, or an empty one, which becomes
+                    // MIDI on commit (safe — unlike audio, a MIDI kind
+                    // re-binds no interface input).
+                    //
+                    // **It was Shift, and Shift is no longer bound to it at
+                    // all.** The owner asked for the draw to move to the
+                    // command key, and a gesture that is moved while the old
+                    // finger still works is not moved: Shift already means
+                    // "add to the selection" on a clip body and "stretch"
+                    // from a clip's edge, both of them a few points away from
+                    // this same empty lane, and a modifier that means three
+                    // things depending on what is underneath it is a modifier
+                    // nobody can learn.
+                    //
+                    // `modifiers.command` and not `command || ctrl`: this is
+                    // a POINTER gesture, and egui already reports the
+                    // platform's command finger there — Cmd on macOS, Ctrl
+                    // everywhere else. The `|| ctrl` spelling the keyboard
+                    // shortcuts in this file use exists so that a Mac user
+                    // typing Ctrl-S is not ignored; there is no such second
+                    // reading for a modifier held during a drag.
                     Some(A::Lane(lane, t)) => {
-                        if shift {
+                        if ctx.input(|i| i.modifiers.command) {
                             // ANY lane takes a MIDI item now — on an audio
                             // channel it simply does not sound, which is
                             // the neat kind of nothing, the owner's word.
@@ -42125,6 +42143,163 @@ mod tests {
         frame(app, vec![egui::Event::PointerMoved(pos)]);
         frame(app, vec![button(true)]);
         frame(app, vec![button(false)]);
+    }
+
+    /// **A whole DRAG from `from` to `to` with `mods` held throughout** —
+    /// arrive, press, travel, release — as a hand does it.
+    ///
+    /// [`click_with`]'s sibling, and it keeps that helper's one hard-won
+    /// detail: the modifier goes on `RawInput::modifiers` as well as on every
+    /// event, because the app latches the frame's modifiers once from
+    /// `ctx.input` and a press decorated only at the event level arrives
+    /// unmodified.
+    ///
+    /// Four frames, not three. The travel is its own frame because a gesture
+    /// that never moves is not a drag: the press only ARMS `arr_drag`, the
+    /// frame after it is where the drag is ridden, and the release is where
+    /// the deed is done. A three-frame version of this passed against a build
+    /// where the drag arm did nothing at all.
+    fn drag_with(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+        from: Pos2,
+        to: Pos2,
+        mods: egui::Modifiers,
+    ) {
+        let frame = |app: &mut TangentApp, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(1300.0, 900.0),
+                    )),
+                    modifiers: mods,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        let button = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: mods,
+        };
+        frame(app, vec![egui::Event::PointerMoved(from)]);
+        frame(app, vec![button(from, true)]);
+        frame(app, vec![egui::Event::PointerMoved(to)]);
+        frame(app, vec![button(to, false)]);
+    }
+
+    /// **A MIDI item is drawn with the COMMAND key, shift draws nothing, and
+    /// what is drawn LOOPS from birth even though it holds no notes.**
+    ///
+    /// Two owner asks in one gesture. The draw moved off shift — where it
+    /// collided with the two things shift already means a few points away, on
+    /// a clip's body and on a clip's edge — and onto the platform command
+    /// key. And the item it makes has to be a loop the moment it exists, not
+    /// once somebody has played into it: an empty item IS the case, because a
+    /// part drawn and not yet written is exactly what gets its right edge
+    /// pulled to lay down the bars it will be played into.
+    ///
+    /// Driven at the event level, because what is under test is which
+    /// modifier reaches the handler at all. A state-level call to the create
+    /// path would have passed on either binding.
+    ///
+    /// Reverts performed, both red: put `shift` back in the `A::Lane` arm and
+    /// the "shift drew" assert fires; set `loop_s` to `0.0` at creation and
+    /// the loop assert names the zero.
+    #[test]
+    fn cmd_draws_a_midi_item_that_loops_from_birth_and_shift_draws_nothing() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        app.arrangement_open = true;
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.arrangement_rect.expect("the arrangement was never drawn");
+        // An EMPTY lane, and asserted to be one: the arm under test is the
+        // one that answers a press on bare ground, and a lane that turned out
+        // to hold a clip would be testing the clip gestures instead.
+        let lane = 4_usize;
+        assert!(!app.channel_used(lane), "lane {lane} is not the bare one this needs");
+        let (from, to, t0, t1) = {
+            let clips = app.arr_clip_views();
+            let v = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &v);
+            let row = l.lane_rows[lane];
+            assert!(row.is_positive(), "lane {lane} has no row on screen");
+            let y = row.center().y;
+            let a = Pos2::new(l.lanes_area.left() + l.lanes_area.width() * 0.20, y);
+            let b = Pos2::new(l.lanes_area.left() + l.lanes_area.width() * 0.45, y);
+            assert!(
+                matches!(
+                    crate::arrangement_panel::hit_test(rect, &v, a),
+                    Some(crate::arrangement_panel::Hit::Lane(n, _)) if n == lane
+                ),
+                "the press does not land on the empty lane"
+            );
+            (
+                a,
+                b,
+                crate::arrangement_panel::time_at(rect, &v, a.x),
+                crate::arrangement_panel::time_at(rect, &v, b.x),
+            )
+        };
+
+        // ── shift draws NOTHING ──
+        let before = app.arrangement.clips.len();
+        drag_with(&ctx, &mut app, from, to, egui::Modifiers::SHIFT);
+        assert_eq!(
+            app.arrangement.clips.len(),
+            before,
+            "shift still draws a MIDI item — the gesture was copied, not moved"
+        );
+
+        // ── cmd draws one ──
+        drag_with(&ctx, &mut app, from, to, egui::Modifiers::COMMAND);
+        assert_eq!(
+            app.arrangement.clips.len(),
+            before + 1,
+            "cmd-drag on an empty lane drew nothing"
+        );
+        let c = app.arrangement.clips.last().expect("the item landed").clone();
+        assert_eq!(c.kind, crate::arrangement::ClipKind::Midi);
+        assert_eq!(c.lane, lane, "the item landed on the wrong lane");
+        assert!(c.notes.is_empty(), "a drawn item was born holding notes");
+        // The length is the snapped span the hand covered, and the LOOP is
+        // that same length: one pass, pinned, so the first pull of the right
+        // edge lays down a second rather than revealing empty time.
+        let want = app.arr_snap_t(t1) - app.arr_snap_t(t0);
+        assert!(want > 0.0, "the fixture drag snapped to nothing");
+        assert!(
+            (c.len_s - want).abs() < 1.0e-9,
+            "the item is {} long where the drag was {want}",
+            c.len_s
+        );
+        assert!(
+            (c.loop_s - c.len_s).abs() < 1.0e-9 && c.loop_s > 0.0,
+            "an empty drawn item was born with loop {} against a length of {}",
+            c.loop_s,
+            c.len_s
+        );
+
+        // And the loop is REAL, not a number sitting in a field: pulled to
+        // three times its length the clip keeps every second of it, because
+        // `arr_trim_right` reads `loop_s` and drops the end-of-file cap.
+        let id = c.id;
+        app.arr_trim_right(id, c.start_s + c.len_s * 3.0);
+        let after = app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip");
+        assert!(
+            after.len_s > want * 2.5,
+            "a looping item refused to be pulled past one pass: {} of {}",
+            after.len_s,
+            want * 3.0
+        );
+        assert!(
+            (after.loop_s - want).abs() < 1.0e-9,
+            "pulling the edge moved the loop itself to {}",
+            after.loop_s
+        );
     }
 
     /// **Shift-clicking an insert bay takes it out of circuit and puts it

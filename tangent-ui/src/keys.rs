@@ -542,7 +542,13 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
         ]),
         HelpView::Arrange => rows.extend([
             ("DRAG", "move a clip · edges trim · corners fade"),
-            ("S-DRG", "shift-drag: draw a MIDI item"),
+            // **Cmd, not shift.** The owner moved the creation gesture onto
+            // the command key and unbound shift from it entirely; the card is
+            // the only place in the app that says what the gesture IS, so a
+            // row left behind here would be the app teaching a chord it no
+            // longer answers. Spelled "cmd-drag" like the editor's own C-DRG
+            // row, which is the same finger.
+            ("C-DRG", "cmd-drag a lane: draw a MIDI item"),
             // "MIDI or audio", because it said "a MIDI clip" long after
             // audio stretch shipped — the row understated the feature while
             // C-G below overstated its own, in the opposite direction.
