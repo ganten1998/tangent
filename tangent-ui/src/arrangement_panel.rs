@@ -410,7 +410,7 @@ pub struct ArrangeView<'a> {
     /// `RowKind::Automation` still covers every automation row in the
     /// timeline and the drawing, hit-testing and editing do not fork.
     pub master_automation: Vec<AutoView<'a>>,
-    /// A MIDI item being drawn by shift-drag right now: lane, from, to —
+    /// A MIDI item being drawn by cmd-drag right now: lane, from, to —
     /// ghosted until the button comes up and the document takes it.
     pub pending: Option<(usize, f64, f64)>,
     /// The tempo and meter map get a lane of their own, above the tracks.

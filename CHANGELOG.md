@@ -145,6 +145,16 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **Draw a MIDI item with Cmd-drag on a lane, not shift-drag.** Shift is no
+  longer bound to it at all. On this timeline shift already means "add to the
+  selection" on a clip's body and "stretch" from a clip's edge, both of them a
+  few points from the empty ground this gesture starts on, and a modifier that
+  means three things depending on what is under it is a modifier nobody can
+  learn. Cmd is the platform's command finger — Ctrl off macOS — and it is
+  already what the editor's rubber band uses. The item is still born pinned at
+  the length it was drawn and looping from that moment, notes or no notes, so
+  the first pull of its right edge lays down a second pass.
+
 - **Alt-click a record button to arm that track and nothing else; shift-click to
   build a set.** The one-lane gesture was on shift, which is the multi-select
   key everywhere else on this desk and therefore meant the opposite of what the
