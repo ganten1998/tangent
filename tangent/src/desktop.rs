@@ -10602,7 +10602,6 @@ impl DesktopApp {
         // as the DX7's so the two masks cannot disagree about the desk.
         let mut keys_mask = 0u32;
         let armed = self.app.armed_mask();
-        let selected = self.app.selected_channel();
         // **The desk's EXPLICIT input bindings, when any channel has one.**
         // The strip's own menu names inputs now; the moment one channel
         // does, the whole desk routes explicitly — bound channels take
@@ -10659,17 +10658,15 @@ impl DesktopApp {
                 None => {}
             }
         }
-        // **Armed, selected, or alone in the editor** — the whole rule, in
-        // one place, tested there. See `recorder::live_midi_off`.
+        // **Armed, or alone in the editor** — the whole rule, in one place,
+        // tested there. The SELECTED lane used to hear the keyboard too and
+        // no longer does: see `recorder::live_midi_off` for the owner's
+        // ruling and what it costs.
         let kinds: Vec<_> = (0..tangent_ui::recorder::CHANNELS)
             .map(|ch| self.app.channel_kind(ch))
             .collect();
-        let midi_off = tangent_ui::recorder::live_midi_off(
-            &kinds,
-            armed,
-            selected,
-            self.app.midi_editor_lane(),
-        );
+        let midi_off =
+            tangent_ui::recorder::live_midi_off(&kinds, armed, self.app.midi_editor_lane());
         crate::devices::set_channel_picks(&self.recorder.audio, explicit);
         e.set_midi_off(u64::from(midi_off));
         e.set_armed(armed);

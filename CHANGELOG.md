@@ -199,6 +199,19 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **Only an ARMED track hears the keyboard.** Selecting a MIDI track used to
+  open it to live notes as well, on the reasoning that trying an instrument out
+  should not begin by arming a track. What that cost in the room was arm
+  reading as a lie: an armed track sitting silent while an unarmed one sounded
+  and metered, because selection is quiet and sticky — every click on a header
+  sets it, and nothing on the strip says it also opens a MIDI gate. The lane
+  answering the keyboard was not the lane wearing the R. Arm is now the whole
+  of it, and the price is paid knowingly: auditioning an instrument means
+  arming its track first.
+
+  The MIDI editor is untouched and is still the road that needs no arm — while
+  it is open, its clip's lane is the only lane that hears, armed or not.
+
 - **Every clip is a loop from the moment it is made, audio as well as MIDI.**
   A drawn MIDI item and an imported `.mid` were already pinned at their own
   length and looping from birth; a recorded take, a split's tail and every
