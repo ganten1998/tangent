@@ -12,16 +12,18 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
-- **A looping clip shows where every pass ends.** A diagonal recess is cut into
-  the clip at each turn of the loop — one notch per multiple of the loop's
-  length inside the clip, so a one-bar part dragged over four bars reads as
-  four bars of one part instead of as one green box. The notch is cut into the
-  clip's own colour rather than printed on it in the clip's ink, a groove and a
-  land either side of the boundary second, so it says the same thing on a
-  near-black theme and on a bone one. It is dropped when a pass is too narrow
-  to place — a hundred notches a point apart is a moiré claiming to be
-  structure, not a picture of a loop — and an empty MIDI item that has not been
-  played into yet gets it too, which is exactly when it is most useful.
+- **A looping clip shows where every pass ends, audio and MIDI alike.** A
+  diagonal recess is cut into the clip at each turn of the loop — one notch per
+  multiple of the loop's length inside the clip, so a one-bar part dragged over
+  four bars reads as four bars of one part instead of as one green box, and a
+  four-bar drum take pulled over sixteen shows its four passes through the
+  waveform. The notch is cut into the clip's own colour rather than printed on
+  it in the clip's ink, a groove and a land either side of the boundary second,
+  so it says the same thing on a near-black theme and on a bone one. It is
+  dropped when a pass is too narrow to place — a hundred notches a point apart
+  is a moiré claiming to be structure, not a picture of a loop — and an empty
+  MIDI item that has not been played into yet gets it too, which is exactly
+  when it is most useful.
 
 - **The MIDI editor has a loop bar.** The clip's right end carries a bar down
   the roll with a grip tab on the ruler above it: drag it left to shorten the

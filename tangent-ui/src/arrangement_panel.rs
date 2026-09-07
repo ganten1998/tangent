@@ -5072,19 +5072,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // takes this ink, so the clip cannot half-agree with itself.
         let clip_ink = on_ink(color);
         painter.rect_filled(r, 3.0, color);
+        // The clip's UNCLAMPED pixel span, measured once: where the whole
+        // clip would stand if the viewport were not cutting it. Both the note
+        // miniature and the loop seams are mapped through it, and `x_of`
+        // builds a `Layout` every time it is asked, so it is worth the
+        // binding.
+        //
+        // **Out of the MIDI branch it used to live in**, because the seams
+        // came out with it — see below.
+        let full_x = (
+            x_of(rect, view, clip.start_s),
+            x_of(rect, view, clip.start_s + clip.len_s),
+        );
         // A MIDI item draws its NOTES in miniature — the arrangement can
         // read what the editor will say. An empty item keeps the dashed
         // staff that says "MIDI, nothing played yet".
         if clip.midi && r.width() >= 8.0 {
-            // The clip's UNCLAMPED pixel span, measured once: where the whole
-            // clip would stand if the viewport were not cutting it. Both the
-            // miniature and the loop seams are mapped through it, and `x_of`
-            // builds a `Layout` every time it is asked, so it is worth the
-            // binding.
-            let full_x = (
-                x_of(rect, view, clip.start_s),
-                x_of(rect, view, clip.start_s + clip.len_s),
-            );
             if clip.notes.is_empty() {
                 // The dashed staff sits under the title too, or an empty
                 // MIDI item's line runs through its own name.
@@ -5100,51 +5103,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 }
             } else {
                 draw_note_miniature(painter, r, full_x, clip, clip_ink);
-            }
-            // ── the loop seams ────────────────────────────────────────────
-            //
-            // **A diagonal recess where one pass ends and the next begins**,
-            // the owner's "make it such that theres a diagonal recess between
-            // loops". A looped clip is one bar of notes drawn over and over,
-            // and there was nothing in the picture that said so: two bars and
-            // twenty bars of the same part were the same green box, and the
-            // only way to find out how many times it repeated was to open the
-            // editor and count. The notch is that fact, drawn.
-            //
-            // **Cut into the clip's own surface rather than printed on it.**
-            // `separate` is what the panel already uses for the seam between
-            // two lanes — the surface moved away from itself, which reads on
-            // a near-black theme and on a bone one alike — and `deepen` is
-            // its mirror, so the pair is a groove and a land and not a double
-            // stripe. Neither is `clip_ink`: ink is for figures somebody has
-            // to READ, and a notch is not a figure. The boundary second sits
-            // between the two faces, so the recess straddles the turn rather
-            // than standing beside it.
-            //
-            // Drawn OVER the miniature, because a notch takes the material
-            // and whatever was printed on it; under the name, because a name
-            // should not be cut. The lean comes off the clip's own height so
-            // the diagonal holds its angle whatever the lane is worth, and is
-            // capped against the pass so a seam cannot lean into its
-            // neighbour on a clip zoomed down to a few points a pass.
-            let seams = loop_seam_xs(r, full_x, clip);
-            if !seams.is_empty() {
-                let lean = (r.height() * 0.30)
-                    .clamp(2.0, 8.0)
-                    .min(loop_pass_w(full_x, clip) * 0.5);
-                let (top, bot) = (r.top() + 1.0, r.bottom() - 1.0);
-                let faces = [(-0.75, deepen(color, 0.18)), (0.75, separate(color, 0.26))];
-                for x in seams {
-                    for (dx, face) in faces {
-                        painter.line_segment(
-                            [
-                                Pos2::new(x + dx + lean * 0.5, top),
-                                Pos2::new(x + dx - lean * 0.5, bot),
-                            ],
-                            Stroke::new(1.0, face),
-                        );
-                    }
-                }
             }
         }
         // ── the wave ──────────────────────────────────────────────────────
@@ -5203,6 +5161,63 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     [Pos2::new(x, y0.min(y1)), Pos2::new(x, y1.max(y0) + 0.5)],
                     Stroke::new(1.0, ink),
                 );
+            }
+        }
+        // ── the loop seams ────────────────────────────────────────────────
+        //
+        // **A diagonal recess where one pass ends and the next begins**, the
+        // owner's "make it such that theres a diagonal recess between loops".
+        // A looped clip is one bar drawn over and over, and there was nothing
+        // in the picture that said so: two bars and twenty bars of the same
+        // part were the same green box, and the only way to find out how many
+        // times it repeated was to open the editor and count. The notch is
+        // that fact, drawn.
+        //
+        // **Every clip, not only the MIDI ones.** This lived inside the
+        // `clip.midi` branch above, which was true of loops on the day it was
+        // written and stopped being true the day audio started repeating:
+        // `audio_clip_passes` lays a `Placed` down per pass and
+        // `looped_span_envelope` folds the waveform into the loop, so a
+        // four-bar drum take pulled over sixteen bars already SOUNDED like
+        // four passes and already DREW four passes of the same waveform —
+        // with nothing anywhere to say where one ended. Half of the picture's
+        // argument, applied to half the clips.
+        //
+        // **Cut into the clip's own surface rather than printed on it.**
+        // `separate` is what the panel already uses for the seam between two
+        // lanes — the surface moved away from itself, which reads on a
+        // near-black theme and on a bone one alike — and `deepen` is its
+        // mirror, so the pair is a groove and a land and not a double stripe.
+        // Neither is `clip_ink`: ink is for figures somebody has to READ, and
+        // a notch is not a figure. The boundary second sits between the two
+        // faces, so the recess straddles the turn rather than standing beside
+        // it.
+        //
+        // Drawn OVER the miniature AND over the wave, because a notch takes
+        // the material and whatever was printed on it — which is what moved
+        // it below the wave block rather than merely out of the branch; under
+        // the name and the fades, because a name should not be cut and a fade
+        // is the envelope rather than the material. The lean comes off the
+        // clip's own height so the diagonal holds its angle whatever the lane
+        // is worth, and is capped against the pass so a seam cannot lean into
+        // its neighbour on a clip zoomed down to a few points a pass.
+        let seams = loop_seam_xs(r, full_x, clip);
+        if !seams.is_empty() {
+            let lean = (r.height() * 0.30)
+                .clamp(2.0, 8.0)
+                .min(loop_pass_w(full_x, clip) * 0.5);
+            let (top, bot) = (r.top() + 1.0, r.bottom() - 1.0);
+            let faces = [(-0.75, deepen(color, 0.18)), (0.75, separate(color, 0.26))];
+            for x in seams {
+                for (dx, face) in faces {
+                    painter.line_segment(
+                        [
+                            Pos2::new(x + dx + lean * 0.5, top),
+                            Pos2::new(x + dx - lean * 0.5, bot),
+                        ],
+                        Stroke::new(1.0, face),
+                    );
+                }
             }
         }
         // The fades: translucent wedges from the top corners, their feet at
@@ -9769,16 +9784,137 @@ selected: false,
         }
     }
 
+    /// **An AUDIO clip that loops is notched too.**
+    ///
+    /// The seam pass lived inside the `clip.midi` branch, which was true of
+    /// loops on the day it was written and stopped being true the day audio
+    /// started repeating. A four-bar drum take pulled over sixteen bars
+    /// SOUNDS like four passes — `audio_clip_passes` lays a `Placed` down per
+    /// pass — and DRAWS four passes of the same waveform, because
+    /// `looped_span_envelope` folds the picture into the loop. The one thing
+    /// missing was any mark saying where one ended and the next began, which
+    /// is the whole of what the notch is for.
+    ///
+    /// The fixture carries a real wave and no notes, so it goes down the
+    /// audio road through `draw` — and the wave is why the seam moved BELOW
+    /// the wave pass rather than merely out of the branch: a notch takes the
+    /// material and whatever was printed on it, and a notch printed before
+    /// the waveform would have the waveform drawn back over it.
+    ///
+    /// Revert checks performed: put the seam pass back inside `if clip.midi`
+    /// and this paints nothing; leave it out of the branch but above the wave
+    /// and the diagonals survive, so the order is asserted by shape INDEX
+    /// rather than by presence — the wave's own columns inside the same clip
+    /// must all come first.
+    #[test]
+    fn a_looped_audio_clip_is_notched_where_each_pass_ends() {
+        let bar_s = 2.0;
+        let none: [crate::arrangement::ArrNote; 0] = [];
+        // A wave with something in it, spanning the whole clip: every bucket
+        // a full-scale pair, so the columns are unmistakable and none of them
+        // is skipped for being flat.
+        let wave: Vec<f32> = (0..256).flat_map(|_| [-0.8f32, 0.8]).collect();
+        let clips = [ClipView {
+            midi: false,
+            notes: &none,
+            wave: &wave,
+            wave_from_s: 0.0,
+            wave_span_s: bar_s * 4.0,
+            ..a_looped_clip(&none, bar_s, 4.0)
+        }];
+        let mut v = a_view(&clips);
+        v.view_start_s = 0.0;
+        v.view_len_s = 12.0;
+        v.song_s = 12.0;
+        let area = rect();
+        let r = clip_rect(area, &v, &clips[0]);
+        assert!(r.is_positive(), "the fixture clip is not on screen");
+
+        // Three boundaries inside four passes, two faces each.
+        let want: Vec<f32> = [2.0, 4.0, 6.0].iter().map(|t| x_of(area, &v, *t)).collect();
+        let drawn = diagonals_in(&v, r);
+        assert_eq!(
+            drawn.len(),
+            6,
+            "a looping AUDIO clip painted {} diagonals, not the six a \
+             three-seam clip owes",
+            drawn.len()
+        );
+        for (n, pair) in drawn.chunks(2).enumerate() {
+            let mid = (pair[0].0.x + pair[0].1.x + pair[1].0.x + pair[1].1.x) / 4.0;
+            assert!(
+                (mid - want[n]).abs() < 1.5,
+                "seam {n} was painted around {mid}, not at {}",
+                want[n]
+            );
+        }
+
+        // **And it is cut into the wave, not under it.** The order is the
+        // half a presence assert cannot see: every vertical column of the
+        // waveform inside this clip has to be emitted BEFORE every diagonal
+        // of a seam, or the picture the notch was supposed to interrupt is
+        // painted straight back over it.
+        let (waves, seams) = shape_indices_in(&v, r);
+        assert!(!waves.is_empty(), "the fixture drew no waveform at all");
+        assert!(!seams.is_empty(), "the fixture drew no seam at all");
+        assert!(
+            waves.iter().max() < seams.iter().min(),
+            "a waveform column at shape {:?} is painted after a seam at {:?}",
+            waves.iter().max(),
+            seams.iter().min()
+        );
+    }
+
+    /// Where the waveform's columns and the loop's seams landed in the shape
+    /// list, as `(vertical indices, diagonal indices)` inside `r`.
+    ///
+    /// The same filter [`diagonals_in`] uses, kept apart from it because this
+    /// one is about ORDER and needs the verticals it throws away. The clip's
+    /// own rect bounds both, so the grid and the playhead — vertical, and
+    /// drawn across the whole panel — are excluded by the containment test
+    /// the same way they are there.
+    fn shape_indices_in(v: &ArrangeView<'_>, r: Rect) -> (Vec<usize>, Vec<usize>) {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let area = rect();
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(area), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(area);
+                    draw(ui.painter(), area, v);
+                });
+            },
+        );
+        let (mut vert, mut diag) = (Vec::new(), Vec::new());
+        for (i, s) in out.shapes.iter().enumerate() {
+            let egui::Shape::LineSegment { points, .. } = &s.shape else {
+                continue;
+            };
+            let (a, b) = (points[0], points[1]);
+            if !r.contains(a) || !r.contains(b) {
+                continue;
+            }
+            if (a.x - b.x).abs() < 0.25 && (a.y - b.y).abs() > 0.25 {
+                vert.push(i);
+            } else if (a.x - b.x).abs() > 0.25 && (a.y - b.y).abs() > 0.25 {
+                diag.push(i);
+            }
+        }
+        (vert, diag)
+    }
+
     /// **Nothing that does not loop, and nothing too fine to place, is
     /// notched.**
     ///
     /// Three cases, each of which drew a seam in some draft of this: a clip
-    /// with no loop at all (every audio clip, and every document written
-    /// before looping existed), a clip that holds exactly one pass (a drawn
-    /// MIDI item before its edge has been pulled — it loops, and there is
-    /// nothing yet for the loop to end against), and a one-bar loop over two
-    /// hundred bars seen whole, where a seam every point is a moiré that
-    /// claims to be structure.
+    /// with no loop at all (a document written before looping existed, and a
+    /// clip whose Loop row has been unticked), a clip that holds exactly one
+    /// pass — which is every clip at the moment it is made, since a loop as
+    /// long as its clip has nothing yet to end against — and a one-bar loop
+    /// over two hundred bars seen whole, where a seam every point is a moiré
+    /// that claims to be structure.
     ///
     /// Revert performed: drop the `SEAM_MIN_PASS_W` gate and the last case
     /// paints a hundred and ninety-odd notches across one clip.
