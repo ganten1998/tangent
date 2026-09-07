@@ -2294,6 +2294,92 @@ fn visible_passes(
     start..end
 }
 
+/// **How narrow a pass may be drawn before its seams are dropped**, in points.
+///
+/// A one-bar loop under a two-hundred-bar clip, seen whole, is a pass a point
+/// wide: two hundred notches at that spacing are not a picture of a loop, they
+/// are a moiré over the whole clip, and the eye reads it as texture rather than
+/// as structure. The miniature already refuses to draw marks it cannot place
+/// (see [`draw_note_miniature`]); a seam that cannot say WHERE the loop turns
+/// over is worth less than nothing, because it is claiming to.
+const SEAM_MIN_PASS_W: f32 = 6.0;
+
+/// **How wide one pass of a looped clip draws**, in points, across the clip's
+/// unclamped span. Zero for a clip that does not loop.
+///
+/// One formula with two callers — where the seams fall, and how far a notch is
+/// allowed to lean before it leans into the next one — because a lean measured
+/// against a pass width computed a second way is the pair that drifts.
+fn loop_pass_w(full_x: (f32, f32), clip: &ClipView<'_>) -> f32 {
+    if clip.loop_s <= 1.0e-6
+        || !clip.loop_s.is_finite()
+        || clip.len_s <= 0.0
+        || !clip.len_s.is_finite()
+    {
+        return 0.0;
+    }
+    let w = (f64::from(full_x.1 - full_x.0) * clip.loop_s / clip.len_s) as f32;
+    if w.is_finite() {
+        w.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// **Where a looped clip's seams fall**, as x in points, left to right.
+///
+/// One boundary per multiple of `loop_s` strictly inside `len_s` — the places
+/// [`crate::arrangement::clip_notes_in_song_time`] starts another pass — and
+/// only the ones that land inside the drawn rect with room to be seen.
+///
+/// `full_x` is the clip's UNCLAMPED pixel span, the same one the miniature is
+/// mapped through and for the same reason: the drawn rect is cut to the
+/// viewport, so counting passes across the CUT width would slide every seam
+/// sideways the moment the clip crossed an edge — which is the fault the
+/// miniature shipped with once already ("clip begins shrinking").
+///
+/// Arithmetic and not a walk. The passes are evenly spaced, so the two that
+/// bound the rect invert directly, and a clip holding five hundred passes of
+/// which four are on screen costs four.
+fn loop_seam_xs(r: Rect, full_x: (f32, f32), clip: &ClipView<'_>) -> Vec<f32> {
+    let (fx0, fx1) = full_x;
+    if !r.is_positive()
+        || !fx0.is_finite()
+        || !fx1.is_finite()
+        || clip.loop_s <= 1.0e-6
+        || !clip.loop_s.is_finite()
+        || !clip.len_s.is_finite()
+        // A clip no longer than one pass has no seam: there is no second
+        // pass for the first one to end against.
+        || clip.len_s <= clip.loop_s + 1.0e-9
+    {
+        return Vec::new();
+    }
+    let pass_w = loop_pass_w(full_x, clip);
+    if pass_w < SEAM_MIN_PASS_W {
+        return Vec::new();
+    }
+    // The same count and the same ceiling the miniature and the schedule use,
+    // so the picture cannot claim a pass the sound does not play.
+    let passes = ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 512);
+    let lo = ((r.left() - fx0) / pass_w).ceil();
+    let hi = ((r.right() - fx0) / pass_w).floor();
+    if !lo.is_finite() || !hi.is_finite() || hi < lo {
+        return Vec::new();
+    }
+    // `as` saturates rather than wrapping, which is what is wanted at both
+    // ends: a clip scrolled off to the left asks for a negative first seam
+    // and gets the first one there is.
+    let from = (lo.max(1.0) as usize).clamp(1, passes);
+    let to = ((hi.max(0.0) as usize).saturating_add(1)).clamp(from, passes);
+    (from..to)
+        .map(|k| fx0 + pass_w * k as f32)
+        // Clear of the clip's own border, which would otherwise swallow a
+        // seam sitting on it and leave a pass that looks like it has none.
+        .filter(|x| *x > r.left() + 1.0 && *x < r.right() - 1.0)
+        .collect()
+}
+
 /// The clip's notes as a miniature: pitch spread across the clip's height
 /// (padded to at least an octave so one note does not fill the box), each
 /// note a small bar over its own span of the drawn length.
@@ -3604,6 +3690,25 @@ fn separate(c: Color32, t: f32) -> Color32 {
         Color32::WHITE
     } else {
         Color32::BLACK
+    };
+    blend(c, toward, t)
+}
+
+/// **[`separate`]'s mirror**: move a colour further INTO itself — toward black
+/// when it is already dark, toward white when it is already light.
+///
+/// The other face of a recess. `separate` gives the face that always reads,
+/// because it moves away from the surface and so is visible on a near-black
+/// clip and on a bone one alike; this gives the face that falls the other way,
+/// which is what turns a pair of lines into a NOTCH rather than a double
+/// stripe. It is allowed to be nearly invisible at the ends of the range — a
+/// surface already at black has nowhere deeper to go — which is exactly why
+/// the reading half of the pair is the other one.
+fn deepen(c: Color32, t: f32) -> Color32 {
+    let toward = if crate::recorder_panel::wants_light_ink(c) {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
     };
     blend(c, toward, t)
 }
@@ -4971,6 +5076,15 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // read what the editor will say. An empty item keeps the dashed
         // staff that says "MIDI, nothing played yet".
         if clip.midi && r.width() >= 8.0 {
+            // The clip's UNCLAMPED pixel span, measured once: where the whole
+            // clip would stand if the viewport were not cutting it. Both the
+            // miniature and the loop seams are mapped through it, and `x_of`
+            // builds a `Layout` every time it is asked, so it is worth the
+            // binding.
+            let full_x = (
+                x_of(rect, view, clip.start_s),
+                x_of(rect, view, clip.start_s + clip.len_s),
+            );
             if clip.notes.is_empty() {
                 // The dashed staff sits under the title too, or an empty
                 // MIDI item's line runs through its own name.
@@ -4985,11 +5099,52 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     x += 8.0;
                 }
             } else {
-                let full_x = (
-                    x_of(rect, view, clip.start_s),
-                    x_of(rect, view, clip.start_s + clip.len_s),
-                );
                 draw_note_miniature(painter, r, full_x, clip, clip_ink);
+            }
+            // ── the loop seams ────────────────────────────────────────────
+            //
+            // **A diagonal recess where one pass ends and the next begins**,
+            // the owner's "make it such that theres a diagonal recess between
+            // loops". A looped clip is one bar of notes drawn over and over,
+            // and there was nothing in the picture that said so: two bars and
+            // twenty bars of the same part were the same green box, and the
+            // only way to find out how many times it repeated was to open the
+            // editor and count. The notch is that fact, drawn.
+            //
+            // **Cut into the clip's own surface rather than printed on it.**
+            // `separate` is what the panel already uses for the seam between
+            // two lanes — the surface moved away from itself, which reads on
+            // a near-black theme and on a bone one alike — and `deepen` is
+            // its mirror, so the pair is a groove and a land and not a double
+            // stripe. Neither is `clip_ink`: ink is for figures somebody has
+            // to READ, and a notch is not a figure. The boundary second sits
+            // between the two faces, so the recess straddles the turn rather
+            // than standing beside it.
+            //
+            // Drawn OVER the miniature, because a notch takes the material
+            // and whatever was printed on it; under the name, because a name
+            // should not be cut. The lean comes off the clip's own height so
+            // the diagonal holds its angle whatever the lane is worth, and is
+            // capped against the pass so a seam cannot lean into its
+            // neighbour on a clip zoomed down to a few points a pass.
+            let seams = loop_seam_xs(r, full_x, clip);
+            if !seams.is_empty() {
+                let lean = (r.height() * 0.30)
+                    .clamp(2.0, 8.0)
+                    .min(loop_pass_w(full_x, clip) * 0.5);
+                let (top, bot) = (r.top() + 1.0, r.bottom() - 1.0);
+                let faces = [(-0.75, deepen(color, 0.18)), (0.75, separate(color, 0.26))];
+                for x in seams {
+                    for (dx, face) in faces {
+                        painter.line_segment(
+                            [
+                                Pos2::new(x + dx + lean * 0.5, top),
+                                Pos2::new(x + dx - lean * 0.5, bot),
+                            ],
+                            Stroke::new(1.0, face),
+                        );
+                    }
+                }
             }
         }
         // ── the wave ──────────────────────────────────────────────────────
@@ -9451,6 +9606,216 @@ selected: false,
             got.len(),
             want.len()
         );
+    }
+
+    /// Every DIAGONAL line segment the whole panel painted inside `r`, as
+    /// `(top point, bottom point, ink)`.
+    ///
+    /// Diagonal is the filter that isolates a loop seam from everything else
+    /// drawn over a clip: the grid, the playhead and the lane seams are
+    /// vertical, the empty item's staff is horizontal, and the miniature and
+    /// the wave are rects. The fades are diagonal, which is why every fixture
+    /// here has none — and why this reads the whole `draw` rather than calling
+    /// the seam pass on its own. A seam computed and not painted is the fault
+    /// this exists to catch.
+    fn diagonals_in(v: &ArrangeView<'_>, r: Rect) -> Vec<(Pos2, Pos2, Color32)> {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let area = rect();
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(area), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(area);
+                    draw(ui.painter(), area, v);
+                });
+            },
+        );
+        let mut got = Vec::new();
+        for s in &out.shapes {
+            let egui::Shape::LineSegment { points, stroke } = &s.shape else {
+                continue;
+            };
+            let (a, b) = (points[0], points[1]);
+            if (a.x - b.x).abs() < 0.25 || (a.y - b.y).abs() < 0.25 {
+                continue;
+            }
+            if !r.contains(a) || !r.contains(b) {
+                continue;
+            }
+            let (top, bot) = if a.y <= b.y { (a, b) } else { (b, a) };
+            got.push((top, bot, stroke.color));
+        }
+        got.sort_by(|x, y| x.0.x.total_cmp(&y.0.x));
+        got
+    }
+
+    /// **A looped clip shows where every pass ends**, as a diagonal recess.
+    ///
+    /// The owner: "make it such that theres a diagonal recess between loops."
+    /// Two bars and twenty bars of the same one-bar part were the same green
+    /// box, and the only way to find out how many times it repeated was to
+    /// open the editor and count.
+    ///
+    /// Checked as GEOMETRY and as PAINT, because the two are the pair that
+    /// drifts: `loop_seam_xs` is asserted to put a seam at every multiple of
+    /// the loop inside the clip, and then the whole panel is run and the
+    /// diagonals it actually emitted are matched against those same seconds.
+    /// An empty item is used for the paint half — a MIDI item drawn and not
+    /// yet played into is the case the seam matters most for, since it has no
+    /// notes to hint at its own shape.
+    ///
+    /// Reverts performed, both red: give the two faces one colour and the
+    /// groove assert goes; drop the `saturating_add(1)` from the `to` bound
+    /// and the clip cut off at five seconds loses its last visible seam —
+    /// which is why the cut window is here at all, since a clip seen whole
+    /// gets that bound from its own end and the fault hides.
+    #[test]
+    fn a_looped_clip_is_notched_where_each_pass_ends() {
+        let bar_s = 2.0;
+        let notes = a_looped_bar(bar_s);
+        let none: [crate::arrangement::ArrNote; 0] = [];
+        // Four passes of one bar, seen whole with room to spare, so a pass is
+        // a couple of hundred points and nothing is near the density floor.
+        let clips = [ClipView { notes: &none, ..a_looped_clip(&notes, bar_s, 4.0) }];
+        let mut v = a_view(&clips);
+        v.view_start_s = 0.0;
+        v.view_len_s = 12.0;
+        v.song_s = 12.0;
+        let area = rect();
+        let r = clip_rect(area, &v, &clips[0]);
+        assert!(r.is_positive(), "the fixture clip is not on screen");
+        let full_x = (
+            x_of(area, &v, clips[0].start_s),
+            x_of(area, &v, clips[0].start_s + clips[0].len_s),
+        );
+        // Three boundaries inside four passes: 2s, 4s and 6s. Not four — the
+        // clip's own right edge is where it ends, not where it turns over.
+        let want: Vec<f32> = [2.0, 4.0, 6.0].iter().map(|t| x_of(area, &v, *t)).collect();
+        let got = loop_seam_xs(r, full_x, &clips[0]);
+        assert_eq!(got.len(), want.len(), "seams at {got:?}, wanted {want:?}");
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 0.5, "a seam at {g} belongs at {w}");
+        }
+
+        // And they were painted. Two faces a seam — the groove and the land —
+        // so six lines, in pairs straddling each boundary.
+        let drawn = diagonals_in(&v, r);
+        assert_eq!(
+            drawn.len(),
+            6,
+            "four passes painted {} diagonals, not the six a three-seam clip owes",
+            drawn.len()
+        );
+        for (n, pair) in drawn.chunks(2).enumerate() {
+            let mid = (pair[0].0.x + pair[0].1.x + pair[1].0.x + pair[1].1.x) / 4.0;
+            assert!(
+                (mid - want[n]).abs() < 1.5,
+                "seam {n} was painted around {mid}, not at {}",
+                want[n]
+            );
+            // A RECESS leans: the top of the notch stands ahead of its foot.
+            for (top, bot, _) in pair {
+                assert!(
+                    top.x > bot.x + 1.0,
+                    "the seam is not on the diagonal: {top:?} over {bot:?}"
+                );
+            }
+        }
+
+        // **The notch is cut into the clip's own surface**, not printed on it
+        // in the clip's ink. The two faces sit either side of the lane's
+        // colour, and neither of them is the near-white or near-black that a
+        // figure would be drawn in — this is the house rule that keeps a
+        // hand-painted lane from wearing somebody else's seam.
+        let face = Color32::from_rgb(0x2E, 0x6B, 0x46);
+        let lum = |c: Color32| crate::recorder_panel::wants_light_ink(c);
+        let inks: Vec<Color32> = drawn.iter().map(|(_, _, c)| *c).collect();
+        for c in &inks {
+            let ratio = crate::recorder_panel::contrast_ratio(*c, face);
+            assert!(
+                ratio < 3.0,
+                "a seam face at {ratio:.2}:1 off the clip is a stripe, not a recess"
+            );
+            assert_ne!(*c, crate::recorder_panel::INK_LIGHT, "the seam took the ink");
+            assert_ne!(*c, crate::recorder_panel::INK_DARK, "the seam took the ink");
+        }
+        assert!(
+            inks.iter().any(|c| lum(*c) != lum(inks[0])) || inks.iter().any(|c| *c != inks[0]),
+            "both faces of the notch are the same colour, which is a line and not a groove"
+        );
+
+        // **And the same clip with its tail off the right of the window.**
+        // The seam range is arithmetic, and the arithmetic that bounds it at
+        // the viewport's edge is the half that only shows here: the last seam
+        // BEFORE the cut is at the boundary the floor lands on, and a bound
+        // that forgot the range is half-open drops it. Seen whole, the clip's
+        // own end supplies that bound and the fault hides.
+        let mut cut = a_view(&clips);
+        cut.view_start_s = 0.0;
+        cut.view_len_s = 5.0;
+        cut.song_s = 12.0;
+        let cr = clip_rect(area, &cut, &clips[0]);
+        let cut_full_x = (
+            x_of(area, &cut, clips[0].start_s),
+            x_of(area, &cut, clips[0].start_s + clips[0].len_s),
+        );
+        let want: Vec<f32> = [2.0, 4.0].iter().map(|t| x_of(area, &cut, *t)).collect();
+        let got = loop_seam_xs(cr, cut_full_x, &clips[0]);
+        assert_eq!(got.len(), want.len(), "cut off at 5s: seams at {got:?}, wanted {want:?}");
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 0.5, "a seam at {g} belongs at {w}");
+        }
+    }
+
+    /// **Nothing that does not loop, and nothing too fine to place, is
+    /// notched.**
+    ///
+    /// Three cases, each of which drew a seam in some draft of this: a clip
+    /// with no loop at all (every audio clip, and every document written
+    /// before looping existed), a clip that holds exactly one pass (a drawn
+    /// MIDI item before its edge has been pulled — it loops, and there is
+    /// nothing yet for the loop to end against), and a one-bar loop over two
+    /// hundred bars seen whole, where a seam every point is a moiré that
+    /// claims to be structure.
+    ///
+    /// Revert performed: drop the `SEAM_MIN_PASS_W` gate and the last case
+    /// paints a hundred and ninety-odd notches across one clip.
+    #[test]
+    fn a_clip_with_no_loop_or_no_room_for_one_is_not_notched() {
+        let bar_s = 2.0;
+        let notes = a_looped_bar(bar_s);
+        let area = rect();
+        for (what, clip, window_s) in [
+            (
+                "a clip that does not loop",
+                ClipView { loop_s: 0.0, ..a_looped_clip(&notes, bar_s, 4.0) },
+                12.0,
+            ),
+            ("a clip holding one pass", a_looped_clip(&notes, bar_s, 1.0), 12.0),
+            (
+                "two hundred passes seen whole",
+                a_looped_clip(&notes, bar_s, 200.0),
+                bar_s * 200.0,
+            ),
+        ] {
+            let clips = [clip];
+            let mut v = a_view(&clips);
+            v.view_start_s = 0.0;
+            v.view_len_s = window_s;
+            v.song_s = window_s;
+            let r = clip_rect(area, &v, &clips[0]);
+            assert!(r.is_positive(), "{what}: the fixture is not on screen");
+            let full_x = (
+                x_of(area, &v, clips[0].start_s),
+                x_of(area, &v, clips[0].start_s + clips[0].len_s),
+            );
+            let got = loop_seam_xs(r, full_x, &clips[0]);
+            assert!(got.is_empty(), "{what} was given {} seams", got.len());
+            let drawn = diagonals_in(&v, r);
+            assert!(drawn.is_empty(), "{what} painted {} diagonals", drawn.len());
+        }
     }
 
     /// **Nothing to draw, and no room to draw it**: neither panics, and
