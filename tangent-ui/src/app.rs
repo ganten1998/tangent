@@ -13301,14 +13301,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// **Glue the selected clips on ONE track into a single clip.**
     ///
-    /// The escape hatch from the loop: a MIDI item repeats rather than
-    /// revealing empty time, so the way to get one long pass out of several
-    /// is to write them and weld them. Cmd+G on macOS, Ctrl+G elsewhere.
+    /// Several parts, written and welded into one. Cmd+G on macOS, Ctrl+G
+    /// elsewhere.
     ///
     /// **Silence between them is included.** Gluing two bars a bar apart
     /// gives four bars, not two — otherwise the result would not line up
     /// with the song it came out of, and "glue" would mean "close the gaps",
     /// which is a different and much less useful verb.
+    ///
+    /// **And the weld is itself a loop, over the whole of what was glued.**
+    /// This used to be the escape HATCH from the loop — the way to get one
+    /// long pass out of several — and the owner has reversed it: "Gluing two
+    /// items together regardless of status will now create a loop of those
+    /// two items, but as one clip now." Which is the same rule the rest of
+    /// the file keeps: glue makes a clip, and every clip the app makes is a
+    /// loop over its own length. The repeats of the sources are already
+    /// spelled out into literal notes by the expansion below, so the glued
+    /// clip's own pass is everything it swallowed, gaps and all, and it
+    /// sounds exactly as it did — until its right edge is pulled, which is
+    /// now how you get the welded phrase a second time.
     ///
     /// One track at a time. Clips on different lanes cannot become one clip,
     /// and quietly gluing the ones that happen to share a lane would be a
@@ -13389,10 +13400,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             start_s: start,
             offset_s: 0.0,
             len_s: (end - start).max(0.05),
-            // **The glued clip does not loop.** Its whole purpose is to be
-            // one long pass; pinning it would put back the thing it was made
-            // to escape.
-            loop_s: 0.0,
+            // **The glued clip loops over the whole of what was glued.**
+            //
+            // It used to be the one clip in the app born without a loop, on
+            // the reasoning that its whole purpose was to be one long pass
+            // and pinning it would put back the thing it was made to escape.
+            // The owner has ruled the other way: "Gluing two items together
+            // regardless of status will now create a loop of those two items,
+            // but as one clip now."
+            //
+            // Nothing about the result sounds different for it. The sources'
+            // repeats are already spelled out into literal notes above, and a
+            // loop as long as the clip it sits on is one pass — so the weld
+            // plays exactly as it did. What changes is the right edge: pull
+            // it and the welded phrase, silences and all, comes round again.
+            // Which is the whole of the escape that was being protected here
+            // — you weld to get one pass, and you drag to get it twice.
+            loop_s: (end - start).max(0.05),
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: "MIDI".to_owned(),
@@ -40704,12 +40728,24 @@ mod tests {
         assert_eq!(c.value_at(8.0), Some(0.4), "the written value is not the one set");
     }
 
-    /// **Glue welds the selected MIDI clips on one track, silence included.**
+    /// **Glue welds the selected MIDI clips on one track, silence included,
+    /// and the weld is a loop over the whole of it.**
     ///
     /// Gluing two one-bar clips a bar apart gives FOUR bars, not two: the
     /// gap is part of the music's shape, and a glue that closed it would be
     /// a different and much less useful verb — the result would no longer
     /// line up with the song it came out of.
+    ///
+    /// The loop assert used to say the opposite — "the glued clip should not
+    /// loop" — and the owner has reversed the rule it was guarding. Both
+    /// halves are asserted together on purpose: the loop has to be the FULL
+    /// glued span and not one source's, or the weld would come round again
+    /// halfway through itself the first time anybody pulled its edge, which
+    /// is the failure a bare `loop_s > 0.0` would not catch.
+    ///
+    /// Revert check performed: `loop_s: 0.0` back at the construction site
+    /// and the loop assert names the zero; the source's own one-second loop
+    /// there instead and it names the one.
     #[test]
     fn glue_welds_clips_on_one_track_and_keeps_the_silence() {
         use crate::arrangement::{ArrClip, ArrNote, ClipKind};
@@ -40740,7 +40776,12 @@ mod tests {
             "the silence between them was dropped: {} should be 3",
             c.len_s
         );
-        assert_eq!(c.loop_s, 0.0, "the glued clip should not loop");
+        assert!(
+            (c.loop_s - 3.0).abs() < 1e-9,
+            "the weld loops over {} - it should be a single pass of the whole \
+             three seconds it swallowed",
+            c.loop_s
+        );
         assert_eq!(c.notes.len(), 2, "{:?}", c.notes);
         assert!((c.notes[0].at_s - 0.0).abs() < 1e-9);
         assert!(
