@@ -507,13 +507,27 @@ pub enum ChannelKind {
 /// Three rules, in order:
 ///
 /// 1. A lane that is not a MIDI channel never hears a note.
-/// 2. A MIDI lane hears the keyboard when it is ARMED **or SELECTED**. Arm
-///    used to be the whole of it, which meant trying an instrument out began
-///    by arming a track — and a half-finished take was one keypress away.
-///    Selecting a track is already the gesture that means "this one".
+/// 2. **A MIDI lane hears the keyboard when it is ARMED, and only then.**
 /// 3. **While the MIDI editor is open it is the ONLY lane that hears.** An
 ///    audition there is a question about the clip in front of you; with two
 ///    instruments armed, one key played both of them.
+///
+/// **Rule 2 used to read "armed OR SELECTED", and the owner struck the
+/// selection out on 2026-09-07**: "unarmed tracks still make sounds ... that's
+/// nonsensical and should be overridden even if it was me". What it looked
+/// like from the room is worth writing down, because it is what a report of
+/// this will look like next time: an armed track making no sound while an
+/// unarmed one sounded and metered, which is arm reading as a lie. Selection
+/// is a quiet, sticky thing — every click on a header sets it and nothing
+/// visibly says it also opens a MIDI gate — so the lane that answered the
+/// keyboard was not the lane wearing the R.
+///
+/// **What it costs, stated plainly**: trying an instrument out now begins by
+/// arming a track, which is the very thing the selection clause was added to
+/// avoid — a half-finished take is one keypress from an audition. The editor's
+/// own audition (rule 3) is untouched and remains the road that needs no arm.
+/// Logic and Cubase both sound the selected instrument track without a record
+/// arm, so this desk is now deliberately stricter than they are.
 ///
 /// It is one mask rather than a gate per rule because the mask's EDGE is what
 /// releases the notes a silenced lane was holding. A second gate would have no
@@ -528,7 +542,6 @@ pub enum ChannelKind {
 pub fn live_midi_off(
     kinds: &[Option<ChannelKind>],
     armed: u32,
-    selected: Option<usize>,
     editor_lane: Option<usize>,
 ) -> u32 {
     // Rule 3 short-circuits, but still answers to rule 1: an editor somehow
@@ -544,8 +557,8 @@ pub fn live_midi_off(
     }
     let mut off = all;
     for ch in 0..CHANNELS.min(32) {
-        let live = kinds.get(ch).copied().flatten() == Some(ChannelKind::Midi)
-            && (armed & (1 << ch) != 0 || selected == Some(ch));
+        let live =
+            kinds.get(ch).copied().flatten() == Some(ChannelKind::Midi) && armed & (1 << ch) != 0;
         if live {
             off &= !(1u32 << ch);
         }
@@ -3833,10 +3846,10 @@ mod tests {
 
     /// **The three rules that decide which instrument a key plays.**
     ///
-    /// Every one of them is a bug the owner reported: arming to audition,
-    /// and one key sounding two instruments at once in the editor.
+    /// Every one of them is a bug the owner reported: an unarmed track
+    /// sounding, and one key sounding two instruments at once in the editor.
     #[test]
-    fn live_midi_reaches_armed_selected_and_the_editors_lane_alone() {
+    fn live_midi_reaches_armed_lanes_and_the_editors_lane_alone() {
         use super::{live_midi_off, ChannelKind};
         let off = |ch: usize, m: u32| m & (1 << ch) != 0;
         let mut kinds = vec![None; super::CHANNELS];
@@ -3844,44 +3857,52 @@ mod tests {
         kinds[1] = Some(ChannelKind::Midi);
         kinds[2] = Some(ChannelKind::Audio);
 
-        // Nothing armed, nothing selected: silence, which is what it always
-        // did and what the two rules below are exceptions to.
-        let m = live_midi_off(&kinds, 0, None, None);
+        // Nothing armed: silence. The editor is the ONE exception below.
+        let m = live_midi_off(&kinds, 0, None);
         assert!(off(0, m) && off(1, m) && off(2, m));
 
-        // ARMED sounds.
-        let m = live_midi_off(&kinds, 1 << 1, None, None);
+        // ARMED sounds, and it is the only thing that does.
+        let m = live_midi_off(&kinds, 1 << 1, None);
         assert!(!off(1, m), "an armed MIDI lane takes no notes");
         assert!(off(0, m));
 
-        // SELECTED sounds, unarmed — the whole point. Trying an instrument
-        // out used to begin by arming a track, one keypress from a take.
-        let m = live_midi_off(&kinds, 0, Some(0), None);
-        assert!(!off(0, m), "a selected MIDI lane still needs arming");
-        assert!(off(1, m));
+        // **An UNARMED lane is silent whatever else is true of it.** This is
+        // the owner's 2026-09-07 ruling and the regression guard for it: the
+        // desk used to open the SELECTED lane too, so an armed track and an
+        // unarmed one sounded together and the unarmed one was the one you
+        // heard. There is no selection in this function's arguments any more,
+        // which is the strongest form the rule can take — but the case worth
+        // naming is lane 0 live while lane 1 is the armed one.
+        let m = live_midi_off(&kinds, 1 << 1, None);
+        assert!(off(0, m), "an unarmed MIDI lane was handed the keyboard");
 
-        // A selected AUDIO lane is still an audio lane.
-        let m = live_midi_off(&kinds, 0, Some(2), None);
+        // An armed AUDIO lane is still an audio lane. Rule 1 outranks rule 2.
+        let m = live_midi_off(&kinds, 1 << 2, None);
         assert!(off(2, m), "an audio lane was handed a note");
 
         // **The editor takes the desk.** Both lanes armed, editor open on
         // lane 1: lane 0 goes quiet. This is "Mini v4 on track one, piano
         // on track 2, audition note, it triggers BOTH".
-        let m = live_midi_off(&kinds, 0b11, Some(0), Some(1));
+        let m = live_midi_off(&kinds, 0b11, Some(1));
         assert!(!off(1, m), "the edited lane went quiet");
         assert!(off(0, m), "the other armed instrument sounded too");
+
+        // **And the editor still needs no arm** — the one road to an audition
+        // that survived rule 2 losing its selection clause.
+        let m = live_midi_off(&kinds, 0, Some(1));
+        assert!(!off(1, m), "the editor's own lane needs arming now");
 
         // And an editor somehow open on an audio lane silences every
         // CHANNEL rather than opening the desk up.
         let all = ((1u64 << super::CHANNELS) - 1) as u32;
-        assert_eq!(live_midi_off(&kinds, 0b11, Some(0), Some(2)), all);
+        assert_eq!(live_midi_off(&kinds, 0b11, Some(2)), all);
 
         // **The strips past the channels are never in this mask.** Drums,
         // click and fx read it for their own bit and have never been gated
         // by it; a mask built as "everything off, then open the live ones"
         // reaches them where the old one did not.
-        for (armed, sel, ed) in [(0u32, None, None), (0b11, Some(0), Some(1)), (0, Some(0), None)] {
-            let m = live_midi_off(&kinds, armed, sel, ed);
+        for (armed, ed) in [(0u32, None), (0b11, Some(1)), (0, Some(1))] {
+            let m = live_midi_off(&kinds, armed, ed);
             assert_eq!(m & !all, 0, "a strip past the channels was gated: {m:#x}");
         }
     }
