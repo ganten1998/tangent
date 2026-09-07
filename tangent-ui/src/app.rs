@@ -2698,6 +2698,14 @@ fn kit_shortfall(report: &crate::drumpad::KitEmbedReport) -> String {
 }
 
 /// A bare clip standing at `start_s` on `lane`, named after its file.
+///
+/// **The one construction site that cannot arm its own loop**, and the
+/// reason [`TangentApp::note_clip_len`] arms it instead. Every clip is born
+/// looping over its own length — the owner's ruling — but a file's length is
+/// the decoder's fact and nothing here has a decoder: `len_s` leaves as the
+/// whole-file sentinel, so a `loop_s` written now could only be a guess. The
+/// two numbers are the same fact and they are learned together, once, when
+/// the host reports back.
 fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::ArrClip {
     crate::arrangement::ArrClip {
         kind: crate::arrangement::ClipKind::Audio,
@@ -5499,6 +5507,11 @@ impl TangentApp {
             self.set_in_folder(n, true);
         }
         let mut arr = crate::arrangement::Arrangement::default();
+        // **Every clip here loops over its own length**, because every clip
+        // the app makes does. A loop as long as its clip is one pass and
+        // draws no seams, so the photograph is unchanged — but a fixture
+        // that builds clips the app cannot build is a fixture that will
+        // eventually be used to prove something false.
         let backing = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
             notes: Vec::new(),
@@ -5507,7 +5520,7 @@ impl TangentApp {
             start_s: 0.0,
             offset_s: 0.0,
             len_s: 95.0,
-            loop_s: 0.0,
+            loop_s: 95.0,
             fade_in_s: 1.5,
             fade_out_s: 6.0,
             name: "Blue Bossa - backing".to_owned(),
@@ -5527,7 +5540,7 @@ impl TangentApp {
             start_s: 16.0,
             offset_s: 2.0,
             len_s: 21.0,
-            loop_s: 0.0,
+            loop_s: 21.0,
             fade_in_s: 0.4,
             fade_out_s: 0.4,
             name: "take 3".to_owned(),
@@ -5547,7 +5560,7 @@ impl TangentApp {
             start_s: 48.0,
             offset_s: 0.0,
             len_s: 30.0,
-            loop_s: 0.0,
+            loop_s: 30.0,
             fade_in_s: 0.0,
             fade_out_s: 2.5,
             name: "solo".to_owned(),
@@ -5583,7 +5596,7 @@ impl TangentApp {
             start_s: 32.0,
             offset_s: 0.0,
             len_s: 16.0,
-            loop_s: 0.0,
+            loop_s: 16.0,
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: "MIDI".to_owned(),
@@ -8430,7 +8443,7 @@ impl TangentApp {
                 start_s: r.start_s.max(0.0),
                 offset_s: 0.0,
                 len_s: r.len_s,
-                // **A recorded MIDI take is a LOOP, like a drawn one.**
+                // **A recorded take is a LOOP, whichever kind it is.**
                 //
                 // A MIDI item drawn on a lane has been pinned at its own
                 // length and looped from birth since it existed, so dragging
@@ -8441,15 +8454,18 @@ impl TangentApp {
                 // part onto a lane behaved differently at the one gesture
                 // everybody uses on a part they like.
                 //
+                // The AUDIO half of that sentence used to stand here as its
+                // own exception — "a repeat would be a different feature" —
+                // and it is not one any more: `desktop::audio_clip_passes`
+                // spells an audio loop out into a `Placed` per pass, and the
+                // owner's ruling is that the kinds stop differing. "The
+                // default behavior will be all clips audio or midi at time
+                // of creation are loops." A four-bar drum take dragged to
+                // sixteen bars is the whole reason anybody records four bars.
+                //
                 // Its own length is the pass, which is what the recording
-                // was: the loop is the take. An AUDIO take is left alone —
-                // there its file's remaining length is the cap and a repeat
-                // would be a different feature.
-                loop_s: if kind == crate::arrangement::ClipKind::Midi {
-                    r.len_s.max(0.05)
-                } else {
-                    0.0
-                },
+                // was: the loop is the take.
+                loop_s: r.len_s.max(0.05),
                 fade_in_s: 0.0,
                 fade_out_s: 0.0,
                 name,
@@ -8498,6 +8514,33 @@ impl TangentApp {
     /// so the scrubber can draw without a decode next time. Deliberately
     /// does NOT mark the clips dirty: this annotates the schedule the host
     /// is already holding, and marking would reload for ever.
+    ///
+    /// **And it is where an imported audio clip's LOOP is born.**
+    ///
+    /// Every clip is a loop over its own length from the moment it is made —
+    /// the owner's ruling, and every other construction site in this file
+    /// obeys it in one literal. A dropped file cannot: `clip_at` writes the
+    /// whole-file sentinel because the length is the decoder's fact, so a
+    /// loop written there would be a number nobody had measured. The two are
+    /// the same fact, and this is the instant the app first holds it.
+    ///
+    /// **`len_s == 0.0` is what makes that safe to do here rather than
+    /// ambiguous.** The sentinel means "never measured", the guard above
+    /// leaves on anything else, and so a clip whose loop was deliberately
+    /// unticked in the clip menu — which zeroes `loop_s` and leaves `len_s`
+    /// alone, on purpose — can never have it silently re-armed by the next
+    /// decode. A clip only passes through this door once in its life.
+    ///
+    /// The consequence for OLD documents is worth saying out loud: a project
+    /// saved before this shipped, whose audio clip still carries the
+    /// sentinel because nothing ever resolved it, gains a loop the first
+    /// time it is decoded here. Nothing about it sounds different — a loop as
+    /// long as its clip is one pass — but its right edge now pulls out into
+    /// repeats instead of stopping at the end of the file. That is the rule
+    /// applied at the first moment it CAN be applied, which is the only
+    /// honest place to draw the line: the alternative is a document whose
+    /// clips behave differently from identical clips made a minute later,
+    /// with nothing on screen to explain why.
     pub fn note_clip_len(&mut self, id: u64, len_s: f64) {
         let Some(i) = self.arrangement.clips.iter().position(|c| c.id == id) else {
             return;
@@ -8518,6 +8561,9 @@ impl TangentApp {
         // frame. See `project_dirty`.
         let was_clean = !self.project_dirty_exact();
         self.arrangement.clips[i].len_s = len_s;
+        // The loop, from the same number, in the same breath. See above for
+        // why this cannot re-arm a loop somebody turned off.
+        self.arrangement.clips[i].loop_s = len_s;
         if was_clean {
             self.mark_project_saved();
         }
@@ -14208,7 +14254,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 start_s: t,
                 offset_s: c.offset_s + head,
                 len_s: len - head,
-                loop_s: 0.0,
+                // **A blade makes a clip, so the clip it makes is a loop** —
+                // over its own new length, like everything else born here.
+                //
+                // The HEAD is left holding whatever loop it already had, and
+                // that is not an oversight: a four-bar clip repeating one bar,
+                // cut at two and a half, still repeats that bar for two and a
+                // half bars. Re-cutting the head's loop to its new length
+                // would throw the pass away and weld the repeats it had into
+                // one, which is glue's verb and not the blade's.
+                loop_s: len - head,
                 fade_in_s: 0.0,
                 fade_out_s: tail_fade,
                 name: c.name.clone(),
@@ -52749,8 +52804,8 @@ mod folder_tests {
         assert!(a.folder_children(2).is_empty());
     }
 
-    /// **A recorded MIDI take repeats when its right edge is pulled, like a
-    /// drawn one.**
+    /// **A recorded take repeats when its right edge is pulled, like a drawn
+    /// one — and BOTH kinds do.**
     ///
     /// A MIDI item DRAWN on a lane has been pinned at its own length and
     /// looped from birth since it existed, so dragging its right edge lays
@@ -52760,15 +52815,22 @@ mod folder_tests {
     /// uses on a part they like, which is what the owner meant by "MIDI are
     /// still not clips".
     ///
-    /// Audio is deliberately not looped: there the file's remaining length is
-    /// the cap `arr_trim_right` respects, and repeating it would be a
-    /// different feature rather than the same one.
+    /// **Audio used to be excluded on purpose and is not any more.** The note
+    /// that stood here said the file's remaining length was the cap and a
+    /// repeat would be a different feature; `audio_clip_passes` has since
+    /// made it the same feature, and the owner's ruling is that the kinds
+    /// stop differing at creation. So the audio half is asserted beside the
+    /// MIDI half rather than left to a comment, because a rule that holds for
+    /// one kind and is merely claimed for the other is the shape this pair
+    /// has already gone wrong in once.
     ///
-    /// Revert check performed: put `loop_s: 0.0` back for MIDI and the first
-    /// assert names it; the notes assert goes with it, because `notes_in`
-    /// stops laying down a second pass.
+    /// Revert checks performed, each red on its own assert: put `loop_s: 0.0`
+    /// back for MIDI and the first assert names the zero (the notes assert
+    /// goes with it, because `clip_notes_in_song_time` stops laying down a
+    /// second pass); restore the `if kind == Midi { .. } else { 0.0 }` arm
+    /// and the audio assert names it.
     #[test]
-    fn a_recorded_midi_take_loops_when_it_is_pulled_longer() {
+    fn a_recorded_take_of_either_kind_loops_when_it_is_pulled_longer() {
         use crate::arrangement::{ClipKind, RecordedClip};
         // `add_recorded_clips` refuses without a project — a take has to have
         // somewhere to land — so this one gets a scratch one.
@@ -52810,6 +52872,186 @@ mod folder_tests {
             "pulled to three times its length a looping take gave {} notes, not \
              three passes of one",
             notes.len()
+        );
+
+        // ── and the AUDIO half of the same rule ──
+        //
+        // A take with a path is an audio take. It is born looping over its
+        // own length like everything else, and the proof that this is not
+        // decoration is `arr_trim_right`: with a loop it has no end of file
+        // to run out of, so the right edge pulls out into repeats. The file
+        // is never opened — `add_recorded_clips` reads the path for a name
+        // and nothing else — so a name is all this needs to be.
+        a.add_recorded_clips(vec![RecordedClip {
+            lane: 1,
+            start_s: 0.0,
+            len_s: 4.0,
+            path: Some("media/take 1.wav".to_owned()),
+            notes: Vec::new(),
+        }]);
+        let audio = a
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.kind == ClipKind::Audio)
+            .expect("the audio take landed")
+            .clone();
+        assert!(
+            (audio.loop_s - 4.0).abs() < 1.0e-9,
+            "a recorded AUDIO take was born with loop {} - its right edge will \
+             stop at the end of the file instead of laying down another pass",
+            audio.loop_s
+        );
+        // The cap really is gone: the host knows this file is four seconds
+        // long, and the edge goes past it.
+        a.set_clip_infos(vec![crate::ports::ClipInfo {
+            id: audio.id,
+            wave: Vec::new(),
+            file_s: 4.0,
+            wave_from_s: 0.0,
+            wave_span_s: 4.0,
+        }]);
+        a.settings.arr_snap = false;
+        a.arr_trim_right(audio.id, 12.0);
+        let pulled = a
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id == audio.id)
+            .expect("the audio take")
+            .len_s;
+        assert!(
+            pulled > 11.0,
+            "the audio take stopped at {pulled} - the end-of-file cap is still \
+             on a clip that loops"
+        );
+    }
+
+    /// **A dropped audio file gets its loop when it gets its length, and only
+    /// once.**
+    ///
+    /// `clip_at` is the one construction site in this file that cannot arm a
+    /// loop of its own: an imported file's length is the decoder's fact, so
+    /// the clip leaves with `len_s == 0.0` — the whole-file sentinel — and a
+    /// `loop_s` written there could only be a guess. `note_clip_len` is where
+    /// the host reports back, and it hands over both numbers at once.
+    ///
+    /// The second half is the one worth having a test for. That door has to
+    /// be one-way, or the Loop row of the clip menu is a switch that flips
+    /// itself back: unticking a loop zeroes `loop_s` and deliberately leaves
+    /// `len_s` alone, so a decode arriving afterwards must not see a clip it
+    /// is entitled to re-arm. The `len_s != 0.0` guard is what makes the
+    /// sentinel mean "never measured" rather than "not looping", and it is
+    /// asserted here rather than reasoned about.
+    ///
+    /// Revert checks performed: drop the `loop_s` line from `note_clip_len`
+    /// and the first assert names the zero; move it above the early return so
+    /// it runs on a measured clip and the last assert catches the loop coming
+    /// back from the dead.
+    #[test]
+    fn an_imported_audio_clip_is_armed_by_the_decode_and_only_by_the_first_one() {
+        let (_ctx, mut a) = headless(Caps::DESKTOP);
+        a.arrangement.clips.push(crate::arrangement::ArrClip {
+            id: 7,
+            lane: 0,
+            kind: crate::arrangement::ClipKind::Audio,
+            path: "media/riff.wav".to_owned(),
+            start_s: 0.0,
+            // What `clip_at` writes: the length is not known yet.
+            len_s: 0.0,
+            loop_s: 0.0,
+            ..Default::default()
+        });
+        let of = |a: &TangentApp| {
+            let c = a.arrangement.clips.iter().find(|c| c.id == 7).expect("the clip");
+            (c.len_s, c.loop_s)
+        };
+
+        a.note_clip_len(7, 6.0);
+        let (len, lp) = of(&a);
+        assert!(
+            (len - 6.0).abs() < 1.0e-9 && (lp - 6.0).abs() < 1.0e-9,
+            "the decode left the clip at length {len} and loop {lp} - both \
+             should be the six seconds it just measured"
+        );
+
+        // Now the loop is turned off, which is what the clip menu's Loop row
+        // does: `loop_s` to zero, `len_s` untouched. Written here rather than
+        // driven through the menu because what is under test is the DOOR, not
+        // the switch — the row has its own test.
+        a.arr_clip_mut(7).expect("the clip").loop_s = 0.0;
+
+        // A second decode — a reload, a stretch, a relaunch. It must change
+        // nothing at all.
+        a.note_clip_len(7, 6.0);
+        assert_eq!(
+            of(&a).1,
+            0.0,
+            "a second decode re-armed a loop the owner had turned off"
+        );
+    }
+
+    /// **The blade makes a clip, so the clip it makes is a loop — and the
+    /// half it cuts FROM keeps the loop it already had.**
+    ///
+    /// Two rules that look like one and are not. The tail is a brand new clip
+    /// and takes the birthright every other construction site here gives:
+    /// a loop over its own length, so its right edge pulls out into repeats
+    /// rather than stopping. The head is not new — it is the same clip,
+    /// shorter — and a four-bar clip repeating one bar, cut at two and a
+    /// half, still repeats that bar. Re-cutting the head's loop to its new
+    /// length would weld those repeats into a single pass, which is glue's
+    /// verb and not the blade's.
+    ///
+    /// Revert checks performed: put `loop_s: 0.0` back on the tail and the
+    /// tail assert names it; set the head's loop to its new length and the
+    /// head assert names that.
+    #[test]
+    fn a_split_gives_the_tail_a_loop_and_leaves_the_head_its_own() {
+        let (_ctx, mut a) = headless(Caps::DESKTOP);
+        a.settings.arr_snap = false;
+        a.arrangement.clips.push(crate::arrangement::ArrClip {
+            id: 3,
+            lane: 0,
+            kind: crate::arrangement::ClipKind::Midi,
+            start_s: 0.0,
+            len_s: 8.0,
+            // Four passes of two seconds.
+            loop_s: 2.0,
+            notes: vec![crate::arrangement::ArrNote {
+                at_s: 0.5,
+                dur_s: 0.25,
+                key: 60,
+                vel: 100,
+            }],
+            ..Default::default()
+        });
+        a.arr_selected = Some(3);
+        a.recorder.position_s = 5.0;
+        a.arr_split_at_playhead();
+
+        let head = a.arrangement.clips.iter().find(|c| c.id == 3).expect("the head");
+        assert!((head.len_s - 5.0).abs() < 1.0e-9, "the head is {} long", head.len_s);
+        assert!(
+            (head.loop_s - 2.0).abs() < 1.0e-9,
+            "the head's two-second pass became {} - the blade welded its \
+             repeats instead of cutting through them",
+            head.loop_s
+        );
+
+        let tail = a
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id != 3)
+            .expect("the tail landed");
+        assert!((tail.len_s - 3.0).abs() < 1.0e-9, "the tail is {} long", tail.len_s);
+        assert!(
+            (tail.loop_s - tail.len_s).abs() < 1.0e-9 && tail.loop_s > 0.0,
+            "the tail was born with loop {} against a length of {} - a clip \
+             the blade made is a clip, and every clip is a loop",
+            tail.loop_s,
+            tail.len_s
         );
     }
 
