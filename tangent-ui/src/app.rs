@@ -2182,6 +2182,16 @@ enum MeDrag {
     /// transport was last sent to, so a hand that has not crossed a grid
     /// line does not send it there again every frame.
     NavScrub { dom: (f64, f64), last: f64 },
+    /// **The LOOP BAR being pulled**: the clip's one pass gets longer or
+    /// shorter under the hand.
+    ///
+    /// `grab_s` is how far the hand was from the bar when it took hold, in
+    /// seconds, so the bar never jumps to meet the pointer — the contract
+    /// every other drag in this app keeps, and one that matters more here
+    /// than most: the grab zone is ten points wide, so a bar that snapped to
+    /// the hand would move by up to ten points on the press frame and the
+    /// loop would change length before anybody had dragged anything.
+    LoopBar { grab_s: f64 },
 }
 
 /// Where the media explorer wakes up: the user's home, or the root.
@@ -14268,6 +14278,76 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         crate::midi_editor::snap_floor_t(&self.midi_edit_view(st, clip), t)
     }
 
+    /// **The shortest a loop may be pulled**, in seconds.
+    ///
+    /// The same floor `arr_trim_right` puts under a clip's length, and it is
+    /// the same number for the same reason: below it a clip is a sliver
+    /// nobody can grab back. It matters more here than there, because the
+    /// loop's length is a DIVISOR — the schedule and both pictures count
+    /// `len / loop` passes and clamp that count, so a loop pulled to a
+    /// thousandth of a second under a minute-long clip would not merely look
+    /// silly, it would stop sounding after the clamp ran out.
+    const ME_LOOP_MIN_S: f64 = 0.05;
+
+    /// **Put the loop's right end at `t`** — the loop bar's one writer.
+    ///
+    /// The owner: "a bar on the right end of clip/loop will be draggable to
+    /// right or left, shortening or lengthening the loop."
+    ///
+    /// Snapped by the editor's own magnet, so the loop lands on the grid the
+    /// notes inside it landed on. The SNAP chip governs it like everything
+    /// else here: a loop is a musical length, and a magnet that held the
+    /// notes and not the bar around them would make a bar-long loop a matter
+    /// of luck.
+    ///
+    /// **And the clip grows to hold its own pass.** `len_s` is how long the
+    /// clip stands on the timeline and `loop_s` is how long one pass of it
+    /// is, and the schedule DROPS every note past `len_s` — so a loop
+    /// lengthened past the clip's end would go on saying it was two bars long
+    /// while the second bar of it was silent. A control that can be dragged
+    /// into a state where its own tail does not sound is a control that lies.
+    /// The clip is therefore pushed out to the loop, never pulled in: a clip
+    /// longer than its loop is a stack of passes and stays exactly as it was,
+    /// and trimming a loop SHORT does not shorten the clip, it lays down more
+    /// passes — which is the whole point of the gesture.
+    fn me_set_loop_end(&mut self, t: f64) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let Some(start) = self.arrangement.clips.iter().find(|c| c.id == id).map(|c| c.start_s)
+        else {
+            return;
+        };
+        if !t.is_finite() {
+            return;
+        }
+        let mut end = self.me_snap(t);
+        if end - start < Self::ME_LOOP_MIN_S {
+            // Under the floor. With the magnet on, the answer is the first
+            // grid line past the clip's head rather than the floor itself —
+            // a loop dragged to its shortest should still be a note value,
+            // not whatever fifty milliseconds happens to fall on. `max` after
+            // it, because a grid fine enough (a 64th at 400bpm is nine
+            // milliseconds) can land under the floor too, and the floor wins.
+            end = self.me_snap_ceil(start + Self::ME_LOOP_MIN_S);
+            end = end.max(start + Self::ME_LOOP_MIN_S);
+        }
+        let loop_s = end - start;
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let len_s = clip.len_s.max(loop_s);
+        if (clip.loop_s - loop_s).abs() < 1.0e-9 && (clip.len_s - len_s).abs() < 1.0e-9 {
+            return;
+        }
+        clip.loop_s = loop_s;
+        clip.len_s = len_s;
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.dirty = true;
+        }
+    }
+
     /// Keep `i` in the sorted selection; answer whether it was new.
     fn me_select(&mut self, i: usize, extend: bool) {
         let Some(st) = self.midi_edit.as_mut() else {
@@ -15350,6 +15430,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             name: &clip.name,
             clip_start_s: clip.start_s,
             clip_len_s: clip.len_s,
+            loop_s: clip.loop_s,
             offset_s: clip.offset_s,
             notes: &clip.notes,
             selected: &st.selected,
@@ -17615,7 +17696,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // Read here, from the same view the hit was read from, so a
                 // navigator press is priced against the picture it landed
                 // on and not against one recomputed a line later.
-                let (hit, nav_at, nav_dom) = {
+                // `roll_at` rides along for the same reason: the loop bar is
+                // grabbed at a distance from where it stands, and that
+                // distance has to be measured in the ROLL's axis against the
+                // same view the hit came from.
+                let (hit, nav_at, nav_dom, roll_at) = {
                     let st = self.midi_edit.as_ref().unwrap();
                     let clip = self.arrangement.clips.iter().find(|c| c.id == id).unwrap();
                     let view = self.midi_edit_view(st, clip);
@@ -17624,6 +17709,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         crate::midi_editor::hit_test(rect, &view, p),
                         crate::midi_editor::nav_time_at(&l, &view, p.x),
                         (view.nav_start_s, view.nav_len_s),
+                        crate::midi_editor::time_at(&l, &view, p.x),
                     )
                 };
                 use crate::midi_editor::Hit as H;
@@ -17727,6 +17813,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // it must not fall through to the arm below, which would
                     // read a press on the strip as a press on empty roll.
                     Some(H::NavWindow | H::NavLeft | H::NavRight | H::NavField(_)) => {}
+                    // **The loop bar.** Picked up by wherever the hand landed
+                    // on it, like the navigator's window: the bar is where the
+                    // pass ends, and a press must not be an edit.
+                    Some(H::LoopBar) if pressed => {
+                        let end = self
+                            .arrangement
+                            .clips
+                            .iter()
+                            .find(|c| c.id == id)
+                            .map_or(0.0, |c| c.start_s + c.loop_s);
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = Some(MeDrag::LoopBar { grab_s: roll_at - end });
+                        }
+                    }
+                    // The right button means nothing on it either, and it must
+                    // not fall through to the empty-roll arm below: the bar
+                    // stands over the roll, and a right press there would open
+                    // the app menu from a control that has no menu.
+                    Some(H::LoopBar) => {}
                     Some(H::Vel(t)) if pressed => {
                         if let Some(st) = self.midi_edit.as_mut() {
                             st.drag = Some(MeDrag::Vel);
@@ -18166,6 +18271,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     let end = (nav_t - grab_s).min(dom.0 + dom.1);
                     self.me_steer(start, (end - start).max(0.25), dom);
                 }
+                MeDrag::LoopBar { grab_s } => self.me_set_loop_end(t_at - grab_s),
                 MeDrag::NavScrub { dom, last } => {
                     // The band's scrub: the transport follows the hand for
                     // as long as the press is held, snapped as the press
@@ -49050,6 +49156,198 @@ mod tests {
         assert!((s4 - floor).abs() < 1.0e-6, "the window went to {s4}; the world starts at {floor}");
         release(&ctx, &mut app, Pos2::new(5.0, grab.y));
         assert!(app.midi_edit.as_ref().unwrap().drag.is_none(), "the release did not let go");
+    }
+
+    /// A looping clip open in the editor with the whole of it on the roll:
+    /// eight seconds from 4:00, one pass, a note in it. `(rect, id)`.
+    fn midi_editor_on_a_loop(ctx: &egui::Context, app: &mut TangentApp) -> (Rect, u64) {
+        use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+        app.arrangement_open = true;
+        let _ = run_frame(ctx, app);
+        app.arrangement.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            notes: vec![ArrNote { at_s: 0.5, dur_s: 1.0, key: 60, vel: 100 }],
+            lane: 0,
+            path: String::new(),
+            start_s: 4.0,
+            offset_s: 0.0,
+            len_s: 8.0,
+            // Pinned at its own length, which is what a drawn item is born as.
+            loop_s: 8.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "m".into(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        let id = app.arrangement.clips[0].id;
+        app.open_midi_editor(id);
+        app.settings.midi_snap = true;
+        if let Some(st) = app.midi_edit.as_mut() {
+            // Wide enough that the bar stays on the roll all the way out to
+            // eighteen seconds, which the "past the clip's end" leg needs.
+            st.view_start_s = 2.0;
+            st.view_len_s = 20.0;
+        }
+        let _ = run_frame(ctx, app);
+        (app.midi_edit_rect.expect("the editor drew nowhere"), id)
+    }
+
+    /// **The loop bar shortens the loop, lengthens it, and takes the clip
+    /// with it rather than leaving a pass that does not sound.**
+    ///
+    /// The owner: "In midi editor, a bar on the right end of clip/loop will
+    /// be draggable to right or left, shortening or lengthening the loop."
+    ///
+    /// Four things, each of which can go wrong on its own. The press must not
+    /// move the bar — the grab zone is ten points wide and a bar that snapped
+    /// to the hand would change the loop before anybody dragged. Dragged IN,
+    /// the loop shortens and the clip stands exactly as it was, which is what
+    /// turns one pass into two. Dragged OUT past the clip's end, the clip
+    /// grows to hold the pass, because the schedule drops every note past
+    /// `len_s` and a loop whose tail is silent is a control that lies. And
+    /// dragged back through the clip's own head it stops at a grid line
+    /// rather than at zero.
+    ///
+    /// Driven at the event level: what is under test is a HANDLE, and a
+    /// state-level call to the writer would have proved nothing about
+    /// whether a press ever reaches it.
+    ///
+    /// Reverts performed, all three red: drop `grab_s` and use the hand's own
+    /// second, and the magnet-OFF press assertion catches the jump (the
+    /// magnet-on one does not — see that leg for why it is here); write
+    /// `loop_s` without `len_s.max(loop_s)` and the grown clip reads eight
+    /// around a fourteen-second pass; drop the floor and the last leg reads a
+    /// loop of MINUS four seconds.
+    #[test]
+    fn the_loop_bar_sets_the_loop_and_the_clip_never_ends_before_its_own_pass() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, id) = midi_editor_on_a_loop(&ctx, &mut app);
+        let clip_of = |app: &TangentApp| {
+            let c = app.arrangement.clips.iter().find(|c| c.id == id).expect("the clip");
+            (c.start_s, c.len_s, c.loop_s)
+        };
+        assert_eq!(clip_of(&app), (4.0, 8.0, 8.0), "the fixture is not one pass of eight");
+        // Where a second stands on the roll, and the bar's own column, asked
+        // fresh every time: pulling the loop changes the clip, and a
+        // rectangle cached across a drag is one from before the drag.
+        let x_at = |app: &TangentApp, t: f64| -> f32 {
+            let st = app.midi_edit.as_ref().expect("the editor closed");
+            let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+            let view = app.midi_edit_view(st, clip);
+            crate::midi_editor::x_of(&crate::midi_editor::Layout::new(rect), &view, t)
+        };
+        let bar_x = |app: &TangentApp| -> f32 {
+            let st = app.midi_edit.as_ref().expect("the editor closed");
+            let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+            let view = app.midi_edit_view(st, clip);
+            crate::midi_editor::loop_bar_x(&crate::midi_editor::Layout::new(rect), &view)
+                .expect("the loop drew no bar")
+        };
+        let y = crate::midi_editor::Layout::new(rect).ruler.center().y;
+
+        // ── the press alone changes nothing ──
+        // Deliberately three points off the bar's centre, inside the grab:
+        // that offset is exactly what a jump would swallow.
+        let at = Pos2::new(bar_x(&app) + 3.0, y);
+        press(&ctx, &mut app, at);
+        assert!(
+            matches!(app.midi_edit.as_ref().unwrap().drag, Some(MeDrag::LoopBar { .. })),
+            "the press on the bar picked up something else"
+        );
+        assert_eq!(clip_of(&app), (4.0, 8.0, 8.0), "the press moved the loop to meet the hand");
+
+        // ── in: four seconds, so the clip now holds two passes ──
+        let at = Pos2::new(x_at(&app, 8.0) + 3.0, y);
+        move_to(&ctx, &mut app, at);
+        let (_, len, loop_s) = clip_of(&app);
+        assert!((loop_s - 4.0).abs() < 1.0e-6, "the loop came in to {loop_s}, not four seconds");
+        assert!((len - 8.0).abs() < 1.0e-9, "shortening the loop changed the clip to {len}");
+        let passes = {
+            let c = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+            crate::arrangement::clip_notes_in_song_time(c).len()
+        };
+        assert_eq!(passes, 2, "an eight-second clip over a four-second loop played {passes}");
+
+        // ── out, past the clip's own end: the clip grows to hold the pass ──
+        let at = Pos2::new(x_at(&app, 18.0) + 3.0, y);
+        move_to(&ctx, &mut app, at);
+        let (_, len, loop_s) = clip_of(&app);
+        assert!((loop_s - 14.0).abs() < 1.0e-6, "the loop went out to {loop_s}, not fourteen");
+        assert!(
+            (len - loop_s).abs() < 1.0e-9,
+            "the clip is {len} long around a {loop_s} pass — its tail would not sound"
+        );
+
+        // ── back through the clip's own head: a grid line, never nothing ──
+        let at = Pos2::new(x_at(&app, 0.0), y);
+        move_to(&ctx, &mut app, at);
+        let (_, _, loop_s) = clip_of(&app);
+        let step = {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+            crate::midi_editor::grid_step_s(&app.midi_edit_view(st, clip))
+        };
+        assert!(
+            loop_s >= TangentApp::ME_LOOP_MIN_S,
+            "the loop was pulled to {loop_s}, under the floor"
+        );
+        assert!(
+            (loop_s - step).abs() < 1.0e-6,
+            "the shortest loop is {loop_s} against a grid step of {step}"
+        );
+
+        release(&ctx, &mut app, at);
+        assert!(app.midi_edit.as_ref().unwrap().drag.is_none(), "the release did not let go");
+
+        // ── with the magnet OFF, the grab offset is the whole story ──
+        //
+        // **This leg is why the offset is testable at all.** With the magnet
+        // on, a bar picked up a few points off centre lands on the same grid
+        // line either way — the snap swallows the error, and a version of
+        // this test that only ever ran snapped passed against a build that
+        // threw `grab_s` away. Off the grid the bar has to land exactly where
+        // the hand put it, less the distance it was taken hold at, and the
+        // press is deliberately made at the far edge of the ten-point zone so
+        // that distance is as large as a hand can make it.
+        app.settings.midi_snap = false;
+        let per_pt = {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+            let view = app.midi_edit_view(st, clip);
+            let l = crate::midi_editor::Layout::new(rect);
+            crate::midi_editor::time_at(&l, &view, 1.0) - crate::midi_editor::time_at(&l, &view, 0.0)
+        };
+        let x0 = bar_x(&app);
+        let at = Pos2::new(x0 + crate::midi_editor::LOOP_BAR_GRAB - 0.5, y);
+        let (_, _, before) = clip_of(&app);
+        press(&ctx, &mut app, at);
+        assert!(
+            (clip_of(&app).2 - before).abs() < 1.0e-9,
+            "off the grid, the press alone moved the loop from {before} to {} — it jumped \
+             the four and a half points it was picked up at",
+            clip_of(&app).2
+        );
+        let at = Pos2::new(x0 + 40.0, y);
+        move_to(&ctx, &mut app, at);
+        let (_, _, after) = clip_of(&app);
+        // The hand's TRAVEL, not the pointer's distance from the bar: it was
+        // picked up four and a half points to the right of the line, so a bar
+        // riding at its grab moves by the difference and one that jumped to
+        // the pointer moves by the whole forty.
+        let travelled = (40.0 - f64::from(crate::midi_editor::LOOP_BAR_GRAB - 0.5)) * per_pt;
+        assert!(
+            (after - before - travelled).abs() < travelled * 0.05,
+            "the hand travelled {travelled} and the loop moved by {} \
+             — the bar jumped to the pointer instead of riding at its grab",
+            after - before
+        );
+        release(&ctx, &mut app, at);
     }
 
     /// **The navigator's edges zoom the window, and the far end stands

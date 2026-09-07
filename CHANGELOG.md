@@ -23,6 +23,18 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   structure, not a picture of a loop — and an empty MIDI item that has not been
   played into yet gets it too, which is exactly when it is most useful.
 
+- **The MIDI editor has a loop bar.** The clip's right end carries a bar down
+  the roll with a grip tab on the ruler above it: drag it left to shorten the
+  loop and right to lengthen it. Shortening turns one pass into several without
+  touching the clip's place on the timeline, which is how a four-bar part
+  becomes four repeats of one bar; lengthening past the clip's own end grows
+  the clip with it, because the schedule drops everything past the clip's end
+  and a loop whose tail is silent is a control that lies. It follows the SNAP
+  chip like everything else in the editor, so a loop lands on the grid the
+  notes in it landed on, and it will not be pulled shorter than one grid line.
+  A note that ends on the turn keeps its own edge — notes win on the roll, and
+  the tab on the ruler is the half of the handle that nothing can cover.
+
 - **Press and hold a DX7 patch name to hear it.** The instrument's picker
   sounds the patch under your finger at middle C, on the strip the window
   belongs to, for as long as the button is down. It works in both panes, on
