@@ -2735,22 +2735,57 @@ fn draw_note_miniature(
     let y_of = |k: usize| {
         inner.top() + (inner.height() - bar_h) * (1.0 - k as f32 / span)
     };
-    let bar = |x0: f32, top: f32, bottom: f32| {
-        painter.rect_filled(
+    // **Every mark of this clip goes into ONE shape.**
+    //
+    // A mark used to be a `rect_filled`, which is a `Shape` of its own: a
+    // hundred bytes pushed on the frame's list, and then a whole rounded
+    // rectangle tessellated out of it — an arc at each of four corners and
+    // a feathered skirt around the outside, eight vertices and thirty
+    // indices for a dash a point and a half wide. Measured on the perf
+    // fixture's largest project at the whole-song zoom, that was 51,240 of
+    // the frame's 53,232 shapes, and the tessellator spent 3.9 ms of the
+    // frame's 5.7 on them: the miniatures WERE the frame.
+    //
+    // They are four vertices and two triangles each now, written straight
+    // into a mesh the clip hands over once — 2,480 shapes and 3.2 ms.
+    // The geometry is the same rectangle to the bit —
+    // the arithmetic above is untouched, and `mod tests` still holds the
+    // picture against the plain walk cell by cell — so what is given up is
+    // only what epaint was doing UNDERNEATH the rectangle:
+    //
+    // * the feathered edge. A mark is 1.5 pt wide against a feather of half
+    //   a point on a retina screen, so the softening was a third of it; a
+    //   miniature is an impression of a part, drawn in ink at 80% and
+    //   overlapping itself, and a crisper dash is not a different picture.
+    // * epaint's pixel rounding of a filled rect (`round_rects_to_pixels`,
+    //   on by default). The merged marks all sit on whole-point column
+    //   boundaries and so all shared one rounding; unrounded they still
+    //   share one phase, so they stay a comb rather than becoming a ragged
+    //   one. A held note's span moves by less than a pixel.
+    // * the 1 pt corner radius, which epaint clamped to 0.75 on a mark this
+    //   size and which `what_do_the_note_miniatures_pay_every_frame` had
+    //   already measured as costing nothing to drop.
+    //
+    // What it must NOT give up is the order: a mark's ink is translucent, so
+    // two marks that overlap read darker, and triangles are drawn in the
+    // order they are indexed. The span pass writes first and the merged
+    // columns after, exactly as the two `rect_filled` passes did.
+    let mark_ink = ink.gamma_multiply(0.8);
+    let mut mesh = egui::epaint::Mesh::default();
+    let bar = |mesh: &mut egui::epaint::Mesh, x0: f32, top: f32, bottom: f32| {
+        mesh.add_colored_rect(
             Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x0 + 1.5, bottom)),
-            1.0,
-            ink.gamma_multiply(0.8),
+            mark_ink,
         );
     };
     // One mark drawn where it actually falls, over the span it actually
     // covers. This is the plain walk's own drawing, kept as a closure so
     // that the merged path can reach for it note by note.
-    let span_bar = |x0: f32, x1: f32, k: u8| {
+    let span_bar = |mesh: &mut egui::epaint::Mesh, x0: f32, x1: f32, k: u8| {
         let y = y_of(usize::from(k));
-        painter.rect_filled(
+        mesh.add_colored_rect(
             Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1.max(x0 + 1.5), y + bar_h)),
-            1.0,
-            ink.gamma_multiply(0.8),
+            mark_ink,
         );
     };
     // One column of the merge grid per point of width, and a ceiling on it.
@@ -2819,43 +2854,49 @@ fn draw_note_miniature(
             // it is. A held note crosses many columns and reads as a line;
             // folding it into the column it starts in would delete it.
             if lit.is_empty() || x1 - x0 >= 1.0 {
-                span_bar(x0, x1, k);
+                span_bar(&mut mesh, x0, x1, k);
             } else {
                 let c = (((x0 - inner.left()).max(0.0)) as usize).min(cols - 1);
                 lit[c * 2 + usize::from(k) / 64] |= 1u64 << (usize::from(k) % 64);
             }
         }
     }
-    if lit.is_empty() {
-        return;
-    }
-    for c in 0..cols {
-        let words = [lit[c * 2], lit[c * 2 + 1]];
-        if words == [0, 0] {
-            continue;
-        }
-        let x0 = inner.left() + c as f32;
-        // Pitches come out ascending, so y comes out descending: a run
-        // grows UPWARD and is drawn when the next pitch stops touching it.
-        let mut run: Option<(f32, f32)> = None;
-        for (w, mut bits) in words.into_iter().enumerate() {
-            while bits != 0 {
-                let k = bits.trailing_zeros() as usize + w * 64;
-                bits &= bits - 1;
-                let y = y_of(k);
-                run = Some(match run {
-                    Some((top, bottom)) if y + bar_h >= top => (y, bottom),
-                    Some((top, bottom)) => {
-                        bar(x0, top, bottom);
-                        (y, y + bar_h)
-                    }
-                    None => (y, y + bar_h),
-                });
+    // **The one exit that hands the mesh over.** The merged columns are
+    // skipped when there is no grid, not returned from: the span pass has
+    // already written into the mesh by here, and a `return` above the
+    // handover is how a clip's whole miniature goes missing.
+    if !lit.is_empty() {
+        for c in 0..cols {
+            let words = [lit[c * 2], lit[c * 2 + 1]];
+            if words == [0, 0] {
+                continue;
+            }
+            let x0 = inner.left() + c as f32;
+            // Pitches come out ascending, so y comes out descending: a run
+            // grows UPWARD and is drawn when the next pitch stops touching it.
+            let mut run: Option<(f32, f32)> = None;
+            for (w, mut bits) in words.into_iter().enumerate() {
+                while bits != 0 {
+                    let k = bits.trailing_zeros() as usize + w * 64;
+                    bits &= bits - 1;
+                    let y = y_of(k);
+                    run = Some(match run {
+                        Some((top, bottom)) if y + bar_h >= top => (y, bottom),
+                        Some((top, bottom)) => {
+                            bar(&mut mesh, x0, top, bottom);
+                            (y, y + bar_h)
+                        }
+                        None => (y, y + bar_h),
+                    });
+                }
+            }
+            if let Some((top, bottom)) = run {
+                bar(&mut mesh, x0, top, bottom);
             }
         }
-        if let Some((top, bottom)) = run {
-            bar(x0, top, bottom);
-        }
+    }
+    if !mesh.is_empty() {
+        painter.add(egui::Shape::mesh(mesh));
     }
 }
 
@@ -10111,8 +10152,30 @@ selected: false,
     /// The samples a drawing covers, sorted, at [`SUB`] to the point.
     type Cells = Vec<(i32, i32)>;
 
+    /// **Every mark a miniature painted, whichever shape carried it.**
+    ///
+    /// A mark used to be one `Shape::Rect` and is two triangles inside the
+    /// clip's own `Shape::Mesh` now — see `draw_note_miniature`. The
+    /// rectangle did not move, so the readers below recover it rather than
+    /// the drawing being bent to suit them: `Mesh::add_colored_rect` writes
+    /// four vertices per mark, top-left, top-right, bottom-left,
+    /// bottom-right, so a chunk of four IS one mark and the first and last
+    /// of them are its corners. The reference walk still paints plain rects
+    /// — which is the point of these tests, and the reason this reads BOTH.
+    pub(super) fn marks_of(shape: &egui::Shape) -> Vec<Rect> {
+        match shape {
+            egui::Shape::Rect(q) => vec![q.rect],
+            egui::Shape::Mesh(m) => m
+                .vertices
+                .chunks_exact(4)
+                .map(|v| Rect::from_min_max(v[0].pos, v[3].pos))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// **What a miniature LIGHTS**, at [`SUB`] cells to the point: every
-    /// sample any of its rects covers. This is the picture as an eye gets
+    /// sample any of its marks covers. This is the picture as an eye gets
     /// it, so two drawings that agree here are the same miniature however
     /// differently they were built.
     fn lit_cells(draw: impl FnOnce(&Painter)) -> Cells {
@@ -10124,10 +10187,7 @@ selected: false,
             g.get(layer)
                 .map(|list| {
                     list.all_entries()
-                        .filter_map(|c| match &c.shape {
-                            egui::Shape::Rect(q) => Some(q.rect),
-                            _ => None,
-                        })
+                        .flat_map(|c| marks_of(&c.shape))
                         .flat_map(|q| {
                             let s = |v: f32| (v * SUB).round() as i32;
                             let (x0, x1) = (s(q.left()), s(q.right()));
@@ -10182,14 +10242,7 @@ selected: false,
             }
             ctx.graphics(|g| {
                 g.get(layer)
-                    .map(|list| {
-                        list.all_entries()
-                            .filter_map(|c| match &c.shape {
-                                egui::Shape::Rect(q) => Some(q.rect),
-                                _ => None,
-                            })
-                            .collect()
-                    })
+                    .map(|list| list.all_entries().flat_map(|c| marks_of(&c.shape)).collect())
                     .unwrap_or_default()
             })
         };
@@ -11114,7 +11167,7 @@ selected: false,
 
 #[cfg(test)]
 mod miniature_cost_probe {
-    use super::tests::{a_view, reference_miniature, rect};
+    use super::tests::{a_view, marks_of, reference_miniature, rect};
     use super::*;
     use crate::arrangement::ArrNote;
     use std::time::{Duration, Instant};
@@ -11196,17 +11249,15 @@ mod miniature_cost_probe {
         })
     }
 
-    /// Every rect the miniature pass emitted, in draw order.
+    /// Every MARK the miniature pass emitted, in draw order — a rect from
+    /// the reference walk, a quad out of the drawing's mesh. See
+    /// `tests::marks_of`; a count that stopped seeing the marks the moment
+    /// they moved into a mesh would have reported the whole cost gone.
     fn rects(ctx: &egui::Context, layer: egui::LayerId) -> Vec<Rect> {
         ctx.graphics(|g| {
             g.get(layer)
                 .map(|list| {
-                    list.all_entries()
-                        .filter_map(|c| match &c.shape {
-                            egui::Shape::Rect(r) => Some(r.rect),
-                            _ => None,
-                        })
-                        .collect()
+                    list.all_entries().flat_map(|c| marks_of(&c.shape)).collect()
                 })
                 .unwrap_or_default()
         })
