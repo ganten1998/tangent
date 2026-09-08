@@ -1611,7 +1611,7 @@ mod tests {
         // before making the next would measure a machine that is not the
         // one the owner has.
         let mut kept: Vec<Instance> = Vec::new();
-        let mut totals = [Duration::ZERO; 6];
+        let mut totals = [Duration::ZERO; 7];
         for bay in 0..n {
             let t = Instant::now();
             let module = crate::scan::module_for(&bundle).expect("open the bundle");
@@ -1645,6 +1645,16 @@ mod tests {
             for _ in 0..8 {
                 after = after.max(block_peak(&mut inst, &mut bufs2, &[]).unwrap_or(0.0).abs());
             }
+            // **And what CLOSING this bay costs**, because a project switch
+            // pays it before the incoming one is read: `save_plugin_states`
+            // asks every occupied bay of the OUTGOING session for its state,
+            // and `save_insert_state`'s own doc says asking a sampler for one
+            // is not free. Measured on the same instance rather than guessed
+            // at.
+            let t = Instant::now();
+            let saved = inst.state_handle().save().map(|b| b.len()).unwrap_or(0);
+            let get_state = t.elapsed();
+            totals[6] += get_state;
             for (slot, d) in
                 [open, list, create, restore, warm, processing].into_iter().enumerate()
             {
@@ -1653,7 +1663,8 @@ mod tests {
             println!(
                 "  bay {bay}: module_for {open:?} | audio_modules {list:?} | create {create:?} \
                  | load_state {restore:?} ({}) | warm_up {warm:?} ({}) | set_processing \
-                 {processing:?} | handed to the rack at {:.1} dBFS",
+                 {processing:?} | handed to the rack at {:.1} dBFS | getState {get_state:?} \
+                 ({saved} bytes)",
                 if restored { "restored" } else { "none" },
                 match &gate {
                     None => "an effect, no gate".to_owned(),
@@ -1665,13 +1676,22 @@ mod tests {
         }
         let elapsed = whole.elapsed();
         let names = ["module_for", "audio_modules", "create", "load_state", "warm_up", "processing"];
+        // The open is what the first six cost; `getState` belongs to CLOSING
+        // the outgoing session, so it is reported beside the table and not
+        // inside it.
+        let open_total: Duration = totals[..6].iter().sum();
         println!("  --- {n} bays, {elapsed:?} of wall clock ---");
         for (name, total) in names.into_iter().zip(totals) {
             println!(
                 "  {name:<14} {total:>12?}  {:>5.1}% of the open",
-                total.as_secs_f64() / elapsed.as_secs_f64() * 100.0
+                total.as_secs_f64() / open_total.as_secs_f64() * 100.0
             );
         }
+        println!(
+            "  {:<14} {:>12?}  what a project SWITCH pays for these bays before the \
+             incoming document is read (save_plugin_states)",
+            "getState", totals[6],
+        );
         // Kept alive to here on purpose; dropping them is not part of the
         // number above.
         drop(kept);
