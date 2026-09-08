@@ -16429,9 +16429,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Re-list the explorer's directory: folders first, then audio files,
     /// both sorted, dotfiles skipped.
     fn refresh_media(&mut self) {
-        const AUDIO: [&str; 11] = [
-            "wav", "aiff", "aif", "mp3", "m4a", "aac", "flac", "ogg", "opus", "caf", "wma",
-        ];
         // An EMPTY media_dir is the ROOTS view: every drive letter that
         // answers, or the one root everything else has. Portable — the
         // probe simply finds nothing but "/" off Windows.
@@ -16517,13 +16514,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 match std::fs::metadata(e.path()) {
                     Ok(t) if t.is_dir() => dirs.push(name),
                     Ok(t) if t.is_file() => {
-                        let audio = std::path::Path::new(&name)
-                            .extension()
-                            .and_then(|x| x.to_str())
-                            .is_some_and(|x| {
-                                AUDIO.contains(&x.to_ascii_lowercase().as_str())
-                            });
-                        if audio {
+                        // The filter is `drumpad_panel::is_audio_file` now,
+                        // shared with the sampler's explorer: two panels
+                        // that list different files out of one folder is a
+                        // panel offering what its sibling hides.
+                        if crate::drumpad_panel::is_audio_file(&name) {
                             files.push(name);
                         }
                     }
