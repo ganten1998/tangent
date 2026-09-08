@@ -102,7 +102,12 @@ eframe = { version = "0.33", default-features = false, features = [
 log = "0.4"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# `float_roundtrip` for the same reason tangent-ui turns it on: the plugin
+# build round-trips the settings JSON through DAW project files, and a float
+# that reads back one ULP off is a setting that drifts on every save. Cargo
+# unifies features per crate, so this is also what any binary that links
+# tangent-ui gets; naming it here keeps the intent visible in both places.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 dirs = "6"
 fd-lock = "4"
 # Optional: the LAME C build cannot be CROSS-compiled at all — autoconf tests
