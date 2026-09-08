@@ -420,6 +420,31 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **Opening a project with instruments on it took the better part of a
+  minute, and almost all of it was one wait nobody was waiting for.** Every
+  hosted instrument was warmed up before it was allowed into its rack, and
+  the warm-up held a five second floor: five seconds of deliberate wall
+  clock, per bay, one bay at a time, on the thread that draws the window. A
+  nine channel session carrying seven of the same sampled Rhodes measured
+  40.3 seconds to open, 35.0 of them inside that floor.
+
+  The floor was costed for a different job. It exists so the recorder does
+  not arm on a sampled piano that is still reading its samples off disk and
+  record a silent take, and it was paid once, when the Recorder view opened,
+  behind a view somebody had just asked for. Filling a rack is not that job:
+  loading a plug-in into a bay arms nothing. So a bay load warms up under its
+  own policy now, keeping every part of the test that decides anything and
+  dropping the wait that follows it. The same seven bays come up in 6.8
+  seconds, each one still proved to make a sound before it is handed over,
+  and each one still handed over silent. What is left is very nearly all the
+  plug-in's own: about a fifth of a second to construct each instance and
+  another third to restore its preset.
+
+  The launch splash covers the whole of it again as a result. It gives up
+  after twelve seconds by design, so a session like this one used to lose its
+  cover a third of the way in and leave a half drawn window sitting there for
+  the rest.
+
 - **A take that had finished decoding could sit behind the desk.** The window
   rests between animations now, so everything the app does after a frame has to
   ask for the frame that shows it. Five roads did not: a decoded take arriving,
