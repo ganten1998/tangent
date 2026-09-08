@@ -11178,12 +11178,31 @@ impl Engine {
                 Some(bytes) => inst.load_state(bytes).err(),
                 None => None,
             };
-            // **A voice warms up like the slot it used to be.** The gate exists so
-            // a sampled piano is not handed to the callback while it still renders
-            // silence; nothing about moving into a bay changed that. An effect
-            // needs no warm-up — see the note on `load` — and gets none.
+            // **A voice warms up like the slot it used to be, but NOT under the
+            // slot's policy.** The gate exists so a sampled piano is not handed
+            // to the callback while it still renders silence; nothing about
+            // moving into a bay changed that. An effect needs no warm-up — see
+            // the note on `load` — and gets none.
+            //
+            // **What DID change is who pays, and it is why opening a project
+            // took the better part of a minute.** `Policy::default`'s five
+            // second floor was costed for one instrument warmed once behind a
+            // view the user had just opened; the reconcile in `desktop.rs`
+            // fills a rack one bay per frame, so a project with seven sampled
+            // instruments on it paid that floor seven times, serially, on the
+            // UI thread, before the desk was usable. Measured on the owner's
+            // own session: 40.3 s for seven bays, 35.0 s of it — 86.8% —
+            // inside this one call, most of that spent in `thread::sleep`,
+            // because the gate paces itself at realtime on purpose.
+            //
+            // `Policy::at_load` is the same gate with the two numbers that
+            // belong to an ARMING decision brought down to what a LOAD
+            // actually reads: the same seven bays come up in 6.05 s, every one
+            // of them still Ready by `Evidence::Probe`. The whole argument,
+            // and what it deliberately does not give up, is written where the
+            // policy is.
             if voice {
-                let gate = tangent_host::ready::warm_up(&mut inst, tangent_host::Policy::default());
+                let gate = tangent_host::ready::warm_up(&mut inst, tangent_host::Policy::at_load());
                 if gate.state() == tangent_host::ReadyState::Failed {
                         return Err(gate
                             .reason()
