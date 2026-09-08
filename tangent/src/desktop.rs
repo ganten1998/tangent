@@ -6841,19 +6841,72 @@ impl DesktopApp {
     #[cfg(feature = "recorder")]
     fn open_project_at_launch(&mut self) {
         let root = self.app.project_root();
-        // **The template first.** It is what a launch opens now, so it has
-        // to exist before anything asks for it — it used to be seeded after
-        // the project was already chosen, which was fine while launch
-        // reopened whatever was last on screen.
+        // **The template first.** It is what a launch falls back to, what
+        // the sweep measures a stray scratch against, and what New is made
+        // from, so it has to exist before any of the three asks for it.
         let template = self.templates_dir().join("default");
         self.app.seed_template(&template);
-        // **Every launch starts on the default template.**
+        // **The remembered project comes back first, and the template is what
+        // a launch falls back TO.**
         //
-        // It reopened the remembered project, so the app came up on whatever
-        // was last touched and a session leaked into the next one. The owner:
-        // "On open, Tangent should ALWAYS start on the default template --
-        // for now, no exceptions."
+        // This road ran the other way round for a week: it adopted the
+        // stencil unconditionally, on the owner's "on open, Tangent should
+        // ALWAYS start on the default template -- for now, no exceptions."
+        // The "for now" expired the day he opened the app to work and found
+        // his song gone: "moscow when loaded now contains no clips or media
+        // in the arrangement." Nothing was gone — `moscow1/project.tan` was
+        // whole on disk the whole time, twelve clips and 2,354 notes, and it
+        // opens perfectly through the File menu. It was never being opened,
+        // because `bootstrap_project` — the road that reads
+        // `settings.project_path` — stopped being called by anything here and
+        // this function replaced whatever it would have found. A launch that
+        // silently substitutes an empty document for somebody's song looks
+        // exactly like data loss from the outside, and that is the reason the
+        // order is reversed rather than the ordering being merely tidied.
         //
+        // What the reversal keeps: it is the SAME session coming back, not a
+        // leak from a different one. The session that quit wrote the path,
+        // and it wrote its desk into the settings on the way out — see
+        // `reopen_remembered_project`, which is why no desk snapshot is
+        // applied here. The template still stands behind it for a first
+        // launch, a deleted project, a stencil path left by a crash, and the
+        // New flow, which never went through this function at all.
+        //
+        // The sweep runs either way: `Untitled` litter is nobody's session
+        // and clearing it has nothing to do with which document opens. It
+        // runs BEFORE the reopen so a swept folder that the settings happened
+        // to name is seen as gone and falls through to the template, rather
+        // than being reopened from a path that no longer exists.
+        Self::sweep_disposable_untitleds(&root, &template);
+        if self.app.reopen_remembered_project() {
+            // The project's own plugin states, exactly as an explicit open
+            // takes them — `switch_project` does these two after
+            // `open_project` for the same reason. An unmaterialised scratch
+            // has no shelf and mirrors an empty one, which clears the live
+            // sidecars; that is the same answer the template road gives.
+            self.copy_states_from_project();
+            self.force_insert_reload();
+            let _ = self.app.take_desk_reload();
+            return;
+        }
+        self.adopt_fresh_from_template(&root, &template);
+    }
+
+    /// **Stand the session on a fresh clone of the default template.**
+    ///
+    /// The half of a launch that runs when there is nothing to come back to,
+    /// and the whole of what Reset Template wants — which is why it is its
+    /// own function. Reset shares the road so that what lands on screen after
+    /// a reset is exactly what a first launch shows; before the split it
+    /// called `open_project_at_launch` for that, and the moment that function
+    /// learned to reopen the remembered project, a reset would have put the
+    /// user's last song back instead of the stencil it had just rebuilt.
+    #[cfg(feature = "recorder")]
+    fn adopt_fresh_from_template(
+        &mut self,
+        root: &std::path::Path,
+        template: &std::path::Path,
+    ) {
         // Cloned into the working scratch rather than opened in place: the
         // template is a stencil, and opening it directly would mean every
         // edit — and every save — writing over the thing every New is made
@@ -6877,19 +6930,19 @@ impl DesktopApp {
         // creating folders called untitled PERIOD." The template is
         // adopted IN MEMORY, aimed at a prospective folder that
         // materialises only at the first thing worth keeping (a take, a
-        // kit edit, a Save). And the litter of past sessions goes: any
-        // stray Untitled that provably holds no work is cleared here.
-        Self::sweep_disposable_untitleds(&root, &template);
-        let dir = tangent_ui::app::fresh_project_dir(&root);
-        let dir = if dir.exists() && !launch_reclaimable(&dir, &template) {
-            next_untitled(&root, &dir)
+        // kit edit, a Save). The litter of past sessions is already gone:
+        // the sweep runs above, before the reopen, so it clears the same
+        // strays whichever document this launch ends up on.
+        let dir = tangent_ui::app::fresh_project_dir(root);
+        let dir = if dir.exists() && !launch_reclaimable(&dir, template) {
+            next_untitled(root, &dir)
         } else {
             dir
         };
         if dir.exists() {
             let _ = std::fs::remove_dir_all(&dir);
         }
-        self.app.adopt_template(&template, &dir);
+        self.app.adopt_template(template, &dir);
         // The template's own plugin states become the session's globals -
         // and a template with no shelf CLEARS them, which is what a fresh
         // session means.
@@ -8978,9 +9031,12 @@ impl DesktopApp {
                     }
                 }
                 self.app.seed_template(&template);
-                // The same road a launch takes, so what lands on screen is
-                // exactly what a fresh install would show.
-                self.open_project_at_launch();
+                // The same road a launch with nothing to come back to takes,
+                // so what lands on screen is exactly what a fresh install
+                // would show — and NOT the project the settings remember,
+                // which is what `open_project_at_launch` would now hand back.
+                let root = self.app.project_root();
+                self.adopt_fresh_from_template(&root, &template);
                 self.app.notify(
                     Kind::Info,
                     "The default template is back to the shipped desk. Its \
@@ -20343,6 +20399,90 @@ mod tests {
                 at = abs + "TangentApp::new".len();
             }
         }
+    }
+
+    /// **A launch reopens the remembered project BEFORE it reaches for the
+    /// template, and Reset Template still gets the template.**
+    ///
+    /// The owner, on the build that shipped without this: "moscow when loaded
+    /// now contains no clips or media in the arrangement." His document was
+    /// whole on disk the whole time — twelve clips, 2,354 notes — and every
+    /// road that reads one read it correctly. `open_project_at_launch` simply
+    /// never asked: it adopted the shipped template unconditionally, so the
+    /// path in `settings.project_path` could not reach the screen no matter
+    /// what it named. A launch that silently substitutes an empty document
+    /// for somebody's song is indistinguishable from losing it.
+    ///
+    /// Two things have to hold together and they fail in opposite directions,
+    /// which is why both are here. The reopen must come FIRST and must
+    /// RETURN, or the adopt below it replaces what it just found — that is
+    /// the same shape as the fault, arriving one line later. And Reset
+    /// Template must not go through this function at all: it rebuilds the
+    /// stencil and then wants to stand on it, and the moment a launch learned
+    /// to reopen, sharing that road would have handed the user their last
+    /// song back instead of the desk a fresh install shows.
+    ///
+    /// A source scan because `DesktopApp` cannot be built in a test — the
+    /// precedent is `every_edge_where_frames_stop_flushes_the_settings_debounce`
+    /// above. `tangent_ui::app`'s
+    /// `a_relaunch_puts_the_owners_song_back_on_the_timeline` is the other
+    /// half: it runs the reopen for real against a document shaped like his
+    /// and asserts every clip comes back and can be drawn.
+    ///
+    /// Revert-check: move the `reopen_remembered_project` block below the
+    /// adopt and the ordering assert goes red; point Reset Template back at
+    /// `open_project_at_launch` and the last one does.
+    #[test]
+    fn a_launch_reopens_the_remembered_project_before_it_reaches_for_the_template() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let body_of = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            let open = at + src[at..].find('{').expect("a body");
+            let end = src[open..]
+                .find("\n    /// ")
+                .map_or(src.len(), |n| open + n);
+            &src[open..end]
+        };
+        let launch = body_of("fn open_project_at_launch(&mut self)");
+        let reopen = launch
+            .find("self.app.reopen_remembered_project()")
+            .expect(
+                "the launch does not ask for the remembered project at all, \
+                 so whatever the settings name cannot reach the screen",
+            );
+        let adopt = launch
+            .find("self.adopt_fresh_from_template(")
+            .expect("the launch has no template fallback left");
+        assert!(
+            reopen < adopt,
+            "the launch adopts the template before it asks for the remembered \
+             project, so the song it just reopened is replaced by an empty one"
+        );
+        // And it LEAVES. A reopen followed by the adopt anyway is the fault
+        // with an extra read in front of it.
+        assert!(
+            launch[reopen..adopt].contains("return;"),
+            "the launch reopens the remembered project and then falls through \
+             to the template adopt, which replaces it"
+        );
+
+        // Reset Template wants the stencil, not the last song.
+        let reset = src
+            .find("ProjectRequest::ResetTemplate =>")
+            .expect("the Reset Template arm is gone");
+        let arm = &src[reset..reset + src[reset..].find("ProjectRequest::Save").expect("the arm after it")];
+        assert!(
+            arm.contains("self.adopt_fresh_from_template("),
+            "Reset Template no longer stands the session on the stencil it \
+             just rebuilt"
+        );
+        assert!(
+            !arm.contains("self.open_project_at_launch()"),
+            "Reset Template goes through the launch road, which now reopens \
+             the remembered project — so a reset rebuilds the template and \
+             then puts the user's last song on screen instead of it"
+        );
     }
 
     /// **Every edge where frames may stop drains the settings debounce.**
