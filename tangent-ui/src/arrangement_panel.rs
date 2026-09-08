@@ -127,6 +127,13 @@ pub struct ClipView<'a> {
     pub wave: &'a [f32],
     pub wave_from_s: f64,
     pub wave_span_s: f64,
+    /// **The file's picture at every zoom**, when the host has built one —
+    /// `ports::ClipInfo::peaks`, borrowed through its `Arc`. When this is
+    /// here the painter reads the window itself, column by column, and the
+    /// `wave*` fields above are not consulted: the pyramid answers any zoom,
+    /// so there is no span to be inside of and nothing for the host to
+    /// redraw when the view moves. `None` falls back to the host-drawn wave.
+    pub peaks: Option<&'a crate::peaks::Peaks>,
     /// The clip's notes, source-relative like the document's. Drawn as a
     /// miniature where audio draws its wave; empty draws the dashed staff.
     pub notes: &'a [crate::arrangement::ArrNote],
@@ -4520,6 +4527,89 @@ fn auto_ground(p: &Ink, lane: usize) -> Color32 {
     crate::recorder_panel::legible_surface(separate(blend(base, p.ruler, 0.35), 0.26))
 }
 
+/// **A clip's waveform from its pyramid, as one mesh.**
+///
+/// Two things at once, and the second is the larger.
+///
+/// The picture comes from `peaks` rather than from a host-drawn span: for
+/// every column the panel works out which seconds of the SOURCE stand under
+/// it — the clip's trim, and for a looped clip the fold back into its loop —
+/// and asks the pyramid for the lowest and highest sample there. So the
+/// wave is right at the zoom it is drawn at, on the frame the window moves,
+/// and the host is never asked to walk samples for a view change. The fold
+/// is the engine's own rule and the old host picture's: pass `k` plays
+/// `offset_s .. offset_s + loop_s` of the file again, and a column that
+/// straddles a seam reads on past the seam rather than wrapping, which is
+/// what `looped_span_envelope` did and what
+/// `a_looped_audio_clip_repeats_its_first_pass` holds.
+///
+/// And it is ONE shape. The column loop emitted a feathered `LineSegment`
+/// per pixel per clip — thirteen thousand shapes on a 1920-wide window with
+/// eight clips, each tessellated as a stroke with end caps (eight vertices,
+/// sixteen triangles), 0.63 ms a frame before a single pixel was painted.
+/// A min/max band is two vertices per column and two triangles between
+/// neighbours; the tessellator passes a mesh through. The look is kept:
+/// at each column the band spans exactly the rows the stroke did (held to
+/// a point by `the_band_from_the_pyramid_covers_the_rows_the_columns_did`),
+/// and between columns it joins them, which is the outline a waveform has
+/// always been. A silent column keeps a one-point floor so a flat stretch
+/// still reads as a line at every pixel density.
+///
+/// A column outside the clip's own seconds (a rounding hair at either end)
+/// breaks the band, and the next one starts a new run — never a triangle
+/// across a gap. The pyramid's answer is finite and clamped by contract, so
+/// no column can carry a NaN into the mesh.
+fn wave_band(
+    painter: &Painter,
+    r: Rect,
+    clip: &ClipView<'_>,
+    peaks: &crate::peaks::Peaks,
+    t0: f64,
+    dt: f64,
+    ink: Color32,
+) {
+    let mid = r.center().y;
+    let half = r.height() * 0.40;
+    let cols = r.width().ceil() as usize;
+    let looped = clip.loop_s > 1.0e-6 && clip.loop_s.is_finite();
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.reserve_vertices(cols * 2);
+    mesh.reserve_triangles(cols * 2);
+    // The previous column's top vertex in the run being built, if any.
+    let mut prev: Option<u32> = None;
+    for i in 0..cols {
+        let x = r.left() + i as f32;
+        if x > r.right() {
+            break;
+        }
+        let t = t0 + f64::from(i as f32) * dt;
+        let into = t - clip.start_s;
+        if !into.is_finite() || into < 0.0 || into >= clip.len_s {
+            prev = None;
+            continue;
+        }
+        let src = clip.offset_s + if looped { into.rem_euclid(clip.loop_s) } else { into };
+        if !src.is_finite() {
+            prev = None;
+            continue;
+        }
+        let (lo, hi) = peaks.minmax_s(src, src + dt);
+        let y0 = mid - hi * half;
+        let y1 = (mid - lo * half).max(y0 + 1.0);
+        let top = mesh.vertices.len() as u32;
+        mesh.colored_vertex(Pos2::new(x, y0), ink);
+        mesh.colored_vertex(Pos2::new(x, y1), ink);
+        if let Some(p) = prev {
+            mesh.add_triangle(p, p + 1, top);
+            mesh.add_triangle(p + 1, top + 1, top);
+        }
+        prev = Some(top);
+    }
+    if !mesh.indices.is_empty() {
+        painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
 /// Paint the whole view into `rect`.
 
 pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
@@ -5348,8 +5438,20 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // middle. Audio is not symmetric; the outline of both sides is the
         // shape people read, and one number per column is a bar chart of
         // loudness wearing a waveform's clothes.
+        //
+        // **From the pyramid when there is one, and then as ONE shape.** A
+        // clip with `peaks` is drawn by `wave_band`: the column loop below
+        // is the older road, kept for a clip the host has pictured but not
+        // yet pyramided, and drawn exactly as it was.
         let pairs = clip.wave.len() / 2;
-        if pairs > 0 && clip.wave_span_s > 0.0 && r.width() >= 4.0 {
+        if r.width() >= 4.0 && clip.peaks.is_some() {
+            let t0 = time_at_in(&l, view, r.left());
+            let t1 = time_at_in(&l, view, r.left() + 1.0);
+            let dt = (t1 - t0).abs().max(1.0e-9);
+            if let Some(peaks) = clip.peaks {
+                wave_band(painter, r, clip, peaks, t0, dt, clip_ink.gamma_multiply(0.62));
+            }
+        } else if pairs > 0 && clip.wave_span_s > 0.0 && r.width() >= 4.0 {
             let mid = r.center().y;
             let half = r.height() * 0.40;
             let cols = r.width().ceil() as usize;
@@ -6570,6 +6672,7 @@ LaneView {
                 wave: &[],
                 wave_from_s: 0.0,
                 wave_span_s: 0.0,
+                peaks: None,
                 selected: false,
                 midi: false,
                 loop_s: 0.0,
@@ -6589,6 +6692,7 @@ LaneView {
                 wave: &[],
                 wave_from_s: 0.0,
                 wave_span_s: 0.0,
+                peaks: None,
                 selected: true,
                 midi: false,
                 loop_s: 0.0,
@@ -9681,6 +9785,7 @@ selected: false,
             wave: &[],
             wave_from_s: 0.0,
             wave_span_s: 0.0,
+            peaks: None,
             notes,
             loop_s: bar_s,
             offset_s: 0.0,
@@ -9995,6 +10100,16 @@ selected: false,
 
     /// The waveform's own columns inside `r`, as their top and bottom.
     fn wave_columns_in(v: &ArrangeView<'_>, r: Rect) -> Vec<(f32, f32)> {
+        wave_columns_xy_in(v, r).into_iter().map(|(_, top, bot)| (top, bot)).collect()
+    }
+
+    /// The waveform's columns inside `r` with their x: one per pixel column,
+    /// whichever road drew them. The host-drawn wave is a vertical
+    /// `LineSegment` per column; the pyramid's band is one `Mesh` per clip
+    /// with two vertices per column, top then bottom, and a column's rows
+    /// are read straight off that pair — the band between neighbours is
+    /// the tessellator's business, not the picture's.
+    fn wave_columns_xy_in(v: &ArrangeView<'_>, r: Rect) -> Vec<(f32, f32, f32)> {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
         crate::fonts::apply_text_styles(&ctx);
@@ -10010,17 +10125,216 @@ selected: false,
         );
         let mut got = Vec::new();
         for s in &out.shapes {
-            let egui::Shape::LineSegment { points, .. } = &s.shape else {
-                continue;
-            };
-            let (a, b) = (points[0], points[1]);
-            // A wave column is VERTICAL and stands inside the clip.
-            if (a.x - b.x).abs() > 0.25 || !r.contains(a) || !r.contains(b) {
-                continue;
+            match &s.shape {
+                egui::Shape::LineSegment { points, .. } => {
+                    let (a, b) = (points[0], points[1]);
+                    // A wave column is VERTICAL and stands inside the clip.
+                    if (a.x - b.x).abs() > 0.25 || !r.contains(a) || !r.contains(b) {
+                        continue;
+                    }
+                    got.push((a.x, a.y.min(b.y), a.y.max(b.y)));
+                }
+                egui::Shape::Mesh(m) => {
+                    for pair in m.vertices.chunks_exact(2) {
+                        let (a, b) = (pair[0].pos, pair[1].pos);
+                        if (a.x - b.x).abs() > 0.25 || !r.contains(a) || !r.contains(b) {
+                            continue;
+                        }
+                        got.push((a.x, a.y.min(b.y), a.y.max(b.y)));
+                    }
+                }
+                _ => {}
             }
-            got.push((a.y.min(b.y), a.y.max(b.y)));
         }
         got
+    }
+
+    /// A pyramid over `seconds` of stereo audio at 48 kHz: a 5 kHz tone
+    /// under a slow amplitude swell. Five kilohertz so that every column at
+    /// every zoom these tests draw holds whole cycles — a column's min and
+    /// max are then the envelope and not the phase, and two columns a hair
+    /// apart in time read the same. (At 220 Hz a millisecond column held a
+    /// fifth of a cycle and neighbours disagreed by half the height.)
+    /// `after` is the amplitude from `loud_until_s` on — a step the
+    /// loop-fold test reads.
+    fn a_pyramid(seconds: f64, loud_until_s: f64, after: f32) -> crate::peaks::Peaks {
+        let rate = 48_000u32;
+        let frames = (seconds * f64::from(rate)) as usize;
+        let mut v = Vec::with_capacity(frames * 2);
+        for f in 0..frames {
+            let t = f as f64 / f64::from(rate);
+            let env = if t < loud_until_s {
+                0.55 + 0.35 * (t * std::f64::consts::TAU * 0.25).sin()
+            } else {
+                f64::from(after)
+            };
+            let x = ((t * std::f64::consts::TAU * 5_000.0).sin() * env) as f32;
+            v.push(x);
+            v.push(x * 0.5);
+        }
+        crate::peaks::Peaks::build(&v, 2, rate)
+    }
+
+    /// The host's old per-pixel picture of the same pyramid's file: `cols`
+    /// min/max pairs over `from_s..from_s + span_s` of the source, each the
+    /// exact fold of its frames — what `ClipInfo::wave` carried before the
+    /// pyramid, built from the pyramid so the two pictures share one file.
+    fn a_legacy_wave(p: &crate::peaks::Peaks, from_s: f64, span_s: f64, cols: usize) -> Vec<f32> {
+        (0..cols)
+            .flat_map(|i| {
+                let a = from_s + span_s * i as f64 / cols as f64;
+                let b = from_s + span_s * (i + 1) as f64 / cols as f64;
+                let (lo, hi) = p.minmax_s(a, b);
+                [lo, hi]
+            })
+            .collect()
+    }
+
+    /// **The band from the pyramid covers the rows the columns did.**
+    ///
+    /// Same file, two roads: the host's per-pixel picture drawn as a line
+    /// per column, and the pyramid drawn as one band. At every column the
+    /// two must agree to a point — the band is a different SHAPE (one mesh,
+    /// two vertices a column, a one-point floor where the stroke had a half)
+    /// and must not be a different picture. Checked at three zooms, from
+    /// the clip seen whole to a bar of it, because the pyramid picks a
+    /// different level at each and the host's buckets do not.
+    #[test]
+    fn the_band_from_the_pyramid_covers_the_rows_the_columns_did() {
+        let none: [crate::arrangement::ArrNote; 0] = [];
+        let peaks = a_pyramid(8.0, 8.0, 0.0);
+        let area = rect();
+        for (start_s, len_s) in [(0.0f64, 12.0f64), (1.0, 4.0), (3.5, 1.0)] {
+            let clip = ClipView {
+                midi: false,
+                notes: &none,
+                loop_s: 0.0,
+                ..a_looped_clip(&none, 2.0, 4.0)
+            };
+            assert!((clip.len_s - 8.0).abs() < 1e-9);
+            // The host's picture for THIS window: one pair per pixel over
+            // the seconds on screen, as `wave_span` used to ask for.
+            let (vs, vl) = (start_s, len_s);
+            let from = vs.max(clip.start_s) - clip.start_s;
+            let to = (vs + vl).min(clip.start_s + clip.len_s) - clip.start_s;
+            let px = {
+                let v = a_view(std::slice::from_ref(&clip));
+                Layout::new(area, &v).lanes_area.width()
+            };
+            let cols = ((to - from) / vl * f64::from(px)).ceil().max(1.0) as usize;
+            let wave = a_legacy_wave(&peaks, from + clip.offset_s, to - from, cols);
+            let legacy = [ClipView {
+                wave: &wave,
+                wave_from_s: from,
+                wave_span_s: to - from,
+                ..clip
+            }];
+            let banded = [ClipView { peaks: Some(&peaks), ..clip }];
+            let mut vl_ = a_view(&legacy);
+            vl_.view_start_s = start_s;
+            vl_.view_len_s = len_s;
+            vl_.song_s = 12.0;
+            let mut vb = a_view(&banded);
+            vb.view_start_s = start_s;
+            vb.view_len_s = len_s;
+            vb.song_s = 12.0;
+            let r = clip_rect(area, &vb, &banded[0]);
+            assert!(r.is_positive());
+            let old = wave_columns_xy_in(&vl_, r);
+            let new = wave_columns_xy_in(&vb, r);
+            assert!(old.len() > 100, "window {start_s}+{len_s}: the columns drew {}", old.len());
+            assert!(
+                (new.len() as i64 - old.len() as i64).abs() <= 2,
+                "window {start_s}+{len_s}: {} columns against {} band vertices",
+                old.len(),
+                new.len()
+            );
+            let mut worst = 0.0f32;
+            for (x, top, bot) in &new {
+                let Some((_, t2, b2)) = old.iter().find(|(ox, ..)| (ox - x).abs() < 0.01) else {
+                    continue;
+                };
+                worst = worst.max((top - t2).abs()).max((bot - b2).abs());
+                assert!(
+                    (top - t2).abs() <= 1.0 && (bot - b2).abs() <= 1.0,
+                    "window {start_s}+{len_s}, column {x}: band {top}..{bot} vs columns {t2}..{b2}"
+                );
+            }
+            assert!(worst > 0.0 || new.len() == old.len(), "nothing was compared");
+        }
+    }
+
+    /// **A looped audio clip's picture repeats its first pass.**
+    ///
+    /// The fold used to live in the host (`looped_span_envelope`), and it
+    /// was the only place a looped clip's wave was folded into its loop; a
+    /// painter reading the pyramid straight through the clip's seconds
+    /// would draw eight bars of FILE under a two-bar loop — the very fault
+    /// that fold was written for. So: a four-pass clip over a file whose
+    /// sound drops to a whisper after the loop's end, and every pass must be
+    /// the loud first one, column for column, and none of them the whisper.
+    #[test]
+    fn a_looped_audio_clip_repeats_its_first_pass() {
+        let none: [crate::arrangement::ArrNote; 0] = [];
+        let loop_s = 2.0;
+        // Loud for the loop's two seconds, a whisper for the six after.
+        let peaks = a_pyramid(8.0, loop_s, 0.05);
+        let clips = [ClipView {
+            midi: false,
+            notes: &none,
+            peaks: Some(&peaks),
+            ..a_looped_clip(&none, loop_s, 4.0)
+        }];
+        let mut v = a_view(&clips);
+        v.view_start_s = 0.0;
+        v.view_len_s = 8.0;
+        v.song_s = 8.0;
+        let area = rect();
+        let r = clip_rect(area, &v, &clips[0]);
+        assert!(r.is_positive());
+        let cols = wave_columns_xy_in(&v, r);
+        assert!(cols.len() > 400, "the fixture drew {} columns", cols.len());
+        let pass_w = f64::from(x_of(area, &v, loop_s) - x_of(area, &v, 0.0));
+        let half = r.height() * 0.40;
+        let first: Vec<(f32, f32, f32)> =
+            cols.iter().copied().filter(|(x, ..)| f64::from(x - r.left()) < pass_w).collect();
+        assert!(first.len() > 100);
+        let mut compared = 0usize;
+        for (x, top, bot) in &cols {
+            let k = (f64::from(x - r.left()) / pass_w).floor();
+            if k < 1.0 {
+                continue;
+            }
+            // The column ON a seam reads its first side and then on past
+            // the seam — the host's old rule, kept — so it is the one
+            // column of a pass that may differ from the first pass's.
+            let phase = f64::from(x - r.left()) - k * pass_w;
+            if phase < 1.0 || phase > pass_w - 1.0 {
+                continue;
+            }
+            // The same column of the first pass, to the nearest point: a
+            // pass is not a whole number of points wide, so the phase
+            // inside it drifts by a fraction of a column per pass.
+            let x1 = f64::from(*x) - k * pass_w;
+            let Some((_, t1, b1)) = first
+                .iter()
+                .min_by(|a, b| (f64::from(a.0) - x1).abs().total_cmp(&(f64::from(b.0) - x1).abs()))
+            else {
+                continue;
+            };
+            assert!(
+                (top - t1).abs() <= 1.5 && (bot - b1).abs() <= 1.5,
+                "pass {k}, column {x}: {top}..{bot} against the first pass's {t1}..{b1}"
+            );
+            // And loud: a whisper would be a couple of points tall.
+            assert!(
+                bot - top > half * 0.5,
+                "pass {k}, column {x} is {} tall: the file was read past the loop",
+                bot - top
+            );
+            compared += 1;
+        }
+        assert!(compared > 300, "only {compared} columns in later passes");
     }
 
     fn diagonals_in(v: &ArrangeView<'_>, r: Rect) -> Vec<(Pos2, Pos2, Color32)> {
@@ -10210,6 +10524,7 @@ selected: false,
             wave: &wave,
             wave_from_s: 0.0,
             wave_span_s: bar_s * 4.0,
+            peaks: None,
             ..a_looped_clip(&none, bar_s, 4.0)
         }];
         let mut v = a_view(&clips);
@@ -10255,17 +10570,26 @@ selected: false,
         );
 
         // **The wave stays out of the bites.** Full-scale on every bucket, so
-        // this is the worst case the clip can offer.
-        let cols = wave_columns_in(&v, r);
-        assert!(!cols.is_empty(), "the fixture drew no waveform");
-        for (top, bot) in &cols {
-            assert!(
-                *top >= r.top() + d - 0.5 && *bot <= r.bottom() - d + 0.5,
-                "a waveform column runs {top}..{bot}, into a bite {d} deep on \
-                 a clip spanning {}..{}",
-                r.top(),
-                r.bottom()
-            );
+        // this is the worst case the clip can offer — on BOTH roads, the
+        // host-drawn columns and the pyramid's band.
+        let full: Vec<f32> = vec![1.0f32, -1.0, 1.0, -1.0].repeat(48_000 * 2);
+        let loud = crate::peaks::Peaks::build(&full, 2, 48_000);
+        let banded = [ClipView { peaks: Some(&loud), ..clips[0] }];
+        let mut vb = a_view(&banded);
+        vb.view_start_s = 0.0;
+        vb.view_len_s = 12.0;
+        vb.song_s = 12.0;
+        for (road, cols) in [("columns", wave_columns_in(&v, r)), ("band", wave_columns_in(&vb, r))] {
+            assert!(!cols.is_empty(), "{road}: the fixture drew no waveform");
+            for (top, bot) in &cols {
+                assert!(
+                    *top >= r.top() + d - 0.5 && *bot <= r.bottom() - d + 0.5,
+                    "{road}: a waveform column runs {top}..{bot}, into a bite {d} deep on \
+                     a clip spanning {}..{}",
+                    r.top(),
+                    r.bottom()
+                );
+            }
         }
     }
 
@@ -10601,6 +10925,7 @@ mod miniature_cost_probe {
                 wave: &[],
                 wave_from_s: 0.0,
                 wave_span_s: 0.0,
+                peaks: None,
                 notes,
                 loop_s,
                 offset_s: 0.0,

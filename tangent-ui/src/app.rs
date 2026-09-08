@@ -10841,7 +10841,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// pixel on any drag, and recomputing a screenful of waveforms sixty
     /// times a second is a pass over several million samples per frame for a
     /// picture nobody could tell apart from the last one.
+    ///
+    /// **Never, once every audio clip carries a pyramid.** `ClipInfo::peaks`
+    /// answers any window at draw time, so there is no picture to go stale
+    /// and no reload to ask for; the host's road through here (redraw the
+    /// span, `note_waves_drawn`) is kept for a document whose clips are
+    /// still pictured the old way — a file not yet decoded, a host that has
+    /// not pyramided it — and for nothing else. Asked of the document, not
+    /// of `arr_wave_at`: that field being `None` is what made this answer
+    /// `true`, and a gate that stayed on the old field would have reloaded
+    /// every frame for ever once the host stopped calling `note_waves_drawn`.
     pub fn arr_waves_stale(&self) -> bool {
+        let pyramided = self
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| c.kind == crate::arrangement::ClipKind::Audio)
+            .all(|c| self.clip_infos.get(&c.id).is_some_and(|i| i.peaks.is_some()));
+        if pyramided {
+            return false;
+        }
         let Some((start, len, w)) = self.arr_wave_view() else {
             return false;
         };
@@ -11203,6 +11222,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 crate::arrangement_panel::ClipView {
                     wave_from_s,
                     wave_span_s,
+                    peaks: info.and_then(|i| i.peaks.as_deref()),
                     id: c.id,
                     loop_s: c.loop_s,
                     notes: &c.notes,
@@ -11247,6 +11267,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         wave: &[],
                         wave_from_s: 0.0,
                         wave_span_s: 0.0,
+                        peaks: None,
                         // A take being recorded does not loop: it is one
                         // continuous pass, and there is no clip yet to ask.
                         loop_s: 0.0,
@@ -56083,6 +56104,21 @@ mod perf_probes {
     /// min/max picture over the clip's drawn span — 1024 pairs, about a
     /// lane's width of columns at the windows above.
     fn give_pictures(app: &mut TangentApp, take_s: f64) {
+        // One pyramid for the take, shared by every clip that plays it —
+        // as the host shares one decode per file.
+        let peaks = {
+            let rate = 48_000u32;
+            let frames = (take_s * f64::from(rate)) as usize;
+            let mut v = Vec::with_capacity(frames * 2);
+            for f in 0..frames {
+                let t = f as f32 / rate as f32;
+                let env = 0.6 + 0.3 * (t * 0.7).sin();
+                let x = (t * 440.0 * std::f32::consts::TAU).sin() * env;
+                v.push(x);
+                v.push(x * 0.8);
+            }
+            crate::peaks::Peaks::build(&v, 2, rate).shared()
+        };
         for c in &app.arrangement.clips {
             if c.kind != crate::arrangement::ClipKind::Audio {
                 continue;
@@ -56101,7 +56137,7 @@ mod perf_probes {
                     file_s: take_s,
                     wave_from_s: 0.0,
                     wave_span_s: c.len_s,
-                    peaks: None,
+                    peaks: Some(peaks.clone()),
                 },
             );
         }
@@ -56550,5 +56586,101 @@ mod arrange_axis_tests {
             assert!(on_screen > 0, "{}: the fixture put no clip on screen", size.tag());
             assert!(checked >= 12 * fx::census(&app.arrangement).clips, "{}", size.tag());
         }
+    }
+}
+
+/// The stale gate and the pyramid — see `arr_waves_stale`.
+#[cfg(test)]
+mod arrange_peaks_tests {
+    use super::*;
+    use crate::arrangement::{ArrClip, ClipKind};
+
+    fn an_audio_clip(lane: usize, start_s: f64) -> ArrClip {
+        ArrClip {
+            pedal: Vec::new(),
+            kind: ClipKind::Audio,
+            notes: Vec::new(),
+            lane,
+            path: "media/take.wav".into(),
+            start_s,
+            offset_s: 0.0,
+            len_s: 4.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "take".into(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        }
+    }
+
+    /// **Once every audio clip has a pyramid, no view move is stale.**
+    ///
+    /// The host asks this every frame and answers `true` with a whole
+    /// reload — a document walk, a sample walk, an engine clip swap. With a
+    /// pyramid on every audio clip the painter reads any window itself, so
+    /// the answer has to be `false` however far the window is steered; and
+    /// it has to go back to the old road the moment one audio clip is
+    /// pictured the old way, or that clip's picture would never follow the
+    /// zoom.
+    #[test]
+    fn a_pyramided_document_is_never_stale_and_a_legacy_clip_reopens_the_road() {
+        let ctx = egui::Context::default();
+        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+        app.settings.arr_visible = 8;
+        app.arrangement_open = true;
+        app.arrangement_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 420.0)));
+        app.arrangement.add_clip(an_audio_clip(0, 1.0));
+        let a = app.arrangement.clips[0].id;
+        assert!(app.arr_waves_stale(), "a clip with no picture at all is stale");
+        let peaks = crate::peaks::Peaks::build(&vec![0.5f32; 48_000 * 8], 2, 48_000).shared();
+        app.clip_infos.insert(
+            a,
+            crate::ports::ClipInfo {
+                id: a,
+                file_s: 4.0,
+                peaks: Some(peaks.clone()),
+                ..Default::default()
+            },
+        );
+        assert!(!app.arr_waves_stale(), "a pyramided clip is never stale");
+        for (start, len) in [(0.0, 30.0), (100.0, 1.0), (0.0, 3_600.0), (2.5, 2.0)] {
+            app.arr_steer(start, len);
+            assert!(!app.arr_waves_stale(), "stale after steering to {start}+{len}");
+        }
+        // And the clip view carries the pyramid the painter will read.
+        let clips = app.arr_clip_views();
+        assert!(clips.iter().any(|c| c.id == a && c.peaks.is_some()));
+        // A second audio clip pictured the OLD way reopens the host's road.
+        app.arrangement.add_clip(an_audio_clip(1, 1.0));
+        let b = app.arrangement.clips[1].id;
+        app.clip_infos.insert(
+            b,
+            crate::ports::ClipInfo {
+                id: b,
+                file_s: 4.0,
+                wave: vec![0.5; 20],
+                wave_from_s: 0.0,
+                wave_span_s: 4.0,
+                peaks: None,
+            },
+        );
+        assert!(app.arr_waves_stale(), "a legacy clip is not answered by the pyramid gate");
+        let at = app.arr_wave_view().expect("the arrangement is open");
+        app.note_waves_drawn(at);
+        assert!(!app.arr_waves_stale(), "just drawn is not stale");
+        app.arr_steer(at.0 + at.1, at.1);
+        assert!(app.arr_waves_stale(), "a whole window's pan on the legacy road is stale");
+        // A MIDI-only document has nothing to picture and is never stale.
+        let mut midi = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+        midi.arrangement_open = true;
+        midi.arrangement_rect = app.arrangement_rect;
+        midi.arrangement.add_clip(ArrClip { kind: ClipKind::Midi, path: String::new(), ..an_audio_clip(0, 1.0) });
+        assert!(!midi.arr_waves_stale());
     }
 }
