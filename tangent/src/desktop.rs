@@ -736,6 +736,9 @@ pub struct DesktopApp {
     comp_rows_stale: bool,
     #[cfg(feature = "recorder")]
     comp_rows_at: Option<std::time::Instant>,
+    /// The frame-time log, when `TANGENT_FRAME_LOG` asked for it. See
+    /// [`FrameLog`].
+    frame_log: FrameLog,
     /// Bumped every time `start_engine` seats a new engine, so every cache
     /// that stands for "what THIS engine was told" can notice it is talking
     /// to a different one. See `push_desk_if_changed`.
@@ -1872,6 +1875,162 @@ fn cartridge_info(
 /// How often free space is measured again while the band is open.
 #[cfg(feature = "recorder")]
 const DISK_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// **The frame-time log.** `TANGENT_FRAME_LOG=1`, read once, times the
+/// sections of `DesktopApp::update` and prints, once a second through
+/// `log::info!`, the count of frames and the p50 / p95 / max of each in
+/// milliseconds:
+///
+/// ```text
+/// frame: 31 frames | update 1.9/3.2/7.4 | chore 0.0/0.0/0.0 | fill 0.1/0.2/0.3
+///   | app 1.6/2.8/6.9 | after 0.1/0.3/0.5 | covers 0.0/0.0/0.0
+///   | dt 33.1/34.0/41.2 | cpu(prev) 2.4/3.9/8.8
+/// ```
+///
+/// `update` is the wall time of the whole call; `chore`, `fill`, `app`
+/// (`TangentApp::frame`, which is the paint), `after` and `covers` (the
+/// splash and the busy overlay) are its sections in order, and what is left
+/// between their sum and `update` is the title check and the small
+/// bookkeeping around them. `dt` is egui's `unstable_dt`, the time between
+/// frames — the frame rate the window is really running at, which after the
+/// resting policy should be near zero frames a second with nothing moving.
+/// `cpu(prev)` is eframe's `cpu_usage` for the PREVIOUS frame: the whole
+/// of it, tessellation and the render included, so `cpu(prev) - update` is
+/// the part of a frame this function cannot see from inside itself.
+///
+/// The same OnceLock discipline as `IVORY_PACE` and `IVORY_GEOM_PROBE`,
+/// and the same rule for its cost: when the variable is unset every mark
+/// is one `bool` test and the log is never touched. A diagnostic that costs
+/// something when it is off is a diagnostic that gets deleted, and this
+/// one exists so that every per-frame number in the next perf push is
+/// measured on the owner's machine rather than estimated.
+struct FrameLog {
+    /// Whether the variable was set. Everything below is unused when not.
+    on: bool,
+    since: std::time::Instant,
+    frames: u32,
+    /// One `Vec` of samples per [`FrameSection`], in section order.
+    samples: [Vec<f32>; FrameSection::COUNT],
+    /// Where the running section started, and where `update` started.
+    mark_at: std::time::Instant,
+    update_at: std::time::Instant,
+}
+
+/// The parts of `update` the log times, in the order they run.
+#[derive(Clone, Copy)]
+enum FrameSection {
+    Chore,
+    Fill,
+    App,
+    After,
+    Covers,
+    Update,
+    Dt,
+    CpuPrev,
+}
+
+impl FrameSection {
+    const COUNT: usize = 8;
+    const NAMES: [&'static str; Self::COUNT] =
+        ["chore", "fill", "app", "after", "covers", "update", "dt", "cpu(prev)"];
+}
+
+impl FrameLog {
+    /// Read the variable once and build the log in the state it asks for.
+    fn from_env() -> Self {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let now = std::time::Instant::now();
+        Self {
+            on: *ON.get_or_init(|| std::env::var_os("TANGENT_FRAME_LOG").is_some()),
+            since: now,
+            frames: 0,
+            samples: std::array::from_fn(|_| Vec::new()),
+            mark_at: now,
+            update_at: now,
+        }
+    }
+
+    /// `update` began: start the whole-frame clock and the first section.
+    #[inline]
+    fn begin(&mut self) {
+        if !self.on {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.update_at = now;
+        self.mark_at = now;
+    }
+
+    /// The section that just ran is `what`; the next one starts now.
+    #[inline]
+    fn mark(&mut self, what: FrameSection) {
+        if !self.on {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.samples[what as usize].push(now.duration_since(self.mark_at).as_secs_f32() * 1e3);
+        self.mark_at = now;
+    }
+
+    /// `update` is over: close the frame, take egui's and eframe's numbers,
+    /// and print if a second has passed.
+    fn end(&mut self, dt: f32, cpu_prev: Option<f32>) {
+        if !self.on {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.samples[FrameSection::Update as usize]
+            .push(now.duration_since(self.update_at).as_secs_f32() * 1e3);
+        if dt.is_finite() && dt > 0.0 {
+            self.samples[FrameSection::Dt as usize].push(dt * 1e3);
+        }
+        if let Some(cpu) = cpu_prev.filter(|c| c.is_finite()) {
+            self.samples[FrameSection::CpuPrev as usize].push(cpu * 1e3);
+        }
+        self.frames += 1;
+        if now.duration_since(self.since) < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let mut line = format!("frame: {} frames", self.frames);
+        // `update` first, then the sections in order, then the two clocks.
+        let order = [
+            FrameSection::Update,
+            FrameSection::Chore,
+            FrameSection::Fill,
+            FrameSection::App,
+            FrameSection::After,
+            FrameSection::Covers,
+            FrameSection::Dt,
+            FrameSection::CpuPrev,
+        ];
+        for s in order {
+            let v = &mut self.samples[s as usize];
+            v.sort_by(f32::total_cmp);
+            line.push_str(&format!(
+                " | {} {:.1}/{:.1}/{:.1}",
+                FrameSection::NAMES[s as usize],
+                percentile(v, 0.50),
+                percentile(v, 0.95),
+                percentile(v, 1.0),
+            ));
+            v.clear();
+        }
+        log::info!("{line}");
+        self.since = now;
+        self.frames = 0;
+    }
+}
+
+/// The value `q` of the way up a SORTED sample, 0.0 for nothing. `q = 1.0`
+/// is the maximum; the index is clamped so no `q` can reach past the end.
+fn percentile(sorted: &[f32], q: f32) -> f32 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let last = sorted.len() - 1;
+    let at = ((sorted.len() as f32 * q.clamp(0.0, 1.0)) as usize).min(last);
+    sorted[at]
+}
 
 /// **The resting window's three cadences.** See `DesktopApp::host_frame_due`.
 ///
@@ -14793,6 +14952,7 @@ impl DesktopApp {
             comp_rows_stale: true,
             #[cfg(feature = "recorder")]
             comp_rows_at: None,
+            frame_log: FrameLog::from_env(),
             #[cfg(feature = "recorder")]
             engine_epoch: 0,
             #[cfg(feature = "recorder")]
@@ -15029,6 +15189,8 @@ impl eframe::App for DesktopApp {
     /// that opens a device, raises a native panel or creates a directory
     /// happens between those two lines.
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // See `FrameLog`: one bool test per mark when the log is off.
+        self.frame_log.begin();
         // **The announced block runs FIRST, before anything else asks for
         // work.** The overlay it was announced under was painted at the
         // bottom of the last frame and eframe presented when that `update`
@@ -15037,8 +15199,10 @@ impl eframe::App for DesktopApp {
         // moment at which a caller may honestly go ahead and block.
         #[cfg(feature = "recorder")]
         self.run_chore(ctx);
+        self.frame_log.mark(FrameSection::Chore);
         #[cfg(feature = "recorder")]
         self.fill_recorder_state(ctx);
+        self.frame_log.mark(FrameSection::Fill);
         // Before the frame, not after: the app decides whether to raise the
         // Welcome card while it paints, and a flag set afterwards would be one
         // frame stale — which is exactly one frame of card over wordmark.
@@ -15167,12 +15331,19 @@ impl eframe::App for DesktopApp {
         if self.painted_once {
             self.app.frame(ctx);
         }
+        self.frame_log.mark(FrameSection::App);
         #[cfg(feature = "recorder")]
         self.after_frame(ctx, frame);
+        self.frame_log.mark(FrameSection::After);
         self.paint_splash(ctx);
         self.paint_busy(ctx);
+        self.frame_log.mark(FrameSection::Covers);
         self.painted_once = true;
         self.host_frame_due(ctx);
+        if self.frame_log.on {
+            let dt = ctx.input(|i| i.unstable_dt);
+            self.frame_log.end(dt, frame.info().cpu_usage);
+        }
         // **The geometry probe.** `IVORY_GEOM_PROBE=1` prints, once the
         // window has settled, everything the app believes about where it is
         // — then closes itself through the ordinary quit path, because an
@@ -18554,6 +18725,56 @@ mod tests {").expect("the tests module")];
         let compare = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
         eprintln!(
             "desk publish per frame: routes+keys+bypass+desk {publish:.1} us; the change compare {compare:.3} us ({same} unchanged)"
+        );
+    }
+
+    /// **The frame log's percentiles**: empty is zero, `q = 1` is the max,
+    /// and the index never reaches past the end.
+    #[test]
+    fn the_frame_log_percentiles_are_bounded() {
+        assert_eq!(percentile(&[], 0.5), 0.0);
+        let v = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        assert_eq!(percentile(&v, 0.0), 1.0);
+        assert_eq!(percentile(&v, 0.5), 6.0);
+        assert_eq!(percentile(&v, 0.95), 10.0);
+        assert_eq!(percentile(&v, 1.0), 10.0);
+        assert_eq!(percentile(&v, 7.0), 10.0);
+        assert_eq!(percentile(&[4.0], 0.5), 4.0);
+    }
+
+    /// **Every section of `update` is bracketed by the frame log, in order,
+    /// and the log is read once.** A section that loses its mark is a
+    /// section whose time lands in its neighbour's column.
+    #[test]
+    fn every_update_section_is_bracketed_by_the_frame_log() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame)").expect("update");
+        let end = src[at + 1..].find("\n    fn ").map_or(src.len(), |n| at + 1 + n);
+        let body = &src[at..end];
+        let mut last = 0;
+        for needle in [
+            "self.frame_log.begin();",
+            "self.run_chore(ctx);",
+            "self.frame_log.mark(FrameSection::Chore);",
+            "self.fill_recorder_state(ctx);",
+            "self.frame_log.mark(FrameSection::Fill);",
+            "self.app.frame(ctx);",
+            "self.frame_log.mark(FrameSection::App);",
+            "self.after_frame(ctx, frame);",
+            "self.frame_log.mark(FrameSection::After);",
+            "self.paint_busy(ctx);",
+            "self.frame_log.mark(FrameSection::Covers);",
+            "self.frame_log.end(dt, frame.info().cpu_usage);",
+        ] {
+            let here = body.find(needle).unwrap_or_else(|| panic!("`{needle}` is gone from update"));
+            assert!(here >= last, "`{needle}` is out of order in update");
+            last = here;
+        }
+        let from_env = src.find("fn from_env() -> Self").expect("FrameLog::from_env");
+        assert!(
+            src[from_env..from_env + 600].contains("get_or_init(|| std::env::var_os(\"TANGENT_FRAME_LOG\")"),
+            "TANGENT_FRAME_LOG is not read once through a OnceLock"
         );
     }
 
