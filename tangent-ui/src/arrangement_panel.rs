@@ -2386,14 +2386,28 @@ fn clip_has_seam(clip: &ClipView<'_>) -> bool {
 
 /// How deep a divot bites into the clip's top and bottom edge.
 ///
-/// A tenth of the lane, floored at two points and capped at four. The tenth
-/// is not a taste: the waveform is drawn within forty per cent of the height
-/// either side of the middle, so a tenth is the most that can be taken
-/// without the bite reaching into it, and the miniature is inset by the same
-/// number for the same reason. Two points is the least that reads as a bite
-/// rather than as an artefact.
+/// A tenth of the lane, floored at two points. The tenth is not a taste: the
+/// waveform is drawn within forty per cent of the height either side of the
+/// middle, so a tenth is the most that can be taken without the bite reaching
+/// into it, and the miniature is inset by the same number for the same
+/// reason. Two points is the least that reads as a bite rather than as an
+/// artefact.
+///
+/// **The four-point ceiling that used to sit here was the bug the owner kept
+/// reporting.** It bound above forty points of lane, which is every lane on
+/// a real desk — a track row is ninety-odd points at four visible lanes — so
+/// the tenth never applied and every clip got the same four-point nick
+/// whatever its height. At that size the two bites do not read as a shape
+/// change at all; what reaches the eye is a faint vertical line, which is
+/// precisely what taking the material away was meant to replace. Nothing
+/// justified the ceiling: the doc argued the tenth and then capped it.
+///
+/// So the tenth stands on its own, and the geometry that has to be respected
+/// is respected where it lives — `notched_clip_pieces` still holds the bite
+/// inside half the height, and the wave still owns the middle eighty per
+/// cent by construction.
 fn clip_bite_d(r: Rect) -> f32 {
-    (r.height() * 0.10).clamp(2.0, 4.0)
+    (r.height() * 0.10).max(2.0)
 }
 
 /// The clip's own outline, with a triangular divot bitten out of the top and
