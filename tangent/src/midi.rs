@@ -178,7 +178,7 @@ pub struct MidiFastLane {
     /// desktop seating a new producer at engine start. `try_lock` on the push
     /// side so a mid-install collision drops one event instead of blocking.
     #[cfg(feature = "recorder")]
-    slot: std::sync::Mutex<Option<rtrb::Producer<crate::instrument::MidiEvent>>>,
+    slot: Mutex<Option<rtrb::Producer<crate::instrument::MidiEvent>>>,
     /// Whether the drumpad is up with MIDI live — pushed by the desktop each
     /// frame. Frame-stale by nature; so was the UI-drain mirror it replaces.
     pads_live: std::sync::atomic::AtomicBool,
@@ -188,7 +188,7 @@ impl MidiFastLane {
     pub fn new() -> Self {
         Self {
             #[cfg(feature = "recorder")]
-            slot: std::sync::Mutex::new(None),
+            slot: Mutex::new(None),
             pads_live: std::sync::atomic::AtomicBool::new(false),
         }
     }

@@ -1178,7 +1178,7 @@ fn draw_readout(painter: &Painter, strip: Rect, r: Readout<'_>, cap: f32, p: &Pa
     let stacked = if alts.is_some() { 1.9 } else { 1.15 };
     // Rounded before anything is derived from it, so the block height and the
     // alternates agree with what is actually rasterised.
-    let main = crate::fonts::px(
+    let main = fonts::px(
         fit(chord, strip.width())
             .min(alts.as_deref().map_or(f32::MAX, |a| fit(a, strip.width()) / 0.52))
             .min(strip.height() / stacked)
@@ -1187,7 +1187,7 @@ fn draw_readout(painter: &Painter, strip: Rect, r: Readout<'_>, cap: f32, p: &Pa
     if main < 5.0 {
         return;
     }
-    let alt_size = crate::fonts::px(main * 0.52);
+    let alt_size = fonts::px(main * 0.52);
     let block = if alts.is_some() { main + alt_size * 1.5 } else { main };
     let top = strip.center().y - block * 0.5;
     painter.text(
@@ -1302,7 +1302,7 @@ fn draw_column(
                 Pos2::new(cx, y),
                 Align2::CENTER_CENTER,
                 placed.note.letter,
-                FontId::new(crate::fonts::px(g.space * 0.86), fonts::courier_bold()),
+                FontId::new(fonts::px(g.space * 0.86), fonts::courier_bold()),
                 p.lit_text,
             );
         }
@@ -1409,7 +1409,7 @@ fn draw_octave_signs(
             group.iter().map(|n| n.pos).min().unwrap_or(0).min(0) - OCTAVE_SIGN_GAP
         };
         let y = g.y(edge);
-        let size = crate::fonts::px(g.space * 1.15);
+        let size = fonts::px(g.space * 1.15);
         painter.text(
             Pos2::new(x - head_w * 1.2, y),
             Align2::RIGHT_CENTER,
@@ -1605,7 +1605,7 @@ fn draw_clef(painter: &Painter, g: Geometry, clef: Clef, p: &Palette) -> f32 {
             Pos2::new(x + w * 0.45, anchor + dy),
             Align2::CENTER_CENTER,
             "8",
-            FontId::new(crate::fonts::px(g.space * 1.4), fonts::courier_bold()),
+            FontId::new(fonts::px(g.space * 1.4), fonts::courier_bold()),
             p.ink,
         );
     }
@@ -1817,7 +1817,7 @@ mod tests {
     /// just been freed from. Same audit as the theory view.
     #[test]
     fn every_theme_prints_the_staff_on_its_own_page() {
-        let mut grounds = std::collections::HashSet::new();
+        let mut grounds = HashSet::new();
         let mut bad: Vec<String> = Vec::new();
         for theme in crate::theme::factory() {
             for dark in [false, true] {

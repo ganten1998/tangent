@@ -611,9 +611,9 @@ impl Convolver {
     #[cfg(test)]
     fn footprint(&self) -> usize {
         let engine = |e: &Engine| -> usize {
-            e.paths.capacity() * std::mem::size_of::<(usize, usize)>()
+            e.paths.capacity() * size_of::<(usize, usize)>()
                 + e.filt.iter().map(|v| v.capacity() * 4).sum::<usize>()
-                + e.filt.capacity() * std::mem::size_of::<Vec<f32>>()
+                + e.filt.capacity() * size_of::<Vec<f32>>()
                 + e.ring.iter().map(|v| v.capacity() * 4).sum::<usize>()
                 + e.prev.iter().map(|v| v.capacity() * 4).sum::<usize>()
                 + e.re.capacity() * 4

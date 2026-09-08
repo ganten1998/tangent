@@ -176,7 +176,7 @@ fn main() {
     // The loudest thing the input ever saw, kept so that "no click" can say
     // whether the input was silent (nothing patched, gain down) or merely
     // quieter than the threshold. Without it the failure is unactionable.
-    let peak = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let peak = Arc::new(AtomicU32::new(0));
 
     // **Generic over the sample format, because FreeBSD makes it matter.**
     // The shim's "default" device converts to f32 and reports a nonsense

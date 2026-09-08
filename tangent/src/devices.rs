@@ -477,7 +477,7 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
             let mut sel = lock(shared);
             sel.wanted = Some(uid);
             Some(AudioChoice {
-                selection: tangent_record::audio::InputSelection::Key(matched.key),
+                selection: InputSelection::Key(matched.key),
                 channels: tangent_record::audio::Picks::from_slice(&[]),
             })
         }

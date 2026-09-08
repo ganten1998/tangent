@@ -244,7 +244,7 @@ impl DrumpadDoc {
         // the old way and compares.
         let mut root = kits.get(primary).map(Self::to_value).unwrap_or_default();
         root.insert("primary_lane".into(), Value::from(primary as u64));
-        let mut lane_kits = serde_json::Map::new();
+        let mut lane_kits = Map::new();
         for (lane, kit) in kits.iter().enumerate() {
             // An empty kit is the absence of one; writing it would grow the
             // file by a lane nobody has for no reading anybody does.

@@ -1741,7 +1741,7 @@ mod shot {
         const W: usize = 1200;
         const H: usize = 520;
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
         // Lay out AND build the font atlas at the render scale, so a glyph is
         // rasterised at the size it is shown rather than magnified.
         ctx.set_pixels_per_point(SCALE);
@@ -1783,7 +1783,7 @@ mod shot {
         let first = ctx.run(Default::default(), |_| {});
         soak(&first.textures_delta, &mut atlas);
         let out = ctx.run(Default::default(), |c| {
-            let p = egui::Painter::new(c.clone(), egui::LayerId::debug(), rect);
+            let p = Painter::new(c.clone(), egui::LayerId::debug(), rect);
             // A plausible desk under the scrim, so the veil reads honestly.
             p.rect_filled(rect, 0.0, Color32::from_rgb(0x2b, 0x2f, 0x35));
             for i in 0..14 {

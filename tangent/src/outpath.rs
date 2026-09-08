@@ -231,7 +231,7 @@ mod mac {
     /// field, which prints nothing.
     fn get<T: Copy + Default>(id: AudioObjectID, address: &PropertyAddress) -> Option<T> {
         let mut value = T::default();
-        let mut size = std::mem::size_of::<T>() as u32;
+        let mut size = size_of::<T>() as u32;
         // SAFETY: `size` describes `value` exactly, the address is a live
         // borrow for the length of the call, and the HAL writes at most
         // `size` bytes. A non-zero status leaves `value` untouched and we
@@ -246,7 +246,7 @@ mod mac {
                 (&mut value as *mut T).cast(),
             )
         };
-        (status == 0 && size as usize == std::mem::size_of::<T>()).then_some(value)
+        (status == 0 && size as usize == size_of::<T>()).then_some(value)
     }
 
     /// A `CFStringRef` property, copied out as a `String`.
@@ -289,7 +289,7 @@ mod mac {
         if status != 0 || bytes == 0 {
             return Vec::new();
         }
-        let count = bytes as usize / std::mem::size_of::<AudioObjectID>();
+        let count = bytes as usize / size_of::<AudioObjectID>();
         let mut ids = vec![0 as AudioObjectID; count];
         let mut io = bytes;
         // SAFETY: `ids` holds exactly `io` bytes and the HAL writes at most
@@ -307,7 +307,7 @@ mod mac {
         if status != 0 {
             return Vec::new();
         }
-        ids.truncate(io as usize / std::mem::size_of::<AudioObjectID>());
+        ids.truncate(io as usize / size_of::<AudioObjectID>());
         ids
     }
 

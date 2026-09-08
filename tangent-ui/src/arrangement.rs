@@ -1719,7 +1719,7 @@ pub const DOC_NAME_LEGACY: &str = "project.tangent";
 /// The project document inside `dir`: the canonical name if that file
 /// exists, else the legacy one if THAT exists, else the canonical - which
 /// is what a writer minting a fresh document wants too.
-pub fn doc_in(dir: &std::path::Path) -> std::path::PathBuf {
+pub fn doc_in(dir: &std::path::Path) -> PathBuf {
     let new = dir.join(DOC_NAME);
     if new.is_file() {
         return new;

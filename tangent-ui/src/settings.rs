@@ -3481,7 +3481,7 @@ impl Settings {
     /// the block is empty unless somebody put a plugin on an individual pad.
     fn move_legacy_pad_racks(&mut self) {
         use crate::recorder::{DRUM_PADS, INSERTS, STRIPS};
-        let ins = crate::recorder::INSERTS;
+        let ins = INSERTS;
         // Which channel carries the drumpad, by the same sentinel the engine
         // reads. Channel 0 already owns the legacy block; nothing to do.
         let Some(ch) = (1..crate::recorder::CHANNELS).find(|c| {
@@ -4752,7 +4752,7 @@ impl Settings {
     ///
     /// Beside `settings.json`, and named so a person poking at the folder can
     /// tell what it is without being told.
-    pub fn backup_path() -> std::path::PathBuf {
+    pub fn backup_path() -> PathBuf {
         Self::path().with_file_name("settings.backup.json")
     }
 
@@ -5721,7 +5721,7 @@ mod tests {
 
     #[test]
     fn the_four_media_folders_are_separate_and_default_under_documents() {
-        let s = super::Settings::default();
+        let s = Settings::default();
         let root = s.media_root();
         assert!(
             root.ends_with("Tangent Media"),
@@ -5754,7 +5754,7 @@ mod tests {
     /// middle, where they would reorder everybody's file on the next save.
     #[test]
     fn the_preset_folder_override_round_trips_at_the_end_of_the_map() {
-        let mut s = super::Settings::default();
+        let mut s = Settings::default();
         // Absent until chosen, so an untouched file keeps its shape.
         assert!(!s.to_map().contains_key("preset_dir"));
         s.preset_dir = Some("/tmp/my-presets".to_owned());
@@ -5764,15 +5764,15 @@ mod tests {
             Some("preset_dir"),
             "preset_dir is not the last of our own keys"
         );
-        let back = super::Settings::from_map(map);
+        let back = Settings::from_map(map);
         assert_eq!(back.preset_dir.as_deref(), Some("/tmp/my-presets"));
         assert_eq!(
             back.preset_root(),
-            std::path::PathBuf::from("/tmp/my-presets")
+            PathBuf::from("/tmp/my-presets")
         );
         // And an empty string is not a choice, exactly as for the other
         // three folders.
-        let mut blank = super::Settings::default();
+        let mut blank = Settings::default();
         blank.preset_dir = Some("   ".to_owned());
         assert_eq!(
             blank.preset_root(),
@@ -5785,7 +5785,7 @@ mod tests {
     /// `preset_dir`, which it joined after.
     #[test]
     fn the_ir_folder_override_round_trips_at_the_end_of_the_map() {
-        let mut s = super::Settings::default();
+        let mut s = Settings::default();
         // Absent until chosen, so an untouched file keeps its shape.
         assert!(!s.to_map().contains_key("irs_dir"));
         s.irs_dir = Some("/tmp/my-irs".to_owned());
@@ -5795,11 +5795,11 @@ mod tests {
             Some("irs_dir"),
             "irs_dir is not the last of our own keys"
         );
-        let back = super::Settings::from_map(map);
+        let back = Settings::from_map(map);
         assert_eq!(back.irs_dir.as_deref(), Some("/tmp/my-irs"));
-        assert_eq!(back.irs_root(), std::path::PathBuf::from("/tmp/my-irs"));
+        assert_eq!(back.irs_root(), PathBuf::from("/tmp/my-irs"));
         // An empty string is not a choice, exactly as for the other four.
-        let mut blank = super::Settings::default();
+        let mut blank = Settings::default();
         blank.irs_dir = Some("   ".to_owned());
         assert_eq!(blank.irs_root(), blank.media_root().join("IRs"));
     }
@@ -5807,11 +5807,11 @@ mod tests {
     /// Each folder is chosen on its own, and choosing one moves nothing else.
     #[test]
     fn choosing_one_folder_leaves_the_other_two_alone() {
-        let mut s = super::Settings::default();
+        let mut s = Settings::default();
         let projects = s.project_root();
         let exports = s.export_root();
         s.record_dir = Some("/tmp/somewhere-else".to_owned());
-        assert_eq!(s.record_root(), std::path::PathBuf::from("/tmp/somewhere-else"));
+        assert_eq!(s.record_root(), PathBuf::from("/tmp/somewhere-else"));
         assert_eq!(s.project_root(), projects, "the projects followed the takes");
         assert_eq!(s.export_root(), exports, "the exports followed the takes");
         // An empty string is not a choice: it falls back rather than
@@ -5834,7 +5834,7 @@ mod tests {
     #[test]
     fn resetting_the_desk_leaves_no_channel_behind() {
         use super::ResetScope;
-        let mut s = super::Settings::first_launch();
+        let mut s = Settings::first_launch();
         // A track on slot 8, the way `add_bare_track` makes one, plus the
         // other per-channel marks.
         s.tracks_added |= 1 << 8;
@@ -5847,7 +5847,7 @@ mod tests {
 
         s.reset(ResetScope::Desk);
 
-        let fresh = super::Settings::first_launch();
+        let fresh = Settings::first_launch();
         assert_eq!(
             s.tracks_added, fresh.tracks_added,
             "a channel survived the reset: mask {:b}",
@@ -5862,7 +5862,7 @@ mod tests {
         );
 
         // And "Everything" is at least as thorough as "The Desk".
-        let mut all = super::Settings::first_launch();
+        let mut all = Settings::first_launch();
         all.tracks_added |= 1 << 8;
         all.reset(ResetScope::Everything);
         assert_eq!(all.tracks_added, fresh.tracks_added);
@@ -5876,7 +5876,7 @@ mod tests {
     /// switching views.
     #[test]
     fn a_guessed_reader_mode_is_cleared_once_and_then_left_alone() {
-        let mut s = super::Settings::default();
+        let mut s = Settings::default();
         s.screen_reader_mode = true;
         assert!(s.clear_guessed_reader_mode(false), "the one-shot did not run");
         assert!(!s.screen_reader_mode, "the guess survived");
@@ -5897,7 +5897,7 @@ mod tests {
     /// the moment of the wipe. It is asked, and the setting is kept.
     #[test]
     fn a_reader_mode_saved_while_a_reader_is_attached_survives_the_one_shot() {
-        let mut s = super::Settings::default();
+        let mut s = Settings::default();
         s.screen_reader_mode = true;
         assert!(s.clear_guessed_reader_mode(true), "the one-shot did not run");
         assert!(s.screen_reader_mode, "a reader user's own setting was wiped");
@@ -5914,7 +5914,7 @@ mod tests {
     /// migration pins them instead, once.
     #[test]
     fn an_existing_install_is_pinned_to_where_its_takes_already_are() {
-        let mut s = super::Settings::default();
+        let mut s = Settings::default();
         assert!(!s.media_root_v20);
         // Runs once and says so.
         assert!(s.pin_legacy_media_root());
@@ -5923,7 +5923,7 @@ mod tests {
         // A file that has already been through it is left alone, whatever
         // is on disk: re-pinning would undo a folder the user had since
         // moved.
-        let mut chosen = super::Settings::default();
+        let mut chosen = Settings::default();
         chosen.media_root_v20 = true;
         chosen.record_dir = Some("/tmp/mine".to_owned());
         assert!(!chosen.pin_legacy_media_root());
@@ -6563,7 +6563,7 @@ mod tests {
     /// column 1".
     #[test]
     fn a_byte_order_mark_in_front_of_the_settings_is_read_past() {
-        let map = super::parse_object("\u{feff}{ \"transpose\": 3 }")
+        let map = parse_object("\u{feff}{ \"transpose\": 3 }")
             .expect("a file with a byte-order mark was refused");
         assert_eq!(map.get("transpose").and_then(|v| v.as_i64()), Some(3));
         // And through the file loader, which is the road that mattered: the
@@ -6583,7 +6583,7 @@ mod tests {
         assert!(s.unreadable.is_none(), "a readable file was reported as unreadable");
         assert!(!dir.join("settings.json.unreadable").exists(), "a readable file was set aside");
         // Not an object at all: named as such rather than as a parse error.
-        let why = super::parse_object("[1, 2]").expect_err("an array was accepted as settings");
+        let why = parse_object("[1, 2]").expect_err("an array was accepted as settings");
         assert!(why.contains("an array"), "{why}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7557,7 +7557,7 @@ mod tests {
         // And the desk reset takes them: a wiped desk keeping a flag would
         // be waiting to silence the first plugin loaded onto it.
         let mut wiped = s.clone();
-        wiped.reset(super::ResetScope::Everything);
+        wiped.reset(ResetScope::Everything);
         assert!(wiped.insert_bypass.0.is_empty());
     }
 

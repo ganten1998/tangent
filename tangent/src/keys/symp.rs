@@ -411,7 +411,7 @@ impl Harp {
     /// Bytes of string this harp carries — the arena, which is the whole
     /// of its memory beyond `size_of::<Harp>()`.
     pub fn arena_bytes(&self) -> usize {
-        self.arena.len() * std::mem::size_of::<f32>()
+        self.arena.len() * size_of::<f32>()
     }
 
     fn index(pitch: u8) -> Option<usize> {
@@ -1326,7 +1326,7 @@ mod tests {
         println!("brief's 78x with the 88-loop worst case on top: {:.0}x", 1.0 / (1.0 / 78.0 + ns_all / period_ns));
         println!(
             "memory: size_of::<Harp>() = {} bytes, arena {} bytes at {RATE} Hz",
-            std::mem::size_of::<Harp>(),
+            size_of::<Harp>(),
             h.arena_bytes()
         );
         // 5. Re-stringing: what `set_patch` pays on the audio thread for
@@ -1385,8 +1385,8 @@ mod tests {
     fn the_harp_is_small() {
         for rate in [44_100.0_f32, 48_000.0, 96_000.0, 192_000.0] {
             let h = Harp::new(rate);
-            let total = std::mem::size_of::<Harp>() + h.arena_bytes();
-            println!("{rate} Hz: {} bytes struct + {} bytes arena = {} KB", std::mem::size_of::<Harp>(), h.arena_bytes(), total / 1024);
+            let total = size_of::<Harp>() + h.arena_bytes();
+            println!("{rate} Hz: {} bytes struct + {} bytes arena = {} KB", size_of::<Harp>(), h.arena_bytes(), total / 1024);
             assert!(total < 1_400_000, "{total} bytes at {rate} Hz");
             // Every line holds its own period with room to read behind it.
             for (i, l) in h.loops.iter().enumerate() {

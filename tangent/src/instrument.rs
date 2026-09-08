@@ -1877,11 +1877,11 @@ struct Shared {
     /// A layout change for the monitor ring already handed over. Read in the
     /// same place `pending_monitor` is, and for the same reason: the audio
     /// thread must never block on the UI's lock.
-    pending_monitor_layout: std::sync::Mutex<Option<([u8; INPUTS], tangent_record::audio::Picks)>>,
-    pending_monitor: std::sync::Mutex<
+    pending_monitor_layout: Mutex<Option<([u8; INPUTS], tangent_record::audio::Picks)>>,
+    pending_monitor: Mutex<
         Option<
             Option<(
-                rtrb::Consumer<f32>,
+                Consumer<f32>,
                 u16,
                 [u8; INPUTS],
                 u32,
@@ -2228,7 +2228,7 @@ struct Shared {
     /// multiplied, pushed on the UI thread and DRAINED on the audio thread —
     /// draining frees nothing, `Voice` being 155 inline numbers, so the
     /// callback stays allocation-free in both directions.
-    pending_voices: std::sync::Mutex<Vec<(usize, crate::dx7::Voice)>>,
+    pending_voices: Mutex<Vec<(usize, crate::dx7::Voice)>>,
     /// **The key one lane is being HELD on for an audition**, or `u32::MAX`
     /// where nothing is held. The DX7 picker's press-and-hold, and the only
     /// note path in this engine that names a STRIP.
@@ -2341,11 +2341,11 @@ struct Shared {
     /// `pending_monitor` handoff exactly: the host builds every buffer, the
     /// callback `try_lock`s and takes, and nothing is ever allocated or
     /// dropped on the audio thread.
-    pending_ir: std::sync::Mutex<Option<IrJob>>,
+    pending_ir: Mutex<Option<IrJob>>,
     /// The finished (or cancelled) job on its way back OUT, buffers and all,
     /// so their deallocation happens on the host's thread. `try_lock`ed by
     /// the callback; drained by [`Engine::take_captured`].
-    finished_ir: std::sync::Mutex<Option<IrJob>>,
+    finished_ir: Mutex<Option<IrJob>>,
     /// The host asked the road to stop. Read once per callback; the running
     /// job is handed back through `finished_ir` however far it got.
     ir_stop: AtomicBool,
@@ -2420,8 +2420,8 @@ impl Shared {
             track_loaded: AtomicBool::new(false),
             monitor_on: AtomicBool::new(false),
             reastream_on: AtomicBool::new(false),
-            pending_monitor: std::sync::Mutex::new(None),
-            pending_monitor_layout: std::sync::Mutex::new(None),
+            pending_monitor: Mutex::new(None),
+            pending_monitor_layout: Mutex::new(None),
             monitor_slip: AtomicU64::new(0),
             monitor_backlog: AtomicU32::new(0),
             pending_swaps: AtomicU32::new(0),
@@ -2515,7 +2515,7 @@ impl Shared {
             tap_dropped: AtomicU64::new(0),
             midi_dropped: AtomicU64::new(0),
             pedal_dropped: AtomicU64::new(0),
-            pending_voices: std::sync::Mutex::new(Vec::new()),
+            pending_voices: Mutex::new(Vec::new()),
             // Nothing held anywhere. `u32::MAX` and not a key, so that the
             // zeroed word a lazier sentinel would have used cannot read as
             // "this lane is holding C-1".
@@ -2529,8 +2529,8 @@ impl Shared {
             insert_key: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             insert_key_n: AtomicUsize::new(0),
             insert_bypass: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
-            pending_ir: std::sync::Mutex::new(None),
-            finished_ir: std::sync::Mutex::new(None),
+            pending_ir: Mutex::new(None),
+            finished_ir: Mutex::new(None),
             ir_stop: AtomicBool::new(false),
             ir_cap_pos: AtomicU32::new(0),
             ir_cap_total: AtomicU32::new(0),
@@ -2692,7 +2692,7 @@ enum Backend {
         inst: Instance,
         /// Held, never read. See the note above about drop order.
         #[allow(dead_code, reason = "kept alive for the instance's sake, not read")]
-        module: std::sync::Arc<Module>,
+        module: Arc<Module>,
     },
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     Lv2(tangent_host::lv2::Instance),
@@ -2715,8 +2715,8 @@ impl Backend {
     /// nothing reads, and without the second its arpeggiator has no grid.
     fn process_voice(
         &mut self,
-        notes: &[tangent_host::Note],
-        controls: &[tangent_host::Control],
+        notes: &[Note],
+        controls: &[Control],
         params: &[tangent_host::ParamPoint],
         transport: crate::analog::arp::Transport,
         frames: usize,
@@ -3382,8 +3382,8 @@ fn run_rack(
     planar: &mut [Vec<f32>],
     frames: usize,
     out: &mut [Vec<f32>],
-    notes: &[tangent_host::Note],
-    controls: &[tangent_host::Control],
+    notes: &[Note],
+    controls: &[Control],
     // **Automation for this block, per BAY.** Indexed by the slot's position
     // in the rack, because a parameter id means nothing without knowing which
     // plugin it belongs to and two bays can hold the same effect.
@@ -3892,7 +3892,7 @@ struct Renderer {
     /// Before this, every rack on every channel was handed `&self.controls`
     /// — the live list, and nothing else. A recorded pedal had no door into
     /// an instrument even once the clip carried it.
-    lane_controls: Vec<tangent_host::Control>,
+    lane_controls: Vec<Control>,
     /// Where the three pedals stand on the LIVE input, as a level rather
     /// than as the events that got them there.
     ///
@@ -3918,7 +3918,7 @@ struct Renderer {
     /// apart on purpose: the first needs `&mut` on the instruments, the
     /// second needs the buffers borrowed, and the block's worth of pedal
     /// moves is at most three per lane.
-    lane_pedal_out: Vec<(u8, tangent_host::Control)>,
+    lane_pedal_out: Vec<(u8, Control)>,
     /// The transport's position in frames, advanced by `run_transport` and
     /// nothing else. Project frames, not clip frames: a clip positions itself
     /// as `pos - placed.start`.
@@ -4261,7 +4261,7 @@ struct Renderer {
     gain_coeff: f32,
     /// The live input, when one is open. Drained EVERY block whether or not
     /// anybody is listening — see `mix_monitor`.
-    monitor: Option<rtrb::Consumer<f32>>,
+    monitor: Option<Consumer<f32>>,
     /// How many channels that ring carries per frame.
     monitor_channels: usize,
     /// Slewed, so switching monitoring on is a fade rather than a bang.
@@ -4583,8 +4583,8 @@ impl Renderer {
         // its tails. The gate is per CHANNEL and travels as one atomic mask,
         // like mute and solo.
         let armed = self.shared.midi_off.load(Ordering::Relaxed) & (1 << at.min(63)) == 0;
-        let notes: &[tangent_host::Note] = if armed { &self.notes } else { &[] };
-        let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
+        let notes: &[Note] = if armed { &self.notes } else { &[] };
+        let controls: &[Control] = if armed { &self.controls } else { &[] };
         let Some(rack) = self.racks.get(at) else {
             return;
         };
@@ -5204,7 +5204,7 @@ impl Renderer {
                 for pitch in 0..128u8 {
                     if self.sounding & (1 << pitch) != 0 && self.notes.len() < MAX_EVENTS_PER_BLOCK
                     {
-                        self.notes.push(tangent_host::Note {
+                        self.notes.push(Note {
                             offset: 0,
                             pitch: i16::from(pitch),
                             velocity: 0.0,
@@ -5565,8 +5565,8 @@ impl Renderer {
                     let armed = self.shared.midi_off.load(Ordering::Relaxed)
                         & (1 << Strip::Click.index().min(63))
                         == 0;
-                    let notes: &[tangent_host::Note] = if armed { &self.notes } else { &[] };
-                    let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
+                    let notes: &[Note] = if armed { &self.notes } else { &[] };
+                    let controls: &[Control] = if armed { &self.controls } else { &[] };
                     // **NOT-A-CHANNEL:** the click's own strip, which can
                     // never be one of the sixteen and so can never be a
                     // folder.
@@ -6972,8 +6972,8 @@ impl Renderer {
                 self.run_pedalboard(lane, n, armed, true);
             }
             {
-                let notes: &[tangent_host::Note] = if armed { &self.notes } else { &[] };
-                let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
+                let notes: &[Note] = if armed { &self.notes } else { &[] };
+                let controls: &[Control] = if armed { &self.controls } else { &[] };
                 // **This seat's own parameter queue, not the empty one.** Every rack
                 // outside the general channels used to be handed an empty queue,
                 // which was true while the only writer was an automation curve —
@@ -9190,7 +9190,7 @@ impl Renderer {
                 // clip's pedal plays on an unarmed lane exactly as its notes
                 // do, and the arm is what the notes' own comment calls "the
                 // whole point of the arm".
-                let controls: &[tangent_host::Control] = &lane_controls;
+                let controls: &[Control] = &lane_controls;
                 // **This seat's own parameter queue, not the empty one.** Every rack
                 // outside the general channels used to be handed an empty queue,
                 // which was true while the only writer was an automation curve —
@@ -9546,7 +9546,7 @@ impl Renderer {
             return;
         }
         self.board_ran |= bit;
-        let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
+        let controls: &[Control] = if armed { &self.controls } else { &[] };
         for pedal in 0..tangent_ui::recorder::AMP_PEDALS {
             let seat = tangent_ui::recorder::amp_pedal_seat(ch, pedal);
             // An empty pedal rack costs this one load and nothing else —
@@ -13615,7 +13615,7 @@ impl Engine {
     pub fn set_monitor(
         &mut self,
         tap: Option<(
-            rtrb::Consumer<f32>,
+            Consumer<f32>,
             u16,
             [u8; INPUTS],
             u32,
@@ -14936,7 +14936,7 @@ pub fn plugin_test(filter: Option<String>) {
 #[derive(Debug, Clone, Copy)]
 pub struct StallWatch {
     /// The last callback count seen, and when it last MOVED.
-    seen: Option<(u64, std::time::Instant)>,
+    seen: Option<(u64, Instant)>,
 }
 
 /// How long the callback count may sit still, while the stream claims to run,
@@ -14946,7 +14946,7 @@ pub struct StallWatch {
 /// system sleep excepted (and a rebuild on wake is the right call anyway) —
 /// while short enough that "I switched to ASIO and hear nothing" becomes a
 /// message and a recovery in the time it takes to reach for the fader.
-pub const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+pub const STALL_AFTER: Duration = Duration::from_secs(2);
 
 impl StallWatch {
     pub fn new() -> Self {
@@ -14955,7 +14955,7 @@ impl StallWatch {
 
     /// Feed one reading; `true` means the output is stalled and should be
     /// rebuilt. `now` is a parameter so tests need not sleep.
-    pub fn note(&mut self, running: bool, callbacks: u64, now: std::time::Instant) -> bool {
+    pub fn note(&mut self, running: bool, callbacks: u64, now: Instant) -> bool {
         if !running {
             // A stream that admits it stopped is the FAULT path's business,
             // not the watchdog's; stop measuring so a later restart begins
@@ -15205,7 +15205,7 @@ mod tests {
     fn folding_to_mono_keeps_the_level() {
         // Hard left, nothing right: the fold puts half of it in both.
         let mut buf = [1.0f32, 0.0, 0.5, -0.5, 0.3, 0.3];
-        super::fold_mono(&mut buf, true);
+        fold_mono(&mut buf, true);
         assert!((buf[0] - 0.5).abs() < 1e-6, "{buf:?}");
         assert!((buf[1] - 0.5).abs() < 1e-6, "{buf:?}");
         // Out of phase cancels, which is the whole reason to press it.
@@ -15218,7 +15218,7 @@ mod tests {
         // Off is a no-op, and the branch is outside the loop for a reason:
         // this runs on the audio callback.
         let mut same = [1.0f32, 0.0];
-        super::fold_mono(&mut same, false);
+        fold_mono(&mut same, false);
         assert_eq!(same, [1.0, 0.0]);
     }
     use super::*;
@@ -15247,7 +15247,7 @@ mod tests {
     #[test]
     fn a_climbing_callback_count_is_never_a_stall() {
         let mut w = StallWatch::new();
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         assert!(!w.note(true, 0, t0));
         for i in 1..100u64 {
             assert!(
@@ -15260,16 +15260,16 @@ mod tests {
     #[test]
     fn a_count_that_stops_climbing_while_running_is_a_stall_after_the_grace() {
         let mut w = StallWatch::new();
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         w.note(true, 41, t0);
-        w.note(true, 42, t0 + std::time::Duration::from_millis(10));
+        w.note(true, 42, t0 + Duration::from_millis(10));
         // Still inside the grace: quiet, but not yet declared.
-        assert!(!w.note(true, 42, t0 + std::time::Duration::from_millis(500)));
+        assert!(!w.note(true, 42, t0 + Duration::from_millis(500)));
         // Past it: dead. This is the ASIO driver unloaded under a live stream.
         assert!(w.note(
             true,
             42,
-            t0 + std::time::Duration::from_millis(10) + STALL_AFTER
+            t0 + Duration::from_millis(10) + STALL_AFTER
         ));
     }
 
@@ -15277,7 +15277,7 @@ mod tests {
     fn a_device_that_never_serves_one_callback_is_caught_too() {
         // The count never moves off zero; the first reading starts the clock.
         let mut w = StallWatch::new();
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         assert!(!w.note(true, 0, t0));
         assert!(w.note(true, 0, t0 + STALL_AFTER));
     }
@@ -15285,7 +15285,7 @@ mod tests {
     #[test]
     fn a_stream_that_admits_stopping_is_not_the_watchdogs_business() {
         let mut w = StallWatch::new();
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         w.note(true, 7, t0);
         // The fault path owns this: running=false must not read as a stall,
         // and must reset the clock so a restart starts fresh.
@@ -15293,7 +15293,7 @@ mod tests {
         assert!(!w.note(
             true,
             7,
-            t0 + STALL_AFTER * 5 + std::time::Duration::from_millis(1)
+            t0 + STALL_AFTER * 5 + Duration::from_millis(1)
         ));
     }
 
@@ -17188,10 +17188,10 @@ mod tests {
             .store(0.5f32.to_bits(), Ordering::Relaxed);
         // No drum lane assigned: the hidden Drums internals rule and rest at
         // unity, so the expected level is file * PREVIEW_GAIN(0.8) * 0.5.
-        r.preview = Some(std::sync::Arc::new(tangent_record::decode::Clip {
+        r.preview = Some(Arc::new(tangent_record::decode::Clip {
             samples: vec![0.25_f32; 2 * 4096],
             rate: RATE as u32,
-            source: std::path::PathBuf::from("audition.wav"),
+            source: PathBuf::from("audition.wav"),
         }));
         r.preview_pos = 0;
 
@@ -17288,7 +17288,7 @@ mod tests {
         let clip = Arc::new(tangent_record::decode::Clip {
             samples: vec![value; frames * 2],
             rate: RATE as u32,
-            source: std::path::PathBuf::new(),
+            source: PathBuf::new(),
         });
         for &p in pads {
             kit.pads[p] = Some(Arc::clone(&clip));
@@ -18607,7 +18607,7 @@ mod tests {
     /// untouched) is the bit-exact test above.
     #[test]
     fn empty_pedals_cost_an_idle_desk_nothing_measurable() {
-        let cost = |amp: bool| -> std::time::Duration {
+        let cost = |amp: bool| -> Duration {
             let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
             if amp {
                 e.load_insert(3, 0, Some(Path::new(crate::builtin_fx::AMP_PATH)), None)
@@ -18618,9 +18618,9 @@ mod tests {
             e.set_rolling(false);
             let mut out = vec![0.0f32; 512 * 2];
             e.render_offline(&mut out);
-            let mut best = std::time::Duration::MAX;
+            let mut best = Duration::MAX;
             for _ in 0..7 {
-                let t = std::time::Instant::now();
+                let t = Instant::now();
                 for _ in 0..200 {
                     out.fill(0.0);
                     e.render_offline(&mut out);
@@ -18632,7 +18632,7 @@ mod tests {
         let bare = cost(false);
         let dressed = cost(true);
         assert!(
-            dressed < bare * 3 + std::time::Duration::from_millis(30),
+            dressed < bare * 3 + Duration::from_millis(30),
             "an idle amp desk took {dressed:?} against {bare:?} bare"
         );
     }
@@ -19433,7 +19433,7 @@ mod tests {
             clip: Arc::new(tangent_record::decode::Clip {
                 samples: vec![level; 48_000],
                 rate: 48_000,
-                source: std::path::PathBuf::from("key.wav"),
+                source: PathBuf::from("key.wav"),
             }),
             strip,
             start: 0,
@@ -19963,7 +19963,7 @@ mod tests {
             e.set_transport(1, 0);
             e.set_rolling(true);
             let mut out = vec![0.0f32; FRAMES * 2];
-            let mut push_silence = |jack: &mut rtrb::Producer<f32>| {
+            let mut push_silence = |jack: &mut Producer<f32>| {
                 for _ in 0..FRAMES {
                     let _ = jack.push(0.0);
                 }
@@ -21501,7 +21501,7 @@ mod tests {
         let clip = Arc::new(tangent_record::decode::Clip {
             samples: vec![0.5; 4000],
             rate: 48_000,
-            source: std::path::PathBuf::from("c.wav"),
+            source: PathBuf::from("c.wav"),
         });
         // Four device outputs, so 3/4 exists to route to.
         let (mut r, _tx, shared) = renderer_with_midi(4);
@@ -21563,7 +21563,7 @@ mod tests {
                 })
                 .collect(),
             rate: 48_000,
-            source: std::path::PathBuf::from("s.wav"),
+            source: PathBuf::from("s.wav"),
         });
         let (mut r, _tx, shared) = renderer_with_midi(2);
         let (to, _from) = r.hijack_track_rings();
@@ -21699,7 +21699,7 @@ mod tests {
         let clip = Arc::new(tangent_record::decode::Clip {
             samples: vec![0.5; 4000],
             rate: 48_000,
-            source: std::path::PathBuf::from("c.wav"),
+            source: PathBuf::from("c.wav"),
         });
         let (mut r, _tx, shared) = renderer_with_midi(4);
         let (mut to_audio, _from) = r.hijack_track_rings();
@@ -21745,7 +21745,7 @@ mod tests {
         let clip = Arc::new(tangent_record::decode::Clip {
             samples: vec![0.5; 4000],
             rate: 48_000,
-            source: std::path::PathBuf::from("c.wav"),
+            source: PathBuf::from("c.wav"),
         });
         let render = |dest_gain: f32| {
             let clip = Arc::clone(&clip);
@@ -21800,7 +21800,7 @@ mod tests {
         let clip = Arc::new(tangent_record::decode::Clip {
             samples: vec![0.5; 4000],
             rate: 48_000,
-            source: std::path::PathBuf::from("c.wav"),
+            source: PathBuf::from("c.wav"),
         });
         let render = |route: bool| {
             let clip = Arc::clone(&clip);
@@ -22031,7 +22031,7 @@ mod tests {
         let clip = Arc::new(tangent_record::decode::Clip {
             samples: vec![0.5; 4000],
             rate: 48_000,
-            source: std::path::PathBuf::from("c.wav"),
+            source: PathBuf::from("c.wav"),
         });
         // **Channel 1 -> 7 -> 5: the chain runs DOWN the desk.**
         //
@@ -22107,7 +22107,7 @@ mod tests {
         let clip = Arc::new(tangent_record::decode::Clip {
             samples: vec![0.5; 4000],
             rate: 48_000,
-            source: std::path::PathBuf::from("c.wav"),
+            source: PathBuf::from("c.wav"),
         });
         let (mut r, _tx, shared) = renderer_with_midi(2);
         let (mut to_audio, _from) = r.hijack_track_rings();
@@ -22189,7 +22189,7 @@ mod tests {
             Arc::new(tangent_record::decode::Clip {
                 samples: vec![v; 2000],
                 rate: 48_000,
-                source: std::path::PathBuf::from("c.wav"),
+                source: PathBuf::from("c.wav"),
             })
         };
         let a = constant(0.5);
@@ -22257,7 +22257,7 @@ mod tests {
         let clip = Arc::new(tangent_record::decode::Clip {
             samples: vec![0.5; 4000],
             rate: 48_000,
-            source: std::path::PathBuf::from("c.wav"),
+            source: PathBuf::from("c.wav"),
         });
         let run = |pan: f32| -> (f32, f32) {
             let (mut r, _tx, shared) = renderer_with_midi(2);
@@ -23189,7 +23189,7 @@ mod tests {
         let clip = Arc::new(tangent_record::decode::Clip {
             samples,
             rate: 48_000,
-            source: std::path::PathBuf::from("s.wav"),
+            source: PathBuf::from("s.wav"),
         });
         let placed = |strip: usize| Placed {
             clip: Arc::clone(&clip),
@@ -23297,7 +23297,7 @@ mod tests {
             clip: Arc::new(tangent_record::decode::Clip {
                 samples: vec![0.5; 96_000],
                 rate: 48_000,
-                source: std::path::PathBuf::from("c.wav"),
+                source: PathBuf::from("c.wav"),
             }),
             strip: 2,
             start: 0,
@@ -23393,7 +23393,7 @@ mod tests {
             clip: Arc::new(tangent_record::decode::Clip {
                 samples: vec![0.5; 96_000],
                 rate: 48_000,
-                source: std::path::PathBuf::from("c.wav"),
+                source: PathBuf::from("c.wav"),
             }),
             strip: 0,
             start: 0,
@@ -23430,7 +23430,7 @@ mod tests {
             clip: Arc::new(tangent_record::decode::Clip {
                 samples: vec![1.0; 8000],
                 rate: 48_000,
-                source: std::path::PathBuf::from("c.wav"),
+                source: PathBuf::from("c.wav"),
             }),
             strip: 0,
             start: 0,
@@ -23481,7 +23481,7 @@ mod tests {
             Arc::new(tangent_record::decode::Clip {
                 samples: vec![v; 4000],
                 rate: 48_000,
-                source: std::path::PathBuf::from("c.wav"),
+                source: PathBuf::from("c.wav"),
             })
         };
         let clip_on = |lane: usize, level: f32| Placed {
@@ -23551,7 +23551,7 @@ mod tests {
         let clip = Arc::new(tangent_record::decode::Clip {
             samples: (0..frames).flat_map(|i| [i as f32, i as f32]).collect(),
             rate: 48_000,
-            source: std::path::PathBuf::from("t.wav"),
+            source: PathBuf::from("t.wav"),
         });
 
         let (mut r, mut tx, shared) = renderer_with_midi(2);
@@ -23716,7 +23716,7 @@ mod tests {
     fn choosing_a_patch_changes_what_comes_out() {
         use crate::dx7::Voice;
 
-        let sound = |r: &mut Renderer, tx: &mut rtrb::Producer<MidiEvent>| {
+        let sound = |r: &mut Renderer, tx: &mut Producer<MidiEvent>| {
             queue(tx, 0, [0x90, 60, 100]);
             let mut out = vec![0.0_f32; 2 * 4096];
             r.render(&mut out, 0, 0);

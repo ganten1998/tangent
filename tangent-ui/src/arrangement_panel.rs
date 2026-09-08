@@ -5879,8 +5879,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // wears, so the row reads as one object.
             let face = crate::recorder_panel::legible_surface(if view.master_color != 0 {
                 let (cr, cg, cb) =
-                    crate::mixer_panel::STRIP_COLORS[view.master_color.min(
-                        crate::mixer_panel::STRIP_COLORS.len() - 1,
+                    STRIP_COLORS[view.master_color.min(
+                        STRIP_COLORS.len() - 1,
                     )];
                 Color32::from_rgb(cr, cg, cb)
             } else {
@@ -6235,7 +6235,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // with its number under it — a dial this small needs the readout to
         // be a control you can trust.
         let dial = |painter: &Painter, cell: Rect, t: f32, cap: Color32| {
-            self::dial(painter, cell, t, cap, p.lane, p.clip_ink);
+            dial(painter, cell, t, cap, p.lane, p.clip_ink);
         };
         let readout = |painter: &Painter, cell: Rect, text: String| {
             if !cell.is_positive() || cell.height() < 7.0 {
@@ -7891,7 +7891,7 @@ ArrangeView {
             Some(Hit::BusGain(MASTER_COLUMN)),
             "the master's level cannot be pressed"
         );
-        assert_eq!(MASTER_COLUMN, crate::recorder::CHANNELS + 1);
+        assert_eq!(MASTER_COLUMN, CHANNELS + 1);
 
         // **Hidden, and the tracks take the room back.** Not removed: a
         // session always has an output.
@@ -8291,8 +8291,8 @@ ArrangeView {
                     .palette_choice
                     .rem_euclid(crate::mixer_panel::PALETTES.len() as i64)
                     as usize];
-                for ch in 0..crate::recorder::CHANNELS {
-                    let (r, g, b) = crate::mixer_panel::STRIP_COLORS[pal.slot(ch)];
+                for ch in 0..CHANNELS {
+                    let (r, g, b) = STRIP_COLORS[pal.slot(ch)];
                     let plate = Color32::from_rgb(r, g, b);
                     let ink_on = on_ink(plate);
                     let mut c2 = |what: &str, fg: Color32, floor: f32| {
@@ -8485,9 +8485,9 @@ ArrangeView {
                     [set.palette_choice.rem_euclid(
                         crate::mixer_panel::PALETTES.len() as i64,
                     ) as usize];
-                for ch in 0..crate::recorder::CHANNELS {
+                for ch in 0..CHANNELS {
                     let (r, g, b) =
-                        crate::mixer_panel::STRIP_COLORS[pal.slot(ch)];
+                        STRIP_COLORS[pal.slot(ch)];
                     check(
                         "clip ink on a clip",
                         p.clip_ink,

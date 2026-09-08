@@ -3074,7 +3074,7 @@ fn name_for(
 ) -> Option<crate::a11y::Node> {
     use crate::a11y::Node;
     let fx_value = |fx: Fx| {
-        crate::recorder_panel::knob_reading(view.fx_units[fx.index()], view.fx.get(fx))
+        knob_reading(view.fx_units[fx.index()], view.fx.get(fx))
     };
     let up = |norm: f32| crate::a11y::Travel { norm: norm.clamp(0.0, 1.0), up: true };
     Some(match produces {
@@ -3211,7 +3211,7 @@ fn name_for(
                     f64::from(view.gains.master),
                     0.0,
                     1.0,
-                    crate::recorder::gain_text(view.gains.master),
+                    gain_text(view.gains.master),
                     // **The FADER's position, not the gain.** `Hit::SetMaster`
                     // carries where the knob stands and `fader_to_gain` turns
                     // it into amplitude over a decibel curve, so the two are
@@ -3219,7 +3219,7 @@ fn name_for(
                     // knob's position sent one press of the up arrow from
                     // -6 dB to -20.4 — it moved, which is exactly why a test
                     // that only asked "did anything change" would have passed.
-                    up(crate::recorder::gain_to_fader(view.gains.master)),
+                    up(gain_to_fader(view.gains.master)),
                 ),
                 Hit::SetFx(fx, _) => Node::slider(
                     id(fx.title()),
@@ -3736,7 +3736,7 @@ fn draw_folder(painter: &Painter, r: Rect, p: &Palette) {
     let col = toward(p.ink, p.bg, 0.35);
     painter.rect_filled(tab, 1.0, col);
     painter.rect_filled(body, 1.5, col);
-    painter.rect_stroke(body, 1.5, Stroke::new(1.2_f32, p.line), egui::StrokeKind::Inside);
+    painter.rect_stroke(body, 1.5, Stroke::new(1.2_f32, p.line), StrokeKind::Inside);
 }
 
 // ── the monitor ────────────────────────────────────────────────────────────
@@ -4128,7 +4128,7 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
         return;
     }
     painter.rect_filled(r, 2.0, p.lcd_face);
-    painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), egui::StrokeKind::Inside);
+    painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
     // The LEFT HALF carries the whole pre-scope cluster now, STACKED: the
     // big musical position with the clock beside it on top, the viewport's
     // Start/End/Length rows under them — every part still draggable. The
@@ -5801,7 +5801,7 @@ fn draw_lufs(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette
     // that used to own the other edge are gone.
     {
         const STEP: f32 = 2.0;
-        let (lo, _) = crate::recorder::LUFS_RANGE;
+        let (lo, _) = LUFS_RANGE;
         let size = lufs_tick_size(l.lufs_bar.width());
         let mut last = f32::NEG_INFINITY;
         let mut lufs = 0.0_f32;
@@ -6514,11 +6514,11 @@ fn draw_tempo(
             l.tempo_tap,
             3.0,
             Stroke::new(1.0, TEMPO_CAP),
-            egui::StrokeKind::Inside,
+            StrokeKind::Inside,
         );
         painter.text(
             l.tempo_tap.center(),
-            egui::Align2::CENTER_CENTER,
+            Align2::CENTER_CENTER,
             "TAP",
             FontId::monospace((l.tempo_tap.height() * 0.62).clamp(7.0, 10.0)),
             TEMPO_CAP,
@@ -7067,9 +7067,9 @@ mod tests {
         // **Nothing moves at the sizes anybody works in.** This is the
         // assertion that protects the view the owner already likes.
         for w in [900.0f32, 1300.0, 1600.0] {
-            let linear = (super::BAND_H_AT_1300 * f64::from(w) / 1300.0).trunc() as f32;
+            let linear = (BAND_H_AT_1300 * f64::from(w) / 1300.0).trunc() as f32;
             assert_eq!(
-                super::band_height(w),
+                band_height(w),
                 linear,
                 "the band changed at {w}, which is a window and not a screen"
             );
@@ -7078,8 +7078,8 @@ mod tests {
         // Wide: shorter, and inside the range that was asked for. 3440 sits
         // on the floor, which is 0.63 of linear and therefore exactly 37%.
         for (w, lo, hi) in [(2560.0f32, 0.24, 0.32), (3440.0, 0.24, 0.375)] {
-            let linear = super::BAND_H_AT_1300 * f64::from(w) / 1300.0;
-            let got = f64::from(super::band_height(w));
+            let linear = BAND_H_AT_1300 * f64::from(w) / 1300.0;
+            let got = f64::from(band_height(w));
             let cut = 1.0 - got / linear;
             assert!(
                 cut >= lo && cut <= hi,
@@ -7091,8 +7091,8 @@ mod tests {
         }
         // And never more than the floor, however wide the screen.
         for w in [5120.0f32, 7680.0] {
-            let linear = super::BAND_H_AT_1300 * f64::from(w) / 1300.0;
-            let cut = 1.0 - f64::from(super::band_height(w)) / linear;
+            let linear = BAND_H_AT_1300 * f64::from(w) / 1300.0;
+            let cut = 1.0 - f64::from(band_height(w)) / linear;
             assert!(cut <= 0.375, "at {w} the band lost {:.0}%", cut * 100.0);
         }
 
@@ -7101,10 +7101,10 @@ mod tests {
         let share = |w: f32| -> f32 {
             let r = Rect::from_min_size(
                 Pos2::ZERO,
-                Vec2::new(w, super::band_height(w)),
+                Vec2::new(w, band_height(w)),
             );
             let l = Layout::new(r, &RecorderView::empty());
-            1.0 - super::lcd_split(l.lcd)
+            1.0 - lcd_split(l.lcd)
         };
         let at_1600 = share(1600.0);
         let at_2560 = share(2560.0);
@@ -7136,21 +7136,21 @@ mod tests {
         assert!(panel.is_positive(), "the panel has no room");
         assert!(screen.contains_rect(panel), "the panel hangs off the surface");
 
-        let l = super::MetLayout::new(screen, anchor);
+        let l = MetLayout::new(screen, anchor);
         // Every division and every note value is reachable, and each answers
         // with ITS OWN value rather than a neighbour's.
-        for (cell, (d, _)) in super::MetLayout::cells(l.rows[3], MET_DIVS.len())
+        for (cell, (d, _)) in MetLayout::cells(l.rows[3], MET_DIVS.len())
             .iter()
             .zip(MET_DIVS)
         {
             assert_eq!(met_hit_test(screen, anchor, cell.center()), Some(MetHit::Div(d)));
         }
-        for (cell, u) in super::MetLayout::cells(l.rows[2], MET_UNITS.len()).iter().zip(MET_UNITS) {
+        for (cell, u) in MetLayout::cells(l.rows[2], MET_UNITS.len()).iter().zip(MET_UNITS) {
             assert_eq!(met_hit_test(screen, anchor, cell.center()), Some(MetHit::Unit(u)));
         }
         // Minus and plus step the beats; the count between them is a READOUT
         // and pressing it must not change anything.
-        let beats = super::MetLayout::cells(l.rows[1], 3);
+        let beats = MetLayout::cells(l.rows[1], 3);
         assert_eq!(met_hit_test(screen, anchor, beats[0].center()), Some(MetHit::Beats(-1)));
         assert_eq!(met_hit_test(screen, anchor, beats[2].center()), Some(MetHit::Beats(1)));
         assert_eq!(
@@ -7158,7 +7158,7 @@ mod tests {
             None,
             "the beat count acted like a button"
         );
-        let sound = super::MetLayout::cells(l.rows[4], 2);
+        let sound = MetLayout::cells(l.rows[4], 2);
         // Default is the FIRST of the two and Custom the second — the order
         // the owner asked for, and the one the drawing paints.
         assert_eq!(met_hit_test(screen, anchor, sound[0].center()), Some(MetHit::SoundReset));
@@ -7168,7 +7168,7 @@ mod tests {
         // The tempo answers along its whole ROW, not just the two-point well
         // — a hand a little high still moves it — and reads 0 at the left end
         // and 1 at the right.
-        let track = super::met_tempo_track(screen, anchor);
+        let track = met_tempo_track(screen, anchor);
         let y = l.rows[0].center().y;
         match met_hit_test(screen, anchor, Pos2::new(track.left() + 0.5, y)) {
             Some(MetHit::Tempo(t)) => assert!(t < 0.02, "the left end reads {t}"),
@@ -7220,7 +7220,7 @@ mod tests {
     fn the_close_box_is_never_a_blank_square() {
         for side in [4.0_f32, 6.0, 9.0, 12.0, 14.7, 20.0, 40.0] {
             let r = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::splat(side));
-            let (arms, w) = super::close_x_arms(r)
+            let (arms, w) = close_x_arms(r)
                 .unwrap_or_else(|| panic!("a {side}-point close box drew nothing"));
             assert!(w >= 1.0, "a {side}-point arm is {w} thick");
             for arm in arms {
@@ -7240,7 +7240,7 @@ mod tests {
             );
         }
         // And nothing at all for a square with no room.
-        assert!(super::close_x_arms(Rect::NOTHING).is_none());
+        assert!(close_x_arms(Rect::NOTHING).is_none());
     }
 
     /// **The dial lands on whole beats; the FIELD is where decimals live.**
@@ -7253,23 +7253,23 @@ mod tests {
     fn the_tempo_dial_lands_on_whole_beats() {
         for step in 0..=200 {
             let t = step as f32 / 200.0;
-            let bpm = super::knob_to_tempo(t);
+            let bpm = knob_to_tempo(t);
             assert!(
                 (bpm - bpm.round()).abs() < 1e-9,
                 "the dial produced {bpm} at {t}"
             );
-            assert!(bpm >= f64::from(super::MIN_BPM) - 0.5);
-            assert!(bpm <= f64::from(super::MAX_BPM) + 0.5);
+            assert!(bpm >= f64::from(MIN_BPM) - 0.5);
+            assert!(bpm <= f64::from(MAX_BPM) + 0.5);
         }
         // The ends are exact, not rounded off the edge of the range.
-        assert_eq!(super::knob_to_tempo(0.0), f64::from(super::MIN_BPM).round());
-        assert_eq!(super::knob_to_tempo(1.0), f64::from(super::MAX_BPM).round());
+        assert_eq!(knob_to_tempo(0.0), f64::from(MIN_BPM).round());
+        assert_eq!(knob_to_tempo(1.0), f64::from(MAX_BPM).round());
 
         // And a TYPED decimal survives: it never comes through the knob, and
         // the readout shows the tenth rather than hiding it.
         assert_eq!(crate::recorder::parse_bpm("137.5"), Some(137.5));
-        assert_eq!(super::tempo_text(137.5), "137.5");
-        assert_eq!(super::tempo_text(137.0), "137");
+        assert_eq!(tempo_text(137.5), "137.5");
+        assert_eq!(tempo_text(137.0), "137");
     }
 
 
@@ -7286,7 +7286,7 @@ mod tests {
         let mut bad: Vec<String> = Vec::new();
         for theme in crate::theme::factory() {
             for dark in [false, true] {
-                let mut set = crate::settings::Settings::default();
+                let mut set = Settings::default();
                 theme.apply(&mut set);
                 set.dark_mode = dark;
                 let p = palette(&set);
@@ -9956,7 +9956,7 @@ mod tests {
         let mut bad: Vec<String> = Vec::new();
         for theme in crate::theme::factory() {
             for dark in [false, true] {
-                let mut set = crate::settings::Settings::default();
+                let mut set = Settings::default();
                 theme.apply(&mut set);
                 set.dark_mode = dark;
                 let p = palette(&set);
@@ -10006,7 +10006,7 @@ mod tests {
         let mut bad: Vec<String> = Vec::new();
         for theme in crate::theme::factory() {
             for dark in [false, true] {
-                let mut set = crate::settings::Settings::default();
+                let mut set = Settings::default();
                 theme.apply(&mut set);
                 set.dark_mode = dark;
                 let face = band_face(&set);
@@ -10055,7 +10055,7 @@ mod tests {
         // which is the whole reason `heart_shade` exists rather than the
         // colours being used raw: a strip colour is muted on purpose, and
         // muted on a sprite seven pixels wide is a grey smudge.
-        let mut set = crate::settings::Settings::default();
+        let mut set = Settings::default();
         set.dark_mode = true;
         let face = band_face(&set);
         let mut flat = 0;
@@ -10196,7 +10196,7 @@ mod tests {
         let mut bad: Vec<String> = Vec::new();
         for theme in crate::theme::factory() {
             for dark in [false, true] {
-                let mut set = crate::settings::Settings::default();
+                let mut set = Settings::default();
                 theme.apply(&mut set);
                 set.dark_mode = dark;
                 let p = palette(&set);
@@ -10246,7 +10246,7 @@ mod tests {
         let mut bad: Vec<String> = Vec::new();
         for theme in crate::theme::factory() {
             for dark in [false, true] {
-                let mut set = crate::settings::Settings::default();
+                let mut set = Settings::default();
                 theme.apply(&mut set);
                 set.dark_mode = dark;
                 let mode = if dark { "dark" } else { "light" };
@@ -11391,8 +11391,8 @@ pub fn draw_met(
     if row.is_positive() {
         label(row, "TEMPO");
         let track = MetLayout::track(row);
-        let span = (crate::recorder::MAX_BPM - crate::recorder::MIN_BPM).max(1.0);
-        let t = (((v.bpm - crate::recorder::MIN_BPM) / span) as f32).clamp(0.0, 1.0);
+        let span = (MAX_BPM - MIN_BPM).max(1.0);
+        let t = (((v.bpm - MIN_BPM) / span) as f32).clamp(0.0, 1.0);
         let h = (row.height() * 0.22).max(2.0);
         let well = Rect::from_center_size(track.center(), Vec2::new(track.width(), h));
         painter.rect_filled(well, h * 0.5, p.well);
@@ -12426,7 +12426,7 @@ mod claim_probe {
         for rolling in [false, true] {
             let mut v = RecorderView::empty();
             if rolling {
-                v.state = crate::recorder::RecordState::Rolling;
+                v.state = RecordState::Rolling;
             }
             let mut worst_err = 0.0_f32;
             let mut worst_w = 0.0_f32;

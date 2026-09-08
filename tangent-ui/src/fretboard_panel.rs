@@ -1114,7 +1114,7 @@ fn draw_intervals(
     // margin it sits in would hang over the last fret.
     let font = FontId::new(
         fonts::px((g.spacing * 0.62).clamp(8.0, 15.0).min(rect.width() * 0.52)),
-        crate::fonts::courier_bold(),
+        fonts::courier_bold(),
     );
     for (string, state) in voicing.strings.iter().enumerate() {
         let StringState::Sounding { pitch, .. } = state else {
@@ -1123,7 +1123,7 @@ fn draw_intervals(
         let name = interval_name(i.tonic, *pitch);
         painter.text(
             Pos2::new(rect.center().x, g.y(string)),
-            egui::Align2::CENTER_CENTER,
+            Align2::CENTER_CENTER,
             name,
             font.clone(),
             // The root in the app's own chord colour, so the thing everything

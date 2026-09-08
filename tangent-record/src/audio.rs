@@ -549,8 +549,8 @@ fn with_pipewire_node<T>(_node: &str, f: impl FnOnce() -> T) -> T {
 ///   already been believed once.
 pub struct GraphDropouts {
     /// Latest reading: -1 is "unknown", anything else is the count.
-    latest: std::sync::Arc<std::sync::atomic::AtomicI64>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    latest: Arc<std::sync::atomic::AtomicI64>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GraphDropouts {
@@ -564,8 +564,8 @@ impl GraphDropouts {
     /// that answers `None` forever and starts no thread at all.
     pub fn start() -> Self {
         use std::sync::atomic::{AtomicBool, AtomicI64};
-        let latest = std::sync::Arc::new(AtomicI64::new(-1));
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let latest = Arc::new(AtomicI64::new(-1));
+        let stop = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "linux")]
         {
             let latest_t = std::sync::Arc::clone(&latest);
@@ -603,14 +603,14 @@ impl GraphDropouts {
     /// Cheap enough for a per-frame read — one relaxed load — which is the
     /// point of the thread: the SPAWNING is on a timer, the READING is free.
     pub fn latest(&self) -> Option<u64> {
-        let v = self.latest.load(std::sync::atomic::Ordering::Relaxed);
+        let v = self.latest.load(Ordering::Relaxed);
         u64::try_from(v).ok()
     }
 }
 
 impl Drop for GraphDropouts {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -731,7 +731,7 @@ fn our_audio_nodes(dump_json: &str, pid: u32) -> Vec<u64> {
 /// token wherever the row's id parses. The LAST occurrence of an id wins,
 /// because `-n 2` prints two snapshots and the first is often idle.
 fn sum_errs(top_output: &str, ids: &[u64]) -> Option<u64> {
-    let mut latest: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut latest: HashMap<u64, u64> = HashMap::new();
     for line in top_output.lines() {
         let mut t = line.split_whitespace();
         let _state = t.next();
@@ -1022,8 +1022,8 @@ pub fn release_graph_quantum() -> bool {
 /// What we forced, or 0 when nothing is held. The prior force (somebody
 /// else's pin, put back on release) rides in the high half of a second
 /// atomic so a claim survives being asked twice without stacking.
-static CLAIMED_QUANTUM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static PRIOR_FORCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CLAIMED_QUANTUM: AtomicU32 = AtomicU32::new(0);
+static PRIOR_FORCE: AtomicU32 = AtomicU32::new(0);
 
 /// Where the claim writes its crash marker, set once by the binary at boot.
 /// A crash cannot release the claim, so the NEXT launch does: if the marker
@@ -1251,7 +1251,7 @@ pub fn system() -> Option<String> {
 /// not a preference worth honouring, so it is not honoured.
 fn build_host(want: &Option<String>) -> cpal::Host {
     #[cfg(test)]
-    HOSTS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    HOSTS_BUILT.fetch_add(1, Ordering::Relaxed);
     if let Some(want) = want {
         return cpal::available_hosts()
             .into_iter()
@@ -3426,11 +3426,11 @@ mod tests {
         // Serialize against any other test that touches SYSTEM.
         let baseline_system = system();
         with_host(|_| ()); // whatever key is current: cached from here on
-        let start = HOSTS_BUILT.load(std::sync::atomic::Ordering::Relaxed);
+        let start = HOSTS_BUILT.load(Ordering::Relaxed);
         with_host(|_| ());
         with_host(|_| ());
         assert_eq!(
-            HOSTS_BUILT.load(std::sync::atomic::Ordering::Relaxed),
+            HOSTS_BUILT.load(Ordering::Relaxed),
             start,
             "a second and third with_host on the same system rebuilt the host \
              - under ASIO that rebuild is the driver-teardown bug"
@@ -3440,11 +3440,11 @@ mod tests {
         // cached again.
         set_system(Some("not-a-real-system-name"));
         with_host(|_| ());
-        let after_switch = HOSTS_BUILT.load(std::sync::atomic::Ordering::Relaxed);
+        let after_switch = HOSTS_BUILT.load(Ordering::Relaxed);
         assert_eq!(after_switch, start + 1, "the new key should build exactly once");
         with_host(|_| ());
         assert_eq!(
-            HOSTS_BUILT.load(std::sync::atomic::Ordering::Relaxed),
+            HOSTS_BUILT.load(Ordering::Relaxed),
             after_switch,
             "the new key should then be cached"
         );

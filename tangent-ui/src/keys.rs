@@ -429,7 +429,7 @@ fn heading(word: &'static str) -> (&'static str, &'static str) {
 
 fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> {
     let describe_on = |&(_, label, action, _): &(
-        egui::Key,
+        Key,
         &'static str,
         KeyAction,
         bool,
@@ -1865,18 +1865,18 @@ pub struct Konami {
     at: usize,
 }
 
-const KONAMI: [egui::Key; 11] = [
-    egui::Key::ArrowUp,
-    egui::Key::ArrowUp,
-    egui::Key::ArrowDown,
-    egui::Key::ArrowDown,
-    egui::Key::ArrowLeft,
-    egui::Key::ArrowRight,
-    egui::Key::ArrowLeft,
-    egui::Key::ArrowRight,
-    egui::Key::B,
-    egui::Key::A,
-    egui::Key::Enter,
+const KONAMI: [Key; 11] = [
+    Key::ArrowUp,
+    Key::ArrowUp,
+    Key::ArrowDown,
+    Key::ArrowDown,
+    Key::ArrowLeft,
+    Key::ArrowRight,
+    Key::ArrowLeft,
+    Key::ArrowRight,
+    Key::B,
+    Key::A,
+    Key::Enter,
 ];
 
 impl Konami {
@@ -1890,7 +1890,7 @@ impl Konami {
     /// Feed one pressed key; answers true on the press that completes the
     /// code. The walk resets after completion, though the caller's
     /// once-per-install latch means that hardly matters.
-    pub fn feed(&mut self, key: egui::Key) -> bool {
+    pub fn feed(&mut self, key: Key) -> bool {
         if key == KONAMI[self.at] {
             self.at += 1;
             if self.at == KONAMI.len() {

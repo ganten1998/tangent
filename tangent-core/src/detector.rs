@@ -1839,7 +1839,7 @@ mod winner_probe {
             vec![51, 55, 61, 65, 69, 72],
             vec![43, 53, 58, 59, 63],
         ] {
-            let set: std::collections::HashSet<u8> = notes.iter().copied().collect();
+            let set: HashSet<u8> = notes.iter().copied().collect();
             let plain = d.detect_chord(&set);
             let (dbg, ranked) = d.detect_chord_debug(&set, 3);
             println!(

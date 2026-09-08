@@ -413,7 +413,7 @@ impl MidiTake {
         &self,
         timeline: &Timeline,
         tempo_bpm: f64,
-        path: &std::path::Path,
+        path: &Path,
         meter: Meter,
     ) -> std::io::Result<()> {
         self.build_with_meter(timeline, tempo_bpm, meter).save(path)

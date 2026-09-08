@@ -3957,7 +3957,7 @@ mod tests {
         }) else {
             panic!("no VST3 matching Pro-R; this test needs one installed");
         };
-        let module = crate::scan::Module::open(&bundle).expect("open module");
+        let module = Module::open(&bundle).expect("open module");
         let class = module
             .audio_modules()
             .into_iter()

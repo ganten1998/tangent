@@ -1854,8 +1854,8 @@ mod tests {
     /// MOVES with the theme, and that everything printed on it still reads.
     #[test]
     fn every_theme_grounds_the_theory_view_in_its_own_colour() {
-        let mut seen_light = std::collections::HashSet::new();
-        let mut seen_dark = std::collections::HashSet::new();
+        let mut seen_light = HashSet::new();
+        let mut seen_dark = HashSet::new();
         let mut bad: Vec<String> = Vec::new();
         for theme in crate::theme::factory() {
             for dark in [false, true] {
@@ -2193,7 +2193,7 @@ mod tests {
             crate::staff::StaffSet::Grand,
         ] {
             for note in [100u8, 113, 41, 29] {
-                let mut s = crate::settings::Settings::first_launch();
+                let mut s = Settings::first_launch();
                 s.staff_set = set.key();
                 let views = s.theory_views();
                 let w = 1300.0_f32;
@@ -2209,9 +2209,9 @@ mod tests {
                 let h = (inner.height() * 0.075).clamp(9.0, 14.0);
                 let lh = h * 0.82;
                 let legend_centre_y = inner.min.y + h + lh * 0.5;
-                let notes: std::collections::HashSet<u8> = [note].into_iter().collect();
+                let notes: HashSet<u8> = [note].into_iter().collect();
                 let ctx = egui::Context::default();
-                crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+                fonts::install(&ctx, fonts::FontChoice::default(), None);
                 let out = ctx.run(egui::RawInput::default(), |ctx| {
                     let painter = ctx.layer_painter(egui::LayerId::debug());
                     draw(
