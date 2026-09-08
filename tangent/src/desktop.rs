@@ -9972,11 +9972,23 @@ impl DesktopApp {
         }
         // Lengths the decode just established, written down so the scrubber
         // can draw next launch without one. Never marks the clips dirty.
-        // Empty on nearly every reload, and `note_clip_len` asks the EXACT
-        // dirty question per call, so nothing may be asked when there is
-        // nothing to write.
-        for (id, len_s) in fill_len {
-            self.app.note_clip_len(id, len_s);
+        //
+        // **The whole batch in one call.** The exact "was this project
+        // clean?" question the app asks around a fill is a walk of the
+        // entire document, and the re-mark after it is another; asked per
+        // clip they were paid 2N times on the one frame an N-take session
+        // lands its decodes on, which is also the frame that is already
+        // doing every other thing an open does. Asked once around the batch
+        // they are paid twice, whatever N is. `note_clip_lens` states the
+        // contract; the one difference from asking per clip is in the
+        // conservative direction (a batch that begins dirty stays dirty).
+        //
+        // **And an empty batch costs nothing**, which matters more than it
+        // looks: this list is empty on nearly every reload, and a reload
+        // runs on every clips-dirty edit, so a drag would otherwise pay a
+        // document walk per frame for nothing.
+        if !fill_len.is_empty() {
+            self.app.note_clip_lens(&fill_len);
         }
         // Files no clip references any more leave the cache with the edit.
         // **Only when there is a document to resolve against.** Without one
@@ -18840,6 +18852,33 @@ mod tests {
         assert!(done.peaks.is_some());
         assert!((done.file_s - 2.0).abs() < 1e-3);
         assert!(done.wave[col(0.45) * 2 + 1] > 0.8);
+    }
+
+    /// **The lengths a reload measured go over in ONE call, and an empty
+    /// list makes no call at all.**
+    ///
+    /// Both halves are costs, not tidiness. The app asks an exact "was this
+    /// project clean?" question around a fill — a walk of the whole
+    /// document — and re-marks after it, so per clip that is 2N document
+    /// walks on the frame an N-take session lands its decodes on. And the
+    /// list is empty on nearly every reload, while a reload runs on every
+    /// clips-dirty edit: a drag that paid a walk per frame for an empty
+    /// batch would be the same fault the other way round.
+    ///
+    /// A source scan; `DesktopApp` cannot be built in a test, and the app
+    /// side's own `note_clip_lens` tests carry the semantics.
+    #[test]
+    fn a_reloads_measured_lengths_go_over_in_one_call() {
+        let src = include_str!("desktop.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        assert!(
+            body.contains("if !fill_len.is_empty() {\n            self.app.note_clip_lens(&fill_len);"),
+            "the reload asks per clip again, or asks with an empty batch"
+        );
+        assert!(
+            !body.contains("self.app.note_clip_len("),
+            "a per-clip length write is a document walk per clip, twice"
+        );
     }
 
     /// **A settled stretched clip is drawn from the RENDER's pyramid, at
