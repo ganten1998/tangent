@@ -12,8 +12,9 @@
 //! The shape is a REAL document's shape rather than a bag of notes: audio and
 //! MIDI mixed, some clips looped, some trimmed, some stretched, fades on the
 //! audio, a few automation curves, markers, and a desk snapshot taken from
-//! `Settings::default()` — which is where a real document's 13,167-entry
-//! `desk.inserts` array comes from.
+//! `Settings::default()` — the shipped desk, two occupied seats (a real
+//! document's `desk.inserts` was 13,167 entries before version 7; it is
+//! the 108-seat head and a sparse tail now).
 //!
 //! **Test-only.** Declared `#[cfg(test)]` in `lib.rs`; nothing here ships,
 //! and the WAV writer at the bottom exists only because `tangent-ui` cannot
@@ -287,16 +288,27 @@ fn markers(song_s: f64) -> Vec<ArrMarker> {
 /// The desk as `TangentApp::desk_snapshot_of(&Settings::default())` takes
 /// it — the same fields from the same settings, spelled here because that
 /// function is private to `app.rs` and the document has to carry a desk to
-/// have a real document's shape (the 13,167-entry `inserts` array).
+/// have a real document's shape.
 pub(crate) fn desk() -> DeskSnap {
-    let s = Settings::default();
+    desk_of(&Settings::default())
+}
+
+/// The snapshot `desk_snapshot_of` would take of ANY settings — the same
+/// field list, rebuilt here because the app's is private.
+pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
     let sig = s.time_signature();
     DeskSnap {
         kinds: s.channel_kinds.to_vec(),
         icons: s.channel_icons.to_vec(),
         names: s.strip_names.clone(),
         colors: s.strip_colors.to_vec(),
-        inserts: s.strip_inserts.clone(),
+        inserts: s
+            .strip_inserts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.is_empty())
+            .map(|(n, p)| (n, p.clone()))
+            .collect(),
         sends: s.strip_sends.to_vec(),
         muted: s.strip_muted,
         soloed: s.strip_soloed,
@@ -574,7 +586,8 @@ fn the_fixtures_round_trip_and_have_the_promised_shape() {
         assert!(arr.clips.iter().any(|c| c.fade_in_s > 0.0), "no fades");
         assert!(!arr.automation.is_empty() && !arr.markers.is_empty());
         let desk = arr.desk.as_ref().expect("a desk");
-        assert_eq!(desk.inserts.len(), crate::recorder::INSERT_SPACE);
+        assert_eq!(desk.bay(0), Some(crate::dialogs::DRUMPAD_PATH), "the shipped desk");
+        assert!(desk.inserts.iter().all(|(_, p)| !p.is_empty()), "an empty seat was kept");
         let text = arr.to_json();
         let back = Arrangement::from_json(&text).to_json();
         if back != text {
@@ -853,5 +866,92 @@ fn perf_envelope() {
             if dev > 1e-6 { "  <-- DISAGREES" } else { "" }
         );
         assert!(dev <= 1e-6, "{what}: the pyramid disagrees with the walk by {dev}");
+    }
+}
+
+/// **doc_bytes**: what a REAL-shaped document weighs on disk — the owner's
+/// cr78test (13 clips, 140 notes, three occupied bays low in the desk) and
+/// moscow1 (13 clips, 2,354 notes, nine bays with one at seat 4149, the
+/// folder-extra rack that defeats any trailing trim) — and how much of it
+/// is the desk's insert seats. Ignored by default; run with
+/// `--ignored --nocapture`, before and after the seat space changed shape.
+#[test]
+#[ignore]
+fn perf_doc_bytes() {
+    use crate::arrangement::{ArrNote, ClipKind, ARRANGEMENT_VERSION};
+    let low: &[(usize, &str)] = &[
+        (0, crate::dialogs::DRUMPAD_PATH),
+        (3, crate::dialogs::BUILTIN_PATH),
+        (15, "/Library/Audio/Plug-Ins/VST3/Reverb.vst3"),
+    ];
+    let far: &[(usize, &str)] = &[
+        (0, crate::dialogs::DRUMPAD_PATH),
+        (3, crate::dialogs::BUILTIN_PATH),
+        (6, "/Library/Audio/Plug-Ins/VST3/Pro-Q 3.vst3"),
+        (9, "/Library/Audio/Plug-Ins/VST3/Rhodes Anthology.vst3"),
+        (15, "/Library/Audio/Plug-Ins/VST3/Reverb.vst3"),
+        (21, "/Library/Audio/Plug-Ins/VST3/Compressor.vst3"),
+        (30, "/Library/Audio/Plug-Ins/VST3/Delay.vst3"),
+        (45, "/Library/Audio/Plug-Ins/VST3/Chorus.vst3"),
+        (4149 * crate::recorder::INSERTS, "/Library/Audio/Plug-Ins/VST3/Brusfri.vst3"),
+    ];
+    for (name, notes, bays) in [("cr78test-shaped", 140usize, low), ("moscow1-shaped", 2354, far)] {
+        let mut arr = Arrangement::default();
+        arr.version = ARRANGEMENT_VERSION;
+        arr.named = true;
+        for i in 0..12usize {
+            arr.add_clip(ArrClip {
+                pedal: Vec::new(),
+                path: format!("media/take-{i:03}.wav"),
+                name: format!("take {i}"),
+                lane: i % 8,
+                start_s: i as f64 * 4.0,
+                len_s: 30.0,
+                loop_s: 30.0,
+                ..Default::default()
+            });
+        }
+        let mut part = ArrClip {
+            pedal: Vec::new(),
+            kind: ClipKind::Midi,
+            lane: 1,
+            name: "part".into(),
+            len_s: 64.0,
+            loop_s: 64.0,
+            ..Default::default()
+        };
+        for n in 0..notes {
+            part.notes.push(ArrNote {
+                at_s: n as f64 * 0.25,
+                dur_s: 0.125,
+                key: 36 + (n % 48) as u8,
+                vel: 100,
+            });
+        }
+        arr.add_clip(part);
+        let mut s = Settings::default();
+        for (bay, path) in bays {
+            if let Some(slot) = s.strip_inserts.get_mut(*bay) {
+                *slot = (*path).to_owned();
+            }
+        }
+        s.strip_names = vec!["drums".into(), "keys".into(), "gtr".into()];
+        arr.desk = Some(desk_of(&s));
+        let json = arr.to_json();
+        // The desk's insert seats alone, by the same writer.
+        let desk_only = {
+            let mut bare = Arrangement::default();
+            bare.desk = arr.desk.clone();
+            bare.to_json().len()
+        };
+        let back = Arrangement::from_json(&json);
+        assert_eq!(back.to_json(), json, "{name} is not a fixed point");
+        println!(
+            "doc_bytes    {name:<16} document {:>7} B; the desk alone {:>7} B; {} clips / {notes} notes / {} bays",
+            json.len(),
+            desk_only,
+            arr.clips.len(),
+            bays.len()
+        );
     }
 }

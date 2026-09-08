@@ -2108,28 +2108,79 @@ enum AfterSave {
 ///
 /// One struct rather than two parallel `Vec`s so they cannot fall out of step
 /// — every push, truncate and drain moves both by construction.
-#[derive(Clone, Default, PartialEq)]
+///
+/// # A struct, not a string
+///
+/// A moment used to be the pretty-printed document — 157 to 539 KB on the
+/// owner's projects, 0.8 ms to build at that size and 66 ms at 768 clips,
+/// paid on every committed edit and TWICE on every open; a hundred of them
+/// were 35 MB on a small song and two gigabytes on a large one; and an undo
+/// re-parsed one, which ran the live document back through the reader's
+/// sanitiser and could hand back a struct that no longer matched the text
+/// it came from (an empty-path clip dropped, an id renumbered), so the very
+/// next commit pushed a phantom moment and redo was gone.
+///
+/// Now a moment is the document itself behind an `Arc`, the live desk
+/// beside it, and the exact form is the WORDS of the fingerprint walk kept
+/// rather than mixed — see `Fingerprint`'s doc for why equal words mean
+/// equal text. Building one is a clone (8 µs on eight thousand notes) and
+/// a walk (the once-a-frame cost), restoring one is a clone, and what is
+/// restored is bit for bit what was committed.
+///
+/// **No `PartialEq`, on purpose.** A derived one would compare the floats
+/// as floats (NaN unequal to itself, `-0.0` equal to `0.0`) and the extras
+/// as sets, none of which is text equality. `same_text` is the comparison.
+#[derive(Clone)]
 struct Moment {
-    /// `Arrangement::to_json` with `DeskSnap` inside it.
-    doc: String,
-    /// Every non-empty lane kit, compactly — see `DrumpadDoc::compact_json`.
-    /// A hundred moments of the full 128-pad form would be megabytes.
+    /// The document as it stood, its own `desk` left `None` — the live
+    /// desk rides in `desk`, exactly as `to_json_with_desk` used to bake
+    /// it in. Shared, never edited in place.
+    arr: std::sync::Arc<crate::arrangement::Arrangement>,
+    /// The live desk at that instant. Shared with the moment before it
+    /// whenever the desk did not move, which on a run of clip edits is
+    /// always: a hundred moments then hold ONE desk.
+    desk: std::sync::Arc<crate::arrangement::DeskSnap>,
+    /// Every non-empty lane kit, compactly — see `DrumpadDoc::compact_all`.
+    /// A hundred moments of the full 128-pad form would be megabytes. What
+    /// an undo restores the kits FROM; the comparison is the words.
     kits: String,
+    /// The exact form: every word `undo_mark`'s walk mixes, over the
+    /// document, this desk and the kits. Equal words, equal text.
+    words: std::sync::Arc<Vec<u64>>,
+    /// The same walk as one `u64` — `project_dirty`'s number, from the
+    /// SAME pass as the words so the two cannot describe different moments.
+    mark: u64,
 }
 
-/// **What "saved" means**: the moment that was written, and its fingerprint.
+impl Moment {
+    /// Would `to_json_with_desk` and `compact_all` write the same bytes
+    /// for both? The question every exact caller asks.
+    fn same_text(&self, other: &Self) -> bool {
+        self.words == other.words
+    }
+}
+
+/// **What "saved" means**: the words of the moment that was written, and
+/// its fingerprint.
 ///
-/// One value and not two fields, built by one constructor, because the whole
-/// point of the fingerprint is that it answers the SAME question as the
-/// moment — cheaply. Two fields assigned at two call sites is the shape that
-/// drifts, and a drifted pair here means the title bar and the quit prompt
-/// disagree about whether there is anything to lose.
+/// One value and not two fields, built by one walk, because the whole point
+/// of the fingerprint is that it answers the SAME question as the words —
+/// cheaply. Two fields assigned at two call sites is the shape that drifts,
+/// and a drifted pair here means the title bar and the quit prompt disagree
+/// about whether there is anything to lose. The document itself is not
+/// kept: nothing is ever restored from the saved point, only compared.
 #[derive(Clone)]
 struct SavedPoint {
-    /// The exact bytes. What `project_dirty_exact` compares.
-    at: Moment,
-    /// The same bytes as one `u64`. What `project_dirty` compares.
+    /// The exact form. What `project_dirty_exact` compares.
+    words: std::sync::Arc<Vec<u64>>,
+    /// The same walk as one `u64`. What `project_dirty` compares.
     mark: u64,
+}
+
+impl SavedPoint {
+    fn of(m: &Moment) -> Self {
+        Self { words: std::sync::Arc::clone(&m.words), mark: m.mark }
+    }
 }
 
 /// Everything a track is, held by value. See [`TangentApp::copy_track`].
@@ -3768,6 +3819,8 @@ impl TangentApp {
         // the file carries the whole struct, faders included.
         self.settings_save_at.set(None);
         if self.caps.persist_global_settings {
+            #[cfg(test)]
+            self.settings_writes.set(self.settings_writes.get().saturating_add(1));
             self.settings.save();
             #[cfg(test)]
             self.settings_writes.set(self.settings_writes.get() + 1);
@@ -8690,11 +8743,54 @@ impl TangentApp {
     /// honest place to draw the line: the alternative is a document whose
     /// clips behave differently from identical clips made a minute later,
     /// with nothing on screen to explain why.
+    ///
+    /// One clip; the batch form is `note_clip_lens`, and this is that with
+    /// one element. The contract above is the batch's contract.
     pub fn note_clip_len(&mut self, id: u64, len_s: f64) {
-        let Some(i) = self.arrangement.clips.iter().position(|c| c.id == id) else {
-            return;
-        };
-        if self.arrangement.clips[i].len_s != 0.0 || !(len_s > 0.0) {
+        self.note_clip_lens(&[(id, len_s)]);
+    }
+
+    /// **The whole batch of lengths a reload measured, in one breath.**
+    ///
+    /// The exact "was it clean?" question below is a walk of the whole
+    /// document, and the re-mark after the fill is another; asked per clip
+    /// they were paid 2N times when a session with N unmeasured clips
+    /// opened (every one of them in the same frame, because a reload lands
+    /// its whole batch at once). Asked once around the batch they are paid
+    /// twice, whatever N is.
+    ///
+    /// **The applicable fills are found FIRST, and an empty set returns
+    /// before any question is asked.** `reload_clips` runs on every edit
+    /// with an empty list, and a fill for a clip that is already measured
+    /// or that measured 0.0 (an offset past the file's end) comes back on
+    /// every reload for the life of the session; neither may cost a walk.
+    /// A clip named twice in one batch takes its first length, as the
+    /// one-at-a-time road did.
+    ///
+    /// The single ask happens before any fill lands, so it can never read a
+    /// fill as dirt. The one difference from asking per clip is in the
+    /// conservative direction: a batch that begins dirty stays dirty even
+    /// where a later per-clip ask might have read clean and re-marked — a
+    /// prompt where none was, never a lost afternoon.
+    ///
+    /// MERGE-ME (host lane): `reload_clips` in desktop.rs still calls
+    /// `note_clip_len` per fill; it should call this once with the whole
+    /// `fill_len`, and skip the call when the list is empty.
+    pub fn note_clip_lens(&mut self, fills: &[(u64, f64)]) {
+        let mut todo: Vec<(usize, f64)> = Vec::new();
+        for &(id, len_s) in fills {
+            let Some(i) = self.arrangement.clips.iter().position(|c| c.id == id) else {
+                continue;
+            };
+            if self.arrangement.clips[i].len_s != 0.0
+                || !(len_s > 0.0)
+                || todo.iter().any(|(j, _)| *j == i)
+            {
+                continue;
+            }
+            todo.push((i, len_s));
+        }
+        if todo.is_empty() {
             return;
         }
         // A passive annotation must not make a clean project dirty — the
@@ -8706,13 +8802,17 @@ impl TangentApp {
         // is a cache the next explicit save carries to disk.
         // **Exact**, because being wrong in one direction here CLEARS real
         // dirt: a false "it was clean" re-marks the project saved over
-        // whatever was actually unsaved. Once per decoded file, not per
-        // frame. See `project_dirty`.
+        // whatever was actually unsaved. Once per batch of decoded files,
+        // not per frame. See `project_dirty`.
         let was_clean = !self.project_dirty_exact();
-        self.arrangement.clips[i].len_s = len_s;
-        // The loop, from the same number, in the same breath. See above for
-        // why this cannot re-arm a loop somebody turned off.
-        self.arrangement.clips[i].loop_s = len_s;
+        for (i, len_s) in todo {
+            if let Some(c) = self.arrangement.clips.get_mut(i) {
+                c.len_s = len_s;
+                // The loop, from the same number, in the same breath. See
+                // above for why this cannot re-arm a loop somebody turned off.
+                c.loop_s = len_s;
+            }
+        }
         if was_clean {
             self.mark_project_saved();
         }
@@ -8796,173 +8896,77 @@ impl TangentApp {
     ///
     /// Split out so `template_desk` can build the shipped desk without a
     /// live app — which is what stops seeding the template from capturing
-    /// whatever session happens to be open.
+    /// whatever session happens to be open. Built from `desk_view`, so a
+    /// snapshot and the once-a-frame fingerprint read the settings through
+    /// one derivation.
     fn desk_snapshot_of(settings: &Settings) -> crate::arrangement::DeskSnap {
-        let s = settings;
-        // Settings own this derivation; taking it from there is what keeps
-        // one answer rather than two that can drift.
+        Self::desk_view(settings).to_snap()
+    }
+
+    /// **The live desk, borrowed** — the ONE place the settings' fields
+    /// become a desk. Everything else derives from this: `desk_snapshot_of`
+    /// copies it, `undo_mark` and `walk` hash it in place.
+    ///
+    /// The three derivations that are not plain field reads live here and
+    /// nowhere else: the signature is PARSED (an unreadable string is the
+    /// default, as every other reader of it agrees), the tempo is the
+    /// export spec's, and `tracks_added` is the settings' `i64` narrowed
+    /// to the document's `u32`. A second copy of any of them is a second
+    /// way for the asterisk and the quit prompt to disagree.
+    fn desk_view(s: &Settings) -> crate::arrangement::DeskRef<'_> {
         let sig = s.time_signature();
-        crate::arrangement::DeskSnap {
-            kinds: s.channel_kinds.to_vec(),
-            icons: s.channel_icons.to_vec(),
-            names: s.strip_names.clone(),
-            colors: s.strip_colors.to_vec(),
-            inserts: s.strip_inserts.clone(),
-            sends: s.strip_sends.to_vec(),
+        crate::arrangement::DeskRef {
+            kinds: &s.channel_kinds,
+            icons: &s.channel_icons,
+            names: &s.strip_names,
+            colors: &s.strip_colors,
+            inserts: crate::arrangement::Bays::Dense(&s.strip_inserts),
+            sends: &s.strip_sends,
             muted: s.strip_muted,
             soloed: s.strip_soloed,
-            gains: s.channel_gains.to_vec(),
-            pans: s.channel_pans.to_vec(),
-            inputs: s.channel_inputs.clone(),
+            gains: &s.channel_gains,
+            pans: &s.channel_pans,
+            inputs: &s.channel_inputs,
             drums_gain: s.drums_gain,
             drums_pan: s.drums_pan,
             metronome_gain: s.metronome_gain,
             master_gain: s.master_gain,
             fx_return: s.fx_return_gain,
-            tempo_bpm: f64::from(s.record_export.tempo_bpm),
+            tempo_bpm: s.record_export.tempo_bpm,
             sig_beats: sig.beats,
             sig_unit: sig.unit,
             metronome_on: s.metronome_on,
             tracks_added: s.tracks_added as u32,
-            is_folder: s.strip_is_folder.clone(),
-            in_folder: s.strip_in_folder.clone(),
-            folder_shut: s.strip_folder_shut.clone(),
+            is_folder: &s.strip_is_folder,
+            in_folder: &s.strip_in_folder,
+            folder_shut: &s.strip_folder_shut,
         }
     }
 
     /// Put a document's desk on the settings — the live desk — clamped the
     /// way every settings read is. The host is told to reload the bays with
     /// the states the project carries.
+    ///
+    /// **Does not write the settings file.** The callers own that write: an
+    /// explicit open writes once, after everything an open touches has
+    /// landed; undo owes a debounced one; a stencil read for adoption is
+    /// repointed and written by its adopter. This used to end in
+    /// `save_settings`, which made every open two synchronous pretty-prints
+    /// of a 15,000-line file and every Ctrl+Z one more.
     fn apply_desk_snapshot(&mut self, d: &crate::arrangement::DeskSnap) {
-        // A document saved before the DRUM BUS carries ten-strip arrays:
-        // its click, bus and master rows would land one seat early. Grown
-        // here, in a copy, so an old session opens with its desk intact
-        // and the drums at their defaults.
-        let d = &{
-            let mut d = d.clone();
-            // Frozen at the ERA's numbers (16 channels, 18 strips), per the
-            // migration rule — this read the LIVE constants and went dead
-            // the day the desk grew to 24, stranding that beta window's
-            // documents unlifted.
-            const V18_CH: usize = 16;
-            if d.sends.len() == 18 {
-                d.sends.insert(V18_CH, 0.0);
-                if d.colors.len() == 19 {
-                    d.colors.insert(V18_CH, 0);
-                }
-                if d.names.len() == 19 {
-                    d.names.insert(V18_CH, String::new());
-                }
-                if d.inserts.len() == 19 * crate::recorder::INSERTS {
-                    for _ in 0..crate::recorder::INSERTS {
-                        d.inserts.insert(
-                            V18_CH * crate::recorder::INSERTS,
-                            String::new(),
-                        );
-                    }
-                }
-                let move_mask = |mask: u64| -> u64 {
-                    let keep = mask & ((1u64 << V18_CH) - 1);
-                    let above = mask >> V18_CH;
-                    keep | (above << (V18_CH + 1))
-                };
-                d.muted = move_mask(d.muted);
-                d.soloed = move_mask(d.soloed);
-            }
-            // **An eight-channel-era document, grown to today's count.** The
-            // settings path does this in `adopt_desk`; a project carries its
-            // own desk snapshot and needs the same lift, or opening a session
-            // saved at eight channels scatters its drums/click/fx/master and
-            // every pad's FX onto the new empty channels. Frozen eight-channel
-            // shape: STRIPS 11, master at 11, pad-insert base 12.
-            const OLD_CH: usize = 8;
-            const OLD_STRIPS: usize = 11;
-            let ins3 = crate::recorder::INSERTS;
-            // A sixteen-pad-era doc first grows its pads to 128 at base 12 —
-            // its pads were keys 36..51 — before the channels widen the base.
-            if d.inserts.len() == (OLD_STRIPS + 1 + 16) * ins3 {
-                d.inserts.resize((OLD_STRIPS + 1 + 128) * ins3, String::new());
-                for pad in (0..16usize).rev() {
-                    for bay in 0..ins3 {
-                        let from = (OLD_STRIPS + 1 + pad) * ins3 + bay;
-                        let to = (OLD_STRIPS + 1 + 36 + pad) * ins3 + bay;
-                        d.inserts[to] = std::mem::take(&mut d.inserts[from]);
-                    }
-                }
-            }
-            if d.sends.len() == OLD_STRIPS && crate::recorder::CHANNELS > OLD_CH {
-                let grow = crate::recorder::CHANNELS - OLD_CH;
-                for _ in 0..grow {
-                    if OLD_CH <= d.colors.len() {
-                        d.colors.insert(OLD_CH, 0);
-                    }
-                    if OLD_CH <= d.names.len() {
-                        d.names.insert(OLD_CH, String::new());
-                    }
-                    if OLD_CH <= d.sends.len() {
-                        d.sends.insert(OLD_CH, 0.0);
-                    }
-                }
-                let ins_at = OLD_CH * ins3;
-                for _ in 0..(grow * ins3) {
-                    if ins_at <= d.inserts.len() {
-                        d.inserts.insert(ins_at, String::new());
-                    }
-                }
-                let grow_mask = |mask: u64| -> u64 {
-                    let keep = mask & ((1u64 << OLD_CH) - 1);
-                    let above = mask >> OLD_CH;
-                    keep | (above << (OLD_CH + grow))
-                };
-                d.muted = grow_mask(d.muted);
-                d.soloed = grow_mask(d.soloed);
-                // Not the global `desk_state_shift_v19` flag: that renames the
-                // global state dir, and a project's insert states live in its
-                // own `state/`. The desk ARRAYS relocate here so plugins load
-                // at the right seats; a moved plugin's saved knobs fall back
-                // to defaults, the same graceful cost every shuffle accepts.
-            }
-            // **A sixteen-channel-era document, grown to twenty-four.** The
-            // 4.82-through-5.0 shape: nineteen sends is its fingerprint.
-            // Same fold, same bargain on the project's own state/ sidecars.
-            const V19_CH: usize = 16;
-            if d.sends.len() == 19 && crate::recorder::CHANNELS > V19_CH {
-                let grow = crate::recorder::CHANNELS - V19_CH;
-                for _ in 0..grow {
-                    if V19_CH <= d.colors.len() {
-                        d.colors.insert(V19_CH, 0);
-                    }
-                    if V19_CH <= d.names.len() {
-                        d.names.insert(V19_CH, String::new());
-                    }
-                    if V19_CH <= d.sends.len() {
-                        d.sends.insert(V19_CH, 0.0);
-                    }
-                }
-                let ins_at = V19_CH * ins3;
-                for _ in 0..(grow * ins3) {
-                    if ins_at <= d.inserts.len() {
-                        d.inserts.insert(ins_at, String::new());
-                    }
-                }
-                let grow_mask = |mask: u64| -> u64 {
-                    let keep = mask & ((1u64 << V19_CH) - 1);
-                    let above = mask >> V19_CH;
-                    keep | (above << (V19_CH + grow))
-                };
-                d.muted = grow_mask(d.muted);
-                d.soloed = grow_mask(d.soloed);
-            }
-            d
-        };
+        // A desk from an earlier era of the desk's shape arrives already
+        // lifted: `DeskSnap::from_value` runs the length-keyed era lifts on
+        // the dense array as the file holds it. They ran here once, on a
+        // clone of every desk applied — every open and every undo step —
+        // although a moment can never hold an old-era desk.
         if d.icons.is_empty() {
             // A document from before the badges: derive them — the drum
             // where the drumpad stands, auto everywhere else — instead of
             // leaving the LAST project's badges on this one's tracks.
             for i in 0..crate::recorder::CHANNELS {
-                let bay0 = d.inserts.get(i * crate::recorder::INSERTS);
+                let bay0 = d.bay(i * crate::recorder::INSERTS);
                 self.settings.channel_icons[i] =
-                    u8::from(bay0.is_some_and(|p| p == dialogs::DRUMPAD_PATH));
+                    u8::from(bay0 == Some(dialogs::DRUMPAD_PATH));
             }
         } else {
             for (i, ic) in d.icons.iter().take(crate::recorder::CHANNELS).enumerate() {
@@ -8977,7 +8981,31 @@ impl TangentApp {
         for (i, c) in d.colors.iter().take(self.settings.strip_colors.len()).enumerate() {
             self.settings.strip_colors[i] = *c;
         }
-        self.settings.strip_inserts = d.inserts.clone();
+        // The snapshot's occupied seats, spread over the settings' dense
+        // space — exactly `INSERT_SPACE`, never wider. Everything that
+        // indexes `strip_inserts` by seat — `insert`, `set_insert`, the
+        // track mover, the host's reconcile — keeps its dense vec, and
+        // every one of those seats comes from the seat map, so nothing
+        // past the map is ever asked for.
+        //
+        // **The vec is sized by the map, not by the bay.** This used to
+        // grow to `bay + 1` so that a seat past today's map would round
+        // trip; but a bay is document content, a sparse key can say
+        // anything, and `resize(bay + 1)` was a 2.4 TB allocation for an
+        // eleven-digit key and — with `bay == usize::MAX`, whose add wraps
+        // to zero in release — `resize(0)`, the whole desk emptied by one
+        // line of a file that parsed cleanly. The reader (`DeskSnap::
+        // canonical`) drops such a seat first; this is the second lock,
+        // for a snapshot built any other way: a seat past the space is
+        // skipped, and the settings mirror was going to drop it at the
+        // next launch anyway.
+        let mut dense = vec![String::new(); crate::recorder::INSERT_SPACE];
+        for (bay, path) in &d.inserts {
+            if let Some(slot) = dense.get_mut(*bay) {
+                *slot = path.clone();
+            }
+        }
+        self.settings.strip_inserts = dense;
         for (i, v) in d.sends.iter().take(crate::recorder::STRIPS).enumerate() {
             self.settings.strip_sends[i] = v.clamp(0.0, 1.0);
         }
@@ -9037,7 +9065,6 @@ impl TangentApp {
                 let _ = self.settings.routes.drop_into(ch);
             }
         }
-        self.save_settings();
         self.desk_reload = true;
     }
 
@@ -10241,12 +10268,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         .iter()
         .enumerate()
         .all(|(n, k)| *k == u8::from(n < tracks))
-        && d.inserts.iter().enumerate().all(|(n, p)| {
-            match shipped.iter().find(|(at, _)| *at == n) {
-                Some((_, want)) => p == want,
-                None => p.is_empty(),
-            }
-        })
+        && shipped.iter().all(|(at, want)| d.bay(*at) == Some(*want))
+        && d.inserts.iter().all(|(n, _)| shipped.iter().any(|(at, _)| at == n))
 }
 
     pub fn seed_template(&self, dir: &std::path::Path) {
@@ -10516,7 +10539,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         if keep == KeepPath::Write {
             self.settings.project_path = doc.to_string_lossy().into_owned();
-            self.save_settings();
         }
         self.clips_dirty = true;
         // **The session's DESK arrives with it** — kinds, bays, names,
@@ -10531,6 +10553,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // carries replaces the one in memory.
         self.load_drumpad_doc();
         self.reconcile_auto_bases();
+        // **One settings write per open, here, after everything an open
+        // touches has landed** — the path, the desk, whatever the reconcile
+        // moved. It used to be two synchronous writes: one for the path
+        // BEFORE the desk was applied, so it pretty-printed the previous
+        // session's desk, and one inside `apply_desk_snapshot`.
+        // `project_path` still reaches disk in the same call it changes
+        // in, which is what a relaunch after a crash depends on.
+        //
+        // A `Leave` open writes nothing: `adopt_template` repoints and
+        // writes on its next line, and a stencil opened from the dialog
+        // keeps the previous session's path and leaves the mirror of its
+        // desk to the next settings write — of which there is one for
+        // every control touched.
+        if keep == KeepPath::Write {
+            self.save_settings();
+        }
         self.undo_reset();
     }
 
@@ -13080,7 +13118,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// * **`project_dirty_exact`** is the same question where a wrong answer
     ///   means the app does not OFFER TO SAVE and somebody loses an
     ///   afternoon: `ask_before` (New, Open and Quit all go through it),
-    ///   `new_is_noop`, `note_clip_len`, and the two project-switch
+    ///   `new_is_noop`, `note_clip_lens`, and the two project-switch
     ///   save-backs in `desktop.rs`. Every one of those is event-driven and
     ///   pays the full comparison once, not sixty times a second, so there
     ///   is nothing to buy by making them cheap and everything to lose.
@@ -13097,8 +13135,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// For the callers where a wrong answer costs somebody their work. See
     /// `project_dirty` for the split and for which callers those are.
     pub fn project_dirty_exact(&self) -> bool {
-        let now = self.undo_state();
-        self.saved_state.as_ref().map(|s| &s.at) != Some(&now)
+        let (words, _) = self.walk();
+        !self.saved_state.as_ref().is_some_and(|s| *s.words == words)
     }
 
     /// **Whether New would hand back exactly what is already open** - an
@@ -13196,9 +13234,36 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // accident, because saving makes the project clean and the second
         // ask returns false on its own.
         if self.quit_allowed {
+            self.flush_settings_save();
             return false;
         }
-        self.ask_before(AfterSave::Quit)
+        if self.ask_before(AfterSave::Quit) {
+            return true;
+        }
+        // **A quit that proceeds pays the owed settings write first.**
+        //
+        // Undo and redo owe their desk to the debounce (`save_settings_soon`,
+        // 700 ms) instead of pretty-printing the settings file on every
+        // Ctrl+Z. The debounce drains in the frame tick, and a window that
+        // is closing has no next frame — so Ctrl+Z then Cmd+Q inside the
+        // window left settings.json holding the PRE-undo desk, and the next
+        // launch reopens the project against the settings' desk, not the
+        // document's: the undone fader back, under a clean title bar. Both
+        // roads out of the app come through here — a clean project's close,
+        // and the host's Close after the prompt was answered (`quit_allowed`)
+        // — so this is the one place that can settle the debt. Idempotent:
+        // an on-exit flush in the host finds nothing owed.
+        self.flush_settings_save();
+        false
+    }
+
+    /// Pay the debounced settings write now, if one is owed. Nothing is
+    /// written when nothing is owed, so it can be called from every road
+    /// out without a second write.
+    pub fn flush_settings_save(&mut self) {
+        if self.settings_save_at.take().is_some() {
+            self.save_settings();
+        }
     }
 
     /// The host's cue that the answer was "go", taken once.
@@ -13219,25 +13284,29 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.saved_state = Some(self.saved_point());
     }
 
-    /// The document as UNDO stores it: clips with the desk baked in — one
-    /// string, one moment.
+    /// The document as UNDO stores it: the struct, the live desk beside it,
+    /// the kits compactly, and the words — one moment. See `Moment`.
     ///
-    /// **No clone.** This used to copy the whole `Arrangement` — every clip,
-    /// every note, every path string — for the sole purpose of overwriting
-    /// its `desk` field with the live one before serialising. The desk goes
-    /// in through `to_json_with_desk` now, which exists for exactly this.
-    ///
-    /// **And its own honesty: the clone was not the cost.** Measured at
-    /// 8 µs of this function's 2.8 ms in release, a third of a percent —
-    /// the serialisation is where the time goes and always was. It is gone
-    /// because it was pure waste, not because removing it made anything
-    /// fast. What made the once-a-frame question cheap is `undo_mark`.
+    /// The clone this makes is the one `undo_state` used to boast about
+    /// removing: 8 µs of what was then a 2.8 ms serialisation. The
+    /// serialisation is gone and the clone is what a moment IS, and it is
+    /// the cheapest part of the call after the desk compare.
     fn undo_state(&self) -> Moment {
+        let desk = self.desk_snapshot();
+        let (words, mark) = self.walk_with(desk.as_ref());
+        // The desk is shared with the standing moment when it did not
+        // move. Compared as a struct, which for a desk is right: its floats
+        // are written as floats and a NaN merely fails to share.
+        let desk = match self.history.get(self.hist_at) {
+            Some(top) if *top.desk == desk => std::sync::Arc::clone(&top.desk),
+            _ => std::sync::Arc::new(desk),
+        };
         Moment {
-            doc: self
-                .arrangement
-                .to_json_with_desk(Some(&self.desk_snapshot())),
+            arr: std::sync::Arc::new(self.arrangement.clone_without_desk()),
+            desk,
             kits: crate::drumpad::DrumpadDoc::compact_all(&self.drumpad_kits),
+            words: std::sync::Arc::new(words),
+            mark,
         }
     }
 
@@ -13245,21 +13314,43 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// The arrangement and the kits go into ONE fingerprint rather than two,
     /// so there is a single number to compare and no pair to keep in step.
+    ///
+    /// **No allocation.** Asked once a frame, this used to begin by cloning
+    /// the whole desk — thirteen thousand seat strings, a 316 KB `Vec` —
+    /// into a snapshot it hashed and dropped. The desk is hashed where it
+    /// lives now, through `desk_view`, which is the same derivation the
+    /// snapshot is built from.
     fn undo_mark(&self) -> u64 {
         let mut f = crate::arrangement::Fingerprint::new();
         self.arrangement
-            .hash_into(Some(&self.desk_snapshot()), &mut f);
+            .hash_into_ref(Some(Self::desk_view(&self.settings)), &mut f);
         crate::drumpad::DrumpadDoc::hash_all_into(&self.drumpad_kits, &mut f);
         f.finish()
     }
 
-    /// The pair, taken together at one instant — the only way a `SavedPoint`
+    /// The recorded walk — `undo_mark`'s walk with every word kept — over
+    /// the live document, the live desk and the kits. The words are the
+    /// exact form and the number is the cheap one, from ONE pass.
+    fn walk(&self) -> (Vec<u64>, u64) {
+        self.walk_with(Self::desk_view(&self.settings))
+    }
+
+    /// `walk` over a desk the caller already holds.
+    fn walk_with(&self, desk: crate::arrangement::DeskRef<'_>) -> (Vec<u64>, u64) {
+        // Sized from the standing moment so the list is allocated once; a
+        // document that grew since pays one regrowth, not thirty thousand.
+        let hint = self.history.get(self.hist_at).map_or(0, |m| m.words.len());
+        let mut f = crate::arrangement::Fingerprint::recording(hint);
+        self.arrangement.hash_into_ref(Some(desk), &mut f);
+        crate::drumpad::DrumpadDoc::hash_all_into(&self.drumpad_kits, &mut f);
+        f.finish_recorded()
+    }
+
+    /// The pair, taken together from one walk — the only way a `SavedPoint`
     /// is ever built, so its two halves cannot describe different documents.
     fn saved_point(&self) -> SavedPoint {
-        SavedPoint {
-            at: self.undo_state(),
-            mark: self.undo_mark(),
-        }
+        let (words, mark) = self.walk();
+        SavedPoint { words: std::sync::Arc::new(words), mark }
     }
 
     /// A moment worth keeping: pushed unless it IS the standing moment.
@@ -13267,25 +13358,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// # Why this does NOT take the fingerprint
     ///
-    /// It was measured, and it was refused. A fingerprint here could only
-    /// help in one case — a commit where nothing changed, which today pays
-    /// the full 2.8 ms to find out and would pay 86 µs instead. Every
-    /// commit that DID change something has to serialise anyway, because
-    /// the serialisation is the moment being stored; there is nothing to
-    /// save on the path that matters.
-    ///
-    /// And the cheap answer's failure mode lands on the wrong side of
+    /// The cheap answer's failure mode lands on the wrong side of
     /// `project_dirty`'s split. A collision here does not misdraw an
     /// asterisk: it decides an edit is not worth recording, and the next
     /// Ctrl+Z then reaches past it and takes two edits away instead of one.
     /// Event-driven, once per edit, work on the line — so it stays exact,
-    /// for the same reason `ask_before` does.
+    /// for the same reason `ask_before` does. Exact is cheap now — the
+    /// words are the same walk the fingerprint is — so there is nothing
+    /// left to buy by being approximate.
     fn undo_commit(&mut self) {
         let state = self.undo_state();
+        self.undo_commit_moment(state);
+    }
+
+    /// `undo_commit` with the moment already built — so `undo_reset`, which
+    /// needs the same moment as its saved baseline AND as moment zero, walks
+    /// the document once rather than twice.
+    fn undo_commit_moment(&mut self, state: Moment) {
         if self
             .history
             .get(self.hist_at)
-            .is_some_and(|top| *top == state)
+            .is_some_and(|top| top.same_text(&state))
         {
             return;
         }
@@ -13304,11 +13397,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn undo_reset(&mut self) {
         // A fresh line of time is also a fresh baseline for "unsaved": every
         // road into a document — open, save-as, new, launch — ends here, so
-        // this is the one place that cannot be forgotten.
-        self.saved_state = Some(self.saved_point());
+        // this is the one place that cannot be forgotten. One moment serves
+        // as both: it used to be built twice, two identical documents
+        // serialised back to back on every open.
+        let state = self.undo_state();
+        self.saved_state = Some(SavedPoint::of(&state));
         self.history.clear();
         self.hist_at = 0;
-        self.undo_commit();
+        self.undo_commit_moment(state);
     }
 
     /// Stand at `at`: the document and the desk become that moment.
@@ -13332,10 +13428,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // to onto the top of the stack and make redo unreachable.
             self.drumpad_save();
         }
-        let arr = crate::arrangement::Arrangement::from_json(&moment.doc);
-        if let Some(desk) = arr.desk.clone() {
-            self.apply_desk_snapshot(&desk);
-        }
+        // The struct, not a re-parse: what comes back is bit for bit what
+        // was committed, never the reader's sanitised opinion of it — see
+        // `Moment`. The document carries the moment's desk afterwards, as
+        // the parsed one used to, for the two roads that read it.
+        self.apply_desk_snapshot(&moment.desk);
+        // The settings file is a MIRROR of a desk the document already
+        // holds, so the write it is owed rides the fader debounce rather
+        // than landing synchronously on every Ctrl+Z — it was a 15,000-line
+        // pretty-print per keypress. The host flushes the debounce at quit.
+        // The one settings-only fact the apply changes, a route dropped for
+        // a restored folder, rides the same write. Do not put a synchronous
+        // `save_settings` back here.
+        self.save_settings_soon();
+        let mut arr = (*moment.arr).clone();
+        arr.desk = Some((*moment.desk).clone());
         self.arrangement = arr;
         // No document write. Undo and redo used to save the doc to disk on
         // every step — the loudest of the four implicit writers, and the
@@ -16406,19 +16513,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The DOCUMENT's desk is asked first and the live one second,
         // because two of the four roads here have not applied the snapshot
         // yet: at launch `settings` still describes the previous session.
-        let is_drum_bay = |inserts: &[String], ch: &usize| {
-            inserts
-                .get(ch * crate::recorder::INSERTS)
-                .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH)
-        };
         let legacy_lane = self
             .arrangement
             .desk
             .as_ref()
-            .and_then(|d| (0..crate::recorder::CHANNELS).find(|ch| is_drum_bay(&d.inserts, ch)))
+            .and_then(|d| {
+                (0..crate::recorder::CHANNELS).find(|ch| {
+                    d.bay(ch * crate::recorder::INSERTS) == Some(crate::dialogs::DRUMPAD_PATH)
+                })
+            })
             .or_else(|| {
-                (0..crate::recorder::CHANNELS)
-                    .find(|ch| is_drum_bay(&self.settings.strip_inserts, ch))
+                (0..crate::recorder::CHANNELS).find(|ch| {
+                    self.settings
+                        .strip_inserts
+                        .get(ch * crate::recorder::INSERTS)
+                        .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH)
+                })
             });
         let (kits, saved_lane) = match self.project_doc() {
             Some(doc) => crate::drumpad::DrumpadDoc::load_all_beside(
@@ -35332,7 +35442,7 @@ mod tests {
         let read = crate::arrangement::Arrangement::load_from(&doc);
         let desk = read.desk.expect("the save left the desk out");
         assert_eq!(desk.kinds[2], app.settings.channel_kinds[2]);
-        assert_eq!(desk.inserts[2 * crate::recorder::INSERTS], "/x/EP.vst3");
+        assert_eq!(desk.bay(2 * crate::recorder::INSERTS), Some("/x/EP.vst3"));
         assert!((desk.gains[2] - 0.42).abs() < 1e-9);
         assert!((desk.tempo_bpm - 93.0).abs() < 1e-9);
 
@@ -36568,9 +36678,7 @@ mod tests {
             shipped
                 .inserts
                 .iter()
-                .enumerate()
-                .filter(|(_, p)| !p.is_empty())
-                .map(|(n, p)| (n, p.as_str()))
+                .map(|(n, p)| (*n, p.as_str()))
                 .collect::<Vec<_>>(),
         );
     }
@@ -36606,9 +36714,7 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("template dir");
             let mut arr = crate::arrangement::Arrangement::default();
             let mut d = TangentApp::template_desk();
-            for p in d.inserts.iter_mut() {
-                p.clear();
-            }
+            d.inserts.clear();
             let tracks = shipped
                 .iter()
                 .map(|(at, _)| at / INSERTS + 1)
@@ -36618,7 +36724,7 @@ mod tests {
                 *k = u8::from(n < tracks);
             }
             for (at, path) in shipped {
-                d.inserts[*at] = (*path).to_owned();
+                d.set_bay(*at, path);
             }
             arr.desk = Some(d);
             arr.save_to(&doc);
@@ -36654,12 +36760,12 @@ mod tests {
             };
             let desk = back.desk.expect("a template has a desk");
             assert_eq!(
-                desk.inserts.get(0).map(String::as_str),
+                desk.bay(0),
                 Some(crate::dialogs::DRUMPAD_PATH),
                 "a template holding {shipped:?} was not healed to the shipped desk"
             );
             assert_eq!(
-                desk.inserts.get(INSERTS).map(String::as_str),
+                desk.bay(INSERTS),
                 Some(crate::dialogs::BUILTIN_PATH),
                 "a template holding {shipped:?} was not healed to the shipped desk"
             );
@@ -36675,7 +36781,7 @@ mod tests {
                 panic!("the fixture would not read back")
             };
             let d = a.desk.as_mut().expect("a desk");
-            d.inserts[2 * INSERTS] = crate::dialogs::BUILTIN_PATH.to_owned();
+            d.set_bay(2 * INSERTS, crate::dialogs::BUILTIN_PATH);
             a.save_to(&doc);
         }
         app.seed_template(&dir);
@@ -36686,7 +36792,7 @@ mod tests {
         };
         let desk = kept.desk.expect("a desk");
         assert_eq!(
-            desk.inserts.get(2 * INSERTS).map(String::as_str),
+            desk.bay(2 * INSERTS),
             Some(crate::dialogs::BUILTIN_PATH),
             "a template somebody had arranged was overwritten"
         );
@@ -53178,6 +53284,460 @@ mod folder_tests {
         assert_eq!(app.hist_at, start, "undo could not reach the beginning");
     }
 
+    /// **Undo puts back the struct that was committed, not the reader's
+    /// opinion of it.**
+    ///
+    /// A moment used to be text, and undo re-parsed it — through
+    /// `from_map`'s sanitiser, which drops an audio clip without a path
+    /// and raises a counter that fell behind its clips. Whatever it
+    /// changed, the live document then differed from the moment it was
+    /// standing on, so the very next commit pushed a phantom moment and
+    /// the redo tail died with it. The clip here is an in-memory state
+    /// the reader would not hand back, chosen to make the difference
+    /// visible; the property is that the difference is gone.
+    #[test]
+    fn undo_restores_the_struct_it_committed_not_a_reparse() {
+        let mut app = app();
+        app.undo_reset();
+        let start = app.hist_at;
+        app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
+            path: String::new(),
+            len_s: 1.0,
+            ..Default::default()
+        });
+        app.arrangement.next_id = 0;
+        app.arr_save_edits();
+        assert_eq!(app.hist_at, start + 1, "the edit made no moment");
+        app.arrangement.clips[0].len_s = 2.0;
+        app.arr_save_edits();
+        assert_eq!(app.hist_at, start + 2, "the second edit made no moment");
+        let depth = app.history.len();
+
+        app.undo();
+        assert_eq!(app.hist_at, start + 1, "undo did not move");
+        assert_eq!(app.arrangement.clips.len(), 1, "the restore dropped the clip");
+        assert_eq!(app.arrangement.clips[0].len_s, 1.0, "the restore has the wrong length");
+        assert_eq!(app.arrangement.next_id, 0, "the restore normalised the counter");
+        assert!(
+            app.arrangement.desk.is_some(),
+            "the document no longer carries the moment's desk after an undo"
+        );
+        // The proof: standing on a moment, a commit has nothing to push.
+        app.undo_commit();
+        assert_eq!(app.history.len(), depth, "a commit after undo pushed a phantom moment");
+        assert_eq!(app.hist_at, start + 1, "and it moved the timeline");
+        app.redo();
+        assert_eq!(app.arrangement.clips[0].len_s, 2.0, "redo was lost");
+    }
+
+    /// **One walk seeds both the baseline and moment zero.** They used to
+    /// be two serialisations of the same document; now the saved point IS
+    /// the first moment's words, shared, so they cannot describe different
+    /// documents.
+    #[test]
+    fn undo_reset_seeds_the_baseline_and_moment_zero_from_one_walk() {
+        let app = a_settled_session();
+        let saved = app.saved_state.as_ref().expect("a settled session has a baseline");
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.hist_at, 0);
+        assert!(
+            std::sync::Arc::ptr_eq(&saved.words, &app.history[0].words),
+            "the baseline and moment zero were walked separately"
+        );
+        assert_eq!(saved.mark, app.history[0].mark);
+        assert!(!app.project_dirty() && !app.project_dirty_exact());
+    }
+
+    /// **A desk that did not move is held once.** A run of clip edits is
+    /// the ordinary session, and every moment of it used to carry its own
+    /// copy of thousands of seat strings.
+    #[test]
+    fn moments_share_a_desk_that_did_not_move() {
+        let mut app = a_settled_session();
+        app.arrangement.clips[0].notes[0].at_s = 0.25;
+        app.arr_save_edits();
+        app.arrangement.clips[0].notes[0].at_s = 0.5;
+        app.arr_save_edits();
+        assert_eq!(app.history.len(), 3);
+        assert!(
+            std::sync::Arc::ptr_eq(&app.history[0].desk, &app.history[1].desk)
+                && std::sync::Arc::ptr_eq(&app.history[1].desk, &app.history[2].desk),
+            "an unchanged desk was copied into each moment"
+        );
+        app.settings.master_gain = 0.3;
+        app.arr_save_edits();
+        assert_eq!(app.history.len(), 4);
+        assert!(
+            !std::sync::Arc::ptr_eq(&app.history[2].desk, &app.history[3].desk),
+            "a moved desk was shared with the moment before it"
+        );
+        assert!((app.history[3].desk.master_gain - 0.3).abs() < 1e-9);
+    }
+
+    /// **What the writer cannot see is not a moment.** The words fold the
+    /// way the text does: a stretch inside the deadband is no key, and
+    /// every unwritable float is the same absent key.
+    #[test]
+    fn an_edit_the_writer_cannot_see_pushes_no_moment() {
+        let mut app = a_settled_session();
+        let depth = app.history.len();
+        app.arrangement.clips[0].stretch = 1.0 + 1.0e-12;
+        app.undo_commit();
+        assert_eq!(app.history.len(), depth, "a stretch inside the deadband made a moment");
+        assert!(!app.project_dirty_exact(), "and it reads as unsaved work");
+        // An unwritable note time IS a change: the key leaves the file.
+        app.arrangement.clips[0].notes[0].at_s = f64::NAN;
+        app.undo_commit();
+        assert_eq!(app.history.len(), depth + 1, "an omitted key was not a change");
+        // Another NaN writes the same file, so it is the same moment.
+        app.arrangement.clips[0].notes[0].at_s = f64::from_bits(0x7ff8_0000_0000_0001);
+        app.undo_commit();
+        assert_eq!(app.history.len(), depth + 1, "two NaNs made two moments");
+    }
+
+    /// A project folder with a document that carries a desk — the common
+    /// case, since every document the app saves carries one.
+    fn a_project_with_a_desk(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("song");
+        std::fs::create_dir_all(&dir).expect("project dir");
+        let doc = crate::arrangement::doc_in(&dir);
+        let mut arr = crate::arrangement::Arrangement::default();
+        arr.desk = Some(TangentApp::template_desk());
+        arr.save_to(&doc);
+        (root, doc)
+    }
+
+    /// **An explicit open writes the settings file once.** It was two: one
+    /// for the path before the desk was applied, and one inside
+    /// `apply_desk_snapshot`. Counted rather than timed — see
+    /// `settings_writes`.
+    #[test]
+    fn an_explicit_open_writes_the_settings_once() {
+        let (root, doc) = a_project_with_a_desk("open-once");
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings_writes.set(0);
+        app.open_project(&doc);
+        assert_eq!(
+            app.settings_writes.get(),
+            1,
+            "an explicit open wrote the settings {} times",
+            app.settings_writes.get()
+        );
+        assert!(app.settings_save_at.get().is_none(), "an explicit open also owes a debounced write");
+        assert_eq!(app.settings.project_path, doc.to_string_lossy(), "the path did not land");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Adopting the template writes once, after the repoint.** The inner
+    /// open is a `Leave` and owes nothing, so what reaches the disk names
+    /// the scratch and never the shelf.
+    #[test]
+    fn adopting_the_template_writes_the_settings_once_after_the_repoint() {
+        let (root, doc) = a_project_with_a_desk("adopt-once");
+        let template = doc.parent().expect("the template dir").to_path_buf();
+        let scratch = root.join("Untitled");
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings_writes.set(0);
+        app.adopt_template(&template, &scratch);
+        assert_eq!(
+            app.settings_writes.get(),
+            1,
+            "adopting wrote the settings {} times",
+            app.settings_writes.get()
+        );
+        let on_disk = Settings::load();
+        assert!(
+            std::path::Path::new(&on_disk.project_path).starts_with(&scratch),
+            "the one write named {}, not the scratch",
+            on_disk.project_path
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Undo owes a debounced settings write and makes no synchronous
+    /// one.** Every Ctrl+Z used to pretty-print the whole settings file
+    /// through `apply_desk_snapshot`.
+    #[test]
+    fn undo_owes_a_debounced_settings_write_and_makes_no_synchronous_one() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.undo_reset();
+        let was = app.settings.master_gain;
+        app.settings.master_gain = 0.25;
+        app.arr_save_edits();
+        app.settings_writes.set(0);
+        app.settings_save_at.set(None);
+        app.undo();
+        assert!((app.settings.master_gain - was).abs() < 1e-9, "undo did not restore the desk");
+        assert_eq!(app.settings_writes.get(), 0, "undo wrote the settings synchronously");
+        assert!(app.settings_save_at.get().is_some(), "undo owes no settings write at all");
+        app.redo();
+        assert!((app.settings.master_gain - 0.25).abs() < 1e-9, "redo did not restore the desk");
+        assert_eq!(app.settings_writes.get(), 0, "redo wrote the settings synchronously");
+    }
+
+    /// **A quit that proceeds pays the owed settings write first.** Undo
+    /// owes its desk to the 700 ms debounce; a quit inside that window
+    /// used to leave settings.json holding the pre-undo desk, and the next
+    /// launch reopens the project against the settings' desk. Both roads
+    /// out pass through `intercept_quit`: the clean close, and the host's
+    /// Close after the prompt was answered. Counted, like the other three.
+    #[test]
+    fn a_quit_that_proceeds_pays_the_owed_settings_write() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.undo_reset();
+        let was = app.settings.master_gain;
+        app.settings.master_gain = 0.25;
+        app.arr_save_edits();
+        app.undo();
+        assert!((app.settings.master_gain - was).abs() < 1e-9, "undo did not restore the desk");
+        assert!(app.settings_save_at.get().is_some(), "undo owes no settings write");
+        app.settings_writes.set(0);
+        // The clean project's close: not intercepted, and the debt is paid.
+        assert!(!app.intercept_quit(), "a clean project asked");
+        assert_eq!(app.settings_writes.get(), 1, "the owed write was not paid at quit");
+        assert!(app.settings_save_at.get().is_none(), "the debt stands after it was paid");
+        assert!(
+            (Settings::load().master_gain - was).abs() < 1e-9,
+            "the file holds the pre-undo desk"
+        );
+        // The answered prompt's close comes back through `quit_allowed`,
+        // and pays whatever is owed by then.
+        app.quit_allowed = true;
+        app.settings_save_at.set(Some(std::time::Instant::now() + GEOMETRY_SAVE_DELAY));
+        app.settings_writes.set(0);
+        assert!(!app.intercept_quit());
+        assert_eq!(app.settings_writes.get(), 1, "the answered quit did not pay");
+        // And a close with nothing owed writes nothing.
+        app.settings_writes.set(0);
+        assert!(!app.intercept_quit());
+        assert_eq!(app.settings_writes.get(), 0, "a quit with nothing owed wrote anyway");
+    }
+
+    /// **A seat named past the map by a document cannot size the desk.**
+    ///
+    /// The v7 tail is `"<bay>": "<path>"`, and a bay is whatever the file
+    /// says: `100000000000` asked `apply_desk_snapshot` to resize the
+    /// live `strip_inserts` to 2.4 TB of strings (an abort at open, from a
+    /// document that parsed cleanly and so never reached the quarantine),
+    /// and `18446744073709551615` — `usize::MAX`, whose `+ 1` wraps to
+    /// zero in release — resized it to NOTHING, so the open's one settings
+    /// write persisted a desk with no instruments. Every earlier build had
+    /// read a short array and lost nothing. The reader drops such a seat
+    /// and the apply sizes by the map; this opens the document through the
+    /// real road and asks for the instruments, the length, and what the
+    /// settings file was handed.
+    #[test]
+    fn a_seat_past_the_map_cannot_size_the_desk() {
+        use crate::recorder::{INSERTS, INSERT_SPACE};
+        let (root, doc) = a_project_with_a_desk("seat-past-map");
+        // Two instruments this session's own settings do NOT seat, so
+        // finding them proves the document's desk landed.
+        let mut arr = crate::arrangement::Arrangement::load_from(&doc);
+        let mut desk = arr.desk.take().expect("the fixture desk");
+        for ch in 0..crate::recorder::CHANNELS {
+            desk.set_bay(ch * INSERTS, "");
+        }
+        desk.set_bay(3 * INSERTS, crate::dialogs::DRUMPAD_PATH);
+        desk.set_bay(2 * INSERTS, "/x/EP.vst3");
+        arr.desk = Some(desk);
+        arr.save_to(&doc);
+        let text = std::fs::read_to_string(&doc).expect("the document");
+        let mut json: serde_json::Value = serde_json::from_str(&text).expect("json");
+        json["desk"].as_object_mut().expect("a desk").insert(
+            "inserts_tail".into(),
+            serde_json::json!({
+                "100000000000": "a terabyte",
+                "18446744073709551615": "a wrap to zero",
+                "12447": "brusfri",
+            }),
+        );
+        std::fs::write(&doc, json.to_string()).expect("rewrite");
+
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.open_project(&doc);
+        let live = &app.settings.strip_inserts;
+        assert_eq!(live.len(), INSERT_SPACE, "a bay in the file sized the desk");
+        assert_eq!(live[3 * INSERTS], crate::dialogs::DRUMPAD_PATH, "the drumpad's seat was lost");
+        assert_eq!(live[2 * INSERTS], "/x/EP.vst3", "the piano's seat was lost");
+        assert_eq!(live[12447], "brusfri", "a real far seat was lost with the poison");
+        assert_eq!(app.settings.project_path, doc.to_string_lossy(), "the open did not land");
+        // And the one write the open makes carried the instruments, not
+        // an emptied desk — that write is what the next launch reopens on.
+        let on_disk = Settings::load();
+        assert_eq!(
+            on_disk.strip_inserts.get(3 * INSERTS).map(String::as_str),
+            Some(crate::dialogs::DRUMPAD_PATH),
+            "the settings file was handed a desk without its drumpad"
+        );
+        assert!(on_disk.strip_inserts.len() <= INSERT_SPACE);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A document whose desk was written in an earlier ERA of the desk's
+    /// shape, from the frozen literals the lifts key on: `sends` of the
+    /// era's strip count, `inserts` of the era's bay count, and one plugin
+    /// and one mute bit placed where the lift has to carry them.
+    fn a_document_from_the_era(sends: usize, bays: usize, plugin_at: usize, muted: u64) -> String {
+        let mut inserts = vec![String::new(); bays];
+        if let Some(b) = inserts.get_mut(plugin_at) {
+            *b = "/x/Carried.vst3".to_owned();
+        }
+        if let Some(b) = inserts.get_mut(5 * crate::recorder::INSERTS) {
+            *b = "/x/Channel5.vst3".to_owned();
+        }
+        serde_json::json!({
+            "arrangement_version": 6,
+            "next_clip_id": 1,
+            "clips": [],
+            "desk": {
+                "kinds": vec![1u8; 8],
+                "names": vec![""; sends + 1],
+                "colors": vec![0i64; sends + 1],
+                "inserts": inserts,
+                "sends": vec![0.0f64; sends],
+                "muted": muted,
+                "soloed": 0,
+                "gains": vec![1.0f64; 8],
+                "pans": vec![0.0f64; 8],
+                "inputs": vec![""; 8],
+            }
+        })
+        .to_string()
+    }
+
+    /// **Every era's desk lands at today's seats.** The four length-keyed
+    /// lifts — eighteen strips (the drum bus arriving), sixteen pads, eight
+    /// channels, sixteen channels — each move the seats above their
+    /// insertion point by a frozen amount, and the eighteen-strip one hands
+    /// its result to the sixteen-channel one. Pinned through the live desk
+    /// after the document is applied, which is the same observation
+    /// whichever function does the lifting; the expected seats are the
+    /// literals worked by hand: a bay `b` at strip `s` lands at
+    /// `(s + grown_strips) * 3 + b`, a mute bit at `bit + grown_strips`.
+    #[test]
+    fn a_desk_from_any_era_opens_at_todays_seats() {
+        use crate::recorder::{CHANNELS, INSERTS};
+        let grown_from = |ch: usize| CHANNELS - ch;
+        // (name, sends, bays, plugin at, mute bit, expected bay, expected bit)
+        let eras: [(&str, usize, usize, usize, u64, usize, u64); 3] = [
+            // Eighteen strips: sixteen channels, no drum bus. The plugin on
+            // strip 16 (the click of that era) goes past the bus to 17, and
+            // then the sixteen-channel lift carries it to 17 + 16; the mute
+            // bit on 17 steps to 18 the same way and lands at 18 + 16.
+            ("eighteen strips", 18, 19 * INSERTS, 16 * INSERTS, 1 << 17,
+             (16 + 1 + grown_from(16)) * INSERTS, 18 + grown_from(16) as u64),
+            // Eight channels and sixteen pads: 84 bays. Pad 2 (bay 14*3)
+            // first moves to key 38's seat, (12 + 36 + 2) * 3, then the
+            // channel widening adds 24 strips' worth of bays at 8*3.
+            ("eight channels, sixteen pads", 11, (11 + 1 + 16) * INSERTS, (11 + 1 + 2) * INSERTS, 1 << 9,
+             (12 + 36 + 2 + grown_from(8)) * INSERTS, 9 + grown_from(8) as u64),
+            // Sixteen channels with the drum bus: nineteen strips.
+            ("sixteen channels", 19, 20 * INSERTS, 17 * INSERTS, 1 << 18,
+             (17 + grown_from(16)) * INSERTS, 18 + grown_from(16) as u64),
+        ];
+        for (era, sends, bays, at, bit, want_bay, want_bit) in eras {
+            let (_ctx, mut app) = headless(Caps::PLUGIN);
+            let arr = crate::arrangement::Arrangement::from_json(&a_document_from_the_era(
+                sends, bays, at, bit,
+            ));
+            let desk = arr.desk.expect("the fixture has a desk");
+            app.apply_desk_snapshot(&desk);
+            assert_eq!(
+                app.settings.strip_inserts.get(want_bay).map(String::as_str),
+                Some("/x/Carried.vst3"),
+                "{era}: the carried plugin is not at bay {want_bay}; occupied: {:?}",
+                app.settings
+                    .strip_inserts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| !p.is_empty())
+                    .map(|(n, p)| (n, p.as_str()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                app.settings.strip_inserts.get(5 * INSERTS).map(String::as_str),
+                Some("/x/Channel5.vst3"),
+                "{era}: channel 5's plugin moved"
+            );
+            assert_eq!(
+                app.settings.strip_muted,
+                1 << want_bit,
+                "{era}: the mute bit is not at {want_bit}"
+            );
+            let occupied = app.settings.strip_inserts.iter().filter(|p| !p.is_empty()).count();
+            assert_eq!(occupied, 2, "{era}: a lift duplicated or dropped a plugin");
+        }
+    }
+
+    /// A settled session with two audio clips still carrying the
+    /// whole-file sentinel, as an import leaves them.
+    fn a_session_with_unmeasured_clips() -> (TangentApp, u64, u64) {
+        let mut a = app();
+        let clip = |path: &str| crate::arrangement::ArrClip {
+            pedal: Vec::new(),
+            path: path.into(),
+            ..Default::default()
+        };
+        let x = a.arrangement.add_clip(clip("media/x.wav"));
+        let y = a.arrangement.add_clip(clip("media/y.wav"));
+        a.undo_reset();
+        (a, x, y)
+    }
+
+    /// **A batch of lengths on a clean project leaves it clean, filled, and
+    /// with no new moment**; on a dirty one it fills and leaves the dirt.
+    #[test]
+    fn a_batch_of_lengths_fills_every_clip_and_moves_no_baseline() {
+        let (mut a, x, y) = a_session_with_unmeasured_clips();
+        let depth = a.history.len();
+        a.note_clip_lens(&[(x, 3.5), (y, 7.25), (x, 99.0), (12_345, 1.0)]);
+        assert_eq!(a.arrangement.clips[0].len_s, 3.5, "the first length did not land");
+        assert_eq!(a.arrangement.clips[0].loop_s, 3.5, "the loop was not born with it");
+        assert_eq!(a.arrangement.clips[1].len_s, 7.25);
+        assert!(!a.project_dirty_exact(), "a passive annotation dirtied a clean project");
+        assert!(!a.project_dirty());
+        assert_eq!(a.history.len(), depth, "a fill made a moment");
+
+        let (mut b, x, y) = a_session_with_unmeasured_clips();
+        b.arrangement.clips[0].start_s = 4.0;
+        assert!(b.project_dirty_exact());
+        let saved = b.saved_state.as_ref().map(|s| s.mark);
+        b.note_clip_lens(&[(x, 3.5), (y, 7.25)]);
+        assert_eq!(b.arrangement.clips[1].len_s, 7.25);
+        assert!(b.project_dirty_exact(), "a fill cleaned a dirty project");
+        assert_eq!(b.saved_state.as_ref().map(|s| s.mark), saved, "the baseline moved");
+    }
+
+    /// **A batch with nothing to apply asks nothing and changes nothing** —
+    /// an empty list, an already-measured clip, a length of zero — on a
+    /// clean project and on a dirty one alike.
+    #[test]
+    fn a_batch_with_nothing_to_fill_is_a_noop() {
+        let (mut a, x, _) = a_session_with_unmeasured_clips();
+        a.note_clip_lens(&[]);
+        a.note_clip_lens(&[(x, 0.0), (x, -1.0), (x, f64::NAN), (777, 2.0)]);
+        assert_eq!(a.arrangement.clips[0].len_s, 0.0, "a zero or bad length landed");
+        assert!(!a.project_dirty_exact());
+        a.note_clip_lens(&[(x, 2.0)]);
+        a.note_clip_lens(&[(x, 5.0)]);
+        assert_eq!(a.arrangement.clips[0].len_s, 2.0, "a measured clip was re-measured");
+
+        let (mut b, x, _) = a_session_with_unmeasured_clips();
+        b.arrangement.clips[0].start_s = 4.0;
+        let saved = b.saved_state.as_ref().map(|s| s.mark);
+        b.note_clip_lens(&[(x, 0.0)]);
+        b.note_clip_lens(&[]);
+        assert!(b.project_dirty_exact(), "a no-op batch cleaned a dirty project");
+        assert_eq!(b.saved_state.as_ref().map(|s| s.mark), saved);
+    }
+
     /// The document is a FIXED POINT: writing what was read gives the same
     /// text. Undo's whole comparison rests on it.
     #[test]
@@ -54154,7 +54714,7 @@ mod folder_tests {
         let d = TangentApp::template_desk();
         // Two rows, and only two: the drums on one, the built-in on two.
         assert_eq!(d.tracks_added, 0b11, "the template is not two tracks");
-        let bay = |ch: usize| d.inserts[Strip::Channel(ch).index() * INSERTS].as_str();
+        let bay = |ch: usize| d.bay(Strip::Channel(ch).index() * INSERTS).unwrap_or("");
         assert_eq!(bay(0), crate::dialogs::DRUMPAD_PATH, "channel 1 is not the drums");
         assert_eq!(bay(1), crate::dialogs::BUILTIN_PATH, "channel 2 is not the DX7");
         for ch in 2..CHANNELS {
@@ -55537,6 +56097,72 @@ mod folder_tests {
             ("the click switched on", Box::new(|a: &mut TangentApp| {
                 a.settings.metronome_on = !a.settings.metronome_on;
             })),
+            // **Every remaining desk field**, one edit each, because the
+            // cheap answer reads the settings through `desk_view` and the
+            // exact one through the same view — a field missing from the
+            // walk is missing from BOTH, and only an edit to that field can
+            // say so. Distinct values, so two fields cannot mask each other.
+            ("a channel's kind", Box::new(|a: &mut TangentApp| {
+                a.settings.channel_kinds[3] = 2;
+            })),
+            ("a channel's badge", Box::new(|a: &mut TangentApp| {
+                a.settings.channel_icons[4] = 3;
+            })),
+            ("a plugin in a bay", Box::new(|a: &mut TangentApp| {
+                if let Some(bay) = a.settings.strip_inserts.get_mut(3) {
+                    *bay = "/x/eq.vst3".into();
+                }
+            })),
+            ("a bay holding only whitespace", Box::new(|a: &mut TangentApp| {
+                if let Some(bay) = a.settings.strip_inserts.get_mut(4) {
+                    *bay = "  ".into();
+                }
+            })),
+            ("a send", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_sends[2] = 0.35;
+            })),
+            ("a mute", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_muted ^= 1 << 5;
+            })),
+            ("a solo", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_soloed ^= 1 << 6;
+            })),
+            ("a pan", Box::new(|a: &mut TangentApp| {
+                a.settings.channel_pans[2] = -0.4;
+            })),
+            ("an input", Box::new(|a: &mut TangentApp| {
+                a.settings.channel_inputs.push("in 7".into());
+            })),
+            ("the drum bus", Box::new(|a: &mut TangentApp| {
+                a.settings.drums_gain = 0.55;
+            })),
+            ("the drum bus pan", Box::new(|a: &mut TangentApp| {
+                a.settings.drums_pan = 0.15;
+            })),
+            ("the click level", Box::new(|a: &mut TangentApp| {
+                a.settings.metronome_gain = 0.45;
+            })),
+            ("the effects return", Box::new(|a: &mut TangentApp| {
+                a.settings.fx_return_gain = 0.65;
+            })),
+            ("the tempo", Box::new(|a: &mut TangentApp| {
+                a.settings.record_export.tempo_bpm = 133.0;
+            })),
+            ("the signature", Box::new(|a: &mut TangentApp| {
+                a.settings.record_time_signature = "7/8".into();
+            })),
+            ("which rows exist", Box::new(|a: &mut TangentApp| {
+                a.settings.tracks_added ^= 1 << 9;
+            })),
+            ("a folder", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_is_folder.push(true);
+            })),
+            ("what is inside a folder", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_in_folder.push(true);
+            })),
+            ("a shut folder", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_folder_shut.push(true);
+            })),
             ("a pad's knob", Box::new(|a: &mut TangentApp| {
                 a.drumpad_kits[0].pads[0].params.gain = 0.5;
             })),
@@ -56567,18 +57193,21 @@ mod dirty_cost_probe {
         app
     }
 
-    /// What `project_dirty` USED to do, kept here so the before and the after
-    /// are measured on one machine in one run rather than compared across two
-    /// builds: clone the document, bake the live desk into the copy,
-    /// serialise it, compact the kits, compare two strings.
-    fn the_old_way(app: &TangentApp) -> bool {
-        let mut arr = app.arrangement.clone();
-        arr.desk = Some(app.desk_snapshot());
-        let now = Moment {
-            doc: arr.to_json(),
-            kits: crate::drumpad::DrumpadDoc::compact_all(&app.drumpad_kits),
-        };
-        app.saved_state.as_ref().map(|s| &s.at) != Some(&now)
+    /// What a moment USED to be: the pretty document with the live desk
+    /// baked in, and the compact kits. Kept so the before and the after are
+    /// measured on one machine in one run rather than compared across two
+    /// builds.
+    fn the_old_moment(app: &TangentApp) -> (String, String) {
+        (
+            app.arrangement.to_json_with_desk(Some(&app.desk_snapshot())),
+            crate::drumpad::DrumpadDoc::compact_all(&app.drumpad_kits),
+        )
+    }
+
+    /// What `project_dirty` USED to do: build the old moment and compare
+    /// two strings against the one taken at the save.
+    fn the_old_way(app: &TangentApp, saved: &(String, String)) -> bool {
+        the_old_moment(app) != *saved
     }
 
     fn per_call(n: u32, mut f: impl FnMut()) -> std::time::Duration {
@@ -56621,11 +57250,12 @@ mod dirty_cost_probe {
         );
         // Both answers must be the same answer, or the numbers below are
         // measuring two different questions.
-        assert!(!the_old_way(&app), "the old way called a clean project dirty");
+        let saved = the_old_moment(&app);
+        assert!(!the_old_way(&app, &saved), "the old way called a clean project dirty");
         assert!(!app.project_dirty(), "the fingerprint called a clean project dirty");
 
         let before = per_call(20, || {
-            std::hint::black_box(the_old_way(&app));
+            std::hint::black_box(the_old_way(&app, &saved));
         });
         let after = per_call(2000, || {
             std::hint::black_box(app.project_dirty());
@@ -56664,18 +57294,13 @@ mod dirty_cost_probe {
         );
 
         let with_clone = per_call(20, || {
-            let mut arr = app.arrangement.clone();
-            arr.desk = Some(app.desk_snapshot());
-            std::hint::black_box(Moment {
-                doc: arr.to_json(),
-                kits: crate::drumpad::DrumpadDoc::compact_all(&app.drumpad_kits),
-            });
+            std::hint::black_box(the_old_moment(&app));
         });
-        let without = per_call(20, || {
+        let without = per_call(200, || {
             std::hint::black_box(app.undo_state());
         });
         let clone_only = per_call(200, || {
-            std::hint::black_box(app.arrangement.clone());
+            std::hint::black_box(app.arrangement.clone_without_desk());
         });
         let mark = per_call(2000, || {
             std::hint::black_box(app.undo_mark());
@@ -56683,8 +57308,8 @@ mod dirty_cost_probe {
         let desk = per_call(2000, || {
             std::hint::black_box(app.desk_snapshot());
         });
-        say("BEFORE undo_state (with clone)", with_clone);
-        say("AFTER  undo_state", without);
+        say("BEFORE undo_state (the text moment)", with_clone);
+        say("AFTER  undo_state (the struct moment)", without);
         say("  of which: the clone alone", clone_only);
         say("  for scale: undo_mark", mark);
         say("  of which: desk_snapshot", desk);
@@ -56813,8 +57438,72 @@ mod perf_probes {
             .expect("the fixture has MIDI clips")
     }
 
+    /// An estimate of what one moment holds resident, part by part:
+    /// (document, desk, words, kits). Deep sizes from lengths and
+    /// capacities, not an allocator census; near enough to compare shapes.
+    fn moment_parts(m: &Moment) -> (usize, usize, usize, usize) {
+        use std::mem::size_of;
+        let a = &*m.arr;
+        let mut arr = size_of::<crate::arrangement::Arrangement>();
+        for c in &a.clips {
+            arr += size_of::<crate::arrangement::ArrClip>()
+                + c.path.capacity()
+                + c.name.capacity()
+                + c.notes.capacity() * size_of::<crate::arrangement::ArrNote>()
+                + c.pedal.capacity() * size_of::<crate::arrangement::ArrPedal>()
+                + c.extra.len() * 64;
+        }
+        for c in a.automation.curves() {
+            arr += c.points().len() * size_of::<crate::automation::Point>() + 64;
+        }
+        arr += a.tempo.points().len() * 32 + a.meter.points().len() * 16;
+        for m in &a.markers {
+            arr += 32 + m.name.capacity();
+        }
+        arr += a.extra.len() * 64;
+        let d = &*m.desk;
+        let strs = |v: &[String]| v.iter().map(|s| 24 + s.capacity()).sum::<usize>();
+        let desk = size_of::<crate::arrangement::DeskSnap>()
+            + d.kinds.len()
+            + d.icons.len()
+            + strs(&d.names)
+            + d.colors.len() * 8
+            + d.inserts.iter().map(|(_, p)| 32 + p.capacity()).sum::<usize>()
+            + d.sends.len() * 8
+            + d.gains.len() * 8
+            + d.pans.len() * 8
+            + strs(&d.inputs)
+            + d.is_folder.len()
+            + d.in_folder.len()
+            + d.folder_shut.len();
+        (arr, desk, m.words.len() * 8, m.kits.len())
+    }
+
+    /// The whole history's resident estimate, counting a shared `Arc` once.
+    fn history_bytes(history: &[Moment]) -> usize {
+        let mut seen_arr = std::collections::HashSet::new();
+        let mut seen_desk = std::collections::HashSet::new();
+        let mut seen_words = std::collections::HashSet::new();
+        let mut total = 0;
+        for m in history {
+            let (a, d, w, k) = moment_parts(m);
+            if seen_arr.insert(std::sync::Arc::as_ptr(&m.arr) as usize) {
+                total += a;
+            }
+            if seen_desk.insert(std::sync::Arc::as_ptr(&m.desk) as usize) {
+                total += d;
+            }
+            if seen_words.insert(std::sync::Arc::as_ptr(&m.words) as usize) {
+                total += w;
+            }
+            total += k + std::mem::size_of::<Moment>();
+        }
+        total
+    }
+
     fn moment_bytes(m: &Moment) -> usize {
-        m.doc.len() + m.kits.len()
+        let (a, d, w, k) = moment_parts(m);
+        a + d + w + k
     }
 
     /// **doc_open**: the whole open, and the parts of it that are paid
@@ -56852,7 +57541,7 @@ mod perf_probes {
             let apply = per_call(n, || app.apply_desk_snapshot(&desk));
             say("doc_open", tag, "  of which: apply_desk_snapshot", apply, false);
             let reset = per_call(n, || app.undo_reset());
-            say("doc_open", tag, "  of which: undo_reset (2x undo_state + mark)", reset, false);
+            say("doc_open", tag, "  of which: undo_reset (one walk: baseline + moment zero)", reset, false);
             let us = per_call(n, || {
                 std::hint::black_box(app.undo_state());
             });
@@ -56874,11 +57563,10 @@ mod perf_probes {
             });
             say("doc_open", tag, "project_dirty (the title bar, per frame)", pd, true);
             let m = app.undo_state();
+            let (a, d, w, k) = moment_parts(&m);
             println!(
-                "doc_open     {tag:<3} one Moment = {:.2} MB ({} doc + {} kits bytes); 100 Moments = {:.1} MB",
+                "doc_open     {tag:<3} one Moment = {:.2} MB (est. {a} doc + {d} desk + {w} words + {k} kits bytes); 100 unshared Moments = {:.1} MB",
                 fx::mb(moment_bytes(&m)),
-                m.doc.len(),
-                m.kits.len(),
                 fx::mb(moment_bytes(&m) * 100)
             );
         }
@@ -56915,9 +57603,9 @@ mod perf_probes {
             });
             say("undo_commit", tag, "  of which: undo_state", state, true);
             let held = app.history.len();
-            let bytes: usize = app.history.iter().map(moment_bytes).sum();
+            let bytes = history_bytes(&app.history);
             println!(
-                "undo_commit  {tag:<3} history holds {held} Moments = {:.1} MB; one Moment {:.2} MB; 100 Moments = {:.1} MB",
+                "undo_commit  {tag:<3} history holds {held} Moments = {:.1} MB resident (est., shared desk counted once); per Moment {:.2} MB; 100 such = {:.1} MB",
                 fx::mb(bytes),
                 fx::mb(bytes / held.max(1)),
                 fx::mb(bytes / held.max(1) * 100)
