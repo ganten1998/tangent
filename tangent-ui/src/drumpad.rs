@@ -50,6 +50,15 @@ const PAD_KEYS: [&str; 9] = [
 /// stranger's key or it would pin the file at whatever it first said.
 const KIT_KEYS: [&str; 3] = ["version", "master", "pads"];
 
+/// The keys the LANES-era sidecar writes at its root beside the primary
+/// kit's own — see `save_all_beside`. This file format's keys, not a
+/// stranger's, so a kit read from that root never carries them in `extra`.
+/// It did, once: the primary kit came back wearing `primary_lane` and a
+/// stale copy of the whole `lane_kits` object whenever its own lane was
+/// empty, which made the first undo after every open see a kit that
+/// "differed" and rewrite the sidecar for nothing.
+const SIDECAR_KEYS: [&str; 2] = ["primary_lane", "lane_kits"];
+
 /// One pad's slot in the document.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PadSlot {
@@ -176,23 +185,38 @@ impl DrumpadDoc {
         let Ok(text) = std::fs::read_to_string(Self::sidecar(doc)) else {
             return (out, None);
         };
-        // The legacy kit, always — it is the whole file for a project
-        // written before this existed.
-        let legacy = Self::from_json(&text);
-        let map = serde_json::from_str::<Value>(&text).ok();
-        let obj = map.as_ref().and_then(Value::as_object);
+        // **Parsed once.** The text used to be parsed twice — once as the
+        // legacy kit and once for the lane keys — and every lane's kit was
+        // then serialised back to text and parsed a third time, a
+        // `Value -> String -> Value` trip per lane for nothing. A file that
+        // is not an object reads as it always did: every lane empty, no
+        // opinion about the primary.
+        let Ok(Value::Object(mut root)) = serde_json::from_str::<Value>(&text) else {
+            return (out, None);
+        };
         // The file's own word first; the desk's answer second; lane 0 only
         // when neither has an opinion.
-        let primary = obj
-            .and_then(|m| m.get("primary_lane"))
-            .and_then(Value::as_u64)
-            .map_or_else(|| legacy_lane.unwrap_or(0), |n| n as usize);
+        let said = root.get("primary_lane").and_then(Value::as_u64).map(|n| n as usize);
+        let primary = said.unwrap_or_else(|| legacy_lane.unwrap_or(0));
+        // Only if the file actually said so, and said something in range. A
+        // project written before `primary_lane` existed has no opinion, and
+        // inventing lane 0 for it would be the same guess the caller
+        // already makes.
+        let stated = said.filter(|n| *n < out.len());
+        // The lane kits leave the root before the legacy kit is read from
+        // it, so they are neither parsed as its strangers nor cloned.
+        // `shift_remove`, because `remove` is a swap under `preserve_order`
+        // and would reorder the root's real strangers.
+        let lane_kits = root.shift_remove("lane_kits");
+        // The legacy kit, always — it is the whole file for a project
+        // written before this existed.
         if primary < out.len() {
-            out[primary] = legacy;
+            out[primary] = Self::from_value(root);
         }
         // Then anything the newer key names, which overwrites the legacy
-        // placement when it speaks about the same lane.
-        if let Some(Value::Object(kits)) = obj.and_then(|m| m.get("lane_kits")) {
+        // placement when it speaks about the same lane. A lane whose entry
+        // is not an object reads as the empty kit, as it always did.
+        if let Some(Value::Object(kits)) = lane_kits {
             for (key, v) in kits {
                 let Ok(lane) = key.parse::<usize>() else {
                     continue;
@@ -200,32 +224,25 @@ impl DrumpadDoc {
                 if lane >= out.len() {
                     continue;
                 }
-                if let Ok(text) = serde_json::to_string(v) {
-                    out[lane] = Self::from_json(&text);
-                }
+                out[lane] = match v {
+                    Value::Object(m) => Self::from_value(m),
+                    _ => Self::default(),
+                };
             }
         }
-        // Only if the file actually said so. A project written before
-        // `primary_lane` existed has no opinion, and inventing lane 0 for it
-        // would be the same guess the caller already makes.
-        let stated = obj
-            .and_then(|m| m.get("primary_lane"))
-            .and_then(Value::as_u64)
-            .map(|n| n as usize)
-            .filter(|n| *n < out.len());
         (out, stated)
     }
 
     /// **Every lane's kit into the one sidecar.** See `load_all_beside` for
     /// why the primary kit is also written at the top level.
     pub fn save_all_beside(kits: &[Self], primary: usize, doc: &std::path::Path) {
-        let mut root = match kits.get(primary) {
-            Some(k) => serde_json::from_str::<Value>(&k.to_json())
-                .ok()
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default(),
-            None => serde_json::Map::new(),
-        };
+        // The kit's map straight into the root. This used to pretty-print
+        // each kit to text and parse it back into a `Value` — 128 pads
+        // through the printer and the parser per kit per save — to arrive
+        // at the map `to_value` builds in the first place. Byte-identical
+        // output: `the_sidecar_is_written_as_it_always_was` builds the file
+        // the old way and compares.
+        let mut root = kits.get(primary).map(Self::to_value).unwrap_or_default();
         root.insert("primary_lane".into(), Value::from(primary as u64));
         let mut lane_kits = serde_json::Map::new();
         for (lane, kit) in kits.iter().enumerate() {
@@ -234,9 +251,7 @@ impl DrumpadDoc {
             if kit.is_empty() {
                 continue;
             }
-            if let Ok(v) = serde_json::from_str::<Value>(&kit.to_json()) {
-                lane_kits.insert(lane.to_string(), v);
-            }
+            lane_kits.insert(lane.to_string(), Value::Object(kit.to_value()));
         }
         root.insert("lane_kits".into(), Value::Object(lane_kits));
 
@@ -263,10 +278,19 @@ impl DrumpadDoc {
     }
 
     fn from_json(text: &str) -> Self {
+        match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(map)) => Self::from_value(map),
+            // Garbage and non-objects answer the empty kit — the settings
+            // file's manners, pinned by `bad_documents_answer_the_empty_kit`.
+            _ => Self::default(),
+        }
+    }
+
+    /// A kit from its parsed object — the text readers and the lanes-era
+    /// sidecar reader all come through here, so a file is parsed once
+    /// however many kits it holds.
+    fn from_value(mut map: Map<String, Value>) -> Self {
         let mut out = Self::default();
-        let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(text) else {
-            return out;
-        };
         // Up, never down: a kit written by a newer build keeps the number
         // that build will look for, and an unstamped one becomes this
         // build's, because reading it here is what made it one.
@@ -279,8 +303,8 @@ impl DrumpadDoc {
             out.master = (m as f32).clamp(0.0, 2.0);
         }
         let pads = map.shift_remove("pads");
-        for known in KIT_KEYS {
-            map.shift_remove(known);
+        for known in KIT_KEYS.iter().chain(SIDECAR_KEYS.iter()) {
+            map.shift_remove(*known);
         }
         out.extra = map;
         let Some(Value::Array(pads)) = pads else {
@@ -329,6 +353,13 @@ impl DrumpadDoc {
     }
 
     fn to_json(&self) -> String {
+        serde_json::to_string_pretty(&Value::Object(self.to_value()))
+            .unwrap_or_else(|_| "{}".into())
+    }
+
+    /// The kit as the object the file holds — what `to_json` prints and
+    /// what `save_all_beside` puts under a lane, built once either way.
+    fn to_value(&self) -> Map<String, Value> {
         let mut map = Map::new();
         // The kit's OWN version, not the constant — see [`DRUMPAD_VERSION`].
         map.insert("version".into(), Value::from(self.version));
@@ -365,7 +396,7 @@ impl DrumpadDoc {
         for (k, v) in &self.extra {
             map.entry(k.clone()).or_insert_with(|| v.clone());
         }
-        serde_json::to_string_pretty(&Value::Object(map)).unwrap_or_else(|_| "{}".into())
+        map
     }
 }
 
@@ -485,6 +516,88 @@ mod tests {
             "the kit was downgraded on write: {out}"
         );
         assert_eq!(DrumpadDoc::from_json(&out), kit, "the kit changed on a second trip");
+    }
+
+    /// **The lanes-era root keys are the file's, not the primary kit's
+    /// strangers.** Kits on lanes 0 and 5, the panel left on an empty lane
+    /// 3: the kit read for lane 3 is the empty kit, with nothing in `extra`
+    /// — not a kit wearing `primary_lane` and a copy of every other lane.
+    /// Through the one-kit reader too, which reads the same root.
+    #[test]
+    fn the_lanes_keys_are_the_files_not_a_kits_strangers() {
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-lanekeys-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let doc = dir.join("project.tangent");
+        let mut kits: Vec<DrumpadDoc> = (0..8).map(|_| DrumpadDoc::default()).collect();
+        kits[0].pads[36].path = "media/kick.wav".into();
+        kits[5].pads[40].path = "media/hat.wav".into();
+        kits[5].extra.insert("from_tomorrow".into(), Value::from(1));
+        DrumpadDoc::save_all_beside(&kits, 3, &doc);
+        let (back, primary) = DrumpadDoc::load_all_beside(&doc, 8, None);
+        assert_eq!(primary, Some(3), "the file's primary was not reported");
+        assert_eq!(back[3], DrumpadDoc::default(), "lane 3 came back wearing the root's keys");
+        assert!(back[3].extra.is_empty(), "lane 3's extra: {:?}", back[3].extra);
+        assert_eq!(back[0].pads[36].path, "media/kick.wav");
+        assert_eq!(back[5].pads[40].path, "media/hat.wav");
+        assert_eq!(
+            back[5].extra.get("from_tomorrow"),
+            Some(&Value::from(1)),
+            "a real stranger on a lane kit was lost"
+        );
+        let one = DrumpadDoc::load_beside(&doc);
+        assert!(one.extra.is_empty(), "the one-kit reader kept the root's keys: {:?}", one.extra);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The sidecar's bytes are what they always were.** `save_all_beside`
+    /// used to print each kit and parse it back to build the root; it uses
+    /// the kit's map directly now, and this builds the file the old way
+    /// and compares. With `float_roundtrip` on, the parse of the printed
+    /// float is exact, so the two roads agree byte for byte.
+    #[test]
+    fn the_sidecar_is_written_as_it_always_was() {
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-sidecar-bytes-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let doc = dir.join("project.tangent");
+        let mut kits: Vec<DrumpadDoc> = (0..4).map(|_| DrumpadDoc::default()).collect();
+        kits[1].master = 0.8;
+        kits[1].pads[36].path = "media/kick.wav".into();
+        kits[1].pads[36].params.gain = 1.3;
+        kits[1].pads[36].params.tune = -0.7;
+        kits[1].pads[36].extra.insert("reverse".into(), Value::Bool(true));
+        kits[2].pads[0].path = "media/snare.wav".into();
+        kits[2].pads[0].params.pan = 0.25;
+        kits[2].extra.insert("swing".into(), Value::from(0.24));
+        DrumpadDoc::save_all_beside(&kits, 1, &doc);
+        let written = std::fs::read_to_string(DrumpadDoc::sidecar(&doc)).expect("the sidecar");
+
+        // The old road, verbatim.
+        let mut root = serde_json::from_str::<Value>(&kits[1].to_json())
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        root.insert("primary_lane".into(), Value::from(1u64));
+        let mut lane_kits = Map::new();
+        for (lane, kit) in kits.iter().enumerate() {
+            if kit.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(&kit.to_json()) {
+                lane_kits.insert(lane.to_string(), v);
+            }
+        }
+        root.insert("lane_kits".into(), Value::Object(lane_kits));
+        let expected = serde_json::to_string_pretty(&Value::Object(root)).unwrap_or_default();
+        assert_eq!(written, expected, "the sidecar's bytes moved");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An unstamped kit becomes this build's, and the known keys are never

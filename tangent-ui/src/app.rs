@@ -8650,11 +8650,54 @@ impl TangentApp {
     /// honest place to draw the line: the alternative is a document whose
     /// clips behave differently from identical clips made a minute later,
     /// with nothing on screen to explain why.
+    ///
+    /// One clip; the batch form is `note_clip_lens`, and this is that with
+    /// one element. The contract above is the batch's contract.
     pub fn note_clip_len(&mut self, id: u64, len_s: f64) {
-        let Some(i) = self.arrangement.clips.iter().position(|c| c.id == id) else {
-            return;
-        };
-        if self.arrangement.clips[i].len_s != 0.0 || !(len_s > 0.0) {
+        self.note_clip_lens(&[(id, len_s)]);
+    }
+
+    /// **The whole batch of lengths a reload measured, in one breath.**
+    ///
+    /// The exact "was it clean?" question below is a walk of the whole
+    /// document, and the re-mark after the fill is another; asked per clip
+    /// they were paid 2N times when a session with N unmeasured clips
+    /// opened (every one of them in the same frame, because a reload lands
+    /// its whole batch at once). Asked once around the batch they are paid
+    /// twice, whatever N is.
+    ///
+    /// **The applicable fills are found FIRST, and an empty set returns
+    /// before any question is asked.** `reload_clips` runs on every edit
+    /// with an empty list, and a fill for a clip that is already measured
+    /// or that measured 0.0 (an offset past the file's end) comes back on
+    /// every reload for the life of the session; neither may cost a walk.
+    /// A clip named twice in one batch takes its first length, as the
+    /// one-at-a-time road did.
+    ///
+    /// The single ask happens before any fill lands, so it can never read a
+    /// fill as dirt. The one difference from asking per clip is in the
+    /// conservative direction: a batch that begins dirty stays dirty even
+    /// where a later per-clip ask might have read clean and re-marked — a
+    /// prompt where none was, never a lost afternoon.
+    ///
+    /// MERGE-ME (host lane): `reload_clips` in desktop.rs still calls
+    /// `note_clip_len` per fill; it should call this once with the whole
+    /// `fill_len`, and skip the call when the list is empty.
+    pub fn note_clip_lens(&mut self, fills: &[(u64, f64)]) {
+        let mut todo: Vec<(usize, f64)> = Vec::new();
+        for &(id, len_s) in fills {
+            let Some(i) = self.arrangement.clips.iter().position(|c| c.id == id) else {
+                continue;
+            };
+            if self.arrangement.clips[i].len_s != 0.0
+                || !(len_s > 0.0)
+                || todo.iter().any(|(j, _)| *j == i)
+            {
+                continue;
+            }
+            todo.push((i, len_s));
+        }
+        if todo.is_empty() {
             return;
         }
         // A passive annotation must not make a clean project dirty — the
@@ -8666,13 +8709,17 @@ impl TangentApp {
         // is a cache the next explicit save carries to disk.
         // **Exact**, because being wrong in one direction here CLEARS real
         // dirt: a false "it was clean" re-marks the project saved over
-        // whatever was actually unsaved. Once per decoded file, not per
-        // frame. See `project_dirty`.
+        // whatever was actually unsaved. Once per batch of decoded files,
+        // not per frame. See `project_dirty`.
         let was_clean = !self.project_dirty_exact();
-        self.arrangement.clips[i].len_s = len_s;
-        // The loop, from the same number, in the same breath. See above for
-        // why this cannot re-arm a loop somebody turned off.
-        self.arrangement.clips[i].loop_s = len_s;
+        for (i, len_s) in todo {
+            if let Some(c) = self.arrangement.clips.get_mut(i) {
+                c.len_s = len_s;
+                // The loop, from the same number, in the same breath. See
+                // above for why this cannot re-arm a loop somebody turned off.
+                c.loop_s = len_s;
+            }
+        }
         if was_clean {
             self.mark_project_saved();
         }
@@ -13051,7 +13098,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// * **`project_dirty_exact`** is the same question where a wrong answer
     ///   means the app does not OFFER TO SAVE and somebody loses an
     ///   afternoon: `ask_before` (New, Open and Quit all go through it),
-    ///   `new_is_noop`, `note_clip_len`, and the two project-switch
+    ///   `new_is_noop`, `note_clip_lens`, and the two project-switch
     ///   save-backs in `desktop.rs`. Every one of those is event-driven and
     ///   pays the full comparison once, not sixty times a second, so there
     ///   is nothing to buy by making them cheap and everything to lose.
@@ -52668,6 +52715,68 @@ mod folder_tests {
         app.redo();
         assert!((app.settings.master_gain - 0.25).abs() < 1e-9, "redo did not restore the desk");
         assert_eq!(app.settings_writes.get(), 0, "redo wrote the settings synchronously");
+    }
+
+    /// A settled session with two audio clips still carrying the
+    /// whole-file sentinel, as an import leaves them.
+    fn a_session_with_unmeasured_clips() -> (TangentApp, u64, u64) {
+        let mut a = app();
+        let clip = |path: &str| crate::arrangement::ArrClip {
+            pedal: Vec::new(),
+            path: path.into(),
+            ..Default::default()
+        };
+        let x = a.arrangement.add_clip(clip("media/x.wav"));
+        let y = a.arrangement.add_clip(clip("media/y.wav"));
+        a.undo_reset();
+        (a, x, y)
+    }
+
+    /// **A batch of lengths on a clean project leaves it clean, filled, and
+    /// with no new moment**; on a dirty one it fills and leaves the dirt.
+    #[test]
+    fn a_batch_of_lengths_fills_every_clip_and_moves_no_baseline() {
+        let (mut a, x, y) = a_session_with_unmeasured_clips();
+        let depth = a.history.len();
+        a.note_clip_lens(&[(x, 3.5), (y, 7.25), (x, 99.0), (12_345, 1.0)]);
+        assert_eq!(a.arrangement.clips[0].len_s, 3.5, "the first length did not land");
+        assert_eq!(a.arrangement.clips[0].loop_s, 3.5, "the loop was not born with it");
+        assert_eq!(a.arrangement.clips[1].len_s, 7.25);
+        assert!(!a.project_dirty_exact(), "a passive annotation dirtied a clean project");
+        assert!(!a.project_dirty());
+        assert_eq!(a.history.len(), depth, "a fill made a moment");
+
+        let (mut b, x, y) = a_session_with_unmeasured_clips();
+        b.arrangement.clips[0].start_s = 4.0;
+        assert!(b.project_dirty_exact());
+        let saved = b.saved_state.as_ref().map(|s| s.mark);
+        b.note_clip_lens(&[(x, 3.5), (y, 7.25)]);
+        assert_eq!(b.arrangement.clips[1].len_s, 7.25);
+        assert!(b.project_dirty_exact(), "a fill cleaned a dirty project");
+        assert_eq!(b.saved_state.as_ref().map(|s| s.mark), saved, "the baseline moved");
+    }
+
+    /// **A batch with nothing to apply asks nothing and changes nothing** —
+    /// an empty list, an already-measured clip, a length of zero — on a
+    /// clean project and on a dirty one alike.
+    #[test]
+    fn a_batch_with_nothing_to_fill_is_a_noop() {
+        let (mut a, x, _) = a_session_with_unmeasured_clips();
+        a.note_clip_lens(&[]);
+        a.note_clip_lens(&[(x, 0.0), (x, -1.0), (x, f64::NAN), (777, 2.0)]);
+        assert_eq!(a.arrangement.clips[0].len_s, 0.0, "a zero or bad length landed");
+        assert!(!a.project_dirty_exact());
+        a.note_clip_lens(&[(x, 2.0)]);
+        a.note_clip_lens(&[(x, 5.0)]);
+        assert_eq!(a.arrangement.clips[0].len_s, 2.0, "a measured clip was re-measured");
+
+        let (mut b, x, _) = a_session_with_unmeasured_clips();
+        b.arrangement.clips[0].start_s = 4.0;
+        let saved = b.saved_state.as_ref().map(|s| s.mark);
+        b.note_clip_lens(&[(x, 0.0)]);
+        b.note_clip_lens(&[]);
+        assert!(b.project_dirty_exact(), "a no-op batch cleaned a dirty project");
+        assert_eq!(b.saved_state.as_ref().map(|s| s.mark), saved);
     }
 
     /// The document is a FIXED POINT: writing what was read gives the same
