@@ -103,6 +103,21 @@ use std::path::PathBuf;
 /// remaining hazard is the one the oracle guards: a field the writer
 /// learns and this walk does not is invisible to BOTH answers, so the
 /// oracle test is not optional.
+///
+/// One exclusion, written down because the words now decide the quit
+/// prompt and not only the asterisk. A clip's `extra` may hold a key this
+/// build OWNS but could not read — a newer build's `stretch` written as an
+/// object, say; `clip_key_is_readable` leaves it where it is — and the
+/// writer emits the field it owns first and an extra only where that name
+/// is absent (`entry().or_insert_with`), so such an extra is walked here
+/// and written nowhere. Two structs that differ only by it write the same
+/// text and hold different words. It cannot be reached inside a session:
+/// the spill happens only in the reader, every moment and the saved
+/// baseline (`saved_point`) descend from the one parse an open makes, and
+/// no road re-parses without `undo_reset`. Closing it properly means
+/// spilling only the keys the writer would emit from `extra`, a
+/// writer-side rule the reader would have to duplicate; until then this
+/// is the line that says so.
 pub struct Fingerprint {
     acc: u64,
     /// Every word mixed so far, when this fingerprint is recording.
@@ -938,19 +953,6 @@ pub struct DeskSnap {
     pub folder_shut: Vec<bool>,
 }
 
-/// **The desk by reference** — every field of [`DeskSnap`] borrowed from
-/// wherever it lives, so the once-a-frame fingerprint can walk the LIVE
-/// desk without first cloning thousands of seat strings into a snapshot it
-/// throws away a microsecond later.
-///
-/// This is THE walk, and the one derivation. `DeskSnap::hash_into` goes
-/// through `as_ref`, the snapshot the app takes is built by `to_snap`, and
-/// the app reads its settings into one of these in exactly one function —
-/// so the cheap question (`project_dirty`), the exact one
-/// (`project_dirty_exact`) and the document's own desk all see the same
-/// fields derived the same way. Two walkers over two derivations was the
-/// shape that could disagree, and a disagreement here is a title bar blind
-/// to a fader the quit prompt can see.
 /// **The insert seats a `DeskRef` looks at, in whichever shape their owner
 /// keeps them**: the settings' dense `strip_inserts` (one string per bay,
 /// nearly all empty) or a snapshot's sparse pairs. `iter` yields the
@@ -984,11 +986,27 @@ impl<'a> Iterator for BaysIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Dense(it) => it.find(|(_, p)| !p.is_empty()).map(|(n, p)| (n, p.as_str())),
-            Self::Sparse(it) => it.next().map(|(n, p)| (*n, p.as_str())),
+            // Canonical pairs hold no empties; the filter is for the
+            // constructor that will not be — an empty seat must not be a
+            // word from either shape, or the two stop hashing alike.
+            Self::Sparse(it) => it.find(|(_, p)| !p.is_empty()).map(|(n, p)| (*n, p.as_str())),
         }
     }
 }
 
+/// **The desk by reference** — every field of [`DeskSnap`] borrowed from
+/// wherever it lives, so the once-a-frame fingerprint can walk the LIVE
+/// desk without first cloning thousands of seat strings into a snapshot it
+/// throws away a microsecond later.
+///
+/// This is THE walk, and the one derivation. `DeskSnap::hash_into` goes
+/// through `as_ref`, the snapshot the app takes is built by `to_snap`, and
+/// the app reads its settings into one of these in exactly one function —
+/// so the cheap question (`project_dirty`), the exact one
+/// (`project_dirty_exact`) and the document's own desk all see the same
+/// fields derived the same way. Two walkers over two derivations was the
+/// shape that could disagree, and a disagreement here is a title bar blind
+/// to a fader the quit prompt can see.
 #[derive(Clone, Copy)]
 pub struct DeskRef<'a> {
     pub kinds: &'a [u8],
@@ -3909,6 +3927,25 @@ mod tests {
         let mut by_ref = Fingerprint::new();
         a.hash_into_ref(Some(d.as_ref()), &mut by_ref);
         assert_eq!(by_ref.finish(), a.fingerprint(), "the view hashed differently");
+    }
+
+    /// **An empty seat in the sparse pairs is not a word.** Every
+    /// constructor keeps the pairs canonical (`from_value`, `to_snap`,
+    /// `set_bay`), so this is the lock for the one that will not: a
+    /// hand-pushed `(bay, "")` hashes and copies as no seat at all, the
+    /// way the dense shape has always treated an empty string.
+    #[test]
+    fn an_empty_seat_in_the_sparse_pairs_is_not_a_word() {
+        let a = a_document_with_everything_in_it();
+        let mut d = a.desk.clone().expect("a desk");
+        let clean = d.clone();
+        d.inserts.push((crate::recorder::INSERT_SPACE - 1, String::new()));
+        let mut with = Fingerprint::recording(0);
+        d.as_ref().hash_into(&mut with);
+        let mut without = Fingerprint::recording(0);
+        clean.as_ref().hash_into(&mut without);
+        assert_eq!(with.finish_recorded(), without.finish_recorded(), "an empty seat became a word");
+        assert_eq!(d.as_ref().to_snap(), clean, "to_snap kept the empty seat");
     }
 
     /// **Recording changes nothing about the number.** The words are kept
