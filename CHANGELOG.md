@@ -199,6 +199,73 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **A project opens in the time its audio takes to read, not in the time
+  forty child processes take to spawn.** Every take used to go out to
+  `afconvert` (ffmpeg elsewhere), through a temporary WAV and back in, one
+  file per frame on the UI thread; and once the notes' 250 ms deadline fired,
+  the reload decoded every file still waiting in a single frame and the
+  warm-up queue then decoded them all a second time. A take is now read
+  natively when its header is the plain PCM the recorder writes at the
+  engine's own rate (anything else, a resampled file, an MP3, a stream with
+  no length, a take cut short, still goes to the child), each file is decoded
+  exactly once, refusals are remembered instead of re-spawned on every edit,
+  and the work runs on a small crew of decode threads while the window keeps
+  painting. Measured on forty-five one-minute takes: 1.7 s of serial child
+  processes became 0.17 s of wall time off the UI thread. A missing file is
+  no longer asked for again on every zoom step.
+
+- **Zoom and pan draw from a picture built once.** A clip's waveform was
+  recomputed from its samples whenever the view moved more than a twentieth
+  of the window, and that recompute also rebuilt the engine's schedule and
+  waited on the audio thread twice, which is the hitch and the smear a zoom
+  used to carry. Each decoded file now carries a min/max pyramid, built once
+  beside the decode, and the timeline reads it at any zoom directly: no
+  deadband, no sample walk, no engine push. The waveform is one shape per
+  clip instead of one per pixel column. The panel also lays itself out once
+  per frame instead of once per clip (it had been rebuilding the whole layout
+  three times for every clip in the document, on screen or not), computes
+  its colours once per lane, cuts a label with one text layout instead of
+  one per candidate length, and builds accessibility nodes only on a frame
+  that installs them.
+
+- **A stretched clip renders once the hand stops.** Dragging a clip's edge
+  used to render the whole stretched file on the UI thread for every ratio
+  the pointer passed through. The render is now a job for the decode crew,
+  started when the ratio settles; until it lands the clip is silent and
+  drawn from a stand-in, and the busy cover says so. A ratio that would
+  render past the decoder's ceiling plays the clip unstretched with a notice
+  instead of allocating gigabytes.
+
+- **The window rests.** An idle desk repainted twenty to thirty times a
+  second forever. Now every animator (the transport, live meters, a
+  notification, the busy cover, the splash, a drag, the camera, the
+  analyzer with signal) asks for its own frames, and a still window asks for
+  none. `IVORY_PACE` still forces the old cadence; `IVORY_PACE_PROBE=1`
+  shows the frame rate; `TANGENT_FRAME_LOG=1` logs where each second of
+  frames went, section by section.
+
+- **Settings writes coalesce.** A fader drag, a wheel notch or a held key
+  used to write the whole settings file synchronously on every step. Every
+  repeating gesture now owes one write, paid when the hand stops and always
+  paid before quit, a project switch, or the window losing focus. Explicit
+  saves, the project path and the kit sidecar still write at once.
+
+- **Undo holds the document, not its printout.** Each undo step stored the
+  whole document as pretty-printed JSON and re-parsed it to travel back. A
+  step is now the structure and its words, compared exactly, so a hundred
+  steps of a real project cost a tenth of what they did and an open no
+  longer serialises the document twice to start the history. Opening writes
+  the settings once, and undo and redo do not write them at all.
+
+- **Documents and settings stop carrying thirteen thousand empty seats.**
+  The desk's insert map was written whole, one entry per possible bay, which
+  was most of a small project's bytes and the settings file's. A document
+  now writes its strips' bays as a head and everything past them as a
+  sparse tail (`arrangement_version` 7, `settings_version` 21). Every
+  earlier shape still opens. A build from before this change that opens a
+  new document keeps the strips' bays and drops the far seats on its own
+  save, which is the same loss any earlier format step accepted.
+
 - **Only an ARMED track hears the keyboard.** Selecting a MIDI track used to
   open it to live notes as well, on the reasoning that trying an instrument out
   should not begin by arming a track. What that cost in the room was arm
@@ -352,6 +419,19 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   ships, this stops being a note and becomes something the loader has to do.
 
 ### Fixed
+
+- **A seventeen-digit fraction survives a round trip.** The JSON reader
+  rounded values such as `0.9999999999999999` to `1.0`, so a document with
+  one of them was never equal to itself after a save, which is the class of
+  fault where undo appears to do nothing and redo is gone. The reader is
+  exact now.
+
+- **A quit within the write delay lost the last fader.** The debounced
+  settings write was never flushed on exit; it is drained on every road out.
+
+- **A document second past the timeline's range no longer overflows it**, a
+  looping MIDI clip is capped by the notes it would emit as well as its
+  passes, and a seat named past the desk by a document cannot size the desk.
 
 - **The sustain pedal is recorded into the clip and played back.** A part
   performed with the damper down came back dry: the take kept only the instants
