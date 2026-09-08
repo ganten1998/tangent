@@ -130,7 +130,17 @@ pub fn draw(painter: &Painter, rect: Rect, fade: f32) {
             *c,
             Align2::CENTER_CENTER,
             *ch,
-            FontId::new(r * 1.25, fonts::courier_bold()),
+            // **A WHOLE number, like every other size in this app.** epaint
+            // rasterises unhinted at exactly `size * ppp` with four horizontal
+            // subpixel bins and none vertical, so a fractional size puts the
+            // horizontal strokes across two pixel rows at partial coverage —
+            // and on a capital that is the top bar, which is why the owner
+            // reported the logo's top as "ever so slightly cut off". `r` is a
+            // fraction of a lattice spacing that is itself a fraction of the
+            // window, so this size was fractional at almost every window size
+            // there is. `fonts::px` is the rule the rest of the app already
+            // obeys; the splash was simply never told.
+            FontId::new(fonts::px(r * 1.25), fonts::courier_bold()),
             alpha(INK),
         );
     }

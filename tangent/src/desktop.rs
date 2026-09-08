@@ -16730,7 +16730,7 @@ impl DesktopApp {
 /// Long enough that a fast launch does not FLASH — a splash that appears and
 /// vanishes inside two frames is a glitch, not a loading screen — and short
 /// enough that it is never the thing keeping anybody waiting.
-const SPLASH_MIN: std::time::Duration = std::time::Duration::from_millis(600);
+const SPLASH_MIN: std::time::Duration = std::time::Duration::from_millis(1400);
 /// And the longest it may EVER stay up.
 ///
 /// The cap is the important half. Everything the splash waits on is a device,
