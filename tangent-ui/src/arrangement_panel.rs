@@ -127,6 +127,13 @@ pub struct ClipView<'a> {
     pub wave: &'a [f32],
     pub wave_from_s: f64,
     pub wave_span_s: f64,
+    /// **The file's picture at every zoom**, when the host has built one —
+    /// `ports::ClipInfo::peaks`, borrowed through its `Arc`. When this is
+    /// here the painter reads the window itself, column by column, and the
+    /// `wave*` fields above are not consulted: the pyramid answers any zoom,
+    /// so there is no span to be inside of and nothing for the host to
+    /// redraw when the view moves. `None` falls back to the host-drawn wave.
+    pub peaks: Option<&'a crate::peaks::Peaks>,
     /// The clip's notes, source-relative like the document's. Drawn as a
     /// miniature where audio draws its wave; empty draws the dashed staff.
     pub notes: &'a [crate::arrangement::ArrNote],
@@ -1171,24 +1178,45 @@ impl HeaderRow {
     };
 }
 
+/// **The frame of the panel: what follows from the rect and the header
+/// width, and from nothing else.**
+///
+/// `Layout::new` needs the whole view to stack the rows — which lanes are
+/// hidden, how many automation rows are open, whether the master shows —
+/// but the header column, the ruler, the chip strip, the lanes area and the
+/// grip fall out of the rect the moment the header width is known. Two
+/// callers ask every frame and want only those: the grip's hover check (is
+/// the pointer on the seam?) and the host's wave-view question (how wide are
+/// the lanes?). Each was building every clip view, the whole `ArrangeView`
+/// and the full row stack to read one rectangle. So the frame is its own
+/// step, and `Layout::new` begins with it — the same expressions, in the
+/// same order, so the two cannot disagree about where the lanes begin.
+#[derive(Debug, Clone, Copy)]
+pub struct Frame {
+    pub header: Rect,
+    pub ruler: Rect,
+    pub meter_strip: Rect,
+    pub lanes_area: Rect,
+    pub grip: Rect,
+    /// The resolved header width and ruler height, kept for the corner cell
+    /// `Layout::new` still lays out itself.
+    header_w: f32,
+    ruler_h: f32,
+}
+
 impl Layout {
-    pub fn new(rect: Rect, view: &ArrangeView<'_>) -> Self {
+    /// See [`Frame`]. `header_w` is `ArrangeView::header_w`: a dragged width,
+    /// or `None` for the automatic share.
+    pub fn frame(rect: Rect, header_w: Option<f32>) -> Frame {
         if !rect.is_positive() {
-            return Self {
+            return Frame {
                 header: Rect::NOTHING,
                 ruler: Rect::NOTHING,
                 meter_strip: Rect::NOTHING,
-                tool_met: Rect::NOTHING,
-                tool_snap: Rect::NOTHING,
-                tool_grid: Rect::NOTHING,
-                tool_tempo: Rect::NOTHING,
-                tool_nav: Rect::NOTHING,
                 lanes_area: Rect::NOTHING,
                 grip: Rect::NOTHING,
-                rows: Vec::new(),
-                lane_rows: [Rect::NOTHING; CHANNELS],
-                header_rows: [HeaderRow::NONE; CHANNELS],
-                master_row: BusRow::NONE,
+                header_w: 0.0,
+                ruler_h: 0.0,
             };
         }
         let (share, lo, hi) = HEADER_W;
@@ -1196,8 +1224,7 @@ impl Layout {
         // hand clamp a min above its max, which is a panic in a painter.
         // A dragged width wins over the automatic share, inside the same
         // sanity bounds.
-        let header_w = view
-            .header_w
+        let header_w = header_w
             .unwrap_or(rect.width() * share)
             .max(lo)
             .min(hi.max(400.0))
@@ -1241,6 +1268,35 @@ impl Layout {
             Pos2::new(field_x, rect.top() + ruler_h),
             rect.max,
         );
+        let grip = Rect::from_min_max(
+            Pos2::new(rect.left() + header_w, rect.top()),
+            Pos2::new(rect.left() + header_w + GRIP_W, rect.bottom()),
+        );
+        Frame { header, ruler, meter_strip, lanes_area, grip, header_w, ruler_h }
+    }
+
+    pub fn new(rect: Rect, view: &ArrangeView<'_>) -> Self {
+        if !rect.is_positive() {
+            return Self {
+                header: Rect::NOTHING,
+                ruler: Rect::NOTHING,
+                meter_strip: Rect::NOTHING,
+                tool_met: Rect::NOTHING,
+                tool_snap: Rect::NOTHING,
+                tool_grid: Rect::NOTHING,
+                tool_tempo: Rect::NOTHING,
+                tool_nav: Rect::NOTHING,
+                lanes_area: Rect::NOTHING,
+                grip: Rect::NOTHING,
+                rows: Vec::new(),
+                lane_rows: [Rect::NOTHING; CHANNELS],
+                header_rows: [HeaderRow::NONE; CHANNELS],
+                master_row: BusRow::NONE,
+            };
+        }
+        // The frame first — see [`Frame`] for why it is its own step.
+        let Frame { header, ruler, meter_strip, lanes_area, grip, header_w, ruler_h } =
+            Self::frame(rect, view.header_w);
         // **Eight lanes show; the rest scroll.** The desk grew past what
         // fits at a legible height, so the height is fixed to `VISIBLE_LANES`
         // and `view.lane_scroll` chooses which window shows. A lane outside
@@ -1515,11 +1571,7 @@ impl Layout {
             tool_tempo,
             tool_nav,
             lanes_area,
-            grip: Rect::from_min_max(
-                Pos2::new(rect.left() + header_w, rect.top()),
-                Pos2::new(rect.left() + header_w + GRIP_W, rect.bottom()),
-            ),
-
+            grip,
             rows,
             lane_rows,
             header_rows,
@@ -2073,7 +2125,29 @@ fn bus_strip(painter: &Painter, cell: Rect, t: f32) {
 
 /// Song seconds at `x`, through the zoom window. The one mapping.
 pub fn time_at(rect: Rect, view: &ArrangeView<'_>, x: f32) -> f64 {
-    let l = Layout::new(rect, view);
+    time_at_in(&Layout::new(rect, view), view, x)
+}
+
+/// [`time_at`] for a caller that already holds the frame's [`Layout`].
+///
+/// **The `_in` forms exist because the axis was being rebuilt per call.**
+/// `x_of`, `time_at` and `clip_rect` each constructed a whole `Layout` to
+/// read one pair of numbers off it — the lanes area's left edge and width —
+/// and `clip_rect` constructed three (its own and one per `x_of`). A Layout
+/// is 1.3 µs: thirty-three rows stacked, sixteen header rows measured cell by
+/// cell, a bus row, thirteen kilobytes returned by value. `draw` asked for
+/// one per grid line, per ruler label, per automation point and three per
+/// clip whether the clip was on screen or not, and `targets` asked again;
+/// measured, that was 1.9 µs per clip in the document per frame, which at two
+/// thousand clips is a quarter of a frame spent re-deriving a rectangle that
+/// had not moved. So the frame builds one Layout at its top and hands it
+/// down, and the public forms stay as they were for the seventy-odd callers
+/// in `app` that ask once per gesture, where a Layout is nothing.
+///
+/// Same arithmetic, same degenerate answers: the two must agree to the bit,
+/// because a clip drawn through one and hit-tested through the other is the
+/// pair that drifts. `clip_rect_agrees_with_its_in_form_to_the_bit` holds it.
+pub fn time_at_in(l: &Layout, view: &ArrangeView<'_>, x: f32) -> f64 {
     if !l.lanes_area.is_positive() || view.view_len_s <= 0.0 {
         return 0.0;
     }
@@ -2180,7 +2254,11 @@ pub fn tempo_bpm_at(row: Rect, y: f32) -> f64 {
 
 /// The x a song second draws at. `time_at`'s inverse.
 pub fn x_of(rect: Rect, view: &ArrangeView<'_>, t: f64) -> f32 {
-    let l = Layout::new(rect, view);
+    x_of_in(&Layout::new(rect, view), view, t)
+}
+
+/// [`x_of`] on a Layout the caller already built — see [`time_at_in`].
+pub fn x_of_in(l: &Layout, view: &ArrangeView<'_>, t: f64) -> f32 {
     if !l.lanes_area.is_positive() || view.view_len_s <= 0.0 {
         return l.lanes_area.left();
     }
@@ -2190,12 +2268,20 @@ pub fn x_of(rect: Rect, view: &ArrangeView<'_>, t: f64) -> f32 {
 
 /// A clip's rectangle on its lane, clamped into the lanes area.
 pub fn clip_rect(rect: Rect, view: &ArrangeView<'_>, clip: &ClipView<'_>) -> Rect {
-    let l = Layout::new(rect, view);
+    clip_rect_in(&Layout::new(rect, view), view, clip)
+}
+
+/// [`clip_rect`] on a Layout the caller already built — see [`time_at_in`].
+///
+/// The clamp against `l.lanes_area.right()` is the same edge the time
+/// selection's veil, the pending ghost and the grid guards clamp against, so
+/// a clip and the veil over it end on the same pixel.
+pub fn clip_rect_in(l: &Layout, view: &ArrangeView<'_>, clip: &ClipView<'_>) -> Rect {
     let Some(row) = l.lane_rows.get(clip.lane).copied().filter(Rect::is_positive) else {
         return Rect::NOTHING;
     };
-    let x0 = x_of(rect, view, clip.start_s).max(l.lanes_area.left());
-    let x1 = x_of(rect, view, clip.start_s + clip.len_s).min(l.lanes_area.right());
+    let x0 = x_of_in(l, view, clip.start_s).max(l.lanes_area.left());
+    let x1 = x_of_in(l, view, clip.start_s + clip.len_s).min(l.lanes_area.right());
     if x1 <= x0 {
         return Rect::NOTHING;
     }
@@ -2574,6 +2660,15 @@ fn draw_note_miniature(
     // kind that has no loop to skip, so the span would be a walk over
     // thousands of notes bought and thrown away every frame.
     let (mut first_s, mut last_s) = (f64::INFINITY, f64::NEG_INFINITY);
+    // For the clip of ONE pass: the longest mark, and whether the notes are
+    // in time order — gathered in the same pass as the pitch range, so the
+    // clip that does not loop is walked ONCE for its facts and the marks
+    // below are drawn from the notes under the window alone. A recorded
+    // part is exactly this clip: thousands of notes, no loop to skip, and
+    // it was walked twice a frame however far in the view was zoomed.
+    let mut longest = 0.02f64;
+    let mut in_order = true;
+    let mut prev_at = f64::NEG_INFINITY;
     if passes > 1 {
         for n in clip.notes {
             lo = lo.min(n.key);
@@ -2585,6 +2680,11 @@ fn draw_note_miniature(
         for n in clip.notes {
             lo = lo.min(n.key);
             hi = hi.max(n.key);
+            longest = longest.max(n.dur_s);
+            // A NaN compares false and marks the clip out of order, which
+            // sends it down the whole walk: slower, never wrong.
+            in_order &= n.at_s >= prev_at;
+            prev_at = n.at_s;
         }
     }
     if lo > hi {
@@ -2689,7 +2789,31 @@ fn draw_note_miniature(
         vec![0u64; cols as usize * 2]
     };
     let cols = cols as usize;
-    for (pass, n) in seen.flat_map(|k| clip.notes.iter().map(move |n| (k, n))) {
+    // **The notes under the window, when the clip is one pass in time
+    // order.** `mark` answers None for a note whose span misses `inner`, so
+    // the walk used to visit every note to learn which few to draw; with
+    // the notes sorted by their start the two edges are a binary search
+    // each. The left edge is pulled back by the longest note, because a
+    // note that STARTS before the window can still reach into it. Same
+    // marks as the whole walk — the notes skipped are exactly the ones
+    // `mark` would have refused — and
+    // `a_recorded_part_draws_the_same_picture_as_the_plain_walk` says so on
+    // a sorted part, a reversed one and a shuffled one.
+    let notes: &[crate::arrangement::ArrNote] = if passes == 1 && in_order {
+        let at = |x: f32| (f64::from(x) - f64::from(fx0)) / f64::from(fw) * len + clip.offset_s;
+        let s_lo = at(inner.left()) - longest;
+        let s_hi = at(inner.right());
+        if s_lo.is_finite() && s_hi.is_finite() {
+            let a = clip.notes.partition_point(|n| n.at_s < s_lo);
+            let b = clip.notes.partition_point(|n| n.at_s < s_hi);
+            &clip.notes[a.min(b)..b]
+        } else {
+            clip.notes
+        }
+    } else {
+        clip.notes
+    };
+    for (pass, n) in seen.flat_map(|k| notes.iter().map(move |n| (k, n))) {
         if let Some((x0, x1, k)) = mark(pass, n) {
             // **Wide enough to show where it begins**: draw it as the span
             // it is. A held note crosses many columns and reads as a line;
@@ -2765,7 +2889,13 @@ pub fn click_hit(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
 }
 
 pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
-    let l = Layout::new(rect, view);
+    hit_test_in(&Layout::new(rect, view), view, pos)
+}
+
+/// [`hit_test`] on a Layout the caller already built — see [`time_at_in`].
+/// The wheel handler asks this and the axis on the same frame, and it used
+/// to build a Layout for each.
+pub fn hit_test_in(l: &Layout, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
 
     for (r, hit) in [
         (l.tool_met, Hit::ToolMetronome),
@@ -2842,7 +2972,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         if names.contains(pos) {
             let font_h = strip_font_h(names);
             for (i, m) in view.markers.iter().enumerate().rev() {
-                let x = x_of(rect, view, m.at_s);
+                let x = x_of_in(l, view, m.at_s);
                 let shown = match view.marker_edit.filter(|(n, _)| *n == i) {
                     Some((_, t)) => format!("{t}|"),
                     None if m.name.is_empty() => "\u{2691}".to_owned(),
@@ -2872,7 +3002,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             if pt.at_bar == 0 && view.meter.points().len() == 1 && typing.is_none() {
                 continue;
             }
-            let x = x_of(rect, view, bar_at(view, pt.at_bar));
+            let x = x_of_in(l, view, bar_at(view, pt.at_bar));
             // The same width the chip is DRAWN at, including the field's
             // caret: a target that disagreed with the paint by a character
             // would be a chip you cannot press once you have opened it.
@@ -2904,7 +3034,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
                     .enumerate()
                     .map(|(i, q)| {
                         let at = Pos2::new(
-                            tempo_x_of(rect, view, row.lane, q.at_beat),
+                            tempo_x_of(l, view, row.lane, q.at_beat),
                             tempo_y_of(row.lane, q.bpm),
                         );
                         (i, at.distance(pos))
@@ -2919,7 +3049,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
                 // pixels above lands visually in the ruler.
                 if row.lane.contains(pos) {
                     return Some(Hit::TempoLane(
-                        time_at(rect, view, pos.x),
+                        time_at_in(l, view, pos.x),
                         tempo_bpm_at(row.lane, pos.y),
                     ));
                 }
@@ -2988,7 +3118,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let at = Pos2::new(x_of(rect, view, p.at_s), auto_y_of(row.lane, p.value));
+                let at = Pos2::new(x_of_in(l, view, p.at_s), auto_y_of(row.lane, p.value));
                 (lo + i, at.distance(pos))
             })
             // **Finite first.** A non-finite distance compares false against
@@ -3017,14 +3147,14 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             return Some(Hit::AutoLane(
                 lane,
                 slot,
-                time_at(rect, view, pos.x),
+                time_at_in(l, view, pos.x),
                 auto_value_at(row.lane, pos.y),
             ));
         }
         continue;
     }
     if l.ruler.is_positive() && l.ruler.contains(pos) {
-        return Some(Hit::Ruler(time_at(rect, view, pos.x)));
+        return Some(Hit::Ruler(time_at_in(l, view, pos.x)));
     }
     for clip in view.clips.iter().rev() {
         // A clip being RECORDED is a picture, not a control — the document
@@ -3032,7 +3162,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         if clip.recording {
             continue;
         }
-        let r = clip_rect(rect, view, clip);
+        let r = clip_rect_in(l, view, clip);
         if !r.is_positive() || !r.contains(pos) {
             continue;
         }
@@ -3060,14 +3190,14 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     }
     for (i, row) in l.lane_rows.iter().enumerate() {
         if row.is_positive() && row.contains(pos) {
-            return Some(Hit::Lane(i, time_at(rect, view, pos.x)));
+            return Some(Hit::Lane(i, time_at_in(l, view, pos.x)));
         }
     }
     // The master's field, last: its header's own controls are pushed above
     // and have already answered, so what is left is the ground beside them.
     if let Some(row) = l.rows.iter().find(|r| r.kind == RowKind::Master) {
         if row.lane.is_positive() && row.lane.contains(pos) {
-            return Some(Hit::MasterLane(time_at(rect, view, pos.x)));
+            return Some(Hit::MasterLane(time_at_in(l, view, pos.x)));
         }
     }
     None
@@ -3091,7 +3221,11 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
 /// then each row from the top — a track's header cells left to right,
 /// then the clips standing on it.
 pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
-    let l = Layout::new(rect, view);
+    targets_in(&Layout::new(rect, view), view)
+}
+
+/// [`targets`] on a Layout the caller already built — see [`time_at_in`].
+pub fn targets_in(l: &Layout, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
     let mut out: Vec<(Rect, Hit)> = Vec::new();
     let mut push = |r: Rect, hit: Hit| {
         if r.is_positive() {
@@ -3177,7 +3311,7 @@ pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
                     // on an edge would hand a keyboard a trim it never
                     // asked for. A clip too narrow to have a body is one
                     // there is nothing to press.
-                    let r = clip_rect(rect, view, clip);
+                    let r = clip_rect_in(l, view, clip);
                     if !r.is_positive() {
                         continue;
                     }
@@ -3209,8 +3343,25 @@ pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
 /// the song, and the dial readouts. A timeline a blind student cannot read
 /// the shape of has been made navigable and not useful.
 pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> {
+    a11y_nodes_from(view, &targets(rect, view))
+}
+
+/// [`a11y_nodes`] over a target list the caller already has.
+///
+/// **Two hundred nodes were being built and dropped every frame.** `paint`
+/// ran `a11y_nodes` (which ran `targets`) and then `targets` again, and
+/// handed the result to `offer_nodes`, whose first line returns when no
+/// reader is on — so for everybody but a screen-reader user the frame
+/// formatted two hundred labels, two hundred Debug strings for the ids and
+/// two target walks, and threw them away. The nodes are now built only on a
+/// frame that will install them, from the one `targets` walk that frame
+/// also needs for the map back from a focused node to its hit.
+pub fn a11y_nodes_from(
+    view: &ArrangeView<'_>,
+    hits: &[(Rect, Hit)],
+) -> Vec<crate::a11y::Node> {
     use crate::a11y::{Node, Travel};
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(hits.len());
     let up = |norm: f32| Travel { norm: norm.clamp(0.0, 1.0), up: true };
     // The name a person would use for a row, whether or not it is a track
     // yet. Never an empty string — a node labelled "" is a node a reader
@@ -3239,7 +3390,7 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
             format!("bar {a} to {b}")
         }
     };
-    for (r, hit) in targets(rect, view) {
+    for &(r, hit) in hits {
         let id = egui::Id::new(("arrangement", format!("{hit:?}")));
         let node = match hit {
             // ── the toolbar ───────────────────────────────────────────
@@ -3537,6 +3688,26 @@ struct Ink {
     solo: Color32,
     meter: Color32,
     select: Color32,
+    // ── Worked out ONCE per frame from the roles above, because they were
+    // being worked out per switch, per chip, per bar label and per
+    // automation row: `quiet` and `legible_surface` each cost a contrast
+    // walk (three powf per colour per step), and none of these depend on
+    // anything but the theme. See `ink`. ──
+    /// A switch's letter when it is OFF, on `hdr_lane`.
+    switch_off: Color32,
+    /// An empty slot's number and its +, on `empty_ground`.
+    empty_ink: Color32,
+    /// The folder arrow and its count, on `hdr_lane`.
+    collapse_ink: Color32,
+    /// A bay chip's word: a tenant, an empty +, a bypassed tenant.
+    bay_ink: [Color32; 3],
+    /// The bar numbers and the clock, on the ruler — the numbers a notch
+    /// stronger than the clock, see the ruler loop in `draw`.
+    ruler_num: Color32,
+    ruler_clock: Color32,
+    /// An automation row's ground under an even and an odd lane — see
+    /// [`auto_ground`], which reads this.
+    auto_ground: [Color32; 2],
 }
 
 /// One rack chip: a plugin's short name, or a plus for an empty bay.
@@ -3592,12 +3763,12 @@ fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, bypassed: bool, p
     // 0.45, the figure two hundred lines down where the same state is drawn
     // on a lane. `quiet` re-measures against this chip's own ground and
     // stops at 4.5:1, so "quieter" never becomes "gone" on a dark theme.
-    let dim = if bypassed && has {
-        0.45
+    let word_ink = if bypassed && has {
+        p.bay_ink[2]
     } else if has {
-        0.08
+        p.bay_ink[0]
     } else {
-        0.34
+        p.bay_ink[1]
     };
     let inner = Rect::from_min_max(Pos2::new(r.left() + text_left, r.top()), r.max);
     painter.text(
@@ -3605,7 +3776,7 @@ fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, bypassed: bool, p
         Align2::CENTER_CENTER,
         cut_to(painter, inner.width() - 4.0, word, &font),
         font,
-        quiet(ink, bone, dim),
+        word_ink,
     );
 }
 
@@ -3718,13 +3889,33 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
         }
     };
     let engrave = on(strip);
+    // Through the guard as well: it carries the M/S/R letters, and
+    // shading the field 18% darker is exactly the kind of nudge that
+    // lands a pale theme in the dead zone where neither ink clears.
+    let hdr_lane = crate::recorder_panel::legible_surface(shade(lane, 0.82));
+    // The per-frame derivations — the same calls the draw loops made, made
+    // here once. `quiet`'s figures are each caller's own and are named at
+    // the call sites that used to compute them.
+    let switch_off = quiet(on_ink(hdr_lane), hdr_lane, 0.18);
+    let empty_ink = quiet(on_ink(empty_ground), empty_ground, 0.22);
+    let collapse_ink = quiet(on_ink(hdr_lane), hdr_lane, 0.22);
+    let bay_ink = [
+        quiet(engrave, strip, 0.08),
+        quiet(engrave, strip, 0.34),
+        quiet(engrave, strip, 0.45),
+    ];
+    let ruler_num = quiet(on_ink(ruler), ruler, 0.08);
+    let ruler_clock = quiet(on_ink(ruler), ruler, 0.18);
+    // Character first, then DISTANCE — see [`auto_ground`] for the whole
+    // argument and the measurements behind 0.35 and 0.26.
+    let auto_ground_of = |base: Color32| {
+        crate::recorder_panel::legible_surface(separate(blend(base, ruler, 0.35), 0.26))
+    };
+    let auto_ground = [auto_ground_of(lane), auto_ground_of(lane_alt)];
     Ink {
         hdr_wood: wood,
         hdr_face: strip,
-        // Through the guard as well: it carries the M/S/R letters, and
-        // shading the field 18% darker is exactly the kind of nudge that
-        // lands a pale theme in the dead zone where neither ink clears.
-        hdr_lane: crate::recorder_panel::legible_surface(shade(lane, 0.82)),
+        hdr_lane,
         ruler,
         wood: shade(wood, if dark { 0.62 } else { 1.0 }),
         face: strip,
@@ -3757,6 +3948,13 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
         solo: redder_of(lane),
         meter: Color32::from_rgb(0x3D, 0xC0, 0x5A),
         select: on(lane),
+        switch_off,
+        empty_ink,
+        collapse_ink,
+        bay_ink,
+        ruler_num,
+        ruler_clock,
+        auto_ground,
     }
 }
 
@@ -3777,12 +3975,24 @@ fn on_ink(bg: Color32) -> Color32 {
     }
 }
 
+/// How many times `quiet` has been asked on this thread, for the test that
+/// holds a frame to a handful: each ask is a contrast walk, and a frame
+/// once made 124 of them for answers that do not change between frames.
+/// Thread-local because the tests run in parallel and a frame is drawn on
+/// the thread that asked for it.
+#[cfg(test)]
+thread_local! {
+    static QUIET_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `pub(crate)` because the MIXER's rack needs it too, for the bypassed bay
 /// label: one contrast-guarded dim for the whole app rather than a second
 /// copy in the other panel that could be given a different floor by somebody
 /// who never saw this one. It lives here because this is where it was
 /// written and where every other caller of it still is.
 pub(crate) fn quiet(ink: Color32, bg: Color32, t: f32) -> Color32 {
+    #[cfg(test)]
+    QUIET_CALLS.with(|n| n.set(n.get() + 1));
     // **Quieter, but never quiet enough to stop being words.** How far `t`
     // can go depends on the ground: on the pale themes a third of the way
     // toward a near-white panel is already a grey nobody reads, which is what
@@ -4137,8 +4347,8 @@ fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
 /// One function because both the drawing and the hit test need the same
 /// answer; two copies of this is how a handle comes to be drawn somewhere it
 /// cannot be pressed.
-fn tempo_x_of(rect: Rect, view: &ArrangeView<'_>, lane: Rect, at_beat: f64) -> f32 {
-    let x = x_of(rect, view, view.tempo.seconds_at_beat(at_beat));
+fn tempo_x_of(l: &Layout, view: &ArrangeView<'_>, lane: Rect, at_beat: f64) -> f32 {
+    let x = x_of_in(l, view, view.tempo.seconds_at_beat(at_beat));
     if !x.is_finite() {
         return x;
     }
@@ -4298,7 +4508,9 @@ fn draw_auto_headers(
                         Align2::CENTER_CENTER,
                         "M",
                         FontId::new(size, crate::fonts::courier_bold()),
-                        if on { on_ink(plate) } else { quiet(on_ink(plate), plate, 0.18) },
+                        // Off is on `hdr_lane`, whose quieted ink `ink`
+                        // already worked out once for every switch.
+                        if on { on_ink(plate) } else { p.switch_off },
                     );
                 }
             }
@@ -4398,7 +4610,6 @@ fn auto_header_seam(p: &Ink) -> Color32 {
 }
 
 fn auto_ground(p: &Ink, lane: usize) -> Color32 {
-    let base = if lane % 2 == 0 { p.lane } else { p.lane_alt };
     // Character first, then DISTANCE. The blend gives the row the ruler's
     // hue so it reads as a strip about something other than a track; on the
     // themes whose ruler already sits near the lane that blend alone changed
@@ -4411,7 +4622,93 @@ fn auto_ground(p: &Ink, lane: usize) -> Color32 {
     // 0.14 and 0.20 both left Centennial and Porcelain at 1.02:1 against
     // their own lane — indistinguishable — and 0.26 is where every theme
     // clears. Ink still reads at 4.7:1 on the worst of them.
-    crate::recorder_panel::legible_surface(separate(blend(base, p.ruler, 0.35), 0.26))
+    //
+    // Two answers per frame, not one per row per loop: the base is the
+    // lane's stripe, and there are two stripes. `ink` derives both.
+    p.auto_ground[lane % 2]
+}
+
+/// **A clip's waveform from its pyramid, as one mesh.**
+///
+/// Two things at once, and the second is the larger.
+///
+/// The picture comes from `peaks` rather than from a host-drawn span: for
+/// every column the panel works out which seconds of the SOURCE stand under
+/// it — the clip's trim, and for a looped clip the fold back into its loop —
+/// and asks the pyramid for the lowest and highest sample there. So the
+/// wave is right at the zoom it is drawn at, on the frame the window moves,
+/// and the host is never asked to walk samples for a view change. The fold
+/// is the engine's own rule and the old host picture's: pass `k` plays
+/// `offset_s .. offset_s + loop_s` of the file again, and a column that
+/// straddles a seam reads on past the seam rather than wrapping, which is
+/// what `looped_span_envelope` did and what
+/// `a_looped_audio_clip_repeats_its_first_pass` holds.
+///
+/// And it is ONE shape. The column loop emitted a feathered `LineSegment`
+/// per pixel per clip — thirteen thousand shapes on a 1920-wide window with
+/// eight clips, each tessellated as a stroke with end caps (eight vertices,
+/// sixteen triangles), 0.63 ms a frame before a single pixel was painted.
+/// A min/max band is two vertices per column and two triangles between
+/// neighbours; the tessellator passes a mesh through. The look is kept:
+/// at each column the band spans exactly the rows the stroke did (held to
+/// a point by `the_band_from_the_pyramid_covers_the_rows_the_columns_did`),
+/// and between columns it joins them, which is the outline a waveform has
+/// always been. A silent column keeps a one-point floor so a flat stretch
+/// still reads as a line at every pixel density.
+///
+/// A column outside the clip's own seconds (a rounding hair at either end)
+/// breaks the band, and the next one starts a new run — never a triangle
+/// across a gap. The pyramid's answer is finite and clamped by contract, so
+/// no column can carry a NaN into the mesh.
+fn wave_band(
+    painter: &Painter,
+    r: Rect,
+    clip: &ClipView<'_>,
+    peaks: &crate::peaks::Peaks,
+    t0: f64,
+    dt: f64,
+    ink: Color32,
+) {
+    let mid = r.center().y;
+    let half = r.height() * 0.40;
+    let cols = r.width().ceil() as usize;
+    let looped = clip.loop_s > 1.0e-6 && clip.loop_s.is_finite();
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.reserve_vertices(cols * 2);
+    mesh.reserve_triangles(cols * 2);
+    // The previous column's top vertex in the run being built, if any.
+    let mut prev: Option<u32> = None;
+    for i in 0..cols {
+        let x = r.left() + i as f32;
+        if x > r.right() {
+            break;
+        }
+        let t = t0 + f64::from(i as f32) * dt;
+        let into = t - clip.start_s;
+        if !into.is_finite() || into < 0.0 || into >= clip.len_s {
+            prev = None;
+            continue;
+        }
+        let src = clip.offset_s + if looped { into.rem_euclid(clip.loop_s) } else { into };
+        if !src.is_finite() {
+            prev = None;
+            continue;
+        }
+        let (lo, hi) = peaks.minmax_s(src, src + dt);
+        let y0 = mid - hi * half;
+        let y1 = (mid - lo * half).max(y0 + 1.0);
+        let top = mesh.vertices.len() as u32;
+        mesh.colored_vertex(Pos2::new(x, y0), ink);
+        mesh.colored_vertex(Pos2::new(x, y1), ink);
+        if let Some(p) = prev {
+            mesh.add_triangle(p, p + 1, top);
+            mesh.add_triangle(p + 1, top + 1, top);
+        }
+        prev = Some(top);
+    }
+    if !mesh.indices.is_empty() {
+        painter.add(egui::Shape::mesh(mesh));
+    }
 }
 
 /// Paint the whole view into `rect`.
@@ -4483,7 +4780,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     let mut bars: Vec<(u32, f32)> = Vec::new();
     let mut n = first;
     while n <= last && bars.len() < 512 {
-        let x = x_of(rect, view, bar_at(view, n));
+        let x = x_of_in(&l, view, bar_at(view, n));
         if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() + 0.5 {
             bars.push((n, x));
         }
@@ -4533,7 +4830,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             Align2::LEFT_TOP,
             format!("{}", n.saturating_add(1)),
             font.clone(),
-            quiet(on_ink(p.ruler), p.ruler, 0.08),
+            p.ruler_num,
         );
     }
     // **The clock row: h:mm:ss along the ruler's foot** — the owner's
@@ -4553,7 +4850,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let mut n = (view.view_start_s / want).floor().max(0.0);
         while n * want <= view.view_start_s + view.view_len_s {
             let t = n * want;
-            let x = x_of(rect, view, t);
+            let x = x_of_in(&l, view, t);
             if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() - 30.0 {
                 let secs = t.round() as u64;
                 let word = if secs >= 3600 {
@@ -4566,7 +4863,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     Align2::LEFT_BOTTOM,
                     word,
                     font.clone(),
-                    quiet(on_ink(p.ruler), p.ruler, 0.18),
+                    p.ruler_clock,
                 );
             }
             n += 1.0;
@@ -4619,8 +4916,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if t0 > t1 {
                 break;
             }
-            let x0 = x_of(rect, view, t0);
-            let x1 = x_of(rect, view, view.tempo.seconds_at_beat(q0 + qn));
+            let x0 = x_of_in(&l, view, t0);
+            let x1 = x_of_in(&l, view, view.tempo.seconds_at_beat(q0 + qn));
             let bar_px = f64::from(x1 - x0);
             if exp >= 0 {
                 // **A multi-bar grid draws COARSER, visibly** — the owner
@@ -4650,7 +4947,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     let mut k = 1u32;
                     while (f64::from(k) * step_q) < qn - 1.0e-9 && k < 512 {
                         let t = view.tempo.seconds_at_beat(q0 + f64::from(k) * step_q);
-                        line(x_of(rect, view, t), 0.55);
+                        line(x_of_in(&l, view, t), 0.55);
                         drawn += 1;
                         k += 1;
                     }
@@ -4787,11 +5084,11 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             line.push(Pos2::new(row.lane.left(), y));
         }
         for (i, q) in shown.iter().enumerate() {
-            let at = Pos2::new(x_of(rect, view, q.at_s), auto_y_of(row.lane, q.value));
+            let at = Pos2::new(x_of_in(&l, view, q.at_s), auto_y_of(row.lane, q.value));
             line.push(at);
             if q.shape == crate::automation::Shape::Hold {
                 if let Some(next) = shown.get(i + 1) {
-                    line.push(Pos2::new(x_of(rect, view, next.at_s), at.y));
+                    line.push(Pos2::new(x_of_in(&l, view, next.at_s), at.y));
                 }
             }
         }
@@ -4829,7 +5126,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // desk draws there.
         let painter = &painter.with_clip_rect(row.lane);
         for (i, q) in shown.iter().enumerate() {
-            let at = Pos2::new(x_of(rect, view, q.at_s), auto_y_of(row.lane, q.value));
+            let at = Pos2::new(x_of_in(&l, view, q.at_s), auto_y_of(row.lane, q.value));
             if !at.x.is_finite() || !at.y.is_finite() {
                 continue;
             }
@@ -4921,11 +5218,11 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 line.push(Pos2::new(row.lane.left(), tempo_y_of(row.lane, first.bpm)));
             }
             for (i, q) in pts.iter().enumerate() {
-                let x = x_of(rect, view, view.tempo.seconds_at_beat(q.at_beat));
+                let x = x_of_in(&l, view, view.tempo.seconds_at_beat(q.at_beat));
                 let at = Pos2::new(x, tempo_y_of(row.lane, q.bpm));
                 line.push(at);
                 if let Some(next) = pts.get(i + 1) {
-                    let nx = x_of(rect, view, view.tempo.seconds_at_beat(next.at_beat));
+                    let nx = x_of_in(&l, view, view.tempo.seconds_at_beat(next.at_beat));
                     // **The RAMP belongs to the point it slides FROM**, which
                     // is `TempoPoint::ramp`'s own words and what
                     // `bpm_at_beat` reads: a ramp on point *i* interpolates
@@ -4955,7 +5252,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 crate::fonts::courier(),
             );
             for (i, q) in pts.iter().enumerate() {
-                let x = tempo_x_of(rect, view, row.lane, q.at_beat);
+                let x = tempo_x_of(&l, view, row.lane, q.at_beat);
                 let at = Pos2::new(x, tempo_y_of(row.lane, q.bpm));
                 if !at.x.is_finite() || !at.y.is_finite() {
                     continue;
@@ -5036,7 +5333,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if pt.at_bar == 0 && view.meter.points().len() == 1 && typing.is_none() {
                 continue;
             }
-            let x = x_of(rect, view, bar_at(view, pt.at_bar));
+            let x = x_of_in(&l, view, bar_at(view, pt.at_bar));
             if x < l.meter_strip.left() - 2.0 || x > l.meter_strip.right() + 2.0 {
                 continue;
             }
@@ -5087,7 +5384,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let nfont = FontId::new(strip_font_h(names), crate::fonts::courier());
         let nbox = strip_box_h(names);
         for (i, m) in view.markers.iter().enumerate() {
-            let x = x_of(rect, view, m.at_s);
+            let x = x_of_in(&l, view, m.at_s);
             if x < l.meter_strip.left() - 2.0 || x > l.meter_strip.right() + 2.0 {
                 continue;
             }
@@ -5148,35 +5445,51 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     }
 
     // ── the clips ─────────────────────────────────────────────────────────
+    //
+    // A lane's clip colour and its ink are a function of the lane, worked
+    // out the first time a clip on it is drawn and read back for the rest:
+    // the dead-zone guard is a contrast walk of up to fifty steps, and a
+    // lane full of clips paid it once per clip.
+    let mut lane_ink: [Option<(Color32, Color32)>; CHANNELS] = [None; CHANNELS];
     for clip in view.clips {
-        let r = clip_rect(rect, view, clip);
+        let r = clip_rect_in(&l, view, clip);
         if !r.is_positive() {
             continue;
         }
-        // Through the dead-zone guard, like the strip and the header plate:
-        // a hand-painted lane can point its clips at the grid's three
-        // unreadable third tones, and the auto palettes' contract does not
-        // cover the hand grid.
-        let color = crate::recorder_panel::legible_surface(
-            view.lanes
-                .get(clip.lane)
-                .map(|lane| lane.color)
-                .filter(|c| *c != 0)
-                .map(|c| {
-                    let (cr, cg, cb) = STRIP_COLORS[c.min(STRIP_COLORS.len() - 1)];
-                    Color32::from_rgb(cr, cg, cb)
-                })
-                // An unpainted lane's clips are the desk's green — the
-                // timeline wave's own colour, so the two surfaces agree what
-                // audio looks like.
-                .unwrap_or(Color32::from_rgb(0x2E, 0x6B, 0x46)),
-        );
-        // Measured on THIS clip rather than taken from `p`: the guard can
-        // move an olive to the side of the dead zone where the dark ink is
-        // the one that reads, and `p.clip_ink` is the light one. Everything
-        // printed inside the clip — name, staff, wave, fades, handles —
-        // takes this ink, so the clip cannot half-agree with itself.
-        let clip_ink = on_ink(color);
+        let (color, clip_ink) = match lane_ink.get(clip.lane).copied().flatten() {
+            Some(pair) => pair,
+            None => {
+                // Through the dead-zone guard, like the strip and the header
+                // plate: a hand-painted lane can point its clips at the
+                // grid's three unreadable third tones, and the auto
+                // palettes' contract does not cover the hand grid.
+                let color = crate::recorder_panel::legible_surface(
+                    view.lanes
+                        .get(clip.lane)
+                        .map(|lane| lane.color)
+                        .filter(|c| *c != 0)
+                        .map(|c| {
+                            let (cr, cg, cb) = STRIP_COLORS[c.min(STRIP_COLORS.len() - 1)];
+                            Color32::from_rgb(cr, cg, cb)
+                        })
+                        // An unpainted lane's clips are the desk's green —
+                        // the timeline wave's own colour, so the two
+                        // surfaces agree what audio looks like.
+                        .unwrap_or(Color32::from_rgb(0x2E, 0x6B, 0x46)),
+                );
+                // Measured on THIS clip rather than taken from `p`: the
+                // guard can move an olive to the side of the dead zone where
+                // the dark ink is the one that reads, and `p.clip_ink` is
+                // the light one. Everything printed inside the clip — name,
+                // staff, wave, fades, handles — takes this ink, so the clip
+                // cannot half-agree with itself.
+                let pair = (color, on_ink(color));
+                if let Some(slot) = lane_ink.get_mut(clip.lane) {
+                    *slot = Some(pair);
+                }
+                pair
+            }
+        };
         // The clip's UNCLAMPED pixel span, measured once: where the whole
         // clip would stand if the viewport were not cutting it. The note
         // miniature and the loop seams are both mapped through it, and `x_of`
@@ -5186,8 +5499,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // **Above the fill now**, because the fill needs the seams: the clip
         // is not a rectangle any more when it repeats.
         let full_x = (
-            x_of(rect, view, clip.start_s),
-            x_of(rect, view, clip.start_s + clip.len_s),
+            x_of_in(&l, view, clip.start_s),
+            x_of_in(&l, view, clip.start_s + clip.len_s),
         );
         // ── the clip's own shape ──────────────────────────────────────────
         //
@@ -5242,15 +5555,27 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // middle. Audio is not symmetric; the outline of both sides is the
         // shape people read, and one number per column is a bar chart of
         // loudness wearing a waveform's clothes.
+        //
+        // **From the pyramid when there is one, and then as ONE shape.** A
+        // clip with `peaks` is drawn by `wave_band`: the column loop below
+        // is the older road, kept for a clip the host has pictured but not
+        // yet pyramided, and drawn exactly as it was.
         let pairs = clip.wave.len() / 2;
-        if pairs > 0 && clip.wave_span_s > 0.0 && r.width() >= 4.0 {
+        if r.width() >= 4.0 && clip.peaks.is_some() {
+            let t0 = time_at_in(&l, view, r.left());
+            let t1 = time_at_in(&l, view, r.left() + 1.0);
+            let dt = (t1 - t0).abs().max(1.0e-9);
+            if let Some(peaks) = clip.peaks {
+                wave_band(painter, r, clip, peaks, t0, dt, clip_ink.gamma_multiply(0.62));
+            }
+        } else if pairs > 0 && clip.wave_span_s > 0.0 && r.width() >= 4.0 {
             let mid = r.center().y;
             let half = r.height() * 0.40;
             let cols = r.width().ceil() as usize;
             // Seconds per pixel, from the panel's own mapping so this cannot
             // drift from the grid.
-            let t0 = time_at(rect, view, r.left());
-            let t1 = time_at(rect, view, r.left() + 1.0);
+            let t0 = time_at_in(&l, view, r.left());
+            let t1 = time_at_in(&l, view, r.left() + 1.0);
             let dt = (t1 - t0).abs().max(1.0e-9);
             let ink = clip_ink.gamma_multiply(0.62);
             for i in 0..cols {
@@ -5292,7 +5617,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // the fade's end — the picture IS the envelope.
         let veil = Color32::from_black_alpha(110);
         if clip.fade_in_s > 0.0 {
-            let fx = x_of(rect, view, clip.start_s + clip.fade_in_s).clamp(r.left(), r.right());
+            let fx = x_of_in(&l, view, clip.start_s + clip.fade_in_s).clamp(r.left(), r.right());
             painter.add(egui::Shape::convex_polygon(
                 vec![r.left_top(), Pos2::new(fx, r.top()), Pos2::new(r.left(), r.bottom())],
                 veil,
@@ -5304,7 +5629,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             );
         }
         if clip.fade_out_s > 0.0 {
-            let fx = x_of(rect, view, clip.start_s + clip.len_s - clip.fade_out_s)
+            let fx = x_of_in(&l, view, clip.start_s + clip.len_s - clip.fade_out_s)
                 .clamp(r.left(), r.right());
             painter.add(egui::Shape::convex_polygon(
                 vec![Pos2::new(fx, r.top()), r.right_top(), Pos2::new(r.right(), r.bottom())],
@@ -5394,8 +5719,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // mattered — visible only in the gaps, the standard DAW picture
     // inverted. Under the playhead still, which always reads on top.
     if let Some((t0, t1)) = view.time_sel.filter(|(a, b)| b > a) {
-        let x0 = x_of(rect, view, t0).max(l.lanes_area.left());
-        let x1 = x_of(rect, view, t1).min(l.lanes_area.right());
+        let x0 = x_of_in(&l, view, t0).max(l.lanes_area.left());
+        let x1 = x_of_in(&l, view, t1).min(l.lanes_area.right());
         if x1 > x0 {
             let sel = Color32::from_rgb(0xC9, 0x8B, 0x3D);
             painter.rect_filled(
@@ -5427,7 +5752,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     }
 
     // ── the playhead, through the lanes and the ruler ─────────────────────
-    let px = x_of(rect, view, view.playhead_s);
+    let px = x_of_in(&l, view, view.playhead_s);
     if px >= l.lanes_area.left() - 0.5 && px <= l.lanes_area.right() + 0.5 {
         painter.line_segment(
             [Pos2::new(px, l.ruler.top()), Pos2::new(px, l.lanes_area.bottom())],
@@ -5753,7 +6078,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 // a dark ground, and the row numbers were unreadable on most
                 // of the sixteen. The + circle two inches away had the right
                 // answer the whole time.
-                quiet(on_ink(p.empty_ground), p.empty_ground, 0.22)
+                p.empty_ink
             },
         );
         // The input chip draws on EVERY lane — binding an input is how a
@@ -5772,7 +6097,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 // actually drawn on, and blended rather than made
                 // transparent. It was the themed face at 55% alpha, which on
                 // a dark theme is a circle nobody can see.
-                let ink = quiet(on_ink(p.empty_ground), p.empty_ground, 0.22);
+                let ink = p.empty_ink;
                 let radius = row.add.width().min(row.add.height()) * 0.5 - 1.0;
                 let w = (radius * 0.12).clamp(1.2, 2.2);
                 painter.circle_stroke(c, radius, Stroke::new(w, ink));
@@ -5928,6 +6253,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         };
         readout(painter, row.pan_readout, pan_word);
         // The labels, under their dials — always visible, the standard.
+        let label_ink = quiet(ink_on, face, 0.34);
         for (dial, word) in [(row.pan, "PAN"), (row.knob, "VOL"), (row.send, "SND")] {
             if !dial.is_positive() {
                 continue;
@@ -5942,7 +6268,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     Align2::CENTER_TOP,
                     word,
                     FontId::new(band.height().clamp(6.0, 8.0), crate::fonts::courier()),
-                    quiet(ink_on, face, 0.34),
+                    label_ink,
                 );
             }
         }
@@ -6009,7 +6335,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 Align2::CENTER_CENTER,
                 label,
                 FontId::new((r.height() * 0.6).clamp(8.0, 12.0), crate::fonts::courier_bold()),
-                if on { on_ink(lit) } else { quiet(on_ink(p.hdr_lane), p.hdr_lane, 0.18) },
+                if on { on_ink(lit) } else { p.switch_off },
             );
         }
         // **The FOLDER box, bottom-left.**
@@ -6022,7 +6348,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // children are on screen and counting them out loud says nothing.
         if row.collapse.is_positive() && lane.is_folder {
             let cr = row.collapse;
-            let ink = quiet(on_ink(p.hdr_lane), p.hdr_lane, 0.22);
+            let ink = p.collapse_ink;
             let c = cr.center();
             let a = cr.width() * 0.30;
             let tri = if lane.folder_shut {
@@ -6057,8 +6383,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // up and the document takes it.
     if let Some((lane, t0, t1)) = view.pending {
         if let Some(row) = l.lane_rows.get(lane).copied().filter(|r| r.is_positive()) {
-            let x0 = x_of(rect, view, t0).max(l.lanes_area.left());
-            let x1 = x_of(rect, view, t1).min(l.lanes_area.right());
+            let x0 = x_of_in(&l, view, t0).max(l.lanes_area.left());
+            let x1 = x_of_in(&l, view, t1).min(l.lanes_area.right());
             if x1 > x0 {
                 let ghost = Rect::from_min_max(
                     Pos2::new(x0, row.top() + 1.5),
@@ -6262,7 +6588,85 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     }
 }
 
+/// **A label cut to `width` with an ellipsis, in a few layouts rather than
+/// one per character.**
+///
+/// It measured the whole text and then, on a miss, shrank it one character
+/// at a time, laying out every candidate — ten to thirty galleys per chip
+/// per frame, for every bay chip, input chip, routing button, lane name and
+/// clip name that did not fit, which on a busy header is most of them.
+/// Cached galleys are hash-and-probe hits, but a truncation point that
+/// moves (every clip name during a zoom) is that many real shapings.
+///
+/// The galley the first measure makes already carries every glyph's
+/// advance, so where the cut falls is ESTIMATED from it: the ellipsis after
+/// `k` glyphs lands about where their advances add up to. About, not
+/// exactly — the layout rounds each glyph's x to the pixel together with
+/// that glyph's own bearing, so `の` at 12.6 stands at 13 and `…` at 12.6
+/// stands at 12, and no prefix arithmetic reproduces it. So the estimate is
+/// given a pixel and a quarter of slack, which makes it an UPPER bound on
+/// what the walk would accept (a rounding of at most a pixel plus the
+/// sixteenth the galley's rect is quantised to), the candidate is measured
+/// once, and if it does not fit the old walk carries on DOWNWARD from
+/// there — one step, usually. The answer is therefore the walk's own answer
+/// by construction, in three or four layouts instead of twenty, two of
+/// them (the whole text, the ellipsis) stable strings the cache answers
+/// without shaping. `cut_to_gives_the_walk_its_own_answer` holds the two
+/// equal over a sweep of names, widths and both faces, CJK and runs of
+/// spaces included. Text with a newline has more than one row and goes to
+/// the walk as it always did.
 pub(crate) fn cut_to(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
+    let measure = |t: &str| painter.layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE);
+    let whole = measure(text);
+    if whole.rect.width() <= width {
+        return text.to_owned();
+    }
+    let mut keep = text.len();
+    if let [row] = whole.rows.as_slice() {
+        // A pixel for the glyph rounding (half from the cursor, half from a
+        // bearing), a sixteenth for the rect's quantum, and a little air.
+        const SLACK: f32 = 1.25;
+        let ell = measure("\u{2026}").rect.width();
+        // One glyph per char, in order, so the byte count walks with them
+        // and every stop is a char boundary. `fits` is the byte length of
+        // the glyphs BEFORE the one under the cursor: keep those, and the
+        // ellipsis takes that one's place.
+        let mut cursor = 0.0f32;
+        let mut bytes = 0usize;
+        let mut fits = 0usize;
+        for g in &row.glyphs {
+            if cursor + ell > width + SLACK {
+                break;
+            }
+            fits = bytes;
+            cursor += g.advance_width;
+            bytes += g.chr.len_utf8();
+        }
+        if fits < text.len() && text.is_char_boundary(fits) {
+            let cut = format!("{}\u{2026}", text[..fits].trim_end());
+            if measure(&cut).rect.width() <= width {
+                return cut;
+            }
+            keep = fits;
+        }
+    }
+    while keep > 0 {
+        keep -= 1;
+        while keep > 0 && !text.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        let cut = format!("{}\u{2026}", text[..keep].trim_end());
+        if measure(&cut).rect.width() <= width {
+            return cut;
+        }
+    }
+    String::new()
+}
+
+/// The walk `cut_to` replaced, kept as its oracle: every candidate laid out
+/// and the first that fits returned.
+#[cfg(test)]
+pub(crate) fn cut_to_reference(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
     let measure = |t: &str| {
         painter
             .layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE)
@@ -6338,7 +6742,7 @@ mod tests {
         assert!(row.lane.is_positive(), "the tempo lane has no room");
 
         // The handle for the point at beat zero.
-        let x = tempo_x_of(rect, &v, row.lane, 0.0);
+        let x = tempo_x_of(&l, &v, row.lane, 0.0);
         assert!(
             x >= row.lane.left() + AUTO_POINT_R - 0.01,
             "the first handle is drawn half outside the lane: x={x} left={}",
@@ -6464,6 +6868,7 @@ LaneView {
                 wave: &[],
                 wave_from_s: 0.0,
                 wave_span_s: 0.0,
+                peaks: None,
                 selected: false,
                 midi: false,
                 loop_s: 0.0,
@@ -6483,6 +6888,7 @@ LaneView {
                 wave: &[],
                 wave_from_s: 0.0,
                 wave_span_s: 0.0,
+                peaks: None,
                 selected: true,
                 midi: false,
                 loop_s: 0.0,
@@ -8083,6 +8489,270 @@ ArrangeView {
     }
 
 
+    /// **The `_in` forms ARE the public forms, to the bit.**
+    ///
+    /// `draw`, `hit_test` and `targets` read the axis through a Layout built
+    /// once per frame; `app` reads it through the public forms once per
+    /// gesture. A clip drawn through one and grabbed through the other has to
+    /// be the same rectangle — not within a pixel, the SAME — or the clip you
+    /// see and the clip you can press come apart by a fraction that grows
+    /// with the zoom. So every corner is compared by its bits, over the
+    /// panel's own clips, at several windows (whole song, zoomed in, scrolled
+    /// past the clips, an hour wide, a second wide) and several rects down to
+    /// the degenerate. `hit_test` and `targets` are held to the same bar.
+    #[test]
+    fn clip_rect_agrees_with_its_in_form_to_the_bit() {
+        let c = clips();
+        let bits = |r: Rect| {
+            [r.min.x.to_bits(), r.min.y.to_bits(), r.max.x.to_bits(), r.max.y.to_bits()]
+        };
+        for (w, h) in [(1300.0, 420.0), (1920.0, 960.0), (300.0, 100.0), (10.0, 10.0), (0.0, 0.0)] {
+            let r = Rect::from_min_size(Pos2::new(3.0, 7.0), Vec2::new(w, h));
+            for (start, len) in
+                [(0.0, 120.0), (40.0, 10.0), (200.0, 50.0), (0.0, 3600.0), (9.5, 1.0), (0.0, 0.0)]
+            {
+                let mut v = a_view(&c);
+                v.view_start_s = start;
+                v.view_len_s = len;
+                let l = Layout::new(r, &v);
+                for clip in &c {
+                    let a = clip_rect(r, &v, clip);
+                    let b = clip_rect_in(&l, &v, clip);
+                    assert_eq!(bits(a), bits(b), "clip {} at {w}x{h}, window {start}+{len}: {a:?} vs {b:?}", clip.id);
+                }
+                for t in [0.0, 10.0, 59.7, 120.0, start, start + len, -3.0] {
+                    let x = x_of(r, &v, t);
+                    assert_eq!(x.to_bits(), x_of_in(&l, &v, t).to_bits(), "x_of({t})");
+                    assert_eq!(
+                        time_at(r, &v, x).to_bits(),
+                        time_at_in(&l, &v, x).to_bits(),
+                        "time_at({x})"
+                    );
+                }
+                for p in [r.center(), r.left_top(), Pos2::new(r.left() + 200.0, r.top() + 60.0)] {
+                    assert_eq!(hit_test(r, &v, p), hit_test_in(&l, &v, p), "hit at {p:?}");
+                }
+                assert_eq!(targets(r, &v), targets_in(&l, &v), "targets at {w}x{h}");
+            }
+        }
+    }
+
+    /// One painted frame of `v`: the shapes it emitted and how many galleys
+    /// the font cache holds afterwards — the two things a clip that is not
+    /// on screen must not add to.
+    fn frame_of(v: &ArrangeView<'_>, area: Rect) -> (Vec<egui::epaint::ClippedShape>, usize) {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(area), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(area);
+                    draw(ui.painter(), area, v);
+                });
+            },
+        );
+        let galleys = ctx.fonts(|f| f.num_galleys_in_cache());
+        (out.shapes, galleys)
+    }
+
+    /// **A clip that is not on screen costs the rect test and nothing else.**
+    ///
+    /// The clip loop derives a colour, measures an ink, lays out a name and
+    /// walks a miniature for every clip it reaches; a clip past the window's
+    /// end, or on a lane that is scrolled away, must be turned back before
+    /// any of that — a two-thousand-clip song is mostly clips nobody is
+    /// looking at, and the frame has to be priced by the window, not by the
+    /// document. Held as what the frame EMITS: a thousand clips that cannot
+    /// be seen add no shape and no galley to a frame that already draws two.
+    #[test]
+    fn an_offscreen_clip_costs_no_shape_and_no_galley() {
+        let bar_s = 2.0;
+        let notes = a_looped_bar(bar_s);
+        let two = clips();
+        let mut many = clips();
+        for i in 0..1_000u64 {
+            // Past the window's end, on a visible lane; and inside the
+            // window, on a lane the eight-lane window does not reach.
+            let (lane, start_s) = if i % 2 == 0 { (1, 1_000.0 + i as f64) } else { (30, 5.0) };
+            many.push(ClipView {
+                id: 100 + i,
+                lane,
+                start_s,
+                len_s: 4.0,
+                name: "a name that would need a galley",
+                midi: true,
+                notes: &notes,
+                loop_s: bar_s,
+                ..a_looped_clip(&notes, bar_s, 2.0)
+            });
+        }
+        let area = rect();
+        let v2 = a_view(&two);
+        let vn = a_view(&many);
+        assert_eq!(vn.clips.len(), 1_002);
+        let (s2, g2) = frame_of(&v2, area);
+        let (sn, gn) = frame_of(&vn, area);
+        assert_eq!(sn.len(), s2.len(), "a thousand clips off screen added shapes");
+        assert_eq!(gn, g2, "a thousand clips off screen laid out text");
+    }
+
+    /// **The grid is priced by the pixels, not by the song.**
+    ///
+    /// Full-height lines through the lanes: one per bar while bars are five
+    /// points apart, the gridbox's subdivisions between them when THEY are
+    /// five apart, and past that the walk skips by the ruler's own step. So
+    /// however wide the window and whatever the gridbox says, the count is
+    /// bounded by the width in points — a thousand-hour window at 1/32 must
+    /// not ask the UI thread for a million lines.
+    #[test]
+    fn grid_lines_are_bounded_by_the_width_at_every_zoom() {
+        let c = clips();
+        let area = rect();
+        let l = Layout::new(area, &a_view(&c));
+        let field = l.lanes_area;
+        let cap = (field.width() / 5.0 * 2.0) as usize + 16;
+        for len_s in [1.0, 10.0, 100.0, 1_000.0, 36_000.0, 3.6e6] {
+            for exp in [-6i8, -2, 0, 3] {
+                let mut v = a_view(&c);
+                v.view_start_s = 0.0;
+                v.view_len_s = len_s;
+                v.song_s = len_s;
+                v.grid_exp = exp;
+                let (shapes, _) = frame_of(&v, area);
+                let lines = shapes
+                    .iter()
+                    .filter(|s| match &s.shape {
+                        egui::Shape::LineSegment { points, .. } => {
+                            (points[0].x - points[1].x).abs() < 0.01
+                                && (points[0].y - field.top()).abs() < 0.01
+                                && (points[1].y - field.bottom()).abs() < 0.01
+                        }
+                        _ => false,
+                    })
+                    .count();
+                assert!(
+                    lines <= cap,
+                    "{len_s} s wide at grid {exp}: {lines} grid lines, more than {cap}"
+                );
+                // A fine gridbox on a wide window draws NO lines, by design:
+                // bars under five points are skipped and their subdivisions
+                // with them. The bar-or-coarser settings always show the
+                // strong lines the walk steps by.
+                if exp >= 0 {
+                    assert!(lines > 0, "{len_s} s wide at grid {exp}: no grid at all");
+                }
+            }
+        }
+    }
+
+    /// **`cut_to` answers exactly what the walk did**, over every name
+    /// shape the panel prints (plugin names, ROUTING counts, the input
+    /// words, accents, CJK, runs of spaces, a long run of one letter, the
+    /// empty string), widths swept at a quarter point from nothing to the
+    /// whole word, in both faces at the sizes the header uses. The walk
+    /// laid out every candidate; the shipped one reads the cut off the
+    /// first galley and checks it once. Same string or the test says where.
+    #[test]
+    fn cut_to_gives_the_walk_its_own_answer() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("cut-to"));
+        let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+        let names = [
+            "Tangent Compressor",
+            "Brusfri",
+            "Valhalla Supermassive",
+            "ROUTING 12",
+            "NO INPUT",
+            "a",
+            "",
+            "\u{dc}n\u{ef}c\u{f6}d\u{e9} N\u{e4}m\u{e9}",
+            "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30ad}\u{30b9}\u{30c8}",
+            "two  spaces  here ",
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "Vocal take 3 (comp) - final FINAL v2",
+        ];
+        let fonts = [
+            FontId::new(7.0, crate::fonts::courier()),
+            FontId::new(10.0, crate::fonts::courier()),
+            FontId::new(11.5, crate::fonts::courier()),
+            FontId::new(8.5, crate::fonts::courier_bold()),
+            FontId::new(12.0, crate::fonts::courier_bold()),
+        ];
+        let mut checked = 0usize;
+        let mut cut = 0usize;
+        for font in &fonts {
+            for name in names {
+                let full = painter
+                    .layout_no_wrap(name.to_owned(), font.clone(), Color32::WHITE)
+                    .rect
+                    .width();
+                let mut w = -1.0f32;
+                while w <= full + 2.0 {
+                    let want = cut_to_reference(&painter, w, name, font);
+                    let got = cut_to(&painter, w, name, font);
+                    assert_eq!(got, want, "{name:?} at {w} in {font:?}");
+                    checked += 1;
+                    cut += usize::from(got != name);
+                    w += 0.25;
+                }
+            }
+        }
+        assert!(checked > 2_000 && cut > 500, "{checked} checked, {cut} of them cut");
+
+        // **And the count.** Every distinct string laid out lands in the
+        // font's galley cache, so the cache's growth across one call is the
+        // number of layouts it made. The walk paid one per character it
+        // removed; the shipped one pays for the text, the ellipsis, the
+        // candidate and at most a step or two of the walk.
+        let layouts = |f: &dyn Fn(&Painter, f32, &str, &FontId) -> String| -> usize {
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+            let _ = ctx.run(Default::default(), |_| {});
+            let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+            let before = ctx.fonts(|f| f.num_galleys_in_cache());
+            let font = FontId::new(10.0, crate::fonts::courier());
+            let got = f(&painter, 40.0, "Tangent Compressor", &font);
+            assert!(got.ends_with('\u{2026}') && got.len() < 12, "{got:?}");
+            ctx.fonts(|f| f.num_galleys_in_cache()) - before
+        };
+        let (walk, now) = (layouts(&cut_to_reference), layouts(&cut_to));
+        assert!(walk >= 10, "the walk laid out only {walk} galleys");
+        assert!(now <= 5, "cut_to laid out {now} galleys against the walk's {walk}");
+    }
+
+    /// **A frame asks `quiet` a handful of times, not one per switch.**
+    ///
+    /// `quiet` is a contrast walk: a blend and up to thirteen `contrast_ratio`
+    /// calls, three `powf` each. It was asked per bar number, per clock label,
+    /// per bay chip, per switch letter and per dial label — about a hundred
+    /// and eighty times a frame on eight lanes — for answers that depend on
+    /// the theme alone. Those live in `Ink` now, derived once; what is left
+    /// per lane is the two inks that depend on the lane's own plate. Eight
+    /// used lanes with every chip and switch drawn: a fixed dozen plus two
+    /// a lane, and the bound says so.
+    #[test]
+    fn quiet_is_asked_a_handful_of_times_per_frame() {
+        let c = clips();
+        let mut v = a_view(&c);
+        for lane in v.lanes.iter_mut().take(8) {
+            lane.used = true;
+            lane.inserts = ["Comp", "EQ", "Verb", "", "", ""];
+        }
+        v.show_tempo_lane = true;
+        let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        QUIET_CALLS.with(|n| n.set(0));
+        let (shapes, _) = frame_of(&v, tall);
+        let asked = QUIET_CALLS.with(std::cell::Cell::get);
+        assert!(shapes.len() > 100, "the frame drew {} shapes", shapes.len());
+        println!("quiet asked {asked} times for the frame");
+        assert!(asked <= 12 + 2 * 8, "quiet was asked {asked} times in one frame");
+        assert!(asked >= 8, "quiet was asked only {asked} times: the count is broken");
+    }
+
     #[test]
     fn the_time_axis_round_trips() {
         let c = clips();
@@ -9417,6 +10087,7 @@ selected: false,
             wave: &[],
             wave_from_s: 0.0,
             wave_span_s: 0.0,
+            peaks: None,
             notes,
             loop_s: bar_s,
             offset_s: 0.0,
@@ -9598,6 +10269,58 @@ selected: false,
         }
     }
 
+    /// **A recorded part — one pass, thousands of notes — draws the plain
+    /// walk's picture from the notes under the window alone.**
+    ///
+    /// The clip that does not loop is the one `visible_passes` cannot help
+    /// and the one with the most notes, and it was walked whole twice a
+    /// frame. The windowed walk depends on the notes being in time order,
+    /// which the commit points keep but nothing guarantees, so the same
+    /// part is drawn sorted, reversed and shuffled: the sorted one takes
+    /// the window and the other two the whole walk, and all three must
+    /// light the plain walk's cells at every zoom and scroll, both trims.
+    #[test]
+    fn a_recorded_part_draws_the_same_picture_as_the_plain_walk() {
+        let bar_s = 2.0;
+        let one = a_looped_bar(bar_s);
+        // A hundred bars: the views reach sixty, and the plain walk this is
+        // held against draws every note of every bar in debug.
+        let sorted: Vec<crate::arrangement::ArrNote> = (0..100)
+            .flat_map(|b| {
+                one.iter().map(move |n| crate::arrangement::ArrNote {
+                    at_s: n.at_s + b as f64 * bar_s,
+                    ..*n
+                })
+            })
+            .collect();
+        assert!(sorted.windows(2).all(|w| w[0].at_s <= w[1].at_s));
+        let mut reversed = sorted.clone();
+        reversed.reverse();
+        let mut shuffled = sorted.clone();
+        let mut seed = 11u64;
+        for i in (1..shuffled.len()).rev() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            shuffled.swap(i, (seed >> 33) as usize % (i + 1));
+        }
+        // Both trims for the windowed road; the whole-walk roads at one.
+        for (what, notes, trims) in [
+            ("sorted", &sorted, &[0.0, bar_s * 0.375][..]),
+            ("reversed", &reversed, &[bar_s * 0.375][..]),
+            ("shuffled", &shuffled, &[0.0][..]),
+        ] {
+            for &offset_s in trims {
+                let clips = [ClipView {
+                    loop_s: 0.0,
+                    offset_s,
+                    notes,
+                    ..a_looped_clip(notes, bar_s, 100.0)
+                }];
+                assert!(clips[0].len_s > 120.0, "{what}: the part must outlast the views");
+                the_two_miniatures_agree(&clips, offset_s);
+            }
+        }
+    }
+
     /// **A held note does not veto the merge, and is not folded into it.**
     ///
     /// This is the case the first version of the fix got wrong, and it got it
@@ -9731,6 +10454,16 @@ selected: false,
 
     /// The waveform's own columns inside `r`, as their top and bottom.
     fn wave_columns_in(v: &ArrangeView<'_>, r: Rect) -> Vec<(f32, f32)> {
+        wave_columns_xy_in(v, r).into_iter().map(|(_, top, bot)| (top, bot)).collect()
+    }
+
+    /// The waveform's columns inside `r` with their x: one per pixel column,
+    /// whichever road drew them. The host-drawn wave is a vertical
+    /// `LineSegment` per column; the pyramid's band is one `Mesh` per clip
+    /// with two vertices per column, top then bottom, and a column's rows
+    /// are read straight off that pair — the band between neighbours is
+    /// the tessellator's business, not the picture's.
+    fn wave_columns_xy_in(v: &ArrangeView<'_>, r: Rect) -> Vec<(f32, f32, f32)> {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
         crate::fonts::apply_text_styles(&ctx);
@@ -9746,17 +10479,216 @@ selected: false,
         );
         let mut got = Vec::new();
         for s in &out.shapes {
-            let egui::Shape::LineSegment { points, .. } = &s.shape else {
-                continue;
-            };
-            let (a, b) = (points[0], points[1]);
-            // A wave column is VERTICAL and stands inside the clip.
-            if (a.x - b.x).abs() > 0.25 || !r.contains(a) || !r.contains(b) {
-                continue;
+            match &s.shape {
+                egui::Shape::LineSegment { points, .. } => {
+                    let (a, b) = (points[0], points[1]);
+                    // A wave column is VERTICAL and stands inside the clip.
+                    if (a.x - b.x).abs() > 0.25 || !r.contains(a) || !r.contains(b) {
+                        continue;
+                    }
+                    got.push((a.x, a.y.min(b.y), a.y.max(b.y)));
+                }
+                egui::Shape::Mesh(m) => {
+                    for pair in m.vertices.chunks_exact(2) {
+                        let (a, b) = (pair[0].pos, pair[1].pos);
+                        if (a.x - b.x).abs() > 0.25 || !r.contains(a) || !r.contains(b) {
+                            continue;
+                        }
+                        got.push((a.x, a.y.min(b.y), a.y.max(b.y)));
+                    }
+                }
+                _ => {}
             }
-            got.push((a.y.min(b.y), a.y.max(b.y)));
         }
         got
+    }
+
+    /// A pyramid over `seconds` of stereo audio at 48 kHz: a 5 kHz tone
+    /// under a slow amplitude swell. Five kilohertz so that every column at
+    /// every zoom these tests draw holds whole cycles — a column's min and
+    /// max are then the envelope and not the phase, and two columns a hair
+    /// apart in time read the same. (At 220 Hz a millisecond column held a
+    /// fifth of a cycle and neighbours disagreed by half the height.)
+    /// `after` is the amplitude from `loud_until_s` on — a step the
+    /// loop-fold test reads.
+    fn a_pyramid(seconds: f64, loud_until_s: f64, after: f32) -> crate::peaks::Peaks {
+        let rate = 48_000u32;
+        let frames = (seconds * f64::from(rate)) as usize;
+        let mut v = Vec::with_capacity(frames * 2);
+        for f in 0..frames {
+            let t = f as f64 / f64::from(rate);
+            let env = if t < loud_until_s {
+                0.55 + 0.35 * (t * std::f64::consts::TAU * 0.25).sin()
+            } else {
+                f64::from(after)
+            };
+            let x = ((t * std::f64::consts::TAU * 5_000.0).sin() * env) as f32;
+            v.push(x);
+            v.push(x * 0.5);
+        }
+        crate::peaks::Peaks::build(&v, 2, rate)
+    }
+
+    /// The host's old per-pixel picture of the same pyramid's file: `cols`
+    /// min/max pairs over `from_s..from_s + span_s` of the source, each the
+    /// exact fold of its frames — what `ClipInfo::wave` carried before the
+    /// pyramid, built from the pyramid so the two pictures share one file.
+    fn a_legacy_wave(p: &crate::peaks::Peaks, from_s: f64, span_s: f64, cols: usize) -> Vec<f32> {
+        (0..cols)
+            .flat_map(|i| {
+                let a = from_s + span_s * i as f64 / cols as f64;
+                let b = from_s + span_s * (i + 1) as f64 / cols as f64;
+                let (lo, hi) = p.minmax_s(a, b);
+                [lo, hi]
+            })
+            .collect()
+    }
+
+    /// **The band from the pyramid covers the rows the columns did.**
+    ///
+    /// Same file, two roads: the host's per-pixel picture drawn as a line
+    /// per column, and the pyramid drawn as one band. At every column the
+    /// two must agree to a point — the band is a different SHAPE (one mesh,
+    /// two vertices a column, a one-point floor where the stroke had a half)
+    /// and must not be a different picture. Checked at three zooms, from
+    /// the clip seen whole to a bar of it, because the pyramid picks a
+    /// different level at each and the host's buckets do not.
+    #[test]
+    fn the_band_from_the_pyramid_covers_the_rows_the_columns_did() {
+        let none: [crate::arrangement::ArrNote; 0] = [];
+        let peaks = a_pyramid(8.0, 8.0, 0.0);
+        let area = rect();
+        for (start_s, len_s) in [(0.0f64, 12.0f64), (1.0, 4.0), (3.5, 1.0)] {
+            let clip = ClipView {
+                midi: false,
+                notes: &none,
+                loop_s: 0.0,
+                ..a_looped_clip(&none, 2.0, 4.0)
+            };
+            assert!((clip.len_s - 8.0).abs() < 1e-9);
+            // The host's picture for THIS window: one pair per pixel over
+            // the seconds on screen, as `wave_span` used to ask for.
+            let (vs, vl) = (start_s, len_s);
+            let from = vs.max(clip.start_s) - clip.start_s;
+            let to = (vs + vl).min(clip.start_s + clip.len_s) - clip.start_s;
+            let px = {
+                let v = a_view(std::slice::from_ref(&clip));
+                Layout::new(area, &v).lanes_area.width()
+            };
+            let cols = ((to - from) / vl * f64::from(px)).ceil().max(1.0) as usize;
+            let wave = a_legacy_wave(&peaks, from + clip.offset_s, to - from, cols);
+            let legacy = [ClipView {
+                wave: &wave,
+                wave_from_s: from,
+                wave_span_s: to - from,
+                ..clip
+            }];
+            let banded = [ClipView { peaks: Some(&peaks), ..clip }];
+            let mut vl_ = a_view(&legacy);
+            vl_.view_start_s = start_s;
+            vl_.view_len_s = len_s;
+            vl_.song_s = 12.0;
+            let mut vb = a_view(&banded);
+            vb.view_start_s = start_s;
+            vb.view_len_s = len_s;
+            vb.song_s = 12.0;
+            let r = clip_rect(area, &vb, &banded[0]);
+            assert!(r.is_positive());
+            let old = wave_columns_xy_in(&vl_, r);
+            let new = wave_columns_xy_in(&vb, r);
+            assert!(old.len() > 100, "window {start_s}+{len_s}: the columns drew {}", old.len());
+            assert!(
+                (new.len() as i64 - old.len() as i64).abs() <= 2,
+                "window {start_s}+{len_s}: {} columns against {} band vertices",
+                old.len(),
+                new.len()
+            );
+            let mut worst = 0.0f32;
+            for (x, top, bot) in &new {
+                let Some((_, t2, b2)) = old.iter().find(|(ox, ..)| (ox - x).abs() < 0.01) else {
+                    continue;
+                };
+                worst = worst.max((top - t2).abs()).max((bot - b2).abs());
+                assert!(
+                    (top - t2).abs() <= 1.0 && (bot - b2).abs() <= 1.0,
+                    "window {start_s}+{len_s}, column {x}: band {top}..{bot} vs columns {t2}..{b2}"
+                );
+            }
+            assert!(worst > 0.0 || new.len() == old.len(), "nothing was compared");
+        }
+    }
+
+    /// **A looped audio clip's picture repeats its first pass.**
+    ///
+    /// The fold used to live in the host (`looped_span_envelope`), and it
+    /// was the only place a looped clip's wave was folded into its loop; a
+    /// painter reading the pyramid straight through the clip's seconds
+    /// would draw eight bars of FILE under a two-bar loop — the very fault
+    /// that fold was written for. So: a four-pass clip over a file whose
+    /// sound drops to a whisper after the loop's end, and every pass must be
+    /// the loud first one, column for column, and none of them the whisper.
+    #[test]
+    fn a_looped_audio_clip_repeats_its_first_pass() {
+        let none: [crate::arrangement::ArrNote; 0] = [];
+        let loop_s = 2.0;
+        // Loud for the loop's two seconds, a whisper for the six after.
+        let peaks = a_pyramid(8.0, loop_s, 0.05);
+        let clips = [ClipView {
+            midi: false,
+            notes: &none,
+            peaks: Some(&peaks),
+            ..a_looped_clip(&none, loop_s, 4.0)
+        }];
+        let mut v = a_view(&clips);
+        v.view_start_s = 0.0;
+        v.view_len_s = 8.0;
+        v.song_s = 8.0;
+        let area = rect();
+        let r = clip_rect(area, &v, &clips[0]);
+        assert!(r.is_positive());
+        let cols = wave_columns_xy_in(&v, r);
+        assert!(cols.len() > 400, "the fixture drew {} columns", cols.len());
+        let pass_w = f64::from(x_of(area, &v, loop_s) - x_of(area, &v, 0.0));
+        let half = r.height() * 0.40;
+        let first: Vec<(f32, f32, f32)> =
+            cols.iter().copied().filter(|(x, ..)| f64::from(x - r.left()) < pass_w).collect();
+        assert!(first.len() > 100);
+        let mut compared = 0usize;
+        for (x, top, bot) in &cols {
+            let k = (f64::from(x - r.left()) / pass_w).floor();
+            if k < 1.0 {
+                continue;
+            }
+            // The column ON a seam reads its first side and then on past
+            // the seam — the host's old rule, kept — so it is the one
+            // column of a pass that may differ from the first pass's.
+            let phase = f64::from(x - r.left()) - k * pass_w;
+            if phase < 1.0 || phase > pass_w - 1.0 {
+                continue;
+            }
+            // The same column of the first pass, to the nearest point: a
+            // pass is not a whole number of points wide, so the phase
+            // inside it drifts by a fraction of a column per pass.
+            let x1 = f64::from(*x) - k * pass_w;
+            let Some((_, t1, b1)) = first
+                .iter()
+                .min_by(|a, b| (f64::from(a.0) - x1).abs().total_cmp(&(f64::from(b.0) - x1).abs()))
+            else {
+                continue;
+            };
+            assert!(
+                (top - t1).abs() <= 1.5 && (bot - b1).abs() <= 1.5,
+                "pass {k}, column {x}: {top}..{bot} against the first pass's {t1}..{b1}"
+            );
+            // And loud: a whisper would be a couple of points tall.
+            assert!(
+                bot - top > half * 0.5,
+                "pass {k}, column {x} is {} tall: the file was read past the loop",
+                bot - top
+            );
+            compared += 1;
+        }
+        assert!(compared > 300, "only {compared} columns in later passes");
     }
 
     fn diagonals_in(v: &ArrangeView<'_>, r: Rect) -> Vec<(Pos2, Pos2, Color32)> {
@@ -9946,6 +10878,7 @@ selected: false,
             wave: &wave,
             wave_from_s: 0.0,
             wave_span_s: bar_s * 4.0,
+            peaks: None,
             ..a_looped_clip(&none, bar_s, 4.0)
         }];
         let mut v = a_view(&clips);
@@ -9991,17 +10924,26 @@ selected: false,
         );
 
         // **The wave stays out of the bites.** Full-scale on every bucket, so
-        // this is the worst case the clip can offer.
-        let cols = wave_columns_in(&v, r);
-        assert!(!cols.is_empty(), "the fixture drew no waveform");
-        for (top, bot) in &cols {
-            assert!(
-                *top >= r.top() + d - 0.5 && *bot <= r.bottom() - d + 0.5,
-                "a waveform column runs {top}..{bot}, into a bite {d} deep on \
-                 a clip spanning {}..{}",
-                r.top(),
-                r.bottom()
-            );
+        // this is the worst case the clip can offer — on BOTH roads, the
+        // host-drawn columns and the pyramid's band.
+        let full: Vec<f32> = vec![1.0f32, -1.0, 1.0, -1.0].repeat(48_000 * 2);
+        let loud = crate::peaks::Peaks::build(&full, 2, 48_000);
+        let banded = [ClipView { peaks: Some(&loud), ..clips[0] }];
+        let mut vb = a_view(&banded);
+        vb.view_start_s = 0.0;
+        vb.view_len_s = 12.0;
+        vb.song_s = 12.0;
+        for (road, cols) in [("columns", wave_columns_in(&v, r)), ("band", wave_columns_in(&vb, r))] {
+            assert!(!cols.is_empty(), "{road}: the fixture drew no waveform");
+            for (top, bot) in &cols {
+                assert!(
+                    *top >= r.top() + d - 0.5 && *bot <= r.bottom() - d + 0.5,
+                    "{road}: a waveform column runs {top}..{bot}, into a bite {d} deep on \
+                     a clip spanning {}..{}",
+                    r.top(),
+                    r.bottom()
+                );
+            }
         }
     }
 
@@ -10319,10 +11261,18 @@ mod miniature_cost_probe {
         let looped_music = a_bar(bar_s);
         let looped_short = a_bar_of_short_notes(bar_s);
         let flat = a_flat_part(bar_s, 200);
+        // The same part in TIME ORDER, which is how a committed clip holds
+        // its notes (the MIDI commit and the recorder both sort by at_s):
+        // `a_bar` appends its held notes after the short ones, so `flat` is
+        // out of order within every bar and takes the whole walk, while
+        // this one is walked only under the window. Both are measured.
+        let mut recorded = flat.clone();
+        recorded.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
         for (part, notes, loop_s) in [
             ("a looped clip of music", &looped_music, bar_s),
             ("a looped clip of sub-pixel notes", &looped_short, bar_s),
             ("a clip that does not loop", &flat, 0.0),
+            ("a recorded clip in time order", &recorded, 0.0),
         ] {
         let clips: Vec<ClipView<'_>> = (0..VISIBLE_LANES)
             .map(|lane| ClipView {
@@ -10337,6 +11287,7 @@ mod miniature_cost_probe {
                 wave: &[],
                 wave_from_s: 0.0,
                 wave_span_s: 0.0,
+                peaks: None,
                 notes,
                 loop_s,
                 offset_s: 0.0,

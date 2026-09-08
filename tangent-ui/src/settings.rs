@@ -8027,3 +8027,53 @@ mod tests {
         );
     }
 }
+
+/// **settings_save**: what one settings save costs — `to_map`, the pretty
+/// print, the bytes — and the read back. Ignored; run in RELEASE with
+/// `--ignored --nocapture`. Here rather than in `perf_fixtures` because
+/// `to_map` and `load_from` are private, as they should be.
+#[cfg(test)]
+mod perf_probe {
+    use super::*;
+    use crate::perf_fixtures::{per_call, say};
+
+    #[test]
+    #[ignore]
+    fn perf_settings_save() {
+        println!(
+            "settings_save [{}]: Settings::default().to_map() + to_string_pretty, and load_from",
+            crate::perf_fixtures::build()
+        );
+        let s = Settings::default();
+        let map_t = per_call(50, || {
+            std::hint::black_box(s.to_map());
+        });
+        say("settings", "-", "to_map()", map_t, true);
+        let map = s.to_map();
+        let pretty_t = per_call(50, || {
+            std::hint::black_box(
+                serde_json::to_string_pretty(&Value::Object(map.clone())).expect("json"),
+            );
+        });
+        say("settings", "-", "to_string_pretty (incl. map clone)", pretty_t, true);
+        let text = serde_json::to_string_pretty(&Value::Object(map.clone())).expect("json");
+        println!(
+            "settings     -   settings.json = {} bytes ({:.1} KB), {} top-level keys, strip_inserts {} entries",
+            text.len(),
+            text.len() as f64 / 1024.0,
+            map.len(),
+            s.strip_inserts.len()
+        );
+        let dir = crate::perf_fixtures::scratch("settings");
+        let path = dir.join("settings.json");
+        let save_t = per_call(20, || s.save_to(&path));
+        say("settings", "-", "save_to (map + pretty + write + rename)", save_t, true);
+        let load_t = per_call(20, || {
+            std::hint::black_box(Settings::load_from(&path));
+        });
+        say("settings", "-", "load_from (read + parse + from_map)", load_t, true);
+        let back = Settings::load_from(&path);
+        assert_eq!(back.to_json(), s.to_json(), "the save did not round trip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

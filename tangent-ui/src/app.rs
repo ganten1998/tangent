@@ -10933,11 +10933,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if !self.arrangement_open {
             return None;
         }
-        let clips = self.arr_clip_views();
-        let view = self.arrange_view(&clips);
-        let l = crate::arrangement_panel::Layout::new(rect, &view);
-        let w = l.lanes_area.width();
-        (w >= 1.0).then_some((view.view_start_s, view.view_len_s, w))
+        // The host asks this every frame; the lanes' width is the frame's
+        // and the window is `arr_window_now`, so neither the clip views nor
+        // the row stack are built to answer it.
+        let f = crate::arrangement_panel::Layout::frame(rect, self.arr_header_w_pt());
+        let w = f.lanes_area.width();
+        let (start, len) = self.arr_window_now();
+        (w >= 1.0).then_some((start, len, w))
     }
 
     /// Whether the pictures are stale enough to be worth redrawing.
@@ -10946,7 +10948,26 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// pixel on any drag, and recomputing a screenful of waveforms sixty
     /// times a second is a pass over several million samples per frame for a
     /// picture nobody could tell apart from the last one.
+    ///
+    /// **Never, once every audio clip carries a pyramid.** `ClipInfo::peaks`
+    /// answers any window at draw time, so there is no picture to go stale
+    /// and no reload to ask for; the host's road through here (redraw the
+    /// span, `note_waves_drawn`) is kept for a document whose clips are
+    /// still pictured the old way — a file not yet decoded, a host that has
+    /// not pyramided it — and for nothing else. Asked of the document, not
+    /// of `arr_wave_at`: that field being `None` is what made this answer
+    /// `true`, and a gate that stayed on the old field would have reloaded
+    /// every frame for ever once the host stopped calling `note_waves_drawn`.
     pub fn arr_waves_stale(&self) -> bool {
+        let pyramided = self
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| c.kind == crate::arrangement::ClipKind::Audio)
+            .all(|c| self.clip_infos.get(&c.id).is_some_and(|i| i.peaks.is_some()));
+        if pyramided {
+            return false;
+        }
         let Some((start, len, w)) = self.arr_wave_view() else {
             return false;
         };
@@ -11236,11 +11257,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if !on_lanes && !on_header && !on_strip {
             return;
         }
-        let (zone, axes) = {
+        // One view and one Layout per tick, scalars out — the wheel's rule,
+        // for the same borrow reason.
+        let (zone, axes, s_per_px) = {
             let clips = self.arr_clip_views();
             let view = self.arrange_view(&clips);
             let l = crate::arrangement_panel::Layout::new(rect, &view);
-            if on_lanes {
+            let (zone, axes) = if on_lanes {
                 (l.lanes_area, EdgeAxes::Both)
             } else if on_strip {
                 // The lanes' own rectangle, not the strip's: the strip is a
@@ -11252,13 +11275,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 (l.lanes_area, EdgeAxes::X)
             } else {
                 (l.header, EdgeAxes::Y)
-            }
-        };
-        let step = edge_scroll_step(ctx, zone, p, axes);
-        if step == Vec2::ZERO {
-            return;
-        }
-        if step.x != 0.0 {
+            };
             // Points into seconds through `time_at`, the same pair of calls
             // the wheel over the grid already uses, and out through
             // `arr_steer` — the ONE clamp the horizontal window has.
@@ -11271,17 +11288,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // scroll was a silent no-op. Anywhere inside the field gives the
             // true slope, and the centre is inside it by construction.
             let probe = zone.center().x;
-            let (start, len, s_per_px) = {
-                let clips = self.arr_clip_views();
-                let view = self.arrange_view(&clips);
-                let (start, len) = self.arr_window_now();
-                let a = crate::arrangement_panel::time_at(rect, &view, probe);
-                (
-                    start,
-                    len,
-                    crate::arrangement_panel::time_at(rect, &view, probe + 1.0) - a,
-                )
-            };
+            let a = crate::arrangement_panel::time_at_in(&l, &view, probe);
+            (zone, axes, crate::arrangement_panel::time_at_in(&l, &view, probe + 1.0) - a)
+        };
+        let step = edge_scroll_step(ctx, zone, p, axes);
+        if step == Vec2::ZERO {
+            return;
+        }
+        if step.x != 0.0 {
+            let (start, len) = self.arr_window_now();
             self.arr_steer(start + f64::from(step.x) * s_per_px, len);
         }
         if step.y != 0.0 {
@@ -11314,6 +11329,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 crate::arrangement_panel::ClipView {
                     wave_from_s,
                     wave_span_s,
+                    peaks: info.and_then(|i| i.peaks.as_deref()),
                     id: c.id,
                     loop_s: c.loop_s,
                     notes: &c.notes,
@@ -11358,6 +11374,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         wave: &[],
                         wave_from_s: 0.0,
                         wave_span_s: 0.0,
+                        peaks: None,
                         // A take being recorded does not loop: it is one
                         // continuous pass, and there is no clip yet to ask.
                         loop_s: 0.0,
@@ -19221,10 +19238,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .input(|i| i.pointer.hover_pos())
                     .zip(self.arrangement_rect)
                     .is_some_and(|(p, rect)| {
-                        let clips = self.arr_clip_views();
-                        let view = self.arrange_view(&clips);
-                        let l = crate::arrangement_panel::Layout::new(rect, &view);
-                        l.grip.is_positive() && l.grip.contains(p)
+                        // The frame alone: the seam's place does not depend
+                        // on the rows, and this is asked on every frame the
+                        // pointer is anywhere over the panel.
+                        let f = crate::arrangement_panel::Layout::frame(
+                            rect,
+                            self.arr_header_w_pt(),
+                        );
+                        f.grip.is_positive() && f.grip.contains(p)
                     });
             self.arr_grip_lit = dragging || hovering;
             if self.arr_grip_lit {
@@ -19669,12 +19690,30 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // header column (occupied rows, the plus rows, the wood
                 // behind them) is the channels' section. The timeline keeps
                 // the wheel's time-zoom, the owner's ruling. No scrollbar.
-                let over_headers = {
+                //
+                // **One view, one Layout, scalars out.** This block used to
+                // be two — one list of clip views and a Layout for the
+                // header question, another list, two `time_at` Layouts and
+                // a `hit_test` Layout for the axis — on every frame with a
+                // wheel event in it. Everything the branches below need is
+                // a number, and every branch calls `&mut self`, so the
+                // borrow of the views has to END here; that is why it is
+                // one block returning a tuple and not a `view` kept alive.
+                let (over_headers, s_per_px, start, len, over_grid) = {
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
-                    crate::arrangement_panel::Layout::new(rect, &view)
-                        .header
-                        .contains(p)
+                    let l = crate::arrangement_panel::Layout::new(rect, &view);
+                    // Seconds per point through `time_at_in`, guard included:
+                    // a degenerate lanes area answers 0 for both and the pan
+                    // is a no-op, never an `inf` that a balanced diagonal
+                    // turns into a NaN window.
+                    let a = crate::arrangement_panel::time_at_in(&l, &view, p.x);
+                    let s = crate::arrangement_panel::time_at_in(&l, &view, p.x + 1.0) - a;
+                    let over = matches!(
+                        crate::arrangement_panel::hit_test_in(&l, &view, p),
+                        Some(crate::arrangement_panel::Hit::ToolGrid)
+                    );
+                    (l.header.contains(p), s, view.view_start_s, view.view_len_s, over)
                 };
                 if over_headers {
                     // **Combined delta, like the mixer.** Holding Shift makes
@@ -19725,17 +19764,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                     return;
                 }
-                let (anchor, s_per_px, start, len, over_grid) = {
-                    let clips = self.arr_clip_views();
-                    let view = self.arrange_view(&clips);
-                    let a = crate::arrangement_panel::time_at(rect, &view, p.x);
-                    let s = crate::arrangement_panel::time_at(rect, &view, p.x + 1.0) - a;
-                    let over = matches!(
-                        crate::arrangement_panel::hit_test(rect, &view, p),
-                        Some(crate::arrangement_panel::Hit::ToolGrid)
-                    );
-                    (a, s, view.view_start_s, view.view_len_s, over)
-                };
                 let ctrl_alt = alt && ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
                 if over_grid || ctrl_alt {
                     // **The gridbox is turned by the wheel** — up for
@@ -19769,12 +19797,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // five, and the wheel zooms THERE, wherever the hand
                     // rests. A trackpad's sideways component still pans,
                     // because sideways means along.
-                    let _ = anchor;
                     let anchor = self.recorder.position_s;
                     if scroll.x.abs() > 0.0 {
                         self.arr_steer(start - f64::from(scroll.x) * s_per_px, len);
                     }
                     if scroll.y.abs() > 0.0 {
+                        // **From the window as it stands AFTER the pan.** The
+                        // zoom used to scale the `start` read before it, so
+                        // on any event carrying both components — a
+                        // trackpad's ordinary diagonal — this `arr_steer`
+                        // overwrote the one above and the sideways travel
+                        // was lost. Pinned by
+                        // `the_plain_wheel_over_the_lanes_zooms_at_the_playhead_and_a_diagonal_pans_too`.
+                        let (start, len) = self.arr_window_now();
                         let factor = f64::from((-scroll.y * 0.005).exp());
                         self.arr_steer(anchor - (anchor - start) * factor, len * factor);
                     }
@@ -21431,6 +21466,33 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// The header column's width in points — `ArrangeView::header_w`, worked
+    /// out in ONE place.
+    ///
+    /// A dragged width wins; otherwise the default lines the header's right
+    /// edge up with the band's camera/timecode separator — one vertical,
+    /// two surfaces, the owner's word. Its own fn because two per-frame
+    /// callers (the grip's hover check, the host's wave-view question) need
+    /// the panel's `Frame` and nothing else of the view, and `Layout::frame`
+    /// wants exactly this number; the alternative was building every clip
+    /// view and the whole `ArrangeView` to read it.
+    fn arr_header_w_pt(&self) -> Option<f32> {
+        if self.settings.arr_header_w > 0.0 {
+            Some(self.settings.arr_header_w as f32)
+        } else if self.last_band.is_positive() {
+            Some(
+                (crate::recorder_panel::camera_split_x(
+                    self.last_band,
+                    &self.recorder_layout_view(),
+                ) - self.last_band.left()
+                    + 6.0)
+                    .max(150.0),
+            )
+        } else {
+            None
+        }
+    }
+
     fn arrange_view<'a>(
         &'a self,
         clips: &'a [crate::arrangement_panel::ClipView<'a>],
@@ -21653,23 +21715,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .min(self.active_channels().saturating_sub(self.arr_visible())),
             visible_lanes: self.arr_visible(),
             clips,
-            header_w: if self.settings.arr_header_w > 0.0 {
-                Some(self.settings.arr_header_w as f32)
-            } else if self.last_band.is_positive() {
-                // The default lines the header's right edge up with the
-                // band's camera/timecode separator — one vertical, two
-                // surfaces, the owner's word.
-                Some(
-                    (crate::recorder_panel::camera_split_x(
-                        self.last_band,
-                        &self.recorder_layout_view(),
-                    ) - self.last_band.left()
-                        + 6.0)
-                        .max(150.0),
-                )
-            } else {
-                None
-            },
+            header_w: self.arr_header_w_pt(),
             time_sel: self.time_sel,
             selected_channel: self.selected_channel,
             selected_tracks: &self.selected_tracks,
@@ -32237,17 +32283,28 @@ impl TangentApp {
             // **Not while the MIDI editor is up.** It floats over the lanes
             // and owns every key; leaving the timeline's nodes allocated
             // under it would put focus on controls a person cannot see.
-            let on_arr = if self.midi_edit.is_some() {
+            //
+            // **And not unless a reader is on.** `offer_nodes` begins with
+            // `if !on { return None }`, and `on` was `reader_mode()` — so for
+            // a sighted session every frame built two hundred nodes and two
+            // target walks for that line to discard. The gate is the SAME
+            // predicate, asked this frame, so what is built is exactly what
+            // is consumed: `reader_mode()` is the menu row's own setting or
+            // the host's detection for THIS session (`set_screen_reader`,
+            // pushed across the firewall, never written to disk — the
+            // persisted wrong answer is the mistake that fn's doc records).
+            // Not a live AccessKit query, because `tangent-ui` may not name
+            // the feature that could answer one, and not a flag of this
+            // fn's own, because two flags for one question is how they
+            // come apart.
+            let on_arr = if self.midi_edit.is_some() || !self.reader_mode() {
                 None
             } else {
-                let (nodes, hits) = {
-                    let nodes = crate::arrangement_panel::a11y_nodes(rect, &view);
-                    let hits = crate::arrangement_panel::targets(rect, &view);
-                    (nodes, hits)
-                };
+                let hits = crate::arrangement_panel::targets(rect, &view);
+                let nodes = crate::arrangement_panel::a11y_nodes_from(&view, &hits);
                 offer_nodes(
                     ui,
-                    self.reader_mode(),
+                    true,
                     &nodes,
                     self.settings.white_key_active_color.to_color32(),
                 )
@@ -52518,6 +52575,131 @@ mod tests {").expect("the tests module")];
              {by_hand}"
         );
     }
+
+    /// One frame carrying a wheel event at `at`, with `mods` held.
+    fn wheel_frame(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+        at: Pos2,
+        delta: Vec2,
+        mods: egui::Modifiers,
+    ) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                modifiers: mods,
+                events: vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta,
+                        modifiers: mods,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+    }
+
+    /// The lanes area, and seconds per point across it, as the panel maps
+    /// them right now.
+    fn lanes_and_scale(app: &TangentApp, rect: Rect) -> (Rect, f64) {
+        let clips = app.arr_clip_views();
+        let view = app.arrange_view(&clips);
+        let l = crate::arrangement_panel::Layout::new(rect, &view);
+        let x = l.lanes_area.center().x;
+        let a = crate::arrangement_panel::time_at(rect, &view, x);
+        let s = crate::arrangement_panel::time_at(rect, &view, x + 1.0) - a;
+        (l.lanes_area, s)
+    }
+
+    /// **The plain wheel over the lanes zooms at the PLAYHEAD, and a
+    /// sideways component pans first.**
+    ///
+    /// Nothing sent a wheel event over the lanes before this: both wheel
+    /// tests aim at the header column and return in its branch, so the
+    /// zoom, the pans and the gridbox turn below could all have been broken
+    /// by a refactor of the handler and every test stayed green. The rule
+    /// pinned here is the handler's own: `factor = exp(-dy * 0.005)`, the
+    /// window scaled about `recorder.position_s` (the owner's ruling, not the
+    /// pointer), and `x` spent as a pan at the pre-event scale.
+    ///
+    /// The diagonal case also pins a FIX. The branch panned and then zoomed
+    /// from the `start` it had read before the pan, so on any event carrying
+    /// both components — a trackpad's ordinary diagonal — the zoom's
+    /// `arr_steer` overwrote the pan and the sideways travel was lost. The
+    /// zoom now reads the window back after the pan.
+    #[test]
+    fn the_plain_wheel_over_the_lanes_zooms_at_the_playhead_and_a_diagonal_pans_too() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = arrangement_with_a_clip(&ctx, &mut app);
+        app.recorder.position_s = 3.0;
+        let (lanes, s_per_px) = lanes_and_scale(&app, rect);
+        assert!(s_per_px > 0.0, "the lanes have no scale");
+        let at = lanes.center();
+        let (start0, len0) = app.arr_window_now();
+        let anchor = 3.0;
+
+        // Zoom in: a forty-point notch.
+        wheel_frame(&ctx, &mut app, at, Vec2::new(0.0, 40.0), egui::Modifiers::NONE);
+        let factor = f64::from((-40.0f32 * 0.005).exp());
+        let (start1, len1) = app.arr_window_now();
+        assert!((len1 - len0 * factor).abs() < 1.0e-6, "len {len0} -> {len1}, wanted x{factor}");
+        let want = (anchor - (anchor - start0) * factor).max(0.0);
+        assert!((start1 - want).abs() < 1.0e-6, "start {start0} -> {start1}, wanted {want}");
+
+        // A diagonal: thirty points forward AND the same notch. The pan
+        // lands first, at the pre-event scale, and the zoom scales the
+        // PANNED window.
+        let (_, s1) = lanes_and_scale(&app, rect);
+        wheel_frame(&ctx, &mut app, at, Vec2::new(-30.0, 40.0), egui::Modifiers::NONE);
+        let panned = (start1 + 30.0 * s1).max(0.0);
+        let (start2, len2) = app.arr_window_now();
+        assert!((len2 - len1 * factor).abs() < 1.0e-6, "diagonal: len {len1} -> {len2}");
+        let want = (anchor - (anchor - panned) * factor).max(0.0);
+        assert!(
+            (start2 - want).abs() < 1.0e-6,
+            "diagonal: start {start1} -> {start2}, wanted {want} (the pan was lost if it is \
+             {})",
+            (anchor - (anchor - start1) * factor).max(0.0)
+        );
+    }
+
+    /// **Alt+wheel over the lanes PANS**, both axes summed, at the panel's
+    /// own seconds-per-point — and the gridbox is turned by the wheel over
+    /// it. The same handler as the test above, the branches it did not take.
+    #[test]
+    fn alt_wheel_pans_the_lanes_and_the_wheel_over_the_gridbox_turns_it() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = arrangement_with_a_clip(&ctx, &mut app);
+        // Start away from the rail so a pan either way is visible.
+        app.arr_steer(10.0, 30.0);
+        let (lanes, s_per_px) = lanes_and_scale(&app, rect);
+        let alt = egui::Modifiers { alt: true, ..Default::default() };
+        let (start0, len0) = app.arr_window_now();
+        wheel_frame(&ctx, &mut app, lanes.center(), Vec2::new(12.0, 8.0), alt);
+        let (start1, len1) = app.arr_window_now();
+        assert!((len1 - len0).abs() < 1.0e-9, "an Alt pan changed the zoom: {len0} -> {len1}");
+        let want = start0 - 20.0 * s_per_px;
+        assert!((start1 - want).abs() < 1.0e-6, "Alt pan: {start0} -> {start1}, wanted {want}");
+
+        let grid = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            crate::arrangement_panel::Layout::new(rect, &view).tool_grid
+        };
+        assert!(grid.is_positive(), "no gridbox to aim at");
+        app.settings.arr_grid_exp = 0;
+        wheel_frame(&ctx, &mut app, grid.center(), Vec2::new(0.0, 3.0), egui::Modifiers::NONE);
+        assert_eq!(app.settings.arr_grid_exp, 1, "wheel up over the gridbox did not coarsen");
+        wheel_frame(&ctx, &mut app, grid.center(), Vec2::new(0.0, -3.0), egui::Modifiers::NONE);
+        wheel_frame(&ctx, &mut app, grid.center(), Vec2::new(0.0, -3.0), egui::Modifiers::NONE);
+        assert_eq!(app.settings.arr_grid_exp, -1, "wheel down over the gridbox did not refine");
+        // And the window did not move for it.
+        let (start2, len2) = app.arr_window_now();
+        assert!((start2 - start1).abs() < 1.0e-9 && (len2 - len1).abs() < 1.0e-9);
+    }
 }
 
 #[cfg(test)]
@@ -56520,3 +56702,646 @@ mod dirty_cost_probe {
 }
 
 
+/// **The perf probes that need the app**: open, undo, layout, views and a
+/// whole drawn frame, each per fixture size. Ignored by default; run them
+/// in RELEASE with
+///
+/// ```text
+/// cargo test --release -p tangent-ui --lib perf_probes -- --ignored --nocapture
+/// ```
+///
+/// They live here rather than beside the fixtures because every one of them
+/// reaches something private to `TangentApp`: `open_project_keeping` and
+/// `KeepPath`, `undo_state`, `undo_mark`, `desk_snapshot`, `arr_clip_views`,
+/// `arrange_view`, and the fields a headless frame has to set by hand. The
+/// documents come from `crate::perf_fixtures`, so a number here and a number
+/// there are about the same song. Every line says which build it is; a debug
+/// number is ten to fifteen times a shipping one.
+#[cfg(test)]
+mod perf_probes {
+    use super::*;
+    use crate::arrangement_panel::{clip_rect, draw, ArrangeView, ClipView, Layout};
+    use crate::perf_fixtures as fx;
+    use crate::perf_fixtures::{per_call, pct_frame, say, Size};
+
+    /// The two windows: the rect the panel's own tests draw into, and a
+    /// full-screen arrangement on a 1920-wide display.
+    const RECTS: [(&str, f32, f32); 2] =
+        [("1300x420", 1300.0, 420.0), ("1920x960", 1920.0, 960.0)];
+
+    fn rect_of(w: f32, h: f32) -> Rect {
+        Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))
+    }
+
+    fn reps(size: Size, s: u32, m: u32, l: u32, xl: u32) -> u32 {
+        match size {
+            Size::S => s,
+            Size::M => m,
+            Size::L => l,
+            Size::XL => xl,
+        }
+    }
+
+    /// A headless app with `size`'s document OPEN through the real open
+    /// road, the arrangement showing in `rect`, and a picture on every audio
+    /// clip the way the host would have pushed one after the decode.
+    fn app_with(size: Size, rect: Rect, dir: &std::path::Path) -> (egui::Context, TangentApp) {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+        // Eight lanes on screen, as the panel's own tests draw and as a
+        // desktop window shows: headless, the auto count answers four.
+        app.settings.arr_visible = 8;
+        let doc = fx::write_project(size, dir, false);
+        app.open_project_keeping(&doc, KeepPath::Leave);
+        app.arrangement_open = true;
+        app.arrangement_rect = Some(rect);
+        give_pictures(&mut app, size.spec().take_s);
+        (ctx, app)
+    }
+
+    /// What the host pushes once a take is decoded: the file's length and a
+    /// min/max picture over the clip's drawn span — 1024 pairs, about a
+    /// lane's width of columns at the windows above.
+    fn give_pictures(app: &mut TangentApp, take_s: f64) {
+        // One pyramid for the take, shared by every clip that plays it —
+        // as the host shares one decode per file.
+        let peaks = {
+            let rate = 48_000u32;
+            let frames = (take_s * f64::from(rate)) as usize;
+            let mut v = Vec::with_capacity(frames * 2);
+            for f in 0..frames {
+                let t = f as f32 / rate as f32;
+                let env = 0.6 + 0.3 * (t * 0.7).sin();
+                let x = (t * 440.0 * std::f32::consts::TAU).sin() * env;
+                v.push(x);
+                v.push(x * 0.8);
+            }
+            crate::peaks::Peaks::build(&v, 2, rate).shared()
+        };
+        for c in &app.arrangement.clips {
+            if c.kind != crate::arrangement::ClipKind::Audio {
+                continue;
+            }
+            let wave: Vec<f32> = (0..1024)
+                .flat_map(|i| {
+                    let env = 0.8 * (-((i % 64) as f32) / 20.0).exp();
+                    [-env * 0.9, env]
+                })
+                .collect();
+            app.clip_infos.insert(
+                c.id,
+                crate::ports::ClipInfo {
+                    id: c.id,
+                    wave,
+                    file_s: take_s,
+                    wave_from_s: 0.0,
+                    wave_span_s: c.len_s,
+                    peaks: Some(peaks.clone()),
+                },
+            );
+        }
+    }
+
+    /// The first MIDI clip's index — the one whose note an "edit" moves.
+    fn a_midi_clip(app: &TangentApp) -> usize {
+        app.arrangement
+            .clips
+            .iter()
+            .position(|c| !c.notes.is_empty())
+            .expect("the fixture has MIDI clips")
+    }
+
+    fn moment_bytes(m: &Moment) -> usize {
+        m.doc.len() + m.kits.len()
+    }
+
+    /// **doc_open**: the whole open, and the parts of it that are paid
+    /// again later — `undo_state`, `undo_mark`, `desk_snapshot`, the
+    /// fingerprint — beside the once-a-frame `project_dirty`.
+    #[test]
+    #[ignore]
+    fn perf_doc_open() {
+        println!(
+            "doc_open [{}]: open_project_keeping(doc, KeepPath::Leave) per size, and its parts",
+            fx::build()
+        );
+        let dir = fx::scratch("doc-open");
+        for size in Size::chosen() {
+            let tag = size.tag();
+            let doc = fx::write_project(size, &dir.join(tag), false);
+            let ctx = egui::Context::default();
+            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+            let n = reps(size, 5, 5, 3, 2);
+            let open = per_call(n, || app.open_project_keeping(&doc, KeepPath::Leave));
+            let c = fx::census(&app.arrangement);
+            println!(
+                "doc_open     {tag:<3} {} clips / {} notes / {:.0} s, doc {:.0} KB",
+                c.clips,
+                c.notes,
+                c.song_s,
+                std::fs::metadata(&doc).map(|m| m.len()).unwrap_or(0) / 1024
+            );
+            say("doc_open", tag, "open_project_keeping (whole call)", open, false);
+            let read = per_call(n, || {
+                std::hint::black_box(crate::arrangement::Arrangement::read_from(&doc));
+            });
+            say("doc_open", tag, "  of which: Arrangement::read_from", read, false);
+            let desk = app.arrangement.desk.clone().expect("the fixture carries a desk");
+            let apply = per_call(n, || app.apply_desk_snapshot(&desk));
+            say("doc_open", tag, "  of which: apply_desk_snapshot", apply, false);
+            let reset = per_call(n, || app.undo_reset());
+            say("doc_open", tag, "  of which: undo_reset (2x undo_state + mark)", reset, false);
+            let us = per_call(n, || {
+                std::hint::black_box(app.undo_state());
+            });
+            say("doc_open", tag, "undo_state (to_json_with_desk + kits)", us, true);
+            let um = per_call(n * 20, || {
+                std::hint::black_box(app.undo_mark());
+            });
+            say("doc_open", tag, "undo_mark (fingerprint, doc + kits)", um, true);
+            let ds = per_call(500, || {
+                std::hint::black_box(app.desk_snapshot());
+            });
+            say("doc_open", tag, "desk_snapshot", ds, true);
+            let fp = per_call(n * 20, || {
+                std::hint::black_box(app.arrangement.fingerprint_with_desk(Some(&desk)));
+            });
+            say("doc_open", tag, "Fingerprint over the doc (+desk)", fp, true);
+            let pd = per_call(n * 20, || {
+                std::hint::black_box(app.project_dirty());
+            });
+            say("doc_open", tag, "project_dirty (the title bar, per frame)", pd, true);
+            let m = app.undo_state();
+            println!(
+                "doc_open     {tag:<3} one Moment = {:.2} MB ({} doc + {} kits bytes); 100 Moments = {:.1} MB",
+                fx::mb(moment_bytes(&m)),
+                m.doc.len(),
+                m.kits.len(),
+                fx::mb(moment_bytes(&m) * 100)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **undo_commit**: one committed edit (the Moment build, the compare,
+    /// the push), a commit where nothing changed, and what a hundred
+    /// Moments weigh.
+    #[test]
+    #[ignore]
+    fn perf_undo_commit() {
+        println!("undo_commit [{}]: per committed edit, per size", fx::build());
+        let dir = fx::scratch("undo");
+        for size in Size::chosen() {
+            let tag = size.tag();
+            let doc = fx::write_project(size, &dir.join(tag), false);
+            let ctx = egui::Context::default();
+            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+            app.open_project_keeping(&doc, KeepPath::Leave);
+            let midi = a_midi_clip(&app);
+            let n = reps(size, 20, 20, 10, 5);
+            let t = Instant::now();
+            for i in 0..n {
+                app.arrangement.clips[midi].notes[0].at_s = f64::from(i + 1) * 0.001;
+                app.undo_commit();
+            }
+            let edit = t.elapsed() / n;
+            say("undo_commit", tag, "undo_commit (a real edit)", edit, true);
+            let same = per_call(n, || app.undo_commit());
+            say("undo_commit", tag, "undo_commit (nothing changed: build + compare)", same, true);
+            let state = per_call(n, || {
+                std::hint::black_box(app.undo_state());
+            });
+            say("undo_commit", tag, "  of which: undo_state", state, true);
+            let held = app.history.len();
+            let bytes: usize = app.history.iter().map(moment_bytes).sum();
+            println!(
+                "undo_commit  {tag:<3} history holds {held} Moments = {:.1} MB; one Moment {:.2} MB; 100 Moments = {:.1} MB",
+                fx::mb(bytes),
+                fx::mb(bytes / held.max(1)),
+                fx::mb(bytes / held.max(1) * 100)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `clip_rect` with the `Layout` handed in — the prototype: the same
+    /// arithmetic as `clip_rect` and `x_of`, minus the three `Layout::new`
+    /// calls per clip.
+    fn rect_from(l: &Layout, view: &ArrangeView<'_>, clip: &ClipView<'_>) -> Rect {
+        let Some(row) = l.lane_rows.get(clip.lane).copied().filter(Rect::is_positive) else {
+            return Rect::NOTHING;
+        };
+        let x = |t: f64| {
+            if !l.lanes_area.is_positive() || view.view_len_s <= 0.0 {
+                return l.lanes_area.left();
+            }
+            let f = ((t - view.view_start_s) / view.view_len_s) as f32;
+            l.lanes_area.left() + f * l.lanes_area.width()
+        };
+        let x0 = x(clip.start_s).max(l.lanes_area.left());
+        let x1 = x(clip.start_s + clip.len_s).min(l.lanes_area.right());
+        if x1 <= x0 {
+            return Rect::NOTHING;
+        }
+        Rect::from_min_max(Pos2::new(x0, row.top() + 1.5), Pos2::new(x1, row.bottom() - 1.5))
+    }
+
+    /// **layout**: `Layout::new` per size, and `clip_rect` over every clip
+    /// — which rebuilds the Layout three times per clip — against one
+    /// Layout and per-clip arithmetic.
+    #[test]
+    #[ignore]
+    fn perf_layout() {
+        println!(
+            "layout [{}]: Layout::new; clip_rect x every clip (3 Layouts each) vs one Layout + per-clip math; 1920x960",
+            fx::build()
+        );
+        let dir = fx::scratch("layout");
+        for size in Size::chosen() {
+            let tag = size.tag();
+            let r = rect_of(1920.0, 960.0);
+            let (_ctx, app) = app_with(size, r, &dir.join(tag));
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let layout = per_call(500, || {
+                std::hint::black_box(Layout::new(r, &view));
+            });
+            say("layout", tag, "Layout::new(rect, &view)", layout, true);
+            let n = reps(size, 50, 20, 10, 5);
+            let all = per_call(n, || {
+                for c in &clips {
+                    std::hint::black_box(clip_rect(r, &view, c));
+                }
+            });
+            say(
+                "layout",
+                tag,
+                &format!("clip_rect x {} clips (3 Layouts each)", clips.len()),
+                all,
+                true,
+            );
+            let fast = per_call(n * 20, || {
+                let l = Layout::new(r, &view);
+                for c in &clips {
+                    std::hint::black_box(rect_from(&l, &view, c));
+                }
+            });
+            say("layout", tag, "prototype: one Layout + per-clip math", fast, true);
+            let real = per_call(n * 20, || {
+                let l = Layout::new(r, &view);
+                for c in &clips {
+                    std::hint::black_box(crate::arrangement_panel::clip_rect_in(&l, &view, c));
+                }
+            });
+            say("layout", tag, "shipped: one Layout + clip_rect_in per clip", real, true);
+            let l = Layout::new(r, &view);
+            let mut worst = 0.0f32;
+            let mut visible = 0usize;
+            for c in &clips {
+                let a = clip_rect(r, &view, c);
+                let b = rect_from(&l, &view, c);
+                assert_eq!(a.is_positive(), b.is_positive(), "clip {} differs in existence", c.id);
+                if a.is_positive() {
+                    visible += 1;
+                    worst = worst.max((a.min - b.min).length()).max((a.max - b.max).length());
+                }
+            }
+            println!(
+                "layout       {tag:<3} prototype agrees on all {} clips ({visible} on screen; worst corner deviation {worst:e} pt); {:.0}x cheaper",
+                clips.len(),
+                all.as_secs_f64() / fast.as_secs_f64()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **views**: what the host's per-frame `arr_waves_stale` check pays —
+    /// `arr_clip_views`, `arrange_view` and a `Layout::new`, every frame,
+    /// to learn that the window has not moved.
+    #[test]
+    #[ignore]
+    fn perf_views() {
+        println!(
+            "views [{}]: arr_waves_stale per frame = arr_clip_views + arrange_view + Layout::new; 1920x960",
+            fx::build()
+        );
+        let dir = fx::scratch("views");
+        for size in Size::chosen() {
+            let tag = size.tag();
+            let r = rect_of(1920.0, 960.0);
+            let (_ctx, app) = app_with(size, r, &dir.join(tag));
+            assert!(app.arr_waves_stale(), "a fresh open has no pictures yet, so it is stale");
+            let stale = per_call(500, || {
+                std::hint::black_box(app.arr_waves_stale());
+            });
+            say("views", tag, "arr_waves_stale (the per-frame check)", stale, true);
+            let cv = per_call(500, || {
+                std::hint::black_box(app.arr_clip_views());
+            });
+            say("views", tag, "  arr_clip_views", cv, true);
+            let clips = app.arr_clip_views();
+            let av = per_call(500, || {
+                std::hint::black_box(app.arrange_view(&clips));
+            });
+            say("views", tag, "  arrange_view", av, true);
+            let view = app.arrange_view(&clips);
+            let ln = per_call(500, || {
+                std::hint::black_box(Layout::new(r, &view));
+            });
+            say("views", tag, "  Layout::new", ln, true);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A layer nothing else paints into, so the shapes read back are the
+    /// frame's and only the frame's — `miniature_cost_probe`'s method.
+    fn a_painter(ctx: &egui::Context) -> (egui::LayerId, egui::Painter) {
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("perf-draw"));
+        (layer, egui::Painter::new(ctx.clone(), layer, Rect::EVERYTHING))
+    }
+
+    fn shed(ctx: &egui::Context, layer: egui::LayerId) {
+        ctx.graphics_mut(|g| *g.entry(layer) = Default::default());
+    }
+
+    fn shapes(ctx: &egui::Context, layer: egui::LayerId) -> Vec<egui::epaint::ClippedShape> {
+        ctx.graphics(|g| {
+            g.get(layer).map(|list| list.all_entries().cloned().collect()).unwrap_or_default()
+        })
+    }
+
+    /// How many of each kind of shape a frame emitted — what the count is
+    /// made of, so a number can be traced to the code that drew it.
+    fn tally(shapes: &[egui::epaint::ClippedShape]) -> String {
+        fn walk(s: &egui::Shape, n: &mut [usize; 6]) {
+            match s {
+                egui::Shape::Rect(_) => n[0] += 1,
+                egui::Shape::Text(_) => n[1] += 1,
+                egui::Shape::LineSegment { .. } => n[2] += 1,
+                egui::Shape::Path(_) => n[3] += 1,
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, n)),
+                _ => n[5] += 1,
+            }
+            if matches!(s, egui::Shape::Mesh(_)) {
+                n[4] += 1;
+            }
+        }
+        let mut n = [0usize; 6];
+        for c in shapes {
+            walk(&c.shape, &mut n);
+        }
+        format!("rect {} text {} line {} path {} mesh {} other {}", n[0], n[1], n[2], n[3], n[4], n[5] - n[4])
+    }
+
+    fn vertices(prims: &[egui::epaint::ClippedPrimitive]) -> (usize, usize) {
+        prims.iter().fold((0, 0), |(v, i), p| match &p.primitive {
+            egui::epaint::Primitive::Mesh(m) => (v + m.vertices.len(), i + m.indices.len()),
+            egui::epaint::Primitive::Callback(_) => (v, i),
+        })
+    }
+
+    /// **panel_draw**: one whole `arrangement_panel::draw` frame, per size,
+    /// at the whole song, eight bars and one bar, in both windows — shape
+    /// emission and tessellation timed apart, with the shape and vertex
+    /// counts that explain them.
+    #[test]
+    #[ignore]
+    fn perf_panel_draw() {
+        println!(
+            "panel_draw [{}]: arrangement_panel::draw, one frame = emit + tessellate, per size / window / zoom",
+            fx::build()
+        );
+        let dir = fx::scratch("draw");
+        for size in Size::chosen() {
+            let tag = size.tag();
+            for (rname, w, h) in RECTS {
+                let r = rect_of(w, h);
+                let (ctx, mut app) = app_with(size, r, &dir.join(format!("{tag}-{rname}")));
+                let song = app.arr_span();
+                let (layer, painter) = a_painter(&ctx);
+                // The two close zooms sit a tenth of the way in, on a bar
+                // line, where every lane has something standing.
+                let at = (song * 0.1 / fx::BAR_S).floor() * fx::BAR_S;
+                for (zname, window) in [
+                    ("whole song", None),
+                    ("8 bars", Some((at, 8.0 * fx::BAR_S))),
+                    ("1 bar", Some((at, fx::BAR_S))),
+                ] {
+                    app.arr_window = window;
+                    let clips = app.arr_clip_views();
+                    let view = app.arrange_view(&clips);
+                    let end = view.view_start_s + view.view_len_s;
+                    let in_view = clips
+                        .iter()
+                        .filter(|c| {
+                            c.start_s < end
+                                && c.start_s + c.len_s > view.view_start_s
+                                && c.lane >= view.lane_scroll
+                                && c.lane < view.lane_scroll + view.visible_lanes
+                        })
+                        .count();
+                    shed(&ctx, layer);
+                    draw(&painter, r, &view);
+                    let first = shapes(&ctx, layer);
+                    let count = first.len();
+                    let kinds = tally(&first);
+                    shed(&ctx, layer);
+
+                    let n = reps(size, 30, 20, 10, 6);
+                    let mut total = Duration::ZERO;
+                    for _ in 0..n {
+                        let t = Instant::now();
+                        draw(&painter, r, &view);
+                        total += t.elapsed();
+                        shed(&ctx, layer);
+                    }
+                    let emit = total / n;
+
+                    draw(&painter, r, &view);
+                    let m = 8;
+                    let mut tess = Duration::ZERO;
+                    for _ in 0..m {
+                        let s = shapes(&ctx, layer);
+                        let t = Instant::now();
+                        std::hint::black_box(ctx.tessellate(s, 1.0));
+                        tess += t.elapsed();
+                    }
+                    let tess = tess / m;
+                    let prims = ctx.tessellate(shapes(&ctx, layer), 1.0);
+                    let (verts, idx) = vertices(&prims);
+                    shed(&ctx, layer);
+
+                    println!(
+                        "panel_draw   {tag:<3} {rname:>9} {zname:<10} ({in_view:>4} clips in view, {:>7.1} s): {count:>6} shapes ({kinds}), {verts:>8} verts / {idx:>8} idx -> emit {emit:>10.3?} + tess {tess:>10.3?} = {:>10.3?}  {:>6.1}% frame  [{}]",
+                        view.view_len_s,
+                        emit + tess,
+                        pct_frame(emit + tess),
+                        fx::build()
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The arrangement's frame axis, held against the perf fixtures — see
+/// `arrangement_panel::time_at_in` for why the `_in` forms exist and
+/// `clip_rect_agrees_with_its_in_form_to_the_bit` for the panel's own
+/// version of this check. This one runs the fixture DOCUMENTS through the
+/// app's real `arr_clip_views`/`arrange_view`, at every size the benchmark
+/// draws, so a fixture shape the hand-built views do not have (clips on
+/// lanes past sixteen, folded loops, trimmed takes) cannot slip past.
+#[cfg(test)]
+mod arrange_axis_tests {
+    use super::*;
+    use crate::arrangement_panel::{clip_rect, clip_rect_in, Layout};
+    use crate::perf_fixtures::{self as fx, Size};
+
+    #[test]
+    fn every_fixture_clip_rect_agrees_with_its_in_form() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let bits = |r: Rect| {
+            [r.min.x.to_bits(), r.min.y.to_bits(), r.max.x.to_bits(), r.max.y.to_bits()]
+        };
+        for size in [Size::S, Size::M, Size::L, Size::XL] {
+            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+            app.settings.arr_visible = 8;
+            app.arrangement = fx::arrangement(size);
+            app.arrangement_open = true;
+            let song = app.arr_span();
+            let mut checked = 0usize;
+            let mut on_screen = 0usize;
+            for (w, h) in [(1920.0, 960.0), (1300.0, 420.0), (640.0, 200.0)] {
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
+                app.arrangement_rect = Some(rect);
+                for window in [
+                    None,
+                    Some((song * 0.1, 16.0)),
+                    Some((song * 0.5, 2.0)),
+                    Some((0.0, (song * 4.0).max(3_600.0))),
+                ] {
+                    app.arr_window = window;
+                    let clips = app.arr_clip_views();
+                    let view = app.arrange_view(&clips);
+                    let l = Layout::new(rect, &view);
+                    for c in &clips {
+                        let a = clip_rect(rect, &view, c);
+                        let b = clip_rect_in(&l, &view, c);
+                        assert_eq!(
+                            bits(a),
+                            bits(b),
+                            "{} clip {} at {w}x{h}, window {window:?}: {a:?} vs {b:?}",
+                            size.tag(),
+                            c.id
+                        );
+                        checked += 1;
+                        on_screen += usize::from(a.is_positive());
+                    }
+                }
+            }
+            assert!(on_screen > 0, "{}: the fixture put no clip on screen", size.tag());
+            assert!(checked >= 12 * fx::census(&app.arrangement).clips, "{}", size.tag());
+        }
+    }
+}
+
+/// The stale gate and the pyramid — see `arr_waves_stale`.
+#[cfg(test)]
+mod arrange_peaks_tests {
+    use super::*;
+    use crate::arrangement::{ArrClip, ClipKind};
+
+    fn an_audio_clip(lane: usize, start_s: f64) -> ArrClip {
+        ArrClip {
+            pedal: Vec::new(),
+            kind: ClipKind::Audio,
+            notes: Vec::new(),
+            lane,
+            path: "media/take.wav".into(),
+            start_s,
+            offset_s: 0.0,
+            len_s: 4.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "take".into(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        }
+    }
+
+    /// **Once every audio clip has a pyramid, no view move is stale.**
+    ///
+    /// The host asks this every frame and answers `true` with a whole
+    /// reload — a document walk, a sample walk, an engine clip swap. With a
+    /// pyramid on every audio clip the painter reads any window itself, so
+    /// the answer has to be `false` however far the window is steered; and
+    /// it has to go back to the old road the moment one audio clip is
+    /// pictured the old way, or that clip's picture would never follow the
+    /// zoom.
+    #[test]
+    fn a_pyramided_document_is_never_stale_and_a_legacy_clip_reopens_the_road() {
+        let ctx = egui::Context::default();
+        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+        app.settings.arr_visible = 8;
+        app.arrangement_open = true;
+        app.arrangement_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 420.0)));
+        app.arrangement.add_clip(an_audio_clip(0, 1.0));
+        let a = app.arrangement.clips[0].id;
+        assert!(app.arr_waves_stale(), "a clip with no picture at all is stale");
+        let peaks = crate::peaks::Peaks::build(&vec![0.5f32; 48_000 * 8], 2, 48_000).shared();
+        app.clip_infos.insert(
+            a,
+            crate::ports::ClipInfo {
+                id: a,
+                file_s: 4.0,
+                peaks: Some(peaks.clone()),
+                ..Default::default()
+            },
+        );
+        assert!(!app.arr_waves_stale(), "a pyramided clip is never stale");
+        for (start, len) in [(0.0, 30.0), (100.0, 1.0), (0.0, 3_600.0), (2.5, 2.0)] {
+            app.arr_steer(start, len);
+            assert!(!app.arr_waves_stale(), "stale after steering to {start}+{len}");
+        }
+        // And the clip view carries the pyramid the painter will read.
+        let clips = app.arr_clip_views();
+        assert!(clips.iter().any(|c| c.id == a && c.peaks.is_some()));
+        // A second audio clip pictured the OLD way reopens the host's road.
+        app.arrangement.add_clip(an_audio_clip(1, 1.0));
+        let b = app.arrangement.clips[1].id;
+        app.clip_infos.insert(
+            b,
+            crate::ports::ClipInfo {
+                id: b,
+                file_s: 4.0,
+                wave: vec![0.5; 20],
+                wave_from_s: 0.0,
+                wave_span_s: 4.0,
+                peaks: None,
+            },
+        );
+        assert!(app.arr_waves_stale(), "a legacy clip is not answered by the pyramid gate");
+        let at = app.arr_wave_view().expect("the arrangement is open");
+        app.note_waves_drawn(at);
+        assert!(!app.arr_waves_stale(), "just drawn is not stale");
+        app.arr_steer(at.0 + at.1, at.1);
+        assert!(app.arr_waves_stale(), "a whole window's pan on the legacy road is stale");
+        // A MIDI-only document has nothing to picture and is never stale.
+        let mut midi = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+        midi.arrangement_open = true;
+        midi.arrangement_rect = app.arrangement_rect;
+        midi.arrangement.add_clip(ArrClip { kind: ClipKind::Midi, path: String::new(), ..an_audio_clip(0, 1.0) });
+        assert!(!midi.arr_waves_stale());
+    }
+}
