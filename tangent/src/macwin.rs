@@ -85,7 +85,7 @@
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use objc2::runtime::{AnyClass, AnyObject, Bool, NSObject, NSObjectProtocol, ProtocolObject, Sel};
-use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSEvent, NSFloatingWindowLevel, NSModalResponse, NSModalResponseOK,
     NSNormalWindowLevel, NSOpenPanel, NSOpenSavePanelDelegate, NSTextField, NSView, NSWindow,

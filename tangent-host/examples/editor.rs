@@ -20,7 +20,7 @@
 
 use std::time::{Duration, Instant};
 
-use tangent_host::{Editor, Instance, Module, Note, Setup};
+use tangent_host::{Editor, Instance, Note, Setup};
 
 /// How long each pump gets before the loop takes a turn. 16 ms is a 60 Hz
 /// frame, which is what the app's own loop gives it.
