@@ -13232,7 +13232,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // accident, because saving makes the project clean and the second
         // ask returns false on its own.
         if self.quit_allowed {
-            self.flush_settings_save();
+            self.flush_settings_now();
             return false;
         }
         if self.ask_before(AfterSave::Quit) {
@@ -13251,17 +13251,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // and the host's Close after the prompt was answered (`quit_allowed`)
         // — so this is the one place that can settle the debt. Idempotent:
         // an on-exit flush in the host finds nothing owed.
-        self.flush_settings_save();
+        self.flush_settings_now();
         false
-    }
-
-    /// Pay the debounced settings write now, if one is owed. Nothing is
-    /// written when nothing is owed, so it can be called from every road
-    /// out without a second write.
-    pub fn flush_settings_save(&mut self) {
-        if self.settings_save_at.take().is_some() {
-            self.save_settings();
-        }
     }
 
     /// The host's cue that the answer was "go", taken once.
@@ -53450,11 +53441,16 @@ mod folder_tests {
             "adopting wrote the settings {} times",
             app.settings_writes.get()
         );
-        let on_disk = Settings::load();
+        // The one write is the LAST thing `adopt_template` does, so what it
+        // wrote is what the struct held at that moment. Asked of the struct
+        // rather than read back from disk: the settings file is one shared
+        // path for every test in this process, and a neighbour's save can
+        // land between this write and a read-back (it did, under the
+        // `settings` filter, and the read-back came back naming nothing).
         assert!(
-            std::path::Path::new(&on_disk.project_path).starts_with(&scratch),
+            std::path::Path::new(&app.settings.project_path).starts_with(&scratch),
             "the one write named {}, not the scratch",
-            on_disk.project_path
+            app.settings.project_path
         );
         let _ = std::fs::remove_dir_all(&root);
     }
