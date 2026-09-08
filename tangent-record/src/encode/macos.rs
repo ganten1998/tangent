@@ -157,7 +157,7 @@ impl Encoder {
         // and "cannot write" is a bad way to learn that.
         let _ = std::fs::remove_file(path);
 
-        let url = unsafe { NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy())) };
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
         let file_type = unsafe { AVFileTypeMPEG4 }.ok_or("AVFileTypeMPEG4 is missing")?;
         let writer = unsafe { AVAssetWriter::assetWriterWithURL_fileType_error(&url, file_type) }
             .map_err(|e| format!("could not create the video file: {e}"))?;
