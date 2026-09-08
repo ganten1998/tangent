@@ -40594,7 +40594,7 @@ mod tests {
             assert!(chip.is_positive(), "the first channel wears no input chip");
             chip.center()
         };
-        ctx.run(
+        let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                 events: vec![
@@ -40760,7 +40760,7 @@ mod tests {
         // Two quick clicks: egui fires the double on the second press.
         for _ in 0..2 {
             for pressed in [true, false] {
-                ctx.run(
+                let _ = ctx.run(
                     egui::RawInput {
                         screen_rect: Some(Rect::from_min_size(
                             Pos2::ZERO,
@@ -40879,7 +40879,7 @@ mod tests {
                 assert!(cell.is_positive(), "master bay {slot} drew nowhere");
                 cell.center()
             };
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                     events: vec![
@@ -40933,7 +40933,7 @@ mod tests {
                     l.header_rows[0].panel.center()
                 }
             };
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                     events: vec![
@@ -40974,7 +40974,7 @@ mod tests {
                 .expect("the view did not open");
             // A press in the covered area, where piano keys live underneath.
             let p = Pos2::new(covered.center().x, covered.bottom() - 10.0);
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                     events: vec![
@@ -45137,7 +45137,7 @@ mod tests {
             app.selected_channel = None;
             app.selected_tracks.clear();
             app.dialog = None;
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                     events: vec![
@@ -45183,7 +45183,7 @@ mod tests {
         let _ = run_frame(&ctx, &mut app);
         let rect = app.mixer_rect.expect("mixer rect");
         let frame = |app: &mut TangentApp, events: Vec<egui::Event>| {
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(
                         Pos2::ZERO,
@@ -45272,7 +45272,7 @@ mod tests {
         let _ = run_frame(&ctx, &mut app);
         let rect = app.arrangement_rect.expect("arrange rect");
         let frame = |app: &mut TangentApp, events: Vec<egui::Event>| {
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(
                         Pos2::ZERO,
@@ -50579,7 +50579,7 @@ mod tests {").expect("the tests module")];
         for _round in 0..4 {
             for _ in 0..2 {
                 for pressed in [true, false] {
-                    ctx.run(
+                    let _ = ctx.run(
                         egui::RawInput {
                             screen_rect: Some(Rect::from_min_size(
                                 Pos2::ZERO,
@@ -50671,7 +50671,7 @@ mod tests {").expect("the tests module")];
         /// A plain frame with no events. NOT `run_frame`, which pops one
         /// request off the queue and throws it away — the note-off among them.
         fn idle(ctx: &egui::Context, app: &mut TangentApp) {
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                     ..Default::default()
@@ -50690,7 +50690,7 @@ mod tests {").expect("the tests module")];
 
         for _ in 0..2 {
             for pressed in [true, false] {
-                ctx.run(
+                let _ = ctx.run(
                     egui::RawInput {
                         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                         events: vec![

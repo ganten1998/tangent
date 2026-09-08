@@ -91,7 +91,7 @@ mod tests {
     fn the_party_ends_and_says_so() {
         let ctx = egui::Context::default();
         let mut ended = true;
-        ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
                 assert!(draw(ui.painter(), r, 0.1), "the party never started");

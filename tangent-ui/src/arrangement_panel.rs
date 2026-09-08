@@ -9089,7 +9089,7 @@ ArrangeView {
                     v.tempo_hot = Some(2);
                     v.meter_edit = Some((5, "7/"));
                     let r = Rect::from_min_size(Pos2::ZERO, size);
-                    ctx.run(Default::default(), |ctx| {
+                    let _ = ctx.run(Default::default(), |ctx| {
                         egui::Area::new("tempo-probe".into()).show(ctx, |ui| {
                             draw(ui.painter(), r, &v);
                         });
@@ -9149,7 +9149,7 @@ selected: false,
                 let r = Rect::from_min_size(Pos2::ZERO, size);
                 // Painting is the assertion: a NaN or an inverted rect
                 // panics in egui's tessellator rather than drawing wrong.
-                ctx.run(Default::default(), |ctx| {
+                let _ = ctx.run(Default::default(), |ctx| {
                     egui::Area::new("auto-probe".into()).show(ctx, |ui| {
                         draw(ui.painter(), r, &v);
                     });

@@ -1042,7 +1042,7 @@ mod tests {
     fn draw_once(ctx: &egui::Context, live: &mut FaceLive, st: &FaceStyle, events: Vec<egui::Event>) -> Option<FaceAction> {
         let mut asked = None;
         let room = Vec2::new(900.0, 560.0 - crate::shell::CHROME_BAR_H);
-        ctx.run(
+        let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, room)),
                 events,
