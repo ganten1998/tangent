@@ -569,6 +569,41 @@ fn write_perf_projects() {
     }
 }
 
+/// The seat the far-seat fixture fills, and with what. Bay 4149 is a pad's
+/// own effect seat, far past the 108-seat head; the path is the shape a
+/// real one has, so an older build that keeps it would try to load it.
+pub(crate) const FAR_SEAT: usize = 4149;
+pub(crate) const FAR_SEAT_PATH: &str = "/Library/Audio/Plug-Ins/VST3/Brusfri.vst3";
+
+/// **A document with a seat past the head**, beside `perf-S`, for the
+/// cross-version check. The shipped desk's two occupied seats both sit
+/// inside the head, so `perf-S` writes no `inserts_tail` and a build
+/// before v7 opens it whole; this one seats a plug-in in [`FAR_SEAT`] so
+/// the tail is written and an OLDER reader's answer to it (keep the head,
+/// drop the far seat) can be watched rather than argued. Written without
+/// media: the takes are `perf-S`'s, and the document is what is under test.
+#[test]
+#[ignore]
+fn write_far_seat_project() {
+    let Some(out) = std::env::var_os("TANGENT_PERF_OUT") else {
+        println!("set TANGENT_PERF_OUT=/some/dir to write the fixture; nothing written");
+        return;
+    };
+    let dir = PathBuf::from(out).join("perf-S-far");
+    let mut arr = arrangement(Size::S);
+    arr.desk.as_mut().expect("the fixture carries a desk").set_bay(FAR_SEAT, FAR_SEAT_PATH);
+    std::fs::create_dir_all(&dir).expect("project dir");
+    let doc = dir.join(crate::arrangement::DOC_NAME);
+    arr.save_to(&doc);
+    let text = std::fs::read_to_string(&doc).expect("the document just written");
+    assert!(text.contains("\"inserts_tail\""), "the far seat did not reach the tail");
+    println!(
+        "fixture S-far: seat {FAR_SEAT} = {FAR_SEAT_PATH}, doc {:.1} KB -> {}",
+        text.len() as f64 / 1024.0,
+        dir.display()
+    );
+}
+
 /// The fixture is a fixed point of the document reader, and is the shape it
 /// claims to be. Not ignored: it is what makes the sizes trustworthy, and it
 /// costs a few hundred milliseconds in debug.
