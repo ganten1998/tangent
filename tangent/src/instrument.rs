@@ -1547,6 +1547,16 @@ impl PadKit {
 /// FTZ + DAZ on this thread (x86 only; a no-op elsewhere). Bit 15 is
 /// flush-to-zero, bit 6 denormals-are-zero — a tail decaying into
 /// subnormals runs orders of magnitude slower on x86 without them.
+///
+/// **The deprecation is Rust's, and the replacement is hand-written inline
+/// assembly.** `_mm_getcsr`/`_mm_setcsr` are deprecated because LLVM does
+/// not model MXCSR, so the intrinsics can be reordered around the float
+/// work they are meant to govern; the sanctioned fix is `stmxcsr`/`ldmxcsr`
+/// through `asm!`. That is a change to the denormal handling of the audio
+/// thread on a target this machine cannot run, so it is not made in a lint
+/// pass: the call stays and this says why. Rust 1.97.1 offers no safe
+/// intrinsic to move to.
+#[allow(deprecated)]
 #[inline]
 fn flush_denormals() {
     #[cfg(target_arch = "x86_64")]
