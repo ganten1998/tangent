@@ -8359,7 +8359,7 @@ impl Renderer {
             if mc.strip.min(CHANNELS - 1) != ch {
                 continue;
             }
-            if at < mc.start || at >= mc.start + mc.len {
+            if at < mc.start || at >= mc.start.saturating_add(mc.len) {
                 continue;
             }
             let rel = at - mc.start;
@@ -8686,7 +8686,7 @@ impl Renderer {
                     let mut cur = self.midi_cursor.get(idx).copied().unwrap_or(0);
                     while cur < mc.notes.len() {
                         let nt = mc.notes[cur];
-                        let on_f = mc.start + nt.at;
+                        let on_f = mc.start.saturating_add(nt.at);
                         if on_f >= end {
                             break;
                         }
@@ -8760,11 +8760,11 @@ impl Renderer {
                             velocity: f32::from(nt.vel) / 127.0,
                             on: true,
                         });
-                        let end_rel = (nt.at + nt.dur.max(1)).min(mc.len);
+                        let end_rel = nt.at.saturating_add(nt.dur.max(1)).min(mc.len);
                         self.active_clip.push(ActiveClipNote {
                             lane: ch as u8,
                             key: nt.key,
-                            off: mc.start + end_rel,
+                            off: mc.start.saturating_add(end_rel),
                         });
                         if nt.key < 128 {
                             self.sounding |= 1u128 << nt.key;
