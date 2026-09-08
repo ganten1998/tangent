@@ -13042,6 +13042,10 @@ impl Engine {
     /// ASIO: a stop and a start on a driver the SDK has unloaded is the null
     /// read the Windows crash of 2026-09-05 was made of, and the caller keeps
     /// this behind `cfg(target_os = "macos")` for exactly that reason.
+    ///
+    /// Which is why it reads as dead off macOS: there is no caller there,
+    /// deliberately.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn restart_output(&self) -> Result<(), String> {
         use cpal::traits::StreamTrait;
         let stream = self.stream.as_ref().ok_or("no output stream to start")?;
@@ -15056,6 +15060,12 @@ impl Default for StallWatch {
 /// before. A stall hours after a successful restart gets a fresh budget:
 /// the count having moved since the last try is what says the last try
 /// worked. Pure — fed the callback count — so it is tested without a device.
+///
+/// Only macOS acts on it — see `restart_output` — so off macOS the whole
+/// type is built, tested and never consulted. It stays ungated because the
+/// tests are the point: it is the one part of the stall answer that can be
+/// checked without a device, on whatever machine is to hand.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub struct StallRecovery {
     tries: u8,
@@ -15063,6 +15073,7 @@ pub struct StallRecovery {
     at: Option<u64>,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl StallRecovery {
     /// Restarts before a rebuild. Five is ten seconds at the watch's two,
     /// which is longer than any flap measured and shorter than anybody would
