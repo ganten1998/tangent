@@ -12718,6 +12718,21 @@ impl Engine {
     /// never read a half-written table: growing, the new words land before
     /// the count that admits them; shrinking, the count drops before the
     /// words go. A torn read would route a channel to a jack nobody chose.
+    ///
+    /// **The clear is not an oversight, and dropping it is not an
+    /// optimisation.** It leaves a window in which the table reads EMPTY —
+    /// the render loop walks `0..route_n` and so touches no cell at all
+    /// while the count is zero — and the obvious cure, writing the words
+    /// first and publishing the count last, is worse in two ways. A route
+    /// is TWO words, the packed target and its gain, so a reader admitted
+    /// by a live count could pair a new target with the previous gain; and
+    /// for every index below the OLD count it would read a table half old
+    /// and half new. What the window costs as it stands is one block of an
+    /// unrouted output, and only on an edit — `push_monitor_settings`
+    /// publishes under a change gate, not every frame — against a block
+    /// sent somewhere nobody chose. A publish with neither fault needs two
+    /// tables and an index to flip between them, which is a different
+    /// change from reordering two stores.
     pub fn set_routes(&self, routes: &tangent_ui::routing::Routes) {
         use tangent_ui::routing::Target;
         let n = routes.0.len().min(MAX_ROUTES);
@@ -12754,6 +12769,14 @@ impl Engine {
     /// worst a racing chunk can do is feed one block of the OLD table or of
     /// silence — and a key only modulates a detector, it moves no audio, so
     /// one such block is a meter flicker and not a wrong sample.
+    ///
+    /// **Here least of all may the count be stored last.** `insert_key` is a
+    /// SPARSE map indexed by `seat * INSERTS + bay`, not a dense prefix the
+    /// count bounds, so removing an edge means writing a zero into that
+    /// edge's own cell — there is no count that can hide it. Publishing the
+    /// count after the cells would therefore leave a chunk reading a table
+    /// with some edges cleared and others not yet written, which is exactly
+    /// the outcome the paragraph above rules out.
     // `&self`, like `set_routes`: the whole write is interior atomics, and
     // the publish path holds the engine by shared reference.
     pub fn set_insert_keys(&self, keys: &[(usize, usize, usize)]) {
@@ -13083,6 +13106,14 @@ impl Engine {
         }
     }
 
+    /// **Hand the audio thread the arrangement's audio schedule, whole.**
+    ///
+    /// The new list goes over on a two-slot ring and the callback swaps it
+    /// in; the list it DISPLACES comes back on the retiring ring, to be
+    /// dropped here. That return is the whole reason there is a ring in each
+    /// direction: a schedule holds `Arc`s on every decoded file in the
+    /// session, and freeing a hundred megabytes inside the callback is a
+    /// dropout.
     ///
     /// **It no longer WAITS for that return.** It used to spin, a
     /// millisecond at a time, until the callback handed the old list back —
@@ -19336,8 +19367,6 @@ mod tests {
         crate::builtin_fx::state_text(spec, &v, &[]).into_bytes()
     }
 
-    /// One constant mono clip on one lane, a second long — the key tests'
-    /// signal, because a constant's level needs no window to agree on.
     /// **A schedule hand-off never sleeps on the UI thread, and the newest
     /// one wins.** On an offline engine — no callback until a block is
     /// rendered, which is when the old wait burnt its full quarter second —
@@ -19397,6 +19426,8 @@ mod tests {
         assert!(e.midi_pending.is_none());
     }
 
+    /// One constant mono clip on one lane, a second long — the key tests'
+    /// signal, because a constant's level needs no window to agree on.
     fn flat_clip(strip: usize, level: f32) -> Placed {
         Placed {
             clip: Arc::new(tangent_record::decode::Clip {
@@ -20406,9 +20437,6 @@ mod tests {
         assert!(!e.insert_bypassed(3, 1), "an absent entry did not clear");
     }
 
-    /// **A folder inside a folder**, which the single descending fold has to
-    /// get right without recursing: the inner one is the higher index, so it
-    /// finishes and folds into the outer before the outer's turn comes.
     /// **A folder does its folding ONCE.**
     ///
     /// A folder is a channel, so `mix_channels` walked it like any other —
@@ -20889,6 +20917,9 @@ mod tests {
         );
     }
 
+    /// **A folder inside a folder**, which the single descending fold has to
+    /// get right without recursing: the inner one is the higher index, so it
+    /// finishes and folds into the outer before the outer's turn comes.
     #[test]
     fn a_folder_inside_a_folder_reaches_the_master_through_both() {
         use std::sync::Arc;

@@ -704,8 +704,10 @@ pub struct DesktopApp {
     window_minimized: Option<bool>,
     /// **The host's half of the resting window's ledger** — see
     /// `host_frame_due`. `meters_live` is decided in `fill_recorder_state`
-    /// from the numbers it just read (any meter, needle, hold, needle or
-    /// pad above the floor); `camera_wanted` is whether frames are being
+    /// from the numbers it just read — an input or master meter, a hold
+    /// line, a strip peak, the limiter's gain reduction, a pad, a lane the
+    /// timeline is sounding, or a loudness window still above silence;
+    /// `camera_wanted` is whether frames are being
     /// asked of the capture thread, which arrive on its clock and not
     /// ours; `activity_at` is the last input event, MIDI event or
     /// session/transport edge, after which frames keep coming for
@@ -1574,38 +1576,6 @@ fn amp_board_to_seed(
     untouched.then_some((ch, AMP_DEFAULT_BOARD))
 }
 
-/// **Seed the board an amp landing in `seat` should wear — and switch every
-/// pedal of it OFF.**
-///
-/// A free function on the app rather than a block inside the reconcile, for
-/// the reason [`amp_board_to_seed`] is a lookup rather than a settings read:
-/// the decision was already testable as plain logic and the WRITES were not,
-/// and the writes are where the interesting half now lives. A test can drive
-/// this against a headless `TangentApp` and read back both what landed and
-/// what state it landed in; nothing could drive the reconcile, which needs an
-/// engine, a device and a frame.
-///
-/// **The board arrives dressed, and it arrives silent.** Seven pedals in
-/// series is a sound nobody asked for on an amp somebody has only just
-/// loaded — a compressor, a wah, a drive, a chorus, a tremolo, a delay and a
-/// plate, all at their defaults, between a guitar and the first note played
-/// through it. The owner's words on the shipped build: they "should be off
-/// by default for beta testing".
-///
-/// Off means BYPASSED and not absent, which is the whole reason the seed is
-/// worth keeping: every pedal is loaded, named on its chip, openable in its
-/// own window and one shift-click from being in circuit. That is only honest
-/// because the state can be SEEN — `faces_amp` draws a bypassed chip on the
-/// well, struck through, and the pedal's own face carries a BYPASS button —
-/// and shipping it bypassed without those two would be a board that
-/// mysteriously does nothing, which is worse than the loudness it avoids.
-///
-/// **The bypass is written AFTER the tenant, and that ordering is
-/// load-bearing.** `TangentApp::set_insert` drops a bay's bypass whenever the
-/// tenant really changes, precisely so a flag cannot be left behind to
-/// silence the NEXT plugin to land there — so a flag written first would be
-/// wiped by the very write that puts the pedal in the seat.
-#[cfg(feature = "recorder")]
 /// Copy a chosen click sound into Tangent's own config directory and answer
 /// where it landed. See the caller for why the file is kept rather than
 /// pointed at.
@@ -1640,6 +1610,38 @@ fn keep_click_sample(file: &std::path::Path) -> std::io::Result<std::path::PathB
     keep_click_sample_in(&tangent_core::config::dir().join("click"), file)
 }
 
+/// **Seed the board an amp landing in `seat` should wear — and switch every
+/// pedal of it OFF.**
+///
+/// A free function on the app rather than a block inside the reconcile, for
+/// the reason [`amp_board_to_seed`] is a lookup rather than a settings read:
+/// the decision was already testable as plain logic and the WRITES were not,
+/// and the writes are where the interesting half now lives. A test can drive
+/// this against a headless `TangentApp` and read back both what landed and
+/// what state it landed in; nothing could drive the reconcile, which needs an
+/// engine, a device and a frame.
+///
+/// **The board arrives dressed, and it arrives silent.** Seven pedals in
+/// series is a sound nobody asked for on an amp somebody has only just
+/// loaded — a compressor, a wah, a drive, a chorus, a tremolo, a delay and a
+/// plate, all at their defaults, between a guitar and the first note played
+/// through it. The owner's words on the shipped build: they "should be off
+/// by default for beta testing".
+///
+/// Off means BYPASSED and not absent, which is the whole reason the seed is
+/// worth keeping: every pedal is loaded, named on its chip, openable in its
+/// own window and one shift-click from being in circuit. That is only honest
+/// because the state can be SEEN — `faces_amp` draws a bypassed chip on the
+/// well, struck through, and the pedal's own face carries a BYPASS button —
+/// and shipping it bypassed without those two would be a board that
+/// mysteriously does nothing, which is worse than the loudness it avoids.
+///
+/// **The bypass is written AFTER the tenant, and that ordering is
+/// load-bearing.** `TangentApp::set_insert` drops a bay's bypass whenever the
+/// tenant really changes, precisely so a flag cannot be left behind to
+/// silence the NEXT plugin to land there — so a flag written first would be
+/// wiped by the very write that puts the pedal in the seat.
+#[cfg(feature = "recorder")]
 fn seed_amp_board(app: &mut tangent_ui::app::TangentApp, seat: usize) {
     // The SEAT the amp landed in, which for a group's bays 3..5 is not its
     // channel — `amp_board_to_seed` is the one place that translates, and it
@@ -4530,6 +4532,14 @@ impl DesktopApp {
             }
         }
 
+        // **A bay that loaded changed the desk after the frame that would
+        // have drawn it.** The tick below covers a batch — it is asked while
+        // bays are still outstanding — but not the LAST bay of one: that
+        // frame's walk counts zero, the cover stands down, and the plugin's
+        // face, its parameter list and any sentence its failure left would
+        // have waited for the next mouse move. See `late_change`.
+        late_change(ctx, due.is_some());
+
         // One walk, two answers — the bay to announce and the size of the
         // wait. See `insert_walk`, which is where the reasoning lives. Taken
         // AFTER the load above, so what it counts is what is left.
@@ -4628,7 +4638,14 @@ impl DesktopApp {
         if self.app.take_clips_dirty() {
             self.clips_owed = true;
         } else if self.app.arr_waves_stale() {
-            self.refresh_pictures();
+            // The pictures are remade here, at the end of the frame that
+            // moved the view — so the frame that DRAWS them has to be asked
+            // for. `refresh_pictures` answers whether it made any: with no
+            // arrangement on screen it makes none and asks for nothing,
+            // which is what keeps a stale flag from spinning the window.
+            // See `late_change`.
+            let made = self.refresh_pictures();
+            late_change(ctx, made);
         }
 
         // **The drumpad's kit, on the same bargain**: a drop, a clear or a
@@ -4643,7 +4660,7 @@ impl DesktopApp {
         // **The click's sound, on the same bargain.** Decoded here, off the
         // audio thread, and handed over on the engine's own ring.
         if self.app.take_click_sample_dirty() {
-            self.reload_click();
+            self.reload_click(ctx);
         }
 
 
@@ -9410,10 +9427,16 @@ impl DesktopApp {
         }
         // What the crew finished since last frame goes into the caches
         // first; a landed clip is a schedule the engine has not heard.
-        if self.land_decodes() {
+        if self.land_decodes(ctx) {
             self.clips_owed = true;
         }
+        // **Nothing owed, nothing queued, nothing in the crew's hands** —
+        // which is also a decode meter with no work left under it. See
+        // `settle_warm_meter`: this return is reachable with the cover
+        // still standing, and the drain below is not the only road that
+        // owes it an exit.
         if !self.clips_owed && !self.pads_owed && self.warm.is_empty() && self.pool.idle() {
+            self.settle_warm_meter();
             return;
         }
         // **The notes do not wait on the decoder.** See
@@ -9428,7 +9451,38 @@ impl DesktopApp {
                 // file is still on its way: the clock restarts, so the
                 // schedule is refreshed four times a second as files land
                 // and settled for good at the drain. See `Decode`.
-                if self.reload_clips(Decode::CachedOnly, ctx) {
+                //
+                // **A door that fired PUSHED, so it owes the frame that
+                // draws what it pushed.** `reload_clips` has no early
+                // return: every path through it ends in `set_clip_infos`
+                // and `set_track_info`, and both are bare stores on the far
+                // side of the firewall with no repaint of their own. So this
+                // is a road that changes the desk after the frame that would
+                // have drawn it, exactly like the five in `after_frame`, and
+                // it was left out when those were walked.
+                //
+                // It is reachable with nothing at all behind it. On the
+                // frame the LAST file lands, `land_decodes` raises the debt,
+                // this door answers it — everything is cached now, so
+                // `deferred` is false and the debt closes — and the drain
+                // below then finds the debt already cleared, so it reports
+                // no reload and asks for no frame. The cover comes down on
+                // that same frame, and `paint_busy` returns without asking
+                // either once the overlay has served its minimum. With an
+                // engine open the idle poll draws it a quarter second late;
+                // with no engine (the device would not open, and decoding
+                // runs at the default rate regardless) nothing polls at all
+                // and the last take's waveform waits for a mouse move.
+                //
+                // Unconditional, and honest: the reload pushes whatever it
+                // built, every time it runs. It cannot cost a resting
+                // window, because the door only runs while a debt stands, a
+                // debt is transient — this line closes it or the drain does
+                // — and the deadline lets it through four times a second at
+                // worst.
+                let deferred = self.reload_clips(Decode::CachedOnly, ctx);
+                late_change(ctx, true);
+                if deferred {
                     self.clips_owed_at = Some(std::time::Instant::now());
                 } else {
                     self.clips_owed = false;
@@ -9482,18 +9536,10 @@ impl DesktopApp {
         // latency on every note anybody draws, since an edit marks the
         // clips dirty.
         if self.warm.is_empty() && self.pool.idle() {
-            // The same courtesy the insert meter gets: the frame the queue
-            // empties on is the only one that can read "12 of 12".
-            if !self.warm_count.idle() && self.busied == Busied::Decode {
-                let progress = self.warm_count.saw(0).progress();
-                if let Some(busy) = self.busy.as_mut() {
-                    busy.detail = None;
-                    busy.progress = Some(progress);
-                }
-            }
-            self.warm_count = Counted::default();
-            self.busy_chunk_done(Busied::Decode);
+            self.settle_warm_meter();
+            let mut reloaded = false;
             if std::mem::take(&mut self.clips_owed) {
+                reloaded = true;
                 self.clips_owed_at = None;
                 // A stretch still rendering keeps the debt open on the
                 // deadline's clock: the schedule is re-read when the render
@@ -9504,8 +9550,17 @@ impl DesktopApp {
                 }
             }
             if std::mem::take(&mut self.pads_owed) {
+                reloaded = true;
                 self.reload_pads();
             }
+            // **This is the road the decoded take arrives on**, and it is
+            // the only one here that does not ask for a frame of its own:
+            // the meter's tick below belongs to a queue with work left in
+            // it, and this road runs when there is none. A debt is only
+            // owed because something changed — an edit, a device, a file
+            // landing — so a reload having run IS the change, and a pass
+            // that answered nothing asks for nothing. See `late_change`.
+            late_change(ctx, reloaded);
             return;
         }
         // Outstanding is what is queued plus what is in the workers' hands;
@@ -9524,6 +9579,44 @@ impl DesktopApp {
         ctx.request_repaint();
     }
 
+    /// **The decode meter's last reading, and its cover's exit.**
+    ///
+    /// The frame the work runs out on is the only one that can read "45 of
+    /// 45": the reading is taken from what is still OUTSTANDING, so a meter
+    /// whose final state is one short of full is a meter that looks like it
+    /// gave up. The same courtesy the insert loader keeps, for the same
+    /// reason. Then the cover is let go — `busy.rs`'s law, which is that a
+    /// chunked driver owns the overlay until it says it has run out of
+    /// work, and nothing else can take it away.
+    ///
+    /// **Called from BOTH of `run_warm`'s quiet returns, because the second
+    /// one is reachable on its own.** It used to hang off the drain alone,
+    /// and this is the road that got past it: `queue_warm` fills the queue
+    /// while a debt is open, then the deadline door ANSWERS that debt —
+    /// every clip in the document cached or refused — while the queue still
+    /// holds paths no clip references any more, the edit that dropped them
+    /// having landed after they were queued. Those decode, come back, and
+    /// are dropped as unwanted (`land_decodes` keeps only what the document
+    /// still names), so nothing raises a debt again; the next pass arrives
+    /// at the do-nothing return with both flags false, an empty queue and
+    /// an idle crew, and the drain is never reached. "Loading audio" then
+    /// covers the desk for the rest of the session, repainting for ever,
+    /// because `paint_busy` keeps the frames coming while a cover is up.
+    /// Delete the audio clips of a project whose takes are still loading
+    /// and that is precisely what happened.
+    #[cfg(feature = "recorder")]
+    fn settle_warm_meter(&mut self) {
+        if !self.warm_count.idle() && self.busied == Busied::Decode {
+            let progress = self.warm_count.saw(0).progress();
+            if let Some(busy) = self.busy.as_mut() {
+                busy.detail = None;
+                busy.progress = Some(progress);
+            }
+        }
+        self.warm_count = Counted::default();
+        self.busy_chunk_done(Busied::Decode);
+    }
+
     /// Take what the crew has finished into the caches. Answers whether a
     /// CLIP landed — a schedule the engine has not heard yet.
     ///
@@ -9533,7 +9626,14 @@ impl DesktopApp {
     /// not have to visit the cache to leave it. A pad is kept as it lands;
     /// `reload_pads` sweeps its own cache against every drum lane. A
     /// refusal is remembered exactly as the inline road remembers one.
-    fn land_decodes(&mut self) -> bool {
+    ///
+    /// **A landing that had something to SAY asks for its own frame.** A
+    /// clip landing raises `clips_owed`, and the reload that answers it asks
+    /// for the frame that draws the new picture; a notification has no such
+    /// road behind it, and a render that failed while the file it belongs to
+    /// had already left the cache would otherwise put a message on a window
+    /// that is not going to paint again. See `late_change`.
+    fn land_decodes(&mut self, ctx: &egui::Context) -> bool {
         let rate = self
             .recorder
             .engine
@@ -9609,9 +9709,11 @@ impl DesktopApp {
                 }
             }
         }
+        let told = !notes.is_empty();
         for note in notes {
             self.app.notify(Kind::Error, note);
         }
+        late_change(ctx, told);
         clips
     }
 
@@ -9903,11 +10005,23 @@ impl DesktopApp {
         }
         // Lengths the decode just established, written down so the scrubber
         // can draw next launch without one. Never marks the clips dirty.
-        // Empty on nearly every reload, and `note_clip_len` asks the EXACT
-        // dirty question per call, so nothing may be asked when there is
-        // nothing to write.
-        for (id, len_s) in fill_len {
-            self.app.note_clip_len(id, len_s);
+        //
+        // **The whole batch in one call.** The exact "was this project
+        // clean?" question the app asks around a fill is a walk of the
+        // entire document, and the re-mark after it is another; asked per
+        // clip they were paid 2N times on the one frame an N-take session
+        // lands its decodes on, which is also the frame that is already
+        // doing every other thing an open does. Asked once around the batch
+        // they are paid twice, whatever N is. `note_clip_lens` states the
+        // contract; the one difference from asking per clip is in the
+        // conservative direction (a batch that begins dirty stays dirty).
+        //
+        // **And an empty batch costs nothing**, which matters more than it
+        // looks: this list is empty on nearly every reload, and a reload
+        // runs on every clips-dirty edit, so a drag would otherwise pay a
+        // document walk per frame for nothing.
+        if !fill_len.is_empty() {
+            self.app.note_clip_lens(&fill_len);
         }
         // Files no clip references any more leave the cache with the edit.
         // **Only when there is a document to resolve against.** Without one
@@ -9970,9 +10084,28 @@ impl DesktopApp {
     /// so would be asked again every frame for ever. The panel is being
     /// taught to read `ClipInfo.peaks` directly; when it does, `arr_waves_
     /// stale` will stop asking and this will simply never run.
-    fn refresh_pictures(&mut self) {
+    ///
+    /// **Answers whether it pushed at all**, because the caller has to ask
+    /// for the frame that draws what it pushed and must not ask for one it
+    /// does not need — see `late_change`. With no window on screen there is
+    /// nothing to make a picture FOR and nothing is pushed; that is the
+    /// answer that matters, because the road is walked on EVERY frame for as
+    /// long as the flag stands (no view means `note_waves_drawn` is never
+    /// answered either, so the flag goes on standing), and an unconditional
+    /// repaint there would be a window that never rests again.
+    ///
+    /// **Said exactly: it is "was there a view to draw", not "is this set
+    /// different from the one on screen".** A pass that reaches the end
+    /// answers `true` even when the set it pushed is EMPTY, and that is not
+    /// a slip — a document whose last audio clip has just gone pushes an
+    /// empty set, and the window has to be told to stop drawing the one it
+    /// still has. Answering the sharper question would mean comparing the
+    /// new infos against the last ones pushed, which is a walk of every clip
+    /// on a road that already exists to be cheap; the flag it clears is what
+    /// keeps this from running again.
+    fn refresh_pictures(&mut self) -> bool {
         let Some(wave_view) = self.app.arr_wave_view() else {
-            return;
+            return false;
         };
         let rate = self
             .recorder
@@ -10003,6 +10136,7 @@ impl DesktopApp {
         }
         self.app.set_clip_infos(clip_infos);
         self.app.note_waves_drawn(wave_view);
+        true
     }
 
     /// The drumpad's samples: decode every slot at the engine's rate, push
@@ -10015,8 +10149,13 @@ impl DesktopApp {
     /// the setting is LEFT alone in the failure cases — a sound file living
     /// on a drive that is not plugged in today should come back tomorrow, not
     /// be forgotten because it was missing once.
+    ///
+    /// The refusal is the one thing here the window shows, so it is the one
+    /// thing that asks for a frame — this runs after the frame that would
+    /// have drawn it, and a rested window has nothing else coming. See
+    /// `late_change`.
     #[cfg(feature = "recorder")]
-    fn reload_click(&mut self) {
+    fn reload_click(&mut self, ctx: &egui::Context) {
         let path = self.app.click_sample().to_owned();
         let Some(engine) = self.recorder.engine.as_mut() else {
             return;
@@ -10033,6 +10172,7 @@ impl DesktopApp {
                     error: format!("that click sound would not load: {e}"),
                     ..Default::default()
                 });
+                late_change(ctx, true);
             }
         }
     }
@@ -11161,19 +11301,6 @@ impl DesktopApp {
         }
     }
 
-    /// Copy the faders, the click and the tempo into the audio thread.
-    ///
-    /// Every frame, unconditionally. These are all atomic stores of a float or
-    /// a bool behind a smoothing ramp, so writing an unchanged value costs
-    /// nothing — and a change-detection cache here would be a second copy of
-    /// the settings to get out of step with the first.
-    /// Hand the desk's routes to the engine, dropping any that the current
-    /// device cannot honour.
-    ///
-    /// Pruning here rather than at the picker: the picker knows what the
-    /// device offered when it opened, and this runs every frame — so a route
-    /// survives an interface being unplugged and replugged, and is dropped
-    /// only against the device that is actually open.
     /// Tell the app how many outputs the open device has, so the routing
     /// picker offers the jacks that exist rather than a guess.
     fn publish_device_outs(&mut self) {
@@ -11185,17 +11312,37 @@ impl DesktopApp {
         self.app.set_device_outs(outs);
     }
 
+    /// Hand the desk's routes to the engine, dropping any that the current
+    /// device cannot honour.
+    ///
+    /// Pruning here rather than at the picker: the picker knows only what the
+    /// device offered when it opened, and the pruned copy is never written
+    /// back to the desk — so a route survives an interface being unplugged
+    /// and replugged, and is dropped only against the device that is actually
+    /// open. The device width is part of the change key the caller compares
+    /// (`desk_unchanged` takes `outs`), precisely so a swap for a narrower
+    /// interface re-prunes rather than leaving a channel pointed at a jack
+    /// that is gone.
+    ///
+    /// **Not every frame.** It used to be, and the doc above this said so
+    /// until the day the sentence outlived the code: the caller puts this and
+    /// `set_desk` behind `desk_unchanged` now, because each of them is a
+    /// table walk on the engine's side rather than one atomic store. What the
+    /// engine does with the tables when they DO go over — clear the count,
+    /// write the cells, publish the count — is `Engine::set_routes`' own
+    /// argument, and it is worth reading before touching either end.
     fn publish_routes(&self, e: &crate::instrument::Engine) {
         let outs = e.output().channels as usize;
         let mut routes = self.app.routes().clone();
         routes.prune(outs, tangent_ui::recorder::CHANNELS);
         e.set_routes(&routes);
-        // **The sidechain key table rides beside the routes**, whole each
-        // frame on the same bargain: absent means cleared, so the engine
-        // never keeps an edge the desk no longer has. The desk speaks
-        // (strip, slot) so saved edges survive seat renumbering; the engine
-        // speaks (seat, bay), and THIS is the one place the translation
-        // happens — through `seat_bay`, like every other slot address.
+        // **The sidechain key table rides beside the routes**, whole on
+        // every publish and on the same bargain: absent means cleared, so
+        // the engine never keeps an edge the desk no longer has. The desk
+        // speaks (strip, slot) so saved edges survive seat renumbering; the
+        // engine speaks (seat, bay), and THIS is the one place the
+        // translation happens — through `seat_bay`, like every other slot
+        // address.
         let keys: Vec<(usize, usize, usize)> = self
             .app
             .insert_keys()
@@ -11208,13 +11355,21 @@ impl DesktopApp {
             })
             .collect();
         engine_set_insert_keys(e, &keys);
-        // **And the bypassed bays**, whole each frame on the same bargain:
-        // absent means in circuit. Already in SEAT terms - a bypass is stored
-        // at the plugin's own address - so unlike the keys above there is no
-        // `seat_bay` translation here to get wrong.
+        // **And the bypassed bays**, whole on every publish and on the same
+        // bargain: absent means in circuit. Already in SEAT terms - a bypass
+        // is stored at the plugin's own address - so unlike the keys above
+        // there is no `seat_bay` translation here to get wrong.
         engine_set_insert_bypass(e, self.app.insert_bypass());
     }
 
+    /// Copy the faders, the click and the tempo into the audio thread.
+    ///
+    /// Every frame, unconditionally. These are all atomic stores of a float
+    /// or a bool behind a smoothing ramp, so writing an unchanged value costs
+    /// nothing — and a change-detection cache here would be a second copy of
+    /// the settings to get out of step with the first. The TABLES in the
+    /// middle of this function are the exception and say why where they sit:
+    /// a table is a walk, not a store.
     fn push_monitor_settings(&mut self) {
         // **The live tap, if one has been waiting for an engine to appear.**
         //
@@ -17236,6 +17391,34 @@ fn run_decode_job(decoder: &Decoder, job: &DecodeJob) -> Result<Decoded, String>
 #[cfg(feature = "recorder")]
 const EXPORT_RUNNING: &str = "export-running";
 
+/// **Something changed AFTER the frame that would have drawn it — ask for
+/// the frame that will.**
+///
+/// The one door for the whole of `after_frame`, and it exists because the
+/// window RESTS now. `paint` no longer ends with an unconditional tick:
+/// a frame happens when an animator asks for one, and nothing else. But
+/// every slow thing in this file runs at the END of a frame, after the app
+/// has painted — a decode landing in the caches, a picture remade for a
+/// view that moved, a plugin's face arriving in its bay. Each of those
+/// changes what the window is showing at the one moment the window is not
+/// going to be shown again, so the new picture sat in the app's ports
+/// until the user happened to move the mouse. The decoded take was
+/// invisible; the file was open, the sound was there, the waveform was
+/// not.
+///
+/// **And it takes an answer rather than being called unconditionally.** A
+/// repaint on every pass through `after_frame` is the 50 ms tick back under
+/// another name — the whole of what the resting window bought, spent on a
+/// road that usually changed nothing. So every caller says whether it
+/// really changed something, and a caller that cannot honestly say so has
+/// to learn to.
+#[cfg(feature = "recorder")]
+fn late_change(ctx: &egui::Context, changed: bool) {
+    if changed {
+        ctx.request_repaint();
+    }
+}
+
 /// Whether a reload has anything to do in a bay: something is in it, or
 /// something is coming to it.
 ///
@@ -18190,14 +18373,25 @@ mod tests {
             "nothing hands the notes over on a deadline any more, so MIDI is \
              back to waiting on whatever the audio decoder is doing"
         );
+        // **The WHOLE function, not a fixed window off its front.** This
+        // read `&body[at..at + 2_000]` and the ordering below stopped being
+        // able to fail: the pop is 4,700 characters into `run_warm` and was
+        // already past the window on the day the window was written, so
+        // `unwrap_or(usize::MAX)` answered "not found" and `door < pop` was
+        // true whatever the code said. A fixed-width source window is a
+        // guard with a shelf life; the end of the function is a landmark
+        // that moves with it.
         let warm = body
             .find("fn run_warm")
-            .map(|at| &body[at..body.len().min(at + 2_000)])
+            .map(|at| &body[at..])
             .expect("run_warm is still called that");
+        let warm = &warm[..warm.find("fn settle_warm_meter").expect("the exit follows")];
         let door = warm
             .find("CLIPS_OWED_DEADLINE")
             .expect("the deadline is checked inside run_warm");
-        let pop = warm.find("self.warm.pop_front()").unwrap_or(usize::MAX);
+        let pop = warm
+            .find("self.warm.pop_front()")
+            .expect("the queue is still popped inside run_warm");
         assert!(
             door < pop,
             "the deadline is checked AFTER the queue is popped, so a queue \
@@ -18529,6 +18723,176 @@ mod tests {
         assert_eq!(stretch_step(&mut seen, 7, &key(1_500_000), false), StretchStep::Submit);
     }
 
+    /// **A window that has come to rest**: two empty passes, because a
+    /// fresh `Context` is born owing one frame and spends it on the first.
+    /// After this `has_requested_repaint` is the honest question "does
+    /// anything want to be drawn", which is what these two tests ask.
+    fn rested_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |_| {});
+        }
+        assert!(!ctx.has_requested_repaint(), "the window would not settle");
+        ctx
+    }
+
+    /// **A worker that lands a file wakes a window that is asleep.**
+    ///
+    /// The half of the resting window's bargain that the CREW keeps, and it
+    /// is `DecodePool::hire`'s `wake.request_repaint()` this pins, not
+    /// anything in `late_change` — delete that door entirely and this stays
+    /// green. Named for what it guards, because the guard on the late roads
+    /// themselves is the source scan two tests below and a reader who
+    /// mistook this one for it would think those roads were driven.
+    ///
+    /// Worth its own test all the same: nothing asks for a frame while
+    /// nothing moves, so a decode that comes back on a worker thread has to
+    /// ask for one itself or it is a take that finished behind a window that
+    /// will not draw it. A context nobody has touched has no repaint
+    /// pending; one landing is enough to give it one.
+    #[test]
+    fn a_worker_that_lands_a_file_wakes_a_resting_window() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = DecodePool::with_decoder(2, counting_decoder(calls));
+        let ctx = rested_context();
+        pool.submit(
+            Warm::Clip(std::path::PathBuf::from("/takes/late.wav")),
+            Work::Decode,
+            48_000,
+            &ctx,
+        );
+        assert_eq!(drain_until(&mut pool, 48_000, 1).len(), 1, "the file lands");
+        assert!(
+            ctx.has_requested_repaint(),
+            "the crew landed a file and nothing asked for the frame that \
+             draws it: the take is decoded and invisible until somebody \
+             moves the mouse"
+        );
+    }
+
+    /// **And the roads that run AFTER a frame ask for the one that draws
+    /// them — only when they really changed something.**
+    ///
+    /// `late_change` is the whole rule in one line, and both halves of it
+    /// matter: no repaint at all is the invisible take the crew's own wake
+    /// prevents above; an
+    /// unconditional one is the 50 ms tick back under another name, on a
+    /// road that is walked on every frame and usually changes nothing.
+    #[test]
+    fn a_change_made_after_the_frame_asks_for_a_frame_and_nothing_else_does() {
+        let ctx = rested_context();
+        super::late_change(&ctx, false);
+        assert!(
+            !ctx.has_requested_repaint(),
+            "a pass that changed nothing must not wake the window"
+        );
+        super::late_change(&ctx, true);
+        assert!(ctx.has_requested_repaint(), "a pass that changed something must");
+    }
+
+    /// **Every road in `after_frame` that changes what is on screen goes
+    /// through `late_change`, and the road that changes nothing does not.**
+    ///
+    /// A source scan because `DesktopApp` cannot be built in a test (the
+    /// precedent is `every_one_launch_shuffle_is_reached_only_through_its_
+    /// own_taken_flag`), and every one of these is a road whose fault is
+    /// invisible: the work happens, the state is right, and the window
+    /// simply never paints it. What it pins is that each caller passes an
+    /// ANSWER wherever it has one — only the two roads that cannot fail to
+    /// have changed something may spell `true` — and that the warm-up's
+    /// do-nothing return asks for nothing at all.
+    #[test]
+    fn the_late_roads_ask_for_a_frame_and_the_idle_one_does_not() {
+        let src = include_str!("desktop.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        assert!(
+            body.contains("fn late_change(ctx: &egui::Context, changed: bool) {"),
+            "the one door for a change made after the frame is gone"
+        );
+        for (road, ask) in [
+            ("the view moved", "let made = self.refresh_pictures();\n            late_change(ctx, made);"),
+            ("a reload ran", "late_change(ctx, reloaded);"),
+            ("a landing spoke", "late_change(ctx, told);"),
+            ("a bay loaded", "late_change(ctx, due.is_some());"),
+            (
+                "the deadline door reloaded",
+                "let deferred = self.reload_clips(Decode::CachedOnly, ctx);\n                late_change(ctx, true);",
+            ),
+        ] {
+            assert!(body.contains(ask), "{road}: the frame that draws it is not asked for");
+        }
+        // **`late_change(ctx, true)` is a repaint with the answer written
+        // out of the question**, so every site that spells one has to be a
+        // road that cannot fail to have changed something. There are exactly
+        // two, and they are the two named above: the click's refusal, which
+        // is reached solely on the failure arm and has just written an error
+        // into the track info, and the deadline door, whose reload ends in
+        // `set_clip_infos` on every path it can take. A third would be
+        // somebody reaching for a repaint instead of an answer, which is the
+        // 50 ms tick back under another name.
+        assert_eq!(
+            body.matches("late_change(ctx, true)").count(),
+            2,
+            "an unconditional late repaint is the resting window undone"
+        );
+        // The warm-up's nothing-to-do return: no work, no change, no frame.
+        let warm = body
+            .find("fn run_warm")
+            .map(|at| &body[at..])
+            .expect("run_warm is still called that");
+        let warm = &warm[..warm.find("fn land_decodes").expect("land_decodes follows")];
+        let idle = warm
+            .find("if !self.clips_owed && !self.pads_owed")
+            .expect("the do-nothing door");
+        let after = &warm[idle..];
+        let door_end = after.find("\n        }").expect("the door closes");
+        assert!(
+            !after[..door_end].contains("request_repaint"),
+            "the pass that found nothing to do asks for another frame, which \
+             is a window that never rests again"
+        );
+    }
+
+    /// **Every road out of the warm-up that leaves no work behind lets the
+    /// cover go.**
+    ///
+    /// `run_warm` has two quiet returns and only one of them used to settle
+    /// the meter, which left "Loading audio" over the desk for the rest of
+    /// the session on a road that is perfectly ordinary — see
+    /// `settle_warm_meter` for how it is reached. A source scan, because
+    /// `DesktopApp` cannot be built in a test; what it pins is that neither
+    /// return can be written again without the exit.
+    #[test]
+    fn a_warm_pass_with_nothing_left_lets_the_cover_go() {
+        let src = include_str!("desktop.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        let warm = body
+            .find("fn run_warm")
+            .map(|at| &body[at..])
+            .expect("run_warm is still called that");
+        let warm = &warm[..warm.find("fn settle_warm_meter").expect("the exit follows")];
+        // Both quiet returns: the one that found nothing to do, and the one
+        // that drains. Nothing else in the function returns.
+        assert_eq!(warm.matches("            return;").count(), 2, "run_warm's returns moved");
+        assert_eq!(
+            warm.matches("self.settle_warm_meter();").count(),
+            2,
+            "a road out of the warm-up leaves the decode cover standing with \
+             no work under it, and paint_busy repaints for ever behind it"
+        );
+        // And the exit really is an exit: the meter's last reading and the
+        // cover's release, in that order.
+        let exit = body
+            .find("fn settle_warm_meter")
+            .map(|at| &body[at..])
+            .expect("settle_warm_meter");
+        let saw = exit.find("self.warm_count.saw(0)").expect("the n-of-n courtesy");
+        let done = exit
+            .find("self.busy_chunk_done(Busied::Decode);")
+            .expect("the cover is let go");
+        assert!(saw < done, "the meter has to read n of n before the cover goes");
+    }
+
     /// The ceiling on a render is the decoder's own, applied to what the
     /// render would PRODUCE; a shrink never trips it, and a ratio that is
     /// not a number is over it rather than a giant allocation.
@@ -18578,6 +18942,108 @@ mod tests {
         assert!(done.peaks.is_some());
         assert!((done.file_s - 2.0).abs() < 1e-3);
         assert!(done.wave[col(0.45) * 2 + 1] > 0.8);
+    }
+
+    /// **The lengths a reload measured go over in ONE call, and an empty
+    /// list makes no call at all.**
+    ///
+    /// Both halves are costs, not tidiness. The app asks an exact "was this
+    /// project clean?" question around a fill — a walk of the whole
+    /// document — and re-marks after it, so per clip that is 2N document
+    /// walks on the frame an N-take session lands its decodes on. And the
+    /// list is empty on nearly every reload, while a reload runs on every
+    /// clips-dirty edit: a drag that paid a walk per frame for an empty
+    /// batch would be the same fault the other way round.
+    ///
+    /// A source scan; `DesktopApp` cannot be built in a test, and the app
+    /// side's own `note_clip_lens` tests carry the semantics.
+    #[test]
+    fn a_reloads_measured_lengths_go_over_in_one_call() {
+        let src = include_str!("desktop.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        assert!(
+            body.contains("if !fill_len.is_empty() {\n            self.app.note_clip_lens(&fill_len);"),
+            "the reload asks per clip again, or asks with an empty batch"
+        );
+        assert!(
+            !body.contains("self.app.note_clip_len("),
+            "a per-clip length write is a document walk per clip, twice"
+        );
+    }
+
+    /// **A settled stretched clip is drawn from the RENDER's pyramid, at
+    /// the clip's own seconds.**
+    ///
+    /// The painter maps a clip's seconds one-to-one onto the pyramid it is
+    /// handed — that is the whole contract of `ClipInfo.peaks` — so a clip
+    /// at ratio 2.0 handed the SOURCE file's pyramid would draw its
+    /// waveform at half the time the speakers play it: a transient a bar
+    /// early, and every trim made against a picture that is not the sound.
+    /// The stand-in road above is the deliberate exception and hands over
+    /// no pyramid at all, which is why it is safe.
+    #[test]
+    fn a_settled_stretch_is_drawn_from_the_render_at_the_clips_own_time() {
+        let rate = 48_000usize;
+        // One burst, between 0.2 s and 0.3 s of the FILE.
+        let samples: Vec<f32> = (0..rate)
+            .flat_map(|f| {
+                let t = f as f64 / rate as f64;
+                [if (0.2..0.3).contains(&t) { 0.9 } else { 0.0 }; 2]
+            })
+            .collect();
+        let source = Decoded::of(tangent_record::decode::Clip {
+            samples,
+            rate: 48_000,
+            source: std::path::PathBuf::from("s.wav"),
+        });
+        // What the crew lands in `stretch_cache` for this clip.
+        let rendered = Decoded::of(crate::stretch::stretch(
+            &source.clip,
+            2.0,
+            crate::stretch::Mode::Tape,
+        ));
+        let mut clip = audio_clip(0.0, 0.0, 2.0);
+        clip.stretch = 2.0;
+        let info = clip_picture(&clip, &rendered, 48_000, Some((0.0, 2.0, 200.0f32)), None);
+        let peaks = info.peaks.expect("a settled render hands its pyramid over");
+        assert!(
+            peaks.minmax_s(0.42, 0.58).1 > 0.8,
+            "the burst is not at the second the clip plays it"
+        );
+        assert!(
+            peaks.minmax_s(0.20, 0.30).1 < 0.05,
+            "the burst is still at its FILE time, so the pyramid handed over \
+             is the source's and the waveform disagrees with the audio by \
+             the stretch ratio"
+        );
+        assert!(
+            (peaks.seconds() - 2.0).abs() < 0.01,
+            "the pyramid is a second long, so it is the file's and not the render's"
+        );
+        // And the two roads that BUILD that picture take the render, not the
+        // file. Neither can be driven headless — `DesktopApp` cannot be
+        // built in a test — so the pairing is pinned where it is written:
+        // the value handed over with no stand-in comes out of
+        // `stretch_cache`, never out of `track_cache`.
+        let src = include_str!("desktop.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        for (road, settled) in [
+            (
+                "reload_clips",
+                "if let Some(made) = self.stretch_cache.get(&key) {\n                        (made.clone(), None)",
+            ),
+            (
+                "refresh_pictures",
+                "match self.stretch_cache.get(&key) {\n                        Some(made) => (made, None),",
+            ),
+        ] {
+            assert!(
+                body.contains(settled),
+                "{road} no longer draws a settled stretch from the render's \
+                 own decode; a source pyramid with no stand-in is a waveform \
+                 that lies by the ratio"
+            );
+        }
     }
 
     /// **What one stretch render costs** — the work a drag used to do per
