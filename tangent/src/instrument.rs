@@ -12420,21 +12420,6 @@ impl Engine {
         }
     }
 
-    /// Whether a backing track is loaded, playing or not.
-    ///
-    /// Loaded is the question, not playing: a take is armed before the
-    /// transport rolls, and a track that starts with it would otherwise decide
-    /// the take's sources one buffer too late.
-    ///
-    /// **Read back by the engine's own tests and by nothing else in the
-    /// binary.** `tangent` is a bin crate, so `pub` roots nothing: an
-    /// accessor the desk happens not to ask for reads as dead however
-    /// thoroughly it is exercised.
-    #[allow(dead_code)]
-    pub fn track_loaded(&self) -> bool {
-        self.shared.track_loaded.load(Ordering::Relaxed)
-    }
-
     // ── the instruments' state ──────────────────────────────────────────────
 
     /// Which channels' rack voices ignore the note stream, as one mask.
