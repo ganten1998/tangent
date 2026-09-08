@@ -77,6 +77,7 @@ impl FontChoice {
     pub fn from_key(s: &str) -> Self {
         match s {
             "courier" => FontChoice::Courier,
+            "terminess" => FontChoice::Terminess,
             "jetbrains" => FontChoice::JetBrains,
             // Unknown falls back to the DEFAULT, which is what this
             // function's own doc promises — it used to name Courier
@@ -102,6 +103,15 @@ impl FontChoice {
         }
     }
 
+    /// **Every key this writes, it reads back.** `terminess` was missing from
+    /// `from_key` while `key()` had written it since the face was added, so a
+    /// settings file naming Terminess came back as the DEFAULT — and the
+    /// default is JetBrains, the largest of the three on its own em. The
+    /// owner had chosen Terminess and been silently moved to the biggest
+    /// face in the list, which is the opposite of this type's stated promise
+    /// that "a settings file that names one keeps it, so nobody's desk
+    /// changes typeface under them". `the_font_choice_reads_back_what_it_wrote`
+    /// is what stops the next face from arriving the same way.
     pub const ALL: [FontChoice; 3] = [
         FontChoice::Courier,
         FontChoice::Terminess,
@@ -250,6 +260,34 @@ pub fn apply_text_styles(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
+
+    /// **Every face reads back as the face it wrote.**
+    ///
+    /// `key()` and `from_key` are a pair and nothing made them one: the
+    /// `terminess` arm was simply absent from the match, so the round trip
+    /// went through `_ => default()` and the owner's chosen face became
+    /// JetBrains on every launch. It looked like a font that would not stick,
+    /// which is a hard thing to report and an easy thing to disbelieve.
+    ///
+    /// Asserted over `ALL` rather than over three literals, so a fourth face
+    /// is covered the day it is added rather than the day somebody notices.
+    #[test]
+    fn the_font_choice_reads_back_what_it_wrote() {
+        for f in super::FontChoice::ALL {
+            assert_eq!(
+                super::FontChoice::from_key(f.key()),
+                f,
+                "{:?} writes {:?} and reads back as something else",
+                f,
+                f.key()
+            );
+        }
+        assert_eq!(
+            super::FontChoice::from_key("no such face"),
+            super::FontChoice::default(),
+            "an unknown key still falls back to the default"
+        );
+    }
 
     /// **Every font size is a whole number, at every window width.**
     ///
