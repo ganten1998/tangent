@@ -11085,6 +11085,94 @@ selected: false,
         let _ = v;
     }
 
+    /// **A note whose numbers are nonsense draws no panic.**
+    ///
+    /// The times in a clip come out of a document, and a document can hold
+    /// whatever a file on disk holds: seconds far past any song, seconds
+    /// before the start, a length of zero to divide by. The marks are
+    /// vertices in a mesh now rather than rects, so this walks the whole
+    /// drawing — the plain span pass, the merge grid and the handover — with
+    /// each of those in turn, at a zoom where the grid is allocated and at
+    /// one where it is not, and checks that what came out is a mesh
+    /// epaint will accept: whole marks, and every index inside its own
+    /// vertex list.
+    ///
+    /// It asserts survival, not a picture: what a NaN should LOOK like is
+    /// not a question with an answer, and the answer today is that it maps
+    /// to the whole clip (`f64::max(NaN, 0.0)` is 0.0 and `min(NaN, 1.0)` is
+    /// 1.0), which is what it did as rects too. The column index is the one
+    /// place this could go wrong quietly — `as usize` saturates a NaN to 0
+    /// and an infinity to the maximum, and the clamp behind it is what keeps
+    /// both inside the grid.
+    ///
+    /// It reads the shape list rather than `lit_cells` on purpose. A NaN
+    /// note draws a mark the full width of the clip, and rasterising five
+    /// hundred passes of those at four cells to the point took the first
+    /// version of this test seven minutes to say "no panic".
+    #[test]
+    fn a_note_with_impossible_times_survives_the_drawing() {
+        use crate::arrangement::ArrNote;
+        let wild = [
+            ArrNote { at_s: f64::NAN, dur_s: 0.25, key: 60, vel: 100 },
+            ArrNote { at_s: 0.0, dur_s: f64::NAN, key: 61, vel: 100 },
+            ArrNote { at_s: f64::INFINITY, dur_s: 1.0, key: 62, vel: 100 },
+            ArrNote { at_s: f64::NEG_INFINITY, dur_s: 1.0, key: 63, vel: 100 },
+            ArrNote { at_s: -1.0e9, dur_s: 1.0e9, key: 64, vel: 100 },
+            ArrNote { at_s: 1.0e18, dur_s: 1.0e18, key: 65, vel: 100 },
+            ArrNote { at_s: f64::MAX, dur_s: f64::MAX, key: 66, vel: 100 },
+            ArrNote { at_s: 0.5, dur_s: -4.0, key: 67, vel: 100 },
+            // One ordinary note, so the clip has a picture to lose.
+            ArrNote { at_s: 1.0, dur_s: 0.5, key: 68, vel: 100 },
+        ];
+        let ctx = egui::Context::default();
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("wild-mini"));
+        let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+        let bar_s = 2.0;
+        let mut drawn = 0usize;
+        for loop_s in [0.0, bar_s] {
+            for len_s in [0.0, 1.0e-12, bar_s * 8.0, 1.0e12] {
+                for offset_s in [0.0, f64::NAN, -1.0e9] {
+                    let clips =
+                        [ClipView { len_s, loop_s, offset_s, ..a_looped_clip(&wild, bar_s, 8.0) }];
+                    // Two windows: one where 0.02 s is under a point and the
+                    // merge grid is built, one where it is not.
+                    for window_s in [bar_s * 400.0, bar_s * 0.5] {
+                        let mut v = a_view(&clips);
+                        v.view_start_s = 0.0;
+                        v.view_len_s = window_s;
+                        v.song_s = window_s;
+                        ctx.graphics_mut(|g| *g.entry(layer) = Default::default());
+                        draw_note_miniature(
+                            &painter,
+                            rect(),
+                            (0.0, 1300.0),
+                            &clips[0],
+                            Color32::WHITE,
+                        );
+                        let what = format!("loop {loop_s} len {len_s} trim {offset_s} at {window_s}");
+                        ctx.graphics(|g| {
+                            for c in g.get(layer).into_iter().flat_map(|l| l.all_entries()) {
+                                if let egui::Shape::Mesh(m) = &c.shape {
+                                    assert!(m.is_valid(), "{what}: an index past the vertices");
+                                    assert_eq!(
+                                        m.vertices.len() % 4,
+                                        0,
+                                        "{what}: a mark with {} vertices",
+                                        m.vertices.len()
+                                    );
+                                    drawn += m.vertices.len() / 4;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        // Every one of those clips could have bailed out before it drew, and
+        // a sweep that painted nothing would assert nothing.
+        assert!(drawn > 0, "no mark was drawn at all, so nothing was checked");
+    }
+
     /// **A loop with an enormous pass count is bounded work.**
     ///
     /// A one-beat loop over an hour holds thousands of passes; zoomed to a
