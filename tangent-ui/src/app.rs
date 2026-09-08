@@ -2506,6 +2506,43 @@ fn edge_scroll_step(ctx: &egui::Context, zone: Rect, p: Pos2, axes: EdgeAxes) ->
     pps * dt
 }
 
+/// **The plain wheel is spent on the axis the hand meant.**
+///
+/// Over the lanes the plain wheel zooms on `y` and pans on `x`, and since
+/// the diagonal fix (`the_plain_wheel_over_the_lanes_zooms_at_the_playhead_and_a_diagonal_pans_too`)
+/// both components of one event are honoured. A trackpad, though, rarely
+/// sends a clean axis: two fingers drawn straight down arrive with a few
+/// tenths of a point of `x` per event as they drift, and a sideways pan
+/// carries the same on `y`. Before the fix that drift was harmless by
+/// accident — the zoom's `arr_steer` overwrote the pan — and honoured it
+/// would be a window that walks sideways through every zoom and breathes
+/// through every pan: a thirty-event flick at three tenths of a point is
+/// nine points of travel nobody asked for.
+///
+/// So the MINOR axis is dropped when it is under a point, or under a fifth
+/// of the major. Under a point, because that is the size of a finger's
+/// drift and a pan or a zoom that small per event is not one a person is
+/// making; under a fifth, because a fast flick drifts by whole points and no
+/// deliberate diagonal is that lopsided. An event on one axis alone passes
+/// untouched, so a slow single-axis gesture keeps every fraction it sends;
+/// what is given up is the sub-point diagonal, a gesture too small to see
+/// per event and too odd to make on purpose. Alt and the pan modifier sum
+/// both axes by design and never come through here.
+fn plain_wheel_axes(scroll: Vec2) -> Vec2 {
+    let (ax, ay) = (scroll.x.abs(), scroll.y.abs());
+    if ax == 0.0 || ay == 0.0 {
+        return scroll;
+    }
+    let noise = |minor: f32, major: f32| minor < 1.0 || minor < major * 0.2;
+    if ax >= ay {
+        if noise(ay, ax) { Vec2::new(scroll.x, 0.0) } else { scroll }
+    } else if noise(ax, ay) {
+        Vec2::new(0.0, scroll.y)
+    } else {
+        scroll
+    }
+}
+
 /// **The shelf templates live on, under `Projects/`.**
 ///
 /// Spelled once here because three roads need the same word and the host
@@ -19897,6 +19934,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // rests. A trackpad's sideways component still pans,
                     // because sideways means along.
                     let anchor = self.recorder.position_s;
+                    // A trackpad's drift on the axis it did not mean is
+                    // dropped here rather than spent — see
+                    // `plain_wheel_axes`. Now that a diagonal keeps both
+                    // components, that drift would otherwise walk the
+                    // window sideways through a zoom.
+                    let scroll = plain_wheel_axes(scroll);
                     if scroll.x.abs() > 0.0 {
                         self.arr_steer(start - f64::from(scroll.x) * s_per_px, len);
                     }
@@ -32249,30 +32292,36 @@ impl TangentApp {
             self.draw_bay_carry(ui.painter(), ui.ctx().pointer_interact_pos());
             // Sixteen strips' worth of tab stops. See `tangent_ui::a11y`.
             //
-            // Both lists built before the call, so the view's borrow of
-            // `self` is done with by the time `offer_to_keyboard` wants it
-            // mutably. They are pure functions of the rect and the view;
-            // hoisting them changes nothing but the borrow.
-            let (nodes, hits) = {
-                let nodes = crate::mixer_panel::a11y_nodes(rect, &view);
+            // **Built only on a frame that installs them.** `offer_nodes`
+            // begins with `if !on { return None }` and `on` was
+            // `reader_mode()`, so for a sighted session every frame with the
+            // desk open laid the desk out twice (once inside `a11y_nodes`,
+            // once for `hits`), formatted a label and a Debug id per control
+            // on sixteen strips, and handed it all to that line to discard.
+            // The timeline's branch below had the same shape and was fixed
+            // the same way: the gate is the SAME predicate `offer_nodes`
+            // was discarding on, asked this frame — not a live AccessKit
+            // query and not a second flag, for the reasons written on that
+            // gate — and the nodes come from the one `targets` walk the map
+            // back from a focused node also needs. Sighted behaviour is
+            // identical (`on_desk` was `None` on those frames before and is
+            // `None` now); in reader mode one Layout replaces two and the
+            // node ids are unchanged, so focus continuity is kept.
+            let on_desk = if !self.reader_mode() {
+                None
+            } else {
                 let hits = crate::mixer_panel::Layout::new(rect, &view).targets();
-                (nodes, hits)
+                let nodes = crate::mixer_panel::a11y_nodes_from(&view, &hits);
+                offer_nodes(ui, true, &nodes, self.settings.white_key_active_color.to_color32())
+                    .and_then(|node| {
+                        // Back to the hit by RECT, which is what both lists
+                        // are keyed on — the nodes are derived from `hits`
+                        // and keep its rects, so this cannot mismatch.
+                        hits.iter()
+                            .find(|(r, _)| *r == node.rect)
+                            .map(|(_, hit)| Focused::Desk { hit: *hit, travel: node.travel })
+                    })
             };
-            let on_desk = offer_nodes(
-                ui,
-                self.reader_mode(),
-                &nodes,
-                self.settings.white_key_active_color.to_color32(),
-            )
-            .and_then(|node| {
-                // Back to the hit by RECT, which is what both lists are keyed
-                // on — `a11y_nodes` walks `targets` and keeps its rects, so
-                // this cannot mismatch without the two having disagreed about
-                // the layout, which they cannot: they build the same one.
-                hits.iter()
-                    .find(|(r, _)| *r == node.rect)
-                    .map(|(_, hit)| Focused::Desk { hit: *hit, travel: node.travel })
-            });
             // A strip mid-carry: the source dims, the target column lights.
             if let Some((from, _, true)) = self.mixer_reorder {
                 let l = crate::mixer_panel::Layout::new(rect, &view);
@@ -52724,7 +52773,9 @@ mod tests {").expect("the tests module")];
     /// from the `start` it had read before the pan, so on any event carrying
     /// both components — a trackpad's ordinary diagonal — the zoom's
     /// `arr_steer` overwrote the pan and the sideways travel was lost. The
-    /// zoom now reads the window back after the pan.
+    /// zoom now reads the window back after the pan. The diagonal here is
+    /// thirty against forty — a deliberate one, well over the fifth below
+    /// which `plain_wheel_axes` reads the minor axis as drift.
     #[test]
     fn the_plain_wheel_over_the_lanes_zooms_at_the_playhead_and_a_diagonal_pans_too() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
@@ -52759,6 +52810,54 @@ mod tests {").expect("the tests module")];
              {})",
             (anchor - (anchor - start1) * factor).max(0.0)
         );
+    }
+
+    /// **A trackpad's drift on the plain wheel is not spent.** Two fingers
+    /// drawn down arrive with tenths of a point of `x`; a sideways pan with
+    /// the same on `y`. Once the diagonal fix let both components of an
+    /// event through, that drift would have walked the window sideways
+    /// through every zoom and breathed it through every pan — nine points
+    /// over a thirty-event flick. `plain_wheel_axes` drops the minor axis
+    /// under a point or under a fifth of the major, and the handler is
+    /// checked end to end here: a zoom with drift lands exactly where the
+    /// clean zoom does, and a pan with drift keeps its zoom.
+    #[test]
+    fn a_trackpads_drift_on_the_plain_wheel_neither_pans_nor_zooms() {
+        // The rule on its own, both ways round and at both thresholds.
+        let keep = |v: Vec2| plain_wheel_axes(v) == v;
+        assert!(keep(Vec2::new(0.0, 40.0)) && keep(Vec2::new(-30.0, 0.0)), "a clean axis is untouched");
+        assert!(keep(Vec2::new(0.3, 0.0)), "a slow single-axis event keeps its fraction");
+        assert!(keep(Vec2::new(-30.0, 40.0)) && keep(Vec2::new(9.0, 40.0)), "a deliberate diagonal keeps both");
+        assert_eq!(plain_wheel_axes(Vec2::new(0.4, 40.0)), Vec2::new(0.0, 40.0), "sub-point x on a zoom");
+        assert_eq!(plain_wheel_axes(Vec2::new(-30.0, 0.7)), Vec2::new(-30.0, 0.0), "sub-point y on a pan");
+        assert_eq!(plain_wheel_axes(Vec2::new(3.0, 60.0)), Vec2::new(0.0, 60.0), "a flick's whole-point drift, under a fifth");
+        assert_eq!(plain_wheel_axes(Vec2::new(-1.0, 4.0)), Vec2::new(-1.0, 4.0), "a point and a quarter of the major is a diagonal");
+
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = arrangement_with_a_clip(&ctx, &mut app);
+        app.recorder.position_s = 3.0;
+        app.arr_steer(10.0, 30.0);
+        let (lanes, _) = lanes_and_scale(&app, rect);
+        let at = lanes.center();
+        let anchor = 3.0;
+        let factor = f64::from((-40.0f32 * 0.005).exp());
+
+        // A zoom with four tenths of a point of drift: the window the clean
+        // zoom would give, not one that has crept sideways.
+        let (start0, len0) = app.arr_window_now();
+        wheel_frame(&ctx, &mut app, at, Vec2::new(0.4, 40.0), egui::Modifiers::NONE);
+        let (start1, len1) = app.arr_window_now();
+        assert!((len1 - len0 * factor).abs() < 1.0e-6, "len {len0} -> {len1}, wanted x{factor}");
+        let want = (anchor - (anchor - start0) * factor).max(0.0);
+        assert!((start1 - want).abs() < 1.0e-9, "the drift panned: start {start0} -> {start1}, wanted {want}");
+
+        // A pan with seven tenths of a point of drift: the zoom holds.
+        let (_, s1) = lanes_and_scale(&app, rect);
+        wheel_frame(&ctx, &mut app, at, Vec2::new(-30.0, 0.7), egui::Modifiers::NONE);
+        let (start2, len2) = app.arr_window_now();
+        assert!((len2 - len1).abs() < 1.0e-9, "the drift zoomed: len {len1} -> {len2}");
+        let want = (start1 + 30.0 * s1).max(0.0);
+        assert!((start2 - want).abs() < 1.0e-6, "pan: start {start1} -> {start2}, wanted {want}");
     }
 
     /// **Alt+wheel over the lanes PANS**, both axes summed, at the panel's

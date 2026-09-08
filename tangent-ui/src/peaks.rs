@@ -59,10 +59,19 @@ fn fold(into: &mut [f32; 2], b: [f32; 2]) {
 }
 
 /// The drawn answer for a fold: flat for nothing, clamped otherwise.
+///
+/// **Both ends of both values.** This clamped the minimum from below and
+/// the maximum from above only, which is enough while the block straddles
+/// the drawable range and wrong the moment it does not: a block whose every
+/// sample sits above 1.0 (a hot file, a float WAV that was never
+/// normalised) answered `(1.5, 1.0)`, a minimum ABOVE its maximum, and a
+/// block wholly below -1.0 the mirror of it. The host's column loop clamped
+/// each end to `-1..=1` and drew such a block as a bar pinned to the rail,
+/// which is what the picture promises in the module doc.
 #[inline]
 fn finish(acc: [f32; 2]) -> (f32, f32) {
     if acc[0] <= acc[1] {
-        (acc[0].max(-1.0), acc[1].min(1.0))
+        (acc[0].clamp(-1.0, 1.0), acc[1].clamp(-1.0, 1.0))
     } else {
         (0.0, 0.0)
     }
@@ -343,6 +352,30 @@ mod tests {
         let s = vec![3.0f32, -2.5, 3.0, -2.5];
         let p = Peaks::build(&s, 2, 48_000);
         assert_eq!(p.minmax(0, 2), (-1.0, 1.0));
+    }
+
+    /// A block that never comes back inside the range is a bar on the rail,
+    /// not an inverted pair: `finish` used to clamp the minimum from below
+    /// and the maximum from above only, so all-above-one answered
+    /// `(1.5, 1.0)` and all-below-minus-one `(-1.0, -1.5)`.
+    #[test]
+    fn a_block_wholly_outside_the_range_pins_to_the_rail_and_stays_ordered() {
+        let hot = vec![1.5f32; 64 * 2];
+        let p = Peaks::build(&hot, 2, 48_000);
+        assert_eq!(p.minmax(0, 16), (1.0, 1.0), "all above one");
+        assert_eq!(p.minmax(0, 64), (1.0, 1.0), "all above one, every level");
+        let cold = vec![-1.5f32; 64 * 2];
+        let p = Peaks::build(&cold, 2, 48_000);
+        assert_eq!(p.minmax(0, 16), (-1.0, -1.0), "all below minus one");
+        assert_eq!(p.minmax(0, 64), (-1.0, -1.0), "all below minus one, every level");
+        // And a mixed file keeps lo <= hi under every query it can be asked.
+        let mixed: Vec<f32> = (0..2_000).map(|f| if f % 700 < 350 { 2.0 } else { -3.0 }).collect();
+        let p = Peaks::build(&mixed, 1, 48_000);
+        for (a, b) in [(0, 16), (0, 2_000), (340, 360), (700, 1_050), (1_999, 2_000)] {
+            let (lo, hi) = p.minmax(a, b);
+            assert!(lo <= hi, "{a}..{b}: lo {lo} above hi {hi}");
+            assert!((-1.0..=1.0).contains(&lo) && (-1.0..=1.0).contains(&hi), "{a}..{b}: {lo} {hi}");
+        }
     }
 
     #[test]
