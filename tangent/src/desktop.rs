@@ -797,6 +797,13 @@ pub struct DesktopApp {
     /// back is a fresh attempt rather than a permanent refusal.
     #[cfg(feature = "recorder")]
     warm_refused: std::collections::HashSet<std::path::PathBuf>,
+    /// The decoder's sentence for each refusal in `warm_refused`, so the
+    /// band can go on saying WHY without the file being asked again. Kept
+    /// beside the set rather than folded into it because the set's three
+    /// literals are pinned by a source scan; written, cleared and swept
+    /// wherever the set is.
+    #[cfg(feature = "recorder")]
+    refused_why: std::collections::HashMap<std::path::PathBuf, String>,
     /// Clips that have been time-stretched, by `(file, ratio in millionths,
     /// mode)`.
     ///
@@ -1842,7 +1849,10 @@ const ENGINE_TRIES: u8 = 5;
 /// are handed over regardless, and the drain-triggered reload still happens
 /// afterwards — `reload_clips` rebuilds from the document either way, so the
 /// cost of being early is at most one extra rebuild and the benefit is that
-/// no decoder state can silence a note.
+/// no decoder state can silence a note. **At most one rebuild, and never a
+/// decode**: the deadline door asks for cached files only (`Decode`), and
+/// keeps the debt open while anything is still queued, so a clip whose file
+/// lands later is heard at the next tick or at the drain.
 ///
 /// A quarter of a second: under what anybody would notice between drawing a
 /// note and pressing play, and far above a frame, so a drag that dirties the
@@ -8704,6 +8714,7 @@ impl DesktopApp {
                 let _ = self.app.take_desk_reload();
                 self.track_cache.clear();
                 self.warm_refused.clear();
+                self.refused_why.clear();
                 self.stretch_cache.clear();
                 self.pad_cache.clear();
                 self.clips_owed = true;
@@ -8908,9 +8919,16 @@ impl DesktopApp {
                 .clips_owed_at
                 .get_or_insert_with(std::time::Instant::now);
             if since.elapsed() >= CLIPS_OWED_DEADLINE {
-                self.clips_owed = false;
-                self.clips_owed_at = None;
-                self.reload_clips();
+                // Cached files only, and the debt stays open while any
+                // file is still on its way: the clock restarts, so the
+                // schedule is refreshed four times a second as files land
+                // and settled for good at the drain. See `Decode`.
+                if self.reload_clips(Decode::CachedOnly) {
+                    self.clips_owed_at = Some(std::time::Instant::now());
+                } else {
+                    self.clips_owed = false;
+                    self.clips_owed_at = None;
+                }
             }
         } else {
             self.clips_owed_at = None;
@@ -8935,7 +8953,7 @@ impl DesktopApp {
             self.busy_chunk_done(Busied::Decode);
             if std::mem::take(&mut self.clips_owed) {
                 self.clips_owed_at = None;
-                self.reload_clips();
+                let _ = self.reload_clips(Decode::Inline);
             }
             if std::mem::take(&mut self.pads_owed) {
                 self.reload_pads();
@@ -8950,6 +8968,18 @@ impl DesktopApp {
             Warm::Clip(p) => (p.clone(), false),
             Warm::Pad(p) => (p.clone(), true),
         };
+        // **Already decoded: a file the drain reload met inline, or one the
+        // queue was built before it landed.** Counted as done for the meter
+        // (`saw` above read it as outstanding), never decoded twice — this
+        // was the second half of the open that decoded everything twice.
+        if if pads {
+            self.pad_cache.contains_key(&path)
+        } else {
+            self.track_cache.contains_key(&path)
+        } {
+            ctx.request_repaint();
+            return;
+        }
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
@@ -9000,7 +9030,8 @@ impl DesktopApp {
             // skips a refused pad, and `reload_pads`, which is the road that
             // paints the pad red — it decodes on its own and is unaffected by
             // this set, so a file that comes back still lights.
-            Err(_) => {
+            Err(why) => {
+                self.refused_why.insert(path.clone(), why);
                 self.warm_refused.insert(path);
             }
         }
@@ -9060,7 +9091,11 @@ impl DesktopApp {
         }
     }
 
-    fn reload_clips(&mut self) {
+    /// Rebuild the engine's schedule and the band's pictures from the
+    /// document. `decode` says what to do about an audio file that is not
+    /// cached yet — see [`Decode`]; the answer is whether any clip was left
+    /// out for that reason, so the caller knows the debt is still open.
+    fn reload_clips(&mut self, decode: Decode) -> bool {
         // **Not gated on the document being SAVED.**
         //
         // This used to return here when there was no file on disk yet, which
@@ -9087,6 +9122,7 @@ impl DesktopApp {
         let mut error = String::new();
         let mut fill_len: Vec<(u64, f64)> = Vec::new();
         let mut clip_infos: Vec<tangent_ui::ports::ClipInfo> = Vec::new();
+        let mut deferred = false;
         // The window the pictures are being made FOR. See `wave_span`.
         let wave_view = self.app.arr_wave_view();
         for clip in &doc.clips {
@@ -9124,6 +9160,26 @@ impl DesktopApp {
             let path = tangent_ui::arrangement::Arrangement::resolve(doc_path, &clip.path);
             let decoded = match self.track_cache.get(&path) {
                 Some(c) => Arc::clone(c),
+                // **A remembered refusal is not asked again.** This arm
+                // used to decode unconditionally, so one missing take in a
+                // project spawned `afconvert` on every reload — every edit,
+                // every zoom step past the threshold, every frame of a drag
+                // — to be told "no" again. The sentence it was told is kept
+                // (`refused_why`) so the band goes on saying why; the
+                // refusal itself is swept with the clip that caused it,
+                // which is when a fixed file gets its fresh attempt.
+                None if self.warm_refused.contains(&path) => {
+                    error = self
+                        .refused_why
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_else(|| "that file would not decode".to_owned());
+                    continue;
+                }
+                None if decode == Decode::CachedOnly => {
+                    deferred = true;
+                    continue;
+                }
                 None => match tangent_record::decode::decode(&path, rate) {
                     Ok(c) => {
                         let c = Arc::new(c);
@@ -9134,6 +9190,11 @@ impl DesktopApp {
                         // The name is kept out of the info on purpose: a row
                         // that says a file name next to an error reads as
                         // "loaded but broken", and nothing is loaded.
+                        // Remembered like the warm-up's refusals, and for the
+                        // same reason: an answer that is not written down is
+                        // asked for again next frame.
+                        self.refused_why.insert(path.clone(), e.clone());
+                        self.warm_refused.insert(path.clone());
                         error = e;
                         continue;
                     }
@@ -9283,6 +9344,8 @@ impl DesktopApp {
             // tries again.
             self.warm_refused
                 .retain(|path| referenced(path) || live_pads.iter().any(|p| p == path));
+            let refused = &self.warm_refused;
+            self.refused_why.retain(|path, _| refused.contains(path));
         }
         // And the stretched renders with them — including every ratio a drag
         // passed through on its way to the one that stuck. A drag across a
@@ -9308,6 +9371,7 @@ impl DesktopApp {
         info.seconds = span;
         info.error = error;
         self.app.set_track_info(info);
+        deferred
     }
 
     /// The drumpad's samples: decode every slot at the engine's rate, push
@@ -14488,6 +14552,8 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             warm_refused: std::collections::HashSet::new(),
             #[cfg(feature = "recorder")]
+            refused_why: std::collections::HashMap::new(),
+            #[cfg(feature = "recorder")]
             stretch_cache: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
             pad_cache: std::collections::HashMap::new(),
@@ -15813,6 +15879,27 @@ enum Chore {
     },
 }
 
+/// What `reload_clips` may do about an audio file that is NOT in the cache.
+///
+/// **Two doors, two answers.** The drain door — the queue came up empty, so
+/// the warm-up has had its turn — decodes a miss where it stands: that is
+/// the "cover and an optimisation, never a precondition" rule, and it is
+/// what makes a file that appeared late still play. The DEADLINE door
+/// exists for the notes, which need no decoding, and used to take the same
+/// arm: with forty files still queued it decoded all forty in that one
+/// frame, a multi-second freeze under a cover frozen at "2 of 45", and then
+/// `run_warm` popped the same forty and decoded each again. So the deadline
+/// door now leaves a miss alone and says so, and the debt stays open until
+/// the drain settles it.
+#[cfg(feature = "recorder")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decode {
+    /// Decode a miss here and now.
+    Inline,
+    /// Skip a miss and report it deferred; the audio follows as files land.
+    CachedOnly,
+}
+
 /// One file the next reload will need, and which cache its decode belongs in.
 #[cfg(feature = "recorder")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16857,6 +16944,74 @@ mod tests {
             code.contains("self.warm_refused")
                 && code.contains("referenced(path) || live_pads.iter().any(|p| p == path)"),
             "a refusal has to leave with the clip OR THE PAD that caused it"
+        );
+    }
+
+    /// **The deadline door decodes nothing, and a refused file is never
+    /// asked again by the reload.** Two source pins, because neither road
+    /// can be driven headless (a reload needs an engine, a document and a
+    /// decoder). What they hold: the deadline door hands `reload_clips`
+    /// `Decode::CachedOnly` — it exists for the NOTES, and the day it took
+    /// the inline arm it decoded forty files in one frame under a frozen
+    /// cover and then decoded them all again; the drain door keeps
+    /// `Decode::Inline`, the cover-not-precondition rule; a popped item
+    /// already in its cache is not decoded twice; and the reload's miss arm
+    /// consults `warm_refused` BEFORE it reaches for the decoder, so one
+    /// missing take cannot spawn a child per edit, per zoom step, per drag
+    /// frame.
+    #[test]
+    fn the_deadline_reload_is_cached_only_and_a_refusal_is_not_re_decoded() {
+        let src = include_str!("desktop.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        let warm = body
+            .find("fn run_warm")
+            .map(|at| &body[at..])
+            .expect("run_warm is still called that");
+        let warm = &warm[..warm.find("fn queue_warm").expect("queue_warm follows")];
+        let pop = warm.find("self.warm.pop_front()").expect("the pop");
+        let (door, drain) = warm.split_at(pop);
+        assert!(
+            door.contains("self.reload_clips(Decode::CachedOnly)"),
+            "the deadline door has to ask for cached files only"
+        );
+        assert!(
+            !door.contains("Decode::Inline"),
+            "the deadline door must never decode inline: that is the \
+             forty-files-in-one-frame freeze"
+        );
+        assert!(
+            drain.contains("self.reload_clips(Decode::Inline)"),
+            "the drain door is the cover-not-precondition road and keeps its \
+             inline decode"
+        );
+        assert!(
+            drain.contains("self.track_cache.contains_key(&path)")
+                && drain.contains("self.pad_cache.contains_key(&path)"),
+            "a popped item already in its cache has to be skipped, or every \
+             file the drain decoded inline is decoded again"
+        );
+        let reload = body
+            .find("fn reload_clips")
+            .map(|at| &body[at..])
+            .expect("reload_clips");
+        let reload = &reload[..reload.find("fn reload_click").expect("reload_click follows")];
+        let refused = reload
+            .find("None if self.warm_refused.contains(&path) =>")
+            .expect("the reload consults the refusals");
+        let cached_only = reload
+            .find("None if decode == Decode::CachedOnly =>")
+            .expect("the reload honours the policy");
+        let decoder = reload
+            .find("tangent_record::decode::decode(&path, rate)")
+            .expect("the inline fallback is still there");
+        assert!(
+            refused < decoder && cached_only < decoder,
+            "the refusal check and the policy have to come BEFORE the decoder \
+             is reached"
+        );
+        assert!(
+            reload.contains("self.warm_refused.insert(path.clone());"),
+            "an inline refusal has to be remembered like the warm-up's"
         );
     }
 
