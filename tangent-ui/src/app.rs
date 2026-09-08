@@ -56691,7 +56691,7 @@ mod perf_probes {
             let apply = per_call(n, || app.apply_desk_snapshot(&desk));
             say("doc_open", tag, "  of which: apply_desk_snapshot", apply, false);
             let reset = per_call(n, || app.undo_reset());
-            say("doc_open", tag, "  of which: undo_reset (2x undo_state + mark)", reset, false);
+            say("doc_open", tag, "  of which: undo_reset (one walk: baseline + moment zero)", reset, false);
             let us = per_call(n, || {
                 std::hint::black_box(app.undo_state());
             });
