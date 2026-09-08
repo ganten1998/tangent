@@ -206,6 +206,9 @@ fn note_child_spawn() {
 /// * anything the first [`NATIVE_PEEK_BYTES`] already rule out — see
 ///   [`peek_declines`]: an MP3, an AIFF or an MP4 costs one small read here
 ///   and not a pass through memory before the child reads it again;
+/// * a parse that comes out EMPTY — a header that declares no audio, which
+///   is what an unfinished take looks like before `WavWriter` first patches
+///   its sizes;
 /// * anything the STRICT parse refuses — not RIFF (AIFF, CAF, MP3, RF64),
 ///   a format the parser has no arm for, and a chunk that claims more bytes
 ///   than the file holds. That last one is a take that was cut short: the
@@ -230,10 +233,32 @@ fn read_native(path: &Path, rate: u32) -> Option<(Vec<f32>, u32)> {
         return None;
     }
     // The rest, behind the header already in hand. `len` sizes the one
-    // allocation; a file that grew since `metadata` merely reallocates.
+    // allocation; a file that grew since `metadata` merely reallocates —
+    // and the read is BOUNDED by the same ceiling the size check applied,
+    // because `metadata` and this read are two different moments. Without
+    // the bound a file that grew between them (a take still being written,
+    // a folder syncing underneath us) would be read whole however large it
+    // had become, which is the one thing the ceiling exists to stop. Read
+    // short, the strict walk below refuses it and the child answers.
     bytes.reserve((len as usize).saturating_sub(bytes.len()));
-    file.read_to_end(&mut bytes).ok()?;
+    (&mut file)
+        .take(NATIVE_MAX_BYTES.saturating_sub(bytes.len() as u64))
+        .read_to_end(&mut bytes)
+        .ok()?;
     let (samples, got, channels) = parse_wav(&bytes, true).ok()?;
+    // **Nothing is not an answer.** A `data` chunk declaring zero bytes
+    // parses cleanly and comes out empty, and that is exactly what a take
+    // whose process died looks like: `WavWriter` writes its sizes as zero
+    // and patches them every two seconds, so up to two seconds of real
+    // audio can sit behind a header that says there is none. This road
+    // cannot tell that from a file that really is empty — and answering
+    // "nothing" would settle it, because `decode` stops at
+    // `samples.len() < 2` and the child, which may yet read the bytes that
+    // are on the disk, would never be asked. So an empty parse declines
+    // like every other shape this road cannot serve.
+    if samples.is_empty() {
+        return None;
+    }
     if got != rate || channels != 2 {
         return None;
     }
@@ -770,6 +795,21 @@ mod tests {
         let mut short = wav_bytes(3, 2, 48_000, 32, &f32s, false);
         short.truncate(short.len() - 8);
         spawn_for("short.wav", &short);
+        // **The take that never got its first patch.** `WavWriter` writes
+        // its sizes as zero and patches them every two seconds, so a take
+        // whose process died carries real audio behind a header that says
+        // there is none. The strict walk reads that as an empty file — a
+        // clean parse with nothing in it — and an empty answer here would
+        // stop `decode` at "that file has no audio in it" without the child
+        // ever being asked whether it can read what is on the disk.
+        let mut unpatched = wav_bytes(3, 2, 48_000, 32, &f32s, false);
+        let n = unpatched.len();
+        unpatched[n - 4 - f32s.len()..n - f32s.len()].copy_from_slice(&0u32.to_le_bytes());
+        assert!(
+            parse_wav(&unpatched, true).is_ok_and(|(s, _, _)| s.is_empty()),
+            "the fixture is meant to parse cleanly and come out empty"
+        );
+        spawn_for("unpatched.wav", &unpatched);
         // ...which the TOLERANT parse still reads as far as it goes, because
         // that is what a child's own streamed output looks like.
         let (got, _) = wav_stereo_f32(&short).expect("tolerant");
