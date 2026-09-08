@@ -880,113 +880,124 @@ fn frames_at(rate: f64, seconds: f64) -> u64 {
     (seconds.max(0.0) * rate).round() as u64
 }
 
-/// A peak envelope of `len` frames starting `offset` frames into `clip`,
-/// interleaved stereo folded to one magnitude per bucket — the played
-/// span's picture, where `Clip::envelope` is the whole file's.
-#[cfg(feature = "recorder")]
-fn span_envelope(
-    clip: &tangent_record::decode::Clip,
-    offset: usize,
-    len: usize,
-    buckets: usize,
-) -> Vec<f32> {
-    let total = clip.samples.len() / 2;
-    let start = offset.min(total);
-    let end = (offset + len).min(total);
-    let frames = end.saturating_sub(start);
-    if frames == 0 || buckets == 0 {
-        return Vec::new();
-    }
-    // **MIN and MAX, not a peak.** A column drawn from one number is a bar
-    // chart of loudness; the shape anybody reads off a waveform is the
-    // outline of both sides, and audio is not symmetric about zero. See
-    // `tangent_ui::ports::ClipInfo`.
-    let mut out = vec![0.0f32; buckets * 2];
-    for i in 0..buckets {
-        let a = start + i * frames / buckets;
-        let b = (start + (i + 1) * frames / buckets).max(a + 1).min(end);
-        // **Seeded at the infinities, not at zero.**
-        //
-        // Starting both at 0.0 forces every bucket to straddle it: a passage
-        // that is entirely above the line — a bass note's positive half, or
-        // anything with a DC offset on it — reports a minimum of zero and is
-        // drawn as though it swung down to silence. Audio crosses zero often
-        // enough that it mostly looked right, which is why it would have
-        // survived a glance. See `frame_range_minmax`.
-        let (lo, hi) = frame_range_minmax(clip, a, b);
-        out[i * 2] = lo;
-        out[i * 2 + 1] = hi;
-    }
-    out
-}
-
-/// The lowest and highest sample across `[a, b)` frames, both channels.
+/// **A clip's picture for a window, read from its pyramid.** `buckets`
+/// `(min, max)` pairs over `span_s` seconds beginning `into_s` into the
+/// clip's PLAYED span (past the left trim), at `rate`.
 ///
-/// **MIN and MAX, not a peak, and seeded at the infinities** — see
-/// [`span_envelope`], where both of those are explained and where this used to
-/// be inline. It came out so the looped picture below could read the same
-/// numbers rather than a second opinion about them.
-#[cfg(feature = "recorder")]
-fn frame_range_minmax(clip: &tangent_record::decode::Clip, a: usize, b: usize) -> (f32, f32) {
-    let mut lo = f32::INFINITY;
-    let mut hi = f32::NEG_INFINITY;
-    for f in a..b {
-        for ch in 0..2 {
-            let v = clip.samples.get(f * 2 + ch).copied().unwrap_or(0.0);
-            if v.is_finite() {
-                lo = lo.min(v);
-                hi = hi.max(v);
-            }
-        }
-    }
-    // An empty or wholly non-finite bucket is a flat line, which is the only
-    // honest thing to draw for "nothing here".
-    if lo <= hi {
-        (lo.max(-1.0), hi.min(1.0))
-    } else {
-        (0.0, 0.0)
-    }
-}
-
-/// **A LOOPED clip's picture: the same pass, drawn again and again.**
+/// This is the picture the host used to walk the samples for, bucket by
+/// bucket, on every reload — a pass over every visible frame of every
+/// visible clip at every five-percent zoom step, and the whole file for a
+/// clip off screen. `Peaks::minmax` answers the same question in a handful
+/// of block reads (see `tangent_ui::peaks` for what "exact to the block"
+/// means), so the picture is now a function of the window, not of the
+/// audio's length.
 ///
-/// [`span_envelope`] reads the file straight through, which is right for a
-/// clip that plays once and wrong for one that repeats — an eight-bar clip
-/// looping one bar was drawn as eight bars of the file, so the waveform said
-/// one thing and the speakers said another.
+/// **MIN and MAX, not a peak**: a column drawn from one number is a bar
+/// chart of loudness; the shape anybody reads off a waveform is the outline
+/// of both sides, and audio is not symmetric about zero. Both rules the old
+/// walk kept — seeded at the infinities so a passage entirely above the
+/// line is not drawn swinging down to silence, and a bucket with nothing
+/// finite in it drawn flat — live inside the pyramid now.
 ///
-/// Each bucket's time is folded into the loop before it is looked up. A bucket
-/// that straddles a repeat's seam reads only its first side, which is under a
-/// pixel wide and is what every other bucket in this file does with a range it
-/// cannot fit.
+/// **A LOOPED clip is drawn as it PLAYS: the same pass, drawn again and
+/// again.** Reading the file straight through is right for a clip that
+/// plays once and wrong for one that repeats — an eight-bar clip looping
+/// one bar was drawn as eight bars of the file, so the waveform said one
+/// thing and the speakers another. Each bucket's time is folded into the
+/// loop before it is looked up; a bucket that straddles a repeat's seam
+/// reads only its first side, which is under a pixel wide and is what every
+/// other bucket does with a range it cannot fit. This is the ONE place that
+/// fold is made for a picture; `a_looped_clips_picture_is_the_same_pass_
+/// over_and_over` pins it.
 #[cfg(feature = "recorder")]
-fn looped_span_envelope(
-    clip: &tangent_record::decode::Clip,
-    offset_s: f64,
-    loop_s: f64,
+fn pyramid_wave(
+    peaks: &tangent_ui::peaks::Peaks,
+    clip: &tangent_ui::arrangement::ArrClip,
     into_s: f64,
     span_s: f64,
     buckets: usize,
-    rate: f64,
+    rate: u32,
 ) -> Vec<f32> {
-    let total = clip.samples.len() / 2;
-    if buckets == 0 || total == 0 || !(loop_s > 1.0e-6) || !(span_s > 0.0) {
+    let total = peaks.frames();
+    if buckets == 0 || total == 0 || !(span_s > 0.0) {
         return Vec::new();
     }
-    let mut out = vec![0.0f32; buckets * 2];
-    for i in 0..buckets {
-        let t0 = into_s + span_s * i as f64 / buckets as f64;
-        let t1 = into_s + span_s * (i + 1) as f64 / buckets as f64;
-        let folded = t0.rem_euclid(loop_s);
-        let a = frames_at(rate, offset_s + folded) as usize;
-        let width = frames_at(rate, (t1 - t0).max(0.0)).max(1) as usize;
-        let a = a.min(total);
-        let b = (a + width).min(total);
-        let (lo, hi) = frame_range_minmax(clip, a, b.max(a));
-        out[i * 2] = lo;
-        out[i * 2 + 1] = hi;
+    let rate = f64::from(rate);
+    let mut out = Vec::with_capacity(buckets * 2);
+    if clip.loop_s > 1.0e-6 {
+        for i in 0..buckets {
+            let t0 = into_s + span_s * i as f64 / buckets as f64;
+            let t1 = into_s + span_s * (i + 1) as f64 / buckets as f64;
+            let folded = t0.rem_euclid(clip.loop_s);
+            let a = frames_at(rate, clip.offset_s + folded) as usize;
+            let width = frames_at(rate, (t1 - t0).max(0.0)).max(1) as usize;
+            let (lo, hi) = peaks.minmax(a, a.saturating_add(width));
+            out.push(lo);
+            out.push(hi);
+        }
+    } else {
+        // The same tiling the sample walk used: `[start, end)` shared out
+        // evenly, every bucket at least a frame wide, none past the end.
+        let start = (frames_at(rate, clip.offset_s + into_s) as usize).min(total);
+        let end = start
+            .saturating_add(frames_at(rate, span_s) as usize)
+            .min(total);
+        let frames = end - start;
+        if frames == 0 {
+            return Vec::new();
+        }
+        // In u64, because `i * frames` is a pixel count times a frame
+        // count and a 32-bit build would wrap it.
+        let at = |i: usize| start + (i as u64 * frames as u64 / buckets as u64) as usize;
+        for i in 0..buckets {
+            let a = at(i);
+            let b = at(i + 1).max(a + 1).min(end);
+            let (lo, hi) = peaks.minmax(a, b);
+            out.push(lo);
+            out.push(hi);
+        }
     }
     out
+}
+
+/// One clip's `ClipInfo`: its pyramid for the painter that reads one, and
+/// the window-bounded picture (`wave_span`) for the painter that still reads
+/// `wave`, both from the same `Decoded`. With no window — the arrangement
+/// closed, or the clip off screen — a coarse whole-clip picture, which is
+/// what a clip needs before anybody has looked at it.
+#[cfg(feature = "recorder")]
+fn clip_picture(
+    clip: &tangent_ui::arrangement::ArrClip,
+    decoded: &Decoded,
+    rate: u32,
+    wave_view: Option<(f64, f64, f32)>,
+) -> tangent_ui::ports::ClipInfo {
+    let file_s = decoded.clip.seconds();
+    let len_s = clip.play_len_s(file_s);
+    let (wave, wave_from_s, wave_span_s) = match wave_view
+        .and_then(|(vs, vl, px)| wave_span(clip.start_s, len_s, vs, vl, px))
+    {
+        Some((from, span, buckets)) => {
+            // In the clip's own file, which is where the samples are: the
+            // drawn second `from` is `from - start_s` into the played span,
+            // past the left trim.
+            let into = (from - clip.start_s).max(0.0);
+            (pyramid_wave(&decoded.peaks, clip, into, span, buckets, rate), from, span)
+        }
+        None => (
+            pyramid_wave(&decoded.peaks, clip, 0.0, len_s, CLIP_WAVE_BUCKETS, rate),
+            clip.start_s,
+            len_s,
+        ),
+    };
+    tangent_ui::ports::ClipInfo {
+        id: clip.id,
+        wave,
+        file_s,
+        wave_from_s,
+        wave_span_s,
+        peaks: Some(Arc::clone(&decoded.peaks)),
+    }
 }
 
 /// How many buckets a clip's picture wants, and which of its seconds.
@@ -2453,6 +2464,31 @@ fn stretched_clip_audio(
 /// millionths, mode's key" is how a sweep quietly stops matching what was
 /// inserted — the doc on the live path used to warn the sweep to keep up
 /// with it by hand.
+/// The live path's stretched copy, with its picture. The samples come from
+/// `crate::stretch::stretch` under [`stretch_key`], the same renderer and
+/// key the offline bounce uses through [`stretched_clip_audio`]; the pyramid
+/// is built beside them so a stretched clip is drawn from its stretched
+/// audio like an unstretched one is from its file. A free function over the
+/// cache, not a method, so `reload_clips` can hold the document borrowed
+/// while it fills the cache.
+#[cfg(feature = "recorder")]
+fn stretched_live(
+    clip: &tangent_ui::arrangement::ArrClip,
+    decoded: &Decoded,
+    path: &std::path::Path,
+    cache: &mut std::collections::HashMap<StretchKey, Decoded>,
+) -> Decoded {
+    let Some((key, mode)) = stretch_key(clip, path) else {
+        return decoded.clone();
+    };
+    if let Some(made) = cache.get(&key) {
+        return made.clone();
+    }
+    let made = Decoded::of(crate::stretch::stretch(&decoded.clip, clip.stretch, mode));
+    cache.insert(key, made.clone());
+    made
+}
+
 #[cfg(feature = "recorder")]
 fn stretch_key(
     clip: &tangent_ui::arrangement::ArrClip,
@@ -4160,14 +4196,17 @@ impl DesktopApp {
         // **The document's clips, whenever an edit touched them.** The app
         // marks; this decodes, pushes the engine's schedule, and rebuilds
         // the band's picture — after the frame, like every other slow thing.
-        // **...and whenever the ZOOM has moved far enough to matter.** A
-        // waveform is drawn at a zoom: the pictures are made at the pixels
-        // the clips occupy, so a view that has travelled needs new ones or
-        // the audio is smeared across columns it does not belong in. See
-        // `TangentApp::arr_waves_stale`, which is the threshold that keeps
-        // this off the frame path during a drag.
-        if self.app.take_clips_dirty() || self.app.arr_waves_stale() {
+        // **A ZOOM that has moved far enough to matter gets the pictures
+        // ALONE.** A waveform is drawn at a zoom: the pictures are made at
+        // the pixels the clips occupy, so a view that has travelled needs
+        // new ones or the audio is smeared across columns it does not
+        // belong in — but it needs no schedule, and it used to get one,
+        // ring swaps and all. See `TangentApp::arr_waves_stale` for the
+        // threshold and `refresh_pictures` for what a view move now costs.
+        if self.app.take_clips_dirty() {
             self.clips_owed = true;
+        } else if self.app.arr_waves_stale() {
+            self.refresh_pictures();
         }
 
         // **The drumpad's kit, on the same bargain**: a drop, a clear or a
@@ -9163,9 +9202,25 @@ impl DesktopApp {
     }
 
     /// Rebuild the engine's schedule and the band's pictures from the
-    /// document. `decode` says what to do about an audio file that is not
-    /// cached yet — see [`Decode`]; the answer is whether any clip was left
-    /// out for that reason, so the caller knows the debt is still open.
+    /// document — the answer to a DOCUMENT change. `decode` says what to do
+    /// about an audio file that is not cached yet (see [`Decode`]); the
+    /// answer is whether any clip was left out for that reason, so the
+    /// caller knows the debt is still open.
+    ///
+    /// **A view move is not a document change** and never comes here: it is
+    /// answered by [`DesktopApp::refresh_pictures`], which reads the caches
+    /// and touches neither the engine nor the document. This was one
+    /// function for both, so a five-percent zoom rebuilt every pass and
+    /// every note list, walked the first take's whole file for a band
+    /// picture nobody could see, and pushed the schedule through two ring
+    /// swaps that each wait on the audio callback — for a change that
+    /// touched no audio.
+    ///
+    /// The document is read IN PLACE — a clone of it carried every note and
+    /// the automation, per reload, per drag frame — and everything the loop
+    /// learns is collected into owned locals and pushed once the borrow is
+    /// over. Inside the loop only FIELDS of `self` are touched, which is
+    /// what lets the arrangement stay borrowed across it.
     fn reload_clips(&mut self, decode: Decode) -> bool {
         // **Not gated on the document being SAVED.**
         //
@@ -9185,7 +9240,8 @@ impl DesktopApp {
             .engine
             .as_ref()
             .map_or(48_000, |e| e.output().sample_rate);
-        let doc = self.app.arrangement().clone();
+        // The window the pictures are being made FOR. See `wave_span`.
+        let wave_view = self.app.arr_wave_view();
         let mut placed = Vec::new();
         let mut midi_placed = Vec::new();
         let mut info: Option<tangent_ui::ports::TrackInfo> = None;
@@ -9194,9 +9250,14 @@ impl DesktopApp {
         let mut fill_len: Vec<(u64, f64)> = Vec::new();
         let mut clip_infos: Vec<tangent_ui::ports::ClipInfo> = Vec::new();
         let mut deferred = false;
-        // The window the pictures are being made FOR. See `wave_span`.
-        let wave_view = self.app.arr_wave_view();
-        for clip in &doc.clips {
+        // What the sweeps below keep, resolved ONCE per clip. The closures
+        // this replaced resolved every clip for every cache entry — a
+        // PathBuf join per pair, on every reload.
+        let mut live_files: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        let mut live_stretches: std::collections::HashSet<StretchKey> =
+            std::collections::HashSet::new();
+        for clip in &self.app.arrangement().clips {
             // A MIDI item is a schedule of its own: notes in frames from
             // the clip's drawn left edge — the trim (`offset_s`) already
             // paid, a note the trim cut the head off SKIPPED rather than
@@ -9229,6 +9290,7 @@ impl DesktopApp {
                 continue;
             };
             let path = tangent_ui::arrangement::Arrangement::resolve(doc_path, &clip.path);
+            live_files.insert(path.clone());
             let decoded = match self.track_cache.get(&path) {
                 Some(c) => c.clone(),
                 // **A remembered refusal is not asked again.** This arm
@@ -9273,7 +9335,7 @@ impl DesktopApp {
             };
             // **The stretched copy, if this clip asks for one.**
             //
-            // Everything below — the trim, the fades, the envelope, the
+            // Everything below — the trim, the fades, the picture, the
             // frame counts — then works on the stretched audio without
             // knowing it, which is the point of doing it here: a clip
             // stretched to 1.5 is a clip whose file is half again as long,
@@ -9281,7 +9343,10 @@ impl DesktopApp {
             // where its seconds are. Shared with the offline bounce — see
             // `stretched_clip_audio` and `stretch_key`, which the sweep
             // below reads too.
-            let decoded = self.stretched_live(clip, &decoded, &path);
+            let decoded = stretched_live(clip, &decoded, &path, &mut self.stretch_cache);
+            if let Some((key, _)) = stretch_key(clip, &path) {
+                live_stretches.insert(key);
+            }
             let file_s = decoded.clip.seconds();
             if clip.len_s == 0.0 {
                 fill_len.push((clip.id, (file_s - clip.offset_s).max(0.0)));
@@ -9302,77 +9367,9 @@ impl DesktopApp {
                     error: String::new(),
                 });
             }
-            // **The clip's own picture, at the resolution it is being drawn
-            // at.** Only the visible slice, and only when the arrangement is
-            // showing — see `wave_span`, which says why a fixed budget
-            // cannot be right at every zoom.
-            let frames = |s: f64| frames_at(f64::from(rate), s);
-            // **A looped clip is drawn as it PLAYS**, the same pass over and
-            // over — see `looped_span_envelope`. Reading the file straight
-            // through would have shown eight bars of audio under a clip that
-            // repeats one.
-            let looped = clip.loop_s > 1.0e-6;
-            let (wave, wave_from_s, wave_span_s) = match wave_view.and_then(|(vs, vl, px)| {
-                wave_span(clip.start_s, len_s, vs, vl, px)
-            }) {
-                Some((from, span, buckets)) => {
-                    // In the clip's own file, which is where the samples
-                    // are: the drawn second `from` is `from - start_s` into
-                    // the played span, past the left trim.
-                    let into = (from - clip.start_s).max(0.0);
-                    let wave = if looped {
-                        looped_span_envelope(
-                            &decoded.clip,
-                            clip.offset_s,
-                            clip.loop_s,
-                            into,
-                            span,
-                            buckets,
-                            f64::from(rate),
-                        )
-                    } else {
-                        span_envelope(
-                            &decoded.clip,
-                            frames(clip.offset_s + into) as usize,
-                            frames(span) as usize,
-                            buckets,
-                        )
-                    };
-                    (wave, from, span)
-                }
-                // Nothing on screen, or no panel: a coarse whole-clip
-                // picture, which is what the band's own scrubber uses and
-                // what a clip needs before anybody has looked at it.
-                None => {
-                    let wave = if looped {
-                        looped_span_envelope(
-                            &decoded.clip,
-                            clip.offset_s,
-                            clip.loop_s,
-                            0.0,
-                            len_s,
-                            CLIP_WAVE_BUCKETS,
-                            f64::from(rate),
-                        )
-                    } else {
-                        span_envelope(
-                            &decoded.clip,
-                            frames(clip.offset_s) as usize,
-                            frames(len_s) as usize,
-                            CLIP_WAVE_BUCKETS,
-                        )
-                    };
-                    (wave, clip.start_s, len_s)
-                }
-            };
-            clip_infos.push(tangent_ui::ports::ClipInfo {
-                id: clip.id,
-                wave,
-                file_s,
-                wave_from_s,
-                wave_span_s,
-                peaks: Some(Arc::clone(&decoded.peaks)),
-            });
+            // **The clip's own picture**, from its pyramid. See
+            // `clip_picture`.
+            clip_infos.push(clip_picture(clip, &decoded, rate, wave_view));
         }
         self.app.set_clip_infos(clip_infos);
         if let Some(at) = wave_view {
@@ -9380,6 +9377,9 @@ impl DesktopApp {
         }
         // Lengths the decode just established, written down so the scrubber
         // can draw next launch without one. Never marks the clips dirty.
+        // Empty on nearly every reload, and `note_clip_len` asks the EXACT
+        // dirty question per call, so nothing may be asked when there is
+        // nothing to write.
         for (id, len_s) in fill_len {
             self.app.note_clip_len(id, len_s);
         }
@@ -9387,15 +9387,7 @@ impl DesktopApp {
         // **Only when there is a document to resolve against.** Without one
         // nothing can match, and sweeping on that basis would throw away every
         // decoded file the moment a project became unsaved.
-        if let Some(doc_path) = doc_path.as_ref() {
-            // Resolved ONCE per clip. The closure this replaced resolved
-            // every clip for every cache entry — a PathBuf join per pair,
-            // on every reload.
-            let live_files: std::collections::HashSet<std::path::PathBuf> = doc
-                .clips
-                .iter()
-                .map(|c| tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path))
-                .collect();
+        if doc_path.is_some() {
             let referenced = |path: &std::path::PathBuf| live_files.contains(path);
             self.track_cache.retain(|path, _| referenced(path));
             // **The refusal set holds PADS as well as clips, so this sweep
@@ -9403,12 +9395,12 @@ impl DesktopApp {
             //
             // It asked only the clips, which was true while only clips could
             // be refused. Now that a pad's refusal is remembered too — see
-            // the arm in `run_warm` and what dropping it cost — a sweep that
-            // knows nothing about pads would throw every pad refusal away on
-            // the next clip reload, `queue_warm` would re-queue all of them,
-            // and the spawn-for-ever loop would be back with one extra step
-            // in it. Collected first because the closure below borrows the
-            // app while `retain` borrows the set.
+            // the arm in `land_decodes` and what dropping it cost — a sweep
+            // that knows nothing about pads would throw every pad refusal
+            // away on the next clip reload, `queue_warm` would re-queue all
+            // of them, and the spawn-for-ever loop would be back with one
+            // extra step in it. Collected first because the closure below
+            // borrows the app while `retain` borrows the set.
             let live_pads: Vec<std::path::PathBuf> = (0..tangent_ui::recorder::CHANNELS)
                 .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
                 .flat_map(|lane| self.app.drumpad_paths_of(lane))
@@ -9421,20 +9413,11 @@ impl DesktopApp {
                 .retain(|path| referenced(path) || live_pads.iter().any(|p| p == path));
             let refused = &self.warm_refused;
             self.refused_why.retain(|path, _| refused.contains(path));
-        }
-        // And the stretched renders with them — including every ratio a drag
-        // passed through on its way to the one that stuck. A drag across a
-        // clip's edge is a hundred frames and a hundred ratios; without
-        // this, that is a hundred whole copies of the file left in memory.
-        if let Some(doc_path) = doc_path.as_ref() {
-            let live_stretches: std::collections::HashSet<StretchKey> = doc
-                .clips
-                .iter()
-                .filter_map(|c| {
-                    stretch_key(c, &tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path))
-                        .map(|(key, _)| key)
-                })
-                .collect();
+            // And the stretched renders with them — including every ratio a
+            // drag passed through on its way to the one that stuck. A drag
+            // across a clip's edge is a hundred frames and a hundred ratios;
+            // without this, that is a hundred whole copies of the file left
+            // in memory.
             self.stretch_cache.retain(|key, _| live_stretches.contains(key));
         }
         if let Some(e) = self.recorder.engine.as_mut() {
@@ -9448,27 +9431,50 @@ impl DesktopApp {
         deferred
     }
 
-    /// The live path's stretched copy, with its picture. The samples come
-    /// from `crate::stretch::stretch` under [`stretch_key`], the same
-    /// renderer and key the offline bounce uses through
-    /// `stretched_clip_audio`; the pyramid is built beside them so a
-    /// stretched clip is drawn from its stretched audio like an unstretched
-    /// one is from its file.
-    fn stretched_live(
-        &mut self,
-        clip: &tangent_ui::arrangement::ArrClip,
-        decoded: &Decoded,
-        path: &std::path::Path,
-    ) -> Decoded {
-        let Some((key, mode)) = stretch_key(clip, path) else {
-            return decoded.clone();
+    /// **The pictures alone, for a view that has moved**: every cached
+    /// audio clip's `ClipInfo` remade for the window from its pyramid. No
+    /// decode, no render, no engine, no document write — a clip whose file
+    /// is still in flight or was refused simply has no picture, exactly as
+    /// it had none after the last reload, so the set of infos this pushes is
+    /// the set the last reload pushed.
+    ///
+    /// Called from `after_frame` on `arr_waves_stale`, which is also where
+    /// `note_waves_drawn` MUST be answered: that flag reads stale until
+    /// somebody says the pictures were drawn, and a host that stopped saying
+    /// so would be asked again every frame for ever. The panel is being
+    /// taught to read `ClipInfo.peaks` directly; when it does, `arr_waves_
+    /// stale` will stop asking and this will simply never run.
+    fn refresh_pictures(&mut self) {
+        let Some(wave_view) = self.app.arr_wave_view() else {
+            return;
         };
-        if let Some(made) = self.stretch_cache.get(&key) {
-            return made.clone();
+        let rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(48_000, |e| e.output().sample_rate);
+        let mut clip_infos: Vec<tangent_ui::ports::ClipInfo> = Vec::new();
+        if let Some(doc_path) = self.app.project_doc() {
+            for clip in &self.app.arrangement().clips {
+                if clip.kind == tangent_ui::arrangement::ClipKind::Midi {
+                    continue;
+                }
+                let path = tangent_ui::arrangement::Arrangement::resolve(doc_path, &clip.path);
+                let Some(decoded) = self.track_cache.get(&path) else {
+                    continue;
+                };
+                let decoded = match stretch_key(clip, &path) {
+                    None => decoded,
+                    Some((key, _)) => match self.stretch_cache.get(&key) {
+                        Some(made) => made,
+                        None => continue,
+                    },
+                };
+                clip_infos.push(clip_picture(clip, decoded, rate, Some(wave_view)));
+            }
         }
-        let made = Decoded::of(crate::stretch::stretch(&decoded.clip, clip.stretch, mode));
-        self.stretch_cache.insert(key, made.clone());
-        made
+        self.app.set_clip_infos(clip_infos);
+        self.app.note_waves_drawn(wave_view);
     }
 
     /// The drumpad's samples: decode every slot at the engine's rate, push
@@ -18422,23 +18428,38 @@ mod tests {
         assert!(from + span <= 107.0 + 1e-9, "it ran past the clip's end");
     }
 
-    /// The envelope is MIN and MAX, and a silent clip is a flat line rather
-    /// than a NaN.
+    fn peaks_of(samples: &[f32]) -> tangent_ui::peaks::Peaks {
+        tangent_ui::peaks::Peaks::build(samples, 2, 48_000)
+    }
+
+    fn audio_clip(offset_s: f64, loop_s: f64, len_s: f64) -> tangent_ui::arrangement::ArrClip {
+        tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            offset_s,
+            loop_s,
+            len_s,
+            ..Default::default()
+        }
+    }
+
+    /// The picture is MIN and MAX, a silent clip is a flat line rather than
+    /// a NaN, and a degenerate ask — no buckets, no span, a trim past the
+    /// end, a NaN or an infinity from a hand-edited document — is nothing or
+    /// flat, never a panic.
     #[test]
-    fn the_envelope_carries_both_sides() {
-        let clip = tangent_record::decode::Clip {
-            // A sawtooth from −1 to +1: the two sides are different, which is
-            // what a peak-only envelope cannot show.
-            samples: (0..1000)
-                .flat_map(|i| {
-                    let v = (i as f32 / 500.0) - 1.0;
-                    [v, v]
-                })
-                .collect(),
-            rate: 48_000,
-            source: std::path::PathBuf::from("t.wav"),
-        };
-        let env = span_envelope(&clip, 0, 1000, 4);
+    fn the_picture_carries_both_sides() {
+        // A sawtooth from −1 to +1: the two sides are different, which is
+        // what a peak-only picture cannot show.
+        let saw: Vec<f32> = (0..1000)
+            .flat_map(|i| {
+                let v = (i as f32 / 500.0) - 1.0;
+                [v, v]
+            })
+            .collect();
+        let p = peaks_of(&saw);
+        let whole = 1000.0 / 48_000.0;
+        let clip = audio_clip(0.0, 0.0, whole);
+        let env = super::pyramid_wave(&p, &clip, 0.0, whole, 4, 48_000);
         assert_eq!(env.len(), 8, "four buckets is four pairs");
         for k in 0..4 {
             let (lo, hi) = (env[k * 2], env[k * 2 + 1]);
@@ -18446,20 +18467,196 @@ mod tests {
             assert!(lo >= -1.0 && hi <= 1.0, "bucket {k} left the range");
         }
         // The first bucket is the negative quarter and the last the positive
-        // one, which a mirrored peak envelope would have drawn identically.
+        // one, which a mirrored peak picture would have drawn identically.
         assert!(env[0] < -0.4 && env[1] < 0.0, "{:?}", &env[..2]);
         assert!(env[6] > 0.0 && env[7] > 0.4, "{:?}", &env[6..]);
 
-        let quiet = tangent_record::decode::Clip {
-            samples: vec![0.0; 200],
-            rate: 48_000,
-            source: std::path::PathBuf::from("q.wav"),
-        };
-        assert!(span_envelope(&quiet, 0, 100, 4).iter().all(|v| *v == 0.0));
+        let quiet = peaks_of(&vec![0.0; 200]);
+        let short = 100.0 / 48_000.0;
+        assert!(super::pyramid_wave(&quiet, &clip, 0.0, short, 4, 48_000)
+            .iter()
+            .all(|v| *v == 0.0));
         // Nothing to draw is nothing, not a panic.
-        assert!(span_envelope(&quiet, 0, 0, 4).is_empty());
-        assert!(span_envelope(&quiet, 0, 100, 0).is_empty());
-        assert!(span_envelope(&quiet, 9_999, 100, 4).is_empty());
+        assert!(super::pyramid_wave(&quiet, &clip, 0.0, 0.0, 4, 48_000).is_empty());
+        assert!(super::pyramid_wave(&quiet, &clip, 0.0, short, 0, 48_000).is_empty());
+        assert!(super::pyramid_wave(&quiet, &audio_clip(9_999.0, 0.0, 1.0), 0.0, 1.0, 4, 48_000).is_empty());
+        // What a hand-edited document can say: none of it panics, and a
+        // looped read past the end is flat.
+        let _ = super::pyramid_wave(&quiet, &audio_clip(f64::NAN, 0.0, 1.0), f64::INFINITY, 1.0, 4, 48_000);
+        let _ = super::pyramid_wave(&quiet, &audio_clip(f64::INFINITY, 1.0, 1.0), 0.0, f64::INFINITY, 4, 48_000);
+        assert_eq!(
+            super::pyramid_wave(&quiet, &audio_clip(5.0, 1.0, 1.0), 0.0, 1.0, 2, 48_000),
+            vec![0.0; 4]
+        );
+        assert!(super::pyramid_wave(&quiet, &clip, 0.0, short, 4, 0).iter().all(|v| *v == 0.0));
+    }
+
+    /// **A looped clip is drawn as it PLAYS: the same pass, drawn again and
+    /// again.** The file is a burst in its first second and a flat 0.5 for
+    /// the two after; a clip looping that first second over three seconds
+    /// must show the burst three times and the 0.5 never — a picture that
+    /// read the file straight through (the bug `pyramid_wave` inherits the
+    /// fold from) shows the burst once and then a bar. This is the only pin
+    /// on the fold; the old sample walk had none.
+    #[test]
+    fn a_looped_clips_picture_is_the_same_pass_over_and_over() {
+        let rate = 48_000usize;
+        let samples: Vec<f32> = (0..rate * 3)
+            .flat_map(|f| {
+                let t = f as f64 / rate as f64;
+                let v = if t < 1.0 {
+                    if (0.2..0.3).contains(&t) {
+                        0.9
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.5
+                };
+                [v, v]
+            })
+            .collect();
+        let p = peaks_of(&samples);
+        let looped = audio_clip(0.0, 1.0, 3.0);
+        let folded = super::pyramid_wave(&p, &looped, 0.0, 3.0, 300, 48_000);
+        assert_eq!(folded.len(), 600);
+        for i in 0..300 {
+            let (lo, hi) = (folded[i * 2], folded[i * 2 + 1]);
+            assert!(
+                (hi - 0.5).abs() > 0.05 && (lo - 0.5).abs() > 0.05,
+                "bucket {i} read the file straight through: {lo}..{hi}"
+            );
+            // One bucket of slack at each edge of the burst: a block is
+            // sixteen frames and a bucket edge can sit on one.
+            let col = i % 100;
+            if (21..29).contains(&col) {
+                assert!(hi > 0.8, "bucket {i} should be the burst, got {hi}");
+            } else if !(19..=31).contains(&col) {
+                assert!(hi < 0.05 && lo > -0.05, "bucket {i} should be silent: {lo}..{hi}");
+            }
+        }
+        // The same clip with its loop off reads the file straight through:
+        // the second and third seconds are the file's own 0.5.
+        let straight = super::pyramid_wave(&p, &audio_clip(0.0, 0.0, 3.0), 0.0, 3.0, 300, 48_000);
+        assert!((straight[150 * 2 + 1] - 0.5).abs() < 1e-6, "{}", straight[150 * 2 + 1]);
+        // And a window that starts mid-pass folds the same way: a second
+        // drawn from 1.5 s in has the burst at 1.7..1.8.
+        let mid = super::pyramid_wave(&p, &looped, 1.5, 1.0, 100, 48_000);
+        for i in 0..100 {
+            let hi = mid[i * 2 + 1];
+            if (71..79).contains(&i) {
+                assert!(hi > 0.8, "bucket {i} of the mid-pass window should be the burst");
+            } else if !(69..=81).contains(&i) {
+                assert!(hi < 0.05, "bucket {i} of the mid-pass window should be silent: {hi}");
+            }
+        }
+        // A trim moves the fold with it: offset 0.1 s puts the burst at
+        // 0.1..0.2 of every pass.
+        let trimmed = super::pyramid_wave(&p, &audio_clip(0.1, 1.0, 2.0), 0.0, 2.0, 200, 48_000);
+        assert!(trimmed[15 * 2 + 1] > 0.8 && trimmed[115 * 2 + 1] > 0.8);
+        assert!(trimmed[25 * 2 + 1] < 0.05 && trimmed[125 * 2 + 1] < 0.05);
+    }
+
+    /// **What one picture pass costs**, against the sample walk it replaced,
+    /// for forty-five 60 s clips laid end to end: fit-to-song across 1,900
+    /// points, and a 10 s window. The old walk is copied in here verbatim so
+    /// the two are measured on the same clips. Ignored; run in RELEASE:
+    ///
+    /// ```text
+    /// cargo test --release -p tangent --bin tangent what_a_picture_pass_costs -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn what_a_picture_pass_costs() {
+        fn old_minmax(clip: &tangent_record::decode::Clip, a: usize, b: usize) -> (f32, f32) {
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for f in a..b {
+                for ch in 0..2 {
+                    let v = clip.samples.get(f * 2 + ch).copied().unwrap_or(0.0);
+                    if v.is_finite() {
+                        lo = lo.min(v);
+                        hi = hi.max(v);
+                    }
+                }
+            }
+            if lo <= hi {
+                (lo.max(-1.0), hi.min(1.0))
+            } else {
+                (0.0, 0.0)
+            }
+        }
+        fn old_walk(clip: &tangent_record::decode::Clip, offset: usize, len: usize, buckets: usize) -> Vec<f32> {
+            let total = clip.samples.len() / 2;
+            let start = offset.min(total);
+            let end = (offset + len).min(total);
+            let frames = end.saturating_sub(start);
+            if frames == 0 || buckets == 0 {
+                return Vec::new();
+            }
+            let mut out = vec![0.0f32; buckets * 2];
+            for i in 0..buckets {
+                let a = start + i * frames / buckets;
+                let b = (start + (i + 1) * frames / buckets).max(a + 1).min(end);
+                let (lo, hi) = old_minmax(clip, a, b);
+                out[i * 2] = lo;
+                out[i * 2 + 1] = hi;
+            }
+            out
+        }
+        let build = if cfg!(debug_assertions) { "DEBUG" } else { "release" };
+        let rate = 48_000u32;
+        let frames = 60 * rate as usize;
+        let mut clips = Vec::new();
+        let mut decoded = Vec::new();
+        for i in 0..45usize {
+            let samples: Vec<f32> = (0..frames)
+                .flat_map(|f| {
+                    let t = f as f32 / rate as f32;
+                    let v = (t * (110.0 + i as f32) * std::f32::consts::TAU).sin() * 0.7;
+                    [v, v * 0.8]
+                })
+                .collect();
+            decoded.push(super::Decoded::of(tangent_record::decode::Clip {
+                samples,
+                rate,
+                source: std::path::PathBuf::from(format!("{i}.wav")),
+            }));
+            let mut clip = audio_clip(0.0, 0.0, 60.0);
+            clip.start_s = 60.0 * i as f64;
+            clip.id = i as u64;
+            clips.push(clip);
+        }
+        for (label, view) in [
+            ("fit-to-song 2,700 s / 1,900 pt", (0.0, 2_700.0, 1_900.0f32)),
+            ("10 s window / 1,900 pt", (1_200.0, 10.0, 1_900.0f32)),
+        ] {
+            let n = 20;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                for (clip, d) in clips.iter().zip(&decoded) {
+                    if let Some((from, span, buckets)) = super::wave_span(clip.start_s, 60.0, view.0, view.1, view.2) {
+                        let into = (from - clip.start_s).max(0.0);
+                        let fr = |s: f64| super::frames_at(f64::from(rate), s) as usize;
+                        std::hint::black_box(old_walk(&d.clip, fr(into), fr(span), buckets));
+                    }
+                }
+            }
+            let walk = t.elapsed() / n;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                for (clip, d) in clips.iter().zip(&decoded) {
+                    std::hint::black_box(super::clip_picture(clip, d, rate, Some(view)));
+                }
+            }
+            let pyramid = t.elapsed() / n;
+            println!(
+                "pictures [{build}] {label}: 45 x 60 s clips, sample walk {walk:.3?} ({:.1}% of a 16.6 ms frame) | pyramid {pyramid:.3?} ({:.1}%) | {:.1}x",
+                walk.as_secs_f64() / 0.0166 * 100.0,
+                pyramid.as_secs_f64() / 0.0166 * 100.0,
+                walk.as_secs_f64() / pyramid.as_secs_f64()
+            );
+        }
     }
 
     /// **Running the test suite must not write the user's own desk.**
