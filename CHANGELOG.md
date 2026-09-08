@@ -420,6 +420,24 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A take that had finished decoding could sit behind the desk.** The window
+  rests between animations now, so everything the app does after a frame has to
+  ask for the frame that shows it. Five roads did not: a decoded take arriving,
+  the last redraw of a zoom, a decoder's complaint, the last plug-in of a rack
+  landing, and a click sound that would not load. Each asks now, and only when
+  it really changed something, so a still window still rests.
+
+- **"Loading audio" could take the desk hostage for the rest of the session.**
+  Deleting the audio clips of a project whose takes were still decoding
+  answered the loading debt while files nothing referenced any more were still
+  in the queue; they came back, were dropped as unwanted, and nothing was left
+  to lower the cover. Both quiet ends of the warm-up settle the meter now.
+
+- **The last plug-in in a rack drew its face a frame late**, or not until
+  something else asked for a frame: the loader asked for a repaint only while
+  work was outstanding, and the bay that finishes the walk is the one where
+  nothing is.
+
 - **A seventeen-digit fraction survives a round trip.** The JSON reader
   rounded values such as `0.9999999999999999` to `1.0`, so a document with
   one of them was never equal to itself after a save, which is the class of
