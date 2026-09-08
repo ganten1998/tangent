@@ -321,6 +321,10 @@ const V5_MUSICAL_TIME: u64 = 5;
 /// head is written WHOLE, never trailing-trimmed, so its length can never
 /// collide with the era lengths the migrations key on.
 ///
+/// A sparse key names ANY bay in twenty bytes, so the reader keeps only
+/// seats inside `INSERT_SPACE` (`DeskSnap::canonical` says why); a seat
+/// past the map is dropped there, never spread over memory sized by it.
+///
 /// In memory the snapshot holds only the occupied seats, sorted by bay
 /// (`DeskSnap::inserts`); the settings keep their dense `strip_inserts`
 /// and the two meet in `DeskRef`, where the walk reads either shape as
@@ -1176,10 +1180,24 @@ impl DeskSnap {
         }
     }
 
-    /// Sorted, deduplicated (the first of two claims on a seat wins) and
-    /// free of empties — the one shape `inserts` is allowed to have.
+    /// Sorted, deduplicated (the first of two claims on a seat wins), free
+    /// of empties and inside the seat map — the one shape `inserts` is
+    /// allowed to have.
+    ///
+    /// **The bound is the point.** A dense array's seat count was limited
+    /// by the file (one `"",` per seat); a sparse key is not, and every
+    /// consumer spreads these pairs over a dense space sized by the bay —
+    /// so `"inserts_tail": {"100000000000": "x"}` was a 20-byte request
+    /// for 2.4 TB of strings, and `usize::MAX` an add that wraps to zero
+    /// in release and emptied the live desk instead. Neither shape can
+    /// reach the quarantine (both are valid JSON). The settings reader
+    /// already refuses a `strip_inserts_tail` seat past `INSERT_SPACE`;
+    /// this is the same law on the document road. What is given up is a
+    /// future build's seat past today's map surviving an open here — and
+    /// the settings mirror was already dropping that at the next launch,
+    /// so it was never a real round trip.
     fn canonical(mut pairs: Vec<(usize, String)>) -> Vec<(usize, String)> {
-        pairs.retain(|(_, p)| !p.is_empty());
+        pairs.retain(|(bay, p)| !p.is_empty() && *bay < crate::recorder::INSERT_SPACE);
         pairs.sort_by_key(|(n, _)| *n);
         pairs.dedup_by_key(|(n, _)| *n);
         pairs
@@ -3845,6 +3863,38 @@ mod tests {
         assert_eq!(read.bay(9000), None, "an empty path made a seat");
         assert_eq!(read.bay(500), Some("late"));
         assert!(read.inserts.windows(2).all(|w| w[0].0 < w[1].0), "the pairs are not sorted");
+
+        // And a key that names a seat past the map, in either sparse
+        // shape. A dense array had to SPEND a file byte per seat; a key
+        // spends twenty on any bay at all, and everything downstream sizes
+        // a dense space by the bay — so these are a terabyte and a wrap to
+        // zero, not seats. The last real seat stays, the first past it goes.
+        let space = crate::recorder::INSERT_SPACE;
+        let past = serde_json::json!({
+            "18446744073709551615": "usize-max",
+            "100000000000": "a terabyte of strings",
+            space.to_string(): "one past the map",
+            (space - 1).to_string(): "the last seat",
+            "12447": "brusfri",
+        });
+        let mut tail = written.clone();
+        tail["desk"].as_object_mut().expect("desk").insert("inserts_tail".into(), past.clone());
+        let mut bare = written.clone();
+        let bd = bare["desk"].as_object_mut().expect("desk");
+        bd.insert("inserts".into(), past);
+        bd.shift_remove("inserts_tail");
+        for (shape, json) in [("inserts_tail", tail), ("a bare inserts object", bare)] {
+            let read = Arrangement::from_json(&json.to_string()).desk.expect("a desk");
+            assert_eq!(read.bay(usize::MAX), None, "{shape}: usize::MAX made a seat");
+            assert_eq!(read.bay(100_000_000_000), None, "{shape}: an eleven-digit bay made a seat");
+            assert_eq!(read.bay(space), None, "{shape}: the seat one past the map was kept");
+            assert_eq!(read.bay(space - 1), Some("the last seat"), "{shape}: the last real seat was lost");
+            assert_eq!(read.bay(12447), Some("brusfri"), "{shape}: a real far seat was lost");
+            assert!(
+                read.inserts.iter().all(|(b, _)| *b < space),
+                "{shape}: a seat past the map survived the reader"
+            );
+        }
     }
 
     /// **A desk seen through the view and through a snapshot is one desk.**
