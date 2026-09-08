@@ -8175,6 +8175,116 @@ ArrangeView {
         }
     }
 
+    /// One painted frame of `v`: the shapes it emitted and how many galleys
+    /// the font cache holds afterwards — the two things a clip that is not
+    /// on screen must not add to.
+    fn frame_of(v: &ArrangeView<'_>, area: Rect) -> (Vec<egui::epaint::ClippedShape>, usize) {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(area), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(area);
+                    draw(ui.painter(), area, v);
+                });
+            },
+        );
+        let galleys = ctx.fonts(|f| f.num_galleys_in_cache());
+        (out.shapes, galleys)
+    }
+
+    /// **A clip that is not on screen costs the rect test and nothing else.**
+    ///
+    /// The clip loop derives a colour, measures an ink, lays out a name and
+    /// walks a miniature for every clip it reaches; a clip past the window's
+    /// end, or on a lane that is scrolled away, must be turned back before
+    /// any of that — a two-thousand-clip song is mostly clips nobody is
+    /// looking at, and the frame has to be priced by the window, not by the
+    /// document. Held as what the frame EMITS: a thousand clips that cannot
+    /// be seen add no shape and no galley to a frame that already draws two.
+    #[test]
+    fn an_offscreen_clip_costs_no_shape_and_no_galley() {
+        let bar_s = 2.0;
+        let notes = a_looped_bar(bar_s);
+        let two = clips();
+        let mut many = clips();
+        for i in 0..1_000u64 {
+            // Past the window's end, on a visible lane; and inside the
+            // window, on a lane the eight-lane window does not reach.
+            let (lane, start_s) = if i % 2 == 0 { (1, 1_000.0 + i as f64) } else { (30, 5.0) };
+            many.push(ClipView {
+                id: 100 + i,
+                lane,
+                start_s,
+                len_s: 4.0,
+                name: "a name that would need a galley",
+                midi: true,
+                notes: &notes,
+                loop_s: bar_s,
+                ..a_looped_clip(&notes, bar_s, 2.0)
+            });
+        }
+        let area = rect();
+        let v2 = a_view(&two);
+        let vn = a_view(&many);
+        assert_eq!(vn.clips.len(), 1_002);
+        let (s2, g2) = frame_of(&v2, area);
+        let (sn, gn) = frame_of(&vn, area);
+        assert_eq!(sn.len(), s2.len(), "a thousand clips off screen added shapes");
+        assert_eq!(gn, g2, "a thousand clips off screen laid out text");
+    }
+
+    /// **The grid is priced by the pixels, not by the song.**
+    ///
+    /// Full-height lines through the lanes: one per bar while bars are five
+    /// points apart, the gridbox's subdivisions between them when THEY are
+    /// five apart, and past that the walk skips by the ruler's own step. So
+    /// however wide the window and whatever the gridbox says, the count is
+    /// bounded by the width in points — a thousand-hour window at 1/32 must
+    /// not ask the UI thread for a million lines.
+    #[test]
+    fn grid_lines_are_bounded_by_the_width_at_every_zoom() {
+        let c = clips();
+        let area = rect();
+        let l = Layout::new(area, &a_view(&c));
+        let field = l.lanes_area;
+        let cap = (field.width() / 5.0 * 2.0) as usize + 16;
+        for len_s in [1.0, 10.0, 100.0, 1_000.0, 36_000.0, 3.6e6] {
+            for exp in [-6i8, -2, 0, 3] {
+                let mut v = a_view(&c);
+                v.view_start_s = 0.0;
+                v.view_len_s = len_s;
+                v.song_s = len_s;
+                v.grid_exp = exp;
+                let (shapes, _) = frame_of(&v, area);
+                let lines = shapes
+                    .iter()
+                    .filter(|s| match &s.shape {
+                        egui::Shape::LineSegment { points, .. } => {
+                            (points[0].x - points[1].x).abs() < 0.01
+                                && (points[0].y - field.top()).abs() < 0.01
+                                && (points[1].y - field.bottom()).abs() < 0.01
+                        }
+                        _ => false,
+                    })
+                    .count();
+                assert!(
+                    lines <= cap,
+                    "{len_s} s wide at grid {exp}: {lines} grid lines, more than {cap}"
+                );
+                // A fine gridbox on a wide window draws NO lines, by design:
+                // bars under five points are skipped and their subdivisions
+                // with them. The bar-or-coarser settings always show the
+                // strong lines the walk steps by.
+                if exp >= 0 {
+                    assert!(lines > 0, "{len_s} s wide at grid {exp}: no grid at all");
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_time_axis_round_trips() {
         let c = clips();
