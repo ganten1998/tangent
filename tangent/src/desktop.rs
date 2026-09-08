@@ -18781,12 +18781,12 @@ mod tests {
     #[test]
     fn a_change_made_after_the_frame_asks_for_a_frame_and_nothing_else_does() {
         let ctx = rested_context();
-        super::late_change(&ctx, false);
+        late_change(&ctx, false);
         assert!(
             !ctx.has_requested_repaint(),
             "a pass that changed nothing must not wake the window"
         );
-        super::late_change(&ctx, true);
+        late_change(&ctx, true);
         assert!(ctx.has_requested_repaint(), "a pass that changed something must");
     }
 
