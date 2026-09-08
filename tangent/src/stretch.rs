@@ -77,15 +77,6 @@ impl Mode {
         Mode::ALL.into_iter().find(|m| m.key() == key)
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Mode::Auto => "Auto",
-            Mode::Tape => "Tape - pitch follows",
-            Mode::Rhythmic => "Rhythmic",
-            Mode::Tonal => "Tonal",
-        }
-    }
-
     /// **Which algorithm this material and this ratio want.**
     ///
     /// Two questions, in order:

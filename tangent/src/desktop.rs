@@ -9301,23 +9301,6 @@ impl DesktopApp {
         }
     }
 
-    /// The reload sentinel on the bays of the rows a permutation MOVED.
-    ///
-    /// `order[new] = old`, so a row with `order[n] == n` is a row whose
-    /// plugin, state and bays are all exactly where they were.
-    fn force_insert_reload_for(&mut self, order: &[usize]) {
-        let marks = reload_slots_for_loaded(
-            &tangent_ui::recorder::seat_order(order),
-            tangent_ui::recorder::INSERTS,
-            &self.recorder.inserts_loaded,
-        );
-        for i in marks {
-            if let Some(slot) = self.recorder.inserts_loaded.get_mut(i) {
-                *slot = Some("\u{1f}reload".to_owned());
-            }
-        }
-    }
-
     /// Make the insert reconcile revisit every bay that HOLDS something, or
     /// is about to — load, reload with new state, or unload, one per frame as
     /// it always works. The sentinel can never equal a real path or an empty
