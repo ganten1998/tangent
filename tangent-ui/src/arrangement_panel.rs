@@ -3253,8 +3253,25 @@ pub fn targets_in(l: &Layout, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
 /// the song, and the dial readouts. A timeline a blind student cannot read
 /// the shape of has been made navigable and not useful.
 pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> {
+    a11y_nodes_from(view, &targets(rect, view))
+}
+
+/// [`a11y_nodes`] over a target list the caller already has.
+///
+/// **Two hundred nodes were being built and dropped every frame.** `paint`
+/// ran `a11y_nodes` (which ran `targets`) and then `targets` again, and
+/// handed the result to `offer_nodes`, whose first line returns when no
+/// reader is on — so for everybody but a screen-reader user the frame
+/// formatted two hundred labels, two hundred Debug strings for the ids and
+/// two target walks, and threw them away. The nodes are now built only on a
+/// frame that will install them, from the one `targets` walk that frame
+/// also needs for the map back from a focused node to its hit.
+pub fn a11y_nodes_from(
+    view: &ArrangeView<'_>,
+    hits: &[(Rect, Hit)],
+) -> Vec<crate::a11y::Node> {
     use crate::a11y::{Node, Travel};
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(hits.len());
     let up = |norm: f32| Travel { norm: norm.clamp(0.0, 1.0), up: true };
     // The name a person would use for a row, whether or not it is a track
     // yet. Never an empty string — a node labelled "" is a node a reader
@@ -3283,7 +3300,7 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
             format!("bar {a} to {b}")
         }
     };
-    for (r, hit) in targets(rect, view) {
+    for &(r, hit) in hits {
         let id = egui::Id::new(("arrangement", format!("{hit:?}")));
         let node = match hit {
             // ── the toolbar ───────────────────────────────────────────
