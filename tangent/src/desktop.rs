@@ -11301,19 +11301,6 @@ impl DesktopApp {
         }
     }
 
-    /// Copy the faders, the click and the tempo into the audio thread.
-    ///
-    /// Every frame, unconditionally. These are all atomic stores of a float or
-    /// a bool behind a smoothing ramp, so writing an unchanged value costs
-    /// nothing — and a change-detection cache here would be a second copy of
-    /// the settings to get out of step with the first.
-    /// Hand the desk's routes to the engine, dropping any that the current
-    /// device cannot honour.
-    ///
-    /// Pruning here rather than at the picker: the picker knows what the
-    /// device offered when it opened, and this runs every frame — so a route
-    /// survives an interface being unplugged and replugged, and is dropped
-    /// only against the device that is actually open.
     /// Tell the app how many outputs the open device has, so the routing
     /// picker offers the jacks that exist rather than a guess.
     fn publish_device_outs(&mut self) {
@@ -11325,17 +11312,37 @@ impl DesktopApp {
         self.app.set_device_outs(outs);
     }
 
+    /// Hand the desk's routes to the engine, dropping any that the current
+    /// device cannot honour.
+    ///
+    /// Pruning here rather than at the picker: the picker knows only what the
+    /// device offered when it opened, and the pruned copy is never written
+    /// back to the desk — so a route survives an interface being unplugged
+    /// and replugged, and is dropped only against the device that is actually
+    /// open. The device width is part of the change key the caller compares
+    /// (`desk_unchanged` takes `outs`), precisely so a swap for a narrower
+    /// interface re-prunes rather than leaving a channel pointed at a jack
+    /// that is gone.
+    ///
+    /// **Not every frame.** It used to be, and the doc above this said so
+    /// until the day the sentence outlived the code: the caller puts this and
+    /// `set_desk` behind `desk_unchanged` now, because each of them is a
+    /// table walk on the engine's side rather than one atomic store. What the
+    /// engine does with the tables when they DO go over — clear the count,
+    /// write the cells, publish the count — is `Engine::set_routes`' own
+    /// argument, and it is worth reading before touching either end.
     fn publish_routes(&self, e: &crate::instrument::Engine) {
         let outs = e.output().channels as usize;
         let mut routes = self.app.routes().clone();
         routes.prune(outs, tangent_ui::recorder::CHANNELS);
         e.set_routes(&routes);
-        // **The sidechain key table rides beside the routes**, whole each
-        // frame on the same bargain: absent means cleared, so the engine
-        // never keeps an edge the desk no longer has. The desk speaks
-        // (strip, slot) so saved edges survive seat renumbering; the engine
-        // speaks (seat, bay), and THIS is the one place the translation
-        // happens — through `seat_bay`, like every other slot address.
+        // **The sidechain key table rides beside the routes**, whole on
+        // every publish and on the same bargain: absent means cleared, so
+        // the engine never keeps an edge the desk no longer has. The desk
+        // speaks (strip, slot) so saved edges survive seat renumbering; the
+        // engine speaks (seat, bay), and THIS is the one place the
+        // translation happens — through `seat_bay`, like every other slot
+        // address.
         let keys: Vec<(usize, usize, usize)> = self
             .app
             .insert_keys()
@@ -11348,13 +11355,21 @@ impl DesktopApp {
             })
             .collect();
         engine_set_insert_keys(e, &keys);
-        // **And the bypassed bays**, whole each frame on the same bargain:
-        // absent means in circuit. Already in SEAT terms - a bypass is stored
-        // at the plugin's own address - so unlike the keys above there is no
-        // `seat_bay` translation here to get wrong.
+        // **And the bypassed bays**, whole on every publish and on the same
+        // bargain: absent means in circuit. Already in SEAT terms - a bypass
+        // is stored at the plugin's own address - so unlike the keys above
+        // there is no `seat_bay` translation here to get wrong.
         engine_set_insert_bypass(e, self.app.insert_bypass());
     }
 
+    /// Copy the faders, the click and the tempo into the audio thread.
+    ///
+    /// Every frame, unconditionally. These are all atomic stores of a float
+    /// or a bool behind a smoothing ramp, so writing an unchanged value costs
+    /// nothing — and a change-detection cache here would be a second copy of
+    /// the settings to get out of step with the first. The TABLES in the
+    /// middle of this function are the exception and say why where they sit:
+    /// a table is a walk, not a store.
     fn push_monitor_settings(&mut self) {
         // **The live tap, if one has been waiting for an engine to appear.**
         //
