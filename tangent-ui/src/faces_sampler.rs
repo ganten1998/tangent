@@ -235,7 +235,7 @@ impl Layout {
         // What is left after the fixed furniture, split between the wave and
         // the rows. The wave takes the larger part because it is the panel.
         let free = (left.bottom() - name.bottom() - CROP_H - AIR * 2.0).max(0.0);
-        let wave_h = (free * 0.52).clamp(WAVE_MIN.min(free), WAVE_MAX);
+        let wave_h = (free * 0.42).clamp(WAVE_MIN.min(free), WAVE_MAX);
         let wave = Rect::from_min_size(
             Pos2::new(left.left(), name.bottom() + AIR * 0.5),
             Vec2::new(left.width(), wave_h),
@@ -580,8 +580,13 @@ fn draw_stage(
                 let f = (x - wave.left()) / wave.width().max(1.0);
                 f >= start && f <= end
             };
+            // **The wave is the SECOND tier and the envelope is the
+            // first.** Both were the primary in the first rendering and the
+            // envelope vanished into the waveform wherever it crossed it —
+            // one green line over a green mass. The picture the envelope is
+            // read against has to sit UNDER it.
             let ink = if inside {
-                face::lcd_ink(st, LcdTier::Primary)
+                face::lcd_ink(st, LcdTier::Secondary)
             } else {
                 face::lcd_ink(st, LcdTier::Label)
             };
@@ -657,7 +662,13 @@ fn draw_stage(
     let pts = env.points(cband);
     let line = face::lcd_ink(st, LcdTier::Primary);
     for pair in pts.windows(2) {
-        painter.line_segment([pair[0], pair[1]], Stroke::new(1.6_f32, line));
+        // A dark CASING under the line, so the envelope reads wherever it
+        // crosses the waveform — the same trick a scope trace uses over a
+        // grid, and the thing the first rendering of this panel was missing.
+        painter.line_segment([pair[0], pair[1]], Stroke::new(4.0_f32, st.lcd_face));
+    }
+    for pair in pts.windows(2) {
+        painter.line_segment([pair[0], pair[1]], Stroke::new(1.8_f32, line));
     }
     for (node, id) in [
         (Node::Attack, P_ATTACK),
@@ -771,7 +782,10 @@ fn crop_field(
         Pos2::new(cell.right() - 6.0, cell.center().y),
         Align2::RIGHT_CENTER,
         crop_text(v),
-        FontId::monospace(FIELD_PT),
+        // Never `FontId::monospace` — see `face::slider_row`: this app
+        // links egui without its default fonts, so that family is empty
+        // and a galley in it lays out at zero by zero.
+        FontId::new(FIELD_PT, fonts::courier()),
         // The panel's ink is measured against the panel; inside a well it
         // is the well that has to carry it.
         face::quiet_ink(st, ground),
@@ -811,17 +825,24 @@ fn control_rows(
     if !rows.is_positive() {
         return None;
     }
-    const LEFT: [u32; 5] = [P_VOL, P_MODE, P_TRANSPOSE, P_FINE, P_PORTA];
-    const RIGHT: [u32; 5] = [P_NOTEOFF, P_LOOP, P_XFADE, P_VOICES, P_BEND];
+    // **ONE column, not two, and the reason is a screenshot.** The first
+    // rendering of this panel put the ten rows in two columns, and every
+    // reading in them was GONE: `face::slider_row` lays its reading out
+    // right-to-left after the name and the slider have taken their shares,
+    // and at half this panel's width what was left was fifty points for a
+    // word that wants sixty. egui CLIPS a galley that overruns, so the row
+    // measured perfectly, escaped nothing, and printed no value at all.
+    // `no_word_is_clipped_by_the_room_it_was_given` is the test that came
+    // out of it and it reads the clip rectangles off the shape stream,
+    // because that is the only place the fault is visible.
+    const IDS: [u32; 10] = [
+        P_VOL, P_MODE, P_TRANSPOSE, P_FINE, P_PORTA, P_NOTEOFF, P_LOOP, P_XFADE, P_VOICES, P_BEND,
+    ];
     let mut out = None;
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rows).layout(*ui.layout()));
-    child.columns(2, |cols| {
-        for (col, ids) in cols.iter_mut().zip([LEFT, RIGHT]) {
-            for id in ids {
-                face::keep(&mut out, one_row(col, st, live, id));
-            }
-        }
-    });
+    for id in IDS {
+        face::keep(&mut out, one_row(&mut child, st, live, id));
+    }
     ui.advance_cursor_after_rect(rows);
     out
 }
@@ -851,6 +872,40 @@ fn one_row(ui: &mut egui::Ui, st: &FaceStyle, live: &FaceLive, id: u32) -> Optio
 }
 
 // ── the browser, the main door ──────────────────────────────────────────────
+
+/// **The ink a FILE row is printed in**, measured on the pane's own ground.
+///
+/// It was `face::lcd_ink(st, LcdTier::Primary)` — the LCD's own colour,
+/// which is resolved against the LCD GLASS and has no business anywhere
+/// else. On a light theme that is an amber on a pale recess at about one
+/// and a half to one, and the browser's whole listing was unreadable. The
+/// first light-mode rendering of this panel is what found it; no test did,
+/// because the pane dimmed the ink before painting it and the dimmed colour
+/// matched nothing a sweep recognises.
+///
+/// So the LCD colour is only the STARTING point and the panel's own ground
+/// decides where it ends up — `distinct_surface_at` walks it until it
+/// clears the floor, exactly as the drumpad walks its meter green. Files
+/// stay a different colour from folders, which is the whole reason not to
+/// simply print them in the panel's ink.
+fn file_ink(st: &FaceStyle) -> Color32 {
+    crate::recorder_panel::distinct_surface_at(
+        face::lcd_ink(st, LcdTier::Primary),
+        row_ground(st),
+        4.5,
+    )
+}
+
+/// The ground a browser row's word lands on: the panel under two veils.
+/// Measuring against the PANEL instead put the first fix at 3.6:1 — the
+/// recess darkens the ground toward a dark ink, and the stripe darkens it
+/// again.
+fn row_ground(st: &FaceStyle) -> Color32 {
+    crate::drumpad_panel::media_row_ground(
+        st.s.bg,
+        crate::recorder_panel::wants_light_ink(st.s.bg),
+    )
+}
 
 /// The shortcut chips and the shared media pane.
 ///
@@ -921,7 +976,7 @@ fn browser(
         &pane,
         st.s.ink,
         st.s.bg,
-        face::lcd_ink(st, LcdTier::Primary),
+        file_ink(st),
         crate::recorder_panel::wants_light_ink(st.s.bg),
     );
 
@@ -1040,20 +1095,22 @@ fn take_a_drop(ui: &egui::Ui, body: Rect) -> Option<FaceAction> {
     })
 }
 
+/// The fixtures the tests and the screenshot share. One `a_face`, so the
+/// panel a person looks at is the panel the sweeps measure — a shot built
+/// from its own fixture is a picture of something nothing tests.
 #[cfg(test)]
-mod tests {
+mod tests_support {
     use super::*;
     use crate::face::fit;
-    use crate::recorder_panel::contrast_ratio;
 
-    fn style() -> FaceStyle {
+    pub fn style() -> FaceStyle {
         let set = crate::settings::Settings::default();
         let p = crate::recorder_panel::palette(&set);
         FaceStyle::new(p.bg, p.lcd, p.lcd_face)
     }
 
     /// A pushed face with the sampler's real ids and a file behind it.
-    fn a_face(loaded: bool) -> FaceLive {
+    pub fn a_face(loaded: bool) -> FaceLive {
         let mut live = fit::a_worst_case_face(SAMPLER_PATH, ID_CEILING, STEPPED, false);
         for p in &mut live.face.params {
             p.value = match p.id {
@@ -1094,7 +1151,7 @@ mod tests {
         live
     }
 
-    fn a_peaks() -> std::sync::Arc<crate::peaks::Peaks> {
+    pub fn a_peaks() -> std::sync::Arc<crate::peaks::Peaks> {
         let rate = 48_000u32;
         let n = rate as usize * 2;
         let v: Vec<f32> = (0..n)
@@ -1105,6 +1162,14 @@ mod tests {
             .collect();
         crate::peaks::Peaks::build(&v, 1, rate).shared()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_support::*;
+    use super::*;
+    use crate::face::fit;
+    use crate::recorder_panel::contrast_ratio;
 
     /// One frame of the panel at the floor window, with these events.
     fn draw_once(
@@ -1512,6 +1577,105 @@ mod tests {
         );
     }
 
+    /// **Every ordinary control PRINTS the value the host pushed.**
+    ///
+    /// The fault this is named for was found by looking at a rendering and
+    /// by nothing else. The ten controls were laid out in two columns;
+    /// `face::slider_row` lays its reading out last, right-to-left, after
+    /// the name and the slider have taken their shares of the width; at half
+    /// this panel's width what was left was not enough for the word, and
+    /// egui answered by printing NOTHING. Five rows with a slider, a name,
+    /// and no number anywhere on them.
+    ///
+    /// Every sweep in this file passed while that was true. The row
+    /// allocated correctly, so `escape` saw nothing; the missing word cannot
+    /// fail an ink test, because an ink test can only measure ink that was
+    /// laid down. So this asks the one question that catches it: is the
+    /// string the host pushed actually in the shapes?
+    #[test]
+    fn every_row_prints_the_reading_the_host_pushed() {
+        let mut missing: Vec<String> = Vec::new();
+        for font in fit::FONTS {
+            let ctx = fit::a_ctx(font);
+            let st = style();
+            let window = crate::dialogs::face_window_size(SAMPLER_PATH, None);
+            let room = Vec2::new(window.x, window.y - crate::shell::CHROME_BAR_H);
+            let mut live = a_face(true);
+            // **A reading nothing else could print, at the length a real
+            // one is.** Both halves matter. Unique, so a row that printed
+            // its neighbour's number cannot pass; and ten characters, which
+            // is what "high shelf" is — the longest reading `builtin_fx`
+            // prints, and the length at which the two-column layout ran out
+            // of room. A short probe fits where a real word does not, and a
+            // test that probes with one certifies a panel nobody can read.
+            for p in &mut live.face.params {
+                p.reading = format!("hi shelf{:02}", p.id);
+                // And the longest NAME any of this unit's parameters wears.
+                p.name = "Loop Crossfade".to_owned();
+            }
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, room)),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            fit::dress(ui.style_mut(), &st.s);
+                            egui::Frame::NONE
+                                .inner_margin(egui::Margin::same(fit::MARGIN as i8))
+                                .show(ui, |ui| {
+                                    let _ = crate::faces::draw(ui, &st, &mut live);
+                                });
+                        });
+                },
+            );
+            // **A word with no SIZE is a word nobody can read**, and it is
+            // the shape the fault actually took: `FontId::monospace` lays
+            // out at zero by zero in this app (egui is linked without its
+            // default fonts, so that family is empty), so the shape is
+            // emitted, `galley.text()` answers, and no pixel is drawn. A
+            // test that only asked "is the string in the shapes" passed on
+            // a panel with no numbers on it — this one did, before it
+            // measured.
+            fn walk(s: &egui::Shape, said: &mut Vec<String>) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, said)),
+                    egui::Shape::Text(t) => {
+                        if t.galley.rect.width() > 0.5 && t.galley.rect.height() > 0.5 {
+                            said.push(t.galley.text().to_owned());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut said = Vec::new();
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut said);
+            }
+            let all = said.join(" | ");
+            // The five continuous rows print a reading; the five stepped
+            // ones print their CHOICE, which the worst-case face spells
+            // "high shelf" and the row wears on its button.
+            for id in [P_VOL, P_TRANSPOSE, P_FINE, P_XFADE, P_PORTA] {
+                if !all.contains(&format!("hi shelf{id:02}")) {
+                    missing.push(format!("{}: parameter {id} printed no reading", font.key()));
+                }
+            }
+            let named = said.iter().filter(|t| t.contains("Loop Crossfade")).count();
+            if named < 10 {
+                missing.push(format!("{}: only {named} of the ten rows printed a name", font.key()));
+            }
+            // And the Fine row carries the Hz the owner asked for, beside
+            // whatever the host spelled.
+            if !all.contains("Hz") {
+                missing.push(format!("{}: the Fine row printed no Hz", font.key()));
+            }
+        }
+        assert!(missing.is_empty(), "rows that print nothing:\n  {}", missing.join("\n  "));
+    }
+
     /// **The floor is a promise**: at the window it opens at and at the one
     /// it grows to, on every font, the whole panel and the preset strip
     /// under it stay inside. Through `faces::draw`, so the strip is counted.
@@ -1582,6 +1746,12 @@ mod tests {
                         3.0
                     } else if *ink == face::lcd_ink(&st, LcdTier::Primary) {
                         3.0
+                    } else if *ink == file_ink(&st) {
+                        // The browser's file rows: the fault this floor is
+                        // here for was an LCD amber printed on a pale
+                        // recess at 1.5:1, and it shipped past every sweep
+                        // because the pane dimmed the ink before painting.
+                        4.5
                     } else {
                         continue;
                     };
@@ -1600,6 +1770,48 @@ mod tests {
         }
         assert!(words_seen >= 12, "the sweep recognised only {words_seen} words");
         assert!(bad.is_empty(), "unreadable on:\n  {}", bad.join("\n  "));
+    }
+
+    /// **The browser's two row inks read on the ground the rows are drawn
+    /// on**, which is the panel under two black veils and not the panel.
+    ///
+    /// Asked directly rather than through `fit::ink_on_its_surface`,
+    /// because that sweep reads the ground off the last OPAQUE rectangle
+    /// under a word and both veils are translucent — so it answers with the
+    /// panel, which is exactly the surface that is not there. The fault it
+    /// missed: an LCD amber, chosen against dark glass, printed on a pale
+    /// recess at 3.6:1, found by looking at a light-theme rendering.
+    #[test]
+    fn the_browsers_rows_read_on_the_ground_they_are_drawn_on() {
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                set.dark_mode = dark;
+                let p = crate::recorder_panel::palette(&set);
+                let st = FaceStyle::new(p.bg, p.lcd, p.lcd_face);
+                let ground = row_ground(&st);
+                for (what, ink) in [("a file", file_ink(&st)), ("a folder", st.s.ink)] {
+                    let r = contrast_ratio(ink, ground);
+                    if r < 4.5 {
+                        bad.push(format!(
+                            "{} {}: {what} at {r:.2}:1",
+                            theme.name,
+                            if dark { "dark" } else { "light" }
+                        ));
+                    }
+                }
+                // And they stay TELLING APART: a browser that prints files
+                // and folders in one colour has lost the only thing its
+                // rows say beyond their names.
+                let d = crate::recorder_panel::delta_e(file_ink(&st), st.s.ink);
+                if d < 10.0 {
+                    bad.push(format!("{}: files and folders are one colour ({d:.1})", theme.name));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "unreadable browser rows:\n  {}", bad.join("\n  "));
     }
 
     /// **The envelope's arithmetic inverts.** Every node put at a value and
@@ -1625,5 +1837,68 @@ mod tests {
         let e = Env::new(band, 1.0, 1.0, 0.5, 1.0);
         assert!(e.decay.x <= e.sustain.x + 1e-3, "the decay ran past the plateau");
         assert!(e.release.x <= band.right() + 1e-3, "the release ran off the glass");
+    }
+}
+
+#[cfg(test)]
+mod shot {
+    use super::tests_support::*;
+    use super::*;
+    use crate::face::fit;
+
+    /// **Render the panel to a file, so a person can look at it.**
+    ///
+    /// Not a test of anything: an eye. The ink law — ink is a property of
+    /// the surface it lands on — has been broken nine times in this
+    /// codebase and every one of them was found by looking at a rendering,
+    /// never by a test. The sweeps in this file measure contrast off the
+    /// shape stream and they cannot see a node hidden under a veil, a
+    /// waveform that came out flat, or a panel that is technically legible
+    /// and unreadable.
+    ///
+    /// `composite.rs`'s `mod shot` photographs the COMPOSITE and its
+    /// `frame_painting` is private to that file, so a face — a window, not
+    /// part of the video — cannot be reached that way. This is `busy.rs`'s
+    /// software rasteriser instead, lifted into `face::fit` so the next
+    /// face's shot costs thirty lines.
+    ///
+    ///     IVORY_SHOT=/tmp/sampler.png \
+    ///       cargo test -p tangent-ui --lib faces_sampler::shot \
+    ///       -- --ignored --nocapture
+    ///
+    /// `IVORY_SHOT_THEME=<name>` and `IVORY_SHOT_LIGHT=1` pick the dress,
+    /// the same two `shot::window` honours; `IVORY_SHOT_EMPTY=1` shoots the
+    /// panel with nothing loaded.
+    #[test]
+    #[ignore = "writes a picture for a person to look at"]
+    fn draw_it() {
+        let Ok(out) = std::env::var("IVORY_SHOT") else {
+            eprintln!("IVORY_SHOT not set");
+            return;
+        };
+        let mut set = crate::settings::Settings::default();
+        if let Ok(name) = std::env::var("IVORY_SHOT_THEME") {
+            match crate::theme::factory().into_iter().find(|t| t.name == name) {
+                Some(t) => {
+                    t.apply(&mut set);
+                    set.theme_name = name;
+                }
+                None => eprintln!("no theme called {name}"),
+            }
+        }
+        if std::env::var("IVORY_SHOT_LIGHT").is_ok() {
+            set.dark_mode = false;
+        }
+        let p = crate::recorder_panel::palette(&set);
+        let st = FaceStyle::new(p.bg, p.lcd, p.lcd_face);
+        let loaded = std::env::var("IVORY_SHOT_EMPTY").is_err();
+        let ctx = fit::a_ctx(fonts::FontChoice::default());
+        let window = crate::dialogs::face_window_size(SAMPLER_PATH, None);
+        let mut live = a_face(loaded);
+        let (w, h, rgba) = fit::shoot(&ctx, window, SAMPLER_ABOUT, &st.s, &mut |ui| {
+            let _ = crate::faces::draw(ui, &st, &mut live);
+        });
+        fit::write_png(std::path::Path::new(&out), &rgba, w, h);
+        println!("wrote {out} ({w}x{h}, {} mode)", if set.dark_mode { "dark" } else { "light" });
     }
 }
