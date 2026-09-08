@@ -422,7 +422,25 @@ pub fn slider_row(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(reading)
-                    .font(FontId::monospace(10.0))
+                    // **`FontFamily::Monospace` draws NOTHING in this app.**
+                    //
+                    // `egui` is depended on with `default-features = false`,
+                    // so `FontDefinitions::default()` arrives with its
+                    // Proportional and Monospace families EMPTY, and
+                    // `fonts::install` fills neither — it inserts the two
+                    // named Courier families and maps the text STYLES onto
+                    // them. A `FontId::monospace` galley therefore lays out
+                    // at zero by zero: the shape is emitted, its `text()`
+                    // still answers, and not one pixel is drawn.
+                    //
+                    // Every reading on every face built from this kit has
+                    // been invisible for exactly that reason. It was found
+                    // by looking at a rendering of the sampler's panel —
+                    // ten rows with a name, a slider and no number anywhere
+                    // on them — and by nothing else: the row allocates
+                    // correctly, so no fit sweep sees it, and an ink sweep
+                    // can only measure ink that was laid down.
+                    .font(FontId::new(10.0, fonts::courier()))
                     .color(if at_rest { st.s.faint } else { st.s.ink }),
             );
         });
@@ -1490,8 +1508,8 @@ pub(crate) mod fit {
             crate::faces_sampler::ID_CEILING,
             crate::faces_sampler::STEPPED,
             false,
-            Vec2::new(780.0, 540.0),
-            Vec2::new(1248.0, 864.0),
+            Vec2::new(800.0, 620.0),
+            Vec2::new(1280.0, 992.0),
         ),
     ];
 
@@ -1528,6 +1546,263 @@ pub(crate) mod fit {
     /// width and rounds the galley it lays out inside it. A sub-pixel
     /// overhang is arithmetic; the faults these sweeps pin ran to a hundred.
     pub const SLACK: f32 = 1.0;
+
+    // ── looking at a face ───────────────────────────────────────────────
+    //
+    // **A picture, because the ink law has only ever been broken in ways a
+    // rendering shows and a test does not.** Nine times, every one of them
+    // found by somebody looking at a screenshot. The sweeps above measure
+    // contrast off the shape stream and they are worth keeping, but they
+    // cannot see a node drawn under a veil, a waveform that came out flat,
+    // or a panel that is technically legible and unreadable.
+    //
+    // `composite.rs`'s `mod shot` photographs the COMPOSITE through a GPU,
+    // and its `frame_painting` is private to that file, so a face — which
+    // is a window and not part of the video — cannot be reached that way.
+    // `busy.rs` solved the same problem for the overlay with a software
+    // rasteriser, and this is that method lifted out of one panel's test
+    // module so any face can use it: every triangle egui would have sent to
+    // the card, including the text, which arrives as triangles sampling the
+    // font atlas like anything else.
+
+    /// How many device pixels a point becomes in a shot. Two, so a glyph is
+    /// rasterised at the size it is shown rather than magnified.
+    pub const SHOT_SCALE: f32 = 2.0;
+
+    /// **One frame of a face, rasterised.** Returns `(width, height, rgba)`.
+    ///
+    /// The chain is [`escape`]'s, exactly — the chrome bar, the plugin
+    /// margin, the strap-line — so what comes back is the window a person
+    /// actually sees and not a panel drawn in a vacuum.
+    ///
+    /// Two `ctx.run` passes with the font atlas ACCUMULATED across both:
+    /// the second pass returns only a partial delta (a patch at an offset),
+    /// so reading the atlas from it alone gives a fragment and every glyph
+    /// then samples its neighbour. That is what made `busy.rs`'s first
+    /// version render text as blobs, and it is the one non-obvious line in
+    /// here.
+    pub fn shoot(
+        ctx: &egui::Context,
+        window: Vec2,
+        about: &str,
+        s: &Surface,
+        body: &mut dyn FnMut(&mut egui::Ui),
+    ) -> (usize, usize, Vec<u8>) {
+        ctx.set_pixels_per_point(SHOT_SCALE);
+        let room = Vec2::new(window.x, window.y - crate::shell::CHROME_BAR_H);
+        let w = (room.x * SHOT_SCALE).round() as usize;
+        let h = (room.y * SHOT_SCALE).round() as usize;
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), room);
+        let mut atlas: Option<(usize, usize, Vec<f32>)> = None;
+        let soak = |d: &egui::TexturesDelta, atlas: &mut Option<(usize, usize, Vec<f32>)>| {
+            for (id, img) in &d.set {
+                if *id != egui::TextureId::Managed(0) {
+                    continue;
+                }
+                let egui::ImageData::Color(c) = &img.image;
+                let cov: Vec<f32> = c.pixels.iter().map(|p| f32::from(p.a()) / 255.0).collect();
+                match (img.pos, atlas.as_mut()) {
+                    (Some([px, py]), Some((aw, _, ref mut a))) => {
+                        for row in 0..c.size[1] {
+                            for col in 0..c.size[0] {
+                                let dst = (py + row) * *aw + px + col;
+                                if dst < a.len() {
+                                    a[dst] = cov[row * c.size[0] + col];
+                                }
+                            }
+                        }
+                    }
+                    _ => *atlas = Some((c.size[0], c.size[1], cov)),
+                }
+            }
+        };
+        let mut run = |body: &mut dyn FnMut(&mut egui::Ui)| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            dress(ui.style_mut(), s);
+                            ui.painter().rect_filled(screen, 0.0, s.bg);
+                            egui::Frame::NONE
+                                .inner_margin(egui::Margin::same(MARGIN as i8))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(about)
+                                            .font(FontId::new(10.0, fonts::courier_bold()))
+                                            .color(s.faint),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.scope(&mut *body);
+                                });
+                        });
+                },
+            )
+        };
+        let first = run(body);
+        soak(&first.textures_delta, &mut atlas);
+        let out = run(body);
+        soak(&out.textures_delta, &mut atlas);
+
+        // The ground first, so a shot of a panel that paints nothing is the
+        // panel's own colour rather than black.
+        let mut buf = vec![[s.bg.r(), s.bg.g(), s.bg.b()]; w * h];
+        for prim in &ctx.tessellate(out.shapes, SHOT_SCALE) {
+            let egui::epaint::Primitive::Mesh(m) = &prim.primitive else {
+                continue;
+            };
+            for tri in m.indices.chunks_exact(3) {
+                // **The tessellator's vertices are in POINTS, and this
+                // buffer is in device pixels.** `Context::tessellate` takes
+                // a pixels-per-point only to size its feathering; it does
+                // not scale what it emits, and the renderers multiply in
+                // their own vertex shader. Rasterising the points straight
+                // into a buffer twice their size drew the whole panel into
+                // its top-left QUARTER, which the first shot of the sampler
+                // shows perfectly — a picture that looks like a layout bug
+                // and is a harness bug.
+                let v: Vec<_> = tri
+                    .iter()
+                    .map(|&i| {
+                        let mut vert = m.vertices[i as usize];
+                        vert.pos = egui::pos2(vert.pos.x * SHOT_SCALE, vert.pos.y * SHOT_SCALE);
+                        vert
+                    })
+                    .collect();
+                let x0 = v.iter().map(|p| p.pos.x).fold(f32::MAX, f32::min);
+                let x1 = v.iter().map(|p| p.pos.x).fold(f32::MIN, f32::max);
+                let y0 = v.iter().map(|p| p.pos.y).fold(f32::MAX, f32::min);
+                let y1 = v.iter().map(|p| p.pos.y).fold(f32::MIN, f32::max);
+                let area = |a: egui::epaint::Vertex, b: egui::epaint::Vertex, px: f32, py: f32| {
+                    (b.pos.x - a.pos.x) * (py - a.pos.y) - (b.pos.y - a.pos.y) * (px - a.pos.x)
+                };
+                let denom = area(v[0], v[1], v[2].pos.x, v[2].pos.y);
+                if denom.abs() < 1e-9 {
+                    continue;
+                }
+                let py0 = y0.floor().max(0.0) as usize;
+                let py1 = y1.ceil().min(h as f32 - 1.0).max(0.0) as usize;
+                let px0 = x0.floor().max(0.0) as usize;
+                let px1 = x1.ceil().min(w as f32 - 1.0).max(0.0) as usize;
+                for py in py0..=py1 {
+                    for px in px0..=px1 {
+                        let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+                        let w0 = area(v[1], v[2], fx, fy) / denom;
+                        let w1 = area(v[2], v[0], fx, fy) / denom;
+                        let w2 = area(v[0], v[1], fx, fy) / denom;
+                        if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                            continue;
+                        }
+                        let col = |f: fn(&egui::epaint::Vertex) -> f32| {
+                            w0 * f(&v[0]) + w1 * f(&v[1]) + w2 * f(&v[2])
+                        };
+                        let (r, g, b, mut a) = (
+                            col(|p| f32::from(p.color.r())),
+                            col(|p| f32::from(p.color.g())),
+                            col(|p| f32::from(p.color.b())),
+                            col(|p| f32::from(p.color.a())) / 255.0,
+                        );
+                        // Text and shapes both arrive as textured triangles;
+                        // a shape samples the atlas's white pixel at (0, 0)
+                        // and text samples a glyph.
+                        let is_glyph = col(|p| p.uv.x) > 1e-4 || col(|p| p.uv.y) > 1e-4;
+                        if let (true, Some((aw, ah, px_a))) =
+                            (is_glyph, atlas.as_ref().map(|a| (a.0, a.1, &a.2)))
+                        {
+                            // BILINEAR, because a glyph is a coverage map and
+                            // point-sampling one turns letters into blocks.
+                            let fu = (col(|p| p.uv.x) * aw as f32 - 0.5).clamp(0.0, aw as f32 - 1.0);
+                            let fv = (col(|p| p.uv.y) * ah as f32 - 0.5).clamp(0.0, ah as f32 - 1.0);
+                            let (u0, v0) = (fu.floor() as usize, fv.floor() as usize);
+                            let (u1, v1) = ((u0 + 1).min(aw - 1), (v0 + 1).min(ah - 1));
+                            let (tu, tv) = (fu - u0 as f32, fv - v0 as f32);
+                            let at = |x: usize, y: usize| px_a[y * aw + x];
+                            let top = at(u0, v0) * (1.0 - tu) + at(u1, v0) * tu;
+                            let bot = at(u0, v1) * (1.0 - tu) + at(u1, v1) * tu;
+                            a *= top * (1.0 - tv) + bot * tv;
+                        }
+                        if a <= 0.002 {
+                            continue;
+                        }
+                        let d = &mut buf[py * w + px];
+                        for (i, c) in [r, g, b].into_iter().enumerate() {
+                            d[i] = (c * a + f32::from(d[i]) * (1.0 - a))
+                                .round()
+                                .clamp(0.0, 255.0) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for p in &buf {
+            rgba.extend_from_slice(&[p[0], p[1], p[2], 255]);
+        }
+        (w, h, rgba)
+    }
+
+    /// A minimal RGBA PNG, so this needs no image crate — `composite.rs`'s
+    /// own writer, which is where the shots that already exist come from.
+    /// PNG rather than the BMP `busy.rs` writes because the Read tool
+    /// displays a PNG and nothing has to be converted before a person (or
+    /// the agent that made the picture) can look at it.
+    pub fn write_png(path: &std::path::Path, rgba: &[u8], w: usize, h: usize) {
+        fn crc(bytes: &[u8]) -> u32 {
+            let mut c = 0xffff_ffffu32;
+            for b in bytes {
+                c ^= u32::from(*b);
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        }
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc(&body).to_be_bytes());
+        }
+        /// Stored (uncompressed) deflate blocks inside a zlib wrapper.
+        fn zlib_stored(raw: &[u8]) -> Vec<u8> {
+            let mut z = vec![0x78, 0x01];
+            let mut a = 1u32;
+            let mut b = 0u32;
+            for byte in raw {
+                a = (a + u32::from(*byte)) % 65521;
+                b = (b + a) % 65521;
+            }
+            for (i, part) in raw.chunks(65_535).enumerate() {
+                let last = u8::from((i + 1) * 65_535 >= raw.len());
+                z.push(last);
+                z.extend_from_slice(&(part.len() as u16).to_le_bytes());
+                z.extend_from_slice(&(!(part.len() as u16)).to_le_bytes());
+                z.extend_from_slice(part);
+            }
+            z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+            z
+        }
+        let mut raw = Vec::with_capacity(w * h * 4 + h);
+        for y in 0..h {
+            raw.push(0);
+            let at = y * w * 4;
+            raw.extend_from_slice(&rgba[at..at + w * 4]);
+        }
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+        ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(&mut png, b"IDAT", &zlib_stored(&raw));
+        chunk(&mut png, b"IEND", &[]);
+        std::fs::write(path, png).expect("write the png");
+    }
 }
 
 #[cfg(test)]

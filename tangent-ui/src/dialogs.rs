@@ -5289,7 +5289,7 @@ const FACE_SIZES: &[(&str, Vec2, Vec2, Vec2)] = &[
     // more HEIGHT than the IR, because this left half is a waveform with an
     // envelope drawn on it and a grid of rows under that, where the IR's is
     // two knobs.
-    (SAMPLER_PATH, Vec2::new(0.70, 0.60), Vec2::new(780.0, 540.0), Vec2::new(1248.0, 864.0)),
+    (SAMPLER_PATH, Vec2::new(0.66, 0.69), Vec2::new(800.0, 620.0), Vec2::new(1280.0, 992.0)),
     ("@tangent-eq", Vec2::new(0.404, 0.622), Vec2::new(470.0, 470.0), Vec2::new(752.0, 752.0)),
     ("@tangent-imager", Vec2::new(0.292, 0.635), Vec2::new(340.0, 480.0), Vec2::new(544.0, 768.0)),
     ("@tangent-comp", Vec2::new(0.344, 0.569), Vec2::new(400.0, 430.0), Vec2::new(640.0, 688.0)),

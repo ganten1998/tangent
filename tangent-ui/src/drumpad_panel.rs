@@ -1189,6 +1189,26 @@ impl MediaLayout {
 /// A row's height. Named because two panels now place rows against it.
 pub const MEDIA_ROW_H: f32 = 20.0;
 
+/// **The ground a media row's word actually lands on.**
+///
+/// Two black veils deep: the pane's recess, and then the stripe every other
+/// row wears. A caller that measures its ink against the PANEL is measuring
+/// against a surface no word in this pane is printed on — which is how the
+/// sampler's browser shipped its first light-theme rendering at 3.6:1 with
+/// a test that said 4.5. Ink is a property of the surface it lands on, and
+/// this is that surface, spelled once so both panels ask the same question.
+pub fn media_row_ground(face: Color32, light_ink: bool) -> Color32 {
+    let veil = |c: Color32, a: u8| {
+        let k = 1.0 - f32::from(a) / 255.0;
+        Color32::from_rgb(
+            (f32::from(c.r()) * k) as u8,
+            (f32::from(c.g()) * k) as u8,
+            (f32::from(c.b()) * k) as u8,
+        )
+    };
+    veil(veil(face, if light_ink { 60 } else { 26 }), if light_ink { 40 } else { 16 })
+}
+
 /// What the explorer draws: where it stands, what it lists, where the
 /// listing is scrolled to, and which row is lit.
 #[derive(Debug, Clone, Copy)]
@@ -1208,6 +1228,16 @@ pub struct MediaPane<'a> {
 /// which does, hands the four it uses. `light_ink` is that same fact said
 /// once for the two washes that depend on it: a full black recess on a pale
 /// face is a bruise, the editor's own darker-rows rule.
+///
+/// **The two ROW inks are used as handed, not dimmed.** They used to be
+/// multiplied by 0.85 and 0.9 here, which is this function quietly
+/// overriding a decision its caller made with the ground in front of it —
+/// and it hid the fault from every sweep that recognises inks by identity,
+/// because the ink that landed equalled nothing the caller had computed.
+/// The sampler's first light-theme rendering is what it looked like: an
+/// LCD amber, chosen against dark glass, printed on a pale recess at about
+/// one and a half to one. The header and the chip keep their dimming
+/// because those are the pane's own furniture rather than its content.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_media_pane(
     painter: &Painter,
@@ -1265,7 +1295,7 @@ pub fn draw_media_pane(
             Align2::LEFT_CENTER,
             cut_text(painter, r.width() - 10.0, &word, &font(11.0)),
             font(11.0),
-            if e.dir { ink.gamma_multiply(0.85) } else { file_ink.gamma_multiply(0.9) },
+            if e.dir { ink } else { file_ink },
         );
     }
     // More below? A quiet count, so a long folder says so.
