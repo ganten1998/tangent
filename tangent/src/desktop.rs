@@ -823,6 +823,12 @@ pub struct DesktopApp {
     /// The decode workers `run_warm` feeds and drains. See [`DecodePool`].
     #[cfg(feature = "recorder")]
     pool: DecodePool,
+    /// Per clip, the stretch key the last reload saw it wanting, so a
+    /// render is asked for only once the ratio has stopped moving. See
+    /// [`stretch_step`]. Swept to the clips that still exist at the end of
+    /// each reload, cleared with the caches.
+    #[cfg(feature = "recorder")]
+    stretch_seen: std::collections::HashMap<u64, StretchKey>,
     /// The scope drain's reusable buffer.
     scope_buf: Vec<f32>,
     /// The INSERT tap drain's reusable buffer, and where the tap is aimed —
@@ -912,7 +918,8 @@ fn frames_at(rate: f64, seconds: f64) -> u64 {
 #[cfg(feature = "recorder")]
 fn pyramid_wave(
     peaks: &tangent_ui::peaks::Peaks,
-    clip: &tangent_ui::arrangement::ArrClip,
+    offset_s: f64,
+    loop_s: f64,
     into_s: f64,
     span_s: f64,
     buckets: usize,
@@ -924,12 +931,12 @@ fn pyramid_wave(
     }
     let rate = f64::from(rate);
     let mut out = Vec::with_capacity(buckets * 2);
-    if clip.loop_s > 1.0e-6 {
+    if loop_s > 1.0e-6 {
         for i in 0..buckets {
             let t0 = into_s + span_s * i as f64 / buckets as f64;
             let t1 = into_s + span_s * (i + 1) as f64 / buckets as f64;
-            let folded = t0.rem_euclid(clip.loop_s);
-            let a = frames_at(rate, clip.offset_s + folded) as usize;
+            let folded = t0.rem_euclid(loop_s);
+            let a = frames_at(rate, offset_s + folded) as usize;
             let width = frames_at(rate, (t1 - t0).max(0.0)).max(1) as usize;
             let (lo, hi) = peaks.minmax(a, a.saturating_add(width));
             out.push(lo);
@@ -938,7 +945,7 @@ fn pyramid_wave(
     } else {
         // The same tiling the sample walk used: `[start, end)` shared out
         // evenly, every bucket at least a frame wide, none past the end.
-        let start = (frames_at(rate, clip.offset_s + into_s) as usize).min(total);
+        let start = (frames_at(rate, offset_s + into_s) as usize).min(total);
         let end = start
             .saturating_add(frames_at(rate, span_s) as usize)
             .min(total);
@@ -965,15 +972,35 @@ fn pyramid_wave(
 /// `wave`, both from the same `Decoded`. With no window — the arrangement
 /// closed, or the clip off screen — a coarse whole-clip picture, which is
 /// what a clip needs before anybody has looked at it.
+///
+/// `stand_in` is `Some(ratio)` when `decoded` is the UNSTRETCHED file
+/// standing in for a stretched copy the crew is still rendering: the
+/// picture is read at `1/ratio` of the clip's time so it lands where the
+/// render's will, `file_s` is what the render will measure, and no pyramid
+/// is handed over — its time base would be the file's, not the clip's.
 #[cfg(feature = "recorder")]
 fn clip_picture(
     clip: &tangent_ui::arrangement::ArrClip,
     decoded: &Decoded,
     rate: u32,
     wave_view: Option<(f64, f64, f32)>,
+    stand_in: Option<f64>,
 ) -> tangent_ui::ports::ClipInfo {
-    let file_s = decoded.clip.seconds();
+    // Clip seconds per file second: one, or the pending ratio.
+    let scale = stand_in.filter(|r| r.is_finite() && *r > 0.0).unwrap_or(1.0);
+    let file_s = decoded.clip.seconds() * scale;
     let len_s = clip.play_len_s(file_s);
+    let picture = |into_s: f64, span_s: f64, buckets: usize| {
+        pyramid_wave(
+            &decoded.peaks,
+            clip.offset_s / scale,
+            clip.loop_s / scale,
+            into_s / scale,
+            span_s / scale,
+            buckets,
+            rate,
+        )
+    };
     let (wave, wave_from_s, wave_span_s) = match wave_view
         .and_then(|(vs, vl, px)| wave_span(clip.start_s, len_s, vs, vl, px))
     {
@@ -982,13 +1009,9 @@ fn clip_picture(
             // drawn second `from` is `from - start_s` into the played span,
             // past the left trim.
             let into = (from - clip.start_s).max(0.0);
-            (pyramid_wave(&decoded.peaks, clip, into, span, buckets, rate), from, span)
+            (picture(into, span, buckets), from, span)
         }
-        None => (
-            pyramid_wave(&decoded.peaks, clip, 0.0, len_s, CLIP_WAVE_BUCKETS, rate),
-            clip.start_s,
-            len_s,
-        ),
+        None => (picture(0.0, len_s, CLIP_WAVE_BUCKETS), clip.start_s, len_s),
     };
     tangent_ui::ports::ClipInfo {
         id: clip.id,
@@ -996,7 +1019,7 @@ fn clip_picture(
         file_s,
         wave_from_s,
         wave_span_s,
-        peaks: Some(Arc::clone(&decoded.peaks)),
+        peaks: stand_in.is_none().then(|| Arc::clone(&decoded.peaks)),
     }
 }
 
@@ -2464,31 +2487,6 @@ fn stretched_clip_audio(
 /// millionths, mode's key" is how a sweep quietly stops matching what was
 /// inserted — the doc on the live path used to warn the sweep to keep up
 /// with it by hand.
-/// The live path's stretched copy, with its picture. The samples come from
-/// `crate::stretch::stretch` under [`stretch_key`], the same renderer and
-/// key the offline bounce uses through [`stretched_clip_audio`]; the pyramid
-/// is built beside them so a stretched clip is drawn from its stretched
-/// audio like an unstretched one is from its file. A free function over the
-/// cache, not a method, so `reload_clips` can hold the document borrowed
-/// while it fills the cache.
-#[cfg(feature = "recorder")]
-fn stretched_live(
-    clip: &tangent_ui::arrangement::ArrClip,
-    decoded: &Decoded,
-    path: &std::path::Path,
-    cache: &mut std::collections::HashMap<StretchKey, Decoded>,
-) -> Decoded {
-    let Some((key, mode)) = stretch_key(clip, path) else {
-        return decoded.clone();
-    };
-    if let Some(made) = cache.get(&key) {
-        return made.clone();
-    }
-    let made = Decoded::of(crate::stretch::stretch(&decoded.clip, clip.stretch, mode));
-    cache.insert(key, made.clone());
-    made
-}
-
 #[cfg(feature = "recorder")]
 fn stretch_key(
     clip: &tangent_ui::arrangement::ArrClip,
@@ -8778,6 +8776,7 @@ impl DesktopApp {
                 // project; so does whatever is queued for it.
                 self.pool.invalidate();
                 self.warm.clear();
+                self.stretch_seen.clear();
                 self.clips_owed = true;
                 self.pads_owed = true;
                 // Both are answered a file a frame from here; ask for the
@@ -8995,7 +8994,7 @@ impl DesktopApp {
                 // file is still on its way: the clock restarts, so the
                 // schedule is refreshed four times a second as files land
                 // and settled for good at the drain. See `Decode`.
-                if self.reload_clips(Decode::CachedOnly) {
+                if self.reload_clips(Decode::CachedOnly, ctx) {
                     self.clips_owed_at = Some(std::time::Instant::now());
                 } else {
                     self.clips_owed = false;
@@ -9025,6 +9024,10 @@ impl DesktopApp {
             let (path, pads) = match &item {
                 Warm::Clip(p) => (p, false),
                 Warm::Pad(p) => (p, true),
+                // Never queued here: a render is handed straight to the
+                // crew by `reload_clips`. Said out loud rather than a wildcard,
+                // so the next variant has to decide too.
+                Warm::Stretch(_) => continue,
             };
             // **Already decoded: a file the drain reload met inline, or one
             // the queue was built before it landed.** Counted as done for
@@ -9038,7 +9041,7 @@ impl DesktopApp {
             } {
                 continue;
             }
-            self.pool.submit(item, rate, ctx);
+            self.pool.submit(item, Work::Decode, rate, ctx);
         }
         // Nothing left anywhere: the reload is free, so it happens THIS
         // frame. Waiting a frame for an empty queue would put a frame of
@@ -9058,7 +9061,13 @@ impl DesktopApp {
             self.busy_chunk_done(Busied::Decode);
             if std::mem::take(&mut self.clips_owed) {
                 self.clips_owed_at = None;
-                let _ = self.reload_clips(Decode::Inline);
+                // A stretch still rendering keeps the debt open on the
+                // deadline's clock: the schedule is re-read when the render
+                // lands, or at the next tick, whichever is first.
+                if self.reload_clips(Decode::Inline, ctx) {
+                    self.clips_owed = true;
+                    self.clips_owed_at = Some(std::time::Instant::now());
+                }
             }
             if std::mem::take(&mut self.pads_owed) {
                 self.reload_pads();
@@ -9114,8 +9123,30 @@ impl DesktopApp {
             })
             .unwrap_or_default();
         let mut clips = false;
+        let mut notes: Vec<String> = Vec::new();
         for done in landed {
             match (done.item, done.result) {
+                (Warm::Stretch(key), Ok(made)) => {
+                    // Kept whether or not the clip still wants this ratio:
+                    // the reload this raises sweeps what nothing plays.
+                    self.stretch_cache.insert(key, made);
+                    clips = true;
+                }
+                (Warm::Stretch(key), Err(why)) => {
+                    // The renderer failed on this file. It plays UNSTRETCHED
+                    // from here — cached under the key so it is not asked
+                    // again every tick — and the failure is said out loud
+                    // rather than heard as a clip that went quiet.
+                    let name = key.0.file_name().map(|n| n.to_string_lossy().into_owned());
+                    notes.push(format!(
+                        "could not stretch {}: {why} - it plays unstretched",
+                        name.unwrap_or_else(|| "a clip".to_owned())
+                    ));
+                    if let Some(source) = self.track_cache.get(&key.0).cloned() {
+                        self.stretch_cache.insert(key, source);
+                    }
+                    clips = true;
+                }
                 (Warm::Clip(path), Ok(decoded)) => {
                     if live_files.contains(&path) {
                         self.warm_refused.remove(&path);
@@ -9143,6 +9174,9 @@ impl DesktopApp {
                     self.warm_refused.insert(path);
                 }
             }
+        }
+        for note in notes {
+            self.app.notify(Kind::Error, note);
         }
         clips
     }
@@ -9221,7 +9255,7 @@ impl DesktopApp {
     /// learns is collected into owned locals and pushed once the borrow is
     /// over. Inside the loop only FIELDS of `self` are touched, which is
     /// what lets the arrangement stay borrowed across it.
-    fn reload_clips(&mut self, decode: Decode) -> bool {
+    fn reload_clips(&mut self, decode: Decode, ctx: &egui::Context) -> bool {
         // **Not gated on the document being SAVED.**
         //
         // This used to return here when there was no file on disk yet, which
@@ -9257,6 +9291,8 @@ impl DesktopApp {
             std::collections::HashSet::new();
         let mut live_stretches: std::collections::HashSet<StretchKey> =
             std::collections::HashSet::new();
+        let mut stretched_ids: Vec<u64> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
         for clip in &self.app.arrangement().clips {
             // A MIDI item is a schedule of its own: notes in frames from
             // the clip's drawn left edge — the trim (`offset_s`) already
@@ -9340,25 +9376,77 @@ impl DesktopApp {
             // knowing it, which is the point of doing it here: a clip
             // stretched to 1.5 is a clip whose file is half again as long,
             // and nothing downstream has to hold a second opinion about
-            // where its seconds are. Shared with the offline bounce — see
-            // `stretched_clip_audio` and `stretch_key`, which the sweep
-            // below reads too.
-            let decoded = stretched_live(clip, &decoded, &path, &mut self.stretch_cache);
-            if let Some((key, _)) = stretch_key(clip, &path) {
-                live_stretches.insert(key);
-            }
-            let file_s = decoded.clip.seconds();
-            if clip.len_s == 0.0 {
+            // where its seconds are. The renderer and the key are shared
+            // with the offline bounce (`stretched_clip_audio`, `stretch_key`,
+            // which the sweep below reads too); the RENDER itself is the
+            // crew's, handed over when the ratio has settled (see
+            // `stretch_step`). It used to run here, a whole file per ratio
+            // per frame of a drag, on this thread.
+            //
+            // **While a render is pending the clip is SILENT and drawn from
+            // a stand-in.** The unstretched audio at the stretched window
+            // would play at the wrong speed and pitch, and keeping the last
+            // rendered ratio alive would mean the sweep guarding a second
+            // copy per clip; a clip that goes quiet for the length of a
+            // render is the honest one of the three, and the cover names
+            // the render. The picture is the unstretched pyramid read at
+            // `1/ratio` of the clip's time (exact for tape, close for the
+            // rest), with `file_s` what the render will measure, so trims
+            // and the drag itself keep their numbers; no pyramid is handed
+            // over, because its time base would be the wrong one.
+            let (decoded, stand_in) = match stretch_key(clip, &path) {
+                None => (decoded, None),
+                Some((key, mode)) => {
+                    live_stretches.insert(key.clone());
+                    stretched_ids.push(clip.id);
+                    if let Some(made) = self.stretch_cache.get(&key) {
+                        (made.clone(), None)
+                    } else if stretch_over_ceiling(decoded.clip.frames(), clip.stretch) {
+                        notes.push(format!(
+                            "{} stretched by {:.2} would be longer than the {}-minute ceiling - it plays unstretched",
+                            clip.name,
+                            clip.stretch,
+                            tangent_record::decode::MAX_FRAMES / 60 / 48_000
+                        ));
+                        self.stretch_cache.insert(key, decoded.clone());
+                        (decoded, None)
+                    } else {
+                        let in_flight = self.pool.holds_stretch(&key);
+                        if stretch_step(&mut self.stretch_seen, clip.id, &key, in_flight)
+                            == StretchStep::Submit
+                        {
+                            self.pool.submit(
+                                Warm::Stretch(key),
+                                Work::Stretch {
+                                    source: Arc::clone(&decoded.clip),
+                                    ratio: clip.stretch,
+                                    mode,
+                                },
+                                rate,
+                                ctx,
+                            );
+                        }
+                        deferred = true;
+                        (decoded, Some(clip.stretch))
+                    }
+                }
+            };
+            let file_s = decoded.clip.seconds() * stand_in.unwrap_or(1.0);
+            // A pending clip's length is written down when the render has
+            // measured it, not from the stand-in's arithmetic.
+            if clip.len_s == 0.0 && stand_in.is_none() {
                 fill_len.push((clip.id, (file_s - clip.offset_s).max(0.0)));
             }
             let len_s = clip.play_len_s(file_s);
             span = span.max(clip.start_s + len_s);
-            placed.extend(audio_clip_passes(
-                clip,
-                &decoded.clip,
-                f64::from(rate),
-                clip.gain as f32,
-            ));
+            if stand_in.is_none() {
+                placed.extend(audio_clip_passes(
+                    clip,
+                    &decoded.clip,
+                    f64::from(rate),
+                    clip.gain as f32,
+                ));
+            }
             if info.is_none() {
                 info = Some(tangent_ui::ports::TrackInfo {
                     name: clip.name.clone(),
@@ -9369,7 +9457,11 @@ impl DesktopApp {
             }
             // **The clip's own picture**, from its pyramid. See
             // `clip_picture`.
-            clip_infos.push(clip_picture(clip, &decoded, rate, wave_view));
+            clip_infos.push(clip_picture(clip, &decoded, rate, wave_view, stand_in));
+        }
+        self.stretch_seen.retain(|id, _| stretched_ids.contains(id));
+        for note in notes {
+            self.app.notify(Kind::Error, note);
         }
         self.app.set_clip_infos(clip_infos);
         if let Some(at) = wave_view {
@@ -9463,14 +9555,16 @@ impl DesktopApp {
                 let Some(decoded) = self.track_cache.get(&path) else {
                     continue;
                 };
-                let decoded = match stretch_key(clip, &path) {
-                    None => decoded,
+                // A render still pending is drawn from the same stand-in
+                // the reload draws it from.
+                let (decoded, stand_in) = match stretch_key(clip, &path) {
+                    None => (decoded, None),
                     Some((key, _)) => match self.stretch_cache.get(&key) {
-                        Some(made) => made,
-                        None => continue,
+                        Some(made) => (made, None),
+                        None => (decoded, Some(clip.stretch)),
                     },
                 };
-                clip_infos.push(clip_picture(clip, decoded, rate, Some(wave_view)));
+                clip_infos.push(clip_picture(clip, decoded, rate, Some(wave_view), stand_in));
             }
         }
         self.app.set_clip_infos(clip_infos);
@@ -10573,6 +10667,7 @@ impl DesktopApp {
                 // Anything the crew is still decoding is at the OLD rate.
                 self.pool.invalidate();
                 self.warm.clear();
+                self.stretch_seen.clear();
                 // **Owed, not done here.** Both caches were just emptied, so
                 // this is the single worst decode in the app — every clip in
                 // the session, at once, on the UI thread, from inside a
@@ -14665,6 +14760,8 @@ impl DesktopApp {
             pad_cache: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
             pool: DecodePool::new(),
+            #[cfg(feature = "recorder")]
+            stretch_seen: std::collections::HashMap::new(),
             scope_buf: Vec::new(),
             tap_buf: Vec::new(),
             insert_tap_at: None,
@@ -16016,6 +16113,10 @@ enum Warm {
     Clip(std::path::PathBuf),
     /// A drum pad's sample, into `pad_cache`.
     Pad(std::path::PathBuf),
+    /// A stretched render of a decoded clip, into `stretch_cache`. Never
+    /// queued by `queue_warm`: `reload_clips` hands one to the crew when a
+    /// clip's ratio has settled — see `stretch_step`.
+    Stretch(StretchKey),
 }
 
 #[cfg(feature = "recorder")]
@@ -16023,8 +16124,76 @@ impl Warm {
     fn path(&self) -> &std::path::Path {
         match self {
             Warm::Clip(p) | Warm::Pad(p) => p,
+            Warm::Stretch((p, _, _)) => p,
         }
     }
+}
+
+/// What a worker is asked to do with a job.
+#[cfg(feature = "recorder")]
+enum Work {
+    /// Read and parse the file at the item's path.
+    Decode,
+    /// Render `source` at `ratio` in `mode` — the job behind a
+    /// [`Warm::Stretch`]. The source rides along as the `Arc` the cache
+    /// already holds, so the render reads the decoded audio the schedule
+    /// plays and never the file.
+    Stretch {
+        source: Arc<tangent_record::decode::Clip>,
+        ratio: f64,
+        mode: crate::stretch::Mode,
+    },
+}
+
+/// Whether a stretch is handed to the crew now, or left for a later reload.
+#[cfg(feature = "recorder")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StretchStep {
+    Submit,
+    Wait,
+}
+
+/// **Render a ratio the pointer has stopped on, never one it is passing
+/// through.** A stretch drag dirties the clips on every tick, so `reload_
+/// clips` runs per frame with a new ratio per frame; rendering each was a
+/// whole-file pass per frame on the UI thread, and a hundred ratios per
+/// drag through the cache. The rule, per clip: a ratio seen for the FIRST
+/// time — a project opening, a clip pasted in — is rendered at once; a
+/// ratio that CHANGED since the last reload is written down and waited on;
+/// the same ratio seen again is rendered. A drag therefore renders nothing
+/// until the hand stops, and the release (which reloads once more with the
+/// ratio the last tick left) is what starts the render. A key already in
+/// the crew's hands waits regardless.
+#[cfg(feature = "recorder")]
+fn stretch_step(
+    seen: &mut std::collections::HashMap<u64, StretchKey>,
+    id: u64,
+    key: &StretchKey,
+    in_flight: bool,
+) -> StretchStep {
+    if in_flight {
+        return StretchStep::Wait;
+    }
+    match seen.get(&id) {
+        Some(last) if last == key => StretchStep::Submit,
+        None => {
+            seen.insert(id, key.clone());
+            StretchStep::Submit
+        }
+        Some(_) => {
+            seen.insert(id, key.clone());
+            StretchStep::Wait
+        }
+    }
+}
+
+/// Whether a render would come out past the decoder's own ceiling.
+/// `stretch::tape` allocates `frames * ratio` and nothing else bounded it:
+/// a document saying `"stretch": 4.0` on a twenty-minute clip asked for
+/// 1.84 GB in one allocation. Such a clip plays unstretched and says so.
+#[cfg(feature = "recorder")]
+fn stretch_over_ceiling(frames: usize, ratio: f64) -> bool {
+    !(ratio.is_finite()) || frames as f64 * ratio.max(1.0) > tangent_record::decode::MAX_FRAMES as f64
 }
 
 /// **What the caches hold per file: the samples the engine plays and the
@@ -16069,11 +16238,12 @@ type Decoder = Arc<
     dyn Fn(&std::path::Path, u32) -> Result<tangent_record::decode::Clip, String> + Send + Sync,
 >;
 
-/// One job handed to a worker: what to decode, at which rate, under which
-/// generation of the caches.
+/// One job handed to a worker: which item, what to do for it, at which
+/// rate, under which generation of the caches.
 #[cfg(feature = "recorder")]
 struct DecodeJob {
     item: Warm,
+    work: Work,
     rate: u32,
     gen: u64,
 }
@@ -16187,7 +16357,7 @@ impl DecodePool {
                         break; // the pool is gone
                     };
                     let result = run_decode_job(&decoder, &job);
-                    let DecodeJob { item, rate, gen } = job;
+                    let DecodeJob { item, rate, gen, .. } = job;
                     if done
                         .send(DecodeDone {
                             item,
@@ -16209,7 +16379,7 @@ impl DecodePool {
     }
 
     /// Hand a job to the crew. An item already in flight is left alone.
-    fn submit(&mut self, item: Warm, rate: u32, wake: &egui::Context) {
+    fn submit(&mut self, item: Warm, work: Work, rate: u32, wake: &egui::Context) {
         if !self.in_flight.insert(item.clone()) {
             return;
         }
@@ -16218,6 +16388,7 @@ impl DecodePool {
         }
         let job = DecodeJob {
             item,
+            work,
             rate,
             gen: self.gen,
         };
@@ -16231,7 +16402,7 @@ impl DecodePool {
         // No crew: the job runs here, and its answer takes the same road
         // back so the caller cannot tell the difference.
         let result = run_decode_job(&self.decoder, &job);
-        let DecodeJob { item, rate, gen } = job;
+        let DecodeJob { item, rate, gen, .. } = job;
         let _ = self.done_tx.send(DecodeDone {
             item,
             rate,
@@ -16269,7 +16440,13 @@ impl DecodePool {
         self.in_flight.iter().any(|w| match w {
             Warm::Clip(p) => !pads && p == path,
             Warm::Pad(p) => pads && p == path,
+            Warm::Stretch(_) => false,
         })
+    }
+
+    /// Whether this exact render is in the workers' hands.
+    fn holds_stretch(&self, key: &StretchKey) -> bool {
+        self.in_flight.iter().any(|w| matches!(w, Warm::Stretch(k) if k == key))
     }
 
     fn outstanding(&self) -> usize {
@@ -16314,8 +16491,11 @@ impl DecodePool {
 #[cfg(feature = "recorder")]
 fn run_decode_job(decoder: &Decoder, job: &DecodeJob) -> Result<Decoded, String> {
     let path = job.item.path();
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        decoder(path, job.rate).map(Decoded::of)
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &job.work {
+        Work::Decode => decoder(path, job.rate).map(Decoded::of),
+        Work::Stretch { source, ratio, mode } => {
+            Ok(Decoded::of(crate::stretch::stretch(source, *ratio, *mode)))
+        }
     })) {
         Ok(result) => result,
         Err(_) => Err("the decoder crashed on that file".to_owned()),
@@ -17383,7 +17563,7 @@ mod tests {
         let pop = warm.find("self.warm.pop_front()").expect("the pop");
         let (door, drain) = warm.split_at(pop);
         assert!(
-            door.contains("self.reload_clips(Decode::CachedOnly)"),
+            door.contains("self.reload_clips(Decode::CachedOnly, ctx)"),
             "the deadline door has to ask for cached files only"
         );
         assert!(
@@ -17392,7 +17572,7 @@ mod tests {
              forty-files-in-one-frame freeze"
         );
         assert!(
-            drain.contains("self.reload_clips(Decode::Inline)"),
+            drain.contains("self.reload_clips(Decode::Inline, ctx)"),
             "the drain door is the cover-not-precondition road and keeps its \
              inline decode"
         );
@@ -17488,12 +17668,13 @@ mod tests {
         for i in 0..12 {
             pool.submit(
                 super::Warm::Clip(std::path::PathBuf::from(format!("/takes/{i}.wav"))),
+                super::Work::Decode,
                 48_000,
                 &ctx,
             );
         }
-        pool.submit(super::Warm::Pad(std::path::PathBuf::from("/takes/0.wav")), 48_000, &ctx);
-        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/0.wav")), 48_000, &ctx);
+        pool.submit(super::Warm::Pad(std::path::PathBuf::from("/takes/0.wav")), super::Work::Decode, 48_000, &ctx);
+        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/0.wav")), super::Work::Decode, 48_000, &ctx);
         assert_eq!(pool.outstanding(), 13, "twelve clips, one pad, one repeat");
         assert!(pool.holds(false, std::path::Path::new("/takes/0.wav")));
         assert!(pool.holds(true, std::path::Path::new("/takes/0.wav")));
@@ -17524,13 +17705,13 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut pool = super::DecodePool::with_decoder(2, counting_decoder(calls));
         let ctx = egui::Context::default();
-        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/a.wav")), 48_000, &ctx);
+        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/a.wav")), super::Work::Decode, 48_000, &ctx);
         pool.invalidate();
         drain_to_idle(&mut pool, 48_000);
         assert!(pool.working_on().is_none(), "a stale landing is not a name for the cover");
-        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/b.wav")), 48_000, &ctx);
+        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/b.wav")), super::Work::Decode, 48_000, &ctx);
         drain_to_idle(&mut pool, 44_100);
-        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/c.wav")), 48_000, &ctx);
+        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/c.wav")), super::Work::Decode, 48_000, &ctx);
         assert_eq!(drain_until(&mut pool, 48_000, 1).len(), 1, "a current one still lands");
     }
 
@@ -17543,7 +17724,7 @@ mod tests {
         let mut pool = super::DecodePool::with_decoder(2, counting_decoder(calls));
         let ctx = egui::Context::default();
         for name in ["refuse-1.wav", "crash-1.wav", "fine.wav"] {
-            pool.submit(super::Warm::Clip(std::path::PathBuf::from(format!("/takes/{name}"))), 48_000, &ctx);
+            pool.submit(super::Warm::Clip(std::path::PathBuf::from(format!("/takes/{name}"))), super::Work::Decode, 48_000, &ctx);
         }
         let landed = drain_until(&mut pool, 48_000, 3);
         assert_eq!(landed.len(), 3);
@@ -17558,8 +17739,163 @@ mod tests {
             }
         }
         // And the crew is still alive after the crash: another job lands.
-        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/after.wav")), 48_000, &ctx);
+        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/after.wav")), super::Work::Decode, 48_000, &ctx);
         assert_eq!(drain_until(&mut pool, 48_000, 1).len(), 1);
+    }
+
+    /// **A render goes to the crew like a decode**, keyed by its stretch key,
+    /// and lands as the stretched audio with its own picture.
+    #[test]
+    fn a_stretch_job_lands_as_the_rendered_copy() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = super::DecodePool::with_decoder(2, counting_decoder(std::sync::Arc::clone(&calls)));
+        let ctx = egui::Context::default();
+        let source = std::sync::Arc::new(tangent_record::decode::Clip {
+            samples: (0..4_800).flat_map(|i| [(i as f32 * 0.01).sin(); 2]).collect(),
+            rate: 48_000,
+            source: std::path::PathBuf::from("/takes/s.wav"),
+        });
+        let key: super::StretchKey = (std::path::PathBuf::from("/takes/s.wav"), 2_000_000, "tape".to_owned());
+        pool.submit(
+            super::Warm::Stretch(key.clone()),
+            super::Work::Stretch {
+                source,
+                ratio: 2.0,
+                mode: crate::stretch::Mode::Tape,
+            },
+            48_000,
+            &ctx,
+        );
+        assert!(pool.holds_stretch(&key));
+        assert!(!pool.holds(false, std::path::Path::new("/takes/s.wav")), "a render is not a decode of the file");
+        let landed = drain_until(&mut pool, 48_000, 1);
+        assert_eq!(landed.len(), 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "a render asks no decoder");
+        let made = landed[0].result.as_ref().expect("the render lands");
+        assert_eq!(made.clip.frames(), 9_600, "tape at 2.0 is twice the frames");
+        assert_eq!(made.peaks.frames(), 9_600, "with its own picture");
+        assert!(!pool.holds_stretch(&key));
+    }
+
+    /// **A ratio the pointer is passing through is never rendered.** The
+    /// first ratio a clip is seen with renders at once (a project opening);
+    /// a ratio that changed since the last reload waits; the same ratio
+    /// seen again renders — which is the reload the release fires; and a
+    /// key already in the crew's hands waits whatever the history says.
+    #[test]
+    fn a_render_is_asked_for_only_once_the_ratio_has_stopped_moving() {
+        use super::{stretch_step, StretchStep};
+        let key = |r: i64| -> super::StretchKey { (std::path::PathBuf::from("/takes/s.wav"), r, "auto".to_owned()) };
+        let mut seen = std::collections::HashMap::new();
+        assert_eq!(stretch_step(&mut seen, 7, &key(1_500_000), false), StretchStep::Submit, "first sight renders");
+        // A drag: a new ratio every reload.
+        for r in [1_510_000, 1_520_000, 1_530_000, 1_540_000] {
+            assert_eq!(stretch_step(&mut seen, 7, &key(r), false), StretchStep::Wait, "{r} is still moving");
+        }
+        // The release reloads once more with the ratio the last tick left.
+        assert_eq!(stretch_step(&mut seen, 7, &key(1_540_000), false), StretchStep::Submit);
+        // In the crew's hands: nothing more is asked, however still it is.
+        assert_eq!(stretch_step(&mut seen, 7, &key(1_540_000), true), StretchStep::Wait);
+        // Another clip's history is its own.
+        assert_eq!(stretch_step(&mut seen, 8, &key(1_540_000), false), StretchStep::Submit);
+        // A clip whose ratio went back to a value it had before still waits
+        // one reload: what matters is that it moved since the last one.
+        assert_eq!(stretch_step(&mut seen, 7, &key(1_500_000), false), StretchStep::Wait);
+        assert_eq!(stretch_step(&mut seen, 7, &key(1_500_000), false), StretchStep::Submit);
+    }
+
+    /// The ceiling on a render is the decoder's own, applied to what the
+    /// render would PRODUCE; a shrink never trips it, and a ratio that is
+    /// not a number is over it rather than a giant allocation.
+    #[test]
+    fn a_stretch_past_the_ceiling_is_refused_before_it_allocates() {
+        let ceiling = tangent_record::decode::MAX_FRAMES;
+        assert!(!super::stretch_over_ceiling(ceiling / 2, 1.5));
+        assert!(super::stretch_over_ceiling(ceiling / 2, 4.0));
+        assert!(!super::stretch_over_ceiling(ceiling, 0.25), "a shrink cannot exceed the file");
+        assert!(super::stretch_over_ceiling(ceiling + 1, 0.25), "a file already over it stays over it");
+        assert!(super::stretch_over_ceiling(100, f64::NAN));
+        assert!(super::stretch_over_ceiling(100, f64::INFINITY));
+    }
+
+    /// **A stand-in picture lands where the render's will.** A clip
+    /// stretched to 2.0 whose render is pending is drawn from the
+    /// unstretched pyramid at half the clip's time: a burst at 0.2 s of the
+    /// file shows at 0.4 s of the clip, `file_s` is doubled, and no pyramid
+    /// is handed over.
+    #[test]
+    fn a_pending_stretch_is_drawn_from_a_scaled_stand_in() {
+        let rate = 48_000usize;
+        let samples: Vec<f32> = (0..rate)
+            .flat_map(|f| {
+                let t = f as f64 / rate as f64;
+                [if (0.2..0.3).contains(&t) { 0.9 } else { 0.0 }; 2]
+            })
+            .collect();
+        let decoded = super::Decoded::of(tangent_record::decode::Clip {
+            samples,
+            rate: 48_000,
+            source: std::path::PathBuf::from("s.wav"),
+        });
+        let mut clip = audio_clip(0.0, 0.0, 2.0);
+        clip.stretch = 2.0;
+        let view = Some((0.0, 2.0, 200.0f32));
+        let pending = super::clip_picture(&clip, &decoded, 48_000, view, Some(2.0));
+        assert!(pending.peaks.is_none(), "a stand-in hands over no pyramid");
+        assert!((pending.file_s - 2.0).abs() < 1e-9, "file_s is what the render will measure");
+        let col = |t: f64| ((t - pending.wave_from_s) / pending.wave_span_s * (pending.wave.len() / 2) as f64) as usize;
+        assert!(pending.wave[col(0.45) * 2 + 1] > 0.8, "the burst shows at twice its file time");
+        assert!(pending.wave[col(0.25) * 2 + 1] < 0.05, "and not at its file time");
+        // The same clip with its render landed reads the stretched copy
+        // straight, and hands the pyramid over.
+        let rendered = super::Decoded::of(crate::stretch::stretch(&decoded.clip, 2.0, crate::stretch::Mode::Tape));
+        let done = super::clip_picture(&clip, &rendered, 48_000, view, None);
+        assert!(done.peaks.is_some());
+        assert!((done.file_s - 2.0).abs() < 1e-3);
+        assert!(done.wave[col(0.45) * 2 + 1] > 0.8);
+    }
+
+    /// **What one stretch render costs** — the work a drag used to do per
+    /// frame on the UI thread and now does once, on the crew, when the hand
+    /// stops. A 60 s stereo clip in each mode. Ignored; run in RELEASE:
+    ///
+    /// ```text
+    /// cargo test --release -p tangent --bin tangent what_a_stretch_render_costs -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn what_a_stretch_render_costs() {
+        let build = if cfg!(debug_assertions) { "DEBUG" } else { "release" };
+        let rate = 48_000u32;
+        let clip = tangent_record::decode::Clip {
+            samples: (0..60 * rate as usize)
+                .flat_map(|f| {
+                    let t = f as f32 / rate as f32;
+                    let v = (t * 220.0 * std::f32::consts::TAU).sin() * 0.5 * (-(t % 0.5) * 6.0).exp();
+                    [v, v * 0.8]
+                })
+                .collect(),
+            rate,
+            source: std::path::PathBuf::from("s.wav"),
+        };
+        for (mode, ratio) in [
+            (crate::stretch::Mode::Tape, 1.02),
+            (crate::stretch::Mode::Tape, 1.5),
+            (crate::stretch::Mode::Rhythmic, 1.5),
+            (crate::stretch::Mode::Tonal, 1.5),
+        ] {
+            let t = std::time::Instant::now();
+            let made = crate::stretch::stretch(&clip, ratio, mode);
+            let render = t.elapsed();
+            let t = std::time::Instant::now();
+            let d = super::Decoded::of(made);
+            let peaks = t.elapsed();
+            println!(
+                "stretch [{build}] 60 s clip {mode:?} x{ratio}: render {render:.3?} ({:.0} frames of 16.6 ms) + peaks {peaks:.3?} -> {:.1} s of audio",
+                render.as_secs_f64() / 0.0166,
+                d.clip.seconds()
+            );
+        }
     }
 
     /// **What a forty-five-take open costs through the crew**, against the
@@ -17633,7 +17969,7 @@ mod tests {
         let mut frames = 0usize;
         while landed < paths.len() {
             while pool.free() > 0 && next < paths.len() {
-                pool.submit(super::Warm::Clip(paths[next].clone()), rate, &ctx);
+                pool.submit(super::Warm::Clip(paths[next].clone()), super::Work::Decode, rate, &ctx);
                 next += 1;
             }
             landed += pool.drain(rate).len();
@@ -18459,7 +18795,7 @@ mod tests {
         let p = peaks_of(&saw);
         let whole = 1000.0 / 48_000.0;
         let clip = audio_clip(0.0, 0.0, whole);
-        let env = super::pyramid_wave(&p, &clip, 0.0, whole, 4, 48_000);
+        let env = super::pyramid_wave(&p, clip.offset_s, clip.loop_s, 0.0, whole, 4, 48_000);
         assert_eq!(env.len(), 8, "four buckets is four pairs");
         for k in 0..4 {
             let (lo, hi) = (env[k * 2], env[k * 2 + 1]);
@@ -18473,22 +18809,22 @@ mod tests {
 
         let quiet = peaks_of(&vec![0.0; 200]);
         let short = 100.0 / 48_000.0;
-        assert!(super::pyramid_wave(&quiet, &clip, 0.0, short, 4, 48_000)
+        assert!(super::pyramid_wave(&quiet, clip.offset_s, clip.loop_s, 0.0, short, 4, 48_000)
             .iter()
             .all(|v| *v == 0.0));
         // Nothing to draw is nothing, not a panic.
-        assert!(super::pyramid_wave(&quiet, &clip, 0.0, 0.0, 4, 48_000).is_empty());
-        assert!(super::pyramid_wave(&quiet, &clip, 0.0, short, 0, 48_000).is_empty());
-        assert!(super::pyramid_wave(&quiet, &audio_clip(9_999.0, 0.0, 1.0), 0.0, 1.0, 4, 48_000).is_empty());
+        assert!(super::pyramid_wave(&quiet, clip.offset_s, clip.loop_s, 0.0, 0.0, 4, 48_000).is_empty());
+        assert!(super::pyramid_wave(&quiet, clip.offset_s, clip.loop_s, 0.0, short, 0, 48_000).is_empty());
+        assert!(super::pyramid_wave(&quiet, 9_999.0, 0.0, 0.0, 1.0, 4, 48_000).is_empty());
         // What a hand-edited document can say: none of it panics, and a
         // looped read past the end is flat.
-        let _ = super::pyramid_wave(&quiet, &audio_clip(f64::NAN, 0.0, 1.0), f64::INFINITY, 1.0, 4, 48_000);
-        let _ = super::pyramid_wave(&quiet, &audio_clip(f64::INFINITY, 1.0, 1.0), 0.0, f64::INFINITY, 4, 48_000);
+        let _ = super::pyramid_wave(&quiet, f64::NAN, 0.0, f64::INFINITY, 1.0, 4, 48_000);
+        let _ = super::pyramid_wave(&quiet, f64::INFINITY, 1.0, 0.0, f64::INFINITY, 4, 48_000);
         assert_eq!(
-            super::pyramid_wave(&quiet, &audio_clip(5.0, 1.0, 1.0), 0.0, 1.0, 2, 48_000),
+            super::pyramid_wave(&quiet, 5.0, 1.0, 0.0, 1.0, 2, 48_000),
             vec![0.0; 4]
         );
-        assert!(super::pyramid_wave(&quiet, &clip, 0.0, short, 4, 0).iter().all(|v| *v == 0.0));
+        assert!(super::pyramid_wave(&quiet, clip.offset_s, clip.loop_s, 0.0, short, 4, 0).iter().all(|v| *v == 0.0));
     }
 
     /// **A looped clip is drawn as it PLAYS: the same pass, drawn again and
@@ -18518,7 +18854,7 @@ mod tests {
             .collect();
         let p = peaks_of(&samples);
         let looped = audio_clip(0.0, 1.0, 3.0);
-        let folded = super::pyramid_wave(&p, &looped, 0.0, 3.0, 300, 48_000);
+        let folded = super::pyramid_wave(&p, looped.offset_s, looped.loop_s, 0.0, 3.0, 300, 48_000);
         assert_eq!(folded.len(), 600);
         for i in 0..300 {
             let (lo, hi) = (folded[i * 2], folded[i * 2 + 1]);
@@ -18537,11 +18873,11 @@ mod tests {
         }
         // The same clip with its loop off reads the file straight through:
         // the second and third seconds are the file's own 0.5.
-        let straight = super::pyramid_wave(&p, &audio_clip(0.0, 0.0, 3.0), 0.0, 3.0, 300, 48_000);
+        let straight = super::pyramid_wave(&p, 0.0, 0.0, 0.0, 3.0, 300, 48_000);
         assert!((straight[150 * 2 + 1] - 0.5).abs() < 1e-6, "{}", straight[150 * 2 + 1]);
         // And a window that starts mid-pass folds the same way: a second
         // drawn from 1.5 s in has the burst at 1.7..1.8.
-        let mid = super::pyramid_wave(&p, &looped, 1.5, 1.0, 100, 48_000);
+        let mid = super::pyramid_wave(&p, looped.offset_s, looped.loop_s, 1.5, 1.0, 100, 48_000);
         for i in 0..100 {
             let hi = mid[i * 2 + 1];
             if (71..79).contains(&i) {
@@ -18552,7 +18888,7 @@ mod tests {
         }
         // A trim moves the fold with it: offset 0.1 s puts the burst at
         // 0.1..0.2 of every pass.
-        let trimmed = super::pyramid_wave(&p, &audio_clip(0.1, 1.0, 2.0), 0.0, 2.0, 200, 48_000);
+        let trimmed = super::pyramid_wave(&p, 0.1, 1.0, 0.0, 2.0, 200, 48_000);
         assert!(trimmed[15 * 2 + 1] > 0.8 && trimmed[115 * 2 + 1] > 0.8);
         assert!(trimmed[25 * 2 + 1] < 0.05 && trimmed[125 * 2 + 1] < 0.05);
     }
@@ -18646,7 +18982,7 @@ mod tests {
             let t = std::time::Instant::now();
             for _ in 0..n {
                 for (clip, d) in clips.iter().zip(&decoded) {
-                    std::hint::black_box(super::clip_picture(clip, d, rate, Some(view)));
+                    std::hint::black_box(super::clip_picture(clip, d, rate, Some(view), None));
                 }
             }
             let pyramid = t.elapsed() / n;
