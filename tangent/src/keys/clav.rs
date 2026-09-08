@@ -582,10 +582,12 @@ impl ClavVoice {
         }
     }
 
-    /// The dry patch: `strike_based` through [`ClavBase::DRY`].    ///
+    /// The dry patch: `strike_based` through [`ClavBase::DRY`].
+    ///
     /// One of the strike ladder's rungs that the instrument does not use:
-    /// `mod.rs` calls the base-picking one, and this shorter spelling is
-    /// what the bench and this module's tests strike with.
+    /// `mod.rs` calls the base-picking one. This shorter spelling is what
+    /// `strike_knobs_is_the_dry_base` below and `mod.rs`'s own partial test
+    /// strike with.
     #[allow(dead_code)]
     pub fn strike_knobs(&mut self, pitch: u8, velocity: f32, k: &ClavKnobs) {
         self.strike_based(pitch, velocity, k, &ClavBase::DRY);
