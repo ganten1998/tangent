@@ -780,7 +780,7 @@ pub struct DesktopApp {
     /// here. Cleared when the engine restarts: the cache is keyed to one
     /// sample rate. Entries no clip references leave with the edit.
     #[cfg(feature = "recorder")]
-    track_cache: std::collections::HashMap<std::path::PathBuf, Arc<tangent_record::decode::Clip>>,
+    track_cache: std::collections::HashMap<std::path::PathBuf, Decoded>,
     /// **Files the decoder has already refused**, so it is asked once.
     ///
     /// `queue_warm` skips anything already in `track_cache`, which is what
@@ -813,14 +813,16 @@ pub struct DesktopApp {
     /// the tenth of a cent that rounds away is a hundredth of a sample on
     /// the longest clip anybody will import.
     #[cfg(feature = "recorder")]
-    stretch_cache:
-        std::collections::HashMap<(std::path::PathBuf, i64, String), Arc<tangent_record::decode::Clip>>,
+    stretch_cache: std::collections::HashMap<StretchKey, Decoded>,
     /// The drumpad's decoded samples, by resolved path — its own cache,
     /// because `track_cache` evicts by what the ARRANGEMENT references and
     /// a kit is not the arrangement's business. Same rate-keying, same
     /// clear on an engine restart.
     #[cfg(feature = "recorder")]
-    pad_cache: std::collections::HashMap<std::path::PathBuf, Arc<tangent_record::decode::Clip>>,
+    pad_cache: std::collections::HashMap<std::path::PathBuf, Decoded>,
+    /// The decode workers `run_warm` feeds and drains. See [`DecodePool`].
+    #[cfg(feature = "recorder")]
+    pool: DecodePool,
     /// The scope drain's reusable buffer.
     scope_buf: Vec<f32>,
     /// The INSERT tap drain's reusable buffer, and where the tap is aimed —
@@ -2430,20 +2432,11 @@ fn stretched_clip_audio(
     clip: &tangent_ui::arrangement::ArrClip,
     decoded: std::sync::Arc<tangent_record::decode::Clip>,
     path: &std::path::Path,
-    cache: &mut std::collections::HashMap<
-        (std::path::PathBuf, i64, String),
-        std::sync::Arc<tangent_record::decode::Clip>,
-    >,
+    cache: &mut std::collections::HashMap<StretchKey, std::sync::Arc<tangent_record::decode::Clip>>,
 ) -> std::sync::Arc<tangent_record::decode::Clip> {
-    if (clip.stretch - 1.0).abs() <= 1.0e-9 {
+    let Some((key, mode)) = stretch_key(clip, path) else {
         return decoded;
-    }
-    let mode = crate::stretch::Mode::from_key(&clip.stretch_mode).unwrap_or_default();
-    let key = (
-        path.to_path_buf(),
-        (clip.stretch * 1.0e6).round() as i64,
-        mode.key().to_owned(),
-    );
+    };
     match cache.get(&key) {
         Some(c) => std::sync::Arc::clone(c),
         None => {
@@ -2452,6 +2445,31 @@ fn stretched_clip_audio(
             made
         }
     }
+}
+
+/// The stretch cache's key for a clip and the mode it names; `None` for a
+/// clip that is not stretched. **The one spelling.** The cache is filled
+/// by two roads and swept by a third, and three copies of "ratio in
+/// millionths, mode's key" is how a sweep quietly stops matching what was
+/// inserted — the doc on the live path used to warn the sweep to keep up
+/// with it by hand.
+#[cfg(feature = "recorder")]
+fn stretch_key(
+    clip: &tangent_ui::arrangement::ArrClip,
+    path: &std::path::Path,
+) -> Option<(StretchKey, crate::stretch::Mode)> {
+    if (clip.stretch - 1.0).abs() <= 1.0e-9 {
+        return None;
+    }
+    let mode = crate::stretch::Mode::from_key(&clip.stretch_mode).unwrap_or_default();
+    Some((
+        (
+            path.to_path_buf(),
+            (clip.stretch * 1.0e6).round() as i64,
+            mode.key().to_owned(),
+        ),
+        mode,
+    ))
 }
 
 // **This attribute belongs to the IMPL, not to what is above it.** It was
@@ -4506,7 +4524,7 @@ impl DesktopApp {
                         // would otherwise hold every one of them in memory
                         // for the rest of the session.
                         let clip = match self.pad_cache.get(&path) {
-                            Some(c) => Some(std::sync::Arc::clone(c)),
+                            Some(c) => Some(std::sync::Arc::clone(&c.clip)),
                             None => tangent_record::decode::decode(&path, rate)
                                 .ok()
                                 .map(std::sync::Arc::new),
@@ -8717,6 +8735,10 @@ impl DesktopApp {
                 self.refused_why.clear();
                 self.stretch_cache.clear();
                 self.pad_cache.clear();
+                // Whatever the crew is still decoding belongs to the old
+                // project; so does whatever is queued for it.
+                self.pool.invalidate();
+                self.warm.clear();
                 self.clips_owed = true;
                 self.pads_owed = true;
                 // Both are answered a file a frame from here; ask for the
@@ -8907,8 +8929,19 @@ impl DesktopApp {
     /// reloads keep their own decode fallback, so a file that appears late,
     /// or that fails here, is still tried in the place that actually needs
     /// it — this cannot turn a working clip into a missing one.
+    ///
+    /// **The decodes themselves run on a small crew of threads now** — see
+    /// [`DecodePool`]. This frame's job is to hand out what the crew can
+    /// carry, land what it has finished, keep the meter honest (it counts
+    /// landings), and answer the two debts: the notes on their deadline,
+    /// the rest when nothing is left anywhere.
     fn run_warm(&mut self, ctx: &egui::Context) {
-        if !self.clips_owed && !self.pads_owed && self.warm.is_empty() {
+        // What the crew finished since last frame goes into the caches
+        // first; a landed clip is a schedule the engine has not heard.
+        if self.land_decodes() {
+            self.clips_owed = true;
+        }
+        if !self.clips_owed && !self.pads_owed && self.warm.is_empty() && self.pool.idle() {
             return;
         }
         // **The notes do not wait on the decoder.** See
@@ -8933,13 +8966,46 @@ impl DesktopApp {
         } else {
             self.clips_owed_at = None;
         }
-        if self.warm.is_empty() {
+        if self.warm.is_empty() && self.pool.idle() {
             self.queue_warm();
         }
-        // Nothing to decode: the reload is free, so it happens THIS frame.
-        // Waiting a frame for an empty queue would put a frame of latency on
-        // every note anybody draws, since an edit marks the clips dirty.
-        let Some(item) = self.warm.pop_front() else {
+        // The rate the reloads decode at, read the same way they read it —
+        // the caches are keyed to one rate and a mismatch here would be a
+        // decode neither of them can use.
+        let rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(48_000, |e| e.output().sample_rate);
+        // **Hand the crew what it can carry.** See `DecodePool`: the
+        // decode itself no longer happens here, or on this thread.
+        while self.pool.free() > 0 {
+            let Some(item) = self.warm.pop_front() else {
+                break;
+            };
+            let (path, pads) = match &item {
+                Warm::Clip(p) => (p, false),
+                Warm::Pad(p) => (p, true),
+            };
+            // **Already decoded: a file the drain reload met inline, or one
+            // the queue was built before it landed.** Counted as done for
+            // the meter (it was read as outstanding), never decoded twice —
+            // this was the second half of the open that decoded everything
+            // twice.
+            if if pads {
+                self.pad_cache.contains_key(path)
+            } else {
+                self.track_cache.contains_key(path)
+            } {
+                continue;
+            }
+            self.pool.submit(item, rate, ctx);
+        }
+        // Nothing left anywhere: the reload is free, so it happens THIS
+        // frame. Waiting a frame for an empty queue would put a frame of
+        // latency on every note anybody draws, since an edit marks the
+        // clips dirty.
+        if self.warm.is_empty() && self.pool.idle() {
             // The same courtesy the insert meter gets: the frame the queue
             // empties on is the only one that can read "12 of 12".
             if !self.warm_count.idle() && self.busied == Busied::Decode {
@@ -8959,84 +9025,87 @@ impl DesktopApp {
                 self.reload_pads();
             }
             return;
-        };
-        // The one still in hand counts as outstanding: it is not decoded
-        // until the call below returns.
-        self.warm_count = self.warm_count.saw(self.warm.len() + 1);
-        let progress = self.warm_count.progress();
-        let (path, pads) = match &item {
-            Warm::Clip(p) => (p.clone(), false),
-            Warm::Pad(p) => (p.clone(), true),
-        };
-        // **Already decoded: a file the drain reload met inline, or one the
-        // queue was built before it landed.** Counted as done for the meter
-        // (`saw` above read it as outstanding), never decoded twice — this
-        // was the second half of the open that decoded everything twice.
-        if if pads {
-            self.pad_cache.contains_key(&path)
-        } else {
-            self.track_cache.contains_key(&path)
-        } {
-            ctx.request_repaint();
-            return;
         }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned());
+        // Outstanding is what is queued plus what is in the workers' hands;
+        // `done` rises as they LAND, which is the honest reading. See
+        // `Counted`.
+        self.warm_count = self.warm_count.saw(self.warm.len() + self.pool.outstanding());
+        let progress = self.warm_count.progress();
+        let name = self.pool.working_on();
         if let Some(busy) = self.busy_chunk(Busied::Decode, "Loading audio") {
             busy.detail = name;
             busy.progress = Some(progress);
         }
-        // The rate the reloads decode at, read the same way they read it —
-        // the caches are keyed to one rate and a mismatch here would be a
-        // decode neither of them can use.
+        // Frames carry the meter and the landings, and between a load
+        // starting and the user touching something nothing else is asking
+        // for one.
+        ctx.request_repaint();
+    }
+
+    /// Take what the crew has finished into the caches. Answers whether a
+    /// CLIP landed — a schedule the engine has not heard yet.
+    ///
+    /// A clip nothing references any more (deleted while its file was in
+    /// flight) is dropped rather than cached: the sweep in `reload_clips`
+    /// would have evicted it a frame later, but a hundred megabytes should
+    /// not have to visit the cache to leave it. A pad is kept as it lands;
+    /// `reload_pads` sweeps its own cache against every drum lane. A
+    /// refusal is remembered exactly as the inline road remembers one.
+    fn land_decodes(&mut self) -> bool {
         let rate = self
             .recorder
             .engine
             .as_ref()
             .map_or(48_000, |e| e.output().sample_rate);
-        match tangent_record::decode::decode(&path, rate) {
-            Ok(c) => {
-                let c = Arc::new(c);
-                if pads {
-                    self.pad_cache.insert(path, c);
-                } else {
+        let landed = self.pool.drain(rate);
+        if landed.is_empty() {
+            return false;
+        }
+        let live_files: std::collections::HashSet<std::path::PathBuf> = self
+            .app
+            .project_doc()
+            .map(|doc_path| {
+                self.app
+                    .arrangement()
+                    .clips
+                    .iter()
+                    .filter(|c| c.kind != tangent_ui::arrangement::ClipKind::Midi)
+                    .map(|c| tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut clips = false;
+        for done in landed {
+            match (done.item, done.result) {
+                (Warm::Clip(path), Ok(decoded)) => {
+                    if live_files.contains(&path) {
+                        self.warm_refused.remove(&path);
+                        self.refused_why.remove(&path);
+                        self.track_cache.insert(path, decoded);
+                        clips = true;
+                    }
+                }
+                (Warm::Pad(path), Ok(decoded)) => {
                     self.warm_refused.remove(&path);
-                    self.track_cache.insert(path, c);
+                    self.refused_why.remove(&path);
+                    self.pad_cache.insert(path, decoded);
+                }
+                // **A refusal is an answer, and has to be remembered as
+                // one.** Nothing else records it: a file that will not
+                // decode is absent from the cache exactly like one nobody
+                // has tried yet, and a queue that forgets that refills
+                // itself for ever — see `warm_refused`, and `queue_warm`,
+                // which skips a refused PAD as well as a refused clip: the
+                // day the pads were left out, a template kit pointing at a
+                // folder that did not exist spawned seventeen children a
+                // pass on the UI thread until the window starved.
+                (Warm::Clip(path) | Warm::Pad(path), Err(why)) => {
+                    self.refused_why.insert(path.clone(), why);
+                    self.warm_refused.insert(path);
                 }
             }
-            // **A refusal is an answer, and has to be remembered as one.**
-            // Nothing else records it: a file that will not decode is absent
-            // from the cache exactly like one nobody has tried yet.
-            //
-            // **This used to say `Err(_) if !pads`, and the pads arm below
-            // threw the answer away.** The comment above stated the rule and
-            // the code kept it for clips only, which cost the owner an
-            // unusable app: a launch adopts the template in memory and points
-            // at a scratch folder that is deliberately never created, so a
-            // template carrying a KIT resolves every pad into a directory
-            // that does not exist. Seventeen decodes fail, none is
-            // remembered, `queue_warm` re-queues all seventeen because a
-            // refused file is absent from `pad_cache` exactly like an untried
-            // one, and round it goes — spawning seventeen `afconvert`
-            // children a pass, on the UI thread, for ever. What he saw was a
-            // loading splash that never ended, a sample counter climbing past
-            // three hundred against a kit with seventeen pads in it, and a
-            // window too starved to draw. Sampled at 86% of the main thread
-            // inside `poll`, waiting on children.
-            //
-            // The two halves differ only in what a retry may cost, and both
-            // answers are the same: remember it. See `queue_warm`, which now
-            // skips a refused pad, and `reload_pads`, which is the road that
-            // paints the pad red — it decodes on its own and is unaffected by
-            // this set, so a file that comes back still lights.
-            Err(why) => {
-                self.refused_why.insert(path.clone(), why);
-                self.warm_refused.insert(path);
-            }
         }
-        // A file a frame only advances if frames arrive.
-        ctx.request_repaint();
+        clips
     }
 
     /// Fill the warm-up queue with everything the owed reloads would have to
@@ -9059,6 +9128,7 @@ impl DesktopApp {
                         tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
                     if self.track_cache.contains_key(&path)
                         || self.warm_refused.contains(&path)
+                        || self.pool.holds(false, &path)
                         || !seen.insert(path.clone())
                     {
                         continue;
@@ -9081,6 +9151,7 @@ impl DesktopApp {
                     // the refusal arm in `run_warm` for what that cost.
                     if self.pad_cache.contains_key(&path)
                         || self.warm_refused.contains(&path)
+                        || self.pool.holds(true, &path)
                         || !seen.insert(path.clone())
                     {
                         continue;
@@ -9159,7 +9230,7 @@ impl DesktopApp {
             };
             let path = tangent_ui::arrangement::Arrangement::resolve(doc_path, &clip.path);
             let decoded = match self.track_cache.get(&path) {
-                Some(c) => Arc::clone(c),
+                Some(c) => c.clone(),
                 // **A remembered refusal is not asked again.** This arm
                 // used to decode unconditionally, so one missing take in a
                 // project spawned `afconvert` on every reload — every edit,
@@ -9182,8 +9253,8 @@ impl DesktopApp {
                 }
                 None => match tangent_record::decode::decode(&path, rate) {
                     Ok(c) => {
-                        let c = Arc::new(c);
-                        self.track_cache.insert(path.clone(), Arc::clone(&c));
+                        let c = Decoded::of(c);
+                        self.track_cache.insert(path.clone(), c.clone());
                         c
                     }
                     Err(e) => {
@@ -9208,10 +9279,10 @@ impl DesktopApp {
             // stretched to 1.5 is a clip whose file is half again as long,
             // and nothing downstream has to hold a second opinion about
             // where its seconds are. Shared with the offline bounce — see
-            // `stretched_clip_audio`; the sweep below must keep matching
-            // its key construction.
-            let decoded = stretched_clip_audio(clip, decoded, &path, &mut self.stretch_cache);
-            let file_s = decoded.seconds();
+            // `stretched_clip_audio` and `stretch_key`, which the sweep
+            // below reads too.
+            let decoded = self.stretched_live(clip, &decoded, &path);
+            let file_s = decoded.clip.seconds();
             if clip.len_s == 0.0 {
                 fill_len.push((clip.id, (file_s - clip.offset_s).max(0.0)));
             }
@@ -9219,7 +9290,7 @@ impl DesktopApp {
             span = span.max(clip.start_s + len_s);
             placed.extend(audio_clip_passes(
                 clip,
-                &decoded,
+                &decoded.clip,
                 f64::from(rate),
                 clip.gain as f32,
             ));
@@ -9227,7 +9298,7 @@ impl DesktopApp {
                 info = Some(tangent_ui::ports::TrackInfo {
                     name: clip.name.clone(),
                     seconds: 0.0,
-                    wave: decoded.envelope(TRACK_WAVE_BUCKETS),
+                    wave: decoded.peaks.envelope(TRACK_WAVE_BUCKETS),
                     error: String::new(),
                 });
             }
@@ -9251,7 +9322,7 @@ impl DesktopApp {
                     let into = (from - clip.start_s).max(0.0);
                     let wave = if looped {
                         looped_span_envelope(
-                            &decoded,
+                            &decoded.clip,
                             clip.offset_s,
                             clip.loop_s,
                             into,
@@ -9261,7 +9332,7 @@ impl DesktopApp {
                         )
                     } else {
                         span_envelope(
-                            &decoded,
+                            &decoded.clip,
                             frames(clip.offset_s + into) as usize,
                             frames(span) as usize,
                             buckets,
@@ -9275,7 +9346,7 @@ impl DesktopApp {
                 None => {
                     let wave = if looped {
                         looped_span_envelope(
-                            &decoded,
+                            &decoded.clip,
                             clip.offset_s,
                             clip.loop_s,
                             0.0,
@@ -9285,7 +9356,7 @@ impl DesktopApp {
                         )
                     } else {
                         span_envelope(
-                            &decoded,
+                            &decoded.clip,
                             frames(clip.offset_s) as usize,
                             frames(len_s) as usize,
                             CLIP_WAVE_BUCKETS,
@@ -9300,7 +9371,7 @@ impl DesktopApp {
                 file_s,
                 wave_from_s,
                 wave_span_s,
-                peaks: None,
+                peaks: Some(Arc::clone(&decoded.peaks)),
             });
         }
         self.app.set_clip_infos(clip_infos);
@@ -9317,11 +9388,15 @@ impl DesktopApp {
         // nothing can match, and sweeping on that basis would throw away every
         // decoded file the moment a project became unsaved.
         if let Some(doc_path) = doc_path.as_ref() {
-            let referenced = |path: &std::path::PathBuf| {
-                doc.clips
-                    .iter()
-                    .any(|c| tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path) == *path)
-            };
+            // Resolved ONCE per clip. The closure this replaced resolved
+            // every clip for every cache entry — a PathBuf join per pair,
+            // on every reload.
+            let live_files: std::collections::HashSet<std::path::PathBuf> = doc
+                .clips
+                .iter()
+                .map(|c| tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path))
+                .collect();
+            let referenced = |path: &std::path::PathBuf| live_files.contains(path);
             self.track_cache.retain(|path, _| referenced(path));
             // **The refusal set holds PADS as well as clips, so this sweep
             // has to ask both.**
@@ -9352,16 +9427,15 @@ impl DesktopApp {
         // clip's edge is a hundred frames and a hundred ratios; without
         // this, that is a hundred whole copies of the file left in memory.
         if let Some(doc_path) = doc_path.as_ref() {
-            self.stretch_cache.retain(|(path, ratio, mode), _| {
-                doc.clips.iter().any(|c| {
-                    (c.stretch * 1.0e6).round() as i64 == *ratio
-                        && crate::stretch::Mode::from_key(&c.stretch_mode)
-                            .unwrap_or_default()
-                            .key()
-                            == mode
-                        && tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path) == *path
+            let live_stretches: std::collections::HashSet<StretchKey> = doc
+                .clips
+                .iter()
+                .filter_map(|c| {
+                    stretch_key(c, &tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path))
+                        .map(|(key, _)| key)
                 })
-            });
+                .collect();
+            self.stretch_cache.retain(|key, _| live_stretches.contains(key));
         }
         if let Some(e) = self.recorder.engine.as_mut() {
             e.set_clips(placed);
@@ -9372,6 +9446,29 @@ impl DesktopApp {
         info.error = error;
         self.app.set_track_info(info);
         deferred
+    }
+
+    /// The live path's stretched copy, with its picture. The samples come
+    /// from `crate::stretch::stretch` under [`stretch_key`], the same
+    /// renderer and key the offline bounce uses through
+    /// `stretched_clip_audio`; the pyramid is built beside them so a
+    /// stretched clip is drawn from its stretched audio like an unstretched
+    /// one is from its file.
+    fn stretched_live(
+        &mut self,
+        clip: &tangent_ui::arrangement::ArrClip,
+        decoded: &Decoded,
+        path: &std::path::Path,
+    ) -> Decoded {
+        let Some((key, mode)) = stretch_key(clip, path) else {
+            return decoded.clone();
+        };
+        if let Some(made) = self.stretch_cache.get(&key) {
+            return made.clone();
+        }
+        let made = Decoded::of(crate::stretch::stretch(&decoded.clip, clip.stretch, mode));
+        self.stretch_cache.insert(key, made.clone());
+        made
     }
 
     /// The drumpad's samples: decode every slot at the engine's rate, push
@@ -9435,11 +9532,11 @@ impl DesktopApp {
         for (i, path) in paths.iter().enumerate() {
             let Some(path) = path else { continue };
             let decoded = match self.pad_cache.get(path) {
-                Some(c) => Some(Arc::clone(c)),
+                Some(c) => Some(c.clone()),
                 None => match tangent_record::decode::decode(path, rate) {
                     Ok(c) => {
-                        let c = Arc::new(c);
-                        self.pad_cache.insert(path.clone(), Arc::clone(&c));
+                        let c = Decoded::of(c);
+                        self.pad_cache.insert(path.clone(), c.clone());
                         Some(c)
                     }
                     // The pad wears its file's name in red; there is no row
@@ -9451,8 +9548,8 @@ impl DesktopApp {
             match (decoded, kit.pads.get_mut(i), status.get_mut(i)) {
                 (Some(c), Some(slot), Some(st)) => {
                     st.loaded = true;
-                    st.wave = c.envelope(PAD_WAVE_BUCKETS);
-                    *slot = Some(c);
+                    st.wave = c.peaks.envelope(PAD_WAVE_BUCKETS);
+                    *slot = Some(Arc::clone(&c.clip));
                 }
                 (None, _, Some(st)) => st.missing = true,
                 _ => {}
@@ -9523,7 +9620,7 @@ impl DesktopApp {
                 continue;
             }
             let path = tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
-            let Some(decoded) = self.track_cache.get(&path).map(Arc::clone) else {
+            let Some(decoded) = self.track_cache.get(&path).map(|d| Arc::clone(&d.clip)) else {
                 continue;
             };
             let frames = |s: f64| frames_at(f64::from(rate), s) as usize;
@@ -10467,6 +10564,9 @@ impl DesktopApp {
                 // — the device that just opened may run another.
                 self.track_cache.clear();
                 self.stretch_cache.clear();
+                // Anything the crew is still decoding is at the OLD rate.
+                self.pool.invalidate();
+                self.warm.clear();
                 // **Owed, not done here.** Both caches were just emptied, so
                 // this is the single worst decode in the app — every clip in
                 // the session, at once, on the UI thread, from inside a
@@ -14557,6 +14657,8 @@ impl DesktopApp {
             stretch_cache: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
             pad_cache: std::collections::HashMap::new(),
+            #[cfg(feature = "recorder")]
+            pool: DecodePool::new(),
             scope_buf: Vec::new(),
             tap_buf: Vec::new(),
             insert_tap_at: None,
@@ -15902,12 +16004,316 @@ enum Decode {
 
 /// One file the next reload will need, and which cache its decode belongs in.
 #[cfg(feature = "recorder")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Warm {
     /// A clip on the timeline, into `track_cache`.
     Clip(std::path::PathBuf),
     /// A drum pad's sample, into `pad_cache`.
     Pad(std::path::PathBuf),
+}
+
+#[cfg(feature = "recorder")]
+impl Warm {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Warm::Clip(p) | Warm::Pad(p) => p,
+        }
+    }
+}
+
+/// **What the caches hold per file: the samples the engine plays and the
+/// picture the panel draws, made together.**
+///
+/// The picture is a min/max pyramid (`tangent_ui::peaks::Peaks`), built
+/// from the decoded samples by the same worker that decoded them, so a
+/// file's picture costs one pass off the UI thread for the life of the file
+/// and no reload walks samples for a zoom again. One value rather than a
+/// second map keyed the same way: the three caches are cleared in two
+/// places and swept in two more, and a picture cache of its own would have
+/// been a fifth place to forget.
+#[cfg(feature = "recorder")]
+#[derive(Clone)]
+struct Decoded {
+    clip: Arc<tangent_record::decode::Clip>,
+    peaks: Arc<tangent_ui::peaks::Peaks>,
+}
+
+#[cfg(feature = "recorder")]
+impl Decoded {
+    /// Wrap a fresh decode and build its picture: a pass over the samples,
+    /// which is the worker's job — or the inline fallback's, once.
+    fn of(clip: tangent_record::decode::Clip) -> Self {
+        let peaks = tangent_ui::peaks::Peaks::build(&clip.samples, 2, clip.rate).shared();
+        Decoded {
+            clip: Arc::new(clip),
+            peaks,
+        }
+    }
+}
+
+/// The stretch cache's key: `(file, ratio in millionths, mode)`. See
+/// [`stretch_key`], the one place it is spelled.
+#[cfg(feature = "recorder")]
+type StretchKey = (std::path::PathBuf, i64, String);
+
+/// The decoder the pool runs, `(path, rate) -> Clip`. Injectable so the
+/// pool's tests need neither a file nor a child.
+#[cfg(feature = "recorder")]
+type Decoder = Arc<
+    dyn Fn(&std::path::Path, u32) -> Result<tangent_record::decode::Clip, String> + Send + Sync,
+>;
+
+/// One job handed to a worker: what to decode, at which rate, under which
+/// generation of the caches.
+#[cfg(feature = "recorder")]
+struct DecodeJob {
+    item: Warm,
+    rate: u32,
+    gen: u64,
+}
+
+/// One job's answer, back on the UI thread, still wearing the rate and
+/// generation it was asked under.
+#[cfg(feature = "recorder")]
+struct DecodeDone {
+    item: Warm,
+    rate: u32,
+    gen: u64,
+    result: Result<Decoded, String>,
+}
+
+/// **The decode workers: a few threads, a queue in, a queue out, polled once
+/// a frame.**
+///
+/// Decodes were strictly one file per FRAME on the UI thread: `run_warm`
+/// popped an item, blocked in the decoder, and asked for another frame. A
+/// forty-five-take project was forty-five frames of blocking however many
+/// cores sat idle beside it. This is the IR worker's shape — a channel and
+/// a `try_recv` per frame — with a bounded crew instead of one thread.
+/// Results land in the caches on the UI thread, refusals are remembered
+/// there, and the meter counts LANDINGS, so "12 of 45" means twelve files
+/// really in the cache, not twelve handed out.
+///
+/// **Nothing here touches `DesktopApp`.** A worker gets a path and a rate
+/// and hands back a [`Decoded`] — samples and their peak pyramid, both built
+/// off the UI thread — or a sentence; the caller decides what a result
+/// means. A result carries the rate and the cache generation it was asked
+/// under, and [`DecodePool::drain`] drops one from another rate or an older
+/// generation: the caches are keyed to one engine rate, and a device change
+/// or a project switch mid-flight must not land a wrong-rate clip. The path
+/// is simply still absent, so the next `queue_warm` asks again.
+///
+/// **The crew is hired on the first job, never in the constructor.** A test
+/// that builds the app, or a session that never opens a project, should not
+/// start threads it will never use. Workers exit when the pool drops (the
+/// job sender goes with it); the process `_exit(0)`s on quit anyway. A
+/// worker that cannot be spawned, or a crew that is somehow gone, is not a
+/// failure of the decode: the job runs on the calling thread instead, one a
+/// frame as it always did. The cover, never the precondition.
+#[cfg(feature = "recorder")]
+struct DecodePool {
+    decoder: Decoder,
+    /// How many threads the crew has, and so how many jobs sit in the
+    /// workers' hands at once; the window handed out is twice that so a
+    /// worker never idles for a frame between jobs.
+    workers: usize,
+    jobs: Option<std::sync::mpsc::Sender<DecodeJob>>,
+    done_tx: std::sync::mpsc::Sender<DecodeDone>,
+    done_rx: std::sync::mpsc::Receiver<DecodeDone>,
+    /// Handed out and not yet answered.
+    in_flight: std::collections::HashSet<Warm>,
+    /// Bumped by [`DecodePool::invalidate`]; a result from an older
+    /// generation is dropped on arrival.
+    gen: u64,
+    /// The file that landed most recently, for the cover's detail line.
+    last_landed: Option<String>,
+}
+
+#[cfg(feature = "recorder")]
+impl DecodePool {
+    /// The real decoder, and a crew sized to the machine: half its cores,
+    /// two at least, four at most — decodes are disk-then-memory work and
+    /// eight of them at once would thrash the one thing they share.
+    fn new() -> Self {
+        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 4));
+        Self::with_decoder(
+            workers,
+            Arc::new(|path: &std::path::Path, rate: u32| tangent_record::decode::decode(path, rate)),
+        )
+    }
+
+    fn with_decoder(workers: usize, decoder: Decoder) -> Self {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        DecodePool {
+            decoder,
+            workers: workers.max(1),
+            jobs: None,
+            done_tx,
+            done_rx,
+            in_flight: std::collections::HashSet::new(),
+            gen: 0,
+            last_landed: None,
+        }
+    }
+
+    /// Start the crew. `None` if not one thread could be spawned.
+    fn hire(&self, wake: egui::Context) -> Option<std::sync::mpsc::Sender<DecodeJob>> {
+        let (tx, rx) = std::sync::mpsc::channel::<DecodeJob>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let mut hired = 0usize;
+        for n in 0..self.workers {
+            let rx = Arc::clone(&rx);
+            let done = self.done_tx.clone();
+            let decoder = Arc::clone(&self.decoder);
+            let wake = wake.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("tangent-decode-{n}"))
+                .spawn(move || loop {
+                    // The lock is held only for the `recv`, never for the
+                    // decode, so the others keep taking jobs while this
+                    // one works. A poisoned lock (a worker died holding it)
+                    // is still a receiver.
+                    let job = match rx.lock() {
+                        Ok(guard) => guard.recv(),
+                        Err(poisoned) => poisoned.into_inner().recv(),
+                    };
+                    let Ok(job) = job else {
+                        break; // the pool is gone
+                    };
+                    let result = run_decode_job(&decoder, &job);
+                    let DecodeJob { item, rate, gen } = job;
+                    if done
+                        .send(DecodeDone {
+                            item,
+                            rate,
+                            gen,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    // A landing is worth a frame: the UI may be asleep
+                    // between them.
+                    wake.request_repaint();
+                });
+            hired += usize::from(spawned.is_ok());
+        }
+        (hired > 0).then_some(tx)
+    }
+
+    /// Hand a job to the crew. An item already in flight is left alone.
+    fn submit(&mut self, item: Warm, rate: u32, wake: &egui::Context) {
+        if !self.in_flight.insert(item.clone()) {
+            return;
+        }
+        if self.jobs.is_none() {
+            self.jobs = self.hire(wake.clone());
+        }
+        let job = DecodeJob {
+            item,
+            rate,
+            gen: self.gen,
+        };
+        let job = match self.jobs.as_ref() {
+            Some(tx) => match tx.send(job) {
+                Ok(()) => return,
+                Err(std::sync::mpsc::SendError(job)) => job,
+            },
+            None => job,
+        };
+        // No crew: the job runs here, and its answer takes the same road
+        // back so the caller cannot tell the difference.
+        let result = run_decode_job(&self.decoder, &job);
+        let DecodeJob { item, rate, gen } = job;
+        let _ = self.done_tx.send(DecodeDone {
+            item,
+            rate,
+            gen,
+            result,
+        });
+    }
+
+    /// Take every result that has landed. One from another generation or
+    /// rate is dropped HERE: the path it names is still absent from its
+    /// cache, so the next `queue_warm` asks for it again under the current
+    /// rate. Whether a result is still WANTED — the clip may have been
+    /// deleted mid-flight — is the caller's question.
+    fn drain(&mut self, rate: u32) -> Vec<DecodeDone> {
+        let mut out = Vec::new();
+        while let Ok(done) = self.done_rx.try_recv() {
+            self.in_flight.remove(&done.item);
+            if done.gen != self.gen || done.rate != rate {
+                continue;
+            }
+            if done.result.is_ok() {
+                self.last_landed = done
+                    .item
+                    .path()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned());
+            }
+            out.push(done);
+        }
+        out
+    }
+
+    /// Whether this exact file is in the workers' hands.
+    fn holds(&self, pads: bool, path: &std::path::Path) -> bool {
+        self.in_flight.iter().any(|w| match w {
+            Warm::Clip(p) => !pads && p == path,
+            Warm::Pad(p) => pads && p == path,
+        })
+    }
+
+    fn outstanding(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    fn idle(&self) -> bool {
+        self.in_flight.is_empty()
+    }
+
+    /// How many more jobs the crew will take right now.
+    fn free(&self) -> usize {
+        (self.workers * 2).saturating_sub(self.in_flight.len())
+    }
+
+    /// The caches are about to be emptied: every answer still on its way
+    /// belongs to the old world. The in-flight set is NOT cleared — those
+    /// jobs will land, be dropped by `drain`, and only then is the crew
+    /// idle enough for `queue_warm` to ask for the files again.
+    fn invalidate(&mut self) {
+        self.gen = self.gen.wrapping_add(1);
+        self.last_landed = None;
+    }
+
+    /// A name for the cover: the last file that landed, else the first one
+    /// in the workers' hands.
+    fn working_on(&self) -> Option<String> {
+        self.last_landed.clone().or_else(|| {
+            self.in_flight
+                .iter()
+                .next()
+                .and_then(|w| w.path().file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+    }
+}
+
+/// One job, start to finish, on whichever thread holds it. A decoder that
+/// PANICS on a file answers with a sentence rather than taking its worker
+/// down with the job still counted as outstanding — a meter that can never
+/// finish is the failure this whole road exists to end.
+#[cfg(feature = "recorder")]
+fn run_decode_job(decoder: &Decoder, job: &DecodeJob) -> Result<Decoded, String> {
+    let path = job.item.path();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        decoder(path, job.rate).map(Decoded::of)
+    })) {
+        Ok(result) => result,
+        Err(_) => Err("the decoder crashed on that file".to_owned()),
+    }
 }
 
 /// The key the running export is raised under.
@@ -16985,8 +17391,8 @@ mod tests {
              inline decode"
         );
         assert!(
-            drain.contains("self.track_cache.contains_key(&path)")
-                && drain.contains("self.pad_cache.contains_key(&path)"),
+            drain.contains("self.track_cache.contains_key(path)")
+                && drain.contains("self.pad_cache.contains_key(path)"),
             "a popped item already in its cache has to be skipped, or every \
              file the drain decoded inline is decoded again"
         );
@@ -17013,6 +17419,230 @@ mod tests {
             reload.contains("self.warm_refused.insert(path.clone());"),
             "an inline refusal has to be remembered like the warm-up's"
         );
+    }
+
+    /// A decoder for the pool's tests: a short clip for most names, a
+    /// sentence for one that starts with `refuse`, a PANIC for one that
+    /// starts with `crash`, and a count of every call.
+    fn counting_decoder(calls: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> super::Decoder {
+        std::sync::Arc::new(move |path: &std::path::Path, rate: u32| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name.starts_with("refuse") {
+                return Err(format!("no such file: {name}"));
+            }
+            if name.starts_with("crash") {
+                panic!("a decoder bug on {name}");
+            }
+            Ok(tangent_record::decode::Clip {
+                samples: vec![0.25; 64],
+                rate,
+                source: path.to_path_buf(),
+            })
+        })
+    }
+
+    /// Drain the pool a frame at a time until `n` results have landed or
+    /// ten seconds have gone by.
+    fn drain_until(pool: &mut super::DecodePool, rate: u32, n: usize) -> Vec<super::DecodeDone> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut out = Vec::new();
+        while out.len() < n && std::time::Instant::now() < deadline {
+            out.extend(pool.drain(rate));
+            if out.len() < n {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        out
+    }
+
+    /// Wait until the crew has answered everything it holds, dropping
+    /// whatever lands; what this tests is that NOTHING survives the drain.
+    fn drain_to_idle(pool: &mut super::DecodePool, rate: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !pool.idle() && std::time::Instant::now() < deadline {
+            assert!(pool.drain(rate).is_empty(), "a stale result landed");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(pool.idle(), "the crew never answered");
+    }
+
+    /// **N jobs are N decodes, every one lands, and a landing carries both
+    /// the samples and the picture.** A repeat of an in-flight item is a
+    /// no-op; the same file as a PAD is a different job, because it goes to
+    /// a different cache.
+    #[test]
+    fn the_pool_decodes_each_job_once_and_lands_every_one() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = super::DecodePool::with_decoder(3, counting_decoder(std::sync::Arc::clone(&calls)));
+        let ctx = egui::Context::default();
+        for i in 0..12 {
+            pool.submit(
+                super::Warm::Clip(std::path::PathBuf::from(format!("/takes/{i}.wav"))),
+                48_000,
+                &ctx,
+            );
+        }
+        pool.submit(super::Warm::Pad(std::path::PathBuf::from("/takes/0.wav")), 48_000, &ctx);
+        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/0.wav")), 48_000, &ctx);
+        assert_eq!(pool.outstanding(), 13, "twelve clips, one pad, one repeat");
+        assert!(pool.holds(false, std::path::Path::new("/takes/0.wav")));
+        assert!(pool.holds(true, std::path::Path::new("/takes/0.wav")));
+        assert!(!pool.holds(true, std::path::Path::new("/takes/1.wav")));
+        assert_eq!(pool.free(), 6 - 13usize.min(6), "the window is twice the crew");
+        let landed = drain_until(&mut pool, 48_000, 13);
+        assert_eq!(landed.len(), 13);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 13, "a decode per job, no more");
+        assert!(pool.idle());
+        assert_eq!(pool.free(), 6);
+        for done in &landed {
+            let decoded = done.result.as_ref().expect("a good file lands Ok");
+            assert_eq!(decoded.clip.frames(), 32);
+            assert_eq!(decoded.peaks.frames(), 32, "the picture is built beside the samples");
+            assert_eq!(decoded.peaks.minmax(0, 32), (0.25, 0.25));
+            assert_eq!(done.rate, 48_000);
+        }
+        assert!(pool.working_on().is_some(), "the cover has a name to show");
+    }
+
+    /// **A result from another generation or another rate is dropped on
+    /// arrival**, and the crew is idle again once it has landed — which is
+    /// the door `queue_warm` waits for to ask for the file again under the
+    /// new rate. A project switch and a device change mid-decode both come
+    /// down to this.
+    #[test]
+    fn a_result_from_another_generation_or_rate_is_dropped_on_arrival() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = super::DecodePool::with_decoder(2, counting_decoder(calls));
+        let ctx = egui::Context::default();
+        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/a.wav")), 48_000, &ctx);
+        pool.invalidate();
+        drain_to_idle(&mut pool, 48_000);
+        assert!(pool.working_on().is_none(), "a stale landing is not a name for the cover");
+        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/b.wav")), 48_000, &ctx);
+        drain_to_idle(&mut pool, 44_100);
+        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/c.wav")), 48_000, &ctx);
+        assert_eq!(drain_until(&mut pool, 48_000, 1).len(), 1, "a current one still lands");
+    }
+
+    /// **A refusal is a sentence and a crashing decoder is a sentence**;
+    /// neither leaves the job counted as outstanding for ever, which is
+    /// the one way a meter can fail to finish.
+    #[test]
+    fn a_refusal_and_a_crash_come_back_as_sentences_not_as_a_hang() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = super::DecodePool::with_decoder(2, counting_decoder(calls));
+        let ctx = egui::Context::default();
+        for name in ["refuse-1.wav", "crash-1.wav", "fine.wav"] {
+            pool.submit(super::Warm::Clip(std::path::PathBuf::from(format!("/takes/{name}"))), 48_000, &ctx);
+        }
+        let landed = drain_until(&mut pool, 48_000, 3);
+        assert_eq!(landed.len(), 3);
+        assert!(pool.idle());
+        for done in landed {
+            let name = done.item.path().file_name().unwrap().to_string_lossy().into_owned();
+            match (name.as_str(), done.result) {
+                ("refuse-1.wav", Err(why)) => assert!(why.contains("no such file"), "{why}"),
+                ("crash-1.wav", Err(why)) => assert!(why.contains("crashed"), "{why}"),
+                ("fine.wav", Ok(_)) => {}
+                (name, result) => panic!("{name} answered {:?}", result.map(|_| "Ok")),
+            }
+        }
+        // And the crew is still alive after the crash: another job lands.
+        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/after.wav")), 48_000, &ctx);
+        assert_eq!(drain_until(&mut pool, 48_000, 1).len(), 1);
+    }
+
+    /// **What a forty-five-take open costs through the crew**, against the
+    /// same forty-five decoded one after another on one thread — the shape
+    /// `run_warm` had before the pool. Ignored; run in RELEASE:
+    ///
+    /// ```text
+    /// cargo test --release -p tangent --bin tangent what_a_forty_five_take_open_costs -- --ignored --nocapture
+    /// ```
+    ///
+    /// `TANGENT_PERF_TAKE_S` sets the take length (default 60). The takes
+    /// are 24-bit stereo 48 k through `WavWriter`, which is what the
+    /// recorder writes; they are deleted afterwards.
+    #[test]
+    #[ignore]
+    fn what_a_forty_five_take_open_costs() {
+        let seconds: f64 = std::env::var("TANGENT_PERF_TAKE_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60.0);
+        let rate = 48_000u32;
+        let dir = std::env::temp_dir().join(format!("tangent-perf-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut paths = Vec::new();
+        for i in 0..45 {
+            let path = dir.join(format!("take-{i}.wav"));
+            let spec = tangent_record::wav::WavSpec {
+                sample_rate: rate,
+                channels: 2,
+                format: tangent_record::wav::SampleFormat::Int24,
+            };
+            let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+            let mut w = tangent_record::wav::WavWriter::create(&path, spec, &bext).expect("writer");
+            let frames = (seconds * f64::from(rate)) as usize;
+            let mut block = vec![0.0f32; 4_800 * 2];
+            let mut at = 0usize;
+            while at < frames {
+                let n = (frames - at).min(4_800);
+                for k in 0..n {
+                    let t = (at + k) as f64 / f64::from(rate);
+                    let v = 0.6 * (std::f64::consts::TAU * (110.0 + i as f64) * t).sin() * (-(t % 0.5) * 4.0).exp();
+                    block[k * 2] = v as f32;
+                    block[k * 2 + 1] = (v * 0.8) as f32;
+                }
+                w.write_interleaved(&block[..n * 2]).expect("write");
+                at += n;
+            }
+            w.finish().expect("finish");
+            paths.push(path);
+        }
+        let build = if cfg!(debug_assertions) { "DEBUG" } else { "release" };
+        // One thread, one after another: decode plus the picture.
+        let t = std::time::Instant::now();
+        let mut peaks_time = std::time::Duration::ZERO;
+        for path in &paths {
+            let clip = tangent_record::decode::decode(path, rate).expect("decode");
+            let tp = std::time::Instant::now();
+            let d = super::Decoded::of(clip);
+            peaks_time += tp.elapsed();
+            std::hint::black_box(d);
+        }
+        let serial = t.elapsed();
+        // The crew, fed and drained a frame at a time as `run_warm` does.
+        let mut pool = super::DecodePool::new();
+        let workers = pool.workers;
+        let ctx = egui::Context::default();
+        let t = std::time::Instant::now();
+        let mut next = 0usize;
+        let mut landed = 0usize;
+        let mut frames = 0usize;
+        while landed < paths.len() {
+            while pool.free() > 0 && next < paths.len() {
+                pool.submit(super::Warm::Clip(paths[next].clone()), rate, &ctx);
+                next += 1;
+            }
+            landed += pool.drain(rate).len();
+            frames += 1;
+            if landed < paths.len() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        let pooled = t.elapsed();
+        println!(
+            "open [{build}]: 45 takes x {seconds:.0} s 24-bit: serial decode+peaks {serial:.3?} (peaks {peaks_time:.3?} of it, {:.1} ms per take) | crew of {workers}: {pooled:.3?} wall over {frames} polls | {:.1}x",
+            serial.as_secs_f64() * 1000.0 / 45.0,
+            serial.as_secs_f64() / pooled.as_secs_f64()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

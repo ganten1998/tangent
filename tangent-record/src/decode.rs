@@ -154,18 +154,13 @@ pub fn decode(path: &Path, rate: u32) -> Result<Clip, String> {
 /// the whole file to learn its length.
 const NATIVE_MAX_BYTES: u64 = (MAX_FRAMES as u64) * 2 * 4 + (1 << 20);
 
-/// How many children `read_wav` has started on this thread. A test's proof
-/// that a take never left the process; a `Cell` rather than a `cfg(test)`
-/// static because `proc.rs` scans this file's runtime text up to its first
-/// `#[cfg(test)]`, and a gate placed above `read_wav` would hide `read_wav`
-/// from that scan.
+// How many children `read_wav` has started on this thread. A test's proof
+// that a take never left the process; a `Cell` rather than a `cfg(test)`
+// static because `proc.rs` scans this file's runtime text up to its first
+// `#[cfg(test)]`, and a gate placed above `read_wav` would hide `read_wav`
+// from that scan. Read by the tests through `tests::child_spawns`.
 thread_local! {
     static CHILD_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Children `read_wav` has started on the calling thread.
-pub(crate) fn child_spawns() -> usize {
-    CHILD_SPAWNS.with(std::cell::Cell::get)
 }
 
 fn note_child_spawn() {
@@ -463,6 +458,11 @@ fn read_wav(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Children `read_wav` has started on the calling thread.
+    fn child_spawns() -> usize {
+        CHILD_SPAWNS.with(std::cell::Cell::get)
+    }
 
     /// A hand-rolled WAV: `fmt ` then `data`, sizes as given (a streamed
     /// ffmpeg WAV writes `0xFFFFFFFF` where it could not seek back).
