@@ -2073,7 +2073,29 @@ fn bus_strip(painter: &Painter, cell: Rect, t: f32) {
 
 /// Song seconds at `x`, through the zoom window. The one mapping.
 pub fn time_at(rect: Rect, view: &ArrangeView<'_>, x: f32) -> f64 {
-    let l = Layout::new(rect, view);
+    time_at_in(&Layout::new(rect, view), view, x)
+}
+
+/// [`time_at`] for a caller that already holds the frame's [`Layout`].
+///
+/// **The `_in` forms exist because the axis was being rebuilt per call.**
+/// `x_of`, `time_at` and `clip_rect` each constructed a whole `Layout` to
+/// read one pair of numbers off it — the lanes area's left edge and width —
+/// and `clip_rect` constructed three (its own and one per `x_of`). A Layout
+/// is 1.3 µs: thirty-three rows stacked, sixteen header rows measured cell by
+/// cell, a bus row, thirteen kilobytes returned by value. `draw` asked for
+/// one per grid line, per ruler label, per automation point and three per
+/// clip whether the clip was on screen or not, and `targets` asked again;
+/// measured, that was 1.9 µs per clip in the document per frame, which at two
+/// thousand clips is a quarter of a frame spent re-deriving a rectangle that
+/// had not moved. So the frame builds one Layout at its top and hands it
+/// down, and the public forms stay as they were for the seventy-odd callers
+/// in `app` that ask once per gesture, where a Layout is nothing.
+///
+/// Same arithmetic, same degenerate answers: the two must agree to the bit,
+/// because a clip drawn through one and hit-tested through the other is the
+/// pair that drifts. `clip_rect_agrees_with_its_in_form_to_the_bit` holds it.
+pub fn time_at_in(l: &Layout, view: &ArrangeView<'_>, x: f32) -> f64 {
     if !l.lanes_area.is_positive() || view.view_len_s <= 0.0 {
         return 0.0;
     }
@@ -2180,7 +2202,11 @@ pub fn tempo_bpm_at(row: Rect, y: f32) -> f64 {
 
 /// The x a song second draws at. `time_at`'s inverse.
 pub fn x_of(rect: Rect, view: &ArrangeView<'_>, t: f64) -> f32 {
-    let l = Layout::new(rect, view);
+    x_of_in(&Layout::new(rect, view), view, t)
+}
+
+/// [`x_of`] on a Layout the caller already built — see [`time_at_in`].
+pub fn x_of_in(l: &Layout, view: &ArrangeView<'_>, t: f64) -> f32 {
     if !l.lanes_area.is_positive() || view.view_len_s <= 0.0 {
         return l.lanes_area.left();
     }
@@ -2190,12 +2216,20 @@ pub fn x_of(rect: Rect, view: &ArrangeView<'_>, t: f64) -> f32 {
 
 /// A clip's rectangle on its lane, clamped into the lanes area.
 pub fn clip_rect(rect: Rect, view: &ArrangeView<'_>, clip: &ClipView<'_>) -> Rect {
-    let l = Layout::new(rect, view);
+    clip_rect_in(&Layout::new(rect, view), view, clip)
+}
+
+/// [`clip_rect`] on a Layout the caller already built — see [`time_at_in`].
+///
+/// The clamp against `l.lanes_area.right()` is the same edge the time
+/// selection's veil, the pending ghost and the grid guards clamp against, so
+/// a clip and the veil over it end on the same pixel.
+pub fn clip_rect_in(l: &Layout, view: &ArrangeView<'_>, clip: &ClipView<'_>) -> Rect {
     let Some(row) = l.lane_rows.get(clip.lane).copied().filter(Rect::is_positive) else {
         return Rect::NOTHING;
     };
-    let x0 = x_of(rect, view, clip.start_s).max(l.lanes_area.left());
-    let x1 = x_of(rect, view, clip.start_s + clip.len_s).min(l.lanes_area.right());
+    let x0 = x_of_in(l, view, clip.start_s).max(l.lanes_area.left());
+    let x1 = x_of_in(l, view, clip.start_s + clip.len_s).min(l.lanes_area.right());
     if x1 <= x0 {
         return Rect::NOTHING;
     }
@@ -2765,7 +2799,13 @@ pub fn click_hit(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
 }
 
 pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
-    let l = Layout::new(rect, view);
+    hit_test_in(&Layout::new(rect, view), view, pos)
+}
+
+/// [`hit_test`] on a Layout the caller already built — see [`time_at_in`].
+/// The wheel handler asks this and the axis on the same frame, and it used
+/// to build a Layout for each.
+pub fn hit_test_in(l: &Layout, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
 
     for (r, hit) in [
         (l.tool_met, Hit::ToolMetronome),
@@ -2842,7 +2882,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         if names.contains(pos) {
             let font_h = strip_font_h(names);
             for (i, m) in view.markers.iter().enumerate().rev() {
-                let x = x_of(rect, view, m.at_s);
+                let x = x_of_in(l, view, m.at_s);
                 let shown = match view.marker_edit.filter(|(n, _)| *n == i) {
                     Some((_, t)) => format!("{t}|"),
                     None if m.name.is_empty() => "\u{2691}".to_owned(),
@@ -2872,7 +2912,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             if pt.at_bar == 0 && view.meter.points().len() == 1 && typing.is_none() {
                 continue;
             }
-            let x = x_of(rect, view, bar_at(view, pt.at_bar));
+            let x = x_of_in(l, view, bar_at(view, pt.at_bar));
             // The same width the chip is DRAWN at, including the field's
             // caret: a target that disagreed with the paint by a character
             // would be a chip you cannot press once you have opened it.
@@ -2904,7 +2944,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
                     .enumerate()
                     .map(|(i, q)| {
                         let at = Pos2::new(
-                            tempo_x_of(rect, view, row.lane, q.at_beat),
+                            tempo_x_of(l, view, row.lane, q.at_beat),
                             tempo_y_of(row.lane, q.bpm),
                         );
                         (i, at.distance(pos))
@@ -2919,7 +2959,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
                 // pixels above lands visually in the ruler.
                 if row.lane.contains(pos) {
                     return Some(Hit::TempoLane(
-                        time_at(rect, view, pos.x),
+                        time_at_in(l, view, pos.x),
                         tempo_bpm_at(row.lane, pos.y),
                     ));
                 }
@@ -2988,7 +3028,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let at = Pos2::new(x_of(rect, view, p.at_s), auto_y_of(row.lane, p.value));
+                let at = Pos2::new(x_of_in(l, view, p.at_s), auto_y_of(row.lane, p.value));
                 (lo + i, at.distance(pos))
             })
             // **Finite first.** A non-finite distance compares false against
@@ -3017,14 +3057,14 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             return Some(Hit::AutoLane(
                 lane,
                 slot,
-                time_at(rect, view, pos.x),
+                time_at_in(l, view, pos.x),
                 auto_value_at(row.lane, pos.y),
             ));
         }
         continue;
     }
     if l.ruler.is_positive() && l.ruler.contains(pos) {
-        return Some(Hit::Ruler(time_at(rect, view, pos.x)));
+        return Some(Hit::Ruler(time_at_in(l, view, pos.x)));
     }
     for clip in view.clips.iter().rev() {
         // A clip being RECORDED is a picture, not a control — the document
@@ -3032,7 +3072,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         if clip.recording {
             continue;
         }
-        let r = clip_rect(rect, view, clip);
+        let r = clip_rect_in(l, view, clip);
         if !r.is_positive() || !r.contains(pos) {
             continue;
         }
@@ -3060,14 +3100,14 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     }
     for (i, row) in l.lane_rows.iter().enumerate() {
         if row.is_positive() && row.contains(pos) {
-            return Some(Hit::Lane(i, time_at(rect, view, pos.x)));
+            return Some(Hit::Lane(i, time_at_in(l, view, pos.x)));
         }
     }
     // The master's field, last: its header's own controls are pushed above
     // and have already answered, so what is left is the ground beside them.
     if let Some(row) = l.rows.iter().find(|r| r.kind == RowKind::Master) {
         if row.lane.is_positive() && row.lane.contains(pos) {
-            return Some(Hit::MasterLane(time_at(rect, view, pos.x)));
+            return Some(Hit::MasterLane(time_at_in(l, view, pos.x)));
         }
     }
     None
@@ -3091,7 +3131,11 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
 /// then each row from the top — a track's header cells left to right,
 /// then the clips standing on it.
 pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
-    let l = Layout::new(rect, view);
+    targets_in(&Layout::new(rect, view), view)
+}
+
+/// [`targets`] on a Layout the caller already built — see [`time_at_in`].
+pub fn targets_in(l: &Layout, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
     let mut out: Vec<(Rect, Hit)> = Vec::new();
     let mut push = |r: Rect, hit: Hit| {
         if r.is_positive() {
@@ -3177,7 +3221,7 @@ pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
                     // on an edge would hand a keyboard a trim it never
                     // asked for. A clip too narrow to have a body is one
                     // there is nothing to press.
-                    let r = clip_rect(rect, view, clip);
+                    let r = clip_rect_in(l, view, clip);
                     if !r.is_positive() {
                         continue;
                     }
@@ -4137,8 +4181,8 @@ fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
 /// One function because both the drawing and the hit test need the same
 /// answer; two copies of this is how a handle comes to be drawn somewhere it
 /// cannot be pressed.
-fn tempo_x_of(rect: Rect, view: &ArrangeView<'_>, lane: Rect, at_beat: f64) -> f32 {
-    let x = x_of(rect, view, view.tempo.seconds_at_beat(at_beat));
+fn tempo_x_of(l: &Layout, view: &ArrangeView<'_>, lane: Rect, at_beat: f64) -> f32 {
+    let x = x_of_in(l, view, view.tempo.seconds_at_beat(at_beat));
     if !x.is_finite() {
         return x;
     }
@@ -4483,7 +4527,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     let mut bars: Vec<(u32, f32)> = Vec::new();
     let mut n = first;
     while n <= last && bars.len() < 512 {
-        let x = x_of(rect, view, bar_at(view, n));
+        let x = x_of_in(&l, view, bar_at(view, n));
         if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() + 0.5 {
             bars.push((n, x));
         }
@@ -4553,7 +4597,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let mut n = (view.view_start_s / want).floor().max(0.0);
         while n * want <= view.view_start_s + view.view_len_s {
             let t = n * want;
-            let x = x_of(rect, view, t);
+            let x = x_of_in(&l, view, t);
             if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() - 30.0 {
                 let secs = t.round() as u64;
                 let word = if secs >= 3600 {
@@ -4619,8 +4663,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if t0 > t1 {
                 break;
             }
-            let x0 = x_of(rect, view, t0);
-            let x1 = x_of(rect, view, view.tempo.seconds_at_beat(q0 + qn));
+            let x0 = x_of_in(&l, view, t0);
+            let x1 = x_of_in(&l, view, view.tempo.seconds_at_beat(q0 + qn));
             let bar_px = f64::from(x1 - x0);
             if exp >= 0 {
                 // **A multi-bar grid draws COARSER, visibly** — the owner
@@ -4650,7 +4694,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     let mut k = 1u32;
                     while (f64::from(k) * step_q) < qn - 1.0e-9 && k < 512 {
                         let t = view.tempo.seconds_at_beat(q0 + f64::from(k) * step_q);
-                        line(x_of(rect, view, t), 0.55);
+                        line(x_of_in(&l, view, t), 0.55);
                         drawn += 1;
                         k += 1;
                     }
@@ -4787,11 +4831,11 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             line.push(Pos2::new(row.lane.left(), y));
         }
         for (i, q) in shown.iter().enumerate() {
-            let at = Pos2::new(x_of(rect, view, q.at_s), auto_y_of(row.lane, q.value));
+            let at = Pos2::new(x_of_in(&l, view, q.at_s), auto_y_of(row.lane, q.value));
             line.push(at);
             if q.shape == crate::automation::Shape::Hold {
                 if let Some(next) = shown.get(i + 1) {
-                    line.push(Pos2::new(x_of(rect, view, next.at_s), at.y));
+                    line.push(Pos2::new(x_of_in(&l, view, next.at_s), at.y));
                 }
             }
         }
@@ -4829,7 +4873,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // desk draws there.
         let painter = &painter.with_clip_rect(row.lane);
         for (i, q) in shown.iter().enumerate() {
-            let at = Pos2::new(x_of(rect, view, q.at_s), auto_y_of(row.lane, q.value));
+            let at = Pos2::new(x_of_in(&l, view, q.at_s), auto_y_of(row.lane, q.value));
             if !at.x.is_finite() || !at.y.is_finite() {
                 continue;
             }
@@ -4921,11 +4965,11 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 line.push(Pos2::new(row.lane.left(), tempo_y_of(row.lane, first.bpm)));
             }
             for (i, q) in pts.iter().enumerate() {
-                let x = x_of(rect, view, view.tempo.seconds_at_beat(q.at_beat));
+                let x = x_of_in(&l, view, view.tempo.seconds_at_beat(q.at_beat));
                 let at = Pos2::new(x, tempo_y_of(row.lane, q.bpm));
                 line.push(at);
                 if let Some(next) = pts.get(i + 1) {
-                    let nx = x_of(rect, view, view.tempo.seconds_at_beat(next.at_beat));
+                    let nx = x_of_in(&l, view, view.tempo.seconds_at_beat(next.at_beat));
                     // **The RAMP belongs to the point it slides FROM**, which
                     // is `TempoPoint::ramp`'s own words and what
                     // `bpm_at_beat` reads: a ramp on point *i* interpolates
@@ -4955,7 +4999,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 crate::fonts::courier(),
             );
             for (i, q) in pts.iter().enumerate() {
-                let x = tempo_x_of(rect, view, row.lane, q.at_beat);
+                let x = tempo_x_of(&l, view, row.lane, q.at_beat);
                 let at = Pos2::new(x, tempo_y_of(row.lane, q.bpm));
                 if !at.x.is_finite() || !at.y.is_finite() {
                     continue;
@@ -5036,7 +5080,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if pt.at_bar == 0 && view.meter.points().len() == 1 && typing.is_none() {
                 continue;
             }
-            let x = x_of(rect, view, bar_at(view, pt.at_bar));
+            let x = x_of_in(&l, view, bar_at(view, pt.at_bar));
             if x < l.meter_strip.left() - 2.0 || x > l.meter_strip.right() + 2.0 {
                 continue;
             }
@@ -5087,7 +5131,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let nfont = FontId::new(strip_font_h(names), crate::fonts::courier());
         let nbox = strip_box_h(names);
         for (i, m) in view.markers.iter().enumerate() {
-            let x = x_of(rect, view, m.at_s);
+            let x = x_of_in(&l, view, m.at_s);
             if x < l.meter_strip.left() - 2.0 || x > l.meter_strip.right() + 2.0 {
                 continue;
             }
@@ -5149,7 +5193,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
 
     // ── the clips ─────────────────────────────────────────────────────────
     for clip in view.clips {
-        let r = clip_rect(rect, view, clip);
+        let r = clip_rect_in(&l, view, clip);
         if !r.is_positive() {
             continue;
         }
@@ -5186,8 +5230,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // **Above the fill now**, because the fill needs the seams: the clip
         // is not a rectangle any more when it repeats.
         let full_x = (
-            x_of(rect, view, clip.start_s),
-            x_of(rect, view, clip.start_s + clip.len_s),
+            x_of_in(&l, view, clip.start_s),
+            x_of_in(&l, view, clip.start_s + clip.len_s),
         );
         // ── the clip's own shape ──────────────────────────────────────────
         //
@@ -5249,8 +5293,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             let cols = r.width().ceil() as usize;
             // Seconds per pixel, from the panel's own mapping so this cannot
             // drift from the grid.
-            let t0 = time_at(rect, view, r.left());
-            let t1 = time_at(rect, view, r.left() + 1.0);
+            let t0 = time_at_in(&l, view, r.left());
+            let t1 = time_at_in(&l, view, r.left() + 1.0);
             let dt = (t1 - t0).abs().max(1.0e-9);
             let ink = clip_ink.gamma_multiply(0.62);
             for i in 0..cols {
@@ -5292,7 +5336,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // the fade's end — the picture IS the envelope.
         let veil = Color32::from_black_alpha(110);
         if clip.fade_in_s > 0.0 {
-            let fx = x_of(rect, view, clip.start_s + clip.fade_in_s).clamp(r.left(), r.right());
+            let fx = x_of_in(&l, view, clip.start_s + clip.fade_in_s).clamp(r.left(), r.right());
             painter.add(egui::Shape::convex_polygon(
                 vec![r.left_top(), Pos2::new(fx, r.top()), Pos2::new(r.left(), r.bottom())],
                 veil,
@@ -5304,7 +5348,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             );
         }
         if clip.fade_out_s > 0.0 {
-            let fx = x_of(rect, view, clip.start_s + clip.len_s - clip.fade_out_s)
+            let fx = x_of_in(&l, view, clip.start_s + clip.len_s - clip.fade_out_s)
                 .clamp(r.left(), r.right());
             painter.add(egui::Shape::convex_polygon(
                 vec![Pos2::new(fx, r.top()), r.right_top(), Pos2::new(r.right(), r.bottom())],
@@ -5394,8 +5438,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // mattered — visible only in the gaps, the standard DAW picture
     // inverted. Under the playhead still, which always reads on top.
     if let Some((t0, t1)) = view.time_sel.filter(|(a, b)| b > a) {
-        let x0 = x_of(rect, view, t0).max(l.lanes_area.left());
-        let x1 = x_of(rect, view, t1).min(l.lanes_area.right());
+        let x0 = x_of_in(&l, view, t0).max(l.lanes_area.left());
+        let x1 = x_of_in(&l, view, t1).min(l.lanes_area.right());
         if x1 > x0 {
             let sel = Color32::from_rgb(0xC9, 0x8B, 0x3D);
             painter.rect_filled(
@@ -5427,7 +5471,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     }
 
     // ── the playhead, through the lanes and the ruler ─────────────────────
-    let px = x_of(rect, view, view.playhead_s);
+    let px = x_of_in(&l, view, view.playhead_s);
     if px >= l.lanes_area.left() - 0.5 && px <= l.lanes_area.right() + 0.5 {
         painter.line_segment(
             [Pos2::new(px, l.ruler.top()), Pos2::new(px, l.lanes_area.bottom())],
@@ -6057,8 +6101,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // up and the document takes it.
     if let Some((lane, t0, t1)) = view.pending {
         if let Some(row) = l.lane_rows.get(lane).copied().filter(|r| r.is_positive()) {
-            let x0 = x_of(rect, view, t0).max(l.lanes_area.left());
-            let x1 = x_of(rect, view, t1).min(l.lanes_area.right());
+            let x0 = x_of_in(&l, view, t0).max(l.lanes_area.left());
+            let x1 = x_of_in(&l, view, t1).min(l.lanes_area.right());
             if x1 > x0 {
                 let ghost = Rect::from_min_max(
                     Pos2::new(x0, row.top() + 1.5),
@@ -6338,7 +6382,7 @@ mod tests {
         assert!(row.lane.is_positive(), "the tempo lane has no room");
 
         // The handle for the point at beat zero.
-        let x = tempo_x_of(rect, &v, row.lane, 0.0);
+        let x = tempo_x_of(&l, &v, row.lane, 0.0);
         assert!(
             x >= row.lane.left() + AUTO_POINT_R - 0.01,
             "the first handle is drawn half outside the lane: x={x} left={}",
@@ -8082,6 +8126,54 @@ ArrangeView {
         }
     }
 
+
+    /// **The `_in` forms ARE the public forms, to the bit.**
+    ///
+    /// `draw`, `hit_test` and `targets` read the axis through a Layout built
+    /// once per frame; `app` reads it through the public forms once per
+    /// gesture. A clip drawn through one and grabbed through the other has to
+    /// be the same rectangle — not within a pixel, the SAME — or the clip you
+    /// see and the clip you can press come apart by a fraction that grows
+    /// with the zoom. So every corner is compared by its bits, over the
+    /// panel's own clips, at several windows (whole song, zoomed in, scrolled
+    /// past the clips, an hour wide, a second wide) and several rects down to
+    /// the degenerate. `hit_test` and `targets` are held to the same bar.
+    #[test]
+    fn clip_rect_agrees_with_its_in_form_to_the_bit() {
+        let c = clips();
+        let bits = |r: Rect| {
+            [r.min.x.to_bits(), r.min.y.to_bits(), r.max.x.to_bits(), r.max.y.to_bits()]
+        };
+        for (w, h) in [(1300.0, 420.0), (1920.0, 960.0), (300.0, 100.0), (10.0, 10.0), (0.0, 0.0)] {
+            let r = Rect::from_min_size(Pos2::new(3.0, 7.0), Vec2::new(w, h));
+            for (start, len) in
+                [(0.0, 120.0), (40.0, 10.0), (200.0, 50.0), (0.0, 3600.0), (9.5, 1.0), (0.0, 0.0)]
+            {
+                let mut v = a_view(&c);
+                v.view_start_s = start;
+                v.view_len_s = len;
+                let l = Layout::new(r, &v);
+                for clip in &c {
+                    let a = clip_rect(r, &v, clip);
+                    let b = clip_rect_in(&l, &v, clip);
+                    assert_eq!(bits(a), bits(b), "clip {} at {w}x{h}, window {start}+{len}: {a:?} vs {b:?}", clip.id);
+                }
+                for t in [0.0, 10.0, 59.7, 120.0, start, start + len, -3.0] {
+                    let x = x_of(r, &v, t);
+                    assert_eq!(x.to_bits(), x_of_in(&l, &v, t).to_bits(), "x_of({t})");
+                    assert_eq!(
+                        time_at(r, &v, x).to_bits(),
+                        time_at_in(&l, &v, x).to_bits(),
+                        "time_at({x})"
+                    );
+                }
+                for p in [r.center(), r.left_top(), Pos2::new(r.left() + 200.0, r.top() + 60.0)] {
+                    assert_eq!(hit_test(r, &v, p), hit_test_in(&l, &v, p), "hit at {p:?}");
+                }
+                assert_eq!(targets(r, &v), targets_in(&l, &v), "targets at {w}x{h}");
+            }
+        }
+    }
 
     #[test]
     fn the_time_axis_round_trips() {

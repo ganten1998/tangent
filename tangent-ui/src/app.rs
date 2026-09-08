@@ -56131,6 +56131,13 @@ mod perf_probes {
                 }
             });
             say("layout", tag, "prototype: one Layout + per-clip math", fast, true);
+            let real = per_call(n * 20, || {
+                let l = Layout::new(r, &view);
+                for c in &clips {
+                    std::hint::black_box(crate::arrangement_panel::clip_rect_in(&l, &view, c));
+                }
+            });
+            say("layout", tag, "shipped: one Layout + clip_rect_in per clip", real, true);
             let l = Layout::new(r, &view);
             let mut worst = 0.0f32;
             let mut visible = 0usize;
@@ -56319,5 +56326,68 @@ mod perf_probes {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The arrangement's frame axis, held against the perf fixtures — see
+/// `arrangement_panel::time_at_in` for why the `_in` forms exist and
+/// `clip_rect_agrees_with_its_in_form_to_the_bit` for the panel's own
+/// version of this check. This one runs the fixture DOCUMENTS through the
+/// app's real `arr_clip_views`/`arrange_view`, at every size the benchmark
+/// draws, so a fixture shape the hand-built views do not have (clips on
+/// lanes past sixteen, folded loops, trimmed takes) cannot slip past.
+#[cfg(test)]
+mod arrange_axis_tests {
+    use super::*;
+    use crate::arrangement_panel::{clip_rect, clip_rect_in, Layout};
+    use crate::perf_fixtures::{self as fx, Size};
+
+    #[test]
+    fn every_fixture_clip_rect_agrees_with_its_in_form() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let bits = |r: Rect| {
+            [r.min.x.to_bits(), r.min.y.to_bits(), r.max.x.to_bits(), r.max.y.to_bits()]
+        };
+        for size in [Size::S, Size::M, Size::L, Size::XL] {
+            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+            app.settings.arr_visible = 8;
+            app.arrangement = fx::arrangement(size);
+            app.arrangement_open = true;
+            let song = app.arr_span();
+            let mut checked = 0usize;
+            let mut on_screen = 0usize;
+            for (w, h) in [(1920.0, 960.0), (1300.0, 420.0), (640.0, 200.0)] {
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
+                app.arrangement_rect = Some(rect);
+                for window in [
+                    None,
+                    Some((song * 0.1, 16.0)),
+                    Some((song * 0.5, 2.0)),
+                    Some((0.0, (song * 4.0).max(3_600.0))),
+                ] {
+                    app.arr_window = window;
+                    let clips = app.arr_clip_views();
+                    let view = app.arrange_view(&clips);
+                    let l = Layout::new(rect, &view);
+                    for c in &clips {
+                        let a = clip_rect(rect, &view, c);
+                        let b = clip_rect_in(&l, &view, c);
+                        assert_eq!(
+                            bits(a),
+                            bits(b),
+                            "{} clip {} at {w}x{h}, window {window:?}: {a:?} vs {b:?}",
+                            size.tag(),
+                            c.id
+                        );
+                        checked += 1;
+                        on_screen += usize::from(a.is_positive());
+                    }
+                }
+            }
+            assert!(on_screen > 0, "{}: the fixture put no clip on screen", size.tag());
+            assert!(checked >= 12 * fx::census(&app.arrangement).clips, "{}", size.tag());
+        }
     }
 }
