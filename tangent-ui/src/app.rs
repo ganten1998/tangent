@@ -1,10 +1,19 @@
 //! The eframe App: fixed-size window mechanics, timers, MIDI state, and the
 //! wiring between piano, chord strip, menu, and dialogs.
 //!
-//! Timing model (D-UI-3): no busy loop AT REST. `request_repaint_after(50ms)`
-//! gives the Qt GUI-timer cadence, MIDI events wake the context immediately,
-//! and chord detection runs on its own 100ms gate (with immediate off-cadence
-//! runs after keytoggle clicks and note-preference changes).
+//! Timing model (D-UI-3): **no frames AT REST.** A window with nothing
+//! moving asks for no repaint at all: egui wakes it for input, the MIDI
+//! thread wakes it for a note (`request_repaint_of`), and everything that
+//! animates on its own — needles, the chord detector's 100 ms gate while
+//! notes are held, an armed deadline, the analyzer's decay, a notification
+//! ageing out — asks for exactly the frame it needs through
+//! `animation_due` at the end of `paint`. The host keeps its own ledger for
+//! the engine's side (`DesktopApp::host_frame_due`). It used to be a
+//! 50 ms tick regardless, which egui delivered as 33 ms: an idle desk paid
+//! the whole per-frame bill thirty times a second for nothing. That tick is
+//! one variable away — `IVORY_PACE=tick` — and it is still what a plugin
+//! editor gets, because a plugin's host drives its window on a cadence of
+//! its own.
 //!
 //! `IVORY_PACE=gesture` will instead pace the window to the DISPLAY while a
 //! gesture is in flight — a bare `request_repaint`, which puts eframe's loop
@@ -47,15 +56,24 @@ const GUI_TICK: Duration = Duration::from_millis(50);
 /// `paint`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pace {
-    /// The old behaviour: a 50 ms tick and nothing else.
+    /// Rest when nothing moves; every animator asks for its own frame. The
+    /// default — see the module doc and `animation_due`.
     Off,
+    /// The behaviour before resting existed: a 50 ms tick, always. Kept
+    /// reachable (`IVORY_PACE=tick`) so a state that stops animating under
+    /// `Off` can be confirmed as a missing ledger entry rather than argued
+    /// about, and so the owner can flip back in one launch.
+    Tick,
     /// Refresh-locked while a hand is on something, 50 ms at rest.
     Gesture,
     /// Refresh-locked always. Costs battery; measure before choosing it.
     Always,
 }
 
-/// `IVORY_PACE=off|gesture|always`, read once. **Off by default.**
+/// `IVORY_PACE=off|tick|gesture|always`, read once. **Off by default.**
+///
+/// `tick` is the escape hatch for the resting policy: the unconditional
+/// 50 ms tick every version before this one ran on.
 ///
 /// It shipped as `gesture` and is off again, because it cost more than it
 /// bought. What it bought was a smoother REDRAW during a gesture — about 155
@@ -79,8 +97,18 @@ fn pace_mode() -> Pace {
     *MODE.get_or_init(|| match std::env::var("IVORY_PACE").as_deref() {
         Ok("gesture") => Pace::Gesture,
         Ok("always") => Pace::Always,
+        Ok("tick") => Pace::Tick,
         _ => Pace::Off,
     })
+}
+/// `IVORY_INLINE=<what>`, read once. The demo hooks in `paint` open a menu,
+/// a dialog or a panel on the first frame so it can be photographed; they
+/// are guarded by `demo_menu_done`, which only flips when a hook FIRES, so
+/// with the variable unset every frame used to walk the environment six
+/// times to learn nothing. Same OnceLock discipline as `pace_mode`.
+fn inline_hook() -> Option<&'static str> {
+    static HOOK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::env::var("IVORY_INLINE").ok()).as_deref()
 }
 const DETECT_TICK: Duration = Duration::from_millis(100);
 const DEBOUNCE_100MS: Duration = Duration::from_millis(100);
@@ -665,6 +693,11 @@ pub struct TangentApp {
     barre_drag: Option<(usize, u8)>,
     /// One-shot latch for the IVORY_INLINE=menu debug hook.
     demo_menu_done: bool,
+    /// A MIDI event was drained this frame. The host takes it
+    /// (`take_midi_activity`) to keep frames coming for a moment after a
+    /// note: the sound it made reaches the meters a buffer later, and a
+    /// window that rested on the very next frame would never see it move.
+    midi_activity: bool,
     /// Whether the main window currently has focus. Detached windows are
     /// raised with it and dropped with it, so the app moves as one thing.
     main_focused: bool,
@@ -905,6 +938,9 @@ pub struct TangentApp {
     /// The chips' words, refreshed each frame so the borrowed view can
     /// point at them.
     input_chip_texts: Vec<String>,
+    /// The hash of the settings the chip words were last built from. See
+    /// `frame`.
+    input_chip_key: Option<u64>,
     /// The media explorer: where it stands, what it lists, and the scroll.
     media_dir: std::path::PathBuf,
     media_entries: Vec<crate::drumpad_panel::MediaEntry>,
@@ -1292,8 +1328,19 @@ pub struct TangentApp {
     /// practice session should not have to turn it off again before every
     /// single take. The tick is what makes it outlive the session.
     export_override: Option<recorder::ExportSpec>,
-    /// A settings write owed once the user stops dragging a fader.
-    settings_save_at: Option<Instant>,
+    /// A settings write owed once the user stops dragging a fader — or
+    /// turning a wheel, or holding an arrow key. See `save_settings_soon`.
+    ///
+    /// A `Cell` so that `save_settings`, which takes `&self` at a hundred
+    /// and seventy call sites, can CLEAR it: a synchronous write carries
+    /// the whole settings struct, so any debounced write still owed is
+    /// redundant the moment one lands.
+    settings_save_at: std::cell::Cell<Option<Instant>>,
+    /// How many times the settings file has actually been written by this
+    /// app. Tests count writes rather than watch mtimes, because two
+    /// pretty-prints in a row can land inside one timestamp tick.
+    #[cfg(test)]
+    settings_writes: std::cell::Cell<u32>,
     /// Which insert the open picker is filling, if it is filling one.
     picker_insert: Option<(usize, usize)>,
     /// Every VST3 bundle the host found, for the picker.
@@ -1610,6 +1657,10 @@ pub struct TangentApp {
     /// already does for the detached windows. A mismatch inside the grace is
     /// the window manager; a mismatch after it is a hand on the edge.
     size_asked_at: Option<Instant>,
+    /// The size the bands last asked the window to be, kept from `paint`
+    /// so `write_geometry_now` can run the tiler guard OUTSIDE a frame —
+    /// the flush at quit — with the same number the deadline uses.
+    geometry_target: Option<Vec2>,
     /// A size the APP is asking for: a percentage preset, or the natural size
     /// for a window nobody has dragged yet. Cleared when it is sent.
     ///
@@ -3246,6 +3297,7 @@ impl TangentApp {
             manual_barre: None,
             barre_drag: None,
             demo_menu_done: false,
+            midi_activity: false,
             // Assume focused: a window that has just opened is, and the first
             // frames report None.
             main_focused: true,
@@ -3325,6 +3377,7 @@ impl TangentApp {
             input_menu: None,
             menu_anchor: egui::Pos2::ZERO,
             input_chip_texts: Vec::new(),
+            input_chip_key: None,
             media_dir: dirs_home(),
             media_entries: Vec::new(),
             media_scroll: 0,
@@ -3439,7 +3492,9 @@ impl TangentApp {
             plugin_rescan: false,
             reveal_request: None,
             export_override: None,
-            settings_save_at: None,
+            settings_save_at: std::cell::Cell::new(None),
+            #[cfg(test)]
+            settings_writes: std::cell::Cell::new(0),
             picker_insert: None,
             grabbed: None,
             num_edit: None,
@@ -3515,6 +3570,7 @@ impl TangentApp {
             // The window opens at a size this app chose — see `main.rs` —
             // so the grace runs from launch.
             size_asked_at: Some(Instant::now()),
+            geometry_target: None,
             pending_window_size: None,
             uncover_asked_at: None,
             decorations_sent: None,
@@ -3708,8 +3764,44 @@ impl TangentApp {
     /// reopened tomorrow would silently pick up whatever the standalone was
     /// set to. A plugin's state belongs in its own project file.
     fn save_settings(&self) {
+        // A write that happens now makes the one that was owed redundant:
+        // the file carries the whole struct, faders included.
+        self.settings_save_at.set(None);
         if self.caps.persist_global_settings {
             self.settings.save();
+            #[cfg(test)]
+            self.settings_writes.set(self.settings_writes.get() + 1);
+        }
+    }
+
+    /// How many settings writes this app has made. Tests only.
+    #[cfg(test)]
+    pub(crate) fn settings_writes(&self) -> u32 {
+        self.settings_writes.get()
+    }
+
+    /// **Write anything the debounces still owe, now.**
+    ///
+    /// The debounces exist so a drag is one write rather than a hundred,
+    /// and they trade a bounded loss for it: whatever moved inside the last
+    /// `GEOMETRY_SAVE_DELAY` is not on disk yet. That loss is only bounded
+    /// while frames keep coming. At quit there is no next frame, and a
+    /// fader moved within 700 ms of Cmd+Q was simply gone — for the
+    /// faders, the window geometry and, once the undo mirror went through
+    /// the same road, for a whole undone desk. So the host drains this at
+    /// every edge where the frames may stop: `on_exit`, a project switch,
+    /// and the window losing focus or being minimised. Nothing is written
+    /// when nothing is owed, so calling it often costs one branch.
+    ///
+    /// The geometry half runs the same decision the deadline would have
+    /// (`write_geometry_now`), tiler guard included — flushing must not
+    /// turn a size a window manager imposed into a remembered one.
+    pub fn flush_settings_now(&mut self) {
+        if self.settings_save_at.take().is_some() {
+            self.save_settings();
+        }
+        if self.geometry_save_at.take().is_some() {
+            self.write_geometry_now();
         }
     }
 
@@ -3958,7 +4050,14 @@ impl TangentApp {
     fn process_midi_events(&mut self) {
         while let Ok(ev) = self.midi_rx.try_recv() {
             self.notes.apply(ev);
+            self.midi_activity = true;
         }
+    }
+
+    /// Whether a MIDI event arrived since this was last asked. See
+    /// `midi_activity`.
+    pub fn take_midi_activity(&mut self) -> bool {
+        std::mem::take(&mut self.midi_activity)
     }
 
     /// Whether a channel's MIDI reaches the theory view.
@@ -4993,7 +5092,9 @@ impl TangentApp {
                     if let Some((at, _)) = self.settings.routes.from(n).get(k).copied() {
                         self.settings.routes.set_gain(at, value);
                         self.refresh_route_labels();
-                        self.save_settings();
+                        // Once per pointer move while the strip's route
+                        // gain is dragged: debounced, like the faders.
+                        self.save_settings_soon();
                     }
                 }
                 return;
@@ -8968,8 +9069,14 @@ impl TangentApp {
     /// the rows are rebuilt — so the first open of the menu is as instant
     /// as every other. Runs once a frame; rebuilds only on a real change.
     fn tend_menu_cache(&mut self) {
-        let key = self.menu_cache_key_now();
-        if self.menu_rows_cache.is_none() || key != self.menu_cache_key {
+        // Compared in place: `menu_cache_key_now` clones the device name,
+        // and this runs every frame to answer "unchanged" almost always.
+        let name = self.settings.record_audio_device.as_deref().unwrap_or("");
+        let width = usize::from(self.input_width);
+        if self.menu_rows_cache.is_none()
+            || name != self.menu_cache_key.0
+            || width != self.menu_cache_key.1
+        {
             self.refresh_menu_rows();
         }
     }
@@ -18043,7 +18150,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     let next = (cur + if shift_d > 0.0 { 2 } else { -2 }).clamp(12, 96);
                     if next != cur {
                         self.settings.midi_keys_visible = next as u8;
-                        self.save_settings();
+                        // Per notch, and a flick is thirty of them: debounced.
+                        self.save_settings_soon();
                     }
                     return;
                 }
@@ -18069,7 +18177,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     if step != 0 {
                         self.settings.midi_grid_exp =
                             (self.settings.midi_grid_exp + i64::from(step)).clamp(-7, 3);
-                        self.save_settings();
+                        self.save_settings_soon();
                     }
                 } else if alt {
                     let d = f64::from(scroll.x + scroll.y) * s_per_px;
@@ -19601,7 +19709,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                                 self.active_channels()
                                     .saturating_sub(self.arr_visible()),
                             );
-                            self.save_settings();
+                            // Per notch: debounced, see `save_settings_soon`.
+                            self.save_settings_soon();
                         }
                     } else {
                         // **Pixels of intent, spent in whole lanes** — and
@@ -19643,7 +19752,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     if step != 0 {
                         self.settings.arr_grid_exp =
                             (self.settings.arr_grid_exp + step).clamp(-6, 3);
-                        self.save_settings();
+                        self.save_settings_soon();
                     }
                 } else if alt {
                     // **Alt moves the VIEWPORT** — the owner's correction:
@@ -25337,7 +25446,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 if let Some(w) = want {
                     let exp = i64::from((w * 8.0).round() as i8) - 5;
                     self.settings.arr_grid_exp = exp.clamp(-6, 3);
-                    self.save_settings();
+                    // An arrow HELD on the grid box arrives once per key
+                    // repeat, thirty a second: debounced.
+                    self.save_settings_soon();
                 }
             }
             // A clip is SELECTED, which is what puts the clip commands —
@@ -26424,9 +26535,99 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+
+    /// **The geometry write-back, when its debounce fires or the app is
+    /// asked to flush.** One body for both callers so the tiler guard below
+    /// cannot drift between them: a flush at quit runs exactly the decision
+    /// the 700 ms deadline would have run.
+    fn write_geometry_now(&mut self) {
+        let mut dirty = false;
+        // **Is this size ours to remember, or the window manager's?**
+        //
+        // It used to be answerable from the size alone: the window was
+        // pinned, so any disagreement with the size we asked for meant
+        // something else was placing it. A resizable window makes a
+        // disagreement the NORMAL case — it is what dragging an edge
+        // looks like — so the question moved to timing, exactly as it
+        // already had for the detached windows. Inside `WM_GRACE` of
+        // asking, a mismatch is the tiler overruling us at creation;
+        // after it, a mismatch is a hand.
+        let asked_recently = self
+            .size_asked_at
+            .is_some_and(|t| Instant::now() < t + WM_GRACE);
+        // **And never while a window manager owns us.** `asked_recently`
+        // expires 600 ms after launch, so without this a tiled size was
+        // written into `window_w`/`window_h` and followed the user into
+        // the next, untiled session — a window that opens half-width
+        // forever because it was tiled once.
+        // No target yet means no frame has been painted, and a mismatch
+        // inside the grace with nothing to compare against is left as the
+        // window manager's: nothing is recorded.
+        let target = self.geometry_target;
+        let ours = !self.main_wm_managed
+            && self.main_live_size.is_some_and(|s| {
+                !asked_recently || target.is_some_and(|t| !wm_overrode_size(s, t))
+            });
+        if ours {
+            if let Some(p) = self.main_live_pos {
+                let (x, y) = (p.x.round() as i64, p.y.round() as i64);
+                if self.settings.window_x != Some(x) || self.settings.window_y != Some(y) {
+                    self.settings.window_x = Some(x);
+                    self.settings.window_y = Some(y);
+                    dirty = true;
+                }
+            }
+            // And the SIZE, which nothing recorded before because
+            // there was never one worth recording.
+            if let Some(sz) = self.main_live_size {
+                let (w, h) = (sz.x.round() as i64, sz.y.round() as i64);
+                if self.settings.window_w != Some(w) || self.settings.window_h != Some(h) {
+                    self.settings.window_w = Some(w);
+                    self.settings.window_h = Some(h);
+                    dirty = true;
+                }
+            }
+        }
+        if self.detach_window_visible && !self.detached_wm_managed {
+            dirty |= self.remember_detached_geometry();
+        }
+        if self.fret_window_visible && !self.fret_wm_managed {
+            dirty |= self.remember_fretboard_geometry();
+        }
+        if self.theory_window_visible
+            && self.theory_guard.as_ref().is_none_or(|g| !g.wm_managed())
+        {
+            dirty |= self.remember_theory_geometry();
+        }
+        if self.recorder_window_visible
+            && self.recorder_guard.as_ref().is_none_or(|g| !g.wm_managed())
+        {
+            dirty |= self.remember_recorder_geometry();
+        }
+        if dirty {
+            self.save_settings();
+        }
+    }
+
     /// Debounce a settings write. See `settings_save_at`.
+    ///
+    /// **For anything a hand can REPEAT faster than a frame**: a fader or
+    /// route-gain drag (one call per pointer move), a wheel over a zoom
+    /// (one per accrued notch, thirty in a trackpad flick), an arrow key
+    /// held on the grid box (one per key repeat). Each of those used to call
+    /// `save_settings` directly, and a settings write is a pretty-print of
+    /// the whole file plus a write-and-rename on the UI thread — half a
+    /// millisecond when the file is small and a fifth of a frame when it is
+    /// not, paid per event. A single-shot click or toggle keeps the
+    /// synchronous call; it fires once and a debounce would only widen the
+    /// crash window for nothing.
+    ///
+    /// Trailing: every call pushes the deadline out again, so a long drag is
+    /// one write after the hand stops. The write is drained in `paint` and
+    /// flushed by `flush_settings_now` at every edge where frames may stop.
     fn save_settings_soon(&mut self) {
-        self.settings_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
+        self.settings_save_at
+            .set(Some(Instant::now() + GEOMETRY_SAVE_DELAY));
     }
 
     /// Hand the app the list of installed VST3 bundles.
@@ -28893,7 +29094,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // the dialog under the hand would drop the grab every frame.
                 self.settings.routes.set_gain(index, gain);
                 self.refresh_route_labels();
-                self.save_settings();
+                // A drag in the dialog is one call per pointer move, so
+                // the write is debounced like every other drag's.
+                self.save_settings_soon();
                 if let Some(dialogs::Dialog::Routing { existing, .. }) = self.dialog.as_mut() {
                     if let Some(row) = existing.iter_mut().find(|(at, _, _)| *at == index) {
                         row.2 = gain.clamp(0.0, 1.0);
@@ -30215,10 +30418,27 @@ impl TangentApp {
         self.band_pointer = ctx
             .input(|i| i.pointer.hover_pos())
             .filter(|p| self.last_band.contains(*p));
-        // The input chips' words, refreshed before anything borrows a view.
-        self.input_chip_texts = (0..crate::recorder::CHANNELS)
-            .map(|ch| self.input_chip_text(ch))
-            .collect();
+        // The input chips' words, refreshed before anything borrows a view
+        // — and only when the words can have changed. Thirty-two `format!`s
+        // a frame for text that changes on a settings write; the key is a
+        // hash of the two settings fields the words are made from, so a
+        // frame on which neither moved costs a hash of thirty-two short
+        // strings and no allocation.
+        let chip_key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.settings.channel_inputs.hash(&mut h);
+            self.settings.channel_kinds.hash(&mut h);
+            h.finish()
+        };
+        if self.input_chip_texts.len() != crate::recorder::CHANNELS
+            || self.input_chip_key != Some(chip_key)
+        {
+            self.input_chip_texts = (0..crate::recorder::CHANNELS)
+                .map(|ch| self.input_chip_text(ch))
+                .collect();
+            self.input_chip_key = Some(chip_key);
+        }
         // The input menu's rows, kept warm: rebuilt the frame the device
         // arrives or changes, so the menu never opens against a cold cache.
         self.tend_menu_cache();
@@ -30659,7 +30879,7 @@ impl TangentApp {
         // having to click, and therefore without taking focus from whatever
         // else is being tested. Environment-gated; ships inert.
         //   IVORY_INLINE=menu /Applications/Tangent.app/Contents/MacOS/tangent
-        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("menu") {
+        if !self.demo_menu_done && inline_hook() == Some("menu") {
             self.demo_menu_done = true;
             let at = ui.max_rect().min + Vec2::new(20.0, 20.0);
             self.open_menu_at(&ctx, at);
@@ -30668,7 +30888,7 @@ impl TangentApp {
         // photographed any other way: it is dismissed by a press anywhere
         // outside it, and taking a screenshot is a press somewhere outside it.
         //   IVORY_INLINE=setup /Applications/Tangent.app/Contents/MacOS/tangent
-        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("setup") {
+        if !self.demo_menu_done && inline_hook() == Some("setup") {
             self.demo_menu_done = true;
             self.setup_open = true;
         }
@@ -30677,7 +30897,7 @@ impl TangentApp {
         // be photographed any other way: it is a child viewport on the
         // desktop, so the compositor's shot never sees it.
         //   IVORY_INLINE=track /Applications/Tangent.app/Contents/MacOS/tangent
-        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("track") {
+        if !self.demo_menu_done && inline_hook() == Some("track") {
             self.demo_menu_done = true;
             self.dialog = Some(dialogs::Dialog::Track {
                 lane: 0,
@@ -30703,7 +30923,7 @@ impl TangentApp {
         //   IVORY_INLINE=audio /Applications/Tangent.app/Contents/MacOS/tangent
         if !self.demo_menu_done
             && self.audio_setup.is_some()
-            && std::env::var("IVORY_INLINE").as_deref() == Ok("audio")
+            && inline_hook() == Some("audio")
         {
             self.demo_menu_done = true;
             self.open_audio_setup();
@@ -30713,7 +30933,7 @@ impl TangentApp {
         // somewhere else.
         //   IVORY_INLINE=mixer /Applications/Tangent.app/Contents/MacOS/tangent
         //
-        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("mixer") {
+        if !self.demo_menu_done && inline_hook() == Some("mixer") {
             self.demo_menu_done = true;
             self.mixer_open = true;
         }
@@ -30722,7 +30942,7 @@ impl TangentApp {
         // inputs. A fake eighteen-in device is the only way to look at the two
         // columns at the size they will really be.
         //   IVORY_INLINE=channels /Applications/Tangent.app/Contents/MacOS/tangent
-        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("channels") {
+        if !self.demo_menu_done && inline_hook() == Some("channels") {
             self.demo_menu_done = true;
             self.dialog = Some(dialogs::Dialog::InputChannels {
                 device: "Scarlett 18i20 USB".to_owned(),
@@ -32592,7 +32812,8 @@ impl TangentApp {
                             .clamp(1, crate::recorder::CHANNELS as i64);
                         if next != cur {
                             self.settings.mixer_visible = next as u8;
-                            self.save_settings();
+                            // Per notch: debounced, see `save_settings_soon`.
+                            self.save_settings_soon();
                         }
                     } else {
                         // Plain wheel SCROLLS, in PIXELS — the raw delta IS
@@ -33431,85 +33652,26 @@ impl TangentApp {
             }
         }
 
-        // Debounced write-back for the faders, which are the only settings in
-        // the app changed by DRAGGING. Same reasoning as the geometry below and
-        // a separate deadline, because the two are unrelated gestures and one
-        // resetting the other's timer would let a long drag postpone a save
-        // indefinitely.
-        if let Some(deadline) = self.settings_save_at {
+        // Debounced write-back for the faders, the route gains, the wheel
+        // zooms and the held arrow key — everything a hand can repeat faster
+        // than a frame (see `save_settings_soon`). Same reasoning as the
+        // geometry below and a separate deadline, because the two are
+        // unrelated gestures and one resetting the other's timer would let a
+        // long drag postpone a save indefinitely.
+        if let Some(deadline) = self.settings_save_at.get() {
             if Instant::now() >= deadline {
-                self.settings_save_at = None;
+                self.settings_save_at.set(None);
                 self.save_settings();
             }
         }
 
         // Debounced geometry write-back: one settings.json write after the
         // user stops dragging or resizing, rather than one per frame.
+        self.geometry_target = Some(target);
         if let Some(deadline) = self.geometry_save_at {
             if Instant::now() >= deadline {
                 self.geometry_save_at = None;
-                let mut dirty = false;
-                // **Is this size ours to remember, or the window manager's?**
-                //
-                // It used to be answerable from the size alone: the window was
-                // pinned, so any disagreement with the size we asked for meant
-                // something else was placing it. A resizable window makes a
-                // disagreement the NORMAL case — it is what dragging an edge
-                // looks like — so the question moved to timing, exactly as it
-                // already had for the detached windows. Inside `WM_GRACE` of
-                // asking, a mismatch is the tiler overruling us at creation;
-                // after it, a mismatch is a hand.
-                let asked_recently = self
-                    .size_asked_at
-                    .is_some_and(|t| Instant::now() < t + WM_GRACE);
-                // **And never while a window manager owns us.** `asked_recently`
-                // expires 600 ms after launch, so without this a tiled size was
-                // written into `window_w`/`window_h` and followed the user into
-                // the next, untiled session — a window that opens half-width
-                // forever because it was tiled once.
-                let ours = !self.main_wm_managed
-                    && self
-                        .main_live_size
-                        .is_some_and(|s| !asked_recently || !wm_overrode_size(s, target));
-                if ours {
-                    if let Some(p) = self.main_live_pos {
-                        let (x, y) = (p.x.round() as i64, p.y.round() as i64);
-                        if self.settings.window_x != Some(x) || self.settings.window_y != Some(y) {
-                            self.settings.window_x = Some(x);
-                            self.settings.window_y = Some(y);
-                            dirty = true;
-                        }
-                    }
-                    // And the SIZE, which nothing recorded before because
-                    // there was never one worth recording.
-                    if let Some(sz) = self.main_live_size {
-                        let (w, h) = (sz.x.round() as i64, sz.y.round() as i64);
-                        if self.settings.window_w != Some(w) || self.settings.window_h != Some(h) {
-                            self.settings.window_w = Some(w);
-                            self.settings.window_h = Some(h);
-                            dirty = true;
-                        }
-                    }
-                }
-                if self.detach_window_visible && !self.detached_wm_managed {
-                    dirty |= self.remember_detached_geometry();
-                }
-                if self.fret_window_visible && !self.fret_wm_managed {
-                    dirty |= self.remember_fretboard_geometry();
-                }
-                if self.theory_window_visible
-                    && self.theory_guard.as_ref().is_none_or(|g| !g.wm_managed())
-                {
-                    dirty |= self.remember_theory_geometry();
-                }
-                if self.recorder_window_visible
-                    && self.recorder_guard.as_ref().is_none_or(|g| !g.wm_managed())
-                {
-                    dirty |= self.remember_recorder_geometry();
-                }
-                if dirty {
-                    self.save_settings();
-                }
+                self.write_geometry_now();
             }
         }
 
@@ -34001,7 +34163,7 @@ impl TangentApp {
         // reason, and `window_sizing` keeps a plugin editor from ever doing
         // it inside somebody else's host.
         let paced = match pace_mode() {
-            Pace::Off => false,
+            Pace::Off | Pace::Tick => false,
             Pace::Always => self.caps.window_sizing,
             Pace::Gesture => {
                 self.caps.window_sizing
@@ -34012,10 +34174,83 @@ impl TangentApp {
         };
         if paced {
             ctx.request_repaint();
-        } else {
-            // 50ms GUI cadence; MIDI events wake us sooner via request_repaint_of.
+        } else if pace_mode() == Pace::Tick || !self.caps.window_sizing {
+            // The old 50 ms cadence: asked for by name, or a plugin editor,
+            // whose host owns the window's clock and has no ledger of ours
+            // to consult. MIDI events wake us sooner via request_repaint_of.
             ctx.request_repaint_after(GUI_TICK);
+        } else if let Some(due) = self.animation_due(Instant::now()) {
+            // **Rest otherwise.** Only what is moving asks, and it asks for
+            // exactly when it next needs to be drawn — see `animation_due`.
+            ctx.request_repaint_after(due);
         }
+    }
+
+    /// **What on the app's side still needs a frame with no hand on
+    /// anything**, as the time until it does — `None` when nothing does.
+    ///
+    /// This is the ledger the resting window runs on. egui repaints for
+    /// input by itself and the MIDI thread wakes it for a note; every
+    /// animator that runs on the clock alone has to be listed here or ask
+    /// for its own frame where it animates, and most already do: the VU
+    /// needles (`advance_vu`), the selection ring's withheld off, the MIDI
+    /// editor's audition (`preview_until`), the input and swing menus, an
+    /// insert face's live values, the IR wizard, the export progress, the
+    /// heart, the confetti, the edge auto-scroll, the decoration nudge and a
+    /// notification ageing out — each with its own `request_repaint`. What
+    /// is gathered HERE is the rest: the deadlines that were only ever
+    /// POLLED in `paint`, on the assumption that a frame would come by
+    /// anyway, and the two readouts that move on time alone.
+    ///
+    /// The deadlines: the settings and geometry debounces (a fader drag's
+    /// write has to fire without the mouse moving again), the four startup
+    /// detach single-shots, the window-manager grace windows on the
+    /// detached windows, the uncover handshake, and the decoration nudge.
+    /// The cadences: the chord detector and the voicing solver run on a
+    /// 100 ms gate while notes are held — a chord that lands one event at a
+    /// time would otherwise read as its first note until the next event —
+    /// and the analyzer's smoothing and peak fall while it is showing and
+    /// the scope's envelope is still up or the curves have not reached the
+    /// floor.
+    ///
+    /// The host keeps the other half of the ledger — transport, take,
+    /// meters, camera, engine — in `DesktopApp::host_frame_due`; the two
+    /// combine because `request_repaint_after` keeps the MINIMUM asked.
+    fn animation_due(&self, now: Instant) -> Option<Duration> {
+        let mut due: Option<Duration> = None;
+        let mut sooner = |d: Duration| due = Some(due.map_or(d, |c: Duration| c.min(d)));
+        let by = |t: Instant| t.saturating_duration_since(now);
+        for deadline in [
+            self.settings_save_at.get(),
+            self.geometry_save_at,
+            self.startup_fret_detach_at,
+            self.startup_theory_detach_at,
+            self.startup_recorder_detach_at,
+            self.startup_detach_at,
+            self.decor_nudge_until,
+            self.fret_shown_at.map(|t| t + WM_GRACE),
+            self.detached_shown_at.map(|t| t + WM_GRACE),
+            self.uncover_asked_at
+                .filter(|_| self.pending_window_size.is_some())
+                .map(|t| t + UNCOVER_GRACE),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            sooner(by(deadline));
+        }
+        // Notes held on any instrument: the detector and the solver tick.
+        if !self.sounding.is_empty()
+            || !self.notes.held().is_empty()
+            || self.recorder.lane_sounding.iter().any(|m| *m != 0)
+        {
+            sooner(DETECT_TICK);
+        }
+        // The analyzer, while it is on screen and still has somewhere to go.
+        if self.analyzer_showing() && (self.scope.live() || !self.analyzer.settled()) {
+            sooner(Duration::from_millis(33));
+        }
+        due
     }
 }
 
@@ -48480,6 +48715,432 @@ mod tests {
         );
     }
 
+    /// **A write the debounce owes is paid by the exit road.**
+    ///
+    /// The fader debounce traded a hundred writes for one and a bounded
+    /// loss: whatever moved inside the last 700 ms was not on disk yet, and
+    /// at quit there was no next frame to drain it. `flush_settings_now` is
+    /// what the host calls at every edge where frames stop; this pins that
+    /// it writes exactly what was owed, exactly once, and nothing when
+    /// nothing is owed.
+    #[test]
+    fn a_pending_debounced_write_is_flushed_by_the_exit_road() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let before = app.settings_writes();
+        app.settings.mixer_visible = 5;
+        app.save_settings_soon();
+        assert_eq!(app.settings_writes(), before, "the debounce wrote synchronously");
+        assert!(app.settings_save_at.get().is_some(), "nothing was owed after a debounced save");
+        app.flush_settings_now();
+        assert_eq!(app.settings_writes(), before + 1, "the flush did not write");
+        assert!(app.settings_save_at.get().is_none(), "the flush left the write owed");
+        assert_eq!(Settings::load().mixer_visible, 5, "the flushed file does not carry the change");
+        app.flush_settings_now();
+        assert_eq!(app.settings_writes(), before + 1, "a flush with nothing owed wrote anyway");
+    }
+
+    /// **A synchronous write retires the debounced one.** The file carries
+    /// the whole struct, so a click that writes it makes the drag's owed
+    /// write redundant — one write, not two.
+    #[test]
+    fn a_synchronous_write_retires_the_debounced_one() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.save_settings_soon();
+        let before = app.settings_writes();
+        app.save_settings();
+        assert_eq!(app.settings_writes(), before + 1);
+        assert!(app.settings_save_at.get().is_none(), "the owed write survived a synchronous one");
+        app.flush_settings_now();
+        assert_eq!(app.settings_writes(), before + 1, "the retired write was paid again");
+    }
+
+    /// **A route-gain drag writes the settings once**, on both of its roads:
+    /// the strip's own gain handle (one `apply_mixer_hit` per pointer move)
+    /// and the routing dialog's slider (one `SetRouteGain` per pointer
+    /// move). Each used to write the whole file per event — a two-second
+    /// drag at 60 fps was a hundred and twenty pretty-prints on the UI
+    /// thread.
+    #[test]
+    fn a_route_gain_drag_writes_the_settings_once() {
+        use crate::routing::{Route, Target};
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        assert!(app.settings.routes.add(Route::new(0, Target::Hardware { first: 0, stereo: true })));
+        let before = app.settings_writes();
+        for i in 0..120 {
+            app.apply_dialog_action(DialogAction::SetRouteGain(0, i as f32 / 120.0));
+        }
+        assert!((app.settings.routes.0[0].gain - 119.0 / 120.0).abs() < 1e-6, "the drag did not land");
+        for i in 0..120 {
+            app.apply_mixer_hit(
+                crate::mixer_panel::Hit::RouteGain(crate::recorder::Column(0), 0),
+                i as f32 / 240.0,
+            );
+        }
+        assert!((app.settings.routes.0[0].gain - 119.0 / 240.0).abs() < 1e-6, "the strip drag did not land");
+        assert_eq!(app.settings_writes(), before, "a route-gain drag wrote synchronously");
+        assert!(app.settings_save_at.get().is_some(), "the drag owes no write");
+        app.flush_settings_now();
+        assert_eq!(app.settings_writes(), before + 1);
+    }
+
+    /// **A flick of notches over the mixer's zoom writes the settings once.**
+    ///
+    /// Driven through egui's own input so the whole road is the real one:
+    /// the wheel event, the Shift modifier, the pointer over the mixer, the
+    /// notch accumulator and the `mixer_visible` write. Forty alternating
+    /// notches each change the count (so each one used to write the file);
+    /// none may write synchronously, and the flush afterwards pays exactly
+    /// one.
+    #[test]
+    fn a_flick_of_wheel_notches_over_the_mixer_writes_the_settings_once() {
+        // No Welcome card: it is modal, and a modal dialog takes the pointer
+        // away from the mixer, wheel included.
+        let mut s = Settings::default();
+        s.show_welcome = false;
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, s);
+        app.dialog = None;
+        app.mixer_open = true;
+        let run = |ctx: &egui::Context, app: &mut TangentApp, events: Vec<egui::Event>, shift: bool| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    events,
+                    modifiers: if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE },
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        run(&ctx, &mut app, Vec::new(), false);
+        let rect = app.mixer_rect.expect("the mixer was not drawn");
+        let p = rect.center();
+        run(&ctx, &mut app, vec![egui::Event::PointerMoved(p)], false);
+        let before = app.settings_writes();
+        let was = app.mixer_visible();
+        let mut changed = 0;
+        for i in 0..40 {
+            let d = if i % 2 == 0 { -40.0 } else { 40.0 };
+            let seen = app.mixer_visible();
+            run(
+                &ctx,
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(p),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, d),
+                        modifiers: egui::Modifiers::SHIFT,
+                    },
+                ],
+                true,
+            );
+            if app.mixer_visible() != seen {
+                changed += 1;
+            }
+        }
+        assert!(changed >= 20, "the wheel did not reach the zoom: {changed} of 40 notches changed the count (from {was})");
+        assert_eq!(app.settings_writes(), before, "wheel notches wrote the settings synchronously");
+        assert!(app.settings_save_at.get().is_some(), "the notches owe no write");
+        app.flush_settings_now();
+        assert_eq!(app.settings_writes(), before + 1);
+    }
+
+    /// **No repeating gesture writes the settings file synchronously.**
+    ///
+    /// The counting tests above drive two of the roads; this scan holds the
+    /// rest. Every consumer of a `WheelSteps` accumulator (a zoom stepped
+    /// per notch) and every grid-exponent wheel or key-repeat site must
+    /// reach the file through `save_settings_soon`, never `save_settings`.
+    /// A source scan because the sites are eight arms in three input
+    /// handlers and the failure is one keystroke — somebody restoring the
+    /// synchronous call on a wheel arm because "it is only one write".
+    #[test]
+    fn no_wheel_or_key_repeat_site_writes_the_settings_synchronously() {
+        let whole = include_str!("app.rs");
+        let src = &whole[..whole.find("#[cfg(test)]
+mod tests {").expect("the tests module")];
+        // Every `.steps(` on a wheel accumulator: the next settings call in
+        // that block must be the debounced one.
+        let mut at = 0;
+        let mut steppers = 0;
+        while let Some(rel) = src[at..].find(".steps(") {
+            let here = at + rel;
+            at = here + 7;
+            // Only the wheel accumulators, by the field names that own them.
+            let lead = &src[here.saturating_sub(40)..here];
+            if !lead.contains("wheel_") {
+                continue;
+            }
+            steppers += 1;
+            // A zoom that persists nothing (the media explorer's wheel)
+            // passes; one that persists must do so through the debounce.
+            let after = &src[at..(at + 800).min(src.len())];
+            let sync = after.find("self.save_settings();");
+            let soon = after.find("self.save_settings_soon();");
+            assert!(
+                sync.is_none_or(|a| soon.is_some_and(|b| b < a)),
+                "a wheel-stepped zoom near `{}` writes the settings synchronously",
+                lead.trim()
+            );
+        }
+        assert!(steppers >= 2, "the wheel accumulators moved; re-anchor this scan");
+        // The grid-exponent wheels and the arrow-nudged grid box, by their
+        // own assignments.
+        for anchor in [
+            "(self.settings.midi_grid_exp + i64::from(step)).clamp(-7, 3);",
+            "(self.settings.arr_grid_exp + step).clamp(-6, 3);",
+            "self.settings.arr_grid_exp = exp.clamp(-6, 3);",
+            "self.settings.midi_keys_visible = next as u8;",
+            "self.settings.routes.set_gain(at, value);",
+            "self.settings.routes.set_gain(index, gain);",
+        ] {
+            let here = src.find(anchor).unwrap_or_else(|| panic!("`{anchor}` is gone"));
+            let after = &src[here..(here + 400).min(src.len())];
+            let sync = after.find("self.save_settings();");
+            let soon = after.find("self.save_settings_soon();");
+            assert!(
+                soon.is_some_and(|b| sync.is_none_or(|a| b < a)),
+                "the site at `{anchor}` writes the settings synchronously on a repeating gesture"
+            );
+        }
+    }
+
+    /// One frame with no input; what the app asked egui for afterwards.
+    /// `Duration::MAX` is egui's word for "nothing".
+    fn frame_asks(ctx: &egui::Context, app: &mut TangentApp) -> Duration {
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |v| v.repaint_delay)
+    }
+
+    /// Frames until the app rests, or the last delay it asked for. The
+    /// startup single-shots (the detach restores, 100 ms in) are real
+    /// deadlines and are waited out rather than assumed away.
+    fn settle(ctx: &egui::Context, app: &mut TangentApp) -> Duration {
+        let mut asked = Duration::ZERO;
+        // Three seconds of wall time: the decoration nudge armed on the
+        // first frame is a 1.2 s window of 50 ms frames, and egui's own
+        // widget animations ask for immediate frames that still take time.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            asked = frame_asks(ctx, app);
+            if asked >= Duration::from_secs(1) {
+                break;
+            }
+            std::thread::sleep(asked.clamp(Duration::from_millis(16), Duration::from_millis(300)));
+        }
+        asked
+    }
+
+    /// Who asked for the last repaint, from egui's own record — the
+    /// message a resting test prints when something still wants a frame.
+    fn causes(ctx: &egui::Context) -> String {
+        ctx.repaint_causes()
+            .iter()
+            .map(|c| format!("{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// A desktop app with nothing chosen that animates on its own: no
+    /// Welcome card (it is modal) and no animated heart (a supporter's
+    /// setting, and the license on this machine is whatever is installed).
+    fn quiet_desktop(show_recorder: bool) -> (egui::Context, TangentApp) {
+        let mut s = Settings::default();
+        s.show_welcome = false;
+        s.show_recorder = show_recorder;
+        s.heart_animate = false;
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, s);
+        app.dialog = None;
+        (ctx, app)
+    }
+
+    /// **An idle desk asks for no repaint.**
+    ///
+    /// The whole point of the resting policy, pinned from the outside: after
+    /// the startup deadlines have passed, a desktop window with nothing
+    /// moving — band closed, then band open with silent meters and a
+    /// settled analyzer — ends its frame asking egui for nothing. Every
+    /// per-frame cost in the host used to be multiplied by the 30 Hz this
+    /// test would have measured.
+    #[test]
+    fn an_idle_desk_asks_for_no_repaint() {
+        let (ctx, mut app) = quiet_desktop(false);
+        if app.license.cheated() {
+            // The cheat marker animates the heart's crackle whatever the
+            // setting says; that machine cannot make this claim.
+            return;
+        }
+        let asked = settle(&ctx, &mut app);
+        assert!(
+            asked >= Duration::from_secs(1),
+            "an idle desk still asks for a frame in {asked:?}; asked by {}",
+            causes(&ctx)
+        );
+        // And with the band showing: the analyzer is on screen, unfed and
+        // settled; the needles rest at zero.
+        app.settings.show_recorder = true;
+        let asked = settle(&ctx, &mut app);
+        assert!(
+            asked >= Duration::from_secs(1),
+            "an idle band still asks for a frame in {asked:?}; asked by {}",
+            causes(&ctx)
+        );
+    }
+
+    /// **A debounced settings write earns its own frame.** The drain lives
+    /// in `paint`; a resting window that never painted again would never
+    /// write, and the fader's value would wait for the next mouse move.
+    #[test]
+    fn a_pending_settings_write_earns_its_frame() {
+        let (ctx, mut app) = quiet_desktop(false);
+        let _ = settle(&ctx, &mut app);
+        app.save_settings_soon();
+        let asked = frame_asks(&ctx, &mut app);
+        assert!(asked <= GEOMETRY_SAVE_DELAY, "the owed write earned no frame: {asked:?}");
+        app.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
+        app.settings_save_at.set(None);
+        let asked = frame_asks(&ctx, &mut app);
+        assert!(asked <= GEOMETRY_SAVE_DELAY, "the owed geometry write earned no frame: {asked:?}");
+    }
+
+    /// **Held notes keep the chord detector ticking.** Detection runs on a
+    /// 100 ms gate; a chord that arrives one event at a time would read as
+    /// its first note until the next event if nothing asked for the tick.
+    #[test]
+    fn held_notes_keep_the_detector_ticking() {
+        let (ctx, mut app) = quiet_desktop(false);
+        if app.license.cheated() {
+            return;
+        }
+        let _ = settle(&ctx, &mut app);
+        // A key held on the MIDI keyboard, by the road a real one takes.
+        app.notes.apply(MidiEvent::NoteOn { note: 60, velocity: 100 });
+        let asked = frame_asks(&ctx, &mut app);
+        assert!(asked <= DETECT_TICK, "a held note earned no detector tick: {asked:?}");
+        app.notes.apply(MidiEvent::NoteOff { note: 60 });
+        let asked = settle(&ctx, &mut app);
+        assert!(
+            asked >= Duration::from_secs(1),
+            "the desk did not rest once the note was let go: {asked:?}; asked by {}",
+            causes(&ctx)
+        );
+    }
+
+    /// **A live scope keeps the analyzer moving, and a settled one lets the
+    /// window rest.** The analyzer is fed by the host and decays on its own
+    /// clock; while its envelope is up or its curves are above the floor it
+    /// asks for 33 ms, and once everything has fallen it asks for nothing.
+    #[test]
+    fn a_live_scope_keeps_the_analyzer_moving_until_it_settles() {
+        let (ctx, mut app) = quiet_desktop(true);
+        if app.license.cheated() {
+            return;
+        }
+        let _ = settle(&ctx, &mut app);
+        assert!(app.analyzer_showing(), "the band is open with no camera, so the analyzer shows");
+        // A burst of full-scale sine, enough frames for one FFT.
+        let n = 8_192usize;
+        let loud: Vec<f32> = (0..n * 2)
+            .map(|i| ((i / 2) as f32 * 0.1).sin() * 0.9)
+            .collect();
+        app.scope_feed(&loud, n as f32 / 48_000.0, 48_000.0);
+        let asked = frame_asks(&ctx, &mut app);
+        assert!(asked <= Duration::from_millis(33), "a live analyzer earned no frame: {asked:?}");
+        // Silence, fed in big steps of time so the envelope and the peaks
+        // fall all the way; the window must then rest.
+        let quiet = vec![0.0f32; n * 2];
+        for _ in 0..60 {
+            app.scope_feed(&quiet, 1.0, 48_000.0);
+        }
+        assert!(!app.scope.live(), "the scope envelope did not fall");
+        let asked = settle(&ctx, &mut app);
+        assert!(
+            asked >= Duration::from_secs(1),
+            "a settled analyzer still asks for frames: {asked:?}; asked by {}",
+            causes(&ctx)
+        );
+    }
+
+    /// **How many frames an idle window paints in a second**, band closed
+    /// and band open, under the resting policy. Run with `--ignored
+    /// --nocapture`; the number to compare against is the thirty a second
+    /// the unconditional `GUI_TICK` produced (50 ms asked, 33 ms delivered).
+    #[test]
+    #[ignore]
+    fn idle_frames_in_one_second_probe() {
+        for band in [false, true] {
+            let (ctx, mut app) = quiet_desktop(band);
+            let _ = settle(&ctx, &mut app);
+            let start = Instant::now();
+            let mut frames = 0u32;
+            while start.elapsed() < Duration::from_secs(1) {
+                let asked = frame_asks(&ctx, &mut app);
+                frames += 1;
+                let left = Duration::from_secs(1).saturating_sub(start.elapsed());
+                if asked >= left {
+                    break;
+                }
+                std::thread::sleep(asked.max(Duration::from_millis(1)));
+            }
+            eprintln!(
+                "idle frames in one simulated second, band {}: {frames} (the old tick painted ~30)",
+                if band { "open" } else { "closed" }
+            );
+        }
+    }
+
+    /// **Neither `frame` nor `paint` reads the environment.** Six
+    /// `IVORY_INLINE` reads a frame used to run in `paint`, guarded by a
+    /// latch that only flips when a hook fires — with the variable unset,
+    /// six environment walks a frame forever. The read is a `OnceLock`
+    /// now (`inline_hook`), and this keeps it that way.
+    #[test]
+    fn neither_frame_nor_paint_reads_the_environment() {
+        let whole = include_str!("app.rs");
+        let src = &whole[..whole.find("#[cfg(test)]\nmod tests {").expect("the tests module")];
+        for name in ["pub fn frame(&mut self, ctx: &egui::Context)", "fn paint(&mut self, ui: &mut egui::Ui)"] {
+            let at = src.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            let end = src[at + 1..].find("\n    fn ").map_or(src.len(), |n| at + 1 + n);
+            let body = &src[at..end];
+            assert!(!body.contains("std::env::"), "{name} reads the environment inside a frame");
+        }
+    }
+
+    /// **A plugin editor keeps the old tick.** Its host owns the window's
+    /// clock and has no ledger of ours; the 50 ms cadence every version ran
+    /// on is what it still gets.
+    #[test]
+    fn a_plugin_editor_keeps_the_old_tick() {
+        let (ctx, mut app) = headless(Caps::PLUGIN);
+        app.dialog = None;
+        let asked = settle(&ctx, &mut app);
+        assert!(asked <= GUI_TICK, "the plugin editor rested: {asked:?}");
+    }
+
+    /// **The old cadence is one variable away.** `IVORY_PACE=tick` is read
+    /// once into a `OnceLock`, so it cannot be flipped inside a test; the
+    /// arm is pinned by reading it instead.
+    #[test]
+    fn the_old_cadence_is_reachable_by_name() {
+        let whole = include_str!("app.rs");
+        let src = &whole[..whole.find("#[cfg(test)]
+mod tests {").expect("the tests module")];
+        assert!(src.contains("Ok(\"tick\") => Pace::Tick,"), "IVORY_PACE=tick no longer names the old cadence");
+        let tail = src.rfind("let paced = match pace_mode()").expect("the pacing decision");
+        assert!(
+            src[tail..].contains("pace_mode() == Pace::Tick || !self.caps.window_sizing"),
+            "Pace::Tick no longer restores the unconditional GUI_TICK"
+        );
+    }
+
     /// D-UI-15: the fretboard is a third band in the same stack, and the two
     /// places that compute the window height have to agree about it. They used
     /// to be two copies of the same arithmetic; drift between them is a window
@@ -55857,4 +56518,5 @@ mod dirty_cost_probe {
         say("AFTER  undo_commit (a real edit)", t.elapsed() / n);
     }
 }
+
 
