@@ -28967,10 +28967,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         .iter()
                         .map(|p| (p.symbol.clone(), f64::from(p.value)))
                         .collect();
+                    // **And the state that is NOT a knob**, which for the
+                    // sampler is the loaded file. It has always been pushed
+                    // in `BuiltinFace::extra` — the IR face reads its own
+                    // impulse path out of it — and it has never been saved,
+                    // because this road only ever carried numbers.
+                    let extra = face.extra.clone();
                     self.request_recorder(recorder::RecorderRequest::SavePreset {
                         unit,
                         name,
                         values,
+                        extra,
                     });
                 }
             }
@@ -58788,5 +58795,53 @@ mod sampler_road_tests {
         app.refresh_sampler_browser(&mut live);
         assert!(live.samp_roots[2].1.is_empty(), "a project chip with no project");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Saving a preset carries the SAMPLE across, not only the knobs.**
+    ///
+    /// The path has always been pushed in `BuiltinFace::extra` — the IR
+    /// face reads its own impulse out of it — and it has never been saved,
+    /// because the preset road only ever carried numbers. A sampler patch
+    /// saved that way reopens with the right envelope over silence.
+    #[test]
+    fn saving_a_sampler_preset_carries_the_file_it_is_playing() {
+        let (_ctx, mut app) = tests::headless(crate::host::Caps::DESKTOP);
+        app.set_builtin_face(crate::ports::BuiltinFace {
+            strip: 0,
+            slot: 0,
+            path: crate::faces_sampler::SAMPLER_PATH.to_owned(),
+            params: vec![crate::ports::BuiltinFaceParam {
+                id: 0,
+                symbol: "vol".to_owned(),
+                name: "Volume".to_owned(),
+                units: String::new(),
+                default: 0.5,
+                reading: "0.0 dB".to_owned(),
+                choices: Vec::new(),
+                steps: 0,
+                value: 0.75,
+            }],
+            curve_db: Vec::new(),
+            extra: vec![("sample".to_owned(), "/m/Takes/kick 03.wav".to_owned())],
+        });
+        app.apply_dialog_action(crate::dialogs::DialogAction::FaceSavePreset {
+            strip: 0,
+            slot: 0,
+            name: "Room Kick".to_owned(),
+        });
+        let mut asked = None;
+        while let Some(r) = app.take_recorder_request() {
+            if let recorder::RecorderRequest::SavePreset { unit, values, extra, .. } = r {
+                asked = Some((unit, values, extra));
+            }
+        }
+        let asked = asked.expect("nothing was asked of the host");
+        assert_eq!(asked.0, crate::faces_sampler::SAMPLER_PATH);
+        assert_eq!(asked.1, vec![("vol".to_owned(), 0.75)]);
+        assert_eq!(
+            asked.2,
+            vec![("sample".to_owned(), "/m/Takes/kick 03.wav".to_owned())],
+            "the preset forgot which file it was playing"
+        );
     }
 }
