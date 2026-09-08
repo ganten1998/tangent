@@ -20331,7 +20331,21 @@ mod tests {
                 let desktop = tail.contains("Caps::DESKTOP");
                 // The redirect is set before the construction, so look back
                 // over the enclosing test rather than forward.
-                let back = &body[abs.saturating_sub(3_000)..abs];
+                //
+                // **The enclosing test OR the last 3,000 bytes, whichever
+                // reaches further back.** The window alone was a guess at how
+                // long a test is, and one knob's worth of comment added to the
+                // screenshot harness pushed its constructor past a redirect
+                // that was right there at the top of the same function — a red
+                // suite naming a hazard that did not exist. The function is
+                // what the doc above says this looks over; the window stays
+                // because some of these redirects are set in a helper above
+                // the test that calls it.
+                let opens = body[..abs]
+                    .rfind("\n    fn ")
+                    .unwrap_or(0)
+                    .min(abs.saturating_sub(3_000));
+                let back = &body[opens..abs];
                 let redirected = back.contains("IVORY_SETTINGS_PATH");
                 assert!(
                     !desktop || redirected,
