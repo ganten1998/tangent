@@ -7579,7 +7579,7 @@ mod tests {
         }
     }
     use super::*;
-    use crate::recorder::{fader_to_gain, Gains, Preview};
+    use crate::recorder::{Gains, Preview};
 
     pub(super) fn band(w: f32) -> Rect {
         Rect::from_min_size(Pos2::new(0.0, 350.0), Vec2::new(w, band_height(w)))

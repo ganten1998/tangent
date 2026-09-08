@@ -10,7 +10,6 @@
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 use crate::arrangement::{ArrNote, ArrPedal};
-use crate::mixer_panel::STRIP_COLORS;
 
 /// The top strip's height: title, the grid tools, the ×.
 pub const STRIP_H: f32 = 26.0;
@@ -150,7 +149,7 @@ pub struct MidiEditView<'a> {
     pub sig_top: u32,
     pub sig_bottom: u32,
     pub playhead_s: f64,
-    /// The lane's colour index into [`STRIP_COLORS`]; 0 draws the desk
+    /// The lane's colour index into [`crate::mixer_panel::STRIP_COLORS`]; 0 draws the desk
     /// green, exactly as the arrangement does.
     pub color: usize,
     /// The editor's own DARK flag: warm browns on, the arrange greys off.

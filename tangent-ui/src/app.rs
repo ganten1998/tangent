@@ -37889,7 +37889,7 @@ mod tests {
     /// That is the third time this aliasing has shipped.
     #[test]
     fn every_column_writes_its_own_name_and_no_others() {
-        use crate::recorder::{Strip, COLUMNS_FOR_TEST, STRIPS};
+        use crate::recorder::{COLUMNS_FOR_TEST, STRIPS};
         for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             app.commit_mixer_name(col, format!("col{}", col.0));

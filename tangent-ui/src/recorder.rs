@@ -5213,7 +5213,7 @@ observed_frames: None,
 
 #[cfg(test)]
 mod missing_tests {
-    use super::{missing_from_take, Strip, SLOTS};
+    use super::{missing_from_take, Strip};
 
     /// **The one that costs a take, so the sentence has to be an
     /// instruction.**
