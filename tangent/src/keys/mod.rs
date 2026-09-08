@@ -173,11 +173,19 @@ impl Patch {
 pub const MAX_PARAMS: usize = 8;
 
 /// One knob, as the panel needs to draw it and the file needs to keep it.
+///
+/// **The panel does not read `name` and `about` from here** — `tangent-ui`
+/// cannot see this crate, so `KEYS_PARAM_SPECS` carries its own copy of both
+/// and `the_panel_knobs_and_the_engine_knobs_are_the_same_knobs` asserts the
+/// two tables word for word. These fields are the side that test measures
+/// against, which is the whole reason they are written down twice.
 pub struct ParamSpec {
     /// What the panel calls it.
+    #[allow(dead_code)]
     pub name: &'static str,
     /// The one line under the name. What it does to the INSTRUMENT, not what
     /// it does to the number.
+    #[allow(dead_code)]
     pub about: &'static str,
     /// Where it sits when the sound is initialised.
     ///
@@ -1156,18 +1164,25 @@ impl Keys {
     }
 
     /// The knobs as they stand.
+    ///
+    /// The desk pushes knobs down through `set_param`; reading them back is
+    /// what the panel's Initialise test does, so the shipped path never
+    /// asks. Same for `reset_params` below.
+    #[allow(dead_code)]
     pub fn params(&self) -> &[f32; MAX_PARAMS] {
         &self.params
     }
 
     /// **Initialise the sound**: every knob back to the value the bench
     /// signed off for the patch that is loaded. What the panel's button does.
+    #[allow(dead_code)]
     pub fn reset_params(&mut self) {
         self.params = self.patch.defaults();
     }
 
     /// The VOICING knob, 0 mellow to 1 bright; 0.5 is the bench tuning.
     /// Knob 0 under an older name, kept because the bench calls it.
+    #[allow(dead_code)]
     pub fn set_voicing(&mut self, v: f32) {
         self.set_param(P_VOICING, v);
     }
@@ -1176,6 +1191,7 @@ impl Keys {
     /// 1.5 leaning wider — normalised into knob 1. The panel speaks 0..1
     /// like every other knob; this exists for the bench and for the two-knob
     /// call sites that predate the rack.
+    #[allow(dead_code)]
     pub fn set_width(&mut self, w: f32) {
         self.set_param(P_WIDTH, w.clamp(0.0, WIDTH_FULL) / WIDTH_FULL);
     }

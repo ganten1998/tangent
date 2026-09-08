@@ -730,6 +730,12 @@ fn our_audio_nodes(dump_json: &str, pid: u32) -> Vec<u64> {
 /// row is `S ID QUANT RATE WAIT BUSY W/Q B/Q ERR ...`, so ERR is the ninth
 /// token wherever the row's id parses. The LAST occurrence of an id wins,
 /// because `-n 2` prints two snapshots and the first is often idle.
+///
+/// Compiled where it is called and in every test build. `read_graph_dropouts`
+/// is the only caller and it is Linux-only — its sibling `our_audio_nodes`
+/// carries the same gate — but this half is pure string work and its test is
+/// worth running on the machine the code is written on.
+#[cfg(any(target_os = "linux", test))]
 fn sum_errs(top_output: &str, ids: &[u64]) -> Option<u64> {
     let mut latest: HashMap<u64, u64> = HashMap::new();
     for line in top_output.lines() {

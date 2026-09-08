@@ -704,6 +704,11 @@ pub fn window_title(project: &str, dirty: bool) -> String {
 /// Not gated to X11. A 24 MB texture is waste on every platform, this is
 /// the one place all of them pass through, and a cap that only exists where
 /// somebody already got hurt is a cap that gets forgotten.
+///
+/// macOS is the one platform that does not reach it: the Dock tile wants
+/// `pad_icon_for_dock(shrink_icon_to(icon, 512))` instead, so on this build
+/// the only callers are the tests below.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn shrink_icon_for_x11(icon: egui::IconData) -> egui::IconData {
     /// Comfortably inside every limit: 128×128 is 65 544 bytes, under even
     /// the 262 140-byte classic maximum that applies without BIG-REQUESTS.

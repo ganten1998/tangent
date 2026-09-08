@@ -492,12 +492,18 @@ impl PianoVoice {
         }
     }
 
+    /// The shipped jazz grand at its default knobs.    ///
+    /// A rung of the strike ladder the instrument does not climb: `mod.rs`
+    /// calls the base-picking `strike_based`, and the shorter spellings are
+    /// what the bench and this module's own tests strike with.
+    #[allow(dead_code)]
     pub fn strike(&mut self, pitch: u8, velocity: f32) {
         self.strike_full(pitch, velocity, &PianoKnobs::default(), &PianoBase::JAZZ);
     }
 
     /// `strike` with the panel's VOICING knob: 0 mellow, 1 bright, 0.5 the
     /// bench tuning exactly. See `strike_full` for what the knob touches.
+    #[allow(dead_code)]
     pub fn strike_voiced(&mut self, pitch: u8, velocity: f32, voicing: f32) {
         let mut k = PianoKnobs::default();
         k.voicing = voicing;
@@ -505,6 +511,7 @@ impl PianoVoice {
     }
 
     /// `strike` with the whole panel: every knob this mechanism answers to.
+    #[allow(dead_code)]
     pub fn strike_knobs(&mut self, pitch: u8, velocity: f32, k: &PianoKnobs) {
         self.strike_full(pitch, velocity, k, &PianoBase::JAZZ);
     }
@@ -534,6 +541,7 @@ impl PianoVoice {
     /// showed n2 outliving n1 through nothing but a null in n1's beat. The
     /// t60 column is therefore measured with the unison collapsed, where the
     /// decay is the design and nothing else. `mod.rs` never calls this.
+    #[allow(dead_code)]
     pub fn strike_spread(&mut self, pitch: u8, velocity: f32, spread: f32) {
         let mut k = PianoKnobs::default();
         k.unison = spread;
