@@ -607,6 +607,14 @@ mod mac {
         /// where either side cannot answer — a build machine with no audio
         /// device is not a machine with a bug — and that is honest, because
         /// the follower treats `None` from either road identically.
+        ///
+        /// **`recorder` only, because the expensive road IS cpal.** Minimal
+        /// does not link an audio backend at all (see the feature note in
+        /// `Cargo.toml`), so without this gate the whole test binary refuses
+        /// to compile there - `cargo test -p tangent --no-default-features`
+        /// died on `use cpal::traits`, which is a build the gate never runs
+        /// and so never reported.
+        #[cfg(feature = "recorder")]
         #[test]
         fn the_hal_rate_agrees_with_the_audio_unit_it_replaces() {
             use cpal::traits::{DeviceTrait, HostTrait};

@@ -132,7 +132,17 @@ pub fn plugin_catalog(
 pub fn plugin_catalog_from(
     bundles: Vec<std::path::PathBuf>,
 ) -> Vec<(std::path::PathBuf, Option<String>, Option<String>)> {
-    let rows: Vec<(std::path::PathBuf, Option<String>, Option<String>)> = bundles
+    // **`mut`, and it is not spurious on the three platforms that never
+    // touch it.** The LV2 half below is the only writer and it is cfg'd out
+    // everywhere but Linux and FreeBSD, so a mechanical `unused_mut` fix took
+    // the `mut` away and broke both of those builds. The allow names the
+    // platforms that do not write to it rather than removing the binding's
+    // mutability from the ones that do.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "freebsd")),
+        allow(unused_mut)
+    )]
+    let mut rows: Vec<(std::path::PathBuf, Option<String>, Option<String>)> = bundles
         .into_iter()
         .map(|p| {
             let v = tangent_host::vendor_of(&p);
