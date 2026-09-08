@@ -43,8 +43,7 @@ use objc2_core_video::{
 use objc2_core_audio_types::AudioStreamBasicDescription;
 use objc2_core_media::{
     kCMBlockBufferAssureMemoryNowFlag, CMAudioFormatDescriptionCreate,
-    CMAudioSampleBufferCreateReadyWithPacketDescriptions, CMBlockBuffer,
-    CMBlockBufferCreateWithMemoryBlock, CMBlockBufferReplaceDataBytes, CMFormatDescription,
+    CMAudioSampleBufferCreateReadyWithPacketDescriptions, CMBlockBuffer, CMFormatDescription,
     CMSampleBuffer,
 };
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
@@ -365,6 +364,17 @@ impl Encoder {
         // block and a completion handler, and the caller is the writer thread
         // at Stop — which has nothing else to do and must not return until the
         // file has its index, or the take is unplayable.
+        //
+        // **Apple deprecated it, and the replacement is the thing this
+        // paragraph refuses.** `finishWritingWithCompletionHandler:` returns
+        // immediately and reports through a block, which needs the `block2`
+        // feature this crate deliberately does not turn on (see the
+        // `objc2-av-foundation` note in `Cargo.toml`) and would hand the
+        // writer thread a file whose index may not be written yet. Apple's
+        // own reason for the deprecation — "should not be called from the
+        // main thread" — is satisfied here: the caller is the take's writer
+        // thread, never the main one.
+        #[allow(deprecated)]
         if !unsafe { self.writer.finishWriting() } {
             return Err(status_error(&self.writer, "the video file could not be closed"));
         }
@@ -693,7 +703,7 @@ fn lpcm_format(spec: super::AudioSpec) -> Result<Retained<CMFormatDescription>, 
 fn block_buffer(bytes: &[u8]) -> Result<Retained<CMBlockBuffer>, String> {
     let mut out: *mut CMBlockBuffer = std::ptr::null_mut();
     let status = unsafe {
-        CMBlockBufferCreateWithMemoryBlock(
+        CMBlockBuffer::create_with_memory_block(
             None,
             std::ptr::null_mut(),
             bytes.len(),
@@ -711,7 +721,7 @@ fn block_buffer(bytes: &[u8]) -> Result<Retained<CMBlockBuffer>, String> {
     let block = unsafe { Retained::from_raw(out) }
         .ok_or_else(|| "an audio block vanished".to_owned())?;
     let status = unsafe {
-        CMBlockBufferReplaceDataBytes(
+        CMBlockBuffer::replace_data_bytes(
             std::ptr::NonNull::new(bytes.as_ptr().cast_mut().cast())
                 .ok_or("an empty audio block")?,
             &block,

@@ -15843,10 +15843,10 @@ impl eframe::App for DesktopApp {
                         i.viewport().inner_rect,
                         i.viewport().outer_rect,
                         i.viewport().monitor_size,
-                        i.screen_rect(),
+                        i.content_rect(),
                     )
                 });
-                eprintln!("GEOM egui inner={:?} outer={:?} mon={:?} screen={:?}", vp.0, vp.1, vp.2, vp.3);
+                eprintln!("GEOM egui inner={:?} outer={:?} mon={:?} content={:?}", vp.0, vp.1, vp.2, vp.3);
                 eprintln!("GEOM app  {}", self.app.debug_geometry());
                 eprintln!("GEOM ppp  {}", ctx.pixels_per_point());
                 eprintln!(
@@ -16869,7 +16869,9 @@ impl DesktopApp {
             return;
         }
         let painter = ctx.layer_painter(tangent_ui::busy::cover_layer("tangent-splash"));
-        let rect = ctx.screen_rect();
+        // The CONTENT rectangle, which is the viewport minus whatever the OS
+        // has taken out of it. A cover belongs over what the app draws in.
+        let rect = ctx.content_rect();
         tangent_ui::splash::draw(&painter, rect, fade);
         // While it is up, the window must keep repainting — nothing else is
         // asking it to, and a splash that freezes mid-fade because no input
@@ -17820,7 +17822,8 @@ impl DesktopApp {
         let face = self.app.panel_face();
         let time = ctx.input(|i| i.time);
         let painter = ctx.layer_painter(tangent_ui::busy::cover_layer("tangent-busy"));
-        let rect = ctx.screen_rect();
+        // As the splash: the content rectangle, not the whole viewport.
+        let rect = ctx.content_rect();
         let Some(busy) = self.busy.as_mut() else {
             return;
         };
