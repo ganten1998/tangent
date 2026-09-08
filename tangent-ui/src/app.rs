@@ -8889,16 +8889,25 @@ impl TangentApp {
             self.settings.strip_colors[i] = *c;
         }
         // The snapshot's occupied seats, spread over the settings' dense
-        // space — the whole `INSERT_SPACE`, and wider if a document names
-        // a seat past it (a future build's desk round-trips through here
-        // rather than being cut). Everything that indexes `strip_inserts`
-        // by seat — `insert`, `set_insert`, the track mover, the host's
-        // reconcile — keeps its dense vec.
+        // space — exactly `INSERT_SPACE`, never wider. Everything that
+        // indexes `strip_inserts` by seat — `insert`, `set_insert`, the
+        // track mover, the host's reconcile — keeps its dense vec, and
+        // every one of those seats comes from the seat map, so nothing
+        // past the map is ever asked for.
+        //
+        // **The vec is sized by the map, not by the bay.** This used to
+        // grow to `bay + 1` so that a seat past today's map would round
+        // trip; but a bay is document content, a sparse key can say
+        // anything, and `resize(bay + 1)` was a 2.4 TB allocation for an
+        // eleven-digit key and — with `bay == usize::MAX`, whose add wraps
+        // to zero in release — `resize(0)`, the whole desk emptied by one
+        // line of a file that parsed cleanly. The reader (`DeskSnap::
+        // canonical`) drops such a seat first; this is the second lock,
+        // for a snapshot built any other way: a seat past the space is
+        // skipped, and the settings mirror was going to drop it at the
+        // next launch anyway.
         let mut dense = vec![String::new(); crate::recorder::INSERT_SPACE];
         for (bay, path) in &d.inserts {
-            if *bay >= dense.len() {
-                dense.resize(bay + 1, String::new());
-            }
             if let Some(slot) = dense.get_mut(*bay) {
                 *slot = path.clone();
             }
@@ -52609,6 +52618,66 @@ mod folder_tests {
         app.redo();
         assert!((app.settings.master_gain - 0.25).abs() < 1e-9, "redo did not restore the desk");
         assert_eq!(app.settings_writes.get(), 0, "redo wrote the settings synchronously");
+    }
+
+    /// **A seat named past the map by a document cannot size the desk.**
+    ///
+    /// The v7 tail is `"<bay>": "<path>"`, and a bay is whatever the file
+    /// says: `100000000000` asked `apply_desk_snapshot` to resize the
+    /// live `strip_inserts` to 2.4 TB of strings (an abort at open, from a
+    /// document that parsed cleanly and so never reached the quarantine),
+    /// and `18446744073709551615` — `usize::MAX`, whose `+ 1` wraps to
+    /// zero in release — resized it to NOTHING, so the open's one settings
+    /// write persisted a desk with no instruments. Every earlier build had
+    /// read a short array and lost nothing. The reader drops such a seat
+    /// and the apply sizes by the map; this opens the document through the
+    /// real road and asks for the instruments, the length, and what the
+    /// settings file was handed.
+    #[test]
+    fn a_seat_past_the_map_cannot_size_the_desk() {
+        use crate::recorder::{INSERTS, INSERT_SPACE};
+        let (root, doc) = a_project_with_a_desk("seat-past-map");
+        // Two instruments this session's own settings do NOT seat, so
+        // finding them proves the document's desk landed.
+        let mut arr = crate::arrangement::Arrangement::load_from(&doc);
+        let mut desk = arr.desk.take().expect("the fixture desk");
+        for ch in 0..crate::recorder::CHANNELS {
+            desk.set_bay(ch * INSERTS, "");
+        }
+        desk.set_bay(3 * INSERTS, crate::dialogs::DRUMPAD_PATH);
+        desk.set_bay(2 * INSERTS, "/x/EP.vst3");
+        arr.desk = Some(desk);
+        arr.save_to(&doc);
+        let text = std::fs::read_to_string(&doc).expect("the document");
+        let mut json: serde_json::Value = serde_json::from_str(&text).expect("json");
+        json["desk"].as_object_mut().expect("a desk").insert(
+            "inserts_tail".into(),
+            serde_json::json!({
+                "100000000000": "a terabyte",
+                "18446744073709551615": "a wrap to zero",
+                "12447": "brusfri",
+            }),
+        );
+        std::fs::write(&doc, json.to_string()).expect("rewrite");
+
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.open_project(&doc);
+        let live = &app.settings.strip_inserts;
+        assert_eq!(live.len(), INSERT_SPACE, "a bay in the file sized the desk");
+        assert_eq!(live[3 * INSERTS], crate::dialogs::DRUMPAD_PATH, "the drumpad's seat was lost");
+        assert_eq!(live[2 * INSERTS], "/x/EP.vst3", "the piano's seat was lost");
+        assert_eq!(live[12447], "brusfri", "a real far seat was lost with the poison");
+        assert_eq!(app.settings.project_path, doc.to_string_lossy(), "the open did not land");
+        // And the one write the open makes carried the instruments, not
+        // an emptied desk — that write is what the next launch reopens on.
+        let on_disk = Settings::load();
+        assert_eq!(
+            on_disk.strip_inserts.get(3 * INSERTS).map(String::as_str),
+            Some(crate::dialogs::DRUMPAD_PATH),
+            "the settings file was handed a desk without its drumpad"
+        );
+        assert!(on_disk.strip_inserts.len() <= INSERT_SPACE);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A document whose desk was written in an earlier ERA of the desk's
