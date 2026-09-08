@@ -22864,6 +22864,30 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     // same shape every other road in this file has, and the reason it is
     // two functions rather than one field is that a queue read by the host
     // has to be emptied as it is read or the same load happens twice.
+    //
+    // MERGE-ME(engine): the host lane has to join this road up. In
+    // `desktop.rs`, beside where the other pushes happen:
+    //
+    //   * drain `app.take_sampler_load()` each tick, load the file into
+    //     the sampler seated at that lane's bay, and answer with
+    //     `app.set_sampler_info(lane, SamplerInfo { name, seconds, peaks,
+    //     missing })` — `peaks` is a `crate::peaks::Peaks` built beside
+    //     the decode, exactly as an arrangement clip's is, and `missing`
+    //     is the state for a bay whose file has moved (NOT an error
+    //     string: the envelope is still the one that was dialled in and
+    //     the face says so on the picture);
+    //   * push the loaded path in `BuiltinFace::extra` under the key
+    //     `"sample"`, and gate it in `builtin_fx::is_extra_symbol` the way
+    //     `ir_path` is gated — that key is what
+    //     `DialogAction::FaceSavePreset` now carries into a preset, and
+    //     what `load_unit_preset` must apply for a preset to restore the
+    //     sound rather than only the knobs;
+    //   * clear the entry (an empty `name`) when the bay unloads, so a
+    //     face draws its empty state rather than the last file;
+    //   * register the unit with `voice: true` and do NOT add it to
+    //     `desktop::is_instrument_sentinel` — a bay-seated voice filed
+    //     there is a synth that loads, names itself, draws its panel and
+    //     is silent.
 
     /// **Publish the dragged clip as a `DraggedMedia` payload**, so a
     /// window that takes samples can take it.
@@ -58577,7 +58601,7 @@ mod arrange_peaks_tests {
 #[cfg(test)]
 mod sampler_road_tests {
     use super::*;
-    use crate::arrangement::{ArrClip, ClipKind};
+    use crate::arrangement::{ArrClip, Arrangement, ClipKind, DOC_NAME};
 
     fn a_clip(kind: ClipKind, path: &str) -> ArrClip {
         ArrClip {
@@ -58638,7 +58662,7 @@ mod sampler_road_tests {
     /// for a drag, which nobody would find until a project moved.
     #[test]
     fn a_dragged_audio_clip_carries_the_file_the_timeline_plays() {
-        let (ctx, mut app) = tests::headless(crate::host::Caps::DESKTOP);
+        let (ctx, mut app) = tests::headless(Caps::DESKTOP);
         app.project_doc = std::path::PathBuf::from("/p/song/project.tan");
         let id = app.arrangement.add_clip(a_clip(ClipKind::Audio, "media/take.wav"));
         a_drag_in_flight(&ctx);
@@ -58647,7 +58671,7 @@ mod sampler_road_tests {
             .expect("the clip published nothing");
         assert_eq!(
             got.0,
-            crate::arrangement::Arrangement::resolve(
+            Arrangement::resolve(
                 std::path::Path::new("/p/song/project.tan"),
                 "media/take.wav"
             )
@@ -58662,7 +58686,7 @@ mod sampler_road_tests {
     /// silence, and gives nobody a reason to look at.
     #[test]
     fn a_dragged_midi_clip_is_refused_out_loud() {
-        let (ctx, mut app) = tests::headless(crate::host::Caps::DESKTOP);
+        let (ctx, mut app) = tests::headless(Caps::DESKTOP);
         app.project_doc = std::path::PathBuf::from("/p/song/project.tan");
         let id = app.arrangement.add_clip(a_clip(ClipKind::Midi, "media/part.mid"));
         a_drag_in_flight(&ctx);
@@ -58686,14 +58710,14 @@ mod sampler_road_tests {
     /// two loads is a load that silently did not happen.
     #[test]
     fn the_sampler_takes_its_loads_in_order_and_only_once() {
-        let (_ctx, mut app) = tests::headless(crate::host::Caps::DESKTOP);
+        let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
         assert_eq!(app.take_sampler_load(), None);
-        app.apply_dialog_action(crate::dialogs::DialogAction::PickSample {
+        app.apply_dialog_action(DialogAction::PickSample {
             strip: 0,
             slot: 0,
             path: "/m/Takes/one.wav".to_owned(),
         });
-        app.apply_dialog_action(crate::dialogs::DialogAction::PickSample {
+        app.apply_dialog_action(DialogAction::PickSample {
             strip: 1,
             slot: 0,
             path: "/m/Takes/two.aiff".to_owned(),
@@ -58712,9 +58736,9 @@ mod sampler_road_tests {
     /// silence with a plausible name under it.
     #[test]
     fn a_file_that_is_not_audio_is_refused_out_loud() {
-        let (_ctx, mut app) = tests::headless(crate::host::Caps::DESKTOP);
+        let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
         for bad in ["/m/part.mid", "/m/kit.tgkit", "/m/song.tan", "/m/notes.txt"] {
-            app.apply_dialog_action(crate::dialogs::DialogAction::PickSample {
+            app.apply_dialog_action(DialogAction::PickSample {
                 strip: 0,
                 slot: 0,
                 path: bad.to_owned(),
@@ -58731,7 +58755,7 @@ mod sampler_road_tests {
     /// the last file some other lane loaded.
     #[test]
     fn a_lane_with_no_sample_reads_the_empty_state() {
-        let (_ctx, mut app) = tests::headless(crate::host::Caps::DESKTOP);
+        let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
         assert!(app.sampler_info(3).is_empty());
         app.set_sampler_info(
             3,
@@ -58765,8 +58789,8 @@ mod sampler_road_tests {
 
         let mut settings = Settings::default();
         settings.record_dir = Some(takes.to_string_lossy().into_owned());
-        let (_ctx, mut app) = tests::headless_with(crate::host::Caps::DESKTOP, settings);
-        app.project_doc = song.join(crate::arrangement::DOC_NAME);
+        let (_ctx, mut app) = tests::headless_with(Caps::DESKTOP, settings);
+        app.project_doc = song.join(DOC_NAME);
         let mut live = crate::faces::FaceLive::default();
         app.refresh_sampler_browser(&mut live);
         let words: Vec<&str> = live.samp_roots.iter().map(|(w, _)| w.as_str()).collect();
@@ -58790,7 +58814,7 @@ mod sampler_road_tests {
         // that looks broken.
         let mut settings = Settings::default();
         settings.record_dir = Some(takes.to_string_lossy().into_owned());
-        let (_ctx, mut app) = tests::headless_with(crate::host::Caps::DESKTOP, settings);
+        let (_ctx, mut app) = tests::headless_with(Caps::DESKTOP, settings);
         let mut live = crate::faces::FaceLive::default();
         app.refresh_sampler_browser(&mut live);
         assert!(live.samp_roots[2].1.is_empty(), "a project chip with no project");
@@ -58805,7 +58829,7 @@ mod sampler_road_tests {
     /// saved that way reopens with the right envelope over silence.
     #[test]
     fn saving_a_sampler_preset_carries_the_file_it_is_playing() {
-        let (_ctx, mut app) = tests::headless(crate::host::Caps::DESKTOP);
+        let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
         app.set_builtin_face(crate::ports::BuiltinFace {
             strip: 0,
             slot: 0,
@@ -58824,7 +58848,7 @@ mod sampler_road_tests {
             curve_db: Vec::new(),
             extra: vec![("sample".to_owned(), "/m/Takes/kick 03.wav".to_owned())],
         });
-        app.apply_dialog_action(crate::dialogs::DialogAction::FaceSavePreset {
+        app.apply_dialog_action(DialogAction::FaceSavePreset {
             strip: 0,
             slot: 0,
             name: "Room Kick".to_owned(),
