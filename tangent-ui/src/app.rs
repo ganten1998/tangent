@@ -2057,28 +2057,79 @@ enum AfterSave {
 ///
 /// One struct rather than two parallel `Vec`s so they cannot fall out of step
 /// — every push, truncate and drain moves both by construction.
-#[derive(Clone, Default, PartialEq)]
+///
+/// # A struct, not a string
+///
+/// A moment used to be the pretty-printed document — 157 to 539 KB on the
+/// owner's projects, 0.8 ms to build at that size and 66 ms at 768 clips,
+/// paid on every committed edit and TWICE on every open; a hundred of them
+/// were 35 MB on a small song and two gigabytes on a large one; and an undo
+/// re-parsed one, which ran the live document back through the reader's
+/// sanitiser and could hand back a struct that no longer matched the text
+/// it came from (an empty-path clip dropped, an id renumbered), so the very
+/// next commit pushed a phantom moment and redo was gone.
+///
+/// Now a moment is the document itself behind an `Arc`, the live desk
+/// beside it, and the exact form is the WORDS of the fingerprint walk kept
+/// rather than mixed — see `Fingerprint`'s doc for why equal words mean
+/// equal text. Building one is a clone (8 µs on eight thousand notes) and
+/// a walk (the once-a-frame cost), restoring one is a clone, and what is
+/// restored is bit for bit what was committed.
+///
+/// **No `PartialEq`, on purpose.** A derived one would compare the floats
+/// as floats (NaN unequal to itself, `-0.0` equal to `0.0`) and the extras
+/// as sets, none of which is text equality. `same_text` is the comparison.
+#[derive(Clone)]
 struct Moment {
-    /// `Arrangement::to_json` with `DeskSnap` inside it.
-    doc: String,
-    /// Every non-empty lane kit, compactly — see `DrumpadDoc::compact_json`.
-    /// A hundred moments of the full 128-pad form would be megabytes.
+    /// The document as it stood, its own `desk` left `None` — the live
+    /// desk rides in `desk`, exactly as `to_json_with_desk` used to bake
+    /// it in. Shared, never edited in place.
+    arr: std::sync::Arc<crate::arrangement::Arrangement>,
+    /// The live desk at that instant. Shared with the moment before it
+    /// whenever the desk did not move, which on a run of clip edits is
+    /// always: a hundred moments then hold ONE desk.
+    desk: std::sync::Arc<crate::arrangement::DeskSnap>,
+    /// Every non-empty lane kit, compactly — see `DrumpadDoc::compact_all`.
+    /// A hundred moments of the full 128-pad form would be megabytes. What
+    /// an undo restores the kits FROM; the comparison is the words.
     kits: String,
+    /// The exact form: every word `undo_mark`'s walk mixes, over the
+    /// document, this desk and the kits. Equal words, equal text.
+    words: std::sync::Arc<Vec<u64>>,
+    /// The same walk as one `u64` — `project_dirty`'s number, from the
+    /// SAME pass as the words so the two cannot describe different moments.
+    mark: u64,
 }
 
-/// **What "saved" means**: the moment that was written, and its fingerprint.
+impl Moment {
+    /// Would `to_json_with_desk` and `compact_all` write the same bytes
+    /// for both? The question every exact caller asks.
+    fn same_text(&self, other: &Self) -> bool {
+        self.words == other.words
+    }
+}
+
+/// **What "saved" means**: the words of the moment that was written, and
+/// its fingerprint.
 ///
-/// One value and not two fields, built by one constructor, because the whole
-/// point of the fingerprint is that it answers the SAME question as the
-/// moment — cheaply. Two fields assigned at two call sites is the shape that
-/// drifts, and a drifted pair here means the title bar and the quit prompt
-/// disagree about whether there is anything to lose.
+/// One value and not two fields, built by one walk, because the whole point
+/// of the fingerprint is that it answers the SAME question as the words —
+/// cheaply. Two fields assigned at two call sites is the shape that drifts,
+/// and a drifted pair here means the title bar and the quit prompt disagree
+/// about whether there is anything to lose. The document itself is not
+/// kept: nothing is ever restored from the saved point, only compared.
 #[derive(Clone)]
 struct SavedPoint {
-    /// The exact bytes. What `project_dirty_exact` compares.
-    at: Moment,
-    /// The same bytes as one `u64`. What `project_dirty` compares.
+    /// The exact form. What `project_dirty_exact` compares.
+    words: std::sync::Arc<Vec<u64>>,
+    /// The same walk as one `u64`. What `project_dirty` compares.
     mark: u64,
+}
+
+impl SavedPoint {
+    fn of(m: &Moment) -> Self {
+        Self { words: std::sync::Arc::clone(&m.words), mark: m.mark }
+    }
 }
 
 /// Everything a track is, held by value. See [`TangentApp::copy_track`].
@@ -12973,8 +13024,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// For the callers where a wrong answer costs somebody their work. See
     /// `project_dirty` for the split and for which callers those are.
     pub fn project_dirty_exact(&self) -> bool {
-        let now = self.undo_state();
-        self.saved_state.as_ref().map(|s| &s.at) != Some(&now)
+        let (words, _) = self.walk();
+        !self.saved_state.as_ref().is_some_and(|s| *s.words == words)
     }
 
     /// **Whether New would hand back exactly what is already open** - an
@@ -13095,25 +13146,29 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.saved_state = Some(self.saved_point());
     }
 
-    /// The document as UNDO stores it: clips with the desk baked in — one
-    /// string, one moment.
+    /// The document as UNDO stores it: the struct, the live desk beside it,
+    /// the kits compactly, and the words — one moment. See `Moment`.
     ///
-    /// **No clone.** This used to copy the whole `Arrangement` — every clip,
-    /// every note, every path string — for the sole purpose of overwriting
-    /// its `desk` field with the live one before serialising. The desk goes
-    /// in through `to_json_with_desk` now, which exists for exactly this.
-    ///
-    /// **And its own honesty: the clone was not the cost.** Measured at
-    /// 8 µs of this function's 2.8 ms in release, a third of a percent —
-    /// the serialisation is where the time goes and always was. It is gone
-    /// because it was pure waste, not because removing it made anything
-    /// fast. What made the once-a-frame question cheap is `undo_mark`.
+    /// The clone this makes is the one `undo_state` used to boast about
+    /// removing: 8 µs of what was then a 2.8 ms serialisation. The
+    /// serialisation is gone and the clone is what a moment IS, and it is
+    /// the cheapest part of the call after the desk compare.
     fn undo_state(&self) -> Moment {
+        let desk = self.desk_snapshot();
+        let (words, mark) = self.walk_with(&desk);
+        // The desk is shared with the standing moment when it did not
+        // move. Compared as a struct, which for a desk is right: its floats
+        // are written as floats and a NaN merely fails to share.
+        let desk = match self.history.get(self.hist_at) {
+            Some(top) if *top.desk == desk => std::sync::Arc::clone(&top.desk),
+            _ => std::sync::Arc::new(desk),
+        };
         Moment {
-            doc: self
-                .arrangement
-                .to_json_with_desk(Some(&self.desk_snapshot())),
+            arr: std::sync::Arc::new(self.arrangement.clone_without_desk()),
+            desk,
             kits: crate::drumpad::DrumpadDoc::compact_all(&self.drumpad_kits),
+            words: std::sync::Arc::new(words),
+            mark,
         }
     }
 
@@ -13129,13 +13184,29 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         f.finish()
     }
 
-    /// The pair, taken together at one instant — the only way a `SavedPoint`
+    /// The recorded walk — `undo_mark`'s walk with every word kept — over
+    /// the live document, the live desk and the kits. The words are the
+    /// exact form and the number is the cheap one, from ONE pass.
+    fn walk(&self) -> (Vec<u64>, u64) {
+        self.walk_with(&self.desk_snapshot())
+    }
+
+    /// `walk` over a desk the caller already holds.
+    fn walk_with(&self, desk: &crate::arrangement::DeskSnap) -> (Vec<u64>, u64) {
+        // Sized from the standing moment so the list is allocated once; a
+        // document that grew since pays one regrowth, not thirty thousand.
+        let hint = self.history.get(self.hist_at).map_or(0, |m| m.words.len());
+        let mut f = crate::arrangement::Fingerprint::recording(hint);
+        self.arrangement.hash_into(Some(desk), &mut f);
+        crate::drumpad::DrumpadDoc::hash_all_into(&self.drumpad_kits, &mut f);
+        f.finish_recorded()
+    }
+
+    /// The pair, taken together from one walk — the only way a `SavedPoint`
     /// is ever built, so its two halves cannot describe different documents.
     fn saved_point(&self) -> SavedPoint {
-        SavedPoint {
-            at: self.undo_state(),
-            mark: self.undo_mark(),
-        }
+        let (words, mark) = self.walk();
+        SavedPoint { words: std::sync::Arc::new(words), mark }
     }
 
     /// A moment worth keeping: pushed unless it IS the standing moment.
@@ -13143,25 +13214,27 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// # Why this does NOT take the fingerprint
     ///
-    /// It was measured, and it was refused. A fingerprint here could only
-    /// help in one case — a commit where nothing changed, which today pays
-    /// the full 2.8 ms to find out and would pay 86 µs instead. Every
-    /// commit that DID change something has to serialise anyway, because
-    /// the serialisation is the moment being stored; there is nothing to
-    /// save on the path that matters.
-    ///
-    /// And the cheap answer's failure mode lands on the wrong side of
+    /// The cheap answer's failure mode lands on the wrong side of
     /// `project_dirty`'s split. A collision here does not misdraw an
     /// asterisk: it decides an edit is not worth recording, and the next
     /// Ctrl+Z then reaches past it and takes two edits away instead of one.
     /// Event-driven, once per edit, work on the line — so it stays exact,
-    /// for the same reason `ask_before` does.
+    /// for the same reason `ask_before` does. Exact is cheap now — the
+    /// words are the same walk the fingerprint is — so there is nothing
+    /// left to buy by being approximate.
     fn undo_commit(&mut self) {
         let state = self.undo_state();
+        self.undo_commit_moment(state);
+    }
+
+    /// `undo_commit` with the moment already built — so `undo_reset`, which
+    /// needs the same moment as its saved baseline AND as moment zero, walks
+    /// the document once rather than twice.
+    fn undo_commit_moment(&mut self, state: Moment) {
         if self
             .history
             .get(self.hist_at)
-            .is_some_and(|top| *top == state)
+            .is_some_and(|top| top.same_text(&state))
         {
             return;
         }
@@ -13180,11 +13253,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     fn undo_reset(&mut self) {
         // A fresh line of time is also a fresh baseline for "unsaved": every
         // road into a document — open, save-as, new, launch — ends here, so
-        // this is the one place that cannot be forgotten.
-        self.saved_state = Some(self.saved_point());
+        // this is the one place that cannot be forgotten. One moment serves
+        // as both: it used to be built twice, two identical documents
+        // serialised back to back on every open.
+        let state = self.undo_state();
+        self.saved_state = Some(SavedPoint::of(&state));
         self.history.clear();
         self.hist_at = 0;
-        self.undo_commit();
+        self.undo_commit_moment(state);
     }
 
     /// Stand at `at`: the document and the desk become that moment.
@@ -13208,10 +13284,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // to onto the top of the stack and make redo unreachable.
             self.drumpad_save();
         }
-        let arr = crate::arrangement::Arrangement::from_json(&moment.doc);
-        if let Some(desk) = arr.desk.clone() {
-            self.apply_desk_snapshot(&desk);
-        }
+        // The struct, not a re-parse: what comes back is bit for bit what
+        // was committed, never the reader's sanitised opinion of it — see
+        // `Moment`. The document carries the moment's desk afterwards, as
+        // the parsed one used to, for the two roads that read it.
+        self.apply_desk_snapshot(&moment.desk);
+        let mut arr = (*moment.arr).clone();
+        arr.desk = Some((*moment.desk).clone());
         self.arrangement = arr;
         // No document write. Undo and redo used to save the doc to disk on
         // every step — the loudest of the four implicit writers, and the
@@ -52335,6 +52414,118 @@ mod folder_tests {
         assert_eq!(app.hist_at, start, "undo could not reach the beginning");
     }
 
+    /// **Undo puts back the struct that was committed, not the reader's
+    /// opinion of it.**
+    ///
+    /// A moment used to be text, and undo re-parsed it — through
+    /// `from_map`'s sanitiser, which drops an audio clip without a path
+    /// and raises a counter that fell behind its clips. Whatever it
+    /// changed, the live document then differed from the moment it was
+    /// standing on, so the very next commit pushed a phantom moment and
+    /// the redo tail died with it. The clip here is an in-memory state
+    /// the reader would not hand back, chosen to make the difference
+    /// visible; the property is that the difference is gone.
+    #[test]
+    fn undo_restores_the_struct_it_committed_not_a_reparse() {
+        let mut app = app();
+        app.undo_reset();
+        let start = app.hist_at;
+        app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
+            path: String::new(),
+            len_s: 1.0,
+            ..Default::default()
+        });
+        app.arrangement.next_id = 0;
+        app.arr_save_edits();
+        assert_eq!(app.hist_at, start + 1, "the edit made no moment");
+        app.arrangement.clips[0].len_s = 2.0;
+        app.arr_save_edits();
+        assert_eq!(app.hist_at, start + 2, "the second edit made no moment");
+        let depth = app.history.len();
+
+        app.undo();
+        assert_eq!(app.hist_at, start + 1, "undo did not move");
+        assert_eq!(app.arrangement.clips.len(), 1, "the restore dropped the clip");
+        assert_eq!(app.arrangement.clips[0].len_s, 1.0, "the restore has the wrong length");
+        assert_eq!(app.arrangement.next_id, 0, "the restore normalised the counter");
+        assert!(
+            app.arrangement.desk.is_some(),
+            "the document no longer carries the moment's desk after an undo"
+        );
+        // The proof: standing on a moment, a commit has nothing to push.
+        app.undo_commit();
+        assert_eq!(app.history.len(), depth, "a commit after undo pushed a phantom moment");
+        assert_eq!(app.hist_at, start + 1, "and it moved the timeline");
+        app.redo();
+        assert_eq!(app.arrangement.clips[0].len_s, 2.0, "redo was lost");
+    }
+
+    /// **One walk seeds both the baseline and moment zero.** They used to
+    /// be two serialisations of the same document; now the saved point IS
+    /// the first moment's words, shared, so they cannot describe different
+    /// documents.
+    #[test]
+    fn undo_reset_seeds_the_baseline_and_moment_zero_from_one_walk() {
+        let app = a_settled_session();
+        let saved = app.saved_state.as_ref().expect("a settled session has a baseline");
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.hist_at, 0);
+        assert!(
+            std::sync::Arc::ptr_eq(&saved.words, &app.history[0].words),
+            "the baseline and moment zero were walked separately"
+        );
+        assert_eq!(saved.mark, app.history[0].mark);
+        assert!(!app.project_dirty() && !app.project_dirty_exact());
+    }
+
+    /// **A desk that did not move is held once.** A run of clip edits is
+    /// the ordinary session, and every moment of it used to carry its own
+    /// copy of thousands of seat strings.
+    #[test]
+    fn moments_share_a_desk_that_did_not_move() {
+        let mut app = a_settled_session();
+        app.arrangement.clips[0].notes[0].at_s = 0.25;
+        app.arr_save_edits();
+        app.arrangement.clips[0].notes[0].at_s = 0.5;
+        app.arr_save_edits();
+        assert_eq!(app.history.len(), 3);
+        assert!(
+            std::sync::Arc::ptr_eq(&app.history[0].desk, &app.history[1].desk)
+                && std::sync::Arc::ptr_eq(&app.history[1].desk, &app.history[2].desk),
+            "an unchanged desk was copied into each moment"
+        );
+        app.settings.master_gain = 0.3;
+        app.arr_save_edits();
+        assert_eq!(app.history.len(), 4);
+        assert!(
+            !std::sync::Arc::ptr_eq(&app.history[2].desk, &app.history[3].desk),
+            "a moved desk was shared with the moment before it"
+        );
+        assert!((app.history[3].desk.master_gain - 0.3).abs() < 1e-9);
+    }
+
+    /// **What the writer cannot see is not a moment.** The words fold the
+    /// way the text does: a stretch inside the deadband is no key, and
+    /// every unwritable float is the same absent key.
+    #[test]
+    fn an_edit_the_writer_cannot_see_pushes_no_moment() {
+        let mut app = a_settled_session();
+        let depth = app.history.len();
+        app.arrangement.clips[0].stretch = 1.0 + 1.0e-12;
+        app.undo_commit();
+        assert_eq!(app.history.len(), depth, "a stretch inside the deadband made a moment");
+        assert!(!app.project_dirty_exact(), "and it reads as unsaved work");
+        // An unwritable note time IS a change: the key leaves the file.
+        app.arrangement.clips[0].notes[0].at_s = f64::NAN;
+        app.undo_commit();
+        assert_eq!(app.history.len(), depth + 1, "an omitted key was not a change");
+        // Another NaN writes the same file, so it is the same moment.
+        app.arrangement.clips[0].notes[0].at_s = f64::from_bits(0x7ff8_0000_0000_0001);
+        app.undo_commit();
+        assert_eq!(app.history.len(), depth + 1, "two NaNs made two moments");
+    }
+
     /// The document is a FIXED POINT: writing what was read gives the same
     /// text. Undo's whole comparison rests on it.
     #[test]
@@ -55724,18 +55915,21 @@ mod dirty_cost_probe {
         app
     }
 
-    /// What `project_dirty` USED to do, kept here so the before and the after
-    /// are measured on one machine in one run rather than compared across two
-    /// builds: clone the document, bake the live desk into the copy,
-    /// serialise it, compact the kits, compare two strings.
-    fn the_old_way(app: &TangentApp) -> bool {
-        let mut arr = app.arrangement.clone();
-        arr.desk = Some(app.desk_snapshot());
-        let now = Moment {
-            doc: arr.to_json(),
-            kits: crate::drumpad::DrumpadDoc::compact_all(&app.drumpad_kits),
-        };
-        app.saved_state.as_ref().map(|s| &s.at) != Some(&now)
+    /// What a moment USED to be: the pretty document with the live desk
+    /// baked in, and the compact kits. Kept so the before and the after are
+    /// measured on one machine in one run rather than compared across two
+    /// builds.
+    fn the_old_moment(app: &TangentApp) -> (String, String) {
+        (
+            app.arrangement.to_json_with_desk(Some(&app.desk_snapshot())),
+            crate::drumpad::DrumpadDoc::compact_all(&app.drumpad_kits),
+        )
+    }
+
+    /// What `project_dirty` USED to do: build the old moment and compare
+    /// two strings against the one taken at the save.
+    fn the_old_way(app: &TangentApp, saved: &(String, String)) -> bool {
+        the_old_moment(app) != *saved
     }
 
     fn per_call(n: u32, mut f: impl FnMut()) -> std::time::Duration {
@@ -55778,11 +55972,12 @@ mod dirty_cost_probe {
         );
         // Both answers must be the same answer, or the numbers below are
         // measuring two different questions.
-        assert!(!the_old_way(&app), "the old way called a clean project dirty");
+        let saved = the_old_moment(&app);
+        assert!(!the_old_way(&app, &saved), "the old way called a clean project dirty");
         assert!(!app.project_dirty(), "the fingerprint called a clean project dirty");
 
         let before = per_call(20, || {
-            std::hint::black_box(the_old_way(&app));
+            std::hint::black_box(the_old_way(&app, &saved));
         });
         let after = per_call(2000, || {
             std::hint::black_box(app.project_dirty());
@@ -55821,18 +56016,13 @@ mod dirty_cost_probe {
         );
 
         let with_clone = per_call(20, || {
-            let mut arr = app.arrangement.clone();
-            arr.desk = Some(app.desk_snapshot());
-            std::hint::black_box(Moment {
-                doc: arr.to_json(),
-                kits: crate::drumpad::DrumpadDoc::compact_all(&app.drumpad_kits),
-            });
+            std::hint::black_box(the_old_moment(&app));
         });
-        let without = per_call(20, || {
+        let without = per_call(200, || {
             std::hint::black_box(app.undo_state());
         });
         let clone_only = per_call(200, || {
-            std::hint::black_box(app.arrangement.clone());
+            std::hint::black_box(app.arrangement.clone_without_desk());
         });
         let mark = per_call(2000, || {
             std::hint::black_box(app.undo_mark());
@@ -55840,8 +56030,8 @@ mod dirty_cost_probe {
         let desk = per_call(2000, || {
             std::hint::black_box(app.desk_snapshot());
         });
-        say("BEFORE undo_state (with clone)", with_clone);
-        say("AFTER  undo_state", without);
+        say("BEFORE undo_state (the text moment)", with_clone);
+        say("AFTER  undo_state (the struct moment)", without);
         say("  of which: the clone alone", clone_only);
         say("  for scale: undo_mark", mark);
         say("  of which: desk_snapshot", desk);
@@ -55955,8 +56145,72 @@ mod perf_probes {
             .expect("the fixture has MIDI clips")
     }
 
+    /// An estimate of what one moment holds resident, part by part:
+    /// (document, desk, words, kits). Deep sizes from lengths and
+    /// capacities, not an allocator census; near enough to compare shapes.
+    fn moment_parts(m: &Moment) -> (usize, usize, usize, usize) {
+        use std::mem::size_of;
+        let a = &*m.arr;
+        let mut arr = size_of::<crate::arrangement::Arrangement>();
+        for c in &a.clips {
+            arr += size_of::<crate::arrangement::ArrClip>()
+                + c.path.capacity()
+                + c.name.capacity()
+                + c.notes.capacity() * size_of::<crate::arrangement::ArrNote>()
+                + c.pedal.capacity() * size_of::<crate::arrangement::ArrPedal>()
+                + c.extra.len() * 64;
+        }
+        for c in a.automation.curves() {
+            arr += c.points().len() * size_of::<crate::automation::Point>() + 64;
+        }
+        arr += a.tempo.points().len() * 32 + a.meter.points().len() * 16;
+        for m in &a.markers {
+            arr += 32 + m.name.capacity();
+        }
+        arr += a.extra.len() * 64;
+        let d = &*m.desk;
+        let strs = |v: &[String]| v.iter().map(|s| 24 + s.capacity()).sum::<usize>();
+        let desk = size_of::<crate::arrangement::DeskSnap>()
+            + d.kinds.len()
+            + d.icons.len()
+            + strs(&d.names)
+            + d.colors.len() * 8
+            + strs(&d.inserts)
+            + d.sends.len() * 8
+            + d.gains.len() * 8
+            + d.pans.len() * 8
+            + strs(&d.inputs)
+            + d.is_folder.len()
+            + d.in_folder.len()
+            + d.folder_shut.len();
+        (arr, desk, m.words.len() * 8, m.kits.len())
+    }
+
+    /// The whole history's resident estimate, counting a shared `Arc` once.
+    fn history_bytes(history: &[Moment]) -> usize {
+        let mut seen_arr = std::collections::HashSet::new();
+        let mut seen_desk = std::collections::HashSet::new();
+        let mut seen_words = std::collections::HashSet::new();
+        let mut total = 0;
+        for m in history {
+            let (a, d, w, k) = moment_parts(m);
+            if seen_arr.insert(std::sync::Arc::as_ptr(&m.arr) as usize) {
+                total += a;
+            }
+            if seen_desk.insert(std::sync::Arc::as_ptr(&m.desk) as usize) {
+                total += d;
+            }
+            if seen_words.insert(std::sync::Arc::as_ptr(&m.words) as usize) {
+                total += w;
+            }
+            total += k + std::mem::size_of::<Moment>();
+        }
+        total
+    }
+
     fn moment_bytes(m: &Moment) -> usize {
-        m.doc.len() + m.kits.len()
+        let (a, d, w, k) = moment_parts(m);
+        a + d + w + k
     }
 
     /// **doc_open**: the whole open, and the parts of it that are paid
@@ -56016,11 +56270,10 @@ mod perf_probes {
             });
             say("doc_open", tag, "project_dirty (the title bar, per frame)", pd, true);
             let m = app.undo_state();
+            let (a, d, w, k) = moment_parts(&m);
             println!(
-                "doc_open     {tag:<3} one Moment = {:.2} MB ({} doc + {} kits bytes); 100 Moments = {:.1} MB",
+                "doc_open     {tag:<3} one Moment = {:.2} MB (est. {a} doc + {d} desk + {w} words + {k} kits bytes); 100 unshared Moments = {:.1} MB",
                 fx::mb(moment_bytes(&m)),
-                m.doc.len(),
-                m.kits.len(),
                 fx::mb(moment_bytes(&m) * 100)
             );
         }
@@ -56057,9 +56310,9 @@ mod perf_probes {
             });
             say("undo_commit", tag, "  of which: undo_state", state, true);
             let held = app.history.len();
-            let bytes: usize = app.history.iter().map(moment_bytes).sum();
+            let bytes = history_bytes(&app.history);
             println!(
-                "undo_commit  {tag:<3} history holds {held} Moments = {:.1} MB; one Moment {:.2} MB; 100 Moments = {:.1} MB",
+                "undo_commit  {tag:<3} history holds {held} Moments = {:.1} MB resident (est., shared desk counted once); per Moment {:.2} MB; 100 such = {:.1} MB",
                 fx::mb(bytes),
                 fx::mb(bytes / held.max(1)),
                 fx::mb(bytes / held.max(1) * 100)
