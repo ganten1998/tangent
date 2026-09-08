@@ -392,18 +392,6 @@ pub struct Loaded {
     pub sample_rate: u32,
 }
 
-/// What the warm-up concluded, so the band can be honest about it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WarmUp {
-    /// `false` means the instrument never made a sound and was declared ready by
-    /// timeout. The take may be silent and the UI should say so.
-    pub heard: bool,
-    pub elapsed: Duration,
-    /// Loudest peak seen while warming up. A value just under the readiness
-    /// threshold reads very differently from an exact zero.
-    pub peak: f32,
-}
-
 /// The open output device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputInfo {

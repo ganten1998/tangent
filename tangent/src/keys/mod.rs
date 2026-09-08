@@ -548,6 +548,14 @@ pub struct PianoKnobs {
     /// Multiplier on the damper's time constant: bigger is slower.
     pub release: f32,
     /// How much soundboard. 1.0 is the board as built.
+    ///
+    /// **The piano's board send does NOT come through here** — `render`
+    /// takes knob 7 straight off `params[P_BODY]` and cubes it, for the
+    /// reason `P_BODY`'s own doc gives. This is the mapping DECLARED, so
+    /// that `an_initialised_sound_is_the_bench_tuning` can hold the piano's
+    /// knob 7 to the same 1.0 centre as every other knob and as `EpKnobs`'
+    /// tonebar, which does read its copy.
+    #[allow(dead_code)]
     pub body: f32,
 }
 

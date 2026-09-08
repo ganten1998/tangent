@@ -1207,14 +1207,6 @@ pub fn uncover_screen() {
     }
 }
 
-/// **The content rectangle, in points** — what the app actually gets to draw
-/// in, with any title bar already subtracted.
-pub fn content_size(frame: &eframe::Frame) -> Option<(f64, f64)> {
-    let window = resolve(frame)?;
-    let content = window.contentRectForFrameRect(window.frame());
-    Some((content.size.width, content.size.height))
-}
-
 /// **Keep the content the size it was, across a decoration change.**
 ///
 /// Adding or removing a title bar changes what a window CONTAINS without
