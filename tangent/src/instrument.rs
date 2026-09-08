@@ -3007,6 +3007,10 @@ pub struct Placed {
 impl Placed {
     /// A clip that plays a whole file from 0:00, edges bare — what the old
     /// single backing track was, and what most callers still mean.
+    ///
+    /// The arrangement builds its own `Placed` with edges and gain, so the
+    /// bare constructor survives only in the tests that place one clip.
+    #[allow(dead_code)]
     pub fn whole(clip: Arc<tangent_record::decode::Clip>, start: u64) -> Self {
         let len = clip.frames() as u64;
         Self {
@@ -11715,6 +11719,12 @@ impl Engine {
     /// `Some` means the plugin came up with its defaults and the user's
     /// preset did not survive — worth saying out loud, because the symptom is
     /// "it keeps forgetting my piano" and nothing else in the app would know.
+    ///
+    /// **Read back by the engine's own tests and by nothing else in the
+    /// binary.** `tangent` is a bin crate, so `pub` roots nothing: an
+    /// accessor the desk happens not to ask for reads as dead however
+    /// thoroughly it is exercised.
+    #[allow(dead_code)]
     pub fn insert_state_error(&self, strip: usize, slot: usize) -> Option<&str> {
         self.insert_state_errors.get(strip)?.get(slot)?.as_deref()
     }
@@ -12415,6 +12425,12 @@ impl Engine {
     /// Loaded is the question, not playing: a take is armed before the
     /// transport rolls, and a track that starts with it would otherwise decide
     /// the take's sources one buffer too late.
+    ///
+    /// **Read back by the engine's own tests and by nothing else in the
+    /// binary.** `tangent` is a bin crate, so `pub` roots nothing: an
+    /// accessor the desk happens not to ask for reads as dead however
+    /// thoroughly it is exercised.
+    #[allow(dead_code)]
     pub fn track_loaded(&self) -> bool {
         self.shared.track_loaded.load(Ordering::Relaxed)
     }
@@ -12839,6 +12855,12 @@ impl Engine {
     /// Whether one bay is currently out of circuit, as the audio thread sees
     /// it. The engine's own answer, for tests and for anything that has to
     /// agree with what is actually being heard rather than with the desk.
+    ///
+    /// **Read back by the engine's own tests and by nothing else in the
+    /// binary.** `tangent` is a bin crate, so `pub` roots nothing: an
+    /// accessor the desk happens not to ask for reads as dead however
+    /// thoroughly it is exercised.
+    #[allow(dead_code)]
     pub fn insert_bypassed(&self, seat: usize, bay: usize) -> bool {
         self.shared
             .insert_bypass
@@ -13762,6 +13784,12 @@ impl Engine {
     ///
     /// Not `max_latency`, which is the narrower number the aligners use. See
     /// both fields on `Shared`.
+    ///
+    /// **Read back by the engine's own tests and by nothing else in the
+    /// binary.** `tangent` is a bin crate, so `pub` roots nothing: an
+    /// accessor the desk happens not to ask for reads as dead however
+    /// thoroughly it is exercised.
+    #[allow(dead_code)]
     pub fn latency_frames(&self) -> ([u32; CHANNELS], u32) {
         (
             std::array::from_fn(|i| self.shared.lane_latency[i].load(Ordering::Relaxed)),

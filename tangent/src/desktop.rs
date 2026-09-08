@@ -12271,6 +12271,15 @@ fn permute_loaded_rows(rows: &mut [Option<String>], order: &[usize]) {
     }
 }
 
+/// The bays a permutation MOVED something into or out of.
+///
+/// `reload_slots_for` wraps it for the caller that has no loaded table, and
+/// both are driven by the reconcile tests rather than by the app: the live
+/// path is `force_insert_reload`, which marks every bay that holds
+/// something. The reasoning both share — an empty bay on both sides of a
+/// move has nothing to do, and marking it costs the reconcile a frame to
+/// find that out — is what the tests hold.
+#[allow(dead_code)]
 fn reload_slots_for_loaded(order: &[usize], bays: usize, loaded: &[Option<String>]) -> Vec<usize> {
     let mut out = Vec::new();
     let held = |strip: usize, bay: usize| -> bool {

@@ -358,6 +358,10 @@ impl Board {
     }
 
     /// The mode frequencies this plate was designed with, lowest first.
+    ///
+    /// The plate's own tests and `string.rs`'s read it; the instrument only
+    /// ever ticks the board, never asks what it was tuned to.
+    #[allow(dead_code)]
     pub fn modes(&self) -> impl Iterator<Item = f32> + '_ {
         self.freq[..self.n].iter().copied()
     }
