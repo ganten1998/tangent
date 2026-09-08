@@ -584,7 +584,7 @@ mod tests {
             ..working()
         };
         let frames = SR as usize;
-        let mut meter_for = |hz: f32| {
+        let meter_for = |hz: f32| {
             let mut comp = Comp::new(SR);
             let key = sine(hz, 1.0, frames, SR);
             let mut main = sine(1_000.0, 0.01, frames, SR);

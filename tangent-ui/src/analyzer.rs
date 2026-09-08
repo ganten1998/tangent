@@ -846,7 +846,7 @@ impl Analyzer {
         // depth below one ceiling, and a column of minuses says the same
         // thing every line. The ceiling and the floor are always labelled.
         let step = if range > 100.0 && plot.height() < 160.0 { 20.0 } else { 10.0 };
-        let thin = Stroke::new(1.0, faint);
+        let thin = Stroke::new(1.0_f32, faint);
         let mut db = 0.0;
         while db <= range + 0.5 {
             let y = y_of(db);
@@ -902,7 +902,7 @@ impl Analyzer {
             let strong = labels.contains(f);
             painter.add(Shape::dashed_line(
                 &[Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
-                Stroke::new(1.0, if strong { faint.gamma_multiply(1.6) } else { faint }),
+                Stroke::new(1.0_f32, if strong { faint.gamma_multiply(1.6) } else { faint }),
                 1.0,
                 3.0,
             ));
@@ -927,7 +927,7 @@ impl Analyzer {
                 );
             }
         }
-        painter.rect_stroke(plot, 0.0, Stroke::new(1.0, faint.gamma_multiply(2.0)), egui::StrokeKind::Inside);
+        painter.rect_stroke(plot, 0.0, Stroke::new(1.0_f32, faint.gamma_multiply(2.0)), egui::StrokeKind::Inside);
 
         // ── the picture ────────────────────────────────────────────────────
         let silent = !self.fed || self.loud_db <= SILENT_DB;
@@ -959,15 +959,15 @@ impl Analyzer {
                         if plot.bottom() - y > 0.6 {
                             painter.line_segment(
                                 [Pos2::new(*x, *y), Pos2::new(*x, plot.bottom())],
-                                Stroke::new(1.0, style.fill),
+                                Stroke::new(1.0_f32, style.fill),
                             );
                         }
                     }
                     if self.cfg.peak != Peak::Off {
-                        painter.add(Shape::line(hold, Stroke::new(1.0, dim)));
+                        painter.add(Shape::line(hold, Stroke::new(1.0_f32, dim)));
                     }
-                    painter.add(Shape::line(line.clone(), Stroke::new(3.0, style.glow)));
-                    painter.add(Shape::line(line, Stroke::new(1.4, ink)));
+                    painter.add(Shape::line(line.clone(), Stroke::new(3.0_f32, style.glow)));
+                    painter.add(Shape::line(line, Stroke::new(1.4_f32, ink)));
                 }
                 Mode::Third | Mode::Octave => {
                     let (centres, levels, peaks, width): (&[f32], &[f32], &[f32], f32) =
@@ -992,7 +992,7 @@ impl Analyzer {
                             );
                             painter.line_segment(
                                 [Pos2::new(x0, y), Pos2::new(x1, y)],
-                                Stroke::new(1.4, ink),
+                                Stroke::new(1.4_f32, ink),
                             );
                         }
                         if self.cfg.peak != Peak::Off {
@@ -1000,7 +1000,7 @@ impl Analyzer {
                             if plot.bottom() - yp > 0.5 {
                                 painter.line_segment(
                                     [Pos2::new(x0, yp), Pos2::new(x1, yp)],
-                                    Stroke::new(1.0, dim),
+                                    Stroke::new(1.0_f32, dim),
                                 );
                             }
                         }
@@ -1069,7 +1069,7 @@ impl Analyzer {
             let hz = self.hz_of_x(x);
             painter.line_segment(
                 [Pos2::new(p.x, plot.top()), Pos2::new(p.x, plot.bottom())],
-                Stroke::new(1.0, dim),
+                Stroke::new(1.0_f32, dim),
             );
             let level = if silent { None } else { Some(self.level_at(x)) };
             let words = match level {

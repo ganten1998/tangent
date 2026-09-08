@@ -1384,7 +1384,7 @@ impl Layout {
         // clips on it resolve to nothing through `clip_rect`'s filter.
         let mut rows: Vec<Row> = Vec::with_capacity(CHANNELS + 1);
         let mut y = lanes_area.top();
-        let mut push = |kind: RowKind, h: f32, y: &mut f32, rows: &mut Vec<Row>| {
+        let push = |kind: RowKind, h: f32, y: &mut f32, rows: &mut Vec<Row>| {
             let bottom = *y + h;
             // Wholly inside, or not at all: a half-height lane at the bottom
             // edge is a control you cannot read and a clip you cannot aim at.
@@ -3777,7 +3777,7 @@ fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, bypassed: bool, p
     painter.rect_stroke(
         r,
         2.0,
-        Stroke::new(1.0, ink.gamma_multiply(0.4)),
+        Stroke::new(1.0_f32, ink.gamma_multiply(0.4)),
         egui::StrokeKind::Inside,
     );
     // **The amber bar down the left edge, on a bypassed bay only.**
@@ -4493,14 +4493,14 @@ fn draw_auto_headers(
                         Pos2::new(row.header.left(), row.header.top()),
                         Pos2::new(row.header.right(), row.header.top()),
                     ],
-                    Stroke::new(1.0, auto_header_seam(&p)),
+                    Stroke::new(1.0_f32, auto_header_seam(&p)),
                 );
             }
             if auto.selected {
                 painter.rect_stroke(
                     row.header.shrink(1.0),
                     2.0,
-                    Stroke::new(1.2, crate::recorder_panel::selection_rim(face)),
+                    Stroke::new(1.2_f32, crate::recorder_panel::selection_rim(face)),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -4531,7 +4531,7 @@ fn draw_auto_headers(
                 if auto.armed {
                     painter.circle_filled(c, rad, p.arm);
                 }
-                painter.circle_stroke(c, rad, Stroke::new(1.0, quiet(ink, face, 0.30)));
+                painter.circle_stroke(c, rad, Stroke::new(1.0_f32, quiet(ink, face, 0.30)));
             }
             // **M** — the row's mute. It said B for bypass, which is the
             // same switch under a name only this app used: what it does is
@@ -4790,7 +4790,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     Pos2::new(row.lane.left(), row.lane.top()),
                     Pos2::new(row.lane.right(), row.lane.top()),
                 ],
-                Stroke::new(1.0, auto_seam(&p, lane)),
+                Stroke::new(1.0_f32, auto_seam(&p, lane)),
             );
         }
         // **Its HEADER is not drawn here**, and that is the whole point of
@@ -4841,7 +4841,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 Pos2::new(x, l.ruler.bottom() - 4.0),
                 Pos2::new(x, l.ruler.bottom()),
             ],
-            Stroke::new(1.0, p.faint),
+            Stroke::new(1.0_f32, p.faint),
         );
         if x - last_label < room {
             continue;
@@ -4932,7 +4932,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     // is the strong line (full ink); below it FADES — the
                     // old comment had it backwards, which is why "stark"
                     // never arrived however the base colour moved.
-                    Stroke::new(if w >= 1.0 { 1.6 } else { 1.0 }, p.grid.gamma_multiply(w)),
+                    Stroke::new(if w >= 1.0 { 1.6_f32 } else { 1.0_f32 }, p.grid.gamma_multiply(w)),
                 );
             }
         };
@@ -5017,7 +5017,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 Pos2::new(left, row.bottom()),
                 Pos2::new(row.right(), row.bottom()),
             ],
-            Stroke::new(1.0, p.seam.gamma_multiply(1.25)),
+            Stroke::new(1.0_f32, p.seam.gamma_multiply(1.25)),
         );
     }
 
@@ -5035,7 +5035,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             painter.rect_stroke(
                 *row,
                 0.0,
-                Stroke::new(1.5, p.select.gamma_multiply(0.85)),
+                Stroke::new(1.5_f32, p.select.gamma_multiply(0.85)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -5108,7 +5108,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 // Dashed would say "not real"; this level IS what plays. It
                 // is drawn quieter than a written curve because nothing has
                 // been written yet.
-                Stroke::new(1.2, curve.gamma_multiply(0.55)),
+                Stroke::new(1.2_f32, curve.gamma_multiply(0.55)),
             );
             continue;
         }
@@ -5149,7 +5149,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if a.x.max(b.x) < row.lane.left() || a.x.min(b.x) > row.lane.right() {
                 continue;
             }
-            painter.line_segment([a, b], Stroke::new(1.5, curve));
+            painter.line_segment([a, b], Stroke::new(1.5_f32, curve));
         }
         // **The handles, clipped to their own row.**
         //
@@ -5179,7 +5179,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             painter.circle_filled(at, if hot { AUTO_POINT_R + 1.0 } else { AUTO_POINT_R }, curve);
             // A ring in the ground's own colour, so two points close
             // together read as two rather than as a blob.
-            painter.circle_stroke(at, AUTO_POINT_R, Stroke::new(1.0, ground));
+            painter.circle_stroke(at, AUTO_POINT_R, Stroke::new(1.0_f32, ground));
             // **Chosen wears the selection rim**, the one a chosen track and
             // a chosen automation row already wear — outside the ground ring
             // so it reads at the sizes these handles actually are.
@@ -5187,7 +5187,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 painter.circle_stroke(
                     at,
                     AUTO_POINT_R + 2.0,
-                    Stroke::new(1.4, crate::recorder_panel::selection_rim(ground)),
+                    Stroke::new(1.4_f32, crate::recorder_panel::selection_rim(ground)),
                 );
             }
             // **The value, over the point being dragged.**
@@ -5242,7 +5242,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             painter.rect_filled(row.lane, 0.0, ground);
             painter.line_segment(
                 [row.lane.left_bottom(), row.lane.right_bottom()],
-                Stroke::new(1.0, p.seam),
+                Stroke::new(1.0_f32, p.seam),
             );
             let mut curve = p.playhead;
             for _ in 0..8 {
@@ -5286,7 +5286,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 if a.x.max(b.x) < row.lane.left() || a.x.min(b.x) > row.lane.right() {
                     continue;
                 }
-                painter.line_segment([a, b], Stroke::new(1.5, curve));
+                painter.line_segment([a, b], Stroke::new(1.5_f32, curve));
             }
             let font = FontId::new(
                 (row.lane.height() * 0.34).clamp(7.0, 11.0),
@@ -5303,7 +5303,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 }
                 let hot = view.tempo_hot == Some(i);
                 painter.circle_filled(at, if hot { AUTO_POINT_R + 1.0 } else { AUTO_POINT_R }, curve);
-                painter.circle_stroke(at, AUTO_POINT_R, Stroke::new(1.0, ground));
+                painter.circle_stroke(at, AUTO_POINT_R, Stroke::new(1.0_f32, ground));
                 // The number beside the handle, so a lane read at a glance
                 // says what it is and not merely that something happens.
                 if font.size >= 7.0 && (hot || pts.len() <= 24) {
@@ -5394,7 +5394,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     Pos2::new(x, chip.bottom()),
                     Pos2::new(x, l.ruler.bottom()),
                 ],
-                Stroke::new(1.0, p.engrave.gamma_multiply(0.55)),
+                Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.55)),
             );
             let face = if typing.is_some() { p.select } else { p.face };
             // Square, and the ink chosen from what the fill PRESENTS rather
@@ -5463,7 +5463,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     Pos2::new(x, flag.bottom()),
                     Pos2::new(x, l.ruler.bottom()),
                 ],
-                Stroke::new(1.0, body),
+                Stroke::new(1.0_f32, body),
             );
             // **The held one is SOLID; the rest are translucent.**
             //
@@ -5576,7 +5576,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 while x < r.right() - 3.0 {
                     painter.line_segment(
                         [Pos2::new(x, mid), Pos2::new((x + 4.0).min(r.right() - 3.0), mid)],
-                        Stroke::new(1.0, clip_ink.gamma_multiply(0.5)),
+                        Stroke::new(1.0_f32, clip_ink.gamma_multiply(0.5)),
                     );
                     x += 8.0;
                 }
@@ -5650,7 +5650,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 let y1 = mid - lo.clamp(-1.0, 1.0) * half;
                 painter.line_segment(
                     [Pos2::new(x, y0.min(y1)), Pos2::new(x, y1.max(y0) + 0.5)],
-                    Stroke::new(1.0, ink),
+                    Stroke::new(1.0_f32, ink),
                 );
             }
         }
@@ -5666,7 +5666,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             ));
             painter.line_segment(
                 [Pos2::new(r.left(), r.bottom()), Pos2::new(fx, r.top())],
-                Stroke::new(1.0, clip_ink),
+                Stroke::new(1.0_f32, clip_ink),
             );
         }
         if clip.fade_out_s > 0.0 {
@@ -5679,7 +5679,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             ));
             painter.line_segment(
                 [Pos2::new(fx, r.top()), Pos2::new(r.right(), r.bottom())],
-                Stroke::new(1.0, clip_ink),
+                Stroke::new(1.0_f32, clip_ink),
             );
         }
         // A clip being recorded wears the record's own red, and no handles:
@@ -5688,7 +5688,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             painter.rect_stroke(
                 r,
                 3.0,
-                Stroke::new(1.5, Color32::from_rgb(0xE8, 0x3A, 0x4E)),
+                Stroke::new(1.5_f32, Color32::from_rgb(0xE8, 0x3A, 0x4E)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -5713,9 +5713,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             r,
             3.0,
             if clip.selected {
-                Stroke::new(2.0, p.select)
+                Stroke::new(2.0_f32, p.select)
             } else {
-                Stroke::new(1.0, Color32::from_black_alpha(140))
+                Stroke::new(1.0_f32, Color32::from_black_alpha(140))
             },
             egui::StrokeKind::Inside,
         );
@@ -5786,7 +5786,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                         Pos2::new(x, l.ruler.top()),
                         Pos2::new(x, l.lanes_area.bottom()),
                     ],
-                    Stroke::new(1.0, sel.gamma_multiply(0.8)),
+                    Stroke::new(1.0_f32, sel.gamma_multiply(0.8)),
                 );
             }
         }
@@ -5797,7 +5797,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     if px >= l.lanes_area.left() - 0.5 && px <= l.lanes_area.right() + 0.5 {
         painter.line_segment(
             [Pos2::new(px, l.ruler.top()), Pos2::new(px, l.lanes_area.bottom())],
-            Stroke::new(1.5, p.playhead),
+            Stroke::new(1.5_f32, p.playhead),
         );
         painter.add(egui::Shape::convex_polygon(
             vec![
@@ -5835,7 +5835,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 Pos2::new(l.grip.center().x, l.grip.top() + 6.0),
                 Pos2::new(l.grip.center().x, l.grip.bottom() - 6.0),
             ],
-            Stroke::new(1.0, p.engrave.gamma_multiply(if view.grip_lit { 1.0 } else { 0.55 })),
+            Stroke::new(1.0_f32, p.engrave.gamma_multiply(if view.grip_lit { 1.0 } else { 0.55 })),
         );
     }
     painter.line_segment(
@@ -5843,7 +5843,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             Pos2::new(l.header.right(), rect.top()),
             Pos2::new(l.header.right(), rect.bottom()),
         ],
-        Stroke::new(1.0, p.engrave.gamma_multiply(0.5)),
+        Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.5)),
     );
     // **The automation rows' headers, ON the wood rather than under it.**
     //
@@ -5900,7 +5900,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     Pos2::new(r.panel.left(), r.panel.bottom()),
                     Pos2::new(r.panel.right(), r.panel.bottom()),
                 ],
-                Stroke::new(1.0, ink.gamma_multiply(0.35)),
+                Stroke::new(1.0_f32, ink.gamma_multiply(0.35)),
             );
             // **A** — its automation menu, the same button a track wears,
             // lit while the master is showing any row. Drawn against the
@@ -6066,7 +6066,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 painter.rect_stroke(
                     plate,
                     2.0,
-                    Stroke::new(1.2, crate::recorder_panel::selection_rim(face)),
+                    Stroke::new(1.2_f32, crate::recorder_panel::selection_rim(face)),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -6087,7 +6087,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 painter.rect_stroke(
                     row.panel.shrink(1.0),
                     2.0,
-                    Stroke::new(1.2, crate::recorder_panel::selection_rim(p.empty_ground)),
+                    Stroke::new(1.2_f32, crate::recorder_panel::selection_rim(p.empty_ground)),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -6164,7 +6164,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if lane.armed {
                 painter.circle_filled(c, rad, p.arm);
             }
-            painter.circle_stroke(c, rad, Stroke::new(1.5, ink_on.gamma_multiply(0.8)));
+            painter.circle_stroke(c, rad, Stroke::new(1.5_f32, ink_on.gamma_multiply(0.8)));
         }
         // The name, on its plate — or the rename field mid-typing.
         if row.name.is_positive() {
@@ -6178,7 +6178,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 painter.rect_stroke(
                     row.name,
                     2.0,
-                    Stroke::new(1.0, p.select),
+                    Stroke::new(1.0_f32, p.select),
                     egui::StrokeKind::Inside,
                 );
                 painter.text(
@@ -6435,7 +6435,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 painter.rect_stroke(
                     ghost,
                     3.0,
-                    Stroke::new(1.5, p.select),
+                    Stroke::new(1.5_f32, p.select),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -6583,7 +6583,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         painter.rect_stroke(
             l.tool_nav,
             2.0,
-            Stroke::new(1.0, p.grid.gamma_multiply(2.0)),
+            Stroke::new(1.0_f32, p.grid.gamma_multiply(2.0)),
             egui::StrokeKind::Inside,
         );
         let song = view.song_s.max(view.view_start_s + view.view_len_s).max(1.0e-9);
@@ -6622,7 +6622,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 0.0,
                 // Half a point: the owner wants them THIN — present, not
                 // loud — and the full-width run makes even a hairline read.
-                Stroke::new(0.5, p.face.gamma_multiply(0.35)),
+                Stroke::new(0.5_f32, p.face.gamma_multiply(0.35)),
                 egui::StrokeKind::Inside,
             );
         }

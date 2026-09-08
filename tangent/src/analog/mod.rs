@@ -1193,10 +1193,10 @@ impl Analog {
                         }
                         match model {
                             FilterModel::Ladder => {
-                                self.bank.ladder[g].tick(&x[g], &self.bank.cut[g], &self.bank.k[g], &mut y[g])
+                                self.bank.ladder[g].tick(&x[g], &self.bank.cut[g], &self.bank.k[g], &mut y[g]);
                             }
                             FilterModel::Sem => {
-                                self.bank.sem[g].tick(&x[g], &self.bank.cut[g], &self.bank.damp[g], mode, &mut y[g])
+                                self.bank.sem[g].tick(&x[g], &self.bank.cut[g], &self.bank.damp[g], mode, &mut y[g]);
                             }
                         }
                     }

@@ -3949,7 +3949,7 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
                 painter.rect_stroke(
                     vr,
                     2.0,
-                    Stroke::new(1.5, Color32::from_rgba_unmultiplied(0xff, 0xf4, 0xe0, 200)),
+                    Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(0xff, 0xf4, 0xe0, 200)),
                     StrokeKind::Inside,
                 );
             }
@@ -6513,7 +6513,7 @@ fn draw_tempo(
         painter.rect_stroke(
             l.tempo_tap,
             3.0,
-            Stroke::new(1.0, TEMPO_CAP),
+            Stroke::new(1.0_f32, TEMPO_CAP),
             StrokeKind::Inside,
         );
         painter.text(
@@ -7510,7 +7510,7 @@ mod tests {
             let rightmost = l
                 .targets()
                 .into_iter()
-                .filter(|(rect, p)| {
+                .filter(|(rect, _p)| {
                     rect.is_positive()
                 })
                 .fold(f32::NEG_INFINITY, |acc, (rect, _)| acc.max(rect.right()));
@@ -9775,7 +9775,7 @@ mod tests {
             texture: egui::TextureId::User(7),
             size: Vec2::new(640.0, 480.0),
         };
-        let loaded_track = crate::ports::TrackInfo {
+        let _loaded_track = crate::ports::TrackInfo {
             name: "backing.mp3".to_owned(),
             seconds: 214.0,
             wave: (0..1000)

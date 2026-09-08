@@ -1864,7 +1864,7 @@ fn draw_ir_browser(
     ui.painter().rect_stroke(
         l.browse,
         2.0,
-        egui::Stroke::new(1.0, st.s.edge),
+        egui::Stroke::new(1.0_f32, st.s.edge),
         egui::StrokeKind::Inside,
     );
 

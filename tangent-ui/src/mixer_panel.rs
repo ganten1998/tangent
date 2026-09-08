@@ -1146,7 +1146,7 @@ impl Layout {
         let first = ((px / pitch).floor() as usize).min(shown.saturating_sub(1));
         let frac = px - first as f32 * pitch;
         let last_shown = (first + visible + usize::from(frac > 0.5)).min(shown);
-        let row_h = inner.height();
+        let _row_h = inner.height();
         let strips = std::array::from_fn(|i| {
             let Some(v) = view.strips.get(i) else {
                 return StripStrip::NONE;
@@ -2044,7 +2044,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
             painter.rect_stroke(
                 s.panel,
                 3.0,
-                Stroke::new(1.2, crate::recorder_panel::selection_rim(under)),
+                Stroke::new(1.2_f32, crate::recorder_panel::selection_rim(under)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -2062,7 +2062,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
             painter.rect_stroke(
                 *r,
                 2.0,
-                Stroke::new(1.0, p.engrave.gamma_multiply(0.4)),
+                Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.4)),
                 egui::StrokeKind::Inside,
             );
             centred(
@@ -2170,7 +2170,7 @@ fn strip(
     painter.rect_stroke(
         l.panel,
         3.0,
-        Stroke::new(1.0, p.engrave.gamma_multiply(0.30)),
+        Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.30)),
         egui::StrokeKind::Inside,
     );
     // **A FOLDER is chopped at its top-right** - a 90-degree notch, and
@@ -2183,7 +2183,7 @@ fn strip(
             Pos2::new(l.panel.right() + 1.0, l.panel.top() + CHILD_INDENT),
         );
         painter.rect_filled(notch, 0.0, p.wood);
-        let edge = Stroke::new(1.0, p.engrave.gamma_multiply(0.30));
+        let edge = Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.30));
         painter.line_segment(
             [
                 Pos2::new(notch.left(), l.panel.top()),
@@ -2288,7 +2288,7 @@ fn strip(
         painter.rect_stroke(
             l.name,
             2.0,
-            Stroke::new(1.0, p.lit),
+            Stroke::new(1.0_f32, p.lit),
             egui::StrokeKind::Inside,
         );
         centred(
@@ -2356,7 +2356,7 @@ fn strip(
         painter.rect_stroke(
             l.input_chip,
             2.0,
-            Stroke::new(1.0, p.engrave.gamma_multiply(0.4)),
+            Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.4)),
             egui::StrokeKind::Inside,
         );
         let word = if v.detail.is_empty() { "NO INPUT" } else { v.detail };
@@ -2532,7 +2532,7 @@ fn strip(
         painter.rect_stroke(
             field,
             2.0,
-            Stroke::new(1.0, p.engrave.gamma_multiply(0.30)),
+            Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.30)),
             egui::StrokeKind::Inside,
         );
     }
@@ -2553,7 +2553,7 @@ fn strip(
                     Pos2::new(cell.left() + 1.0, cell.bottom() + 1.0),
                     Pos2::new(cell.right() - 1.0, cell.bottom() + 1.0),
                 ],
-                Stroke::new(1.0, p.engrave.gamma_multiply(0.18)),
+                Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.18)),
             );
         }
         let font = FontId::new(
@@ -2643,7 +2643,7 @@ fn strip(
             painter.rect_stroke(
                 l.db,
                 2.0,
-                Stroke::new(1.0, p.lit),
+                Stroke::new(1.0_f32, p.lit),
                 egui::StrokeKind::Inside,
             );
             centred(painter, l.db, &format!("{buf}_"), db_font, p.engrave);
@@ -2789,7 +2789,7 @@ fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink, number: Option<usize>)
     painter.rect_stroke(
         l.panel,
         3.0,
-        Stroke::new(1.0, p.face.gamma_multiply(0.22)),
+        Stroke::new(1.0_f32, p.face.gamma_multiply(0.22)),
         egui::StrokeKind::Inside,
     );
     // **The number at the top**, in the same ink the plus below it wears —
@@ -2902,7 +2902,7 @@ fn meter(
         );
         painter.line_segment(
             [Pos2::new(bars.left(), y), Pos2::new(bars.right(), y)],
-            Stroke::new(0.5, p.face.gamma_multiply(0.18)),
+            Stroke::new(0.5_f32, p.face.gamma_multiply(0.18)),
         );
     }
 
@@ -3064,7 +3064,7 @@ fn fader(painter: &Painter, r: Rect, gain: f32, face: Color32, p: &Ink) {
     painter.rect_stroke(
         slot,
         slot_w * 0.5,
-        Stroke::new(1.0, p.engrave.gamma_multiply(0.25)),
+        Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.25)),
         egui::StrokeKind::Inside,
     );
 
@@ -3091,14 +3091,14 @@ fn fader(painter: &Painter, r: Rect, gain: f32, face: Color32, p: &Ink) {
                     Pos2::new(slot.left() - 2.0 - len, y),
                     Pos2::new(slot.left() - 2.0, y),
                 ],
-                Stroke::new(1.0, ink),
+                Stroke::new(1.0_f32, ink),
             );
             painter.line_segment(
                 [
                     Pos2::new(slot.right() + 2.0, y),
                     Pos2::new(slot.right() + 2.0 + len, y),
                 ],
-                Stroke::new(1.0, ink),
+                Stroke::new(1.0_f32, ink),
             );
         }
         // Unity, which is the one position a hand looks for and is nowhere
@@ -3110,7 +3110,7 @@ fn fader(painter: &Painter, r: Rect, gain: f32, face: Color32, p: &Ink) {
                 Pos2::new(slot.left() - 1.0, uy),
                 Pos2::new(slot.right() + 1.0, uy),
             ],
-            Stroke::new(1.0, p.cap.gamma_multiply(0.5)),
+            Stroke::new(1.0_f32, p.cap.gamma_multiply(0.5)),
         );
     }
 
@@ -3133,7 +3133,7 @@ fn fader(painter: &Painter, r: Rect, gain: f32, face: Color32, p: &Ink) {
                     Pos2::new(cap.left() + 2.0, ry),
                     Pos2::new(cap.right() - 2.0, ry),
                 ],
-                Stroke::new(0.75, p.cap_rib),
+                Stroke::new(0.75_f32, p.cap_rib),
             );
         }
     }
@@ -3142,7 +3142,7 @@ fn fader(painter: &Painter, r: Rect, gain: f32, face: Color32, p: &Ink) {
             Pos2::new(cap.left() + 1.0, y),
             Pos2::new(cap.right() - 1.0, y),
         ],
-        Stroke::new(1.25, p.engrave.gamma_multiply(0.55)),
+        Stroke::new(1.25_f32, p.engrave.gamma_multiply(0.55)),
     );
 }
 

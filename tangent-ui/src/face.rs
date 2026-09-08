@@ -163,7 +163,7 @@ impl LcdTier {
 /// its own (`draw_timecode_cluster`).
 pub fn lcd_glass(painter: &Painter, r: Rect, st: &FaceStyle) {
     painter.rect_filled(r, 2.0, st.lcd_face);
-    painter.rect_stroke(r, 2.0, Stroke::new(1.0, st.s.edge), StrokeKind::Inside);
+    painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, st.s.edge), StrokeKind::Inside);
 }
 
 /// Ink at a tier — resolved at `FaceStyle::new`, held legible there.
@@ -584,7 +584,7 @@ pub fn gr_meter(painter: &Painter, r: Rect, st: &FaceStyle, gr_db: f32) {
                 egui::pos2(x, inner.top()),
                 egui::pos2(x, inner.top() + inner.height() * 0.18),
             ],
-            Stroke::new(1.0, lcd_ink(st, LcdTier::Label)),
+            Stroke::new(1.0_f32, lcd_ink(st, LcdTier::Label)),
         );
         lcd_text(
             painter,
@@ -627,7 +627,7 @@ pub fn correlation_meter(painter: &Painter, r: Rect, st: &FaceStyle, c: f32) {
     lcd_glass(painter, r, st);
     let pad = (r.height() * 0.18).clamp(3.0, 8.0);
     let inner = r.shrink(pad);
-    let mid = inner.center().x;
+    let _mid = inner.center().x;
     let c = c.clamp(-1.0, 1.0);
     let label_size = fit_mono(
         Rect::from_min_size(inner.min, Vec2::new(inner.width() * 0.12, inner.height())),
@@ -660,7 +660,7 @@ pub fn correlation_meter(painter: &Painter, r: Rect, st: &FaceStyle, c: f32) {
     // The centre mark: always there, so zero has a place to be.
     painter.line_segment(
         [egui::pos2(mid, track.top()), egui::pos2(mid, track.bottom())],
-        Stroke::new(1.0, lcd_ink(st, LcdTier::Label)),
+        Stroke::new(1.0_f32, lcd_ink(st, LcdTier::Label)),
     );
     let x = mid + track.width() * 0.5 * c;
     let bar_h = (track.height() * 0.4).max(3.0);
@@ -830,7 +830,7 @@ pub fn eq_curve(
         let x = hz_to_x(inner, hz);
         painter.line_segment(
             [egui::pos2(x, inner.top()), egui::pos2(x, inner.bottom() - 11.0)],
-            Stroke::new(1.0, lcd_ink(st, LcdTier::Label).gamma_multiply(0.55)),
+            Stroke::new(1.0_f32, lcd_ink(st, LcdTier::Label).gamma_multiply(0.55)),
         );
         let short = if hz >= 1_000.0 {
             format!("{:.0}k", hz / 1_000.0)
@@ -856,7 +856,7 @@ pub fn eq_curve(
         };
         painter.line_segment(
             [egui::pos2(inner.left() + 20.0, y), egui::pos2(inner.right(), y)],
-            Stroke::new(1.0, ink),
+            Stroke::new(1.0_f32, ink),
         );
         lcd_text(
             &painter,
@@ -901,13 +901,13 @@ pub fn eq_curve(
         for i in 1..n {
             painter.line_segment(
                 [pt(i - 1), pt(i)],
-                Stroke::new(3.0, lcd_ink(st, LcdTier::Primary).gamma_multiply(0.22)),
+                Stroke::new(3.0_f32, lcd_ink(st, LcdTier::Primary).gamma_multiply(0.22)),
             );
         }
         for i in 1..n {
             painter.line_segment(
                 [pt(i - 1), pt(i)],
-                Stroke::new(1.4, lcd_ink(st, LcdTier::Primary)),
+                Stroke::new(1.4_f32, lcd_ink(st, LcdTier::Primary)),
             );
         }
     }
@@ -953,7 +953,7 @@ pub fn eq_curve(
         painter.circle_stroke(
             at,
             if hot { 6.0 } else { 5.0 },
-            Stroke::new(1.5, lcd_ink(st, LcdTier::Primary)),
+            Stroke::new(1.5_f32, lcd_ink(st, LcdTier::Primary)),
         );
         lcd_text(
             &painter,
@@ -1064,15 +1064,15 @@ pub fn vectorscope(painter: &Painter, r: Rect, st: &FaceStyle, frames: &[(f32, f
     let c = r.center();
     // The circle, and the axes: M up, S across, the diagonals are the
     // channels themselves.
-    painter.circle_stroke(c, radius, Stroke::new(1.0, lcd_ink(st, LcdTier::Label)));
+    painter.circle_stroke(c, radius, Stroke::new(1.0_f32, lcd_ink(st, LcdTier::Label)));
     let axis = lcd_ink(st, LcdTier::Label).gamma_multiply(0.6);
     painter.line_segment(
         [c - Vec2::new(0.0, radius), c + Vec2::new(0.0, radius)],
-        Stroke::new(1.0, axis),
+        Stroke::new(1.0_f32, axis),
     );
     painter.line_segment(
         [c - Vec2::new(radius, 0.0), c + Vec2::new(radius, 0.0)],
-        Stroke::new(1.0, axis),
+        Stroke::new(1.0_f32, axis),
     );
     let d = radius * std::f32::consts::FRAC_1_SQRT_2;
     lcd_text(painter, c + Vec2::new(-d, -d), Align2::RIGHT_BOTTOM, "L", 9.0, LcdTier::Label, st);
@@ -1106,11 +1106,11 @@ pub fn vectorscope(painter: &Painter, r: Rect, st: &FaceStyle, frames: &[(f32, f
     for (i, &(l, r_)) in frames.iter().enumerate().skip(1) {
         let at = plot(l, r_);
         let (w, ink) = if i >= bright_from {
-            (1.3, hot)
+            (1.3_f32, hot)
         } else if i >= n / 2 {
-            (1.0, mid)
+            (1.0_f32, mid)
         } else {
-            (1.0, dim)
+            (1.0_f32, dim)
         };
         painter.line_segment([prev, at], Stroke::new(w, ink));
         prev = at;
@@ -1165,14 +1165,14 @@ pub(crate) mod fit {
         ] {
             wv.bg_fill = s.raised;
             wv.weak_bg_fill = s.raised;
-            wv.bg_stroke = Stroke::new(1.0, s.edge);
-            wv.fg_stroke = Stroke::new(1.0, s.ink);
+            wv.bg_stroke = Stroke::new(1.0_f32, s.edge);
+            wv.fg_stroke = Stroke::new(1.0_f32, s.ink);
             wv.expansion = 0.0;
         }
         style.visuals.widgets.hovered.bg_fill = s.hover;
         style.visuals.widgets.hovered.weak_bg_fill = s.hover;
         style.visuals.widgets.noninteractive.bg_fill = s.bg;
-        style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, s.ink);
+        style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, s.ink);
         style.visuals.window_fill = s.bg;
         style.visuals.extreme_bg_color = s.well;
         style.visuals.override_text_color = None;
@@ -2360,7 +2360,7 @@ mod tests {
             pressed: down,
             modifiers: egui::Modifiers::NONE,
         };
-        let mut frame = |events: Vec<egui::Event>, live: &mut crate::faces::FaceLive| {
+        let frame = |events: Vec<egui::Event>, live: &mut crate::faces::FaceLive| {
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(screen),
@@ -2507,7 +2507,7 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             }
         };
-        let mut frame = |events: Vec<egui::Event>,
+        let frame = |events: Vec<egui::Event>,
                          live: &mut crate::faces::FaceLive| {
             let _ = ctx.run(
                 egui::RawInput {

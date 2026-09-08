@@ -1756,7 +1756,7 @@ mod shot {
         // fragment and every glyph then samples its neighbour. That is what
         // made the first version of this render text as blobs.
         let mut atlas: Option<(usize, usize, Vec<f32>)> = None;
-        let mut soak = |d: &egui::TexturesDelta, atlas: &mut Option<(usize, usize, Vec<f32>)>| {
+        let soak = |d: &egui::TexturesDelta, atlas: &mut Option<(usize, usize, Vec<f32>)>| {
             for (id, img) in &d.set {
                 if *id != egui::TextureId::Managed(0) {
                     continue;
