@@ -8265,6 +8265,86 @@ impl TangentApp {
     // app owns the document and its saves; decoding and native panels stay
     // the host's. See docs/ARRANGEMENT.md.
 
+    /// **Put back the project the settings remember**, and say whether there
+    /// was one. This is the whole of what a launch owes somebody who quit
+    /// with a song on screen: the same song, at the next launch.
+    ///
+    /// It is its own function because the HOST needs to ask the question and
+    /// then decide. `bootstrap_project` used to hold this road inside itself
+    /// and fall through to making a folder when the answer was no — which is
+    /// the one thing the launch must not do, since "no creating folders
+    /// called untitled PERIOD". So the road is here, it creates nothing, it
+    /// writes nothing, and it answers `false` when there is nothing to
+    /// reopen; the caller owns what happens then. `bootstrap_project` still
+    /// asks it first and still makes the first project when it says no, so
+    /// the road a first launch takes is unchanged.
+    ///
+    /// **The template shelf is refused outright.** A `project_path` naming
+    /// `Projects/Templates/default` is what a crash inside `adopt_template`
+    /// used to leave behind, and reopening one at launch would put the
+    /// session back to standing on the stencil every New is made from —
+    /// exactly the fault `open_project_keeping`'s `KeepPath` doc was written
+    /// about, arriving through the other door. A shelf path answers `false`
+    /// and the caller adopts a fresh session instead, which is what somebody
+    /// in that state wanted anyway.
+    ///
+    /// **No desk snapshot, deliberately.** Every explicit open applies the
+    /// document's own desk; this one must not. At launch the settings ARE
+    /// this project's live desk — they mirror it continuously, control by
+    /// control, and they were written by the session that just quit — so
+    /// applying the snapshot could only roll back whatever was touched after
+    /// the last document write. An open is a session ARRIVING at a document
+    /// it was not standing on; a relaunch is the same session coming back.
+    pub fn reopen_remembered_project(&mut self) -> bool {
+        // The dev hook: an explicit document, no settings touched.
+        if let Some(p) = std::env::var_os("IVORY_ARRANGEMENT_PATH") {
+            self.project_doc = std::path::PathBuf::from(p);
+            self.arrangement = crate::arrangement::Arrangement::load_from(&self.project_doc);
+            self.clips_dirty = true;
+            self.load_drumpad_doc();
+            self.undo_reset();
+            return true;
+        }
+        if self.settings.project_path.is_empty() {
+            return false;
+        }
+        let mut doc = std::path::PathBuf::from(&self.settings.project_path);
+        // A remembered path can go stale by NAME alone - the document
+        // migrated between the canonical and legacy extensions - so a
+        // miss retries the resolver on the same folder before falling
+        // through to a fresh project.
+        if !doc.is_file() {
+            if let Some(dir) = doc.parent() {
+                let resolved = crate::arrangement::doc_in(dir);
+                if resolved.is_file() {
+                    doc = resolved;
+                }
+            }
+        }
+        // A remembered project that is GONE is not an error at launch — the
+        // settings file's own manner with missing files — and a stencil is
+        // not a project. Both fall through to whatever the caller does with
+        // nothing to reopen.
+        if !doc.is_file() || inside_template_shelf(&doc, &self.project_root()) {
+            return false;
+        }
+        // Through the same adoption gate as every explicit open: a
+        // remembered project whose file went bad must be quarantined, not
+        // silently replaced by an empty document that the first implicit
+        // write makes permanent.
+        let (arr, doc) = self.read_for_adoption(&doc);
+        self.project_doc = doc;
+        self.arrangement = arr;
+        self.clips_dirty = true;
+        self.load_drumpad_doc();
+        // **Seed the undo baseline HERE too.** Every road into a document
+        // ends at `undo_reset` — open, save-as, fresh — and this one forgot,
+        // which left `history` empty until the FIRST edit committed its own
+        // post-state as moment zero: launch, delete a clip, Ctrl+Z, nothing.
+        self.undo_reset();
+        true
+    }
+
     /// Open the remembered project, or make the first one — called by the
     /// host once at launch, never in `new` (a test constructing an app must
     /// not create directories in anybody's real music folder).
@@ -8273,52 +8353,8 @@ impl TangentApp {
     /// a remembered backing file becomes the document's first clip, copied
     /// into `media/`, and `track_path` retires — the document owns it now.
     pub fn bootstrap_project(&mut self, projects_root: &std::path::Path) {
-        // The dev hook: an explicit document, no settings touched.
-        if let Some(p) = std::env::var_os("IVORY_ARRANGEMENT_PATH") {
-            self.project_doc = std::path::PathBuf::from(p);
-            self.arrangement = crate::arrangement::Arrangement::load_from(&self.project_doc);
-            self.clips_dirty = true;
-            self.load_drumpad_doc();
-            self.undo_reset();
+        if self.reopen_remembered_project() {
             return;
-        }
-        if !self.settings.project_path.is_empty() {
-            let mut doc = std::path::PathBuf::from(&self.settings.project_path);
-            // A remembered path can go stale by NAME alone - the document
-            // migrated between the canonical and legacy extensions - so a
-            // miss retries the resolver on the same folder before falling
-            // through to a fresh project.
-            if !doc.is_file() {
-                if let Some(dir) = doc.parent() {
-                    let resolved = crate::arrangement::doc_in(dir);
-                    if resolved.is_file() {
-                        doc = resolved;
-                    }
-                }
-            }
-            if doc.is_file() {
-                // Through the same adoption gate as every explicit open: a
-                // remembered project whose file went bad must be
-                // quarantined, not silently replaced by an empty document
-                // that the first implicit write makes permanent.
-                let (arr, doc) = self.read_for_adoption(&doc);
-                self.project_doc = doc;
-                self.arrangement = arr;
-                self.clips_dirty = true;
-                self.load_drumpad_doc();
-                // **Seed the undo baseline HERE too.** Every road into a
-                // document ends at `undo_reset` — open, save-as, fresh —
-                // and this one forgot, which left `history` empty until
-                // the FIRST edit committed its own post-state as moment
-                // zero: launch, delete a clip, Ctrl+Z, nothing. The desk
-                // needs no snapshot first — at launch the settings
-                // already ARE this project's live desk.
-                self.undo_reset();
-                return;
-            }
-            // A remembered project that is GONE falls through to a fresh
-            // one rather than an error at launch — the settings file's own
-            // manner with missing files.
         }
         let dir = fresh_project_dir(projects_root);
         let doc = crate::arrangement::doc_in(&dir);
@@ -37193,6 +37229,181 @@ mod tests {
         let ctx = egui::Context::default();
         let app = TangentApp::new(&ctx, settings, caps);
         (ctx, app)
+    }
+
+    /// **A relaunch puts the owner's song back on the timeline.**
+    ///
+    /// The fault this exists for, in his words: "moscow when loaded now
+    /// contains no clips or media in the arrangement." Nothing was lost —
+    /// `moscow1/project.tan` was whole on disk throughout, twelve MIDI clips
+    /// and 2,354 notes across seven lanes, and every road that reads it read
+    /// it correctly. The launch simply never asked. `open_project_at_launch`
+    /// adopted the shipped template unconditionally, and the road that reads
+    /// `settings.project_path` — `bootstrap_project`, and now this — had
+    /// stopped being called by the host at all, so what the settings
+    /// remembered could not reach the screen. From outside the window that is
+    /// indistinguishable from a song being deleted.
+    ///
+    /// The document here is his, in shape: twelve MIDI clips on lanes 0..=6
+    /// at his own starts and lengths, `named`, with a desk. The assertion is
+    /// deliberately in TWO parts, because "the clips are in memory" is only
+    /// half the claim he was making — the other half is that they are on
+    /// screen, so every clip is put through `clip_rect_in` at three real pane
+    /// sizes and has to come back with somewhere to be drawn. A regression
+    /// that reopens the document and then draws none of it would pass the
+    /// first half alone.
+    ///
+    /// The three refusals are here too, and each is a way this could come
+    /// back worse than it started: nothing remembered (a first launch, which
+    /// must still get its fresh session), a remembered project that has been
+    /// deleted (a launch must not error, and must not stand on a path with no
+    /// file under it), and a path inside the template shelf — what one crash
+    /// inside `adopt_template` leaves behind — which must never be inhabited,
+    /// because from then on every save writes the stencil every New is made
+    /// from.
+    ///
+    /// Revert-check: make `reopen_remembered_project` return `false`
+    /// unconditionally and the first block goes red naming the clip count;
+    /// drop the `inside_template_shelf` clause and the last one does.
+    #[test]
+    fn a_relaunch_puts_the_owners_song_back_on_the_timeline() {
+        use crate::arrangement::{ArrClip, Arrangement, ClipKind};
+        let root = std::env::temp_dir().join(format!(
+            "tangent-relaunch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let projects = root.join("Projects");
+        let dir = projects.join("moscow1");
+        std::fs::create_dir_all(dir.join("media")).expect("the project folder");
+
+        // His twelve, lane and second for second.
+        let his: [(usize, f64, f64); 12] = [
+            (2, 44.314_512_471_655_33, 49.975_147_392_290_246),
+            (3, 48.409_090_909_090_91, 44.129_002_267_573_696),
+            (0, 46.763_151_927_437_64, 49.040_544_217_687_08),
+            (1, 49.295_147_392_290_25, 46.178_684_807_256_23),
+            (4, 52.896_326_530_612_24, 42.579_591_836_734_69),
+            (2, 132.968_820_861_678, 53.150_476_190_476_18),
+            (0, 126.227_664_399_092_96, 59.385_034_013_605_45),
+            (1, 122.785_850_340_136_04, 64.168_344_671_201_82),
+            (3, 129.886_371_882_086_17, 57.051_428_571_428_57),
+            (4, 130.317_505_668_934_25, 55.989_115_646_258_51),
+            (5, 86.399_863_945_578_23, 53.249_160_997_732_42),
+            (6, 83.197_120_181_405_9, 51.745_668_934_240_37),
+        ];
+        let mut arr = Arrangement::default();
+        for (lane, start_s, len_s) in his {
+            arr.add_clip(ArrClip {
+                kind: ClipKind::Midi,
+                lane,
+                start_s,
+                len_s,
+                loop_s: len_s,
+                name: "take".to_owned(),
+                notes: vec![crate::arrangement::ArrNote {
+                    at_s: 0.5,
+                    dur_s: 0.4,
+                    key: 60,
+                    vel: 90,
+                }],
+                ..clip_at("", lane, start_s)
+            });
+        }
+        arr.named = true;
+        arr.desk = Some(TangentApp::template_desk());
+        let doc = crate::arrangement::doc_in(&dir);
+        arr.save_to(&doc);
+
+        // (1) A launch that remembers it puts every clip back.
+        let mut s = Settings::default();
+        s.project_dir = Some(projects.to_string_lossy().into_owned());
+        s.project_path = doc.to_string_lossy().into_owned();
+        // The window he works at, and the lane count he has chosen.
+        s.arr_visible = 10;
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, s.clone());
+        assert!(
+            app.reopen_remembered_project(),
+            "the launch did not reopen the project the settings name"
+        );
+        assert_eq!(
+            app.arrangement.clips.len(),
+            12,
+            "a relaunch came up with {} of his twelve clips — this is the \
+             fault: the document is whole and the launch is not reading it",
+            app.arrangement.clips.len()
+        );
+        assert_eq!(
+            app.project_doc(),
+            Some(doc.as_path()),
+            "the session is standing somewhere other than the project it opened"
+        );
+
+        // (2) And they are DRAWN. In memory is half the claim; the sentence
+        // he wrote was about an empty timeline.
+        for (w, h) in [(1220.0_f32, 500.0_f32), (1300.0, 900.0), (2560.0, 1378.0)] {
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            for c in &clips {
+                assert!(
+                    crate::arrangement_panel::clip_rect_in(&l, &view, c).is_positive(),
+                    "clip {} on lane {} has nowhere to be drawn at {w}x{h}",
+                    c.id,
+                    c.lane
+                );
+            }
+        }
+
+        // (3) A FIRST launch remembers nothing and must say so, so the caller
+        // can hand it the template instead.
+        let mut fresh = Settings::default();
+        fresh.project_dir = Some(projects.to_string_lossy().into_owned());
+        let (_c2, mut blank) = headless_with(Caps::DESKTOP, fresh);
+        assert!(
+            !blank.reopen_remembered_project(),
+            "a launch with nothing remembered claimed to have reopened something"
+        );
+
+        // (4) A remembered project that has been DELETED is not an error and
+        // is not stood on either.
+        let mut gone = s.clone();
+        gone.project_path = projects
+            .join("deleted")
+            .join(crate::arrangement::DOC_NAME)
+            .to_string_lossy()
+            .into_owned();
+        let (_c3, mut orphan) = headless_with(Caps::DESKTOP, gone);
+        assert!(
+            !orphan.reopen_remembered_project(),
+            "a launch reopened a project that is not there"
+        );
+        assert_eq!(
+            orphan.project_doc(),
+            None,
+            "the session took up residence at a path with no document under it"
+        );
+
+        // (5) The STENCIL is refused. A `project_path` naming the shelf is
+        // what a crash inside `adopt_template` leaves; reopening one would
+        // make every save from then on write the template every New is made
+        // from.
+        let shelf = projects.join(TEMPLATE_SHELF).join("default");
+        std::fs::create_dir_all(&shelf).expect("the template shelf");
+        let stencil = crate::arrangement::doc_in(&shelf);
+        Arrangement::default().save_to(&stencil);
+        let mut on_shelf = s.clone();
+        on_shelf.project_path = stencil.to_string_lossy().into_owned();
+        let (_c4, mut standing) = headless_with(Caps::DESKTOP, on_shelf);
+        assert!(
+            !standing.reopen_remembered_project(),
+            "a launch stood the session on the template shelf, where every \
+             save writes the stencil every New is made from"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **A left press picks a flag up and carries it; it never locates.**
