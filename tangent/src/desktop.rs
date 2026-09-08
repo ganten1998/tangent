@@ -10085,12 +10085,24 @@ impl DesktopApp {
     /// taught to read `ClipInfo.peaks` directly; when it does, `arr_waves_
     /// stale` will stop asking and this will simply never run.
     ///
-    /// **Answers whether it really pushed a set of pictures**, because the
-    /// caller has to ask for the frame that draws them and must not ask for
-    /// one it does not need — see `late_change`. With no window there is
-    /// nothing to make a picture FOR, and that road happens on every frame
-    /// for as long as the flag stands: an unconditional repaint there would
-    /// be a window that never rests again.
+    /// **Answers whether it pushed at all**, because the caller has to ask
+    /// for the frame that draws what it pushed and must not ask for one it
+    /// does not need — see `late_change`. With no window on screen there is
+    /// nothing to make a picture FOR and nothing is pushed; that is the
+    /// answer that matters, because the road is walked on EVERY frame for as
+    /// long as the flag stands (no view means `note_waves_drawn` is never
+    /// answered either, so the flag goes on standing), and an unconditional
+    /// repaint there would be a window that never rests again.
+    ///
+    /// **Said exactly: it is "was there a view to draw", not "is this set
+    /// different from the one on screen".** A pass that reaches the end
+    /// answers `true` even when the set it pushed is EMPTY, and that is not
+    /// a slip — a document whose last audio clip has just gone pushes an
+    /// empty set, and the window has to be told to stop drawing the one it
+    /// still has. Answering the sharper question would mean comparing the
+    /// new infos against the last ones pushed, which is a walk of every clip
+    /// on a road that already exists to be cheap; the flag it clears is what
+    /// keeps this from running again.
     fn refresh_pictures(&mut self) -> bool {
         let Some(wave_view) = self.app.arr_wave_view() else {
             return false;
@@ -18698,14 +18710,22 @@ mod tests {
         ctx
     }
 
-    /// **A landing wakes a window that is asleep.**
+    /// **A worker that lands a file wakes a window that is asleep.**
     ///
-    /// The first half of the resting window's bargain: nothing asks for a
-    /// frame while nothing moves, so the crew has to ask for one itself
-    /// when it comes back with a file. A context nobody has touched has no
-    /// repaint pending; one landing is enough to give it one.
+    /// The half of the resting window's bargain that the CREW keeps, and it
+    /// is `DecodePool::hire`'s `wake.request_repaint()` this pins, not
+    /// anything in `late_change` — delete that door entirely and this stays
+    /// green. Named for what it guards, because the guard on the late roads
+    /// themselves is the source scan two tests below and a reader who
+    /// mistook this one for it would think those roads were driven.
+    ///
+    /// Worth its own test all the same: nothing asks for a frame while
+    /// nothing moves, so a decode that comes back on a worker thread has to
+    /// ask for one itself or it is a take that finished behind a window that
+    /// will not draw it. A context nobody has touched has no repaint
+    /// pending; one landing is enough to give it one.
     #[test]
-    fn a_decode_that_lands_asks_a_resting_window_for_a_frame() {
+    fn a_worker_that_lands_a_file_wakes_a_resting_window() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut pool = DecodePool::with_decoder(2, counting_decoder(calls));
         let ctx = rested_context();
@@ -18728,7 +18748,8 @@ mod tests {
     /// them — only when they really changed something.**
     ///
     /// `late_change` is the whole rule in one line, and both halves of it
-    /// matter: no repaint at all is the invisible take above; an
+    /// matter: no repaint at all is the invisible take the crew's own wake
+    /// prevents above; an
     /// unconditional one is the 50 ms tick back under another name, on a
     /// road that is walked on every frame and usually changes nothing.
     #[test]
