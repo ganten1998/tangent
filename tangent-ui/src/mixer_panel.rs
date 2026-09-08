@@ -2191,8 +2191,15 @@ fn strip(
         );
     }
 
-    let cap = |size: f32| FontId::new(size, crate::fonts::courier_bold());
-    let plain = |size: f32| FontId::new(size, crate::fonts::courier());
+    // **Every size on this panel is a fraction of a strip**, which lands
+    // between seven and twelve points — small enough that the face's own cap
+    // height decides whether it can be read at all. `size_scale` is one on
+    // the face the numbers were chosen against and larger on a smaller face;
+    // see `fonts::cap_scale` for the measurements and the owner's report that
+    // this view and the arrangement were "hard to read".
+    let fs = crate::fonts::size_scale(painter.ctx());
+    let cap = |size: f32| FontId::new(size * fs, crate::fonts::courier_bold());
+    let plain = |size: f32| FontId::new(size * fs, crate::fonts::courier());
     let h = l.panel.height();
     // **Everything printed ON the panel, in ink the panel can carry.**
     //
