@@ -18842,6 +18842,81 @@ mod tests {
         assert!(done.wave[col(0.45) * 2 + 1] > 0.8);
     }
 
+    /// **A settled stretched clip is drawn from the RENDER's pyramid, at
+    /// the clip's own seconds.**
+    ///
+    /// The painter maps a clip's seconds one-to-one onto the pyramid it is
+    /// handed — that is the whole contract of `ClipInfo.peaks` — so a clip
+    /// at ratio 2.0 handed the SOURCE file's pyramid would draw its
+    /// waveform at half the time the speakers play it: a transient a bar
+    /// early, and every trim made against a picture that is not the sound.
+    /// The stand-in road above is the deliberate exception and hands over
+    /// no pyramid at all, which is why it is safe.
+    #[test]
+    fn a_settled_stretch_is_drawn_from_the_render_at_the_clips_own_time() {
+        let rate = 48_000usize;
+        // One burst, between 0.2 s and 0.3 s of the FILE.
+        let samples: Vec<f32> = (0..rate)
+            .flat_map(|f| {
+                let t = f as f64 / rate as f64;
+                [if (0.2..0.3).contains(&t) { 0.9 } else { 0.0 }; 2]
+            })
+            .collect();
+        let source = Decoded::of(tangent_record::decode::Clip {
+            samples,
+            rate: 48_000,
+            source: std::path::PathBuf::from("s.wav"),
+        });
+        // What the crew lands in `stretch_cache` for this clip.
+        let rendered = Decoded::of(crate::stretch::stretch(
+            &source.clip,
+            2.0,
+            crate::stretch::Mode::Tape,
+        ));
+        let mut clip = audio_clip(0.0, 0.0, 2.0);
+        clip.stretch = 2.0;
+        let info = clip_picture(&clip, &rendered, 48_000, Some((0.0, 2.0, 200.0f32)), None);
+        let peaks = info.peaks.expect("a settled render hands its pyramid over");
+        assert!(
+            peaks.minmax_s(0.42, 0.58).1 > 0.8,
+            "the burst is not at the second the clip plays it"
+        );
+        assert!(
+            peaks.minmax_s(0.20, 0.30).1 < 0.05,
+            "the burst is still at its FILE time, so the pyramid handed over \
+             is the source's and the waveform disagrees with the audio by \
+             the stretch ratio"
+        );
+        assert!(
+            (peaks.seconds() - 2.0).abs() < 0.01,
+            "the pyramid is a second long, so it is the file's and not the render's"
+        );
+        // And the two roads that BUILD that picture take the render, not the
+        // file. Neither can be driven headless — `DesktopApp` cannot be
+        // built in a test — so the pairing is pinned where it is written:
+        // the value handed over with no stand-in comes out of
+        // `stretch_cache`, never out of `track_cache`.
+        let src = include_str!("desktop.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        for (road, settled) in [
+            (
+                "reload_clips",
+                "if let Some(made) = self.stretch_cache.get(&key) {\n                        (made.clone(), None)",
+            ),
+            (
+                "refresh_pictures",
+                "match self.stretch_cache.get(&key) {\n                        Some(made) => (made, None),",
+            ),
+        ] {
+            assert!(
+                body.contains(settled),
+                "{road} no longer draws a settled stretch from the render's \
+                 own decode; a source pyramid with no stand-in is a waveform \
+                 that lies by the ratio"
+            );
+        }
+    }
+
     /// **What one stretch render costs** — the work a drag used to do per
     /// frame on the UI thread and now does once, on the crew, when the hand
     /// stops. A 60 s stereo clip in each mode. Ignored; run in RELEASE:
