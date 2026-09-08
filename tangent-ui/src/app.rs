@@ -10826,11 +10826,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if !self.arrangement_open {
             return None;
         }
-        let clips = self.arr_clip_views();
-        let view = self.arrange_view(&clips);
-        let l = crate::arrangement_panel::Layout::new(rect, &view);
-        let w = l.lanes_area.width();
-        (w >= 1.0).then_some((view.view_start_s, view.view_len_s, w))
+        // The host asks this every frame; the lanes' width is the frame's
+        // and the window is `arr_window_now`, so neither the clip views nor
+        // the row stack are built to answer it.
+        let f = crate::arrangement_panel::Layout::frame(rect, self.arr_header_w_pt());
+        let w = f.lanes_area.width();
+        let (start, len) = self.arr_window_now();
+        (w >= 1.0).then_some((start, len, w))
     }
 
     /// Whether the pictures are stale enough to be worth redrawing.
@@ -11129,11 +11131,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if !on_lanes && !on_header && !on_strip {
             return;
         }
-        let (zone, axes) = {
+        // One view and one Layout per tick, scalars out — the wheel's rule,
+        // for the same borrow reason.
+        let (zone, axes, s_per_px) = {
             let clips = self.arr_clip_views();
             let view = self.arrange_view(&clips);
             let l = crate::arrangement_panel::Layout::new(rect, &view);
-            if on_lanes {
+            let (zone, axes) = if on_lanes {
                 (l.lanes_area, EdgeAxes::Both)
             } else if on_strip {
                 // The lanes' own rectangle, not the strip's: the strip is a
@@ -11145,13 +11149,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 (l.lanes_area, EdgeAxes::X)
             } else {
                 (l.header, EdgeAxes::Y)
-            }
-        };
-        let step = edge_scroll_step(ctx, zone, p, axes);
-        if step == Vec2::ZERO {
-            return;
-        }
-        if step.x != 0.0 {
+            };
             // Points into seconds through `time_at`, the same pair of calls
             // the wheel over the grid already uses, and out through
             // `arr_steer` — the ONE clamp the horizontal window has.
@@ -11164,17 +11162,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // scroll was a silent no-op. Anywhere inside the field gives the
             // true slope, and the centre is inside it by construction.
             let probe = zone.center().x;
-            let (start, len, s_per_px) = {
-                let clips = self.arr_clip_views();
-                let view = self.arrange_view(&clips);
-                let (start, len) = self.arr_window_now();
-                let a = crate::arrangement_panel::time_at(rect, &view, probe);
-                (
-                    start,
-                    len,
-                    crate::arrangement_panel::time_at(rect, &view, probe + 1.0) - a,
-                )
-            };
+            let a = crate::arrangement_panel::time_at_in(&l, &view, probe);
+            (zone, axes, crate::arrangement_panel::time_at_in(&l, &view, probe + 1.0) - a)
+        };
+        let step = edge_scroll_step(ctx, zone, p, axes);
+        if step == Vec2::ZERO {
+            return;
+        }
+        if step.x != 0.0 {
+            let (start, len) = self.arr_window_now();
             self.arr_steer(start + f64::from(step.x) * s_per_px, len);
         }
         if step.y != 0.0 {
@@ -19113,10 +19109,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .input(|i| i.pointer.hover_pos())
                     .zip(self.arrangement_rect)
                     .is_some_and(|(p, rect)| {
-                        let clips = self.arr_clip_views();
-                        let view = self.arrange_view(&clips);
-                        let l = crate::arrangement_panel::Layout::new(rect, &view);
-                        l.grip.is_positive() && l.grip.contains(p)
+                        // The frame alone: the seam's place does not depend
+                        // on the rows, and this is asked on every frame the
+                        // pointer is anywhere over the panel.
+                        let f = crate::arrangement_panel::Layout::frame(
+                            rect,
+                            self.arr_header_w_pt(),
+                        );
+                        f.grip.is_positive() && f.grip.contains(p)
                     });
             self.arr_grip_lit = dragging || hovering;
             if self.arr_grip_lit {
@@ -19561,12 +19561,30 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // header column (occupied rows, the plus rows, the wood
                 // behind them) is the channels' section. The timeline keeps
                 // the wheel's time-zoom, the owner's ruling. No scrollbar.
-                let over_headers = {
+                //
+                // **One view, one Layout, scalars out.** This block used to
+                // be two — one list of clip views and a Layout for the
+                // header question, another list, two `time_at` Layouts and
+                // a `hit_test` Layout for the axis — on every frame with a
+                // wheel event in it. Everything the branches below need is
+                // a number, and every branch calls `&mut self`, so the
+                // borrow of the views has to END here; that is why it is
+                // one block returning a tuple and not a `view` kept alive.
+                let (over_headers, s_per_px, start, len, over_grid) = {
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
-                    crate::arrangement_panel::Layout::new(rect, &view)
-                        .header
-                        .contains(p)
+                    let l = crate::arrangement_panel::Layout::new(rect, &view);
+                    // Seconds per point through `time_at_in`, guard included:
+                    // a degenerate lanes area answers 0 for both and the pan
+                    // is a no-op, never an `inf` that a balanced diagonal
+                    // turns into a NaN window.
+                    let a = crate::arrangement_panel::time_at_in(&l, &view, p.x);
+                    let s = crate::arrangement_panel::time_at_in(&l, &view, p.x + 1.0) - a;
+                    let over = matches!(
+                        crate::arrangement_panel::hit_test_in(&l, &view, p),
+                        Some(crate::arrangement_panel::Hit::ToolGrid)
+                    );
+                    (l.header.contains(p), s, view.view_start_s, view.view_len_s, over)
                 };
                 if over_headers {
                     // **Combined delta, like the mixer.** Holding Shift makes
@@ -19616,17 +19634,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                     return;
                 }
-                let (anchor, s_per_px, start, len, over_grid) = {
-                    let clips = self.arr_clip_views();
-                    let view = self.arrange_view(&clips);
-                    let a = crate::arrangement_panel::time_at(rect, &view, p.x);
-                    let s = crate::arrangement_panel::time_at(rect, &view, p.x + 1.0) - a;
-                    let over = matches!(
-                        crate::arrangement_panel::hit_test(rect, &view, p),
-                        Some(crate::arrangement_panel::Hit::ToolGrid)
-                    );
-                    (a, s, view.view_start_s, view.view_len_s, over)
-                };
                 let ctrl_alt = alt && ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
                 if over_grid || ctrl_alt {
                     // **The gridbox is turned by the wheel** — up for
@@ -19660,12 +19667,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // five, and the wheel zooms THERE, wherever the hand
                     // rests. A trackpad's sideways component still pans,
                     // because sideways means along.
-                    let _ = anchor;
                     let anchor = self.recorder.position_s;
                     if scroll.x.abs() > 0.0 {
                         self.arr_steer(start - f64::from(scroll.x) * s_per_px, len);
                     }
                     if scroll.y.abs() > 0.0 {
+                        // **From the window as it stands AFTER the pan.** The
+                        // zoom used to scale the `start` read before it, so
+                        // on any event carrying both components — a
+                        // trackpad's ordinary diagonal — this `arr_steer`
+                        // overwrote the one above and the sideways travel
+                        // was lost. Pinned by
+                        // `the_plain_wheel_over_the_lanes_zooms_at_the_playhead_and_a_diagonal_pans_too`.
+                        let (start, len) = self.arr_window_now();
                         let factor = f64::from((-scroll.y * 0.005).exp());
                         self.arr_steer(anchor - (anchor - start) * factor, len * factor);
                     }
@@ -21322,6 +21336,33 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// The header column's width in points — `ArrangeView::header_w`, worked
+    /// out in ONE place.
+    ///
+    /// A dragged width wins; otherwise the default lines the header's right
+    /// edge up with the band's camera/timecode separator — one vertical,
+    /// two surfaces, the owner's word. Its own fn because two per-frame
+    /// callers (the grip's hover check, the host's wave-view question) need
+    /// the panel's `Frame` and nothing else of the view, and `Layout::frame`
+    /// wants exactly this number; the alternative was building every clip
+    /// view and the whole `ArrangeView` to read it.
+    fn arr_header_w_pt(&self) -> Option<f32> {
+        if self.settings.arr_header_w > 0.0 {
+            Some(self.settings.arr_header_w as f32)
+        } else if self.last_band.is_positive() {
+            Some(
+                (crate::recorder_panel::camera_split_x(
+                    self.last_band,
+                    &self.recorder_layout_view(),
+                ) - self.last_band.left()
+                    + 6.0)
+                    .max(150.0),
+            )
+        } else {
+            None
+        }
+    }
+
     fn arrange_view<'a>(
         &'a self,
         clips: &'a [crate::arrangement_panel::ClipView<'a>],
@@ -21544,23 +21585,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .min(self.active_channels().saturating_sub(self.arr_visible())),
             visible_lanes: self.arr_visible(),
             clips,
-            header_w: if self.settings.arr_header_w > 0.0 {
-                Some(self.settings.arr_header_w as f32)
-            } else if self.last_band.is_positive() {
-                // The default lines the header's right edge up with the
-                // band's camera/timecode separator — one vertical, two
-                // surfaces, the owner's word.
-                Some(
-                    (crate::recorder_panel::camera_split_x(
-                        self.last_band,
-                        &self.recorder_layout_view(),
-                    ) - self.last_band.left()
-                        + 6.0)
-                        .max(150.0),
-                )
-            } else {
-                None
-            },
+            header_w: self.arr_header_w_pt(),
             time_sel: self.time_sel,
             selected_channel: self.selected_channel,
             selected_tracks: &self.selected_tracks,
@@ -51867,6 +51892,131 @@ mod tests {
             "the wheel left the desk at {by_wheel} and the shared scroll at \
              {by_hand}"
         );
+    }
+
+    /// One frame carrying a wheel event at `at`, with `mods` held.
+    fn wheel_frame(
+        ctx: &egui::Context,
+        app: &mut TangentApp,
+        at: Pos2,
+        delta: Vec2,
+        mods: egui::Modifiers,
+    ) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                modifiers: mods,
+                events: vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta,
+                        modifiers: mods,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+    }
+
+    /// The lanes area, and seconds per point across it, as the panel maps
+    /// them right now.
+    fn lanes_and_scale(app: &TangentApp, rect: Rect) -> (Rect, f64) {
+        let clips = app.arr_clip_views();
+        let view = app.arrange_view(&clips);
+        let l = crate::arrangement_panel::Layout::new(rect, &view);
+        let x = l.lanes_area.center().x;
+        let a = crate::arrangement_panel::time_at(rect, &view, x);
+        let s = crate::arrangement_panel::time_at(rect, &view, x + 1.0) - a;
+        (l.lanes_area, s)
+    }
+
+    /// **The plain wheel over the lanes zooms at the PLAYHEAD, and a
+    /// sideways component pans first.**
+    ///
+    /// Nothing sent a wheel event over the lanes before this: both wheel
+    /// tests aim at the header column and return in its branch, so the
+    /// zoom, the pans and the gridbox turn below could all have been broken
+    /// by a refactor of the handler and every test stayed green. The rule
+    /// pinned here is the handler's own: `factor = exp(-dy * 0.005)`, the
+    /// window scaled about `recorder.position_s` (the owner's ruling, not the
+    /// pointer), and `x` spent as a pan at the pre-event scale.
+    ///
+    /// The diagonal case also pins a FIX. The branch panned and then zoomed
+    /// from the `start` it had read before the pan, so on any event carrying
+    /// both components — a trackpad's ordinary diagonal — the zoom's
+    /// `arr_steer` overwrote the pan and the sideways travel was lost. The
+    /// zoom now reads the window back after the pan.
+    #[test]
+    fn the_plain_wheel_over_the_lanes_zooms_at_the_playhead_and_a_diagonal_pans_too() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = arrangement_with_a_clip(&ctx, &mut app);
+        app.recorder.position_s = 3.0;
+        let (lanes, s_per_px) = lanes_and_scale(&app, rect);
+        assert!(s_per_px > 0.0, "the lanes have no scale");
+        let at = lanes.center();
+        let (start0, len0) = app.arr_window_now();
+        let anchor = 3.0;
+
+        // Zoom in: a forty-point notch.
+        wheel_frame(&ctx, &mut app, at, Vec2::new(0.0, 40.0), egui::Modifiers::NONE);
+        let factor = f64::from((-40.0f32 * 0.005).exp());
+        let (start1, len1) = app.arr_window_now();
+        assert!((len1 - len0 * factor).abs() < 1.0e-6, "len {len0} -> {len1}, wanted x{factor}");
+        let want = (anchor - (anchor - start0) * factor).max(0.0);
+        assert!((start1 - want).abs() < 1.0e-6, "start {start0} -> {start1}, wanted {want}");
+
+        // A diagonal: thirty points forward AND the same notch. The pan
+        // lands first, at the pre-event scale, and the zoom scales the
+        // PANNED window.
+        let (_, s1) = lanes_and_scale(&app, rect);
+        wheel_frame(&ctx, &mut app, at, Vec2::new(-30.0, 40.0), egui::Modifiers::NONE);
+        let panned = (start1 + 30.0 * s1).max(0.0);
+        let (start2, len2) = app.arr_window_now();
+        assert!((len2 - len1 * factor).abs() < 1.0e-6, "diagonal: len {len1} -> {len2}");
+        let want = (anchor - (anchor - panned) * factor).max(0.0);
+        assert!(
+            (start2 - want).abs() < 1.0e-6,
+            "diagonal: start {start1} -> {start2}, wanted {want} (the pan was lost if it is \
+             {})",
+            (anchor - (anchor - start1) * factor).max(0.0)
+        );
+    }
+
+    /// **Alt+wheel over the lanes PANS**, both axes summed, at the panel's
+    /// own seconds-per-point — and the gridbox is turned by the wheel over
+    /// it. The same handler as the test above, the branches it did not take.
+    #[test]
+    fn alt_wheel_pans_the_lanes_and_the_wheel_over_the_gridbox_turns_it() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let (rect, _) = arrangement_with_a_clip(&ctx, &mut app);
+        // Start away from the rail so a pan either way is visible.
+        app.arr_steer(10.0, 30.0);
+        let (lanes, s_per_px) = lanes_and_scale(&app, rect);
+        let alt = egui::Modifiers { alt: true, ..Default::default() };
+        let (start0, len0) = app.arr_window_now();
+        wheel_frame(&ctx, &mut app, lanes.center(), Vec2::new(12.0, 8.0), alt);
+        let (start1, len1) = app.arr_window_now();
+        assert!((len1 - len0).abs() < 1.0e-9, "an Alt pan changed the zoom: {len0} -> {len1}");
+        let want = start0 - 20.0 * s_per_px;
+        assert!((start1 - want).abs() < 1.0e-6, "Alt pan: {start0} -> {start1}, wanted {want}");
+
+        let grid = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            crate::arrangement_panel::Layout::new(rect, &view).tool_grid
+        };
+        assert!(grid.is_positive(), "no gridbox to aim at");
+        app.settings.arr_grid_exp = 0;
+        wheel_frame(&ctx, &mut app, grid.center(), Vec2::new(0.0, 3.0), egui::Modifiers::NONE);
+        assert_eq!(app.settings.arr_grid_exp, 1, "wheel up over the gridbox did not coarsen");
+        wheel_frame(&ctx, &mut app, grid.center(), Vec2::new(0.0, -3.0), egui::Modifiers::NONE);
+        wheel_frame(&ctx, &mut app, grid.center(), Vec2::new(0.0, -3.0), egui::Modifiers::NONE);
+        assert_eq!(app.settings.arr_grid_exp, -1, "wheel down over the gridbox did not refine");
+        // And the window did not move for it.
+        let (start2, len2) = app.arr_window_now();
+        assert!((start2 - start1).abs() < 1.0e-9 && (len2 - len1).abs() < 1.0e-9);
     }
 }
 

@@ -1171,24 +1171,45 @@ impl HeaderRow {
     };
 }
 
+/// **The frame of the panel: what follows from the rect and the header
+/// width, and from nothing else.**
+///
+/// `Layout::new` needs the whole view to stack the rows — which lanes are
+/// hidden, how many automation rows are open, whether the master shows —
+/// but the header column, the ruler, the chip strip, the lanes area and the
+/// grip fall out of the rect the moment the header width is known. Two
+/// callers ask every frame and want only those: the grip's hover check (is
+/// the pointer on the seam?) and the host's wave-view question (how wide are
+/// the lanes?). Each was building every clip view, the whole `ArrangeView`
+/// and the full row stack to read one rectangle. So the frame is its own
+/// step, and `Layout::new` begins with it — the same expressions, in the
+/// same order, so the two cannot disagree about where the lanes begin.
+#[derive(Debug, Clone, Copy)]
+pub struct Frame {
+    pub header: Rect,
+    pub ruler: Rect,
+    pub meter_strip: Rect,
+    pub lanes_area: Rect,
+    pub grip: Rect,
+    /// The resolved header width and ruler height, kept for the corner cell
+    /// `Layout::new` still lays out itself.
+    header_w: f32,
+    ruler_h: f32,
+}
+
 impl Layout {
-    pub fn new(rect: Rect, view: &ArrangeView<'_>) -> Self {
+    /// See [`Frame`]. `header_w` is `ArrangeView::header_w`: a dragged width,
+    /// or `None` for the automatic share.
+    pub fn frame(rect: Rect, header_w: Option<f32>) -> Frame {
         if !rect.is_positive() {
-            return Self {
+            return Frame {
                 header: Rect::NOTHING,
                 ruler: Rect::NOTHING,
                 meter_strip: Rect::NOTHING,
-                tool_met: Rect::NOTHING,
-                tool_snap: Rect::NOTHING,
-                tool_grid: Rect::NOTHING,
-                tool_tempo: Rect::NOTHING,
-                tool_nav: Rect::NOTHING,
                 lanes_area: Rect::NOTHING,
                 grip: Rect::NOTHING,
-                rows: Vec::new(),
-                lane_rows: [Rect::NOTHING; CHANNELS],
-                header_rows: [HeaderRow::NONE; CHANNELS],
-                master_row: BusRow::NONE,
+                header_w: 0.0,
+                ruler_h: 0.0,
             };
         }
         let (share, lo, hi) = HEADER_W;
@@ -1196,8 +1217,7 @@ impl Layout {
         // hand clamp a min above its max, which is a panic in a painter.
         // A dragged width wins over the automatic share, inside the same
         // sanity bounds.
-        let header_w = view
-            .header_w
+        let header_w = header_w
             .unwrap_or(rect.width() * share)
             .max(lo)
             .min(hi.max(400.0))
@@ -1241,6 +1261,35 @@ impl Layout {
             Pos2::new(field_x, rect.top() + ruler_h),
             rect.max,
         );
+        let grip = Rect::from_min_max(
+            Pos2::new(rect.left() + header_w, rect.top()),
+            Pos2::new(rect.left() + header_w + GRIP_W, rect.bottom()),
+        );
+        Frame { header, ruler, meter_strip, lanes_area, grip, header_w, ruler_h }
+    }
+
+    pub fn new(rect: Rect, view: &ArrangeView<'_>) -> Self {
+        if !rect.is_positive() {
+            return Self {
+                header: Rect::NOTHING,
+                ruler: Rect::NOTHING,
+                meter_strip: Rect::NOTHING,
+                tool_met: Rect::NOTHING,
+                tool_snap: Rect::NOTHING,
+                tool_grid: Rect::NOTHING,
+                tool_tempo: Rect::NOTHING,
+                tool_nav: Rect::NOTHING,
+                lanes_area: Rect::NOTHING,
+                grip: Rect::NOTHING,
+                rows: Vec::new(),
+                lane_rows: [Rect::NOTHING; CHANNELS],
+                header_rows: [HeaderRow::NONE; CHANNELS],
+                master_row: BusRow::NONE,
+            };
+        }
+        // The frame first — see [`Frame`] for why it is its own step.
+        let Frame { header, ruler, meter_strip, lanes_area, grip, header_w, ruler_h } =
+            Self::frame(rect, view.header_w);
         // **Eight lanes show; the rest scroll.** The desk grew past what
         // fits at a legible height, so the height is fixed to `VISIBLE_LANES`
         // and `view.lane_scroll` chooses which window shows. A lane outside
@@ -1515,11 +1564,7 @@ impl Layout {
             tool_tempo,
             tool_nav,
             lanes_area,
-            grip: Rect::from_min_max(
-                Pos2::new(rect.left() + header_w, rect.top()),
-                Pos2::new(rect.left() + header_w + GRIP_W, rect.bottom()),
-            ),
-
+            grip,
             rows,
             lane_rows,
             header_rows,
