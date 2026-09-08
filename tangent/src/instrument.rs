@@ -1537,6 +1537,45 @@ impl PadKit {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// The sampler's one sample
+// ───────────────────────────────────────────────────────────────────────────
+
+/// One sampler bay's audio, handed over whole — the drum kit's bargain for
+/// a unit that holds one sample instead of a hundred and twenty-eight.
+///
+/// **Why the audio travels this road and not the unit's own.** A built-in
+/// unit is built from a sample rate and a list of normalised floats; there is
+/// no float that is a piano. The convolver met this first and answered it by
+/// reading its file HOST-SIDE at load and handing the kernel finished spectra
+/// — which works for an impulse that is loaded once and is a few hundred
+/// kilobytes. A sampler's file is chosen while the session plays, changed
+/// while it plays, and is tens of megabytes; dropping the displaced one runs
+/// `free` on whatever thread let go of it last, and the audio callback must
+/// never be that thread. So this takes the drum kit's protocol instead: the
+/// host pushes a whole sample over a ring, the callback swaps it into the
+/// lane's slot and pushes the displaced one BACK, and the host drops it. The
+/// kernel itself borrows the samples for the length of one block and owns
+/// nothing — see `units::sampler`'s header for the other half of the reason.
+#[derive(Clone)]
+pub struct SamplerSample {
+    // `Arc` and `PathBuf` unqualified: both are already imported at the head
+    // of this module, and `unused_qualifications` is a workspace lint that
+    // `check.sh` runs as `-D warnings`. Same types, one spelling.
+    pub clip: Arc<tangent_record::decode::Clip>,
+    /// What the face prints, and what a preset writes down.
+    pub name: String,
+    /// Where the file came from, so a project can find it again.
+    pub source: PathBuf,
+    /// The MIDI key at which the sample plays at unity speed.
+    pub root_key: u8,
+}
+
+/// Middle C: where a sample plays at the speed it was recorded at until
+/// somebody says otherwise. The one place the figure is written down, so the
+/// face, the state blob and the engine cannot each pick their own.
+pub const SAMPLER_ROOT_KEY: u8 = 60;
+
 /// FTZ + DAZ on this thread (x86 only; a no-op elsewhere). Bit 15 is
 /// flush-to-zero, bit 6 denormals-are-zero — a tail decaying into
 /// subnormals runs orders of magnitude slower on x86 without them.
@@ -2722,6 +2761,12 @@ impl Backend {
         controls: &[Control],
         params: &[tangent_host::ParamPoint],
         transport: crate::analog::arp::Transport,
+        // **The lane's loaded sample**, borrowed for this block and ignored
+        // by every backend but the built-in sampler. A hosted plugin brings
+        // its own library; ours is handed one, and the hand-off is an
+        // argument rather than a field so the audio thread never owns — and
+        // therefore never frees — the samples. See [`SamplerSample`].
+        sample: Option<&SamplerSample>,
         frames: usize,
         bufs: &mut [Vec<f32>],
     ) -> Result<(), String> {
@@ -2786,7 +2831,7 @@ impl Backend {
             // arrives here answers silence, in `BuiltinUnit::process_voice`,
             // rather than passing anything through.
             Backend::Builtin(unit) => {
-                unit.process_voice(notes, controls, params, transport, frames, bufs);
+                unit.process_voice(notes, controls, params, transport, sample, frames, bufs);
                 Ok(())
             }
         }
@@ -3401,6 +3446,13 @@ fn run_rack(
     // polled from the main thread the way a VST3's is.
     shared: &Shared,
     seat: usize,
+    // **This seat's loaded sample, or `None`.** Only a built-in sampler bay
+    // reads it, and only a CHANNEL seat can have one — a pedal seat, a pad
+    // seat and the two master racks are handed `None` at the call, which is
+    // where the "is this a channel" question is already answered. Borrowed
+    // for the block: the engine owns the samples in one per-lane place so a
+    // displaced file is freed on the host thread. See [`SamplerSample`].
+    sample: Option<&SamplerSample>,
     // **The key feed, or `None` on every pass that must not feed.** See
     // [`KeyFeed`]. Disarmed cost is nothing at all: the table is only read
     // when a feed was handed in.
@@ -3546,7 +3598,7 @@ fn run_rack(
             // instrument, and whatever was in `planar` before bay 1 ran is
             // silence or an upstream voice being superseded.
             if p.backend
-                .process_voice(notes, controls, bay_params, transport, frames, &mut p.bufs)
+                .process_voice(notes, controls, bay_params, transport, sample, frames, &mut p.bufs)
                 .is_err()
             {
                 continue;
@@ -3997,6 +4049,14 @@ struct Renderer {
     /// channel now and a bare kit could not say whose it was.
     pad_incoming: Consumer<(usize, PadKit)>,
     pad_retiring: Producer<(usize, PadKit)>,
+    /// **The sampler's file, per lane**, beside the kits above and swapped by
+    /// the same protocol — see [`SamplerSample`] and
+    /// [`Renderer::swap_sampler_samples`]. Indexed by CHANNEL, because a
+    /// sampler is a lane's instrument exactly as a kit is, and two tracks
+    /// each holding one must not share a sound.
+    sampler_samples: Vec<Option<SamplerSample>>,
+    sampler_incoming: Consumer<(usize, Option<SamplerSample>)>,
+    sampler_retiring: Producer<(usize, Option<SamplerSample>)>,
     /// The media explorer's AUDITION: one clip at a time, swapped in like
     /// the kit, played once from the top, summed into the mix.
     preview_incoming: Consumer<Option<Arc<tangent_record::decode::Clip>>>,
@@ -4647,6 +4707,9 @@ impl Renderer {
             &params,
             &self.shared,
             at,
+            // **NOT-A-CHANNEL**, per this function's own note: a bus seat
+            // cannot be a lane and cannot have a sample loaded.
+            None,
             // The bus seats run ONCE per chunk, after the key snapshot was
             // taken — so a keyed master or Fx-bus comp hears the CURRENT
             // chunk's finished stems. See `KeyFeed` for the one-pass rule.
@@ -4671,6 +4734,44 @@ impl Renderer {
             for f in 0..frames {
                 if let (Some(v), Some(s)) = (dst.get_mut(f * TAP_CHANNELS + c), src.get(f)) {
                     *v = *s;
+                }
+            }
+        }
+    }
+
+    /// **Take the sampler files the host has sent, and give back what they
+    /// displace.**
+    ///
+    /// The drumpad's protocol exactly (`mix_pads`'s head), with one
+    /// difference that matters: this runs every callback rather than only
+    /// when something is playing, because a sampler's audio arrives while
+    /// the transport is stopped as often as while it rolls — somebody
+    /// choosing a file in a rested window is the ordinary case.
+    ///
+    /// **Room to give the old one back is checked BEFORE the new one is
+    /// taken.** The rack's `swap` documents why at length: an rtrb push
+    /// returns the value inside its error, so a discarded `Result` DROPS
+    /// what it was carrying — here, tens of megabytes of samples, freed
+    /// between two blocks of audio.
+    ///
+    /// Every arrival is drained in one pass. A session opening with a
+    /// sampler on eight lanes sends eight, and answering one per callback
+    /// would spread the load over eight buffers for no reason: each is a
+    /// pointer move.
+    fn swap_sampler_samples(&mut self) {
+        while self.sampler_retiring.slots() > 0 {
+            let Ok((lane, next)) = self.sampler_incoming.pop() else {
+                break;
+            };
+            match self.sampler_samples.get_mut(lane) {
+                Some(slot) => {
+                    let old = std::mem::replace(slot, next);
+                    let _ = self.sampler_retiring.push((lane, old));
+                }
+                // A lane the desk does not have: hand it straight back
+                // rather than dropping a decoded file on the audio thread.
+                None => {
+                    let _ = self.sampler_retiring.push((lane, next));
                 }
             }
         }
@@ -5018,6 +5119,10 @@ impl Renderer {
             .delay_ns
             .store(heard.saturating_sub(now), Ordering::Relaxed);
         self.swap_plugins();
+        // The sampler's file handoff, in the same breath and for the same
+        // reason: once a callback, before a frame is rendered, so a block
+        // never begins reading one file and ends reading another.
+        self.swap_sampler_samples();
         // The IR wizard's job handoff — once per callback, like the plugin
         // swap above, and before any chunk plays or captures a frame.
         self.take_ir_job();
@@ -5603,6 +5708,8 @@ impl Renderer {
                     &seat_params,
                         &self.shared,
                         Strip::Click.index(),
+                        // The click is a cue seat, not a lane: no sample.
+                        None,
                         // Not a key pass: the click is a cue, and nobody
                         // keys a cue. See `KeyFeed`.
                         None,
@@ -5801,6 +5908,11 @@ impl Renderer {
                             &seat_params,
                             &self.shared,
                             dest,
+                            // A destination CAN be one of the sixteen, so it
+                            // can hold a sampler; handed the same file the
+                            // lane pass hands it, or the bay would play one
+                            // sound on the lane and silence on the send.
+                            self.sampler_samples.get(dest).and_then(Option::as_ref),
                             // NOT a key pass — this is the SEND-BARGAIN's
                             // second run of a rack the lane pass already
                             // fed; feeding it again would clock a keyed
@@ -7060,6 +7172,9 @@ impl Renderer {
                         &seat_params,
                         &self.shared,
                         strip.index(),
+                        self.sampler_samples
+                            .get(strip.index())
+                            .and_then(Option::as_ref),
                         // NOT a key pass: an input strip's seat is fed by
                         // the lane pass in `mix_channels`; this is its
                         // monitor run. See `KeyFeed`.
@@ -8121,6 +8236,8 @@ impl Renderer {
                 &seat_params,
                     &self.shared,
                     rack_at,
+                    // A pad seat is not a lane and has no sample of its own.
+                    None,
                     // Not a key pass in v1: a pad seat is not reachable
                     // from the key picker. See `KeyFeed`.
                     None,
@@ -8213,6 +8330,7 @@ impl Renderer {
                 &seat_params,
                 &self.shared,
                 bus_rack,
+                self.sampler_samples.get(bus_rack).and_then(Option::as_ref),
                 // NOT a key pass — for a non-drum lane this is the seat's
                 // second run per chunk (the sends pass's bargain), and a
                 // pure drum lane's rack runs only here, where v1 does not
@@ -9225,6 +9343,10 @@ impl Renderer {
                 &seat_params,
                     &self.shared,
                     ch,
+                    // **THE road a sampler's audio takes.** This is the pass
+                    // that carries the lane's notes, so it is the pass a
+                    // voice bay renders on.
+                    self.sampler_samples.get(ch).and_then(Option::as_ref),
                     // **THE key pass for a channel's seat** — the one run
                     // per chunk that carries the sidechain, reading LAST
                     // chunk's snapshot (see `key_prev` for the proof that
@@ -9583,6 +9705,9 @@ impl Renderer {
                 &pedal_params,
                 &self.shared,
                 seat,
+                // **NOT-A-CHANNEL:** a pedal seat lives past every channel
+                // index, so it can never have a lane's sample.
+                None,
                 // NOT a key pass: the lane's one feed per chunk belongs to
                 // the channel's own rack. See `KeyFeed`.
                 None,
@@ -9737,6 +9862,10 @@ impl Renderer {
                     &seat_params,
                     &self.shared,
                     ch,
+                    // Still one of the sixteen — see the note above about
+                    // where a folded lane's rack runs — so it keeps its own
+                    // sample, exactly as it keeps its own automation row.
+                    self.sampler_samples.get(ch).and_then(Option::as_ref),
                     // Not a key pass in v1: a folder's rack runs here, after
                     // the chunk's snapshot customers were decided — keying a
                     // bus comp IN a group is a second pass this feature does
@@ -9769,6 +9898,10 @@ impl Renderer {
                         &seat_params,
                         &self.shared,
                         extra,
+                        // **NOT-A-CHANNEL:** a folder's second rack is
+                        // seated past every channel (`folder_extra_seat`),
+                        // so it can never carry a lane's sample.
+                        None,
                         // Not a key pass in v1, exactly as the folder's
                         // first rack above. See `KeyFeed`.
                         None,
@@ -10278,6 +10411,10 @@ pub struct Engine {
     midi_pending: Option<Vec<PlacedMidi>>,
     pad_to_audio: Producer<(usize, PadKit)>,
     pad_from_audio: Consumer<(usize, PadKit)>,
+    /// The sampler's pair, same protocol, same reason: a decoded file is a
+    /// `Vec` of megabytes and the callback may not free one.
+    sampler_to_audio: Producer<(usize, Option<SamplerSample>)>,
+    sampler_from_audio: Consumer<(usize, Option<SamplerSample>)>,
     /// The per-lane instruments' rings, and the host's own record of which
     /// lanes it has shipped one to. The record lives HERE and not in an
     /// atomic because only this thread creates or removes instances; the
@@ -10784,6 +10921,13 @@ impl Engine {
         // The drumpad kit's pair, same capacity, same reason.
         let (pad_to_audio, pad_incoming) = RingBuffer::<(usize, PadKit)>::new(2);
         let (pad_retiring, pad_from_audio) = RingBuffer::<(usize, PadKit)>::new(2);
+        // The sampler's pair. Deeper than the kit's two: a project opening
+        // with a sampler on several lanes delivers them in one frame, and a
+        // ring of two would park all but the first two until the next.
+        let (sampler_to_audio, sampler_incoming) =
+            RingBuffer::<(usize, Option<SamplerSample>)>::new(CHANNELS + 2);
+        let (sampler_retiring, sampler_from_audio) =
+            RingBuffer::<(usize, Option<SamplerSample>)>::new(CHANNELS + 2);
         // The per-lane instruments' pairs. Deeper than the kit's two, because
         // a loading session can legitimately raise every lane at once and the
         // host's diff should land in one frame, not thirty-two.
@@ -10892,6 +11036,9 @@ impl Engine {
             pad_voices: (0..CHANNELS).map(|_| [PadVoice::default(); PADS]).collect(),
             pad_incoming,
             pad_retiring,
+            sampler_samples: (0..CHANNELS).map(|_| None).collect(),
+            sampler_incoming,
+            sampler_retiring,
             preview_incoming,
             preview_retiring,
             preview: None,
@@ -11055,6 +11202,8 @@ impl Engine {
             midi_pending: None,
             pad_to_audio,
             pad_from_audio,
+            sampler_to_audio,
+            sampler_from_audio,
             dx7_to_audio,
             dx7_from_audio,
             keys_to_audio,
@@ -13195,6 +13344,11 @@ impl Engine {
     /// needs somebody to try again. Cheap when there is nothing to do: two
     /// empty pops.
     pub fn retire_tick(&mut self) {
+        // The sampler's displaced files, dropped HERE. `set_sampler_sample`
+        // waits only briefly for its own retiree; anything that arrived
+        // after it gave up is freed on this thread on the next frame,
+        // which is the whole point of the ring.
+        while self.sampler_from_audio.pop().is_ok() {}
         while self.track_from_audio.pop().is_ok() {}
         if let Some(clips) = self.track_pending.take() {
             if let Err(rtrb::PushError::Full(clips)) = self.track_to_audio.push(clips) {
@@ -13228,6 +13382,40 @@ impl Engine {
         let deadline = Instant::now() + RETIRE_TIMEOUT;
         while Instant::now() < deadline {
             if let Ok(old) = self.pad_from_audio.pop() {
+                drop(old);
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The push landed; the retiree is merely late. Delivered.
+        true
+    }
+
+    /// **Hand the audio thread one lane's sampler file**, whole, by the
+    /// kit's own swap protocol — so the displaced sample drops HERE, on the
+    /// host thread, and never in the callback.
+    ///
+    /// `None` empties the bay: a sampler with nothing loaded is silent, which
+    /// is what "the file was deleted" and "the browser was cleared" both
+    /// have to mean.
+    ///
+    /// `true` when the sample was HANDED to the audio thread — the swap
+    /// itself happens on its next block. `false` means the ring was full (a
+    /// stalled callback) and the sample was NOT delivered: the caller must
+    /// retry, or the face draws a waveform over an engine that never got it
+    /// — the drumpad's own lesson, where the pads lit up and struck the DX7.
+    ///
+    /// **`lane` is which channel's sample this is.** A sampler is a lane's
+    /// instrument exactly as a kit is, and two tracks each holding one must
+    /// not share a sound.
+    pub fn set_sampler_sample(&mut self, lane: usize, s: Option<SamplerSample>) -> bool {
+        while self.sampler_from_audio.pop().is_ok() {}
+        if self.sampler_to_audio.push((lane, s)).is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Ok(old) = self.sampler_from_audio.pop() {
                 drop(old);
                 return true;
             }
@@ -16600,6 +16788,9 @@ mod tests {
             pad_voices: (0..CHANNELS).map(|_| [PadVoice::default(); PADS]).collect(),
             pad_incoming: RingBuffer::<(usize, PadKit)>::new(2).1,
             pad_retiring: RingBuffer::<(usize, PadKit)>::new(2).0,
+            sampler_samples: (0..CHANNELS).map(|_| None).collect(),
+            sampler_incoming: RingBuffer::<(usize, Option<SamplerSample>)>::new(2).1,
+            sampler_retiring: RingBuffer::<(usize, Option<SamplerSample>)>::new(2).0,
             preview_incoming: RingBuffer::<Option<Arc<tangent_record::decode::Clip>>>::new(2).1,
             preview_retiring: RingBuffer::<Option<Arc<tangent_record::decode::Clip>>>::new(2).0,
             preview: None,
@@ -16672,7 +16863,7 @@ mod tests {
 
     /// A renderer wired to a live MIDI producer, so events can be queued the way
     /// `send_midi` queues them.
-    fn renderer_with_midi(dev_ch: usize) -> (Renderer, Producer<MidiEvent>, Arc<Shared>) {
+    pub(super) fn renderer_with_midi(dev_ch: usize) -> (Renderer, Producer<MidiEvent>, Arc<Shared>) {
         let shared = Arc::new(Shared::new());
         // **The fresh desk's own shape**: channel 0 is MIDI with the built-in
         // in bay 1, exactly what `Settings::default` produces and the host
@@ -25574,6 +25765,197 @@ mod ir_road {
         assert!(
             rms <= -200.0 && peak <= -200.0,
             "the meter still reads {rms:.1}/{peak:.1} after the stop"
+        );
+    }
+}
+
+// ── the sampler's road, from the host's hand to the lane's bay ──────────────
+#[cfg(test)]
+mod sampler_road {
+    use super::*;
+
+    /// A decoded file that is not silence, named so a test can tell two of
+    /// them apart.
+    fn a_sample(name: &str, value: f32) -> SamplerSample {
+        SamplerSample {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: vec![value; 48_000 * 2],
+                rate: 48_000,
+                source: PathBuf::from(name),
+            }),
+            name: name.to_owned(),
+            source: PathBuf::from(name),
+            root_key: SAMPLER_ROOT_KEY,
+        }
+    }
+
+    /// A rack with a sampler in bay 0, seated exactly as `load_insert` seats
+    /// one: a built-in behind a `Backend`, flagged `voice` from its table row.
+    fn rack_with_a_sampler() -> Rack {
+        let mut inc = Vec::new();
+        let mut ret = Vec::new();
+        for _ in 0..INSERTS {
+            let (_t, i) = RingBuffer::<PluginBox>::new(1);
+            let (r, _f) = RingBuffer::<PluginBox>::new(1);
+            inc.push(i);
+            ret.push(r);
+        }
+        let mut inc = inc.into_iter();
+        let mut ret = ret.into_iter();
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::SAMPLER_PATH)
+            .expect("the sampler is in the table");
+        let mut slots: [PluginBox; INSERTS] = std::array::from_fn(|_| PluginBox(None));
+        slots[0] = PluginBox(Some(Box::new(Hosted {
+            backend: Backend::Builtin(spec.create(48_000.0, &spec.defaults())),
+            bufs: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            channels: TAP_CHANNELS,
+            voice: spec.voice,
+        })));
+        Rack {
+            slots,
+            incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
+            retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
+        }
+    }
+
+    /// **A sampler bay plays the sample it is handed, and only that one.**
+    ///
+    /// The fault this exists for is the one the drum kits met when a second
+    /// drum track arrived: one shared set of samples, so the second lane's
+    /// notes played the first lane's sound. A sampler is a lane's instrument
+    /// in exactly the same way, so the same test has to hold — the sample
+    /// travels to `run_rack` per seat, and two racks fed different files
+    /// must make different sounds from the identical note.
+    #[test]
+    fn a_lane_plays_its_own_sample_and_never_its_neighbours() {
+        let shared = Shared::new();
+        let notes = [Note { offset: 0, pitch: 60, velocity: 1.0, on: true }];
+        let params: [&[tangent_host::ParamPoint]; INSERTS] = [&[], &[], &[]];
+        let level = |sample: Option<&SamplerSample>| -> f32 {
+            let mut rack = rack_with_a_sampler();
+            let mut planar = vec![vec![0.0f32; 512]; TAP_CHANNELS];
+            let mut out = vec![vec![0.0f32; 512]; TAP_CHANNELS];
+            run_rack(
+                &mut rack,
+                &mut planar,
+                512,
+                &mut out,
+                &notes,
+                &[],
+                &params,
+                &shared,
+                0,
+                sample,
+                None,
+            );
+            // The last frame, past the five-millisecond default attack.
+            planar[0][511].abs()
+        };
+        let loud = a_sample("loud.wav", 0.8);
+        let quiet = a_sample("quiet.wav", 0.2);
+        let a = level(Some(&loud));
+        let b = level(Some(&quiet));
+        assert!((a - 0.8).abs() < 0.01, "the loud file played at {a}");
+        assert!((b - 0.2).abs() < 0.01, "the quiet file played at {b}");
+        // And a bay whose file has not arrived is silent rather than
+        // playing whatever the buffers last held.
+        let mut rack = rack_with_a_sampler();
+        let mut planar = vec![vec![0.7f32; 512]; TAP_CHANNELS];
+        let mut out = vec![vec![0.0f32; 512]; TAP_CHANNELS];
+        run_rack(
+            &mut rack, &mut planar, 512, &mut out, &notes, &[], &params, &shared, 0, None, None,
+        );
+        assert!(
+            planar[0].iter().all(|s| *s == 0.0),
+            "an unloaded sampler bay passed its input through instead of replacing it"
+        );
+    }
+
+    /// **A sample swap takes the new file and gives the old one BACK, on the
+    /// lane it belongs to.** The kit's protocol, and the reason for it: a
+    /// decoded file is tens of megabytes and `drop` on the audio callback is
+    /// `free` on the audio callback.
+    #[test]
+    fn a_sample_swap_returns_the_displaced_file_on_its_own_lane() {
+        let (mut r, _tx, _shared) = tests::renderer_with_midi(2);
+        r.sampler_samples[3] = Some(a_sample("first.wav", 0.5));
+        let (mut to, incoming) = RingBuffer::<(usize, Option<SamplerSample>)>::new(2);
+        let (retiring, mut from) = RingBuffer::<(usize, Option<SamplerSample>)>::new(2);
+        r.sampler_incoming = incoming;
+        r.sampler_retiring = retiring;
+        to.push((3, Some(a_sample("second.wav", 0.25))))
+            .expect("room for the sample");
+
+        let mut out = vec![0.0f32; 2 * 512];
+        r.render(&mut out, 0, 0);
+
+        let (lane, old) = from.pop().expect("the displaced sample came back");
+        assert_eq!(lane, 3, "the retired sample came back on the wrong lane");
+        assert_eq!(
+            old.expect("lane 3 had a file").name,
+            "first.wav",
+            "the wrong file was handed back"
+        );
+        assert_eq!(
+            r.sampler_samples[3].as_ref().expect("the new one landed").name,
+            "second.wav"
+        );
+    }
+
+    /// **A sample for a lane the desk does not have goes straight back.**
+    /// The kits' own arm, and the same reason: the alternative to returning
+    /// it is dropping it here, which is the one thing this protocol exists
+    /// to prevent.
+    #[test]
+    fn a_sample_for_a_lane_that_is_not_there_comes_straight_back() {
+        let (mut r, _tx, _shared) = tests::renderer_with_midi(2);
+        let (mut to, incoming) = RingBuffer::<(usize, Option<SamplerSample>)>::new(2);
+        let (retiring, mut from) = RingBuffer::<(usize, Option<SamplerSample>)>::new(2);
+        r.sampler_incoming = incoming;
+        r.sampler_retiring = retiring;
+        to.push((CHANNELS + 7, Some(a_sample("nowhere.wav", 0.5))))
+            .expect("room for the sample");
+
+        let mut out = vec![0.0f32; 2 * 512];
+        r.render(&mut out, 0, 0);
+
+        let (lane, back) = from.pop().expect("the stray sample came back");
+        assert_eq!(lane, CHANNELS + 7);
+        assert_eq!(back.expect("it came back whole").name, "nowhere.wav");
+    }
+
+    /// **The displaced file is freed on the HOST thread, and this measures
+    /// it rather than asserting it.** The `Arc` the test keeps is the
+    /// evidence: while the engine holds the sample there are two owners, and
+    /// after it is replaced and the retire drained there is one — this
+    /// thread's. A count that stayed at two would be a leak; a count that
+    /// fell without `retire_tick` would mean the callback had done the
+    /// freeing, which is the fault.
+    #[test]
+    fn the_engine_hands_a_sample_over_and_drops_the_displaced_one_here() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline engine");
+        let first = a_sample("first.wav", 0.5);
+        let watch = Arc::clone(&first.clip);
+        assert_eq!(Arc::strong_count(&watch), 2, "the test and the sample itself");
+
+        assert!(e.set_sampler_sample(2, Some(first)), "the engine refused the sample");
+        let mut out = vec![0.0f32; 2 * 512];
+        e.render_offline(&mut out);
+        // Handed over: the engine's renderer holds the only other reference.
+        assert_eq!(
+            Arc::strong_count(&watch),
+            2,
+            "the sample did not reach the audio thread whole"
+        );
+
+        assert!(e.set_sampler_sample(2, None), "the engine refused to empty the bay");
+        e.render_offline(&mut out);
+        e.retire_tick();
+        assert_eq!(
+            Arc::strong_count(&watch),
+            1,
+            "the displaced sample is still held somewhere — it was never dropped, \
+             or it was dropped on the audio thread"
         );
     }
 }
