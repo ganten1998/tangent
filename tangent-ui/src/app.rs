@@ -55940,6 +55940,7 @@ mod perf_probes {
                     file_s: take_s,
                     wave_from_s: 0.0,
                     wave_span_s: c.len_s,
+                    peaks: None,
                 },
             );
         }
