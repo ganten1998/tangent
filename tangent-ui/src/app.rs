@@ -406,14 +406,6 @@ const PACE_HOLD: Duration = Duration::from_millis(250);
 /// being the thing you look at while playing.
 const REC_OUTLINE_W: f32 = 2.0;
 
-/// How many timeline tracks a full-screen or tiled window shows.
-///
-/// Ten rather than sixteen: a track row carries a name, three dials, a meter,
-/// four switches and a rack, and sixteen of them on a laptop screen is a row
-/// too short to read any of that. The desk's strips are columns and have no
-/// such floor, so the mixer shows all sixteen.
-const ARR_LANES_FULL: usize = 10;
-
 /// How long after the detached window appears a size mismatch still counts as
 /// the window manager's doing rather than the user's. A tiling WM overrules
 /// the requested size at creation; a person reaching for the window edge takes
@@ -600,7 +592,6 @@ pub struct TangentApp {
     /// Per (SEAT, bay), the built-in compressor's gain-reduction meter in
     /// positive dB — forwarded each frame by the host for open faces.
     insert_gr: HashMap<(usize, usize), f32>,
-    arr_auto_params: HashMap<usize, crate::automation::AutoParam>,
     /// The point under the pointer or being dragged: `(lane, index)`.
     arr_auto_hot: Option<(usize, usize)>,
     /// **The automation row the keyboard is aimed at**, `(lane, slot)`.
@@ -3643,7 +3634,6 @@ impl TangentApp {
             wheel_arr_zoom: WheelSteps::default(),
             wheel_media: WheelSteps::default(),
             insert_gr: HashMap::new(),
-            arr_auto_params: HashMap::new(),
             arr_auto_hot: None,
             arr_auto_sel: None,
             arr_auto_nodes: Vec::new(),
@@ -3696,12 +3686,6 @@ impl TangentApp {
             me.notify(crate::notify::Kind::Error, why);
         }
         me
-    }
-
-    // ── Geometry (spec §3.2, integer truncation like Python) ───────────────
-
-    fn layout_sizes(&self) -> Bands {
-        band_sizes(&self.settings)
     }
 
     /// The channel every note arrives on, whoever is sending.
@@ -3821,7 +3805,7 @@ impl TangentApp {
 
     /// Ask the host for the height this band stack needs, keeping the width.
     ///
-    /// On the desktop the window simply follows `layout_sizes()` on the next
+    /// On the desktop the window simply follows `band_sizes()` on the next
     /// frame. A plugin's editor cannot: nothing resizes it unless it asks, and
     /// `SetSizePercent` was the only thing that ever did. So turning the
     /// guitar view on inside a DAW did not make the editor taller — it made
@@ -6667,18 +6651,6 @@ impl TangentApp {
     }
 
     /// One of the active palette's sixteen, as a bright shade for the heart.
-    /// A colour from a NAMED palette — the animated set's road.
-    fn heart_palette_slot_in(&self, palette: i64, i: usize) -> egui::Color32 {
-        let n = crate::mixer_panel::PALETTES.len();
-        let pal = &crate::mixer_panel::PALETTES[palette.rem_euclid(n as i64) as usize];
-        let idx = pal.slot(i % recorder::CHANNELS);
-        let (r, g, b) = crate::mixer_panel::STRIP_COLORS[idx];
-        recorder_panel::heart_shade(
-            egui::Color32::from_rgb(r, g, b),
-            recorder_panel::band_face(&self.settings),
-        )
-    }
-
     fn heart_palette_slot(&self, i: usize) -> egui::Color32 {
         let idx = self.palette().slot(i % recorder::CHANNELS);
         let (r, g, b) = crate::mixer_panel::STRIP_COLORS[idx];
@@ -13009,6 +12981,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// Step a lane to the next mode.
+    ///
+    /// **Nothing calls this, and that is the finding rather than a reason to
+    /// delete it.** `arr_auto_modes` has no other writer outside the tests,
+    /// so every lane answers `AutoMode::Read` for the life of the process:
+    /// `writes()` is false, `record_automation_move` returns at its guard,
+    /// and `auto_suspend_mask` is always zero. The rest of the mode machinery
+    /// IS wired — the desktop reads the mask every frame, the transport
+    /// releases latches on every stop, and the tests in this file exercise
+    /// all five modes — but no control anywhere offers the row that
+    /// `AutoMode::ALL` describes itself as "the order the row cycles them".
+    /// Automation is written the OTHER way today, by arming one parameter
+    /// (`auto_write_if_armed`, whose doc argues for arming over a global
+    /// write mode), so the shipping feature is whole; it is the modes that
+    /// have no door. Whether that door gets built or the modes come out is
+    /// the owner's call, and deleting the only setter would take the question
+    /// with it.
+    #[allow(dead_code)]
     fn arr_cycle_auto_mode(&mut self, lane: usize) {
         use crate::automation::AutoMode;
         let now = self.arr_auto_mode(lane);
@@ -19550,7 +19539,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.drumpad_claims_pointer(ctx) && self.arr_drag.is_none() {
             return;
         }
-        const MIN: f64 = 0.05;
         let Some(rect) = self.arrangement_rect else {
             return;
         };
@@ -27935,7 +27923,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.current_chord = None;
                 }
                 self.save_settings();
-                // Window resize follows from layout_sizes() on the next pass.
+                // Window resize follows from band_sizes() on the next pass.
                 self.request_natural_size();
             }
             MenuAction::DetachChordWindow => self.detach_chord_window(),
@@ -27971,7 +27959,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.settings.fretboard_detached = true; // remembered for next time
                 }
                 self.save_settings();
-                // The window height follows from layout_sizes() next pass.
+                // The window height follows from band_sizes() next pass.
                 self.voicing_tick(true);
                 self.request_natural_size();
             }
@@ -37889,7 +37877,7 @@ mod tests {
     /// That is the third time this aliasing has shipped.
     #[test]
     fn every_column_writes_its_own_name_and_no_others() {
-        use crate::recorder::{Strip, COLUMNS_FOR_TEST, STRIPS};
+        use crate::recorder::{COLUMNS_FOR_TEST, STRIPS};
         for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             app.commit_mixer_name(col, format!("col{}", col.0));
@@ -40594,7 +40582,7 @@ mod tests {
             assert!(chip.is_positive(), "the first channel wears no input chip");
             chip.center()
         };
-        ctx.run(
+        let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                 events: vec![
@@ -40617,7 +40605,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// **A rename swallows the frame's keys — no track dies to a title.**
     /// Typing "DDD" or hitting Backspace while renaming a lane used to reach
     /// the Delete-track shortcut, because the arrange key gate did not know a
@@ -40760,7 +40747,7 @@ mod tests {
         // Two quick clicks: egui fires the double on the second press.
         for _ in 0..2 {
             for pressed in [true, false] {
-                ctx.run(
+                let _ = ctx.run(
                     egui::RawInput {
                         screen_rect: Some(Rect::from_min_size(
                             Pos2::ZERO,
@@ -40879,7 +40866,7 @@ mod tests {
                 assert!(cell.is_positive(), "master bay {slot} drew nowhere");
                 cell.center()
             };
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                     events: vec![
@@ -40933,7 +40920,7 @@ mod tests {
                     l.header_rows[0].panel.center()
                 }
             };
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                     events: vec![
@@ -40974,7 +40961,7 @@ mod tests {
                 .expect("the view did not open");
             // A press in the covered area, where piano keys live underneath.
             let p = Pos2::new(covered.center().x, covered.bottom() - 10.0);
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                     events: vec![
@@ -45137,7 +45124,7 @@ mod tests {
             app.selected_channel = None;
             app.selected_tracks.clear();
             app.dialog = None;
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                     events: vec![
@@ -45183,7 +45170,7 @@ mod tests {
         let _ = run_frame(&ctx, &mut app);
         let rect = app.mixer_rect.expect("mixer rect");
         let frame = |app: &mut TangentApp, events: Vec<egui::Event>| {
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(
                         Pos2::ZERO,
@@ -45272,7 +45259,7 @@ mod tests {
         let _ = run_frame(&ctx, &mut app);
         let rect = app.arrangement_rect.expect("arrange rect");
         let frame = |app: &mut TangentApp, events: Vec<egui::Event>| {
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(
                         Pos2::ZERO,
@@ -46696,7 +46683,7 @@ mod tests {
 
     /// Turning a band on must make the editor TALLER, not the picture smaller.
     ///
-    /// On the desktop the window follows `layout_sizes()` by itself. A plugin
+    /// On the desktop the window follows `band_sizes()` by itself. A plugin
     /// editor cannot: nothing resizes it unless it asks, and only
     /// `SetSizePercent` ever did. So "Show Fretboard" inside a DAW did not
     /// grow the editor — it shrank the whole layout to fit the height it
@@ -47913,7 +47900,7 @@ mod tests {
             pointer_frame(&ctx, &mut app, Vec::new());
             let r = app.last_drawn;
             assert!(r.is_positive(), "nothing was drawn");
-            let bands = app.layout_sizes();
+            let bands = band_sizes(&app.settings);
             let piano_top = r.min.y + bands.recorder_h + bands.theory_h + bands.chord_h;
             assert!(bands.piano_h > 0.0, "no piano on screen");
             let p = Pos2::new(r.min.x + r.width() * 0.5, piano_top + bands.piano_h * 0.85);
@@ -50579,7 +50566,7 @@ mod tests {").expect("the tests module")];
         for _round in 0..4 {
             for _ in 0..2 {
                 for pressed in [true, false] {
-                    ctx.run(
+                    let _ = ctx.run(
                         egui::RawInput {
                             screen_rect: Some(Rect::from_min_size(
                                 Pos2::ZERO,
@@ -50671,7 +50658,7 @@ mod tests {").expect("the tests module")];
         /// A plain frame with no events. NOT `run_frame`, which pops one
         /// request off the queue and throws it away — the note-off among them.
         fn idle(ctx: &egui::Context, app: &mut TangentApp) {
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                     ..Default::default()
@@ -50690,7 +50677,7 @@ mod tests {").expect("the tests module")];
 
         for _ in 0..2 {
             for pressed in [true, false] {
-                ctx.run(
+                let _ = ctx.run(
                     egui::RawInput {
                         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
                         events: vec![
@@ -57053,19 +57040,19 @@ mod aspect_snap_tests {
         let w = 1300.0_f32;
         let on = Vec2::new(w, aspect_height_at(&settings, w));
         assert!(
-            Self_aspect_none(&settings, on),
+            aspect_none(&settings, on),
             "a size straight off the curve was not recognised as on-aspect"
         );
         // A half-screen tile is not, so a tiler never escapes this way.
         let tiled = Vec2::new(1280.0, 1415.0);
         assert!(
-            !Self_aspect_none(&settings, tiled),
+            !aspect_none(&settings, tiled),
             "a tiled shape looked on-aspect, which would release the latch \
              under a tiling window manager"
         );
     }
 
-    fn Self_aspect_none(settings: &Settings, now: Vec2) -> bool {
+    fn aspect_none(settings: &Settings, now: Vec2) -> bool {
         TangentApp::aspect_snap_for(settings, None, now).is_none()
     }
 

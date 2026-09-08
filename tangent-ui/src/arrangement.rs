@@ -1297,11 +1297,6 @@ impl DeskSnap {
         Value::Object(m)
     }
 
-    /// The desk into a [`Fingerprint`] — `DeskRef::hash_into`, the one walk.
-    fn hash_into(&self, f: &mut Fingerprint) {
-        self.as_ref().hash_into(f);
-    }
-
     fn from_value(v: &Value) -> Option<Self> {
         let m = v.as_object()?;
         let f = |k: &str, d: f64| m.get(k).and_then(Value::as_f64).unwrap_or(d);

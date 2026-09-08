@@ -1937,7 +1937,6 @@ mod tests {
             None
         );
     }
-    use super::*;
 
     /// **A key signature decides both the spelling and what is printed.**
     ///
