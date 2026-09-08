@@ -837,9 +837,42 @@ pub fn eq_curve(
         } else {
             format!("{hz:.0}")
         };
+        // **The end labels are held on the glass, and the word is MEASURED
+        // to hold them there.** The sweep runs edge to edge by construction
+        // — `hz_to_x` puts 20 Hz on `inner.left()` and 20 kHz on
+        // `inner.right()` — so a CENTRED word on either of those lines hangs
+        // half of itself off the end, and the glass is inset only six. "20k"
+        // is three characters wide and painted 2.3 points past the panel at
+        // EVERY width the window can be dragged to, which is the stepped
+        // row's fault over again and invisible for the same reason: egui
+        // clips rather than overdraws, so the picture just quietly lost the
+        // k.
+        //
+        // The half that stayed inside was the worse half. Ink is a property
+        // of the surface it lands on, and a word that is not WHOLLY on the
+        // glass is a word on the dialog's ground wearing the glass's ink:
+        // `LcdTier::Label` is walked to 1.6 against the glass in
+        // `FaceStyle::new` and against nothing else, and on Sandstone it
+        // measures 1.57 on the panel and 1.97 on the glass it was meant for.
+        // Both sweeps caught the same overhang from opposite ends.
+        //
+        // So the label is laid out and its centre held inside the ends,
+        // which moves nothing that already fit and cannot be wrong for a
+        // font this was never sized against — the three the app ships differ
+        // by a point a character. Max-then-min rather than `clamp`, which
+        // asserts when its bounds cross, and a panel narrower than one label
+        // crosses them.
+        let half = painter
+            .layout_no_wrap(short.clone(), FontId::monospace(label_size), Color32::WHITE)
+            .rect
+            .width()
+            * 0.5;
         lcd_text(
             &painter,
-            egui::pos2(x, inner.bottom()),
+            egui::pos2(
+                x.max(inner.left() + half).min(inner.right() - half),
+                inner.bottom(),
+            ),
             Align2::CENTER_BOTTOM,
             &short,
             label_size,
