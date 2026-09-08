@@ -55907,6 +55907,9 @@ mod perf_probes {
         crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
         let _ = ctx.run(Default::default(), |_| {});
         let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+        // Eight lanes on screen, as the panel's own tests draw and as a
+        // desktop window shows: headless, the auto count answers four.
+        app.settings.arr_visible = 8;
         let doc = fx::write_project(size, dir, false);
         app.open_project_keeping(&doc, KeepPath::Leave);
         app.arrangement_open = true;
@@ -56203,6 +56206,29 @@ mod perf_probes {
         })
     }
 
+    /// How many of each kind of shape a frame emitted — what the count is
+    /// made of, so a number can be traced to the code that drew it.
+    fn tally(shapes: &[egui::epaint::ClippedShape]) -> String {
+        fn walk(s: &egui::Shape, n: &mut [usize; 6]) {
+            match s {
+                egui::Shape::Rect(_) => n[0] += 1,
+                egui::Shape::Text(_) => n[1] += 1,
+                egui::Shape::LineSegment { .. } => n[2] += 1,
+                egui::Shape::Path(_) => n[3] += 1,
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, n)),
+                _ => n[5] += 1,
+            }
+            if matches!(s, egui::Shape::Mesh(_)) {
+                n[4] += 1;
+            }
+        }
+        let mut n = [0usize; 6];
+        for c in shapes {
+            walk(&c.shape, &mut n);
+        }
+        format!("rect {} text {} line {} path {} mesh {} other {}", n[0], n[1], n[2], n[3], n[4], n[5] - n[4])
+    }
+
     fn vertices(prims: &[egui::epaint::ClippedPrimitive]) -> (usize, usize) {
         prims.iter().fold((0, 0), |(v, i), p| match &p.primitive {
             egui::epaint::Primitive::Mesh(m) => (v + m.vertices.len(), i + m.indices.len()),
@@ -56252,7 +56278,9 @@ mod perf_probes {
                         .count();
                     shed(&ctx, layer);
                     draw(&painter, r, &view);
-                    let count = shapes(&ctx, layer).len();
+                    let first = shapes(&ctx, layer);
+                    let count = first.len();
+                    let kinds = tally(&first);
                     shed(&ctx, layer);
 
                     let n = reps(size, 30, 20, 10, 6);
@@ -56280,7 +56308,7 @@ mod perf_probes {
                     shed(&ctx, layer);
 
                     println!(
-                        "panel_draw   {tag:<3} {rname:>9} {zname:<10} ({in_view:>4} clips in view, {:>7.1} s): {count:>6} shapes, {verts:>8} verts / {idx:>8} idx -> emit {emit:>10.3?} + tess {tess:>10.3?} = {:>10.3?}  {:>6.1}% frame  [{}]",
+                        "panel_draw   {tag:<3} {rname:>9} {zname:<10} ({in_view:>4} clips in view, {:>7.1} s): {count:>6} shapes ({kinds}), {verts:>8} verts / {idx:>8} idx -> emit {emit:>10.3?} + tess {tess:>10.3?} = {:>10.3?}  {:>6.1}% frame  [{}]",
                         view.view_len_s,
                         emit + tess,
                         pct_frame(emit + tess),
