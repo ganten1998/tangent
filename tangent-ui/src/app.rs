@@ -32303,30 +32303,36 @@ impl TangentApp {
             self.draw_bay_carry(ui.painter(), ui.ctx().pointer_interact_pos());
             // Sixteen strips' worth of tab stops. See `tangent_ui::a11y`.
             //
-            // Both lists built before the call, so the view's borrow of
-            // `self` is done with by the time `offer_to_keyboard` wants it
-            // mutably. They are pure functions of the rect and the view;
-            // hoisting them changes nothing but the borrow.
-            let (nodes, hits) = {
-                let nodes = crate::mixer_panel::a11y_nodes(rect, &view);
+            // **Built only on a frame that installs them.** `offer_nodes`
+            // begins with `if !on { return None }` and `on` was
+            // `reader_mode()`, so for a sighted session every frame with the
+            // desk open laid the desk out twice (once inside `a11y_nodes`,
+            // once for `hits`), formatted a label and a Debug id per control
+            // on sixteen strips, and handed it all to that line to discard.
+            // The timeline's branch below had the same shape and was fixed
+            // the same way: the gate is the SAME predicate `offer_nodes`
+            // was discarding on, asked this frame — not a live AccessKit
+            // query and not a second flag, for the reasons written on that
+            // gate — and the nodes come from the one `targets` walk the map
+            // back from a focused node also needs. Sighted behaviour is
+            // identical (`on_desk` was `None` on those frames before and is
+            // `None` now); in reader mode one Layout replaces two and the
+            // node ids are unchanged, so focus continuity is kept.
+            let on_desk = if !self.reader_mode() {
+                None
+            } else {
                 let hits = crate::mixer_panel::Layout::new(rect, &view).targets();
-                (nodes, hits)
+                let nodes = crate::mixer_panel::a11y_nodes_from(&view, &hits);
+                offer_nodes(ui, true, &nodes, self.settings.white_key_active_color.to_color32())
+                    .and_then(|node| {
+                        // Back to the hit by RECT, which is what both lists
+                        // are keyed on — the nodes are derived from `hits`
+                        // and keep its rects, so this cannot mismatch.
+                        hits.iter()
+                            .find(|(r, _)| *r == node.rect)
+                            .map(|(_, hit)| Focused::Desk { hit: *hit, travel: node.travel })
+                    })
             };
-            let on_desk = offer_nodes(
-                ui,
-                self.reader_mode(),
-                &nodes,
-                self.settings.white_key_active_color.to_color32(),
-            )
-            .and_then(|node| {
-                // Back to the hit by RECT, which is what both lists are keyed
-                // on — `a11y_nodes` walks `targets` and keeps its rects, so
-                // this cannot mismatch without the two having disagreed about
-                // the layout, which they cannot: they build the same one.
-                hits.iter()
-                    .find(|(r, _)| *r == node.rect)
-                    .map(|(_, hit)| Focused::Desk { hit: *hit, travel: node.travel })
-            });
             // A strip mid-carry: the source dims, the target column lights.
             if let Some((from, _, true)) = self.mixer_reorder {
                 let l = crate::mixer_panel::Layout::new(rect, &view);

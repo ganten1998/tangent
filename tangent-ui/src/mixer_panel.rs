@@ -1676,10 +1676,26 @@ impl Layout {
 /// labels is a desk nobody can navigate. Every node here leads with the
 /// channel's own name.
 pub fn a11y_nodes(rect: Rect, view: &MixerView<'_>) -> Vec<crate::a11y::Node> {
+    a11y_nodes_from(view, &Layout::new(rect, view).targets())
+}
+
+/// [`a11y_nodes`] over a target list the caller already has.
+///
+/// **A few hundred nodes were being built and dropped every frame.** The
+/// desk branch of `paint` ran `a11y_nodes` (a Layout and its `targets`) and
+/// then `targets` again for the map back from a focused node to its hit,
+/// and handed the nodes to `offer_nodes`, whose first line returns when no
+/// reader is on — so for everybody but a screen-reader user every frame
+/// with the desk open laid the desk out twice, formatted a label and a
+/// Debug id per control on sixteen strips, and threw them away. The
+/// timeline had the same shape and was fixed first
+/// (`arrangement_panel::a11y_nodes_from`); this is the desk's half. The
+/// nodes are now built only on a frame that will install them, from the
+/// one `targets` walk that frame also needs.
+pub fn a11y_nodes_from(view: &MixerView<'_>, hits: &[(Rect, Hit)]) -> Vec<crate::a11y::Node> {
     use crate::a11y::{Node, Travel};
-    let l = Layout::new(rect, view);
-    let mut out = Vec::new();
-    for (r, hit) in l.targets() {
+    let mut out = Vec::with_capacity(hits.len());
+    for &(r, hit) in hits {
         let Some(col) = hit_column(hit) else { continue };
         let Some(s) = view.strips.get(col.0) else { continue };
         // An empty slot is a plus sign and nothing else; the eight controls
