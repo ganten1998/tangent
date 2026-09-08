@@ -77,7 +77,52 @@ use std::path::PathBuf;
 /// and it is possible: sixty-four bits are not a document. What that costs
 /// decides where a fingerprint may be used and where the exact comparison
 /// has to stay; `TangentApp::project_dirty` writes that split down.
-pub struct Fingerprint(u64);
+///
+/// # The words themselves: the exact form
+///
+/// A [`Fingerprint::recording`] KEEPS every word it mixes, and that list
+/// is exact where the number is not. Two documents whose word lists are
+/// equal write the same text, because the encoding is injective and the
+/// walk mirrors the writer:
+///
+/// * every list is preceded by its length, every string by its byte
+///   length, every optional thing by a tag word — so the words parse back
+///   into exactly one walk;
+/// * a float is its bits, with the writer's own folding of the non-finite
+///   into one word (they are all "no key", or `null`, on the wire);
+/// * and the walk visits every field the writer emits under the writer's
+///   own conditions — the property the oracle tests
+///   `the_fingerprint_moves_when_the_document_moves` and
+///   `the_fingerprint_stands_when_the_document_stands` pin, and now pin
+///   for the words as well as the number.
+///
+/// This is what lets undo keep a document as a struct and still answer
+/// "would the saved file differ?" byte-exactly without serialising it:
+/// compare the words. One walk, kept, costs the notes' four words each
+/// and nothing per note that the fingerprint did not already pay. The
+/// remaining hazard is the one the oracle guards: a field the writer
+/// learns and this walk does not is invisible to BOTH answers, so the
+/// oracle test is not optional.
+///
+/// One exclusion, written down because the words now decide the quit
+/// prompt and not only the asterisk. A clip's `extra` may hold a key this
+/// build OWNS but could not read — a newer build's `stretch` written as an
+/// object, say; `clip_key_is_readable` leaves it where it is — and the
+/// writer emits the field it owns first and an extra only where that name
+/// is absent (`entry().or_insert_with`), so such an extra is walked here
+/// and written nowhere. Two structs that differ only by it write the same
+/// text and hold different words. It cannot be reached inside a session:
+/// the spill happens only in the reader, every moment and the saved
+/// baseline (`saved_point`) descend from the one parse an open makes, and
+/// no road re-parses without `undo_reset`. Closing it properly means
+/// spilling only the keys the writer would emit from `extra`, a
+/// writer-side rule the reader would have to duplicate; until then this
+/// is the line that says so.
+pub struct Fingerprint {
+    acc: u64,
+    /// Every word mixed so far, when this fingerprint is recording.
+    words: Option<Vec<u64>>,
+}
 
 impl Default for Fingerprint {
     fn default() -> Self {
@@ -85,10 +130,19 @@ impl Default for Fingerprint {
     }
 }
 
+/// A large odd seed, so a document whose first word is zero still moves.
+const FINGERPRINT_SEED: u64 = 0x243f_6a88_85a3_08d3;
+
 impl Fingerprint {
-    /// A large odd seed, so a document whose first word is zero still moves.
     pub fn new() -> Self {
-        Self(0x243f_6a88_85a3_08d3)
+        Self { acc: FINGERPRINT_SEED, words: None }
+    }
+
+    /// A fingerprint that also keeps its words — see the type's doc.
+    /// `capacity` is a hint (the previous walk's length, usually) so the
+    /// list is allocated once rather than grown thirty thousand times.
+    pub fn recording(capacity: usize) -> Self {
+        Self { acc: FINGERPRINT_SEED, words: Some(Vec::with_capacity(capacity)) }
     }
 
     /// One word in. rustc's own FxHash step — rotate, mix, multiply by a
@@ -101,7 +155,10 @@ impl Fingerprint {
     /// per word is the difference between a fingerprint that disappears
     /// inside a frame's rounding error and one that does not.
     pub fn u64(&mut self, v: u64) {
-        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+        if let Some(words) = &mut self.words {
+            words.push(v);
+        }
+        self.acc = (self.acc.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
     }
 
     pub fn bool(&mut self, v: bool) {
@@ -205,13 +262,21 @@ impl Fingerprint {
     /// ones are stirred back in once, at the end, rather than thirty
     /// thousand times on the way.
     pub fn finish(self) -> u64 {
-        let mut x = self.0;
+        let mut x = self.acc;
         x ^= x >> 30;
         x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
         x ^= x >> 27;
         x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
         x ^= x >> 31;
         x
+    }
+
+    /// The words and the number, from the one walk. Empty words from a
+    /// fingerprint that was not recording — the caller asked for both, so
+    /// it built one with [`Fingerprint::recording`].
+    pub fn finish_recorded(mut self) -> (Vec<u64>, u64) {
+        let words = self.words.take().unwrap_or_default();
+        (words, self.finish())
     }
 }
 
@@ -223,7 +288,7 @@ impl Fingerprint {
 /// stamp "version 4" on a file still full of version 9's keys, and the build
 /// that wrote them would then run its 4→9 migrations over data that had
 /// already been through them.
-pub const ARRANGEMENT_VERSION: u64 = 6;
+pub const ARRANGEMENT_VERSION: u64 = 7;
 
 /// **Version 5: musical time.**
 ///
@@ -242,6 +307,54 @@ pub const ARRANGEMENT_VERSION: u64 = 6;
 /// pinned to seconds. A migration that helpfully made old MIDI musical would
 /// move notes in songs people have already finished.
 const V5_MUSICAL_TIME: u64 = 5;
+
+/// **Version 7: the desk's seats stop being a dense array.**
+///
+/// `desk.inserts` was one string per bay of the whole seat map — 13,167 of
+/// them since the pads, the folders and the amp pedals got seats — and all
+/// but a handful empty in every document ever written: 132 KB of `""` lines,
+/// 84% of a small project's file and a quarter of a large one, built,
+/// written, parsed, cloned and hashed on every save, open, undo and frame.
+///
+/// From this version the writer puts the first [`HEAD_BAYS`] seats — every
+/// strip and the master, the seats a document has always had — in the
+/// `inserts` array as before, and every occupied seat past them in
+/// `inserts_tail`, an object of `"<bay>": "<path>"` in ascending order.
+/// The reader takes the array at ANY length (a v1 desk, an eighteen-strip
+/// one, a 13,167-entry one, today's 108), the tail if present, and also a
+/// bare object under `inserts` (the fully sparse shape, so no shape this
+/// build could be handed is refused) — and dispatches on the SHAPE it
+/// finds, never on the version stamp: a document keeps a HIGHER stamp than
+/// the build that opens it, so an older build that opens a v7 document and
+/// saves writes `arrangement_version: 7` with a dense array, and that has
+/// to read correctly too.
+///
+/// Why a head array at all, rather than the object alone: an older build
+/// reading a v7 document sees the head — its instruments and channel
+/// effects — and loses only the far seats (per-pad effects, amp pedals) if
+/// it saves; with a bare object it would open every project silent. The
+/// head is written WHOLE, never trailing-trimmed, so its length can never
+/// collide with the era lengths the migrations key on.
+///
+/// A sparse key names ANY bay in twenty bytes, so the reader keeps only
+/// seats inside `INSERT_SPACE` (`DeskSnap::canonical` says why); a seat
+/// past the map is dropped there, never spread over memory sized by it.
+///
+/// In memory the snapshot holds only the occupied seats, sorted by bay
+/// (`DeskSnap::inserts`); the settings keep their dense `strip_inserts`
+/// and the two meet in `DeskRef`, where the walk reads either shape as
+/// the same sequence of occupied seats.
+const V7_SPARSE_SEATS: u64 = 7;
+
+/// The seats a document's desk carries as a plain array: every strip and
+/// the master, `(STRIPS + 1) * INSERTS`. See [`V7_SPARSE_SEATS`].
+pub const HEAD_BAYS: usize = (crate::recorder::STRIPS + 1) * crate::recorder::INSERTS;
+
+// The sixteen-pad era's desk had exactly 84 bays and the lift that carries
+// it keys on that length alone; a head of that length would be lifted as
+// if it were one. The head is 108 today; this is what says so out loud the
+// day the desk changes shape.
+const _: () = assert!(HEAD_BAYS != (11 + 1 + 16) * 3, "the head collides with the sixteen-pad era");
 
 /// Every key a clip object holds that THIS build understands.
 ///
@@ -780,7 +893,13 @@ pub struct DeskSnap {
     pub icons: Vec<u8>,
     pub names: Vec<String>,
     pub colors: Vec<i64>,
-    pub inserts: Vec<String>,
+    /// **The occupied seats only**, `(bay, path)` sorted by bay, never an
+    /// empty path — the `BypassBays` shape. Dense it was 13,167 strings a
+    /// snapshot, copied into every undo moment; see [`V7_SPARSE_SEATS`].
+    /// Kept canonical by every constructor (`from_value` sorts and drops
+    /// empties, `DeskRef::to_snap` filters them, `set_bay` keeps the order)
+    /// so that two desks that write the same text are equal as structs.
+    pub inserts: Vec<(usize, String)>,
     pub sends: Vec<f64>,
     pub muted: u64,
     pub soloed: u64,
@@ -834,7 +953,274 @@ pub struct DeskSnap {
     pub folder_shut: Vec<bool>,
 }
 
+/// **The insert seats a `DeskRef` looks at, in whichever shape their owner
+/// keeps them**: the settings' dense `strip_inserts` (one string per bay,
+/// nearly all empty) or a snapshot's sparse pairs. `iter` yields the
+/// OCCUPIED seats in ascending bay order from either, which is the one
+/// thing the walk and the writer read — so a settings desk and the
+/// snapshot taken from it hash alike without either being converted.
+#[derive(Clone, Copy)]
+pub enum Bays<'a> {
+    Dense(&'a [String]),
+    Sparse(&'a [(usize, String)]),
+}
+
+impl<'a> Bays<'a> {
+    pub fn iter(self) -> BaysIter<'a> {
+        match self {
+            Self::Dense(v) => BaysIter::Dense(v.iter().enumerate()),
+            Self::Sparse(v) => BaysIter::Sparse(v.iter()),
+        }
+    }
+}
+
+/// See [`Bays::iter`].
+pub enum BaysIter<'a> {
+    Dense(std::iter::Enumerate<std::slice::Iter<'a, String>>),
+    Sparse(std::slice::Iter<'a, (usize, String)>),
+}
+
+impl<'a> Iterator for BaysIter<'a> {
+    type Item = (usize, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense(it) => it.find(|(_, p)| !p.is_empty()).map(|(n, p)| (n, p.as_str())),
+            // Canonical pairs hold no empties; the filter is for the
+            // constructor that will not be — an empty seat must not be a
+            // word from either shape, or the two stop hashing alike.
+            Self::Sparse(it) => it.find(|(_, p)| !p.is_empty()).map(|(n, p)| (*n, p.as_str())),
+        }
+    }
+}
+
+/// **The desk by reference** — every field of [`DeskSnap`] borrowed from
+/// wherever it lives, so the once-a-frame fingerprint can walk the LIVE
+/// desk without first cloning thousands of seat strings into a snapshot it
+/// throws away a microsecond later.
+///
+/// This is THE walk, and the one derivation. `DeskSnap::hash_into` goes
+/// through `as_ref`, the snapshot the app takes is built by `to_snap`, and
+/// the app reads its settings into one of these in exactly one function —
+/// so the cheap question (`project_dirty`), the exact one
+/// (`project_dirty_exact`) and the document's own desk all see the same
+/// fields derived the same way. Two walkers over two derivations was the
+/// shape that could disagree, and a disagreement here is a title bar blind
+/// to a fader the quit prompt can see.
+#[derive(Clone, Copy)]
+pub struct DeskRef<'a> {
+    pub kinds: &'a [u8],
+    pub icons: &'a [u8],
+    pub names: &'a [String],
+    pub colors: &'a [i64],
+    pub inserts: Bays<'a>,
+    pub sends: &'a [f64],
+    pub muted: u64,
+    pub soloed: u64,
+    pub gains: &'a [f64],
+    pub pans: &'a [f64],
+    pub inputs: &'a [String],
+    pub drums_gain: f64,
+    pub drums_pan: f64,
+    pub metronome_gain: f64,
+    pub master_gain: f64,
+    pub fx_return: f64,
+    pub tempo_bpm: f64,
+    pub sig_beats: u8,
+    pub sig_unit: u8,
+    pub metronome_on: bool,
+    pub tracks_added: u32,
+    pub is_folder: &'a [bool],
+    pub in_folder: &'a [bool],
+    pub folder_shut: &'a [bool],
+}
+
+impl DeskRef<'_> {
+    /// The one place a desk is copied into an owned snapshot.
+    pub fn to_snap(&self) -> DeskSnap {
+        DeskSnap {
+            kinds: self.kinds.to_vec(),
+            icons: self.icons.to_vec(),
+            names: self.names.to_vec(),
+            colors: self.colors.to_vec(),
+            inserts: self.inserts.iter().map(|(n, p)| (n, p.to_owned())).collect(),
+            sends: self.sends.to_vec(),
+            muted: self.muted,
+            soloed: self.soloed,
+            gains: self.gains.to_vec(),
+            pans: self.pans.to_vec(),
+            inputs: self.inputs.to_vec(),
+            drums_gain: self.drums_gain,
+            drums_pan: self.drums_pan,
+            metronome_gain: self.metronome_gain,
+            master_gain: self.master_gain,
+            fx_return: self.fx_return,
+            tempo_bpm: self.tempo_bpm,
+            sig_beats: self.sig_beats,
+            sig_unit: self.sig_unit,
+            metronome_on: self.metronome_on,
+            tracks_added: self.tracks_added,
+            is_folder: self.is_folder.to_vec(),
+            in_folder: self.in_folder.to_vec(),
+            folder_shut: self.folder_shut.to_vec(),
+        }
+    }
+
+    /// The desk into a [`Fingerprint`], field for field with
+    /// `DeskSnap::to_value`.
+    ///
+    /// **The two walk together or the title bar goes blind.** A field added
+    /// to the struct and to `to_value` but not to here is a desk change no
+    /// comparison can see — the asterisk stays off while a fader stands
+    /// somewhere new. `the_fingerprint_moves_when_the_document_moves`
+    /// is what catches that, and it catches it by MUTATING every field
+    /// rather than by reading this list; `the_cheap_dirty_answer_and_the_
+    /// exact_one_agree` does the same from the settings side.
+    fn hash_into(&self, f: &mut Fingerprint) {
+        f.len(self.kinds.len());
+        for k in self.kinds {
+            f.u64(u64::from(*k));
+        }
+        f.len(self.icons.len());
+        for i in self.icons {
+            f.u64(u64::from(*i));
+        }
+        f.len(self.names.len());
+        for n in self.names {
+            f.str(n);
+        }
+        f.len(self.colors.len());
+        for c in self.colors {
+            f.u64(*c as u64);
+        }
+        // The occupied seats, counted first so the words parse back into
+        // exactly one desk, then each as its bay and its path. The same
+        // pairs from a dense settings vec and from a snapshot, and the
+        // same pairs the writer puts in the head and the tail — a desk of
+        // thirteen thousand empty seats is a handful of words now.
+        f.len(self.inserts.iter().count());
+        for (bay, path) in self.inserts.iter() {
+            f.len(bay);
+            f.str(path);
+        }
+        f.len(self.sends.len());
+        for s in self.sends {
+            f.f64(*s);
+        }
+        f.u64(self.muted);
+        f.u64(self.soloed);
+        f.len(self.gains.len());
+        for g in self.gains {
+            f.f64(*g);
+        }
+        f.len(self.pans.len());
+        for p in self.pans {
+            f.f64(*p);
+        }
+        f.len(self.inputs.len());
+        for i in self.inputs {
+            f.str(i);
+        }
+        f.f64(self.drums_gain);
+        f.f64(self.drums_pan);
+        f.f64(self.metronome_gain);
+        f.f64(self.master_gain);
+        f.f64(self.fx_return);
+        f.f64(self.tempo_bpm);
+        f.u64(u64::from(self.sig_beats));
+        f.u64(u64::from(self.sig_unit));
+        f.bool(self.metronome_on);
+        f.u64(u64::from(self.tracks_added));
+        for v in [self.is_folder, self.in_folder, self.folder_shut] {
+            f.len(v.len());
+            for b in v {
+                f.bool(*b);
+            }
+        }
+    }
+}
+
 impl DeskSnap {
+    /// This snapshot by reference — see [`DeskRef`].
+    pub fn as_ref(&self) -> DeskRef<'_> {
+        DeskRef {
+            kinds: &self.kinds,
+            icons: &self.icons,
+            names: &self.names,
+            colors: &self.colors,
+            inserts: Bays::Sparse(&self.inserts),
+            sends: &self.sends,
+            muted: self.muted,
+            soloed: self.soloed,
+            gains: &self.gains,
+            pans: &self.pans,
+            inputs: &self.inputs,
+            drums_gain: self.drums_gain,
+            drums_pan: self.drums_pan,
+            metronome_gain: self.metronome_gain,
+            master_gain: self.master_gain,
+            fx_return: self.fx_return,
+            tempo_bpm: self.tempo_bpm,
+            sig_beats: self.sig_beats,
+            sig_unit: self.sig_unit,
+            metronome_on: self.metronome_on,
+            tracks_added: self.tracks_added,
+            is_folder: &self.is_folder,
+            in_folder: &self.in_folder,
+            folder_shut: &self.folder_shut,
+        }
+    }
+
+    /// What stands in seat `bay`, if anything. Binary search, since the
+    /// pairs are sorted.
+    pub fn bay(&self, bay: usize) -> Option<&str> {
+        self.inserts
+            .binary_search_by_key(&bay, |(n, _)| *n)
+            .ok()
+            .and_then(|i| self.inserts.get(i))
+            .map(|(_, p)| p.as_str())
+    }
+
+    /// Put `path` in seat `bay` — or empty the seat, for an empty path —
+    /// keeping the pairs sorted and free of empties.
+    pub fn set_bay(&mut self, bay: usize, path: &str) {
+        match self.inserts.binary_search_by_key(&bay, |(n, _)| *n) {
+            Ok(i) if path.is_empty() => {
+                self.inserts.remove(i);
+            }
+            Ok(i) => {
+                if let Some(slot) = self.inserts.get_mut(i) {
+                    slot.1 = path.to_owned();
+                }
+            }
+            Err(_) if path.is_empty() => {}
+            Err(i) => self.inserts.insert(i, (bay, path.to_owned())),
+        }
+    }
+
+    /// Sorted, deduplicated (the first of two claims on a seat wins), free
+    /// of empties and inside the seat map — the one shape `inserts` is
+    /// allowed to have.
+    ///
+    /// **The bound is the point.** A dense array's seat count was limited
+    /// by the file (one `"",` per seat); a sparse key is not, and every
+    /// consumer spreads these pairs over a dense space sized by the bay —
+    /// so `"inserts_tail": {"100000000000": "x"}` was a 20-byte request
+    /// for 2.4 TB of strings, and `usize::MAX` an add that wraps to zero
+    /// in release and emptied the live desk instead. Neither shape can
+    /// reach the quarantine (both are valid JSON). The settings reader
+    /// already refuses a `strip_inserts_tail` seat past `INSERT_SPACE`;
+    /// this is the same law on the document road. What is given up is a
+    /// future build's seat past today's map surviving an open here — and
+    /// the settings mirror was already dropping that at the next launch,
+    /// so it was never a real round trip.
+    fn canonical(mut pairs: Vec<(usize, String)>) -> Vec<(usize, String)> {
+        pairs.retain(|(bay, p)| !p.is_empty() && *bay < crate::recorder::INSERT_SPACE);
+        pairs.sort_by_key(|(n, _)| *n);
+        pairs.dedup_by_key(|(n, _)| *n);
+        pairs
+    }
+
     fn to_value(&self) -> Value {
         let mut m = Map::new();
         let nums = |v: &[f64]| {
@@ -861,10 +1247,18 @@ impl DeskSnap {
             "colors".into(),
             Value::Array(self.colors.iter().map(|c| Value::Number((*c).into())).collect()),
         );
-        m.insert(
-            "inserts".into(),
-            Value::Array(self.inserts.iter().map(|i| Value::String(i.clone())).collect()),
-        );
+        // The head whole, the far seats sparse — see `V7_SPARSE_SEATS`.
+        let mut head = vec![Value::String(String::new()); HEAD_BAYS];
+        let mut tail = Map::new();
+        for (bay, path) in &self.inserts {
+            match head.get_mut(*bay) {
+                Some(slot) => *slot = Value::String(path.clone()),
+                None => {
+                    tail.insert(bay.to_string(), Value::String(path.clone()));
+                }
+            }
+        }
+        m.insert("inserts".into(), Value::Array(head));
         m.insert("sends".into(), nums(&self.sends));
         m.insert("muted".into(), Value::Number(u64::from(self.muted).into()));
         m.insert("soloed".into(), Value::Number(u64::from(self.soloed).into()));
@@ -894,72 +1288,18 @@ impl DeskSnap {
         m.insert("is_folder".into(), bools(&self.is_folder));
         m.insert("in_folder".into(), bools(&self.in_folder));
         m.insert("folder_shut".into(), bools(&self.folder_shut));
+        // Appended, at the END, and only when a seat past the head is
+        // occupied: a desk that never had one keeps its shape, and a build
+        // that has never heard of the key reads the head as it always did.
+        if !tail.is_empty() {
+            m.insert("inserts_tail".into(), Value::Object(tail));
+        }
         Value::Object(m)
     }
 
-    /// The desk into a [`Fingerprint`], field for field with `to_value`.
-    ///
-    /// **The two walk together or the title bar goes blind.** A field added
-    /// to this struct and to `to_value` but not to here is a desk change no
-    /// cheap comparison can see — the asterisk stays off while a fader
-    /// stands somewhere new. `the_fingerprint_moves_when_the_document_moves`
-    /// is what catches that, and it catches it by MUTATING every field
-    /// rather than by reading this list.
+    /// The desk into a [`Fingerprint`] — `DeskRef::hash_into`, the one walk.
     fn hash_into(&self, f: &mut Fingerprint) {
-        f.len(self.kinds.len());
-        for k in &self.kinds {
-            f.u64(u64::from(*k));
-        }
-        f.len(self.icons.len());
-        for i in &self.icons {
-            f.u64(u64::from(*i));
-        }
-        f.len(self.names.len());
-        for n in &self.names {
-            f.str(n);
-        }
-        f.len(self.colors.len());
-        for c in &self.colors {
-            f.u64(*c as u64);
-        }
-        f.len(self.inserts.len());
-        for i in &self.inserts {
-            f.str(i);
-        }
-        f.len(self.sends.len());
-        for s in &self.sends {
-            f.f64(*s);
-        }
-        f.u64(self.muted);
-        f.u64(self.soloed);
-        f.len(self.gains.len());
-        for g in &self.gains {
-            f.f64(*g);
-        }
-        f.len(self.pans.len());
-        for p in &self.pans {
-            f.f64(*p);
-        }
-        f.len(self.inputs.len());
-        for i in &self.inputs {
-            f.str(i);
-        }
-        f.f64(self.drums_gain);
-        f.f64(self.drums_pan);
-        f.f64(self.metronome_gain);
-        f.f64(self.master_gain);
-        f.f64(self.fx_return);
-        f.f64(self.tempo_bpm);
-        f.u64(u64::from(self.sig_beats));
-        f.u64(u64::from(self.sig_unit));
-        f.bool(self.metronome_on);
-        f.u64(u64::from(self.tracks_added));
-        for v in [&self.is_folder, &self.in_folder, &self.folder_shut] {
-            f.len(v.len());
-            for b in v {
-                f.bool(*b);
-            }
-        }
+        self.as_ref().hash_into(f);
     }
 
     fn from_value(v: &Value) -> Option<Self> {
@@ -990,42 +1330,75 @@ impl DeskSnap {
                 .map(|a| a.iter().map(|x| x.as_bool().unwrap_or(false)).collect())
                 .unwrap_or_default()
         };
-        // Hoisted for the `tracks_added` fallback below, which reconstructs
-        // the missing bits from what the rest of the snapshot says.
         let kinds_v: Vec<u8> = m
             .get("kinds")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
             .unwrap_or_default();
-        let names_v = strings("names");
         let inputs_v = strings("inputs");
-        let inserts_v = strings("inserts");
-        let colors_v: Vec<i64> = m
-            .get("colors")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_i64).collect())
-            .unwrap_or_default();
-        Some(Self {
-            kinds: m
-                .get("kinds")
+        // The seats, by the SHAPE the file holds them in — see
+        // `V7_SPARSE_SEATS` for why never by the version stamp.
+        let pairs_of = |o: &Map<String, Value>| -> Vec<(usize, String)> {
+            o.iter()
+                .filter_map(|(k, v)| Some((k.parse::<usize>().ok()?, v.as_str()?.to_owned())))
+                .collect()
+        };
+        let (mut names_v, mut colors_v, mut sends_v, mut muted_v, mut soloed_v) = (
+            strings("names"),
+            m.get("colors")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
+                .map(|a| a.iter().filter_map(Value::as_i64).collect::<Vec<i64>>())
                 .unwrap_or_default(),
+            floats("sends"),
+            m.get("muted").and_then(Value::as_u64).unwrap_or(0),
+            m.get("soloed").and_then(Value::as_u64).unwrap_or(0),
+        );
+        let mut pairs = match m.get("inserts") {
+            // A dense array of ANY length: every document before v7 and
+            // the head of every one since. The era lifts run here, on the
+            // dense vec, keyed on the lengths the file was written at.
+            Some(Value::Array(_)) => {
+                let mut dense = strings("inserts");
+                lift_eras(
+                    &mut sends_v,
+                    &mut colors_v,
+                    &mut names_v,
+                    &mut dense,
+                    &mut muted_v,
+                    &mut soloed_v,
+                );
+                dense
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, p)| !p.is_empty())
+                    .collect()
+            }
+            // The fully sparse shape: today's desk, nothing to lift.
+            Some(Value::Object(o)) => pairs_of(o),
+            _ => Vec::new(),
+        };
+        // The far seats. A seat the array already fills keeps the array's
+        // word — `canonical` keeps the first claim, and the head's come
+        // first.
+        if let Some(Value::Object(tail)) = m.get("inserts_tail") {
+            pairs.extend(pairs_of(tail));
+        }
+        let inserts = Self::canonical(pairs);
+        let bay_at = |n: usize| {
+            inserts.binary_search_by_key(&n, |(b, _)| *b).is_ok()
+        };
+        Some(Self {
+            kinds: kinds_v.clone(),
             icons: m
                 .get("icons")
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n.min(u64::from(crate::recorder_panel::ICON_MAX)) as u8)).collect())
                 .unwrap_or_default(),
-            names: strings("names"),
-            colors: m
-                .get("colors")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_i64).collect())
-                .unwrap_or_default(),
-            inserts: strings("inserts"),
-            sends: floats("sends"),
-            muted: m.get("muted").and_then(Value::as_u64).unwrap_or(0),
-            soloed: m.get("soloed").and_then(Value::as_u64).unwrap_or(0),
+            names: names_v.clone(),
+            colors: colors_v.clone(),
+            sends: sends_v,
+            muted: muted_v,
+            soloed: soloed_v,
             gains: floats("gains"),
             pans: floats("pans"),
             inputs: strings("inputs"),
@@ -1046,7 +1419,9 @@ impl DeskSnap {
             // describing them: a channel with a kind, a name, a colour, an
             // input or a plugin in a bay is a channel that was there.
             // Defaulting to zero would open every old project with no
-            // tracks on it.
+            // tracks on it. Read AFTER the era lifts, so a channel row is
+            // a channel row — before, an eight-channel-era desk's drum
+            // strip sat where channel 8 does today and could pass for one.
             tracks_added: m
                 .get("tracks_added")
                 .and_then(Value::as_u64)
@@ -1061,11 +1436,8 @@ impl DeskSnap {
                             let coloured = colors_v.get(at).copied().unwrap_or(0) != 0;
                             let input =
                                 inputs_v.get(n).is_some_and(|s| !s.is_empty());
-                            let bay = (0..crate::recorder::INSERTS).any(|b| {
-                                inserts_v
-                                    .get(at * crate::recorder::INSERTS + b)
-                                    .is_some_and(|p| !p.is_empty())
-                            });
+                            let bay = (0..crate::recorder::INSERTS)
+                                .any(|b| bay_at(at * crate::recorder::INSERTS + b));
                             if kind || named || coloured || input || bay {
                                 bits |= 1 << n;
                             }
@@ -1077,7 +1449,142 @@ impl DeskSnap {
             is_folder: bools("is_folder"),
             in_folder: bools("in_folder"),
             folder_shut: bools("folder_shut"),
+            inserts,
         })
+    }
+}
+
+/// **A desk written in an earlier ERA of the desk's shape, grown to
+/// today's.** Four lifts, each keyed on the LENGTH the file was written at
+/// — the sends count is a strip count, the bay count a seat map — and each
+/// frozen at its era's literals, per the migration rule: this read the live
+/// constants once and went dead the day the desk grew to 24, stranding that
+/// beta window's documents unlifted.
+///
+/// Here in the READER, on the dense array as the file holds it, and not in
+/// `apply_desk_snapshot` where they used to run on a clone of every desk
+/// applied — every open and every undo step — although a moment can never
+/// hold an old-era desk. A property of how the FILE was written belongs
+/// beside the `tracks_added` reconstruction, which is the same kind of
+/// fact. `a_desk_from_any_era_opens_at_todays_seats` pins each era through
+/// the live desk, which is the same observation whichever function lifts.
+fn lift_eras(
+    sends: &mut Vec<f64>,
+    colors: &mut Vec<i64>,
+    names: &mut Vec<String>,
+    inserts: &mut Vec<String>,
+    muted: &mut u64,
+    soloed: &mut u64,
+) {
+    // A document saved before the DRUM BUS carries eighteen-strip arrays:
+    // its click, bus and master rows would land one seat early. Frozen at
+    // the era's numbers (16 channels, 18 strips).
+    const V18_CH: usize = 16;
+    if sends.len() == 18 {
+        sends.insert(V18_CH, 0.0);
+        if colors.len() == 19 {
+            colors.insert(V18_CH, 0);
+        }
+        if names.len() == 19 {
+            names.insert(V18_CH, String::new());
+        }
+        if inserts.len() == 19 * crate::recorder::INSERTS {
+            for _ in 0..crate::recorder::INSERTS {
+                inserts.insert(V18_CH * crate::recorder::INSERTS, String::new());
+            }
+        }
+        let move_mask = |mask: u64| -> u64 {
+            let keep = mask & ((1u64 << V18_CH) - 1);
+            let above = mask >> V18_CH;
+            keep | (above << (V18_CH + 1))
+        };
+        *muted = move_mask(*muted);
+        *soloed = move_mask(*soloed);
+    }
+    // **An eight-channel-era document, grown to today's count.** The
+    // settings path does this in `adopt_desk`; a project carries its own
+    // desk snapshot and needs the same lift, or opening a session saved at
+    // eight channels scatters its drums/click/fx/master and every pad's FX
+    // onto the new empty channels. Frozen eight-channel shape: STRIPS 11,
+    // master at 11, pad-insert base 12.
+    const OLD_CH: usize = 8;
+    const OLD_STRIPS: usize = 11;
+    let ins3 = crate::recorder::INSERTS;
+    // A sixteen-pad-era doc first grows its pads to 128 at base 12 — its
+    // pads were keys 36..51 — before the channels widen the base.
+    if inserts.len() == (OLD_STRIPS + 1 + 16) * ins3 {
+        inserts.resize((OLD_STRIPS + 1 + 128) * ins3, String::new());
+        for pad in (0..16usize).rev() {
+            for bay in 0..ins3 {
+                let from = (OLD_STRIPS + 1 + pad) * ins3 + bay;
+                let to = (OLD_STRIPS + 1 + 36 + pad) * ins3 + bay;
+                let moved = std::mem::take(&mut inserts[from]);
+                inserts[to] = moved;
+            }
+        }
+    }
+    if sends.len() == OLD_STRIPS && crate::recorder::CHANNELS > OLD_CH {
+        let grow = crate::recorder::CHANNELS - OLD_CH;
+        for _ in 0..grow {
+            if OLD_CH <= colors.len() {
+                colors.insert(OLD_CH, 0);
+            }
+            if OLD_CH <= names.len() {
+                names.insert(OLD_CH, String::new());
+            }
+            if OLD_CH <= sends.len() {
+                sends.insert(OLD_CH, 0.0);
+            }
+        }
+        let ins_at = OLD_CH * ins3;
+        for _ in 0..(grow * ins3) {
+            if ins_at <= inserts.len() {
+                inserts.insert(ins_at, String::new());
+            }
+        }
+        let grow_mask = |mask: u64| -> u64 {
+            let keep = mask & ((1u64 << OLD_CH) - 1);
+            let above = mask >> OLD_CH;
+            keep | (above << (OLD_CH + grow))
+        };
+        *muted = grow_mask(*muted);
+        *soloed = grow_mask(*soloed);
+        // Not the global `desk_state_shift_v19` flag: that renames the
+        // global state dir, and a project's insert states live in its own
+        // `state/`. The desk ARRAYS relocate here so plugins load at the
+        // right seats; a moved plugin's saved knobs fall back to defaults,
+        // the same graceful cost every shuffle accepts.
+    }
+    // **A sixteen-channel-era document, grown to twenty-four.** The
+    // 4.82-through-5.0 shape: nineteen sends is its fingerprint. Same fold,
+    // same bargain on the project's own state/ sidecars.
+    const V19_CH: usize = 16;
+    if sends.len() == 19 && crate::recorder::CHANNELS > V19_CH {
+        let grow = crate::recorder::CHANNELS - V19_CH;
+        for _ in 0..grow {
+            if V19_CH <= colors.len() {
+                colors.insert(V19_CH, 0);
+            }
+            if V19_CH <= names.len() {
+                names.insert(V19_CH, String::new());
+            }
+            if V19_CH <= sends.len() {
+                sends.insert(V19_CH, 0.0);
+            }
+        }
+        let ins_at = V19_CH * ins3;
+        for _ in 0..(grow * ins3) {
+            if ins_at <= inserts.len() {
+                inserts.insert(ins_at, String::new());
+            }
+        }
+        let grow_mask = |mask: u64| -> u64 {
+            let keep = mask & ((1u64 << V19_CH) - 1);
+            let above = mask >> V19_CH;
+            keep | (above << (V19_CH + grow))
+        };
+        *muted = grow_mask(*muted);
+        *soloed = grow_mask(*soloed);
     }
 }
 
@@ -1340,6 +1847,29 @@ impl Arrangement {
             return Self::default();
         };
         Self::from_map(map)
+    }
+
+    /// This document copied with `desk: None`.
+    ///
+    /// For undo, which keeps a moment as the struct rather than as text and
+    /// carries the LIVE desk beside it — so the desk this document happens
+    /// to be holding (the one it was opened or last saved with, thousands
+    /// of seat strings) must not be copied a hundred times over. Every
+    /// other field is named so a field added to the struct is a compile
+    /// error here rather than a moment that silently forgets it.
+    pub fn clone_without_desk(&self) -> Self {
+        Self {
+            clips: self.clips.clone(),
+            desk: None,
+            next_id: self.next_id,
+            named: self.named,
+            extra: self.extra.clone(),
+            automation: self.automation.clone(),
+            tempo: self.tempo.clone(),
+            meter: self.meter.clone(),
+            markers: self.markers.clone(),
+            version: self.version,
+        }
     }
 
     fn from_map(mut map: Map<String, Value>) -> Self {
@@ -2086,6 +2616,12 @@ impl Arrangement {
     /// to the writer and forgotten here fails a test rather than shipping a
     /// title bar that cannot see it.
     pub fn hash_into(&self, desk: Option<&DeskSnap>, f: &mut Fingerprint) {
+        self.hash_into_ref(desk.map(DeskSnap::as_ref), f);
+    }
+
+    /// `hash_into` over a desk that is only borrowed — the app's live desk,
+    /// read straight out of the settings once a frame. See [`DeskRef`].
+    pub fn hash_into_ref(&self, desk: Option<DeskRef<'_>>, f: &mut Fingerprint) {
         f.u64(self.version);
         // The NORMALISED counter, the same expression the writer emits —
         // see `to_json`'s note on why a document has to be a fixed point.
@@ -2117,6 +2653,17 @@ impl Arrangement {
                 f.f64(n.dur_s);
                 f.u64(u64::from(n.key));
                 f.u64(u64::from(n.vel));
+            }
+            // The pedal, after the notes as the writer has it. Omitted when
+            // empty there, so the length is the one word that tells "no
+            // pedal" from "a pedal" — the notes' own arrangement. This was
+            // MISSING: the pedal lane shipped without a word here, and the
+            // title bar could not see a pedal edit until the next note moved.
+            f.len(c.pedal.len());
+            for e in &c.pedal {
+                f.f64(e.at_s);
+                f.u64(u64::from(e.cc));
+                f.u64(u64::from(e.value));
             }
             f.u64(c.id);
             f.u64(match c.anchor {
@@ -2200,6 +2747,16 @@ impl Arrangement {
                 f.u64(u64::from(p.sig.beats));
                 f.u64(u64::from(p.sig.unit));
             }
+        }
+        // Markers, written only when there are any, so the length alone
+        // says "none" the way the writer's absent key does. Also MISSING
+        // until now — a marker placed, moved or renamed left the asterisk
+        // off; the quit prompt, being exact, still asked, which is the one
+        // reason nobody lost a marker to it.
+        f.len(self.markers.len());
+        for m in &self.markers {
+            f.f64(m.at_s);
+            f.str(&m.name);
         }
         f.map(&self.extra);
     }
@@ -2894,7 +3451,7 @@ mod tests {
             icons: vec![0, 3],
             names: vec!["drums".into(), String::new(), "gtr".into()],
             colors: vec![3, 0, 11],
-            inserts: vec![String::new(), "reverb".into()],
+            inserts: vec![(1, "reverb".into()), (4149 * 3, "brusfri".into())],
             sends: vec![0.0, 0.25],
             muted: 0b0010,
             soloed: 0b0100,
@@ -2918,7 +3475,10 @@ mod tests {
         let mut extra = Map::new();
         extra.insert("a_newer_builds_key".into(), Value::from("kept"));
         a.add_clip(ArrClip {
-            pedal: Vec::new(),
+            pedal: vec![
+                ArrPedal { at_s: 0.5, cc: 64, value: 127 },
+                ArrPedal { at_s: 2.0, cc: 64, value: 0 },
+            ],
             kind: ClipKind::Midi,
             notes: vec![
                 ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 },
@@ -2992,14 +3552,24 @@ mod tests {
                 }],
             ),
         ]);
+        a.markers.push(ArrMarker { at_s: 12.5, name: "Verse".into() });
         a.extra.insert("song_of_the_future".into(), Value::from(9));
         a
     }
 
-    /// The edit moved the document, and the fingerprint saw it.
+    /// The recorded walk — the exact form undo compares. See the
+    /// `Fingerprint` doc for why equal words mean equal text.
+    fn words(a: &Arrangement) -> Vec<u64> {
+        let mut f = Fingerprint::recording(0);
+        a.hash_into(a.desk.as_ref(), &mut f);
+        f.finish_recorded().0
+    }
+
+    /// The edit moved the document, and the fingerprint saw it — and so
+    /// did the words, which is the stronger claim undo now rests on.
     fn moves_both(name: &str, edit: impl Fn(&mut Arrangement)) {
         let a = a_document_with_everything_in_it();
-        let (json, fp) = (a.to_json(), a.fingerprint());
+        let (json, fp, w) = (a.to_json(), a.fingerprint(), words(&a));
         let mut b = a;
         edit(&mut b);
         assert_ne!(b.to_json(), json, "`{name}` did not change the document at all");
@@ -3008,13 +3578,14 @@ mod tests {
             fp,
             "`{name}` changed the document and the fingerprint did not move"
         );
+        assert_ne!(words(&b), w, "`{name}` changed the document and the words did not");
     }
 
     /// The edit did NOT move the document, so the fingerprint must not move
     /// either — a fingerprint that jumps where the file does not is an
     /// asterisk over work nobody did, and an undo moment for it.
     fn moves_neither(name: &str, base: Arrangement, edit: impl Fn(&mut Arrangement)) {
-        let (json, fp) = (base.to_json(), base.fingerprint());
+        let (json, fp, w) = (base.to_json(), base.fingerprint(), words(&base));
         let mut b = base;
         edit(&mut b);
         assert_eq!(b.to_json(), json, "`{name}` moved the document after all");
@@ -3023,6 +3594,7 @@ mod tests {
             fp,
             "`{name}` left the document alone and the fingerprint moved"
         );
+        assert_eq!(words(&b), w, "`{name}` left the document alone and the words moved");
     }
 
     /// **Every meaningful change moves the fingerprint.**
@@ -3043,7 +3615,16 @@ mod tests {
         });
         moves_both("a strip colour", |a| a.desk.as_mut().unwrap().colors[2] = 4);
         moves_both("a plugin in a bay", |a| {
-            a.desk.as_mut().unwrap().inserts[0] = "eq".into();
+            a.desk.as_mut().unwrap().inserts[0].1 = "eq".into();
+        });
+        moves_both("a plugin in a far seat", |a| {
+            a.desk.as_mut().unwrap().set_bay(4149 * 3, "other");
+        });
+        moves_both("a far seat emptied", |a| {
+            a.desk.as_mut().unwrap().set_bay(4149 * 3, "");
+        });
+        moves_both("a seat arriving in the head", |a| {
+            a.desk.as_mut().unwrap().set_bay(0, "eq");
         });
         moves_both("a send", |a| a.desk.as_mut().unwrap().sends[1] = 0.3);
         moves_both("a mute", |a| a.desk.as_mut().unwrap().muted ^= 1);
@@ -3093,6 +3674,13 @@ mod tests {
         moves_both("a note leaving", |a| {
             a.clips[0].notes.pop();
         });
+        moves_both("a pedal MOVED", |a| a.clips[0].pedal[0].at_s = 0.75);
+        moves_both("a pedal's depth", |a| a.clips[0].pedal[0].value = 64);
+        moves_both("which pedal", |a| a.clips[0].pedal[1].cc = 67);
+        moves_both("a pedal movement arriving", |a| {
+            a.clips[0].pedal.push(ArrPedal { at_s: 3.0, cc: 64, value: 127 });
+        });
+        moves_both("the pedal leaving", |a| a.clips[0].pedal.clear());
         moves_both("a clip's id", |a| a.clips[0].id += 100);
         moves_both("a clip's anchor", |a| a.clips[1].anchor = Anchor::Beat);
         moves_both("following the tempo", |a| a.clips[1].follow_tempo = true);
@@ -3181,6 +3769,12 @@ mod tests {
         moves_both("automation going away", |a| {
             a.automation = crate::automation::Automation::default();
         });
+        moves_both("a marker MOVED", |a| a.markers[0].at_s = 13.0);
+        moves_both("a marker renamed", |a| a.markers[0].name = "Chorus".into());
+        moves_both("a marker arriving", |a| {
+            a.markers.push(ArrMarker { at_s: 40.0, name: String::new() });
+        });
+        moves_both("the markers leaving", |a| a.markers.clear());
         moves_both("a stranger's key on the document", |a| {
             a.extra.insert("also_from_tomorrow".into(), Value::from(true));
         });
@@ -3233,6 +3827,152 @@ mod tests {
         });
     }
 
+    /// **The seats are written as a whole head and a sparse tail, and read
+    /// back from any shape.** The one fixture, three ways: as this build
+    /// writes it, as a build before v7 wrote it (one dense string per bay,
+    /// all 13,167), and as the fully sparse object — the same desk, the
+    /// same fingerprint, and a fixed point of the writer.
+    #[test]
+    fn the_seats_are_a_whole_head_and_a_sparse_tail_from_any_shape() {
+        let a = a_document_with_everything_in_it();
+        let d = a.desk.clone().expect("a desk");
+        let written = serde_json::from_str::<Value>(&a.to_json()).expect("json");
+        let desk = written.get("desk").and_then(Value::as_object).expect("a desk object");
+        let head = desk.get("inserts").and_then(Value::as_array).expect("the head array");
+        assert_eq!(head.len(), HEAD_BAYS, "the head is not written whole");
+        assert_eq!(head[1], Value::String("reverb".into()));
+        let tail = desk.get("inserts_tail").and_then(Value::as_object).expect("a tail");
+        assert_eq!(tail.get("12447"), Some(&Value::String("brusfri".into())));
+        assert_eq!(tail.len(), 1, "a head seat leaked into the tail");
+        assert!(a.to_json().matches("\"\"").count() < 200, "thousands of empties again");
+
+        // The dense shape every earlier build wrote.
+        let mut dense = vec![Value::String(String::new()); crate::recorder::INSERT_SPACE];
+        dense[1] = Value::String("reverb".into());
+        dense[12447] = Value::String("brusfri".into());
+        let mut old = written.clone();
+        let od = old["desk"].as_object_mut().expect("desk");
+        od.insert("inserts".into(), Value::Array(dense));
+        od.shift_remove("inserts_tail");
+        let from_dense = Arrangement::from_json(&old.to_string());
+        assert_eq!(from_dense.desk.as_ref(), Some(&d), "the dense shape read differently");
+        assert_eq!(from_dense.fingerprint(), a.fingerprint(), "the dense shape hashes apart");
+        assert_eq!(from_dense.to_json(), a.to_json(), "the dense shape is not rewritten as v7");
+
+        // The fully sparse object.
+        let mut sparse = written.clone();
+        let sd = sparse["desk"].as_object_mut().expect("desk");
+        sd.insert("inserts".into(), serde_json::json!({"1": "reverb", "12447": "brusfri"}));
+        sd.shift_remove("inserts_tail");
+        let from_sparse = Arrangement::from_json(&sparse.to_string());
+        assert_eq!(from_sparse.desk.as_ref(), Some(&d), "the sparse object read differently");
+        assert_eq!(from_sparse.fingerprint(), a.fingerprint());
+
+        // And what the reader refuses to be confused by: an empty path, a
+        // key that is not a seat, a seat claimed twice, out of order.
+        let mut odd = written.clone();
+        let odd_d = odd["desk"].as_object_mut().expect("desk");
+        odd_d.insert(
+            "inserts_tail".into(),
+            serde_json::json!({"12447": "brusfri", "9000": "", "x": "y", "012447": "shadow", "500": "late"}),
+        );
+        let read = Arrangement::from_json(&odd.to_string()).desk.expect("a desk");
+        assert_eq!(read.bay(12447), Some("brusfri"), "the second claim on a seat won");
+        assert_eq!(read.bay(9000), None, "an empty path made a seat");
+        assert_eq!(read.bay(500), Some("late"));
+        assert!(read.inserts.windows(2).all(|w| w[0].0 < w[1].0), "the pairs are not sorted");
+
+        // And a key that names a seat past the map, in either sparse
+        // shape. A dense array had to SPEND a file byte per seat; a key
+        // spends twenty on any bay at all, and everything downstream sizes
+        // a dense space by the bay — so these are a terabyte and a wrap to
+        // zero, not seats. The last real seat stays, the first past it goes.
+        let space = crate::recorder::INSERT_SPACE;
+        let past = serde_json::json!({
+            "18446744073709551615": "usize-max",
+            "100000000000": "a terabyte of strings",
+            space.to_string(): "one past the map",
+            (space - 1).to_string(): "the last seat",
+            "12447": "brusfri",
+        });
+        let mut tail = written.clone();
+        tail["desk"].as_object_mut().expect("desk").insert("inserts_tail".into(), past.clone());
+        let mut bare = written.clone();
+        let bd = bare["desk"].as_object_mut().expect("desk");
+        bd.insert("inserts".into(), past);
+        bd.shift_remove("inserts_tail");
+        for (shape, json) in [("inserts_tail", tail), ("a bare inserts object", bare)] {
+            let read = Arrangement::from_json(&json.to_string()).desk.expect("a desk");
+            assert_eq!(read.bay(usize::MAX), None, "{shape}: usize::MAX made a seat");
+            assert_eq!(read.bay(100_000_000_000), None, "{shape}: an eleven-digit bay made a seat");
+            assert_eq!(read.bay(space), None, "{shape}: the seat one past the map was kept");
+            assert_eq!(read.bay(space - 1), Some("the last seat"), "{shape}: the last real seat was lost");
+            assert_eq!(read.bay(12447), Some("brusfri"), "{shape}: a real far seat was lost");
+            assert!(
+                read.inserts.iter().all(|(b, _)| *b < space),
+                "{shape}: a seat past the map survived the reader"
+            );
+        }
+    }
+
+    /// **A desk seen through the view and through a snapshot is one desk.**
+    /// `to_snap` and `as_ref` are inverses, and the number is the same
+    /// whichever way the walk reaches the fields — which is what lets the
+    /// app fingerprint its live settings without a clone.
+    #[test]
+    fn a_desk_by_reference_is_the_same_desk() {
+        let a = a_document_with_everything_in_it();
+        let d = a.desk.as_ref().expect("the fixture has a desk");
+        assert_eq!(d.as_ref().to_snap(), *d, "to_snap(as_ref(d)) is not d");
+        let mut by_ref = Fingerprint::new();
+        a.hash_into_ref(Some(d.as_ref()), &mut by_ref);
+        assert_eq!(by_ref.finish(), a.fingerprint(), "the view hashed differently");
+    }
+
+    /// **An empty seat in the sparse pairs is not a word.** Every
+    /// constructor keeps the pairs canonical (`from_value`, `to_snap`,
+    /// `set_bay`), so this is the lock for the one that will not: a
+    /// hand-pushed `(bay, "")` hashes and copies as no seat at all, the
+    /// way the dense shape has always treated an empty string.
+    #[test]
+    fn an_empty_seat_in_the_sparse_pairs_is_not_a_word() {
+        let a = a_document_with_everything_in_it();
+        let mut d = a.desk.clone().expect("a desk");
+        let clean = d.clone();
+        d.inserts.push((crate::recorder::INSERT_SPACE - 1, String::new()));
+        let mut with = Fingerprint::recording(0);
+        d.as_ref().hash_into(&mut with);
+        let mut without = Fingerprint::recording(0);
+        clean.as_ref().hash_into(&mut without);
+        assert_eq!(with.finish_recorded(), without.finish_recorded(), "an empty seat became a word");
+        assert_eq!(d.as_ref().to_snap(), clean, "to_snap kept the empty seat");
+    }
+
+    /// **Recording changes nothing about the number.** The words are kept
+    /// beside the mix, never instead of it, so a moment's mark and the
+    /// title bar's answer come from one walk and cannot disagree.
+    #[test]
+    fn a_recording_fingerprint_answers_the_same_number() {
+        let a = a_document_with_everything_in_it();
+        let mut f = Fingerprint::recording(0);
+        a.hash_into(a.desk.as_ref(), &mut f);
+        let (w, mark) = f.finish_recorded();
+        assert_eq!(mark, a.fingerprint(), "recording moved the number");
+        assert!(!w.is_empty(), "nothing was recorded");
+        assert!(
+            Fingerprint::new().finish_recorded().0.is_empty(),
+            "a plain fingerprint kept words"
+        );
+        // And the copy undo keeps is the same document apart from its desk.
+        let bare = a.clone_without_desk();
+        assert!(bare.desk.is_none());
+        assert_eq!(
+            bare.to_json_with_desk(a.desk.as_ref()),
+            a.to_json(),
+            "the desk-less copy is a different document"
+        );
+    }
+
     /// **A save and a load do not move the fingerprint.**
     ///
     /// The comparison that decides "is there anything unsaved" runs against
@@ -3262,6 +4002,41 @@ mod tests {
             "the file moved the fingerprint"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A float written at seventeen digits reads back as itself.**
+    ///
+    /// ryu writes the SHORTEST decimal that round-trips, and for a value
+    /// one ULP under 1.0 that is `0.9999999999999999`. serde_json's default
+    /// float parser takes a fast path on such inputs and answered `1.0`, so
+    /// a document carrying one was not a fixed point: it opened dirty, its
+    /// fingerprint moved on every load, and an undo across it pushed a
+    /// moment for an edit nobody made. `float_roundtrip` in Cargo.toml is
+    /// what makes this hold; the feature is a dependency flag, which is why
+    /// the property gets a test of its own rather than a comment.
+    #[test]
+    fn a_seventeen_digit_float_is_a_fixed_point() {
+        let awkward = 0.999_999_999_999_999_9_f64;
+        assert_ne!(awkward, 1.0, "the literal rounded to 1.0 at compile time");
+        let mut a = a_document_with_everything_in_it();
+        a.clips[0].fade_out_s = awkward;
+        let json = a.to_json();
+        assert!(
+            json.contains("0.9999999999999999"),
+            "the writer did not spell the value at seventeen digits"
+        );
+        let back = Arrangement::from_json(&json);
+        assert_eq!(
+            back.clips[0].fade_out_s.to_bits(),
+            awkward.to_bits(),
+            "the reader rounded the fade to a neighbour"
+        );
+        assert_eq!(back.to_json(), json, "the document is not a fixed point");
+        assert_eq!(
+            back.fingerprint(),
+            a.fingerprint(),
+            "a save and a load moved the fingerprint"
+        );
     }
 
     /// **The awkward floats hash the way the WRITER treats them.**
