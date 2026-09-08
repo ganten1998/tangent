@@ -24487,7 +24487,25 @@ mod sidecar_walk_probe {
         let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let from = scratch("probe-from");
         let to = scratch("probe-to");
-        two_seat_shelf(&from);
+        // **A REAL shelf when one is named.** `TANGENT_PROBE_SHELF=<project>/state`
+        // copies that session's sidecars in, because the shelf read costs one
+        // `is_file` and one `copy` per file it finds and a real project holds
+        // more than the two seats the synthetic case seeds. The synthetic
+        // shelf stays the default so the number in the doc above can be
+        // re-run on any machine with nothing installed.
+        let seeded = match std::env::var_os("TANGENT_PROBE_SHELF") {
+            Some(dir) => {
+                let mut n = 0usize;
+                for e in std::fs::read_dir(&dir).expect("the shelf named by TANGENT_PROBE_SHELF").flatten() {
+                    if sidecar_seat_bay(&e.file_name().to_string_lossy()).is_some() {
+                        std::fs::copy(e.path(), from.join(e.file_name())).expect("seed");
+                        n += 1;
+                    }
+                }
+                n
+            }
+            None => two_seat_shelf(&from).len(),
+        };
         // A warm pass each, so neither number is a cold directory cache.
         per_seat_mirror(&from, &to);
         mirror_sidecars(&from, &to);
@@ -24499,7 +24517,7 @@ mod sidecar_walk_probe {
         let ((), calls) = fs_calls(|| mirror_sidecars(&from, &to));
         let one = t.elapsed();
         println!(
-            "{TOTAL_SEATS} seats x {INSERTS} bays = {INSERT_SPACE} seat/bays, 2 occupied\n  \
+            "{TOTAL_SEATS} seats x {INSERTS} bays = {INSERT_SPACE} seat/bays, {seeded} occupied\n  \
              per-seat walk = {was_calls} filesystem calls, {was:?} ({:.1}% of a 16.6ms frame)\n  \
              shelf read    = {calls} filesystem calls, {one:?} ({:.1}% of a 16.6ms frame)\n  \
              a project open runs two mirrors: {was_calls_2} calls / {:?} before, \
