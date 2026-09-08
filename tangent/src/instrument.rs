@@ -8359,7 +8359,7 @@ impl Renderer {
             if mc.strip.min(CHANNELS - 1) != ch {
                 continue;
             }
-            if at < mc.start || at >= mc.start + mc.len {
+            if at < mc.start || at >= mc.start.saturating_add(mc.len) {
                 continue;
             }
             let rel = at - mc.start;
@@ -8686,7 +8686,7 @@ impl Renderer {
                     let mut cur = self.midi_cursor.get(idx).copied().unwrap_or(0);
                     while cur < mc.notes.len() {
                         let nt = mc.notes[cur];
-                        let on_f = mc.start + nt.at;
+                        let on_f = mc.start.saturating_add(nt.at);
                         if on_f >= end {
                             break;
                         }
@@ -8760,11 +8760,11 @@ impl Renderer {
                             velocity: f32::from(nt.vel) / 127.0,
                             on: true,
                         });
-                        let end_rel = (nt.at + nt.dur.max(1)).min(mc.len);
+                        let end_rel = nt.at.saturating_add(nt.dur.max(1)).min(mc.len);
                         self.active_clip.push(ActiveClipNote {
                             lane: ch as u8,
                             key: nt.key,
-                            off: mc.start + end_rel,
+                            off: mc.start.saturating_add(end_rel),
                         });
                         if nt.key < 128 {
                             self.sounding |= 1u128 << nt.key;
@@ -10264,6 +10264,11 @@ pub struct Engine {
     click_from_audio: Consumer<Click>,
     midi_to_audio: Producer<Vec<PlacedMidi>>,
     midi_from_audio: Consumer<Vec<PlacedMidi>>,
+    /// A schedule the ring had no room for, waiting for [`Engine::retire_tick`]
+    /// to try again. Newest wins: a later `set_clips` replaces what is parked
+    /// here rather than queueing behind it. See `set_clips`.
+    track_pending: Option<Vec<Placed>>,
+    midi_pending: Option<Vec<PlacedMidi>>,
     pad_to_audio: Producer<(usize, PadKit)>,
     pad_from_audio: Consumer<(usize, PadKit)>,
     /// The per-lane instruments' rings, and the host's own record of which
@@ -11039,6 +11044,8 @@ impl Engine {
             click_from_audio,
             midi_to_audio,
             midi_from_audio,
+            track_pending: None,
+            midi_pending: None,
             pad_to_audio,
             pad_from_audio,
             dx7_to_audio,
@@ -13076,6 +13083,21 @@ impl Engine {
         }
     }
 
+    ///
+    /// **It no longer WAITS for that return.** It used to spin, a
+    /// millisecond at a time, until the callback handed the old list back —
+    /// one buffer period on a good day, the full `RETIRE_TIMEOUT` when the
+    /// callback was not running (a stalled device, the offline engine before
+    /// its first block). A clip drag rebuilds the schedule every frame, so
+    /// that was up to two buffer periods of the UI thread doing nothing per
+    /// frame, and half a second of it on a stalled device. The bargain is
+    /// kept another way: the displaced list is dropped on this thread by
+    /// [`Engine::retire_tick`], once a frame, or by the next call here,
+    /// whichever comes first. **Newest wins and nothing is lost**: a push
+    /// the ring cannot take (two already waiting for a callback that has
+    /// not come) is parked, retried by the tick, and replaced by anything
+    /// newer that arrives meanwhile — the list that would have been
+    /// overtaken anyway. `track_loaded` is stored at the call, as before.
     pub fn set_clips(&mut self, clips: Vec<Placed>) {
         // Whatever came back earlier is dropped first, so the ring always has
         // room and two rapid loads cannot wedge.
@@ -13083,34 +13105,43 @@ impl Engine {
         self.shared
             .track_loaded
             .store(!clips.is_empty(), Ordering::Relaxed);
-        if self.track_to_audio.push(clips).is_err() {
-            return;
-        }
-        let deadline = Instant::now() + RETIRE_TIMEOUT;
-        while Instant::now() < deadline {
-            if let Ok(old) = self.track_from_audio.pop() {
-                drop(old);
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
+        // A parked list is older than this one: it dies here, unheard.
+        self.track_pending = None;
+        if let Err(rtrb::PushError::Full(clips)) = self.track_to_audio.push(clips) {
+            self.track_pending = Some(clips);
         }
     }
 
     /// Hand the audio thread the arrangement's MIDI schedule, whole — the
     /// same swap protocol as `set_clips`, so the old list drops HERE, never
-    /// in the callback.
+    /// in the callback, and the same park-and-retry instead of a wait.
     pub fn set_midi_clips(&mut self, clips: Vec<PlacedMidi>) {
         while self.midi_from_audio.pop().is_ok() {}
-        if self.midi_to_audio.push(clips).is_err() {
-            return;
+        self.midi_pending = None;
+        if let Err(rtrb::PushError::Full(clips)) = self.midi_to_audio.push(clips) {
+            self.midi_pending = Some(clips);
         }
-        let deadline = Instant::now() + RETIRE_TIMEOUT;
-        while Instant::now() < deadline {
-            if let Ok(old) = self.midi_from_audio.pop() {
-                drop(old);
-                return;
+    }
+
+    /// **Once a frame, from the host**: drop what the callback has handed
+    /// back since last time, and push what a full ring parked. This is the
+    /// other half of `set_clips` no longer waiting — the audio thread only
+    /// swaps when its retiring ring has a free slot, so a UI thread that
+    /// never drained would stop the swaps after two, and a parked list
+    /// needs somebody to try again. Cheap when there is nothing to do: two
+    /// empty pops.
+    pub fn retire_tick(&mut self) {
+        while self.track_from_audio.pop().is_ok() {}
+        if let Some(clips) = self.track_pending.take() {
+            if let Err(rtrb::PushError::Full(clips)) = self.track_to_audio.push(clips) {
+                self.track_pending = Some(clips);
             }
-            std::thread::sleep(Duration::from_millis(1));
+        }
+        while self.midi_from_audio.pop().is_ok() {}
+        if let Some(clips) = self.midi_pending.take() {
+            if let Err(rtrb::PushError::Full(clips)) = self.midi_to_audio.push(clips) {
+                self.midi_pending = Some(clips);
+            }
         }
     }
 
@@ -19307,6 +19338,65 @@ mod tests {
 
     /// One constant mono clip on one lane, a second long — the key tests'
     /// signal, because a constant's level needs no window to agree on.
+    /// **A schedule hand-off never sleeps on the UI thread, and the newest
+    /// one wins.** On an offline engine — no callback until a block is
+    /// rendered, which is when the old wait burnt its full quarter second —
+    /// three `set_clips` in a row return at once; two sit in the ring and
+    /// the third is parked. After a block the callback has taken the first
+    /// and handed back the empty list it started with; a tick pushes the
+    /// parked third. After two more blocks the rack holds the THIRD list,
+    /// the first two have been dropped on this thread (their `Arc`s are back
+    /// to one owner), and a fourth call while one is parked replaces the
+    /// parked one rather than queueing behind it.
+    #[test]
+    fn a_schedule_hand_off_never_sleeps_and_the_newest_wins() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let lists: Vec<Placed> = (0..3).map(|i| flat_clip(0, 0.1 * (i + 1) as f32)).collect();
+        let arcs: Vec<Arc<tangent_record::decode::Clip>> =
+            lists.iter().map(|p| Arc::clone(&p.clip)).collect();
+        let t = Instant::now();
+        for p in lists {
+            e.set_clips(vec![p]);
+        }
+        let took = t.elapsed();
+        assert!(
+            took < Duration::from_millis(100),
+            "three hand-offs took {took:?}; one used to be a 250 ms wait on an offline engine"
+        );
+        assert!(e.track_pending.is_some(), "the third list is parked behind a two-slot ring");
+        let mut out = vec![0.0f32; 512 * 2];
+        e.render_offline(&mut out); // the callback takes list 1
+        e.retire_tick(); // the empty starter list comes back; list 3 goes in
+        assert!(e.track_pending.is_none(), "the tick pushed the parked list");
+        e.render_offline(&mut out); // list 2
+        e.render_offline(&mut out); // list 3
+        e.retire_tick();
+        assert_eq!(Arc::strong_count(&arcs[0]), 1, "list 1 was dropped on this thread");
+        assert_eq!(Arc::strong_count(&arcs[1]), 1, "list 2 was dropped on this thread");
+        assert_eq!(Arc::strong_count(&arcs[2]), 2, "the rack holds the newest list");
+        // Newest wins while parked: fill the ring again, park a fourth, then
+        // a fifth replaces it and the fourth dies here.
+        let fourth = flat_clip(0, 0.4);
+        let fifth = flat_clip(0, 0.5);
+        let (a4, a5) = (Arc::clone(&fourth.clip), Arc::clone(&fifth.clip));
+        e.set_clips(vec![flat_clip(0, 0.6)]);
+        e.set_clips(vec![flat_clip(0, 0.7)]);
+        e.set_clips(vec![fourth]);
+        assert_eq!(Arc::strong_count(&a4), 2, "parked");
+        e.set_clips(vec![fifth]);
+        assert_eq!(Arc::strong_count(&a4), 1, "overtaken while parked: dropped here, unheard");
+        assert_eq!(Arc::strong_count(&a5), 2, "the fifth is the one parked");
+        // The MIDI twin parks and retries the same way, and rendering with
+        // nothing pending is still fine.
+        e.set_midi_clips(Vec::new());
+        e.set_midi_clips(Vec::new());
+        e.set_midi_clips(Vec::new());
+        assert!(e.midi_pending.is_some());
+        e.render_offline(&mut out);
+        e.retire_tick();
+        assert!(e.midi_pending.is_none());
+    }
+
     fn flat_clip(strip: usize, level: f32) -> Placed {
         Placed {
             clip: Arc::new(tangent_record::decode::Clip {

@@ -17,6 +17,11 @@
 //! rate**, because that is the only shape the mixer wants and both tools will
 //! convert to it. A mono file is duplicated across both channels, which is
 //! what a mono backing track should do.
+//!
+//! **And a third road in front of both**: a stereo WAV already at the asked
+//! rate — which is every take this app has ever written — is read and parsed
+//! here without a child at all. See `read_native` for the gates; the two
+//! tools above remain the answer for everything else.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -87,7 +92,7 @@ impl Clip {
 /// it is what stops somebody who picked a two-hour podcast by mistake from
 /// finding out by watching the machine swap. The error says the length, so it
 /// reads as "that file is enormous" rather than as a failure.
-const MAX_FRAMES: usize = 20 * 60 * 48_000;
+pub const MAX_FRAMES: usize = 20 * 60 * 48_000;
 
 /// Decode `path` to interleaved stereo f32 at `rate`.
 ///
@@ -105,8 +110,17 @@ const MAX_FRAMES: usize = 20 * 60 * 48_000;
 /// a format this cannot read is a clear sentence instead of noise.
 pub fn decode(path: &Path, rate: u32) -> Result<Clip, String> {
     let rate = rate.clamp(8_000, 192_000);
-    let wav = read_wav(path, rate)?;
-    let (samples, got) = wav_stereo_f32(&wav)?;
+    // **The file itself first, the child only for what the file is not.**
+    // See `read_native`: a take is a plain WAV this file already parses, and
+    // the child was costing nineteen milliseconds and a temp file per take
+    // to produce the same bytes.
+    let (samples, got) = match read_native(path, rate) {
+        Some(native) => native,
+        None => {
+            let wav = read_wav(path, rate)?;
+            wav_stereo_f32(&wav)?
+        }
+    };
     if samples.len() < 2 {
         return Err("that file has no audio in it".to_owned());
     }
@@ -133,8 +147,69 @@ pub fn decode(path: &Path, rate: u32) -> Result<Clip, String> {
     })
 }
 
+/// The most bytes the native road will read into memory before it has seen
+/// a header: [`MAX_FRAMES`] of 32-bit stereo plus room for the chunks in
+/// front of `data`. Anything larger is refused before it is read at all,
+/// which is the one thing the child road could never do — it had to convert
+/// the whole file to learn its length.
+const NATIVE_MAX_BYTES: u64 = (MAX_FRAMES as u64) * 2 * 4 + (1 << 20);
+
+// How many children `read_wav` has started on this thread. A test's proof
+// that a take never left the process; a `Cell` rather than a `cfg(test)`
+// static because `proc.rs` scans this file's runtime text up to its first
+// `#[cfg(test)]`, and a gate placed above `read_wav` would hide `read_wav`
+// from that scan. Read by the tests through `tests::child_spawns`.
+thread_local! {
+    static CHILD_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn note_child_spawn() {
+    CHILD_SPAWNS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// **The native road: read the file and parse it here, when it is a WAV this
+/// file can already read at the rate that was asked for.** `None` means
+/// "not this way" — the child road follows, exactly as before.
+///
+/// Every media file in a real project is a take this app wrote: RIFF/WAVE,
+/// `bext` first, tag-1 or float `fmt `, `data` last, at the engine's rate.
+/// `wav_stereo_f32` has parsed that shape for as long as it has existed,
+/// because it is the shape `afconvert` and ffmpeg hand back — so the child
+/// was being spawned to convert a file into the file it already was.
+/// Measured on a 60 s 24-bit take: 37 ms through `afconvert` (19 ms of it
+/// fixed: spawn, a 23 MB temp file, and reading it back), 7 ms here, the
+/// samples bit-identical. Forty-five takes is 1.7 s against 0.3 s.
+///
+/// **What still goes to the child, and why each:**
+/// * a rate other than the ask — `resample_stereo` is linear, a RECOVERY for
+///   a decoder that disobeyed, not a converter; the child resamples properly;
+/// * a channel count other than two — the child's mono-to-stereo and
+///   downmix gains are its own, and the doubling here has not been measured
+///   against them;
+/// * a file longer than [`NATIVE_MAX_BYTES`] on disk — refused unread, the
+///   child then produces the "that file is N minutes long" sentence as it
+///   always has;
+/// * anything the STRICT parse refuses — not RIFF (AIFF, CAF, MP3, RF64),
+///   a format the parser has no arm for, and a chunk that claims more bytes
+///   than the file holds. That last one is a take that was cut short: the
+///   tolerant parse would return the bytes that are there as if they were
+///   the whole file, and a clip silently a minute short is worse than one
+///   the child either reads the same way or refuses out loud.
+fn read_native(path: &Path, rate: u32) -> Option<(Vec<f32>, u32)> {
+    let len = std::fs::metadata(path).ok()?.len();
+    if len > NATIVE_MAX_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let (samples, got, channels) = parse_wav(&bytes, true).ok()?;
+    if got != rate || channels != 2 {
+        return None;
+    }
+    Some((samples, got))
+}
+
 /// Interleaved stereo f32 out of a RIFF/WAVE byte string, plus the rate its
-/// own `fmt ` chunk states.
+/// own `fmt ` chunk states — the TOLERANT read, for what a child produced.
 ///
 /// **Walked rather than assumed at offset 44.** `afconvert` writes an `FLLR`
 /// padding chunk before `data` to page-align it, and ffmpeg piping to stdout
@@ -144,6 +219,16 @@ pub fn decode(path: &Path, rate: u32) -> Result<Clip, String> {
 /// decoder that did not listen); int16/24/32 are converted, because a
 /// decoder that ignored the codec ask should still come out as music.
 fn wav_stereo_f32(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
+    parse_wav(bytes, false).map(|(samples, rate, _)| (samples, rate))
+}
+
+/// The walk behind [`wav_stereo_f32`], with its `strict` face for
+/// [`read_native`]: a chunk whose declared size runs past the end of the
+/// bytes is refused rather than clamped, and a `data` chunk past
+/// [`MAX_FRAMES`] is refused before a single sample is allocated. Returns
+/// the source channel count beside the samples, so the native road can
+/// tell a real stereo file from a doubled mono one.
+fn parse_wav(bytes: &[u8], strict: bool) -> Result<(Vec<f32>, u32, u16), String> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err("the decoder did not produce audio".to_owned());
     }
@@ -152,11 +237,16 @@ fn wav_stereo_f32(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
     let mut at = 12usize;
     while at + 8 <= bytes.len() {
         let id = &bytes[at..at + 4];
-        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        let size = u32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]])
+            as usize;
         let from = at + 8;
+        let end = from.saturating_add(size);
+        if strict && end > bytes.len() {
+            return Err("the file is shorter than its header says it is".to_owned());
+        }
         // Clamped: a streamed WAV's size fields lie (see above), and a
         // truncated file's run past the end — what there is is still music.
-        let to = from.saturating_add(size).min(bytes.len());
+        let to = end.min(bytes.len());
         if id == b"fmt " && to - from >= 16 {
             let c = &bytes[from..to];
             let mut tag = u16::from_le_bytes([c[0], c[1]]);
@@ -176,7 +266,7 @@ fn wav_stereo_f32(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
             break;
         }
         // Chunks are word-aligned; an odd size carries a pad byte.
-        at = from.saturating_add(size + (size & 1));
+        at = from.saturating_add(size).saturating_add(size & 1);
     }
     let Some((tag, channels, rate, bits)) = fmt else {
         return Err("the decoded audio does not say what format it is".to_owned());
@@ -188,6 +278,10 @@ fn wav_stereo_f32(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
         return Err("the decoded audio has an impossible format".to_owned());
     }
     let ch = channels as usize;
+    if strict && data.len() / (usize::from(bits / 8).max(1) * ch) > MAX_FRAMES {
+        // The child road says how long it is; this road only declines.
+        return Err("longer than the native road reads".to_owned());
+    }
     let read: fn(&[u8]) -> f32 = match (tag, bits) {
         (3, 32) => |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
         (1, 16) => |b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0,
@@ -213,7 +307,7 @@ fn wav_stereo_f32(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
         samples.push(l);
         samples.push(r);
     }
-    Ok((samples, rate))
+    Ok((samples, rate, channels))
 }
 
 /// Linear resample of interleaved stereo, `from` Hz to `to` Hz.
@@ -253,6 +347,7 @@ fn resample_stereo(input: &[f32], from: u32, to: u32) -> Vec<f32> {
 fn read_wav(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
     use std::io::Read;
 
+    note_child_spawn();
     let program = crate::encode::ffmpeg::program();
     let mut child = crate::proc::command(&program)
         // `-nostdin`, or a child that decides it wants a terminal takes the
@@ -338,6 +433,7 @@ fn read_wav(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
     }
     let _sweep = Sweep(tmp.clone());
 
+    note_child_spawn();
     let out = crate::proc::command("/usr/bin/afconvert")
         .arg(path)
         .args(["-f", "WAVE", "-d"])
@@ -362,6 +458,11 @@ fn read_wav(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Children `read_wav` has started on the calling thread.
+    fn child_spawns() -> usize {
+        CHILD_SPAWNS.with(std::cell::Cell::get)
+    }
 
     /// A hand-rolled WAV: `fmt ` then `data`, sizes as given (a streamed
     /// ffmpeg WAV writes `0xFFFFFFFF` where it could not seek back).
@@ -434,54 +535,71 @@ mod tests {
         assert!((mid - 0.5).abs() < 0.01, "halfway was {mid}");
     }
 
-    /// **A file goes in and stereo float comes out at the rate asked for.**
-    ///
-    /// Run against a real file through whatever this platform decodes with,
-    /// because the thing being tested is the subprocess contract — the flags,
-    /// the byte order and, on macOS, the chunk walk that a fixed offset gets
-    /// wrong.
-    #[test]
-    fn a_wav_round_trips_through_the_platform_decoder() {
-        // A second of a 440 Hz tone, written with this crate's own writer.
-        let dir = std::env::temp_dir().join(format!("tangent-decode-{}", std::process::id()));
+    /// A second of a 440 Hz tone at `rate`, written with this crate's own
+    /// writer in `format`, under a directory of the test's own.
+    fn write_tone(name: &str, rate: u32, format: crate::wav::SampleFormat) -> Option<(std::path::PathBuf, Vec<f32>)> {
+        let dir = std::env::temp_dir().join(format!("tangent-decode-{}-{name}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("tone.wav");
-        let rate = 48_000u32;
         let frames = rate as usize;
         let mut pcm = Vec::with_capacity(frames * 2);
         for f in 0..frames {
             let x = (std::f32::consts::TAU * 440.0 * f as f32 / rate as f32).sin() * 0.5;
             pcm.push(x);
-            pcm.push(x);
+            pcm.push(x * 0.75);
         }
         let spec = crate::wav::WavSpec {
             sample_rate: rate,
             channels: 2,
-            format: crate::wav::SampleFormat::Float32,
+            format,
         };
         let bext = crate::wav::Bext::new(crate::wav::Wallclock::now_utc(), spec);
         match crate::wav::WavWriter::create(&path, spec, &bext) {
             Ok(mut w) => {
                 w.write_interleaved(&pcm).expect("write");
                 w.finish().expect("finish");
+                Some((path, pcm))
             }
             Err(e) => {
                 eprintln!("no writer here ({e}); skipping");
-                return;
+                None
             }
         }
+    }
 
+    fn sweep(path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// **A file goes in and stereo float comes out at the rate asked for.**
+    ///
+    /// Run against a real file through whatever this platform decodes with,
+    /// because the thing being tested is the subprocess contract — the flags,
+    /// the byte order and, on macOS, the chunk walk that a fixed offset gets
+    /// wrong. The file is at 44.1 k and the ask is 48 k ON PURPOSE: a file
+    /// already at the asked rate never reaches the child any more (see
+    /// `read_native`), and this test exists to exercise the child.
+    #[test]
+    fn a_wav_round_trips_through_the_platform_decoder() {
+        let Some((path, _)) = write_tone("child", 44_100, crate::wav::SampleFormat::Float32) else {
+            return;
+        };
+        let before = child_spawns();
+        let rate = 48_000u32;
         let clip = match decode(&path, rate) {
             Ok(c) => c,
             Err(e) => {
                 // No decoder on this machine is a real answer, not a failure:
                 // the Linux CI box may have neither ffmpeg nor a bundled one.
                 eprintln!("no decoder here ({e}); skipping");
-                let _ = std::fs::remove_dir_all(&dir);
+                sweep(&path);
                 return;
             }
         };
-        let _ = std::fs::remove_dir_all(&dir);
+        sweep(&path);
+        assert_eq!(child_spawns(), before + 1, "a rate mismatch has to go to the child");
 
         assert_eq!(clip.rate, rate);
         assert!(
@@ -499,6 +617,97 @@ mod tests {
         // read from the wrong offset looks like.
         let head = clip.samples[..96].iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(head > 0.01, "the decode started inside the header");
+    }
+
+    /// **A take as this app writes it never leaves the process.** Both
+    /// shapes the app writes — the timeline's float take and the recorder's
+    /// 24-bit one, each with its `bext` in front — decode with no child, and
+    /// the samples are what the writer was given (to a 24-bit step for the
+    /// integer one).
+    #[test]
+    fn a_take_as_the_app_writes_it_decodes_without_a_child() {
+        for (name, format, step) in [
+            ("float", crate::wav::SampleFormat::Float32, 0.0f32),
+            ("int24", crate::wav::SampleFormat::Int24, 1.0 / 8_388_608.0),
+        ] {
+            let Some((path, pcm)) = write_tone(name, 48_000, format) else {
+                return;
+            };
+            let before = child_spawns();
+            let clip = decode(&path, 48_000).expect("the native road reads a take");
+            sweep(&path);
+            assert_eq!(child_spawns(), before, "{name}: a take spawned a child");
+            assert_eq!(clip.rate, 48_000);
+            assert_eq!(clip.samples.len(), pcm.len(), "{name}: length");
+            let worst = clip
+                .samples
+                .iter()
+                .zip(&pcm)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(worst <= step * 1.01, "{name}: samples drifted by {worst}");
+            assert_eq!(clip.source, path);
+        }
+    }
+
+    /// **What the native road declines still reaches the child**, so nothing
+    /// that decoded before stops decoding: bytes that are not a WAV, an RF64
+    /// header, a WAV at another rate, a mono WAV, and a take cut short —
+    /// whose header claims more `data` than the file holds. Each is counted
+    /// as a spawn; whether the child then succeeds depends on the machine
+    /// and is not this test's question.
+    #[test]
+    fn what_the_native_road_declines_goes_to_the_child() {
+        let dir = std::env::temp_dir().join(format!("tangent-decode-decline-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let spawn_for = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).expect("write");
+            let before = child_spawns();
+            let _ = decode(&path, 48_000);
+            assert_eq!(child_spawns(), before + 1, "{name} did not reach the child");
+        };
+        spawn_for("garbage.bin", b"this is not a wav file at all, not even close");
+        let f32s: Vec<u8> = [0.5f32, -0.5, 0.25, -0.25]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let mut rf64 = wav_bytes(3, 2, 48_000, 32, &f32s, false);
+        rf64[0..4].copy_from_slice(b"RF64");
+        spawn_for("rf64.wav", &rf64);
+        spawn_for("mono.wav", &wav_bytes(3, 1, 48_000, 32, &f32s, false));
+        spawn_for("other-rate.wav", &wav_bytes(3, 2, 44_100, 32, &f32s, false));
+        // A streamed writer's lying sizes are the child's business too.
+        spawn_for("streamed.wav", &wav_bytes(3, 2, 48_000, 32, &f32s, true));
+        // The take cut short: a real header, patched to say 4 frames, with
+        // only 2 on disk behind it.
+        let mut short = wav_bytes(3, 2, 48_000, 32, &f32s, false);
+        short.truncate(short.len() - 8);
+        spawn_for("short.wav", &short);
+        // ...which the TOLERANT parse still reads as far as it goes, because
+        // that is what a child's own streamed output looks like.
+        let (got, _) = wav_stereo_f32(&short).expect("tolerant");
+        assert_eq!(got.len(), 2, "the tolerant walk keeps what is there");
+        assert!(
+            parse_wav(&short, true).is_err(),
+            "the strict walk must not pass a short file off as whole"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The strict walk refuses a `data` chunk past the ceiling before it
+    /// allocates a sample for it, and the size check cannot overflow on a
+    /// chunk that claims the whole 32-bit range.
+    #[test]
+    fn the_strict_walk_declines_the_ceiling_before_allocating() {
+        // A header alone whose data chunk claims 4 GiB: strict refuses it as
+        // short (the bytes are not there), tolerant reads zero frames.
+        let mut b = wav_bytes(3, 2, 48_000, 32, &[], false);
+        let n = b.len();
+        b[n - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_wav(&b, true).is_err());
+        let (s, _) = wav_stereo_f32(&b).expect("tolerant");
+        assert!(s.is_empty());
     }
 
     /// The envelope is the outline, and it is as long as it was asked for.
@@ -521,5 +730,101 @@ mod tests {
         assert!(env[1] > 0.7, "the loud third did not show: {env:?}");
         // Degenerate asks answer with nothing rather than dividing by zero.
         assert!(clip.envelope(0).is_empty());
+    }
+}
+
+/// **decode**: what a take costs to read through `decode()` — the native
+/// road for a stereo WAV at the asked rate, the platform child for the
+/// rest — against the child road alone. Ignored; run in RELEASE:
+///
+/// ```text
+/// cargo test --release -p tangent-record --lib perf_probe::perf_decode -- --ignored --nocapture
+/// ```
+///
+/// The files are what the recorder writes: 24-bit PCM, stereo, 48 kHz,
+/// through this crate's own `WavWriter`. The child road is measured by
+/// asking for a rate the file is not at, which is the one gate every take
+/// passes and no `afconvert` invocation can skip; its number therefore
+/// includes a resample the native road never does, and reads as an upper
+/// bound on what a take used to cost, not an exact one.
+#[cfg(test)]
+mod perf_probe {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn per_call(n: u32, mut f: impl FnMut()) -> Duration {
+        let t = Instant::now();
+        for _ in 0..n {
+            f();
+        }
+        t.elapsed() / n.max(1)
+    }
+
+    /// A take of `seconds`: decaying sine bursts, a note every half second,
+    /// written a block at a time. Answers the bytes on disk.
+    fn write_take(path: &Path, seconds: f64, rate: u32) -> u64 {
+        let spec = crate::wav::WavSpec {
+            sample_rate: rate,
+            channels: 2,
+            format: crate::wav::SampleFormat::Int24,
+        };
+        let bext = crate::wav::Bext::new(crate::wav::Wallclock::now_utc(), spec);
+        let mut w = crate::wav::WavWriter::create(path, spec, &bext).expect("writer");
+        let frames = (seconds * f64::from(rate)) as usize;
+        let mut block = vec![0.0f32; 4_800 * 2];
+        let mut at = 0usize;
+        while at < frames {
+            let n = (frames - at).min(4_800);
+            for k in 0..n {
+                let t = (at + k) as f64 / f64::from(rate);
+                let into = t - (t * 2.0).floor() / 2.0;
+                let env = 0.7 * (-into * 5.0).exp();
+                let ph = std::f64::consts::TAU * 220.0 * into;
+                let v = env * (ph.sin() + 0.4 * (2.0 * ph).sin());
+                block[k * 2] = v as f32;
+                block[k * 2 + 1] = (v * 0.9) as f32;
+            }
+            w.write_interleaved(&block[..n * 2]).expect("write");
+            at += n;
+        }
+        let bytes = w.total_bytes();
+        w.finish().expect("finish");
+        bytes
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_decode() {
+        let build = if cfg!(debug_assertions) { "DEBUG" } else { "release" };
+        println!(
+            "decode [{build}]: decode() on a 24-bit stereo 48 kHz take (native road) vs the platform child (asked at 44.1 kHz, so it resamples too)"
+        );
+        let rate = 48_000u32;
+        let dir = std::env::temp_dir().join(format!("tangent-perf-decode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        for (seconds, n) in [(5.0, 5u32), (60.0, 3), (180.0, 2)] {
+            let path = dir.join(format!("take-{seconds}s.wav"));
+            let bytes = write_take(&path, seconds, rate);
+            let native = per_call(n, || {
+                let clip = decode(&path, rate).expect("the native road");
+                std::hint::black_box(clip);
+            });
+            let child = per_call(n, || {
+                // No decoder on this machine: the column reads as the cost
+                // of finding that out.
+                let got = decode(&path, 44_100).map(|c| c.samples.len()).unwrap_or(0);
+                std::hint::black_box(got);
+            });
+            let read_only = per_call(n, || {
+                std::hint::black_box(std::fs::read(&path).expect("read"));
+            });
+            println!(
+                "decode       {seconds:>5.0} s ({:>6.1} MB): native {native:>10.3?} (of which fs::read {read_only:>9.3?}) | child+resample {child:>10.3?} | {:>5.1}x  [{build}]",
+                bytes as f64 / 1_048_576.0,
+                child.as_secs_f64() / native.as_secs_f64().max(1e-9)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
