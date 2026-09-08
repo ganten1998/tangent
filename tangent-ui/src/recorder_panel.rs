@@ -266,17 +266,57 @@ pub(crate) struct Palette {
 pub const INK_LIGHT: Color32 = Color32::from_rgb(0xE8, 0xDC, 0xC0);
 pub const INK_DARK: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
 
+/// One channel of [`luminance`]: sRGB to linear, the arithmetic WCAG writes.
+///
+/// Not called on the drawing path — [`srgb_to_linear_table`] holds its 256
+/// answers — but it is where they come FROM, and the only place the curve
+/// is written down.
+fn srgb_to_linear(v: u8) -> f32 {
+    let v = f32::from(v) / 255.0;
+    if v <= 0.03928 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// The sRGB transfer curve for every channel value there is, built once.
+///
+/// **A channel is a `u8`, so the curve has 256 answers and no more.** They
+/// were being recomputed instead: three `powf(2.4)` per colour, per
+/// [`contrast_ratio`], and this app asks that question in a loop —
+/// `legible_surface` walks up to fifty steps and measures at each one,
+/// `quiet` twelve, `distinct_surface_at` sixteen, and the arrangement runs
+/// them per clip and per header on every frame. The survey put it at three
+/// to five thousand `powf` a frame, and up to ten microseconds in a single
+/// `legible_surface` call when the lane colour lands in the dead zone.
+///
+/// The table is filled by [`srgb_to_linear`] itself rather than by a list of
+/// numbers typed out here, and that is the whole safety argument: the
+/// entries are not "close to" the arithmetic they replace, they ARE it,
+/// evaluated once instead of a thousand times a frame. This has to be exact
+/// and not merely near, because the 4.5:1 decisions built on it are
+/// load-bearing — there is a band of luminance around 0.12 to 0.22 where
+/// neither ink clears 4.5 and the SURFACE has to move
+/// ([`legible_surface`]), and a colour sitting on that boundary would flip
+/// sides if the curve moved in its last bit.
+/// `the_luminance_table_is_the_arithmetic_it_replaced` proves all 256.
+fn srgb_to_linear_table() -> &'static [f32; 256] {
+    static LIN: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    // `v` comes from `0..256`, so the cast is the index's own range.
+    LIN.get_or_init(|| std::array::from_fn(|v| srgb_to_linear(v as u8)))
+}
+
 /// Relative luminance, sRGB, as WCAG defines it.
+///
+/// The three lookups are total: a `u8` widened to `usize` cannot leave a
+/// 256-long array, so there is no bounds check to fail however strange the
+/// colour a document hands in. See [`srgb_to_linear_table`].
 pub fn luminance(c: Color32) -> f32 {
-    let ch = |v: u8| {
-        let v = f32::from(v) / 255.0;
-        if v <= 0.03928 {
-            v / 12.92
-        } else {
-            ((v + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    let lin = srgb_to_linear_table();
+    0.2126 * lin[usize::from(c.r())]
+        + 0.7152 * lin[usize::from(c.g())]
+        + 0.0722 * lin[usize::from(c.b())]
 }
 
 /// Contrast ratio between two colours, 1.0 (identical) to 21.0 (black/white).
@@ -6807,6 +6847,82 @@ fn painter_border(painter: &Painter, rect: Rect) {
 
 #[cfg(test)]
 mod tests {
+    /// **The luminance channel curve as it was computed before the table,
+    /// kept as the specification of it.**
+    ///
+    /// This is the body `luminance` had, verbatim. It exists so the table
+    /// can be checked against the arithmetic rather than against a list of
+    /// numbers somebody transcribed — a golden list would say the table has
+    /// not changed since it was written down, which is not the question.
+    pub(super) fn luminance_reference(c: Color32) -> f32 {
+        let ch = |v: u8| {
+            let v = f32::from(v) / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+
+    /// **The table IS the arithmetic, to the bit, for every input it can be
+    /// asked about.**
+    ///
+    /// Not "within an epsilon". Everything legible in this app is decided by
+    /// comparing a contrast ratio against a fixed floor — 4.5, 4.6, 3.0 —
+    /// and a colour whose ratio lands on one of those floors flips sides if
+    /// the curve moves in its last bit. `legible_surface` would then walk to
+    /// a different surface, which is a visible change to a painted lane, and
+    /// the dead zone at 0.12-0.22 luminance is exactly where the borderline
+    /// colours live.
+    ///
+    /// A channel is a `u8`: 256 inputs, and the table holds all of them. The
+    /// rest of `luminance` — the three weights and their sum — is the same
+    /// expression it always was, so 256 bit-equal channel values is the
+    /// whole proof for all 16.7 million colours. The sweep below is belt and
+    /// braces against exactly that reasoning being wrong somewhere (a
+    /// contraction the table's loads permit and the inlined `powf` did not,
+    /// say), and it costs a fraction of a second.
+    #[test]
+    fn the_luminance_table_is_the_arithmetic_it_replaced() {
+        for v in 0..=255u8 {
+            let want = srgb_to_linear(v);
+            let got = srgb_to_linear_table()[usize::from(v)];
+            assert_eq!(
+                want.to_bits(),
+                got.to_bits(),
+                "channel {v}: the table says {got:e}, the curve says {want:e}"
+            );
+        }
+        // Every (r, g) pair, with b walked across its whole range as they
+        // go, and then the greys and the pure channels, which are where the
+        // hand-picked theme colours actually sit.
+        let mut checked = 0u32;
+        let mut check = |c: Color32| {
+            let (want, got) = (luminance_reference(c), luminance(c));
+            assert_eq!(
+                want.to_bits(),
+                got.to_bits(),
+                "{c:?}: the table says {got:e}, the arithmetic says {want:e}"
+            );
+            checked += 1;
+        };
+        for r in 0..=255u8 {
+            for g in 0..=255u8 {
+                let b = (u32::from(r) * 7 + u32::from(g) * 13) as u8;
+                check(Color32::from_rgb(r, g, b));
+            }
+        }
+        for v in 0..=255u8 {
+            check(Color32::from_rgb(v, v, v));
+            check(Color32::from_rgb(v, 0, 0));
+            check(Color32::from_rgb(0, v, 0));
+            check(Color32::from_rgb(0, 0, v));
+        }
+        assert_eq!(checked, 256 * 256 + 4 * 256, "the sweep did not run");
+    }
+
     /// **The badge table is dense, unique, and every code draws.** The
     /// picker iterates `ICON_PICKS` and the strips dispatch on the code; a
     /// code that vanished or collided would re-badge every saved session.
@@ -12585,5 +12701,134 @@ mod claim_probe {
             w += 1.0;
         }
         println!("worst readout overhang left of the bar {worst_over:.2} at w={worst_w:.0}; worst after/before ratio {ratio_worst:.2} at w={ratio_w:.0}");
+    }
+}
+
+/// **What a contrast decision costs**, with the sRGB curve looked up against
+/// with it computed — the measurement behind `srgb_to_linear_table`.
+///
+/// Ignored by default; run with `--ignored --nocapture`, and in RELEASE. A
+/// debug build reports about ten times the truth on this code and the app
+/// ships optimised.
+#[cfg(test)]
+mod contrast_probe {
+    use super::tests::luminance_reference;
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// [`contrast_ratio`] over the curve as it was computed, so the two
+    /// roads are timed doing the same work.
+    fn contrast_powf(a: Color32, b: Color32) -> f32 {
+        let (x, y) = (luminance_reference(a), luminance_reference(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// [`legible_surface`] over the same, verbatim but for the ratio it asks.
+    fn legible_surface_powf(c: Color32) -> Color32 {
+        let light = contrast_powf(c, INK_LIGHT);
+        let dark = contrast_powf(c, INK_DARK);
+        if light.max(dark) >= 4.5 {
+            return c;
+        }
+        let (ink, toward) = if light > dark {
+            (INK_LIGHT, Color32::BLACK)
+        } else {
+            (INK_DARK, Color32::WHITE)
+        };
+        let mut out = c;
+        for step in 1u8..=50 {
+            let t = f32::from(step) * 0.02_f32;
+            let f = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t) as u8;
+            out = Color32::from_rgb(
+                f(c.r(), toward.r()),
+                f(c.g(), toward.g()),
+                f(c.b(), toward.b()),
+            );
+            if contrast_powf(out, ink) >= 4.6 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn timed(n: u32, mut f: impl FnMut()) -> Duration {
+        let t = Instant::now();
+        for _ in 0..n {
+            f();
+        }
+        t.elapsed() / n
+    }
+
+    #[test]
+    #[ignore]
+    fn what_does_a_contrast_decision_cost() {
+        // The strips' own swatches, which is what the arrangement measures
+        // every frame: one `legible_surface` per visible clip and per header.
+        let swatches: Vec<Color32> = crate::mixer_panel::STRIP_COLORS
+            .iter()
+            .map(|&(r, g, b)| Color32::from_rgb(r, g, b))
+            .collect();
+        // A colour in the dead zone, where the walk runs its fifty steps and
+        // the powf bill is at its worst.
+        let deep = swatches
+            .iter()
+            .copied()
+            .filter(|c| (0.12..0.22).contains(&luminance(*c)))
+            .max_by(|a, b| luminance(*a).total_cmp(&luminance(*b)))
+            .expect("no dead-zone swatch in the table");
+
+        // **The colour goes through `black_box`, not the answer.** Both of
+        // these are pure functions of one constant, so a `black_box` on the
+        // RESULT lets the optimiser hoist the whole call out of the loop and
+        // time an empty one: the first run of this said `legible_surface`
+        // cost a nanosecond, which is a bus cycle and not fifty steps of
+        // colour arithmetic. Blinding the INPUT is what keeps the work
+        // inside the loop.
+        // **The colour goes through `black_box`, not the answer.** Both of
+        // these are pure functions of one constant, so a `black_box` on the
+        // RESULT lets the optimiser hoist the whole call out of the loop and
+        // time an empty one: the first run of this said `legible_surface`
+        // cost a nanosecond, which is a bus cycle and not fifty steps of
+        // colour arithmetic. Blinding the INPUT is what keeps the work
+        // inside the loop.
+        //
+        // And the cheap calls are timed over the whole swatch table rather
+        // than one colour, because `Duration` counts in whole nanoseconds
+        // and a table lookup does not take one: measured singly, the fast
+        // road reports zero and the ratio is unreadable.
+        let opaque = || std::hint::black_box(deep);
+        println!(
+            "contrast [{}]: legible_surface       table {:>9.3?}  powf {:>9.3?}   (one colour in the dead zone, {deep:?}, luminance {:.3})",
+            crate::perf_fixtures::build(),
+            timed(20_000, || { std::hint::black_box(legible_surface(opaque())); }),
+            timed(20_000, || { std::hint::black_box(legible_surface_powf(opaque())); }),
+            luminance(deep),
+        );
+        let sweep = |f: &dyn Fn(Color32)| {
+            timed(200, || {
+                for c in &swatches {
+                    f(std::hint::black_box(*c));
+                }
+            })
+        };
+        println!(
+            "contrast [{}]: luminance       x{:<5} table {:>9.3?}  powf {:>9.3?}",
+            crate::perf_fixtures::build(),
+            swatches.len(),
+            sweep(&|c| { std::hint::black_box(luminance(c)); }),
+            sweep(&|c| { std::hint::black_box(luminance_reference(c)); }),
+        );
+        println!(
+            "contrast [{}]: legible_surface x{:<5} table {:>9.3?}  powf {:>9.3?}",
+            crate::perf_fixtures::build(),
+            swatches.len(),
+            sweep(&|c| { std::hint::black_box(legible_surface(c)); }),
+            sweep(&|c| { std::hint::black_box(legible_surface_powf(c)); }),
+        );
+        // And the answers must not have moved.
+        for c in &swatches {
+            assert_eq!(legible_surface(*c), legible_surface_powf(*c), "{c:?} moved");
+        }
     }
 }
