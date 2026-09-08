@@ -6,7 +6,7 @@
 //! binary so it can be listened to. A plugin that instantiates but returns
 //! silence is the single most common hosting bug, and it looks exactly like
 //! success from every log line except this one.
-use tangent_host::{Instance, Module, Note, Setup};
+use tangent_host::{Instance, Note, Setup};
 
 fn main() {
     let filter = std::env::args().nth(1).unwrap_or_else(|| "piano".into());

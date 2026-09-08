@@ -17,7 +17,7 @@
 //! that fires every note at offset 0 of some block proves nothing about sync,
 //! and sync is the whole feature.
 
-use tangent_host::{Instance, Module, Note, Setup};
+use tangent_host::{Instance, Note, Setup};
 use tangent_record::clock::{Nanos, Timeline};
 use tangent_record::smf::{Captured, MidiTake};
 use tangent_record::take::{Manifest, Take, WallTime};

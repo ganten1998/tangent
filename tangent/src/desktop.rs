@@ -8246,7 +8246,6 @@ impl DesktopApp {
     /// saved states", and the difference is the export bug the stems chips
     /// were blamed for: see `desk_insert_state`.
     fn start_offline_bounce(&mut self, spec: tangent_ui::ports::ProjectExportSpec) {
-        use tangent_ui::ports::ExportFormat;
         // Every road out of here is a road out of a message that is already
         // standing — see `start_bounce`, which says why.
         macro_rules! refuse {

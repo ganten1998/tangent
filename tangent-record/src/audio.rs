@@ -568,8 +568,8 @@ impl GraphDropouts {
         let stop = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "linux")]
         {
-            let latest_t = std::sync::Arc::clone(&latest);
-            let stop_t = std::sync::Arc::clone(&stop);
+            let latest_t = Arc::clone(&latest);
+            let stop_t = Arc::clone(&stop);
             let spawned = std::thread::Builder::new()
                 .name("graph-dropouts".to_owned())
                 .spawn(move || {

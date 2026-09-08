@@ -233,6 +233,11 @@ use tangent_record::clock::Nanos;
 // The number of instrument slots is the GUI's, not this file's. Defining a
 // second one here is how the band ends up drawing three faders for four
 // renderers, or four for three, and neither side would fail to compile.
+//
+// The shipped build reaches it only through the `[`SLOTS`]` doc links in
+// this module — the code that reads the value is in the tests — so the
+// import is unused by the lint's reckoning and load-bearing by every other.
+#[allow(unused_imports)]
 use tangent_ui::recorder::SLOTS;
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -2764,13 +2769,13 @@ impl Backend {
                     let ch = (c.channel.clamp(0, 15)) as u8;
                     let at = c.offset.max(0) as i64;
                     let _ = match c.controller {
-                        tangent_host::Control::PITCH_BEND => {
+                        Control::PITCH_BEND => {
                             // 0..=16383 back into the two seven-bit halves the
                             // wire carries, LSB first.
                             let v = c.value.min(16383);
                             inst.push_midi(at, &[0xE0 | ch, (v & 0x7F) as u8, (v >> 7) as u8])
                         }
-                        tangent_host::Control::AFTERTOUCH => {
+                        Control::AFTERTOUCH => {
                             inst.push_midi(at, &[0xD0 | ch, c.value.min(127) as u8])
                         }
                         cc if (0..=127).contains(&cc) => inst.push_midi(
