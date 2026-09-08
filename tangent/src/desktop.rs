@@ -9022,6 +9022,12 @@ impl DesktopApp {
     /// landings), and answer the two debts: the notes on their deadline,
     /// the rest when nothing is left anywhere.
     fn run_warm(&mut self, ctx: &egui::Context) {
+        // The engine's half of a hand-off that no longer waits: what the
+        // callback handed back dies here, once a frame. See
+        // `Engine::retire_tick`.
+        if let Some(e) = self.recorder.engine.as_mut() {
+            e.retire_tick();
+        }
         // What the crew finished since last frame goes into the caches
         // first; a landed clip is a schedule the engine has not heard.
         if self.land_decodes() {
