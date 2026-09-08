@@ -205,6 +205,10 @@ struct Recorder {
     /// The drumpad kit could not be handed to the audio thread last frame
     /// (stalled callback, absent engine) — try again this one.
     pads_retry: bool,
+    /// The same, for a sampler bay's file. Same reason and the same cost of
+    /// getting it wrong: a face drawing a waveform over an engine that never
+    /// received the samples.
+    sampler_retry: bool,
     audio: crate::devices::Shared,
     camera: crate::devices::Shared,
     /// Why enumeration failed last time, so the band can say "permission" and
@@ -658,6 +662,13 @@ pub struct DesktopApp {
     clips_owed_at: Option<std::time::Instant>,
     #[cfg(feature = "recorder")]
     pads_owed: bool,
+    /// A sampler bay's file has to be decoded and delivered — raised by a
+    /// bay landing, by a device change, by a fresh project, and by the app
+    /// choosing a file. Answered in `run_warm`, beside the kit's, so the
+    /// decode happens a file a frame in front of a meter rather than as one
+    /// blocking call.
+    #[cfg(feature = "recorder")]
+    sampler_owed: bool,
     /// What the insert loader's meter reads for the batch it is working
     /// through. Zeroed between batches. See [`Counted`], which is where the
     /// arithmetic and the reason for it live.
@@ -901,6 +912,24 @@ pub struct DesktopApp {
     /// clear on an engine restart.
     #[cfg(feature = "recorder")]
     pad_cache: std::collections::HashMap<std::path::PathBuf, Decoded>,
+    /// The sampler bays' decoded files, by resolved path — its own cache for
+    /// the reason the kit has its own: `track_cache` evicts by what the
+    /// ARRANGEMENT references, and an instrument's sample is not the
+    /// arrangement's business. Same rate-keying, same clear on an engine
+    /// restart, same sweep against what is actually loaded.
+    #[cfg(feature = "recorder")]
+    sampler_cache: std::collections::HashMap<std::path::PathBuf, Decoded>,
+    /// What each lane's sampler has actually been GIVEN — the path and the
+    /// root key of the sample now on the audio thread.
+    ///
+    /// Not a cache and not a mirror of the desk: it is the record that lets
+    /// a reload deliver only what CHANGED. `Engine::set_sampler_sample`
+    /// waits on the callback for its retiree, so re-delivering thirty-two
+    /// unchanged lanes because one bay loaded would spend a frame doing
+    /// nothing. Cleared wherever `sampler_cache` is, because a file decoded
+    /// at the old device's rate is not the file this lane is playing.
+    #[cfg(feature = "recorder")]
+    sampler_have: Vec<Option<(std::path::PathBuf, u8)>>,
     /// The decode workers `run_warm` feeds and drains. See [`DecodePool`].
     #[cfg(feature = "recorder")]
     pool: DecodePool,
@@ -4543,6 +4572,15 @@ impl DesktopApp {
         // frame's walk counts zero, the cover stands down, and the plugin's
         // face, its parameter list and any sentence its failure left would
         // have waited for the next mouse move. See `late_change`.
+        //
+        // **And a bay that changed may be a SAMPLER.** Its file is named in
+        // the bay's own state (`sample_path`), so the moment a bay lands is
+        // the moment the engine can be told which file to play — and the
+        // moment one is emptied is when the lane's samples have to be let
+        // go. One flag for both, answered in `run_warm` a file at a time.
+        if due.is_some() {
+            self.sampler_owed = true;
+        }
         late_change(ctx, due.is_some());
 
         // One walk, two answers — the bay to announce and the size of the
@@ -4657,6 +4695,22 @@ impl DesktopApp {
         // project switch marks; this decodes and pushes the samples whole.
         if std::mem::take(&mut self.recorder.pads_retry) || self.app.take_drumpad_dirty() {
             self.pads_owed = true;
+        }
+        // **And the sampler's file, on the same bargain.** The retry is the
+        // only writer here today: a bay landing raises the flag where the
+        // bay lands, and everything that changes a sampler's file changes
+        // the bay's state, which is a bay landing.
+        //
+        // MERGE-ME(ui): the app's own road, once the port exists. It writes
+        // the chosen file into the bay's state and marks the bay for a
+        // reload, which is how a picked file persists into the project —
+        // `bind_insert_ir` further down this file is the same three writes:
+        //
+        // while let Some((lane, path)) = self.app.take_sampler_load() {
+        //     self.bind_insert_sample(lane, &path);
+        // }
+        if std::mem::take(&mut self.recorder.sampler_retry) {
+            self.sampler_owed = true;
         }
         // **And neither runs until its files are already decoded.** See
         // `run_warm`, which is where both of those flags are answered.
@@ -9273,6 +9327,8 @@ impl DesktopApp {
                 self.refused_why.clear();
                 self.stretch_cache.clear();
                 self.pad_cache.clear();
+                self.sampler_cache.clear();
+                self.sampler_have = vec![None; tangent_ui::recorder::CHANNELS];
                 // Whatever the crew is still decoding belongs to the old
                 // project; so does whatever is queued for it.
                 self.pool.invalidate();
@@ -9280,6 +9336,7 @@ impl DesktopApp {
                 self.stretch_seen.clear();
                 self.clips_owed = true;
                 self.pads_owed = true;
+                self.sampler_owed = true;
                 // Both are answered a file a frame from here; ask for the
                 // frames, since a fresh scratch is exactly the moment nobody
                 // is touching anything.
@@ -9478,7 +9535,7 @@ impl DesktopApp {
         // `settle_warm_meter`: this return is reachable with the cover
         // still standing, and the drain below is not the only road that
         // owes it an exit.
-        if !self.clips_owed && !self.pads_owed && self.warm.is_empty() && self.pool.idle() {
+        if !self.clips_owed && !self.pads_owed && !self.sampler_owed && self.warm.is_empty() && self.pool.idle() {
             self.settle_warm_meter();
             return;
         }
@@ -9552,9 +9609,10 @@ impl DesktopApp {
             let Some(item) = self.warm.pop_front() else {
                 break;
             };
-            let (path, pads) = match &item {
-                Warm::Clip(p) => (p, false),
-                Warm::Pad(p) => (p, true),
+            let (path, pads, sampler) = match &item {
+                Warm::Clip(p) => (p, false, false),
+                Warm::Pad(p) => (p, true, false),
+                Warm::Sampler(p) => (p, false, true),
                 // Never queued here: a render is handed straight to the
                 // crew by `reload_clips`. Said out loud rather than a wildcard,
                 // so the next variant has to decide too.
@@ -9565,7 +9623,9 @@ impl DesktopApp {
             // the meter (it was read as outstanding), never decoded twice —
             // this was the second half of the open that decoded everything
             // twice.
-            if if pads {
+            if if sampler {
+                self.sampler_cache.contains_key(path)
+            } else if pads {
                 self.pad_cache.contains_key(path)
             } else {
                 self.track_cache.contains_key(path)
@@ -9595,6 +9655,10 @@ impl DesktopApp {
             if std::mem::take(&mut self.pads_owed) {
                 reloaded = true;
                 self.reload_pads();
+            }
+            if std::mem::take(&mut self.sampler_owed) {
+                reloaded = true;
+                self.reload_sampler();
             }
             // **This is the road the decoded take arrives on**, and it is
             // the only one here that does not ask for a frame of its own:
@@ -9737,6 +9801,13 @@ impl DesktopApp {
                     self.refused_why.remove(&path);
                     self.pad_cache.insert(path, decoded);
                 }
+                // Kept as it lands, like a pad's: `reload_sampler` sweeps
+                // its own cache against every lane that still names the file.
+                (Warm::Sampler(path), Ok(decoded)) => {
+                    self.warm_refused.remove(&path);
+                    self.refused_why.remove(&path);
+                    self.sampler_cache.insert(path, decoded);
+                }
                 // **A refusal is an answer, and has to be remembered as
                 // one.** Nothing else records it: a file that will not
                 // decode is absent from the cache exactly like one nobody
@@ -9746,7 +9817,7 @@ impl DesktopApp {
                 // day the pads were left out, a template kit pointing at a
                 // folder that did not exist spawned seventeen children a
                 // pass on the UI thread until the window starved.
-                (Warm::Clip(path) | Warm::Pad(path), Err(why)) => {
+                (Warm::Clip(path) | Warm::Pad(path) | Warm::Sampler(path), Err(why)) => {
                     self.refused_why.insert(path.clone(), why);
                     self.warm_refused.insert(path);
                 }
@@ -9810,6 +9881,22 @@ impl DesktopApp {
                     }
                     self.warm.push_back(Warm::Pad(path));
                 }
+            }
+        }
+        if self.sampler_owed {
+            // One file per lane at most, so this walk is cheap beside the
+            // pads' hundred and twenty-eight — and it reads the ENGINE's
+            // bays rather than the desk's, because a sampler's file is
+            // named in the bay's own state and arrives with the bay.
+            for path in self.sampler_files() {
+                if self.sampler_cache.contains_key(&path)
+                    || self.warm_refused.contains(&path)
+                    || self.pool.holds_sampler(&path)
+                    || !seen.insert(path.clone())
+                {
+                    continue;
+                }
+                self.warm.push_back(Warm::Sampler(path));
             }
         }
     }
@@ -10092,8 +10179,17 @@ impl DesktopApp {
             // A refusal outlives the thing that referenced it no longer than
             // a decode does, so a file fixed on disk and pointed at again
             // tries again.
-            self.warm_refused
-                .retain(|path| referenced(path) || live_pads.iter().any(|p| p == path));
+            // And the sampler bays, for exactly the reason the pads are
+            // here: a refusal thrown away is a file re-queued for ever.
+            let live_samplers: Vec<std::path::PathBuf> = self.sampler_files();
+            // The clip-or-pad half stays on ONE line: the checklist test
+            // reads this expression out of the source with the comments
+            // stripped and the lines trimmed, so wrapping it would have
+            // read as the sweep losing its pads.
+            self.warm_refused.retain(|path| {
+                referenced(path) || live_pads.iter().any(|p| p == path)
+                    || live_samplers.iter().any(|p| p == path)
+            });
             let refused = &self.warm_refused;
             self.refused_why.retain(|path, _| refused.contains(path));
             // And the stretched renders with them — including every ratio a
@@ -10300,6 +10396,199 @@ impl DesktopApp {
         self.pad_cache.retain(|path, _| live.iter().any(|p| p == path));
         if !delivered_all {
             self.recorder.pads_retry = true;
+        }
+    }
+
+    /// **Every lane that has a sampler bay, and what file it names.**
+    ///
+    /// Read out of the ENGINE rather than the desk, and that is the whole
+    /// shape of this feature: a sampler's file is not in the document, it is
+    /// in the BAY's state — the extra symbols `sample_path`, `sample_name`
+    /// and `root_key`, the convolver's `ir_path` road — so it arrives with
+    /// the bay and travels with the preset. Asking the desk instead would
+    /// mean a second copy of the same fact and a way for the two to differ.
+    ///
+    /// **One sample per LANE, and the first sampler bay wins.** Nothing
+    /// forbids seating two of them in one lane's rack; the engine store is
+    /// per lane because a lane's instrument is one instrument, so the second
+    /// would play the first one's file. Answered here rather than left to
+    /// chance, and the face's own picker only ever offers bay 0 anyway.
+    ///
+    /// `None` for the path means a bay with nothing loaded — which has to be
+    /// reported, not skipped, or emptying a bay would leave its old samples
+    /// playing on the audio thread.
+    #[cfg(feature = "recorder")]
+    fn sampler_bays(&self) -> Vec<(usize, Option<std::path::PathBuf>, u8)> {
+        let Some(e) = self.recorder.engine.as_ref() else {
+            return Vec::new();
+        };
+        let bays = tangent_ui::recorder::INSERTS;
+        let mut out = Vec::new();
+        for lane in 0..tangent_ui::recorder::CHANNELS {
+            for bay in 0..bays {
+                let Some((spec, _)) = e.builtin_insert(lane, bay) else {
+                    continue;
+                };
+                if spec.path != crate::builtin_fx::SAMPLER_PATH {
+                    continue;
+                }
+                let extra = e.builtin_extra(lane, bay);
+                let read = |key: &str| {
+                    extra
+                        .iter()
+                        .find(|(s, _)| s == key)
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or_default()
+                };
+                let path = read("sample_path");
+                // A key outside the wire's 0..127 is a corrupt blob, not a
+                // note; middle C is what an unset one has always meant.
+                let root = read("root_key")
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|k| *k <= 127)
+                    .unwrap_or(crate::instrument::SAMPLER_ROOT_KEY);
+                out.push((
+                    lane,
+                    (!path.is_empty()).then(|| std::path::PathBuf::from(path)),
+                    root,
+                ));
+                break;
+            }
+        }
+        out
+    }
+
+    /// Just the files, for the warm-up queue and the refusal sweep.
+    #[cfg(feature = "recorder")]
+    fn sampler_files(&self) -> Vec<std::path::PathBuf> {
+        self.sampler_bays()
+            .into_iter()
+            .filter_map(|(_, path, _)| path)
+            .collect()
+    }
+
+    /// **The sampler bays' files: decode what changed, hand it to the
+    /// engine, and tell the app what it turned out to be.**
+    ///
+    /// `reload_pads`'s sibling, with its own cache — see `sampler_cache` —
+    /// and one difference that is worth the line it costs: this delivers
+    /// only the lanes whose file actually CHANGED. `set_sampler_sample`
+    /// waits on the audio callback for its retiree, so re-delivering
+    /// thirty-two unchanged lanes because one bay finished loading would
+    /// spend a frame handing the audio thread files it already has.
+    /// `sampler_have` is that record.
+    ///
+    /// A file that will not decode empties the bay and says so — the same
+    /// answer a missing pad gets, and for the same reason: a lane playing a
+    /// file that is not there is a project that sounds one way today and
+    /// another way tomorrow with nothing on screen to say why.
+    #[cfg(feature = "recorder")]
+    fn reload_sampler(&mut self) {
+        let rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(48_000, |e| e.output().sample_rate);
+        // What every lane SHOULD be holding, indexed by lane. A lane with no
+        // sampler bay at all wants nothing, which is how a bay that was
+        // removed gets its samples freed.
+        let mut wanted: Vec<Option<(std::path::PathBuf, u8)>> =
+            vec![None; tangent_ui::recorder::CHANNELS];
+        for (lane, path, root) in self.sampler_bays() {
+            if let (Some(slot), Some(path)) = (wanted.get_mut(lane), path) {
+                *slot = Some((path, root));
+            }
+        }
+        let mut delivered_all = true;
+        for lane in 0..tangent_ui::recorder::CHANNELS {
+            let want = wanted[lane].clone();
+            if self.sampler_have.get(lane) == Some(&want) {
+                continue;
+            }
+            // Decoded here or taken from the cache, exactly as a pad is —
+            // and the cache is what makes two lanes naming the same file
+            // decode it once and share the `Arc`.
+            let decoded = want.as_ref().and_then(|(path, _)| {
+                match self.sampler_cache.get(path) {
+                    Some(c) => Some(c.clone()),
+                    None => match tangent_record::decode::decode(path, rate) {
+                        Ok(c) => {
+                            let c = Decoded::of(c);
+                            self.sampler_cache.insert(path.clone(), c.clone());
+                            Some(c)
+                        }
+                        Err(_) => None,
+                    },
+                }
+            });
+            let sample = match (&want, &decoded) {
+                (Some((path, root)), Some(c)) => Some(crate::instrument::SamplerSample {
+                    clip: Arc::clone(&c.clip),
+                    name: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    source: path.clone(),
+                    root_key: *root,
+                }),
+                _ => None,
+            };
+            // **What the face is told**, built here whether or not it lands:
+            // the name it prints, how long the file is, the peak pyramid it
+            // draws the waveform from — already built beside the samples by
+            // `Decoded::of`, so this is a clone of an `Arc` and not a second
+            // walk of the audio — and whether the file is simply gone.
+            let _name = sample.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+            let _seconds = decoded.as_ref().map_or(0.0, |c| c.clip.seconds());
+            let _peaks = decoded.as_ref().map(|c| Arc::clone(&c.peaks));
+            let _missing = want.is_some() && decoded.is_none();
+            // **What is actually being SENT**, read off the sample itself
+            // rather than off the wish above. `source` is the sample's own
+            // record of where it came from — the field a reopened project
+            // resolves — so taking the ledger from it means the two can
+            // never disagree, and a file that would not decode records
+            // nothing and is tried again the next time a bay changes.
+            let sent = sample.as_ref().map(|s| (s.source.clone(), s.root_key));
+            let landed = self
+                .recorder
+                .engine
+                .as_mut()
+                .is_some_and(|e| e.set_sampler_sample(lane, sample));
+            if landed {
+                if let Some(slot) = self.sampler_have.get_mut(lane) {
+                    *slot = sent;
+                }
+                // MERGE-ME(ui): the sibling's port, once `ports::SamplerInfo`
+                // and `TangentApp::set_sampler_info` exist. Drop the four
+                // underscores above when this comes back:
+                //
+                // self.app.set_sampler_info(lane, tangent_ui::ports::SamplerInfo {
+                //     name: _name,
+                //     seconds: _seconds,
+                //     peaks: _peaks,
+                //     missing: _missing,
+                // });
+            } else {
+                // **The face only draws once the file actually LANDED.** A
+                // full ring under a stalled callback — or no engine at all —
+                // would otherwise leave the panel showing a waveform over an
+                // engine that never got the samples, which is the drumpad's
+                // own lesson (its pads lit up and struck the DX7).
+                delivered_all = false;
+            }
+        }
+        // Files no lane names any more leave the cache with the edit, asked
+        // across EVERY lane — the kit's rule, and for its reason: sweeping
+        // per lane would evict the sample a second lane is still playing.
+        let live: Vec<std::path::PathBuf> = wanted
+            .iter()
+            .filter_map(|w| w.as_ref().map(|(p, _)| p.clone()))
+            .collect();
+        self.sampler_cache
+            .retain(|path, _| live.iter().any(|p| p == path));
+        if !delivered_all {
+            self.recorder.sampler_retry = true;
         }
     }
 
@@ -11303,6 +11592,12 @@ impl DesktopApp {
                 // keyed to a rate this device may not run.
                 self.pad_cache.clear();
                 self.pads_owed = true;
+                // And the sampler's, for the same reason: every cached file
+                // was decoded at a rate this device may not run, and a lane
+                // holding one would play it at the wrong speed.
+                self.sampler_cache.clear();
+                self.sampler_have = vec![None; tangent_ui::recorder::CHANNELS];
+                self.sampler_owed = true;
                 // Both of those are answered a file a frame from here on, and
                 // between a device settling and the user touching something
                 // nothing else is asking for a frame.
@@ -15415,6 +15710,7 @@ impl DesktopApp {
                 fallback: None,
                 reastream: None,
                 pads_retry: false,
+                sampler_retry: false,
                 inserts_loaded: vec![None; tangent_ui::recorder::INSERT_SPACE],
                 camera_opening: false,
                 camera_silent_since: None,
@@ -15524,6 +15820,8 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             pads_owed: false,
             #[cfg(feature = "recorder")]
+            sampler_owed: false,
+            #[cfg(feature = "recorder")]
             insert_batch: Counted::default(),
             #[cfg(feature = "recorder")]
             insert_announced: None,
@@ -15568,6 +15866,10 @@ impl DesktopApp {
             stretch_cache: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
             pad_cache: std::collections::HashMap::new(),
+            #[cfg(feature = "recorder")]
+            sampler_cache: std::collections::HashMap::new(),
+            #[cfg(feature = "recorder")]
+            sampler_have: vec![None; tangent_ui::recorder::CHANNELS],
             #[cfg(feature = "recorder")]
             pool: DecodePool::new(),
             #[cfg(feature = "recorder")]
@@ -17050,6 +17352,8 @@ enum Warm {
     Clip(std::path::PathBuf),
     /// A drum pad's sample, into `pad_cache`.
     Pad(std::path::PathBuf),
+    /// A sampler bay's file, into `sampler_cache`.
+    Sampler(std::path::PathBuf),
     /// A stretched render of a decoded clip, into `stretch_cache`. Never
     /// queued by `queue_warm`: `reload_clips` hands one to the crew when a
     /// clip's ratio has settled — see `stretch_step`.
@@ -17060,7 +17364,7 @@ enum Warm {
 impl Warm {
     fn path(&self) -> &std::path::Path {
         match self {
-            Warm::Clip(p) | Warm::Pad(p) => p,
+            Warm::Clip(p) | Warm::Pad(p) | Warm::Sampler(p) => p,
             Warm::Stretch((p, _, _)) => p,
         }
     }
@@ -17377,8 +17681,18 @@ impl DecodePool {
         self.in_flight.iter().any(|w| match w {
             Warm::Clip(p) => !pads && p == path,
             Warm::Pad(p) => pads && p == path,
-            Warm::Stretch(_) => false,
+            // Its own question, below: a third kind does not fit a boolean,
+            // and widening this one would have made every caller re-decide
+            // what `false` meant.
+            Warm::Sampler(_) | Warm::Stretch(_) => false,
         })
+    }
+
+    /// Whether this exact sampler file is in the workers' hands.
+    fn holds_sampler(&self, path: &std::path::Path) -> bool {
+        self.in_flight
+            .iter()
+            .any(|w| matches!(w, Warm::Sampler(p) if p == path))
     }
 
     /// Whether this exact render is in the workers' hands.
@@ -19446,6 +19760,102 @@ mod tests {
         let again = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(again, files.len(), "a second seeding added files");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The sampler's reload keeps the four promises the drumpad's does**,
+    /// checked in the source because the behaviours they name are each one
+    /// line and each of them was a defect somewhere else first.
+    ///
+    /// 1. It sweeps its cache across EVERY lane, not the one it just
+    ///    touched — a per-lane sweep evicts the file a second lane is still
+    ///    playing (the kit's own lesson, written into `reload_pads`).
+    /// 2. It delivers only what CHANGED, because `set_sampler_sample` waits
+    ///    on the audio callback and thirty-two no-op deliveries is a frame
+    ///    spent handing the engine files it already has.
+    /// 3. It only records a lane as loaded once the hand-off actually
+    ///    LANDED — the drumpad's pads lit up over an engine that never got
+    ///    the kit, and struck the DX7.
+    /// 4. A file the decoder refused is remembered, and the refusal sweep
+    ///    keeps it while a lane still names the file. Without that, a
+    ///    missing sample is re-queued every pass for ever.
+    #[test]
+    fn the_sampler_reload_sweeps_every_lane_and_delivers_only_what_changed() {
+        let src = include_str!("desktop.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        let reload = body
+            .find("fn reload_sampler")
+            .map(|at| &body[at..])
+            .expect("reload_sampler is still called that");
+        let reload = &reload[..reload
+            .find("fn save_insert_states")
+            .or_else(|| reload.find("\n    fn "))
+            .expect("something follows it")];
+        assert!(
+            reload.contains("self.sampler_cache\n            .retain(")
+                || reload.contains("self.sampler_cache.retain("),
+            "the sampler reload no longer sweeps its cache"
+        );
+        assert!(
+            reload.contains("if self.sampler_have.get(lane) == Some(&want)"),
+            "the reload lost its only-what-changed test, so every bay landing \
+             hands the audio thread thirty-two files it already has"
+        );
+        assert!(
+            reload.contains("if landed {") && reload.contains("sampler_retry = true"),
+            "a hand-off that did not land has to be retried, not recorded as done"
+        );
+        // The queue skips what the decoder already answered "no" to.
+        let queue = body
+            .find("if self.sampler_owed {")
+            .map(|at| &body[at..body.len().min(at + 900)])
+            .expect("queue_warm still has a sampler arm");
+        assert!(
+            queue.contains("self.warm_refused.contains(&path)"),
+            "the sampler queue has to skip what the decoder already refused"
+        );
+        // And the sweep that expires a refusal asks the sampler bays, or it
+        // throws their refusals away on the next clip reload.
+        assert!(
+            body.contains("live_samplers.iter().any(|p| p == path)"),
+            "the refusal sweep has to keep a sampler's refusal while a lane \
+             still names the file"
+        );
+    }
+
+    /// **The sampler's file is read out of the BAY, and one bay per lane.**
+    ///
+    /// Two claims that are cheap here and expensive to find later. The first
+    /// is the design: a sampler's sample is named in the bay's own state, so
+    /// it travels with the preset and there is no second copy on the desk to
+    /// disagree with it. The second is the arbitration: a lane's store holds
+    /// ONE sample, so a rack with two sampler bays has to pick, and the
+    /// first one wins by a `break` rather than by whichever iteration
+    /// happened to be last.
+    #[test]
+    fn a_lanes_sample_is_read_from_its_first_sampler_bay() {
+        let src = include_str!("desktop.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        let walk = body
+            .find("fn sampler_bays")
+            .map(|at| &body[at..])
+            .expect("sampler_bays is still called that");
+        let walk = &walk[..walk.find("fn sampler_files").expect("sampler_files follows")];
+        assert!(
+            walk.contains("e.builtin_extra(lane, bay)") && walk.contains("read(\"sample_path\")"),
+            "the walk no longer reads the file out of the bay's own state"
+        );
+        assert!(
+            walk.contains("break;"),
+            "without the break, a lane with two sampler bays takes the LAST \
+             one's file and the first bay plays a sound nothing named"
+        );
+        // And the symbols it reads are the ones the unit persists.
+        for symbol in ["sample_path", "root_key"] {
+            assert!(
+                crate::builtin_fx::is_extra_symbol(crate::builtin_fx::SAMPLER_PATH, symbol),
+                "{symbol} is read here and not persisted by the unit"
+            );
+        }
     }
 
     #[test]

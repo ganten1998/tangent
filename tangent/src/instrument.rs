@@ -25835,6 +25835,8 @@ mod sampler_road {
             let mut rack = rack_with_a_sampler();
             let mut planar = vec![vec![0.0f32; 512]; TAP_CHANNELS];
             let mut out = vec![vec![0.0f32; 512]; TAP_CHANNELS];
+            // **NOT-A-CHANNEL:** a synthetic rack built by this test, with
+            // no desk behind it and no folder to run twice.
             run_rack(
                 &mut rack,
                 &mut planar,
@@ -25862,6 +25864,7 @@ mod sampler_road {
         let mut rack = rack_with_a_sampler();
         let mut planar = vec![vec![0.7f32; 512]; TAP_CHANNELS];
         let mut out = vec![vec![0.0f32; 512]; TAP_CHANNELS];
+        // **NOT-A-CHANNEL:** the same synthetic rack as above.
         run_rack(
             &mut rack, &mut planar, 512, &mut out, &notes, &[], &params, &shared, 0, None, None,
         );
@@ -25891,11 +25894,15 @@ mod sampler_road {
 
         let (lane, old) = from.pop().expect("the displaced sample came back");
         assert_eq!(lane, 3, "the retired sample came back on the wrong lane");
-        assert_eq!(
-            old.expect("lane 3 had a file").name,
-            "first.wav",
-            "the wrong file was handed back"
-        );
+        let old = old.expect("lane 3 had a file");
+        assert_eq!(old.name, "first.wav", "the wrong file was handed back");
+        // The whole identity travels, not just the audio: the name the face
+        // printed and the path a project has to find again come back with
+        // it. Where the file came from is what a reopened project resolves,
+        // so a sample that arrived without it would be one nobody could
+        // reload.
+        assert_eq!(old.source, PathBuf::from("first.wav"));
+        assert_eq!(old.root_key, SAMPLER_ROOT_KEY);
         assert_eq!(
             r.sampler_samples[3].as_ref().expect("the new one landed").name,
             "second.wav"
