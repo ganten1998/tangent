@@ -76,6 +76,10 @@ const PEAK_FALL_DB_S: f32 = 12.0;
 /// The lowest level the picture will ever show, whatever the range says.
 /// Below −140 the FFT is reading its own rounding.
 const FLOOR_DB: f32 = -140.0;
+/// Less than this much change in a frame is not motion — see
+/// [`Analyzer::settled`]. A tenth of a decibel is under a pixel on every
+/// scale the face draws.
+const SETTLED_DB: f32 = 0.1;
 
 /// How long the printed peak holds before it takes a new measurement.
 /// Three readings a second is what a person can follow; sixty is a blur.
@@ -450,6 +454,19 @@ pub struct Analyzer {
     fed: bool,
     re: Vec<f32>,
     im: Vec<f32>,
+    /// Whether the last `tick` changed anything an eye could see — see
+    /// `settled`. Interior-mutable because the question is asked from the
+    /// repaint decision, which holds the app by shared reference; atomic
+    /// rather than a `Cell` only so an `Analyzer` can sit in a `static`.
+    moved: std::sync::atomic::AtomicBool,
+    /// The curve a silent window reads, per (scale, tilt) — see
+    /// `tick_silence`.
+    silent: Option<((Scale, Tilt), Vec<f32>)>,
+    /// How many transforms THIS analyzer has run. Tests only: the silence
+    /// gate is pinned by counting what it skips, per instance because the
+    /// tests run in parallel.
+    #[cfg(test)]
+    transforms: std::sync::atomic::AtomicUsize,
 }
 
 impl Analyzer {
@@ -472,7 +489,17 @@ impl Analyzer {
             fed: false,
             re: Vec::new(),
             im: Vec::new(),
+            moved: std::sync::atomic::AtomicBool::new(false),
+            silent: None,
+            #[cfg(test)]
+            transforms: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many transforms this analyzer has run. Tests only.
+    #[cfg(test)]
+    fn transforms(&self) -> usize {
+        self.transforms.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn set_rate(&mut self, rate: f32) {
@@ -523,6 +550,18 @@ impl Analyzer {
 
     /// The reading one frame of the ring gives, then the smoothing and the
     /// peaks advanced by `dt`.
+    ///
+    /// **A silent window is not transformed.** When every frame the FFT
+    /// would see is under [`crate::scope::SILENT_FLOOR`] the reading is
+    /// known in advance — `FLOOR_DB` plus the tilt in every bin, which is
+    /// exactly what the transform of that window yields once `to_db` has
+    /// floored it — so the transform and the 512-bin scan are skipped and
+    /// only the smoothing and the peak fall run, on that known reading. The
+    /// picture decays exactly as it would have; the host fed the analyzer
+    /// every frame the engine ran, silence included, and this was a 2,048 to
+    /// 8,192-point FFT thirty times a second on a stopped mix. The scope
+    /// counts the quiet tail as the samples arrive, so the gate costs one
+    /// compare.
     pub fn tick(&mut self, scope: &Scope, dt: f32) {
         if self.cfg.frozen {
             return;
@@ -531,10 +570,45 @@ impl Analyzer {
         if scope.frames() < n {
             return;
         }
+        if scope.quiet_tail() >= n {
+            self.tick_silence(dt);
+            return;
+        }
+        self.tick_transform(scope, dt);
+    }
+
+    /// The reading of a window known to be silent, without the transform:
+    /// the curve and the bands at `FLOOR_DB` plus the tilt, no readout, no
+    /// clip — then the same finish a transformed frame gets.
+    fn tick_silence(&mut self, dt: f32) {
+        let tilt = self.cfg.tilt.db_per_octave();
+        let tilt_at = |hz: f32| tilt * (hz / 1000.0).log2();
+        // The silent curve depends on the scale and the tilt only, so it is
+        // made once per setting rather than per frame.
+        let key = (self.cfg.scale, self.cfg.tilt);
+        if self.silent.as_ref().is_none_or(|(k, _)| *k != key) {
+            let curve: Vec<f32> = (0..BINS).map(|i| FLOOR_DB + tilt_at(self.bin_hz(i))).collect();
+            self.silent = Some((key, curve));
+        }
+        if let Some((_, curve)) = self.silent.as_ref() {
+            self.fine.copy_from_slice(curve);
+        }
+        self.clipped = false;
+        let thirds: Vec<f32> = THIRD_OCTAVE_HZ.iter().map(|&c| FLOOR_DB + tilt_at(c)).collect();
+        let octaves: Vec<f32> = OCTAVE_HZ.iter().map(|&c| FLOOR_DB + tilt_at(c)).collect();
+        self.finish((0.0, FLOOR_DB), &thirds, &octaves, dt);
+    }
+
+    /// The transform proper. Test code calls it directly to compare a
+    /// gated silent tick against the transform of the same silence.
+    fn tick_transform(&mut self, scope: &Scope, dt: f32) {
+        let n = self.cfg.fft.size();
         if self.re.len() != n {
             self.re = vec![0.0; n];
             self.im = vec![0.0; n];
         }
+        #[cfg(test)]
+        self.transforms.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut peak = 0.0f32;
         for i in 0..n {
             let s = self.cfg.channel.of(scope.stereo_back(n - 1 - i));
@@ -611,17 +685,6 @@ impl Analyzer {
             let db = b - 0.25 * (a - c) * delta;
             loud = (hz, db + tilt_at(hz));
         }
-        self.loud_hz = loud.0;
-        self.loud_db = loud.1;
-        // The printed peak: held, then refreshed; jumped for a louder event.
-        self.readout_age += dt.max(0.0);
-        let now = (loud.1 > SILENT_DB).then_some(loud);
-        let jump = matches!((self.readout, now), (Some((_, held)), Some((_, db))) if db > held + READOUT_JUMP_DB);
-        if self.readout.is_none() || self.readout_age >= READOUT_HOLD_S || jump || now.is_none() {
-            self.readout = now;
-            self.readout_age = 0.0;
-        }
-
         // **The bars: the ENERGY in each band**, which is the RTA's meaning
         // and not the curve's. A third-octave band at 1 kHz is 231 Hz wide
         // and holds twenty FFT bins at this size; summing their power is
@@ -649,6 +712,22 @@ impl Analyzer {
         };
         let thirds: Vec<f32> = THIRD_OCTAVE_HZ.iter().map(|&c| band(c, 1.0 / 3.0)).collect();
         let octaves: Vec<f32> = OCTAVE_HZ.iter().map(|&c| band(c, 1.0)).collect();
+        self.finish(loud, &thirds, &octaves, dt);
+    }
+
+    /// What every reading ends with, transformed or known: the readout, then
+    /// the smoothing and the peaks on every series at once.
+    fn finish(&mut self, loud: (f32, f32), thirds: &[f32], octaves: &[f32], dt: f32) {
+        self.loud_hz = loud.0;
+        self.loud_db = loud.1;
+        // The printed peak: held, then refreshed; jumped for a louder event.
+        self.readout_age += dt.max(0.0);
+        let now = (loud.1 > SILENT_DB).then_some(loud);
+        let jump = matches!((self.readout, now), (Some((_, held)), Some((_, db))) if db > held + READOUT_JUMP_DB);
+        if self.readout.is_none() || self.readout_age >= READOUT_HOLD_S || jump || now.is_none() {
+            self.readout = now;
+            self.readout_age = 0.0;
+        }
 
         // Smoothing, then the peaks, on every series at once.
         let k = match self.cfg.average.tau() {
@@ -657,26 +736,52 @@ impl Analyzer {
         };
         let fall = PEAK_FALL_DB_S * dt.max(0.0);
         let peak_mode = self.cfg.peak;
-        let settle = |avg: &mut [f32], peak: &mut [f32], now: &[f32]| {
+        // Whether any series moved by more than the eye resolves — see
+        // `settled`, which the repaint policy asks.
+        let mut moved = false;
+        let mut settle = |avg: &mut [f32], peak: &mut [f32], now: &[f32]| {
             for i in 0..avg.len() {
+                let (was_avg, was_peak) = (avg[i], peak[i]);
                 avg[i] += (now[i] - avg[i]) * k;
                 peak[i] = match peak_mode {
                     Peak::Off => avg[i],
                     Peak::Decay => (peak[i] - fall).max(avg[i]),
                     Peak::Hold => peak[i].max(avg[i]),
                 };
+                moved |= (avg[i] - was_avg).abs() > SETTLED_DB || (peak[i] - was_peak).abs() > SETTLED_DB;
             }
         };
         let fine = self.fine.clone();
         settle(&mut self.avg, &mut self.peak, &fine);
-        settle(&mut self.third, &mut self.third_peak, &thirds);
-        settle(&mut self.octave, &mut self.octave_peak, &octaves);
+        settle(&mut self.third, &mut self.third_peak, thirds);
+        settle(&mut self.octave, &mut self.octave_peak, octaves);
+        self.moved.store(moved, std::sync::atomic::Ordering::Relaxed);
         self.fed = true;
     }
 
     /// The curve as drawn, dB per display bin — for tests and readouts.
     pub fn curve(&self) -> &[f32] {
         &self.avg
+    }
+
+    /// **Whether the last tick changed nothing an eye could see** — the
+    /// averaging has converged and no peak is still falling. The repaint
+    /// policy asks this: an analyzer that is settled draws the same picture
+    /// next frame, so a resting window loses nothing by not painting it.
+    ///
+    /// Motion rather than "at the floor", because the floor is not one
+    /// number: the tilt lifts a silent curve by up to twenty decibels at the
+    /// top of the scale, and a HELD peak sits wherever it was caught and is
+    /// still perfectly still. And it is measured in `tick` rather than
+    /// derived here, so the answer is exactly what the last feed did.
+    ///
+    /// **Consumed on read.** The host feeds the analyzer before the frame
+    /// paints and this is asked at the frame's end, so a tick that moved
+    /// something earns exactly one more frame; when the feed stops (the
+    /// engine went away) the flag is not renewed and the window rests on a
+    /// picture that would not have changed anyway.
+    pub fn settled(&self) -> bool {
+        !self.moved.swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The level under `x` (0..1 across the picture), on whichever series is
@@ -1036,6 +1141,86 @@ mod tests {
         a.cfg.peak = Peak::Off;
         a.cfg.tilt = Tilt::Zero;
         a.tick(scope, 0.016);
+    }
+
+    /// **A silent window is read without a transform, and reads the same.**
+    ///
+    /// Loud first (one transform), then half a second of digital silence
+    /// — longer than the largest window — and the tick runs no transform,
+    /// yet its curve, its bars and its readout equal what the transform of
+    /// that same silence gives, tilt and all, and the picture goes on
+    /// decaying until it settles. Then a silence SHORTER than the window
+    /// still transforms: the loud frames are still inside it.
+    #[test]
+    fn a_silent_window_is_read_without_a_transform_and_reads_the_same() {
+        for fft in Fft::ALL {
+            for tilt in Tilt::ALL {
+                let mut gated = Analyzer::new(RATE);
+                gated.cfg.fft = *fft;
+                gated.cfg.tilt = *tilt;
+                let mut plain = Analyzer::new(RATE);
+                plain.cfg = gated.cfg;
+                let loud = fed(0.5, sine(1000.0, 0.5));
+                gated.tick(&loud, 0.016);
+                plain.tick(&loud, 0.016);
+                assert_eq!(gated.transforms(), 1, "a loud window was not transformed");
+                let mut quiet = loud;
+                quiet.tick(&vec![0.0f32; (0.5 * RATE) as usize * 2], 0.5);
+                assert!(quiet.quiet_tail() >= fft.size(), "the quiet tail did not cover the window");
+                gated.tick(&quiet, 0.016);
+                plain.tick_transform(&quiet, 0.016);
+                assert_eq!(gated.transforms(), 1, "the gated tick transformed a silent window ({fft:?}, {tilt:?})");
+                assert_eq!(plain.transforms(), 2);
+                assert_eq!(gated.fine, plain.fine, "the silent reading differs from the transform's ({fft:?}, {tilt:?})");
+                assert_eq!(gated.avg, plain.avg);
+                assert_eq!(gated.peak, plain.peak);
+                assert_eq!(gated.third, plain.third);
+                assert_eq!(gated.octave, plain.octave);
+                assert_eq!(gated.loudest(), plain.loudest());
+                assert_eq!(gated.clipped, plain.clipped);
+                // And it decays to rest on the known reading alone.
+                let mut ticks = 0;
+                while !gated.settled() && ticks < 10_000 {
+                    gated.tick(&quiet, 0.033);
+                    ticks += 1;
+                }
+                assert!(ticks > 0 && ticks < 10_000, "the gated picture did not settle ({ticks} ticks)");
+                assert_eq!(gated.transforms(), 1, "settling ran a transform");
+            }
+        }
+        // Silence shorter than the window: the loud frames are still in it.
+        let mut a = Analyzer::new(RATE);
+        a.cfg.fft = Fft::N8192;
+        let mut scope = fed(0.5, sine(1000.0, 0.5));
+        scope.tick(&vec![0.0f32; 2_000 * 2], 0.04);
+        a.tick(&scope, 0.016);
+        assert_eq!(a.transforms(), 1, "a partly silent window was not transformed");
+    }
+
+    /// **What a tick costs**, transformed against gated, per window size,
+    /// release. `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn what_a_tick_costs_probe() {
+        for fft in Fft::ALL {
+            let mut a = Analyzer::new(RATE);
+            a.cfg.fft = *fft;
+            let loud = fed(0.5, sine(1000.0, 0.5));
+            let mut quiet = fed(0.5, sine(1000.0, 0.5));
+            quiet.tick(&vec![0.0f32; (0.5 * RATE) as usize * 2], 0.5);
+            let n = 400u32;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                a.tick(&loud, 0.016);
+            }
+            let transformed = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                a.tick(&quiet, 0.016);
+            }
+            let gated = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+            eprintln!("analyzer tick at {}: transformed {transformed:.1} us, silent-gated {gated:.1} us", fft.label());
+        }
     }
 
     /// **A sine reads at its frequency and its level**, whichever window is
