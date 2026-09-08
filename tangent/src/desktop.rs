@@ -4161,7 +4161,7 @@ impl DesktopApp {
                 let rate = f64::from(e.output().sample_rate).max(1.0);
                 match self.app.loop_region().filter(|_| !session_rolling) {
                     Some((a, b)) => {
-                        e.set_loop((a.max(0.0) * rate) as u64, (b.max(0.0) * rate) as u64)
+                        e.set_loop((a.max(0.0) * rate) as u64, (b.max(0.0) * rate) as u64);
                     }
                     None => e.set_loop(0, 0),
                 }
@@ -9077,12 +9077,12 @@ impl DesktopApp {
                 }
             }
             tangent_ui::ports::ProjectRequest::ExportTrack => {
-                self.start_bounce(false, false, None)
+                self.start_bounce(false, false, None);
             }
             // Processed, like the dialog's own default: the files sum to the
             // record, which is what a bare "export stems" row means.
             tangent_ui::ports::ProjectRequest::ExportStems => {
-                self.start_bounce(true, false, None)
+                self.start_bounce(true, false, None);
             }
             tangent_ui::ports::ProjectRequest::New
             | tangent_ui::ports::ProjectRequest::NewKeeping
@@ -15274,7 +15274,7 @@ impl DesktopApp {
                  retry."
             ));
         }
-        let mut device = DeviceMidi::new(cc.egui_ctx.clone());
+        let device = DeviceMidi::new(cc.egui_ctx.clone());
         // Grabbed BEFORE the connection is made and before the session exists,
         // because everything that stamps a time has to share one epoch. Two
         // `Timebase::new()` calls would silently place the MIDI and the audio

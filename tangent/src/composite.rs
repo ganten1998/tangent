@@ -541,7 +541,7 @@ impl Compositor {
         });
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let padded_bpr = padded_bytes_per_row(width);
-        let mut buffer = || {
+        let buffer = || {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("tangent composite readback"),
                 size: u64::from(padded_bpr) * u64::from(height),

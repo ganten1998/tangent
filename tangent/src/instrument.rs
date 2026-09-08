@@ -19963,7 +19963,7 @@ mod tests {
             e.set_transport(1, 0);
             e.set_rolling(true);
             let mut out = vec![0.0f32; FRAMES * 2];
-            let mut push_silence = |jack: &mut Producer<f32>| {
+            let push_silence = |jack: &mut Producer<f32>| {
                 for _ in 0..FRAMES {
                     let _ = jack.push(0.0);
                 }

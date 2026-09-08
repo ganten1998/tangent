@@ -489,7 +489,7 @@ pub fn draw_analog(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Op
             Pos2::new(lay.header.left(), lay.header.bottom()),
             Pos2::new(lay.header.right(), lay.header.bottom()),
         ],
-        Stroke::new(1.0, st.s.edge),
+        Stroke::new(1.0_f32, st.s.edge),
     );
 
     // The section captions and their dividers.
@@ -505,14 +505,14 @@ pub fn draw_analog(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Op
         if i > 0 {
             painter.line_segment(
                 [Pos2::new(s.left(), s.top() + 2.0), Pos2::new(s.left(), s.bottom() - 2.0)],
-                Stroke::new(1.0, st.s.edge),
+                Stroke::new(1.0_f32, st.s.edge),
             );
         }
     }
     let band_y = lay.lower_top - BAND_AIR * 0.5;
     painter.line_segment(
         [Pos2::new(lay.header.left(), band_y), Pos2::new(lay.header.right(), band_y)],
-        Stroke::new(1.0, st.s.edge),
+        Stroke::new(1.0_f32, st.s.edge),
     );
 
     // The dead dial: Mode under the ladder.
@@ -727,7 +727,7 @@ fn toggle(ui: &mut egui::Ui, painter: &Painter, st: &FaceStyle, c: &Ctl, cell: R
     let plate = Rect::from_center_size(cell.center(), Vec2::new(w, h));
     let ground = if on { st.s.raised } else { st.s.well };
     painter.rect_filled(plate, 3.0, ground);
-    painter.rect_stroke(plate, 3.0, Stroke::new(1.0, st.s.edge), StrokeKind::Inside);
+    painter.rect_stroke(plate, 3.0, Stroke::new(1.0_f32, st.s.edge), StrokeKind::Inside);
     let ink = if on { st.s.ink } else { face::quiet_ink(st, ground) };
     word(
         painter,
@@ -773,7 +773,7 @@ fn segmented(
         Pos2::new(cell.left() + 3.0, cell.top() + caption_h + (cell.height() - caption_h - h) * 0.5),
         Vec2::new(cell.width() - 6.0, h),
     );
-    painter.rect_stroke(row, 3.0, Stroke::new(1.0, st.s.edge), StrokeKind::Inside);
+    painter.rect_stroke(row, 3.0, Stroke::new(1.0_f32, st.s.edge), StrokeKind::Inside);
     let seg_w = row.width() / n as f32;
     let mut asked = None;
     for (i, w) in words.iter().enumerate() {

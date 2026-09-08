@@ -3922,7 +3922,7 @@ fn draw_algorithm(painter: &egui::Painter, rect: Rect, patch: &crate::ports::Pat
         painter.rect_stroke(
             r,
             2.0,
-            Stroke::new(if heavy { 2.0 } else { 1.0 }, t.text),
+            Stroke::new(if heavy { 2.0_f32 } else { 1.0_f32 }, t.text),
             egui::StrokeKind::Inside,
         );
         painter.text(
@@ -5917,7 +5917,7 @@ fn draw_ir_level(
         let x = rect.left() + rect.width() * frac(peak);
         ui.painter().line_segment(
             [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-            Stroke::new(2.0, t.text),
+            Stroke::new(2.0_f32, t.text),
         );
     }
     // Where the headroom runs out, so "how much further can I push this" is
@@ -5925,7 +5925,7 @@ fn draw_ir_level(
     let gx = rect.left() + rect.width() * frac(-6.0);
     ui.painter().line_segment(
         [Pos2::new(gx, rect.top()), Pos2::new(gx, rect.bottom())],
-        Stroke::new(1.0, t.faint),
+        Stroke::new(1.0_f32, t.faint),
     );
     ui.add_space(4.0);
     // **PEAK first.** Staging a loop is a peak job — the question is how
@@ -6277,7 +6277,7 @@ fn draw_ir_result(
             .collect();
         ui.painter().add(egui::Shape::line(
             pts,
-            Stroke::new(1.5, crate::face::lcd_ink(st, crate::face::LcdTier::Primary)),
+            Stroke::new(1.5_f32, crate::face::lcd_ink(st, crate::face::LcdTier::Primary)),
         ));
         // The measured floor, as a grid line the tail can be judged against.
         let fy = rect.top()
@@ -6285,7 +6285,7 @@ fn draw_ir_result(
                 * (1.0 - ((r.noise_floor_db + 100.0) / 100.0).clamp(0.0, 1.0));
         ui.painter().line_segment(
             [Pos2::new(rect.left(), fy), Pos2::new(rect.right(), fy)],
-            Stroke::new(1.0, crate::face::lcd_ink(st, crate::face::LcdTier::Label)),
+            Stroke::new(1.0_f32, crate::face::lcd_ink(st, crate::face::LcdTier::Label)),
         );
     }
     ui.add_space(6.0);
@@ -8330,7 +8330,7 @@ fn show_on(
                                                         ui.painter().rect_stroke(
                                                             resp.rect,
                                                             2.0,
-                                                            Stroke::new(1.5, t.text),
+                                                            Stroke::new(1.5_f32, t.text),
                                                             egui::StrokeKind::Inside,
                                                         );
                                                     }
@@ -8398,7 +8398,7 @@ fn show_on(
                                     painter.rect_stroke(
                                         tag,
                                         3.0,
-                                        Stroke::new(1.0, t.text),
+                                        Stroke::new(1.0_f32, t.text),
                                         egui::StrokeKind::Inside,
                                     );
                                     painter.galley(at, galley, t.text);
@@ -9700,7 +9700,7 @@ fn show_on(
                             // just clicked is laid out against a set that no
                             // longer matches what is drawn.
                             let mut want = exposed.clone();
-                            let mut toggle = |want: &mut Vec<(u16, Option<u16>)>,
+                            let toggle = |want: &mut Vec<(u16, Option<u16>)>,
                                               pick: (u16, Option<u16>),
                                               on: bool| {
                                 want.retain(|p| *p != pick);
@@ -9889,7 +9889,7 @@ fn show_on(
                                     .color(dim),
                                 );
                                 ui.add_space(8.0);
-                                let mut row = |ui: &mut egui::Ui, word: &str, hint: &str| -> bool {
+                                let row = |ui: &mut egui::Ui, word: &str, hint: &str| -> bool {
                                     let clicked = ui
                                         .add_sized(
                                             Vec2::new(ui.available_width(), 24.0),
@@ -10639,7 +10639,7 @@ fn show_on(
                                 .clamp(120.0, 460.0);
                             egui::Frame::NONE
                                 .fill(t.field_bg)
-                                .stroke(Stroke::new(1.0, t.text.gamma_multiply(0.45)))
+                                .stroke(Stroke::new(1.0_f32, t.text.gamma_multiply(0.45)))
                                 .inner_margin(egui::Margin::same(4))
                                 .corner_radius(3)
                                 .show(ui, |ui| {
@@ -10727,7 +10727,7 @@ fn show_on(
                                         1.0,
                                     )
                                     .clamp(3.0, 12.0);
-                                    let mut swatch = |ui: &mut egui::Ui, c: usize| {
+                                    let swatch = |ui: &mut egui::Ui, c: usize| {
                                         let (cr, cg, cb) = crate::mixer_panel::STRIP_COLORS
                                             [c.min(crate::mixer_panel::STRIP_COLORS.len() - 1)];
                                         let (rect, _) = ui.allocate_exact_size(
@@ -11390,13 +11390,13 @@ fn show_on(
                             match s.stage {
                                 IrStage::Io => draw_ir_io(ui, &t, s),
                                 IrStage::Level => {
-                                    draw_ir_level(ui, &t, s, &mut action)
+                                    draw_ir_level(ui, &t, s, &mut action);
                                 }
                                 IrStage::Sweep => {
-                                    draw_ir_sweep(ui, &t, s, &mut action)
+                                    draw_ir_sweep(ui, &t, s, &mut action);
                                 }
                                 IrStage::Result => {
-                                    draw_ir_result(ui, &t, &st, s, &mut action)
+                                    draw_ir_result(ui, &t, &st, s, &mut action);
                                 }
                             }
                             ui.add_space((ui.available_height() - 30.0).max(0.0));
@@ -19183,7 +19183,7 @@ at: None,
         };
         // A loop that follows its send exactly: whatever goes out comes back
         // at the same number. Nothing here is limiting anything.
-        let mut settle_at = |s: &mut IrWizardState, send: f32, ring: f32| {
+        let settle_at = |s: &mut IrWizardState, send: f32, ring: f32| {
             s.level_db = send;
             // The old reading, still in flight through the ring.
             for _ in 0..3 {

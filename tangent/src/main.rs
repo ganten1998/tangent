@@ -132,7 +132,7 @@ pub fn plugin_catalog(
 pub fn plugin_catalog_from(
     bundles: Vec<std::path::PathBuf>,
 ) -> Vec<(std::path::PathBuf, Option<String>, Option<String>)> {
-    let mut rows: Vec<(std::path::PathBuf, Option<String>, Option<String>)> = bundles
+    let rows: Vec<(std::path::PathBuf, Option<String>, Option<String>)> = bundles
         .into_iter()
         .map(|p| {
             let v = tangent_host::vendor_of(&p);
@@ -631,7 +631,7 @@ fn install_panic_hook() {
 /// Python QSharedMemory key "tangent-midi-monitor"; a crashed instance never
 /// blocks relaunch (the OS releases the lock with the process).
 fn acquire_single_instance() -> bool {
-    let Some(home) = dirs::home_dir() else {
+    let Some(_home) = dirs::home_dir() else {
         return true; // no home dir: don't block launching
     };
     let dir = tangent_core::config::dir();

@@ -2078,7 +2078,7 @@ mod tests {
             ..Default::default()
         };
         let body_rect = std::cell::Cell::new(Rect::NOTHING);
-        let mut run = |events: Vec<egui::Event>| -> SurfaceReport {
+        let run = |events: Vec<egui::Event>| -> SurfaceReport {
             let mut report = SurfaceReport::default();
             let _ = ctx.run(
                 egui::RawInput {

@@ -244,7 +244,7 @@ pub fn draw_amp(
                     // and the quiet ink alone was already carrying empty.
                     let off = !empty && live_off.get(pedal).copied().unwrap_or(false);
                     let ground = if off { st.s.well } else { st.s.raised };
-                    let mut word = egui::RichText::new(&cut[pedal])
+                    let word = egui::RichText::new(&cut[pedal])
                         .font(bold(9.0))
                         // An empty seat wears the quiet ink, and a
                         // chip is RAISED, so that ink is measured

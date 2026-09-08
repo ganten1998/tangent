@@ -1102,7 +1102,7 @@ fn draw_intervals(
     painter.rect_filled(rect, 0.0, p.board);
     painter.line_segment(
         [rect.left_top(), rect.left_bottom()],
-        Stroke::new(1.0, p.wire),
+        Stroke::new(1.0_f32, p.wire),
     );
     // **No heading.** The strip is a margin on the end of the neck, and a
     // word across the top of it would be the widest thing in it — which is the

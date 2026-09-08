@@ -1070,7 +1070,7 @@ mod tests {
     #[test]
     fn the_anti_phase_sum_damps_the_fundamental_at_a2() {
         let f0 = 110.0_f32;
-        let mut level = |pickup: f32| {
+        let level = |pickup: f32| {
             let mut k = knobs();
             k.pickup = pickup;
             let out = strike_and_run(45, 0.7, &k, &ClavBase::DRY, 0.7);
@@ -1253,7 +1253,7 @@ mod tests {
     /// the level law's business and not the coil's.
     #[test]
     fn the_string_swings_the_reference_gaps_at_the_coil() {
-        let mut swing_at = |vel: f32| {
+        let swing_at = |vel: f32| {
             let mut v = ClavVoice::new(RATE);
             v.strike_based(64, vel, &knobs(), &ClavBase::DRY);
             (0..(0.25 * RATE) as usize)

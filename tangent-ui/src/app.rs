@@ -5013,7 +5013,7 @@ impl TangentApp {
     /// Empty unless `n` is itself in a selection of more than one, which is
     /// what keeps every ordinary single-track gesture on exactly one track.
     fn selection_partners(&self, n: usize) -> Vec<usize> {
-        let mut out: Vec<usize> =
+        let out: Vec<usize> =
             if self.selected_tracks.len() < 2 || !self.selected_tracks.contains(&n) {
                 Vec::new()
             } else {
@@ -9383,7 +9383,7 @@ impl TangentApp {
                 painter.rect_stroke(
                     field,
                     3.0,
-                    egui::Stroke::new(1.0, ink.gamma_multiply(0.5)),
+                    egui::Stroke::new(1.0_f32, ink.gamma_multiply(0.5)),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -14297,7 +14297,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         painter.rect_stroke(
             r,
             3.0,
-            egui::Stroke::new(1.0, face.edge),
+            egui::Stroke::new(1.0_f32, face.edge),
             egui::StrokeKind::Inside,
         );
         painter.text(
@@ -14471,7 +14471,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // which is what makes the two strokes read as a check rather than as
         // a chevron lying on its side.
         let elbow = Pos2::new(right - h * 0.62, mid + h * 0.38);
-        let stroke = egui::Stroke::new(1.6, ink);
+        let stroke = egui::Stroke::new(1.6_f32, ink);
         painter.line_segment(
             [Pos2::new(right - h, mid - h * 0.05), elbow],
             stroke,
@@ -14523,7 +14523,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         painter.rect_stroke(
             frame,
             3.0,
-            egui::Stroke::new(1.0, face.edge),
+            egui::Stroke::new(1.0_f32, face.edge),
             egui::StrokeKind::Inside,
         );
         for (r, (label, ticked)) in rows.iter().zip(&labels) {
@@ -14549,7 +14549,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     Pos2::new(frame.left() + 4.0, second.top()),
                     Pos2::new(frame.right() - 4.0, second.top()),
                 ],
-                egui::Stroke::new(1.0, face.faint),
+                egui::Stroke::new(1.0_f32, face.faint),
             );
         }
     }
@@ -17633,7 +17633,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         painter.rect_stroke(
             menu.rect,
             4.0,
-            egui::Stroke::new(1.2, ink.gamma_multiply(0.5)),
+            egui::Stroke::new(1.2_f32, ink.gamma_multiply(0.5)),
             egui::StrokeKind::Inside,
         );
         let current = if self.settings.midi_swing {
@@ -17668,7 +17668,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     Pos2::new(r.left() + 2.0, r.bottom()),
                     Pos2::new(r.right() - 2.0, r.bottom()),
                 ],
-                egui::Stroke::new(1.0, ink.gamma_multiply(0.25)),
+                egui::Stroke::new(1.0_f32, ink.gamma_multiply(0.25)),
             );
         }
         for (i, (name, ratio, pct)) in
@@ -17724,7 +17724,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         painter.rect_stroke(
             menu,
             4.0,
-            egui::Stroke::new(1.2, ink.gamma_multiply(0.5)),
+            egui::Stroke::new(1.2_f32, ink.gamma_multiply(0.5)),
             egui::StrokeKind::Inside,
         );
         // The NAME row: the pad's word, editable — a caret while typing.
@@ -17780,7 +17780,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         for x in [x0, x1] {
             painter.line_segment(
                 [Pos2::new(x, wave.top()), Pos2::new(x, wave.bottom())],
-                egui::Stroke::new(2.0, ink),
+                egui::Stroke::new(2.0_f32, ink),
             );
         }
         // OBEY NOTE-OFFS, with its little lamp.
@@ -17792,7 +17792,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         painter.rect_stroke(
             lamp,
             2.0,
-            egui::Stroke::new(1.2, ink.gamma_multiply(0.7)),
+            egui::Stroke::new(1.2_f32, ink.gamma_multiply(0.7)),
             egui::StrokeKind::Inside,
         );
         if params.obey {
@@ -24178,7 +24178,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 match std::fs::metadata(e.path()) {
                     Ok(t) if t.is_dir() => dirs.push(name),
                     Ok(t) if t.is_file() && crate::faces::is_ir_file(&name) => {
-                        files.push(name)
+                        files.push(name);
                     }
                     _ => {}
                 }
@@ -27682,7 +27682,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // a key and a click that drift apart here strand a reader user
             // in whichever mode the wrong one left them.
             K::ToggleReaderMode => {
-                self.apply_menu_action(ctx, MenuAction::ToggleScreenReaderMode)
+                self.apply_menu_action(ctx, MenuAction::ToggleScreenReaderMode);
             }
             K::CycleFont => self.apply_menu_action(ctx, MenuAction::CycleFont),
             // These open dialogs. The shortcut gate already refuses to fire
@@ -27697,7 +27697,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             K::ManageTaughtChords => self.apply_menu_action(ctx, MenuAction::ManageTaughtChords),
             K::ToggleChordLearning => self.apply_menu_action(ctx, MenuAction::ToggleChordLearning),
             K::ToggleNotePreference => {
-                self.apply_menu_action(ctx, MenuAction::ToggleNotePreference)
+                self.apply_menu_action(ctx, MenuAction::ToggleNotePreference);
             }
             // "Clear what I placed", not "clear everything": notes arriving
             // from a MIDI keyboard are not ours to drop, and they would come
@@ -28176,7 +28176,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     message: None,
                     installed_as: self.license.display_name().map(str::to_owned),
                     focus: true,
-                })
+                });
             }
             // **Both ways, by hand, and the only half that is REMEMBERED.**
             // The host turns this on for a session when it sees a reader
@@ -31716,7 +31716,7 @@ impl TangentApp {
                 }
             }
         }
-        let monitor = monitor.map(|m| m.x);
+        let _monitor = monitor.map(|m| m.x);
         let filling = self.caps.window_sizing && {
             let natural = band_sizes_at(&self.settings, pane.x.max(1.0).trunc());
             let fixed = natural.recorder_h
@@ -32367,7 +32367,7 @@ impl TangentApp {
                                             strip.bottom(),
                                         ),
                                     ],
-                                    egui::Stroke::new(2.0, lit),
+                                    egui::Stroke::new(2.0_f32, lit),
                                 );
                             }
                         }
@@ -32391,7 +32391,7 @@ impl TangentApp {
                                     Pos2::new(dst.panel.left(), dst.panel.top()),
                                     Pos2::new(dst.panel.left(), dst.panel.bottom()),
                                 ],
-                                egui::Stroke::new(2.0, lit),
+                                egui::Stroke::new(2.0_f32, lit),
                             );
                         }
                     } else if self.in_folder(from) {
@@ -32401,7 +32401,7 @@ impl TangentApp {
                             ui.painter().rect_stroke(
                                 dst.panel,
                                 4.0,
-                                egui::Stroke::new(2.0, lit),
+                                egui::Stroke::new(2.0_f32, lit),
                                 egui::StrokeKind::Inside,
                             );
                         }
@@ -32518,7 +32518,7 @@ impl TangentApp {
                                         Pos2::new(rect.left(), strip.bottom() - 1.0),
                                         Pos2::new(rect.right(), strip.bottom() - 1.0),
                                     ],
-                                    egui::Stroke::new(2.0, lit),
+                                    egui::Stroke::new(2.0_f32, lit),
                                 );
                             }
                         }
@@ -32539,7 +32539,7 @@ impl TangentApp {
                                     Pos2::new(rect.left(), row.panel.top()),
                                     Pos2::new(rect.right(), row.panel.top()),
                                 ],
-                                egui::Stroke::new(2.0, lit),
+                                egui::Stroke::new(2.0_f32, lit),
                             );
                         }
                     } else if moved && self.in_folder(from) {
@@ -32550,7 +32550,7 @@ impl TangentApp {
                             ui.painter().rect_stroke(
                                 row.panel,
                                 2.0,
-                                egui::Stroke::new(2.0, lit),
+                                egui::Stroke::new(2.0_f32, lit),
                                 egui::StrokeKind::Inside,
                             );
                         }
@@ -32572,7 +32572,7 @@ impl TangentApp {
                         r,
                         0.0,
                         egui::Stroke::new(
-                            1.0,
+                            1.0_f32,
                             egui::Color32::from_rgb(0xF2, 0xE9, 0xD2).gamma_multiply(0.8),
                         ),
                         egui::StrokeKind::Inside,
@@ -32791,7 +32791,7 @@ impl TangentApp {
                         ui.painter().rect_stroke(
                             *src,
                             3.0,
-                            egui::Stroke::new(1.5, egui::Color32::from_black_alpha(140)),
+                            egui::Stroke::new(1.5_f32, egui::Color32::from_black_alpha(140)),
                             egui::StrokeKind::Inside,
                         );
                     }
@@ -32805,7 +32805,7 @@ impl TangentApp {
                                 *dst,
                                 3.0,
                                 egui::Stroke::new(
-                                    2.0,
+                                    2.0_f32,
                                     egui::Color32::from_rgb(0xC9, 0x8B, 0x3D),
                                 ),
                                 egui::StrokeKind::Inside,
@@ -43333,7 +43333,7 @@ mod tests {
     /// and (b) no opaque fill painted after any of them touches it.
     #[test]
     fn the_empty_slot_borders_are_painted_over_nothing() {
-        let (ctx, mut app) = headless(Caps::DESKTOP);
+        let (ctx, app) = headless(Caps::DESKTOP);
         let expected = {
             // The border is the arrangement's FACE at its own fade. That face
             // is a theme role now (`fx_strip`) rather than a fixed wardrobe
@@ -48055,7 +48055,7 @@ mod tests {
         const FRAMES: usize = 400;
         const PER_FRAME: usize = 200;
         const RATE: f32 = 48_000.0;
-        let mut scenario = |name: &str, setup: &dyn Fn(&egui::Context, &mut TangentApp)| {
+        let scenario = |name: &str, setup: &dyn Fn(&egui::Context, &mut TangentApp)| {
             let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::first_launch());
             app.settings.show_camera_pane = false;
             setup(&ctx, &mut app);

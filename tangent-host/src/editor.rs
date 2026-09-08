@@ -366,7 +366,7 @@ impl Editor {
     /// The host's half of the LV2 UI contract: a UI opens knowing nothing and
     /// is told its values by `port_event`. A no-op for VST3, whose editor asks
     /// its own controller.
-    pub fn port_changed(&mut self, id: u32, value: f32) {
+    pub fn port_changed(&mut self, _id: u32, _value: f32) {
         match &mut self.inner {
             EditorInner::Plugin(_) => {}
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]

@@ -1255,7 +1255,7 @@ mod tests {
         // worst case is a harp that never gets to judge.
         let mut h = Harp::new(RATE);
         h.set_pedal(true);
-        let mut poke = |h: &mut Harp, i: usize| {
+        let poke = |h: &mut Harp, i: usize| {
             if i % secs(0.1) == 0 {
                 h.key_down(60);
                 h.voice_done(60);

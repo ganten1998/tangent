@@ -897,7 +897,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     painter.rect_stroke(
         l.panel,
         4.0,
-        Stroke::new(1.5, ink.gamma_multiply(0.5)),
+        Stroke::new(1.5_f32, ink.gamma_multiply(0.5)),
         egui::StrokeKind::Inside,
     );
 
@@ -936,7 +936,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         painter.rect_stroke(
             r,
             3.0,
-            Stroke::new(1.0, ink.gamma_multiply(if lit { 0.9 } else { 0.4 })),
+            Stroke::new(1.0_f32, ink.gamma_multiply(if lit { 0.9 } else { 0.4 })),
             egui::StrokeKind::Inside,
         );
         painter.text(
@@ -958,7 +958,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         painter.rect_stroke(
             r,
             3.0,
-            Stroke::new(1.0, ink.gamma_multiply(if view.draw_mode { 0.9 } else { 0.4 })),
+            Stroke::new(1.0_f32, ink.gamma_multiply(if view.draw_mode { 0.9 } else { 0.4 })),
             egui::StrokeKind::Inside,
         );
         let c = if view.draw_mode { face } else { ink.gamma_multiply(0.7) };
@@ -992,7 +992,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         for s in [-1.0f32, 1.0] {
             painter.line_segment(
                 [Pos2::new(c.x - a, c.y - a * s), Pos2::new(c.x + a, c.y + a * s)],
-                Stroke::new(1.5, ink.gamma_multiply(0.7)),
+                Stroke::new(1.5_f32, ink.gamma_multiply(0.7)),
             );
         }
     }
@@ -1004,13 +1004,13 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         painter.rect_stroke(
             Rect::from_min_size(Pos2::new(c.x - a, c.y - a * 0.4), Vec2::splat(a * 1.3)),
             1.0,
-            Stroke::new(1.2, ink),
+            Stroke::new(1.2_f32, ink),
             egui::StrokeKind::Inside,
         );
         painter.rect_stroke(
             Rect::from_min_size(Pos2::new(c.x - a * 0.3, c.y - a), Vec2::splat(a * 1.3)),
             1.0,
-            Stroke::new(1.2, ink),
+            Stroke::new(1.2_f32, ink),
             egui::StrokeKind::Inside,
         );
     }
@@ -1105,7 +1105,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             painter.rect_stroke(
                 w,
                 1.5,
-                Stroke::new(1.0, ink.gamma_multiply(0.85)),
+                Stroke::new(1.0_f32, ink.gamma_multiply(0.85)),
                 egui::StrokeKind::Inside,
             );
             // The edges are the zoom, so they are drawn as something to take
@@ -1125,13 +1125,13 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         if px >= b.left() && px <= b.right() {
             painter.line_segment(
                 [Pos2::new(px, b.top()), Pos2::new(px, b.bottom())],
-                Stroke::new(1.0, Color32::from_rgb(0xE8, 0x3A, 0x4E)),
+                Stroke::new(1.0_f32, Color32::from_rgb(0xE8, 0x3A, 0x4E)),
             );
         }
         painter.rect_stroke(
             b,
             2.0,
-            Stroke::new(1.0, ink.gamma_multiply(0.4)),
+            Stroke::new(1.0_f32, ink.gamma_multiply(0.4)),
             egui::StrokeKind::Inside,
         );
     }
@@ -1205,14 +1205,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                         Pos2::new(row_roll.left(), row_roll.bottom()),
                         Pos2::new(row_roll.right(), row_roll.bottom()),
                     ],
-                    Stroke::new(1.0, ink.gamma_multiply(0.16)),
+                    Stroke::new(1.0_f32, ink.gamma_multiply(0.16)),
                 );
             }
         }
     }
     painter.line_segment(
         [l.keys.right_top(), l.keys.right_bottom()],
-        Stroke::new(1.0, ink.gamma_multiply(0.4)),
+        Stroke::new(1.0_f32, ink.gamma_multiply(0.4)),
     );
 
     // ── the grid ─────────────────────────────────────────────────────────
@@ -1225,7 +1225,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         painter.line_segment(
             [Pos2::new(x, l.roll.top()), Pos2::new(x, l.roll.bottom())],
             Stroke::new(
-                1.0,
+                1.0_f32,
                 ink.gamma_multiply(if is_bar { 0.30 } else { 0.10 }),
             ),
         );
@@ -1293,9 +1293,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             r,
             2.0,
             if picked {
-                Stroke::new(2.0, ink)
+                Stroke::new(2.0_f32, ink)
             } else {
-                Stroke::new(1.0, Color32::from_black_alpha(140))
+                Stroke::new(1.0_f32, Color32::from_black_alpha(140))
             },
             egui::StrokeKind::Inside,
         );
@@ -1325,7 +1325,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                 if x >= l.roll.left() - 0.5 && x <= l.roll.right() + 0.5 {
                     painter.line_segment(
                         [Pos2::new(x, l.ruler.bottom() - 4.0), Pos2::new(x, l.ruler.bottom())],
-                        Stroke::new(1.0, ink.gamma_multiply(0.6)),
+                        Stroke::new(1.0_f32, ink.gamma_multiply(0.6)),
                     );
                     painter.text(
                         Pos2::new(x + 3.0, l.ruler.top() + 1.0),
@@ -1356,7 +1356,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                                     Pos2::new(xb, l.ruler.bottom() - 2.5),
                                     Pos2::new(xb, l.ruler.bottom()),
                                 ],
-                                Stroke::new(1.0, ink.gamma_multiply(0.35)),
+                                Stroke::new(1.0_f32, ink.gamma_multiply(0.35)),
                             );
                             painter.text(
                                 Pos2::new(xb + 2.0, l.ruler.top() + 2.5),
@@ -1430,7 +1430,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                 // half-pedalling the value exists to keep.
                 painter.line_segment(
                     [Pos2::new(r.left(), r.top()), Pos2::new(r.right(), r.top())],
-                    Stroke::new(1.6, hue(v)),
+                    Stroke::new(1.6_f32, hue(v)),
                 );
             }
         };
@@ -1445,7 +1445,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             if x > cx0 && x < cx1 && (standing > 0 || e.value > 0) {
                 painter.line_segment(
                     [Pos2::new(x, y_of_v(standing)), Pos2::new(x, y_of_v(e.value))],
-                    Stroke::new(1.6, hue(standing.max(e.value))),
+                    Stroke::new(1.6_f32, hue(standing.max(e.value))),
                 );
             }
             standing = e.value;
@@ -1473,7 +1473,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                 }
                 painter.line_segment(
                     [Pos2::new(a, y), Pos2::new(b, y)],
-                    Stroke::new(1.5, ink.gamma_multiply(0.45)),
+                    Stroke::new(1.5_f32, ink.gamma_multiply(0.45)),
                 );
             };
             let mut standing = 0_u8;
@@ -1493,7 +1493,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                 Pos2::new(l.vel.left(), l.vel.bottom() - 0.5),
                 Pos2::new(l.vel.right(), l.vel.bottom() - 0.5),
             ],
-            Stroke::new(1.0, ink.gamma_multiply(0.25)),
+            Stroke::new(1.0_f32, ink.gamma_multiply(0.25)),
         );
     }
 
@@ -1559,7 +1559,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             // says "grab here" rather than "here is a dot".
             let top = Pos2::new(x, l.vel.bottom() - h);
             painter.circle_filled(top, VEL_TOP_R, face);
-            painter.circle_stroke(top, VEL_TOP_R, Stroke::new(1.2, shaft));
+            painter.circle_stroke(top, VEL_TOP_R, Stroke::new(1.2_f32, shaft));
         }
     }
 
@@ -1569,7 +1569,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         painter.rect_stroke(
             r,
             0.0,
-            Stroke::new(1.0, ink.gamma_multiply(0.8)),
+            Stroke::new(1.0_f32, ink.gamma_multiply(0.8)),
             egui::StrokeKind::Inside,
         );
         // UNmultiplied — the premultiplied form with RGB far above the
@@ -1620,7 +1620,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                         Pos2::new(x + dx, tab.top() + 2.0),
                         Pos2::new(x + dx, tab.bottom() - 2.0),
                     ],
-                    Stroke::new(1.0, face),
+                    Stroke::new(1.0_f32, face),
                 );
             }
         }
@@ -1631,7 +1631,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     if px >= l.roll.left() && px <= l.roll.right() {
         painter.line_segment(
             [Pos2::new(px, l.roll.top()), Pos2::new(px, l.roll.bottom())],
-            Stroke::new(1.5, Color32::from_rgb(0xE8, 0x3A, 0x4E)),
+            Stroke::new(1.5_f32, Color32::from_rgb(0xE8, 0x3A, 0x4E)),
         );
     }
 }

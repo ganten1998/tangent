@@ -2439,7 +2439,7 @@ impl Settings {
     /// visible rather than hidden behind a menu nobody opens, and it is the
     /// trade the owner chose.
     pub fn first_launch() -> Self {
-        let mut s = Self {
+        let s = Self {
             show_fretboard: true,
             theory_order: crate::theory_panel::Views::all().keys(),
             show_recorder: true,

@@ -293,7 +293,7 @@ mod tests {
         // the same samples out as in, then the moment the path switched off
         // there would be a step.
         let mut s = Stream::new(2);
-        let mut ph = Phase::new();
+        let ph = Phase::new();
         let src = ramp(64, 2, 0.0);
         let mut dst = vec![0.0; 64 * 2];
         let n = ph.program_frames(64, 1.0);

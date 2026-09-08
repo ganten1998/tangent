@@ -1585,7 +1585,7 @@ impl Session {
                 }
                 None => {
                     self.plugin_audio =
-                        Some(PluginAudio::start(t, self.timebase, self.tap_tx.clone()))
+                        Some(PluginAudio::start(t, self.timebase, self.tap_tx.clone()));
                 }
             },
             None => self.plugin_audio = None,
