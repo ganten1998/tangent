@@ -732,3 +732,99 @@ mod tests {
         assert!(clip.envelope(0).is_empty());
     }
 }
+
+/// **decode**: what a take costs to read through `decode()` — the native
+/// road for a stereo WAV at the asked rate, the platform child for the
+/// rest — against the child road alone. Ignored; run in RELEASE:
+///
+/// ```text
+/// cargo test --release -p tangent-record --lib perf_probe::perf_decode -- --ignored --nocapture
+/// ```
+///
+/// The files are what the recorder writes: 24-bit PCM, stereo, 48 kHz,
+/// through this crate's own `WavWriter`. The child road is measured by
+/// asking for a rate the file is not at, which is the one gate every take
+/// passes and no `afconvert` invocation can skip; its number therefore
+/// includes a resample the native road never does, and reads as an upper
+/// bound on what a take used to cost, not an exact one.
+#[cfg(test)]
+mod perf_probe {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn per_call(n: u32, mut f: impl FnMut()) -> Duration {
+        let t = Instant::now();
+        for _ in 0..n {
+            f();
+        }
+        t.elapsed() / n.max(1)
+    }
+
+    /// A take of `seconds`: decaying sine bursts, a note every half second,
+    /// written a block at a time. Answers the bytes on disk.
+    fn write_take(path: &Path, seconds: f64, rate: u32) -> u64 {
+        let spec = crate::wav::WavSpec {
+            sample_rate: rate,
+            channels: 2,
+            format: crate::wav::SampleFormat::Int24,
+        };
+        let bext = crate::wav::Bext::new(crate::wav::Wallclock::now_utc(), spec);
+        let mut w = crate::wav::WavWriter::create(path, spec, &bext).expect("writer");
+        let frames = (seconds * f64::from(rate)) as usize;
+        let mut block = vec![0.0f32; 4_800 * 2];
+        let mut at = 0usize;
+        while at < frames {
+            let n = (frames - at).min(4_800);
+            for k in 0..n {
+                let t = (at + k) as f64 / f64::from(rate);
+                let into = t - (t * 2.0).floor() / 2.0;
+                let env = 0.7 * (-into * 5.0).exp();
+                let ph = std::f64::consts::TAU * 220.0 * into;
+                let v = env * (ph.sin() + 0.4 * (2.0 * ph).sin());
+                block[k * 2] = v as f32;
+                block[k * 2 + 1] = (v * 0.9) as f32;
+            }
+            w.write_interleaved(&block[..n * 2]).expect("write");
+            at += n;
+        }
+        let bytes = w.total_bytes();
+        w.finish().expect("finish");
+        bytes
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_decode() {
+        let build = if cfg!(debug_assertions) { "DEBUG" } else { "release" };
+        println!(
+            "decode [{build}]: decode() on a 24-bit stereo 48 kHz take (native road) vs the platform child (asked at 44.1 kHz, so it resamples too)"
+        );
+        let rate = 48_000u32;
+        let dir = std::env::temp_dir().join(format!("tangent-perf-decode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        for (seconds, n) in [(5.0, 5u32), (60.0, 3), (180.0, 2)] {
+            let path = dir.join(format!("take-{seconds}s.wav"));
+            let bytes = write_take(&path, seconds, rate);
+            let native = per_call(n, || {
+                let clip = decode(&path, rate).expect("the native road");
+                std::hint::black_box(clip);
+            });
+            let child = per_call(n, || {
+                // No decoder on this machine: the column reads as the cost
+                // of finding that out.
+                let got = decode(&path, 44_100).map(|c| c.samples.len()).unwrap_or(0);
+                std::hint::black_box(got);
+            });
+            let read_only = per_call(n, || {
+                std::hint::black_box(std::fs::read(&path).expect("read"));
+            });
+            println!(
+                "decode       {seconds:>5.0} s ({:>6.1} MB): native {native:>10.3?} (of which fs::read {read_only:>9.3?}) | child+resample {child:>10.3?} | {:>5.1}x  [{build}]",
+                bytes as f64 / 1_048_576.0,
+                child.as_secs_f64() / native.as_secs_f64().max(1e-9)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
