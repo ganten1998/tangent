@@ -9451,7 +9451,38 @@ impl DesktopApp {
                 // file is still on its way: the clock restarts, so the
                 // schedule is refreshed four times a second as files land
                 // and settled for good at the drain. See `Decode`.
-                if self.reload_clips(Decode::CachedOnly, ctx) {
+                //
+                // **A door that fired PUSHED, so it owes the frame that
+                // draws what it pushed.** `reload_clips` has no early
+                // return: every path through it ends in `set_clip_infos`
+                // and `set_track_info`, and both are bare stores on the far
+                // side of the firewall with no repaint of their own. So this
+                // is a road that changes the desk after the frame that would
+                // have drawn it, exactly like the five in `after_frame`, and
+                // it was left out when those were walked.
+                //
+                // It is reachable with nothing at all behind it. On the
+                // frame the LAST file lands, `land_decodes` raises the debt,
+                // this door answers it — everything is cached now, so
+                // `deferred` is false and the debt closes — and the drain
+                // below then finds the debt already cleared, so it reports
+                // no reload and asks for no frame. The cover comes down on
+                // that same frame, and `paint_busy` returns without asking
+                // either once the overlay has served its minimum. With an
+                // engine open the idle poll draws it a quarter second late;
+                // with no engine (the device would not open, and decoding
+                // runs at the default rate regardless) nothing polls at all
+                // and the last take's waveform waits for a mouse move.
+                //
+                // Unconditional, and honest: the reload pushes whatever it
+                // built, every time it runs. It cannot cost a resting
+                // window, because the door only runs while a debt stands, a
+                // debt is transient — this line closes it or the drain does
+                // — and the deadline lets it through four times a second at
+                // worst.
+                let deferred = self.reload_clips(Decode::CachedOnly, ctx);
+                late_change(ctx, true);
+                if deferred {
                     self.clips_owed_at = Some(std::time::Instant::now());
                 } else {
                     self.clips_owed = false;
@@ -18720,8 +18751,9 @@ mod tests {
     /// own_taken_flag`), and every one of these is a road whose fault is
     /// invisible: the work happens, the state is right, and the window
     /// simply never paints it. What it pins is that each caller passes an
-    /// ANSWER rather than `true`, and that the warm-up's do-nothing return
-    /// asks for nothing at all.
+    /// ANSWER wherever it has one — only the two roads that cannot fail to
+    /// have changed something may spell `true` — and that the warm-up's
+    /// do-nothing return asks for nothing at all.
     #[test]
     fn the_late_roads_ask_for_a_frame_and_the_idle_one_does_not() {
         let src = include_str!("desktop.rs");
@@ -18735,16 +18767,25 @@ mod tests {
             ("a reload ran", "late_change(ctx, reloaded);"),
             ("a landing spoke", "late_change(ctx, told);"),
             ("a bay loaded", "late_change(ctx, due.is_some());"),
+            (
+                "the deadline door reloaded",
+                "let deferred = self.reload_clips(Decode::CachedOnly, ctx);\n                late_change(ctx, true);",
+            ),
         ] {
             assert!(body.contains(ask), "{road}: the frame that draws it is not asked for");
         }
-        // Nothing may ask unconditionally: `late_change(ctx, true)` is a
-        // repaint with the answer written out of the question, and the only
-        // place it is allowed is the click's refusal, which is reached
-        // solely on the failure arm.
+        // **`late_change(ctx, true)` is a repaint with the answer written
+        // out of the question**, so every site that spells one has to be a
+        // road that cannot fail to have changed something. There are exactly
+        // two, and they are the two named above: the click's refusal, which
+        // is reached solely on the failure arm and has just written an error
+        // into the track info, and the deadline door, whose reload ends in
+        // `set_clip_infos` on every path it can take. A third would be
+        // somebody reaching for a repaint instead of an answer, which is the
+        // 50 ms tick back under another name.
         assert_eq!(
             body.matches("late_change(ctx, true)").count(),
-            1,
+            2,
             "an unconditional late repaint is the resting window undone"
         );
         // The warm-up's nothing-to-do return: no work, no change, no frame.
