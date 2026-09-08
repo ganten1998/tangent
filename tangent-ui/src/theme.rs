@@ -1431,6 +1431,17 @@ mod tests {
     /// owner's rule: a page of music sits on the same bone the naturals are,
     /// with the same black on it, and in dark mode on the same near-black the
     /// sharps are.
+    ///
+    /// **This checks what a theme DECLARES, which is not the same question as
+    /// what gets painted, and the difference cost three releases.** A theme
+    /// can declare `background` and then hand the piano a different natural
+    /// key through `dark.white_key`; and the piano can put a keyboard the
+    /// right way up out of a pale key it had to derive, which the theme never
+    /// declared at all. Both happened, one per mode, on the two dark-designed
+    /// themes, and this test went on passing through all of it because the
+    /// fields it compares were correct the whole time. The painted half is
+    /// `piano::every_theme_paints_its_naturals_on_its_own_page`; neither test
+    /// is the other one.
     #[test]
     fn the_theory_ground_is_the_keyboard_not_the_band() {
         for t in factory() {
