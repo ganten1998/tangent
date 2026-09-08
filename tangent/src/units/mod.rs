@@ -28,6 +28,7 @@ pub mod imager;
 /// Minimal build — which has no effects chain to borrow from — skips it.
 #[cfg(feature = "recorder")]
 pub mod plate;
+pub mod sampler;
 pub mod sweep;
 pub mod tape;
 pub mod trem;
