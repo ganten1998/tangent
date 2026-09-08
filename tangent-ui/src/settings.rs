@@ -35,7 +35,13 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 20;
+///
+/// **21: the insert seats are written as a whole head and a sparse tail** —
+/// see `to_map`'s `strip_inserts`. No migration arm: the array is still an
+/// array and the tail is an additive key, so a 20 reads here unchanged and a
+/// 21 reads on a 20 build with its head intact. The stamp records the shape
+/// the file was written in, which is what a stamp is for.
+const SETTINGS_VERSION: u64 = 21;
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -2910,6 +2916,31 @@ impl Settings {
                 .take(crate::recorder::INSERT_SPACE)
                 .collect();
         }
+        // **The far seats of a v21 file**, merged onto the staged array — a
+        // seat the array already fills keeps the array's word, because the
+        // array is the fresher writer's whenever an older build has saved
+        // in between (it rewrites the array and carries this key through
+        // unread). Taken out of the map here so it never lands in `extra`,
+        // where a stale copy would win over the head on the next write.
+        // Same shape as the document's `inserts_tail`.
+        if let Some(Value::Object(tail)) = map.shift_remove("strip_inserts_tail") {
+            for (k, v) in &tail {
+                let (Ok(bay), Some(path)) = (k.parse::<usize>(), v.as_str()) else {
+                    continue;
+                };
+                if path.is_empty() || bay >= crate::recorder::INSERT_SPACE {
+                    continue;
+                }
+                if desk.inserts.len() <= bay {
+                    desk.inserts.resize(bay + 1, String::new());
+                }
+                if let Some(slot) = desk.inserts.get_mut(bay) {
+                    if slot.is_empty() {
+                        *slot = path.to_owned();
+                    }
+                }
+            }
+        }
         if let Some(Value::Array(v)) = map.shift_remove("strip_names") {
             desk.names = v
                 .into_iter()
@@ -4127,26 +4158,38 @@ impl Settings {
             Value::Array(self.strip_sends.iter().map(|v| Value::from(*v)).collect()),
         );
         map.insert("strip_muted".into(), Value::from(self.strip_muted));
-        // **Trailing empties are not written.** The insert space is one seat
-        // per strip, per pad and per drum LANE — thousands of them — and all
-        // but a handful are empty in every real session. Writing the whole
-        // array put tens of kilobytes of `""` in every settings file and
-        // every project desk, and it grows with the seat map.
+        // **The head whole, the far seats sparse.** The insert space is one
+        // seat per strip, per pad, per folder and per amp pedal — 13,167 of
+        // them — and all but a handful are empty in every real session. The
+        // old rule wrote the array up to its LAST occupied seat, which on the
+        // owner's desk is seat 4149 (a folder-extra rack): 12,448 entries,
+        // 100 KB of `""`, 72% of the file, pretty-printed on every one of the
+        // ~170 synchronous settings writes.
         //
-        // Safe because nothing reads this by length: `insert()` uses `get`
-        // and treats a missing seat as empty, and `set_insert` resizes when
-        // it needs a seat past the end.
+        // Now the array is exactly the first `HEAD_BAYS` seats — every strip
+        // and the master, the seats every build has always read — and every
+        // occupied seat past them goes in `strip_inserts_tail`, appended at
+        // the end like every additive key. An OLDER build reading this file
+        // keeps a valid desk (the head), carries the tail through its own
+        // saves as a stranger's key, and loses at most the far seats it never
+        // knew about; a bare object here would have read on that build as no
+        // desk at all and put the shipped instruments back — and the plugin
+        // is a separately built binary sharing this file. The head is
+        // written whole rather than trimmed so its length can never be one
+        // of the era lengths `adopt_desk`'s lifts key on (84 is the
+        // sixteen-pad era). See `crate::arrangement::V7_SPARSE_SEATS` for the
+        // document's identical shape.
+        //
+        // Nothing reads this by length: `insert()` uses `get` and treats a
+        // missing seat as empty, and `set_insert` resizes when it needs a
+        // seat past the end.
         map.insert(
             "strip_inserts".into(),
             Value::Array(
-                self.strip_inserts
-                    [..self
-                        .strip_inserts
-                        .iter()
-                        .rposition(|p| !p.is_empty())
-                        .map_or(0, |i| i + 1)]
-                    .iter()
-                    .map(|p| Value::String(p.clone()))
+                (0..crate::arrangement::HEAD_BAYS)
+                    .map(|i| {
+                        Value::String(self.strip_inserts.get(i).cloned().unwrap_or_default())
+                    })
                     .collect(),
             ),
         );
@@ -4648,6 +4691,19 @@ impl Settings {
         // byte-for-byte shape.
         if self.midi_pedal_lane {
             map.insert("midi_pedal_lane".into(), Value::Bool(true));
+        }
+        // The far seats — see `strip_inserts` above. At the END like every
+        // additive key, only when one is occupied, in ascending order.
+        let tail: Map<String, Value> = self
+            .strip_inserts
+            .iter()
+            .enumerate()
+            .skip(crate::arrangement::HEAD_BAYS)
+            .filter(|(_, p)| !p.is_empty())
+            .map(|(n, p)| (n.to_string(), Value::String(p.clone())))
+            .collect();
+        if !tail.is_empty() {
+            map.insert("strip_inserts_tail".into(), Value::Object(tail));
         }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
@@ -7965,6 +8021,74 @@ mod tests {
         );
     }
 
+    /// **The seats are written as a whole head and a sparse tail, and the
+    /// desk that comes back is the desk that went out.** A plugin in a pad
+    /// rack and one on the far folder-extra seat both ride the tail; the
+    /// head is exactly `HEAD_BAYS` long whatever is occupied; the tail is
+    /// the file's own key and never a stranger in `extra`; and the file no
+    /// longer carries thousands of `""`.
+    #[test]
+    fn the_seats_are_a_whole_head_and_a_sparse_tail() {
+        let mut s = Settings::default();
+        let far = 4149 * crate::recorder::INSERTS;
+        let pad = 200;
+        s.strip_inserts[far] = "/x/Brusfri.vst3".to_owned();
+        s.strip_inserts[pad] = "/x/PadComp.vst3".to_owned();
+        s.strip_inserts[5 * crate::recorder::INSERTS] = "/x/Channel5.vst3".to_owned();
+        let map = s.to_map();
+        let head = map.get("strip_inserts").and_then(Value::as_array).expect("the head");
+        assert_eq!(head.len(), crate::arrangement::HEAD_BAYS, "the head is not written whole");
+        assert_eq!(head[5 * crate::recorder::INSERTS], Value::String("/x/Channel5.vst3".into()));
+        let tail = map.get("strip_inserts_tail").and_then(Value::as_object).expect("a tail");
+        assert_eq!(
+            tail.keys().cloned().collect::<Vec<_>>(),
+            vec![pad.to_string(), far.to_string()],
+            "the tail is not the far seats in order"
+        );
+        let text = s.to_json();
+        assert!(text.matches("\"\"").count() < 400, "thousands of empties again: {}", text.len());
+
+        let back = Settings::from_json(&text);
+        assert_eq!(back.strip_inserts, s.strip_inserts, "the desk moved through the file");
+        assert!(!back.extra.contains_key("strip_inserts_tail"), "the tail became a stranger");
+        assert_eq!(back.strip_inserts.len(), crate::recorder::INSERT_SPACE);
+
+        // A desk with nothing past the head writes no tail at all.
+        let plain = Settings::default();
+        assert!(!plain.to_map().contains_key("strip_inserts_tail"), "an empty tail was written");
+        assert_eq!(Settings::from_json(&plain.to_json()).strip_inserts, plain.strip_inserts);
+    }
+
+    /// **An older build's array and this build's tail meet on the dense
+    /// desk, and the array wins where it speaks.** The file an older build
+    /// saves after reading a 21: its trailing-trimmed array, and the tail it
+    /// carried through as a key it did not know.
+    #[test]
+    fn an_older_builds_array_and_the_tail_meet_on_the_dense_desk() {
+        use crate::recorder::INSERTS;
+        let json = serde_json::json!({
+            "settings_version": 20,
+            "strip_inserts": ["/x/A.vst3", "", "", "/x/B.vst3"],
+            "strip_inserts_tail": {
+                "3": "/x/Stale.vst3",
+                "200": "/x/PadComp.vst3",
+                "12447": "/x/Brusfri.vst3",
+                "9000": "",
+                "x": "/x/Nowhere.vst3",
+                "99999999": "/x/PastTheMap.vst3"
+            }
+        })
+        .to_string();
+        let s = Settings::from_json(&json);
+        assert_eq!(s.strip_inserts[0], "/x/A.vst3");
+        assert_eq!(s.strip_inserts[3], "/x/B.vst3", "the tail's stale copy beat the array");
+        assert_eq!(s.strip_inserts[200], "/x/PadComp.vst3", "a pad-rack seat did not land");
+        assert_eq!(s.strip_inserts[4149 * INSERTS], "/x/Brusfri.vst3", "the far seat did not land");
+        assert!(s.strip_inserts[9000].is_empty(), "an empty path made a seat");
+        assert_eq!(s.strip_inserts.len(), crate::recorder::INSERT_SPACE, "a seat past the map grew it");
+        assert!(!s.extra.contains_key("strip_inserts_tail"));
+    }
+
     /// **The v17 drumpad seat survives a staged desk.** Every real file
     /// carries `strip_inserts`, which stages into `LegacyDesk` and REPLACES
     /// `self.strip_inserts` at adoption — so the migration's seat, written
@@ -8074,6 +8198,49 @@ mod perf_probe {
         say("settings", "-", "load_from (read + parse + from_map)", load_t, true);
         let back = Settings::load_from(&path);
         assert_eq!(back.to_json(), s.to_json(), "the save did not round trip");
+
+        // **The owner's desk**: fifteen occupied seats, one of them at
+        // 4149 — a folder-extra rack — which is what defeated the old
+        // trailing trim and made every settings write carry 12,448 seats.
+        let mut owner = Settings::default();
+        for (bay, path) in [
+            (6usize, "/Library/Audio/Plug-Ins/VST3/Pro-Q 3.vst3"),
+            (9, "/Library/Audio/Plug-Ins/VST3/Rhodes Anthology.vst3"),
+            (15, "/Library/Audio/Plug-Ins/VST3/Reverb.vst3"),
+            (21, "/Library/Audio/Plug-Ins/VST3/Compressor.vst3"),
+            (30, "/Library/Audio/Plug-Ins/VST3/Delay.vst3"),
+            (45, "/Library/Audio/Plug-Ins/VST3/Chorus.vst3"),
+            (200, "/Library/Audio/Plug-Ins/VST3/PadComp.vst3"),
+            (4149 * crate::recorder::INSERTS, "/Library/Audio/Plug-Ins/VST3/Brusfri.vst3"),
+        ] {
+            if let Some(slot) = owner.strip_inserts.get_mut(bay) {
+                *slot = path.to_owned();
+            }
+        }
+        let text = owner.to_json();
+        let seats = owner
+            .to_map()
+            .get("strip_inserts")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        println!(
+            "settings     -   the owner's desk: settings.json = {} bytes ({:.1} KB), strip_inserts array {} entries, {} lines of \"\"",
+            text.len(),
+            text.len() as f64 / 1024.0,
+            seats,
+            text.lines().filter(|l| l.trim() == "\"\"," || l.trim() == "\"\"").count()
+        );
+        let save_o = per_call(20, || owner.save_to(&path));
+        say("settings", "-", "the owner's desk: save_to", save_o, true);
+        let load_o = per_call(20, || {
+            std::hint::black_box(Settings::load_from(&path));
+        });
+        say("settings", "-", "the owner's desk: load_from", load_o, true);
+        assert_eq!(
+            Settings::load_from(&path).strip_inserts,
+            owner.strip_inserts,
+            "the owner's desk did not round trip"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
