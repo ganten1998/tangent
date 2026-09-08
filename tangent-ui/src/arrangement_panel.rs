@@ -3650,6 +3650,26 @@ struct Ink {
     solo: Color32,
     meter: Color32,
     select: Color32,
+    // ── Worked out ONCE per frame from the roles above, because they were
+    // being worked out per switch, per chip, per bar label and per
+    // automation row: `quiet` and `legible_surface` each cost a contrast
+    // walk (three powf per colour per step), and none of these depend on
+    // anything but the theme. See `ink`. ──
+    /// A switch's letter when it is OFF, on `hdr_lane`.
+    switch_off: Color32,
+    /// An empty slot's number and its +, on `empty_ground`.
+    empty_ink: Color32,
+    /// The folder arrow and its count, on `hdr_lane`.
+    collapse_ink: Color32,
+    /// A bay chip's word: a tenant, an empty +, a bypassed tenant.
+    bay_ink: [Color32; 3],
+    /// The bar numbers and the clock, on the ruler — the numbers a notch
+    /// stronger than the clock, see the ruler loop in `draw`.
+    ruler_num: Color32,
+    ruler_clock: Color32,
+    /// An automation row's ground under an even and an odd lane — see
+    /// [`auto_ground`], which reads this.
+    auto_ground: [Color32; 2],
 }
 
 /// One rack chip: a plugin's short name, or a plus for an empty bay.
@@ -3705,12 +3725,12 @@ fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, bypassed: bool, p
     // 0.45, the figure two hundred lines down where the same state is drawn
     // on a lane. `quiet` re-measures against this chip's own ground and
     // stops at 4.5:1, so "quieter" never becomes "gone" on a dark theme.
-    let dim = if bypassed && has {
-        0.45
+    let word_ink = if bypassed && has {
+        p.bay_ink[2]
     } else if has {
-        0.08
+        p.bay_ink[0]
     } else {
-        0.34
+        p.bay_ink[1]
     };
     let inner = Rect::from_min_max(Pos2::new(r.left() + text_left, r.top()), r.max);
     painter.text(
@@ -3718,7 +3738,7 @@ fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, bypassed: bool, p
         Align2::CENTER_CENTER,
         cut_to(painter, inner.width() - 4.0, word, &font),
         font,
-        quiet(ink, bone, dim),
+        word_ink,
     );
 }
 
@@ -3831,13 +3851,33 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
         }
     };
     let engrave = on(strip);
+    // Through the guard as well: it carries the M/S/R letters, and
+    // shading the field 18% darker is exactly the kind of nudge that
+    // lands a pale theme in the dead zone where neither ink clears.
+    let hdr_lane = crate::recorder_panel::legible_surface(shade(lane, 0.82));
+    // The per-frame derivations — the same calls the draw loops made, made
+    // here once. `quiet`'s figures are each caller's own and are named at
+    // the call sites that used to compute them.
+    let switch_off = quiet(on_ink(hdr_lane), hdr_lane, 0.18);
+    let empty_ink = quiet(on_ink(empty_ground), empty_ground, 0.22);
+    let collapse_ink = quiet(on_ink(hdr_lane), hdr_lane, 0.22);
+    let bay_ink = [
+        quiet(engrave, strip, 0.08),
+        quiet(engrave, strip, 0.34),
+        quiet(engrave, strip, 0.45),
+    ];
+    let ruler_num = quiet(on_ink(ruler), ruler, 0.08);
+    let ruler_clock = quiet(on_ink(ruler), ruler, 0.18);
+    // Character first, then DISTANCE — see [`auto_ground`] for the whole
+    // argument and the measurements behind 0.35 and 0.26.
+    let auto_ground_of = |base: Color32| {
+        crate::recorder_panel::legible_surface(separate(blend(base, ruler, 0.35), 0.26))
+    };
+    let auto_ground = [auto_ground_of(lane), auto_ground_of(lane_alt)];
     Ink {
         hdr_wood: wood,
         hdr_face: strip,
-        // Through the guard as well: it carries the M/S/R letters, and
-        // shading the field 18% darker is exactly the kind of nudge that
-        // lands a pale theme in the dead zone where neither ink clears.
-        hdr_lane: crate::recorder_panel::legible_surface(shade(lane, 0.82)),
+        hdr_lane,
         ruler,
         wood: shade(wood, if dark { 0.62 } else { 1.0 }),
         face: strip,
@@ -3870,6 +3910,13 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
         solo: redder_of(lane),
         meter: Color32::from_rgb(0x3D, 0xC0, 0x5A),
         select: on(lane),
+        switch_off,
+        empty_ink,
+        collapse_ink,
+        bay_ink,
+        ruler_num,
+        ruler_clock,
+        auto_ground,
     }
 }
 
@@ -3890,12 +3937,24 @@ fn on_ink(bg: Color32) -> Color32 {
     }
 }
 
+/// How many times `quiet` has been asked on this thread, for the test that
+/// holds a frame to a handful: each ask is a contrast walk, and a frame
+/// once made 124 of them for answers that do not change between frames.
+/// Thread-local because the tests run in parallel and a frame is drawn on
+/// the thread that asked for it.
+#[cfg(test)]
+thread_local! {
+    static QUIET_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `pub(crate)` because the MIXER's rack needs it too, for the bypassed bay
 /// label: one contrast-guarded dim for the whole app rather than a second
 /// copy in the other panel that could be given a different floor by somebody
 /// who never saw this one. It lives here because this is where it was
 /// written and where every other caller of it still is.
 pub(crate) fn quiet(ink: Color32, bg: Color32, t: f32) -> Color32 {
+    #[cfg(test)]
+    QUIET_CALLS.with(|n| n.set(n.get() + 1));
     // **Quieter, but never quiet enough to stop being words.** How far `t`
     // can go depends on the ground: on the pale themes a third of the way
     // toward a near-white panel is already a grey nobody reads, which is what
@@ -4411,7 +4470,9 @@ fn draw_auto_headers(
                         Align2::CENTER_CENTER,
                         "M",
                         FontId::new(size, crate::fonts::courier_bold()),
-                        if on { on_ink(plate) } else { quiet(on_ink(plate), plate, 0.18) },
+                        // Off is on `hdr_lane`, whose quieted ink `ink`
+                        // already worked out once for every switch.
+                        if on { on_ink(plate) } else { p.switch_off },
                     );
                 }
             }
@@ -4511,7 +4572,6 @@ fn auto_header_seam(p: &Ink) -> Color32 {
 }
 
 fn auto_ground(p: &Ink, lane: usize) -> Color32 {
-    let base = if lane % 2 == 0 { p.lane } else { p.lane_alt };
     // Character first, then DISTANCE. The blend gives the row the ruler's
     // hue so it reads as a strip about something other than a track; on the
     // themes whose ruler already sits near the lane that blend alone changed
@@ -4524,7 +4584,10 @@ fn auto_ground(p: &Ink, lane: usize) -> Color32 {
     // 0.14 and 0.20 both left Centennial and Porcelain at 1.02:1 against
     // their own lane — indistinguishable — and 0.26 is where every theme
     // clears. Ink still reads at 4.7:1 on the worst of them.
-    crate::recorder_panel::legible_surface(separate(blend(base, p.ruler, 0.35), 0.26))
+    //
+    // Two answers per frame, not one per row per loop: the base is the
+    // lane's stripe, and there are two stripes. `ink` derives both.
+    p.auto_ground[lane % 2]
 }
 
 /// **A clip's waveform from its pyramid, as one mesh.**
@@ -4729,7 +4792,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             Align2::LEFT_TOP,
             format!("{}", n.saturating_add(1)),
             font.clone(),
-            quiet(on_ink(p.ruler), p.ruler, 0.08),
+            p.ruler_num,
         );
     }
     // **The clock row: h:mm:ss along the ruler's foot** — the owner's
@@ -4762,7 +4825,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     Align2::LEFT_BOTTOM,
                     word,
                     font.clone(),
-                    quiet(on_ink(p.ruler), p.ruler, 0.18),
+                    p.ruler_clock,
                 );
             }
             n += 1.0;
@@ -5344,35 +5407,51 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     }
 
     // ── the clips ─────────────────────────────────────────────────────────
+    //
+    // A lane's clip colour and its ink are a function of the lane, worked
+    // out the first time a clip on it is drawn and read back for the rest:
+    // the dead-zone guard is a contrast walk of up to fifty steps, and a
+    // lane full of clips paid it once per clip.
+    let mut lane_ink: [Option<(Color32, Color32)>; CHANNELS] = [None; CHANNELS];
     for clip in view.clips {
         let r = clip_rect_in(&l, view, clip);
         if !r.is_positive() {
             continue;
         }
-        // Through the dead-zone guard, like the strip and the header plate:
-        // a hand-painted lane can point its clips at the grid's three
-        // unreadable third tones, and the auto palettes' contract does not
-        // cover the hand grid.
-        let color = crate::recorder_panel::legible_surface(
-            view.lanes
-                .get(clip.lane)
-                .map(|lane| lane.color)
-                .filter(|c| *c != 0)
-                .map(|c| {
-                    let (cr, cg, cb) = STRIP_COLORS[c.min(STRIP_COLORS.len() - 1)];
-                    Color32::from_rgb(cr, cg, cb)
-                })
-                // An unpainted lane's clips are the desk's green — the
-                // timeline wave's own colour, so the two surfaces agree what
-                // audio looks like.
-                .unwrap_or(Color32::from_rgb(0x2E, 0x6B, 0x46)),
-        );
-        // Measured on THIS clip rather than taken from `p`: the guard can
-        // move an olive to the side of the dead zone where the dark ink is
-        // the one that reads, and `p.clip_ink` is the light one. Everything
-        // printed inside the clip — name, staff, wave, fades, handles —
-        // takes this ink, so the clip cannot half-agree with itself.
-        let clip_ink = on_ink(color);
+        let (color, clip_ink) = match lane_ink.get(clip.lane).copied().flatten() {
+            Some(pair) => pair,
+            None => {
+                // Through the dead-zone guard, like the strip and the header
+                // plate: a hand-painted lane can point its clips at the
+                // grid's three unreadable third tones, and the auto
+                // palettes' contract does not cover the hand grid.
+                let color = crate::recorder_panel::legible_surface(
+                    view.lanes
+                        .get(clip.lane)
+                        .map(|lane| lane.color)
+                        .filter(|c| *c != 0)
+                        .map(|c| {
+                            let (cr, cg, cb) = STRIP_COLORS[c.min(STRIP_COLORS.len() - 1)];
+                            Color32::from_rgb(cr, cg, cb)
+                        })
+                        // An unpainted lane's clips are the desk's green —
+                        // the timeline wave's own colour, so the two
+                        // surfaces agree what audio looks like.
+                        .unwrap_or(Color32::from_rgb(0x2E, 0x6B, 0x46)),
+                );
+                // Measured on THIS clip rather than taken from `p`: the
+                // guard can move an olive to the side of the dead zone where
+                // the dark ink is the one that reads, and `p.clip_ink` is
+                // the light one. Everything printed inside the clip — name,
+                // staff, wave, fades, handles — takes this ink, so the clip
+                // cannot half-agree with itself.
+                let pair = (color, on_ink(color));
+                if let Some(slot) = lane_ink.get_mut(clip.lane) {
+                    *slot = Some(pair);
+                }
+                pair
+            }
+        };
         // The clip's UNCLAMPED pixel span, measured once: where the whole
         // clip would stand if the viewport were not cutting it. The note
         // miniature and the loop seams are both mapped through it, and `x_of`
@@ -5961,7 +6040,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 // a dark ground, and the row numbers were unreadable on most
                 // of the sixteen. The + circle two inches away had the right
                 // answer the whole time.
-                quiet(on_ink(p.empty_ground), p.empty_ground, 0.22)
+                p.empty_ink
             },
         );
         // The input chip draws on EVERY lane — binding an input is how a
@@ -5980,7 +6059,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 // actually drawn on, and blended rather than made
                 // transparent. It was the themed face at 55% alpha, which on
                 // a dark theme is a circle nobody can see.
-                let ink = quiet(on_ink(p.empty_ground), p.empty_ground, 0.22);
+                let ink = p.empty_ink;
                 let radius = row.add.width().min(row.add.height()) * 0.5 - 1.0;
                 let w = (radius * 0.12).clamp(1.2, 2.2);
                 painter.circle_stroke(c, radius, Stroke::new(w, ink));
@@ -6136,6 +6215,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         };
         readout(painter, row.pan_readout, pan_word);
         // The labels, under their dials — always visible, the standard.
+        let label_ink = quiet(ink_on, face, 0.34);
         for (dial, word) in [(row.pan, "PAN"), (row.knob, "VOL"), (row.send, "SND")] {
             if !dial.is_positive() {
                 continue;
@@ -6150,7 +6230,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     Align2::CENTER_TOP,
                     word,
                     FontId::new(band.height().clamp(6.0, 8.0), crate::fonts::courier()),
-                    quiet(ink_on, face, 0.34),
+                    label_ink,
                 );
             }
         }
@@ -6217,7 +6297,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 Align2::CENTER_CENTER,
                 label,
                 FontId::new((r.height() * 0.6).clamp(8.0, 12.0), crate::fonts::courier_bold()),
-                if on { on_ink(lit) } else { quiet(on_ink(p.hdr_lane), p.hdr_lane, 0.18) },
+                if on { on_ink(lit) } else { p.switch_off },
             );
         }
         // **The FOLDER box, bottom-left.**
@@ -6230,7 +6310,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // children are on screen and counting them out loud says nothing.
         if row.collapse.is_positive() && lane.is_folder {
             let cr = row.collapse;
-            let ink = quiet(on_ink(p.hdr_lane), p.hdr_lane, 0.22);
+            let ink = p.collapse_ink;
             let c = cr.center();
             let a = cr.width() * 0.30;
             let tri = if lane.folder_shut {
@@ -8604,6 +8684,35 @@ ArrangeView {
         let (walk, now) = (layouts(&cut_to_reference), layouts(&cut_to));
         assert!(walk >= 10, "the walk laid out only {walk} galleys");
         assert!(now <= 5, "cut_to laid out {now} galleys against the walk's {walk}");
+    }
+
+    /// **A frame asks `quiet` a handful of times, not one per switch.**
+    ///
+    /// `quiet` is a contrast walk: a blend and up to thirteen `contrast_ratio`
+    /// calls, three `powf` each. It was asked per bar number, per clock label,
+    /// per bay chip, per switch letter and per dial label — about a hundred
+    /// and eighty times a frame on eight lanes — for answers that depend on
+    /// the theme alone. Those live in `Ink` now, derived once; what is left
+    /// per lane is the two inks that depend on the lane's own plate. Eight
+    /// used lanes with every chip and switch drawn: a fixed dozen plus two
+    /// a lane, and the bound says so.
+    #[test]
+    fn quiet_is_asked_a_handful_of_times_per_frame() {
+        let c = clips();
+        let mut v = a_view(&c);
+        for lane in v.lanes.iter_mut().take(8) {
+            lane.used = true;
+            lane.inserts = ["Comp", "EQ", "Verb", "", "", ""];
+        }
+        v.show_tempo_lane = true;
+        let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        QUIET_CALLS.with(|n| n.set(0));
+        let (shapes, _) = frame_of(&v, tall);
+        let asked = QUIET_CALLS.with(std::cell::Cell::get);
+        assert!(shapes.len() > 100, "the frame drew {} shapes", shapes.len());
+        println!("quiet asked {asked} times for the frame");
+        assert!(asked <= 12 + 2 * 8, "quiet was asked {asked} times in one frame");
+        assert!(asked >= 8, "quiet was asked only {asked} times: the count is broken");
     }
 
     #[test]
