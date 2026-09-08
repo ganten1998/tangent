@@ -884,7 +884,177 @@ pub struct DeskSnap {
     pub folder_shut: Vec<bool>,
 }
 
+/// **The desk by reference** — every field of [`DeskSnap`] borrowed from
+/// wherever it lives, so the once-a-frame fingerprint can walk the LIVE
+/// desk without first cloning thousands of seat strings into a snapshot it
+/// throws away a microsecond later.
+///
+/// This is THE walk, and the one derivation. `DeskSnap::hash_into` goes
+/// through `as_ref`, the snapshot the app takes is built by `to_snap`, and
+/// the app reads its settings into one of these in exactly one function —
+/// so the cheap question (`project_dirty`), the exact one
+/// (`project_dirty_exact`) and the document's own desk all see the same
+/// fields derived the same way. Two walkers over two derivations was the
+/// shape that could disagree, and a disagreement here is a title bar blind
+/// to a fader the quit prompt can see.
+#[derive(Clone, Copy)]
+pub struct DeskRef<'a> {
+    pub kinds: &'a [u8],
+    pub icons: &'a [u8],
+    pub names: &'a [String],
+    pub colors: &'a [i64],
+    pub inserts: &'a [String],
+    pub sends: &'a [f64],
+    pub muted: u64,
+    pub soloed: u64,
+    pub gains: &'a [f64],
+    pub pans: &'a [f64],
+    pub inputs: &'a [String],
+    pub drums_gain: f64,
+    pub drums_pan: f64,
+    pub metronome_gain: f64,
+    pub master_gain: f64,
+    pub fx_return: f64,
+    pub tempo_bpm: f64,
+    pub sig_beats: u8,
+    pub sig_unit: u8,
+    pub metronome_on: bool,
+    pub tracks_added: u32,
+    pub is_folder: &'a [bool],
+    pub in_folder: &'a [bool],
+    pub folder_shut: &'a [bool],
+}
+
+impl DeskRef<'_> {
+    /// The one place a desk is copied into an owned snapshot.
+    pub fn to_snap(&self) -> DeskSnap {
+        DeskSnap {
+            kinds: self.kinds.to_vec(),
+            icons: self.icons.to_vec(),
+            names: self.names.to_vec(),
+            colors: self.colors.to_vec(),
+            inserts: self.inserts.to_vec(),
+            sends: self.sends.to_vec(),
+            muted: self.muted,
+            soloed: self.soloed,
+            gains: self.gains.to_vec(),
+            pans: self.pans.to_vec(),
+            inputs: self.inputs.to_vec(),
+            drums_gain: self.drums_gain,
+            drums_pan: self.drums_pan,
+            metronome_gain: self.metronome_gain,
+            master_gain: self.master_gain,
+            fx_return: self.fx_return,
+            tempo_bpm: self.tempo_bpm,
+            sig_beats: self.sig_beats,
+            sig_unit: self.sig_unit,
+            metronome_on: self.metronome_on,
+            tracks_added: self.tracks_added,
+            is_folder: self.is_folder.to_vec(),
+            in_folder: self.in_folder.to_vec(),
+            folder_shut: self.folder_shut.to_vec(),
+        }
+    }
+
+    /// The desk into a [`Fingerprint`], field for field with
+    /// `DeskSnap::to_value`.
+    ///
+    /// **The two walk together or the title bar goes blind.** A field added
+    /// to the struct and to `to_value` but not to here is a desk change no
+    /// comparison can see — the asterisk stays off while a fader stands
+    /// somewhere new. `the_fingerprint_moves_when_the_document_moves`
+    /// is what catches that, and it catches it by MUTATING every field
+    /// rather than by reading this list; `the_cheap_dirty_answer_and_the_
+    /// exact_one_agree` does the same from the settings side.
+    fn hash_into(&self, f: &mut Fingerprint) {
+        f.len(self.kinds.len());
+        for k in self.kinds {
+            f.u64(u64::from(*k));
+        }
+        f.len(self.icons.len());
+        for i in self.icons {
+            f.u64(u64::from(*i));
+        }
+        f.len(self.names.len());
+        for n in self.names {
+            f.str(n);
+        }
+        f.len(self.colors.len());
+        for c in self.colors {
+            f.u64(*c as u64);
+        }
+        f.len(self.inserts.len());
+        for i in self.inserts {
+            f.str(i);
+        }
+        f.len(self.sends.len());
+        for s in self.sends {
+            f.f64(*s);
+        }
+        f.u64(self.muted);
+        f.u64(self.soloed);
+        f.len(self.gains.len());
+        for g in self.gains {
+            f.f64(*g);
+        }
+        f.len(self.pans.len());
+        for p in self.pans {
+            f.f64(*p);
+        }
+        f.len(self.inputs.len());
+        for i in self.inputs {
+            f.str(i);
+        }
+        f.f64(self.drums_gain);
+        f.f64(self.drums_pan);
+        f.f64(self.metronome_gain);
+        f.f64(self.master_gain);
+        f.f64(self.fx_return);
+        f.f64(self.tempo_bpm);
+        f.u64(u64::from(self.sig_beats));
+        f.u64(u64::from(self.sig_unit));
+        f.bool(self.metronome_on);
+        f.u64(u64::from(self.tracks_added));
+        for v in [self.is_folder, self.in_folder, self.folder_shut] {
+            f.len(v.len());
+            for b in v {
+                f.bool(*b);
+            }
+        }
+    }
+}
+
 impl DeskSnap {
+    /// This snapshot by reference — see [`DeskRef`].
+    pub fn as_ref(&self) -> DeskRef<'_> {
+        DeskRef {
+            kinds: &self.kinds,
+            icons: &self.icons,
+            names: &self.names,
+            colors: &self.colors,
+            inserts: &self.inserts,
+            sends: &self.sends,
+            muted: self.muted,
+            soloed: self.soloed,
+            gains: &self.gains,
+            pans: &self.pans,
+            inputs: &self.inputs,
+            drums_gain: self.drums_gain,
+            drums_pan: self.drums_pan,
+            metronome_gain: self.metronome_gain,
+            master_gain: self.master_gain,
+            fx_return: self.fx_return,
+            tempo_bpm: self.tempo_bpm,
+            sig_beats: self.sig_beats,
+            sig_unit: self.sig_unit,
+            metronome_on: self.metronome_on,
+            tracks_added: self.tracks_added,
+            is_folder: &self.is_folder,
+            in_folder: &self.in_folder,
+            folder_shut: &self.folder_shut,
+        }
+    }
+
     fn to_value(&self) -> Value {
         let mut m = Map::new();
         let nums = |v: &[f64]| {
@@ -947,69 +1117,9 @@ impl DeskSnap {
         Value::Object(m)
     }
 
-    /// The desk into a [`Fingerprint`], field for field with `to_value`.
-    ///
-    /// **The two walk together or the title bar goes blind.** A field added
-    /// to this struct and to `to_value` but not to here is a desk change no
-    /// cheap comparison can see — the asterisk stays off while a fader
-    /// stands somewhere new. `the_fingerprint_moves_when_the_document_moves`
-    /// is what catches that, and it catches it by MUTATING every field
-    /// rather than by reading this list.
+    /// The desk into a [`Fingerprint`] — `DeskRef::hash_into`, the one walk.
     fn hash_into(&self, f: &mut Fingerprint) {
-        f.len(self.kinds.len());
-        for k in &self.kinds {
-            f.u64(u64::from(*k));
-        }
-        f.len(self.icons.len());
-        for i in &self.icons {
-            f.u64(u64::from(*i));
-        }
-        f.len(self.names.len());
-        for n in &self.names {
-            f.str(n);
-        }
-        f.len(self.colors.len());
-        for c in &self.colors {
-            f.u64(*c as u64);
-        }
-        f.len(self.inserts.len());
-        for i in &self.inserts {
-            f.str(i);
-        }
-        f.len(self.sends.len());
-        for s in &self.sends {
-            f.f64(*s);
-        }
-        f.u64(self.muted);
-        f.u64(self.soloed);
-        f.len(self.gains.len());
-        for g in &self.gains {
-            f.f64(*g);
-        }
-        f.len(self.pans.len());
-        for p in &self.pans {
-            f.f64(*p);
-        }
-        f.len(self.inputs.len());
-        for i in &self.inputs {
-            f.str(i);
-        }
-        f.f64(self.drums_gain);
-        f.f64(self.drums_pan);
-        f.f64(self.metronome_gain);
-        f.f64(self.master_gain);
-        f.f64(self.fx_return);
-        f.f64(self.tempo_bpm);
-        f.u64(u64::from(self.sig_beats));
-        f.u64(u64::from(self.sig_unit));
-        f.bool(self.metronome_on);
-        f.u64(u64::from(self.tracks_added));
-        for v in [&self.is_folder, &self.in_folder, &self.folder_shut] {
-            f.len(v.len());
-            for b in v {
-                f.bool(*b);
-            }
-        }
+        self.as_ref().hash_into(f);
     }
 
     fn from_value(v: &Value) -> Option<Self> {
@@ -2159,6 +2269,12 @@ impl Arrangement {
     /// to the writer and forgotten here fails a test rather than shipping a
     /// title bar that cannot see it.
     pub fn hash_into(&self, desk: Option<&DeskSnap>, f: &mut Fingerprint) {
+        self.hash_into_ref(desk.map(DeskSnap::as_ref), f);
+    }
+
+    /// `hash_into` over a desk that is only borrowed — the app's live desk,
+    /// read straight out of the settings once a frame. See [`DeskRef`].
+    pub fn hash_into_ref(&self, desk: Option<DeskRef<'_>>, f: &mut Fingerprint) {
         f.u64(self.version);
         // The NORMALISED counter, the same expression the writer emits —
         // see `to_json`'s note on why a document has to be a fixed point.
@@ -3353,6 +3469,20 @@ mod tests {
                 unit: 8,
             });
         });
+    }
+
+    /// **A desk seen through the view and through a snapshot is one desk.**
+    /// `to_snap` and `as_ref` are inverses, and the number is the same
+    /// whichever way the walk reaches the fields — which is what lets the
+    /// app fingerprint its live settings without a clone.
+    #[test]
+    fn a_desk_by_reference_is_the_same_desk() {
+        let a = a_document_with_everything_in_it();
+        let d = a.desk.as_ref().expect("the fixture has a desk");
+        assert_eq!(d.as_ref().to_snap(), *d, "to_snap(as_ref(d)) is not d");
+        let mut by_ref = Fingerprint::new();
+        a.hash_into_ref(Some(d.as_ref()), &mut by_ref);
+        assert_eq!(by_ref.finish(), a.fingerprint(), "the view hashed differently");
     }
 
     /// **Recording changes nothing about the number.** The words are kept

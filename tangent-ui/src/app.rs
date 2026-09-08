@@ -8756,37 +8756,50 @@ impl TangentApp {
     ///
     /// Split out so `template_desk` can build the shipped desk without a
     /// live app — which is what stops seeding the template from capturing
-    /// whatever session happens to be open.
+    /// whatever session happens to be open. Built from `desk_view`, so a
+    /// snapshot and the once-a-frame fingerprint read the settings through
+    /// one derivation.
     fn desk_snapshot_of(settings: &Settings) -> crate::arrangement::DeskSnap {
-        let s = settings;
-        // Settings own this derivation; taking it from there is what keeps
-        // one answer rather than two that can drift.
+        Self::desk_view(settings).to_snap()
+    }
+
+    /// **The live desk, borrowed** — the ONE place the settings' fields
+    /// become a desk. Everything else derives from this: `desk_snapshot_of`
+    /// copies it, `undo_mark` and `walk` hash it in place.
+    ///
+    /// The three derivations that are not plain field reads live here and
+    /// nowhere else: the signature is PARSED (an unreadable string is the
+    /// default, as every other reader of it agrees), the tempo is the
+    /// export spec's, and `tracks_added` is the settings' `i64` narrowed
+    /// to the document's `u32`. A second copy of any of them is a second
+    /// way for the asterisk and the quit prompt to disagree.
+    fn desk_view(s: &Settings) -> crate::arrangement::DeskRef<'_> {
         let sig = s.time_signature();
-        crate::arrangement::DeskSnap {
-            kinds: s.channel_kinds.to_vec(),
-            icons: s.channel_icons.to_vec(),
-            names: s.strip_names.clone(),
-            colors: s.strip_colors.to_vec(),
-            inserts: s.strip_inserts.clone(),
-            sends: s.strip_sends.to_vec(),
+        crate::arrangement::DeskRef {
+            kinds: &s.channel_kinds,
+            icons: &s.channel_icons,
+            names: &s.strip_names,
+            colors: &s.strip_colors,
+            inserts: &s.strip_inserts,
+            sends: &s.strip_sends,
             muted: s.strip_muted,
             soloed: s.strip_soloed,
-            gains: s.channel_gains.to_vec(),
-            pans: s.channel_pans.to_vec(),
-            inputs: s.channel_inputs.clone(),
+            gains: &s.channel_gains,
+            pans: &s.channel_pans,
+            inputs: &s.channel_inputs,
             drums_gain: s.drums_gain,
             drums_pan: s.drums_pan,
             metronome_gain: s.metronome_gain,
             master_gain: s.master_gain,
             fx_return: s.fx_return_gain,
-            tempo_bpm: f64::from(s.record_export.tempo_bpm),
+            tempo_bpm: s.record_export.tempo_bpm,
             sig_beats: sig.beats,
             sig_unit: sig.unit,
             metronome_on: s.metronome_on,
             tracks_added: s.tracks_added as u32,
-            is_folder: s.strip_is_folder.clone(),
-            in_folder: s.strip_in_folder.clone(),
-            folder_shut: s.strip_folder_shut.clone(),
+            is_folder: &s.strip_is_folder,
+            in_folder: &s.strip_in_folder,
+            folder_shut: &s.strip_folder_shut,
         }
     }
 
@@ -13186,7 +13199,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the cheapest part of the call after the desk compare.
     fn undo_state(&self) -> Moment {
         let desk = self.desk_snapshot();
-        let (words, mark) = self.walk_with(&desk);
+        let (words, mark) = self.walk_with(desk.as_ref());
         // The desk is shared with the standing moment when it did not
         // move. Compared as a struct, which for a desk is right: its floats
         // are written as floats and a NaN merely fails to share.
@@ -13207,10 +13220,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// The arrangement and the kits go into ONE fingerprint rather than two,
     /// so there is a single number to compare and no pair to keep in step.
+    ///
+    /// **No allocation.** Asked once a frame, this used to begin by cloning
+    /// the whole desk — thirteen thousand seat strings, a 316 KB `Vec` —
+    /// into a snapshot it hashed and dropped. The desk is hashed where it
+    /// lives now, through `desk_view`, which is the same derivation the
+    /// snapshot is built from.
     fn undo_mark(&self) -> u64 {
         let mut f = crate::arrangement::Fingerprint::new();
         self.arrangement
-            .hash_into(Some(&self.desk_snapshot()), &mut f);
+            .hash_into_ref(Some(Self::desk_view(&self.settings)), &mut f);
         crate::drumpad::DrumpadDoc::hash_all_into(&self.drumpad_kits, &mut f);
         f.finish()
     }
@@ -13219,16 +13238,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the live document, the live desk and the kits. The words are the
     /// exact form and the number is the cheap one, from ONE pass.
     fn walk(&self) -> (Vec<u64>, u64) {
-        self.walk_with(&self.desk_snapshot())
+        self.walk_with(Self::desk_view(&self.settings))
     }
 
     /// `walk` over a desk the caller already holds.
-    fn walk_with(&self, desk: &crate::arrangement::DeskSnap) -> (Vec<u64>, u64) {
+    fn walk_with(&self, desk: crate::arrangement::DeskRef<'_>) -> (Vec<u64>, u64) {
         // Sized from the standing moment so the list is allocated once; a
         // document that grew since pays one regrowth, not thirty thousand.
         let hint = self.history.get(self.hist_at).map_or(0, |m| m.words.len());
         let mut f = crate::arrangement::Fingerprint::recording(hint);
-        self.arrangement.hash_into(Some(desk), &mut f);
+        self.arrangement.hash_into_ref(Some(desk), &mut f);
         crate::drumpad::DrumpadDoc::hash_all_into(&self.drumpad_kits, &mut f);
         f.finish_recorded()
     }
@@ -55009,6 +55028,72 @@ mod folder_tests {
             })),
             ("the click switched on", Box::new(|a: &mut TangentApp| {
                 a.settings.metronome_on = !a.settings.metronome_on;
+            })),
+            // **Every remaining desk field**, one edit each, because the
+            // cheap answer reads the settings through `desk_view` and the
+            // exact one through the same view — a field missing from the
+            // walk is missing from BOTH, and only an edit to that field can
+            // say so. Distinct values, so two fields cannot mask each other.
+            ("a channel's kind", Box::new(|a: &mut TangentApp| {
+                a.settings.channel_kinds[3] = 2;
+            })),
+            ("a channel's badge", Box::new(|a: &mut TangentApp| {
+                a.settings.channel_icons[4] = 3;
+            })),
+            ("a plugin in a bay", Box::new(|a: &mut TangentApp| {
+                if let Some(bay) = a.settings.strip_inserts.get_mut(3) {
+                    *bay = "/x/eq.vst3".into();
+                }
+            })),
+            ("a bay holding only whitespace", Box::new(|a: &mut TangentApp| {
+                if let Some(bay) = a.settings.strip_inserts.get_mut(4) {
+                    *bay = "  ".into();
+                }
+            })),
+            ("a send", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_sends[2] = 0.35;
+            })),
+            ("a mute", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_muted ^= 1 << 5;
+            })),
+            ("a solo", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_soloed ^= 1 << 6;
+            })),
+            ("a pan", Box::new(|a: &mut TangentApp| {
+                a.settings.channel_pans[2] = -0.4;
+            })),
+            ("an input", Box::new(|a: &mut TangentApp| {
+                a.settings.channel_inputs.push("in 7".into());
+            })),
+            ("the drum bus", Box::new(|a: &mut TangentApp| {
+                a.settings.drums_gain = 0.55;
+            })),
+            ("the drum bus pan", Box::new(|a: &mut TangentApp| {
+                a.settings.drums_pan = 0.15;
+            })),
+            ("the click level", Box::new(|a: &mut TangentApp| {
+                a.settings.metronome_gain = 0.45;
+            })),
+            ("the effects return", Box::new(|a: &mut TangentApp| {
+                a.settings.fx_return_gain = 0.65;
+            })),
+            ("the tempo", Box::new(|a: &mut TangentApp| {
+                a.settings.record_export.tempo_bpm = 133.0;
+            })),
+            ("the signature", Box::new(|a: &mut TangentApp| {
+                a.settings.record_time_signature = "7/8".into();
+            })),
+            ("which rows exist", Box::new(|a: &mut TangentApp| {
+                a.settings.tracks_added ^= 1 << 9;
+            })),
+            ("a folder", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_is_folder.push(true);
+            })),
+            ("what is inside a folder", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_in_folder.push(true);
+            })),
+            ("a shut folder", Box::new(|a: &mut TangentApp| {
+                a.settings.strip_folder_shut.push(true);
             })),
             ("a pad's knob", Box::new(|a: &mut TangentApp| {
                 a.drumpad_kits[0].pads[0].params.gain = 0.5;
