@@ -4707,7 +4707,8 @@ impl DesktopApp {
         // `bind_insert_ir` further down this file is the same three writes:
         //
         // while let Some((lane, path)) = self.app.take_sampler_load() {
-        //     self.bind_insert_sample(lane, &path);
+        //     self.bind_insert_sample(lane, 0, &path.to_string_lossy(),
+        //                             crate::instrument::SAMPLER_ROOT_KEY);
         // }
         if std::mem::take(&mut self.recorder.sampler_retry) {
             self.sampler_owed = true;
@@ -5817,6 +5818,65 @@ impl DesktopApp {
         write_insert_state(strip, slot, spec.path, &blob);
         let bays = tangent_ui::recorder::INSERTS;
         if let Some(cell) = self.recorder.inserts_loaded.get_mut(strip * bays + slot) {
+            *cell = Some("\u{1f}reload".to_owned());
+        }
+        true
+    }
+
+    /// **Point a sampler bay at a file**, and reload the bay so it is heard.
+    ///
+    /// `bind_insert_ir`'s twin, one screen down, and the same three writes:
+    /// the extras into the bay's state sidecar, the sidecar to disk, and the
+    /// reload sentinel that makes the reconcile build the bay again. The
+    /// third is what carries the change into the engine — `reload_sampler`
+    /// reads the file out of the BAY, so a state blob that has not been
+    /// re-read is a bay still playing yesterday's sample.
+    ///
+    /// An empty `path` empties the bay. Unlike the IR's road there is no
+    /// separate clearing function, because there is no reason to refuse one:
+    /// the IR refuses a path that is not a file so an undecoded sentinel can
+    /// never be persisted, and clearing therefore needs its own door. Here
+    /// the empty string is not a sentinel, it is the answer, and the decode
+    /// that would refuse a bad path happens in `reload_sampler` where a
+    /// failure has a face to report to.
+    ///
+    /// `root_key` is written beside the path so the key a sample plays at
+    /// unity travels with it; out of the wire's range it is the middle C
+    /// `SAMPLER_ROOT_KEY` names, which is what an unset one has always meant.
+    ///
+    /// MERGE-ME(ui): nothing calls this yet — the app's `take_sampler_load`
+    /// is the caller, and it is the sibling's. The `allow` goes with the
+    /// call site, in `per_frame` beside the drumpad's retry.
+    #[cfg(feature = "recorder")]
+    #[allow(dead_code)]
+    fn bind_insert_sample(&mut self, lane: usize, slot: usize, path: &str, root_key: u8) -> bool {
+        let Some(e) = self.recorder.engine.as_ref() else {
+            return false;
+        };
+        let Some((spec, values)) = e.builtin_insert(lane, slot) else {
+            return false;
+        };
+        if spec.path != crate::builtin_fx::SAMPLER_PATH {
+            return false;
+        }
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let root = if root_key <= 127 {
+            root_key
+        } else {
+            crate::instrument::SAMPLER_ROOT_KEY
+        };
+        let mut extra = e.builtin_extra(lane, slot).to_vec();
+        extra.retain(|(k, _)| !matches!(k.as_str(), "sample_path" | "sample_name" | "root_key"));
+        extra.push(("sample_path".to_owned(), path.to_owned()));
+        extra.push(("sample_name".to_owned(), name));
+        extra.push(("root_key".to_owned(), root.to_string()));
+        let blob = crate::builtin_fx::state_text(spec, values, &extra).into_bytes();
+        write_insert_state(lane, slot, spec.path, &blob);
+        let bays = tangent_ui::recorder::INSERTS;
+        if let Some(cell) = self.recorder.inserts_loaded.get_mut(lane * bays + slot) {
             *cell = Some("\u{1f}reload".to_owned());
         }
         true
@@ -19849,13 +19909,31 @@ mod tests {
             "without the break, a lane with two sampler bays takes the LAST \
              one's file and the first bay plays a sound nothing named"
         );
-        // And the symbols it reads are the ones the unit persists.
-        for symbol in ["sample_path", "root_key"] {
+        // **And every symbol either side spells is one the unit persists.**
+        // A typo in one of these is the quietest failure this feature has:
+        // `state_text` writes only what `is_extra_symbol` claims, so a
+        // misspelled key is a file that saves as nothing and reopens as an
+        // empty bay, with no error anywhere.
+        let bind = body
+            .find("fn bind_insert_sample")
+            .map(|at| &body[at..])
+            .expect("bind_insert_sample is still called that");
+        let bind = &bind[..bind.find("fn clear_insert_ir").expect("clear_insert_ir follows")];
+        for symbol in ["sample_path", "sample_name", "root_key"] {
             assert!(
                 crate::builtin_fx::is_extra_symbol(crate::builtin_fx::SAMPLER_PATH, symbol),
-                "{symbol} is read here and not persisted by the unit"
+                "{symbol} is spelled here and not persisted by the unit"
+            );
+            assert!(
+                bind.contains(&format!("\"{symbol}\"")),
+                "the binder no longer writes {symbol}"
             );
         }
+        assert!(
+            walk.contains("read(\"root_key\")"),
+            "the walk stopped reading the root key, so every sample plays at \
+             middle C whatever the face was told"
+        );
     }
 
     #[test]
