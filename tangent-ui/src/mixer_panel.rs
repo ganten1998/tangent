@@ -3207,15 +3207,17 @@ fn centred(painter: &Painter, r: Rect, text: &str, font: FontId, colour: Color32
     painter.text(
         r.center(),
         egui::Align2::CENTER_CENTER,
-        &cut_to_fit(painter, r.width(), text, &font),
+        // The timeline's cut, which reads where the ellipsis lands off the
+        // one galley the first measure makes. The desk kept its own copy of
+        // the walk that one replaced — a layout per character per chip that
+        // did not fit, every frame — and the two had drifted apart only in
+        // cost, never in answer.
+        &crate::arrangement_panel::cut_to(painter, r.width(), text, &font),
         font,
         colour,
     );
 }
 
-/// The longest prefix of `text` that fits `width`, with an ellipsis if it was
-/// cut. Measured through the painter's own fonts, because a character's width
-/// is a property of the face and not of the count.
 /// A plugin's name for a rack bay: the end of it, not the beginning.
 ///
 /// **The vendor is the first word and the useless one.** "FabFilter Pro-R 2"
@@ -3243,7 +3245,7 @@ fn shorten_plugin(painter: &Painter, width: f32, name: &str, font: &FontId) -> S
     }
     // Nothing fits whole, so the LAST word cut is still better than the first
     // word whole: "Pro-R…" names a plugin and "FabFilt…" names a company.
-    cut_to_fit(painter, width, words.last().copied().unwrap_or(name), font)
+    crate::arrangement_panel::cut_to(painter, width, words.last().copied().unwrap_or(name), font)
 }
 
 /// What `c` actually looks like once it is painted over `under`.
@@ -3283,31 +3285,6 @@ fn print_on(bg: Color32, p: &Ink) -> Color32 {
     } else {
         crate::recorder_panel::INK_DARK
     }
-}
-
-fn cut_to_fit(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
-    let measure = |t: &str| {
-        painter
-            .layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE)
-            .rect
-            .width()
-    };
-    if measure(text) <= width {
-        return text.to_owned();
-    }
-    // From the end: the front of a name is the half that identifies it.
-    let mut keep = text.len();
-    while keep > 0 {
-        keep -= 1;
-        while keep > 0 && !text.is_char_boundary(keep) {
-            keep -= 1;
-        }
-        let cut = format!("{}\u{2026}", text[..keep].trim_end());
-        if measure(&cut) <= width {
-            return cut;
-        }
-    }
-    String::new()
 }
 
 #[cfg(test)]
