@@ -55,6 +55,15 @@ pub fn courier_bold() -> FontFamily {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum FontChoice {
     Courier,
+    /// **The face a fresh install wears**, at the owner's word — twice now.
+    /// Courier Prime was the default from the beginning, Terminess after it,
+    /// and JetBrains briefly while a named size and a drawn one disagreed by
+    /// a fifth. `cap_scale` settles that, so this is the default again on its
+    /// own merits.
+    ///
+    /// A settings file that names a face keeps it, so nobody's desk changes
+    /// typeface under them; only an install that has never chosen gets this.
+    #[default]
     Terminess,
     /// **The one a fresh install wears**, at the owner's word — Courier Prime
     /// was the default from the beginning and Terminess after it, and both
@@ -62,13 +71,13 @@ pub enum FontChoice {
     /// desk changes typeface under them. Only an install that has never
     /// chosen gets this.
     ///
-    /// It is also the largest of the three on its own em — cap 0.730 against
-    /// Terminess' 0.645 and Courier Prime's 0.580 — so a fresh install now
-    /// opens on the face that reads biggest at a given size, which is the
-    /// difference the owner measured by eye and the reason the other two were
-    /// briefly scaled up to meet it. Shipping this one instead is the same
-    /// answer without a scale factor between a named size and a drawn one.
-    #[default]
+    /// It is the largest of the three on its own em — cap 0.730 against
+    /// Terminess' 0.645 and Courier Prime's 0.580 — and it was briefly the
+    /// default for that reason alone: shipping the biggest face was a way to
+    /// avoid a scale factor between a named size and a drawn one.
+    ///
+    /// The scale factor exists now (`cap_scale`), so that trade is gone and
+    /// the default is the owner's choice again rather than a workaround.
     JetBrains,
 }
 
@@ -232,6 +241,52 @@ pub fn install(ctx: &egui::Context, choice: FontChoice, custom_font_path: Option
         .insert(FontFamily::Name(FAMILY_COURIER_BOLD.into()), bold);
 
     ctx.set_fonts(defs);
+    // Park what a named size will actually draw at, for the panels whose
+    // sizes are small enough for the difference to matter. See `cap_scale`.
+    ctx.data_mut(|d| d.insert_temp(egui::Id::NULL, CapScale(cap_scale(choice))));
+}
+
+/// **What a named size actually draws, face by face.**
+///
+/// The three bundled faces do not agree about how much of the em a capital
+/// occupies: JetBrains Mono spends 0.730 of it, Terminess 0.645 and Courier
+/// Prime 0.580. So `FontId::new(10.0, ..)` is three different sizes on the
+/// screen, and the smallest of them is a fifth shorter than the largest.
+///
+/// That is invisible in chrome, where the type is 13 points and has room. It
+/// is not invisible in the arrangement and the mixer, where the sizes are a
+/// fraction of a lane or a strip and land between seven and twelve points
+/// with a floor under them — the owner's report was that those two views are
+/// "hard to read", and this is the whole of why.
+///
+/// The ratio is against JetBrains because JetBrains is the default and is
+/// therefore the size every one of those numbers was chosen by eye against.
+/// A face at least as generous as JetBrains scales by one and is untouched.
+pub fn cap_scale(choice: FontChoice) -> f32 {
+    const JETBRAINS_CAP: f32 = 0.730;
+    let cap = match choice {
+        FontChoice::JetBrains => JETBRAINS_CAP,
+        FontChoice::Terminess => 0.645,
+        FontChoice::Courier => 0.580,
+    };
+    (JETBRAINS_CAP / cap).max(1.0)
+}
+
+/// The key [`cap_scale`]'s answer is parked under, so a painter can ask
+/// without knowing which face was installed.
+#[derive(Clone, Copy, Default)]
+struct CapScale(f32);
+
+/// **The scale for the face this context is wearing.** One for a context
+/// nobody has installed fonts into, which is every test that builds a bare
+/// `egui::Context` — so a panel that multiplies by this is unchanged there.
+///
+/// Kept on the CONTEXT rather than in a global because a plug-in build can
+/// hold more than one, and two editors on different faces must not read each
+/// other's answer.
+pub fn size_scale(ctx: &egui::Context) -> f32 {
+    ctx.data(|d| d.get_temp::<CapScale>(egui::Id::NULL))
+        .map_or(1.0, |c| c.0)
 }
 
 /// Map egui text styles so stock widgets pick the right family: bold Courier

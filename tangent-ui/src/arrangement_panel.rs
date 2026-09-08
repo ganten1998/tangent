@@ -3759,7 +3759,7 @@ fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, bypassed: bool, p
     } else {
         0.0
     };
-    let font = FontId::new((r.height() * 0.62).clamp(7.0, 10.0), crate::fonts::courier());
+    let font = FontId::new(((r.height() * 0.62).clamp(7.0, 10.0)) * crate::fonts::size_scale(painter.ctx()), crate::fonts::courier());
     // **And the word goes as quiet as a bypassed automation row's does** —
     // 0.45, the figure two hundred lines down where the same state is drawn
     // on a lane. `quiet` re-measures against this chip's own ground and
@@ -4473,7 +4473,7 @@ fn draw_auto_headers(
             if h.close.is_positive() {
                 let c = h.close.center();
                 let a = h.close.width() * 0.26;
-                let stroke = Stroke::new(crate::fonts::px(h.close.width() * 0.10), quiet(ink, face, 0.28));
+                let stroke = Stroke::new(crate::fonts::px((h.close.width() * 0.10) * crate::fonts::size_scale(painter.ctx())), quiet(ink, face, 0.28));
                 painter.line_segment(
                     [Pos2::new(c.x - a, c.y - a), Pos2::new(c.x + a, c.y + a)],
                     stroke,
@@ -4502,7 +4502,7 @@ fn draw_auto_headers(
                 let on = auto.bypassed;
                 let plate = if on { p.mute } else { p.hdr_lane };
                 painter.rect_filled(h.bypass, 2.0, plate);
-                let size = crate::fonts::px((h.bypass.height() * 0.62).clamp(7.0, 11.0));
+                let size = crate::fonts::px((h.bypass.height() * 0.62).clamp(7.0, 11.0) * crate::fonts::size_scale(painter.ctx()));
                 if size >= 7.0 {
                     painter.text(
                         h.bypass.center(),
@@ -4516,7 +4516,7 @@ fn draw_auto_headers(
                 }
             }
             // What it controls.
-            let size = crate::fonts::px((row.header.height() * 0.46).clamp(7.0, 11.0));
+            let size = crate::fonts::px((row.header.height() * 0.46).clamp(7.0, 11.0) * crate::fonts::size_scale(painter.ctx()));
             let room = h.name.width() - 4.0;
             if h.name.is_positive() && size >= 7.0 && room > 20.0 {
                 let font = FontId::new(size, crate::fonts::courier());
@@ -4556,7 +4556,7 @@ fn draw_auto_headers(
                 );
             }
             if h.readout.is_positive() {
-                let size = crate::fonts::px((h.readout.height() * 0.86).clamp(6.0, 9.0));
+                let size = crate::fonts::px((h.readout.height() * 0.86).clamp(6.0, 9.0) * crate::fonts::size_scale(painter.ctx()));
                 if size >= 6.0 {
                     painter.text(
                         h.readout.center(),
@@ -4774,7 +4774,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     let first = (bar_of(view, view.view_start_s) / step) * step;
     let last = bar_of(view, view.view_start_s + view.view_len_s).saturating_add(step);
     let nums = number_row(l.ruler, l.meter_strip);
-    let font = FontId::new((nums.height() * 0.76).clamp(7.0, 12.0), crate::fonts::courier());
+    let font = FontId::new(((nums.height() * 0.76).clamp(7.0, 12.0)) * crate::fonts::size_scale(painter.ctx()), crate::fonts::courier());
     // **Bounded.** The step is chosen so this is a few dozen iterations, and
     // the bound is here because a hand-edited map with a one-beat bar in it
     // could otherwise ask the UI thread for millions.
@@ -4839,7 +4839,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // afternoon". The interval widens as the view does.
     {
         let clk = clock_row(l.ruler, l.meter_strip);
-        let font = FontId::new((clk.height() * 0.74).clamp(6.5, 10.0), crate::fonts::courier());
+        let font = FontId::new(((clk.height() * 0.74).clamp(6.5, 10.0)) * crate::fonts::size_scale(painter.ctx()), crate::fonts::courier());
         let steps: [f64; 12] = [
             1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
         ];
@@ -5159,7 +5159,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // the hand has taken this node. The owner asked for it while
             // moving, so it appears while moving and not on hover.
             if auto.moving == Some(lo + i) {
-                let size = crate::fonts::px((row.lane.height() * 0.34).clamp(8.0, 12.0));
+                let size = crate::fonts::px((row.lane.height() * 0.34).clamp(8.0, 12.0) * crate::fonts::size_scale(painter.ctx()));
                 let font = FontId::new(size, crate::fonts::courier_bold());
                 // Above the handle, and pushed back inside the row when the
                 // point is near the top — a readout off the top of the lane
@@ -5660,7 +5660,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
         // The name, cut to the clip.
         if r.width() >= 30.0 {
-            let font = FontId::new((r.height() * 0.22).clamp(8.0, 11.0), crate::fonts::courier_bold());
+            let font = FontId::new(((r.height() * 0.22).clamp(8.0, 11.0)) * crate::fonts::size_scale(painter.ctx()), crate::fonts::courier_bold());
             painter.text(
                 Pos2::new(r.left() + FADE_W + 2.0, r.top() + 2.0),
                 Align2::LEFT_TOP,
@@ -5874,7 +5874,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     2.0,
                     if on { p.select } else { ink.gamma_multiply(0.14) },
                 );
-                let size = crate::fonts::px((r.automation.height() * 0.68).clamp(7.0, 11.0));
+                let size = crate::fonts::px((r.automation.height() * 0.68).clamp(7.0, 11.0) * crate::fonts::size_scale(painter.ctx()));
                 if size >= 7.0 {
                     let plate = if on { p.select } else { face };
                     painter.text(
@@ -5962,7 +5962,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 } else {
                     format!("{:+.1}", 20.0 * g.log10())
                 };
-                let size = crate::fonts::px((r.knob_readout.height() * 0.86).clamp(6.0, 9.0));
+                let size = crate::fonts::px((r.knob_readout.height() * 0.86).clamp(6.0, 9.0) * crate::fonts::size_scale(painter.ctx()));
                 if size >= 6.0 {
                     painter.text(
                         r.knob_readout.center(),
@@ -6335,7 +6335,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 r.center(),
                 Align2::CENTER_CENTER,
                 label,
-                FontId::new((r.height() * 0.6).clamp(8.0, 12.0), crate::fonts::courier_bold()),
+                FontId::new(((r.height() * 0.6).clamp(8.0, 12.0)) * crate::fonts::size_scale(painter.ctx()), crate::fonts::courier_bold()),
                 if on { on_ink(lit) } else { p.switch_off },
             );
         }
