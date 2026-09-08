@@ -12718,6 +12718,21 @@ impl Engine {
     /// never read a half-written table: growing, the new words land before
     /// the count that admits them; shrinking, the count drops before the
     /// words go. A torn read would route a channel to a jack nobody chose.
+    ///
+    /// **The clear is not an oversight, and dropping it is not an
+    /// optimisation.** It leaves a window in which the table reads EMPTY —
+    /// the render loop walks `0..route_n` and so touches no cell at all
+    /// while the count is zero — and the obvious cure, writing the words
+    /// first and publishing the count last, is worse in two ways. A route
+    /// is TWO words, the packed target and its gain, so a reader admitted
+    /// by a live count could pair a new target with the previous gain; and
+    /// for every index below the OLD count it would read a table half old
+    /// and half new. What the window costs as it stands is one block of an
+    /// unrouted output, and only on an edit — `push_monitor_settings`
+    /// publishes under a change gate, not every frame — against a block
+    /// sent somewhere nobody chose. A publish with neither fault needs two
+    /// tables and an index to flip between them, which is a different
+    /// change from reordering two stores.
     pub fn set_routes(&self, routes: &tangent_ui::routing::Routes) {
         use tangent_ui::routing::Target;
         let n = routes.0.len().min(MAX_ROUTES);
@@ -12754,6 +12769,14 @@ impl Engine {
     /// worst a racing chunk can do is feed one block of the OLD table or of
     /// silence — and a key only modulates a detector, it moves no audio, so
     /// one such block is a meter flicker and not a wrong sample.
+    ///
+    /// **Here least of all may the count be stored last.** `insert_key` is a
+    /// SPARSE map indexed by `seat * INSERTS + bay`, not a dense prefix the
+    /// count bounds, so removing an edge means writing a zero into that
+    /// edge's own cell — there is no count that can hide it. Publishing the
+    /// count after the cells would therefore leave a chunk reading a table
+    /// with some edges cleared and others not yet written, which is exactly
+    /// the outcome the paragraph above rules out.
     // `&self`, like `set_routes`: the whole write is interior atomics, and
     // the publish path holds the engine by shared reference.
     pub fn set_insert_keys(&self, keys: &[(usize, usize, usize)]) {
