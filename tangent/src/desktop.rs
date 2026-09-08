@@ -1574,38 +1574,6 @@ fn amp_board_to_seed(
     untouched.then_some((ch, AMP_DEFAULT_BOARD))
 }
 
-/// **Seed the board an amp landing in `seat` should wear — and switch every
-/// pedal of it OFF.**
-///
-/// A free function on the app rather than a block inside the reconcile, for
-/// the reason [`amp_board_to_seed`] is a lookup rather than a settings read:
-/// the decision was already testable as plain logic and the WRITES were not,
-/// and the writes are where the interesting half now lives. A test can drive
-/// this against a headless `TangentApp` and read back both what landed and
-/// what state it landed in; nothing could drive the reconcile, which needs an
-/// engine, a device and a frame.
-///
-/// **The board arrives dressed, and it arrives silent.** Seven pedals in
-/// series is a sound nobody asked for on an amp somebody has only just
-/// loaded — a compressor, a wah, a drive, a chorus, a tremolo, a delay and a
-/// plate, all at their defaults, between a guitar and the first note played
-/// through it. The owner's words on the shipped build: they "should be off
-/// by default for beta testing".
-///
-/// Off means BYPASSED and not absent, which is the whole reason the seed is
-/// worth keeping: every pedal is loaded, named on its chip, openable in its
-/// own window and one shift-click from being in circuit. That is only honest
-/// because the state can be SEEN — `faces_amp` draws a bypassed chip on the
-/// well, struck through, and the pedal's own face carries a BYPASS button —
-/// and shipping it bypassed without those two would be a board that
-/// mysteriously does nothing, which is worse than the loudness it avoids.
-///
-/// **The bypass is written AFTER the tenant, and that ordering is
-/// load-bearing.** `TangentApp::set_insert` drops a bay's bypass whenever the
-/// tenant really changes, precisely so a flag cannot be left behind to
-/// silence the NEXT plugin to land there — so a flag written first would be
-/// wiped by the very write that puts the pedal in the seat.
-#[cfg(feature = "recorder")]
 /// Copy a chosen click sound into Tangent's own config directory and answer
 /// where it landed. See the caller for why the file is kept rather than
 /// pointed at.
@@ -1640,6 +1608,38 @@ fn keep_click_sample(file: &std::path::Path) -> std::io::Result<std::path::PathB
     keep_click_sample_in(&tangent_core::config::dir().join("click"), file)
 }
 
+/// **Seed the board an amp landing in `seat` should wear — and switch every
+/// pedal of it OFF.**
+///
+/// A free function on the app rather than a block inside the reconcile, for
+/// the reason [`amp_board_to_seed`] is a lookup rather than a settings read:
+/// the decision was already testable as plain logic and the WRITES were not,
+/// and the writes are where the interesting half now lives. A test can drive
+/// this against a headless `TangentApp` and read back both what landed and
+/// what state it landed in; nothing could drive the reconcile, which needs an
+/// engine, a device and a frame.
+///
+/// **The board arrives dressed, and it arrives silent.** Seven pedals in
+/// series is a sound nobody asked for on an amp somebody has only just
+/// loaded — a compressor, a wah, a drive, a chorus, a tremolo, a delay and a
+/// plate, all at their defaults, between a guitar and the first note played
+/// through it. The owner's words on the shipped build: they "should be off
+/// by default for beta testing".
+///
+/// Off means BYPASSED and not absent, which is the whole reason the seed is
+/// worth keeping: every pedal is loaded, named on its chip, openable in its
+/// own window and one shift-click from being in circuit. That is only honest
+/// because the state can be SEEN — `faces_amp` draws a bypassed chip on the
+/// well, struck through, and the pedal's own face carries a BYPASS button —
+/// and shipping it bypassed without those two would be a board that
+/// mysteriously does nothing, which is worse than the loudness it avoids.
+///
+/// **The bypass is written AFTER the tenant, and that ordering is
+/// load-bearing.** `TangentApp::set_insert` drops a bay's bypass whenever the
+/// tenant really changes, precisely so a flag cannot be left behind to
+/// silence the NEXT plugin to land there — so a flag written first would be
+/// wiped by the very write that puts the pedal in the seat.
+#[cfg(feature = "recorder")]
 fn seed_amp_board(app: &mut tangent_ui::app::TangentApp, seat: usize) {
     // The SEAT the amp landed in, which for a group's bays 3..5 is not its
     // channel — `amp_board_to_seed` is the one place that translates, and it
