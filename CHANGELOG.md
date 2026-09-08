@@ -438,6 +438,14 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   work was outstanding, and the bay that finishes the walk is the one where
   nothing is.
 
+- **The EQ's end frequency labels stay on the glass.** "20k" was centred on a
+  grid line that sits exactly on the right edge, so half the word hung past the
+  panel and egui quietly clipped the "k" off. The half that stayed was worse
+  than the half that went: a word only partly on the glass takes its contrast
+  from the ground behind it instead, which put that label at 1.57:1 on the
+  Sandstone theme against a floor of 1.6. Labels are measured and held inside
+  the ends now, in whichever of the three shipped fonts is drawing them.
+
 - **A seventeen-digit fraction survives a round trip.** The JSON reader
   rounded values such as `0.9999999999999999` to `1.0`, so a document with
   one of them was never equal to itself after a save, which is the class of
