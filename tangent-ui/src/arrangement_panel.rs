@@ -3691,7 +3691,6 @@ pub fn a11y_nodes_from(
             | Hit::Ruler(_)
             | Hit::AutoPoint(..)
             | Hit::AutoLane(..)
-            | Hit::AutoMenu(_)
             | Hit::TempoPoint(_)
             | Hit::TempoLane(..)
             | Hit::MeterChip(_) => continue,
