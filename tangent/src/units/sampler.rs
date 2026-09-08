@@ -962,6 +962,28 @@ fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
     ((c3 * t + c2) * t + c1) * t + c0
 }
 
+/// **What the Fine dial actually does to the pitch, in HERTZ, at one key.**
+///
+/// The owner asked for "pitch change (hz)" and the stored value is CENTS,
+/// because a fixed hertz offset is a different interval at every key and a
+/// sampler is played across a keyboard: +5 Hz is a semitone down at the
+/// bottom of a piano and inaudible at the top. So the dial keeps the
+/// interval and the face prints what that interval comes to WHERE YOU ARE —
+/// which is this function, and it needs a key, which is why
+/// `builtin_fx::describe` cannot answer it: that is handed a dial and
+/// nothing else.
+///
+/// `key` is the note being shown (the root, unless a face has a better
+/// idea); the answer is the SHIFT, signed, not the resulting pitch.
+///
+/// A sample has no fundamental this can be honest about — a snare is not a
+/// note — so the reference is equal temperament at A440, which is what "the
+/// key you are playing" means everywhere else in this app.
+pub fn fine_hz_at(key: u8, cents: f32) -> f32 {
+    let base = 440.0 * ((f32::from(key) - 69.0) / 12.0).exp2();
+    base * ((cents / 1200.0).exp2() - 1.0)
+}
+
 /// Where each dial rests, normalised — the one place the published defaults
 /// are spelled as arithmetic on the ranges above rather than as decimals, so
 /// moving a range moves its default with it. `builtin_fx`'s table reads this,
@@ -1416,6 +1438,27 @@ mod tests {
         assert_eq!(step_index(default_norm(P_VOICES), MAX_VOICES as i32) + 1, 16);
         assert_eq!(step_index(default_norm(P_BEND), BEND_MAX_SEMIS + 1), 2);
         assert_eq!(step_index(default_norm(P_MODE), 3), MODE_PITCHED);
+    }
+
+    /// **Fine reads in hertz at the key it is asked about.** The stored
+    /// value is cents precisely BECAUSE hertz is not constant across the
+    /// keyboard, so the one thing this must not do is answer the same
+    /// number everywhere.
+    #[test]
+    fn fine_reads_in_hertz_at_the_key_it_is_asked_about() {
+        // A440 detuned by a hundredth of a semitone: about a quarter of a Hz.
+        let at_a4 = fine_hz_at(69, 100.0);
+        let want = 440.0 * (2.0f32.powf(100.0 / 1200.0) - 1.0);
+        assert!((at_a4 - want).abs() < 1e-3, "A4 read {at_a4}, wanted {want}");
+        // An octave up is twice the shift, which is the whole reason cents
+        // are what is stored.
+        let at_a5 = fine_hz_at(81, 100.0);
+        assert!(
+            (at_a5 / at_a4 - 2.0).abs() < 1e-3,
+            "an octave up read {at_a5} against {at_a4} — the shift is not scaling"
+        );
+        assert!(fine_hz_at(60, -100.0) < 0.0, "a flat detune read sharp");
+        assert_eq!(fine_hz_at(60, 0.0), 0.0);
     }
 
     /// **The stepped rounding is the analog's rounding.** Two copies of one
