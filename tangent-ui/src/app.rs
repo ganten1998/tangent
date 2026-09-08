@@ -32017,17 +32017,28 @@ impl TangentApp {
             // **Not while the MIDI editor is up.** It floats over the lanes
             // and owns every key; leaving the timeline's nodes allocated
             // under it would put focus on controls a person cannot see.
-            let on_arr = if self.midi_edit.is_some() {
+            //
+            // **And not unless a reader is on.** `offer_nodes` begins with
+            // `if !on { return None }`, and `on` was `reader_mode()` — so for
+            // a sighted session every frame built two hundred nodes and two
+            // target walks for that line to discard. The gate is the SAME
+            // predicate, asked this frame, so what is built is exactly what
+            // is consumed: `reader_mode()` is the menu row's own setting or
+            // the host's detection for THIS session (`set_screen_reader`,
+            // pushed across the firewall, never written to disk — the
+            // persisted wrong answer is the mistake that fn's doc records).
+            // Not a live AccessKit query, because `tangent-ui` may not name
+            // the feature that could answer one, and not a flag of this
+            // fn's own, because two flags for one question is how they
+            // come apart.
+            let on_arr = if self.midi_edit.is_some() || !self.reader_mode() {
                 None
             } else {
-                let (nodes, hits) = {
-                    let nodes = crate::arrangement_panel::a11y_nodes(rect, &view);
-                    let hits = crate::arrangement_panel::targets(rect, &view);
-                    (nodes, hits)
-                };
+                let hits = crate::arrangement_panel::targets(rect, &view);
+                let nodes = crate::arrangement_panel::a11y_nodes_from(&view, &hits);
                 offer_nodes(
                     ui,
-                    self.reader_mode(),
+                    true,
                     &nodes,
                     self.settings.white_key_active_color.to_color32(),
                 )
