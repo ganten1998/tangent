@@ -1484,6 +1484,15 @@ pub(crate) mod fit {
             Vec2::new(900.0, 560.0),
             Vec2::new(1400.0, 840.0),
         ),
+        // The sampler's ids are dense 0..16, so the ceiling IS the count.
+        (
+            crate::faces_sampler::SAMPLER_PATH,
+            crate::faces_sampler::ID_CEILING,
+            crate::faces_sampler::STEPPED,
+            false,
+            Vec2::new(780.0, 540.0),
+            Vec2::new(1248.0, 864.0),
+        ),
     ];
 
     /// The smallest a face may be DRAGGED to, asked of the production

@@ -111,11 +111,22 @@ pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
 /// table it might not be in**: `faces_analog` carries its own named
 /// tests for its window and its ink, and `face::fit::FACES` lists it
 /// explicitly for the shared sweeps.
-pub const VOICE_UNITS: [(&str, &str, &str); 1] = [(
-    crate::faces_analog::ANALOG_PATH,
-    crate::dialogs::ANALOG_NAME,
-    crate::faces_analog::ANALOG_ABOUT,
-)];
+pub const VOICE_UNITS: [(&str, &str, &str); 2] = [
+    (
+        crate::faces_analog::ANALOG_PATH,
+        crate::dialogs::ANALOG_NAME,
+        crate::faces_analog::ANALOG_ABOUT,
+    ),
+    // The second: a sampler, seated in a bay like the analog and for the
+    // same reason — it is a VOICE, so it is here and not in `SUITE_UNITS`,
+    // and `is_voice_face` suppresses the bypass row for it exactly as it
+    // does for the analog.
+    (
+        crate::faces_sampler::SAMPLER_PATH,
+        crate::dialogs::SAMPLER_NAME,
+        crate::faces_sampler::SAMPLER_ABOUT,
+    ),
+];
 
 /// The face a sentinel names, if it is one of the suite's — or one of the
 /// voices', which open through the same door and wear the same title bar.
@@ -269,6 +280,43 @@ pub struct FaceLive {
     /// — `App::bay_gesture`, the one door every bay gesture comes through —
     /// and until now nothing on screen answered.
     pub pedals_off: [bool; crate::recorder::AMP_PEDALS],
+    // ── the sampler's own state ─────────────────────────────────────────
+    // Appended at the END, this struct's law. Every field here is either
+    // pushed by the app or a gesture the face keeps to itself — the same
+    // two kinds the IR browser's block above holds, and for the same
+    // reasons, so the shapes are deliberately the IR's.
+    /// **What the host knows about the loaded file**, pushed after every
+    /// load. See [`crate::ports::SamplerInfo`].
+    pub sampler: crate::ports::SamplerInfo,
+    /// **Where the sampler's browser is standing.** The face WRITES this —
+    /// walking in and out of a folder is the whole of the gesture — and the
+    /// app reads it to know what to list. Empty until the app has put a
+    /// folder in it, exactly as [`Self::ir_dir`] works.
+    pub samp_dir: String,
+    /// The shortcut chips over the listing: `(word, path)`, left to right.
+    /// Pushed, because two of the three are Tangent's own folders and only
+    /// the app knows where those are — the Takes folder and the open
+    /// project's `media/`. An empty path draws a chip that says so rather
+    /// than one that walks nowhere.
+    pub samp_roots: Vec<(String, String)>,
+    /// What [`Self::samp_dir`] holds, pushed: folders first, then the audio
+    /// this build can read.
+    pub samp_entries: Vec<crate::drumpad_panel::MediaEntry>,
+    /// Which directory `samp_entries` describes, so the app can tell whether
+    /// the listing it holds is still the answer — the cache key riding with
+    /// the data, [`Self::ir_listed`]'s bargain.
+    pub samp_listed: String,
+    /// The generation `samp_entries` was read at, so a file that lands in
+    /// the folder on screen shows up without a walk.
+    pub samp_gen: u64,
+    /// The first row shown — the browser's own scroll.
+    pub samp_scroll: usize,
+    /// The lit row: the file that was last pressed.
+    pub samp_sel: Option<usize>,
+    /// Wheel intent the browser has not spent yet. See `app::WheelSteps`:
+    /// one mouse notch is one event, a trackpad flick is thirty, and both
+    /// have to mean the same amount of walking.
+    pub samp_wheel: crate::app::WheelSteps,
 }
 
 /// One row of the IR browser: a folder to walk into, or an impulse to load.
@@ -440,6 +488,17 @@ pub enum FaceAction {
     /// costs no allocation; this fires once on a double-click and can afford
     /// a Vec.
     SetMany { sets: Vec<(u32, f32)> },
+    /// **Load this file into the sampler's bay.** Appended at the END, this
+    /// enum's law.
+    ///
+    /// A PATH and nothing else, the [`Self::PickIr`] bargain exactly: the
+    /// face never opens a file, so what leaves here is where the file is
+    /// and the wish, and the host owns every byte that moves. It is raised
+    /// by all three of the sampler's doors — a press on a browser row, an
+    /// in-app drag dropped on the window (a clip out of the arrangement, or
+    /// a row out of either explorer), and an OS file drop — because they
+    /// differ only in how the path was found.
+    PickSample { path: String },
 }
 
 fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {
@@ -777,6 +836,7 @@ pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fa
         "@tangent-ir" => draw_ir(ui, st, live),
         crate::faces_amp::AMP_PATH => crate::faces_amp::draw_amp(ui, st, live),
         crate::faces_analog::ANALOG_PATH => crate::faces_analog::draw_analog(ui, st, live),
+        crate::faces_sampler::SAMPLER_PATH => crate::faces_sampler::draw_sampler(ui, st, live),
         // The tape, the trim, and anything the suite grows before its face
         // does: every parameter as a row, in id order — sliders for the
         // continuous ones, the cycling button for anything stepped, so a
