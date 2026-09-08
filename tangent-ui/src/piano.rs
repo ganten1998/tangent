@@ -71,7 +71,7 @@ fn idle_colors(s: &Settings) -> (Color32, Color32) {
     //
     // This used to stop at the line above, on the argument that dark mode has
     // an escape a theme can actually reach — `dark.white_key` and
-    // `dark.black_key`, which the two dark-designed themes both name on
+    // `dark.black_key`, which the two dark-designed themes both named on
     // purpose to sit at their own quieter level. The argument was wrong in
     // one specific way: naming a colour says where a theme wants its keys,
     // not that the pair it named can still be told apart. Nocturne and
@@ -83,6 +83,14 @@ fn idle_colors(s: &Settings) -> (Color32, Color32) {
     // same means. A theme that is already clear is returned untouched, which
     // is every other theme in the set, so this is inert on thirty-two of the
     // thirty-four theme-and-mode pairs.
+    //
+    // Once the lift walked here too, those two overrides had nothing left to
+    // do and were doing harm: they held the NATURALS at 0.099 and 0.093
+    // luminance over grounds of 0.006 and 0.002, so on exactly two themes the
+    // dark keyboard was a mid slab floating above its own page while the
+    // other sixteen paint their naturals ON it. They are gone from the theme
+    // table, and the fallbacks below — the sharps' colour for the naturals,
+    // the naturals' for the sharps — are what every theme in the set uses.
     keys_the_right_way_up(naturals, keys_apart(naturals, sharps), true)
 }
 
@@ -167,11 +175,14 @@ const KEYS_APART: f32 = 9.0;
 /// sharps on a dark field. A theme already clear of the line is returned
 /// untouched, so this is inert on all seventeen.
 ///
-/// **Only in light mode.** Dark mode has an escape a theme can actually
-/// reach — `dark.white_key` / `dark.black_key`, which both of these themes
-/// use, deliberately, to sit at their own quieter level. A derivation there
-/// would overrule a theme that has spoken. This one only speaks where the
-/// theme has been silenced by another rule.
+/// **In both modes.** It was light-mode only, on the argument that dark mode
+/// has an escape a theme can actually reach — `dark.white_key` /
+/// `dark.black_key` — and that a derivation there would overrule a theme that
+/// had spoken. Both halves of that were wrong: the pair those two themes
+/// spoke was itself a mask at 1.81:1 and 2.09:1, and holding the naturals off
+/// their own ground to make room for it is what made the dark keyboard read
+/// bright. The overrides are gone and this walks in either mode, where the
+/// theme has been silenced by the theory-ground rule and nowhere else.
 fn keys_apart(natural: Color32, sharp: Color32) -> Color32 {
     use crate::recorder_panel::contrast_ratio;
     if contrast_ratio(sharp, natural) >= KEYS_APART {
@@ -771,6 +782,54 @@ mod tests {
             loud.is_empty(),
             "the piano derived a key brighter than anything else it paints:\n  {}",
             loud.join("\n  ")
+        );
+    }
+
+    /// **The naturals ARE the page, and in dark mode two themes were not.**
+    ///
+    /// The theory page sits on the naturals' colour — the owner's own rule,
+    /// checked from the theme table by
+    /// `theme::the_theory_ground_is_the_keyboard_not_the_band`. Checked from
+    /// the theme TABLE, which is why it never noticed: it compares the fields
+    /// a theme declares, and a theme can declare `background` and then hand
+    /// the piano a different natural through `dark.white_key`. Sixteen themes
+    /// never did, so the two colours agreed everywhere anybody looked.
+    ///
+    /// Nocturne and Phosphor did. Their dark naturals came out at 0.099 and
+    /// 0.093 luminance over pages of 0.006 and 0.002, while the other sixteen
+    /// paint theirs exactly ON the page at 0.010 to 0.014 — so on those two,
+    /// and only those two, the dark keyboard was a mid slab hanging above its
+    /// own ground with bone sharps on top of it. That is the owner's "Dark
+    /// mode - bright (and probably wrong) Keyboard", and it is not a
+    /// brightness fault at heart: it is a seam. The band and the page below it
+    /// were made of different colours.
+    ///
+    /// Asserted as equality rather than as a contrast floor, because that is
+    /// what the rule actually says. A ratio would have let 0.093 on 0.002
+    /// through under any bar loose enough to be arguable.
+    ///
+    /// Revert check performed: put `dark.white_key`/`dark.black_key` back on
+    /// either theme and it names itself here.
+    #[test]
+    fn every_theme_paints_its_dark_naturals_on_its_own_page() {
+        let mut adrift: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            let mut s = Settings::default();
+            theme.apply(&mut s);
+            s.dark_mode = true;
+            let naturals = idle_colors(&s).0;
+            let page = themed_bg(&s);
+            if naturals != page {
+                adrift.push(format!(
+                    "{}: naturals {:?}, page {:?}",
+                    theme.name, naturals, page
+                ));
+            }
+        }
+        assert!(
+            adrift.is_empty(),
+            "the keyboard is not made of the page it sits on:\n  {}",
+            adrift.join("\n  ")
         );
     }
 
