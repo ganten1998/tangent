@@ -1,0 +1,15 @@
+# Revisions git blame should look straight through.
+#
+# A commit that reformats or renames across the whole tree buries the
+# history of every line it touches: blame stops at the sweep instead of
+# at the change that put the logic there. Listing it here fixes that.
+#
+# Enable it once per clone (it cannot be committed as a repo setting):
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Only ever add a commit whose diff cannot change behaviour.
+
+# Every path in the workspace is spelled once (1,230 unused_qualifications,
+# rustc's own machine-applicable fixes, 2026-09-08).
+5c71132376873c96e4e6a0893b534f48924cc93c
