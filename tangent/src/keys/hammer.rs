@@ -294,8 +294,10 @@ impl Hammer {
         self.contact = 0.0;
     }
 
-    /// The three accessors below report on the mechanism rather than drive
-    /// it, so the voice never asks: the hammer tests and `string.rs`'s
+    /// Whether the hammer is touching the string this sample.
+    ///
+    /// This and the two accessors below report on the mechanism rather than
+    /// drive it, so the voice never asks: the hammer tests and `string.rs`'s
     /// contact-time sweeps are the readers.
     #[allow(dead_code)]
     pub fn in_contact(&self) -> bool {
