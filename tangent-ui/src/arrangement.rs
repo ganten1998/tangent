@@ -273,7 +273,7 @@ impl Fingerprint {
 /// stamp "version 4" on a file still full of version 9's keys, and the build
 /// that wrote them would then run its 4→9 migrations over data that had
 /// already been through them.
-pub const ARRANGEMENT_VERSION: u64 = 6;
+pub const ARRANGEMENT_VERSION: u64 = 7;
 
 /// **Version 5: musical time.**
 ///
@@ -292,6 +292,50 @@ pub const ARRANGEMENT_VERSION: u64 = 6;
 /// pinned to seconds. A migration that helpfully made old MIDI musical would
 /// move notes in songs people have already finished.
 const V5_MUSICAL_TIME: u64 = 5;
+
+/// **Version 7: the desk's seats stop being a dense array.**
+///
+/// `desk.inserts` was one string per bay of the whole seat map — 13,167 of
+/// them since the pads, the folders and the amp pedals got seats — and all
+/// but a handful empty in every document ever written: 132 KB of `""` lines,
+/// 84% of a small project's file and a quarter of a large one, built,
+/// written, parsed, cloned and hashed on every save, open, undo and frame.
+///
+/// From this version the writer puts the first [`HEAD_BAYS`] seats — every
+/// strip and the master, the seats a document has always had — in the
+/// `inserts` array as before, and every occupied seat past them in
+/// `inserts_tail`, an object of `"<bay>": "<path>"` in ascending order.
+/// The reader takes the array at ANY length (a v1 desk, an eighteen-strip
+/// one, a 13,167-entry one, today's 108), the tail if present, and also a
+/// bare object under `inserts` (the fully sparse shape, so no shape this
+/// build could be handed is refused) — and dispatches on the SHAPE it
+/// finds, never on the version stamp: a document keeps a HIGHER stamp than
+/// the build that opens it, so an older build that opens a v7 document and
+/// saves writes `arrangement_version: 7` with a dense array, and that has
+/// to read correctly too.
+///
+/// Why a head array at all, rather than the object alone: an older build
+/// reading a v7 document sees the head — its instruments and channel
+/// effects — and loses only the far seats (per-pad effects, amp pedals) if
+/// it saves; with a bare object it would open every project silent. The
+/// head is written WHOLE, never trailing-trimmed, so its length can never
+/// collide with the era lengths the migrations key on.
+///
+/// In memory the snapshot holds only the occupied seats, sorted by bay
+/// (`DeskSnap::inserts`); the settings keep their dense `strip_inserts`
+/// and the two meet in `DeskRef`, where the walk reads either shape as
+/// the same sequence of occupied seats.
+const V7_SPARSE_SEATS: u64 = 7;
+
+/// The seats a document's desk carries as a plain array: every strip and
+/// the master, `(STRIPS + 1) * INSERTS`. See [`V7_SPARSE_SEATS`].
+pub const HEAD_BAYS: usize = (crate::recorder::STRIPS + 1) * crate::recorder::INSERTS;
+
+// The sixteen-pad era's desk had exactly 84 bays and the lift that carries
+// it keys on that length alone; a head of that length would be lifted as
+// if it were one. The head is 108 today; this is what says so out loud the
+// day the desk changes shape.
+const _: () = assert!(HEAD_BAYS != (11 + 1 + 16) * 3, "the head collides with the sixteen-pad era");
 
 /// Every key a clip object holds that THIS build understands.
 ///
@@ -830,7 +874,13 @@ pub struct DeskSnap {
     pub icons: Vec<u8>,
     pub names: Vec<String>,
     pub colors: Vec<i64>,
-    pub inserts: Vec<String>,
+    /// **The occupied seats only**, `(bay, path)` sorted by bay, never an
+    /// empty path — the `BypassBays` shape. Dense it was 13,167 strings a
+    /// snapshot, copied into every undo moment; see [`V7_SPARSE_SEATS`].
+    /// Kept canonical by every constructor (`from_value` sorts and drops
+    /// empties, `DeskRef::to_snap` filters them, `set_bay` keeps the order)
+    /// so that two desks that write the same text are equal as structs.
+    pub inserts: Vec<(usize, String)>,
     pub sends: Vec<f64>,
     pub muted: u64,
     pub soloed: u64,
@@ -897,13 +947,51 @@ pub struct DeskSnap {
 /// fields derived the same way. Two walkers over two derivations was the
 /// shape that could disagree, and a disagreement here is a title bar blind
 /// to a fader the quit prompt can see.
+/// **The insert seats a `DeskRef` looks at, in whichever shape their owner
+/// keeps them**: the settings' dense `strip_inserts` (one string per bay,
+/// nearly all empty) or a snapshot's sparse pairs. `iter` yields the
+/// OCCUPIED seats in ascending bay order from either, which is the one
+/// thing the walk and the writer read — so a settings desk and the
+/// snapshot taken from it hash alike without either being converted.
+#[derive(Clone, Copy)]
+pub enum Bays<'a> {
+    Dense(&'a [String]),
+    Sparse(&'a [(usize, String)]),
+}
+
+impl<'a> Bays<'a> {
+    pub fn iter(self) -> BaysIter<'a> {
+        match self {
+            Self::Dense(v) => BaysIter::Dense(v.iter().enumerate()),
+            Self::Sparse(v) => BaysIter::Sparse(v.iter()),
+        }
+    }
+}
+
+/// See [`Bays::iter`].
+pub enum BaysIter<'a> {
+    Dense(std::iter::Enumerate<std::slice::Iter<'a, String>>),
+    Sparse(std::slice::Iter<'a, (usize, String)>),
+}
+
+impl<'a> Iterator for BaysIter<'a> {
+    type Item = (usize, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense(it) => it.find(|(_, p)| !p.is_empty()).map(|(n, p)| (n, p.as_str())),
+            Self::Sparse(it) => it.next().map(|(n, p)| (*n, p.as_str())),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct DeskRef<'a> {
     pub kinds: &'a [u8],
     pub icons: &'a [u8],
     pub names: &'a [String],
     pub colors: &'a [i64],
-    pub inserts: &'a [String],
+    pub inserts: Bays<'a>,
     pub sends: &'a [f64],
     pub muted: u64,
     pub soloed: u64,
@@ -933,7 +1021,7 @@ impl DeskRef<'_> {
             icons: self.icons.to_vec(),
             names: self.names.to_vec(),
             colors: self.colors.to_vec(),
-            inserts: self.inserts.to_vec(),
+            inserts: self.inserts.iter().map(|(n, p)| (n, p.to_owned())).collect(),
             sends: self.sends.to_vec(),
             muted: self.muted,
             soloed: self.soloed,
@@ -983,9 +1071,15 @@ impl DeskRef<'_> {
         for c in self.colors {
             f.u64(*c as u64);
         }
-        f.len(self.inserts.len());
-        for i in self.inserts {
-            f.str(i);
+        // The occupied seats, counted first so the words parse back into
+        // exactly one desk, then each as its bay and its path. The same
+        // pairs from a dense settings vec and from a snapshot, and the
+        // same pairs the writer puts in the head and the tail — a desk of
+        // thirteen thousand empty seats is a handful of words now.
+        f.len(self.inserts.iter().count());
+        for (bay, path) in self.inserts.iter() {
+            f.len(bay);
+            f.str(path);
         }
         f.len(self.sends.len());
         for s in self.sends {
@@ -1032,7 +1126,7 @@ impl DeskSnap {
             icons: &self.icons,
             names: &self.names,
             colors: &self.colors,
-            inserts: &self.inserts,
+            inserts: Bays::Sparse(&self.inserts),
             sends: &self.sends,
             muted: self.muted,
             soloed: self.soloed,
@@ -1053,6 +1147,42 @@ impl DeskSnap {
             in_folder: &self.in_folder,
             folder_shut: &self.folder_shut,
         }
+    }
+
+    /// What stands in seat `bay`, if anything. Binary search, since the
+    /// pairs are sorted.
+    pub fn bay(&self, bay: usize) -> Option<&str> {
+        self.inserts
+            .binary_search_by_key(&bay, |(n, _)| *n)
+            .ok()
+            .and_then(|i| self.inserts.get(i))
+            .map(|(_, p)| p.as_str())
+    }
+
+    /// Put `path` in seat `bay` — or empty the seat, for an empty path —
+    /// keeping the pairs sorted and free of empties.
+    pub fn set_bay(&mut self, bay: usize, path: &str) {
+        match self.inserts.binary_search_by_key(&bay, |(n, _)| *n) {
+            Ok(i) if path.is_empty() => {
+                self.inserts.remove(i);
+            }
+            Ok(i) => {
+                if let Some(slot) = self.inserts.get_mut(i) {
+                    slot.1 = path.to_owned();
+                }
+            }
+            Err(_) if path.is_empty() => {}
+            Err(i) => self.inserts.insert(i, (bay, path.to_owned())),
+        }
+    }
+
+    /// Sorted, deduplicated (the first of two claims on a seat wins) and
+    /// free of empties — the one shape `inserts` is allowed to have.
+    fn canonical(mut pairs: Vec<(usize, String)>) -> Vec<(usize, String)> {
+        pairs.retain(|(_, p)| !p.is_empty());
+        pairs.sort_by_key(|(n, _)| *n);
+        pairs.dedup_by_key(|(n, _)| *n);
+        pairs
     }
 
     fn to_value(&self) -> Value {
@@ -1081,10 +1211,18 @@ impl DeskSnap {
             "colors".into(),
             Value::Array(self.colors.iter().map(|c| Value::Number((*c).into())).collect()),
         );
-        m.insert(
-            "inserts".into(),
-            Value::Array(self.inserts.iter().map(|i| Value::String(i.clone())).collect()),
-        );
+        // The head whole, the far seats sparse — see `V7_SPARSE_SEATS`.
+        let mut head = vec![Value::String(String::new()); HEAD_BAYS];
+        let mut tail = Map::new();
+        for (bay, path) in &self.inserts {
+            match head.get_mut(*bay) {
+                Some(slot) => *slot = Value::String(path.clone()),
+                None => {
+                    tail.insert(bay.to_string(), Value::String(path.clone()));
+                }
+            }
+        }
+        m.insert("inserts".into(), Value::Array(head));
         m.insert("sends".into(), nums(&self.sends));
         m.insert("muted".into(), Value::Number(u64::from(self.muted).into()));
         m.insert("soloed".into(), Value::Number(u64::from(self.soloed).into()));
@@ -1114,6 +1252,12 @@ impl DeskSnap {
         m.insert("is_folder".into(), bools(&self.is_folder));
         m.insert("in_folder".into(), bools(&self.in_folder));
         m.insert("folder_shut".into(), bools(&self.folder_shut));
+        // Appended, at the END, and only when a seat past the head is
+        // occupied: a desk that never had one keeps its shape, and a build
+        // that has never heard of the key reads the head as it always did.
+        if !tail.is_empty() {
+            m.insert("inserts_tail".into(), Value::Object(tail));
+        }
         Value::Object(m)
     }
 
@@ -1150,42 +1294,75 @@ impl DeskSnap {
                 .map(|a| a.iter().map(|x| x.as_bool().unwrap_or(false)).collect())
                 .unwrap_or_default()
         };
-        // Hoisted for the `tracks_added` fallback below, which reconstructs
-        // the missing bits from what the rest of the snapshot says.
         let kinds_v: Vec<u8> = m
             .get("kinds")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
             .unwrap_or_default();
-        let names_v = strings("names");
         let inputs_v = strings("inputs");
-        let inserts_v = strings("inserts");
-        let colors_v: Vec<i64> = m
-            .get("colors")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_i64).collect())
-            .unwrap_or_default();
-        Some(Self {
-            kinds: m
-                .get("kinds")
+        // The seats, by the SHAPE the file holds them in — see
+        // `V7_SPARSE_SEATS` for why never by the version stamp.
+        let pairs_of = |o: &Map<String, Value>| -> Vec<(usize, String)> {
+            o.iter()
+                .filter_map(|(k, v)| Some((k.parse::<usize>().ok()?, v.as_str()?.to_owned())))
+                .collect()
+        };
+        let (mut names_v, mut colors_v, mut sends_v, mut muted_v, mut soloed_v) = (
+            strings("names"),
+            m.get("colors")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
+                .map(|a| a.iter().filter_map(Value::as_i64).collect::<Vec<i64>>())
                 .unwrap_or_default(),
+            floats("sends"),
+            m.get("muted").and_then(Value::as_u64).unwrap_or(0),
+            m.get("soloed").and_then(Value::as_u64).unwrap_or(0),
+        );
+        let mut pairs = match m.get("inserts") {
+            // A dense array of ANY length: every document before v7 and
+            // the head of every one since. The era lifts run here, on the
+            // dense vec, keyed on the lengths the file was written at.
+            Some(Value::Array(_)) => {
+                let mut dense = strings("inserts");
+                lift_eras(
+                    &mut sends_v,
+                    &mut colors_v,
+                    &mut names_v,
+                    &mut dense,
+                    &mut muted_v,
+                    &mut soloed_v,
+                );
+                dense
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, p)| !p.is_empty())
+                    .collect()
+            }
+            // The fully sparse shape: today's desk, nothing to lift.
+            Some(Value::Object(o)) => pairs_of(o),
+            _ => Vec::new(),
+        };
+        // The far seats. A seat the array already fills keeps the array's
+        // word — `canonical` keeps the first claim, and the head's come
+        // first.
+        if let Some(Value::Object(tail)) = m.get("inserts_tail") {
+            pairs.extend(pairs_of(tail));
+        }
+        let inserts = Self::canonical(pairs);
+        let bay_at = |n: usize| {
+            inserts.binary_search_by_key(&n, |(b, _)| *b).is_ok()
+        };
+        Some(Self {
+            kinds: kinds_v.clone(),
             icons: m
                 .get("icons")
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n.min(u64::from(crate::recorder_panel::ICON_MAX)) as u8)).collect())
                 .unwrap_or_default(),
-            names: strings("names"),
-            colors: m
-                .get("colors")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_i64).collect())
-                .unwrap_or_default(),
-            inserts: strings("inserts"),
-            sends: floats("sends"),
-            muted: m.get("muted").and_then(Value::as_u64).unwrap_or(0),
-            soloed: m.get("soloed").and_then(Value::as_u64).unwrap_or(0),
+            names: names_v.clone(),
+            colors: colors_v.clone(),
+            sends: sends_v,
+            muted: muted_v,
+            soloed: soloed_v,
             gains: floats("gains"),
             pans: floats("pans"),
             inputs: strings("inputs"),
@@ -1206,7 +1383,9 @@ impl DeskSnap {
             // describing them: a channel with a kind, a name, a colour, an
             // input or a plugin in a bay is a channel that was there.
             // Defaulting to zero would open every old project with no
-            // tracks on it.
+            // tracks on it. Read AFTER the era lifts, so a channel row is
+            // a channel row — before, an eight-channel-era desk's drum
+            // strip sat where channel 8 does today and could pass for one.
             tracks_added: m
                 .get("tracks_added")
                 .and_then(Value::as_u64)
@@ -1221,11 +1400,8 @@ impl DeskSnap {
                             let coloured = colors_v.get(at).copied().unwrap_or(0) != 0;
                             let input =
                                 inputs_v.get(n).is_some_and(|s| !s.is_empty());
-                            let bay = (0..crate::recorder::INSERTS).any(|b| {
-                                inserts_v
-                                    .get(at * crate::recorder::INSERTS + b)
-                                    .is_some_and(|p| !p.is_empty())
-                            });
+                            let bay = (0..crate::recorder::INSERTS)
+                                .any(|b| bay_at(at * crate::recorder::INSERTS + b));
                             if kind || named || coloured || input || bay {
                                 bits |= 1 << n;
                             }
@@ -1237,7 +1413,142 @@ impl DeskSnap {
             is_folder: bools("is_folder"),
             in_folder: bools("in_folder"),
             folder_shut: bools("folder_shut"),
+            inserts,
         })
+    }
+}
+
+/// **A desk written in an earlier ERA of the desk's shape, grown to
+/// today's.** Four lifts, each keyed on the LENGTH the file was written at
+/// — the sends count is a strip count, the bay count a seat map — and each
+/// frozen at its era's literals, per the migration rule: this read the live
+/// constants once and went dead the day the desk grew to 24, stranding that
+/// beta window's documents unlifted.
+///
+/// Here in the READER, on the dense array as the file holds it, and not in
+/// `apply_desk_snapshot` where they used to run on a clone of every desk
+/// applied — every open and every undo step — although a moment can never
+/// hold an old-era desk. A property of how the FILE was written belongs
+/// beside the `tracks_added` reconstruction, which is the same kind of
+/// fact. `a_desk_from_any_era_opens_at_todays_seats` pins each era through
+/// the live desk, which is the same observation whichever function lifts.
+fn lift_eras(
+    sends: &mut Vec<f64>,
+    colors: &mut Vec<i64>,
+    names: &mut Vec<String>,
+    inserts: &mut Vec<String>,
+    muted: &mut u64,
+    soloed: &mut u64,
+) {
+    // A document saved before the DRUM BUS carries eighteen-strip arrays:
+    // its click, bus and master rows would land one seat early. Frozen at
+    // the era's numbers (16 channels, 18 strips).
+    const V18_CH: usize = 16;
+    if sends.len() == 18 {
+        sends.insert(V18_CH, 0.0);
+        if colors.len() == 19 {
+            colors.insert(V18_CH, 0);
+        }
+        if names.len() == 19 {
+            names.insert(V18_CH, String::new());
+        }
+        if inserts.len() == 19 * crate::recorder::INSERTS {
+            for _ in 0..crate::recorder::INSERTS {
+                inserts.insert(V18_CH * crate::recorder::INSERTS, String::new());
+            }
+        }
+        let move_mask = |mask: u64| -> u64 {
+            let keep = mask & ((1u64 << V18_CH) - 1);
+            let above = mask >> V18_CH;
+            keep | (above << (V18_CH + 1))
+        };
+        *muted = move_mask(*muted);
+        *soloed = move_mask(*soloed);
+    }
+    // **An eight-channel-era document, grown to today's count.** The
+    // settings path does this in `adopt_desk`; a project carries its own
+    // desk snapshot and needs the same lift, or opening a session saved at
+    // eight channels scatters its drums/click/fx/master and every pad's FX
+    // onto the new empty channels. Frozen eight-channel shape: STRIPS 11,
+    // master at 11, pad-insert base 12.
+    const OLD_CH: usize = 8;
+    const OLD_STRIPS: usize = 11;
+    let ins3 = crate::recorder::INSERTS;
+    // A sixteen-pad-era doc first grows its pads to 128 at base 12 — its
+    // pads were keys 36..51 — before the channels widen the base.
+    if inserts.len() == (OLD_STRIPS + 1 + 16) * ins3 {
+        inserts.resize((OLD_STRIPS + 1 + 128) * ins3, String::new());
+        for pad in (0..16usize).rev() {
+            for bay in 0..ins3 {
+                let from = (OLD_STRIPS + 1 + pad) * ins3 + bay;
+                let to = (OLD_STRIPS + 1 + 36 + pad) * ins3 + bay;
+                let moved = std::mem::take(&mut inserts[from]);
+                inserts[to] = moved;
+            }
+        }
+    }
+    if sends.len() == OLD_STRIPS && crate::recorder::CHANNELS > OLD_CH {
+        let grow = crate::recorder::CHANNELS - OLD_CH;
+        for _ in 0..grow {
+            if OLD_CH <= colors.len() {
+                colors.insert(OLD_CH, 0);
+            }
+            if OLD_CH <= names.len() {
+                names.insert(OLD_CH, String::new());
+            }
+            if OLD_CH <= sends.len() {
+                sends.insert(OLD_CH, 0.0);
+            }
+        }
+        let ins_at = OLD_CH * ins3;
+        for _ in 0..(grow * ins3) {
+            if ins_at <= inserts.len() {
+                inserts.insert(ins_at, String::new());
+            }
+        }
+        let grow_mask = |mask: u64| -> u64 {
+            let keep = mask & ((1u64 << OLD_CH) - 1);
+            let above = mask >> OLD_CH;
+            keep | (above << (OLD_CH + grow))
+        };
+        *muted = grow_mask(*muted);
+        *soloed = grow_mask(*soloed);
+        // Not the global `desk_state_shift_v19` flag: that renames the
+        // global state dir, and a project's insert states live in its own
+        // `state/`. The desk ARRAYS relocate here so plugins load at the
+        // right seats; a moved plugin's saved knobs fall back to defaults,
+        // the same graceful cost every shuffle accepts.
+    }
+    // **A sixteen-channel-era document, grown to twenty-four.** The
+    // 4.82-through-5.0 shape: nineteen sends is its fingerprint. Same fold,
+    // same bargain on the project's own state/ sidecars.
+    const V19_CH: usize = 16;
+    if sends.len() == 19 && crate::recorder::CHANNELS > V19_CH {
+        let grow = crate::recorder::CHANNELS - V19_CH;
+        for _ in 0..grow {
+            if V19_CH <= colors.len() {
+                colors.insert(V19_CH, 0);
+            }
+            if V19_CH <= names.len() {
+                names.insert(V19_CH, String::new());
+            }
+            if V19_CH <= sends.len() {
+                sends.insert(V19_CH, 0.0);
+            }
+        }
+        let ins_at = V19_CH * ins3;
+        for _ in 0..(grow * ins3) {
+            if ins_at <= inserts.len() {
+                inserts.insert(ins_at, String::new());
+            }
+        }
+        let grow_mask = |mask: u64| -> u64 {
+            let keep = mask & ((1u64 << V19_CH) - 1);
+            let above = mask >> V19_CH;
+            keep | (above << (V19_CH + grow))
+        };
+        *muted = grow_mask(*muted);
+        *soloed = grow_mask(*soloed);
     }
 }
 
@@ -3104,7 +3415,7 @@ mod tests {
             icons: vec![0, 3],
             names: vec!["drums".into(), String::new(), "gtr".into()],
             colors: vec![3, 0, 11],
-            inserts: vec![String::new(), "reverb".into()],
+            inserts: vec![(1, "reverb".into()), (4149 * 3, "brusfri".into())],
             sends: vec![0.0, 0.25],
             muted: 0b0010,
             soloed: 0b0100,
@@ -3268,7 +3579,16 @@ mod tests {
         });
         moves_both("a strip colour", |a| a.desk.as_mut().unwrap().colors[2] = 4);
         moves_both("a plugin in a bay", |a| {
-            a.desk.as_mut().unwrap().inserts[0] = "eq".into();
+            a.desk.as_mut().unwrap().inserts[0].1 = "eq".into();
+        });
+        moves_both("a plugin in a far seat", |a| {
+            a.desk.as_mut().unwrap().set_bay(4149 * 3, "other");
+        });
+        moves_both("a far seat emptied", |a| {
+            a.desk.as_mut().unwrap().set_bay(4149 * 3, "");
+        });
+        moves_both("a seat arriving in the head", |a| {
+            a.desk.as_mut().unwrap().set_bay(0, "eq");
         });
         moves_both("a send", |a| a.desk.as_mut().unwrap().sends[1] = 0.3);
         moves_both("a mute", |a| a.desk.as_mut().unwrap().muted ^= 1);
@@ -3469,6 +3789,62 @@ mod tests {
                 unit: 8,
             });
         });
+    }
+
+    /// **The seats are written as a whole head and a sparse tail, and read
+    /// back from any shape.** The one fixture, three ways: as this build
+    /// writes it, as a build before v7 wrote it (one dense string per bay,
+    /// all 13,167), and as the fully sparse object — the same desk, the
+    /// same fingerprint, and a fixed point of the writer.
+    #[test]
+    fn the_seats_are_a_whole_head_and_a_sparse_tail_from_any_shape() {
+        let a = a_document_with_everything_in_it();
+        let d = a.desk.clone().expect("a desk");
+        let written = serde_json::from_str::<Value>(&a.to_json()).expect("json");
+        let desk = written.get("desk").and_then(Value::as_object).expect("a desk object");
+        let head = desk.get("inserts").and_then(Value::as_array).expect("the head array");
+        assert_eq!(head.len(), HEAD_BAYS, "the head is not written whole");
+        assert_eq!(head[1], Value::String("reverb".into()));
+        let tail = desk.get("inserts_tail").and_then(Value::as_object).expect("a tail");
+        assert_eq!(tail.get("12447"), Some(&Value::String("brusfri".into())));
+        assert_eq!(tail.len(), 1, "a head seat leaked into the tail");
+        assert!(a.to_json().matches("\"\"").count() < 200, "thousands of empties again");
+
+        // The dense shape every earlier build wrote.
+        let mut dense = vec![Value::String(String::new()); crate::recorder::INSERT_SPACE];
+        dense[1] = Value::String("reverb".into());
+        dense[12447] = Value::String("brusfri".into());
+        let mut old = written.clone();
+        let od = old["desk"].as_object_mut().expect("desk");
+        od.insert("inserts".into(), Value::Array(dense));
+        od.shift_remove("inserts_tail");
+        let from_dense = Arrangement::from_json(&old.to_string());
+        assert_eq!(from_dense.desk.as_ref(), Some(&d), "the dense shape read differently");
+        assert_eq!(from_dense.fingerprint(), a.fingerprint(), "the dense shape hashes apart");
+        assert_eq!(from_dense.to_json(), a.to_json(), "the dense shape is not rewritten as v7");
+
+        // The fully sparse object.
+        let mut sparse = written.clone();
+        let sd = sparse["desk"].as_object_mut().expect("desk");
+        sd.insert("inserts".into(), serde_json::json!({"1": "reverb", "12447": "brusfri"}));
+        sd.shift_remove("inserts_tail");
+        let from_sparse = Arrangement::from_json(&sparse.to_string());
+        assert_eq!(from_sparse.desk.as_ref(), Some(&d), "the sparse object read differently");
+        assert_eq!(from_sparse.fingerprint(), a.fingerprint());
+
+        // And what the reader refuses to be confused by: an empty path, a
+        // key that is not a seat, a seat claimed twice, out of order.
+        let mut odd = written.clone();
+        let odd_d = odd["desk"].as_object_mut().expect("desk");
+        odd_d.insert(
+            "inserts_tail".into(),
+            serde_json::json!({"12447": "brusfri", "9000": "", "x": "y", "012447": "shadow", "500": "late"}),
+        );
+        let read = Arrangement::from_json(&odd.to_string()).desk.expect("a desk");
+        assert_eq!(read.bay(12447), Some("brusfri"), "the second claim on a seat won");
+        assert_eq!(read.bay(9000), None, "an empty path made a seat");
+        assert_eq!(read.bay(500), Some("late"));
+        assert!(read.inserts.windows(2).all(|w| w[0].0 < w[1].0), "the pairs are not sorted");
     }
 
     /// **A desk seen through the view and through a snapshot is one desk.**
