@@ -31,6 +31,16 @@ const WINDOW_S: f32 = 0.040;
 /// piano grows to fill the face, the noise floor between songs does not.
 const ENV_FLOOR: f32 = 0.25;
 
+/// **Below this a sample is silence for the ANALYZER's purposes**: -160 dBFS.
+/// Not the scope's own `SILENCE` (a drawing threshold) and far under any
+/// scale the analyzer can show, on purpose: a window whose every sample is
+/// under this reads `FLOOR_DB` in every bin whatever the window, the tilt
+/// or the range, so skipping the transform for it changes nothing on
+/// screen. Digital silence from a stopped mix is exactly zero and a reverb
+/// tail decays under this within seconds; a plugin's dither at -120 dBFS is
+/// signal and is transformed.
+pub const SILENT_FLOOR: f32 = 1.0e-8;
+
 /// Below this window peak the signal is silence and the scope draws its
 /// resting line instead of amplified nothing.
 const SILENCE: f32 = 0.004;
@@ -92,6 +102,10 @@ pub struct Scope {
     /// so a hit fills the face at once and the decay is watchable.
     env: f32,
     rate: f32,
+    /// How many of the NEWEST frames are silence (`SILENT_FLOOR`), counted
+    /// as they arrive: the analyzer skips its transform when this covers its
+    /// whole window. Saturates at the ring's capacity.
+    tail_quiet: usize,
 }
 
 impl Scope {
@@ -102,6 +116,7 @@ impl Scope {
             filled: 0,
             env: ENV_FLOOR,
             rate: rate.max(8_000.0),
+            tail_quiet: 0,
         }
     }
 
@@ -123,7 +138,15 @@ impl Scope {
             self.buf[at + 1] = pair[1];
             self.head = (self.head + 1) % CAPACITY;
             self.filled = (self.filled + 1).min(CAPACITY);
-            peak = peak.max(pair[0].abs().max(pair[1].abs()));
+            let loud = pair[0].abs().max(pair[1].abs());
+            peak = peak.max(loud);
+            // NaN is not silence: it fails the compare and resets the tail,
+            // so a broken sample is transformed and seen rather than hidden.
+            self.tail_quiet = if loud < SILENT_FLOOR {
+                (self.tail_quiet + 1).min(CAPACITY)
+            } else {
+                0
+            };
         }
         // Release ~350 ms to floor; attack is the max() — immediate.
         self.env = (self.env * (-dt / 0.35).exp()).max(peak).max(ENV_FLOOR);
@@ -132,6 +155,11 @@ impl Scope {
     /// How many frames the ring holds, saturating at its capacity.
     pub fn frames(&self) -> usize {
         self.filled
+    }
+
+    /// How many of the newest frames are silence — see `SILENT_FLOOR`.
+    pub fn quiet_tail(&self) -> usize {
+        self.tail_quiet
     }
 
     /// Whether the envelope is still above its floor — sound was heard
