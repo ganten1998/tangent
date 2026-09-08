@@ -2767,7 +2767,7 @@ fn stretched_clip_audio(
     clip: &tangent_ui::arrangement::ArrClip,
     decoded: std::sync::Arc<tangent_record::decode::Clip>,
     path: &std::path::Path,
-    cache: &mut std::collections::HashMap<StretchKey, std::sync::Arc<tangent_record::decode::Clip>>,
+    cache: &mut std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>>,
 ) -> std::sync::Arc<tangent_record::decode::Clip> {
     let Some((key, mode)) = stretch_key(clip, path) else {
         return decoded;
@@ -4985,7 +4985,7 @@ impl DesktopApp {
                         // would otherwise hold every one of them in memory
                         // for the rest of the session.
                         let clip = match self.pad_cache.get(&path) {
-                            Some(c) => Some(std::sync::Arc::clone(&c.clip)),
+                            Some(c) => Some(Arc::clone(&c.clip)),
                             None => tangent_record::decode::decode(&path, rate)
                                 .ok()
                                 .map(std::sync::Arc::new),
@@ -17018,9 +17018,9 @@ struct DecodePool {
     /// workers' hands at once; the window handed out is twice that so a
     /// worker never idles for a frame between jobs.
     workers: usize,
-    jobs: Option<std::sync::mpsc::Sender<DecodeJob>>,
-    done_tx: std::sync::mpsc::Sender<DecodeDone>,
-    done_rx: std::sync::mpsc::Receiver<DecodeDone>,
+    jobs: Option<mpsc::Sender<DecodeJob>>,
+    done_tx: mpsc::Sender<DecodeDone>,
+    done_rx: mpsc::Receiver<DecodeDone>,
     /// Handed out and not yet answered.
     in_flight: std::collections::HashSet<Warm>,
     /// Bumped by [`DecodePool::invalidate`]; a result from an older
@@ -17044,7 +17044,7 @@ impl DecodePool {
     }
 
     fn with_decoder(workers: usize, decoder: Decoder) -> Self {
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
         DecodePool {
             decoder,
             workers: workers.max(1),
@@ -17058,9 +17058,9 @@ impl DecodePool {
     }
 
     /// Start the crew. `None` if not one thread could be spawned.
-    fn hire(&self, wake: egui::Context) -> Option<std::sync::mpsc::Sender<DecodeJob>> {
-        let (tx, rx) = std::sync::mpsc::channel::<DecodeJob>();
-        let rx = Arc::new(std::sync::Mutex::new(rx));
+    fn hire(&self, wake: egui::Context) -> Option<mpsc::Sender<DecodeJob>> {
+        let (tx, rx) = mpsc::channel::<DecodeJob>();
+        let rx = Arc::new(Mutex::new(rx));
         let mut hired = 0usize;
         for n in 0..self.workers {
             let rx = Arc::clone(&rx);
@@ -17120,7 +17120,7 @@ impl DecodePool {
         let job = match self.jobs.as_ref() {
             Some(tx) => match tx.send(job) {
                 Ok(()) => return,
-                Err(std::sync::mpsc::SendError(job)) => job,
+                Err(mpsc::SendError(job)) => job,
             },
             None => job,
         };
@@ -18335,8 +18335,8 @@ mod tests {
     /// A decoder for the pool's tests: a short clip for most names, a
     /// sentence for one that starts with `refuse`, a PANIC for one that
     /// starts with `crash`, and a count of every call.
-    fn counting_decoder(calls: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> super::Decoder {
-        std::sync::Arc::new(move |path: &std::path::Path, rate: u32| {
+    fn counting_decoder(calls: Arc<std::sync::atomic::AtomicUsize>) -> Decoder {
+        Arc::new(move |path: &std::path::Path, rate: u32| {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let name = path
                 .file_name()
@@ -18358,7 +18358,7 @@ mod tests {
 
     /// Drain the pool a frame at a time until `n` results have landed or
     /// ten seconds have gone by.
-    fn drain_until(pool: &mut super::DecodePool, rate: u32, n: usize) -> Vec<super::DecodeDone> {
+    fn drain_until(pool: &mut DecodePool, rate: u32, n: usize) -> Vec<DecodeDone> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut out = Vec::new();
         while out.len() < n && std::time::Instant::now() < deadline {
@@ -18372,7 +18372,7 @@ mod tests {
 
     /// Wait until the crew has answered everything it holds, dropping
     /// whatever lands; what this tests is that NOTHING survives the drain.
-    fn drain_to_idle(pool: &mut super::DecodePool, rate: u32) {
+    fn drain_to_idle(pool: &mut DecodePool, rate: u32) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !pool.idle() && std::time::Instant::now() < deadline {
             assert!(pool.drain(rate).is_empty(), "a stale result landed");
@@ -18387,19 +18387,19 @@ mod tests {
     /// a different cache.
     #[test]
     fn the_pool_decodes_each_job_once_and_lands_every_one() {
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut pool = super::DecodePool::with_decoder(3, counting_decoder(std::sync::Arc::clone(&calls)));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = DecodePool::with_decoder(3, counting_decoder(Arc::clone(&calls)));
         let ctx = egui::Context::default();
         for i in 0..12 {
             pool.submit(
-                super::Warm::Clip(std::path::PathBuf::from(format!("/takes/{i}.wav"))),
-                super::Work::Decode,
+                Warm::Clip(std::path::PathBuf::from(format!("/takes/{i}.wav"))),
+                Work::Decode,
                 48_000,
                 &ctx,
             );
         }
-        pool.submit(super::Warm::Pad(std::path::PathBuf::from("/takes/0.wav")), super::Work::Decode, 48_000, &ctx);
-        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/0.wav")), super::Work::Decode, 48_000, &ctx);
+        pool.submit(Warm::Pad(std::path::PathBuf::from("/takes/0.wav")), Work::Decode, 48_000, &ctx);
+        pool.submit(Warm::Clip(std::path::PathBuf::from("/takes/0.wav")), Work::Decode, 48_000, &ctx);
         assert_eq!(pool.outstanding(), 13, "twelve clips, one pad, one repeat");
         assert!(pool.holds(false, std::path::Path::new("/takes/0.wav")));
         assert!(pool.holds(true, std::path::Path::new("/takes/0.wav")));
@@ -18427,16 +18427,16 @@ mod tests {
     /// down to this.
     #[test]
     fn a_result_from_another_generation_or_rate_is_dropped_on_arrival() {
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut pool = super::DecodePool::with_decoder(2, counting_decoder(calls));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = DecodePool::with_decoder(2, counting_decoder(calls));
         let ctx = egui::Context::default();
-        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/a.wav")), super::Work::Decode, 48_000, &ctx);
+        pool.submit(Warm::Clip(std::path::PathBuf::from("/takes/a.wav")), Work::Decode, 48_000, &ctx);
         pool.invalidate();
         drain_to_idle(&mut pool, 48_000);
         assert!(pool.working_on().is_none(), "a stale landing is not a name for the cover");
-        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/b.wav")), super::Work::Decode, 48_000, &ctx);
+        pool.submit(Warm::Clip(std::path::PathBuf::from("/takes/b.wav")), Work::Decode, 48_000, &ctx);
         drain_to_idle(&mut pool, 44_100);
-        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/c.wav")), super::Work::Decode, 48_000, &ctx);
+        pool.submit(Warm::Clip(std::path::PathBuf::from("/takes/c.wav")), Work::Decode, 48_000, &ctx);
         assert_eq!(drain_until(&mut pool, 48_000, 1).len(), 1, "a current one still lands");
     }
 
@@ -18445,11 +18445,11 @@ mod tests {
     /// the one way a meter can fail to finish.
     #[test]
     fn a_refusal_and_a_crash_come_back_as_sentences_not_as_a_hang() {
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut pool = super::DecodePool::with_decoder(2, counting_decoder(calls));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = DecodePool::with_decoder(2, counting_decoder(calls));
         let ctx = egui::Context::default();
         for name in ["refuse-1.wav", "crash-1.wav", "fine.wav"] {
-            pool.submit(super::Warm::Clip(std::path::PathBuf::from(format!("/takes/{name}"))), super::Work::Decode, 48_000, &ctx);
+            pool.submit(Warm::Clip(std::path::PathBuf::from(format!("/takes/{name}"))), Work::Decode, 48_000, &ctx);
         }
         let landed = drain_until(&mut pool, 48_000, 3);
         assert_eq!(landed.len(), 3);
@@ -18464,7 +18464,7 @@ mod tests {
             }
         }
         // And the crew is still alive after the crash: another job lands.
-        pool.submit(super::Warm::Clip(std::path::PathBuf::from("/takes/after.wav")), super::Work::Decode, 48_000, &ctx);
+        pool.submit(Warm::Clip(std::path::PathBuf::from("/takes/after.wav")), Work::Decode, 48_000, &ctx);
         assert_eq!(drain_until(&mut pool, 48_000, 1).len(), 1);
     }
 
@@ -18472,18 +18472,18 @@ mod tests {
     /// and lands as the stretched audio with its own picture.
     #[test]
     fn a_stretch_job_lands_as_the_rendered_copy() {
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut pool = super::DecodePool::with_decoder(2, counting_decoder(std::sync::Arc::clone(&calls)));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = DecodePool::with_decoder(2, counting_decoder(Arc::clone(&calls)));
         let ctx = egui::Context::default();
-        let source = std::sync::Arc::new(tangent_record::decode::Clip {
+        let source = Arc::new(tangent_record::decode::Clip {
             samples: (0..4_800).flat_map(|i| [(i as f32 * 0.01).sin(); 2]).collect(),
             rate: 48_000,
             source: std::path::PathBuf::from("/takes/s.wav"),
         });
-        let key: super::StretchKey = (std::path::PathBuf::from("/takes/s.wav"), 2_000_000, "tape".to_owned());
+        let key: StretchKey = (std::path::PathBuf::from("/takes/s.wav"), 2_000_000, "tape".to_owned());
         pool.submit(
-            super::Warm::Stretch(key.clone()),
-            super::Work::Stretch {
+            Warm::Stretch(key.clone()),
+            Work::Stretch {
                 source,
                 ratio: 2.0,
                 mode: crate::stretch::Mode::Tape,
@@ -18510,7 +18510,7 @@ mod tests {
     #[test]
     fn a_render_is_asked_for_only_once_the_ratio_has_stopped_moving() {
         use super::{stretch_step, StretchStep};
-        let key = |r: i64| -> super::StretchKey { (std::path::PathBuf::from("/takes/s.wav"), r, "auto".to_owned()) };
+        let key = |r: i64| -> StretchKey { (std::path::PathBuf::from("/takes/s.wav"), r, "auto".to_owned()) };
         let mut seen = std::collections::HashMap::new();
         assert_eq!(stretch_step(&mut seen, 7, &key(1_500_000), false), StretchStep::Submit, "first sight renders");
         // A drag: a new ratio every reload.
@@ -18535,12 +18535,12 @@ mod tests {
     #[test]
     fn a_stretch_past_the_ceiling_is_refused_before_it_allocates() {
         let ceiling = tangent_record::decode::MAX_FRAMES;
-        assert!(!super::stretch_over_ceiling(ceiling / 2, 1.5));
-        assert!(super::stretch_over_ceiling(ceiling / 2, 4.0));
-        assert!(!super::stretch_over_ceiling(ceiling, 0.25), "a shrink cannot exceed the file");
-        assert!(super::stretch_over_ceiling(ceiling + 1, 0.25), "a file already over it stays over it");
-        assert!(super::stretch_over_ceiling(100, f64::NAN));
-        assert!(super::stretch_over_ceiling(100, f64::INFINITY));
+        assert!(!stretch_over_ceiling(ceiling / 2, 1.5));
+        assert!(stretch_over_ceiling(ceiling / 2, 4.0));
+        assert!(!stretch_over_ceiling(ceiling, 0.25), "a shrink cannot exceed the file");
+        assert!(stretch_over_ceiling(ceiling + 1, 0.25), "a file already over it stays over it");
+        assert!(stretch_over_ceiling(100, f64::NAN));
+        assert!(stretch_over_ceiling(100, f64::INFINITY));
     }
 
     /// **A stand-in picture lands where the render's will.** A clip
@@ -18557,7 +18557,7 @@ mod tests {
                 [if (0.2..0.3).contains(&t) { 0.9 } else { 0.0 }; 2]
             })
             .collect();
-        let decoded = super::Decoded::of(tangent_record::decode::Clip {
+        let decoded = Decoded::of(tangent_record::decode::Clip {
             samples,
             rate: 48_000,
             source: std::path::PathBuf::from("s.wav"),
@@ -18565,7 +18565,7 @@ mod tests {
         let mut clip = audio_clip(0.0, 0.0, 2.0);
         clip.stretch = 2.0;
         let view = Some((0.0, 2.0, 200.0f32));
-        let pending = super::clip_picture(&clip, &decoded, 48_000, view, Some(2.0));
+        let pending = clip_picture(&clip, &decoded, 48_000, view, Some(2.0));
         assert!(pending.peaks.is_none(), "a stand-in hands over no pyramid");
         assert!((pending.file_s - 2.0).abs() < 1e-9, "file_s is what the render will measure");
         let col = |t: f64| ((t - pending.wave_from_s) / pending.wave_span_s * (pending.wave.len() / 2) as f64) as usize;
@@ -18573,8 +18573,8 @@ mod tests {
         assert!(pending.wave[col(0.25) * 2 + 1] < 0.05, "and not at its file time");
         // The same clip with its render landed reads the stretched copy
         // straight, and hands the pyramid over.
-        let rendered = super::Decoded::of(crate::stretch::stretch(&decoded.clip, 2.0, crate::stretch::Mode::Tape));
-        let done = super::clip_picture(&clip, &rendered, 48_000, view, None);
+        let rendered = Decoded::of(crate::stretch::stretch(&decoded.clip, 2.0, crate::stretch::Mode::Tape));
+        let done = clip_picture(&clip, &rendered, 48_000, view, None);
         assert!(done.peaks.is_some());
         assert!((done.file_s - 2.0).abs() < 1e-3);
         assert!(done.wave[col(0.45) * 2 + 1] > 0.8);
@@ -18613,7 +18613,7 @@ mod tests {
             let made = crate::stretch::stretch(&clip, ratio, mode);
             let render = t.elapsed();
             let t = std::time::Instant::now();
-            let d = super::Decoded::of(made);
+            let d = Decoded::of(made);
             let peaks = t.elapsed();
             println!(
                 "stretch [{build}] 60 s clip {mode:?} x{ratio}: render {render:.3?} ({:.0} frames of 16.6 ms) + peaks {peaks:.3?} -> {:.1} s of audio",
@@ -18679,13 +18679,13 @@ mod tests {
         for path in &paths {
             let clip = tangent_record::decode::decode(path, rate).expect("decode");
             let tp = std::time::Instant::now();
-            let d = super::Decoded::of(clip);
+            let d = Decoded::of(clip);
             peaks_time += tp.elapsed();
             std::hint::black_box(d);
         }
         let serial = t.elapsed();
         // The crew, fed and drained a frame at a time as `run_warm` does.
-        let mut pool = super::DecodePool::new();
+        let mut pool = DecodePool::new();
         let workers = pool.workers;
         let ctx = egui::Context::default();
         let t = std::time::Instant::now();
@@ -18694,7 +18694,7 @@ mod tests {
         let mut frames = 0usize;
         while landed < paths.len() {
             while pool.free() > 0 && next < paths.len() {
-                pool.submit(super::Warm::Clip(paths[next].clone()), super::Work::Decode, rate, &ctx);
+                pool.submit(Warm::Clip(paths[next].clone()), Work::Decode, rate, &ctx);
                 next += 1;
             }
             landed += pool.drain(rate).len();
@@ -19379,12 +19379,12 @@ mod tests {
             loop_s: 1e299,
             ..Default::default()
         };
-        let decoded = std::sync::Arc::new(tangent_record::decode::Clip {
+        let decoded = Arc::new(tangent_record::decode::Clip {
             samples: vec![0.0; 96],
             rate: 48_000,
             source: std::path::PathBuf::from("far.wav"),
         });
-        let passes = super::audio_clip_passes(&far, &decoded, 48_000.0, 1.0);
+        let passes = audio_clip_passes(&far, &decoded, 48_000.0, 1.0);
         for p in &passes {
             assert!(p.start.checked_add(p.len).is_some());
         }
@@ -19411,10 +19411,10 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        let notes = super::midi_clip_notes(&dense, 48_000.0);
+        let notes = midi_clip_notes(&dense, 48_000.0);
         assert!(!notes.is_empty());
         assert!(
-            notes.len() <= super::MAX_EXPANDED_NOTES,
+            notes.len() <= MAX_EXPANDED_NOTES,
             "{} notes were handed to the audio thread",
             notes.len()
         );
@@ -19436,7 +19436,7 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        assert_eq!(super::midi_clip_notes(&modest, 48_000.0).len(), 16 * 4_096);
+        assert_eq!(midi_clip_notes(&modest, 48_000.0).len(), 16 * 4_096);
     }
 
     #[test]
@@ -19612,7 +19612,7 @@ mod tests {
         let p = peaks_of(&saw);
         let whole = 1000.0 / 48_000.0;
         let clip = audio_clip(0.0, 0.0, whole);
-        let env = super::pyramid_wave(&p, clip.offset_s, clip.loop_s, 0.0, whole, 4, 48_000);
+        let env = pyramid_wave(&p, clip.offset_s, clip.loop_s, 0.0, whole, 4, 48_000);
         assert_eq!(env.len(), 8, "four buckets is four pairs");
         for k in 0..4 {
             let (lo, hi) = (env[k * 2], env[k * 2 + 1]);
@@ -19626,22 +19626,22 @@ mod tests {
 
         let quiet = peaks_of(&vec![0.0; 200]);
         let short = 100.0 / 48_000.0;
-        assert!(super::pyramid_wave(&quiet, clip.offset_s, clip.loop_s, 0.0, short, 4, 48_000)
+        assert!(pyramid_wave(&quiet, clip.offset_s, clip.loop_s, 0.0, short, 4, 48_000)
             .iter()
             .all(|v| *v == 0.0));
         // Nothing to draw is nothing, not a panic.
-        assert!(super::pyramid_wave(&quiet, clip.offset_s, clip.loop_s, 0.0, 0.0, 4, 48_000).is_empty());
-        assert!(super::pyramid_wave(&quiet, clip.offset_s, clip.loop_s, 0.0, short, 0, 48_000).is_empty());
-        assert!(super::pyramid_wave(&quiet, 9_999.0, 0.0, 0.0, 1.0, 4, 48_000).is_empty());
+        assert!(pyramid_wave(&quiet, clip.offset_s, clip.loop_s, 0.0, 0.0, 4, 48_000).is_empty());
+        assert!(pyramid_wave(&quiet, clip.offset_s, clip.loop_s, 0.0, short, 0, 48_000).is_empty());
+        assert!(pyramid_wave(&quiet, 9_999.0, 0.0, 0.0, 1.0, 4, 48_000).is_empty());
         // What a hand-edited document can say: none of it panics, and a
         // looped read past the end is flat.
-        let _ = super::pyramid_wave(&quiet, f64::NAN, 0.0, f64::INFINITY, 1.0, 4, 48_000);
-        let _ = super::pyramid_wave(&quiet, f64::INFINITY, 1.0, 0.0, f64::INFINITY, 4, 48_000);
+        let _ = pyramid_wave(&quiet, f64::NAN, 0.0, f64::INFINITY, 1.0, 4, 48_000);
+        let _ = pyramid_wave(&quiet, f64::INFINITY, 1.0, 0.0, f64::INFINITY, 4, 48_000);
         assert_eq!(
-            super::pyramid_wave(&quiet, 5.0, 1.0, 0.0, 1.0, 2, 48_000),
+            pyramid_wave(&quiet, 5.0, 1.0, 0.0, 1.0, 2, 48_000),
             vec![0.0; 4]
         );
-        assert!(super::pyramid_wave(&quiet, clip.offset_s, clip.loop_s, 0.0, short, 4, 0).iter().all(|v| *v == 0.0));
+        assert!(pyramid_wave(&quiet, clip.offset_s, clip.loop_s, 0.0, short, 4, 0).iter().all(|v| *v == 0.0));
     }
 
     /// **A looped clip is drawn as it PLAYS: the same pass, drawn again and
@@ -19671,7 +19671,7 @@ mod tests {
             .collect();
         let p = peaks_of(&samples);
         let looped = audio_clip(0.0, 1.0, 3.0);
-        let folded = super::pyramid_wave(&p, looped.offset_s, looped.loop_s, 0.0, 3.0, 300, 48_000);
+        let folded = pyramid_wave(&p, looped.offset_s, looped.loop_s, 0.0, 3.0, 300, 48_000);
         assert_eq!(folded.len(), 600);
         for i in 0..300 {
             let (lo, hi) = (folded[i * 2], folded[i * 2 + 1]);
@@ -19690,11 +19690,11 @@ mod tests {
         }
         // The same clip with its loop off reads the file straight through:
         // the second and third seconds are the file's own 0.5.
-        let straight = super::pyramid_wave(&p, 0.0, 0.0, 0.0, 3.0, 300, 48_000);
+        let straight = pyramid_wave(&p, 0.0, 0.0, 0.0, 3.0, 300, 48_000);
         assert!((straight[150 * 2 + 1] - 0.5).abs() < 1e-6, "{}", straight[150 * 2 + 1]);
         // And a window that starts mid-pass folds the same way: a second
         // drawn from 1.5 s in has the burst at 1.7..1.8.
-        let mid = super::pyramid_wave(&p, looped.offset_s, looped.loop_s, 1.5, 1.0, 100, 48_000);
+        let mid = pyramid_wave(&p, looped.offset_s, looped.loop_s, 1.5, 1.0, 100, 48_000);
         for i in 0..100 {
             let hi = mid[i * 2 + 1];
             if (71..79).contains(&i) {
@@ -19705,7 +19705,7 @@ mod tests {
         }
         // A trim moves the fold with it: offset 0.1 s puts the burst at
         // 0.1..0.2 of every pass.
-        let trimmed = super::pyramid_wave(&p, 0.1, 1.0, 0.0, 2.0, 200, 48_000);
+        let trimmed = pyramid_wave(&p, 0.1, 1.0, 0.0, 2.0, 200, 48_000);
         assert!(trimmed[15 * 2 + 1] > 0.8 && trimmed[115 * 2 + 1] > 0.8);
         assert!(trimmed[25 * 2 + 1] < 0.05 && trimmed[125 * 2 + 1] < 0.05);
     }
@@ -19770,7 +19770,7 @@ mod tests {
                     [v, v * 0.8]
                 })
                 .collect();
-            decoded.push(super::Decoded::of(tangent_record::decode::Clip {
+            decoded.push(Decoded::of(tangent_record::decode::Clip {
                 samples,
                 rate,
                 source: std::path::PathBuf::from(format!("{i}.wav")),
@@ -19788,9 +19788,9 @@ mod tests {
             let t = std::time::Instant::now();
             for _ in 0..n {
                 for (clip, d) in clips.iter().zip(&decoded) {
-                    if let Some((from, span, buckets)) = super::wave_span(clip.start_s, 60.0, view.0, view.1, view.2) {
+                    if let Some((from, span, buckets)) = wave_span(clip.start_s, 60.0, view.0, view.1, view.2) {
                         let into = (from - clip.start_s).max(0.0);
-                        let fr = |s: f64| super::frames_at(f64::from(rate), s) as usize;
+                        let fr = |s: f64| frames_at(f64::from(rate), s) as usize;
                         std::hint::black_box(old_walk(&d.clip, fr(into), fr(span), buckets));
                     }
                 }
@@ -19799,7 +19799,7 @@ mod tests {
             let t = std::time::Instant::now();
             for _ in 0..n {
                 for (clip, d) in clips.iter().zip(&decoded) {
-                    std::hint::black_box(super::clip_picture(clip, d, rate, Some(view), None));
+                    std::hint::black_box(clip_picture(clip, d, rate, Some(view), None));
                 }
             }
             let pyramid = t.elapsed() / n;
@@ -24086,7 +24086,7 @@ mod sidecar_walk_probe {
         let t = std::time::Instant::now();
         let mut outstanding = 0usize;
         for _ in 0..n {
-            let (_, left) = super::insert_walk(loaded.len(), |i| want_at(i) != loaded[i].as_deref());
+            let (_, left) = insert_walk(loaded.len(), |i| want_at(i) != loaded[i].as_deref());
             outstanding += left;
         }
         let walk = t.elapsed() / n;
@@ -24120,7 +24120,7 @@ mod sidecar_walk_probe {
             (13_167, vec![1, 2, 13_166]),
         ] {
             let mismatch = |i: usize| mismatched.contains(&i);
-            let (_, outstanding) = super::insert_walk(len, mismatch);
+            let (_, outstanding) = insert_walk(len, mismatch);
             assert_eq!(outstanding > 0, (0..len).any(mismatch), "{len} bays, {mismatched:?}");
             assert_eq!(outstanding, mismatched.len());
         }
