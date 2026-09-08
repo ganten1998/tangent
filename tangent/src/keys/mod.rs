@@ -1180,22 +1180,6 @@ impl Keys {
         self.params = self.patch.defaults();
     }
 
-    /// The VOICING knob, 0 mellow to 1 bright; 0.5 is the bench tuning.
-    /// Knob 0 under an older name, kept because the bench calls it.
-    #[allow(dead_code)]
-    pub fn set_voicing(&mut self, v: f32) {
-        self.set_param(P_VOICING, v);
-    }
-
-    /// The WIDTH knob in its OLD units — 0 mono, 1.0 stock seating, up to
-    /// 1.5 leaning wider — normalised into knob 1. The panel speaks 0..1
-    /// like every other knob; this exists for the bench and for the two-knob
-    /// call sites that predate the rack.
-    #[allow(dead_code)]
-    pub fn set_width(&mut self, w: f32) {
-        self.set_param(P_WIDTH, w.clamp(0.0, WIDTH_FULL) / WIDTH_FULL);
-    }
-
     /// Strike a key.
     ///
     /// `velocity` is MIDI velocity over 127, so 0.0 to 1.0 — the same units

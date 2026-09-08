@@ -63,7 +63,7 @@ pub struct PianoBase {
 
 impl PianoBase {
     /// The instrument the bench signed off first: mid-forward, woody,
-    /// voiced for a trio room. Every field 1.0-shaped so `strike_knobs`
+    /// voiced for a trio room. Every field 1.0-shaped so `strike_based`
     /// through this base is bit-identical to the pre-base build.
     pub const JAZZ: PianoBase = PianoBase {
         t60: 1.0,
@@ -492,33 +492,19 @@ impl PianoVoice {
         }
     }
 
-    /// The shipped jazz grand at its default knobs.    ///
+    /// The shipped jazz grand at its default knobs.
+    ///
     /// A rung of the strike ladder the instrument does not climb: `mod.rs`
-    /// calls the base-picking `strike_based`, and the shorter spellings are
-    /// what the bench and this module's own tests strike with.
+    /// calls the base-picking `strike_based`. What strikes this one is
+    /// `symp.rs`'s tests, which need a real piano string beside the harp.
     #[allow(dead_code)]
     pub fn strike(&mut self, pitch: u8, velocity: f32) {
         self.strike_full(pitch, velocity, &PianoKnobs::default(), &PianoBase::JAZZ);
     }
 
-    /// `strike` with the panel's VOICING knob: 0 mellow, 1 bright, 0.5 the
-    /// bench tuning exactly. See `strike_full` for what the knob touches.
-    #[allow(dead_code)]
-    pub fn strike_voiced(&mut self, pitch: u8, velocity: f32, voicing: f32) {
-        let mut k = PianoKnobs::default();
-        k.voicing = voicing;
-        self.strike_full(pitch, velocity, &k, &PianoBase::JAZZ);
-    }
-
-    /// `strike` with the whole panel: every knob this mechanism answers to.
-    #[allow(dead_code)]
-    pub fn strike_knobs(&mut self, pitch: u8, velocity: f32, k: &PianoKnobs) {
-        self.strike_full(pitch, velocity, k, &PianoBase::JAZZ);
-    }
-
-    /// `strike_knobs` on a chosen base — the patch's instrument rather than
-    /// the shipped jazz grand. Through `PianoBase::JAZZ` this is
-    /// `strike_knobs` exactly.
+    /// The whole panel on a chosen base — the patch's instrument rather than
+    /// the shipped jazz grand. Through `PianoBase::JAZZ` it is `strike` with
+    /// the knobs spelled out.
     pub fn strike_based(
         &mut self,
         pitch: u8,
