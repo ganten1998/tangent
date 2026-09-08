@@ -55,7 +55,7 @@
 //! reason written there: a crate costs a THIRD-PARTY-LICENSES diff at
 //! release and this does not.
 
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke};
+use egui::{Align2, FontId, Painter, Pos2, Rect, Shape, Stroke};
 
 use crate::scope::{Scope, ScopeStyle};
 
