@@ -747,6 +747,15 @@ pub struct DesktopApp {
     /// `reconcile_reastream`.
     #[cfg(feature = "recorder")]
     reastream_pushed: Option<Option<tangent_record::reastream::ReaStreamConfig>>,
+    /// **The desk tables the engine was last given**, so `push_monitor_settings`
+    /// publishes the routing table, the sidechain-key table, the bypass table
+    /// and the send/mute/solo desk on CHANGE and not every frame. See
+    /// [`PushedDesk`].
+    #[cfg(feature = "recorder")]
+    pushed_desk: Option<PushedDesk>,
+    /// The drumpad knobs each lane was last given, on the same bargain.
+    #[cfg(feature = "recorder")]
+    pushed_pads: [Option<tangent_ui::recorder::DrumKitParams>; tangent_ui::recorder::CHANNELS],
     /// The maps the engine was last given. Compared before pushing, because
     /// `Engine::set_maps` is a ring handover that WAITS for the displaced
     /// pair to come back — cheap once, and a stall if it ran every frame.
@@ -10748,6 +10757,9 @@ impl DesktopApp {
         // machine with no monitor (or one another app holds) would have kept
         // counting and writing 4/4 while the band showed 6/8.
         self.recorder.session.set_meter(self.app.time_signature());
+        // The desk, built ONCE for this frame: the take facts below read
+        // its masks and the engine push further down compares it.
+        let desk = self.app.desk();
         // The placement facts, fresh each frame so `begin` latches this
         // frame's truth: the playhead (where the take will start on the
         // timeline), the head the count-in will leave in the file, and the
@@ -10764,7 +10776,6 @@ impl DesktopApp {
                 // A pre-roll count-in delays the file, it is not IN it.
                 0.0
             };
-            let desk = self.app.desk();
             let mask = |bits: &[bool]| {
                 bits.iter()
                     .enumerate()
@@ -10783,27 +10794,60 @@ impl DesktopApp {
         let gains = self.app.gains();
         e.set_metronome_gain(gains.metronome);
         e.set_drums(self.app.drums_gain(), self.app.drums_pan());
-        // **The routing table, every frame, like every other desk value.**
-        // Pruned first against what the device actually has: an interface
-        // swapped for a smaller one leaves routes pointing at jacks that are
-        // gone, and a fader that moves and does nothing is worse than a
-        // route that admitted it went away. See `Routes::prune`.
-        self.publish_routes(e);
+        // **The routing table, the key table, the bypass table and the
+        // desk — on CHANGE.** They used to go every frame like the gains
+        // above, and unlike a gain each of them is a table walk on the
+        // engine's side (see `PushedDesk`). Compared against what this
+        // engine was last given, keyed on the engine and on the device
+        // width the routes are pruned against: an interface swapped for a
+        // smaller one changes `outs`, and the routes pointing at jacks that
+        // are gone are pruned again then. See `Routes::prune`.
+        let outs = e.output().channels as usize;
+        if !desk_unchanged(
+            self.pushed_desk.as_ref(),
+            self.engine_epoch,
+            outs,
+            self.app.routes(),
+            self.app.insert_keys(),
+            self.app.insert_bypass(),
+            &desk,
+        ) {
+            self.publish_routes(e);
+            e.set_desk(&desk);
+            // A fresh engine forgets the pads with everything else.
+            if self.pushed_desk.as_ref().is_none_or(|p| p.epoch != self.engine_epoch) {
+                self.pushed_pads = [None; tangent_ui::recorder::CHANNELS];
+            }
+            self.pushed_desk = Some(PushedDesk {
+                epoch: self.engine_epoch,
+                outs,
+                routes: self.app.routes().clone(),
+                keys: self.app.insert_keys().clone(),
+                bypass: self.app.insert_bypass().to_vec(),
+                desk,
+            });
+        }
         e.set_master_gain(gains.master);
         // **The channel that had no fader before there was a mixer**, and the
         // routing that decides what reaches the effects bus. Pushed whole
         // every frame, like the gains above and for the same reason.
         e.set_fx_return(gains.fx_return);
-        e.set_desk(&self.app.desk());
-        // The drumpad's knobs, whole, on the desk's own bargain: atomic
-        // stores of numbers that only move when a hand is on them.
+        // The drumpad's knobs, on the same on-change bargain as the tables:
+        // atomic stores of numbers that only move when a hand is on them,
+        // compared here so a hand that is not on them costs a compare.
         // **The knobs, to every lane holding a kit.** One document kit still,
         // so they all get the same numbers; per-lane kits change what is sent
         // and not this loop.
         for lane in (0..tangent_ui::recorder::CHANNELS)
             .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
         {
-            e.set_pad_params(lane, &self.app.drum_kit_params_of(lane));
+            let params = self.app.drum_kit_params_of(lane);
+            if self.pushed_pads.get(lane).copied().flatten() != Some(params) {
+                e.set_pad_params(lane, &params);
+                if let Some(slot) = self.pushed_pads.get_mut(lane) {
+                    *slot = Some(params);
+                }
+            }
         }
         // **The microphone fader, and it goes to ONE place now.** It used to
         // go to two — the session's writer thread and the engine — because the
@@ -12515,6 +12559,59 @@ fn shorten_home(path: &std::path::Path) -> String {
         Some(rest) => format!("~{rest}"),
         None => text,
     }
+}
+
+/// **What the engine was last told about the desk's tables**, keyed on the
+/// engine it was told (`epoch`) and the device width the routes were pruned
+/// against (`outs`).
+///
+/// `push_monitor_settings` used to publish all four every frame the band was
+/// open: `set_routes` cleared and rewrote the route table, `set_insert_keys`
+/// cleared all 13,167 key cells and rewrote them, `set_insert_bypass` loaded
+/// 13,167 cells with a `contains` per cell, and `set_desk` rebuilt the
+/// mute/solo masks — twenty-six thousand atomic operations a frame on cache
+/// lines the audio thread is about to read, to publish tables that change
+/// when somebody clicks. Each publish also opens the brief window in which
+/// the audio thread can read an EMPTY route or key table (the count is
+/// cleared first); publishing on change means that window opens when the
+/// desk changes, as it always did, and not thirty times a second.
+///
+/// Compared field by field against the live settings BEFORE anything is
+/// cloned (`desk_unchanged`), so the steady state costs a few equality
+/// walks over small lists and no allocation; the clone happens once, when
+/// something did change.
+#[cfg(feature = "recorder")]
+#[derive(Clone, Debug, PartialEq)]
+struct PushedDesk {
+    epoch: u64,
+    outs: usize,
+    routes: tangent_ui::routing::Routes,
+    keys: tangent_ui::routing::KeyEdges,
+    bypass: Vec<(usize, usize)>,
+    desk: tangent_ui::recorder::Desk,
+}
+
+/// Whether the tables the engine holds (`pushed`) are the ones the desk
+/// shows now. `None` — nothing pushed yet, or a fresh engine — is never
+/// "unchanged": a new engine starts empty and must be primed.
+#[cfg(feature = "recorder")]
+fn desk_unchanged(
+    pushed: Option<&PushedDesk>,
+    epoch: u64,
+    outs: usize,
+    routes: &tangent_ui::routing::Routes,
+    keys: &tangent_ui::routing::KeyEdges,
+    bypass: &[(usize, usize)],
+    desk: &tangent_ui::recorder::Desk,
+) -> bool {
+    pushed.is_some_and(|p| {
+        p.epoch == epoch
+            && p.outs == outs
+            && p.routes == *routes
+            && p.keys == *keys
+            && p.bypass.as_slice() == bypass
+            && p.desk == *desk
+    })
 }
 
 /// The per-frame strings `fill_recorder_state` keeps between frames, each
@@ -14702,6 +14799,10 @@ impl DesktopApp {
             comp_rows_epoch: u64::MAX,
             #[cfg(feature = "recorder")]
             reastream_pushed: None,
+            #[cfg(feature = "recorder")]
+            pushed_desk: None,
+            #[cfg(feature = "recorder")]
+            pushed_pads: [None; tangent_ui::recorder::CHANNELS],
             pace_frames: 0,
             pace_dt: Vec::new(),
             reader_seen: false,
@@ -18342,6 +18443,117 @@ mod tests {").expect("the tests module")];
             "comp needles over {} rows: walk {walk:.1} us, indexed {indexed:.2} us ({} comps, hits {hits})",
             ledger.len(),
             rows.len()
+        );
+    }
+
+    /// **The desk's tables go to the engine on change, not every frame.**
+    ///
+    /// The pure half: nothing pushed (or a fresh engine, or a narrower
+    /// device) is never "unchanged", an identical desk is, and a moved route
+    /// gain, a new key edge, a bypassed bay or a mute each count as change.
+    #[test]
+    fn the_desk_tables_are_pushed_on_change_only() {
+        use tangent_ui::routing::{KeyEdges, Route, Routes, Target};
+        let mut routes = Routes::default();
+        routes.add(Route::new(0, Target::Hardware { first: 0, stereo: true }));
+        let keys = KeyEdges::default();
+        let bypass: Vec<(usize, usize)> = Vec::new();
+        let desk = tangent_ui::recorder::Desk::default();
+        assert!(!desk_unchanged(None, 1, 2, &routes, &keys, &bypass, &desk), "nothing pushed read as unchanged");
+        let pushed = PushedDesk {
+            epoch: 1,
+            outs: 2,
+            routes: routes.clone(),
+            keys: keys.clone(),
+            bypass: bypass.clone(),
+            desk,
+        };
+        assert!(desk_unchanged(Some(&pushed), 1, 2, &routes, &keys, &bypass, &desk));
+        assert!(!desk_unchanged(Some(&pushed), 2, 2, &routes, &keys, &bypass, &desk), "a new engine read as unchanged");
+        assert!(!desk_unchanged(Some(&pushed), 1, 4, &routes, &keys, &bypass, &desk), "a wider device read as unchanged");
+        let mut moved = routes.clone();
+        moved.set_gain(0, 0.5);
+        assert!(!desk_unchanged(Some(&pushed), 1, 2, &moved, &keys, &bypass, &desk), "a route gain read as unchanged");
+        let mut keyed = keys.clone();
+        keyed.set(0, 0, Some(1));
+        assert!(!desk_unchanged(Some(&pushed), 1, 2, &routes, &keyed, &bypass, &desk), "a key edge read as unchanged");
+        assert!(!desk_unchanged(Some(&pushed), 1, 2, &routes, &keys, &[(3, 0)], &desk), "a bypass read as unchanged");
+        let mut muted = desk;
+        muted.muted[0] = true;
+        assert!(!desk_unchanged(Some(&pushed), 1, 2, &routes, &keys, &bypass, &muted), "a mute read as unchanged");
+    }
+
+    /// And the wiring half, by scan: inside `push_monitor_settings` the
+    /// route publish and `set_desk` sit under the `desk_unchanged` gate, and
+    /// the gate is keyed on `engine_epoch` so a fresh engine is primed.
+    #[test]
+    fn push_monitor_settings_publishes_the_tables_under_the_change_gate() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn push_monitor_settings(&mut self)").expect("push_monitor_settings");
+        let end = src[at + 1..].find("\n    fn ").map_or(src.len(), |n| at + 1 + n);
+        let body = &src[at..end];
+        let gate = body.find("if !desk_unchanged(").expect("the change gate is gone");
+        let routes = body.find("self.publish_routes(e);").expect("the route publish is gone");
+        let desk = body.find("e.set_desk(&desk);").expect("set_desk is gone");
+        assert!(gate < routes && gate < desk, "a table publish sits outside the change gate");
+        assert!(body[gate..routes].contains("self.engine_epoch"), "the gate is not keyed on the engine");
+        assert_eq!(body.matches("self.app.desk()").count(), 1, "the desk is built more than once a frame");
+    }
+
+    /// **What the four table publishes cost per frame**, release, on an
+    /// offline engine — the per-frame bill `PushedDesk` retires — against
+    /// the compare that replaces it. `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn what_the_desk_publish_costs_per_frame_probe() {
+        use std::time::Instant;
+        use tangent_ui::routing::{KeyEdges, Route, Routes, Target};
+        let e = crate::instrument::Engine::offline(48_000, tangent_record::audio::Timebase::new())
+            .expect("offline engine");
+        let mut routes = Routes::default();
+        for ch in 0..8 {
+            routes.add(Route::new(ch, Target::Hardware { first: 0, stereo: true }));
+        }
+        let mut keys = KeyEdges::default();
+        keys.set(2, 1, Some(0));
+        let bays = vec![(6usize, 0usize), (9, 1)];
+        let key_rows: Vec<(usize, usize, usize)> = keys
+            .0
+            .iter()
+            .map(|k| {
+                let (seat, bay) = tangent_ui::recorder::seat_bay(k.strip, k.slot);
+                (seat, bay, k.from)
+            })
+            .collect();
+        let desk = tangent_ui::recorder::Desk::default();
+        let n = 2_000u32;
+        let t = Instant::now();
+        for _ in 0..n {
+            let mut pruned = routes.clone();
+            pruned.prune(2, tangent_ui::recorder::CHANNELS);
+            e.set_routes(&pruned);
+            e.set_insert_keys(&key_rows);
+            e.set_insert_bypass(&bays);
+            e.set_desk(&desk);
+        }
+        let publish = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+        let pushed = PushedDesk {
+            epoch: 1,
+            outs: 2,
+            routes: routes.clone(),
+            keys: keys.clone(),
+            bypass: bays.clone(),
+            desk,
+        };
+        let t = Instant::now();
+        let mut same = 0u32;
+        for _ in 0..n {
+            same += u32::from(desk_unchanged(Some(&pushed), 1, 2, &routes, &keys, &bays, &desk));
+        }
+        let compare = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+        eprintln!(
+            "desk publish per frame: routes+keys+bypass+desk {publish:.1} us; the change compare {compare:.3} us ({same} unchanged)"
         );
     }
 
