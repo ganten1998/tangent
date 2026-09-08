@@ -1974,6 +1974,26 @@ pub enum RecorderRequest {
         unit: String,
         name: String,
         values: Vec<(String, f64)>,
+        /// **The unit's state that is not a knob**, as `(key, text)` —
+        /// `ports::BuiltinFace::extra` handed straight back, which for the
+        /// sampler is the loaded FILE and for the convolver the impulse.
+        ///
+        /// Widened rather than a second request, because a preset is one
+        /// file and two writes of it is a preset that can be half saved. A
+        /// preset that remembers only the knobs gives you back the right
+        /// envelope over silence — every crop, every stage and every voice
+        /// count where you left it, playing nothing, because the file was
+        /// never written down.
+        ///
+        // MERGE-ME(engine): `desktop.rs`'s `R::SavePreset` arm and
+        // `save_unit_preset` must carry this into
+        // `tangent_ui::preset::Preset::state` (the field is there and
+        // round-trips), and `load_unit_preset` must apply what comes back
+        // through whatever road binds a sampler's file — the same road
+        // `SetInsertIr` uses for an impulse. Until then the UI writes the
+        // path into the request and the host drops it on the floor, which
+        // is the one thing this field exists to stop.
+        extra: Vec<(String, String)>,
     },
     /// Read the preset at `path` and answer with
     /// [`crate::ports::PresetLoaded`] via `TangentApp::set_preset_loaded`.

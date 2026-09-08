@@ -1676,6 +1676,130 @@ mod tests {
         assert!(missing.is_empty(), "rows that print nothing:\n  {}", missing.join("\n  "));
     }
 
+    /// **The unit chrome is the chrome, not a second one.** Preset, Save
+    /// and Init are appended by `faces::draw` under every face and this
+    /// panel builds none of them; BYPASS is deliberately absent, because a
+    /// VOICE in bay 0 is already silenced by the lane's own mute and a
+    /// second switch onto a different flag would be a unit that reads
+    /// bypassed in one place and live in another.
+    #[test]
+    fn the_sampler_wears_the_preset_strip_and_no_bypass_row() {
+        assert!(crate::faces::is_voice_face(SAMPLER_PATH), "a voice is what suppresses the row");
+        let ctx = fit::a_ctx(fonts::FontChoice::default());
+        let st = style();
+        let mut live = a_face(true);
+        live.bypassed = true;
+        let words = fit::ink_on_its_surface(
+            &ctx,
+            crate::dialogs::face_window_size(SAMPLER_PATH, None),
+            SAMPLER_ABOUT,
+            &st.s,
+            &mut |ui| {
+                let _ = crate::faces::draw(ui, &st, &mut live);
+            },
+        );
+        let said: Vec<&str> = words.iter().map(|(_, _, t)| t.as_str()).collect();
+        for want in ["PRESET", "Save", "Init"] {
+            assert!(said.contains(&want), "the chrome has no {want}: {said:?}");
+        }
+        assert!(
+            !said.iter().any(|t| t.contains("BYPASS")),
+            "a voice drew a bypass row: {said:?}"
+        );
+    }
+
+    /// **Init walks every parameter the host pushed**, not only the ones
+    /// this panel draws — so a sampler whose engine grows a knob the face
+    /// has no room for is still reset whole. The strip builds the ask; what
+    /// this pins is that the panel's own return does not swallow it.
+    #[test]
+    fn init_asks_for_every_pushed_default() {
+        let ctx = fit::a_ctx(fonts::FontChoice::default());
+        let st = style();
+        let mut live = a_face(true);
+        // One more parameter than the face knows about, as a newer engine
+        // would push it.
+        live.face.params.push(crate::ports::BuiltinFaceParam {
+            id: 99,
+            symbol: "later".to_owned(),
+            name: "Later".to_owned(),
+            units: String::new(),
+            default: 0.75,
+            reading: "later".to_owned(),
+            choices: Vec::new(),
+            steps: 0,
+            value: 0.1,
+        });
+        let mut asked = None;
+        let window = crate::dialogs::face_window_size(SAMPLER_PATH, None);
+        let room = Vec2::new(window.x, window.y - crate::shell::CHROME_BAR_H);
+        // Two frames: the first lays the strip out, the second presses Init
+        // where the first put it.
+        let mut init_at = None;
+        for pass in 0..2 {
+            let events = match (pass, init_at) {
+                (1, Some(at)) => vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+                _ => Vec::new(),
+            };
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, room)),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            fit::dress(ui.style_mut(), &st.s);
+                            egui::Frame::NONE
+                                .inner_margin(egui::Margin::same(fit::MARGIN as i8))
+                                .show(ui, |ui| {
+                                    face::keep(&mut asked, crate::faces::draw(ui, &st, &mut live));
+                                });
+                        });
+                },
+            );
+            if pass == 0 {
+                fn walk(s: &egui::Shape, at: &mut Option<Pos2>) {
+                    match s {
+                        egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, at)),
+                        egui::Shape::Text(t) if t.galley.text() == "Init" => {
+                            *at = Some(t.pos + t.galley.rect.size() * 0.5);
+                        }
+                        _ => {}
+                    }
+                }
+                for cs in &out.shapes {
+                    walk(&cs.shape, &mut init_at);
+                }
+                assert!(init_at.is_some(), "the strip drew no Init");
+            }
+        }
+        let Some(FaceAction::SetMany { sets }) = asked else {
+            panic!("Init asked for nothing");
+        };
+        assert_eq!(sets.len(), ID_CEILING + 1, "Init skipped a pushed parameter");
+        assert!(
+            sets.iter().any(|(id, v)| *id == 99 && (*v - 0.75).abs() < 1e-6),
+            "Init skipped a parameter the face does not draw"
+        );
+    }
+
     /// **The floor is a promise**: at the window it opens at and at the one
     /// it grows to, on every font, the whole panel and the preset strip
     /// under it stay inside. Through `faces::draw`, so the strip is counted.

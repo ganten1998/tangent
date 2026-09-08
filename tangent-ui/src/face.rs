@@ -1616,7 +1616,7 @@ pub(crate) mod fit {
                 }
             }
         };
-        let mut run = |body: &mut dyn FnMut(&mut egui::Ui)| {
+        let run = |body: &mut dyn FnMut(&mut egui::Ui)| {
             ctx.run(
                 egui::RawInput {
                     screen_rect: Some(screen),
