@@ -608,7 +608,7 @@ fn knob(
         text_w,
         reading,
         READING_PT,
-        egui::FontFamily::Monospace,
+        fonts::courier(),
         if turning { st.s.ink } else { st.s.faint },
     );
     let dial = Rect::from_min_max(

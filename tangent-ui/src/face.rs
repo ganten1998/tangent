@@ -182,7 +182,7 @@ pub fn lcd_text(
     tier: LcdTier,
     st: &FaceStyle,
 ) {
-    painter.text(at, align, text, FontId::monospace(size), lcd_ink(st, tier));
+    painter.text(at, align, text, FontId::new(size, fonts::courier()), lcd_ink(st, tier));
 }
 
 /// The floor a quiet word has to clear on whatever it is printed on. A
@@ -881,7 +881,7 @@ pub fn eq_curve(
         // asserts when its bounds cross, and a panel narrower than one label
         // crosses them.
         let half = painter
-            .layout_no_wrap(short.clone(), FontId::monospace(label_size), Color32::WHITE)
+            .layout_no_wrap(short.clone(), FontId::new(label_size, fonts::courier()), Color32::WHITE)
             .rect
             .width()
             * 0.5;
