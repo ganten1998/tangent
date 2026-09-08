@@ -53,7 +53,7 @@
 //!
 //! // Every frame, at the BOTTOM, after the desk has drawn itself.
 //! if let Some(busy) = &mut self.busy {
-//!     let up = busy.draw(&painter, ctx.screen_rect(), face, time);
+//!     let up = busy.draw(&painter, ctx.content_rect(), face, time);
 //!     self.app.set_busy_up(up);          // the host's own flag; see below
 //!     if self.busy_done && busy.may_close() {
 //!         self.busy = None;

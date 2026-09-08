@@ -15398,7 +15398,7 @@ at: None,
         let with = ctx
             .run(input(), |ctx| {
                 let painter = ctx.layer_painter(crate::busy::cover_layer("tangent-busy"));
-                busy.draw(&painter, ctx.screen_rect(), FALLBACK_FACE, 0.0);
+                busy.draw(&painter, ctx.content_rect(), FALLBACK_FACE, 0.0);
                 draw(ctx);
             })
             .shapes;
