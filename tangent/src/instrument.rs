@@ -13083,6 +13083,14 @@ impl Engine {
         }
     }
 
+    /// **Hand the audio thread the arrangement's audio schedule, whole.**
+    ///
+    /// The new list goes over on a two-slot ring and the callback swaps it
+    /// in; the list it DISPLACES comes back on the retiring ring, to be
+    /// dropped here. That return is the whole reason there is a ring in each
+    /// direction: a schedule holds `Arc`s on every decoded file in the
+    /// session, and freeing a hundred megabytes inside the callback is a
+    /// dropout.
     ///
     /// **It no longer WAITS for that return.** It used to spin, a
     /// millisecond at a time, until the callback handed the old list back —
@@ -19336,8 +19344,6 @@ mod tests {
         crate::builtin_fx::state_text(spec, &v, &[]).into_bytes()
     }
 
-    /// One constant mono clip on one lane, a second long — the key tests'
-    /// signal, because a constant's level needs no window to agree on.
     /// **A schedule hand-off never sleeps on the UI thread, and the newest
     /// one wins.** On an offline engine — no callback until a block is
     /// rendered, which is when the old wait burnt its full quarter second —
@@ -19397,6 +19403,8 @@ mod tests {
         assert!(e.midi_pending.is_none());
     }
 
+    /// One constant mono clip on one lane, a second long — the key tests'
+    /// signal, because a constant's level needs no window to agree on.
     fn flat_clip(strip: usize, level: f32) -> Placed {
         Placed {
             clip: Arc::new(tangent_record::decode::Clip {
@@ -20406,9 +20414,6 @@ mod tests {
         assert!(!e.insert_bypassed(3, 1), "an absent entry did not clear");
     }
 
-    /// **A folder inside a folder**, which the single descending fold has to
-    /// get right without recursing: the inner one is the higher index, so it
-    /// finishes and folds into the outer before the outer's turn comes.
     /// **A folder does its folding ONCE.**
     ///
     /// A folder is a channel, so `mix_channels` walked it like any other —
@@ -20889,6 +20894,9 @@ mod tests {
         );
     }
 
+    /// **A folder inside a folder**, which the single descending fold has to
+    /// get right without recursing: the inner one is the higher index, so it
+    /// finishes and folds into the outer before the outer's turn comes.
     #[test]
     fn a_folder_inside_a_folder_reaches_the_master_through_both() {
         use std::sync::Arc;
