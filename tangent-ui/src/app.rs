@@ -8827,7 +8827,7 @@ impl TangentApp {
             icons: &s.channel_icons,
             names: &s.strip_names,
             colors: &s.strip_colors,
-            inserts: &s.strip_inserts,
+            inserts: crate::arrangement::Bays::Dense(&s.strip_inserts),
             sends: &s.strip_sends,
             muted: s.strip_muted,
             soloed: s.strip_soloed,
@@ -8861,135 +8861,19 @@ impl TangentApp {
     /// `save_settings`, which made every open two synchronous pretty-prints
     /// of a 15,000-line file and every Ctrl+Z one more.
     fn apply_desk_snapshot(&mut self, d: &crate::arrangement::DeskSnap) {
-        // A document saved before the DRUM BUS carries ten-strip arrays:
-        // its click, bus and master rows would land one seat early. Grown
-        // here, in a copy, so an old session opens with its desk intact
-        // and the drums at their defaults.
-        let d = &{
-            let mut d = d.clone();
-            // Frozen at the ERA's numbers (16 channels, 18 strips), per the
-            // migration rule — this read the LIVE constants and went dead
-            // the day the desk grew to 24, stranding that beta window's
-            // documents unlifted.
-            const V18_CH: usize = 16;
-            if d.sends.len() == 18 {
-                d.sends.insert(V18_CH, 0.0);
-                if d.colors.len() == 19 {
-                    d.colors.insert(V18_CH, 0);
-                }
-                if d.names.len() == 19 {
-                    d.names.insert(V18_CH, String::new());
-                }
-                if d.inserts.len() == 19 * crate::recorder::INSERTS {
-                    for _ in 0..crate::recorder::INSERTS {
-                        d.inserts.insert(
-                            V18_CH * crate::recorder::INSERTS,
-                            String::new(),
-                        );
-                    }
-                }
-                let move_mask = |mask: u64| -> u64 {
-                    let keep = mask & ((1u64 << V18_CH) - 1);
-                    let above = mask >> V18_CH;
-                    keep | (above << (V18_CH + 1))
-                };
-                d.muted = move_mask(d.muted);
-                d.soloed = move_mask(d.soloed);
-            }
-            // **An eight-channel-era document, grown to today's count.** The
-            // settings path does this in `adopt_desk`; a project carries its
-            // own desk snapshot and needs the same lift, or opening a session
-            // saved at eight channels scatters its drums/click/fx/master and
-            // every pad's FX onto the new empty channels. Frozen eight-channel
-            // shape: STRIPS 11, master at 11, pad-insert base 12.
-            const OLD_CH: usize = 8;
-            const OLD_STRIPS: usize = 11;
-            let ins3 = crate::recorder::INSERTS;
-            // A sixteen-pad-era doc first grows its pads to 128 at base 12 —
-            // its pads were keys 36..51 — before the channels widen the base.
-            if d.inserts.len() == (OLD_STRIPS + 1 + 16) * ins3 {
-                d.inserts.resize((OLD_STRIPS + 1 + 128) * ins3, String::new());
-                for pad in (0..16usize).rev() {
-                    for bay in 0..ins3 {
-                        let from = (OLD_STRIPS + 1 + pad) * ins3 + bay;
-                        let to = (OLD_STRIPS + 1 + 36 + pad) * ins3 + bay;
-                        d.inserts[to] = std::mem::take(&mut d.inserts[from]);
-                    }
-                }
-            }
-            if d.sends.len() == OLD_STRIPS && crate::recorder::CHANNELS > OLD_CH {
-                let grow = crate::recorder::CHANNELS - OLD_CH;
-                for _ in 0..grow {
-                    if OLD_CH <= d.colors.len() {
-                        d.colors.insert(OLD_CH, 0);
-                    }
-                    if OLD_CH <= d.names.len() {
-                        d.names.insert(OLD_CH, String::new());
-                    }
-                    if OLD_CH <= d.sends.len() {
-                        d.sends.insert(OLD_CH, 0.0);
-                    }
-                }
-                let ins_at = OLD_CH * ins3;
-                for _ in 0..(grow * ins3) {
-                    if ins_at <= d.inserts.len() {
-                        d.inserts.insert(ins_at, String::new());
-                    }
-                }
-                let grow_mask = |mask: u64| -> u64 {
-                    let keep = mask & ((1u64 << OLD_CH) - 1);
-                    let above = mask >> OLD_CH;
-                    keep | (above << (OLD_CH + grow))
-                };
-                d.muted = grow_mask(d.muted);
-                d.soloed = grow_mask(d.soloed);
-                // Not the global `desk_state_shift_v19` flag: that renames the
-                // global state dir, and a project's insert states live in its
-                // own `state/`. The desk ARRAYS relocate here so plugins load
-                // at the right seats; a moved plugin's saved knobs fall back
-                // to defaults, the same graceful cost every shuffle accepts.
-            }
-            // **A sixteen-channel-era document, grown to twenty-four.** The
-            // 4.82-through-5.0 shape: nineteen sends is its fingerprint.
-            // Same fold, same bargain on the project's own state/ sidecars.
-            const V19_CH: usize = 16;
-            if d.sends.len() == 19 && crate::recorder::CHANNELS > V19_CH {
-                let grow = crate::recorder::CHANNELS - V19_CH;
-                for _ in 0..grow {
-                    if V19_CH <= d.colors.len() {
-                        d.colors.insert(V19_CH, 0);
-                    }
-                    if V19_CH <= d.names.len() {
-                        d.names.insert(V19_CH, String::new());
-                    }
-                    if V19_CH <= d.sends.len() {
-                        d.sends.insert(V19_CH, 0.0);
-                    }
-                }
-                let ins_at = V19_CH * ins3;
-                for _ in 0..(grow * ins3) {
-                    if ins_at <= d.inserts.len() {
-                        d.inserts.insert(ins_at, String::new());
-                    }
-                }
-                let grow_mask = |mask: u64| -> u64 {
-                    let keep = mask & ((1u64 << V19_CH) - 1);
-                    let above = mask >> V19_CH;
-                    keep | (above << (V19_CH + grow))
-                };
-                d.muted = grow_mask(d.muted);
-                d.soloed = grow_mask(d.soloed);
-            }
-            d
-        };
+        // A desk from an earlier era of the desk's shape arrives already
+        // lifted: `DeskSnap::from_value` runs the length-keyed era lifts on
+        // the dense array as the file holds it. They ran here once, on a
+        // clone of every desk applied — every open and every undo step —
+        // although a moment can never hold an old-era desk.
         if d.icons.is_empty() {
             // A document from before the badges: derive them — the drum
             // where the drumpad stands, auto everywhere else — instead of
             // leaving the LAST project's badges on this one's tracks.
             for i in 0..crate::recorder::CHANNELS {
-                let bay0 = d.inserts.get(i * crate::recorder::INSERTS);
+                let bay0 = d.bay(i * crate::recorder::INSERTS);
                 self.settings.channel_icons[i] =
-                    u8::from(bay0.is_some_and(|p| p == dialogs::DRUMPAD_PATH));
+                    u8::from(bay0 == Some(dialogs::DRUMPAD_PATH));
             }
         } else {
             for (i, ic) in d.icons.iter().take(crate::recorder::CHANNELS).enumerate() {
@@ -9004,7 +8888,22 @@ impl TangentApp {
         for (i, c) in d.colors.iter().take(self.settings.strip_colors.len()).enumerate() {
             self.settings.strip_colors[i] = *c;
         }
-        self.settings.strip_inserts = d.inserts.clone();
+        // The snapshot's occupied seats, spread over the settings' dense
+        // space — the whole `INSERT_SPACE`, and wider if a document names
+        // a seat past it (a future build's desk round-trips through here
+        // rather than being cut). Everything that indexes `strip_inserts`
+        // by seat — `insert`, `set_insert`, the track mover, the host's
+        // reconcile — keeps its dense vec.
+        let mut dense = vec![String::new(); crate::recorder::INSERT_SPACE];
+        for (bay, path) in &d.inserts {
+            if *bay >= dense.len() {
+                dense.resize(bay + 1, String::new());
+            }
+            if let Some(slot) = dense.get_mut(*bay) {
+                *slot = path.clone();
+            }
+        }
+        self.settings.strip_inserts = dense;
         for (i, v) in d.sends.iter().take(crate::recorder::STRIPS).enumerate() {
             self.settings.strip_sends[i] = v.clamp(0.0, 1.0);
         }
@@ -10261,12 +10160,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         .iter()
         .enumerate()
         .all(|(n, k)| *k == u8::from(n < tracks))
-        && d.inserts.iter().enumerate().all(|(n, p)| {
-            match shipped.iter().find(|(at, _)| *at == n) {
-                Some((_, want)) => p == want,
-                None => p.is_empty(),
-            }
-        })
+        && shipped.iter().all(|(at, want)| d.bay(*at) == Some(*want))
+        && d.inserts.iter().all(|(n, _)| shipped.iter().any(|(at, _)| at == n))
 }
 
     pub fn seed_template(&self, dir: &std::path::Path) {
@@ -16466,19 +16361,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The DOCUMENT's desk is asked first and the live one second,
         // because two of the four roads here have not applied the snapshot
         // yet: at launch `settings` still describes the previous session.
-        let is_drum_bay = |inserts: &[String], ch: &usize| {
-            inserts
-                .get(ch * crate::recorder::INSERTS)
-                .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH)
-        };
         let legacy_lane = self
             .arrangement
             .desk
             .as_ref()
-            .and_then(|d| (0..crate::recorder::CHANNELS).find(|ch| is_drum_bay(&d.inserts, ch)))
+            .and_then(|d| {
+                (0..crate::recorder::CHANNELS).find(|ch| {
+                    d.bay(ch * crate::recorder::INSERTS) == Some(crate::dialogs::DRUMPAD_PATH)
+                })
+            })
             .or_else(|| {
-                (0..crate::recorder::CHANNELS)
-                    .find(|ch| is_drum_bay(&self.settings.strip_inserts, ch))
+                (0..crate::recorder::CHANNELS).find(|ch| {
+                    self.settings
+                        .strip_inserts
+                        .get(ch * crate::recorder::INSERTS)
+                        .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH)
+                })
             });
         let (kits, saved_lane) = match self.project_doc() {
             Some(doc) => crate::drumpad::DrumpadDoc::load_all_beside(
@@ -35224,7 +35122,7 @@ mod tests {
         let read = crate::arrangement::Arrangement::load_from(&doc);
         let desk = read.desk.expect("the save left the desk out");
         assert_eq!(desk.kinds[2], app.settings.channel_kinds[2]);
-        assert_eq!(desk.inserts[2 * crate::recorder::INSERTS], "/x/EP.vst3");
+        assert_eq!(desk.bay(2 * crate::recorder::INSERTS), Some("/x/EP.vst3"));
         assert!((desk.gains[2] - 0.42).abs() < 1e-9);
         assert!((desk.tempo_bpm - 93.0).abs() < 1e-9);
 
@@ -36460,9 +36358,7 @@ mod tests {
             shipped
                 .inserts
                 .iter()
-                .enumerate()
-                .filter(|(_, p)| !p.is_empty())
-                .map(|(n, p)| (n, p.as_str()))
+                .map(|(n, p)| (*n, p.as_str()))
                 .collect::<Vec<_>>(),
         );
     }
@@ -36498,9 +36394,7 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("template dir");
             let mut arr = crate::arrangement::Arrangement::default();
             let mut d = TangentApp::template_desk();
-            for p in d.inserts.iter_mut() {
-                p.clear();
-            }
+            d.inserts.clear();
             let tracks = shipped
                 .iter()
                 .map(|(at, _)| at / INSERTS + 1)
@@ -36510,7 +36404,7 @@ mod tests {
                 *k = u8::from(n < tracks);
             }
             for (at, path) in shipped {
-                d.inserts[*at] = (*path).to_owned();
+                d.set_bay(*at, path);
             }
             arr.desk = Some(d);
             arr.save_to(&doc);
@@ -36546,12 +36440,12 @@ mod tests {
             };
             let desk = back.desk.expect("a template has a desk");
             assert_eq!(
-                desk.inserts.get(0).map(String::as_str),
+                desk.bay(0),
                 Some(crate::dialogs::DRUMPAD_PATH),
                 "a template holding {shipped:?} was not healed to the shipped desk"
             );
             assert_eq!(
-                desk.inserts.get(INSERTS).map(String::as_str),
+                desk.bay(INSERTS),
                 Some(crate::dialogs::BUILTIN_PATH),
                 "a template holding {shipped:?} was not healed to the shipped desk"
             );
@@ -36567,7 +36461,7 @@ mod tests {
                 panic!("the fixture would not read back")
             };
             let d = a.desk.as_mut().expect("a desk");
-            d.inserts[2 * INSERTS] = crate::dialogs::BUILTIN_PATH.to_owned();
+            d.set_bay(2 * INSERTS, crate::dialogs::BUILTIN_PATH);
             a.save_to(&doc);
         }
         app.seed_template(&dir);
@@ -36578,7 +36472,7 @@ mod tests {
         };
         let desk = kept.desk.expect("a desk");
         assert_eq!(
-            desk.inserts.get(2 * INSERTS).map(String::as_str),
+            desk.bay(2 * INSERTS),
             Some(crate::dialogs::BUILTIN_PATH),
             "a template somebody had arranged was overwritten"
         );
@@ -52717,6 +52611,102 @@ mod folder_tests {
         assert_eq!(app.settings_writes.get(), 0, "redo wrote the settings synchronously");
     }
 
+    /// A document whose desk was written in an earlier ERA of the desk's
+    /// shape, from the frozen literals the lifts key on: `sends` of the
+    /// era's strip count, `inserts` of the era's bay count, and one plugin
+    /// and one mute bit placed where the lift has to carry them.
+    fn a_document_from_the_era(sends: usize, bays: usize, plugin_at: usize, muted: u64) -> String {
+        let mut inserts = vec![String::new(); bays];
+        if let Some(b) = inserts.get_mut(plugin_at) {
+            *b = "/x/Carried.vst3".to_owned();
+        }
+        if let Some(b) = inserts.get_mut(5 * crate::recorder::INSERTS) {
+            *b = "/x/Channel5.vst3".to_owned();
+        }
+        serde_json::json!({
+            "arrangement_version": 6,
+            "next_clip_id": 1,
+            "clips": [],
+            "desk": {
+                "kinds": vec![1u8; 8],
+                "names": vec![""; sends + 1],
+                "colors": vec![0i64; sends + 1],
+                "inserts": inserts,
+                "sends": vec![0.0f64; sends],
+                "muted": muted,
+                "soloed": 0,
+                "gains": vec![1.0f64; 8],
+                "pans": vec![0.0f64; 8],
+                "inputs": vec![""; 8],
+            }
+        })
+        .to_string()
+    }
+
+    /// **Every era's desk lands at today's seats.** The four length-keyed
+    /// lifts — eighteen strips (the drum bus arriving), sixteen pads, eight
+    /// channels, sixteen channels — each move the seats above their
+    /// insertion point by a frozen amount, and the eighteen-strip one hands
+    /// its result to the sixteen-channel one. Pinned through the live desk
+    /// after the document is applied, which is the same observation
+    /// whichever function does the lifting; the expected seats are the
+    /// literals worked by hand: a bay `b` at strip `s` lands at
+    /// `(s + grown_strips) * 3 + b`, a mute bit at `bit + grown_strips`.
+    #[test]
+    fn a_desk_from_any_era_opens_at_todays_seats() {
+        use crate::recorder::{CHANNELS, INSERTS};
+        let grown_from = |ch: usize| CHANNELS - ch;
+        // (name, sends, bays, plugin at, mute bit, expected bay, expected bit)
+        let eras: [(&str, usize, usize, usize, u64, usize, u64); 3] = [
+            // Eighteen strips: sixteen channels, no drum bus. The plugin on
+            // strip 16 (the click of that era) goes past the bus to 17, and
+            // then the sixteen-channel lift carries it to 17 + 16; the mute
+            // bit on 17 steps to 18 the same way and lands at 18 + 16.
+            ("eighteen strips", 18, 19 * INSERTS, 16 * INSERTS, 1 << 17,
+             (16 + 1 + grown_from(16)) * INSERTS, 18 + grown_from(16) as u64),
+            // Eight channels and sixteen pads: 84 bays. Pad 2 (bay 14*3)
+            // first moves to key 38's seat, (12 + 36 + 2) * 3, then the
+            // channel widening adds 24 strips' worth of bays at 8*3.
+            ("eight channels, sixteen pads", 11, (11 + 1 + 16) * INSERTS, (11 + 1 + 2) * INSERTS, 1 << 9,
+             (12 + 36 + 2 + grown_from(8)) * INSERTS, 9 + grown_from(8) as u64),
+            // Sixteen channels with the drum bus: nineteen strips.
+            ("sixteen channels", 19, 20 * INSERTS, 17 * INSERTS, 1 << 18,
+             (17 + grown_from(16)) * INSERTS, 18 + grown_from(16) as u64),
+        ];
+        for (era, sends, bays, at, bit, want_bay, want_bit) in eras {
+            let (_ctx, mut app) = headless(Caps::PLUGIN);
+            let arr = crate::arrangement::Arrangement::from_json(&a_document_from_the_era(
+                sends, bays, at, bit,
+            ));
+            let desk = arr.desk.expect("the fixture has a desk");
+            app.apply_desk_snapshot(&desk);
+            assert_eq!(
+                app.settings.strip_inserts.get(want_bay).map(String::as_str),
+                Some("/x/Carried.vst3"),
+                "{era}: the carried plugin is not at bay {want_bay}; occupied: {:?}",
+                app.settings
+                    .strip_inserts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| !p.is_empty())
+                    .map(|(n, p)| (n, p.as_str()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                app.settings.strip_inserts.get(5 * INSERTS).map(String::as_str),
+                Some("/x/Channel5.vst3"),
+                "{era}: channel 5's plugin moved"
+            );
+            assert_eq!(
+                app.settings.strip_muted,
+                1 << want_bit,
+                "{era}: the mute bit is not at {want_bit}"
+            );
+            let occupied = app.settings.strip_inserts.iter().filter(|p| !p.is_empty()).count();
+            assert_eq!(occupied, 2, "{era}: a lift duplicated or dropped a plugin");
+        }
+    }
+
     /// A settled session with two audio clips still carrying the
     /// whole-file sentinel, as an import leaves them.
     fn a_session_with_unmeasured_clips() -> (TangentApp, u64, u64) {
@@ -53755,7 +53745,7 @@ mod folder_tests {
         let d = TangentApp::template_desk();
         // Two rows, and only two: the drums on one, the built-in on two.
         assert_eq!(d.tracks_added, 0b11, "the template is not two tracks");
-        let bay = |ch: usize| d.inserts[Strip::Channel(ch).index() * INSERTS].as_str();
+        let bay = |ch: usize| d.bay(Strip::Channel(ch).index() * INSERTS).unwrap_or("");
         assert_eq!(bay(0), crate::dialogs::DRUMPAD_PATH, "channel 1 is not the drums");
         assert_eq!(bay(1), crate::dialogs::BUILTIN_PATH, "channel 2 is not the DX7");
         for ch in 2..CHANNELS {
@@ -56494,7 +56484,7 @@ mod perf_probes {
             + d.icons.len()
             + strs(&d.names)
             + d.colors.len() * 8
-            + strs(&d.inserts)
+            + d.inserts.iter().map(|(_, p)| 32 + p.capacity()).sum::<usize>()
             + d.sends.len() * 8
             + d.gains.len() * 8
             + d.pans.len() * 8
