@@ -65,6 +65,10 @@ pub mod routing;
 pub mod theme;
 pub mod theory_panel;
 pub mod tapring;
+/// Documents of a known size for the perf probes, and the probes that need
+/// nothing but a document. Test-only; see the module header.
+#[cfg(test)]
+pub(crate) mod perf_fixtures;
 
 /// The version the About box reports.
 ///
