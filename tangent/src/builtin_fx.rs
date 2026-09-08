@@ -69,6 +69,20 @@ pub const IR_PATH: &str = "@tangent-ir";
 /// `docs/ANALOG-BRIEF.md` §7.
 pub const ANALOG_PATH: &str = "@tangent-analog";
 
+/// **The second built-in VOICE**, and the first that plays somebody else's
+/// audio. Seated exactly as the analog is — `voice: true` in [`UNITS`] is
+/// what routes the block's notes to it and takes its output as the channel's
+/// signal — and deliberately NOT in `desktop::is_instrument_sentinel`, for
+/// the reason spelled out above [`ANALOG_PATH`]: that list names the three
+/// mask-rendered instruments, and a voice added to it is filtered out of the
+/// engine and plays nothing.
+///
+/// Its audio does NOT travel in its state blob. The file is named there (the
+/// extra symbols `sample_path` and `root_key`, the convolver's `ir_path`
+/// road) and the samples themselves reach the audio thread the way a drum kit
+/// does — see `instrument::SamplerSample`.
+pub const SAMPLER_PATH: &str = "@tangent-sampler";
+
 /// One parameter a unit publishes: what the automation lane, the state blob
 /// and (one day) a knob panel all address it by.
 ///
@@ -441,6 +455,68 @@ fn build_analog(sample_rate: f32) -> BuiltinUnit {
     BuiltinUnit::Analog(AnalogUnit::new(sample_rate))
 }
 
+/// **The sampler's sixteen dials.** Ids 0..15, in the order the brief
+/// declares them, and both halves of the feature index by exactly these —
+/// the face reads the symbols back through [`spec_for`].
+///
+/// The DEFAULTS are arithmetic on the kernel's own range constants rather
+/// than sixteen decimals, so a range that moves takes its default with it:
+/// `sampler::default_norm` is the one place a rest is decided, and a test
+/// below holds this table to it. Everything here is normalised 0..=1, the
+/// house contract; the maps to seconds, cents and semitones live beside the
+/// DSP in `units::sampler` WITH their inverses, so the face can print a
+/// number and read one back without keeping a second copy of the taper.
+///
+/// **Two dials that look continuous and are not, and one that looks stepped
+/// and is not.** Mode, Obey Note Off, Loop, Max Voices and Bend Range are
+/// stepped, because each position is a different thing rather than more of
+/// the same one. Transpose is CONTINUOUS with a rounded readout: the brief
+/// asks for whole semitones and the kernel rounds, but a forty-nine-position
+/// cycling row is not a dial anybody wants to drag two octaves on.
+pub const SAMPLER_FACE_PARAMS: [ParamSpec; crate::units::sampler::PARAM_COUNT] = {
+    use crate::units::sampler as k;
+    [
+        ParamSpec { id: k::P_VOL, symbol: "vol", name: "Volume", units: "x", default: 0.5, steps: 0 },
+        ParamSpec { id: k::P_MODE, symbol: "mode", name: "Sample Mode", units: "", default: 0.0, steps: 3 },
+        ParamSpec { id: k::P_TRANSPOSE, symbol: "transpose", name: "Transpose", units: "semi", default: 0.5, steps: 0 },
+        ParamSpec { id: k::P_FINE, symbol: "fine", name: "Fine", units: "c", default: 0.5, steps: 0 },
+        ParamSpec { id: k::P_ATTACK, symbol: "attack", name: "Attack", units: "ms", default: SAMPLER_ATTACK_REST, steps: 0 },
+        ParamSpec { id: k::P_DECAY, symbol: "decay", name: "Decay", units: "ms", default: SAMPLER_DECAY_REST, steps: 0 },
+        ParamSpec { id: k::P_SUSTAIN, symbol: "sustain", name: "Sustain", units: "%", default: 1.0, steps: 0 },
+        ParamSpec { id: k::P_RELEASE, symbol: "release", name: "Release", units: "ms", default: SAMPLER_RELEASE_REST, steps: 0 },
+        ParamSpec { id: k::P_START, symbol: "start", name: "Start", units: "%", default: 0.0, steps: 0 },
+        ParamSpec { id: k::P_END, symbol: "end", name: "End", units: "%", default: 1.0, steps: 0 },
+        ParamSpec { id: k::P_NOTEOFF, symbol: "noteoff", name: "Obey Note Off", units: "", default: 1.0, steps: 2 },
+        ParamSpec { id: k::P_LOOP, symbol: "loop", name: "Loop", units: "", default: 0.0, steps: 2 },
+        ParamSpec { id: k::P_XFADE, symbol: "xfade", name: "Loop Crossfade", units: "ms", default: SAMPLER_XFADE_REST, steps: 0 },
+        ParamSpec { id: k::P_VOICES, symbol: "voices", name: "Max Voices", units: "", default: SAMPLER_VOICES_REST, steps: k::MAX_VOICES as i32 },
+        ParamSpec { id: k::P_PORTA, symbol: "porta", name: "Portamento", units: "ms", default: 0.0, steps: 0 },
+        ParamSpec { id: k::P_BEND, symbol: "bend", name: "Bend Range", units: "semi", default: SAMPLER_BEND_REST, steps: k::BEND_MAX_SEMIS + 1 },
+    ]
+};
+
+/// The four tapered rests and the two stepped ones, spelled where a `const`
+/// can hold them: `ParamSpec::default` is a `const` field and the kernel's
+/// maps are `fn`s, which const evaluation cannot call. The arithmetic is the
+/// map's, inlined once each, and `the_samplers_defaults_are_the_kernels`
+/// holds every one of them to `sampler::default_norm` at test time — so the
+/// duplication cannot drift silently, which is the only thing wrong with it.
+///
+/// The cube root is what `sampler::secs_norm` does: 5 ms of a five-second
+/// sweep sits a tenth of the way round, not a thousandth.
+const SAMPLER_ATTACK_REST: f32 = 0.1; // (0.005 / 5.0).cbrt()
+const SAMPLER_DECAY_REST: f32 = 0.341_995_2; // (0.20 / 5.0).cbrt()
+const SAMPLER_RELEASE_REST: f32 = 0.246_621_2; // (0.15 / 10.0).cbrt()
+const SAMPLER_XFADE_REST: f32 = 0.271_441_76; // (0.010 / 0.5).cbrt()
+/// Sixteen voices of thirty-two: position 15 of 0..31.
+const SAMPLER_VOICES_REST: f32 = 15.0 / 31.0;
+/// Two semitones of the twenty-five positions 0..=24.
+const SAMPLER_BEND_REST: f32 = 2.0 / 24.0;
+
+fn build_sampler(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Sampler(SamplerUnit::new(sample_rate))
+}
+
 /// Every effect this build ships. Order is nothing; the path is the key.
 pub const UNITS: &[UnitSpec] = &[
     UnitSpec {
@@ -548,6 +624,15 @@ pub const UNITS: &[UnitSpec] = &[
         class: "Tangent Analog",
         params: &ANALOG_FACE_PARAMS,
         build: build_analog,
+        voice: true,
+    },
+    // The second voice, and the first that plays a file. Same class-is-the-
+    // preset-folder rule as the analog's.
+    UnitSpec {
+        path: SAMPLER_PATH,
+        class: "Tangent Sampler",
+        params: &SAMPLER_FACE_PARAMS,
+        build: build_sampler,
         voice: true,
     },
 ];
@@ -751,6 +836,7 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
         // honest one. Every dial not named above — drive amount, depths,
         // widths, mixes, the wah's damping — is percent for the same reason.
         (ANALOG_PATH, id) => analog_reading(id, v),
+        (SAMPLER_PATH, id) => sampler_reading(id, v),
         _ => fmt_pct(v),
     }
 }
@@ -780,6 +866,7 @@ pub fn choices(path: &str, id: u32) -> Vec<String> {
         // the harmonics, in the clipper's own terms.
         (DRIVE_PATH, 3) => vec!["matched".to_owned(), "uneven".to_owned()],
         (ANALOG_PATH, id) => analog_choices(id),
+        (SAMPLER_PATH, id) => sampler_choices(id),
         _ => Vec::new(),
     }
 }
@@ -889,6 +976,61 @@ fn analog_choices(id: u32) -> Vec<String> {
     }
 }
 
+/// **What each of the sampler's dials reads**, printed through the kernel's
+/// own maps — the functions beside the DSP — so the face and the sound
+/// cannot disagree. A missing arm here is a knob that reads wrong, which is
+/// why every one of the sixteen is named and none falls through.
+fn sampler_reading(id: u32, v: f32) -> String {
+    use crate::units::sampler as k;
+    use tangent_ui::face::{fmt_ms, fmt_pct};
+    let onoff = |v: f32| (if v >= 0.5 { "on" } else { "off" }).to_owned();
+    let ms = |secs: f32| {
+        if secs <= 0.0 {
+            "off".to_owned()
+        } else {
+            fmt_ms(secs * 1000.0)
+        }
+    };
+    match id {
+        // A linear gain, printed as the multiplier it is. Not decibels: the
+        // dial's own range is 0..2 and 0 has no decibel, so a dB readout
+        // would need a special case at the one end people actually use.
+        k::P_VOL => format!("{:.2}x", v.clamp(0.0, 1.0) * k::VOL_MAX),
+        k::P_MODE => k::MODE_LABELS[k::step_index(v, 3)].to_owned(),
+        // Whole semitones, because the kernel rounds to them — printing
+        // "+6.9" over a knob that plays +7 is the readout lying about the
+        // sound, which is the fault this whole function exists to avoid.
+        k::P_TRANSPOSE => format!("{:+.0} semi", k::bipolar(v, k::TRANSPOSE_SEMIS).round()),
+        // CENTS, and cents alone here. The owner asked for "pitch change
+        // (hz)" and the face prints the Hz beside this — through
+        // `sampler::fine_hz_at`, which needs the ROOT KEY and therefore
+        // cannot be answered by a function that is handed only a dial.
+        k::P_FINE => format!("{:+.0} c", k::bipolar(v, k::FINE_CENTS)),
+        k::P_ATTACK => ms(k::secs(v, k::ATTACK_SECS)),
+        k::P_DECAY => ms(k::secs(v, k::DECAY_SECS)),
+        k::P_RELEASE => ms(k::secs(v, k::RELEASE_SECS)),
+        k::P_XFADE => ms(k::secs(v, k::XFADE_MS / 1000.0)),
+        k::P_PORTA => ms(k::secs(v, k::PORTA_SECS)),
+        k::P_SUSTAIN | k::P_START | k::P_END => fmt_pct(v),
+        k::P_NOTEOFF | k::P_LOOP => onoff(v),
+        k::P_VOICES => format!("{}", k::step_index(v, k::MAX_VOICES as i32) + 1),
+        k::P_BEND => format!("{} semi", k::step_index(v, k::BEND_MAX_SEMIS + 1)),
+        _ => fmt_pct(v),
+    }
+}
+
+/// The sampler's stepped dials, each position's word in step order.
+fn sampler_choices(id: u32) -> Vec<String> {
+    use crate::units::sampler as k;
+    match id {
+        k::P_MODE => k::MODE_LABELS.iter().map(|w| (*w).to_owned()).collect(),
+        k::P_NOTEOFF | k::P_LOOP => vec!["off".to_owned(), "on".to_owned()],
+        k::P_VOICES => (1..=k::MAX_VOICES).map(|n| format!("{n}")).collect(),
+        k::P_BEND => (0..=k::BEND_MAX_SEMIS).map(|n| format!("{n} semi")).collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub fn spec_for(path: &str) -> Option<&'static UnitSpec> {
     UNITS.iter().find(|u| u.path == path)
 }
@@ -949,6 +1091,14 @@ pub fn is_extra_symbol(path: &str, symbol: &str) -> bool {
             // "t07" must NOT alias t7 — one value per symbol, one spelling.
             .is_some_and(|n| n < crate::units::denoise::DENOISE_BANDS && symbol == format!("t{n}")),
         IR_PATH => symbol == "ir_path",
+        // **The sampler's file, named rather than carried.** The audio
+        // travels the drum kit's road (`instrument::SamplerSample`) and never
+        // through a state blob; what persists is where it came from, what to
+        // call it, and the key it plays at unity — three lines, so a reopened
+        // project can find the same sound again. `sample_name` is written
+        // down as well as derived, because a library may rename a file and
+        // the words the face printed are what somebody chose the preset by.
+        SAMPLER_PATH => matches!(symbol, "sample_path" | "sample_name" | "root_key"),
         _ => false,
     }
 }
@@ -1050,6 +1200,8 @@ pub enum BuiltinUnit {
     Ir(IrUnit),
     /// The voice. Appended, the enum's law.
     Analog(AnalogUnit),
+    /// The second voice. Appended for the same reason.
+    Sampler(SamplerUnit),
 }
 
 impl BuiltinUnit {
@@ -1106,6 +1258,11 @@ impl BuiltinUnit {
             // (brief §7.9). `run_rack` reads it for a built-in voice where
             // it exempts a VST3 one, which has no route to say.
             BuiltinUnit::Analog(u) => u.synth.latency(),
+            // Nothing: the read head is at the sample it writes, and every
+            // interpolation tap is one already in the file. A sampler that
+            // billed frames it does not use would push the whole channel
+            // late for arithmetic that happens between two of them.
+            BuiltinUnit::Sampler(_) => 0,
         }
     }
 
@@ -1133,6 +1290,7 @@ impl BuiltinUnit {
             BuiltinUnit::Wah(u) => u.set_param(id, value),
             BuiltinUnit::Ir(u) => u.set_param(id, value),
             BuiltinUnit::Analog(u) => u.set_param(id, value),
+            BuiltinUnit::Sampler(u) => u.set_param(id, value),
         }
     }
 
@@ -1234,7 +1392,7 @@ impl BuiltinUnit {
             // the input through as if it had done something. `run_rack`
             // never asks — `voice: true` routes it to `process_voice` — so
             // this arm is the same kind of line the loader's used to be.
-            BuiltinUnit::Analog(_) => {
+            BuiltinUnit::Analog(_) | BuiltinUnit::Sampler(_) => {
                 for ch in out.iter_mut() {
                     for s in ch.iter_mut().take(frames) {
                         *s = 0.0;
@@ -1245,22 +1403,32 @@ impl BuiltinUnit {
     }
 
     /// **Render a voice: notes in, the plugin's own buffers out** — the
-    /// VST3 `process_voice` contract, for the one built-in that takes notes.
+    /// VST3 `process_voice` contract, for the built-ins that take notes.
     /// `params` is this block's automation and `transport` the song's
     /// position, both of which the effects' road carries past a voice; the
-    /// analog reads both (the arpeggiator needs the second). Every other
-    /// unit is an effect and answers silence, the arm above's line.
+    /// analog reads both (the arpeggiator needs the second). Every unit that
+    /// is an effect answers silence, the arm above's line.
+    ///
+    /// **`sample` is the LANE's loaded file, borrowed for this block.** It is
+    /// an argument and not a field for the reason `units::sampler`'s header
+    /// gives at length: the engine holds the decoded clip in one per-lane
+    /// place so that a displaced sample is freed on the host thread, and a
+    /// unit that kept its own `Arc` would put that free on the callback. It
+    /// arrives here rather than at `set_param` time because a bay has no way
+    /// to ask for anything between blocks — the road in is the block.
     pub fn process_voice(
         &mut self,
         notes: &[tangent_host::Note],
         controls: &[tangent_host::Control],
         params: &[tangent_host::ParamPoint],
         transport: crate::analog::arp::Transport,
+        sample: Option<&crate::instrument::SamplerSample>,
         frames: usize,
         bufs: &mut [Vec<f32>],
     ) {
         match self {
             BuiltinUnit::Analog(u) => u.process_voice(notes, controls, params, transport, frames, bufs),
+            BuiltinUnit::Sampler(u) => u.process_voice(notes, controls, params, sample, frames, bufs),
             _ => {
                 for ch in bufs.iter_mut() {
                     for s in ch.iter_mut().take(frames) {
@@ -1332,6 +1500,11 @@ impl BuiltinUnit {
             BuiltinUnit::Ir(u) => u.kernel.clear(),
             // Every voice off, the dials settled where they stand.
             BuiltinUnit::Analog(u) => u.synth.clear(),
+            // The same, and it keeps NOTHING about the file — because it
+            // holds nothing about the file. The convolver's clear has to say
+            // "tails go, the loaded filter stays"; a sampler borrows its
+            // audio for the length of a block and has no such split.
+            BuiltinUnit::Sampler(u) => u.kernel.clear(),
         }
     }
 }
@@ -2333,6 +2506,155 @@ impl AnalogUnit {
     }
 }
 
+/// The most events one block of a sampler's may carry, the analog's figure
+/// and its reason: sized once so a wild MIDI file cannot grow a `Vec` on the
+/// audio thread.
+const SAMPLER_EVENTS: usize = 1024;
+
+/// **The sampler, seated.** Translates the host's notes, controls and
+/// automation — VST3's shapes — into the kernel's events in time order, hands
+/// the kernel the lane's file for the length of the call, and de-interleaves
+/// the result into the bay's planar buffers.
+///
+/// Deliberately the same shape as [`AnalogUnit`], down to the sort key and
+/// the pass loop, because they are the same job: two voices whose kernels
+/// speak events and interleaved stereo, sitting behind one planar contract.
+/// The one difference is the borrowed sample, and that difference is the
+/// whole design — see [`BuiltinUnit::process_voice`].
+pub struct SamplerUnit {
+    kernel: crate::units::sampler::Sampler,
+    /// Events gathered with their offset and arrival order, then sorted
+    /// unstably on both — the second key is what makes the sort stable
+    /// without the allocation a stable sort makes.
+    queue: Vec<(usize, u32, crate::units::sampler::Event)>,
+    events: Vec<crate::units::sampler::Event>,
+    scratch: Vec<f32>,
+}
+
+impl SamplerUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::sampler::Sampler::new(sample_rate),
+            queue: Vec::with_capacity(SAMPLER_EVENTS),
+            events: Vec::with_capacity(SAMPLER_EVENTS),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = SAMPLER_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        self.kernel.set_param(id, washed(spec, value));
+    }
+
+    /// Notes, controls and automation into events; events and the lane's
+    /// file into the kernel; the kernel's stereo into `bufs`. Frames past
+    /// [`SCRATCH_FRAMES`] are rendered in passes with the events re-based,
+    /// so a long offline block is the same audio as the same block in
+    /// callback-sized pieces.
+    pub fn process_voice(
+        &mut self,
+        notes: &[tangent_host::Note],
+        controls: &[tangent_host::Control],
+        params: &[tangent_host::ParamPoint],
+        sample: Option<&crate::instrument::SamplerSample>,
+        frames: usize,
+        bufs: &mut [Vec<f32>],
+    ) {
+        use crate::units::sampler::Event;
+        if frames == 0 || bufs.is_empty() {
+            return;
+        }
+        self.queue.clear();
+        let last = frames - 1;
+        let mut seq = 0u32;
+        let mut push = |queue: &mut Vec<(usize, u32, Event)>, at: i32, e: Event| {
+            if queue.len() < SAMPLER_EVENTS {
+                queue.push(((at.max(0) as usize).min(last), seq, e));
+                seq += 1;
+            }
+        };
+        for n in notes {
+            let key = n.pitch.clamp(0, 127) as u8;
+            let e = if n.on {
+                Event::NoteOn { at: 0, key, vel: n.velocity.clamp(0.0, 1.0) }
+            } else {
+                Event::NoteOff { at: 0, key }
+            };
+            push(&mut self.queue, n.offset, e);
+        }
+        for c in controls {
+            let e = match c.controller {
+                tangent_host::Control::PITCH_BEND => Event::Bend {
+                    at: 0,
+                    amount: (f32::from(c.value.min(16383)) - 8192.0) / 8192.0,
+                },
+                tangent_host::Control::SUSTAIN => Event::Sustain { at: 0, down: c.value >= 64 },
+                // All sound off, all notes off: the wire's two panic buttons.
+                120 | 123 => Event::AllNotesOff { at: 0 },
+                // A sampler has no modulation section to hang a wheel off,
+                // and aftertouch with nothing to move is a control that
+                // would arrive and do nothing. Dropped by name rather than
+                // by a wildcard nobody has to think about.
+                _ => continue,
+            };
+            push(&mut self.queue, c.offset, e);
+        }
+        for p in params {
+            push(
+                &mut self.queue,
+                p.offset,
+                Event::Param { at: 0, id: p.id, value: p.value as f32 },
+            );
+        }
+        self.queue.sort_unstable_by_key(|e| (e.0, e.1));
+
+        // **The lane's file, borrowed for exactly this call.** A clip whose
+        // rate is zero — which no decoder produces and a corrupt cache
+        // might — is treated as no file at all rather than as a division.
+        let borrowed = sample.and_then(|s| {
+            (s.clip.rate > 0 && !s.clip.samples.is_empty()).then(|| {
+                crate::units::sampler::SampleRef {
+                    data: &s.clip.samples,
+                    // The decoder's contract: interleaved stereo, always.
+                    channels: 2,
+                    rate: s.clip.rate as f32,
+                    root_key: s.root_key,
+                }
+            })
+        });
+
+        let mut done = 0usize;
+        while done < frames {
+            let n = (frames - done).min(SCRATCH_FRAMES);
+            self.events.clear();
+            for (at, _, e) in &self.queue {
+                if *at < done || *at >= done + n {
+                    continue;
+                }
+                let at = *at - done;
+                self.events.push(match *e {
+                    Event::NoteOn { key, vel, .. } => Event::NoteOn { at, key, vel },
+                    Event::NoteOff { key, .. } => Event::NoteOff { at, key },
+                    Event::Bend { amount, .. } => Event::Bend { at, amount },
+                    Event::Sustain { down, .. } => Event::Sustain { at, down },
+                    Event::Param { id, value, .. } => Event::Param { at, id, value },
+                    Event::AllNotesOff { .. } => Event::AllNotesOff { at },
+                });
+            }
+            self.kernel
+                .render(&mut self.scratch, n, 2, &self.events, borrowed);
+            for (ch, buf) in bufs.iter_mut().enumerate() {
+                for (i, s) in buf.iter_mut().skip(done).take(n).enumerate() {
+                    *s = if ch < 2 { self.scratch[2 * i + ch] } else { 0.0 };
+                }
+            }
+            done += n;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2350,17 +2672,29 @@ mod tests {
     }
 
     /// **The analog's registration is the kernel's table, row for row**, the
-    /// voice flag is on it and on nothing else, and every one of its dials
-    /// reads and, where stepped, offers its positions. The transcription
-    /// is a compile-time loop, so "cannot drift" is true; this is here for
-    /// the day somebody rewrites that loop.
+    /// voice flag is on it and on the other VOICE alone, and every one of its
+    /// dials reads and, where stepped, offers its positions. The
+    /// transcription is a compile-time loop, so "cannot drift" is true; this
+    /// is here for the day somebody rewrites that loop.
+    ///
+    /// The flag's list was `path == ANALOG_PATH` while the analog was the
+    /// only voice, and it is spelled as a LIST now rather than loosened,
+    /// because the thing worth catching has not changed: a `voice: true`
+    /// that lands on an effect makes the channel play silence, and a
+    /// `voice: false` on an instrument makes it never hear a note.
     #[test]
-    fn the_analog_registers_as_the_kernels_table_and_the_only_voice() {
+    fn the_analog_registers_as_the_kernels_table_and_one_of_the_two_voices() {
         let spec = spec_for(ANALOG_PATH).expect("the analog is in the table");
         assert!(spec.voice, "the analog is not a voice");
         assert_eq!(spec.class, "Tangent Analog");
+        let voices = [ANALOG_PATH, SAMPLER_PATH];
         for u in UNITS {
-            assert_eq!(u.voice, u.path == ANALOG_PATH, "{} has the wrong voice flag", u.path);
+            assert_eq!(
+                u.voice,
+                voices.contains(&u.path),
+                "{} has the wrong voice flag",
+                u.path
+            );
         }
         assert_eq!(spec.params.len(), crate::analog::PARAMS.len());
         for (a, b) in spec.params.iter().zip(crate::analog::PARAMS) {
@@ -2437,6 +2771,9 @@ mod tests {
                     if block == 0 { controls } else { &[] },
                     if block == 0 { params } else { &[] },
                     crate::analog::arp::Transport::default(),
+                    // The analog plays no file; the sampler's argument is
+                    // the only one that ever carries anything here.
+                    None,
                     512,
                     &mut bufs,
                 );
@@ -3548,6 +3885,253 @@ mod tests {
                 "{} still did nothing to a microphone the ensemble had \
                  already widened",
                 spec.params[id].symbol
+            );
+        }
+    }
+
+    // ── the sampler ─────────────────────────────────────────────────────────
+
+    /// A tone that is not silence, decoded shape, for a bay to play.
+    fn test_sample(frames: usize, rate: u32) -> crate::instrument::SamplerSample {
+        let mut samples = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let x = (i as f32 / 64.0).sin() * 0.5;
+            samples[i * 2] = x;
+            samples[i * 2 + 1] = x;
+        }
+        crate::instrument::SamplerSample {
+            clip: std::sync::Arc::new(tangent_record::decode::Clip {
+                samples,
+                rate,
+                source: std::path::PathBuf::from("/tmp/tangent-test-sample.wav"),
+            }),
+            name: "test sample".to_owned(),
+            source: std::path::PathBuf::from("/tmp/tangent-test-sample.wav"),
+            root_key: crate::instrument::SAMPLER_ROOT_KEY,
+        }
+    }
+
+    /// **The sampler's registration is the brief's table, id for id, and it
+    /// is a voice.** Both halves of the feature index by these ids and read
+    /// these symbols; a row out of order is a face whose Attack knob moves
+    /// the Decay, and the compiler cannot see it. Every dial reads, and every
+    /// stepped one offers exactly its positions — a missing `describe` arm is
+    /// a knob that prints a percentage over a mode name.
+    #[test]
+    fn the_sampler_registers_as_the_briefs_table_and_as_a_voice() {
+        let spec = spec_for(SAMPLER_PATH).expect("the sampler is in the table");
+        assert!(spec.voice, "the sampler is not a voice");
+        assert_eq!(spec.class, "Tangent Sampler");
+        let want = [
+            "vol", "mode", "transpose", "fine", "attack", "decay", "sustain", "release",
+            "start", "end", "noteoff", "loop", "xfade", "voices", "porta", "bend",
+        ];
+        assert_eq!(spec.params.len(), want.len());
+        for (id, symbol) in want.iter().enumerate() {
+            let p = &spec.params[id];
+            assert_eq!(p.id as usize, id, "row {id} is addressed as {}", p.id);
+            assert_eq!(&p.symbol, symbol, "id {id} is not {symbol}");
+        }
+        let values = spec.defaults();
+        for p in spec.params {
+            let reading = describe(SAMPLER_PATH, p.id, p.default, &values);
+            assert!(!reading.is_empty(), "{} reads nothing", p.symbol);
+            let choices = choices(SAMPLER_PATH, p.id);
+            if p.steps >= 2 {
+                assert_eq!(
+                    choices.len(),
+                    p.steps as usize,
+                    "{} offers {} positions for {} steps",
+                    p.symbol,
+                    choices.len(),
+                    p.steps
+                );
+                let at = crate::units::sampler::step_index(p.default, p.steps);
+                assert_eq!(
+                    choices[at], reading,
+                    "{}'s reading is not its position's word",
+                    p.symbol
+                );
+            } else {
+                assert!(choices.is_empty(), "{} is continuous but offers positions", p.symbol);
+            }
+        }
+        // The readings the brief names, by the kernel's own maps.
+        assert_eq!(describe(SAMPLER_PATH, 1, 1.0, &values), "one-shot");
+        assert_eq!(describe(SAMPLER_PATH, 0, 0.5, &values), "1.00x");
+        assert_eq!(describe(SAMPLER_PATH, 13, 1.0, &values), "32");
+        assert_eq!(describe(SAMPLER_PATH, 15, 0.0, &values), "0 semi");
+        assert_eq!(describe(SAMPLER_PATH, 10, 1.0, &values), "on");
+        assert!(describe(SAMPLER_PATH, 2, 1.0, &values).contains("+24"));
+        assert!(describe(SAMPLER_PATH, 3, 0.0, &values).contains("-100"));
+        // Portamento at rest is OFF, not "0 ms": a time of zero is a knob
+        // that is out of circuit, and the analog's glide says so too.
+        assert_eq!(describe(SAMPLER_PATH, 14, 0.0, &values), "off");
+    }
+
+    /// **The published defaults ARE the kernel's.** The table cannot call
+    /// `sampler::default_norm` — `ParamSpec::default` is a `const` field and
+    /// that is a `fn` — so the four tapered rests are spelled twice, once as
+    /// arithmetic in a comment and once as the decimal a `const` can hold.
+    /// This is the join: it is the only thing standing between the face's
+    /// rest and the kernel's, and a drift between those two is a bay that
+    /// opens sounding different from the one the tests measured.
+    #[test]
+    fn the_samplers_defaults_are_the_kernels_own() {
+        for p in &SAMPLER_FACE_PARAMS {
+            let want = crate::units::sampler::default_norm(p.id);
+            assert!(
+                (p.default - want).abs() < 1e-6,
+                "{} rests at {} in the table and {want} in the kernel",
+                p.symbol,
+                p.default
+            );
+        }
+        // And the brief's own numbers, read back through the maps.
+        use crate::units::sampler as k;
+        let at = |id: u32| SAMPLER_FACE_PARAMS[id as usize].default;
+        assert!((k::secs(at(k::P_ATTACK), k::ATTACK_SECS) - 0.005).abs() < 1e-5);
+        assert!((k::secs(at(k::P_DECAY), k::DECAY_SECS) - 0.20).abs() < 1e-4);
+        assert!((k::secs(at(k::P_RELEASE), k::RELEASE_SECS) - 0.15).abs() < 1e-4);
+        assert!((k::secs(at(k::P_XFADE), k::XFADE_MS / 1000.0) * 1000.0 - 10.0).abs() < 1e-2);
+        assert_eq!(k::step_index(at(k::P_VOICES), k::MAX_VOICES as i32) + 1, 16);
+        assert_eq!(k::step_index(at(k::P_BEND), k::BEND_MAX_SEMIS + 1), 2);
+        assert!((at(k::P_VOL) * k::VOL_MAX - 1.0).abs() < 1e-6);
+        assert!((k::bipolar(at(k::P_TRANSPOSE), k::TRANSPOSE_SEMIS)).abs() < 1e-4);
+        assert!((k::bipolar(at(k::P_FINE), k::FINE_CENTS)).abs() < 1e-3);
+    }
+
+    /// **The sampler's file is NAMED in its state, never carried in it.**
+    /// Three extra symbols, round-tripping through the same blob the knobs
+    /// use — and a blob from a build that had never heard of them still
+    /// loads, because that is what the symbol space is for. The failure this
+    /// prevents is the one the IR unit met: a bay that reopens pointing at
+    /// nothing, silently, with the project claiming it is fine.
+    #[test]
+    fn the_samplers_file_survives_its_own_state_blob() {
+        let spec = spec_for(SAMPLER_PATH).unwrap();
+        assert!(is_extra_symbol(SAMPLER_PATH, "sample_path"));
+        assert!(is_extra_symbol(SAMPLER_PATH, "sample_name"));
+        assert!(is_extra_symbol(SAMPLER_PATH, "root_key"));
+        assert!(!is_extra_symbol(SAMPLER_PATH, "ir_path"));
+        assert!(!is_extra_symbol(ANALOG_PATH, "sample_path"));
+        let mut values = spec.defaults();
+        values[4] = 0.42;
+        // A path with spaces and an equals sign, because a sample library
+        // folder is exactly where both live.
+        let extra = vec![
+            ("sample_path".to_owned(), "/Samples/My Kit/kick=hard.wav".to_owned()),
+            ("sample_name".to_owned(), "kick=hard.wav".to_owned()),
+            ("root_key".to_owned(), "36".to_owned()),
+        ];
+        let blob = state_text(spec, &values, &extra);
+        assert_eq!(values_from_state(spec, blob.as_bytes()).expect("parses"), values);
+        assert_eq!(extra_from_state(spec, blob.as_bytes()), extra);
+    }
+
+    /// **A seated sampler plays the file it is handed, and is silent
+    /// without one.** The whole hand-off in one test: the bay is built from
+    /// the table, fed a note through the VST3-shaped road every voice
+    /// travels, and handed the lane's sample as a borrow. The empty half
+    /// matters as much — a bay whose file has not landed yet must make no
+    /// sound rather than whatever was in the buffers.
+    #[test]
+    fn a_seated_sampler_plays_what_it_is_handed_and_nothing_otherwise() {
+        let spec = spec_for(SAMPLER_PATH).unwrap();
+        let mut unit = spec.create(48_000.0, &spec.defaults());
+        let notes = [tangent_host::Note { offset: 0, pitch: 60, velocity: 1.0, on: true }];
+        let sample = test_sample(24_000, 48_000);
+        let mut bufs = vec![vec![0.0f32; 512]; 2];
+
+        // With nothing loaded: a note, and silence.
+        unit.process_voice(
+            &notes,
+            &[],
+            &[],
+            crate::analog::arp::Transport::default(),
+            None,
+            512,
+            &mut bufs,
+        );
+        let quiet = bufs[0].iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        assert_eq!(quiet, 0.0, "an empty sampler bay made {quiet} of sound");
+
+        // And with the file: the same note, heard, on both channels.
+        unit.process_voice(
+            &[],
+            &[],
+            &[],
+            crate::analog::arp::Transport::default(),
+            Some(&sample),
+            512,
+            &mut bufs,
+        );
+        let peak = bufs[0].iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        assert!(peak > 0.05, "the loaded sampler only reached {peak}");
+        assert_eq!(bufs[0], bufs[1], "the file is mono-summed but the bay is not");
+
+        // An effect's road answers silence rather than passing audio
+        // through — a voice that leaked its input would double the channel.
+        let input = vec![vec![0.7f32; 512]; 2];
+        let mut out = vec![vec![0.0f32; 512]; 2];
+        unit.process(&input, 512, &mut out);
+        assert!(out.iter().all(|c| c.iter().all(|s| *s == 0.0)));
+    }
+
+    /// **A block longer than the scratch is the same audio as the same
+    /// block in pieces.** The pass loop re-bases its events, and an event
+    /// left at its original offset would fire in every pass — a note
+    /// retriggering four times inside one offline block, which is what an
+    /// export sounds like when this is wrong.
+    #[test]
+    fn a_long_block_is_the_same_audio_as_the_short_blocks_that_make_it() {
+        let spec = spec_for(SAMPLER_PATH).unwrap();
+        let sample = test_sample(48_000, 48_000);
+        let long = {
+            let mut unit = spec.create(48_000.0, &spec.defaults());
+            let mut bufs = vec![vec![0.0f32; 2_048]; 2];
+            let notes = [tangent_host::Note { offset: 700, pitch: 67, velocity: 0.8, on: true }];
+            unit.process_voice(
+                &notes,
+                &[],
+                &[],
+                crate::analog::arp::Transport::default(),
+                Some(&sample),
+                2_048,
+                &mut bufs,
+            );
+            bufs[0].clone()
+        };
+        let short = {
+            let mut unit = spec.create(48_000.0, &spec.defaults());
+            let mut out = Vec::new();
+            let mut bufs = vec![vec![0.0f32; 512]; 2];
+            for block in 0..4 {
+                let notes = [tangent_host::Note {
+                    offset: 700 - block * 512,
+                    pitch: 67,
+                    velocity: 0.8,
+                    on: true,
+                }];
+                let here: &[tangent_host::Note] = if block == 1 { &notes } else { &[] };
+                unit.process_voice(
+                    here,
+                    &[],
+                    &[],
+                    crate::analog::arp::Transport::default(),
+                    Some(&sample),
+                    512,
+                    &mut bufs,
+                );
+                out.extend_from_slice(&bufs[0]);
+            }
+            out
+        };
+        assert_eq!(long.len(), short.len());
+        for (i, (a, b)) in long.iter().zip(&short).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "frame {i} differs: {a} in one pass, {b} in four"
             );
         }
     }
