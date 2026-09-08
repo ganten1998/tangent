@@ -5678,6 +5678,7 @@ impl TangentApp {
                 file_s,
                 wave_from_s: 0.0,
                 wave_span_s: span_s,
+                peaks: None,
             }
         };
         self.set_clip_infos(vec![
@@ -38885,7 +38886,7 @@ mod tests {
         std::fs::write(&file, b"pcm, allegedly").expect("write");
         app.import_audio_at(&file, 4, 10.0).expect("import");
         let id = app.arrangement().clips[0].id;
-        app.set_clip_infos(vec![crate::ports::ClipInfo { id: id, wave: vec![0.5; 10], file_s: 8.0, wave_from_s: 0.0, wave_span_s: 8.0 }]);
+        app.set_clip_infos(vec![crate::ports::ClipInfo { id: id, wave: vec![0.5; 10], file_s: 8.0, wave_from_s: 0.0, wave_span_s: 8.0, peaks: None }]);
         app.arr_resolve_len(id);
 
         app.arr_selected = Some(id);
@@ -38933,7 +38934,7 @@ mod tests {
         app.import_audio_at(&file, 4, 12.0).expect("import");
         let ids: Vec<u64> = app.arrangement().clips.iter().map(|c| c.id).collect();
         for &id in &ids {
-            app.set_clip_infos(vec![crate::ports::ClipInfo { id: id, wave: vec![0.5; 10], file_s: 8.0, wave_from_s: 0.0, wave_span_s: 8.0 }]);
+            app.set_clip_infos(vec![crate::ports::ClipInfo { id: id, wave: vec![0.5; 10], file_s: 8.0, wave_from_s: 0.0, wave_span_s: 8.0, peaks: None }]);
             app.arr_resolve_len(id);
         }
         // The whole group is selected; the copy carries all of it.
@@ -38985,7 +38986,7 @@ mod tests {
         app.import_audio_at(&file, 4, 10.0).expect("import");
         let id = app.arrangement().clips[0].id;
         // The host met the file: 60 seconds long.
-        app.set_clip_infos(vec![crate::ports::ClipInfo { id: id, wave: vec![0.5; 10], file_s: 60.0, wave_from_s: 0.0, wave_span_s: 60.0 }]);
+        app.set_clip_infos(vec![crate::ports::ClipInfo { id: id, wave: vec![0.5; 10], file_s: 60.0, wave_from_s: 0.0, wave_span_s: 60.0, peaks: None }]);
         app.arr_resolve_len(id);
         assert!((app.arrangement().clips[0].len_s - 60.0).abs() < 1e-9);
 
@@ -53940,6 +53941,7 @@ mod folder_tests {
             file_s: 4.0,
             wave_from_s: 0.0,
             wave_span_s: 4.0,
+            peaks: None,
         }]);
         a.settings.arr_snap = false;
         a.arr_trim_right(audio.id, 12.0);

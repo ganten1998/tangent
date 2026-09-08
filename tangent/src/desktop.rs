@@ -9239,6 +9239,7 @@ impl DesktopApp {
                 file_s,
                 wave_from_s,
                 wave_span_s,
+                peaks: None,
             });
         }
         self.app.set_clip_infos(clip_infos);

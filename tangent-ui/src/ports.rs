@@ -41,6 +41,15 @@ pub struct ClipInfo {
     pub wave_from_s: f64,
     /// How many seconds it covers. Zero means there is no picture.
     pub wave_span_s: f64,
+    /// **The file's picture at every zoom** — a min/max pyramid the host
+    /// builds once per decode (see [`crate::peaks::Peaks`]) and shares for
+    /// the life of the file. `None` until the file is decoded, or for a file
+    /// that would not decode. A painter that has this needs nothing above:
+    /// it reads any window at draw time, so the view never waits on the host
+    /// and the host never re-walks samples for a zoom. The `wave*` fields
+    /// are the older, host-drawn picture and stay until every reader has
+    /// moved over.
+    pub peaks: Option<std::sync::Arc<crate::peaks::Peaks>>,
 }
 
 use crate::midi_event::MidiEvent;
