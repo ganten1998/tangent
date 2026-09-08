@@ -4701,15 +4701,21 @@ impl DesktopApp {
         // bay lands, and everything that changes a sampler's file changes
         // the bay's state, which is a bay landing.
         //
-        // MERGE-ME(ui): the app's own road, once the port exists. It writes
-        // the chosen file into the bay's state and marks the bay for a
-        // reload, which is how a picked file persists into the project —
-        // `bind_insert_ir` further down this file is the same three writes:
+        // **The file the face chose, bound into the bay's own state.**
         //
-        // while let Some((lane, path)) = self.app.take_sampler_load() {
-        //     self.bind_insert_sample(lane, 0, &path.to_string_lossy(),
-        //                             crate::instrument::SAMPLER_ROOT_KEY);
-        // }
+        // Not kept in a side table: writing it into the BAY is what makes a
+        // picked sample survive a save and a reopen, because the bay's state
+        // is what a project writes down. `bind_insert_ir` further down this
+        // file is the same three writes for an impulse, and this road was
+        // built to match it.
+        while let Some((lane, path)) = self.app.take_sampler_load() {
+            self.bind_insert_sample(
+                lane,
+                0,
+                &path.to_string_lossy(),
+                crate::instrument::SAMPLER_ROOT_KEY,
+            );
+        }
         if std::mem::take(&mut self.recorder.sampler_retry) {
             self.sampler_owed = true;
         }
@@ -5397,8 +5403,8 @@ impl DesktopApp {
                 // the unit's folder and re-pushing the rows, so what a panel
                 // shows is what the disk holds — the rule the request enum
                 // promises.
-                R::SavePreset { unit, name, values } => {
-                    self.save_unit_preset(&unit, &name, &values);
+                R::SavePreset { unit, name, values, extra } => {
+                    self.save_unit_preset(&unit, &name, &values, &extra);
                     self.push_preset_rows(&unit);
                 }
                 R::LoadPreset { unit, path } => {
@@ -5675,7 +5681,18 @@ impl DesktopApp {
     /// The filename is the SANITIZED name; the typed name goes inside the
     /// file. Same name, same unit, same file: saving "Warm Bus" twice is an
     /// update, not a "Warm Bus (2)".
-    fn save_unit_preset(&mut self, unit: &str, name: &str, values: &[(String, f64)]) {
+    /// **A preset remembers the FILE as well as the knobs.** `state` is the
+    /// face's `extra` handed straight through — the sampler's loaded sample,
+    /// the convolver's impulse. Without it a sampler patch reopens with the
+    /// right envelope over silence, which is the fault the sampler's own
+    /// lane found and the convolver has been quietly carrying.
+    fn save_unit_preset(
+        &mut self,
+        unit: &str,
+        name: &str,
+        values: &[(String, f64)],
+        state: &[(String, String)],
+    ) {
         let dir = self.unit_preset_dir(unit);
         if std::fs::create_dir_all(&dir).is_err() {
             return;
@@ -5687,6 +5704,7 @@ impl DesktopApp {
             unit: unit.to_owned(),
             name: name.trim().to_owned(),
             values: values.to_vec(),
+            state: state.to_vec(),
             extra: Default::default(),
         };
         let tmp = path.with_extension("tangentpreset.tmp");
@@ -5844,11 +5862,9 @@ impl DesktopApp {
     /// unity travels with it; out of the wire's range it is the middle C
     /// `SAMPLER_ROOT_KEY` names, which is what an unset one has always meant.
     ///
-    /// MERGE-ME(ui): nothing calls this yet — the app's `take_sampler_load`
-    /// is the caller, and it is the sibling's. The `allow` goes with the
-    /// call site, in `per_frame` beside the drumpad's retry.
+    /// Called once a frame from `per_frame`, draining the app's
+    /// `take_sampler_load` queue — the road a face's chosen file travels.
     #[cfg(feature = "recorder")]
-    #[allow(dead_code)]
     fn bind_insert_sample(&mut self, lane: usize, slot: usize, path: &str, root_key: u8) -> bool {
         let Some(e) = self.recorder.engine.as_ref() else {
             return false;
@@ -10599,10 +10615,10 @@ impl DesktopApp {
             // draws the waveform from — already built beside the samples by
             // `Decoded::of`, so this is a clone of an `Arc` and not a second
             // walk of the audio — and whether the file is simply gone.
-            let _name = sample.as_ref().map(|s| s.name.clone()).unwrap_or_default();
-            let _seconds = decoded.as_ref().map_or(0.0, |c| c.clip.seconds());
-            let _peaks = decoded.as_ref().map(|c| Arc::clone(&c.peaks));
-            let _missing = want.is_some() && decoded.is_none();
+            let name = sample.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+            let seconds = decoded.as_ref().map_or(0.0, |c| c.clip.seconds());
+            let peaks = decoded.as_ref().map(|c| Arc::clone(&c.peaks));
+            let missing = want.is_some() && decoded.is_none();
             // **What is actually being SENT**, read off the sample itself
             // rather than off the wish above. `source` is the sample's own
             // record of where it came from — the field a reopened project
@@ -10619,16 +10635,19 @@ impl DesktopApp {
                 if let Some(slot) = self.sampler_have.get_mut(lane) {
                     *slot = sent;
                 }
-                // MERGE-ME(ui): the sibling's port, once `ports::SamplerInfo`
-                // and `TangentApp::set_sampler_info` exist. Drop the four
-                // underscores above when this comes back:
-                //
-                // self.app.set_sampler_info(lane, tangent_ui::ports::SamplerInfo {
-                //     name: _name,
-                //     seconds: _seconds,
-                //     peaks: _peaks,
-                //     missing: _missing,
-                // });
+                // **What the face draws, told by the road that actually
+                // delivered it.** Reported inside the landed arm so the panel
+                // can never show a waveform for a sample the audio thread
+                // refused — the drumpad's own lesson, one file up.
+                self.app.set_sampler_info(
+                    lane,
+                    tangent_ui::ports::SamplerInfo {
+                        name,
+                        seconds,
+                        peaks,
+                        missing,
+                    },
+                );
             } else {
                 // **The face only draws once the file actually LANDED.** A
                 // full ring under a stalled callback — or no engine at all —
@@ -12969,6 +12988,9 @@ fn seed_factory_presets(unit: &str, dir: &std::path::Path) {
             version: tangent_ui::preset::PRESET_VERSION,
             unit: unit.to_owned(),
             name: f.name.to_owned(),
+            // A shipped preset carries knobs only; nothing factory-made
+            // names a file on this disk.
+            state: Vec::new(),
             values: f
                 .values()
                 .into_iter()
@@ -19966,16 +19988,6 @@ mod tests {
         // a face to open.
         for unit in crate::builtin_fx::UNITS {
             if unit.path == crate::builtin_fx::TRIM_PATH {
-                continue;
-            }
-            // MERGE-ME(ui): delete these four lines. The sampler's engine
-            // half landed before its face did, and this exemption is written
-            // so that it stops applying the moment `faces::SUITE_UNITS`
-            // grows its row — the second condition goes false and the
-            // assertion below runs on the sampler like everything else.
-            if unit.path == crate::builtin_fx::SAMPLER_PATH
-                && tangent_ui::faces::suite_unit(unit.path).is_none()
-            {
                 continue;
             }
             assert!(
