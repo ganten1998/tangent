@@ -13118,9 +13118,36 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // accident, because saving makes the project clean and the second
         // ask returns false on its own.
         if self.quit_allowed {
+            self.flush_settings_save();
             return false;
         }
-        self.ask_before(AfterSave::Quit)
+        if self.ask_before(AfterSave::Quit) {
+            return true;
+        }
+        // **A quit that proceeds pays the owed settings write first.**
+        //
+        // Undo and redo owe their desk to the debounce (`save_settings_soon`,
+        // 700 ms) instead of pretty-printing the settings file on every
+        // Ctrl+Z. The debounce drains in the frame tick, and a window that
+        // is closing has no next frame — so Ctrl+Z then Cmd+Q inside the
+        // window left settings.json holding the PRE-undo desk, and the next
+        // launch reopens the project against the settings' desk, not the
+        // document's: the undone fader back, under a clean title bar. Both
+        // roads out of the app come through here — a clean project's close,
+        // and the host's Close after the prompt was answered (`quit_allowed`)
+        // — so this is the one place that can settle the debt. Idempotent:
+        // an on-exit flush in the host finds nothing owed.
+        self.flush_settings_save();
+        false
+    }
+
+    /// Pay the debounced settings write now, if one is owed. Nothing is
+    /// written when nothing is owed, so it can be called from every road
+    /// out without a second write.
+    pub fn flush_settings_save(&mut self) {
+        if self.settings_save_at.take().is_some() {
+            self.save_settings();
+        }
     }
 
     /// The host's cue that the answer was "go", taken once.
@@ -52618,6 +52645,44 @@ mod folder_tests {
         app.redo();
         assert!((app.settings.master_gain - 0.25).abs() < 1e-9, "redo did not restore the desk");
         assert_eq!(app.settings_writes.get(), 0, "redo wrote the settings synchronously");
+    }
+
+    /// **A quit that proceeds pays the owed settings write first.** Undo
+    /// owes its desk to the 700 ms debounce; a quit inside that window
+    /// used to leave settings.json holding the pre-undo desk, and the next
+    /// launch reopens the project against the settings' desk. Both roads
+    /// out pass through `intercept_quit`: the clean close, and the host's
+    /// Close after the prompt was answered. Counted, like the other three.
+    #[test]
+    fn a_quit_that_proceeds_pays_the_owed_settings_write() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.undo_reset();
+        let was = app.settings.master_gain;
+        app.settings.master_gain = 0.25;
+        app.arr_save_edits();
+        app.undo();
+        assert!((app.settings.master_gain - was).abs() < 1e-9, "undo did not restore the desk");
+        assert!(app.settings_save_at.is_some(), "undo owes no settings write");
+        app.settings_writes.set(0);
+        // The clean project's close: not intercepted, and the debt is paid.
+        assert!(!app.intercept_quit(), "a clean project asked");
+        assert_eq!(app.settings_writes.get(), 1, "the owed write was not paid at quit");
+        assert!(app.settings_save_at.is_none(), "the debt stands after it was paid");
+        assert!(
+            (Settings::load().master_gain - was).abs() < 1e-9,
+            "the file holds the pre-undo desk"
+        );
+        // The answered prompt's close comes back through `quit_allowed`,
+        // and pays whatever is owed by then.
+        app.quit_allowed = true;
+        app.settings_save_at = Some(std::time::Instant::now() + GEOMETRY_SAVE_DELAY);
+        app.settings_writes.set(0);
+        assert!(!app.intercept_quit());
+        assert_eq!(app.settings_writes.get(), 1, "the answered quit did not pay");
+        // And a close with nothing owed writes nothing.
+        app.settings_writes.set(0);
+        assert!(!app.intercept_quit());
+        assert_eq!(app.settings_writes.get(), 0, "a quit with nothing owed wrote anyway");
     }
 
     /// **A seat named past the map by a document cannot size the desk.**
