@@ -2660,6 +2660,15 @@ fn draw_note_miniature(
     // kind that has no loop to skip, so the span would be a walk over
     // thousands of notes bought and thrown away every frame.
     let (mut first_s, mut last_s) = (f64::INFINITY, f64::NEG_INFINITY);
+    // For the clip of ONE pass: the longest mark, and whether the notes are
+    // in time order — gathered in the same pass as the pitch range, so the
+    // clip that does not loop is walked ONCE for its facts and the marks
+    // below are drawn from the notes under the window alone. A recorded
+    // part is exactly this clip: thousands of notes, no loop to skip, and
+    // it was walked twice a frame however far in the view was zoomed.
+    let mut longest = 0.02f64;
+    let mut in_order = true;
+    let mut prev_at = f64::NEG_INFINITY;
     if passes > 1 {
         for n in clip.notes {
             lo = lo.min(n.key);
@@ -2671,6 +2680,11 @@ fn draw_note_miniature(
         for n in clip.notes {
             lo = lo.min(n.key);
             hi = hi.max(n.key);
+            longest = longest.max(n.dur_s);
+            // A NaN compares false and marks the clip out of order, which
+            // sends it down the whole walk: slower, never wrong.
+            in_order &= n.at_s >= prev_at;
+            prev_at = n.at_s;
         }
     }
     if lo > hi {
@@ -2775,7 +2789,31 @@ fn draw_note_miniature(
         vec![0u64; cols as usize * 2]
     };
     let cols = cols as usize;
-    for (pass, n) in seen.flat_map(|k| clip.notes.iter().map(move |n| (k, n))) {
+    // **The notes under the window, when the clip is one pass in time
+    // order.** `mark` answers None for a note whose span misses `inner`, so
+    // the walk used to visit every note to learn which few to draw; with
+    // the notes sorted by their start the two edges are a binary search
+    // each. The left edge is pulled back by the longest note, because a
+    // note that STARTS before the window can still reach into it. Same
+    // marks as the whole walk — the notes skipped are exactly the ones
+    // `mark` would have refused — and
+    // `a_recorded_part_draws_the_same_picture_as_the_plain_walk` says so on
+    // a sorted part, a reversed one and a shuffled one.
+    let notes: &[crate::arrangement::ArrNote] = if passes == 1 && in_order {
+        let at = |x: f32| (f64::from(x) - f64::from(fx0)) / f64::from(fw) * len + clip.offset_s;
+        let s_lo = at(inner.left()) - longest;
+        let s_hi = at(inner.right());
+        if s_lo.is_finite() && s_hi.is_finite() {
+            let a = clip.notes.partition_point(|n| n.at_s < s_lo);
+            let b = clip.notes.partition_point(|n| n.at_s < s_hi);
+            &clip.notes[a.min(b)..b]
+        } else {
+            clip.notes
+        }
+    } else {
+        clip.notes
+    };
+    for (pass, n) in seen.flat_map(|k| notes.iter().map(move |n| (k, n))) {
         if let Some((x0, x1, k)) = mark(pass, n) {
             // **Wide enough to show where it begins**: draw it as the span
             // it is. A held note crosses many columns and reads as a line;
@@ -10231,6 +10269,58 @@ selected: false,
         }
     }
 
+    /// **A recorded part — one pass, thousands of notes — draws the plain
+    /// walk's picture from the notes under the window alone.**
+    ///
+    /// The clip that does not loop is the one `visible_passes` cannot help
+    /// and the one with the most notes, and it was walked whole twice a
+    /// frame. The windowed walk depends on the notes being in time order,
+    /// which the commit points keep but nothing guarantees, so the same
+    /// part is drawn sorted, reversed and shuffled: the sorted one takes
+    /// the window and the other two the whole walk, and all three must
+    /// light the plain walk's cells at every zoom and scroll, both trims.
+    #[test]
+    fn a_recorded_part_draws_the_same_picture_as_the_plain_walk() {
+        let bar_s = 2.0;
+        let one = a_looped_bar(bar_s);
+        // A hundred bars: the views reach sixty, and the plain walk this is
+        // held against draws every note of every bar in debug.
+        let sorted: Vec<crate::arrangement::ArrNote> = (0..100)
+            .flat_map(|b| {
+                one.iter().map(move |n| crate::arrangement::ArrNote {
+                    at_s: n.at_s + b as f64 * bar_s,
+                    ..*n
+                })
+            })
+            .collect();
+        assert!(sorted.windows(2).all(|w| w[0].at_s <= w[1].at_s));
+        let mut reversed = sorted.clone();
+        reversed.reverse();
+        let mut shuffled = sorted.clone();
+        let mut seed = 11u64;
+        for i in (1..shuffled.len()).rev() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            shuffled.swap(i, (seed >> 33) as usize % (i + 1));
+        }
+        // Both trims for the windowed road; the whole-walk roads at one.
+        for (what, notes, trims) in [
+            ("sorted", &sorted, &[0.0, bar_s * 0.375][..]),
+            ("reversed", &reversed, &[bar_s * 0.375][..]),
+            ("shuffled", &shuffled, &[0.0][..]),
+        ] {
+            for &offset_s in trims {
+                let clips = [ClipView {
+                    loop_s: 0.0,
+                    offset_s,
+                    notes,
+                    ..a_looped_clip(notes, bar_s, 100.0)
+                }];
+                assert!(clips[0].len_s > 120.0, "{what}: the part must outlast the views");
+                the_two_miniatures_agree(&clips, offset_s);
+            }
+        }
+    }
+
     /// **A held note does not veto the merge, and is not folded into it.**
     ///
     /// This is the case the first version of the fix got wrong, and it got it
@@ -11171,10 +11261,18 @@ mod miniature_cost_probe {
         let looped_music = a_bar(bar_s);
         let looped_short = a_bar_of_short_notes(bar_s);
         let flat = a_flat_part(bar_s, 200);
+        // The same part in TIME ORDER, which is how a committed clip holds
+        // its notes (the MIDI commit and the recorder both sort by at_s):
+        // `a_bar` appends its held notes after the short ones, so `flat` is
+        // out of order within every bar and takes the whole walk, while
+        // this one is walked only under the window. Both are measured.
+        let mut recorded = flat.clone();
+        recorded.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
         for (part, notes, loop_s) in [
             ("a looped clip of music", &looped_music, bar_s),
             ("a looped clip of sub-pixel notes", &looped_short, bar_s),
             ("a clip that does not loop", &flat, 0.0),
+            ("a recorded clip in time order", &recorded, 0.0),
         ] {
         let clips: Vec<ClipView<'_>> = (0..VISIBLE_LANES)
             .map(|lane| ClipView {
