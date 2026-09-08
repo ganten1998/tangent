@@ -2012,9 +2012,6 @@ mod tests {
         settle_submenu(open, pending, hovered, plain, armed, still, false, now)
     }
 
-    /// The REAL menu, at the size it really measures out at, on the owner's
-    /// own screen — the case the arithmetic above is abstract about.
-    #[test]
     /// **The box is wide enough for the words, in every bundled face.**
     ///
     /// The owner reported the Project menu not fitting its font, and only on
@@ -2100,6 +2097,9 @@ mod tests {
         }
     }
 
+    /// The REAL menu, at the size it really measures out at, on the owner's
+    /// own screen — the case the arithmetic above is abstract about.
+    #[test]
     fn the_app_menu_opens_under_the_hand_on_a_real_screen() {
         let ctx = egui::Context::default();
         fonts::install(&ctx, fonts::FontChoice::default(), None);

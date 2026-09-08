@@ -328,9 +328,9 @@ mod tests {
     /// is covered the day it is added rather than the day somebody notices.
     #[test]
     fn the_font_choice_reads_back_what_it_wrote() {
-        for f in super::FontChoice::ALL {
+        for f in FontChoice::ALL {
             assert_eq!(
-                super::FontChoice::from_key(f.key()),
+                FontChoice::from_key(f.key()),
                 f,
                 "{:?} writes {:?} and reads back as something else",
                 f,
@@ -338,8 +338,8 @@ mod tests {
             );
         }
         assert_eq!(
-            super::FontChoice::from_key("no such face"),
-            super::FontChoice::default(),
+            FontChoice::from_key("no such face"),
+            FontChoice::default(),
             "an unknown key still falls back to the default"
         );
     }
