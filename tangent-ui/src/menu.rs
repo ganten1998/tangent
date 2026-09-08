@@ -2015,6 +2015,91 @@ mod tests {
     /// The REAL menu, at the size it really measures out at, on the owner's
     /// own screen — the case the arithmetic above is abstract about.
     #[test]
+    /// **The box is wide enough for the words, in every bundled face.**
+    ///
+    /// The owner reported the Project menu not fitting its font, and only on
+    /// one of the three. The width is measured at open time from
+    /// `MENU_FONT_SIZE` in the bold family, and the rows are drawn by
+    /// `menu_button` with `TextWrapMode::Extend` — which does not wrap and
+    /// does not shrink, it simply runs past the edge. So a measurement that
+    /// disagrees with the drawing by any amount is a word off the end of the
+    /// menu, and nothing in egui will say so.
+    ///
+    /// Asserted over `FontChoice::ALL` and over every cut of the menu, so a
+    /// fourth face or a new row is covered the day it lands.
+    #[test]
+    fn every_menu_is_wide_enough_for_its_own_words_in_every_face() {
+        for face in fonts::FontChoice::ALL {
+            let ctx = egui::Context::default();
+            fonts::install(&ctx, face, None);
+            fonts::apply_text_styles(&ctx);
+            let _ = ctx.run(Default::default(), |_| {});
+            let mut v = view();
+            v.recorder_on = true;
+            v.fretboard_on = true;
+            v.staff_on = true;
+            v.chord_strip = true;
+            v.camera_pane_on = true;
+            let m = MenuState::open(&ctx, v, Pos2::new(100.0, 100.0), None);
+            // What the rows will actually be drawn at: the Button text style,
+            // which is what `menu_button` uses, NOT the constant the geometry
+            // measured with.
+            let drawn = ctx.style().text_styles[&egui::TextStyle::Button].clone();
+            for e in &m.entries {
+                let (label, extra) = match e {
+                    Entry::Separator => continue,
+                    Entry::Item { label, .. } => (label.clone(), 0.0),
+                    Entry::Submenu { label, .. } => {
+                        let arrow = ctx.fonts_mut(|f| {
+                            f.layout_no_wrap(ARROW.to_owned(), drawn.clone(), Color32::WHITE)
+                                .size()
+                                .x
+                        });
+                        (label.clone(), arrow)
+                    }
+                };
+                let w = ctx.fonts_mut(|f| {
+                    f.layout_no_wrap(label.clone(), drawn.clone(), Color32::WHITE)
+                        .size()
+                        .x
+                });
+                let needs = w + extra + 2.0 * PAD_X;
+                assert!(
+                    m.size.x + 0.5 >= needs,
+                    "{face:?}: the menu is {:.1} wide and {label:?} needs {needs:.1}",
+                    m.size.x
+                );
+            }
+            // **And every SUBMENU, which is where the Project rows live.**
+            // Their width is computed by the same formula off their own
+            // items, so the same disagreement is possible one level down and
+            // is harder to notice: a submenu is only on screen while the
+            // pointer is on its parent row.
+            let mut sub_i = 0usize;
+            for e in &m.entries {
+                let Entry::Submenu { label: parent, items } = e else {
+                    continue;
+                };
+                let box_w = m.subs[sub_i].size.x;
+                sub_i += 1;
+                for it in items {
+                    let w = ctx.fonts_mut(|f| {
+                        f.layout_no_wrap(it.label.clone(), drawn.clone(), Color32::WHITE)
+                            .size()
+                            .x
+                    });
+                    let needs = w + 2.0 * PAD_X;
+                    assert!(
+                        box_w + 0.5 >= needs,
+                        "{face:?}: the {parent:?} submenu is {box_w:.1} wide and \
+                         {:?} needs {needs:.1}",
+                        it.label
+                    );
+                }
+            }
+        }
+    }
+
     fn the_app_menu_opens_under_the_hand_on_a_real_screen() {
         let ctx = egui::Context::default();
         fonts::install(&ctx, fonts::FontChoice::default(), None);
