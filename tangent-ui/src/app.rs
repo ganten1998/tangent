@@ -12981,6 +12981,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// Step a lane to the next mode.
+    ///
+    /// **Nothing calls this, and that is the finding rather than a reason to
+    /// delete it.** `arr_auto_modes` has no other writer outside the tests,
+    /// so every lane answers `AutoMode::Read` for the life of the process:
+    /// `writes()` is false, `record_automation_move` returns at its guard,
+    /// and `auto_suspend_mask` is always zero. The rest of the mode machinery
+    /// IS wired — the desktop reads the mask every frame, the transport
+    /// releases latches on every stop, and the tests in this file exercise
+    /// all five modes — but no control anywhere offers the row that
+    /// `AutoMode::ALL` describes itself as "the order the row cycles them".
+    /// Automation is written the OTHER way today, by arming one parameter
+    /// (`auto_write_if_armed`, whose doc argues for arming over a global
+    /// write mode), so the shipping feature is whole; it is the modes that
+    /// have no door. Whether that door gets built or the modes come out is
+    /// the owner's call, and deleting the only setter would take the question
+    /// with it.
+    #[allow(dead_code)]
     fn arr_cycle_auto_mode(&mut self, lane: usize) {
         use crate::automation::AutoMode;
         let now = self.arr_auto_mode(lane);

@@ -2462,6 +2462,17 @@ impl Settings {
         s
     }
 
+    /// A settings file, or plain defaults if it cannot be used.
+    ///
+    /// **The read half of `save_to`, kept because it is named as one with
+    /// it.** Three comments in this file explain themselves by pointing at
+    /// the pair — the hand-serialised shape at `fretboard_custom_name`, the
+    /// move-aside note in `load` ("`load_from` answers an unreadable file
+    /// with plain defaults, and the app then saves those over it"), and the
+    /// temp-dir note in the tests. `load` reaches the same code through
+    /// `load_report`, because it needs the reason as well as the answer,
+    /// which is why nothing calls this one today.
+    #[allow(dead_code)]
     fn load_from(path: &std::path::Path) -> Self {
         Self::try_load_from(path).unwrap_or_default()
     }
