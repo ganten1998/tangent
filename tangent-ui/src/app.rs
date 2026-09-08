@@ -101,6 +101,15 @@ fn pace_mode() -> Pace {
         _ => Pace::Off,
     })
 }
+/// `IVORY_INLINE=<what>`, read once. The demo hooks in `paint` open a menu,
+/// a dialog or a panel on the first frame so it can be photographed; they
+/// are guarded by `demo_menu_done`, which only flips when a hook FIRES, so
+/// with the variable unset every frame used to walk the environment six
+/// times to learn nothing. Same OnceLock discipline as `pace_mode`.
+fn inline_hook() -> Option<&'static str> {
+    static HOOK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::env::var("IVORY_INLINE").ok()).as_deref()
+}
 const DETECT_TICK: Duration = Duration::from_millis(100);
 const DEBOUNCE_100MS: Duration = Duration::from_millis(100);
 /// Quiet period after a move or resize before window geometry is written back.
@@ -929,6 +938,9 @@ pub struct TangentApp {
     /// The chips' words, refreshed each frame so the borrowed view can
     /// point at them.
     input_chip_texts: Vec<String>,
+    /// The hash of the settings the chip words were last built from. See
+    /// `frame`.
+    input_chip_key: Option<u64>,
     /// The media explorer: where it stands, what it lists, and the scroll.
     media_dir: std::path::PathBuf,
     media_entries: Vec<crate::drumpad_panel::MediaEntry>,
@@ -3365,6 +3377,7 @@ impl TangentApp {
             input_menu: None,
             menu_anchor: egui::Pos2::ZERO,
             input_chip_texts: Vec::new(),
+            input_chip_key: None,
             media_dir: dirs_home(),
             media_entries: Vec::new(),
             media_scroll: 0,
@@ -9056,8 +9069,14 @@ impl TangentApp {
     /// the rows are rebuilt — so the first open of the menu is as instant
     /// as every other. Runs once a frame; rebuilds only on a real change.
     fn tend_menu_cache(&mut self) {
-        let key = self.menu_cache_key_now();
-        if self.menu_rows_cache.is_none() || key != self.menu_cache_key {
+        // Compared in place: `menu_cache_key_now` clones the device name,
+        // and this runs every frame to answer "unchanged" almost always.
+        let name = self.settings.record_audio_device.as_deref().unwrap_or("");
+        let width = usize::from(self.input_width);
+        if self.menu_rows_cache.is_none()
+            || name != self.menu_cache_key.0
+            || width != self.menu_cache_key.1
+        {
             self.refresh_menu_rows();
         }
     }
@@ -30399,10 +30418,27 @@ impl TangentApp {
         self.band_pointer = ctx
             .input(|i| i.pointer.hover_pos())
             .filter(|p| self.last_band.contains(*p));
-        // The input chips' words, refreshed before anything borrows a view.
-        self.input_chip_texts = (0..crate::recorder::CHANNELS)
-            .map(|ch| self.input_chip_text(ch))
-            .collect();
+        // The input chips' words, refreshed before anything borrows a view
+        // — and only when the words can have changed. Thirty-two `format!`s
+        // a frame for text that changes on a settings write; the key is a
+        // hash of the two settings fields the words are made from, so a
+        // frame on which neither moved costs a hash of thirty-two short
+        // strings and no allocation.
+        let chip_key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.settings.channel_inputs.hash(&mut h);
+            self.settings.channel_kinds.hash(&mut h);
+            h.finish()
+        };
+        if self.input_chip_texts.len() != crate::recorder::CHANNELS
+            || self.input_chip_key != Some(chip_key)
+        {
+            self.input_chip_texts = (0..crate::recorder::CHANNELS)
+                .map(|ch| self.input_chip_text(ch))
+                .collect();
+            self.input_chip_key = Some(chip_key);
+        }
         // The input menu's rows, kept warm: rebuilt the frame the device
         // arrives or changes, so the menu never opens against a cold cache.
         self.tend_menu_cache();
@@ -30843,7 +30879,7 @@ impl TangentApp {
         // having to click, and therefore without taking focus from whatever
         // else is being tested. Environment-gated; ships inert.
         //   IVORY_INLINE=menu /Applications/Tangent.app/Contents/MacOS/tangent
-        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("menu") {
+        if !self.demo_menu_done && inline_hook() == Some("menu") {
             self.demo_menu_done = true;
             let at = ui.max_rect().min + Vec2::new(20.0, 20.0);
             self.open_menu_at(&ctx, at);
@@ -30852,7 +30888,7 @@ impl TangentApp {
         // photographed any other way: it is dismissed by a press anywhere
         // outside it, and taking a screenshot is a press somewhere outside it.
         //   IVORY_INLINE=setup /Applications/Tangent.app/Contents/MacOS/tangent
-        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("setup") {
+        if !self.demo_menu_done && inline_hook() == Some("setup") {
             self.demo_menu_done = true;
             self.setup_open = true;
         }
@@ -30861,7 +30897,7 @@ impl TangentApp {
         // be photographed any other way: it is a child viewport on the
         // desktop, so the compositor's shot never sees it.
         //   IVORY_INLINE=track /Applications/Tangent.app/Contents/MacOS/tangent
-        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("track") {
+        if !self.demo_menu_done && inline_hook() == Some("track") {
             self.demo_menu_done = true;
             self.dialog = Some(dialogs::Dialog::Track {
                 lane: 0,
@@ -30887,7 +30923,7 @@ impl TangentApp {
         //   IVORY_INLINE=audio /Applications/Tangent.app/Contents/MacOS/tangent
         if !self.demo_menu_done
             && self.audio_setup.is_some()
-            && std::env::var("IVORY_INLINE").as_deref() == Ok("audio")
+            && inline_hook() == Some("audio")
         {
             self.demo_menu_done = true;
             self.open_audio_setup();
@@ -30897,7 +30933,7 @@ impl TangentApp {
         // somewhere else.
         //   IVORY_INLINE=mixer /Applications/Tangent.app/Contents/MacOS/tangent
         //
-        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("mixer") {
+        if !self.demo_menu_done && inline_hook() == Some("mixer") {
             self.demo_menu_done = true;
             self.mixer_open = true;
         }
@@ -30906,7 +30942,7 @@ impl TangentApp {
         // inputs. A fake eighteen-in device is the only way to look at the two
         // columns at the size they will really be.
         //   IVORY_INLINE=channels /Applications/Tangent.app/Contents/MacOS/tangent
-        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("channels") {
+        if !self.demo_menu_done && inline_hook() == Some("channels") {
             self.demo_menu_done = true;
             self.dialog = Some(dialogs::Dialog::InputChannels {
                 device: "Scarlett 18i20 USB".to_owned(),
@@ -49058,6 +49094,23 @@ mod tests {").expect("the tests module")];
                 "idle frames in one simulated second, band {}: {frames} (the old tick painted ~30)",
                 if band { "open" } else { "closed" }
             );
+        }
+    }
+
+    /// **Neither `frame` nor `paint` reads the environment.** Six
+    /// `IVORY_INLINE` reads a frame used to run in `paint`, guarded by a
+    /// latch that only flips when a hook fires — with the variable unset,
+    /// six environment walks a frame forever. The read is a `OnceLock`
+    /// now (`inline_hook`), and this keeps it that way.
+    #[test]
+    fn neither_frame_nor_paint_reads_the_environment() {
+        let whole = include_str!("app.rs");
+        let src = &whole[..whole.find("#[cfg(test)]\nmod tests {").expect("the tests module")];
+        for name in ["pub fn frame(&mut self, ctx: &egui::Context)", "fn paint(&mut self, ui: &mut egui::Ui)"] {
+            let at = src.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            let end = src[at + 1..].find("\n    fn ").map_or(src.len(), |n| at + 1 + n);
+            let body = &src[at..end];
+            assert!(!body.contains("std::env::"), "{name} reads the environment inside a frame");
         }
     }
 
