@@ -1812,6 +1812,24 @@ mod shot {
                 eprintln!("no theme called {name}");
             }
         }
+        // **Light mode.** `Settings::default` ships dark, so every picture
+        // this harness ever wrote was one half of a theme — and a shot that
+        // cannot photograph both sides of a toggle cannot settle an argument
+        // about a toggle. (Notes down: `IVORY_DEMO_NOTES`, already honoured.)
+        //   IVORY_SHOT_LIGHT=1 ...
+        if std::env::var("IVORY_SHOT_LIGHT").is_ok() {
+            settings.dark_mode = false;
+        }
+        // The theory band, which ships collapsed and so was never in a shot
+        // either. `1` for all four diagrams, or a `Views::keys` list.
+        //   IVORY_SHOT_THEORY=1 ...
+        if let Ok(which) = std::env::var("IVORY_SHOT_THEORY") {
+            settings.theory_order = if which == "1" {
+                tangent_ui::theory_panel::Views::all().keys()
+            } else {
+                which
+            };
+        }
         // The varispeed dial off its detent, which is the state its lit word
         // and its own colours only exist in.
         //   IVORY_SHOT_VARI=1 ...

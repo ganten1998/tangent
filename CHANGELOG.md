@@ -420,6 +420,35 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **Phosphor's and Nocturne's light mode is a light mode.** Those two are the
+  only themes whose light ground is a near-black — it is what makes them what
+  they are — so the piano has to derive a pale key for them and then put the
+  keyboard the right way up out of it, which it has done since the last
+  release. The page did not follow. It went on reading the near-black the theme
+  declares, so light mode gave a bone keyboard butted against a black theory
+  view with a visible seam between them, and the mode toggle changed nothing
+  about the page at all: the same ground, taking the same pale ink, in both
+  modes. Every other theme's page and keyboard are one continuous colour from
+  the top of the circle of fifths to the bottom of the last natural, and those
+  two are now as well. The page asks the piano what it painted rather than
+  working the same answer out a second time from the same roles, so there is
+  one decision and nothing for a second one to drift from. Nothing moves on the
+  other sixteen themes: their naturals ARE their declared ground, which is
+  exactly what the page used to return.
+
+- **Phosphor's and Nocturne's dark keyboards stopped floating above their own
+  page.** Those two are the only themes that ever named their own dark keys,
+  and they named them back when nothing lifted a dark keyboard off a dark
+  ground by itself. The lift has walked in both modes for a release now, so the
+  two overrides had no work left to do and were doing damage instead: they held
+  the naturals at 0.099 and 0.093 luminance over pages of 0.006 and 0.002,
+  while all sixteen other themes paint their dark naturals exactly ON the page
+  at 0.010 to 0.014. A keyboard is supposed to BE the page it sits on, with
+  only the sharps standing off it. Those two were a mid slab hanging above the
+  theory view with bone sharps on top, which is why the dark mode read bright
+  and the seam between the band and the page was visible. They name their
+  ground and nothing else now, like everybody else.
+
 - **A take that had finished decoding could sit behind the desk.** The window
   rests between animations now, so everything the app does after a frame has to
   ask for the frame that shows it. Five roads did not: a decoded take arriving,
