@@ -2499,6 +2499,12 @@ const WELCOME_H: f32 = 560.0;
 /// is assumed to be, a button's real height against 30, and whatever
 /// `apply_theme` does to spacing. It is the first thing anybody sees, so it
 /// gets a margin rather than a squeeze.
+///
+/// Read only by `the_welcome_card_fits_its_own_text`, which is what it is
+/// for: the number is the margin that test holds `WELCOME_H` to, and both
+/// constants above quote it by name to explain their own values. It is a
+/// stated measurement, not a leftover.
+#[allow(dead_code)]
 const WELCOME_SLACK: f32 = 60.0;
 
 /// The dialog as a window. Wide enough for the left column and the longest

@@ -3050,6 +3050,12 @@ pub fn a11y_nodes(rect: Rect, view: &RecorderView<'_>) -> Vec<crate::a11y::Node>
 /// `Hit::Type` is here for a different reason: it is the TYPED twin of a dial
 /// that already has a node, and a tab order with both in it walks every knob
 /// twice while a screen reader reads it twice.
+///
+/// Read only by that coverage test, deliberately: this list IS the partition
+/// and `name_for`'s catch-all is checked against it, so a control added to
+/// `Layout::targets` and forgotten cannot join the surfaces by accident. The
+/// catch-all's own comment points here.
+#[allow(dead_code)]
 fn is_surface(hit: &Hit) -> bool {
     matches!(
         hit,
@@ -4719,6 +4725,14 @@ pub(crate) const CAP_RIB: Color32 = Color32::from_rgb(0xB4, 0xA8, 0x8C);
 /// Where the red zone starts. The last 6 dB, drawn always rather than only once
 /// something has gone wrong, so the top of the scale means something before the
 /// first take instead of after it.
+///
+/// **The arc is drawn from `VU_MARKS`, and this is what holds the table to
+/// its meaning.** `the_vu_needle_points_at_the_mark_the_face_prints` asserts
+/// the red mark and this number are the same place, and
+/// `the_peak_lamp_does_not_light_on_a_limited_mix` asserts it is still -6
+/// dBFS — so the printed face cannot drift off the decibel it claims. Three
+/// doc comments and one painting comment name it as well.
+#[allow(dead_code)]
 const CLIP_ZONE: f32 = 0.501; // -6 dBFS
 
 /// Where the peak LAMP lights: the last fraction of a decibel.
