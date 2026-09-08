@@ -40617,7 +40617,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// **A rename swallows the frame's keys — no track dies to a title.**
     /// Typing "DDD" or hitting Backspace while renaming a lane used to reach
     /// the Delete-track shortcut, because the arrange key gate did not know a

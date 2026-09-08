@@ -6977,11 +6977,6 @@ mod tests {
         }
     }
 
-    /// **The audio path survives the file, and is sanitised on the way out.**
-    ///
-    /// The three Setup keys, together, because they are read in the same breath
-    /// by the host: a rate this build does not offer, a system that is not
-    /// compiled in, or a channel toggle that failed to persist each produce the
     /// **The Shift+wheel zoom counts survive a relaunch, and a hostile file
     /// cannot put the desk into a shape it cannot draw.** Persisted like the
     /// grid, clamped like every other count.
@@ -7006,11 +7001,6 @@ mod tests {
         assert_eq!(wild.midi_keys_visible, 12, "too few keys clamps to the floor");
     }
 
-    /// same symptom — Setup opens showing something other than what is running.
-    #[test]
-    /// The click's sound is a PATH in the settings file, and the file is the
-    /// only place it lives — a build that lost it on save would put the
-    /// built-in click back every launch, silently.
     #[test]
     fn a_pre_lanes_projects_pad_plugins_follow_their_drumpad() {
         use crate::recorder::{pad_rack_index, DRUM_PADS, INSERTS, STRIPS};
@@ -7065,6 +7055,9 @@ mod tests {
         let _ = DRUM_PADS;
     }
 
+    /// The click's sound is a PATH in the settings file, and the file is the
+    /// only place it lives — a build that lost it on save would put the
+    /// built-in click back every launch, silently.
     #[test]
     fn the_chosen_click_sound_round_trips() {
         let mut s = Settings::default();
@@ -7081,6 +7074,12 @@ mod tests {
         assert!(Settings::from_json(&off.to_json()).click_sample.is_empty());
     }
 
+    /// **The audio path survives the file, and is sanitised on the way out.**
+    ///
+    /// The three Setup keys, together, because they are read in the same breath
+    /// by the host: a rate this build does not offer, a system that is not
+    /// compiled in, or a channel toggle that failed to persist each produce the
+    /// same symptom — Setup opens showing something other than what is running.
     #[test]
     fn the_audio_path_settings_round_trip() {
         let mut s = Settings::default();
