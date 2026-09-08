@@ -886,10 +886,30 @@ const CLIP_WAVE_BUCKETS: usize = 600;
 ///
 /// `max(0.0)` because a negative position is a document that has been edited
 /// by hand, and `as u64` on a negative float saturates to zero anyway; saying
-/// so is better than relying on it.
+/// so is better than relying on it. A NaN is zero for the same reason
+/// (`f64::max` answers the other operand).
+///
+/// **And a ceiling, because the document's seconds have none.** The reader
+/// checks a position for finite and non-negative and nothing else, so
+/// `1e300` is a valid `start_s`; `as u64` on it saturates to `u64::MAX`,
+/// and the engine then adds a length to it — a wrap in release, a panic in
+/// any build with overflow checks, either way on the audio thread from a
+/// number in a file. [`MAX_TIMELINE_FRAMES`] is the one clamp: every
+/// position and length the schedule carries passes through here, so any
+/// sum of a few of them fits a `u64` with room to spare.
 fn frames_at(rate: f64, seconds: f64) -> u64 {
-    (seconds.max(0.0) * rate).round() as u64
+    let frames = (seconds.max(0.0) * rate).round();
+    if frames >= MAX_TIMELINE_FRAMES as f64 {
+        MAX_TIMELINE_FRAMES
+    } else {
+        frames as u64
+    }
 }
+
+/// The furthest frame the timeline reaches: a week at 192 kHz. No song is a
+/// week long; the point is that it is finite, and that four of them added
+/// together are nowhere near `u64::MAX`. See [`frames_at`].
+const MAX_TIMELINE_FRAMES: u64 = 7 * 24 * 3_600 * 192_000;
 
 /// **A clip's picture for a window, read from its pyramid.** `buckets`
 /// `(min, max)` pairs over `span_s` seconds beginning `into_s` into the
@@ -2306,6 +2326,15 @@ fn midi_clip_notes(
     } else {
         1
     };
+    // **Bounded by NOTES as well as by passes.** Four thousand passes of a
+    // clip that holds a whole project's notes in its first bar is thirteen
+    // million `ClipNote`s — allocated, sorted and handed to the audio
+    // thread in an `Arc`, per reload, from a document that is valid in
+    // every field. The cap is on the product; a real loop (a bar of
+    // sixteen notes, repeated as long as anybody drags it) never meets it.
+    let passes = passes
+        .min(MAX_EXPANDED_NOTES / clip.notes.len().max(1))
+        .max(1);
     let mut out: Vec<crate::instrument::ClipNote> = (0..passes)
         .flat_map(|pass| {
             let shift = clip.loop_s * pass as f64;
@@ -2349,6 +2378,12 @@ fn midi_clip_notes(
     out.sort_by_key(|n| n.at);
     out
 }
+
+/// The most `ClipNote`s one clip's loop may be spelled out into. See
+/// [`midi_clip_notes`]. Twenty-four bytes each, so the worst schedule a
+/// document can ask for is a 24 MB list, not a 320 MB one.
+#[cfg(feature = "recorder")]
+const MAX_EXPANDED_NOTES: usize = 1_000_000;
 
 #[cfg(feature = "recorder")]
 /// **A MIDI clip's pedal, with its loop spelled out**, in clip-relative
@@ -18636,6 +18671,98 @@ mod tests {
     /// The loop was spelled out for MIDI and not for audio, so a session with
     /// two of each looped half its tracks: the owner's "Looping misses 2/4
     /// tracks when it loops."
+    /// **A number from a document cannot push a frame count past what the
+    /// engine can add to.** `1e300`, infinity, NaN and a negative all pass
+    /// the reader's finite-and-non-negative filter or a hand edit; each
+    /// lands on the ceiling or at zero, and the ceiling survives the sums
+    /// the audio thread makes of it.
+    #[test]
+    fn a_document_second_cannot_overflow_the_timeline() {
+        use super::{frames_at, MAX_TIMELINE_FRAMES};
+        assert_eq!(frames_at(48_000.0, 1.0), 48_000);
+        assert_eq!(frames_at(48_000.0, 1e300), MAX_TIMELINE_FRAMES);
+        assert_eq!(frames_at(48_000.0, f64::INFINITY), MAX_TIMELINE_FRAMES);
+        assert_eq!(frames_at(48_000.0, f64::MAX), MAX_TIMELINE_FRAMES);
+        assert_eq!(frames_at(48_000.0, f64::NAN), 0);
+        assert_eq!(frames_at(48_000.0, -5.0), 0);
+        assert_eq!(frames_at(48_000.0, f64::NEG_INFINITY), 0);
+        // The week itself is the ceiling, at the highest rate the app opens.
+        assert_eq!(frames_at(192_000.0, 7.0 * 24.0 * 3_600.0), MAX_TIMELINE_FRAMES);
+        assert_eq!(frames_at(192_000.0, 7.0 * 24.0 * 3_600.0 + 1.0), MAX_TIMELINE_FRAMES);
+        // What the engine does with two of them - `start + len`,
+        // `start + at`, and the offline transport's own position on top -
+        // fits with room to spare.
+        assert!(MAX_TIMELINE_FRAMES.checked_mul(8).is_some());
+        assert!(MAX_TIMELINE_FRAMES < u64::MAX / 1_000);
+        // And a clip placed there still yields a schedule rather than a
+        // panic: passes over a loop at the ceiling.
+        let far = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            start_s: 1e300,
+            len_s: 1e300,
+            loop_s: 1e299,
+            ..Default::default()
+        };
+        let decoded = std::sync::Arc::new(tangent_record::decode::Clip {
+            samples: vec![0.0; 96],
+            rate: 48_000,
+            source: std::path::PathBuf::from("far.wav"),
+        });
+        let passes = super::audio_clip_passes(&far, &decoded, 48_000.0, 1.0);
+        for p in &passes {
+            assert!(p.start.checked_add(p.len).is_some());
+        }
+    }
+
+    /// **A loop is spelled out into at most a million notes.** The pass
+    /// cap alone let a clip with a project's worth of notes in its first
+    /// second, dragged to 4,096 s over a one-second loop, expand to thirteen
+    /// million `ClipNote`s per reload. The product is capped; an ordinary
+    /// loop keeps every pass.
+    #[test]
+    fn a_long_clip_over_a_tiny_loop_stays_under_the_note_budget() {
+        let dense = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Midi,
+            len_s: 4_096.0,
+            loop_s: 1.0,
+            notes: (0..3_250)
+                .map(|i| tangent_ui::arrangement::ArrNote {
+                    at_s: i as f64 / 3_250.0,
+                    dur_s: 0.01,
+                    key: 60,
+                    vel: 100,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let notes = super::midi_clip_notes(&dense, 48_000.0);
+        assert!(!notes.is_empty());
+        assert!(
+            notes.len() <= super::MAX_EXPANDED_NOTES,
+            "{} notes were handed to the audio thread",
+            notes.len()
+        );
+        // It kept as many passes as the budget allows, not one.
+        assert!(notes.len() > 3_250 * 100, "{}", notes.len());
+        assert!(notes.windows(2).all(|w| w[0].at <= w[1].at), "still sorted");
+
+        let modest = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Midi,
+            len_s: 4_096.0,
+            loop_s: 1.0,
+            notes: (0..16)
+                .map(|i| tangent_ui::arrangement::ArrNote {
+                    at_s: i as f64 / 16.0,
+                    dur_s: 0.05,
+                    key: 60,
+                    vel: 100,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(super::midi_clip_notes(&modest, 48_000.0).len(), 16 * 4_096);
+    }
+
     #[test]
     fn a_looped_audio_clip_is_spelled_out_into_passes() {
         use std::sync::Arc;
