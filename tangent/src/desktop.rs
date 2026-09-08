@@ -690,6 +690,13 @@ pub struct DesktopApp {
     /// again — see `screen_reader_attached`, which is not free of side
     /// effects.
     reader_seen: bool,
+    /// Whether the window had focus, and whether it was minimised, as of the
+    /// last frame — `None` until the window manager has said. The two edges
+    /// (focus lost, minimised) are where the frames may stop arriving, so
+    /// they are where the app's owed settings write is flushed. See
+    /// `TangentApp::flush_settings_now`.
+    window_focused: Option<bool>,
+    window_minimized: Option<bool>,
     /// The maps the engine was last given. Compared before pushing, because
     /// `Engine::set_maps` is a ring handover that WAITS for the displaced
     /// pair to come back — cheap once, and a stall if it ran every frame.
@@ -8845,6 +8852,10 @@ impl DesktopApp {
     /// Switch sessions WHOLE: the old one keeps its desk and its plugin
     /// states, the new one arrives with its own — instruments included.
     fn switch_project(&mut self, doc: &std::path::Path) {
+        // Whatever the debounce owes for the OUTGOING desk lands before the
+        // incoming one replaces it; the open writes synchronously anyway, so
+        // this costs a write only when one was actually pending.
+        self.app.flush_settings_now();
         // The old session first, while it is still the one on the desk.
         //
         // **The plugin states go UNCONDITIONALLY** - a knob turned in a
@@ -14419,6 +14430,8 @@ impl DesktopApp {
             last_title: crate::window_title("", false),
             probe_frames: 0,
             pace_since: None,
+            window_focused: None,
+            window_minimized: None,
             pace_frames: 0,
             pace_dt: Vec::new(),
             reader_seen: false,
@@ -14708,6 +14721,29 @@ impl eframe::App for DesktopApp {
         }
         self.reconcile_screen_cover(ctx, frame);
         self.reconcile_decoration_size(frame);
+        // **A debounced settings write is owed until the frames stop.** The
+        // app coalesces every drag, wheel and key-repeat write behind a
+        // deadline it drains from `paint`, which is fine for as long as
+        // frames keep coming. Two edges where they may not: the window
+        // losing focus (a switch to another app that may never switch back
+        // before a `kill -9`) and the window being minimised (macOS stops
+        // delivering frames to a window that is in the Dock). Both flush;
+        // `on_exit` covers the third edge. Transitions only, and only once
+        // the window manager has actually said something: `focused` is
+        // `None` for the first frames, and treating that as "lost focus"
+        // would write the settings file on every launch for no reason.
+        {
+            let (focused, minimized) =
+                ctx.input(|i| (i.viewport().focused, i.viewport().minimized));
+            let lost_focus = matches!((self.window_focused, focused), (Some(true), Some(false)));
+            let went_down =
+                matches!((self.window_minimized, minimized), (Some(false), Some(true)));
+            self.window_focused = focused;
+            self.window_minimized = minimized;
+            if lost_focus || went_down {
+                self.app.flush_settings_now();
+            }
+        }
         // **The window is closing — is that all right?**
         //
         // With the autosave gone, a close is the last chance to keep an
@@ -14900,6 +14936,11 @@ impl eframe::App for DesktopApp {
     /// practice session and then quit would lose the whole thing.
     #[cfg(feature = "recorder")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // **The settings write the debounce still owes goes FIRST.** A fader
+        // moved, a zoom wheeled or a desk undone inside the last 700 ms is
+        // owed to the file and nothing after this point paints a frame to
+        // drain it. See `TangentApp::flush_settings_now`.
+        self.app.flush_settings_now();
         self.recorder.session.stop();
         self.save_plugin_states();
         // **The document is NOT written here.**
@@ -17740,6 +17781,61 @@ mod tests {
                 at = abs + "TangentApp::new".len();
             }
         }
+    }
+
+    /// **Every edge where frames may stop drains the settings debounce.**
+    ///
+    /// The app coalesces drags, wheel notches and key repeats into one
+    /// settings write behind a 700 ms deadline it drains from `paint`. That
+    /// is only a bounded loss while frames keep coming, and there are three
+    /// edges where they stop: quit (`on_exit`), a project switch (the desk
+    /// is about to be replaced) and the window losing focus or being
+    /// minimised (`update`). Each must call `flush_settings_now`, and
+    /// `on_exit` must call it FIRST — nothing after it paints. A source scan
+    /// because `DesktopApp` cannot be built in a test; the precedent is
+    /// `a_restarted_engine_is_told_the_tempo_map_again` below.
+    ///
+    /// Revert-check: delete the line from `on_exit` and this goes red
+    /// naming it.
+    #[test]
+    fn every_edge_where_frames_stop_flushes_the_settings_debounce() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("
+mod tests {").expect("the tests module")];
+        let body_of = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            let open = at + src[at..].find('{').expect("a body");
+            // Up to the next top-level method: enough to hold the whole fn.
+            let end = src[open..]
+                .find("
+    fn ")
+                .map_or(src.len(), |n| open + n);
+            &src[open..end]
+        };
+        let exit = body_of("fn on_exit(&mut self");
+        let first = exit
+            .find("self.app.flush_settings_now();")
+            .expect("on_exit does not flush the settings debounce");
+        assert!(
+            !exit[..first].contains(';'),
+            "on_exit flushes the settings debounce, but not as its first act"
+        );
+        assert!(
+            body_of("fn switch_project(&mut self").contains("self.app.flush_settings_now();"),
+            "switch_project does not flush the settings debounce before replacing the desk"
+        );
+        let update = body_of("fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame)");
+        assert!(
+            update.contains("self.app.flush_settings_now();"),
+            "update does not flush the settings debounce on focus loss / minimise"
+        );
+        let focus = update.find("i.viewport().focused").expect("update no longer reads focus");
+        let minimised = update.find("i.viewport().minimized").expect("update no longer reads minimised");
+        let flush = update.find("self.app.flush_settings_now();").expect("checked above");
+        assert!(
+            focus < flush && minimised < flush,
+            "the flush in update is not driven by the focus and minimise edges"
+        );
     }
 
     /// **A fresh engine is told the song's musical time.**
