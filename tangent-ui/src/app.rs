@@ -57052,19 +57052,19 @@ mod aspect_snap_tests {
         let w = 1300.0_f32;
         let on = Vec2::new(w, aspect_height_at(&settings, w));
         assert!(
-            Self_aspect_none(&settings, on),
+            aspect_none(&settings, on),
             "a size straight off the curve was not recognised as on-aspect"
         );
         // A half-screen tile is not, so a tiler never escapes this way.
         let tiled = Vec2::new(1280.0, 1415.0);
         assert!(
-            !Self_aspect_none(&settings, tiled),
+            !aspect_none(&settings, tiled),
             "a tiled shape looked on-aspect, which would release the latch \
              under a tiling window manager"
         );
     }
 
-    fn Self_aspect_none(settings: &Settings, now: Vec2) -> bool {
+    fn aspect_none(settings: &Settings, now: Vec2) -> bool {
         TangentApp::aspect_snap_for(settings, None, now).is_none()
     }
 

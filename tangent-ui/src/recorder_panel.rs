@@ -10726,7 +10726,7 @@ impl Fx {
     /// A theme drives the sends and the filters; the one control that will
     /// alter a take whether or not anybody is listening keeps its own red, so
     /// no theme can ever paint it into the master's colour by accident.
-    pub fn cap_themed(self, p: &Palette) -> Color32 {
+    pub(crate) fn cap_themed(self, p: &Palette) -> Color32 {
         match self {
             Fx::Reverb | Fx::Delay | Fx::Chorus | Fx::Phaser => p.fx_knob,
             // The filters are the same family a step down, so the two rows
