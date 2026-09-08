@@ -1839,12 +1839,34 @@ mod tests {
     /// The circle really is fifths, all the way round and back to the start.
     /// A typo in that table would still look like a circle of fifths.
 
-    /// **Every theme brings its own theory ground, in both modes.**
+    /// **Every theme brings its own theory ground, in both modes — and the
+    /// two modes are not the same ground.**
     ///
     /// The owner: "ivory on every light mode, black on every dark mode when
     /// they should be per theme". Two frozen pairs meant sixteen themes drew
     /// their modules on the same two backgrounds. This checks that the ground
     /// MOVES with the theme, and that everything printed on it still reads.
+    ///
+    /// **And that the toggle does something, which is the half it was missing
+    /// for three releases.** Everything above measures colours AGAINST the
+    /// page and nothing asked what the page IS, so a light mode that came up
+    /// black passed every line of it: the ink flipped to bone, the faint and
+    /// the line followed, and each contrast cleared its floor comfortably. On
+    /// Nocturne and Phosphor that is exactly what happened — their light page
+    /// read 0.011 and 0.004 luminance, took light ink, and was
+    /// indistinguishable from their dark page — while the keyboard under it,
+    /// which decides its own polarity, came up pale. The owner: "They also
+    /// have their theory views flipped and inverted."
+    ///
+    /// Stated as which INK the page takes rather than as a luminance bar,
+    /// because that is the decision the page is actually for and it needs no
+    /// number anybody can argue with: a light page takes dark ink, a dark page
+    /// takes light ink, and if a theme takes the same ink in both modes then
+    /// its two modes are one mode wearing two names.
+    ///
+    /// Revert check performed: return `background_color` from
+    /// `piano::themed_bg` again and both dark-designed themes name themselves
+    /// here.
     #[test]
     fn every_theme_grounds_the_theory_view_in_its_own_colour() {
         let mut seen_light = HashSet::new();
@@ -1883,6 +1905,31 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "the theory view does not hold up:\n  {}", bad.join("\n  "));
+        // The page is a different KIND of page in the two modes, on every
+        // theme: dark ink in light mode, light ink in dark mode.
+        let mut stuck: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            let mut s = Settings::default();
+            theme.apply(&mut s);
+            for dark in [false, true] {
+                s.dark_mode = dark;
+                let bg = palette(&s).bg;
+                if crate::recorder_panel::wants_light_ink(bg) != dark {
+                    stuck.push(format!(
+                        "{} {}: page {:?} takes {} ink",
+                        theme.name,
+                        if dark { "dark" } else { "light" },
+                        bg,
+                        if dark { "dark" } else { "light" },
+                    ));
+                }
+            }
+        }
+        assert!(
+            stuck.is_empty(),
+            "the theory page is in the wrong mode:\n  {}",
+            stuck.join("\n  ")
+        );
         // And they are not all the same ground, which was the whole report.
         assert!(
             seen_light.len() > 8,

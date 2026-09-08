@@ -245,23 +245,42 @@ pub fn bg_color(dark_mode: bool) -> Color32 {
     }
 }
 
-/// The background this theme asks for, in the mode it is in.
+/// **The page: the colour the NATURALS are painted, in the mode it is in.**
 ///
-/// Dark mode takes the theme's own dark ground when it named one and darkens
-/// the light one when it did not, which is the derivation every other role
-/// gets.
+/// This is the app's own ground — behind the keyboard, under the theory
+/// modules, under the neck, and in the letterbox margin a window at the wrong
+/// aspect shows. The owner's rule for it has never changed: a page of music
+/// sits on the same bone the naturals are, and in dark mode on the same
+/// near-black the sharps become. So it asks the piano what it painted, rather
+/// than re-deriving the same answer from the same roles a second time.
+///
+/// **It used to re-derive it, and on two themes out of eighteen the two
+/// derivations disagreed.** It read `background` in light mode and
+/// `dark.background` in dark, which is right for sixteen themes because their
+/// `white_key` IS their `background` and the piano paints that. It is not
+/// right for a theme whose light ground is a near-black. Nocturne's and
+/// Phosphor's are — that is what makes them what they are — so
+/// `keys_the_right_way_up` puts their light keyboard the right way up out of
+/// the pale key `keys_apart` had to derive for it, and the page went on
+/// reading the near-black nobody was painting any more. Light mode gave those
+/// two a bone keyboard butted against a black theory page, with a visible seam
+/// between them, while the sixteen others are one continuous colour from the
+/// top of the page to the bottom of the last natural. The owner: "They also
+/// have their theory views flipped and inverted."
+///
+/// One decision, in one place, so a second one cannot drift from it. Inert on
+/// the sixteen: their naturals are their `background` in light mode and their
+/// `dark.background` in dark, which is exactly what this used to return —
+/// checked by rendering the window on Default and Silverface either side of
+/// the change and comparing the PNGs byte for byte.
+///
+/// The one behaviour that is gone with it is the fallback that darkened a
+/// light ground to 12% when a theme named no `dark.background`. A theme with
+/// no dark block now pages on its `black_key` in dark mode, which is what the
+/// rule says the dark page is and what all eighteen factory themes already
+/// name it (`theme::the_theory_ground_is_the_keyboard_not_the_band`).
 pub fn themed_bg(s: &Settings) -> Color32 {
-    if !s.dark_mode {
-        return s.background_color.to_color32();
-    }
-    s.dark_role("background").map_or_else(
-        || {
-            let c = s.background_color.to_color32();
-            let f = |v: u8| (f32::from(v) * 0.12) as u8;
-            Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
-        },
-        |c| c.to_color32(),
-    )
+    idle_colors(s).0
 }
 
 /// Draw the piano into `rect`. `display_notes` must already include manual
@@ -785,44 +804,61 @@ mod tests {
         );
     }
 
-    /// **The naturals ARE the page, and in dark mode two themes were not.**
+    /// **The naturals ARE the page, in both modes, and on two themes they
+    /// were not in either.**
     ///
     /// The theory page sits on the naturals' colour — the owner's own rule,
     /// checked from the theme table by
     /// `theme::the_theory_ground_is_the_keyboard_not_the_band`. Checked from
-    /// the theme TABLE, which is why it never noticed: it compares the fields
-    /// a theme declares, and a theme can declare `background` and then hand
-    /// the piano a different natural through `dark.white_key`. Sixteen themes
-    /// never did, so the two colours agreed everywhere anybody looked.
+    /// the theme TABLE, which is why it never noticed either half of this: it
+    /// compares the fields a theme declares, and what a theme declares is not
+    /// what reaches the screen. A theme can declare `background` and then hand
+    /// the piano a different natural through `dark.white_key`; and the piano
+    /// can put a keyboard the right way up out of a pale key it had to derive,
+    /// which the theme never declared at all. Sixteen themes do neither, so
+    /// the two agreed everywhere anybody looked.
     ///
-    /// Nocturne and Phosphor did. Their dark naturals came out at 0.099 and
-    /// 0.093 luminance over pages of 0.006 and 0.002, while the other sixteen
-    /// paint theirs exactly ON the page at 0.010 to 0.014 — so on those two,
-    /// and only those two, the dark keyboard was a mid slab hanging above its
-    /// own ground with bone sharps on top of it. That is the owner's "Dark
-    /// mode - bright (and probably wrong) Keyboard", and it is not a
-    /// brightness fault at heart: it is a seam. The band and the page below it
-    /// were made of different colours.
+    /// Nocturne and Phosphor did both, one per mode. In dark mode their
+    /// naturals came out at 0.099 and 0.093 luminance over pages of 0.006 and
+    /// 0.002 — a mid slab hanging above its own ground with bone sharps on top
+    /// of it, which is the owner's "Dark mode - bright (and probably wrong)
+    /// Keyboard". In light mode their naturals came out at 0.512 and 0.442 —
+    /// the pale key `keys_apart` derives for a theme with no pale key of its
+    /// own — over pages still reading the declared near-black at 0.011 and
+    /// 0.004, which is the owner's "theory views flipped and inverted". The
+    /// other sixteen sample the same RGB triple for both, in both modes.
+    ///
+    /// Neither is a brightness fault at heart. Both are a seam: the band and
+    /// the page below it made of different colours, on a surface that is
+    /// supposed to be one colour from the top of the theory view to the bottom
+    /// of the last natural.
     ///
     /// Asserted as equality rather than as a contrast floor, because that is
     /// what the rule actually says. A ratio would have let 0.093 on 0.002
     /// through under any bar loose enough to be arguable.
     ///
-    /// Revert check performed: put `dark.white_key`/`dark.black_key` back on
-    /// either theme and it names itself here.
+    /// Revert check performed, both halves: put `dark.white_key` back on
+    /// either theme, or return `background_color` from `themed_bg` again, and
+    /// the two themes name themselves here.
     #[test]
-    fn every_theme_paints_its_dark_naturals_on_its_own_page() {
+    fn every_theme_paints_its_naturals_on_its_own_page() {
         let mut adrift: Vec<String> = Vec::new();
-        for theme in crate::theme::factory() {
+        for (theme, dark) in crate::theme::factory()
+            .into_iter()
+            .flat_map(|t| [(t.clone(), false), (t, true)])
+        {
             let mut s = Settings::default();
             theme.apply(&mut s);
-            s.dark_mode = true;
+            s.dark_mode = dark;
             let naturals = idle_colors(&s).0;
             let page = themed_bg(&s);
             if naturals != page {
                 adrift.push(format!(
-                    "{}: naturals {:?}, page {:?}",
-                    theme.name, naturals, page
+                    "{} {}: naturals {:?}, page {:?}",
+                    theme.name,
+                    if dark { "dark" } else { "light" },
+                    naturals,
+                    page
                 ));
             }
         }
@@ -845,9 +881,16 @@ mod tests {
             theme.apply(&mut s);
             s.dark_mode = dark;
             let (naturals, sharps) = idle_colors(&s);
+            // **The SHARPS against the page, because the naturals ARE the
+            // page.** This used to take the better of the two against the
+            // ground, back when the ground was worked out a second time from
+            // the theme's roles and could differ from what the piano painted.
+            // It cannot any more (`themed_bg`), so the naturals' term is 1.00
+            // on every theme in both modes and taking the maximum of it with
+            // anything is a term that can never fire. What carries a keyboard
+            // was always the other one.
             let ground = themed_bg(&s);
-            let shows =
-                contrast_ratio(naturals, ground).max(contrast_ratio(sharps, ground));
+            let shows = contrast_ratio(sharps, ground);
             let distinct = contrast_ratio(naturals, sharps);
             if shows < 4.5 || distinct < 3.0 {
                 bad.push(format!(
