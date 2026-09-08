@@ -1654,7 +1654,7 @@ mod tests {
         let mut frame =
             |events: Vec<egui::Event>, live: &mut crate::faces::FaceLive| -> (u64, Rect) {
                 let mut seen = (0_u64, Rect::NOTHING);
-                ctx.run(
+                let _ = ctx.run(
                     egui::RawInput {
                         screen_rect: Some(screen),
                         events,

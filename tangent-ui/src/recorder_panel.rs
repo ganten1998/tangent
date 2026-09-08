@@ -6936,7 +6936,7 @@ mod tests {
             assert!(!name.is_empty(), "code {code} has no name");
         }
         let ctx = egui::Context::default();
-        ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let b = Rect::from_min_size(Pos2::ZERO, Vec2::splat(20.0));
                 assert!(
