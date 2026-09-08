@@ -40,11 +40,6 @@ use cpal::{BufferSize, SampleFormat, StreamConfig};
 /// its leading edge is a sharp arrival time.
 const CLICK: f32 = 0.7;
 const BURST: usize = 8;
-/// The absolute floor, whatever the room is doing. The threshold actually used
-/// is this or ten times the measured ambient, whichever is HIGHER — the first
-/// run of this probe triggered on the loopback's own idle content at 0.02 and
-/// reported a 69 ms mean made entirely of noise.
-const FLOOR: f32 = 0.05;
 
 struct Shared {
     /// Nanoseconds (monotonic) at which the click will LEAVE, or 0.
@@ -59,8 +54,6 @@ struct Shared {
     /// Which input channel heard it, and how loud.
     channel: AtomicU64,
     peak_bits: AtomicU64,
-    /// The loudest thing seen on any input while no click was in flight.
-    ambient_bits: AtomicU64,
     /// Per input channel: loudest sample, and strongest burst correlation.
     peaks: Vec<AtomicU64>,
     corrs: Vec<AtomicU64>,
@@ -133,7 +126,6 @@ fn main() {
         max: AtomicU64::new(0),
         channel: AtomicU64::new(u64::MAX),
         peak_bits: AtomicU64::new(0),
-        ambient_bits: AtomicU64::new(0),
         peaks: (0..in_n).map(|_| AtomicU64::new(0)).collect(),
         corrs: (0..in_n).map(|_| AtomicU64::new(0)).collect(),
         missed: AtomicU64::new(0),

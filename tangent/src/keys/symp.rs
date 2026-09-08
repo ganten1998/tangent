@@ -410,6 +410,9 @@ impl Harp {
 
     /// Bytes of string this harp carries — the arena, which is the whole
     /// of its memory beyond `size_of::<Harp>()`.
+    ///
+    /// A measurement, and the memory tests are what read it.
+    #[allow(dead_code)]
     pub fn arena_bytes(&self) -> usize {
         self.arena.len() * size_of::<f32>()
     }
@@ -561,11 +564,19 @@ impl Harp {
     }
 
     /// How many loops are running right now.
+    ///
+    /// The wake/sleep tests are what read it: `active()` is the question the
+    /// instrument asks, this is the number the gate is judged on.
+    #[allow(dead_code)]
     pub fn ticking(&self) -> usize {
         self.n_live
     }
 
     /// Loop-ticks so far — the gate's account of itself.
+    ///
+    /// Read by the tests that pin what "a loop ticks only while it is worth
+    /// ticking" actually costs. Nothing in the instrument asks.
+    #[allow(dead_code)]
     pub fn ticks(&self) -> u64 {
         self.ticks
     }

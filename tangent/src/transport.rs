@@ -83,11 +83,6 @@ impl Transport {
         self.generation += 1;
     }
 
-    /// Where stop returns to.
-    pub fn cursor_s(&self) -> f64 {
-        self.cursor_s
-    }
-
     /// The green button. Starts the audition from the playhead; pressed while
     /// auditioning, PAUSES — the playhead stays put, and the next press picks
     /// up from there. Going home to 0:00 is the stop button's job, which is

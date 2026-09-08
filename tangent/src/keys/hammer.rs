@@ -294,6 +294,12 @@ impl Hammer {
         self.contact = 0.0;
     }
 
+    /// Whether the hammer is touching the string this sample.
+    ///
+    /// This and the two accessors below report on the mechanism rather than
+    /// drive it, so the voice never asks: the hammer tests and `string.rs`'s
+    /// contact-time sweeps are the readers.
+    #[allow(dead_code)]
     pub fn in_contact(&self) -> bool {
         self.state == State::Contact
     }
@@ -301,6 +307,7 @@ impl Hammer {
     /// The hammer's velocity right now, metres per second, positive toward
     /// the string. After a contact this is the rebound: how hard the
     /// string threw it back.
+    #[allow(dead_code)]
     pub fn velocity(&self) -> f32 {
         self.eta_dot
     }
@@ -418,6 +425,7 @@ impl Hammer {
 
     /// How long the most recent strike's first contact lasted, in seconds;
     /// zero while it is still going on or if there has been none.
+    #[allow(dead_code)]
     pub fn contact_secs(&self) -> f32 {
         self.contact
     }

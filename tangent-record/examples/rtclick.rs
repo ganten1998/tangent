@@ -65,6 +65,15 @@ const CLICK_EVERY_MS: f32 = 500.0;
 /// but a run that reports nothing and cannot say why.
 const DETECT: f32 = 0.10;
 
+/// Full scale for 32-bit PCM: 2^31, the magnitude of the most negative sample
+/// an `i32` can hold.
+///
+/// A shift rather than the literal `2_147_483_648.0` because clippy's
+/// `lossy_float_literal` reads that literal as a typo — f32's shortest
+/// round trip for the value is `2_147_483_600.0` and that is what it offers
+/// instead. The two are the SAME f32; only one of them is legibly 2^31.
+const FULL_SCALE_32: f32 = (1u32 << 31) as f32;
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let secs: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(6.0);
@@ -286,7 +295,7 @@ impl InSample for i16 {
     fn to_f32(self) -> f32 { self as f32 / 32768.0 }
 }
 impl InSample for i32 {
-    fn to_f32(self) -> f32 { self as f32 / 2_147_483_648.0 }
+    fn to_f32(self) -> f32 { self as f32 / FULL_SCALE_32 }
 }
 
 #[allow(clippy::too_many_arguments)]

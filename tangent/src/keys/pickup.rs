@@ -255,6 +255,10 @@ impl Transducer {
     /// applied — for tests, and for a consumer whose wave variable is already
     /// a velocity and wants the curve without the derivative (the clavinet
     /// reading Gabrielli's way, which is how `pickup.py` measures that row).
+    ///
+    /// Both of those consumers are outside the shipped path, so nothing in
+    /// the binary calls it — the doc above is the reason it stays.
+    #[allow(dead_code)]
     pub fn flux(&self, x: f32) -> f32 {
         self.curve.flux(x)
     }

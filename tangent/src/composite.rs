@@ -973,8 +973,9 @@ impl Compositor {
 
 /// Paint the window capture into its pane, whole, letterboxed.
 ///
-/// The opposite choice from [`paint_camera`] for the opposite reason: a
-/// webcam's edges are the wall, a window's edges are its controls.
+/// The opposite choice from the CAMERA pane, which `paint_composite` in
+/// `tangent-ui` centre-crops, and for the opposite reason: a webcam's edges
+/// are the wall, a window's edges are its controls.
 fn paint_window(painter: &egui::Painter, pane: egui::Rect, id: egui::TextureId, size: (u32, u32)) {
     if !pane.is_positive() || size.0 == 0 || size.1 == 0 {
         return;
@@ -990,32 +991,6 @@ fn paint_window(painter: &egui::Painter, pane: egui::Rect, id: egui::TextureId, 
     };
     let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0));
     painter.add(egui::Shape::image(id, fitted, uv, egui::Color32::WHITE));
-}
-
-/// Paint the camera into its pane, filling it and cropping the overflow.
-///
-/// **Cropped, not letterboxed.** A letterboxed camera puts black bars inside a
-/// pane that is itself inside a frame, which is two nested borders and reads as
-/// a mistake. Cropping loses the edges of the picture, and the edges of a
-/// webcam pointed at a piano are the wall.
-fn paint_camera(painter: &egui::Painter, pane: egui::Rect, id: egui::TextureId, size: (u32, u32)) {
-    if !pane.is_positive() || size.0 == 0 || size.1 == 0 {
-        return;
-    }
-    let src = size.0 as f32 / size.1 as f32;
-    let dst = pane.width() / pane.height();
-    // The fraction of the source used along each axis. One of them is always
-    // 1.0 — you crop width or height, never both.
-    let (uw, uh) = if src > dst {
-        (dst / src, 1.0)
-    } else {
-        (1.0, src / dst)
-    };
-    let uv = egui::Rect::from_min_max(
-        egui::Pos2::new((1.0 - uw) * 0.5, (1.0 - uh) * 0.5),
-        egui::Pos2::new(1.0 - (1.0 - uw) * 0.5, 1.0 - (1.0 - uh) * 0.5),
-    );
-    painter.add(egui::Shape::image(id, pane, uv, egui::Color32::WHITE));
 }
 
 /// wgpu requires a buffer copy's rows to start on a 256-byte boundary.

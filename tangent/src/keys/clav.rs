@@ -124,12 +124,15 @@ const V_FAST: f32 = 4.0;
 /// velocity — in gaps of the magnet's exponential: the brief's swing axis,
 /// and its reference row, the one that reads H2 −16.6 dB and H3 −37.1 dB
 /// on the flux. `DRIVE` puts the instrument there; a test measures the
-/// swing at the coil and holds it. Fortissimo then measures 0.8 gaps, not
+/// swing at the coil and holds it — which is the only reader, because the
+/// number IS the specification and `DRIVE` below is what the voice runs on.
+/// Fortissimo then measures 0.8 gaps, not
 /// the `0.6 / 0.6^1.3 = 1.2` the level law alone would give, because the
 /// pulse SHORTENS as it strengthens — `N = fs·d/v` — and the loop's energy
 /// goes as `v^1.3 / (1 + 3v)`; between the 0.6 row and the 1.6 one, H3
 /// twelve to twenty dB under the fundamental, which is the brief's own
 /// description of what a clavinet's dirt should be.
+#[allow(dead_code)]
 const SWING_MF: f32 = 0.6;
 
 /// Loop amplitude to gaps. Measured at E4, MIDI 76, with `DRIVE = 1`: the
@@ -580,6 +583,12 @@ impl ClavVoice {
     }
 
     /// The dry patch: `strike_based` through [`ClavBase::DRY`].
+    ///
+    /// One of the strike ladder's rungs that the instrument does not use:
+    /// `mod.rs` calls the base-picking one. This shorter spelling is what
+    /// `strike_knobs_is_the_dry_base` below and `mod.rs`'s own partial test
+    /// strike with.
+    #[allow(dead_code)]
     pub fn strike_knobs(&mut self, pitch: u8, velocity: f32, k: &ClavKnobs) {
         self.strike_based(pitch, velocity, k, &ClavBase::DRY);
     }

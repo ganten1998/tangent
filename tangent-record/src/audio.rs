@@ -568,8 +568,8 @@ impl GraphDropouts {
         let stop = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "linux")]
         {
-            let latest_t = std::sync::Arc::clone(&latest);
-            let stop_t = std::sync::Arc::clone(&stop);
+            let latest_t = Arc::clone(&latest);
+            let stop_t = Arc::clone(&stop);
             let spawned = std::thread::Builder::new()
                 .name("graph-dropouts".to_owned())
                 .spawn(move || {
@@ -730,6 +730,12 @@ fn our_audio_nodes(dump_json: &str, pid: u32) -> Vec<u64> {
 /// row is `S ID QUANT RATE WAIT BUSY W/Q B/Q ERR ...`, so ERR is the ninth
 /// token wherever the row's id parses. The LAST occurrence of an id wins,
 /// because `-n 2` prints two snapshots and the first is often idle.
+///
+/// Compiled where it is called and in every test build. `read_graph_dropouts`
+/// is the only caller and it is Linux-only — its sibling `our_audio_nodes`
+/// carries the same gate — but this half is pure string work and its test is
+/// worth running on the machine the code is written on.
+#[cfg(any(target_os = "linux", test))]
 fn sum_errs(top_output: &str, ids: &[u64]) -> Option<u64> {
     let mut latest: HashMap<u64, u64> = HashMap::new();
     for line in top_output.lines() {
@@ -1647,13 +1653,19 @@ pub struct ConfigWish {
     pub picks: Picks,
 }
 
-/// Fidelity ranking of the sample formats this module can convert to `f32`.
-///
-/// `None` means "cannot read it", and that has to be a real branch rather than a
-/// fallback, because `SampleFormat` is `#[non_exhaustive]` and picking a format
-/// FTZ + DAZ on this thread (x86 only; a no-op elsewhere) — bit 15 is
-/// flush-to-zero, bit 6 denormals-are-zero. A tail decaying into
+/// FTZ + DAZ on this thread (x86 only; a no-op elsewhere). Bit 15 is
+/// flush-to-zero, bit 6 denormals-are-zero — a tail decaying into
 /// subnormals runs orders of magnitude slower on x86 without them.
+///
+/// **The deprecation is Rust's, and the replacement is hand-written inline
+/// assembly.** `_mm_getcsr`/`_mm_setcsr` are deprecated because LLVM does
+/// not model MXCSR, so the intrinsics can be reordered around the float
+/// work they are meant to govern; the sanctioned fix is `stmxcsr`/`ldmxcsr`
+/// through `asm!`. That is a change to the denormal handling of the audio
+/// thread on a target this machine cannot run, so it is not made in a lint
+/// pass: the call stays and this says why. Rust 1.97.1 offers no safe
+/// intrinsic to move to.
+#[allow(deprecated)]
 #[inline]
 fn flush_denormals() {
     #[cfg(target_arch = "x86_64")]
@@ -1665,6 +1677,10 @@ fn flush_denormals() {
     }
 }
 
+/// Fidelity ranking of the sample formats this module can convert to `f32`.
+///
+/// `None` means "cannot read it", and that has to be a real branch rather than a
+/// fallback, because `SampleFormat` is `#[non_exhaustive]` and picking a format
 /// we cannot convert would fail at `build_input_stream` with cpal's own
 /// `expect("host supplied incorrect sample type")` — a panic inside the audio
 /// callback, on the user's machine, with no take.

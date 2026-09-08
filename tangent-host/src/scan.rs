@@ -35,7 +35,7 @@
 //! deliberately leaks on the failure path.
 
 use std::collections::HashSet;
-use std::ffi::{c_void, CString, OsStr};
+use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
 
 use vst3::Steinberg::{
