@@ -18373,14 +18373,25 @@ mod tests {
             "nothing hands the notes over on a deadline any more, so MIDI is \
              back to waiting on whatever the audio decoder is doing"
         );
+        // **The WHOLE function, not a fixed window off its front.** This
+        // read `&body[at..at + 2_000]` and the ordering below stopped being
+        // able to fail: the pop is 4,700 characters into `run_warm` and was
+        // already past the window on the day the window was written, so
+        // `unwrap_or(usize::MAX)` answered "not found" and `door < pop` was
+        // true whatever the code said. A fixed-width source window is a
+        // guard with a shelf life; the end of the function is a landmark
+        // that moves with it.
         let warm = body
             .find("fn run_warm")
-            .map(|at| &body[at..body.len().min(at + 2_000)])
+            .map(|at| &body[at..])
             .expect("run_warm is still called that");
+        let warm = &warm[..warm.find("fn settle_warm_meter").expect("the exit follows")];
         let door = warm
             .find("CLIPS_OWED_DEADLINE")
             .expect("the deadline is checked inside run_warm");
-        let pop = warm.find("self.warm.pop_front()").unwrap_or(usize::MAX);
+        let pop = warm
+            .find("self.warm.pop_front()")
+            .expect("the queue is still popped inside run_warm");
         assert!(
             door < pop,
             "the deadline is checked AFTER the queue is popped, so a queue \
