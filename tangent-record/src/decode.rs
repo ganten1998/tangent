@@ -147,12 +147,26 @@ pub fn decode(path: &Path, rate: u32) -> Result<Clip, String> {
     })
 }
 
-/// The most bytes the native road will read into memory before it has seen
-/// a header: [`MAX_FRAMES`] of 32-bit stereo plus room for the chunks in
-/// front of `data`. Anything larger is refused before it is read at all,
-/// which is the one thing the child road could never do — it had to convert
-/// the whole file to learn its length.
+/// The most bytes the native road will read into memory at all:
+/// [`MAX_FRAMES`] of 32-bit stereo plus room for the chunks in front of
+/// `data`. Anything larger is refused on its size alone, before a byte of it
+/// is read, which is the one thing the child road could never do — it had to
+/// convert the whole file to learn its length.
 const NATIVE_MAX_BYTES: u64 = (MAX_FRAMES as u64) * 2 * 4 + (1 << 20);
+
+/// How much of a file the native road reads before it decides whether to
+/// read the rest: the RIFF header, a `bext` (602 bytes fixed, plus a coding
+/// history), the `fmt ` chunk, and whatever small chunks a writer puts
+/// between them.
+///
+/// **This used to be the whole file.** `read_native` did an `fs::read` of
+/// everything up to [`NATIVE_MAX_BYTES`] and only then looked at byte zero —
+/// so an imported MP3, AIFF or MP4 under that size was pulled through memory
+/// in full, declined at its first four bytes, and handed to the child to be
+/// read again from the start. Twelve bytes decide those; a WAV at another
+/// rate or width is decided at its `fmt `; only a file the header does not
+/// rule out is read to the end. See [`peek_declines`].
+const NATIVE_PEEK_BYTES: usize = 16 * 1024;
 
 // How many children `read_wav` has started on this thread. A test's proof
 // that a take never left the process; a `Cell` rather than a `cfg(test)`
@@ -189,6 +203,9 @@ fn note_child_spawn() {
 /// * a file longer than [`NATIVE_MAX_BYTES`] on disk — refused unread, the
 ///   child then produces the "that file is N minutes long" sentence as it
 ///   always has;
+/// * anything the first [`NATIVE_PEEK_BYTES`] already rule out — see
+///   [`peek_declines`]: an MP3, an AIFF or an MP4 costs one small read here
+///   and not a pass through memory before the child reads it again;
 /// * anything the STRICT parse refuses — not RIFF (AIFF, CAF, MP3, RF64),
 ///   a format the parser has no arm for, and a chunk that claims more bytes
 ///   than the file holds. That last one is a take that was cut short: the
@@ -196,16 +213,85 @@ fn note_child_spawn() {
 ///   the whole file, and a clip silently a minute short is worse than one
 ///   the child either reads the same way or refuses out loud.
 fn read_native(path: &Path, rate: u32) -> Option<(Vec<f32>, u32)> {
+    use std::io::Read;
+
     let len = std::fs::metadata(path).ok()?.len();
     if len > NATIVE_MAX_BYTES {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
+    let mut file = std::fs::File::open(path).ok()?;
+    // The header first, and only as much of it as a decision needs.
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(NATIVE_PEEK_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if peek_declines(&bytes, rate) {
+        return None;
+    }
+    // The rest, behind the header already in hand. `len` sizes the one
+    // allocation; a file that grew since `metadata` merely reallocates.
+    bytes.reserve((len as usize).saturating_sub(bytes.len()));
+    file.read_to_end(&mut bytes).ok()?;
     let (samples, got, channels) = parse_wav(&bytes, true).ok()?;
     if got != rate || channels != 2 {
         return None;
     }
     Some((samples, got))
+}
+
+/// **Whether the first bytes of a file already rule the native road out**,
+/// asked of the [`NATIVE_PEEK_BYTES`] read before the rest of the file is.
+///
+/// `true` is a decision: not RIFF/WAVE at all (an MP3, an AIFF, an MP4, an
+/// RF64), or a `fmt ` chunk inside the peek that names another rate, another
+/// channel count, or a format tag the parser has no arm for. `false` is NOT
+/// an admission — it also covers a `fmt ` that lies past the peek or is cut
+/// by its edge, and a file with no `fmt ` before its `data` — because every
+/// strict rule is still applied by [`parse_wav`] on the whole file
+/// afterwards: the chunk sizes against the file, the ceiling, the sample
+/// width, the extensible subformat. This only says no early; it never says
+/// yes, so nothing the strict walk would refuse gets in by being short.
+fn peek_declines(head: &[u8], rate: u32) -> bool {
+    if head.len() < 12 || &head[0..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        return true;
+    }
+    let mut at = 12usize;
+    while at + 8 <= head.len() {
+        let id = &head[at..at + 4];
+        let size = u32::from_le_bytes([head[at + 4], head[at + 5], head[at + 6], head[at + 7]])
+            as usize;
+        let from = at + 8;
+        let to = from.saturating_add(size).min(head.len());
+        if id == b"fmt " {
+            let c = &head[from..to];
+            // Cut by the peek's edge, or too short to be a format at all:
+            // the whole read decides.
+            if c.len() < 16 {
+                return false;
+            }
+            let mut tag = u16::from_le_bytes([c[0], c[1]]);
+            let channels = u16::from_le_bytes([c[2], c[3]]);
+            let got = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+            // WAVE_FORMAT_EXTENSIBLE: the real tag leads the subformat GUID,
+            // exactly as `parse_wav` reads it. Cut short, the whole read
+            // decides.
+            if tag == 0xFFFE {
+                if c.len() < 26 {
+                    return false;
+                }
+                tag = u16::from_le_bytes([c[24], c[25]]);
+            }
+            return !(matches!(tag, 1 | 3) && channels == 2 && got == rate);
+        }
+        if id == b"data" {
+            // Audio before any `fmt `: the strict walk refuses that itself.
+            return false;
+        }
+        // Chunks are word-aligned; an odd size carries a pad byte.
+        at = from.saturating_add(size).saturating_add(size & 1);
+    }
+    false
 }
 
 /// Interleaved stereo f32 out of a RIFF/WAVE byte string, plus the rate its
@@ -693,6 +779,66 @@ mod tests {
             "the strict walk must not pass a short file off as whole"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The peek says no from the first bytes, and never says yes.** An
+    /// MP3's ID3 tag, an AIFF's `FORM`, an MP4's `ftyp` and an RF64 header
+    /// are declined at twelve bytes; a WAV at another rate or width, or in
+    /// a format the parser has no arm for, at its `fmt `. A stereo WAV at
+    /// the asked rate — plain or extensible — is not declined, and neither
+    /// is a header whose `fmt ` lies past the peek or is cut by its edge,
+    /// because those are the whole read's to decide; a truncated `fmt ` of
+    /// the app's own shape is the same. What this pins is that the road
+    /// that used to read the whole file first now reads it only for a file
+    /// its header does not rule out.
+    #[test]
+    fn the_peek_declines_early_and_admits_nothing() {
+        let f32s: Vec<u8> = [0.5f32, -0.5, 0.25, -0.25]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        assert!(peek_declines(b"ID3\x04\x00\x00\x00\x00\x00\x00\xff\xfb", 48_000), "an MP3");
+        assert!(peek_declines(b"FORM\x00\x00\x00\x00AIFF", 48_000), "an AIFF");
+        assert!(peek_declines(b"\x00\x00\x00\x18ftypmp42", 48_000), "an MP4");
+        assert!(peek_declines(b"RIFF", 48_000), "too short to be anything");
+        let mut rf64 = wav_bytes(3, 2, 48_000, 32, &f32s, false);
+        rf64[0..4].copy_from_slice(b"RF64");
+        assert!(peek_declines(&rf64, 48_000), "RF64");
+        assert!(peek_declines(&wav_bytes(3, 2, 44_100, 32, &f32s, false), 48_000), "another rate");
+        assert!(peek_declines(&wav_bytes(3, 1, 48_000, 32, &f32s, false), 48_000), "mono");
+        assert!(peek_declines(&wav_bytes(85, 2, 48_000, 32, &f32s, false), 48_000), "no arm for 85");
+        assert!(!peek_declines(&wav_bytes(3, 2, 48_000, 32, &f32s, false), 48_000), "float stereo");
+        assert!(!peek_declines(&wav_bytes(1, 2, 48_000, 24, &f32s, false), 48_000), "int24 stereo");
+        // The streamed writer's lying sizes are the strict walk's business,
+        // not the peek's: its `fmt ` is honest.
+        assert!(!peek_declines(&wav_bytes(3, 2, 48_000, 32, &f32s, true), 48_000), "streamed");
+        // Extensible: a 40-byte `fmt ` whose real tag leads the GUID.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(b"RIFF\xff\xff\xff\xffWAVEfmt ");
+        ext.extend_from_slice(&40u32.to_le_bytes());
+        ext.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        ext.extend_from_slice(&2u16.to_le_bytes());
+        ext.extend_from_slice(&48_000u32.to_le_bytes());
+        ext.extend_from_slice(&[0u8; 6]); // byte rate, block align
+        ext.extend_from_slice(&32u16.to_le_bytes());
+        ext.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        ext.extend_from_slice(&32u16.to_le_bytes()); // valid bits
+        ext.extend_from_slice(&0u32.to_le_bytes()); // channel mask
+        ext.extend_from_slice(&3u16.to_le_bytes()); // the subformat's tag: float
+        ext.extend_from_slice(&[0u8; 14]);
+        assert!(!peek_declines(&ext, 48_000), "extensible float stereo at the rate");
+        let mut ext_mono = ext.clone();
+        ext_mono[22..24].copy_from_slice(&1u16.to_le_bytes());
+        assert!(peek_declines(&ext_mono, 48_000), "extensible mono");
+        // Cut by the peek's edge before the subformat: undecided.
+        assert!(!peek_declines(&ext[..12 + 8 + 20], 48_000), "a cut extensible fmt is the whole read's");
+        // A `fmt ` past the peek — a megabyte of LIST first — is undecided
+        // too: the walk steps over what it cannot see.
+        let mut far = Vec::new();
+        far.extend_from_slice(b"RIFF\xff\xff\xff\xffWAVELIST");
+        far.extend_from_slice(&(1u32 << 20).to_le_bytes());
+        far.extend_from_slice(&[0u8; 64]);
+        assert!(!peek_declines(&far, 48_000), "a fmt past the peek is the whole read's");
     }
 
     /// The strict walk refuses a `data` chunk past the ceiling before it
