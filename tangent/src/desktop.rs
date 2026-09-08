@@ -1642,7 +1642,7 @@ fn keep_click_sample(file: &std::path::Path) -> std::io::Result<std::path::PathB
 /// silence the NEXT plugin to land there — so a flag written first would be
 /// wiped by the very write that puts the pedal in the seat.
 #[cfg(feature = "recorder")]
-fn seed_amp_board(app: &mut tangent_ui::app::TangentApp, seat: usize) {
+fn seed_amp_board(app: &mut TangentApp, seat: usize) {
     // The SEAT the amp landed in, which for a group's bays 3..5 is not its
     // channel — `amp_board_to_seed` is the one place that translates, and it
     // hands back the channel it decided on so the cells written below cannot
@@ -1674,7 +1674,7 @@ fn seed_amp_board(app: &mut tangent_ui::app::TangentApp, seat: usize) {
 /// the module, so the menu says exactly what the bay chip says.
 #[cfg(feature = "recorder")]
 fn push_fx_params(
-    app: &mut tangent_ui::app::TangentApp,
+    app: &mut TangentApp,
     engine: &crate::instrument::Engine,
     strip: usize,
     inserts: usize,
@@ -1741,7 +1741,7 @@ fn engine_set_insert_bypass(engine: &crate::instrument::Engine, bays: &[(usize, 
 /// the caller only knows which flat index changed, not what it used to hold.
 #[cfg(feature = "recorder")]
 fn push_builtin_faces(
-    app: &mut tangent_ui::app::TangentApp,
+    app: &mut TangentApp,
     engine: &crate::instrument::Engine,
     strip: usize,
 ) {
@@ -2228,15 +2228,15 @@ fn legacy_rate_poll() -> bool {
 /// nothing to join at quit.
 #[cfg(feature = "recorder")]
 struct RatePoll {
-    seen: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    seen: Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[cfg(feature = "recorder")]
 impl RatePoll {
     fn start() -> Self {
         use std::sync::atomic::{AtomicU32, Ordering};
-        let seen = std::sync::Arc::new(AtomicU32::new(0));
-        let weak = std::sync::Arc::downgrade(&seen);
+        let seen = Arc::new(AtomicU32::new(0));
+        let weak = Arc::downgrade(&seen);
         let _ = std::thread::Builder::new()
             .name("tangent-rate-watch".to_owned())
             .spawn(move || loop {
@@ -2536,7 +2536,7 @@ impl Reprobe {
             // A machine that cannot spawn a thread: mark live so the UI
             // falls back to trying the open directly rather than waiting
             // for a watcher that does not exist.
-            live.store(true, std::sync::atomic::Ordering::Relaxed);
+            live.store(true, Ordering::Relaxed);
         }
         Self { stop, live }
     }
@@ -2707,7 +2707,7 @@ fn midi_clip_pedal(
 /// on the last; a fade on every repeat would be a tremolo nobody asked for.
 fn audio_clip_passes(
     clip: &tangent_ui::arrangement::ArrClip,
-    decoded: &std::sync::Arc<tangent_record::decode::Clip>,
+    decoded: &Arc<tangent_record::decode::Clip>,
     rate: f64,
     gain: f32,
 ) -> Vec<crate::instrument::Placed> {
@@ -2734,7 +2734,7 @@ fn audio_clip_passes(
             break;
         }
         out.push(crate::instrument::Placed {
-            clip: std::sync::Arc::clone(decoded),
+            clip: Arc::clone(decoded),
             strip: clip.lane.min(tangent_ui::recorder::CHANNELS - 1),
             start: frames(clip.start_s + at),
             offset: frames(clip.offset_s),
@@ -2767,18 +2767,18 @@ fn audio_clip_passes(
 #[cfg(feature = "recorder")]
 fn stretched_clip_audio(
     clip: &tangent_ui::arrangement::ArrClip,
-    decoded: std::sync::Arc<tangent_record::decode::Clip>,
+    decoded: Arc<tangent_record::decode::Clip>,
     path: &std::path::Path,
     cache: &mut std::collections::HashMap<StretchKey, Arc<tangent_record::decode::Clip>>,
-) -> std::sync::Arc<tangent_record::decode::Clip> {
+) -> Arc<tangent_record::decode::Clip> {
     let Some((key, mode)) = stretch_key(clip, path) else {
         return decoded;
     };
     match cache.get(&key) {
-        Some(c) => std::sync::Arc::clone(c),
+        Some(c) => Arc::clone(c),
         None => {
-            let made = std::sync::Arc::new(crate::stretch::stretch(&decoded, clip.stretch, mode));
-            cache.insert(key, std::sync::Arc::clone(&made));
+            let made = Arc::new(crate::stretch::stretch(&decoded, clip.stretch, mode));
+            cache.insert(key, Arc::clone(&made));
             made
         }
     }
@@ -5005,7 +5005,7 @@ impl DesktopApp {
                             Some(c) => Some(Arc::clone(&c.clip)),
                             None => tangent_record::decode::decode(&path, rate)
                                 .ok()
-                                .map(std::sync::Arc::new),
+                                .map(Arc::new),
                         };
                         if clip.is_some() {
                             e.set_preview(clip);
@@ -6186,7 +6186,7 @@ impl DesktopApp {
                         // FFTs, and a frozen frame would read as a hang.
                         let reference =
                             self.ir.reference.as_ref().map(|r| r.capture.clone());
-                        let (tx, rx) = std::sync::mpsc::channel();
+                        let (tx, rx) = mpsc::channel();
                         std::thread::spawn(move || {
                             let _ = tx.send(process_ir_capture(
                                 &capture, &p.sweep, reference.as_deref(), p.pre, p.rate,
@@ -6243,11 +6243,11 @@ impl DesktopApp {
                     self.ir.live.phase = String::new();
                     busy = true;
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                Err(mpsc::TryRecvError::Empty) => {
                     self.ir.worker = Some(rx);
                     busy = true;
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Disconnected) => {
                     self.ir.live.phase = "deconvolution failed".to_owned();
                 }
             }
@@ -9001,7 +9001,7 @@ impl DesktopApp {
                 // it therefore covers the menu's Save row too, which is the
                 // same request arriving by another door.
                 self.app.notify(
-                    tangent_ui::notify::Kind::Success,
+                    Kind::Success,
                     format!("Project saved - {}", self.app.project_name()),
                 );
             }
@@ -9295,7 +9295,7 @@ impl DesktopApp {
                 continue;
             }
             if count_media(&dir) == 0
-                && tangent_ui::app::TangentApp::scratch_is_disposable(&dir, template)
+                && TangentApp::scratch_is_disposable(&dir, template)
             {
                 let _ = std::fs::remove_dir_all(&dir);
             }
@@ -11005,7 +11005,7 @@ impl DesktopApp {
                 self.recorder.fallback = chosen.clone();
                 if !already_standing_in {
                     self.app.notify(
-                        tangent_ui::notify::Kind::Error,
+                        Kind::Error,
                         format!(
                             "ASIO opened but played nothing - using {} through the \
                              system's own audio. Plug the interface in and it is \
@@ -11067,7 +11067,7 @@ impl DesktopApp {
                         self.recorder.fallback = chosen.clone();
                         if !already_standing_in {
                             self.app.notify(
-                                tangent_ui::notify::Kind::Error,
+                                Kind::Error,
                                 format!(
                                     "ASIO has no working output - is the interface plugged in? \
                                      Using {} through the system's own audio until it is back.",
@@ -11093,7 +11093,7 @@ impl DesktopApp {
                     if let Some(was) = self.recorder.fallback.take() {
                         log::info!("audio: back on {was} - {}", e.output().device);
                         self.app.notify(
-                            tangent_ui::notify::Kind::Success,
+                            Kind::Success,
                             format!("Back on {was} - {}", e.output().device),
                         );
                     }
@@ -13294,7 +13294,7 @@ struct IrRoad {
     /// latency in the quotient.
     reference: Option<IrReference>,
     /// The worker thread chewing a finished capture, if one is out.
-    worker: Option<std::sync::mpsc::Receiver<(Vec<f32>, Vec<f32>, tangent_ui::ports::IrOutcome)>>,
+    worker: Option<mpsc::Receiver<(Vec<f32>, Vec<f32>, tangent_ui::ports::IrOutcome)>>,
     /// The processed pair, waiting for Save (or a retry to replace it).
     finished: Option<IrFinished>,
     /// The picture pushed to the app — see `ports::IrLive`.
@@ -14029,8 +14029,8 @@ pub fn ir_test(arg: Option<String>) {
     // desktop's own duplex rule, and the only way a single-client driver
     // gives you both directions at once.
     let timebase = tangent_record::audio::Timebase::new();
-    let tap = std::sync::Arc::new(crate::midi::RawMidiTap::new(1_024));
-    let mut session = crate::record::Session::new(std::sync::Arc::clone(&tap), timebase);
+    let tap = Arc::new(midi::RawMidiTap::new(1_024));
+    let mut session = crate::record::Session::new(Arc::clone(&tap), timebase);
     let duplex = engine.output_device();
     // **The input is CHOSEN, not defaulted.** The first run of this probe
     // opened "Virtual Mic" while playing the sweep out of a Scarlett, which
@@ -14553,9 +14553,9 @@ const PRE_ROLL_FLAT_DB: f64 = 6.0;
 /// cost the owner's ADAT expander.
 #[cfg(feature = "recorder")]
 fn force_device_rate(want: u32) -> Option<u32> {
-    let tap = std::sync::Arc::new(crate::midi::RawMidiTap::new(64));
+    let tap = Arc::new(midi::RawMidiTap::new(64));
     let mut sess = crate::record::Session::new(
-        std::sync::Arc::clone(&tap),
+        Arc::clone(&tap),
         tangent_record::audio::Timebase::new(),
     );
     sess.open_input(
@@ -14715,9 +14715,9 @@ pub fn device_watch(arg: Option<String>) {
                 // ring is fed by the input session — an output-only probe
                 // waits forever for frames nothing is producing, which is what
                 // the first version of this did.
-                let tap = std::sync::Arc::new(crate::midi::RawMidiTap::new(1_024));
+                let tap = Arc::new(midi::RawMidiTap::new(1_024));
                 let mut sess = crate::record::Session::new(
-                    std::sync::Arc::clone(&tap),
+                    Arc::clone(&tap),
                     tangent_record::audio::Timebase::new(),
                 );
                 let duplex = e.output_device();
@@ -17704,7 +17704,7 @@ impl DesktopApp {
                     self.save_plugin_states();
                     self.copy_states_to_project();
                     self.app.notify(
-                        tangent_ui::notify::Kind::Success,
+                        Kind::Success,
                         format!("Project saved - {}", self.app.project_name()),
                     );
                 }
@@ -17948,7 +17948,7 @@ mod tests {
     #[test]
     fn the_drum_drawer_is_spelled_the_same_on_both_sides() {
         assert_eq!(
-            super::DRUM_PRESET_FOLDER,
+            DRUM_PRESET_FOLDER,
             tangent_ui::dialogs::DRUMPAD_NAME,
             "the save panel and the drumpad's explorer name different folders"
         );
@@ -17967,7 +17967,7 @@ mod tests {
     /// red on the very first poll.
     #[test]
     fn a_rate_watch_waits_out_an_interface_that_is_still_re_syncing() {
-        let mut w = super::RateWatch::default();
+        let mut w = RateWatch::default();
         // The ordinary case, here and in the three tests below: the engine
         // opened at the rate the device was found at, so the two numbers the
         // watch already knows about are one number. They part company only
@@ -17989,7 +17989,7 @@ mod tests {
     /// three over rather than finishing somebody else's.
     #[test]
     fn a_rate_that_comes_back_leaves_no_count_behind() {
-        let mut w = super::RateWatch::default();
+        let mut w = RateWatch::default();
         assert!(!w.note(48_000, 48_000, Some(44_100)));
         assert!(!w.note(48_000, 48_000, Some(44_100)));
         assert!(!w.note(48_000, 48_000, Some(48_000)), "agreement cannot fire");
@@ -18008,7 +18008,7 @@ mod tests {
     /// retry ceiling exists to prevent.
     #[test]
     fn a_device_that_cannot_be_asked_is_not_a_device_that_moved() {
-        let mut w = super::RateWatch::default();
+        let mut w = RateWatch::default();
         for _ in 0..10 {
             assert!(!w.note(48_000, 48_000, None), "silence read as a move");
         }
@@ -18034,7 +18034,7 @@ mod tests {
     /// Revert-check: pass the chosen rate as `engine_at` and it goes red.
     #[test]
     fn a_rate_the_device_cannot_reach_never_reopens_anything() {
-        let mut w = super::RateWatch::default();
+        let mut w = RateWatch::default();
         // The engine opened at 48000 because that is all the device has. The
         // device agrees with the engine, and the choice does not enter into it.
         for _ in 0..30 {
@@ -18066,7 +18066,7 @@ mod tests {
     /// `real == engine_at` — and the first loop below fires on its third poll.
     #[test]
     fn a_converting_output_does_not_reopen_the_path_for_ever() {
-        let mut w = super::RateWatch::default();
+        let mut w = RateWatch::default();
         // Engine rendering 96000, device found at 48000 when it opened, device
         // still at 48000. Nobody has moved anything.
         for _ in 0..30 {
@@ -18095,7 +18095,7 @@ mod tests {
     /// latch that window fires again every poll it lasts.
     #[test]
     fn a_reopen_does_not_immediately_ask_for_another_one() {
-        let mut w = super::RateWatch::default();
+        let mut w = RateWatch::default();
         assert!(!w.note(48_000, 48_000, Some(44_100)));
         assert!(!w.note(48_000, 48_000, Some(44_100)));
         assert!(w.note(48_000, 48_000, Some(44_100)), "never fired");
@@ -18163,7 +18163,7 @@ mod tests {
         // Frame N: announced, nothing painted yet. Blocking here would be the
         // bug.
         assert!(
-            !super::chore_ready(Some(&busy)),
+            !chore_ready(Some(&busy)),
             "the work must not run on the frame it was announced on"
         );
         assert!(present(&ctx, &mut busy), "the overlay paints at once");
@@ -18171,19 +18171,19 @@ mod tests {
         // carrying it also carried the window that asked, so blocking here
         // freezes that window on top of the cover.
         assert!(
-            !super::chore_ready(Some(&busy)),
+            !chore_ready(Some(&busy)),
             "the work ran while the window it was asked from was still on \
              the last frame presented"
         );
         assert!(present(&ctx, &mut busy), "the overlay is still up");
         // Frame N+2: a frame has gone out that is the cover and nothing else.
         assert!(
-            super::chore_ready(Some(&busy)),
+            chore_ready(Some(&busy)),
             "the work must run once a frame of its own has been presented"
         );
         // And an overlay that is GONE never holds the work hostage: a window
         // with no area, or a cap that has fired, must not cost a session.
-        assert!(super::chore_ready(None));
+        assert!(chore_ready(None));
     }
 
     /// **A fast chunked operation shows nobody anything.**
@@ -18241,7 +18241,7 @@ mod tests {
         // Eight plugins to load; two land, and then an amp seeds seven pedals
         // into empty bays, so the work GROWS from under the meter.
         let outstanding = [8usize, 7, 6, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
-        let mut count = super::Counted::default();
+        let mut count = Counted::default();
         let mut last = (0usize, 0usize);
         for (frame, left) in outstanding.into_iter().enumerate() {
             count = count.saw(left);
@@ -18274,7 +18274,7 @@ mod tests {
         );
         // And the growth really was absorbed by the TOTAL and not by undoing
         // work: the reading right after the amp landed still says two done.
-        let grown = super::Counted::default().saw(8).saw(7).saw(6).saw(13);
+        let grown = Counted::default().saw(8).saw(7).saw(6).saw(13);
         assert_eq!((grown.done, grown.total), (2, 15));
     }
 
@@ -18292,7 +18292,7 @@ mod tests {
     fn the_walk_counts_exactly_the_bays_it_will_visit() {
         // Three bays to do, scattered through a seat space of forty.
         let work = [7usize, 19, 33];
-        let (next, outstanding) = super::insert_walk(40, |i| work.contains(&i));
+        let (next, outstanding) = insert_walk(40, |i| work.contains(&i));
         assert_eq!(next, Some(7), "the walk starts at the first bay with work");
         assert_eq!(
             outstanding,
@@ -18300,16 +18300,16 @@ mod tests {
             "the count is the frames of work left, not a subset of it"
         );
         // Settled: nothing mismatches, so there is nothing to say.
-        assert_eq!(super::insert_walk(40, |_| false), (None, 0));
+        assert_eq!(insert_walk(40, |_| false), (None, 0));
         // And a lone bay high up is still found.
-        assert_eq!(super::insert_walk(40, |i| i == 33), (Some(33), 1));
+        assert_eq!(insert_walk(40, |i| i == 33), (Some(33), 1));
         // The clocks agree all the way down: walking the list one bay a frame
         // takes exactly `outstanding` frames and the reading reaches full.
         let mut left: Vec<usize> = work.to_vec();
-        let mut count = super::Counted::default();
+        let mut count = Counted::default();
         let mut frames = 0;
         loop {
-            let (next, outstanding) = super::insert_walk(40, |i| left.contains(&i));
+            let (next, outstanding) = insert_walk(40, |i| left.contains(&i));
             count = count.saw(outstanding);
             let Some(i) = next else { break };
             left.retain(|&b| b != i);
@@ -19238,22 +19238,22 @@ mod tests {
     /// separator-free folder rather than a panic or a path.
     #[test]
     fn every_unit_identity_files_under_a_readable_safe_folder() {
-        assert_eq!(super::preset_subfolder("keys"), "Tangent Keys");
-        assert_eq!(super::preset_subfolder("keys:0"), "Tangent Keys");
-        assert_eq!(super::preset_subfolder("keys:7"), "Tangent Keys");
+        assert_eq!(preset_subfolder("keys"), "Tangent Keys");
+        assert_eq!(preset_subfolder("keys:0"), "Tangent Keys");
+        assert_eq!(preset_subfolder("keys:7"), "Tangent Keys");
         // The table row the trim proved the road with.
         assert_eq!(
-            super::preset_subfolder(crate::builtin_fx::TRIM_PATH),
+            preset_subfolder(crate::builtin_fx::TRIM_PATH),
             "Tangent Trim"
         );
         // And every row the table will ever hold, by construction.
         for spec in crate::builtin_fx::UNITS {
-            assert_eq!(super::preset_subfolder(spec.path), spec.class);
+            assert_eq!(preset_subfolder(spec.path), spec.class);
         }
         // A newer build's sentinel: sanitized identity, `@` shed.
-        assert_eq!(super::preset_subfolder("@tangent-shine"), "tangent-shine");
+        assert_eq!(preset_subfolder("@tangent-shine"), "tangent-shine");
         for hostile in ["../evil", "@a/b", ""] {
-            let folder = super::preset_subfolder(hostile);
+            let folder = preset_subfolder(hostile);
             assert!(!folder.contains('/') && !folder.contains('\\'));
             assert!(!folder.starts_with('.'), "{hostile:?} → {folder:?}");
             assert!(!folder.is_empty());
@@ -19284,21 +19284,21 @@ mod tests {
 
         // The one legal target answers, resolved.
         assert_eq!(
-            super::preset_delete_target(&root, &inside).as_deref(),
+            preset_delete_target(&root, &inside).as_deref(),
             Some(inside.canonicalize().expect("canon").as_path())
         );
         // A file OUTSIDE the root is refused even though it wears our
         // extension — and a traversal that names it through the root is
         // refused too, because the check runs on the resolved path.
-        assert_eq!(super::preset_delete_target(&root, &beside), None);
+        assert_eq!(preset_delete_target(&root, &beside), None);
         let sneaky = drawer.join("..").join("..").join("victim.tangentpreset");
-        assert_eq!(super::preset_delete_target(&root, &sneaky), None);
+        assert_eq!(preset_delete_target(&root, &sneaky), None);
         // A file inside the root that is not a preset is refused.
-        assert_eq!(super::preset_delete_target(&root, &wrong_kind), None);
+        assert_eq!(preset_delete_target(&root, &wrong_kind), None);
         // A root that does not exist deletes nothing rather than resolving
         // relative to whatever the process's directory happens to be.
         assert_eq!(
-            super::preset_delete_target(&scratch.join("gone"), &inside),
+            preset_delete_target(&scratch.join("gone"), &inside),
             None
         );
         let _ = std::fs::remove_dir_all(&scratch);
@@ -19529,21 +19529,21 @@ mod tests {
         let scratch = root.join("Untitled");
         std::fs::create_dir_all(scratch.join("media")).unwrap();
         std::fs::write(scratch.join("project.tangent"), b"the stencil").unwrap();
-        assert!(super::launch_reclaimable(&scratch, &template));
+        assert!(launch_reclaimable(&scratch, &template));
 
         // One take inside: not for deletion, whatever the document says.
         std::fs::write(scratch.join("media").join("take.wav"), b"audio").unwrap();
-        assert!(!super::launch_reclaimable(&scratch, &template));
+        assert!(!launch_reclaimable(&scratch, &template));
         std::fs::remove_file(scratch.join("media").join("take.wav")).unwrap();
 
         // An edited document: somebody worked here.
         std::fs::write(scratch.join("project.tangent"), b"an edit").unwrap();
-        assert!(!super::launch_reclaimable(&scratch, &template));
+        assert!(!launch_reclaimable(&scratch, &template));
 
         // A document that cannot be read equals nothing — refused, because
         // deleting what could not be compared is the same wound.
         std::fs::remove_file(scratch.join("project.tangent")).unwrap();
-        assert!(!super::launch_reclaimable(&scratch, &template));
+        assert!(!launch_reclaimable(&scratch, &template));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -19610,7 +19610,7 @@ mod tests {
         use tangent_ui::recorder::{folder_extra_seat, AMP_PEDALS, CHANNELS, MASTER_SEAT};
         let empty = |_p: usize, _b: usize| false;
         let (ch, board) =
-            super::amp_board_to_seed(3, empty).expect("an untouched channel seeds");
+            amp_board_to_seed(3, empty).expect("an untouched channel seeds");
         assert_eq!(ch, 3, "a channel seeds its own board");
         assert_eq!(board.len(), AMP_PEDALS);
         assert!(board.iter().all(|p| p.starts_with("@tangent-")));
@@ -19619,36 +19619,36 @@ mod tests {
         // ONE non-empty cell anywhere on the board — the seeded board
         // itself included — blocks a second seeding, first and last cells
         // both checked because the walk has two loops to get wrong.
-        assert!(super::amp_board_to_seed(3, |p, b| p == 0 && b == 0).is_none());
+        assert!(amp_board_to_seed(3, |p, b| p == 0 && b == 0).is_none());
         assert!(
-            super::amp_board_to_seed(3, |p, b| p == AMP_PEDALS - 1 && b == 2).is_none(),
+            amp_board_to_seed(3, |p, b| p == AMP_PEDALS - 1 && b == 2).is_none(),
             "a tenant in the last pedal's last bay did not count as touched"
         );
         // **A GROUP's second rack seeds the group's own board.** Bays 3..5
         // of a folder are `folder_extra_seat(ch)`, which is past every pad
         // block; before `pedal_owner` this arm answered None and an amp
         // dropped there arrived as seven pluses.
-        let (ch, board) = super::amp_board_to_seed(folder_extra_seat(5), empty)
+        let (ch, board) = amp_board_to_seed(folder_extra_seat(5), empty)
             .expect("a group's extra rack seeds");
         assert_eq!(ch, 5, "the extra rack seeded somebody else's board");
-        assert_eq!(board, super::AMP_DEFAULT_BOARD, "a different board on the extra rack");
+        assert_eq!(board, AMP_DEFAULT_BOARD, "a different board on the extra rack");
         // ...and once, across BOTH racks, because they share the one board.
         // A cell filled by the first rack's seeding stops the second's.
         assert!(
-            super::amp_board_to_seed(folder_extra_seat(5), |p, b| p == 0 && b == 0).is_none(),
+            amp_board_to_seed(folder_extra_seat(5), |p, b| p == 0 && b == 0).is_none(),
             "a group's two racks each seeded the shared board"
         );
         // Everything with no board of its own — the master, the buses, the
         // pads, a pedal seat itself — still seeds nothing: those amps play
         // bare in v1, and seeding would land the pedals on seat math that
         // means another channel's board.
-        assert!(super::amp_board_to_seed(MASTER_SEAT, empty).is_none());
-        assert!(super::amp_board_to_seed(CHANNELS, empty).is_none());
+        assert!(amp_board_to_seed(MASTER_SEAT, empty).is_none());
+        assert!(amp_board_to_seed(CHANNELS, empty).is_none());
         assert!(
-            super::amp_board_to_seed(folder_extra_seat(CHANNELS - 1) + 1, empty).is_none(),
+            amp_board_to_seed(folder_extra_seat(CHANNELS - 1) + 1, empty).is_none(),
             "the seat just past the folder block claimed a board"
         );
-        assert!(super::amp_board_to_seed(usize::MAX, empty).is_none());
+        assert!(amp_board_to_seed(usize::MAX, empty).is_none());
     }
 
     /// **The seeded board arrives loaded, named — and switched OFF.**
@@ -19684,10 +19684,10 @@ mod tests {
             // into whoever ran the tests' own `~/.config/tangent/settings.json`.
             // Nothing here needs a desktop's capabilities; the two writes this
             // is about are plain settings writes.
-            let mut app = tangent_ui::app::TangentApp::new(
+            let mut app = TangentApp::new(
                 &ctx,
-                tangent_ui::settings::Settings::default(),
-                tangent_ui::host::Caps::PLUGIN,
+                Settings::default(),
+                Caps::PLUGIN,
             );
             for pedal in 0..AMP_PEDALS {
                 assert_eq!(
@@ -19696,12 +19696,12 @@ mod tests {
                     "the board was dressed before the amp landed"
                 );
             }
-            super::seed_amp_board(&mut app, amp_seat);
+            seed_amp_board(&mut app, amp_seat);
             for pedal in 0..AMP_PEDALS {
                 let seat = amp_pedal_seat(ch, pedal);
                 assert_eq!(
                     app.insert(seat, 0),
-                    Some(super::AMP_DEFAULT_BOARD[pedal]),
+                    Some(AMP_DEFAULT_BOARD[pedal]),
                     "pedal {pedal} of the seeded board is not the one the chain names"
                 );
                 assert!(
@@ -19715,7 +19715,7 @@ mod tests {
             // touched and writes nothing — including nothing that would
             // switch a pedal somebody had put back into circuit off again.
             app.set_insert_bypass(amp_pedal_seat(ch, 2), 0, false);
-            super::seed_amp_board(&mut app, amp_seat);
+            seed_amp_board(&mut app, amp_seat);
             assert!(
                 !app.insert_bypassed(amp_pedal_seat(ch, 2), 0),
                 "a second amp re-seeded the board and switched a pedal back off"
@@ -19765,7 +19765,7 @@ mod tests {
             gain: 1.0,
         };
         let mut cache = std::collections::HashMap::new();
-        let got = super::stretched_clip_audio(
+        let got = stretched_clip_audio(
             &clip,
             Arc::clone(&decoded),
             std::path::Path::new("a.wav"),
@@ -19778,7 +19778,7 @@ mod tests {
         );
         // What the offline bounce now schedules: passes over the STRETCHED
         // copy, so the open-ended clip fills its heard length.
-        let passes = super::audio_clip_passes(&clip, &got, 8_000.0, 1.0);
+        let passes = audio_clip_passes(&clip, &got, 8_000.0, 1.0);
         assert_eq!(passes.len(), 1);
         assert_eq!(
             passes[0].len,
@@ -19786,7 +19786,7 @@ mod tests {
             "the bounce would schedule the unstretched length"
         );
         // Memoised: a second ask is the same Arc, not a second render.
-        let again = super::stretched_clip_audio(
+        let again = stretched_clip_audio(
             &clip,
             Arc::clone(&decoded),
             std::path::Path::new("a.wav"),
@@ -19799,7 +19799,7 @@ mod tests {
             stretch: 1.0,
             ..clip
         };
-        let through = super::stretched_clip_audio(
+        let through = stretched_clip_audio(
             &plain,
             Arc::clone(&decoded),
             std::path::Path::new("a.wav"),
@@ -19936,7 +19936,7 @@ mod tests {
         });
 
         // No loop: one pass, unchanged.
-        let one = super::audio_clip_passes(&audio(0.0, 3.0), &decoded, 48_000.0, 0.5);
+        let one = audio_clip_passes(&audio(0.0, 3.0), &decoded, 48_000.0, 0.5);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].start, 4 * 48_000);
         assert_eq!(one[0].len, 3 * 48_000);
@@ -19945,7 +19945,7 @@ mod tests {
 
         // A one-second loop under a 2.5 s clip: three passes, the last a
         // HALF one, each reading the same trim into the file.
-        let many = super::audio_clip_passes(&audio(1.0, 2.5), &decoded, 48_000.0, 0.5);
+        let many = audio_clip_passes(&audio(1.0, 2.5), &decoded, 48_000.0, 0.5);
         assert_eq!(many.len(), 3, "the loop was not spelled out");
         for (n, p) in many.iter().enumerate() {
             assert_eq!(p.start, (4 + n as u64) * 48_000, "pass {n} starts wrong");
@@ -19979,7 +19979,7 @@ mod tests {
         let mut order: Vec<usize> = (0..16).collect();
         let ch = order.remove(0);
         order.insert(2, ch);
-        let hit = super::reload_slots_for(&order, bays);
+        let hit = reload_slots_for(&order, bays);
         let rows: std::collections::BTreeSet<usize> =
             hit.iter().map(|i| i / bays).collect();
         assert_eq!(
@@ -19990,7 +19990,7 @@ mod tests {
         assert_eq!(hit.len(), 3 * bays, "not every bay of a moved row moved");
         // Nothing at all when nothing moved.
         let still: Vec<usize> = (0..16).collect();
-        assert!(super::reload_slots_for(&still, bays).is_empty());
+        assert!(reload_slots_for(&still, bays).is_empty());
         // And never past the rows the permutation names — the drum pads
         // above the channels are not part of a channel reorder.
         assert!(hit.iter().all(|i| i / bays < 16));
@@ -21448,9 +21448,9 @@ mod tests {").expect("the tests module")];
     /// thing the owner's ruling forbade.
     #[test]
     fn the_asio_fallback_is_for_the_session_and_comes_back() {
-        assert!(super::fallback_wanted(Some("ASIO")));
-        assert!(!super::fallback_wanted(Some("JACK")));
-        assert!(!super::fallback_wanted(None));
+        assert!(fallback_wanted(Some("ASIO")));
+        assert!(!fallback_wanted(Some("JACK")));
+        assert!(!fallback_wanted(None));
         let whole = include_str!("desktop.rs");
         let src = &whole[..whole.find("mod tests {").expect("this module")];
         let reopen = {
@@ -21513,7 +21513,7 @@ mod tests {").expect("the tests module")];
 
         let one = src.join("rim.wav");
         std::fs::write(&one, b"RIFFone").expect("write");
-        let got = super::keep_click_sample_in(&kept, &one).expect("the copy failed");
+        let got = keep_click_sample_in(&kept, &one).expect("the copy failed");
         assert_eq!(
             got.file_name().and_then(|n| n.to_str()),
             Some("rim.wav"),
@@ -21532,7 +21532,7 @@ mod tests {").expect("the tests module")];
         // **A second choice replaces the first.** A preference, not a library.
         let two = src.join("cowbell.wav");
         std::fs::write(&two, b"RIFFtwo").expect("write");
-        let got2 = super::keep_click_sample_in(&kept, &two).expect("the copy failed");
+        let got2 = keep_click_sample_in(&kept, &two).expect("the copy failed");
         assert_eq!(std::fs::read(&got2).expect("read"), b"RIFFtwo");
         let left: Vec<String> = std::fs::read_dir(&kept)
             .expect("read_dir")
@@ -21673,15 +21673,15 @@ mod tests {").expect("the tests module")];
         let laptop = names(&["Speaker (Realtek(R) Audio)"]);
         let plugged = names(&["Speaker (Realtek(R) Audio)", "Speakers (Focusrite USB Audio)"]);
         // The platform default: the old rule, untouched.
-        assert!(super::hardware_back(false, &[], &[], true));
-        assert!(!super::hardware_back(false, &[], &[], false));
+        assert!(hardware_back(false, &[], &[], true));
+        assert!(!hardware_back(false, &[], &[], false));
         // ASIO: an alive Realtek is not the interface coming back.
         assert!(
-            !super::hardware_back(true, &laptop, &laptop, true),
+            !hardware_back(true, &laptop, &laptop, true),
             "the reprobe would retry ASIO every two seconds on a laptop's own speakers"
         );
-        assert!(super::hardware_back(true, &laptop, &plugged, true), "the interface arriving was missed");
-        assert!(super::hardware_back(true, &plugged, &laptop, false), "an unplug is a change too");
+        assert!(hardware_back(true, &laptop, &plugged, true), "the interface arriving was missed");
+        assert!(hardware_back(true, &plugged, &laptop, false), "an unplug is a change too");
     }
 
     /// **The rate poll's thread never asks the chosen host under ASIO**, and
@@ -21858,19 +21858,19 @@ mod tests {").expect("the tests module")];
         let good = write("plate.wav", 48_000, 2, 48_000, 0.9);
         let wav = crate::wavread::read(&good).expect("the writer's own file did not read");
         let (kind, said) =
-            super::ir_load_verdict(&wav, 48_000, "plate").expect("a plain stereo IR was refused");
-        assert_eq!(kind, tangent_ui::notify::Kind::Success);
+            ir_load_verdict(&wav, 48_000, "plate").expect("a plain stereo IR was refused");
+        assert_eq!(kind, Kind::Success);
         assert!(said.contains("1.00 s"), "the length was not reported: {said}");
 
         // A rate mismatch LOADS and says so — the unit's standing decision —
         // and says it loudly enough to be read.
         let slow = write("room-44k.wav", 44_100, 2, 44_100, 0.9);
         let wav = crate::wavread::read(&slow).expect("read");
-        let (kind, said) = super::ir_load_verdict(&wav, 48_000, "room-44k")
+        let (kind, said) = ir_load_verdict(&wav, 48_000, "room-44k")
             .expect("a 44.1 k IR was refused rather than loaded shifted");
         assert_eq!(
             kind,
-            tangent_ui::notify::Kind::Error,
+            Kind::Error,
             "a shifted IR was announced as a receipt and would vanish unread"
         );
         assert!(
@@ -21880,15 +21880,15 @@ mod tests {").expect("the tests module")];
         // With no engine running there is nothing to compare against and no
         // claim is made.
         assert_eq!(
-            super::ir_load_verdict(&wav, 0, "room-44k").expect("refused").0,
-            tangent_ui::notify::Kind::Success
+            ir_load_verdict(&wav, 0, "room-44k").expect("refused").0,
+            Kind::Success
         );
 
         // Six channels: refused, because guessing which four are the
         // true-stereo set is how a surround bounce becomes a mystery reverb.
         let wide = write("atmos.wav", 48_000, 6, 4_800, 0.5);
         let wav = crate::wavread::read(&wide).expect("read");
-        let refusal = super::ir_load_verdict(&wav, 48_000, "atmos")
+        let refusal = ir_load_verdict(&wav, 48_000, "atmos")
             .expect_err("a six-channel file was accepted as an IR");
         assert!(refusal.contains("6 channels"), "{refusal}");
 
@@ -21906,7 +21906,7 @@ mod tests {").expect("the tests module")];
         // reads SECONDS, and seconds is what is being pinned.
         let long = write("cathedral.wav", 8_000, 2, 8_000 * 25, 0.9);
         let wav = crate::wavread::read(&long).expect("read");
-        let refusal = super::ir_load_verdict(&wav, 8_000, "cathedral")
+        let refusal = ir_load_verdict(&wav, 8_000, "cathedral")
             .expect_err("a 25 s impulse was bound with no ceiling at all");
         assert!(
             refusal.contains("25.0 s") && refusal.contains("20 s"),
@@ -21917,9 +21917,9 @@ mod tests {").expect("the tests module")];
         let at_ceiling = write("edge.wav", 8_000, 2, 8_000 * 20, 0.9);
         let wav = crate::wavread::read(&at_ceiling).expect("read");
         assert!(
-            super::ir_load_verdict(&wav, 8_000, "edge").is_ok(),
+            ir_load_verdict(&wav, 8_000, "edge").is_ok(),
             "an IR exactly at the {} s ceiling was refused",
-            super::IR_LOAD_MAX_S
+            IR_LOAD_MAX_S
         );
 
         // Silence is a wire, and binding it looks exactly like the load
@@ -21927,7 +21927,7 @@ mod tests {").expect("the tests module")];
         let mute = write("empty.wav", 48_000, 2, 4_800, 0.0);
         let wav = crate::wavread::read(&mute).expect("read");
         assert!(
-            super::ir_load_verdict(&wav, 48_000, "empty")
+            ir_load_verdict(&wav, 48_000, "empty")
                 .expect_err("a silent file was bound")
                 .contains("silent")
         );
@@ -21968,14 +21968,14 @@ mod tests {").expect("the tests module")];
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
-        assert_eq!(super::unique_ir_stem(&dir, "Holmes Plate"), "Holmes Plate");
+        assert_eq!(unique_ir_stem(&dir, "Holmes Plate"), "Holmes Plate");
         std::fs::write(dir.join("Holmes Plate.wav"), b"x").expect("write");
-        assert_eq!(super::unique_ir_stem(&dir, "Holmes Plate"), "Holmes Plate 2");
+        assert_eq!(unique_ir_stem(&dir, "Holmes Plate"), "Holmes Plate 2");
         std::fs::write(dir.join("Holmes Plate 2.wav"), b"x").expect("write");
-        assert_eq!(super::unique_ir_stem(&dir, "Holmes Plate"), "Holmes Plate 3");
+        assert_eq!(unique_ir_stem(&dir, "Holmes Plate"), "Holmes Plate 3");
         // A name nobody has used is still itself — the suffix only appears
         // where it has to.
-        assert_eq!(super::unique_ir_stem(&dir, "Small Room"), "Small Room");
+        assert_eq!(unique_ir_stem(&dir, "Small Room"), "Small Room");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -22118,7 +22118,7 @@ mod tests {").expect("the tests module")];
             let (capture, reference) =
                 loop_through(&plate, &sweep, pre, tail, send_db, floor, 0);
             for (route, refc) in [("classic", None), ("reference", Some(&reference[..]))] {
-                let (l, r, out) = super::process_ir_capture(
+                let (l, r, out) = process_ir_capture(
                     &capture, &sweep, refc, pre, rate, f1, f2, dur,
                 );
                 let got = rt60_of(&l, rate);
@@ -22205,7 +22205,7 @@ mod tests {").expect("the tests module")];
             let tail = (tail_s * rate) as usize;
             let (capture, reference) = loop_through(&plate, &sweep, pre, tail, -6.0, -120.0, 0);
             for (route, refc) in [("classic", None), ("reference", Some(&reference[..]))] {
-                let (l, r, out) = super::process_ir_capture(
+                let (l, r, out) = process_ir_capture(
                     &capture, &sweep, refc, pre, rate, f1, f2, dur,
                 );
                 // The bound HOLDS, and it BINDS: the length is the window,
@@ -22301,7 +22301,7 @@ mod tests {").expect("the tests module")];
         }
         for (route, refc) in [("classic", None), ("reference", Some(&reference[..]))] {
             let (l, _r, _out) =
-                super::process_ir_capture(&capture, &sweep, refc, pre, rate, f1, f2, dur);
+                process_ir_capture(&capture, &sweep, refc, pre, rate, f1, f2, dur);
             let peak = crate::units::sweep::linear_peak(&l);
             assert!(
                 (peak as f64) < 0.05 * rate,
@@ -22339,7 +22339,7 @@ mod tests {").expect("the tests module")];
         let tail = (tail_s * rate) as usize;
         let (capture, _) = loop_through(&plate, &sweep, pre, tail, -3.0, -140.0, 0);
         let (l, _r, out) =
-            super::process_ir_capture(&capture, &sweep, None, pre, rate, f1, f2, dur);
+            process_ir_capture(&capture, &sweep, None, pre, rate, f1, f2, dur);
         assert!(
             out.seconds <= tail_s as f32 + 0.001,
             "a {tail_s} s window produced a {:.3} s IR",
@@ -22533,7 +22533,7 @@ mod tests {").expect("the tests module")];
                 .enumerate()
             {
                 let (l, r, _out) =
-                    super::process_ir_capture(&capture, &sweep, refc, pre, rate, f1, f2, dur);
+                    process_ir_capture(&capture, &sweep, refc, pre, rate, f1, f2, dur);
                 let pp = ripple_pp_db(&mag_curve_db(&l, rate, 100.0, 10_000.0));
                 assert!(
                     pp < 1.5,
@@ -22650,7 +22650,7 @@ mod tests {").expect("the tests module")];
         let tail = (3.0 * rate) as usize;
         let ripple_of = |cap: &[f32], refc: Option<&[f32]>| {
             let (l, _r, _o) =
-                super::process_ir_capture(cap, &sweep, refc, pre, rate, f1, f2, dur);
+                process_ir_capture(cap, &sweep, refc, pre, rate, f1, f2, dur);
             (
                 ripple_pp_db(&mag_curve_db(&l, rate, 100.0, 10_000.0)),
                 crate::units::sweep::linear_peak(&l),
@@ -22772,7 +22772,7 @@ mod tests {").expect("the tests module")];
             let (capture, reference) = loop_through(dut, &sweep, pre, tail, send, floor, 512);
             for (route, refc) in [("classic", None), ("reference", Some(&reference[..]))] {
                 let (l, r, out) =
-                    super::process_ir_capture(&capture, &sweep, refc, pre, rate, f1, f2, dur);
+                    process_ir_capture(&capture, &sweep, refc, pre, rate, f1, f2, dur);
                 // The clamp is where the collapse landed: the direct impulse,
                 // one sample, and the fade that follows it. Nothing may come
                 // back at or under that.
@@ -22929,7 +22929,7 @@ mod tests {").expect("the tests module")];
             loop_through(&plate, &sweep, pre, tail, -6.0, -90.0, 512);
         let mut healthy_route = Vec::new();
         for refc in [None, Some(&healthy_ref[..])] {
-            let (hl, _hr, out) = super::process_ir_capture(
+            let (hl, _hr, out) = process_ir_capture(
                 &healthy, &sweep, refc, pre, rate, f1, f2, dur,
             );
             assert!(
@@ -22961,7 +22961,7 @@ mod tests {").expect("the tests module")];
                     .enumerate()
             {
                 let (healthy_peak, healthy_len) = healthy_route[i];
-                let (l, r, out) = super::process_ir_capture(
+                let (l, r, out) = process_ir_capture(
                     &capture, &sweep, refc, pre, rate, f1, f2, dur,
                 );
                 // The impulse is where a healthy capture puts it, within a
@@ -23239,7 +23239,7 @@ mod tests {").expect("the tests module")];
         }
 
         for (what, refc) in &refs {
-            let (l, r, out) = super::process_ir_capture(
+            let (l, r, out) = process_ir_capture(
                 &capture, &sweep, Some(&refc[..]), pre, rate, f1, f2, dur,
             );
             assert!(out.has_reference, "{what}: the reference road was not taken");
@@ -23318,7 +23318,7 @@ mod tests {").expect("the tests module")];
             *v = hiss();
         }
         let (l, r, out) =
-            super::process_ir_capture(&capture, &sweep, Some(&dead), pre, rate, f1, f2, dur);
+            process_ir_capture(&capture, &sweep, Some(&dead), pre, rate, f1, f2, dur);
         assert!(
             !out.has_reference,
             "a reference pass with nothing on either jack was used as a reference"
@@ -23382,7 +23382,7 @@ mod tests {").expect("the tests module")];
 
         // ── nothing but a real file is bindable ─────────────────────────
         let real = write(&irs, "Holmes Plate.wav");
-        assert!(super::ir_bindable(&real.to_string_lossy()));
+        assert!(ir_bindable(&real.to_string_lossy()));
         // Every ask the UI can encode is recognised AS an ask. Pinned on
         // `ir_is_sentinel` directly as well as through `ir_bindable`, because
         // through `ir_bindable` alone the file test would refuse these on its
@@ -23397,12 +23397,12 @@ mod tests {").expect("the tests module")];
             ),
         ] {
             assert!(
-                super::ir_is_sentinel(&ask),
+                ir_is_sentinel(&ask),
                 "{ask:?} is an ask and was not recognised as one"
             );
         }
         assert!(
-            !super::ir_is_sentinel(&real.to_string_lossy()),
+            !ir_is_sentinel(&real.to_string_lossy()),
             "an ordinary path was mistaken for an ask"
         );
         for refused in [
@@ -23422,21 +23422,21 @@ mod tests {").expect("the tests module")];
             irs.to_string_lossy().into_owned(),
         ] {
             assert!(
-                !super::ir_bindable(&refused),
+                !ir_bindable(&refused),
                 "{refused:?} would have been written into a bay and persisted"
             );
         }
 
         // ── delete ──────────────────────────────────────────────────────
         let doomed = write(&irs, "doomed.wav");
-        let (kind, said) = super::ir_delete_file(&doomed.to_string_lossy(), &irs);
+        let (kind, said) = ir_delete_file(&doomed.to_string_lossy(), &irs);
         assert_eq!(kind, Kind::Success, "{said}");
         assert!(said.contains("doomed.wav"), "the receipt did not name it: {said}");
         assert!(!doomed.exists(), "the file is still there");
 
         // Outside the folder: refused, and the file survives.
         let foreign = write(&outside, "someone-elses.wav");
-        let (kind, said) = super::ir_delete_file(&foreign.to_string_lossy(), &irs);
+        let (kind, said) = ir_delete_file(&foreign.to_string_lossy(), &irs);
         assert_eq!(kind, Kind::Error, "{said}");
         assert!(
             foreign.exists(),
@@ -23452,14 +23452,14 @@ mod tests {").expect("the tests module")];
             std::path::Path::new(&escape).starts_with(&irs),
             "the fixture no longer reproduces the lexical hole it exists for"
         );
-        let (kind, _) = super::ir_delete_file(&escape.to_string_lossy(), &irs);
+        let (kind, _) = ir_delete_file(&escape.to_string_lossy(), &irs);
         assert_eq!(kind, Kind::Error, "a `..` walked out of the IRs folder");
         assert!(foreign.exists(), "the escape deleted the file it aimed at");
 
         // ── paste ───────────────────────────────────────────────────────
         // From a foreign library into the IRs folder: the road the two verbs
         // exist to make, and the original stays where it was.
-        let (kind, said) = super::ir_paste_file(
+        let (kind, said) = ir_paste_file(
             &foreign.to_string_lossy(),
             &irs.to_string_lossy(),
             &irs,
@@ -23471,7 +23471,7 @@ mod tests {").expect("the tests module")];
         // The same paste again: beside, numbered, and the name is said out
         // loud. Not over the top of a measurement that cost somebody an
         // evening, and not a dead-end refusal either.
-        let (kind, said) = super::ir_paste_file(
+        let (kind, said) = ir_paste_file(
             &foreign.to_string_lossy(),
             &irs.to_string_lossy(),
             &irs,
@@ -23488,7 +23488,7 @@ mod tests {").expect("the tests module")];
         );
 
         // Aimed outside: refused, and nothing lands there.
-        let (kind, _) = super::ir_paste_file(
+        let (kind, _) = ir_paste_file(
             &real.to_string_lossy(),
             &outside.to_string_lossy(),
             &irs,
@@ -23499,7 +23499,7 @@ mod tests {").expect("the tests module")];
             "Tangent wrote into a folder it was never given"
         );
         // A source that has since gone is a sentence, not a zero-byte file.
-        let (kind, _) = super::ir_paste_file(
+        let (kind, _) = ir_paste_file(
             &irs.join("vanished.wav").to_string_lossy(),
             &irs.to_string_lossy(),
             &irs,
@@ -23588,7 +23588,7 @@ mod tests {").expect("the tests module")];
         }
 
         let (l, r, out) =
-            super::process_ir_capture(&capture, &sweep, None, pre, rate, f1, f2, dur);
+            process_ir_capture(&capture, &sweep, None, pre, rate, f1, f2, dur);
 
         // **The discrimination is live**: the two recovered channels really
         // do have very different peaks. Without this the assertion below
@@ -23687,7 +23687,7 @@ mod tests {").expect("the tests module")];
 
         let clean = build(false, &mut noise);
         let (_, _, out) =
-            super::process_ir_capture(&clean, &sweep, None, pre, rate, f1, f2, dur);
+            process_ir_capture(&clean, &sweep, None, pre, rate, f1, f2, dur);
         assert!(
             out.floor_settled,
             "a flat pre-roll was called a decay: floor {:.1} dBFS",
@@ -23702,7 +23702,7 @@ mod tests {").expect("the tests module")];
 
         let ringing = build(true, &mut noise);
         let (_, _, out) =
-            super::process_ir_capture(&ringing, &sweep, None, pre, rate, f1, f2, dur);
+            process_ir_capture(&ringing, &sweep, None, pre, rate, f1, f2, dur);
         assert!(
             !out.floor_settled,
             "a pre-roll falling twenty-five dB across itself was reported as the \
@@ -23799,7 +23799,7 @@ mod tests {").expect("the tests module")];
                 reference[f * 2 + 1] = s + u() * idle;
             }
             for (route, refc) in [("classic", None), ("reference", Some(&reference[..]))] {
-                let (l, r, out) = super::process_ir_capture(
+                let (l, r, out) = process_ir_capture(
                     &capture, &sweep, refc, pre, rate, f1, f2, dur,
                 );
                 assert!(
@@ -23886,9 +23886,9 @@ mod tests {").expect("the tests module")];
 
         // The classic route.
         let (l, r, out) =
-            super::process_ir_capture(&capture, &sweep, None, pre, rate, f1, f2, dur);
+            process_ir_capture(&capture, &sweep, None, pre, rate, f1, f2, dur);
         assert!(!out.has_reference);
-        assert_eq!(out.envelope_db.len(), super::IR_ENVELOPE_POINTS);
+        assert_eq!(out.envelope_db.len(), IR_ENVELOPE_POINTS);
         assert!(
             (-100.0..=-85.0).contains(&out.noise_floor_db),
             "the planted ~-95 dB floor read as {}",
@@ -23938,7 +23938,7 @@ mod tests {").expect("the tests module")];
             reference[f * 2] = v;
             reference[f * 2 + 1] = v;
         }
-        let (l2, _r2, out2) = super::process_ir_capture(
+        let (l2, _r2, out2) = process_ir_capture(
             &capture, &sweep, Some(&reference), pre, rate, f1, f2, dur,
         );
         assert!(out2.has_reference, "the reference pass was not used");
@@ -23995,7 +23995,7 @@ mod tests {").expect("the tests module")];
         std::fs::write(root.join("notes.txt"), b"not audio").expect("junk");
         std::fs::write(root.join("broken.wav"), b"RIFFxxxx").expect("junk wav");
 
-        let secs = super::wav_seconds(&root.join("spring.wav")).expect("header read");
+        let secs = wav_seconds(&root.join("spring.wav")).expect("header read");
         assert!((secs - 0.5).abs() < 0.01, "header says {secs} s");
         let bytes = std::fs::read(root.join("spring.wav")).expect("bytes");
         let (back_spec, back) =
@@ -24008,7 +24008,7 @@ mod tests {").expect("the tests module")];
             .fold(0.0f32, |a, (x, y)| a.max((x - y).abs()));
         assert!(worst < 1.0e-6, "float samples moved by {worst}");
 
-        let rows = super::scan_ir_rows(&root);
+        let rows = scan_ir_rows(&root);
         // Path-sorted, subfolder capital before root lowercase — the scan's
         // one ordering rule is "stable and boring".
         assert_eq!(
@@ -24307,7 +24307,7 @@ mod sidecar_walk_probe {
     /// in `settings.rs`: cargo runs these on parallel threads in ONE process,
     /// so a count read here would otherwise include another test's walk, and a
     /// settings path set here would be taken away under it.
-    static SIDECAR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SIDECAR_ENV: Mutex<()> = Mutex::new(());
 
     /// A throwaway folder. `IVORY_PROBE_DIR` moves it onto whatever volume the
     /// question is about — the shelf that matters is a PROJECT folder, and a
@@ -24847,7 +24847,7 @@ mod sidecar_walk_probe {
             tangent_ui::dialogs::set_export_stem_mode(&mut spec, chip);
             assert!(spec.stems, "the fixture never armed the tap at all");
             let mut e = engine_with_comp(Some(&deep_comp_state()));
-            super::arm_stem_tap(&e, spec.stems, spec.stems_dry);
+            arm_stem_tap(&e, spec.stems, spec.stems_dry);
             stem_peak(&mut e)
         };
         let chips = tangent_ui::dialogs::EXPORT_STEM_CHIPS;
@@ -24913,7 +24913,7 @@ mod sidecar_walk_probe {
             tangent_record::audio::Timebase::new(),
         )
         .expect("offline engine");
-        super::furnish_mirror_bay(
+        furnish_mirror_bay(
             &mut from_desk,
             Some(&desk),
             EXPORT_SEAT,
@@ -24922,7 +24922,7 @@ mod sidecar_walk_probe {
         )
         .expect("the mirror seats the comp");
         warm(&mut from_desk);
-        super::arm_stem_tap(&from_desk, true, false);
+        arm_stem_tap(&from_desk, true, false);
         let squeezed = stem_peak(&mut from_desk);
 
         // The same call with no desk to ask, which is the road the export took
@@ -24932,7 +24932,7 @@ mod sidecar_walk_probe {
             tangent_record::audio::Timebase::new(),
         )
         .expect("offline engine");
-        super::furnish_mirror_bay(
+        furnish_mirror_bay(
             &mut from_shelf,
             None,
             EXPORT_SEAT,
@@ -24941,7 +24941,7 @@ mod sidecar_walk_probe {
         )
         .expect("the mirror seats the comp");
         warm(&mut from_shelf);
-        super::arm_stem_tap(&from_shelf, true, false);
+        arm_stem_tap(&from_shelf, true, false);
         let untouched = stem_peak(&mut from_shelf);
 
         // SAFETY: still under `SIDECAR_ENV`.

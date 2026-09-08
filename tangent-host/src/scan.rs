@@ -1251,7 +1251,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ivory-bundle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let bundle = dir.join("Foo.vst3");
-        let inner = bundle.join("Contents").join(super::CONTENTS_SUBDIR);
+        let inner = bundle.join("Contents").join(CONTENTS_SUBDIR);
         std::fs::create_dir_all(&inner).unwrap();
         std::fs::write(inner.join("aaa-helper.dll"), b"x").unwrap();
         std::fs::write(inner.join("Foo.pdb"), b"x").unwrap();

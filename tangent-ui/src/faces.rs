@@ -632,7 +632,7 @@ const PRESET_LEAD: f32 = 6.0;
 /// which it adds to the width the caller asked for and to the row height.
 /// Named here because the strip has to know what its own field will cost
 /// before it draws one.
-const TEXT_EDIT_MARGIN: egui::Vec2 = egui::vec2(8.0, 4.0);
+const TEXT_EDIT_MARGIN: Vec2 = egui::vec2(8.0, 4.0);
 
 /// **What the preset strip is made of at a given width, and how tall that
 /// makes it.**

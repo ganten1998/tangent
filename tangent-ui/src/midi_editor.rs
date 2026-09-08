@@ -2021,7 +2021,7 @@ mod tests {
     /// aim at, and there is nothing behind it to click past to.
     #[test]
     fn the_ped_chip_swaps_the_lane_and_the_lane_reads_the_hands_height() {
-        let notes = [crate::arrangement::ArrNote { at_s: 0.5, dur_s: 0.25, key: 60, vel: 100 }];
+        let notes = [ArrNote { at_s: 0.5, dur_s: 0.25, key: 60, vel: 100 }];
         let r = rect();
         let mut v = view(&notes);
         let l = Layout::new(r);
@@ -2082,7 +2082,7 @@ mod tests {
     /// answers only at a note's TOP.
     #[test]
     fn the_pen_decides_what_the_velocity_lane_answers() {
-        let notes = [crate::arrangement::ArrNote { at_s: 0.5, dur_s: 0.25, key: 60, vel: 100 }];
+        let notes = [ArrNote { at_s: 0.5, dur_s: 0.25, key: 60, vel: 100 }];
         let r = rect();
         let mut v = view(&notes);
 
@@ -2150,9 +2150,9 @@ mod tests {
                 theme.apply(&mut set);
                 let pick = |role: &str, light: crate::settings::Rgb| {
                     let c = set.dark_role_if(dark, role).unwrap_or(light);
-                    egui::Color32::from_rgb(c.r, c.g, c.b)
+                    Color32::from_rgb(c.r, c.g, c.b)
                 };
-                let face = super::roll_face(
+                let face = roll_face(
                     pick("fx_strip", set.fx_strip_color),
                     pick("meter_bg", set.meter_bg_color),
                     dark,
@@ -2163,8 +2163,8 @@ mod tests {
                     // The note's fill and the shaft's colour come from one
                     // call on one number; if either site ever reaches for a
                     // different function this stops being true.
-                    let a = super::velocity_hue(loud, quiet, face, v);
-                    let b = super::velocity_hue(loud, quiet, face, v);
+                    let a = velocity_hue(loud, quiet, face, v);
+                    let b = velocity_hue(loud, quiet, face, v);
                     assert_eq!(
                         a, b,
                         "{} {}: velocity {v} is not one colour",
@@ -2438,7 +2438,7 @@ mod tests {
     /// `click_hit` and both halves go red.
     #[test]
     fn a_click_reads_past_a_notes_resize_zone() {
-        let notes = [crate::arrangement::ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 100 }];
+        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 100 }];
         let v = view(&notes);
         let r = rect();
         let l = Layout::new(r);
@@ -2510,7 +2510,7 @@ mod tests {
         // And no further: past the allowance it is empty roll again, or the
         // whole editor would be one enormous handle.
         assert!(matches!(
-            hit_test(rect(), &v, Pos2::new(r.right() + super::EDGE_SLOP + 3.0, y)),
+            hit_test(rect(), &v, Pos2::new(r.right() + EDGE_SLOP + 3.0, y)),
             Some(Hit::Cell(..))
         ));
 

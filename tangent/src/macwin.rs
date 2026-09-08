@@ -870,7 +870,7 @@ fn guard_child_frames(main: &NSWindow) {
                         if *repairs < MAX_REPAIRS {
                             window.setFrameOrigin(anchor.origin);
                             *repairs += 1;
-                            REPAIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            REPAIRS.fetch_add(1, Ordering::Relaxed);
                         } else {
                             *anchor = now;
                             *repairs = 0;
@@ -885,7 +885,7 @@ fn guard_child_frames(main: &NSWindow) {
     ANCHORS.with(|a| a.borrow_mut().retain(|k, _| seen.contains(k)));
 }
 
-fn same_rect(a: objc2_foundation::NSRect, b: objc2_foundation::NSRect) -> bool {
+fn same_rect(a: NSRect, b: NSRect) -> bool {
     let close = |x: f64, y: f64| (x - y).abs() < 0.5;
     close(a.origin.x, b.origin.x)
         && close(a.origin.y, b.origin.y)
@@ -896,7 +896,7 @@ fn same_rect(a: objc2_foundation::NSRect, b: objc2_foundation::NSRect) -> bool {
 /// A frame that moved without resizing: the one shape a Space switch
 /// leaves and a hand does not, since a hand is a pressed button and a resize
 /// changes the size.
-fn unrequested_move(anchor: objc2_foundation::NSRect, now: objc2_foundation::NSRect) -> bool {
+fn unrequested_move(anchor: NSRect, now: NSRect) -> bool {
     let close = |x: f64, y: f64| (x - y).abs() < 0.5;
     close(anchor.size.width, now.size.width)
         && close(anchor.size.height, now.size.height)

@@ -583,7 +583,7 @@ impl AudioTrack {
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 interleaved.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(interleaved),
+                size_of_val(interleaved),
             )
         };
         let block = block_buffer(bytes)?;

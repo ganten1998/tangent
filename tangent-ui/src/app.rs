@@ -571,27 +571,27 @@ pub struct TangentApp {
     /// each, which is what it was: mixing a track means watching its volume
     /// and its send at once, and a row that could only show one of them made
     /// that a thing you toggled between rather than saw.
-    arr_auto_open: std::collections::HashSet<(usize, crate::automation::AutoParam)>,
+    arr_auto_open: HashSet<(usize, crate::automation::AutoParam)>,
     /// Which automation lanes are armed to WRITE. Session state, like
     /// `arr_auto_open`: arming is a thing you do for the next take, not a
     /// property of the song.
-    arr_auto_armed: std::collections::HashSet<(usize, crate::automation::AutoParam)>,
+    arr_auto_armed: HashSet<(usize, crate::automation::AutoParam)>,
     /// Which are bypassed — kept, drawn, editable, and not applied.
-    arr_auto_bypassed: std::collections::HashSet<(usize, crate::automation::AutoParam)>,
+    arr_auto_bypassed: HashSet<(usize, crate::automation::AutoParam)>,
     /// Per strip, what each of its three bays offers an automation lane.
     /// Pushed by the host — see [`Self::set_fx_params`].
-    fx_params: std::collections::HashMap<usize, [crate::ports::FxParams; crate::recorder::INSERTS]>,
+    fx_params: HashMap<usize, [crate::ports::FxParams; recorder::INSERTS]>,
     /// Per (SEAT, bay), a loaded built-in effect's spec and current values.
     /// Pushed by the host on load/change ([`Self::set_builtin_face`]),
     /// mirrored optimistically by a local drag ([`Self::set_insert_param`]).
-    builtin_faces: std::collections::HashMap<(usize, usize), crate::ports::BuiltinFace>,
+    builtin_faces: HashMap<(usize, usize), crate::ports::BuiltinFace>,
     /// Knob edits the host has not echoed back yet: (seat, bay, id) →
     /// (value, frames left). During a drag the push is one frame behind
     /// the finger, and letting it win yanked the slider backward every
     /// other frame — the "flashing" a beta hand caught in minutes. A
     /// pending value shields its param until the echo matches or a grace
     /// period passes (a refused edit must not shield forever).
-    pending_inserts: std::collections::HashMap<(usize, usize, u32), (f32, u8)>,
+    pending_inserts: HashMap<(usize, usize, u32), (f32, u8)>,
     /// Accrued wheel intent for the three stepped consumers - see
     /// [`WheelSteps`] for why stepping per event was the trackpad's ruin.
     wheel_mixer_zoom: WheelSteps,
@@ -599,8 +599,8 @@ pub struct TangentApp {
     wheel_media: WheelSteps,
     /// Per (SEAT, bay), the built-in compressor's gain-reduction meter in
     /// positive dB — forwarded each frame by the host for open faces.
-    insert_gr: std::collections::HashMap<(usize, usize), f32>,
-    arr_auto_params: std::collections::HashMap<usize, crate::automation::AutoParam>,
+    insert_gr: HashMap<(usize, usize), f32>,
+    arr_auto_params: HashMap<usize, crate::automation::AutoParam>,
     /// The point under the pointer or being dragged: `(lane, index)`.
     arr_auto_hot: Option<(usize, usize)>,
     /// **The automation row the keyboard is aimed at**, `(lane, slot)`.
@@ -646,14 +646,14 @@ pub struct TangentApp {
     /// Each lane's automation mode. Absent is [`crate::automation::AutoMode`]'s
     /// default, Read. Session-only — see the type, where the reason is a
     /// safety one.
-    arr_auto_modes: std::collections::HashMap<usize, crate::automation::AutoMode>,
+    arr_auto_modes: HashMap<usize, crate::automation::AutoMode>,
     /// Lanes a Latch has armed. Cleared when the transport stops, which is
     /// what makes Latch different from Write.
-    arr_auto_latched: std::collections::HashSet<usize>,
+    arr_auto_latched: HashSet<usize>,
     /// The last point WRITTEN per `(lane, param)`, so a move at sixty frames
     /// a second does not lay down sixty points a second. See
     /// `arr_write_automation`.
-    arr_auto_last: std::collections::HashMap<(usize, crate::automation::AutoParam), (f64, f64)>,
+    arr_auto_last: HashMap<(usize, crate::automation::AutoParam), (f64, f64)>,
     /// Whether the transport was rolling last frame, so the app can notice
     /// it STOP. The host writes the recorder's state straight into the app,
     /// so there is no call to hang this on — the edge is looked for instead.
@@ -819,9 +819,9 @@ pub struct TangentApp {
     /// The Konami walk. Watched on EVERY install, always: for the keyless
     /// it is the door in, and for a paying supporter it is the switch that
     /// wears the corruption or takes it off - see `DialogAction::AcceptCheat`.
-    konami: crate::keys::Konami,
+    konami: keys::Konami,
     /// When the confetti started, if a party is on. See `confetti::draw`.
-    confetti_at: Option<std::time::Instant>,
+    confetti_at: Option<Instant>,
     /// An insert bay being carried to another channel: `(strip, bay, where
     /// the press landed, has it really moved)`.
     ///
@@ -836,17 +836,17 @@ pub struct TangentApp {
     bay_carry: Option<(usize, usize, Pos2, bool)>,
     /// The strip whose colour palette is open, if any.
     /// A decibel figure being typed into a strip, and which.
-    mixer_typing: Option<(crate::recorder::Column, String)>,
+    mixer_typing: Option<(recorder::Column, String)>,
     /// The channel whose NAME is being typed, and what is in the field.
     ///
     /// Its own field rather than a mode on `mixer_typing`: the two accept
     /// different characters, commit to different places and are drawn in
     /// different rows, and a shared one would need a tag at every use.
-    mixer_naming: Option<(crate::recorder::Column, String)>,
+    mixer_naming: Option<(recorder::Column, String)>,
     /// The SWG menu, while it hangs under its chip.
     swing_menu: Option<SwingMenu>,
     /// The loaded insert bay whose Delete/Replace menu is open, if any.
-    mixer_fx_menu: Option<(crate::recorder::Column, usize)>,
+    mixer_fx_menu: Option<(recorder::Column, usize)>,
     /// The bay whose editor should open the moment its plugin loads — the
     /// pick that just happened, never a restore at launch. The host takes it
     /// after a successful `load_insert`; see `take_open_insert_on_load`.
@@ -934,7 +934,7 @@ pub struct TangentApp {
     input_menu: Option<InputMenu>,
     /// Where the last mixer/arrange press landed — the corner a context
     /// menu hangs from.
-    menu_anchor: egui::Pos2,
+    menu_anchor: Pos2,
     /// The chips' words, refreshed each frame so the borrowed view can
     /// point at them.
     input_chip_texts: Vec<String>,
@@ -1016,7 +1016,7 @@ pub struct TangentApp {
     /// The pad's NAME being typed in its menu.
     pad_name_typing: Option<String>,
     /// A pad being CARRIED to another pad: `(from, origin, active)`.
-    pad_carry: Option<(usize, egui::Pos2, bool)>,
+    pad_carry: Option<(usize, Pos2, bool)>,
     /// A drumpad knob value being typed, single-click's own door.
     drumpad_num: Option<(crate::drumpad_panel::Param, String)>,
     /// The clicked media row — highlighted, auditioned.
@@ -1024,7 +1024,7 @@ pub struct TangentApp {
     /// A strip being carried across the mixer: `(from, origin, active)` —
     /// active once the hand has really moved, so a rename's double-click
     /// never turns into a shuffle.
-    mixer_reorder: Option<(usize, egui::Pos2, bool)>,
+    mixer_reorder: Option<(usize, Pos2, bool)>,
     /// A track reorder's permutation, waiting for the HOST to move the
     /// plugin-state sidecars and reload the racks: `order[new] = old`,
     /// channel space. Taken once.
@@ -1041,7 +1041,7 @@ pub struct TangentApp {
     /// to.
     arr_sel_seen: (Option<u64>, Vec<u64>),
     /// A selection band in flight, both corners in screen space.
-    arr_band: Option<(egui::Pos2, egui::Pos2)>,
+    arr_band: Option<(Pos2, Pos2)>,
     /// A GROUP move's snapshot: `(id, start_s, lane)` for every selected
     /// clip when a member was grabbed — the whole set rides the drag.
     arr_move_orig: Vec<(u64, f64, usize)>,
@@ -1053,17 +1053,17 @@ pub struct TangentApp {
     /// last tick's (which would compound rounding into drift).
     arr_stretch_orig: Vec<crate::arrangement::ArrClip>,
     /// Tap-tempo presses, newest last. Cleared by a 2.5 s silence.
-    tap_times: Vec<std::time::Instant>,
+    tap_times: Vec<Instant>,
     /// The CLIP's own right-click menu: (clip id, where it hangs). Two rows
     /// — delete the take, copy the take — the owner's words on both.
-    arr_clip_menu: Option<(u64, egui::Pos2)>,
+    arr_clip_menu: Option<(u64, Pos2)>,
     /// **The ruler strip's menu**, and which flag it was opened on.
     ///
     /// `None` for the empty strip — the two rows there make something — and
     /// `Some(i)` over a flag, where the rows act on the marker under the
     /// hand. One field rather than two because it is one menu with two
     /// shapes, and two would be two things to remember to close.
-    arr_flag_menu: Option<(FlagMenuOn, egui::Pos2)>,
+    arr_flag_menu: Option<(FlagMenuOn, Pos2)>,
     /// Which marker the left button picked up, if any.
     ///
     /// **A marker's left button selects and drags and does nothing else** —
@@ -1074,7 +1074,7 @@ pub struct TangentApp {
     arr_marker_sel: Option<usize>,
     /// The arrange header BAY's right-click menu: (lane, bay, where).
     /// Two rows — Delete FX, Replace FX — the mixer's insert menu, here.
-    arr_fx_menu: Option<(usize, usize, egui::Pos2)>,
+    arr_fx_menu: Option<(usize, usize, Pos2)>,
     /// **The metronome's panel, while it hangs.** Painted like the dials'
     /// own right-click panels rather than built as a dialog — see
     /// `recorder_panel::draw_met`. `Some(())` because it has no state of its
@@ -1084,7 +1084,7 @@ pub struct TangentApp {
     met_drag: bool,
     /// The meters' held picture: rise instant, fall exponential — the
     /// engine hands raw per-frame maxima, and raw maxima flicker.
-    meter_hold: [[f32; 2]; crate::recorder::STRIPS],
+    meter_hold: [[f32; 2]; recorder::STRIPS],
     /// The UNDO history: whole document states (clips + desk baked in),
     /// shared by the editor, the arrangement and the mixer — one line of
     /// time, whichever surface wrote it. `hist_at` is where NOW stands.
@@ -1169,7 +1169,7 @@ pub struct TangentApp {
     arrangement_rect: Option<Rect>,
     /// Per-clip pictures the host pushed after decoding: the PLAYED span's
     /// wave and the file's length in seconds, by clip id.
-    clip_infos: std::collections::HashMap<u64, crate::ports::ClipInfo>,
+    clip_infos: HashMap<u64, crate::ports::ClipInfo>,
     /// The window the clip pictures were last drawn FOR.
     ///
     /// **A waveform is drawn at a zoom**, and a picture computed once at
@@ -1239,7 +1239,7 @@ pub struct TangentApp {
     /// hot-plug) — the menu itself never waits on an OS enumeration.
     menu_rows_cache: Option<[Vec<String>; 3]>,
     menu_cache_key: (String, usize),
-    menu_cache_at: Option<std::time::Instant>,
+    menu_cache_at: Option<Instant>,
     /// The submenu row under the pointer, for the hover light.
     menu_hover_row: Option<usize>,
     /// The TOP row under the pointer, for lighting it. Separate from
@@ -1290,7 +1290,7 @@ pub struct TangentApp {
     /// The host's scan of each unit's preset folder, keyed by unit identity
     /// ("@tangent-eq", "keys:2"). Pushed like the cartridge above; the app
     /// never opens the folder itself.
-    preset_rows: std::collections::HashMap<String, Vec<crate::ports::PresetRow>>,
+    preset_rows: HashMap<String, Vec<crate::ports::PresetRow>>,
     /// A preset the host has read back for a face to apply, latched until
     /// [`TangentApp::take_preset_loaded`] drains it.
     preset_loaded: Option<crate::ports::PresetLoaded>,
@@ -1588,7 +1588,7 @@ pub struct TangentApp {
     /// wordmark for the whole of the launch wait.
     /// The backing track, as the host decoded it. Empty when none is loaded.
     track: crate::ports::TrackInfo,
-    pending_welcome: Option<dialogs::Dialog>,
+    pending_welcome: Option<Dialog>,
     /// Whether the host says its launch splash is still up. Always false in
     /// hosts that have no splash, which is every host but the desktop app.
     splash_up: bool,
@@ -2018,7 +2018,7 @@ enum ArrDrag {
     Zoom { anchor_s: f64, last_y: f32 },
     /// A press on the ruler, fate undecided: sideways becomes a TIME
     /// SELECTION, up-and-down becomes the zoom, a plain release locates.
-    RulerPress { t0: f64, from: egui::Pos2 },
+    RulerPress { t0: f64, from: Pos2 },
     /// The selection in flight: `t0` is the anchor end.
     TimeSel { t0: f64 },
     /// Alt-drag: the hand holds the VIEW and slides it along the song.
@@ -2026,7 +2026,7 @@ enum ArrDrag {
     /// The toolbar navigator: horizontal scrolls, vertical zooms, both at
     /// once. `px_w` is the box's width at the press, so the whole song
     /// maps across the whole box for the gesture's life.
-    Nav { last: egui::Pos2, px_w: f32 },
+    Nav { last: Pos2, px_w: f32 },
 }
 
 /// The channel input menu: a floating column of four, submenus opening
@@ -2037,7 +2037,7 @@ enum ArrDrag {
 struct InputMenu {
     ch: usize,
     /// Top-left corner the column hangs from, in window points.
-    at: egui::Pos2,
+    at: Pos2,
     /// Which top row's submenu is open. Hover decides; a click confirms.
     hover: Option<usize>,
     /// The three submenus' rows, SNAPSHOTTED when the menu opens — device
@@ -2082,7 +2082,7 @@ struct MidiEdit {
     /// The velocity new notes are born with — the last one anybody set.
     last_vel: u8,
     /// A marquee in flight, both corners in screen space.
-    marquee: Option<(egui::Pos2, egui::Pos2)>,
+    marquee: Option<(Pos2, Pos2)>,
 }
 
 /// What a save prompt is standing in front of.
@@ -2189,7 +2189,7 @@ struct TrackCopy {
     /// Which lane it came from — the host needs it to find the plugin state
     /// files, which are keyed by strip and bay.
     from: usize,
-    kind: Option<crate::recorder::ChannelKind>,
+    kind: Option<recorder::ChannelKind>,
     name: String,
     color: i64,
     icon: u8,
@@ -2902,17 +2902,17 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
 /// first bay holds the built-in DX7, or failing that the first MIDI channel
 /// carrying any instrument at all. A desk with neither opens silent, which
 /// is the honest reading of a desk with nothing to play.
-fn default_armed(settings: &crate::settings::Settings) -> u32 {
+fn default_armed(settings: &Settings) -> u32 {
     let kind = |n: usize| settings.channel_kinds.get(n).copied().unwrap_or(0);
     let bay0 = |n: usize| {
         settings
             .strip_inserts
-            .get(n * crate::recorder::INSERTS)
+            .get(n * recorder::INSERTS)
             .map_or("", String::as_str)
     };
-    (0..crate::recorder::CHANNELS)
+    (0..recorder::CHANNELS)
         .find(|n| kind(*n) == 1 && bay0(*n) == dialogs::BUILTIN_PATH)
-        .or_else(|| (0..crate::recorder::CHANNELS).find(|n| kind(*n) == 1 && !bay0(*n).is_empty()))
+        .or_else(|| (0..recorder::CHANNELS).find(|n| kind(*n) == 1 && !bay0(*n).is_empty()))
         .map_or(0, |n| 1 << n)
 }
 
@@ -3093,7 +3093,7 @@ struct MixerGrab {
 #[derive(Clone)]
 struct SwingMenu {
     /// The whole menu's rectangle, laid out when the chip was pressed.
-    rect: egui::Rect,
+    rect: Rect,
     /// The percent being typed, when the field is live.
     typing: Option<String>,
 }
@@ -3108,27 +3108,27 @@ const SWING_ROW_H: f32 = 24.0;
 /// A free function because a DRAG asks it while the panel is not being
 /// hit-tested: once the grab is taken the answer must come from the track's
 /// geometry alone, not from whether the pointer is still over a row.
-fn met_track_fraction(screen: egui::Rect, anchor: egui::Rect, pos: egui::Pos2) -> Option<f32> {
-    let track = crate::recorder_panel::met_tempo_track(screen, anchor);
+fn met_track_fraction(screen: Rect, anchor: Rect, pos: Pos2) -> Option<f32> {
+    let track = recorder_panel::met_tempo_track(screen, anchor);
     track
         .is_positive()
         .then(|| ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0))
 }
 
-fn swing_menu_rect(anchor: egui::Rect, panel: egui::Rect) -> egui::Rect {
+fn swing_menu_rect(anchor: Rect, panel: Rect) -> Rect {
     let rows = 1 + crate::midi_editor::SWING_PRESETS.len();
-    let size = egui::Vec2::new(238.0, SWING_ROW_H * rows as f32 + 8.0);
-    let mut min = egui::Pos2::new(anchor.right() - size.x, anchor.bottom() + 4.0);
+    let size = Vec2::new(238.0, SWING_ROW_H * rows as f32 + 8.0);
+    let mut min = Pos2::new(anchor.right() - size.x, anchor.bottom() + 4.0);
     min.x = min.x.max(panel.left() + 4.0);
     min.y = min.y.min(panel.bottom() - size.y - 4.0).max(panel.top());
-    egui::Rect::from_min_size(min, size)
+    Rect::from_min_size(min, size)
 }
 
 /// Row `i` of the SWG menu: 0 is the percent field, 1.. the presets.
-fn swing_menu_row(menu: egui::Rect, i: usize) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::Pos2::new(menu.left() + 4.0, menu.top() + 4.0 + SWING_ROW_H * i as f32),
-        egui::Vec2::new(menu.width() - 8.0, SWING_ROW_H),
+fn swing_menu_row(menu: Rect, i: usize) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(menu.left() + 4.0, menu.top() + 4.0 + SWING_ROW_H * i as f32),
+        Vec2::new(menu.width() - 8.0, SWING_ROW_H),
     )
 }
 
@@ -3139,40 +3139,40 @@ const PAD_MENU_ROW_H: f32 = 22.0;
 
 /// Where the pad's context menu stands: beside its pad, held inside the
 /// drumpad panel.
-fn pad_menu_rect(pad: egui::Rect, panel: egui::Rect) -> egui::Rect {
-    let size = egui::Vec2::new(
+fn pad_menu_rect(pad: Rect, panel: Rect) -> Rect {
+    let size = Vec2::new(
         PAD_MENU_W,
         PAD_MENU_ROW_H + PAD_MENU_WAVE_H + PAD_MENU_ROW_H + 16.0,
     );
-    let mut min = egui::Pos2::new(pad.right() + 6.0, pad.top());
+    let mut min = Pos2::new(pad.right() + 6.0, pad.top());
     if min.x + size.x > panel.right() - 4.0 {
         min.x = (pad.left() - size.x - 6.0).max(panel.left() + 4.0);
     }
     min.y = min.y.min(panel.bottom() - size.y - 4.0).max(panel.top() + 4.0);
-    egui::Rect::from_min_size(min, size)
+    Rect::from_min_size(min, size)
 }
 
 /// The menu's rows: the NAME (editable), the wave strip (the trimmer),
 /// then the OBEY switch.
-fn pad_menu_name(menu: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::Pos2::new(menu.left() + 6.0, menu.top() + 5.0),
-        egui::Vec2::new(menu.width() - 12.0, PAD_MENU_ROW_H),
+fn pad_menu_name(menu: Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(menu.left() + 6.0, menu.top() + 5.0),
+        Vec2::new(menu.width() - 12.0, PAD_MENU_ROW_H),
     )
 }
-fn pad_menu_wave(menu: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::Pos2::new(menu.left() + 6.0, menu.top() + PAD_MENU_ROW_H + 8.0),
-        egui::Vec2::new(menu.width() - 12.0, PAD_MENU_WAVE_H - 6.0),
+fn pad_menu_wave(menu: Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(menu.left() + 6.0, menu.top() + PAD_MENU_ROW_H + 8.0),
+        Vec2::new(menu.width() - 12.0, PAD_MENU_WAVE_H - 6.0),
     )
 }
-fn pad_menu_obey(menu: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::Pos2::new(
+fn pad_menu_obey(menu: Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
             menu.left() + 6.0,
             menu.top() + PAD_MENU_ROW_H + PAD_MENU_WAVE_H + 6.0,
         ),
-        egui::Vec2::new(menu.width() - 12.0, PAD_MENU_ROW_H),
+        Vec2::new(menu.width() - 12.0, PAD_MENU_ROW_H),
     )
 }
 
@@ -3440,7 +3440,7 @@ impl TangentApp {
             fullscreen_now: false,
             maximized_now: false,
             decor_remax: None,
-            konami: crate::keys::Konami::default(),
+            konami: keys::Konami::default(),
             confetti_at: None,
             bay_carry: None,
             mixer_typing: None,
@@ -3463,7 +3463,7 @@ impl TangentApp {
             desk_reload: false,
             project_request: None,
             input_menu: None,
-            menu_anchor: egui::Pos2::ZERO,
+            menu_anchor: Pos2::ZERO,
             input_chip_texts: Vec::new(),
             input_chip_key: None,
             media_dir: dirs_home(),
@@ -3476,7 +3476,7 @@ impl TangentApp {
             drumpad_open: false,
             drumpad_rect: None,
             drumpad_pos: None,
-            drumpad_kits: (0..crate::recorder::CHANNELS)
+            drumpad_kits: (0..recorder::CHANNELS)
                 .map(|_| crate::drumpad::DrumpadDoc::default())
                 .collect(),
             drumpad_lane: 0,
@@ -3517,7 +3517,7 @@ impl TangentApp {
             arr_fx_menu: None,
             met_menu: None,
             met_drag: false,
-            meter_hold: [[0.0; 2]; crate::recorder::STRIPS],
+            meter_hold: [[0.0; 2]; recorder::STRIPS],
             history: Vec::new(),
             saved_state: None,
             pending_after_save: None,
@@ -3536,7 +3536,7 @@ impl TangentApp {
             arr_gesture_dirty: false,
             arr_pending: None,
             arrangement_rect: None,
-            clip_infos: std::collections::HashMap::new(),
+            clip_infos: HashMap::new(),
             arr_wave_at: None,
             open_insert_on_load: None,
             mixer_rect: None,
@@ -3572,7 +3572,7 @@ impl TangentApp {
             input_width: 0,
             cartridge: crate::ports::CartridgeInfo::default(),
             staged: vec![None; dialogs::CARTRIDGE_VOICES],
-            preset_rows: std::collections::HashMap::new(),
+            preset_rows: HashMap::new(),
             preset_loaded: None,
             ir_rows: Vec::new(),
             ir_scan_gen: 0,
@@ -3633,17 +3633,17 @@ impl TangentApp {
             window_chrome_h: 0.0,
             a11y_on: None,
             reader_was_detected: false,
-            arr_auto_open: std::collections::HashSet::new(),
-            arr_auto_armed: std::collections::HashSet::new(),
-            arr_auto_bypassed: std::collections::HashSet::new(),
-            fx_params: std::collections::HashMap::new(),
-            builtin_faces: std::collections::HashMap::new(),
-            pending_inserts: std::collections::HashMap::new(),
+            arr_auto_open: HashSet::new(),
+            arr_auto_armed: HashSet::new(),
+            arr_auto_bypassed: HashSet::new(),
+            fx_params: HashMap::new(),
+            builtin_faces: HashMap::new(),
+            pending_inserts: HashMap::new(),
             wheel_mixer_zoom: WheelSteps::default(),
             wheel_arr_zoom: WheelSteps::default(),
             wheel_media: WheelSteps::default(),
-            insert_gr: std::collections::HashMap::new(),
-            arr_auto_params: std::collections::HashMap::new(),
+            insert_gr: HashMap::new(),
+            arr_auto_params: HashMap::new(),
             arr_auto_hot: None,
             arr_auto_sel: None,
             arr_auto_nodes: Vec::new(),
@@ -3651,9 +3651,9 @@ impl TangentApp {
             arr_tempo_hot: None,
             arr_tempo_drag: None,
             arr_tempo_drag_from: None,
-            arr_auto_modes: std::collections::HashMap::new(),
-            arr_auto_latched: std::collections::HashSet::new(),
-            arr_auto_last: std::collections::HashMap::new(),
+            arr_auto_modes: HashMap::new(),
+            arr_auto_latched: HashSet::new(),
+            arr_auto_last: HashMap::new(),
             arr_was_rolling: false,
             // The window opens at a size this app chose — see `main.rs` —
             // so the grace runs from launch.
@@ -4192,7 +4192,7 @@ impl TangentApp {
             return Vec::new();
         }
         let mut out = Vec::new();
-        for n in ch + 1..crate::recorder::CHANNELS {
+        for n in ch + 1..recorder::CHANNELS {
             if !self.settings.strip_in_folder.get(n).copied().unwrap_or(false) {
                 break;
             }
@@ -4216,7 +4216,7 @@ impl TangentApp {
         if !self.is_folder(ch) {
             return Vec::new();
         }
-        (ch + 1..crate::recorder::CHANNELS)
+        (ch + 1..recorder::CHANNELS)
             .take_while(|n| {
                 self.settings.strip_in_folder.get(*n).copied().unwrap_or(false)
             })
@@ -4276,7 +4276,7 @@ impl TangentApp {
             .selected_tracks
             .iter()
             .copied()
-            .filter(|n| *n < crate::recorder::CHANNELS)
+            .filter(|n| *n < recorder::CHANNELS)
             .collect();
         group.sort_unstable();
         if group.len() < 2 || !group.contains(&from) {
@@ -4306,7 +4306,7 @@ impl TangentApp {
         if !self.is_folder(ch) {
             return;
         }
-        while self.settings.strip_folder_shut.len() < crate::recorder::CHANNELS {
+        while self.settings.strip_folder_shut.len() < recorder::CHANNELS {
             self.settings.strip_folder_shut.push(false);
         }
         let was = self.folder_shut(ch);
@@ -4317,7 +4317,7 @@ impl TangentApp {
     }
 
     fn set_is_folder(&mut self, ch: usize, on: bool) {
-        while self.settings.strip_is_folder.len() < crate::recorder::CHANNELS {
+        while self.settings.strip_is_folder.len() < recorder::CHANNELS {
             self.settings.strip_is_folder.push(false);
         }
         if let Some(slot) = self.settings.strip_is_folder.get_mut(ch) {
@@ -4378,7 +4378,7 @@ impl TangentApp {
     }
 
     fn set_in_folder(&mut self, ch: usize, on: bool) {
-        while self.settings.strip_in_folder.len() < crate::recorder::CHANNELS {
+        while self.settings.strip_in_folder.len() < recorder::CHANNELS {
             self.settings.strip_in_folder.push(false);
         }
         if let Some(slot) = self.settings.strip_in_folder.get_mut(ch) {
@@ -4398,10 +4398,10 @@ impl TangentApp {
     /// one level deep, so the gesture takes it OUT of its folder first.
 
     fn toggle_folder(&mut self, ch: usize) {
-        if ch >= crate::recorder::CHANNELS {
+        if ch >= recorder::CHANNELS {
             return;
         }
-        while self.settings.strip_is_folder.len() < crate::recorder::CHANNELS {
+        while self.settings.strip_is_folder.len() < recorder::CHANNELS {
             self.settings.strip_is_folder.push(false);
         }
         let was = self.is_folder(ch);
@@ -4426,7 +4426,7 @@ impl TangentApp {
 
     /// Turn one channel's theory send on or off.
     pub fn set_to_theory(&mut self, ch: usize, on: bool) {
-        while self.settings.strip_to_theory.len() < crate::recorder::CHANNELS {
+        while self.settings.strip_to_theory.len() < recorder::CHANNELS {
             self.settings.strip_to_theory.push(false);
         }
         if let Some(slot) = self.settings.strip_to_theory.get_mut(ch) {
@@ -4443,7 +4443,7 @@ impl TangentApp {
     /// whether any MIDI channel with the switch on is listening — which, on
     /// the shipped desk, is exactly "is track one's switch on".
     fn live_reaches_theory(&self) -> bool {
-        (0..crate::recorder::CHANNELS).any(|n| {
+        (0..recorder::CHANNELS).any(|n| {
             self.to_theory(n)
                 && self.channel_kind(n) == Some(recorder::ChannelKind::Midi)
         })
@@ -4876,7 +4876,7 @@ impl TangentApp {
     ///
     /// So the alias makes the DEFAULT name — "x - 3" — and typing here
     /// replaces it, which is what a default is for.
-    fn commit_mixer_name(&mut self, at: crate::recorder::Column, name: String) {
+    fn commit_mixer_name(&mut self, at: recorder::Column, name: String) {
         // **A COLUMN, converted.** `at` is where the field was drawn and
         // `strip_names` is a desk array, and the two agree on every column but
         // the last — so the master's name was being written into the CLICK's
@@ -4884,10 +4884,10 @@ impl TangentApp {
         // aliasing shipped — and the reason `Column` is now a TYPE.
         let at = at.desk_index();
         let name = name.trim().to_owned();
-        if self.settings.strip_names.len() <= crate::recorder::STRIPS {
+        if self.settings.strip_names.len() <= recorder::STRIPS {
             self.settings
                 .strip_names
-                .resize(crate::recorder::STRIPS + 1, String::new());
+                .resize(recorder::STRIPS + 1, String::new());
         }
         if let Some(slot) = self.settings.strip_names.get_mut(at) {
             *slot = name;
@@ -4906,7 +4906,7 @@ impl TangentApp {
             H::Folder(i) => f32::from(u8::from(
                 i.strip()
                     .and_then(|s| match s {
-                        crate::recorder::Strip::Channel(n) => Some(self.folder_shut(n)),
+                        recorder::Strip::Channel(n) => Some(self.folder_shut(n)),
                         _ => None,
                     })
                     .unwrap_or(false),
@@ -4918,7 +4918,7 @@ impl TangentApp {
             H::Send(i) => view.strips.get(i.0).map_or(0.0, |s| s.send),
             // A route's own level, by its place in THIS channel's list.
             H::RouteGain(i, k) => match i.strip() {
-                Some(crate::recorder::Strip::Channel(n)) => self
+                Some(recorder::Strip::Channel(n)) => self
                     .settings
                     .routes
                     .from(n)
@@ -4988,12 +4988,12 @@ impl TangentApp {
             }
             H::Pan(i) => {
                 match i.strip() {
-                    Some(crate::recorder::Strip::Channel(n)) => {
+                    Some(Strip::Channel(n)) => {
                         if let Some(slot) = self.settings.channel_pans.get_mut(n) {
                             *slot = 0.0;
                         }
                     }
-                    Some(crate::recorder::Strip::Drums) => self.settings.drums_pan = 0.0,
+                    Some(Strip::Drums) => self.settings.drums_pan = 0.0,
                     _ => {}
                 }
                 self.save_settings();
@@ -5020,7 +5020,7 @@ impl TangentApp {
                 self.selected_tracks
                     .iter()
                     .copied()
-                    .filter(|x| *x != n && *x < crate::recorder::CHANNELS)
+                    .filter(|x| *x != n && *x < recorder::CHANNELS)
                     .collect()
             };
         out
@@ -5042,7 +5042,7 @@ impl TangentApp {
     /// Which channel a mixer hit is aimed at, if it is aimed at one.
     fn hit_channel(hit: crate::mixer_panel::Hit) -> Option<usize> {
         match hit.column().strip() {
-            Some(crate::recorder::Strip::Channel(n)) => Some(n),
+            Some(recorder::Strip::Channel(n)) => Some(n),
             _ => None,
         }
     }
@@ -5132,7 +5132,7 @@ impl TangentApp {
     /// Whether one of the four switches is on for channel `n`.
     fn strip_switch(&self, hit: crate::mixer_panel::Hit, n: usize) -> bool {
         use crate::mixer_panel::Hit as H;
-        let bit = crate::recorder::Column(n).desk_index();
+        let bit = recorder::Column(n).desk_index();
         match hit {
             H::Mute(_) => self.settings.strip_muted & (1 << bit) != 0,
             H::Solo(_) => self.settings.strip_soloed & (1 << bit) != 0,
@@ -5159,7 +5159,7 @@ impl TangentApp {
             // Cmd/Ctrl+F alone; the glyph on the strip hides or shows the
             // children, same as the arrangement's arrow.
             H::Folder(i) => {
-                if let Some(crate::recorder::Strip::Channel(n)) = i.strip() {
+                if let Some(Strip::Channel(n)) = i.strip() {
                     self.toggle_folder_shut(n);
                 }
                 return;
@@ -5167,13 +5167,13 @@ impl TangentApp {
             // The button is a door, not a value: it opens the window and the
             // `value` this call carries means nothing to it.
             H::Routing(i) => {
-                if let Some(crate::recorder::Strip::Channel(n)) = i.strip() {
+                if let Some(Strip::Channel(n)) = i.strip() {
                     self.dialog = Some(self.routing_dialog(n, None));
                 }
                 return;
             }
             H::RouteGain(i, k) => {
-                if let Some(crate::recorder::Strip::Channel(n)) = i.strip() {
+                if let Some(Strip::Channel(n)) = i.strip() {
                     // By POSITION in this channel's list, translated to the
                     // desk table's index here — the panel never sees the
                     // table, so a reorder cannot desync the two.
@@ -5214,19 +5214,19 @@ impl TangentApp {
             H::Pan(i) => {
                 let p = f64::from(v).mul_add(2.0, -1.0).clamp(-1.0, 1.0);
                 match i.strip() {
-                    Some(crate::recorder::Strip::Channel(n)) => {
+                    Some(Strip::Channel(n)) => {
                         if let Some(slot) = self.settings.channel_pans.get_mut(n) {
                             *slot = p;
                         }
                     }
-                    Some(crate::recorder::Strip::Drums) => self.settings.drums_pan = p,
+                    Some(Strip::Drums) => self.settings.drums_pan = p,
                     _ => {}
                 }
             }
             // **A press, not a drag**, so it acts on the way down and the
             // value is ignored.
             H::InputChip(i) => {
-                if let Some(crate::recorder::Strip::Channel(n)) = i.strip() {
+                if let Some(Strip::Channel(n)) = i.strip() {
                     self.open_input_menu(n);
                 }
             }
@@ -5310,7 +5310,7 @@ impl TangentApp {
                 // double-click with a blank rename field, which then sat
                 // over the desk swallowing keys and presses (the owner's
                 // "empty name strip interfering with selection").
-                if let Some(crate::recorder::Strip::Channel(n)) = i.strip() {
+                if let Some(Strip::Channel(n)) = i.strip() {
                     if !self.channel_used(n) {
                         return;
                     }
@@ -5472,7 +5472,7 @@ impl TangentApp {
         use crate::automation::AutoParam;
         use crate::mixer_panel::Hit as H;
         use crate::recorder::Strip;
-        let channel_of = |i: crate::recorder::Column| match i.strip() {
+        let channel_of = |i: recorder::Column| match i.strip() {
             Some(Strip::Channel(n)) => Some(n),
             _ => None,
         };
@@ -5571,7 +5571,7 @@ impl TangentApp {
             // rather than simply cut loose: deleting an inner group should
             // leave its tracks in the outer one, not at the top level.
             let up = self.folder_of(n).is_some();
-            for ch in n + 1..crate::recorder::CHANNELS {
+            for ch in n + 1..recorder::CHANNELS {
                 if !self.settings.strip_in_folder.get(ch).copied().unwrap_or(false) {
                     break;
                 }
@@ -5634,9 +5634,9 @@ impl TangentApp {
         // whatever was running in them - the folder-extra seat's included,
         // or a removed folder's second rack stayed loaded invisibly and
         // resurfaced in bays 3..5 the next time the row became a folder.
-        for bay in 0..crate::recorder::INSERTS {
+        for bay in 0..recorder::INSERTS {
             self.set_insert(at, bay, None);
-            self.set_insert(crate::recorder::folder_extra_seat(at), bay, None);
+            self.set_insert(recorder::folder_extra_seat(at), bay, None);
         }
         // **And every bypass on the seats those bays live in.**
         //
@@ -5652,7 +5652,7 @@ impl TangentApp {
         self.settings.insert_bypass.drop_seat(at);
         self.settings
             .insert_bypass
-            .drop_seat(crate::recorder::folder_extra_seat(at));
+            .drop_seat(recorder::folder_extra_seat(at));
         self.save_settings();
     }
 
@@ -5839,11 +5839,11 @@ impl TangentApp {
         self.arrangement.meter = crate::tempo::MeterMap::sanitised(vec![
             crate::tempo::MeterPoint {
                 at_bar: 0,
-                sig: crate::recorder::TimeSignature { beats: 4, unit: 4 },
+                sig: recorder::TimeSignature { beats: 4, unit: 4 },
             },
             crate::tempo::MeterPoint {
                 at_bar: 12,
-                sig: crate::recorder::TimeSignature { beats: 6, unit: 8 },
+                sig: recorder::TimeSignature { beats: 6, unit: 8 },
             },
         ]);
         self.settings.arr_tempo_lane = true;
@@ -5944,14 +5944,14 @@ impl TangentApp {
     }
 
     /// Paint the popup exactly as the frame does, for the harness.
-    pub fn draw_midi_editor_for_shot(&self, painter: &egui::Painter, rect: egui::Rect) {
+    pub fn draw_midi_editor_for_shot(&self, painter: &egui::Painter, rect: Rect) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
         };
         let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == st.id) else {
             return;
         };
-        let r = rect.shrink2(egui::Vec2::new(rect.width() * 0.05, rect.height() * 0.06));
+        let r = rect.shrink2(Vec2::new(rect.width() * 0.05, rect.height() * 0.06));
         if r.is_positive() {
             let view = self.midi_edit_view(st, clip);
             crate::midi_editor::draw(painter, r, &view);
@@ -6034,7 +6034,7 @@ impl TangentApp {
     }
 
     /// Paint the drumpad exactly as the frame does, for the harness.
-    pub fn draw_drumpad_for_shot(&self, painter: &egui::Painter, rect: egui::Rect) {
+    pub fn draw_drumpad_for_shot(&self, painter: &egui::Painter, rect: Rect) {
         let r = crate::drumpad_panel::place(rect, None);
         if r.is_positive() {
             crate::drumpad_panel::draw_dressed(painter, r, &self.drumpad_view(), self.drumpad_dress());
@@ -6127,7 +6127,7 @@ impl TangentApp {
                 },
                 strip: Some(s),
                 route_count: match s {
-                    crate::recorder::Strip::Channel(n) => self.settings.routes.from(n).len(),
+                    Strip::Channel(n) => self.settings.routes.from(n).len(),
                     _ => 0,
                 },
                 // **What the user called it wins.** A desk is a set of names
@@ -6160,7 +6160,7 @@ impl TangentApp {
                 // a strip's Nth slot may live in another rack — the master's
                 // first three do. Everything else answers itself.
                 inserts: std::array::from_fn(|n| {
-                    let (seat, bay) = crate::recorder::seat_bay(i, n);
+                    let (seat, bay) = recorder::seat_bay(i, n);
                     self.insert(seat, bay).map_or("", insert_chip_name)
                 }),
                 // The dot on a keyed chip. By SLOT, matching `inserts`; the
@@ -6175,7 +6175,7 @@ impl TangentApp {
                 // which is the failure the `inserts` block above records
                 // having had, in this very strip, when it indexed raw.
                 bypassed: std::array::from_fn(|n| {
-                    let (seat, bay) = crate::recorder::seat_bay(i, n);
+                    let (seat, bay) = recorder::seat_bay(i, n);
                     self.insert_bypassed(seat, bay)
                 }),
                 kind,
@@ -6231,7 +6231,7 @@ impl TangentApp {
                     name: self
                         .settings
                         .strip_names
-                        .get(crate::recorder::STRIPS)
+                        .get(recorder::STRIPS)
                         .map_or("MASTER", |n| if n.is_empty() { "MASTER" } else { n.as_str() }),
                     detail: "",
                     // **Through `strip_color`, like every other strip.**
@@ -6244,7 +6244,7 @@ impl TangentApp {
                     // had painted by hand got a zero, which is the wood, so
                     // the master came out the same bone as the empty slots
                     // beside it on every theme including the default.
-                    color: self.strip_color(crate::recorder::STRIPS),
+                    color: self.strip_color(recorder::STRIPS),
                     // **Through `seat_bay`, like every other strip.** The
                     // master is the one strip whose six slots do NOT live in
                     // one rack — its first three are the extra seat appended
@@ -6256,7 +6256,7 @@ impl TangentApp {
                     // named something that was never on the master at all.
                     inserts: std::array::from_fn(|n| {
                         let (seat, bay) =
-                            crate::recorder::seat_bay(crate::recorder::STRIPS, n);
+                            recorder::seat_bay(recorder::STRIPS, n);
                         self.insert(seat, bay).map_or("", insert_chip_name)
                     }),
                     kind: None,
@@ -6281,14 +6281,14 @@ impl TangentApp {
                     keyed: std::array::from_fn(|n| {
                         self.settings
                             .insert_keys
-                            .get(crate::recorder::MASTER_SEAT, n)
+                            .get(recorder::MASTER_SEAT, n)
                             .is_some()
                     }),
                     // The master's two racks, resolved the way its names
                     // are: slots 0..2 are the extra seat, 3..5 the original.
                     bypassed: std::array::from_fn(|n| {
                         let (seat, bay) =
-                            crate::recorder::seat_bay(crate::recorder::STRIPS, n);
+                            recorder::seat_bay(recorder::STRIPS, n);
                         self.insert_bypassed(seat, bay)
                     }),
                 },
@@ -6338,7 +6338,7 @@ impl TangentApp {
             // is a persisted preference like the eight beside it; a second
             // copy is a second thing to keep in step.
             varispeed: self.settings.varispeed,
-            loudness: crate::recorder::Loudness {
+            loudness: recorder::Loudness {
                 window: self.settings.lufs_window,
                 ..self.recorder.loudness
             },
@@ -6652,7 +6652,7 @@ impl TangentApp {
     /// the graceful shift this replaced; a wave needs edges, so the colour is
     /// chosen whole and the band it belongs to is what moves.
     fn heart_wave(&self, phase: f32, t: f64) -> egui::Color32 {
-        let n = crate::recorder::CHANNELS;
+        let n = recorder::CHANNELS;
         // **The other way.** The wave travelled up and to the left; the
         // owner's call is down and to the right, which is the direction a
         // thing being read moves.
@@ -6671,20 +6671,20 @@ impl TangentApp {
     fn heart_palette_slot_in(&self, palette: i64, i: usize) -> egui::Color32 {
         let n = crate::mixer_panel::PALETTES.len();
         let pal = &crate::mixer_panel::PALETTES[palette.rem_euclid(n as i64) as usize];
-        let idx = pal.slot(i % crate::recorder::CHANNELS);
+        let idx = pal.slot(i % recorder::CHANNELS);
         let (r, g, b) = crate::mixer_panel::STRIP_COLORS[idx];
-        crate::recorder_panel::heart_shade(
+        recorder_panel::heart_shade(
             egui::Color32::from_rgb(r, g, b),
-            crate::recorder_panel::band_face(&self.settings),
+            recorder_panel::band_face(&self.settings),
         )
     }
 
     fn heart_palette_slot(&self, i: usize) -> egui::Color32 {
-        let idx = self.palette().slot(i % crate::recorder::CHANNELS);
+        let idx = self.palette().slot(i % recorder::CHANNELS);
         let (r, g, b) = crate::mixer_panel::STRIP_COLORS[idx];
-        crate::recorder_panel::heart_shade(
+        recorder_panel::heart_shade(
             egui::Color32::from_rgb(r, g, b),
-            crate::recorder_panel::band_face(&self.settings),
+            recorder_panel::band_face(&self.settings),
         )
     }
 
@@ -6816,7 +6816,7 @@ impl TangentApp {
             // going nowhere at all. See `raise_dialog`. A QUESTION only: a
             // plugin window is not waited on, and raising it on every press
             // would take the focus the person just put on the desk.
-            if self.dialog.as_ref().is_some_and(dialogs::Dialog::is_modal)
+            if self.dialog.as_ref().is_some_and(Dialog::is_modal)
                 && ctx.input(|i| i.pointer.any_pressed())
             {
                 self.raise_dialog = true;
@@ -8103,7 +8103,7 @@ impl TangentApp {
     /// Open the patch editor with a patch in it. For the screenshot hook,
     /// which has no host to fill it in.
     pub fn open_patch_editor_for_shot(&mut self) {
-        self.dialog = Some(dialogs::Dialog::PatchEditor {
+        self.dialog = Some(Dialog::PatchEditor {
             slot: 0,
             patch: crate::ports::PatchEdit {
                 name: "INIT VOICE".to_owned(),
@@ -8148,7 +8148,7 @@ impl TangentApp {
         entries: Vec<dialogs::FileEntry>,
         error: String,
     ) {
-        if let Some(dialogs::Dialog::FileBrowser {
+        if let Some(Dialog::FileBrowser {
             at: shown,
             entries: rows,
             selected,
@@ -8171,7 +8171,7 @@ impl TangentApp {
         at: std::path::PathBuf,
         entries: Vec<dialogs::FileEntry>,
     ) {
-        self.dialog = Some(dialogs::Dialog::FileBrowser {
+        self.dialog = Some(Dialog::FileBrowser {
             title,
             what,
             at,
@@ -8360,7 +8360,7 @@ impl TangentApp {
                     // On a lane that can hold audio — never the DX7's. The
                     // first unused lane on the shipped desk, which is where
                     // the BACKING column used to stand.
-                    let lane = self.lane_for_audio().unwrap_or(crate::recorder::CHANNELS - 1);
+                    let lane = self.lane_for_audio().unwrap_or(recorder::CHANNELS - 1);
                     arr.add_clip(clip_at(&rel, lane, 0.0));
                 }
             }
@@ -8458,7 +8458,7 @@ impl TangentApp {
         (0..self.active_channels())
             .find(|n| self.channel_kind(*n).is_none())
             .or_else(|| {
-                (0..crate::recorder::CHANNELS)
+                (0..recorder::CHANNELS)
                     .find(|n| self.channel_kind(*n) == Some(recorder::ChannelKind::Audio))
             })
     }
@@ -8486,7 +8486,7 @@ impl TangentApp {
             ));
         };
         self.arrangement
-            .add_clip(clip_at(&rel, lane.min(crate::recorder::CHANNELS - 1), start_s.max(0.0)));
+            .add_clip(clip_at(&rel, lane.min(recorder::CHANNELS - 1), start_s.max(0.0)));
         // Through the one save that also makes this a MOMENT undo can
         // reach; the desk rides along as everywhere else.
         let _ = doc;
@@ -8520,9 +8520,9 @@ impl TangentApp {
         // A .mid landing on a BARE lane makes it a MIDI track — the
         // lane-draw's own ritual, so the lane arms and records like one.
         // A lane that already IS something keeps its kind.
-        if self.channel_kind(lane.min(crate::recorder::CHANNELS - 1)).is_none() {
+        if self.channel_kind(lane.min(recorder::CHANNELS - 1)).is_none() {
             self.set_channel_input_spec(
-                lane.min(crate::recorder::CHANNELS - 1),
+                lane.min(recorder::CHANNELS - 1),
                 "midi:all",
             );
         }
@@ -8530,7 +8530,7 @@ impl TangentApp {
             pedal: import.pedal,
             kind: crate::arrangement::ClipKind::Midi,
             notes: import.notes,
-            lane: lane.min(crate::recorder::CHANNELS - 1),
+            lane: lane.min(recorder::CHANNELS - 1),
             path: String::new(),
             start_s: start_s.max(0.0),
             offset_s: 0.0,
@@ -8656,7 +8656,7 @@ impl TangentApp {
             // skipping the carve because no notes landed left the old clip
             // standing, the owner's bug.
             self.arr_carve(
-                r.lane.min(crate::recorder::CHANNELS - 1),
+                r.lane.min(recorder::CHANNELS - 1),
                 r.start_s.max(0.0),
                 r.start_s.max(0.0) + r.len_s,
             );
@@ -8675,7 +8675,7 @@ impl TangentApp {
                 pedal: r.pedal,
                 kind,
                 notes: r.notes,
-                lane: r.lane.min(crate::recorder::CHANNELS - 1),
+                lane: r.lane.min(recorder::CHANNELS - 1),
                 path: r.path.unwrap_or_default(),
                 start_s: r.start_s.max(0.0),
                 offset_s: 0.0,
@@ -8998,18 +8998,18 @@ impl TangentApp {
             // A document from before the badges: derive them — the drum
             // where the drumpad stands, auto everywhere else — instead of
             // leaving the LAST project's badges on this one's tracks.
-            for i in 0..crate::recorder::CHANNELS {
+            for i in 0..recorder::CHANNELS {
                 let bay0 = d.bay(i * recorder::INSERTS);
                 self.settings.channel_icons[i] =
                     u8::from(bay0 == Some(dialogs::DRUMPAD_PATH));
             }
         } else {
-            for (i, ic) in d.icons.iter().take(crate::recorder::CHANNELS).enumerate() {
+            for (i, ic) in d.icons.iter().take(recorder::CHANNELS).enumerate() {
                 self.settings.channel_icons[i] =
-                    (*ic).min(crate::recorder_panel::ICON_MAX);
+                    (*ic).min(recorder_panel::ICON_MAX);
             }
         }
-        for (i, k) in d.kinds.iter().take(crate::recorder::CHANNELS).enumerate() {
+        for (i, k) in d.kinds.iter().take(recorder::CHANNELS).enumerate() {
             self.settings.channel_kinds[i] = (*k).min(2);
         }
         self.settings.strip_names = d.names.clone();
@@ -9041,15 +9041,15 @@ impl TangentApp {
             }
         }
         self.settings.strip_inserts = dense;
-        for (i, v) in d.sends.iter().take(crate::recorder::STRIPS).enumerate() {
+        for (i, v) in d.sends.iter().take(recorder::STRIPS).enumerate() {
             self.settings.strip_sends[i] = v.clamp(0.0, 1.0);
         }
         self.settings.strip_muted = d.muted;
         self.settings.strip_soloed = d.soloed;
-        for (i, v) in d.gains.iter().take(crate::recorder::CHANNELS).enumerate() {
+        for (i, v) in d.gains.iter().take(recorder::CHANNELS).enumerate() {
             self.settings.channel_gains[i] = v.clamp(0.0, 8.0);
         }
-        for (i, v) in d.pans.iter().take(crate::recorder::CHANNELS).enumerate() {
+        for (i, v) in d.pans.iter().take(recorder::CHANNELS).enumerate() {
             self.settings.channel_pans[i] = v.clamp(-1.0, 1.0);
         }
         self.settings.channel_inputs = d.inputs.clone();
@@ -9095,7 +9095,7 @@ impl TangentApp {
         // that at the gesture, but a document's folder arrives here, and
         // the routes it must displace live in settings, not in the
         // document. Same invariant, second doorway.
-        for ch in 0..crate::recorder::CHANNELS {
+        for ch in 0..recorder::CHANNELS {
             if self.settings.strip_is_folder.get(ch).copied().unwrap_or(false) {
                 let _ = self.settings.routes.drop_into(ch);
             }
@@ -9124,7 +9124,7 @@ impl TangentApp {
             self.input_menu_sub(2),
         ]);
         self.menu_cache_key = self.menu_cache_key_now();
-        self.menu_cache_at = Some(std::time::Instant::now());
+        self.menu_cache_at = Some(Instant::now());
     }
 
     /// Keep the cache warm: the moment the interface reports (or changes),
@@ -9148,7 +9148,7 @@ impl TangentApp {
     fn open_input_menu(&mut self, ch: usize) {
         let stale = self
             .menu_cache_at
-            .is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(5));
+            .is_none_or(|at| at.elapsed() > Duration::from_secs(5));
         if stale || self.menu_cache_key != self.menu_cache_key_now() {
             self.refresh_menu_rows();
         }
@@ -9254,7 +9254,7 @@ impl TangentApp {
     /// The floating menu's rectangles: the four top rows, and the open
     /// submenu's rows. Everything the painter draws and the hand presses,
     /// from one function, clamped onto the pane.
-    fn input_menu_rects(&self, m: &InputMenu) -> (Vec<egui::Rect>, Vec<egui::Rect>) {
+    fn input_menu_rects(&self, m: &InputMenu) -> (Vec<Rect>, Vec<Rect>) {
         const W: f32 = 150.0;
         const SUB_W: f32 = 190.0;
         const ROW: f32 = 24.0;
@@ -9262,11 +9262,11 @@ impl TangentApp {
         let tops_h = ROW * INPUT_TOPS.len() as f32;
         let x = m.at.x.min(pane.x - W - SUB_W - 8.0).max(0.0);
         let y = m.at.y.min((pane.y - tops_h).max(0.0));
-        let tops: Vec<egui::Rect> = (0..INPUT_TOPS.len())
+        let tops: Vec<Rect> = (0..INPUT_TOPS.len())
             .map(|i| {
-                egui::Rect::from_min_size(
-                    egui::Pos2::new(x, y + ROW * i as f32),
-                    egui::Vec2::new(W, ROW),
+                Rect::from_min_size(
+                    Pos2::new(x, y + ROW * i as f32),
+                    Vec2::new(W, ROW),
                 )
             })
             .collect();
@@ -9277,9 +9277,9 @@ impl TangentApp {
                 let sy = (y + ROW * top as f32).min((pane.y - sub_h).max(0.0));
                 (0..rows.len())
                     .map(|i| {
-                        egui::Rect::from_min_size(
-                            egui::Pos2::new(x + W, sy + ROW * i as f32),
-                            egui::Vec2::new(SUB_W, ROW),
+                        Rect::from_min_size(
+                            Pos2::new(x + W, sy + ROW * i as f32),
+                            Vec2::new(SUB_W, ROW),
                         )
                     })
                     .collect()
@@ -9376,7 +9376,7 @@ impl TangentApp {
         // into another theme's window.
         let surface = self.menu_surface();
         let (face, ink, lit) = (surface.bg, surface.ink, surface.hover);
-        let column = |painter: &egui::Painter, rows: &[egui::Rect]| {
+        let column = |painter: &egui::Painter, rows: &[Rect]| {
             if let (Some(a), Some(b)) = (rows.first(), rows.last()) {
                 let field = a.union(*b).expand(2.0);
                 painter.rect_filled(field, 3.0, face);
@@ -9394,7 +9394,7 @@ impl TangentApp {
                 painter.rect_filled(r.shrink(1.0), 2.0, lit);
             }
             painter.text(
-                egui::Pos2::new(r.left() + 8.0, r.center().y),
+                Pos2::new(r.left() + 8.0, r.center().y),
                 egui::Align2::LEFT_CENTER,
                 INPUT_TOPS[i],
                 egui::FontId::new(11.0, crate::fonts::courier_bold()),
@@ -9402,7 +9402,7 @@ impl TangentApp {
             );
             if i < 3 {
                 painter.text(
-                    egui::Pos2::new(r.right() - 6.0, r.center().y),
+                    Pos2::new(r.right() - 6.0, r.center().y),
                     egui::Align2::RIGHT_CENTER,
                     "\u{25B8}",
                     egui::FontId::new(10.0, crate::fonts::courier()),
@@ -9418,7 +9418,7 @@ impl TangentApp {
                     painter.rect_filled(r.shrink(1.0), 2.0, lit);
                 }
                 painter.text(
-                    egui::Pos2::new(r.left() + 8.0, r.center().y),
+                    Pos2::new(r.left() + 8.0, r.center().y),
                     egui::Align2::LEFT_CENTER,
                     label,
                     egui::FontId::new(11.0, crate::fonts::courier()),
@@ -9455,7 +9455,7 @@ impl TangentApp {
     }
 
     fn set_channel_input_spec(&mut self, ch: usize, spec: &str) {
-        while self.settings.channel_inputs.len() < crate::recorder::CHANNELS {
+        while self.settings.channel_inputs.len() < recorder::CHANNELS {
             self.settings.channel_inputs.push(String::new());
         }
         if let Some(slot) = self.settings.channel_inputs.get_mut(ch) {
@@ -9494,7 +9494,7 @@ impl TangentApp {
             if let Some(send) = self
                 .settings
                 .strip_sends
-                .get_mut(crate::recorder::Strip::Channel(ch).index())
+                .get_mut(recorder::Strip::Channel(ch).index())
             {
                 *send = 0.0;
             }
@@ -9623,7 +9623,7 @@ impl TangentApp {
             return;
         }
         // And the inverse, for everything that NAMES a lane.
-        let mut inv = [0usize; crate::recorder::CHANNELS];
+        let mut inv = [0usize; CHANNELS];
         for (new, old) in order.iter().enumerate() {
             inv[*old] = new;
         }
@@ -9726,7 +9726,7 @@ impl TangentApp {
                 v[n] = was[order[n]];
             }
         }
-        let full = crate::recorder::INSERT_SPACE;
+        let full = recorder::INSERT_SPACE;
         while self.settings.strip_inserts.len() < full {
             self.settings.strip_inserts.push(String::new());
         }
@@ -9738,16 +9738,16 @@ impl TangentApp {
                 // And the folder-extra seat, which travels with its
                 // channel - see `recorder::seat_order`.
                 let (dst, src) = (
-                    crate::recorder::folder_extra_seat(n),
-                    crate::recorder::folder_extra_seat(order[n]),
+                    recorder::folder_extra_seat(n),
+                    recorder::folder_extra_seat(order[n]),
                 );
                 self.settings.strip_inserts[dst * INSERTS + b] =
                     inserts[src * INSERTS + b].clone();
                 // And the pedalboard, seven seats per channel, same rule.
-                for p in 0..crate::recorder::AMP_PEDALS {
+                for p in 0..recorder::AMP_PEDALS {
                     let (dst, src) = (
-                        crate::recorder::amp_pedal_seat(n, p),
-                        crate::recorder::amp_pedal_seat(order[n], p),
+                        recorder::amp_pedal_seat(n, p),
+                        recorder::amp_pedal_seat(order[n], p),
                     );
                     self.settings.strip_inserts[dst * INSERTS + b] =
                         inserts[src * INSERTS + b].clone();
@@ -9786,16 +9786,16 @@ impl TangentApp {
         if let Some((strip, _)) = self.open_insert_on_load.as_mut() {
             if *strip < CHANNELS {
                 *strip = inv[*strip];
-            } else if let Some((ch, p)) = crate::recorder::amp_pedal_of(*strip) {
+            } else if let Some((ch, p)) = recorder::amp_pedal_of(*strip) {
                 // A pedal seat follows its channel, like its plugins did.
-                *strip = crate::recorder::amp_pedal_seat(inv[ch], p);
+                *strip = recorder::amp_pedal_seat(inv[ch], p);
             }
         }
         if let Some((strip, _)) = self.picker_insert.as_mut() {
             if *strip < CHANNELS {
                 *strip = inv[*strip];
-            } else if let Some((ch, p)) = crate::recorder::amp_pedal_of(*strip) {
-                *strip = crate::recorder::amp_pedal_seat(inv[ch], p);
+            } else if let Some((ch, p)) = recorder::amp_pedal_of(*strip) {
+                *strip = recorder::amp_pedal_seat(inv[ch], p);
             }
         }
         // **And the OPEN pedal window goes DOWN**, rather than being carried.
@@ -9878,11 +9878,11 @@ impl TangentApp {
         }
         // **And which rows are OPEN, armed or bypassed**, for the same
         // reason: they are `(lane, param)` and the lane just changed.
-        let remap = |set: &std::collections::HashSet<(usize, crate::automation::AutoParam)>,
+        let remap = |set: &HashSet<(usize, crate::automation::AutoParam)>,
                      inv: &[usize; CHANNELS]| {
             set.iter()
                 .map(|(l, p)| (if *l < CHANNELS { inv[*l] } else { *l }, *p))
-                .collect::<std::collections::HashSet<_>>()
+                .collect::<HashSet<_>>()
         };
         self.arr_auto_open = remap(&self.arr_auto_open, &inv);
         self.arr_auto_armed = remap(&self.arr_auto_armed, &inv);
@@ -9914,7 +9914,7 @@ impl TangentApp {
         // its docs for why that inversion is not left to a call site.
         self.settings
             .insert_bypass
-            .remap_seats(&crate::recorder::seat_order(order));
+            .remap_seats(&recorder::seat_order(order));
 
         self.desk_state_perm = Some(order.to_vec());
         self.save_settings();
@@ -9922,7 +9922,7 @@ impl TangentApp {
     }
 
     fn add_bare_track(&mut self, n: usize) {
-        if n >= crate::recorder::CHANNELS {
+        if n >= recorder::CHANNELS {
             return;
         }
         self.settings.tracks_added |= 1 << n;
@@ -9931,7 +9931,7 @@ impl TangentApp {
         if let Some(send) = self
             .settings
             .strip_sends
-            .get_mut(crate::recorder::Strip::Channel(n).index())
+            .get_mut(recorder::Strip::Channel(n).index())
         {
             *send = 0.0;
         }
@@ -9949,10 +9949,10 @@ impl TangentApp {
     /// leaves a note in `insert_state_copy` for the host to act on — see
     /// `take_insert_state_copy`.
     pub fn copy_track(&mut self, n: usize) {
-        if n >= crate::recorder::CHANNELS {
+        if n >= recorder::CHANNELS {
             return;
         }
-        let at = crate::recorder::Strip::Channel(n).index();
+        let at = recorder::Strip::Channel(n).index();
         self.track_clipboard = Some(TrackCopy {
             from: n,
             kind: self.channel_kind(n),
@@ -9968,7 +9968,7 @@ impl TangentApp {
             pan: self.settings.channel_pans.get(n).copied().unwrap_or(0.0),
             send: self.settings.strip_sends.get(at).copied().unwrap_or(0.0),
             input: self.channel_input_spec(n).to_owned(),
-            inserts: (0..crate::recorder::INSERTS)
+            inserts: (0..recorder::INSERTS)
                 .map(|b| self.insert(at, b).unwrap_or_default().to_owned())
                 .collect(),
             clips: self
@@ -10005,13 +10005,13 @@ impl TangentApp {
     /// two clips sharing an id is a document that cannot say which one an
     /// edit meant.
     pub fn paste_track(&mut self, into: usize) {
-        if into >= crate::recorder::CHANNELS || self.channel_used(into) {
+        if into >= recorder::CHANNELS || self.channel_used(into) {
             return;
         }
         let Some(copy) = self.track_clipboard.clone() else {
             return;
         };
-        let at = crate::recorder::Strip::Channel(into).index();
+        let at = recorder::Strip::Channel(into).index();
         self.settings.tracks_added |= 1 << into;
         self.set_channel_kind(into, copy.kind);
         if let Some(name) = self.settings.strip_names.get_mut(at) {
@@ -10100,14 +10100,14 @@ impl TangentApp {
     /// pass false too and get neither, because `lane` is past the channels.
     fn open_track_dialog(&mut self, lane: usize, removable: bool) {
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
-        self.dialog = Some(dialogs::Dialog::Track {
+        self.dialog = Some(Dialog::Track {
             palette: self.settings.palette_choice,
             palette_auto: self.settings.palette_auto,
             serial: self.dialog_serial,
             lane,
             removable,
             can_paste: !removable
-                && lane < crate::recorder::CHANNELS
+                && lane < recorder::CHANNELS
                 && self.track_on_clipboard(),
             icon: self.settings.channel_icons.get(lane).copied().unwrap_or(0),
             // Counted here rather than tested in the dialog, because the
@@ -10163,7 +10163,7 @@ impl TangentApp {
         // a bare channel is a bus somebody records onto by mistake. From
         // the AUTHORITY rather than the settings default, so desks that
         // migrated through v14 (which inserted a 0) get it too.
-        if i == crate::recorder::Strip::Drums.index() {
+        if i == recorder::Strip::Drums.index() {
             return crate::mixer_panel::DRUMS_COLOR;
         }
         if self.settings.auto_palette {
@@ -10172,13 +10172,13 @@ impl TangentApp {
             // used to hold fixed amber and fixed red whatever the theme was,
             // which is how a purple theme ended up with an orange click and a
             // red master sitting next to sixteen channels that had all moved.
-            if i == crate::recorder::Strip::Click.index() {
+            if i == recorder::Strip::Click.index() {
                 return pal.click();
             }
-            if i == crate::recorder::STRIPS {
+            if i == recorder::STRIPS {
                 return pal.master();
             }
-            if i < crate::recorder::CHANNELS {
+            if i < recorder::CHANNELS {
                 return pal.slot(i);
             }
         }
@@ -10272,17 +10272,17 @@ impl TangentApp {
 /// touching this and it goes red, naming both.
 const STOCK_DESKS: &[&[(usize, &str)]] = &[
     // Before the drumpad: one instrument track, the built-in DX7.
-    &[(0, crate::dialogs::BUILTIN_PATH)],
+    &[(0, dialogs::BUILTIN_PATH)],
     // The drumpad arrives on track two.
     &[
-        (0, crate::dialogs::BUILTIN_PATH),
-        (crate::recorder::INSERTS, crate::dialogs::DRUMPAD_PATH),
+        (0, dialogs::BUILTIN_PATH),
+        (recorder::INSERTS, dialogs::DRUMPAD_PATH),
     ],
     // "it needs to have drums slot 1 and Tangent DX7 slot 2" — the kit first,
     // which is what a fresh install writes today.
     &[
-        (0, crate::dialogs::DRUMPAD_PATH),
-        (crate::recorder::INSERTS, crate::dialogs::BUILTIN_PATH),
+        (0, dialogs::DRUMPAD_PATH),
+        (recorder::INSERTS, dialogs::BUILTIN_PATH),
     ],
 ];
 
@@ -10296,7 +10296,7 @@ const STOCK_DESKS: &[&[(usize, &str)]] = &[
 fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) -> bool {
     let tracks = shipped
         .iter()
-        .map(|(at, _)| at / crate::recorder::INSERTS + 1)
+        .map(|(at, _)| at / recorder::INSERTS + 1)
         .max()
         .unwrap_or(0);
     d.kinds
@@ -10396,7 +10396,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn template_desk() -> crate::arrangement::DeskSnap {
         use crate::recorder::INSERTS;
         let mut s = Settings::default();
-        let need = (crate::recorder::STRIPS + 1 + crate::recorder::DRUM_PADS) * INSERTS;
+        let need = (recorder::STRIPS + 1 + recorder::DRUM_PADS) * INSERTS;
         if s.strip_inserts.len() < need {
             s.strip_inserts.resize(need, String::new());
         }
@@ -11408,7 +11408,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     notes: &c.notes,
                     offset_s: c.offset_s,
                     recording: false,
-                    lane: c.lane.min(crate::recorder::CHANNELS - 1),
+                    lane: c.lane.min(recorder::CHANNELS - 1),
                     start_s: c.start_s,
                     len_s: self.clip_len_resolved(c),
                     max_len_s: if file_s > 0.0 {
@@ -11436,7 +11436,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 for (lane, is_midi) in &rec.lanes {
                     views.push(crate::arrangement_panel::ClipView {
                         id: 0,
-                        lane: (*lane).min(crate::recorder::CHANNELS - 1),
+                        lane: (*lane).min(recorder::CHANNELS - 1),
                         start_s: rec.start_s,
                         len_s: len,
                         max_len_s: f64::INFINITY,
@@ -11503,7 +11503,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 dt_all = dt_all.max(-start);
             }
             let lane_d = lane_at.map_or(0, |l| {
-                l.min(crate::recorder::CHANNELS - 1) as i64 - g_lane as i64
+                l.min(recorder::CHANNELS - 1) as i64 - g_lane as i64
             });
             let orig = std::mem::take(&mut self.arr_move_orig);
             let mut dirty = false;
@@ -11545,7 +11545,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The lane rules mirror the imports': MIDI never lands on an AUDIO
         // channel, audio never on a MIDI one, and an unused lane takes
         // either — it becomes a clip lane, as a drop would make it.
-        let retarget = lane_at.filter(|l| *l < crate::recorder::CHANNELS).filter(|l| {
+        let retarget = lane_at.filter(|l| *l < recorder::CHANNELS).filter(|l| {
             let kind = self.channel_kind(*l);
             match self.arrangement.clips.iter().find(|c| c.id == id).map(|c| c.kind) {
                 // A MIDI clip goes ANYWHERE — on an audio channel it just
@@ -12012,7 +12012,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// The row under `p` and whether the hand is on its bottom strip.
-    fn arr_row_under(&self, rect: egui::Rect, p: egui::Pos2) -> Option<(usize, bool)> {
+    fn arr_row_under(&self, rect: Rect, p: Pos2) -> Option<(usize, bool)> {
         let clips = self.arr_clip_views();
         let view = self.arrange_view(&clips);
         let l = crate::arrangement_panel::Layout::new(rect, &view);
@@ -12230,17 +12230,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// drawn for — `AutoParam` keys are persisted, so a bay that changed
     /// meaning would silently move somebody's automation to another plugin.
     fn master_bay(bay: usize) -> (usize, usize) {
-        if bay < crate::recorder::INSERTS {
-            (crate::recorder::MASTER_SEAT, bay)
+        if bay < recorder::INSERTS {
+            (recorder::MASTER_SEAT, bay)
         } else {
-            (crate::recorder::MASTER_EXTRA_SEAT, bay - crate::recorder::INSERTS)
+            (recorder::MASTER_EXTRA_SEAT, bay - recorder::INSERTS)
         }
     }
 
     fn arr_open_automation_menu(&mut self, lane: usize) {
         use crate::automation::AutoParam;
         let master = lane == crate::arrangement_panel::MASTER_LANE;
-        if lane >= crate::recorder::CHANNELS && !master {
+        if lane >= recorder::CHANNELS && !master {
             return;
         }
         // **The master offers what the master HAS** - which grew: fader,
@@ -12285,14 +12285,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // saved curve therefore still names the plugin it was drawn for.
         // `master_bay` is the one place that rule lives.
         let two_racks = master || self.is_folder(lane);
-        for bay in 0..crate::recorder::INSERTS * if two_racks { 2 } else { 1 } {
+        for bay in 0..recorder::INSERTS * if two_racks { 2 } else { 1 } {
             let (bay_owner, seat_bay) = if master {
                 Self::master_bay(bay)
             } else {
                 // For a channel this is the identity on bays 0..2 and the
                 // folder-extra seat on 3..5 - the plain order, no
                 // `master_bay` twin. See `recorder::seat_bay`.
-                crate::recorder::seat_bay(lane, bay)
+                recorder::seat_bay(lane, bay)
             };
             let Some(fx) = self.fx_params(bay_owner, seat_bay) else {
                 continue;
@@ -12323,7 +12323,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .collect();
             groups.push(dialogs::AutoGroup { name, rows });
         }
-        self.dialog = Some(dialogs::Dialog::Automation {
+        self.dialog = Some(Dialog::Automation {
             lane,
             who: {
                 // What the header calls it, so the menu's title and the row
@@ -12577,7 +12577,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .to_owned(),
             choices: vec![dialogs::ConfirmChoice::new(
                 "Flatten",
-                dialogs::DialogAction::FlattenTempo,
+                DialogAction::FlattenTempo,
                 true,
             )],
             warn: self.settings.master_knob_color.to_color32(),
@@ -12770,7 +12770,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// cannot be moved: a song has to have a signature from its first bar,
     /// and a map with no point at zero is one `sanitised` would have to
     /// invent an answer for.
-    pub fn set_meter_at(&mut self, bar: u32, sig: Option<crate::recorder::TimeSignature>) {
+    pub fn set_meter_at(&mut self, bar: u32, sig: Option<recorder::TimeSignature>) {
         // **Bar zero is the BAND's signature, not a change.**
         //
         // `live_meter_map` hands back the band's signature whenever the
@@ -12989,7 +12989,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // the master's bit is bit 32, and in a u32 it ALIASED channel 31's,
         // so writing channel 31's fader suspended the master's curve.
         for lane in
-            (0..crate::recorder::CHANNELS).chain([crate::arrangement_panel::MASTER_LANE])
+            (0..recorder::CHANNELS).chain([crate::arrangement_panel::MASTER_LANE])
         {
             let mode = self.arr_auto_mode(lane);
             // `true` for touching: a lane whose mode writes on touch is
@@ -13055,7 +13055,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         value: f64,
     ) {
         use crate::automation::{Point, Shape};
-        if lane >= crate::recorder::CHANNELS {
+        if lane >= recorder::CHANNELS {
             return;
         }
         let at_s = self.recorder.position_s.max(0.0);
@@ -13212,7 +13212,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             return false;
         }
         self.pending_after_save = Some(next.clone());
-        self.dialog = Some(dialogs::Dialog::SaveChanges {
+        self.dialog = Some(Dialog::SaveChanges {
             what: match next {
                 AfterSave::New => "starting a new project",
                 AfterSave::Open => "opening another project",
@@ -13444,7 +13444,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // call, and a kit restored after them would wait a frame.
         let kits = crate::drumpad::DrumpadDoc::from_compact_all(
             &moment.kits,
-            crate::recorder::CHANNELS,
+            recorder::CHANNELS,
         );
         if kits != self.drumpad_kits {
             self.drumpad_kits = kits;
@@ -14245,7 +14245,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.open_insert_on_load == Some(from) {
             self.open_insert_on_load = Some(to);
         }
-        if let Some(dialogs::Dialog::InsertFace { strip, slot, .. }) = self.dialog.as_mut() {
+        if let Some(Dialog::InsertFace { strip, slot, .. }) = self.dialog.as_mut() {
             if (*strip, *slot) == from {
                 *strip = to.0;
                 *slot = to.1;
@@ -14310,23 +14310,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// The metronome tool's rect, which the panel hangs off.
-    fn met_anchor(&self, rect: egui::Rect) -> egui::Rect {
+    fn met_anchor(&self, rect: Rect) -> Rect {
         let clips = self.arr_clip_views();
         let view = self.arrange_view(&clips);
         crate::arrangement_panel::Layout::new(rect, &view).tool_met
     }
 
     /// Draw the metronome's panel, when it is up.
-    fn draw_met_menu(&self, painter: &egui::Painter, rect: egui::Rect) {
+    fn draw_met_menu(&self, painter: &egui::Painter, rect: Rect) {
         if self.met_menu.is_none() {
             return;
         }
         let sig = self.time_signature();
-        crate::recorder_panel::draw_met(
+        recorder_panel::draw_met(
             painter,
             rect,
             self.met_anchor(rect),
-            crate::recorder_panel::MetView {
+            recorder_panel::MetView {
                 bpm: self.tempo_bpm(),
                 beats: sig.beats,
                 unit: sig.unit,
@@ -14340,13 +14340,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// A press or a drag inside the metronome panel. Answers whether the
     /// panel took it — while it is up it owns every press, so a press on its
     /// own chrome is swallowed rather than falling through to the lanes.
-    fn met_menu_press(&mut self, rect: egui::Rect, pos: egui::Pos2, pressed: bool) -> bool {
+    fn met_menu_press(&mut self, rect: Rect, pos: Pos2, pressed: bool) -> bool {
         use crate::recorder_panel::MetHit;
         if self.met_menu.is_none() {
             return false;
         }
         let anchor = self.met_anchor(rect);
-        let hit = crate::recorder_panel::met_hit_test(rect, anchor, pos);
+        let hit = recorder_panel::met_hit_test(rect, anchor, pos);
         // **The tempo keeps its grab.** Once a drag starts on the track it
         // stays on the track, wherever the hand slides to — the rule every
         // fader on this desk follows, and the reason a drag that wanders off
@@ -14360,7 +14360,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if !pressed {
             // A move with no button down, inside the panel: swallowed, so
             // the lanes under it do not hover.
-            return crate::recorder_panel::met_popup_rect(rect, anchor).contains(pos);
+            return recorder_panel::met_popup_rect(rect, anchor).contains(pos);
         }
         match hit {
             Some(MetHit::Close) => {
@@ -14414,7 +14414,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// The tempo, from a fraction along the panel's track.
     fn set_tempo_fraction(&mut self, t: f32) {
-        let bpm = crate::recorder_panel::knob_to_tempo(t);
+        let bpm = recorder_panel::knob_to_tempo(t);
         self.apply_recorder_hit(recorder_panel::Hit::SetTempo(bpm));
     }
 
@@ -14438,9 +14438,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// role inherited from somewhere else — which is the mistake this
     /// codebase has now found seven times, every one of them by looking at a
     /// screenshot rather than by running a test.
-    fn menu_surface(&self) -> crate::recorder_panel::Surface {
+    fn menu_surface(&self) -> recorder_panel::Surface {
         let c = self.settings.fx_strip_color;
-        crate::recorder_panel::surface_of(egui::Color32::from_rgb(c.r, c.g, c.b))
+        recorder_panel::surface_of(egui::Color32::from_rgb(c.r, c.g, c.b))
     }
 
     /// **A tick at the right end of a menu row**, for a row that reports a
@@ -14630,7 +14630,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .iter()
                     .min_by(|a, b| a.start_s.total_cmp(&b.start_s))
                     .map_or(0, |c| c.lane);
-                target.min(crate::recorder::CHANNELS - 1) as i64 - base as i64
+                target.min(recorder::CHANNELS - 1) as i64 - base as i64
             }
             None => 0,
         };
@@ -16182,7 +16182,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             playhead_s: self.recorder.position_s,
             dark: self.settings.me_dark,
             pad_names: {
-                let drum_lane = (0..crate::recorder::CHANNELS).find(|n| {
+                let drum_lane = (0..recorder::CHANNELS).find(|n| {
                     self.insert(*n, 0) == Some(dialogs::DRUMPAD_PATH)
                 });
                 (Some(clip.lane) == drum_lane).then(|| {
@@ -16214,7 +16214,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn midi_editor_lane(&self) -> Option<usize> {
         let id = self.midi_edit.as_ref()?.id;
         let clip = self.arrangement.clips.iter().find(|c| c.id == id)?;
-        (clip.lane < crate::recorder::CHANNELS).then_some(clip.lane)
+        (clip.lane < recorder::CHANNELS).then_some(clip.lane)
     }
 
     fn open_midi_editor(&mut self, id: u64) {
@@ -16559,11 +16559,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let (kits, saved_lane) = match self.project_doc() {
             Some(doc) => crate::drumpad::DrumpadDoc::load_all_beside(
                 doc,
-                crate::recorder::CHANNELS,
+                recorder::CHANNELS,
                 legacy_lane,
             ),
             None => (
-                (0..crate::recorder::CHANNELS)
+                (0..recorder::CHANNELS)
                     .map(|_| crate::drumpad::DrumpadDoc::default())
                     .collect(),
                 None,
@@ -16588,7 +16588,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .is_some_and(|k| !k.is_empty())
             })
             .or_else(|| {
-                (0..crate::recorder::CHANNELS).find(|ch| {
+                (0..recorder::CHANNELS).find(|ch| {
                     self.drumpad_kits
                         .get(*ch)
                         .is_some_and(|k| !k.is_empty())
@@ -17196,7 +17196,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // through the same door a channel reorder uses.
                         use crate::recorder::{pad_insert_index, INSERTS};
                         let (a, b) = (pad_insert_index(from), pad_insert_index(to));
-                        let full = crate::recorder::INSERT_SPACE;
+                        let full = recorder::INSERT_SPACE;
                         while self.settings.strip_inserts.len() < full {
                             self.settings.strip_inserts.push(String::new());
                         }
@@ -17542,7 +17542,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// One frame of the open SWG menu: modal, so every press is either a
     /// row's or closes it, and the keyboard belongs to the percent field.
-    fn swing_menu_frame(&mut self, ctx: &egui::Context, pressed: bool, pointer: Option<egui::Pos2>) {
+    fn swing_menu_frame(&mut self, ctx: &egui::Context, pressed: bool, pointer: Option<Pos2>) {
         ctx.request_repaint();
         let Some(menu) = self.swing_menu.clone() else {
             return;
@@ -17623,7 +17623,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Paint the open SWG menu. Pure: the frame's own state was settled in
     /// [`Self::swing_menu_frame`].
-    fn draw_swing_menu(&self, painter: &egui::Painter, pointer: Option<egui::Pos2>) {
+    fn draw_swing_menu(&self, painter: &egui::Painter, pointer: Option<Pos2>) {
         let Some(menu) = self.swing_menu.as_ref() else {
             return;
         };
@@ -17646,7 +17646,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         {
             let r = swing_menu_row(menu.rect, 0);
             painter.text(
-                egui::Pos2::new(r.left() + 6.0, r.center().y),
+                Pos2::new(r.left() + 6.0, r.center().y),
                 egui::Align2::LEFT_CENTER,
                 "SWING",
                 font.clone(),
@@ -17657,7 +17657,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 None => format!("{current:.1}%"),
             };
             painter.text(
-                egui::Pos2::new(r.right() - 6.0, r.center().y),
+                Pos2::new(r.right() - 6.0, r.center().y),
                 egui::Align2::RIGHT_CENTER,
                 shown,
                 font.clone(),
@@ -17665,8 +17665,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             );
             painter.line_segment(
                 [
-                    egui::Pos2::new(r.left() + 2.0, r.bottom()),
-                    egui::Pos2::new(r.right() - 2.0, r.bottom()),
+                    Pos2::new(r.left() + 2.0, r.bottom()),
+                    Pos2::new(r.right() - 2.0, r.bottom()),
                 ],
                 egui::Stroke::new(1.0, ink.gamma_multiply(0.25)),
             );
@@ -17680,7 +17680,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             let chosen = (current - pct).abs() < 0.05;
             painter.text(
-                egui::Pos2::new(r.left() + 6.0, r.center().y),
+                Pos2::new(r.left() + 6.0, r.center().y),
                 egui::Align2::LEFT_CENTER,
                 format!(
                     "{} {name} ({ratio})",
@@ -17690,7 +17690,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 if chosen { ink } else { ink.gamma_multiply(0.75) },
             );
             painter.text(
-                egui::Pos2::new(r.right() - 6.0, r.center().y),
+                Pos2::new(r.right() - 6.0, r.center().y),
                 egui::Align2::RIGHT_CENTER,
                 format!("{pct:.1}%"),
                 font.clone(),
@@ -17702,7 +17702,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Paint the pad's context menu: the trimmer over the wave, then the
     /// OBEY NOTE-OFFS switch. Pure; the frame's state was settled in
     /// `drumpad_input`.
-    fn draw_pad_menu(&self, painter: &egui::Painter, panel: egui::Rect) {
+    fn draw_pad_menu(&self, painter: &egui::Painter, panel: Rect) {
         let Some(pad) = self.pad_menu else {
             return;
         };
@@ -17736,7 +17736,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 None => self.pad_label(pad).to_owned(),
             };
             painter.text(
-                egui::Pos2::new(row.left() + 6.0, row.center().y),
+                Pos2::new(row.left() + 6.0, row.center().y),
                 egui::Align2::LEFT_CENTER,
                 if shown.is_empty() { "(name)".to_owned() } else { shown },
                 egui::FontId::monospace(10.5),
@@ -17754,8 +17754,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let h = (wave.height() * 0.5 * v.clamp(0.0, 1.0)).max(0.5);
                 painter.line_segment(
                     [
-                        egui::Pos2::new(x, wave.center().y - h),
-                        egui::Pos2::new(x, wave.center().y + h),
+                        Pos2::new(x, wave.center().y - h),
+                        Pos2::new(x, wave.center().y + h),
                     ],
                     egui::Stroke::new(step.max(1.0), green.gamma_multiply(0.5)),
                 );
@@ -17768,9 +17768,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         for (a, b) in [(wave.left(), x0), (x1, wave.right())] {
             if b > a + 0.5 {
                 painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::Pos2::new(a, wave.top()),
-                        egui::Pos2::new(b, wave.bottom()),
+                    Rect::from_min_max(
+                        Pos2::new(a, wave.top()),
+                        Pos2::new(b, wave.bottom()),
                     ),
                     0.0,
                     egui::Color32::from_black_alpha(130),
@@ -17779,15 +17779,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         for x in [x0, x1] {
             painter.line_segment(
-                [egui::Pos2::new(x, wave.top()), egui::Pos2::new(x, wave.bottom())],
+                [Pos2::new(x, wave.top()), Pos2::new(x, wave.bottom())],
                 egui::Stroke::new(2.0, ink),
             );
         }
         // OBEY NOTE-OFFS, with its little lamp.
         let row = pad_menu_obey(menu);
-        let lamp = egui::Rect::from_center_size(
-            egui::Pos2::new(row.left() + 8.0, row.center().y),
-            egui::Vec2::splat(9.0),
+        let lamp = Rect::from_center_size(
+            Pos2::new(row.left() + 8.0, row.center().y),
+            Vec2::splat(9.0),
         );
         painter.rect_stroke(
             lamp,
@@ -17799,7 +17799,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             painter.rect_filled(lamp.shrink(2.0), 1.0, green);
         }
         painter.text(
-            egui::Pos2::new(lamp.right() + 6.0, row.center().y),
+            Pos2::new(lamp.right() + 6.0, row.center().y),
             egui::Align2::LEFT_CENTER,
             "OBEY NOTE-OFFS",
             egui::FontId::monospace(10.0),
@@ -17868,7 +17868,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     fn me_audition(&mut self, notes: Vec<u8>, on: bool) {
-        let drum_lane = (0..crate::recorder::CHANNELS)
+        let drum_lane = (0..recorder::CHANNELS)
             .find(|n| self.insert(*n, 0) == Some(dialogs::DRUMPAD_PATH));
         let lane = self
             .midi_edit
@@ -17882,10 +17882,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // is the comparison clippy rightly calls absurd, and it was
                 // the one thing stopping `cargo clippy --workspace` from
                 // completing at all.)
-                let Some(pad) = k.checked_sub(crate::recorder::DRUM_PAD_BASE) else {
+                let Some(pad) = k.checked_sub(recorder::DRUM_PAD_BASE) else {
                     continue;
                 };
-                if usize::from(pad) < crate::recorder::DRUM_PADS {
+                if usize::from(pad) < recorder::DRUM_PADS {
                     self.request_recorder(recorder::RecorderRequest::PadHit {
                         pad,
                         on,
@@ -17924,7 +17924,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Whether the editor owns the pointer right now: over its panel, or
     /// mid-gesture. The arrangement stands down exactly then — the owner's
     /// rule that the surface UNDER the mouse is the one that answers.
-    fn midi_edit_owns(&self, pointer: Option<egui::Pos2>) -> bool {
+    fn midi_edit_owns(&self, pointer: Option<Pos2>) -> bool {
         if self.midi_edit.is_none() {
             return false;
         }
@@ -18011,7 +18011,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .find(|c| c.id == st.id)
             .and_then(|c| c.notes.last())
             .map_or(SHORTEST, |n| n.dur_s.clamp(SHORTEST, LONGEST));
-        let until = Instant::now() + std::time::Duration::from_secs_f64(secs);
+        let until = Instant::now() + Duration::from_secs_f64(secs);
         if let Some(st) = self.midi_edit.as_mut() {
             st.preview_until = Some(until);
         }
@@ -18277,7 +18277,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
 
         // ── the wheel, by the arrange view's own grammar ─────────────────
-        if scroll != egui::Vec2::ZERO && over {
+        if scroll != Vec2::ZERO && over {
             if let Some(p) = pointer {
                 let (anchor, s_per_px, over_grid) = {
                     let st = self.midi_edit.as_ref().unwrap();
@@ -19286,7 +19286,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .collect();
         for id in ids {
             if let Some(c) = self.arrangement.clips.iter().find(|c| c.id == id) {
-                if c.lane < crate::recorder::CHANNELS && !lanes.contains(&c.lane) {
+                if c.lane < recorder::CHANNELS && !lanes.contains(&c.lane) {
                     lanes.push(c.lane);
                 }
             }
@@ -19407,7 +19407,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // Outside it: the press closes it and is spent, the way
                 // every other menu on this desk dismisses.
                 let inside =
-                    crate::recorder_panel::met_popup_rect(rect, self.met_anchor(rect)).contains(p);
+                    recorder_panel::met_popup_rect(rect, self.met_anchor(rect)).contains(p);
                 if down && !inside && !self.met_drag {
                     self.met_menu = None;
                     self.met_drag = false;
@@ -19688,7 +19688,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     match crate::arrangement_panel::hit_test(rect, &view, p) {
                         Some(crate::arrangement_panel::Hit::HdrBay(n, b)) => Some((n, b)),
                         Some(crate::arrangement_panel::Hit::BusBay(_, b)) => {
-                            Some((crate::recorder::STRIPS, b))
+                            Some((recorder::STRIPS, b))
                         }
                         _ => None,
                     }
@@ -19699,7 +19699,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // the drum pads. Resolve to the seat HERE, so the menu's
                     // delete and replace act on the bay that was clicked and
                     // never the neighbour's.
-                    let (seat, bay) = crate::recorder::seat_bay(n, b);
+                    let (seat, bay) = recorder::seat_bay(n, b);
                     if self.insert(seat, bay).is_some() {
                         self.arr_fx_menu = Some((seat, bay, p));
                         return;
@@ -19819,7 +19819,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 i.modifiers.alt,
             )
         });
-        if scroll != egui::Vec2::ZERO {
+        if scroll != Vec2::ZERO {
             if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
                 // **The wheel over the TRACK HEADERS scrolls the lanes** —
                 // the desk has more lanes than the eight that show, and the
@@ -19873,7 +19873,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         let steps = self.wheel_arr_zoom.steps(d);
                         let cur = self.arr_visible() as i64;
                         let next = (cur + i64::from(steps))
-                            .clamp(1, crate::recorder::CHANNELS as i64);
+                            .clamp(1, recorder::CHANNELS as i64);
                         if next != cur {
                             self.settings.arr_visible = next as u8;
                             // Re-clamp the STORE too — the mixer's rule:
@@ -19980,7 +19980,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // **A double-click puts a dial back** — the desk's one rule,
                 // finally honoured on this view's three as well.
                 if let Some(A::Gain(n) | A::Send(n) | A::Pan(n)) = hit {
-                    let col = crate::recorder::Column(n);
+                    let col = recorder::Column(n);
                     let mixer_hit = match hit {
                         Some(A::Gain(_)) => crate::mixer_panel::Hit::Fader(col),
                         Some(A::Send(_)) => crate::mixer_panel::Hit::Send(col),
@@ -19996,7 +19996,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // fader on this view that could not be put back.
                 if let Some(A::BusGain(n)) = hit {
                     self.reset_mixer_hit(crate::mixer_panel::Hit::Fader(
-                        crate::recorder::Column(n),
+                        recorder::Column(n),
                     ));
                     self.undo_commit();
                     self.arr_drag = None;
@@ -20084,7 +20084,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             .filter(|s| !s.is_empty())
                             .cloned()
                             .unwrap_or_else(|| self.channel_display_name(n).to_owned());
-                        self.mixer_naming = Some((crate::recorder::Column(n), seed));
+                        self.mixer_naming = Some((recorder::Column(n), seed));
                         self.arr_drag = None;
                         return;
                     }
@@ -20357,7 +20357,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // order and this is where that becomes a seat.
                     Some(A::BusBay(_, slot)) => {
                         let (seat, bay) =
-                            crate::recorder::seat_bay(crate::recorder::STRIPS, slot);
+                            recorder::seat_bay(recorder::STRIPS, slot);
                         if self.insert(seat, bay).is_some() {
                             self.bay_carry = Some((seat, bay, p, false));
                         } else {
@@ -20375,7 +20375,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         self.touch_track(n);
                         // Slots 3..5 are a FOLDER's second rack - resolve
                         // through the seat map, like every other caller.
-                        let (seat, bay) = crate::recorder::seat_bay(n, bay);
+                        let (seat, bay) = recorder::seat_bay(n, bay);
                         // **And the mixer's own CARRY**, on the same terms —
                         // see `bay_carry`. A loaded bay arms; the window
                         // still opens on a press that does not travel.
@@ -20747,7 +20747,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             .map(|r| r.lane)
                     };
                     if let (Some(band), Some(param)) = (
-                        band.filter(egui::Rect::is_positive),
+                        band.filter(Rect::is_positive),
                         self.arr_auto_param_at(lane, slot),
                     ) {
                         let t = {
@@ -20796,7 +20796,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             .map(|r| r.lane);
                         (row, crate::arrangement_panel::time_at(rect, &view, p.x))
                     };
-                    if let Some(row) = row.filter(egui::Rect::is_positive) {
+                    if let Some(row) = row.filter(Rect::is_positive) {
                         let bpm = crate::arrangement_panel::tempo_bpm_at(row, p.y);
                         self.arr_drag_tempo_point(index, t, bpm);
                     }
@@ -20876,7 +20876,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         let clips = self.arr_clip_views();
                         let view = self.arrange_view(&clips);
                         let l = crate::arrangement_panel::Layout::new(rect, &view);
-                        let gap = |r: &egui::Rect| -> f32 {
+                        let gap = |r: &Rect| -> f32 {
                             if p.y < r.top() {
                                 r.top() - p.y
                             } else if p.y > r.bottom() {
@@ -20908,7 +20908,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
                     let v = (from + (from_y - p.y) / 420.0 * fine).clamp(0.0, 1.0);
                     self.apply_mixer_hit(
-                        crate::mixer_panel::Hit::Fader(crate::recorder::Column(lane)),
+                        crate::mixer_panel::Hit::Fader(recorder::Column(lane)),
                         v,
                     );
                     self.arr_drag = Some(ArrDrag::Gain { lane, from_y: p.y, from: v });
@@ -20937,7 +20937,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
                     let v = (from + (from_y - p.y) / 420.0 * fine).clamp(0.0, 1.0);
                     self.apply_mixer_hit(
-                        crate::mixer_panel::Hit::Pan(crate::recorder::Column(lane)),
+                        crate::mixer_panel::Hit::Pan(recorder::Column(lane)),
                         v,
                     );
                     self.arr_drag = Some(ArrDrag::HdrPan { lane, from_y: p.y, from: v });
@@ -20946,7 +20946,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
                     let v = (from + (from_y - p.y) / 420.0 * fine).clamp(0.0, 1.0);
                     self.apply_mixer_hit(
-                        crate::mixer_panel::Hit::Send(crate::recorder::Column(lane)),
+                        crate::mixer_panel::Hit::Send(recorder::Column(lane)),
                         v,
                     );
                     self.arr_drag = Some(ArrDrag::Send { lane, from_y: p.y, from: v });
@@ -21068,12 +21068,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // Slots 3..5 are a FOLDER's second rack — through the
                     // seat map like every other caller on this header.
                     Some(crate::arrangement_panel::Hit::HdrBay(n, b)) => {
-                        Some(crate::recorder::seat_bay(n, b))
+                        Some(recorder::seat_bay(n, b))
                     }
                     // The master's six slots live in two racks, and the
                     // header reaches them by their own variant.
                     Some(crate::arrangement_panel::Hit::BusBay(_, slot)) => {
-                        Some(crate::recorder::seat_bay(crate::recorder::STRIPS, slot))
+                        Some(recorder::seat_bay(recorder::STRIPS, slot))
                     }
                     _ => None,
                 };
@@ -21170,7 +21170,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         self.open_global_menu_at(ctx, b);
                         return;
                     }
-                    let band = egui::Rect::from_two_pos(a, b);
+                    let band = Rect::from_two_pos(a, b);
                     let picked: Vec<u64> = {
                         let clips = self.arr_clip_views();
                         let view = self.arrange_view(&clips);
@@ -21181,7 +21181,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             .filter_map(|c| {
                                 let row = l
                                     .lane_rows
-                                    .get(c.lane.min(crate::recorder::CHANNELS - 1))?;
+                                    .get(c.lane.min(recorder::CHANNELS - 1))?;
                                 let x0 = crate::arrangement_panel::x_of(
                                     rect, &view, c.start_s,
                                 );
@@ -21190,9 +21190,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                                     &view,
                                     c.start_s + self.clip_len_resolved(c),
                                 );
-                                let r = egui::Rect::from_min_max(
-                                    egui::Pos2::new(x0, row.top()),
-                                    egui::Pos2::new(x1.max(x0 + 2.0), row.bottom()),
+                                let r = Rect::from_min_max(
+                                    Pos2::new(x0, row.top()),
+                                    Pos2::new(x1.max(x0 + 2.0), row.bottom()),
                                 );
                                 (r.is_positive() && r.intersects(band)).then_some(c.id)
                             })
@@ -21590,7 +21590,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .iter()
             .map(|c| {
                 (
-                    c.lane.min(crate::recorder::CHANNELS - 1),
+                    c.lane.min(recorder::CHANNELS - 1),
                     (c.start_s / domain) as f32,
                     (self.clip_len_resolved(c) / domain) as f32,
                     self.strip_color(c.lane),
@@ -21653,7 +21653,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.recorder.master.left.peak,
                 self.recorder.master.right.peak,
             ],
-            master_color: self.strip_color(crate::recorder::MASTER_SEAT),
+            master_color: self.strip_color(recorder::MASTER_SEAT),
             accent: {
                 let c = self.settings.white_key_active_color;
                 (c.r, c.g, c.b)
@@ -21666,13 +21666,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The master's two racks, in strip order — `seat_bay` is the one
             // place that knows which of its six slots lives where.
             master_inserts: std::array::from_fn(|n| {
-                let (seat, bay) = crate::recorder::seat_bay(crate::recorder::STRIPS, n);
+                let (seat, bay) = recorder::seat_bay(recorder::STRIPS, n);
                 self.insert(seat, bay).map_or("", insert_chip_name)
             }),
             // Which of them are out of circuit, read from the same pair of
             // numbers as the names above — see `settings::BypassBays`.
             master_bypassed: std::array::from_fn(|n| {
-                let (seat, bay) = crate::recorder::seat_bay(crate::recorder::STRIPS, n);
+                let (seat, bay) = recorder::seat_bay(recorder::STRIPS, n);
                 self.insert_bypassed(seat, bay)
             }),
             // No UI to open it yet — the row exists so the tempo work has
@@ -21680,7 +21680,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             show_tempo_lane: self.settings.arr_tempo_lane,
             tempo_hot: self.arr_tempo_hot,
             meter_edit: self.num_edit.as_ref().and_then(|e| match e.field {
-                crate::recorder::NumField::MeterAt(bar) => Some((bar, e.text.as_str())),
+                recorder::NumField::MeterAt(bar) => Some((bar, e.text.as_str())),
                 _ => None,
             }),
             // **A name and whether it is held, and nothing else.**
@@ -21703,7 +21703,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 })
                 .collect(),
             marker_edit: self.num_edit.as_ref().and_then(|e| match e.field {
-                crate::recorder::NumField::MarkerName(i) => Some((i, e.text.as_str())),
+                recorder::NumField::MarkerName(i) => Some((i, e.text.as_str())),
                 _ => None,
             }),
             // **The master's own automation rows**, built exactly as a
@@ -21812,14 +21812,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     inserts: std::array::from_fn(|b| {
                         // Slots 3..5 are the folder's second rack - the
                         // seat map answers for every slot. See seat_bay.
-                        let (seat, bay) = crate::recorder::seat_bay(n, b);
+                        let (seat, bay) = recorder::seat_bay(n, b);
                         self.insert(seat, bay).map_or("", insert_chip_name)
                     }),
                     // And which are bypassed, through the same seat map —
                     // so a FOLDER's second rack answers for its own bays and
                     // never for the three above them.
                     bypassed: std::array::from_fn(|b| {
-                        let (seat, bay) = crate::recorder::seat_bay(n, b);
+                        let (seat, bay) = recorder::seat_bay(n, b);
                         self.insert_bypassed(seat, bay)
                     }),
                     color: self.strip_color(n),
@@ -21865,7 +21865,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 .mixer_naming
                 .as_ref()
                 .and_then(|(at, buf)| at.strip().map(|s| (s.index(), buf.as_str())))
-                .filter(|(i, _)| *i < crate::recorder::CHANNELS),
+                .filter(|(i, _)| *i < recorder::CHANNELS),
             metronome_on: self.settings.metronome_on,
             snap_on: self.settings.arr_snap,
             grip_lit: self.arr_grip_lit,
@@ -21975,7 +21975,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         let lane = self.drumpad_lane;
         let suggested = {
-            let at = crate::recorder::Strip::Channel(lane).index();
+            let at = recorder::Strip::Channel(lane).index();
             let name = self
                 .settings
                 .strip_names
@@ -22419,7 +22419,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Build the routing window for a channel, with the lists only the app
     /// can assemble: the device's jacks, the channels worth sending to, and
     /// what this channel already routes to.
-    fn routing_dialog(&self, channel: usize, picking: Option<bool>) -> dialogs::Dialog {
+    fn routing_dialog(&self, channel: usize, picking: Option<bool>) -> Dialog {
         let hardware = crate::routing::hardware_targets(self.device_outs)
             .into_iter()
             .filter_map(|t| match t {
@@ -22438,7 +22438,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // silently inaudible. Not offering it is the owner's call and the
         // honest one; `set_is_folder` drops any route that already points at
         // a track being turned into a group.
-        let channels = (0..crate::recorder::CHANNELS)
+        let channels = (0..recorder::CHANNELS)
             .filter(|n| *n != channel && self.channel_used(*n) && !self.is_folder(*n))
             .map(|n| {
                 let name = self
@@ -22457,7 +22457,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .into_iter()
             .map(|(at, r)| (at, r.target.label(), r.gain))
             .collect();
-        dialogs::Dialog::Routing {
+        Dialog::Routing {
             channel,
             picking,
             hardware,
@@ -22481,8 +22481,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Still excluded: the destination itself (a bay keying off its own
     /// channel is not a thing anyone means) and unused channels (a key that
     /// never sounds is a compressor that never ducks, silently).
-    fn key_picker_dialog(&self, strip: usize, slot: usize) -> dialogs::Dialog {
-        let channels = (0..crate::recorder::CHANNELS)
+    fn key_picker_dialog(&self, strip: usize, slot: usize) -> Dialog {
+        let channels = (0..recorder::CHANNELS)
             .filter(|n| *n != strip && self.channel_used(*n))
             .map(|n| {
                 let name = self
@@ -22494,7 +22494,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 (n, name)
             })
             .collect();
-        dialogs::Dialog::InsertKeySource {
+        Dialog::InsertKeySource {
             strip,
             slot,
             current: self.settings.insert_keys.get(strip, slot),
@@ -22512,8 +22512,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// edit controller — and which reads it on the main thread, once, when
     /// the bay changes. Polling it per frame would be a COM call per
     /// parameter per plugin per frame.
-    pub fn set_fx_params(&mut self, strip: usize, bays: [crate::ports::FxParams; crate::recorder::INSERTS]) {
-        if strip < crate::recorder::STRIPS + 1 {
+    pub fn set_fx_params(&mut self, strip: usize, bays: [crate::ports::FxParams; recorder::INSERTS]) {
+        if strip < recorder::STRIPS + 1 {
             self.fx_params.insert(strip, bays);
         }
     }
@@ -22621,7 +22621,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             AutoParam::Plugin { bay, id } => {
                 // Bays 3..5 are the folder's second rack; `fx_params` is
                 // keyed by SEAT, so resolve before looking.
-                let (seat, b) = crate::recorder::seat_bay(lane, usize::from(bay));
+                let (seat, b) = recorder::seat_bay(lane, usize::from(bay));
                 self.fx_params(seat, b)
                     .and_then(|fx| fx.params.iter().find(|p| p.id == id))
                     .map_or(0.5, |p| p.default_normalised.clamp(0.0, 1.0))
@@ -22749,7 +22749,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let (seat, sb) = if lane == crate::arrangement_panel::MASTER_LANE {
             Self::master_bay(bay)
         } else {
-            crate::recorder::seat_bay(lane, bay)
+            recorder::seat_bay(lane, bay)
         };
         match self.fx_params(seat, sb) {
             Some(fx) => match fx.params.iter().find(|p| p.id == id) {
@@ -22824,7 +22824,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
         }
         self.pending_inserts.insert((strip, slot, id), (value, 30));
-        self.request_recorder(crate::recorder::RecorderRequest::SetInsertParam {
+        self.request_recorder(recorder::RecorderRequest::SetInsertParam {
             strip,
             slot,
             id,
@@ -23104,7 +23104,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.scratch_warning = Some(warn);
     }
 
-    pub fn open_dialog(&self) -> Option<&dialogs::Dialog> {
+    pub fn open_dialog(&self) -> Option<&Dialog> {
         self.dialog.as_ref()
     }
 
@@ -23503,7 +23503,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         at: f64,
     ) -> Vec<String> {
         let mut errors = Vec::new();
-        let mut lane = lane.min(crate::recorder::CHANNELS - 1);
+        let mut lane = lane.min(recorder::CHANNELS - 1);
         for (i, path) in files.iter().enumerate() {
             if i > 0 {
                 let Some(free) = (0..self.active_channels()).find(|n| !self.channel_used(*n))
@@ -23832,7 +23832,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// contiguity rule that makes the positional model safe. Now the engine
     /// reads `folder_of` per channel, so the two CANNOT disagree; the
     /// O(n^2) over sixteen lanes is free.
-    pub fn folder_parents(&self) -> [i32; crate::recorder::CHANNELS] {
+    pub fn folder_parents(&self) -> [i32; recorder::CHANNELS] {
         std::array::from_fn(|ch| {
             self.folder_of(ch).map_or(-1, |p| p as i32)
         })
@@ -23847,7 +23847,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// paste and the Konami walk. Drawn at the end of the frame over
     /// everything; see `confetti::draw`.
     fn start_confetti(&mut self) {
-        self.confetti_at = Some(std::time::Instant::now());
+        self.confetti_at = Some(Instant::now());
     }
 
     /// **What is painted under `at`**, for anything that has to be dressed for
@@ -23885,7 +23885,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.settings.arr_dark,
             );
         }
-        crate::piano::themed_bg(&self.settings)
+        piano::themed_bg(&self.settings)
     }
 
     /// The desk's own face for the mode the app is in — what every floating
@@ -24007,10 +24007,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // that before pushing the names, and plays patch 0), and an open
         // leaves it at whatever the strip was remembered on.
         let playing = match &self.dialog {
-            Some(dialogs::Dialog::PatchPicker { slot, .. }) => Some(self.dx7_choice_of(*slot).1),
+            Some(Dialog::PatchPicker { slot, .. }) => Some(self.dx7_choice_of(*slot).1),
             _ => None,
         };
-        let Some(dialogs::Dialog::PatchPicker {
+        let Some(Dialog::PatchPicker {
             bank,
             bad_checksum,
             on_default,
@@ -24052,7 +24052,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn set_staged_bank(&mut self, names: Vec<Option<String>>) {
         self.staged = names;
         self.staged.resize(dialogs::CARTRIDGE_VOICES, None);
-        let Some(dialogs::Dialog::PatchPicker {
+        let Some(Dialog::PatchPicker {
             staged,
             staged_marked,
             staged_selected,
@@ -24071,7 +24071,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// What the last Save bank did, in the picker's own words. Good or bad:
     /// "Saved 12 patches to default.syx." or why it could not.
     pub fn set_bank_note(&mut self, said: String) {
-        if let Some(dialogs::Dialog::PatchPicker { note, .. }) = self.dialog.as_mut() {
+        if let Some(Dialog::PatchPicker { note, .. }) = self.dialog.as_mut() {
             *note = said;
         }
     }
@@ -24085,10 +24085,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// the strip that asked, because a question with nowhere to be drawn
     /// is a Save that silently did nothing.
     pub fn ask_bank_replace(&mut self, path: std::path::PathBuf) {
-        if !matches!(self.dialog, Some(dialogs::Dialog::PatchPicker { .. })) {
+        if !matches!(self.dialog, Some(Dialog::PatchPicker { .. })) {
             self.open_patch_picker(self.cartridge_pick_strip);
         }
-        if let Some(dialogs::Dialog::PatchPicker { question, .. }) = self.dialog.as_mut() {
+        if let Some(Dialog::PatchPicker { question, .. }) = self.dialog.as_mut() {
             *question = Some(dialogs::BankQuestion::Replace(path));
         }
     }
@@ -24246,7 +24246,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// is pushed every frame whatever the numbers say; silence arrives as
     /// silence, and "nothing is coming back" gets to be said out loud.
     pub fn ir_wizard_open(&self) -> bool {
-        matches!(self.dialog, Some(dialogs::Dialog::IrWizard { .. }))
+        matches!(self.dialog, Some(Dialog::IrWizard { .. }))
     }
 
     /// Open the IR wizard with the device lists snapshotted NOW — the
@@ -24257,7 +24257,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         state.out_pairs = Self::ir_channel_pairs(self.device_outs);
         state.in_pairs = Self::ir_channel_pairs(usize::from(self.input_width));
         state.live = self.ir_live.clone();
-        self.dialog = Some(dialogs::Dialog::IrWizard {
+        self.dialog = Some(Dialog::IrWizard {
             state: Box::new(state),
         });
     }
@@ -24317,13 +24317,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// visible page does not contain is a highlight on the wrong pad, which
     /// is the bug this was written for.
     fn drumpad_focus(&mut self, key: usize) {
-        let key = key.min(crate::recorder::DRUM_PADS - 1);
+        let key = key.min(recorder::DRUM_PADS - 1);
         self.drumpad_sel = key;
         let page = key
-            .saturating_sub(crate::recorder::DRUM_PAGE_ANCHOR)
-            / crate::recorder::DRUM_PAGE;
+            .saturating_sub(recorder::DRUM_PAGE_ANCHOR)
+            / recorder::DRUM_PAGE;
         self.settings.drumpad_page =
-            page.min(crate::recorder::DRUM_PAGES - 1) as u8;
+            page.min(recorder::DRUM_PAGES - 1) as u8;
     }
 
     /// **The pads as the default template has them**, or empty if it has
@@ -24344,12 +24344,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let (kits, lane) = if doc.exists() {
             crate::drumpad::DrumpadDoc::load_all_beside(
                 &doc,
-                crate::recorder::CHANNELS,
+                recorder::CHANNELS,
                 None,
             )
         } else {
             (
-                (0..crate::recorder::CHANNELS)
+                (0..recorder::CHANNELS)
                     .map(|_| crate::drumpad::DrumpadDoc::default())
                     .collect(),
                 None,
@@ -24510,7 +24510,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// — the analyzer and the goniometer read the tap, and arming it is
     /// also the host's cue to scan and push the unit's preset shelf.
     fn open_unit_face(&mut self, strip: usize, slot: usize) {
-        self.dialog = Some(dialogs::Dialog::InsertFace {
+        self.dialog = Some(Dialog::InsertFace {
             strip,
             slot,
             live: Box::default(),
@@ -24573,7 +24573,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     slot: 0,
                     on: true,
                 });
-                Some(dialogs::Dialog::InsertFace {
+                Some(Dialog::InsertFace {
                     strip: seat,
                     slot: 0,
                     live: Box::default(),
@@ -24623,7 +24623,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// `over` pointing at the amp face it has pointed at all along.
     fn open_stacked_unit_face(&mut self, strip: usize, slot: usize) {
         if let Some(st) = self.pedal_stack.as_mut() {
-            st.dialog = Some(dialogs::Dialog::InsertFace {
+            st.dialog = Some(Dialog::InsertFace {
                 strip,
                 slot,
                 live: Box::default(),
@@ -24657,7 +24657,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// to test first — an unconditional `take()` at the call site is what
     /// would quietly destroy every other dialog each frame.
     fn refreshed_face(&mut self, ctx: &egui::Context, open: Option<Dialog>) -> Option<Dialog> {
-        let Some(dialogs::Dialog::InsertFace { strip, slot, mut live }) = open else {
+        let Some(Dialog::InsertFace { strip, slot, mut live }) = open else {
             return open;
         };
         let (seat, bay) = recorder::seat_bay(strip, slot);
@@ -24735,12 +24735,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         // The bay's bypass, pushed like every other fact the face draws.
         {
-            let (seat, bay) = crate::recorder::seat_bay(strip, slot);
+            let (seat, bay) = recorder::seat_bay(strip, slot);
             live.bypassed = self.insert_bypassed(seat, bay);
         }
         // The meters breathe even when the hand is still.
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
-        Some(dialogs::Dialog::InsertFace { strip, slot, live })
+        ctx.request_repaint_after(Duration::from_millis(33));
+        Some(Dialog::InsertFace { strip, slot, live })
     }
 
     /// **Drop the stacked window unless the face it was opened over is still
@@ -24762,7 +24762,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// first one.
     fn settle_pedal_stack(&mut self) {
         let over = match &self.dialog {
-            Some(dialogs::Dialog::InsertFace { strip, slot, .. }) => Some((*strip, *slot)),
+            Some(Dialog::InsertFace { strip, slot, .. }) => Some((*strip, *slot)),
             _ => None,
         };
         let keep = self
@@ -24798,7 +24798,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// arrives after every keystroke and a page that reset itself on each one
     /// would make the editor unusable.
     pub fn set_patch_edit(&mut self, edit: crate::ports::PatchEdit, note: Option<String>) {
-        let Some(dialogs::Dialog::PatchEditor {
+        let Some(Dialog::PatchEditor {
             patch, name, note: n, ..
         }) = self.dialog.as_mut()
         else {
@@ -24838,7 +24838,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let selected = (!self.cartridge.voices.is_empty()
             && patch < self.cartridge.voices.len())
         .then_some(patch);
-        self.dialog = Some(dialogs::Dialog::patch_picker(
+        self.dialog = Some(Dialog::patch_picker(
             slot,
             self.cartridge.bank.clone(),
             self.cartridge.bad_checksum,
@@ -25032,7 +25032,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn set_audio_status(&mut self, status: recorder::AudioStatus) {
         // Also refreshed into an OPEN panel, or it would show whatever was true
         // at the moment it was opened and never change.
-        if let Some(dialogs::Dialog::AudioSetup { status: live, .. }) = self.dialog.as_mut() {
+        if let Some(Dialog::AudioSetup { status: live, .. }) = self.dialog.as_mut() {
             live.clone_from(&status);
         }
         self.audio_status = status;
@@ -25065,7 +25065,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .as_ref()
             .map(|s| s.output_path(out_name.as_deref()))
             .unwrap_or_default();
-        self.dialog = Some(dialogs::Dialog::AudioSetup {
+        self.dialog = Some(Dialog::AudioSetup {
             // A SNAPSHOT, taken when the panel opens. It is refreshed each
             // frame by the host — see `set_audio_status` — because a status
             // panel that froze the moment it opened would be the least useful
@@ -25093,7 +25093,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let Some(setup) = self.audio_setup.as_ref() else {
             return;
         };
-        self.dialog = Some(dialogs::Dialog::InputChannels {
+        self.dialog = Some(Dialog::InputChannels {
             device: self
                 .audio_status
                 .input
@@ -25332,7 +25332,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// The held notes, in pitch order, as words.
-    fn spoken_notes(&self, notes: &std::collections::HashSet<u8>) -> String {
+    fn spoken_notes(&self, notes: &HashSet<u8>) -> String {
         if notes.is_empty() {
             return "nothing held".to_owned();
         }
@@ -25353,7 +25353,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// competitor set does this.
     fn musical_nodes(
         &self,
-        display: &std::collections::HashSet<u8>,
+        display: &HashSet<u8>,
         piano_rect: Rect,
         chord_rect: Option<Rect>,
         fret_rect: Option<Rect>,
@@ -25596,12 +25596,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.open_input_menu(n);
             }
             A::BusBay(_, slot) => {
-                let (seat, bay) = crate::recorder::seat_bay(crate::recorder::STRIPS, slot);
+                let (seat, bay) = recorder::seat_bay(recorder::STRIPS, slot);
                 self.open_insert_face(seat, bay);
             }
             A::HdrBay(n, bay) => {
                 self.touch_track(n);
-                let (seat, b) = crate::recorder::seat_bay(n, bay);
+                let (seat, b) = recorder::seat_bay(n, bay);
                 self.open_insert_face(seat, b);
             }
             A::AutoParamPick(n, slot) => self.arr_select_auto_row(n, slot),
@@ -25707,7 +25707,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // track title by default." See `Dialog::Project::saved` for
                 // what the two save rows become while it is blank.
                 let saved = self.arrangement.named;
-                self.dialog = Some(dialogs::Dialog::Project {
+                self.dialog = Some(Dialog::Project {
                     name: if saved { self.project_name() } else { String::new() },
                     subdir: self.settings.project_subdir,
                     saved,
@@ -25716,7 +25716,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             Hit::StreamToObs => {
                 // The cog's STREAM door: same dialog the Project menu used
                 // to open, now living in the AUDIO tier by the owner's word.
-                self.dialog = Some(dialogs::Dialog::ReaStream {
+                self.dialog = Some(Dialog::ReaStream {
                     enabled: self.settings.reastream_enabled,
                     identifier: self.settings.reastream_identifier.clone(),
                     host: self.settings.reastream_host.clone(),
@@ -25872,7 +25872,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // run of taps since the last 2.5 s silence, capped at eight;
                 // the reading is total-span over taps-minus-one, which
                 // weighs every interval equally and settles fast.
-                let now = std::time::Instant::now();
+                let now = Instant::now();
                 if self
                     .tap_times
                     .last()
@@ -26311,8 +26311,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// into a rack address goes through here, so none of them has to know
     /// the rule; the ones that already hold a SEAT (the host's reconcile
     /// loop, the pads) never call it and are unaffected.
-    fn slot_seat(&self, col: crate::recorder::Column, n: usize) -> (usize, usize) {
-        crate::recorder::seat_bay(col.desk_index(), n)
+    fn slot_seat(&self, col: recorder::Column, n: usize) -> (usize, usize) {
+        recorder::seat_bay(col.desk_index(), n)
     }
 
     /// Whether one bay's tenant can take a sidechain key, which is what
@@ -26323,7 +26323,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// answers through the `has_sidechain` the host read off its bus list —
     /// pushed once on load, like the parameters it travels with, so a
     /// plugin with no aux bus never grows a row that feeds it silence.
-    fn bay_offers_key(&self, col: crate::recorder::Column, slot: usize) -> bool {
+    fn bay_offers_key(&self, col: recorder::Column, slot: usize) -> bool {
         let (seat, bay) = self.slot_seat(col, slot);
         // The sentinel, spelled the way the picker spells it.
         if self.insert(seat, bay) == Some("@tangent-comp") {
@@ -26335,7 +26335,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn insert(&self, strip: usize, slot: usize) -> Option<&str> {
         self.settings
             .strip_inserts
-            .get(strip * crate::recorder::INSERTS + slot)
+            .get(strip * recorder::INSERTS + slot)
             .map(String::as_str)
             .filter(|p| !p.is_empty())
     }
@@ -26359,15 +26359,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     pub fn open_mixer_for_shot(&mut self) {
         self.mixer_open = true;
-        let strips = crate::recorder::STRIPS;
+        let strips = recorder::STRIPS;
         // A plausible desk: two MIDI channels, one AUDIO, the rest unused —
         // through the ordinary setters, so the picture is what a settings
         // file would produce.
         self.set_channel_input_spec(1, "midi:all");
         self.set_channel_input_spec(2, "2");
         for (at, name) in [
-            (crate::recorder::Strip::Channel(1), "Rhodes"),
-            (crate::recorder::Strip::Channel(2), "x - 3 vox"),
+            (recorder::Strip::Channel(1), "Rhodes"),
+            (recorder::Strip::Channel(2), "x - 3 vox"),
         ] {
             // Through the strip's own column, because `commit_mixer_name`
             // takes a COLUMN — the type exists so a desk index cannot be
@@ -26379,10 +26379,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // A long name and a short one, in the first bay and the last, so the
         // picture shows both what fits and what has to be cut.
         for (strip, slot, path) in [
-            (crate::recorder::Strip::Channel(1).index(), 0, "/x/FabFilter Pro-R 2.vst3"),
-            (crate::recorder::Strip::Channel(1).index(), 2, "/x/Pro-Q 4.vst3"),
-            (crate::recorder::Strip::Channel(2).index(), 0, "/x/Pro-C 3.vst3"),
-            (crate::recorder::Strip::Channel(4).index(), 1, "/x/Saturn 2.vst3"),
+            (recorder::Strip::Channel(1).index(), 0, "/x/FabFilter Pro-R 2.vst3"),
+            (recorder::Strip::Channel(1).index(), 2, "/x/Pro-Q 4.vst3"),
+            (recorder::Strip::Channel(2).index(), 0, "/x/Pro-C 3.vst3"),
+            (recorder::Strip::Channel(4).index(), 1, "/x/Saturn 2.vst3"),
             (strips, 0, "/x/Pro-L 2.vst3"),
         ] {
             self.set_insert(strip, slot, Some(path));
@@ -26390,7 +26390,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if let Some(c) = self
             .settings
             .strip_colors
-            .get_mut(crate::recorder::Strip::Channel(1).index())
+            .get_mut(recorder::Strip::Channel(1).index())
         {
             *c = 3;
         }
@@ -26434,11 +26434,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // The WHOLE insert space, not the strips-plus-pads slice it once
         // was: a write to a folder-extra or pedal seat on a vector still at
         // the old length would fall silently past the end.
-        let need = crate::recorder::INSERT_SPACE;
+        let need = recorder::INSERT_SPACE;
         if self.settings.strip_inserts.len() < need {
             self.settings.strip_inserts.resize(need, String::new());
         }
-        let at = strip * crate::recorder::INSERTS + slot;
+        let at = strip * recorder::INSERTS + slot;
         // **A bay that changes tenant loses its bypass**, and this is the
         // one place that can know it did.
         //
@@ -26609,7 +26609,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     pub fn set_export_dir(&mut self, dir: std::path::PathBuf) {
         let dir = dir.to_string_lossy().into_owned();
         self.export_project_spec.dir = dir.clone();
-        if let Some(dialogs::Dialog::ExportProject { spec, .. }) = self.dialog.as_mut() {
+        if let Some(Dialog::ExportProject { spec, .. }) = self.dialog.as_mut() {
             spec.dir = dir;
         }
     }
@@ -27510,7 +27510,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // remembered bool would then need pressing twice to do anything.
             K::ToggleFullscreen => {
                 let now = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!now));
+                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!now));
             }
             K::ToggleFretboard => self.apply_menu_action(ctx, MenuAction::ToggleFretboard),
             K::ToggleCameraPane => self.apply_menu_action(ctx, MenuAction::ToggleCameraPane),
@@ -27650,7 +27650,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         .selected_channel
                         .filter(|ch| self.insert(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
                         .or_else(|| {
-                            (0..crate::recorder::CHANNELS)
+                            (0..recorder::CHANNELS)
                                 .find(|ch| self.insert(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
                         });
                     match want {
@@ -27724,11 +27724,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 let lane = self
                     .selected_channel
                     .unwrap_or_else(|| {
-                        (0..crate::recorder::CHANNELS)
+                        (0..recorder::CHANNELS)
                             .find(|n| self.channel_used(*n))
                             .unwrap_or(0)
                     });
-                self.apply_dialog_action(dialogs::DialogAction::InsertMedia(lane));
+                self.apply_dialog_action(DialogAction::InsertMedia(lane));
             }
             MenuAction::NewProject => {
                 if self.ask_before(AfterSave::New) {
@@ -27893,7 +27893,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // The colours the app is wearing, named by hand. Seeded with
                 // the current theme's name so "save a tweak to Mono" is a
                 // one-word edit rather than a fresh sentence.
-                self.dialog = Some(dialogs::Dialog::SaveTheme {
+                self.dialog = Some(Dialog::SaveTheme {
                     name: self.settings.theme_name.clone(),
                     message: None,
                     focus: true,
@@ -28012,7 +28012,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             MenuAction::SetStave(key) => {
                 // Exclusive by construction: the whole set is REPLACED.
                 self.settings
-                    .set_staff_set(&crate::staff::StaffSet::from_key(key));
+                    .set_staff_set(&staff::StaffSet::from_key(key));
                 self.save_settings();
             }
             MenuAction::ToggleCustomClef(key) => {
@@ -28226,7 +28226,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             kept: scope.kept().to_owned(),
             choices: vec![dialogs::ConfirmChoice::new(
                 "Reset",
-                dialogs::DialogAction::ResetTo(scope),
+                DialogAction::ResetTo(scope),
                 true,
             )],
             warn: self.settings.master_knob_color.to_color32(),
@@ -28258,7 +28258,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             choices: if undoable {
                 vec![dialogs::ConfirmChoice::new(
                     "Undo",
-                    dialogs::DialogAction::UndoReset,
+                    DialogAction::UndoReset,
                     false,
                 )]
             } else {
@@ -28366,7 +28366,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The half-typed walk goes with it, so a reset in the middle of
             // the sequence does not leave four arrows banked.
             self.license.relock_cheat();
-            self.konami = crate::keys::Konami::default();
+            self.konami = keys::Konami::default();
             // **And the window goes back to 100% on screen, not just in the
             // file.** `Settings::reset` already puts `window_size_percent`
             // back; nothing asked for the resize, so the desk stayed
@@ -28434,7 +28434,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Put the settings back to the copy taken just before the last reset.
     fn undo_the_reset(&mut self, ctx: &egui::Context) {
-        let Some(back) = crate::settings::Settings::load_backup() else {
+        let Some(back) = Settings::load_backup() else {
             return;
         };
         let font = crate::fonts::FontChoice::from_key(&back.font_choice);
@@ -28750,7 +28750,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // rack — so a face that wrote the raw index would bypass
                 // somebody else's plugin. The same translation every other
                 // bay-shaped ask in this file makes.
-                let (seat, bay) = crate::recorder::seat_bay(strip, slot);
+                let (seat, bay) = recorder::seat_bay(strip, slot);
                 if self.insert_bypassed(seat, bay) != on {
                     self.toggle_insert_bypass(seat, bay);
                 }
@@ -28995,7 +28995,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     return;
                 };
                 self.arr_toggle_automation_param(lane, param);
-                if let Some(dialogs::Dialog::Automation { groups, .. }) =
+                if let Some(Dialog::Automation { groups, .. }) =
                     self.dialog.as_mut()
                 {
                     for g in groups.iter_mut() {
@@ -29006,7 +29006,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
             DialogAction::AutomationGroup(name) => {
-                if let Some(dialogs::Dialog::Automation { open_groups, .. }) =
+                if let Some(Dialog::Automation { open_groups, .. }) =
                     self.dialog.as_mut()
                 {
                     if let Some(at) = open_groups.iter().position(|g| *g == name) {
@@ -29064,14 +29064,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // ICON_MAX, not 3 - the clamp that made every NEW badge write
                         // "bass": the table grew to twenty-five and this line
                         // never heard.
-                        *slot = icon.min(crate::recorder_panel::ICON_MAX);
+                        *slot = icon.min(recorder_panel::ICON_MAX);
                     }
                 }
                 self.save_settings();
                 self.undo_commit();
                 // The open dialog's lit slot follows the choice at once.
-                if let Some(dialogs::Dialog::Track { icon: cur, .. }) = self.dialog.as_mut() {
-                    *cur = icon.min(crate::recorder_panel::ICON_MAX);
+                if let Some(Dialog::Track { icon: cur, .. }) = self.dialog.as_mut() {
+                    *cur = icon.min(recorder_panel::ICON_MAX);
                 }
             }
             DialogAction::TrackColor(lane, idx) => {
@@ -29104,7 +29104,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         i.rem_euclid(crate::mixer_panel::PALETTES.len() as i64);
                 }
                 // The open window shows what just happened.
-                if let Some(dialogs::Dialog::Track { palette, palette_auto, .. }) =
+                if let Some(Dialog::Track { palette, palette_auto, .. }) =
                     self.dialog.as_mut()
                 {
                     *palette = self.settings.palette_choice;
@@ -29138,7 +29138,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 if let Some(rate) = self.device_sample_rate() {
                     spec.rate = rate;
                 }
-                self.dialog = Some(dialogs::Dialog::ExportProject {
+                self.dialog = Some(Dialog::ExportProject {
                     spec,
                     sel: self.time_sel.filter(|(a, b)| b > a),
                 });
@@ -29201,8 +29201,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
                 // Live in the open dialog too, or the boxes do not tick until
                 // it is closed and opened again.
-                if let Some(dialogs::Dialog::InputChannels { exposed: live, .. })
-                | Some(dialogs::Dialog::AudioSetup { exposed: live, .. }) = self.dialog.as_mut()
+                if let Some(Dialog::InputChannels { exposed: live, .. })
+                | Some(Dialog::AudioSetup { exposed: live, .. }) = self.dialog.as_mut()
                 {
                     *live = picks;
                 }
@@ -29285,7 +29285,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // A drag in the dialog is one call per pointer move, so
                 // the write is debounced like every other drag's.
                 self.save_settings_soon();
-                if let Some(dialogs::Dialog::Routing { existing, .. }) = self.dialog.as_mut() {
+                if let Some(Dialog::Routing { existing, .. }) = self.dialog.as_mut() {
                     if let Some(row) = existing.iter_mut().find(|(at, _, _)| *at == index) {
                         row.2 = gain.clamp(0.0, 1.0);
                     }
@@ -29302,7 +29302,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // that went now has a different index, and a stale window
                 // would remove the wrong route on the next click.
                 if let Some(ch) = channel {
-                    if matches!(self.dialog, Some(dialogs::Dialog::Routing { .. })) {
+                    if matches!(self.dialog, Some(Dialog::Routing { .. })) {
                         self.dialog = Some(self.routing_dialog(ch, None));
                     }
                 }
@@ -29323,7 +29323,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     Err(e) => {
                         // Stays open with the typed name intact: a read-only
                         // folder or a full disk is worth saying out loud.
-                        if let Some(dialogs::Dialog::SaveTheme { message, .. }) =
+                        if let Some(Dialog::SaveTheme { message, .. }) =
                             self.dialog.as_mut()
                         {
                             *message = Some(format!("Could not save: {e}"));
@@ -29332,7 +29332,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
             DialogAction::OpenReaStream => {
-                self.dialog = Some(dialogs::Dialog::ReaStream {
+                self.dialog = Some(Dialog::ReaStream {
                     enabled: self.settings.reastream_enabled,
                     identifier: self.settings.reastream_identifier.clone(),
                     host: self.settings.reastream_host.clone(),
@@ -29366,7 +29366,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // The input is the kind now, and a synth nobody can
                     // play is a bay wired to nothing.
                     if path.is_some()
-                        && strip < crate::recorder::CHANNELS
+                        && strip < recorder::CHANNELS
                         && self.channel_kind(strip).is_none()
                     {
                         self.set_channel_input_spec(strip, "midi:all");
@@ -29456,7 +29456,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             DialogAction::EditPatch { slot } => {
                 // Opened empty; the host fills it in on the next frame, the
                 // same way it fills the cartridge. See `set_patch_edit`.
-                self.dialog = Some(dialogs::Dialog::PatchEditor {
+                self.dialog = Some(Dialog::PatchEditor {
                     slot,
                     patch: crate::ports::PatchEdit::default(),
                     group: 0,
@@ -29548,7 +29548,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             DialogAction::EditStaged { slot, index } => {
                 // Opened empty and filled by the host next frame, exactly as
                 // `EditPatch` is; the only difference travels in the request.
-                self.dialog = Some(dialogs::Dialog::PatchEditor {
+                self.dialog = Some(Dialog::PatchEditor {
                     slot,
                     patch: crate::ports::PatchEdit::default(),
                     group: 0,
@@ -30145,7 +30145,7 @@ fn default_mixer_visible(pane: Vec2) -> usize {
     // lands on the ladder — the owner's dozen at 100% is a 1490-point pane,
     // twelve strips, untouched. A supporter's upper sixteen scroll into
     // view, which is what the scroll is for.
-    sensible_visible_count(run, COMFY_STRIP_PITCH, 4, crate::recorder::FREE_CHANNELS)
+    sensible_visible_count(run, COMFY_STRIP_PITCH, 4, recorder::FREE_CHANNELS)
 }
 
 /// Initial fixed window size for the ViewportBuilder, computed from settings
@@ -30850,7 +30850,7 @@ impl TangentApp {
                     // whole composite path exists to guarantee is that the
                     // video shows what the window showed.
                     varispeed: s.varispeed,
-                    loudness: crate::recorder::Loudness {
+                    loudness: recorder::Loudness {
                         window: s.lufs_window,
                         ..self.recorder.loudness
                     },
@@ -31029,7 +31029,7 @@ impl TangentApp {
         // A needle that is still moving is a repaint that has to happen, or it
         // freezes wherever the last mouse move left it.
         if self.vu_needle.iter().zip(targets).any(|(n, t)| (n - t).abs() > 1.0e-4) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 
@@ -31087,7 +31087,7 @@ impl TangentApp {
         //   IVORY_INLINE=track /Applications/Tangent.app/Contents/MacOS/tangent
         if !self.demo_menu_done && inline_hook() == Some("track") {
             self.demo_menu_done = true;
-            self.dialog = Some(dialogs::Dialog::Track {
+            self.dialog = Some(Dialog::Track {
                 lane: 0,
                 removable: true,
                 icon: self.settings.channel_icons.first().copied().unwrap_or(0),
@@ -31132,7 +31132,7 @@ impl TangentApp {
         //   IVORY_INLINE=channels /Applications/Tangent.app/Contents/MacOS/tangent
         if !self.demo_menu_done && inline_hook() == Some("channels") {
             self.demo_menu_done = true;
-            self.dialog = Some(dialogs::Dialog::InputChannels {
+            self.dialog = Some(Dialog::InputChannels {
                 device: "Scarlett 18i20 USB".to_owned(),
                 channels: 18,
                 exposed: vec![(0, Some(1)), (3, Some(4)), (5, None)],
@@ -31295,9 +31295,9 @@ impl TangentApp {
                     }
                     if done {
                         self.dialog = Some(if self.license.is_supporter() {
-                            dialogs::Dialog::CheatFun
+                            Dialog::CheatFun
                         } else {
-                            dialogs::Dialog::Cheated
+                            Dialog::Cheated
                         });
                         self.start_confetti();
                     }
@@ -32026,7 +32026,7 @@ impl TangentApp {
         // the theme's `background` role, or its dark twin, derived when the
         // theme did not name one.
         ui.painter()
-            .rect_filled(pane, 0.0, crate::piano::themed_bg(&self.settings));
+            .rect_filled(pane, 0.0, piano::themed_bg(&self.settings));
         // **A DAW view FILLS the window; the theory view is aspect-locked.**
         //
         // The two are different questions and they were being given one
@@ -32201,7 +32201,7 @@ impl TangentApp {
                         // heart settings say. The glow is the theme's own
                         // master colour: crimson on Default, per spec.
                         ui.ctx().request_repaint_after(
-                            std::time::Duration::from_millis(33),
+                            Duration::from_millis(33),
                         );
                         chord_strip::draw_heart_crackle(
                             ui.painter(),
@@ -32211,7 +32211,7 @@ impl TangentApp {
                         );
                     } else if self.settings.heart_animate && self.license.is_supporter() {
                         ui.ctx().request_repaint_after(
-                            std::time::Duration::from_millis(33),
+                            Duration::from_millis(33),
                         );
                         chord_strip::draw_heart_wave(ui.painter(), hr, &|phase| {
                             let fill = self.heart_wave(phase, now);
@@ -32334,9 +32334,9 @@ impl TangentApp {
                 }
                 let at = ui.ctx().input(|i| i.pointer.interact_pos());
                 let lit = egui::Color32::from_rgb(0xC9, 0x8B, 0x3D);
-                if let (Some(crate::recorder::Strip::Channel(n)), Some(p)) = (
+                if let (Some(recorder::Strip::Channel(n)), Some(p)) = (
                     at.and_then(|p| crate::mixer_panel::strip_at(rect, &view, p))
-                        .and_then(crate::recorder::Column::strip)
+                        .and_then(recorder::Column::strip)
                         .map(Some)
                         .unwrap_or(None),
                     at,
@@ -32358,11 +32358,11 @@ impl TangentApp {
                                     .rect_filled(strip, 0.0, lit.gamma_multiply(0.35));
                                 ui.painter().line_segment(
                                     [
-                                        egui::Pos2::new(
+                                        Pos2::new(
                                             strip.right() - 1.0,
                                             strip.top(),
                                         ),
-                                        egui::Pos2::new(
+                                        Pos2::new(
                                             strip.right() - 1.0,
                                             strip.bottom(),
                                         ),
@@ -32373,9 +32373,9 @@ impl TangentApp {
                         }
                         if let Some(head) = l.strips.get(folder) {
                             ui.painter().rect_filled(
-                                egui::Rect::from_min_max(
+                                Rect::from_min_max(
                                     head.panel.min,
-                                    egui::Pos2::new(
+                                    Pos2::new(
                                         head.panel.right(),
                                         head.panel.top() + 3.0,
                                     ),
@@ -32388,8 +32388,8 @@ impl TangentApp {
                         if let Some(dst) = l.strips.get(n) {
                             ui.painter().line_segment(
                                 [
-                                    egui::Pos2::new(dst.panel.left(), dst.panel.top()),
-                                    egui::Pos2::new(dst.panel.left(), dst.panel.bottom()),
+                                    Pos2::new(dst.panel.left(), dst.panel.top()),
+                                    Pos2::new(dst.panel.left(), dst.panel.bottom()),
                                 ],
                                 egui::Stroke::new(2.0, lit),
                             );
@@ -32515,8 +32515,8 @@ impl TangentApp {
                                 ui.painter().rect_filled(strip, 0.0, lit.gamma_multiply(0.35));
                                 ui.painter().line_segment(
                                     [
-                                        egui::Pos2::new(rect.left(), strip.bottom() - 1.0),
-                                        egui::Pos2::new(rect.right(), strip.bottom() - 1.0),
+                                        Pos2::new(rect.left(), strip.bottom() - 1.0),
+                                        Pos2::new(rect.right(), strip.bottom() - 1.0),
                                     ],
                                     egui::Stroke::new(2.0, lit),
                                 );
@@ -32524,9 +32524,9 @@ impl TangentApp {
                         }
                         if let Some(head) = l.header_rows.get(folder) {
                             ui.painter().rect_filled(
-                                egui::Rect::from_min_max(
+                                Rect::from_min_max(
                                     head.panel.min,
-                                    egui::Pos2::new(head.panel.left() + 3.0, head.panel.bottom()),
+                                    Pos2::new(head.panel.left() + 3.0, head.panel.bottom()),
                                 ),
                                 0.0,
                                 lit,
@@ -32536,8 +32536,8 @@ impl TangentApp {
                         if let Some(row) = l.header_rows.get(t) {
                             ui.painter().line_segment(
                                 [
-                                    egui::Pos2::new(rect.left(), row.panel.top()),
-                                    egui::Pos2::new(rect.right(), row.panel.top()),
+                                    Pos2::new(rect.left(), row.panel.top()),
+                                    Pos2::new(rect.right(), row.panel.top()),
                                 ],
                                 egui::Stroke::new(2.0, lit),
                             );
@@ -32567,7 +32567,7 @@ impl TangentApp {
             // The right-drag selection band, while a hand draws one.
             if matches!(self.arr_drag, Some(ArrDrag::ClipBand)) {
                 if let Some((a, b)) = self.arr_band {
-                    let r = egui::Rect::from_two_pos(a, b);
+                    let r = Rect::from_two_pos(a, b);
                     ui.painter().rect_stroke(
                         r,
                         0.0,
@@ -32601,7 +32601,7 @@ impl TangentApp {
                     // owner's word; the pop-out button floats it back over
                     // the lanes with the old rim.
                     let r = if self.settings.midi_editor_floating {
-                        rect.shrink2(egui::Vec2::new(
+                        rect.shrink2(Vec2::new(
                             rect.width() * 0.05,
                             rect.height() * 0.06,
                         ))
@@ -33014,7 +33014,7 @@ impl TangentApp {
                         let steps = self.wheel_mixer_zoom.steps(d);
                         let cur = self.mixer_visible() as i64;
                         let next = (cur + i64::from(steps))
-                            .clamp(1, crate::recorder::CHANNELS as i64);
+                            .clamp(1, recorder::CHANNELS as i64);
                         if next != cur {
                             self.settings.mixer_visible = next as u8;
                             // Per notch: debounced, see `save_settings_soon`.
@@ -33151,7 +33151,7 @@ impl TangentApp {
                                 self.mixer_fx_menu = Some((i, n));
                             } else if i.strip().is_some_and(|s| matches!(
                                 s,
-                                crate::recorder::Strip::Channel(_)
+                                recorder::Strip::Channel(_)
                             )) {
                                 // **An empty slot has a menu now** — one row,
                                 // and it is the one that fills the slot. See
@@ -33159,14 +33159,14 @@ impl TangentApp {
                                 if let Some(strip) = i.strip() {
                                     let used = matches!(
                                         strip,
-                                        crate::recorder::Strip::Channel(n)
+                                        recorder::Strip::Channel(n)
                                             if self.channel_used(n)
                                     );
                                     self.open_track_dialog(strip.index(), used);
                                 }
                             } else if let Some(strip) = i.strip() {
                                 let used =
-                                    matches!(strip, crate::recorder::Strip::Channel(_));
+                                    matches!(strip, recorder::Strip::Channel(_));
                                 self.open_track_dialog(strip.index(), used);
                             }
                         }
@@ -33185,7 +33185,7 @@ impl TangentApp {
                                 // the Paste row. See `open_track_dialog`.
                                 let used = matches!(
                                     strip,
-                                    crate::recorder::Strip::Channel(n) if self.channel_used(n)
+                                    recorder::Strip::Channel(n) if self.channel_used(n)
                                 );
                                 self.open_track_dialog(strip.index(), used);
                             }
@@ -33246,7 +33246,7 @@ impl TangentApp {
                     // the owner asked for, useful later.
                     let pressed_strip = crate::mixer_panel::strip_at(rect, &view, pos)
                         .and_then(|c| c.strip());
-                    if let Some(crate::recorder::Strip::Channel(n)) = pressed_strip {
+                    if let Some(recorder::Strip::Channel(n)) = pressed_strip {
                         self.select_track(n, ui.input(|i| i.modifiers));
                     }
                     let view = self.mixer_view();
@@ -33307,7 +33307,7 @@ impl TangentApp {
                         // really moves; a motionless press stays nothing,
                         // so the rename's double-click is untouched.
                         Some(crate::mixer_panel::Hit::Name(col)) => {
-                            if let Some(crate::recorder::Strip::Channel(n)) = col.strip() {
+                            if let Some(recorder::Strip::Channel(n)) = col.strip() {
                                 if self.channel_used(n) {
                                     self.mixer_reorder = Some((n, pos, false));
                                 }
@@ -33324,9 +33324,9 @@ impl TangentApp {
                         None => {
                             // Bare strip paint: the carry's other handle —
                             // the name plate alone was too small to find.
-                            if let Some(crate::recorder::Strip::Channel(n)) =
+                            if let Some(recorder::Strip::Channel(n)) =
                                 crate::mixer_panel::strip_at(rect, &view, pos)
-                                    .and_then(crate::recorder::Column::strip)
+                                    .and_then(recorder::Column::strip)
                             {
                                 if self.channel_used(n) {
                                     self.mixer_reorder = Some((n, pos, false));
@@ -33384,7 +33384,7 @@ impl TangentApp {
                 } else {
                     let view = self.mixer_view();
                     let target = crate::mixer_panel::strip_at(rect, &view, p)
-                        .map(crate::recorder::Column::desk_index);
+                        .map(recorder::Column::desk_index);
                     // The BAY under the hand, in SEAT space like the carry
                     // itself — `slot_seat` is the one place that knows a
                     // strip's Nth slot may live in another rack.
@@ -33419,9 +33419,9 @@ impl TangentApp {
                         let (target, on_edge) = {
                             let view = self.mixer_view();
                             match crate::mixer_panel::strip_at(rect, &view, p)
-                                .and_then(crate::recorder::Column::strip)
+                                .and_then(recorder::Column::strip)
                             {
-                                Some(crate::recorder::Strip::Channel(to)) => {
+                                Some(recorder::Strip::Channel(to)) => {
                                     let l = crate::mixer_panel::Layout::new(rect, &view);
                                     let edge = l.strips.get(to).is_some_and(|s| {
                                         crate::mixer_panel::folder_drop_strip(s.panel)
@@ -33681,7 +33681,7 @@ impl TangentApp {
             ui.painter().rect_stroke(
                 ui.max_rect(),
                 0.0,
-                egui::Stroke::new(REC_OUTLINE_W, crate::recorder_panel::REC_RED),
+                egui::Stroke::new(REC_OUTLINE_W, recorder_panel::REC_RED),
                 egui::StrokeKind::Inside,
             );
         }
@@ -33964,7 +33964,7 @@ impl TangentApp {
                 .pedal_stack
                 .as_ref()
                 .and_then(|st| match &st.dialog {
-                    Some(dialogs::Dialog::InsertFace { strip, slot, live })
+                    Some(Dialog::InsertFace { strip, slot, live })
                         if live.face.path == loaded.unit =>
                     {
                         Some((*strip, *slot))
@@ -33972,7 +33972,7 @@ impl TangentApp {
                     _ => None,
                 })
                 .or(match self.dialog {
-                    Some(dialogs::Dialog::InsertFace { strip, slot, .. }) => {
+                    Some(Dialog::InsertFace { strip, slot, .. }) => {
                         Some((strip, slot))
                     }
                     _ => None,
@@ -34000,17 +34000,17 @@ impl TangentApp {
             }
         }
         let face_watch = match self.dialog {
-            Some(dialogs::Dialog::InsertFace { strip, slot, .. }) => Some((strip, slot)),
+            Some(Dialog::InsertFace { strip, slot, .. }) => Some((strip, slot)),
             _ => None,
         };
         // **The IR wizard is live the same way.** Its meter, its progress
         // bar and its finished result are all pushed by the host; the open
         // dialog gets this frame's copy before it draws, and the repaint
         // keeps the needle moving while the hand is still.
-        let ir_watch = matches!(self.dialog, Some(dialogs::Dialog::IrWizard { .. }));
-        if let Some(dialogs::Dialog::IrWizard { state }) = self.dialog.as_mut() {
+        let ir_watch = matches!(self.dialog, Some(Dialog::IrWizard { .. }));
+        if let Some(Dialog::IrWizard { state }) = self.dialog.as_mut() {
             state.live = self.ir_live.clone();
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
         // **The suite faces are LIVE**, and there may be two of them: the
         // one in the dialog slot, and the pedal's window standing over it.
@@ -34042,7 +34042,7 @@ impl TangentApp {
         // the same reason `face_watch` is: closing it has to take its tap
         // down and hand the amp's back.
         let stack_watch = match self.pedal_stack.as_ref().map(|st| &st.dialog) {
-            Some(Some(dialogs::Dialog::InsertFace { strip, slot, .. })) => {
+            Some(Some(Dialog::InsertFace { strip, slot, .. })) => {
                 Some((*strip, *slot))
             }
             _ => None,
@@ -34128,7 +34128,7 @@ impl TangentApp {
         // whose window is gone.
         if let Some((strip, slot)) = stack_watch {
             let still = match self.pedal_stack.as_ref().map(|st| &st.dialog) {
-                Some(Some(dialogs::Dialog::InsertFace { strip, slot, .. })) => {
+                Some(Some(Dialog::InsertFace { strip, slot, .. })) => {
                     Some((*strip, *slot))
                 }
                 _ => None,
@@ -34139,7 +34139,7 @@ impl TangentApp {
                     slot,
                     on: false,
                 });
-                if let Some(dialogs::Dialog::InsertFace { strip, slot, .. }) = self.dialog {
+                if let Some(Dialog::InsertFace { strip, slot, .. }) = self.dialog {
                     self.request_recorder(recorder::RecorderRequest::SetInsertTap {
                         strip,
                         slot,
@@ -34150,7 +34150,7 @@ impl TangentApp {
         }
         // The face closed this frame: take the tap down with it.
         if let Some((strip, slot)) = face_watch {
-            if !matches!(self.dialog, Some(dialogs::Dialog::InsertFace { .. })) {
+            if !matches!(self.dialog, Some(Dialog::InsertFace { .. })) {
                 self.request_recorder(recorder::RecorderRequest::SetInsertTap {
                     strip,
                     slot,
@@ -34181,7 +34181,7 @@ impl TangentApp {
         // a door that only works from inside `update` is a worse door. The
         // cost is one duplicate ask on the frame a panel opens from the
         // desk, which the host answers idempotently.
-        if let Some(dialogs::Dialog::InsertFace { strip, slot, .. }) = self.dialog {
+        if let Some(Dialog::InsertFace { strip, slot, .. }) = self.dialog {
             if face_watch != Some((strip, slot)) {
                 self.request_recorder(recorder::RecorderRequest::SetInsertTap {
                     strip,
@@ -34193,7 +34193,7 @@ impl TangentApp {
         // The wizard closed this frame: whatever the IR road was doing —
         // the tone above all — stops with it. A tone that outlives its
         // meter is a signal generator nobody can find the switch for.
-        if ir_watch && !matches!(self.dialog, Some(dialogs::Dialog::IrWizard { .. })) {
+        if ir_watch && !matches!(self.dialog, Some(Dialog::IrWizard { .. })) {
             self.request_recorder(recorder::RecorderRequest::IrCancel);
         }
         // **The party, over everything.** A dim veil and the rainbow, drawn
@@ -34216,7 +34216,7 @@ impl TangentApp {
                 egui::Color32::from_black_alpha((110.0 * fade) as u8),
             );
             if crate::confetti::draw(&painter, screen, t) {
-                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                ctx.request_repaint_after(Duration::from_millis(16));
             } else {
                 self.confetti_at = None;
             }
@@ -34266,12 +34266,12 @@ impl TangentApp {
                     // Rightmost, and the one the eye lands on: the safe one.
                     dialogs::ConfirmChoice::new(
                         "Keep it",
-                        dialogs::DialogAction::NewProjectKeeping,
+                        DialogAction::NewProjectKeeping,
                         false,
                     ),
                     dialogs::ConfirmChoice::new(
                         "Discard it",
-                        dialogs::DialogAction::NewProjectDiscarding,
+                        DialogAction::NewProjectDiscarding,
                         true,
                     ),
                 ],
@@ -34285,7 +34285,7 @@ impl TangentApp {
         // rather than waiting for a pointer to move.
         if let Some(p) = self.export_progress.clone() {
             dialogs::show_export_progress(&ctx, &p, placement);
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
 
         // **The messages, last of all.** Everything the app has to SAY goes in
@@ -34561,7 +34561,7 @@ mod tests {
 
         // And back, with no trace left of a drag that was in progress.
         app.mixer_grab = Some(MixerGrab {
-            hit: crate::mixer_panel::Hit::Fader(crate::recorder::Column(0)),
+            hit: crate::mixer_panel::Hit::Fader(recorder::Column(0)),
             from: Pos2::ZERO,
             moved: true,
             from_value: 0.5,
@@ -34597,7 +34597,7 @@ mod tests {
             Strip::shown()
                 .iter()
                 .position(|c| *c == s)
-                .map(crate::recorder::Column)
+                .map(recorder::Column)
                 .expect("that strip has no column")
         };
         app.apply_mixer_hit(Hit::Fader(column(Strip::Channel(2))), 0.25);
@@ -34710,7 +34710,7 @@ mod tests {
     #[test]
     fn the_channel_chooser_holds_several_inputs_at_once() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
-        app.dialog = Some(dialogs::Dialog::InputChannels {
+        app.dialog = Some(Dialog::InputChannels {
             device: "Scarlett 18i20 USB".to_owned(),
             channels: 18,
             exposed: Vec::new(),
@@ -34731,14 +34731,14 @@ mod tests {
             run(&ctx, &mut app);
         }
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::InputChannels { .. })),
+            matches!(app.dialog, Some(Dialog::InputChannels { .. })),
             "the chooser closed itself while drawing"
         );
 
         // The owner's own example, exactly.
         let want = vec![(0_u16, Some(1_u16)), (3, Some(4)), (5, None)];
         app.apply_dialog_action(DialogAction::SetInputChannels(want.clone()));
-        let Some(dialogs::Dialog::InputChannels { exposed, .. }) = &app.dialog else {
+        let Some(Dialog::InputChannels { exposed, .. }) = &app.dialog else {
             panic!("the chooser vanished");
         };
         assert_eq!(*exposed, want, "the three did not all stick");
@@ -34752,14 +34752,14 @@ mod tests {
         // could not express at all.
         let fewer = vec![(0_u16, Some(1_u16)), (5, None)];
         app.apply_dialog_action(DialogAction::SetInputChannels(fewer.clone()));
-        let Some(dialogs::Dialog::InputChannels { exposed, .. }) = &app.dialog else {
+        let Some(Dialog::InputChannels { exposed, .. }) = &app.dialog else {
             panic!("the chooser vanished");
         };
         assert_eq!(*exposed, fewer);
 
         // Empty is a legal answer: the interface itself is always offered.
         app.apply_dialog_action(DialogAction::SetInputChannels(Vec::new()));
-        let Some(dialogs::Dialog::InputChannels { exposed, .. }) = &app.dialog else {
+        let Some(Dialog::InputChannels { exposed, .. }) = &app.dialog else {
             panic!("the chooser vanished");
         };
         assert!(exposed.is_empty(), "unticking everything did not stick");
@@ -34872,7 +34872,7 @@ mod tests {
         run(&ctx, &mut app);
         app.apply_recorder_hit(recorder_panel::Hit::ShowAudioStatus);
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::AudioSetup { .. })),
+            matches!(app.dialog, Some(Dialog::AudioSetup { .. })),
             "the take settings did not open Setup"
         );
         // Three frames, because a viewport dialog is not fully built on its
@@ -34881,7 +34881,7 @@ mod tests {
             run(&ctx, &mut app);
         }
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::AudioSetup { .. })),
+            matches!(app.dialog, Some(Dialog::AudioSetup { .. })),
             "Setup closed itself while drawing"
         );
 
@@ -34906,7 +34906,7 @@ mod tests {
         assert!(
             matches!(
                 app.dialog,
-                Some(dialogs::Dialog::DevicePicker {
+                Some(Dialog::DevicePicker {
                     kind: dialogs::DeviceKind::AudioInput,
                     ..
                 })
@@ -34929,7 +34929,7 @@ mod tests {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, s);
             let spec = app.settings.fretboard_spec();
             for note in 52u8..=76 {
-                app.notes.apply(crate::midi_event::MidiEvent::NoteOn {
+                app.notes.apply(NoteOn {
                     note,
                     velocity: 100,
                 });
@@ -34962,7 +34962,7 @@ mod tests {
                     pos.string,
                     pos.fret
                 );
-                app.notes.apply(crate::midi_event::MidiEvent::NoteOff { note });
+                app.notes.apply(NoteOff { note });
                 app.voicing_tick(true);
             }
         }
@@ -35131,7 +35131,7 @@ mod tests {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.input_menu = Some(InputMenu {
             ch: 2,
-            at: egui::Pos2::ZERO,
+            at: Pos2::ZERO,
             hover: Some(2),
             rows: [Vec::new(), Vec::new(), vec!["ALL".to_owned()]],
             devices_offered: false,
@@ -35466,7 +35466,7 @@ mod tests {
         app.bootstrap_project(&root.join("Projects"));
         // Furnish the desk: a channel kind, a name, a plugin, a fader.
         app.set_channel_kind(2, Some(recorder::ChannelKind::Midi));
-        app.commit_mixer_name(crate::recorder::Column(2), "Rhodes".to_owned());
+        app.commit_mixer_name(recorder::Column(2), "Rhodes".to_owned());
         app.set_insert(2, 0, Some("/x/EP.vst3"));
         app.settings.channel_gains[2] = 0.42;
         app.settings.record_export.tempo_bpm = 93.0;
@@ -35861,13 +35861,13 @@ mod tests {
         let root = project_scratch("trackcopy");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
-        let at = crate::recorder::Strip::Channel(1).index();
-        app.set_channel_kind(1, Some(crate::recorder::ChannelKind::Midi));
+        let at = recorder::Strip::Channel(1).index();
+        app.set_channel_kind(1, Some(recorder::ChannelKind::Midi));
         // `strip_names` is a Vec that grows on demand, so a fresh settings
         // has none — the same shape `copy_track` reads through `get`.
         app.settings
             .strip_names
-            .resize(crate::recorder::STRIPS + 1, String::new());
+            .resize(recorder::STRIPS + 1, String::new());
         app.settings.strip_names[at] = "Rhodes".to_owned();
         app.settings.strip_colors[at] = 5;
         app.settings.channel_icons[1] = 2;
@@ -35916,11 +35916,11 @@ mod tests {
         );
 
         let to = 4usize;
-        let to_at = crate::recorder::Strip::Channel(to).index();
+        let to_at = recorder::Strip::Channel(to).index();
         assert!(!app.channel_used(to));
         app.paste_track(to);
         assert!(app.channel_used(to), "the slot is still empty");
-        assert_eq!(app.channel_kind(to), Some(crate::recorder::ChannelKind::Midi));
+        assert_eq!(app.channel_kind(to), Some(recorder::ChannelKind::Midi));
         assert_eq!(app.settings.strip_colors[to_at], 5);
         assert_eq!(app.settings.channel_icons[to], 2);
         assert!((app.settings.channel_gains[to] - 0.42).abs() < 1e-9, "the fader");
@@ -35959,8 +35959,8 @@ mod tests {
         app.bootstrap_project(&root.join("Projects"));
         app.settings
             .strip_names
-            .resize(crate::recorder::STRIPS + 1, String::new());
-        app.set_channel_kind(1, Some(crate::recorder::ChannelKind::Midi));
+            .resize(recorder::STRIPS + 1, String::new());
+        app.set_channel_kind(1, Some(recorder::ChannelKind::Midi));
         app.settings.channel_gains[1] = 0.33;
 
         // A track selected, no clips: the chord takes the track.
@@ -35982,7 +35982,7 @@ mod tests {
         app.arr_paste();
         assert!(app.channel_used(6), "the chord did not paste the track");
         assert!((app.settings.channel_gains[6] - 0.33).abs() < 1e-9, "the fader");
-        assert_eq!(app.channel_kind(6), Some(crate::recorder::ChannelKind::Midi));
+        assert_eq!(app.channel_kind(6), Some(recorder::ChannelKind::Midi));
 
         // And with a CLIP selected the chord still means clips: the track
         // clipboard is not disturbed and the clip one fills.
@@ -36229,7 +36229,7 @@ mod tests {
         let rgb = |c: egui::Color32| (c.r(), c.g(), c.b());
 
         // Across the sprite at ONE instant: several distinct bands.
-        let across: std::collections::HashSet<_> = (0..=10)
+        let across: HashSet<_> = (0..=10)
             .map(|d| rgb(app.heart_wave(d as f32 / 10.0, 0.0)))
             .collect();
         assert!(
@@ -36240,7 +36240,7 @@ mod tests {
         );
 
         // At ONE place over time: the bands walk past it.
-        let over_time: std::collections::HashSet<_> = (0..8)
+        let over_time: HashSet<_> = (0..8)
             .map(|k| {
                 rgb(app.heart_wave(0.0, TangentApp::HEART_CYCLE_S * f64::from(k) / 8.0))
             })
@@ -36643,7 +36643,7 @@ mod tests {
         assert_ne!(app.to_theory(3), before, "T did not switch");
 
         let mono = app.settings.master_mono;
-        app.apply_mixer_hit(M::Mono(Column(crate::recorder::CHANNELS)), 0.0);
+        app.apply_mixer_hit(M::Mono(Column(recorder::CHANNELS)), 0.0);
         assert_ne!(app.settings.master_mono, mono, "the mono fold did not switch");
     }
 
@@ -36779,14 +36779,14 @@ mod tests {
         // an entry is never removed from this array either. The second one
         // is the owner's own template, seeded 2 September 2026.
         const SHIPPED_OVER_TIME: &[&[(usize, &str)]] = &[
-            &[(0, crate::dialogs::BUILTIN_PATH)],
+            &[(0, dialogs::BUILTIN_PATH)],
             &[
-                (0, crate::dialogs::BUILTIN_PATH),
-                (INSERTS, crate::dialogs::DRUMPAD_PATH),
+                (0, dialogs::BUILTIN_PATH),
+                (INSERTS, dialogs::DRUMPAD_PATH),
             ],
             &[
-                (0, crate::dialogs::DRUMPAD_PATH),
-                (INSERTS, crate::dialogs::BUILTIN_PATH),
+                (0, dialogs::DRUMPAD_PATH),
+                (INSERTS, dialogs::BUILTIN_PATH),
             ],
         ];
         for shipped in SHIPPED_OVER_TIME {
@@ -36799,12 +36799,12 @@ mod tests {
             let desk = back.desk.expect("a template has a desk");
             assert_eq!(
                 desk.bay(0),
-                Some(crate::dialogs::DRUMPAD_PATH),
+                Some(dialogs::DRUMPAD_PATH),
                 "a template holding {shipped:?} was not healed to the shipped desk"
             );
             assert_eq!(
                 desk.bay(INSERTS),
-                Some(crate::dialogs::BUILTIN_PATH),
+                Some(dialogs::BUILTIN_PATH),
                 "a template holding {shipped:?} was not healed to the shipped desk"
             );
         }
@@ -36831,7 +36831,7 @@ mod tests {
         let desk = kept.desk.expect("a desk");
         assert_eq!(
             desk.bay(2 * INSERTS),
-            Some(crate::dialogs::BUILTIN_PATH),
+            Some(dialogs::BUILTIN_PATH),
             "a template somebody had arranged was overwritten"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -36904,7 +36904,7 @@ mod tests {
         app.settings.project_path = sentinel.to_owned();
         app.open_project_keeping(
             &crate::arrangement::doc_in(&template),
-            super::KeepPath::Leave,
+            KeepPath::Leave,
         );
         assert_eq!(
             app.settings.project_path, sentinel,
@@ -36993,7 +36993,7 @@ mod tests {
         // kit drawer, which is the specific wrong answer this went through.
         assert_eq!(
             app.drum_media_home(),
-            super::dirs_home(),
+            dirs_home(),
             "a sample explorer with no chosen folder should open at home"
         );
         assert_ne!(
@@ -37012,7 +37012,7 @@ mod tests {
             root.join("deleted").to_string_lossy().into_owned();
         assert_eq!(
             app.drum_media_home(),
-            super::dirs_home(),
+            dirs_home(),
             "a missing DEF folder stranded it"
         );
 
@@ -37065,7 +37065,7 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let shelf = root.join(super::TEMPLATE_SHELF);
+        let shelf = root.join(TEMPLATE_SHELF);
         let template = shelf.join("default");
         std::fs::create_dir_all(&template).expect("template dir");
         crate::arrangement::Arrangement::default()
@@ -37739,7 +37739,7 @@ mod tests {
             v.push(s.master_gain);
             v
         };
-        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
+        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             let before = snapshot(&app.settings);
             // A position nothing defaults to, so "it changed" is unambiguous.
@@ -37751,9 +37751,9 @@ mod tests {
             // Which slot in the snapshot this column owns.
             let want = match col.strip() {
                 Some(Strip::Channel(n)) => n,
-                Some(Strip::Drums) => crate::recorder::CHANNELS,
-                Some(Strip::Click) => crate::recorder::CHANNELS + 1,
-                Some(Strip::Fx) => crate::recorder::CHANNELS + 2,
+                Some(Strip::Drums) => recorder::CHANNELS,
+                Some(Strip::Click) => recorder::CHANNELS + 1,
+                Some(Strip::Fx) => recorder::CHANNELS + 2,
                 None => before.len() - 1,
             };
             assert_eq!(
@@ -37774,7 +37774,7 @@ mod tests {
         use crate::mixer_panel::Hit;
         use crate::recorder::COLUMNS_FOR_TEST;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-        app.apply_mixer_hit(Hit::Fader(crate::recorder::Column(COLUMNS_FOR_TEST - 1)), 0.42);
+        app.apply_mixer_hit(Hit::Fader(recorder::Column(COLUMNS_FOR_TEST - 1)), 0.42);
         let desk = app.settings.master_gain;
         assert!(
             (desk - f64::from(recorder::fader_to_gain(0.42))).abs() < 1e-9,
@@ -37819,17 +37819,17 @@ mod tests {
              which is a change to what a fresh install sounds like"
         );
 
-        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
+        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
             app.apply_mixer_hit(Hit::Send(col), 0.61);
         }
         assert!(
             app.settings.strip_sends.iter().any(|v| *v > 0.5),
             "nothing moved, so resetting proves nothing"
         );
-        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
+        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
             app.reset_mixer_hit(Hit::Send(col));
         }
-        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
+        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
             let at = col.desk_index();
             // The master column has no send row of its own, so it indexes
             // one past the table - it is the one strip this question does
@@ -37856,14 +37856,14 @@ mod tests {
         use crate::recorder::COLUMNS_FOR_TEST;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         let fresh = Settings::default();
-        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
+        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
             app.apply_mixer_hit(Hit::Fader(col), 0.13);
         }
         assert_ne!(
             app.settings.master_gain, fresh.master_gain,
             "nothing moved, so resetting proves nothing"
         );
-        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
+        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
             app.reset_mixer_hit(Hit::Fader(col));
         }
         for (what, got, want) in [
@@ -37890,7 +37890,7 @@ mod tests {
     #[test]
     fn every_column_writes_its_own_name_and_no_others() {
         use crate::recorder::{Strip, COLUMNS_FOR_TEST, STRIPS};
-        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
+        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             app.commit_mixer_name(col, format!("col{}", col.0));
             let named: Vec<usize> = (0..=STRIPS)
@@ -37912,7 +37912,7 @@ mod tests {
     #[test]
     fn a_typed_name_is_the_one_the_desk_shows() {
         use crate::recorder::COLUMNS_FOR_TEST;
-        for col in (0..COLUMNS_FOR_TEST).map(crate::recorder::Column) {
+        for col in (0..COLUMNS_FOR_TEST).map(recorder::Column) {
             let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
             app.commit_mixer_name(col, "Rhodes".to_owned());
             assert_eq!(
@@ -37933,7 +37933,7 @@ mod tests {
     #[test]
     fn the_other_button_empties_an_insert() {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-        let at = crate::recorder::Strip::Channel(5).index();
+        let at = recorder::Strip::Channel(5).index();
         app.set_insert(at, 1, Some("/x/Pro-R 2.vst3"));
         assert!(app.insert(at, 1).is_some(), "nothing was loaded to remove");
         app.set_insert(at, 1, None);
@@ -38072,9 +38072,9 @@ mod tests {
         // two bays answer differently.
         app.set_insert(1, 1, Some("/x/Pianoteq 8.vst3"));
 
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(1), 0), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column(1), 0), 0.0);
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::PatchPicker { slot: 1, .. })),
+            matches!(app.dialog, Some(Dialog::PatchPicker { slot: 1, .. })),
             "the built-in did not open its patches"
         );
         // The one thing asked of the host is the STRIP's cartridge names —
@@ -38086,7 +38086,7 @@ mod tests {
         assert!(app.take_recorder_request().is_none());
 
         app.dialog = None;
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(1), 1), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column(1), 1), 0.0);
         assert!(app.dialog.is_none(), "a VST3 does not use the patch picker");
         assert_eq!(
             app.take_recorder_request(),
@@ -38193,7 +38193,7 @@ mod tests {
             path: Some(dialogs::BUILTIN_PATH.into()),
         });
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::PatchPicker { .. })),
+            matches!(app.dialog, Some(Dialog::PatchPicker { .. })),
             "the built-in's face is the patch picker and it did not open"
         );
         assert!(
@@ -38243,7 +38243,7 @@ mod tests {
         app.drumpad_mut().pads[38] = crate::drumpad::PadSlot {
             path: "media/clap.wav".to_owned(),
             name: "Clap".to_owned(),
-            params: crate::recorder::DrumPadParams {
+            params: recorder::DrumPadParams {
                 gain: 0.4,
                 choke: 3,
                 ..Default::default()
@@ -38578,7 +38578,7 @@ mod tests {
         // which matters because two roads into the loader run before the
         // snapshot is applied.
         let mut desk_settings = Settings::default();
-        let bay0 = 3 * crate::recorder::INSERTS;
+        let bay0 = 3 * recorder::INSERTS;
         assert!(
             desk_settings.strip_inserts.len() > bay0,
             "the fixture desk has no channel 3"
@@ -38586,10 +38586,10 @@ mod tests {
         // The stock desk already seats a drumpad on channel 1, which would
         // answer the question before channel 3 was ever asked. Empty every
         // first bay, then seat exactly one.
-        for ch in 0..crate::recorder::CHANNELS {
-            desk_settings.strip_inserts[ch * crate::recorder::INSERTS].clear();
+        for ch in 0..recorder::CHANNELS {
+            desk_settings.strip_inserts[ch * recorder::INSERTS].clear();
         }
-        desk_settings.strip_inserts[bay0] = crate::dialogs::DRUMPAD_PATH.to_owned();
+        desk_settings.strip_inserts[bay0] = dialogs::DRUMPAD_PATH.to_owned();
         let mut arr = crate::arrangement::Arrangement::default();
         arr.desk = Some(TangentApp::desk_snapshot_of(&desk_settings));
         arr.save_to(&doc);
@@ -39173,7 +39173,7 @@ mod tests {
         // Dress channel 1 (the DX7) distinctly.
         app.settings
             .strip_names
-            .resize(crate::recorder::STRIPS + 1, String::new());
+            .resize(recorder::STRIPS + 1, String::new());
         app.settings.strip_names[1] = "LEAD".to_owned();
         app.settings.channel_icons[1] = 2; // guitar badge
         app.settings.strip_colors[1] = 7;
@@ -39225,7 +39225,7 @@ mod tests {
         // moved span is 1..3; every channel outside it is carried unchanged,
         // however many the desk has.
         let perm = app.take_desk_state_perm().expect("no perm for the host");
-        let mut want: Vec<usize> = (0..crate::recorder::CHANNELS).collect();
+        let mut want: Vec<usize> = (0..recorder::CHANNELS).collect();
         want.splice(1..4, [2, 3, 1]);
         assert_eq!(perm, want);
         assert!(app.take_desk_state_perm().is_none(), "taken twice");
@@ -39511,7 +39511,7 @@ mod tests {
         // A track somebody just added touches NOBODY's arms — its own
         // included. It armed itself for a while (first additively, then
         // exclusively) and each version stole something from the player.
-        let n = (1..crate::recorder::CHANNELS)
+        let n = (1..recorder::CHANNELS)
             .find(|n| app.channel_kind(*n).is_none())
             .expect("an unused channel");
         assert_eq!(app.armed_mask(), 2, "the DX7 should stand armed here");
@@ -39675,7 +39675,7 @@ mod tests {
             "replace must keep the plugin until a choice is made"
         );
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::PluginPicker { .. })),
+            matches!(app.dialog, Some(Dialog::PluginPicker { .. })),
             "replace did not open the picker"
         );
         assert_eq!(
@@ -39702,7 +39702,7 @@ mod tests {
         use crate::mixer_panel::Hit;
         use crate::recorder::{Column, Strip};
         let (_, mut app) = headless(Caps::DESKTOP);
-        let n = (0..crate::recorder::CHANNELS)
+        let n = (0..recorder::CHANNELS)
             .find(|n| !app.channel_used(*n))
             .expect("a fresh desk has an unused channel");
 
@@ -39725,7 +39725,7 @@ mod tests {
         );
 
         // Ctrl+T's twin lands on the next free slot.
-        let free = (0..crate::recorder::CHANNELS)
+        let free = (0..recorder::CHANNELS)
             .find(|m| !app.channel_used(*m))
             .expect("a slot left");
         app.add_track_first_free();
@@ -39749,7 +39749,7 @@ mod tests {
         app.set_insert(0, 1, Some("/x/Pianoteq 8.vst3"));
         app.settings
             .strip_names
-            .resize(crate::recorder::STRIPS + 1, String::new());
+            .resize(recorder::STRIPS + 1, String::new());
         app.settings.strip_names[0] = "BELL KEYS".to_owned();
         app.settings.strip_colors[0] = 14;
         app.settings.strip_muted |= 1;
@@ -39765,7 +39765,7 @@ mod tests {
         // Remove with nothing at all. (The backing file's × lives on the
         // band's timeline now; its strip retired at v13.)
         while app.take_recorder_request().is_some() {}
-        app.apply_mixer_hit(Hit::Remove(Column(crate::recorder::CHANNELS)), 0.0);
+        app.apply_mixer_hit(Hit::Remove(Column(recorder::CHANNELS)), 0.0);
         assert_eq!(app.take_recorder_request(), None);
     }
 
@@ -39774,7 +39774,7 @@ mod tests {
     #[test]
     fn loading_a_cartridge_refills_the_open_picker() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(1), 0), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column(1), 0), 0.0);
 
         app.set_cartridge(crate::ports::CartridgeInfo {
             on_default: false,
@@ -39783,7 +39783,7 @@ mod tests {
             voices: (0..32).map(|i| format!("PATCH {i}")).collect(),
             error: String::new(),
         });
-        let Some(dialogs::Dialog::PatchPicker {
+        let Some(Dialog::PatchPicker {
             bank,
             bad_checksum,
             voices,
@@ -39812,7 +39812,7 @@ mod tests {
     #[test]
     fn a_cartridge_that_fails_leaves_the_good_one_alone() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(1), 0), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column(1), 0), 0.0);
         app.set_cartridge(crate::ports::CartridgeInfo {
             on_default: false,
             bank: "ROM1A".to_owned(),
@@ -39824,7 +39824,7 @@ mod tests {
             error: "this is a single-voice dump, not a 32-voice cartridge".to_owned(),
             ..Default::default()
         });
-        let Some(dialogs::Dialog::PatchPicker {
+        let Some(Dialog::PatchPicker {
             bank, voices, error, ..
         }) = &app.dialog
         else {
@@ -39840,7 +39840,7 @@ mod tests {
     #[test]
     fn picking_a_patch_plays_it_and_is_remembered() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_dialog_action(dialogs::DialogAction::ChoosePatch { slot: 1, index: 12 });
+        app.apply_dialog_action(DialogAction::ChoosePatch { slot: 1, index: 12 });
         assert_eq!(
             app.take_recorder_request(),
             Some(recorder::RecorderRequest::ChoosePatch { slot: 1, index: 12 })
@@ -39852,7 +39852,7 @@ mod tests {
 
         // The built-in row. `usize::MAX` is not an index into anything, so it
         // must not be written to the settings as one.
-        app.apply_dialog_action(dialogs::DialogAction::ChoosePatch {
+        app.apply_dialog_action(DialogAction::ChoosePatch {
             slot: 1,
             index: usize::MAX,
         });
@@ -39868,7 +39868,7 @@ mod tests {
 
     /// Put a hand on one of the open picker's rows, or take it off.
     fn hold_patch_row(app: &mut TangentApp, on: Option<dialogs::PatchHold>) {
-        let Some(dialogs::Dialog::PatchPicker { audition, .. }) = app.dialog.as_mut() else {
+        let Some(Dialog::PatchPicker { audition, .. }) = app.dialog.as_mut() else {
             panic!("the picker is not open")
         };
         *audition = on;
@@ -39901,7 +39901,7 @@ mod tests {
     fn a_held_patch_row_sounds_its_strip_and_is_put_back_when_the_hand_lifts() {
         let ctx = egui::Context::default();
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(crate::recorder::Column(1), 0), 0.0);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Insert(recorder::Column(1), 0), 0.0);
         app.set_cartridge(crate::ports::CartridgeInfo {
             on_default: false,
             bank: "ROM1A".to_owned(),
@@ -39959,7 +39959,7 @@ mod tests {
         hold_patch_row(&mut app, Some(row(9)));
         app.patch_audition_tick(&ctx);
         while app.take_recorder_request().is_some() {}
-        if let Some(dialogs::Dialog::PatchPicker { selected, .. }) = app.dialog.as_mut() {
+        if let Some(Dialog::PatchPicker { selected, .. }) = app.dialog.as_mut() {
             *selected = Some(9);
         }
         hold_patch_row(&mut app, None);
@@ -39994,11 +39994,11 @@ mod tests {
     #[test]
     fn a_plugin_does_not_ask_for_a_cartridge_file() {
         let (_, mut app) = headless(Caps::PLUGIN);
-        app.apply_dialog_action(dialogs::DialogAction::LoadCartridge { slot: 0 });
+        app.apply_dialog_action(DialogAction::LoadCartridge { slot: 0 });
         assert!(app.take_file_request().is_none());
 
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_dialog_action(dialogs::DialogAction::LoadCartridge { slot: 0 });
+        app.apply_dialog_action(DialogAction::LoadCartridge { slot: 0 });
         let r = app.take_file_request().expect("the desktop asks");
         assert_eq!(r.purpose, crate::ports::FilePurpose::Cartridge);
         assert!(r.extensions.iter().any(|e| e.eq_ignore_ascii_case("syx")));
@@ -40012,9 +40012,9 @@ mod tests {
     #[test]
     fn staging_moves_go_to_the_host_and_the_pane_refills_in_place() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_dialog_action(dialogs::DialogAction::ShowPatches { slot: 1 });
+        app.apply_dialog_action(DialogAction::ShowPatches { slot: 1 });
         while app.take_recorder_request().is_some() {}
-        app.apply_dialog_action(dialogs::DialogAction::StagePatches {
+        app.apply_dialog_action(DialogAction::StagePatches {
             slot: 1,
             indices: vec![2, 5],
             at: Some(7),
@@ -40031,14 +40031,14 @@ mod tests {
         names[7] = Some("KEEP A".to_owned());
         names[8] = Some("KEEP B".to_owned());
         app.set_staged_bank(names.clone());
-        let Some(dialogs::Dialog::PatchPicker { staged, .. }) = &app.dialog else {
+        let Some(Dialog::PatchPicker { staged, .. }) = &app.dialog else {
             panic!("the picker closed when the staged bank arrived")
         };
         assert_eq!(staged, &names);
 
         // Auditioning a staged slot is a request and NOT a setting: nothing
         // on disk holds that patch yet, so there is nothing to remember.
-        app.apply_dialog_action(dialogs::DialogAction::ChooseStaged { slot: 1, index: 7 });
+        app.apply_dialog_action(DialogAction::ChooseStaged { slot: 1, index: 7 });
         assert_eq!(
             app.take_recorder_request(),
             Some(recorder::RecorderRequest::ChooseStaged { slot: 1, index: 7 })
@@ -40048,7 +40048,7 @@ mod tests {
         // Removing goes the same road, and a selection or a mark on a slot
         // the host has since emptied is dropped rather than left pointing at
         // a hole.
-        if let Some(dialogs::Dialog::PatchPicker {
+        if let Some(Dialog::PatchPicker {
             staged_selected,
             staged_marked,
             ..
@@ -40057,14 +40057,14 @@ mod tests {
             *staged_selected = Some(8);
             staged_marked.extend([7, 8]);
         }
-        app.apply_dialog_action(dialogs::DialogAction::UnstagePatches { slots: vec![8] });
+        app.apply_dialog_action(DialogAction::UnstagePatches { slots: vec![8] });
         assert_eq!(
             app.take_recorder_request(),
             Some(recorder::RecorderRequest::UnstagePatches { slots: vec![8] })
         );
         names[8] = None;
         app.set_staged_bank(names.clone());
-        let Some(dialogs::Dialog::PatchPicker {
+        let Some(Dialog::PatchPicker {
             staged_selected,
             staged_marked,
             ..
@@ -40078,8 +40078,8 @@ mod tests {
         // The bank outlives the window: close it, open it on another strip,
         // and what was built is still there.
         app.dialog = None;
-        app.apply_dialog_action(dialogs::DialogAction::ShowPatches { slot: 3 });
-        let Some(dialogs::Dialog::PatchPicker { staged, slot, .. }) = &app.dialog else {
+        app.apply_dialog_action(DialogAction::ShowPatches { slot: 3 });
+        let Some(Dialog::PatchPicker { staged, slot, .. }) = &app.dialog else {
             panic!("the picker did not open")
         };
         assert_eq!(*slot, 3);
@@ -40093,16 +40093,16 @@ mod tests {
     #[test]
     fn save_bank_asks_for_a_panel_on_the_desktop_and_says_so_in_a_plugin() {
         let (_, mut app) = headless(Caps::PLUGIN);
-        app.apply_dialog_action(dialogs::DialogAction::ShowPatches { slot: 1 });
-        app.apply_dialog_action(dialogs::DialogAction::SaveBank { slot: 1 });
+        app.apply_dialog_action(DialogAction::ShowPatches { slot: 1 });
+        app.apply_dialog_action(DialogAction::SaveBank { slot: 1 });
         assert!(app.take_save_request().is_none(), "a plugin has no panel to raise");
-        let Some(dialogs::Dialog::PatchPicker { note, .. }) = &app.dialog else {
+        let Some(Dialog::PatchPicker { note, .. }) = &app.dialog else {
             panic!("the picker closed")
         };
         assert!(note.contains("plugin"), "the press was taken in silence: {note:?}");
 
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_dialog_action(dialogs::DialogAction::SaveBank { slot: 2 });
+        app.apply_dialog_action(DialogAction::SaveBank { slot: 2 });
         let req = app.take_save_request().expect("the desktop asks");
         assert_eq!(req.purpose, crate::ports::SavePurpose::Bank);
         assert_eq!(req.suggested, dialogs::DEFAULT_BANK_FILE);
@@ -40133,7 +40133,7 @@ mod tests {
         settings.strip_dx7_patch[1] = 12;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, settings);
         while app.take_recorder_request().is_some() {}
-        app.apply_dialog_action(dialogs::DialogAction::ShowPatches { slot: 1 });
+        app.apply_dialog_action(DialogAction::ShowPatches { slot: 1 });
         assert_eq!(
             app.take_recorder_request(),
             Some(recorder::RecorderRequest::LoadStripCartridge { strip: 1 })
@@ -40144,7 +40144,7 @@ mod tests {
             voices: (0..32).map(|i| format!("PATCH {i}")).collect(),
             ..Default::default()
         });
-        let Some(dialogs::Dialog::PatchPicker { selected, .. }) = &app.dialog else {
+        let Some(Dialog::PatchPicker { selected, .. }) = &app.dialog else {
             panic!("the picker closed")
         };
         assert_eq!(
@@ -40161,19 +40161,19 @@ mod tests {
     #[test]
     fn a_bank_already_on_the_shelf_is_asked_about_before_it_is_written_over() {
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_dialog_action(dialogs::DialogAction::ShowPatches { slot: 2 });
-        app.apply_dialog_action(dialogs::DialogAction::SaveBank { slot: 2 });
+        app.apply_dialog_action(DialogAction::ShowPatches { slot: 2 });
+        app.apply_dialog_action(DialogAction::SaveBank { slot: 2 });
         let _ = app.take_save_request();
         while app.take_recorder_request().is_some() {}
         let path = std::path::PathBuf::from("/m/Tangent Media/SYSEX/default.syx");
         app.ask_bank_replace(path.clone());
-        let Some(dialogs::Dialog::PatchPicker { question, slot, .. }) = &app.dialog else {
+        let Some(Dialog::PatchPicker { question, slot, .. }) = &app.dialog else {
             panic!("the picker closed")
         };
         assert_eq!(*slot, 2);
         assert_eq!(*question, Some(dialogs::BankQuestion::Replace(path.clone())));
         assert!(app.take_recorder_request().is_none(), "the bank was written before the answer");
-        app.apply_dialog_action(dialogs::DialogAction::ReplaceBank {
+        app.apply_dialog_action(DialogAction::ReplaceBank {
             slot: 2,
             path: path.clone(),
         });
@@ -40188,7 +40188,7 @@ mod tests {
         // raised the panel rather than being asked of nobody.
         app.dialog = None;
         app.ask_bank_replace(path.clone());
-        let Some(dialogs::Dialog::PatchPicker { question, slot, .. }) = &app.dialog else {
+        let Some(Dialog::PatchPicker { question, slot, .. }) = &app.dialog else {
             panic!("the question had nowhere to be drawn")
         };
         assert_eq!(*slot, 2);
@@ -40202,10 +40202,10 @@ mod tests {
     fn editing_a_staged_patch_opens_the_editor_on_that_slot() {
         let (_, mut app) = headless(Caps::DESKTOP);
         while app.take_recorder_request().is_some() {}
-        app.apply_dialog_action(dialogs::DialogAction::EditStaged { slot: 1, index: 4 });
+        app.apply_dialog_action(DialogAction::EditStaged { slot: 1, index: 4 });
         assert!(matches!(
             app.dialog,
-            Some(dialogs::Dialog::PatchEditor { slot: 1, .. })
+            Some(Dialog::PatchEditor { slot: 1, .. })
         ));
         assert_eq!(
             app.take_recorder_request(),
@@ -40633,7 +40633,7 @@ mod tests {
         assert!(app.channel_used(2), "the fixture channel is not used");
         app.selected_channel = Some(2);
         // A lane rename is open — the same state the header's name field sets.
-        app.mixer_naming = Some((crate::recorder::Column(2), "DR".to_owned()));
+        app.mixer_naming = Some((recorder::Column(2), "DR".to_owned()));
         assert!(app.text_entry_active(), "a rename must count as text entry");
         let _ = run_frame(&ctx, &mut app);
         // Backspace, then D, then D — the owner's "DDDD"/backspace title.
@@ -40829,9 +40829,9 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
 
         // It MOVES: two different faces cannot give one answer.
-        app.settings.fx_strip_color = crate::settings::Rgb::new(0xE3, 0xD9, 0xBD);
+        app.settings.fx_strip_color = Rgb::new(0xE3, 0xD9, 0xBD);
         let pale = app.menu_surface();
-        app.settings.fx_strip_color = crate::settings::Rgb::new(0x14, 0x16, 0x1A);
+        app.settings.fx_strip_color = Rgb::new(0x14, 0x16, 0x1A);
         let dark = app.menu_surface();
         assert_ne!(
             (pale.bg, pale.ink),
@@ -40845,7 +40845,7 @@ mod tests {
         for r in (0u8..=255).step_by(17) {
             for g in (0u8..=255).step_by(51) {
                 for b in (0u8..=255).step_by(51) {
-                    app.settings.fx_strip_color = crate::settings::Rgb::new(r, g, b);
+                    app.settings.fx_strip_color = Rgb::new(r, g, b);
                     let s = app.menu_surface();
                     let ratio = contrast_ratio(s.bg, s.ink);
                     assert!(
@@ -40866,7 +40866,7 @@ mod tests {
             app.arrangement_open = true;
             let _ = run_frame(&ctx, &mut app);
             // A LOADED bay — an empty one is the header's press, by design.
-            let (seat, bay) = crate::recorder::seat_bay(crate::recorder::STRIPS, slot);
+            let (seat, bay) = recorder::seat_bay(recorder::STRIPS, slot);
             app.set_insert(seat, bay, Some("@tangent-comp"));
             let _ = run_frame(&ctx, &mut app);
 
@@ -40950,7 +40950,7 @@ mod tests {
                 |ctx| app.frame(ctx),
             );
             assert!(
-                matches!(app.dialog, Some(dialogs::Dialog::Track { .. })),
+                matches!(app.dialog, Some(Dialog::Track { .. })),
                 "{view:?}: right-click did not summon the track menu (dialog = {:?})",
                 app.dialog.as_ref().map(std::mem::discriminant)
             );
@@ -41481,7 +41481,7 @@ mod tests {
         // first alt-click used to make TWO — the one under the hand and a
         // node seeded at zero in front of it. See
         // `a_curve_holds_only_the_nodes_that_were_drawn`.
-        let i = app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 4.0, 0.75).expect("no point landed");
+        let i = app.arr_put_auto_point(0, AutoParam::Gain, 4.0, 0.75).expect("no point landed");
         let c = app
             .arrangement
             .automation
@@ -41492,7 +41492,7 @@ mod tests {
         assert!((c.points()[i].value - 0.75).abs() < 1e-9);
 
         // Moving it leaves ONE point, not a trail.
-        app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, i, 9.0, 0.25);
+        app.arr_drag_auto_point(0, AutoParam::Gain, i, 9.0, 0.25);
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
         assert_eq!(c.points().len(), 1, "the drag left a trail: {:?}", c.points());
         assert!((c.points()[0].at_s - 9.0).abs() < 1e-9);
@@ -41500,8 +41500,8 @@ mod tests {
 
         // A second point, and moving the first PAST it keeps both and
         // re-sorts — the case a carried index would get wrong.
-        app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 12.0, 0.5);
-        app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, 0, 20.0, 0.1);
+        app.arr_put_auto_point(0, AutoParam::Gain, 12.0, 0.5);
+        app.arr_drag_auto_point(0, AutoParam::Gain, 0, 20.0, 0.1);
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
         assert_eq!(c.points().len(), 2, "{:?}", c.points());
         assert!(
@@ -41512,8 +41512,8 @@ mod tests {
 
         // Undrawing every point takes the curve out of the document
         // entirely — an emptied curve is removed, not stored empty.
-        app.arr_remove_auto_point(0, crate::automation::AutoParam::Gain, 20.0);
-        app.arr_remove_auto_point(0, crate::automation::AutoParam::Gain, 12.0);
+        app.arr_remove_auto_point(0, AutoParam::Gain, 20.0);
+        app.arr_remove_auto_point(0, AutoParam::Gain, 12.0);
         assert!(
             app.arrangement.automation.is_empty(),
             "an emptied curve was kept: {:?}",
@@ -41569,7 +41569,7 @@ mod tests {
 
         // Nothing is armed until something is actually touched.
         assert!(!app.arr_auto_writing(0, false), "a latch armed itself");
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(crate::recorder::Column(0)), 0.6);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(recorder::Column(0)), 0.6);
         // ...and now it stays armed with the hand off.
         assert!(app.arr_auto_writing(0, false), "the latch did not hold");
 
@@ -41582,7 +41582,7 @@ mod tests {
         // A Touch, by contrast, lets go the moment the hand does.
         app.arr_auto_modes.insert(1, AutoMode::Touch);
         app.recorder.playing = true;
-        app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(crate::recorder::Column(1)), 0.6);
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(recorder::Column(1)), 0.6);
         assert!(!app.arr_auto_writing(1, false), "a Touch latched");
     }
 
@@ -42534,7 +42534,7 @@ mod tests {
         three_clips_on_two_lanes(&mut app);
 
         app.open_track_dialog(1, true);
-        let Some(dialogs::Dialog::Track { midi_clips, .. }) = app.dialog else {
+        let Some(Dialog::Track { midi_clips, .. }) = app.dialog else {
             panic!("the track dialog did not open");
         };
         assert_eq!(midi_clips, 2, "lane one's two MIDI clips were not counted");
@@ -42542,7 +42542,7 @@ mod tests {
         // A lane with nothing on it offers no row at all — hidden, not
         // greyed: Export is not what a lane is FOR.
         app.open_track_dialog(7, true);
-        let Some(dialogs::Dialog::Track { midi_clips, .. }) = app.dialog else {
+        let Some(Dialog::Track { midi_clips, .. }) = app.dialog else {
             panic!("the track dialog did not open");
         };
         assert_eq!(midi_clips, 0, "an empty lane was offered a MIDI export");
@@ -42551,7 +42551,7 @@ mod tests {
         app.arr_multi = vec![2];
         app.arr_selected = Some(2);
         app.open_track_dialog(1, true);
-        app.apply_dialog_action(dialogs::DialogAction::ExportMidi(1));
+        app.apply_dialog_action(DialogAction::ExportMidi(1));
         assert!(app.dialog.is_none(), "the dialog stayed up in front of the panel");
         let req = app.take_save_request().expect("the row asked for no panel");
         assert_eq!(req.title, "Export MIDI", "one track, so one file");
@@ -42684,7 +42684,7 @@ mod tests {
         );
 
         app.open_track_dialog(1, true);
-        let Some(dialogs::Dialog::Track { midi_clips, .. }) = app.dialog else {
+        let Some(Dialog::Track { midi_clips, .. }) = app.dialog else {
             panic!("the track dialog did not open");
         };
         assert_eq!(midi_clips, 0, "the track menu offered the row in a plugin");
@@ -43055,8 +43055,8 @@ mod tests {
             app.settings.master_gain
         );
         // One press is one STEP of the fader's travel, not of its gain.
-        let moved = crate::recorder::gain_to_fader(up_to as f32)
-            - crate::recorder::gain_to_fader(before as f32);
+        let moved = recorder::gain_to_fader(up_to as f32)
+            - recorder::gain_to_fader(before as f32);
         assert!(
             (moved - crate::a11y::STEP).abs() < 1e-3,
             "one press moved the fader {moved} rather than {}",
@@ -43922,8 +43922,8 @@ mod tests {
     /// while the chip that was clicked went on looking untouched.
     #[test]
     fn shift_clicking_a_bay_bypasses_it_in_both_views_on_tracks_and_folders() {
-        let track_seat = crate::recorder::Strip::Channel(3).index();
-        let folder_seat = crate::recorder::folder_extra_seat(1);
+        let track_seat = recorder::Strip::Channel(3).index();
+        let folder_seat = recorder::folder_extra_seat(1);
         for arrangement in [false, true] {
             let where_ = if arrangement { "arrangement" } else { "mixer" };
             let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
@@ -44021,7 +44021,7 @@ mod tests {
             app.add_bare_track(n);
         }
         app.toggle_folder(1);
-        let folder_seat = crate::recorder::folder_extra_seat(1);
+        let folder_seat = recorder::folder_extra_seat(1);
         app.set_insert(folder_seat, 0, Some("/x/Verb.vst3"));
         app.set_insert(recorder::MASTER_EXTRA_SEAT, 1, Some("/x/Pro-L.vst3"));
         app.toggle_insert_bypass(folder_seat, 0);
@@ -44219,7 +44219,7 @@ mod tests {
 
         // The setting is what turns it off. Its tick went with the box; this
         // action is the one door left to it.
-        app.apply_dialog_action(dialogs::DialogAction::SetShowTakeSummary(false));
+        app.apply_dialog_action(DialogAction::SetShowTakeSummary(false));
         assert!(!app.settings.show_take_summary);
         app.report_take("Recorded 2:14".to_owned(), false);
         assert!(
@@ -44250,7 +44250,7 @@ mod tests {
         );
         app.report_take("Recorded 0:30".to_owned(), false);
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::FileBrowser { .. })),
+            matches!(app.dialog, Some(Dialog::FileBrowser { .. })),
             "the report displaced an open dialog"
         );
         assert_eq!(
@@ -44284,7 +44284,7 @@ mod tests {
         app.last_band = Rect::NOTHING;
         app.mixer_rect = None;
         app.arrangement_rect = None;
-        let ground = crate::piano::themed_bg(&app.settings);
+        let ground = piano::themed_bg(&app.settings);
         assert_eq!(app.face_under(at), ground);
 
         // The record band owns the top of the window whenever it is showing —
@@ -44471,7 +44471,7 @@ mod tests {
         for body in bodies {
             let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
             app.set_startup_notice(body.to_owned());
-            let st = crate::notify::Style::of(crate::piano::themed_bg(&app.settings));
+            let st = crate::notify::Style::of(piano::themed_bg(&app.settings));
             let mut placed = None;
             let _ = ctx.run(
                 egui::RawInput {
@@ -44688,14 +44688,14 @@ mod tests {
         struct Ports {
             available: Vec<String>,
         }
-        impl crate::ports::MidiPorts for Ports {
+        impl MidiPorts for Ports {
             fn list(&self) -> Vec<String> {
                 self.available.clone()
             }
             fn connect(
                 &mut self,
                 name: &str,
-                _tx: std::sync::mpsc::Sender<crate::midi_event::MidiEvent>,
+                _tx: mpsc::Sender<MidiEvent>,
             ) -> Result<(), String> {
                 if self.available.iter().any(|n| n == name) {
                     Ok(())
@@ -44743,7 +44743,7 @@ mod tests {
 
         // A port that will not open is the other condition, and it stands the
         // same way.
-        app.apply_dialog_action(dialogs::DialogAction::ConnectPort("Gone".to_owned()));
+        app.apply_dialog_action(DialogAction::ConnectPort("Gone".to_owned()));
         assert!(app.said().is_raised(MIDI_PORT_KEY));
         // By KEY, not by position: the message the picker just lowered is
         // still in the queue finishing its tail, and it is the older of the
@@ -44765,13 +44765,13 @@ mod tests {
         assert!(failed.is_standing());
         // Asking again while it is still broken changes the words, not the
         // number of messages.
-        app.apply_dialog_action(dialogs::DialogAction::ConnectPort("Gone Too".to_owned()));
+        app.apply_dialog_action(DialogAction::ConnectPort("Gone Too".to_owned()));
         let again = standing_now(&app);
         assert_eq!(again.id, failed.id, "a second attempt minted a second message");
         assert!(again.text.contains("Gone Too"), "the words did not follow: {}", again.text);
 
         // And the one that opens takes it down.
-        app.apply_dialog_action(dialogs::DialogAction::ConnectPort("Keystation".to_owned()));
+        app.apply_dialog_action(DialogAction::ConnectPort("Keystation".to_owned()));
         assert!(!app.said().is_raised(MIDI_PORT_KEY), "a working port left the failure up");
     }
 
@@ -44907,7 +44907,7 @@ mod tests {
         app.settings.reastream_host = "192.168.0.42".to_owned();
         app.apply_recorder_hit(recorder_panel::Hit::StreamToObs);
         match app.dialog {
-            Some(dialogs::Dialog::ReaStream {
+            Some(Dialog::ReaStream {
                 enabled,
                 ref identifier,
                 ref host,
@@ -44952,7 +44952,7 @@ mod tests {
             // see `recorder::LIMITER_SHIPS_AT`.
             let rest = match fx {
                 recorder_panel::Fx::Lpf => 1.0,
-                recorder_panel::Fx::Limiter => crate::recorder::LIMITER_SHIPS_AT,
+                recorder_panel::Fx::Limiter => recorder::LIMITER_SHIPS_AT,
                 _ => 0.0,
             };
             assert_eq!(app.fx_value(fx), rest, "{} did not go back", fx.title());
@@ -44977,19 +44977,19 @@ mod tests {
     fn the_theory_send_ships_on_for_the_keyboards_track_alone() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         assert!(app.to_theory(1), "track two does not reach the theory view");
-        for n in (0..crate::recorder::CHANNELS).filter(|n| *n != 1) {
+        for n in (0..recorder::CHANNELS).filter(|n| *n != 1) {
             assert!(!app.to_theory(n), "track {} ships switched on", n + 1);
         }
         // The switch is a saved preference, unlike the arm beside it.
         app.set_to_theory(3, true);
         assert!(app.to_theory(3));
         let json = app.settings.to_json();
-        let back = crate::settings::Settings::from_json(&json);
+        let back = Settings::from_json(&json);
         assert!(back.strip_to_theory[3], "the switch did not survive a save");
         assert!(back.strip_to_theory[1], "track two's switch was lost");
         // And an untouched desk writes nothing, so a fresh file keeps its
         // shape — the rule every additive key here follows.
-        let plain = crate::settings::Settings::default();
+        let plain = Settings::default();
         assert!(
             !plain.to_json().contains("strip_to_theory"),
             "an untouched desk wrote the key"
@@ -45879,7 +45879,7 @@ mod tests {
                 arr.left()
             );
             let seam =
-                crate::recorder_panel::camera_split_x(band, &app.recorder_layout_view());
+                recorder_panel::camera_split_x(band, &app.recorder_layout_view());
             let clips = app.arrange_clips_for_shot();
             let view = app.arrange_view_for_shot(&clips);
             let header_right =
@@ -45953,11 +45953,11 @@ mod tests {
     #[test]
     fn f6_cycles_the_views_when_tab_is_walking_the_controls() {
         let ctx = egui::Context::default();
-        let gates = crate::keys::Gates {
+        let gates = keys::Gates {
             recorder_shown: true,
             recorder_available: true,
             window_sizing: true,
-            ..crate::keys::Gates::default()
+            ..keys::Gates::default()
         };
         let with = |key: egui::Key| {
             let _ = ctx.run(
@@ -45973,15 +45973,15 @@ mod tests {
                 },
                 |_| {},
             );
-            crate::keys::pressed(&ctx, gates)
+            keys::pressed(&ctx, gates)
         };
         assert_eq!(
             with(egui::Key::F6),
-            Some(crate::keys::KeyAction::ToggleMixer),
+            Some(keys::KeyAction::ToggleMixer),
             "F6 does not reach the view cycle"
         );
         // And Tab still does it, for everybody not in accessibility mode.
-        assert_eq!(with(egui::Key::Tab), Some(crate::keys::KeyAction::ToggleMixer));
+        assert_eq!(with(egui::Key::Tab), Some(keys::KeyAction::ToggleMixer));
     }
 
     /// **A menu opens where the hand is, in whichever coordinates the
@@ -46039,7 +46039,7 @@ mod tests {
         // And the row overrules it, in the direction somebody would reach
         // for the row in.
         let ctx = egui::Context::default();
-        app.apply_menu_action(&ctx, crate::menu::MenuAction::ToggleScreenReaderMode);
+        app.apply_menu_action(&ctx, MenuAction::ToggleScreenReaderMode);
         assert!(!app.reader_mode(), "the row could not turn off a wrong guess");
         assert!(app.caps.child_windows, "the windows did not come back");
     }
@@ -46061,7 +46061,7 @@ mod tests {
             "the desktop's gate is shut, so the key could never fire"
         );
         assert!(!app.key_gates().reader_mode);
-        app.apply_key_action(&ctx, crate::keys::KeyAction::ToggleReaderMode);
+        app.apply_key_action(&ctx, keys::KeyAction::ToggleReaderMode);
         assert!(app.reader_mode(), "the key did not enter reader mode");
         assert!(
             app.settings.screen_reader_mode,
@@ -46073,7 +46073,7 @@ mod tests {
             "the card's gates did not follow, so it still advertises Tab"
         );
         // The same key backs out, and the windows come home.
-        app.apply_key_action(&ctx, crate::keys::KeyAction::ToggleReaderMode);
+        app.apply_key_action(&ctx, keys::KeyAction::ToggleReaderMode);
         assert!(!app.reader_mode(), "the key could not leave reader mode");
         assert!(app.caps.child_windows, "the windows did not come back");
     }
@@ -46118,7 +46118,7 @@ mod tests {
         // The drag loop, as `update` runs it: a frame's worth of motion,
         // then re-anchor on the UNSNAPPED position — which is what carries
         // a hand out of the detent instead of stalling in it.
-        let travel = recorder_panel::KNOB_TRAVEL;
+        let travel = KNOB_TRAVEL;
         let mut anchor = app.control_value(recorder_panel::Hit::SetVarispeed(0.0));
         let mut frames = 0;
         while !app.settings.varispeed.engaged() {
@@ -46950,7 +46950,7 @@ mod tests {
         let mut s = Settings::default();
         for (fret, theory) in [(false, false), (true, false), (true, true)] {
             s.show_fretboard = fret;
-            s.theory_order = if theory { crate::theory_panel::Views::all().keys() } else { String::new() };
+            s.theory_order = if theory { theory_panel::Views::all().keys() } else { String::new() };
             for avail in [
                 Vec2::new(900.0, 260.0),  // the editor's default
                 Vec2::new(400.0, 200.0),  // a narrow rack
@@ -47008,7 +47008,7 @@ mod tests {
     #[test]
     fn a_detached_theory_band_takes_no_height_in_the_main_window() {
         let mut s = Settings::default();
-        s.theory_order = if true { crate::theory_panel::Views::all().keys() } else { String::new() };
+        s.theory_order = if true { theory_panel::Views::all().keys() } else { String::new() };
         let attached = band_sizes_at(&s, 1300.0);
         assert!(attached.theory_h > 0.0, "the band should be showing");
 
@@ -47034,7 +47034,7 @@ mod tests {
     fn a_plugin_never_starts_with_a_detached_theory_band() {
         let ctx = egui::Context::default();
         let mut s = Settings::default();
-        s.theory_order = if true { crate::theory_panel::Views::all().keys() } else { String::new() };
+        s.theory_order = if true { theory_panel::Views::all().keys() } else { String::new() };
         s.theory_detached = true;
         let app = TangentApp::new(&ctx, s, Caps::PLUGIN);
         assert!(
@@ -47242,7 +47242,7 @@ mod tests {
     /// sides are the real estate they asked for and did not get.
     #[test]
     fn filling_the_screen_uses_all_of_it() {
-        let s = crate::settings::Settings::first_launch();
+        let s = Settings::first_launch();
         for screen in [
             Vec2::new(1920.0, 1080.0),
             Vec2::new(3440.0, 1440.0),
@@ -47292,7 +47292,7 @@ mod tests {
     /// they are handed — so it is the band that pays.
     #[test]
     fn filling_leaves_the_instruments_alone_and_spends_the_theory_band() {
-        let s = crate::settings::Settings::first_launch();
+        let s = Settings::first_launch();
         let screen = Vec2::new(2560.0, 1440.0);
         let natural = band_sizes_at(&s, screen.x);
         let filled = fill_bands(&s, screen);
@@ -47348,7 +47348,7 @@ mod tests {
             app.apply_menu_action(&ctx, MenuAction::Reset(scope));
 
             assert!(
-                matches!(app.open_dialog(), Some(dialogs::Dialog::Confirm { .. })),
+                matches!(app.open_dialog(), Some(Dialog::Confirm { .. })),
                 "{scope:?} did not ask"
             );
             assert_eq!(app.settings.theme_name, s.theme_name, "{scope:?} acted anyway");
@@ -47372,7 +47372,7 @@ mod tests {
         for scope in crate::settings::ResetScope::ALL {
             let (ctx, mut app) = headless(Caps::DESKTOP);
             app.apply_menu_action(&ctx, MenuAction::Reset(scope));
-            let Some(dialogs::Dialog::Confirm { title, body, kept, choices, .. }) =
+            let Some(Dialog::Confirm { title, body, kept, choices, .. }) =
                 app.open_dialog()
             else {
                 panic!("{scope:?} did not open a confirmation");
@@ -47405,13 +47405,13 @@ mod tests {
 
         let mut s = Settings::first_launch();
         s.theme_name = "Iris".into();
-        s.background_color = crate::settings::Rgb { r: 9, g: 9, b: 9 };
+        s.background_color = Rgb { r: 9, g: 9, b: 9 };
         s.record_audio_device = Some("Scarlett 18i20".to_owned());
         s.channel_gains[2] = 0.25;
         let (ctx, mut app) = headless_with(Caps::DESKTOP, s);
 
         app.apply_menu_action(&ctx, MenuAction::Reset(crate::settings::ResetScope::Colours));
-        app.apply_dialog_action(dialogs::DialogAction::ResetTo(
+        app.apply_dialog_action(DialogAction::ResetTo(
             crate::settings::ResetScope::Colours,
         ));
         run_frame(&ctx, &mut app);
@@ -47424,19 +47424,19 @@ mod tests {
         assert_eq!(app.settings.channel_gains[2], 0.25);
 
         // The box that reports it offers the way back.
-        let Some(dialogs::Dialog::Confirm { choices, .. }) = app.open_dialog() else {
+        let Some(Dialog::Confirm { choices, .. }) = app.open_dialog() else {
             panic!("nothing reported the reset");
         };
         assert_eq!(choices.len(), 1);
-        assert!(matches!(choices[0].action, dialogs::DialogAction::UndoReset));
+        assert!(matches!(choices[0].action, DialogAction::UndoReset));
 
         // And it works, across everything the reset touched.
-        app.apply_dialog_action(dialogs::DialogAction::UndoReset);
+        app.apply_dialog_action(DialogAction::UndoReset);
         run_frame(&ctx, &mut app);
         assert_eq!(app.settings.theme_name, "Iris", "Undo did not put the theme back");
         assert_eq!(
             app.settings.background_color,
-            crate::settings::Rgb { r: 9, g: 9, b: 9 }
+            Rgb { r: 9, g: 9, b: 9 }
         );
 
         let _ = std::fs::remove_file(Settings::backup_path());
@@ -47480,7 +47480,7 @@ mod tests {
                     // Still up: a dialog that closed itself while being drawn
                     // is one nobody can answer.
                     assert!(
-                        matches!(app.open_dialog(), Some(dialogs::Dialog::Confirm { .. })),
+                        matches!(app.open_dialog(), Some(Dialog::Confirm { .. })),
                         "{scope:?} dark={dark} closed itself at {pane:?}"
                     );
                 }
@@ -47496,13 +47496,13 @@ mod tests {
     /// settings that are not being saved.
     #[test]
     fn resetting_lands_where_a_fresh_install_lands() {
-        let mut s = crate::settings::Settings::default();
+        let mut s = Settings::default();
         s.show_fretboard = false;
-        s.theory_order = if false { crate::theory_panel::Views::all().keys() } else { String::new() };
+        s.theory_order = if false { theory_panel::Views::all().keys() } else { String::new() };
         s.dark_mode = true;
         s.reset(crate::settings::ResetScope::Everything);
 
-        let fresh = crate::settings::Settings::first_launch();
+        let fresh = Settings::first_launch();
         assert_eq!(s.show_fretboard, fresh.show_fretboard);
         assert_eq!(s.theory_views().count(), fresh.theory_views().count());
         assert_eq!(s.show_recorder, fresh.show_recorder);
@@ -47528,9 +47528,9 @@ mod tests {
     }
 
     /// One bay of a `Settings`, the way `TangentApp::insert` reads it.
-    fn bay_of(s: &crate::settings::Settings, strip: usize, bay: usize) -> Option<&str> {
+    fn bay_of(s: &Settings, strip: usize, bay: usize) -> Option<&str> {
         s.strip_inserts
-            .get(strip * crate::recorder::INSERTS + bay)
+            .get(strip * recorder::INSERTS + bay)
             .map(String::as_str)
             .filter(|p| !p.is_empty())
     }
@@ -47614,7 +47614,7 @@ mod tests {
     /// `first_launch` being what a reset resets to.
     #[test]
     fn a_fresh_install_has_the_built_in_loaded() {
-        let s = crate::settings::Settings::first_launch();
+        let s = Settings::first_launch();
         // **The kit first, the keyboard second** — the owner's order for the
         // out-of-the-box desk. See `Settings::default`.
         assert_eq!(bay_of(&s, 0, 0), Some(dialogs::DRUMPAD_PATH));
@@ -47623,10 +47623,10 @@ mod tests {
         // something. Channels 0 (drumpad) and 1 (DX7) each hold one bay-0
         // instrument; every other bay everywhere is empty.
         assert!(
-            (2..=crate::recorder::STRIPS)
-                .all(|st| (0..crate::recorder::INSERTS).all(|b| bay_of(&s, st, b).is_none()))
-                && (1..crate::recorder::INSERTS).all(|b| bay_of(&s, 0, b).is_none())
-                && (1..crate::recorder::INSERTS).all(|b| bay_of(&s, 1, b).is_none()),
+            (2..=recorder::STRIPS)
+                .all(|st| (0..recorder::INSERTS).all(|b| bay_of(&s, st, b).is_none()))
+                && (1..recorder::INSERTS).all(|b| bay_of(&s, 0, b).is_none())
+                && (1..recorder::INSERTS).all(|b| bay_of(&s, 1, b).is_none()),
             "a fresh install loaded more than the two instruments"
         );
         // No cartridge chosen means the one that ships. See `dx7::factory`.
@@ -47643,7 +47643,7 @@ mod tests {
             1 << 1,
             "the record light opens somewhere other than the keyboard's track"
         );
-        for n in 0..crate::recorder::CHANNELS {
+        for n in 0..recorder::CHANNELS {
             assert_eq!(
                 app.to_theory(n),
                 n == 1,
@@ -47812,7 +47812,7 @@ mod tests {
         // `Settings::path()` is redirected per-thread under `cfg(test)`, so
         // this writes and reads a real file without touching the user's.
         app.settings.save();
-        let reloaded = crate::settings::Settings::load();
+        let reloaded = Settings::load();
         assert!(
             reloaded.record_input_off,
             "the None choice did not survive being written and read back"
@@ -48266,7 +48266,7 @@ mod tests {
         // Now the controller plays C major an octave down - and C major,
         // from C, is what must light.
         for n in [48u8, 52, 55] {
-            app.feed(crate::midi_event::MidiEvent::NoteOn { note: n, velocity: 100 });
+            app.feed(NoteOn { note: n, velocity: 100 });
         }
         let _ = run_frame(&ctx, &mut app);
         let lit = app.display_notes();
@@ -48296,11 +48296,11 @@ mod tests {
         // Every suite unit is named, and none of them leaks its sentinel.
         for (path, name, _) in crate::faces::SUITE_UNITS {
             assert_eq!(
-                super::plugin_display_name(path),
+                plugin_display_name(path),
                 name,
                 "{path} is not named after itself"
             );
-            let chip = super::insert_chip_name(path);
+            let chip = insert_chip_name(path);
             assert!(
                 !chip.contains('@') && !chip.contains("Tangent"),
                 "the chip for {path} reads {chip:?}"
@@ -48316,7 +48316,7 @@ mod tests {
                 .strip_prefix("Tangent ")
                 .or_else(|| name.strip_prefix("TANGENT "))
                 .unwrap_or(name)
-                .strip_suffix(super::EXPERIMENTAL_SUFFIX)
+                .strip_suffix(EXPERIMENTAL_SUFFIX)
                 .map_or_else(
                     || {
                         name.strip_prefix("Tangent ")
@@ -48331,22 +48331,22 @@ mod tests {
             );
             assert!(!chip.is_empty(), "{name} shortened to nothing");
         }
-        assert_eq!(super::insert_chip_name("@tangent-denoise"), "Denoise");
-        assert_eq!(super::insert_chip_name("@tangent-amp"), "Amp");
-        assert_eq!(super::insert_chip_name("@tangent-eq"), "EQ");
+        assert_eq!(insert_chip_name("@tangent-denoise"), "Denoise");
+        assert_eq!(insert_chip_name("@tangent-amp"), "Amp");
+        assert_eq!(insert_chip_name("@tangent-eq"), "EQ");
 
         // The three instruments lose the prefix in a slot too, and keep it
         // where the question is whose instrument this is.
-        assert_eq!(super::insert_chip_name(dialogs::BUILTIN_PATH), "DX7");
-        assert_eq!(super::insert_chip_name(dialogs::DRUMPAD_PATH), "DRUMS");
-        assert_eq!(super::insert_chip_name(dialogs::KEYS_PATH), "KEYS");
-        assert_eq!(super::plugin_display_name(dialogs::BUILTIN_PATH), "TANGENT DX7");
+        assert_eq!(insert_chip_name(dialogs::BUILTIN_PATH), "DX7");
+        assert_eq!(insert_chip_name(dialogs::DRUMPAD_PATH), "DRUMS");
+        assert_eq!(insert_chip_name(dialogs::KEYS_PATH), "KEYS");
+        assert_eq!(plugin_display_name(dialogs::BUILTIN_PATH), "TANGENT DX7");
 
         // And somebody else's plugin is untouched — still the file's own
         // name, still without its extension, still split on both separators.
-        assert_eq!(super::insert_chip_name("/Library/Audio/Plug-Ins/VST3/Pro-R.vst3"), "Pro-R");
-        assert_eq!(super::insert_chip_name("C:\\Program Files\\VST3\\Serum2.vst3"), "Serum2");
-        assert_eq!(super::insert_chip_name(""), "");
+        assert_eq!(insert_chip_name("/Library/Audio/Plug-Ins/VST3/Pro-R.vst3"), "Pro-R");
+        assert_eq!(insert_chip_name("C:\\Program Files\\VST3\\Serum2.vst3"), "Serum2");
+        assert_eq!(insert_chip_name(""), "");
     }
 
     /// The offset is bounded, or a held-down arrow key walks it somewhere a
@@ -49642,7 +49642,7 @@ mod tests {").expect("the tests module")];
         app.open_unit_face(0, 0);
         pointer_frame(&ctx, &mut app, Vec::new());
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::InsertFace { .. })),
+            matches!(app.dialog, Some(Dialog::InsertFace { .. })),
             "the face did not open"
         );
         (ctx, app)
@@ -49686,7 +49686,7 @@ mod tests {").expect("the tests module")];
     /// the panel is drawing its "no board here" caption instead.
     fn board_on_the_face(app: &TangentApp) -> Option<[String; recorder::AMP_PEDALS]> {
         match &app.dialog {
-            Some(dialogs::Dialog::InsertFace { live, .. }) => live.pedals.clone(),
+            Some(Dialog::InsertFace { live, .. }) => live.pedals.clone(),
             other => panic!("no amp face is open: {}", other.is_some()),
         }
     }
@@ -49793,7 +49793,7 @@ mod tests {").expect("the tests module")];
             pointer_frame(&ctx, &mut app, Vec::new());
         }
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::InsertFace { .. })),
+            matches!(app.dialog, Some(Dialog::InsertFace { .. })),
             "the amp face did not open"
         );
         (ctx, app)
@@ -49881,7 +49881,7 @@ mod tests {").expect("the tests module")];
     /// The seat and bay the stacked window is about, if one is standing.
     fn stacked_face(app: &TangentApp) -> Option<(usize, usize)> {
         match app.pedal_stack.as_ref().map(|st| &st.dialog) {
-            Some(Some(dialogs::Dialog::InsertFace { strip, slot, .. })) => Some((*strip, *slot)),
+            Some(Some(Dialog::InsertFace { strip, slot, .. })) => Some((*strip, *slot)),
             _ => None,
         }
     }
@@ -49906,7 +49906,7 @@ mod tests {").expect("the tests module")];
 
         // The amp is still where it was — not swapped, not closed.
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::InsertFace { strip: 0, slot: 0, .. })),
+            matches!(app.dialog, Some(Dialog::InsertFace { strip: 0, slot: 0, .. })),
             "the amp face was replaced by the pedal it opened"
         );
         // And the pedal's own face is standing over it, on its own seat.
@@ -49958,7 +49958,7 @@ mod tests {").expect("the tests module")];
             "Escape did not close the pedal window"
         );
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::InsertFace { strip: 0, slot: 0, .. })),
+            matches!(app.dialog, Some(Dialog::InsertFace { strip: 0, slot: 0, .. })),
             "Escape aimed at the pedal took the amp down with it"
         );
 
@@ -49966,7 +49966,7 @@ mod tests {").expect("the tests module")];
         // writers of `self.dialog` have the slot.
         click_word(&ctx, &mut app, "drive", egui::Modifiers::NONE);
         assert!(app.pedal_stack.is_some(), "the pedal window did not reopen");
-        app.dialog = Some(dialogs::Dialog::About);
+        app.dialog = Some(Dialog::About);
         let _ = frame_words(&ctx, &mut app, egui::Modifiers::NONE, Vec::new());
         assert!(
             app.pedal_stack.is_none(),
@@ -50137,19 +50137,19 @@ mod tests {").expect("the tests module")];
 
         // Now the shape `becomes` leaves in that slot.
         let st = app.pedal_stack.as_mut().expect("the pedal window closed");
-        st.dialog = Some(dialogs::Dialog::Confirm {
+        st.dialog = Some(Dialog::Confirm {
             title: "Delete this impulse?".to_owned(),
             body: "It goes from the folder.".to_owned(),
             kept: String::new(),
             choices: vec![dialogs::ConfirmChoice::new(
                 "Delete",
-                dialogs::DialogAction::CycleTheme,
+                DialogAction::CycleTheme,
                 true,
             )],
             warn: egui::Color32::RED,
         });
         assert!(
-            app.stacked_dialog().is_some_and(dialogs::Dialog::is_modal),
+            app.stacked_dialog().is_some_and(Dialog::is_modal),
             "the fixture did not build a question"
         );
         let (before, after) = pull_the_first_fader(&ctx, &mut app);
@@ -50212,7 +50212,7 @@ mod tests {").expect("the tests module")];
         // Pedal 5 is empty in the fixture, so its chip wears a plus.
         let seat = recorder::amp_pedal_seat(0, 5);
         assert_eq!(app.insert(seat, 0), None, "the fixture dressed pedal 5");
-        app.apply_dialog_action(dialogs::DialogAction::OpenPedalFace {
+        app.apply_dialog_action(DialogAction::OpenPedalFace {
             strip: 0,
             slot: 0,
             pedal: 5,
@@ -50222,7 +50222,7 @@ mod tests {").expect("the tests module")];
         assert!(
             matches!(
                 app.pedal_stack.as_ref().and_then(|st| st.dialog.as_ref()),
-                Some(dialogs::Dialog::PluginPicker { .. })
+                Some(Dialog::PluginPicker { .. })
             ),
             "an empty chip did not offer the picker in the stacked window"
         );
@@ -50234,7 +50234,7 @@ mod tests {").expect("the tests module")];
         let _ = frame_words(&ctx, &mut app, egui::Modifiers::NONE, Vec::new());
 
         // What the picker asks for when a row is chosen.
-        app.apply_dialog_action(dialogs::DialogAction::LoadPlugin {
+        app.apply_dialog_action(DialogAction::LoadPlugin {
             path: Some("@tangent-echo".to_owned()),
         });
         assert_eq!(
@@ -50248,7 +50248,7 @@ mod tests {").expect("the tests module")];
             "the chosen pedal's face did not open in the stacked window"
         );
         assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::InsertFace { strip: 0, slot: 0, .. })),
+            matches!(app.dialog, Some(Dialog::InsertFace { strip: 0, slot: 0, .. })),
             "choosing a pedal put the amp away"
         );
         // And the stack still points at the amp face it started over, so the
@@ -50279,7 +50279,7 @@ mod tests {").expect("the tests module")];
         // Alt empties the seat, exactly as it empties a bay.
         let (_ctx, mut app) = a_desk_with_an_amp_face();
         assert!(!app.alt_down && !app.shift_down, "the desk was holding a key");
-        app.apply_dialog_action(dialogs::DialogAction::OpenPedalFace {
+        app.apply_dialog_action(DialogAction::OpenPedalFace {
             strip: 0,
             slot: 0,
             pedal: 2,
@@ -50291,7 +50291,7 @@ mod tests {").expect("the tests module")];
 
         // Shift takes it out of circuit and puts it back, and opens nothing.
         let (_ctx, mut app) = a_desk_with_an_amp_face();
-        let shift = || dialogs::DialogAction::OpenPedalFace {
+        let shift = || DialogAction::OpenPedalFace {
             strip: 0,
             slot: 0,
             pedal: 2,
@@ -50313,7 +50313,7 @@ mod tests {").expect("the tests module")];
         // that an eraser that opened pickers would be worse than no eraser.
         let (_ctx, mut app) = a_desk_with_an_amp_face();
         app.set_insert(seat, 0, None);
-        app.apply_dialog_action(dialogs::DialogAction::OpenPedalFace {
+        app.apply_dialog_action(DialogAction::OpenPedalFace {
             strip: 0,
             slot: 0,
             pedal: 2,
@@ -50363,7 +50363,7 @@ mod tests {").expect("the tests module")];
             "the fader did not move under an open face: {before} -> {after}"
         );
         match &app.dialog {
-            Some(dialogs::Dialog::InsertFace { live, .. }) => assert_eq!(
+            Some(Dialog::InsertFace { live, .. }) => assert_eq!(
                 live.face.path, "@tangent-comp",
                 "the face stopped being refreshed while the desk was driven"
             ),
@@ -50371,14 +50371,14 @@ mod tests {").expect("the tests module")];
         }
 
         // The control: a question freezes the desk exactly as before.
-        app.dialog = Some(dialogs::Dialog::About);
+        app.dialog = Some(Dialog::About);
         pointer_frame(&ctx, &mut app, Vec::new());
         let (before, after) = pull_the_first_fader(&ctx, &mut app);
         assert!(
             (after - before).abs() < 1e-9,
             "a modal dialog let the fader move: {before} -> {after}"
         );
-        assert!(matches!(app.dialog, Some(dialogs::Dialog::About)));
+        assert!(matches!(app.dialog, Some(Dialog::About)));
     }
 
     /// **T inside a plugin window cycles the theme ONCE.** The desk and the
@@ -50426,7 +50426,7 @@ mod tests {").expect("the tests module")];
                 all[from].name, all[(from + 1) % all.len()].name
             );
             assert!(
-                matches!(app.dialog, Some(dialogs::Dialog::InsertFace { .. })),
+                matches!(app.dialog, Some(Dialog::InsertFace { .. })),
                 "{label}: the theme key closed the face"
             );
         }
@@ -50457,9 +50457,9 @@ mod tests {").expect("the tests module")];
             .expect("the shipped theme is in the factory list");
         app.apply_key_action(&ctx, keys::KeyAction::CycleTheme);
         assert_eq!(app.settings.theme_name, all[(from + 1) % all.len()].name);
-        assert!(matches!(app.dialog, Some(dialogs::Dialog::InsertFace { .. })));
+        assert!(matches!(app.dialog, Some(Dialog::InsertFace { .. })));
         // A question, and the gate closes as it always did.
-        app.dialog = Some(dialogs::Dialog::About);
+        app.dialog = Some(Dialog::About);
         assert!(app.dialog_blocks_keys(&ctx), "a modal dialog let the shortcuts through");
         assert!(app.dialog_blocks_pointer(&ctx));
     }
@@ -50733,7 +50733,7 @@ mod tests {").expect("the tests module")];
         // Wind the deadline back rather than sleeping through it: the
         // mechanism under test is "when it runs out", not how long it is.
         if let Some(st) = app.midi_edit.as_mut() {
-            st.preview_until = Some(Instant::now() - std::time::Duration::from_millis(1));
+            st.preview_until = Some(Instant::now() - Duration::from_millis(1));
         }
         idle(&ctx, &mut app);
         assert_eq!(
@@ -52048,7 +52048,7 @@ mod tests {").expect("the tests module")];
         ));
         let _ = std::fs::remove_dir_all(&root);
         let projects = root.join("Projects");
-        let shelf = projects.join(super::TEMPLATE_SHELF).join("default");
+        let shelf = projects.join(TEMPLATE_SHELF).join("default");
         std::fs::create_dir_all(&shelf).expect("the template shelf");
 
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
@@ -52205,7 +52205,7 @@ mod tests {").expect("the tests module")];
             let clips = app.arr_clip_views();
             let view = app.arrange_view(&clips);
             let l = crate::arrangement_panel::Layout::new(rect, &view);
-            (0..crate::recorder::CHANNELS)
+            (0..recorder::CHANNELS)
                 .filter(|&i| l.lane_rows[i].is_positive())
                 .collect()
         };
@@ -52264,7 +52264,7 @@ mod tests {").expect("the tests module")];
             let clips = app.arr_clip_views();
             let view = app.arrange_view(&clips);
             let l = crate::arrangement_panel::Layout::new(rect, &view);
-            (0..crate::recorder::CHANNELS)
+            (0..recorder::CHANNELS)
                 .filter(|&i| l.lane_rows[i].is_positive())
                 .collect()
         };
@@ -52361,7 +52361,7 @@ mod tests {").expect("the tests module")];
             let clips = app.arr_clip_views();
             let view = app.arrange_view(&clips);
             let l = crate::arrangement_panel::Layout::new(rect, &view);
-            (0..crate::recorder::CHANNELS)
+            (0..recorder::CHANNELS)
                 .filter(|&i| l.header_rows[i].panel.is_positive())
                 .collect::<Vec<_>>()
         };
@@ -52414,7 +52414,7 @@ mod tests {").expect("the tests module")];
     #[test]
     fn a_carried_bay_walks_the_arrangement_header_too() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
-        app.set_insert(crate::recorder::Strip::Channel(0).index(), 0, Some("/x/Comp.vst3"));
+        app.set_insert(recorder::Strip::Channel(0).index(), 0, Some("/x/Comp.vst3"));
         let (rect, _) = arrangement_with_a_tall_stack(&ctx, &mut app);
         let (grab, header) = {
             let clips = app.arr_clip_views();
@@ -52457,7 +52457,7 @@ mod tests {").expect("the tests module")];
         let (grab, region, drawn_at_press) = {
             let view = app.mixer_view();
             let l = crate::mixer_panel::Layout::new(rect, &view);
-            let drawn: Vec<usize> = (0..crate::recorder::CHANNELS)
+            let drawn: Vec<usize> = (0..recorder::CHANNELS)
                 .filter(|&i| l.strips[i].panel.is_positive())
                 .collect();
             (l.strips[0].name.center(), l.region, drawn)
@@ -52487,9 +52487,9 @@ mod tests {").expect("the tests module")];
         let under = {
             let view = app.mixer_view();
             crate::mixer_panel::strip_at(rect, &view, at)
-                .and_then(crate::recorder::Column::strip)
+                .and_then(recorder::Column::strip)
         };
-        let Some(crate::recorder::Strip::Channel(to)) = under else {
+        let Some(recorder::Strip::Channel(to)) = under else {
             panic!("nothing is under the hand after the scroll: {under:?}");
         };
         assert!(
@@ -52558,7 +52558,7 @@ mod tests {").expect("the tests module")];
         for n in 0..10 {
             app.add_bare_track(n);
         }
-        app.set_insert(crate::recorder::Strip::Channel(0).index(), 0, Some("/x/Comp.vst3"));
+        app.set_insert(recorder::Strip::Channel(0).index(), 0, Some("/x/Comp.vst3"));
         let _ = run_frame(&ctx, &mut app);
         let rect = app.mixer_rect.expect("the mixer drew nowhere");
         let (grab, region) = {
@@ -52989,7 +52989,7 @@ mod heart_ring_tests {
         // Travelling BACKWARDS along the diagonal: the colour at phase p and
         // time t is the colour at phase p + d and time t + d's worth. If the
         // sign were the other way this would be phase p - d.
-        let n = f64::from(crate::recorder::CHANNELS as u32);
+        let n = f64::from(recorder::CHANNELS as u32);
         let step = f64::from(TangentApp::HEART_CYCLE_S) / n;
         let bands = f64::from(TangentApp::HEART_BANDS);
         let later = app.heart_wave((1.0 / bands) as f32, step);
@@ -53151,11 +53151,11 @@ mod velocity_selection_tests {
         // clicking a saxophone read as a no-op. Line-in is the last code.
         app.apply_dialog_action(DialogAction::TrackIcon(
             4,
-            crate::recorder_panel::ICON_MAX,
+            recorder_panel::ICON_MAX,
         ));
         assert_eq!(
             app.settings.channel_icons.get(4).copied(),
-            Some(crate::recorder_panel::ICON_MAX),
+            Some(recorder_panel::ICON_MAX),
             "the last badge in the table did not stick"
         );
     }
@@ -53207,7 +53207,7 @@ mod folder_tests {
                     a.settings.strip_in_folder[ch] = in_bits & (1 << ch) != 0;
                 }
                 let table = a.folder_parents();
-                for ch in 0..crate::recorder::CHANNELS {
+                for ch in 0..recorder::CHANNELS {
                     assert_eq!(
                         table[ch],
                         a.folder_of(ch).map_or(-1, |p| p as i32),
@@ -53911,14 +53911,14 @@ mod folder_tests {
     #[test]
     fn the_undo_form_of_a_kit_is_small_and_lossless() {
         use crate::drumpad::{DrumpadDoc, PadSlot};
-        let mut kits: Vec<DrumpadDoc> = (0..crate::recorder::CHANNELS)
+        let mut kits: Vec<DrumpadDoc> = (0..recorder::CHANNELS)
             .map(|_| DrumpadDoc::default())
             .collect();
         kits[3].master = 0.6;
         kits[3].pads[36] = PadSlot {
             path: "media/kick.wav".to_owned(),
             name: "Kick".to_owned(),
-            params: crate::recorder::DrumPadParams {
+            params: recorder::DrumPadParams {
                 gain: 0.4,
                 pan: -0.3,
                 tune: 2.0,
@@ -53928,8 +53928,8 @@ mod folder_tests {
             ..Default::default()
         };
         let text = DrumpadDoc::compact_all(&kits);
-        let back = DrumpadDoc::from_compact_all(&text, crate::recorder::CHANNELS);
-        assert_eq!(back.len(), crate::recorder::CHANNELS);
+        let back = DrumpadDoc::from_compact_all(&text, recorder::CHANNELS);
+        assert_eq!(back.len(), recorder::CHANNELS);
         assert_eq!(back[3].pads[36].path, "media/kick.wav");
         assert_eq!(back[3].pads[36].name, "Kick");
         assert_eq!(back[3].pads[36].params.choke, 3);
@@ -53947,7 +53947,7 @@ mod folder_tests {
 
         // Rubbish is empty kits, never a panic.
         for bad in ["", "{", "[]", "{\"3\": 7}"] {
-            let out = DrumpadDoc::from_compact_all(bad, crate::recorder::CHANNELS);
+            let out = DrumpadDoc::from_compact_all(bad, recorder::CHANNELS);
             assert!(out.iter().all(DrumpadDoc::is_empty), "{bad:?} made pads");
         }
     }
@@ -53958,9 +53958,9 @@ mod folder_tests {
         // A drum track on lane 0: the instrument in bay 0 and a sample on a
         // pad, which is what a full kit is made of.
         app.set_insert(
-            crate::recorder::Strip::Channel(0).index(),
+            recorder::Strip::Channel(0).index(),
             0,
-            Some(crate::dialogs::DRUMPAD_PATH),
+            Some(dialogs::DRUMPAD_PATH),
         );
         app.drumpad_kits[0].pads[36] = crate::drumpad::PadSlot {
             path: "media/kick.wav".to_owned(),
@@ -53974,8 +53974,8 @@ mod folder_tests {
         // Bay 0 carried over — this part already worked, and is what made the
         // lane look like a drum lane.
         assert_eq!(
-            app.insert(crate::recorder::Strip::Channel(3).index(), 0),
-            Some(crate::dialogs::DRUMPAD_PATH),
+            app.insert(recorder::Strip::Channel(3).index(), 0),
+            Some(dialogs::DRUMPAD_PATH),
             "the pasted lane is not a drum lane at all"
         );
         // And the kit came with it, which is the part that did not.
@@ -54108,7 +54108,7 @@ mod folder_tests {
         assert!(a.arr_auto_is_open(3, AutoParam::Gain));
 
         // Move 3 up to 1: order[new] = old.
-        let mut order: Vec<usize> = (0..crate::recorder::CHANNELS).collect();
+        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
         order.remove(3);
         order.insert(1, 3);
         a.reorder_channels(&order);
@@ -54137,7 +54137,7 @@ mod folder_tests {
         assert!(a.arr_auto_is_open(1, AutoParam::Gain), "the row did not follow");
         assert!(!a.arr_auto_is_open(3, AutoParam::Gain), "the row stayed behind");
         // Which the engine agrees with.
-        assert_eq!(a.folder_parents().len(), crate::recorder::CHANNELS);
+        assert_eq!(a.folder_parents().len(), recorder::CHANNELS);
     }
 
     /// **A reorder carries both ends of a sidechain key edge; a delete takes
@@ -54155,10 +54155,10 @@ mod folder_tests {
         }
         // Track 3's bay 0 is keyed by track 1; the master's slot 4 by track 3.
         a.settings.insert_keys.set(3, 0, Some(1));
-        a.settings.insert_keys.set(crate::recorder::MASTER_SEAT, 4, Some(3));
+        a.settings.insert_keys.set(recorder::MASTER_SEAT, 4, Some(3));
 
         // Move 3 up to 1: order[new] = old — the kit test's move.
-        let mut order: Vec<usize> = (0..crate::recorder::CHANNELS).collect();
+        let mut order: Vec<usize> = (0..recorder::CHANNELS).collect();
         order.remove(3);
         order.insert(1, 3);
         a.reorder_channels(&order);
@@ -54171,7 +54171,7 @@ mod folder_tests {
         );
         // The master held still while its source moved.
         assert_eq!(
-            a.settings.insert_keys.get(crate::recorder::MASTER_SEAT, 4),
+            a.settings.insert_keys.get(recorder::MASTER_SEAT, 4),
             Some(1),
             "the master's edge lost its source in the reorder"
         );
@@ -54181,7 +54181,7 @@ mod folder_tests {
         a.remove_channel(1);
         assert_eq!(a.settings.insert_keys.get(1, 0), None, "a deleted track kept a key");
         assert_eq!(
-            a.settings.insert_keys.get(crate::recorder::MASTER_SEAT, 4),
+            a.settings.insert_keys.get(recorder::MASTER_SEAT, 4),
             None,
             "an edge keyed BY the deleted track survived it"
         );
@@ -54309,7 +54309,7 @@ mod folder_tests {
 
         let offered = |a: &TangentApp| -> Vec<usize> {
             match a.key_picker_dialog(0, 1) {
-                dialogs::Dialog::InsertKeySource { channels, .. } => {
+                Dialog::InsertKeySource { channels, .. } => {
                     channels.into_iter().map(|(n, _)| n).collect()
                 }
                 _ => panic!("not the key picker"),
@@ -54322,7 +54322,7 @@ mod folder_tests {
 
         // The choice lands in settings — and only closes the window.
         a.open_key_picker(0, 1);
-        a.apply_dialog_action(dialogs::DialogAction::SetInsertKeySource {
+        a.apply_dialog_action(DialogAction::SetInsertKeySource {
             strip: 0,
             slot: 1,
             from: Some(2),
@@ -54331,13 +54331,13 @@ mod folder_tests {
         assert!(a.dialog.is_none(), "the picker answered and stayed open");
         // The picker reopened on that bay greys what is current.
         match a.key_picker_dialog(0, 1) {
-            dialogs::Dialog::InsertKeySource { current, .. } => {
+            Dialog::InsertKeySource { current, .. } => {
                 assert_eq!(current, Some(2));
             }
             _ => panic!("not the key picker"),
         }
         // And "No sidechain" is the way off.
-        a.apply_dialog_action(dialogs::DialogAction::SetInsertKeySource {
+        a.apply_dialog_action(DialogAction::SetInsertKeySource {
             strip: 0,
             slot: 1,
             from: None,
@@ -54355,9 +54355,9 @@ mod folder_tests {
         let mut a = app();
         a.set_device_outs(16);
         a.set_input_width(4);
-        a.apply_dialog_action(dialogs::DialogAction::OpenIrWizard);
+        a.apply_dialog_action(DialogAction::OpenIrWizard);
         match a.dialog.as_ref() {
-            Some(dialogs::Dialog::IrWizard { state }) => {
+            Some(Dialog::IrWizard { state }) => {
                 assert_eq!(state.out_pairs.len(), 8, "sixteen outs is eight pairs");
                 assert_eq!(state.in_pairs.len(), 2, "four ins is two pairs");
                 assert_eq!(state.out_pairs[6], (12, 13));
@@ -54375,7 +54375,7 @@ mod folder_tests {
         );
 
         use recorder::RecorderRequest as R;
-        a.apply_dialog_action(dialogs::DialogAction::IrTone {
+        a.apply_dialog_action(DialogAction::IrTone {
             on: true,
             out: (12, 13),
             inp: (2, 3),
@@ -54388,7 +54388,7 @@ mod folder_tests {
         // A top that is on no chip row, deliberately: the point of this
         // assertion is that the number the WIZARD chose crosses to the host
         // untouched, and a value the table also holds could pass by accident.
-        a.apply_dialog_action(dialogs::DialogAction::IrCapture {
+        a.apply_dialog_action(DialogAction::IrCapture {
             out: (12, 13),
             inp: (2, 3),
             sweep_s: 15.0,
@@ -54409,9 +54409,9 @@ mod folder_tests {
                 top_hz: 15_500.0,
             })
         );
-        a.apply_dialog_action(dialogs::DialogAction::IrCancel);
+        a.apply_dialog_action(DialogAction::IrCancel);
         assert_eq!(a.take_recorder_request(), Some(R::IrCancel));
-        a.apply_dialog_action(dialogs::DialogAction::IrSave {
+        a.apply_dialog_action(DialogAction::IrSave {
             name: "QV plate".to_owned(),
         });
         assert_eq!(
@@ -54659,7 +54659,7 @@ mod folder_tests {
         // The picker offers the other used channels...
         let offered = |a: &TangentApp| -> Vec<usize> {
             match a.routing_dialog(0, None) {
-                dialogs::Dialog::Routing { channels, .. } => {
+                Dialog::Routing { channels, .. } => {
                     channels.into_iter().map(|(n, _)| n).collect()
                 }
                 _ => panic!("not the routing dialog"),
@@ -54808,8 +54808,8 @@ mod folder_tests {
         // Two rows, and only two: the drums on one, the built-in on two.
         assert_eq!(d.tracks_added, 0b11, "the template is not two tracks");
         let bay = |ch: usize| d.bay(Strip::Channel(ch).index() * INSERTS).unwrap_or("");
-        assert_eq!(bay(0), crate::dialogs::DRUMPAD_PATH, "channel 1 is not the drums");
-        assert_eq!(bay(1), crate::dialogs::BUILTIN_PATH, "channel 2 is not the DX7");
+        assert_eq!(bay(0), dialogs::DRUMPAD_PATH, "channel 1 is not the drums");
+        assert_eq!(bay(1), dialogs::BUILTIN_PATH, "channel 2 is not the DX7");
         for ch in 2..CHANNELS {
             assert!(bay(ch).is_empty(), "channel {} came with a plugin", ch + 1);
         }
@@ -54820,7 +54820,7 @@ mod folder_tests {
         // the copy did not. What shipped was a template that overwrote the
         // default on first launch and put the drum badge on the row holding
         // the DX7. Held together here so the two cannot drift again.
-        let shipped = crate::settings::Settings::default();
+        let shipped = Settings::default();
         for ch in 0..CHANNELS {
             let at = Strip::Channel(ch).index() * INSERTS;
             assert_eq!(
@@ -54842,7 +54842,7 @@ mod folder_tests {
         for n in 0..8 {
             a.add_bare_track(n);
         }
-        a.settings.strip_names = vec![String::new(); crate::recorder::STRIPS + 1];
+        a.settings.strip_names = vec![String::new(); recorder::STRIPS + 1];
         a.settings.strip_names[Strip::Channel(3).index()] = "Loud Guitar".to_owned();
         a.set_insert(Strip::Channel(5).index(), 0, Some("/some/Plugin.vst3"));
         assert_eq!(
@@ -55027,19 +55027,19 @@ mod folder_tests {
         // Quitting into that asks, and does NOT quit.
         assert!(a.intercept_quit(), "quitting did not ask");
         assert!(
-            matches!(a.dialog, Some(dialogs::Dialog::SaveChanges { .. })),
+            matches!(a.dialog, Some(Dialog::SaveChanges { .. })),
             "no prompt was raised"
         );
         assert!(!a.take_quit_now(), "it quit anyway");
 
         // Cancel leaves everything exactly as it was.
-        a.apply_dialog_action(dialogs::DialogAction::SaveChangesCancel);
+        a.apply_dialog_action(DialogAction::SaveChangesCancel);
         assert!(!a.take_quit_now(), "cancel quit the app");
         assert!(a.project_dirty(), "cancel discarded the change");
 
         // Discard goes through.
         assert!(a.intercept_quit());
-        a.apply_dialog_action(dialogs::DialogAction::SaveChangesDiscard);
+        a.apply_dialog_action(DialogAction::SaveChangesDiscard);
         assert!(a.take_quit_now(), "discard did not let the window close");
 
         // **And the close it just asked for is not intercepted AGAIN.**
@@ -55243,7 +55243,7 @@ mod folder_tests {
     fn the_drumpad_opens_on_c2_however_it_was_left() {
         let mut app = app();
         // Left on the far end of the keyboard, as a session would leave it.
-        app.settings.drumpad_page = crate::recorder::DRUM_PAGES as u8 - 1;
+        app.settings.drumpad_page = recorder::DRUM_PAGES as u8 - 1;
         app.drumpad_sel = 120;
         app.open_drumpad();
 
@@ -55257,7 +55257,7 @@ mod folder_tests {
         // the base has to be at or below the key and within one page of it.
         let base = crate::drumpad_panel::page_base(usize::from(app.settings.drumpad_page));
         assert!(
-            (base..base + crate::recorder::DRUM_PAGE).contains(&app.drumpad_sel),
+            (base..base + recorder::DRUM_PAGE).contains(&app.drumpad_sel),
             "C2 ({}) is not on the page that opened (base {base})",
             app.drumpad_sel
         );
@@ -55359,7 +55359,7 @@ mod folder_tests {
         use crate::arrangement::{ClipKind, RecordedClip};
         // `add_recorded_clips` refuses without a project — a take has to have
         // somewhere to land — so this one gets a scratch one.
-        let root = super::tests::project_scratch("midiloop");
+        let root = tests::project_scratch("midiloop");
         let (_ctx, mut a) = headless(Caps::DESKTOP);
         a.bootstrap_project(&root.join("Projects"));
         a.add_recorded_clips(vec![RecordedClip {
@@ -55721,13 +55721,13 @@ mod folder_tests {
         }
         // `strip_names` is grown lazily, so it is empty until something
         // sizes it — the same trap the template test hit.
-        a.settings.strip_names = vec![String::new(); crate::recorder::STRIPS + 1];
+        a.settings.strip_names = vec![String::new(); recorder::STRIPS + 1];
         for n in 0..6 {
-            a.settings.strip_names[crate::recorder::Strip::Channel(n).index()] =
+            a.settings.strip_names[recorder::Strip::Channel(n).index()] =
                 format!("t{n}");
         }
         let name = |a: &TangentApp, n: usize| a.settings.strip_names[
-            crate::recorder::Strip::Channel(n).index()
+            recorder::Strip::Channel(n).index()
         ].clone();
         assert_eq!(a.folder_children(1), vec![2, 3]);
 
@@ -55875,7 +55875,7 @@ mod folder_tests {
     #[test]
     fn the_per_channel_flags_follow_their_tracks_through_a_reorder() {
         let mut a = app();
-        a.settings.strip_to_theory = vec![false; crate::recorder::CHANNELS];
+        a.settings.strip_to_theory = vec![false; recorder::CHANNELS];
         a.settings.strip_to_theory[3] = true;
         a.toggle_folder(3);
         a.set_in_folder(4, true);
@@ -55962,9 +55962,9 @@ mod folder_tests {
         // cells shed on every track, folder or not, so a narrow fixture
         // would only prove the shed.
         app.settings.arr_header_w = 420.0;
-        let rect = egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::Vec2::new(1300.0, 1000.0),
+        let rect = Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(1300.0, 1000.0),
         );
         let clips = app.arr_clip_views();
         let view = app.arrange_view(&clips);
@@ -56334,14 +56334,14 @@ mod fullscreen_proportion_tests {
         s.fretboard_detached = false;
         s.theory_detached = false;
         let w = 1920.0_f32;
-        let windowed = super::band_sizes_at(&s, w);
+        let windowed = band_sizes_at(&s, w);
         assert!(windowed.piano_h > 0.0 && windowed.fret_h > 0.0, "nothing to test");
         assert!(windowed.theory_h > 0.0, "the theory band has to be able to pay");
 
         // A screen far taller than the layout's natural height.
         for extra in [120.0_f32, 400.0, 900.0] {
             let avail = Vec2::new(w, windowed.total().y + extra);
-            let full = super::fill_bands(&s, avail);
+            let full = fill_bands(&s, avail);
             assert!(
                 (full.piano_h - windowed.piano_h).abs() < 0.5,
                 "the piano was stretched from {} to {} with {extra} to spare",
@@ -56377,9 +56377,9 @@ mod fullscreen_proportion_tests {
         s.show_piano = true;
         s.show_fretboard = true;
         let w = 1280.0_f32;
-        let windowed = super::band_sizes_at(&s, w);
+        let windowed = band_sizes_at(&s, w);
         let avail = Vec2::new(w, windowed.total().y * 0.5);
-        let full = super::fill_bands(&s, avail);
+        let full = fill_bands(&s, avail);
         assert!(
             full.total().y <= avail.y + 1.0,
             "the layout overflowed a short screen: {} against {}",
@@ -56582,7 +56582,7 @@ mod aspect_snap_tests {
                 r.left() - area.left() < 40.0
                     && area.contains(r.center())
                     && s.parse::<usize>()
-                        .is_ok_and(|n| (1..=crate::recorder::CHANNELS).contains(&n))
+                        .is_ok_and(|n| (1..=recorder::CHANNELS).contains(&n))
             })
             .map(|(r, _)| r.top())
             .collect();
@@ -56738,7 +56738,7 @@ mod aspect_snap_tests {
             let full_strips = painted_strips(&ctx, &mut app, pane, monitor, how);
             assert_eq!(
                 full_strips,
-                crate::recorder::FREE_CHANNELS,
+                recorder::FREE_CHANNELS,
                 "the filled desk painted {full_strips} strips, not the whole sixteen"
             );
         }
@@ -56864,7 +56864,7 @@ mod aspect_snap_tests {
             (5120, 2800, 10, 16, 10, 16),
             (3440, 1400, 10, 16, 10, 16),
         ];
-        let chans = crate::recorder::CHANNELS;
+        let chans = recorder::CHANNELS;
         for (w, h, lanes_win, strips_win, lanes_full, strips_full) in table {
             let s = desk_on(w, h, 100);
             let ctx = egui::Context::default();
@@ -57135,7 +57135,7 @@ mod aspect_snap_tests {
     #[test]
     fn a_dragged_edge_snaps_the_other_one_to_match() {
         let s = Settings::first_launch();
-        let natural = super::band_sizes_at(&s, 1300.0);
+        let natural = band_sizes_at(&s, 1300.0);
         let right = natural.total().y;
 
         // Dragged TALLER than the layout wants: the height comes back.
@@ -57152,7 +57152,7 @@ mod aspect_snap_tests {
         // A WIDER window keeps its width and takes the height that goes with
         // it — which is what makes the gesture diagonal rather than a snap
         // back to one size.
-        let wide = super::band_sizes_at(&s, 1800.0).total().y;
+        let wide = band_sizes_at(&s, 1800.0).total().y;
         let got = TangentApp::aspect_snap_for(&s, None, Vec2::new(1800.0, right))
             .expect("a wider window should snap its height");
         assert!((got.x - 1800.0).abs() < 1.0, "the width was taken back");
@@ -57170,7 +57170,7 @@ mod aspect_snap_tests {
     #[test]
     fn dragging_a_vertical_edge_takes_the_width_with_it() {
         let s = Settings::first_launch();
-        let natural = super::band_sizes_at(&s, 1300.0).total().y;
+        let natural = band_sizes_at(&s, 1300.0).total().y;
 
         // The hand pulled the bottom edge down 300 points: the width is
         // untouched, so the height is the only thing that moved.
@@ -57184,7 +57184,7 @@ mod aspect_snap_tests {
             got.x
         );
         // And the answer is on the aspect: its height is the one its width wants.
-        let want = super::band_sizes_at(&s, got.x).total().y;
+        let want = band_sizes_at(&s, got.x).total().y;
         assert!(
             (got.y - want).abs() <= 1.5,
             "the answer is off its own aspect: {} against {want}",
@@ -57220,7 +57220,7 @@ mod aspect_snap_tests {
     #[test]
     fn a_window_already_on_its_aspect_is_not_touched() {
         let s = Settings::first_launch();
-        let right = super::band_sizes_at(&s, 1300.0).total().y;
+        let right = band_sizes_at(&s, 1300.0).total().y;
         assert_eq!(TangentApp::aspect_snap_for(&s, None, Vec2::new(1300.0, right)), None);
         // Within a point, for a scaled display's fractional sizes.
         assert_eq!(
@@ -57259,8 +57259,8 @@ mod dirty_cost_probe {
         let ctx = egui::Context::default();
         let mut app = TangentApp::new(
             &ctx,
-            crate::settings::Settings::default(),
-            crate::host::Caps::DESKTOP,
+            Settings::default(),
+            Caps::DESKTOP,
         );
         for lane in 0..8usize {
             for c in 0..16usize {
@@ -57303,15 +57303,15 @@ mod dirty_cost_probe {
         the_old_moment(app) != *saved
     }
 
-    fn per_call(n: u32, mut f: impl FnMut()) -> std::time::Duration {
-        let t = std::time::Instant::now();
+    fn per_call(n: u32, mut f: impl FnMut()) -> Duration {
+        let t = Instant::now();
         for _ in 0..n {
             f();
         }
         t.elapsed() / n
     }
 
-    fn say(what: &str, d: std::time::Duration) {
+    fn say(what: &str, d: Duration) {
         println!(
             "  {what:<34} {:>10.3?}  {:>7.2}% of a 16.6ms frame",
             d,
@@ -57409,7 +57409,7 @@ mod dirty_cost_probe {
 
         // And the whole call, end to end, on a document that really changed.
         app.undo_reset();
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let n = 20;
         for i in 0..n {
             app.arrangement.clips[0].notes[0].at_s = f64::from(i) * 0.001;

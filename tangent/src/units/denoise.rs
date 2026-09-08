@@ -3109,8 +3109,8 @@ impl Denoise {
     /// convolver keeps, for the same contract.
     #[cfg(test)]
     fn footprint(&self) -> usize {
-        let v = |x: &Vec<f32>| x.capacity() * std::mem::size_of::<f32>();
-        self.ring.capacity() * std::mem::size_of::<f32>()
+        let v = |x: &Vec<f32>| x.capacity() * size_of::<f32>();
+        self.ring.capacity() * size_of::<f32>()
             + v(&self.sp.win)
             + v(&self.sp.in_ring)
             + v(&self.sp.acc)
@@ -3125,7 +3125,7 @@ impl Denoise {
             + v(&self.sp.floor)
             + v(&self.sp.ceil)
             + v(&self.sp.map_frac)
-            + self.sp.map_lo.capacity() * std::mem::size_of::<u16>()
+            + self.sp.map_lo.capacity() * size_of::<u16>()
     }
 
     /// Drop every trace of what was playing: bells, resonators, envelopes,

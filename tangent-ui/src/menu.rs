@@ -2017,7 +2017,7 @@ mod tests {
     #[test]
     fn the_app_menu_opens_under_the_hand_on_a_real_screen() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
         let _ = ctx.run(Default::default(), |_| {});
         let mon = Vec2::new(2560.0, 1440.0);
         let mut v = view();

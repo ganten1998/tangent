@@ -750,7 +750,7 @@ impl Palette {
     /// and not CHANNELS: the run length is table HISTORY, and history does
     /// not grow when the desk does.
     pub fn slot(&self, i: usize) -> usize {
-        let i = i % crate::recorder::CHANNELS;
+        let i = i % CHANNELS;
         if i < PALETTE_RUN {
             self.base + i
         } else if i < PALETTE_RUN + 8 {
@@ -898,7 +898,7 @@ const SEND_TRAVEL: f32 = 420.0;
 /// and are not drawn — their controls are the band's.
 // Eight general channels, the click, and the master. BACKING had a column
 // here and is retired: the arrangement's lanes carry audio now.
-pub const COLUMNS: usize = crate::recorder::CHANNELS + 2;
+pub const COLUMNS: usize = CHANNELS + 2;
 
 /// How many route strips a mixer channel shows before it stops growing.
 ///
@@ -1721,12 +1721,12 @@ pub fn a11y_nodes_from(view: &MixerView<'_>, hits: &[(Rect, Hit)]) -> Vec<crate:
                 f64::from(s.gain),
                 0.0,
                 1.0,
-                crate::recorder::gain_text(s.gain),
+                gain_text(s.gain),
                 // The fader's POSITION, not its amplitude — they are equal
                 // only at the ends. See the master knob in `recorder_panel`,
                 // where getting this wrong sent one arrow press from -6 dB
                 // to -20.4.
-                travel(crate::recorder::gain_to_fader(s.gain), DragAxis::Vertical),
+                travel(gain_to_fader(s.gain), DragAxis::Vertical),
             ),
             Hit::Send(_) => Node::slider(
                 id,
@@ -1779,7 +1779,7 @@ pub fn a11y_nodes_from(view: &MixerView<'_>, hits: &[(Rect, Hit)]) -> Vec<crate:
                 id,
                 r,
                 format!("{who} level"),
-                crate::recorder::gain_text(s.gain),
+                gain_text(s.gain),
             ),
             Hit::Routing(_) => Node::button(id, r, format!("{who} routing")),
             Hit::Insert(_, bay) => {
@@ -3325,7 +3325,7 @@ mod tests {
                 [("the mute", p.mute), ("the solo", p.solo), ("the arm", p.arm)]
             {
                 let lit = switch_face(true, other, &p).0;
-                let d = crate::recorder_panel::delta_e(t, lit);
+                let d = delta_e(t, lit);
                 if d < 25.0 {
                     bad.push(format!(
                         "{}: a lit T is {d:.1} from {name} — too close to tell apart",
@@ -3813,7 +3813,7 @@ mod tests {
                 }
                 // And a DIFFERENT colour from loaded, not merely a legible
                 // one: `delta_e` is this app's "is it another colour" answer.
-                let apart = crate::recorder_panel::delta_e(tab, p.lit);
+                let apart = delta_e(tab, p.lit);
                 if apart < 15.0 {
                     bad.push(format!(
                         "{} {mode}: bypassed and loaded are {apart:.1} apart, which is one light",
@@ -4407,10 +4407,10 @@ mod tests {
         // and a soloable bus is a feedback question.
         assert_eq!(
             COLUMNS,
-            crate::recorder::CHANNELS + 2,
+            CHANNELS + 2,
             "a drawn channel went missing"
         );
-        assert_eq!(channels.len(), crate::recorder::CHANNELS + 1);
+        assert_eq!(channels.len(), CHANNELS + 1);
         assert!(!channels.contains(&Strip::Drums), "the retired drum bus came back");
         assert!(channels.contains(&Strip::Click), "the click lost its column");
         assert!(!channels.contains(&Strip::Fx), "the bus is drawn twice");
@@ -4754,7 +4754,7 @@ mod tests {
         // red has to clear it against all sixteen sets, not just its own.
         let mut close: Vec<String> = Vec::new();
         for pal in &PALETTES {
-            for i in 0..crate::recorder::CHANNELS {
+            for i in 0..CHANNELS {
                 let d = delta_e(rgb(slot), rgb(pal.slot(i)));
                 if d < 7.0 {
                     close.push(format!("{} track {i}: {d:.1} apart", pal.name));
@@ -4905,7 +4905,7 @@ mod tests {
         let r = rect();
         // Only VISIBLE_CHANNELS show at once, so scroll each channel into the
         // window before checking it — the desk is wider than the desk shows.
-        for n in 0..crate::recorder::CHANNELS {
+        for n in 0..CHANNELS {
             let mut v = a_view();
             v.scroll_px = n.min(CHANNELS - VISIBLE_CHANNELS) as f32
                 * Layout::metrics(r, VISIBLE_CHANNELS).1;

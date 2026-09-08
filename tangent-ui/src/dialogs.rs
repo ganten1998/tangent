@@ -311,7 +311,7 @@ pub enum Dialog {
         title: String,
         what: BrowseFor,
         /// The directory being shown. The host lists it; this only draws.
-        at: std::path::PathBuf,
+        at: PathBuf,
         /// Directories first, then matching files, sorted by the host.
         entries: Vec<FileEntry>,
         selected: Option<usize>,
@@ -1492,12 +1492,12 @@ pub enum DialogAction {
     /// List this directory and hand the rows back. The host reads the disk;
     /// the dialog draws what it is given, the same division the plugin picker
     /// uses.
-    BrowseTo(std::path::PathBuf),
+    BrowseTo(PathBuf),
     /// The browser's answer. `None` is a cancel, and is sent so the host can
     /// drop whatever it was holding for the request.
     Browsed {
         what: BrowseFor,
-        path: Option<std::path::PathBuf>,
+        path: Option<PathBuf>,
     },
     /// Persist the "Create Project Subdirectory" tick.
     SetProjectSubdir(bool),
@@ -1848,7 +1848,7 @@ pub enum DialogAction {
     /// file asked about is the file written.
     ReplaceBank {
         slot: usize,
-        path: std::path::PathBuf,
+        path: PathBuf,
     },
 }
 
@@ -2801,7 +2801,7 @@ fn export_label(ui: &mut egui::Ui, t: &DialogTheme, text: &str, sub: bool) {
     let indent = if sub { EXPORT_SUB_INDENT } else { 0.0 };
     ui.painter().text(
         rect.left_center() + Vec2::new(indent, 0.0),
-        egui::Align2::LEFT_CENTER,
+        Align2::LEFT_CENTER,
         text,
         FontId::new(if sub { 10.0 } else { 11.0 }, fonts::courier_bold()),
         if sub {
@@ -2907,7 +2907,7 @@ impl Dialog {
 pub struct FileEntry {
     /// What to show. The file name, or `..` for the way up.
     pub name: String,
-    pub path: std::path::PathBuf,
+    pub path: PathBuf,
     pub is_dir: bool,
 }
 
@@ -3927,7 +3927,7 @@ fn draw_algorithm(painter: &egui::Painter, rect: Rect, patch: &crate::ports::Pat
         );
         painter.text(
             *p,
-            egui::Align2::CENTER_CENTER,
+            Align2::CENTER_CENTER,
             format!("{}", i + 1),
             font.clone(),
             t.text,
@@ -3953,7 +3953,7 @@ fn draw_algorithm(painter: &egui::Painter, rect: Rect, patch: &crate::ports::Pat
     let size = (out_h * 0.72).max(6.0);
     painter.text(
         Pos2::new(rect.left(), rect.bottom()),
-        egui::Align2::LEFT_BOTTOM,
+        Align2::LEFT_BOTTOM,
         &label,
         FontId::new(size, fonts::courier_bold()),
         t.text,
@@ -4028,7 +4028,7 @@ pub enum BankQuestion {
     /// Windows and Linux ask this in the panel; on macOS the panel is ours
     /// and, for a bank, refuses nothing, so it is asked here. Yes is
     /// [`DialogAction::ReplaceBank`] for this path.
-    Replace(std::path::PathBuf),
+    Replace(PathBuf),
     /// Clear was pressed: empty every staged slot. Yes is an
     /// [`DialogAction::UnstagePatches`] naming all of them — thirty-one
     /// patches of assembly must not go to a slip of the hand.
@@ -6612,7 +6612,7 @@ fn draw_ir_result(
 /// the sound is left alone and the consequence is printed in the `kept` line,
 /// which is what that line is for: what survives, and how far.
 fn confirm_ir_delete(strip: usize, slot: usize, path: &str, loaded: bool) -> Dialog {
-    let name = std::path::Path::new(path)
+    let name = Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_owned());
@@ -7001,7 +7001,7 @@ fn show_on(
                             ui.add_space(4.0);
                             let bottom_h = 34.0;
                             let list_h = (ui.available_height() - bottom_h).max(40.0);
-                            let mut go: Option<std::path::PathBuf> = None;
+                            let mut go: Option<PathBuf> = None;
                             egui::ScrollArea::vertical()
                             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .max_height(list_h)
@@ -7363,7 +7363,7 @@ fn show_on(
                                         }
                                         ui.painter().text(
                                             resp.rect.left_center() + egui::vec2(9.0, 0.0),
-                                            egui::Align2::LEFT_CENTER,
+                                            Align2::LEFT_CENTER,
                                             *name,
                                             bold(12.0),
                                             p.ink,
@@ -7414,7 +7414,7 @@ fn show_on(
                                         .color(p.faint),
                                 );
                                 ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    Layout::right_to_left(Align::Center),
                                     |ui| {
                                         // The explicit one. A knob resets on a
                                         // double click; the whole sound resets
@@ -7422,7 +7422,7 @@ fn show_on(
                                         // not be eight gestures.
                                         if ui
                                             .add(
-                                                egui::Button::new(
+                                                Button::new(
                                                     RichText::new("Initialise")
                                                         .font(bold(11.0))
                                                         .color(p.ink),
@@ -8393,7 +8393,7 @@ fn show_on(
                                     ));
                                     let galley = painter.layout_no_wrap(what, bold(12.0), t.text);
                                     let at = p + Vec2::new(14.0, 10.0);
-                                    let tag = egui::Rect::from_min_size(at, galley.size()).expand(4.0);
+                                    let tag = Rect::from_min_size(at, galley.size()).expand(4.0);
                                     painter.rect_filled(tag, 3.0, t.bg);
                                     painter.rect_stroke(
                                         tag,
@@ -8883,7 +8883,7 @@ fn show_on(
                             ui.label(format!("Save changes to \u{201c}{name}\u{201d} before {what}?"));
                             ui.add_space(4.0);
                             ui.label(
-                                egui::RichText::new(
+                                RichText::new(
                                     "Changes since the last save will be lost otherwise.",
                                 )
                                 .weak(),
@@ -9865,7 +9865,7 @@ fn show_on(
                                 // was light under system-light and the name
                                 // typed white-on-white.
                                 ui.style_mut().visuals.extreme_bg_color =
-                                    egui::Color32::from_rgb(0x1A, 0x16, 0x12);
+                                    Color32::from_rgb(0x1A, 0x16, 0x12);
                                 // **Empty until the session is saved.** The
                                 // field used to open on "Untitled", which read
                                 // as a name somebody had given the session and
@@ -9875,7 +9875,7 @@ fn show_on(
                                 ui.add(
                                     egui::TextEdit::singleline(name)
                                         .font(bold(13.0))
-                                        .text_color(egui::Color32::WHITE)
+                                        .text_color(Color32::WHITE)
                                         .hint_text(if saved { "" } else { "unsaved" })
                                         .desired_width(f32::INFINITY),
                                 );
@@ -10209,11 +10209,11 @@ fn show_on(
                                     ),
                                 );
                                 ui.style_mut().visuals.extreme_bg_color =
-                                    egui::Color32::from_rgb(0x1A, 0x16, 0x12);
+                                    Color32::from_rgb(0x1A, 0x16, 0x12);
                                 ui.add(
                                     egui::TextEdit::singleline(&mut spec.name)
                                         .font(plain(10.5))
-                                        .text_color(egui::Color32::WHITE)
+                                        .text_color(Color32::WHITE)
                                         .desired_width(180.0),
                                 );
                             });
@@ -10333,8 +10333,8 @@ fn show_on(
                             // to get wrong: the button cannot leave.
                             let done_rect = {
                                 let full = ui.max_rect();
-                                egui::Rect::from_min_size(
-                                    egui::Pos2::new(
+                                Rect::from_min_size(
+                                    Pos2::new(
                                         full.right() - 58.0,
                                         full.bottom() - 24.0,
                                     ),
@@ -10513,12 +10513,12 @@ fn show_on(
                                                 if chosen {
                                                     t.text
                                                 } else {
-                                                    egui::Color32::from_black_alpha(40)
+                                                    Color32::from_black_alpha(40)
                                                 },
                                             );
                                             let ink = if chosen { t.bg } else { t.text };
                                             let cell_bg = if chosen { t.text } else { t.bg };
-                                            let b = egui::Rect::from_center_size(
+                                            let b = Rect::from_center_size(
                                                 rect.center(),
                                                 Vec2::splat(28.0),
                                             );
@@ -10531,7 +10531,7 @@ fn show_on(
                                             ) {
                                                 ui.painter().text(
                                                     rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
+                                                    Align2::CENTER_CENTER,
                                                     *name,
                                                     plain(8.0),
                                                     ink,
@@ -10586,9 +10586,9 @@ fn show_on(
                                             crate::mixer_panel::STRIP_COLORS[idx
                                                 .min(crate::mixer_panel::MANUAL_COLORS - 1)];
                                         let color = if idx == 0 {
-                                            egui::Color32::from_rgb(0x6B, 0x4A, 0x3A)
+                                            Color32::from_rgb(0x6B, 0x4A, 0x3A)
                                         } else {
-                                            egui::Color32::from_rgb(cr, cg, cb)
+                                            Color32::from_rgb(cr, cg, cb)
                                         };
                                         let (rect, resp) = ui.allocate_exact_size(
                                             Vec2::new(sw, 16.0),
@@ -10598,7 +10598,7 @@ fn show_on(
                                         if idx == 0 {
                                             ui.painter().text(
                                                 rect.center(),
-                                                egui::Align2::CENTER_CENTER,
+                                                Align2::CENTER_CENTER,
                                                 "auto",
                                                 plain(7.0),
                                                 t.text,
@@ -10737,7 +10737,7 @@ fn show_on(
                                         ui.painter().rect_filled(
                                             rect,
                                             2.0,
-                                            egui::Color32::from_rgb(cr, cg, cb),
+                                            Color32::from_rgb(cr, cg, cb),
                                         );
                                     };
                                     for c in 0..crate::recorder::CHANNELS {
@@ -11724,7 +11724,7 @@ fn show_on(
                                         );
                                         if ui
                                             .add(
-                                                egui::Button::new(
+                                                Button::new(
                                                     RichText::new(head)
                                                         .font(bold(12.0))
                                                         .color(t.text),
@@ -11754,7 +11754,7 @@ fn show_on(
                                                 if row.on { t.text } else { dim };
                                             if ui
                                                 .add(
-                                                    egui::Button::new(
+                                                    Button::new(
                                                         RichText::new(format!(
                                                             "  {mark} {}",
                                                             row.label
@@ -11802,10 +11802,10 @@ fn show_on(
                                     .color(dim),
                                 );
                                 ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    Layout::right_to_left(Align::Center),
                                     |ui| {
                                         if ui
-                                            .add(egui::Button::new(
+                                            .add(Button::new(
                                                 RichText::new("Done").color(t.text),
                                             ))
                                             .clicked()
@@ -13180,11 +13180,11 @@ mod tests {
     /// both ends rather than trusting the sentence on [`BUILTIN_PATH`].
     #[test]
     fn every_built_in_is_recognised_and_no_real_path_is() {
-        for path in [super::BUILTIN_PATH, super::DRUMPAD_PATH, super::KEYS_PATH] {
-            assert!(super::is_builtin(path), "{path} was not recognised");
+        for path in [BUILTIN_PATH, DRUMPAD_PATH, KEYS_PATH] {
+            assert!(is_builtin(path), "{path} was not recognised");
         }
-        for (path, ..) in super::FX_UNITS {
-            assert!(super::is_builtin(path), "{path} was not recognised");
+        for (path, ..) in FX_UNITS {
+            assert!(is_builtin(path), "{path} was not recognised");
         }
         for path in [
             "/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3",
@@ -13192,7 +13192,7 @@ mod tests {
             "~/tangent-plate.vst3",
             "",
         ] {
-            assert!(!super::is_builtin(path), "{path:?} was taken for a built-in");
+            assert!(!is_builtin(path), "{path:?} was taken for a built-in");
         }
     }
 
@@ -13205,10 +13205,10 @@ mod tests {
     /// order, so the reorder shows up here instead of in somebody's ears.
     #[test]
     fn keys_patches_are_named_in_engine_order() {
-        assert_eq!(super::KEYS_PATCH_NAMES.len(), super::KEYS_PATCHES);
-        assert_eq!(super::KEYS_PATCH_NAMES[0].0, "Piano 1");
-        assert_eq!(super::KEYS_PATCH_NAMES[1].0, "EP Mk.1");
-        for (name, about) in super::KEYS_PATCH_NAMES {
+        assert_eq!(KEYS_PATCH_NAMES.len(), KEYS_PATCHES);
+        assert_eq!(KEYS_PATCH_NAMES[0].0, "Piano 1");
+        assert_eq!(KEYS_PATCH_NAMES[1].0, "EP Mk.1");
+        for (name, about) in KEYS_PATCH_NAMES {
             assert!(!name.is_empty() && !about.is_empty());
             // The reference belongs in the description, never the name. See
             // LICENSING.md, and the same rule FX_UNITS follows.
@@ -13238,7 +13238,7 @@ mod tests {
         // suite's insert units, because the suite reuses three of the
         // chain's names and the day someone renames one is the day the rule
         // needs to be standing on both.
-        let rows = super::FX_UNITS.iter().chain(crate::faces::SUITE_UNITS.iter());
+        let rows = FX_UNITS.iter().chain(crate::faces::SUITE_UNITS.iter());
         for (path, name, what) in rows.clone() {
             let lower = name.to_lowercase();
             for mark in marks {
@@ -13254,8 +13254,8 @@ mod tests {
             );
             assert!(!what.is_empty(), "{name} has nothing under it");
         }
-        for (i, (path, name, _)) in super::FX_UNITS.iter().enumerate() {
-            for (other, other_name, _) in &super::FX_UNITS[i + 1..] {
+        for (i, (path, name, _)) in FX_UNITS.iter().enumerate() {
+            for (other, other_name, _) in &FX_UNITS[i + 1..] {
                 assert_ne!(path, other, "two rows share the path {path}");
                 assert_ne!(name, other_name, "two rows share the name {name}");
             }
@@ -13271,7 +13271,7 @@ mod tests {
             }
         }
         let shared_on_purpose = ["@tangent-chorus", "@tangent-echo", "@tangent-plate"];
-        for (path, name, _) in super::FX_UNITS {
+        for (path, name, _) in FX_UNITS {
             let in_suite = crate::faces::SUITE_UNITS.iter().find(|(p, ..)| *p == path);
             if shared_on_purpose.contains(&path) {
                 let (_, suite_name, _) =
@@ -15327,7 +15327,7 @@ at: None,
             .iter()
             .filter_map(|s| match &s.shape {
                 egui::epaint::Shape::Text(t) if t.galley.job.text == "Export" => {
-                    Some(egui::Rect::from_min_size(t.pos, t.galley.size()))
+                    Some(Rect::from_min_size(t.pos, t.galley.size()))
                 }
                 _ => None,
             })
@@ -18546,7 +18546,7 @@ at: None,
             "Empty did not take every staged slot"
         );
 
-        let path = std::path::PathBuf::from("/m/SYSEX/default.syx");
+        let path = PathBuf::from("/m/SYSEX/default.syx");
         if let Some(Dialog::PatchPicker { question, .. }) = slot.dialog.as_mut() {
             *question = Some(BankQuestion::Replace(path.clone()));
         }

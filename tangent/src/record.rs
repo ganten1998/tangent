@@ -1164,7 +1164,7 @@ pub struct Session {
     /// [`record_video`](Session::record_video) fold the video in without
     /// parsing `take.json` back off disk — this crate writes JSON and
     /// deliberately does not read it.
-    finished: Option<(std::path::PathBuf, Manifest)>,
+    finished: Option<(PathBuf, Manifest)>,
 }
 
 /// **Which region, if any, to hand the screen capture this sample.**
@@ -1442,8 +1442,8 @@ impl Session {
     /// way — see `Take::media`. Asked of the take rather than joined onto
     /// `take_dir` by the caller, so there is one place that knows the name.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn take_video(&self) -> Option<std::path::PathBuf> {
-        self.take.as_ref().map(tangent_record::take::Take::video)
+    pub fn take_video(&self) -> Option<PathBuf> {
+        self.take.as_ref().map(Take::video)
     }
 
     pub fn elapsed(&self) -> f64 {
@@ -1823,7 +1823,7 @@ impl Session {
     /// camera open with nothing on screen showing it wants none. How fast
     /// "afford" is is measured on the capture thread, not decided here — see
     /// `camera::FrameWant`.
-    pub fn set_camera_want(&self, want: tangent_record::camera::FrameWant) {
+    pub fn set_camera_want(&self, want: camera::FrameWant) {
         if let Some(c) = self.camera.as_ref() {
             c.want(want);
         }
@@ -2491,7 +2491,7 @@ impl Session {
             // `frames_expected` against `frames` — where the audit reads it;
             // it just does not raise this particular alarm.
             if self.audio.is_some()
-                && manifest.clock == tangent_record::take::ClockKind::Fitted
+                && manifest.clock == take::ClockKind::Fitted
                 && short as f64 > SHORT_TOLERANCE_FRAMES * nominal
             {
                 problem.get_or_insert_with(|| {
@@ -3559,7 +3559,7 @@ mod tests {
         );
 
         s.record_video(
-            tangent_record::take::VideoReport {
+            take::VideoReport {
                 container: "mp4".into(),
                 video_codec: "h264".into(),
                 audio_codec: "aac".into(),
@@ -3620,7 +3620,7 @@ mod tests {
         let first = s.last_summary().expect("summary").folder.clone();
         s.toggle(&dir, Some("second"), 0, ExportSpec::default());
         s.record_video(
-            tangent_record::take::VideoReport {
+            take::VideoReport {
                 container: "mp4".into(),
                 video_codec: "h264".into(),
                 audio_codec: "aac".into(),

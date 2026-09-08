@@ -763,7 +763,7 @@ fn draw_with(painter: &Painter, rect: Rect, view: &DrumpadView<'_>, face: Color3
         if r.width() > 30.0 {
             painter.text(
                 Pos2::new(r.left() + 4.0, r.top() + 3.0),
-                egui::Align2::LEFT_TOP,
+                Align2::LEFT_TOP,
                 key_name(base + i),
                 font((r.height() * 0.16).clamp(7.0, 10.0)),
                 ink.gamma_multiply(0.45),

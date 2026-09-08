@@ -3852,7 +3852,7 @@ mod tests {
     fn live_midi_reaches_armed_lanes_and_the_editors_lane_alone() {
         use super::{live_midi_off, ChannelKind};
         let off = |ch: usize, m: u32| m & (1 << ch) != 0;
-        let mut kinds = vec![None; super::CHANNELS];
+        let mut kinds = vec![None; CHANNELS];
         kinds[0] = Some(ChannelKind::Midi);
         kinds[1] = Some(ChannelKind::Midi);
         kinds[2] = Some(ChannelKind::Audio);
@@ -3894,7 +3894,7 @@ mod tests {
 
         // And an editor somehow open on an audio lane silences every
         // CHANNEL rather than opening the desk up.
-        let all = ((1u64 << super::CHANNELS) - 1) as u32;
+        let all = ((1u64 << CHANNELS) - 1) as u32;
         assert_eq!(live_midi_off(&kinds, 0b11, Some(2)), all);
 
         // **The strips past the channels are never in this mask.** Drums,
@@ -3926,16 +3926,16 @@ mod tests {
         assert_eq!(meter_number(3.0), "3");
 
         // And the loudness reading follows the ladder it sits under.
-        let l = super::Loudness {
+        let l = Loudness {
             momentary: -14.2,
             short: -14.2,
             integrated: -14.2,
-            window: super::LoudnessWindow::Momentary,
+            window: LoudnessWindow::Momentary,
             pair: [-14.2; 4],
         };
         assert_eq!(l.text(), "14.2", "the reading kept its sign");
         // Silence still says so rather than printing a number.
-        let quiet = super::Loudness::default();
+        let quiet = Loudness::default();
         assert_eq!(quiet.text(), "--");
     }
 
@@ -3978,7 +3978,7 @@ mod tests {
         }
         for pad in [0usize, 1, 127] {
             // `pad_insert_index` already answers in SEATS.
-            let seat = super::pad_insert_index(pad);
+            let seat = pad_insert_index(pad);
             assert_ne!(seat, MASTER_EXTRA_SEAT, "pad {pad} collides with the master");
             for n in 0..INSERTS {
                 assert_eq!(seat_bay(seat, n), (seat, n), "pad {pad} was remapped");
@@ -4189,7 +4189,7 @@ mod tests {
             pair: [-15.0, -21.0, -19.0, -20.0],
         };
         let frac = |v: f32| {
-            let (lo, hi) = super::LUFS_RANGE;
+            let (lo, hi) = LUFS_RANGE;
             (v - lo) / (hi - lo)
         };
         let near = |a: Option<f32>, b: f32| a.is_some_and(|x| (x - b).abs() < 1e-4);

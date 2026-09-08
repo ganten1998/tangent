@@ -856,7 +856,7 @@ fn analog_reading(id: u32, v: f32) -> String {
         P_LFO_DELAY => fmt_ms(v * LFO_DELAY_SECS * 1000.0),
         P_ENSEMBLE => EnsembleMode::from_norm(v).label().to_owned(),
         P_ARP_MODE => ArpMode::from_norm(v).label().to_owned(),
-        P_ARP_RATE => ARP_RATES[crate::analog::arp::rate_index(v)].0.to_owned(),
+        P_ARP_RATE => ARP_RATES[arp::rate_index(v)].0.to_owned(),
         P_ARP_OCT => format!("{} oct", step_index(v, 4) + 1),
         _ => fmt_pct(v),
     }
