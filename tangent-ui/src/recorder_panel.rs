@@ -4141,7 +4141,7 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
     // column. Renamed from `font` because the band's own `font` helper was
     // retired in the un-bolding and a bulk rename walked straight over the
     // calls to this one — the clock quietly changed typeface for a build.
-    let lcd_font = |size: f32| FontId::monospace(size);
+    let lcd_font = |size: f32| FontId::new(size, fonts::courier());
     // The big number: where the playhead stands, musically — as large as
     // the face allows, the number somebody reads from the bench.
     let (b, bt, th) = bars_beats_parts(view.position_s, view.tempo_bpm, view.time_signature);
@@ -6517,7 +6517,7 @@ fn draw_tempo(
             l.tempo_tap.center(),
             Align2::CENTER_CENTER,
             "TAP",
-            FontId::monospace((l.tempo_tap.height() * 0.62).clamp(7.0, 10.0)),
+            FontId::new((l.tempo_tap.height() * 0.62).clamp(7.0, 10.0), fonts::courier()),
             TEMPO_CAP,
         );
     }

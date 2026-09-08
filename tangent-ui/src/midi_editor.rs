@@ -901,7 +901,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     );
 
     // ── the strip ─────────────────────────────────────────────────────────
-    let font = |size: f32| FontId::monospace(size);
+    let font = |size: f32| FontId::new(size, crate::fonts::courier());
     painter.rect_filled(l.strip, 4.0, Color32::from_rgba_premultiplied(0, 0, 0, 60));
     // **The name stops where the navigator starts.** It used to run on
     // under the chips unchecked, which nobody noticed while the strip's

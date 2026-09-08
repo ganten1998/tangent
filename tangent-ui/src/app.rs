@@ -17683,7 +17683,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         } else {
             50.0
         };
-        let font = egui::FontId::monospace(11.0);
+        let font = egui::FontId::new(11.0, crate::fonts::courier());
         // Row 0: the percent field.
         {
             let r = swing_menu_row(menu.rect, 0);
@@ -17781,7 +17781,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 Pos2::new(row.left() + 6.0, row.center().y),
                 egui::Align2::LEFT_CENTER,
                 if shown.is_empty() { "(name)".to_owned() } else { shown },
-                egui::FontId::monospace(10.5),
+                egui::FontId::new(10.5, crate::fonts::courier()),
                 ink,
             );
         }
@@ -17844,7 +17844,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             Pos2::new(lamp.right() + 6.0, row.center().y),
             egui::Align2::LEFT_CENTER,
             "OBEY NOTE-OFFS",
-            egui::FontId::monospace(10.0),
+            egui::FontId::new(10.0, crate::fonts::courier()),
             ink.gamma_multiply(if params.obey { 0.95 } else { 0.6 }),
         );
     }
