@@ -55,16 +55,6 @@ impl Target {
             Target::Channel(n) => format!("Ch {}", n + 1),
         }
     }
-
-    /// The device channels this target touches, for the overlap check.
-    fn hardware_span(self) -> Option<(usize, usize)> {
-        match self {
-            Target::Hardware { first, stereo } => {
-                Some((first, if stereo { first + 1 } else { first }))
-            }
-            Target::Channel(_) => None,
-        }
-    }
 }
 
 /// One route: a source channel, a destination, and how much of it goes.

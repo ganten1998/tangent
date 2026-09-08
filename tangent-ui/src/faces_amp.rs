@@ -297,11 +297,11 @@ pub fn draw_amp(
                                     alt: true,
                                     shift: false,
                                 });
-                                ui.close_menu();
+                                ui.close_kind(egui::UiKind::Menu);
                             }
                             if ui.button("Replace FX").clicked() {
                                 out = Some(FaceAction::OpenPedal { pedal });
-                                ui.close_menu();
+                                ui.close_kind(egui::UiKind::Menu);
                             }
                         });
                     }
