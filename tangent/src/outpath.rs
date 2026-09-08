@@ -86,8 +86,11 @@ pub fn probe(_device: Option<&str>) -> OutputPath {
 /// **The default output's nominal rate, without building an AudioUnit.**
 ///
 /// Off macOS there is no HAL to ask and the caller keeps its own road; see the
-/// macOS twin for why that road was worth leaving.
+/// macOS twin for why that road was worth leaving. Which is also why nothing
+/// calls this one: the rate follower asks the HAL only where there is a HAL,
+/// and the stub is here so the module has one shape on every platform.
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 pub fn nominal_rate(_device: Option<&str>) -> Option<u32> {
     None
 }

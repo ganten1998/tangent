@@ -598,9 +598,14 @@ pub struct DesktopApp {
     /// the presentation options once on the way out. Sending either every
     /// frame fights AppKit's own zoom animation, which is the same lesson the
     /// aspect snap already learned two hundred lines up.
+    ///
+    /// macOS is the only platform with a `macwin`, so this and
+    /// `decor_want_content` below are written and never read anywhere else.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     covering_screen: bool,
     /// The drawable size to restore after a decoration change, and how many
     /// frames it has been tried for. See `reconcile_decoration_size`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     decor_want_content: Option<(f64, f64, u8)>,
     /// The hardware MIDI fast lane, cloned out of `DeviceMidi` before the
     /// ports box swallows it. `start_engine` seats each fresh engine's ring
