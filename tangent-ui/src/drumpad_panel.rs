@@ -349,11 +349,10 @@ impl Layout {
             Pos2::new(split + GAP * 0.5, strip.bottom() + GAP),
             Pos2::new(rect.right() - GAP, rect.bottom() - GAP),
         );
-        let media_head = Rect::from_min_size(
-            media.min,
-            Vec2::new(media.width(), 20.0_f32.min(media.height())),
-        );
-        let media_up = Rect::from_min_size(media_head.min, Vec2::new(24.0, media_head.height()));
+        // The pane's own geometry, asked of the shared explorer rather
+        // than restated: two panels place these rects now.
+        let ml = MediaLayout::new(media);
+        let (media, media_head, media_up) = (ml.pane, ml.head, ml.up);
         if !grid.is_positive() {
             return nothing;
         }
@@ -435,22 +434,17 @@ impl Layout {
 
     /// The media rows below the header — however many fit; the app scrolls
     /// the WINDOW, so row 0 here is entry `media_scroll` there.
+    ///
+    /// Delegated to [`MediaLayout::rows`] the day the sampler grew the same
+    /// pane. Kept as a method because this panel's callers and its own test
+    /// ask it here, and a rename would be churn with no reader.
     pub fn media_rows(&self) -> Vec<Rect> {
-        if !self.media.is_positive() {
-            return Vec::new();
-        }
-        let top = self.media_head.bottom() + 2.0;
-        // A fifth taller than the first cut — the owner squinted at 17.
-        let h = 20.0;
-        let n = (((self.media.bottom() - top) / (h + 1.0)).floor() as usize).min(64);
-        (0..n)
-            .map(|i| {
-                Rect::from_min_size(
-                    Pos2::new(self.media.left(), top + i as f32 * (h + 1.0)),
-                    Vec2::new(self.media.width(), h),
-                )
-            })
-            .collect()
+        self.media_pane().rows()
+    }
+
+    /// The explorer's own layout, for callers that want its hit test.
+    pub fn media_pane(&self) -> MediaLayout {
+        MediaLayout { pane: self.media, head: self.media_head, up: self.media_up }
     }
 
     /// Every knob and the value it shows, for the app's drag handler.
@@ -966,68 +960,22 @@ fn draw_with(painter: &Painter, rect: Rect, view: &DrumpadView<'_>, face: Color3
     }
 
     // ── the media explorer ───────────────────────────────────────────────
-    if l.media.is_positive() {
-        painter.rect_filled(l.media, 2.0, recess);
-        // The header: UP, then where we stand.
-        if l.media_up.is_positive() {
-            chip(painter, l.media_up, "..", false, ink.gamma_multiply(0.6), face);
-        }
-        let label = Rect::from_min_max(
-            Pos2::new(l.media_up.right() + 4.0, l.media_head.top()),
-            l.media_head.max,
-        );
-        if label.is_positive() {
-            painter.text(
-                Pos2::new(label.left(), label.center().y),
-                Align2::LEFT_CENTER,
-                cut_text(painter, label.width(), view.media_dir, &font(10.5)),
-                font(10.5),
-                ink.gamma_multiply(0.55),
-            );
-        }
-        let rows = l.media_rows();
-        for (row, r) in rows.iter().enumerate() {
-            let Some(e) = view.media.get(view.media_scroll + row) else {
-                break;
-            };
-            painter.rect_filled(
-                *r,
-                1.5,
-                if view.media_sel == Some(view.media_scroll + row) {
-                    // The clicked file: lit, so the audition has a face. A
-                    // dark olive, and it stays dark on purpose — over the
-                    // dark faces it lifts, over a pale one it is a plate.
-                    Color32::from_rgba_premultiplied(0x3D, 0x50, 0x2A, 120)
-                } else if row % 2 == 0 {
-                    Color32::from_black_alpha(if light_ink { 40 } else { 16 })
-                } else {
-                    Color32::TRANSPARENT
-                },
-            );
-            let word = if e.dir {
-                format!("\u{25B8} {}", e.name)
-            } else {
-                e.name.clone()
-            };
-            painter.text(
-                Pos2::new(r.left() + 5.0, r.center().y),
-                Align2::LEFT_CENTER,
-                cut_text(painter, r.width() - 10.0, &word, &font(11.0)),
-                font(11.0),
-                if e.dir { ink.gamma_multiply(0.85) } else { green.gamma_multiply(0.9) },
-            );
-        }
-        // More below? A quiet count, so a long folder says so.
-        if view.media.len() > view.media_scroll + rows.len() {
-            painter.text(
-                Pos2::new(l.media.right() - 4.0, l.media.bottom() - 3.0),
-                Align2::RIGHT_BOTTOM,
-                format!("+{}", view.media.len() - view.media_scroll - rows.len()),
-                font(8.0),
-                ink.gamma_multiply(0.4),
-            );
-        }
-    }
+    // The pane itself is [`draw_media_pane`], shared with the sampler's
+    // face; what stays here is the two inks this face wants it drawn in.
+    draw_media_pane(
+        painter,
+        &l.media_pane(),
+        &MediaPane {
+            dir: view.media_dir,
+            entries: view.media,
+            scroll: view.media_scroll,
+            sel: view.media_sel,
+        },
+        ink,
+        face,
+        green,
+        light_ink,
+    );
 }
 
 /// `text`, cut with an ellipsis to fit `width`.
@@ -1104,15 +1052,22 @@ pub fn hit_test(rect: Rect, view: &DrumpadView<'_>, pos: Pos2) -> Option<Hit> {
             return Some(hit);
         }
     }
-    for (row, r) in l.media_rows().iter().enumerate() {
-        if r.is_positive()
-            && r.contains(pos)
-            && view.media.get(view.media_scroll + row).is_some()
-        {
-            return Some(Hit::MediaRow(view.media_scroll + row));
-        }
+    // The rows, through the shared explorer's own hit test — the UP chip
+    // above is still in this panel's priority array, because it competes
+    // with the inspector's chips and the shared one cannot know that.
+    match l.media_pane().hit(
+        &MediaPane {
+            dir: view.media_dir,
+            entries: view.media,
+            scroll: view.media_scroll,
+            sel: view.media_sel,
+        },
+        pos,
+    ) {
+        Some(MediaHit::Row(i)) => Some(Hit::MediaRow(i)),
+        Some(MediaHit::Up) => Some(Hit::MediaUp),
+        None => None,
     }
-    None
 }
 
 /// The pad under `pos`, for drop targeting — pads only, nothing else.
@@ -1124,6 +1079,205 @@ pub fn pad_at(rect: Rect, pos: Pos2) -> Option<usize> {
     l.pads
         .iter()
         .position(|r| r.is_positive() && r.contains(pos))
+}
+
+// ── the media explorer, shared ──────────────────────────────────────────────
+//
+// **Lifted out of this panel rather than copied into the next one.**
+//
+// The IR browser is what happens otherwise. `faces::IrEntry` is
+// [`MediaEntry`] with a field added, `faces::IrLayout::browse_rows` is
+// `Layout::media_rows`' arithmetic retyped, and `App::refresh_ir_browser` is
+// `App::refresh_media`'s scan loop with a generation counter bolted on —
+// three copies of one explorer, each with its own bugs to find. When the
+// sampler grew an explorer too, the fourth copy was the moment to stop, so
+// the pane's geometry, its hit test, its drawing and its file filter moved
+// here and the drumpad now reads them like any other caller.
+
+/// The extensions the explorer will list, lowercased.
+///
+/// It lived as a `const AUDIO` inside `App::refresh_media`, which is to say
+/// it lived where nothing else could ask it. The sampler and the drumpad
+/// take the same files — anything the decoder can open — and a second list
+/// would be a panel that offers a file its sibling hides.
+pub const MEDIA_EXTS: [&str; 11] = [
+    "wav", "aiff", "aif", "mp3", "m4a", "aac", "flac", "ogg", "opus", "caf", "wma",
+];
+
+/// Whether a NAME reads as audio this build can decode. Name only: the
+/// explorer's filter is string work, and string work stays on this side of
+/// the firewall — see `faces::is_ir_file`, the same bargain.
+pub fn is_audio_file(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| MEDIA_EXTS.contains(&x.to_ascii_lowercase().as_str()))
+}
+
+/// What a press in the explorer means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaHit {
+    /// The `..` chip: out one folder.
+    Up,
+    /// A row, by its index in the LISTING — never the screen row. The
+    /// drumpad's `Hit::MediaRow` has carried the absolute index since it
+    /// was written, and a menu or a drag that remembered a screen row
+    /// would name whichever file had scrolled into it.
+    Row(usize),
+}
+
+/// Where the explorer's parts are, from the box it was given.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MediaLayout {
+    pub pane: Rect,
+    pub head: Rect,
+    pub up: Rect,
+}
+
+impl MediaLayout {
+    pub fn new(pane: Rect) -> Self {
+        if !pane.is_positive() {
+            return Self { pane: Rect::NOTHING, head: Rect::NOTHING, up: Rect::NOTHING };
+        }
+        let head = Rect::from_min_size(
+            pane.min,
+            Vec2::new(pane.width(), 20.0_f32.min(pane.height())),
+        );
+        let up = Rect::from_min_size(head.min, Vec2::new(24.0, head.height()));
+        Self { pane, head, up }
+    }
+
+    /// The rows below the header — however many fit; the caller scrolls the
+    /// WINDOW, so row 0 here is entry `scroll` there.
+    pub fn rows(&self) -> Vec<Rect> {
+        if !self.pane.is_positive() {
+            return Vec::new();
+        }
+        let top = self.head.bottom() + 2.0;
+        // A fifth taller than the first cut — the owner squinted at 17.
+        let h = MEDIA_ROW_H;
+        let n = (((self.pane.bottom() - top) / (h + 1.0)).floor() as usize).min(64);
+        (0..n)
+            .map(|i| {
+                Rect::from_min_size(
+                    Pos2::new(self.pane.left(), top + i as f32 * (h + 1.0)),
+                    Vec2::new(self.pane.width(), h),
+                )
+            })
+            .collect()
+    }
+
+    /// What a press at `pos` means, or nothing. A row past the end of the
+    /// listing is not a row: an empty pane full of drawn stripes would
+    /// otherwise answer for files that are not there.
+    pub fn hit(&self, view: &MediaPane<'_>, pos: Pos2) -> Option<MediaHit> {
+        if !self.pane.is_positive() || !self.pane.contains(pos) {
+            return None;
+        }
+        if self.up.is_positive() && self.up.contains(pos) {
+            return Some(MediaHit::Up);
+        }
+        for (row, r) in self.rows().iter().enumerate() {
+            if r.is_positive() && r.contains(pos) && view.entries.get(view.scroll + row).is_some() {
+                return Some(MediaHit::Row(view.scroll + row));
+            }
+        }
+        None
+    }
+}
+
+/// A row's height. Named because two panels now place rows against it.
+pub const MEDIA_ROW_H: f32 = 20.0;
+
+/// What the explorer draws: where it stands, what it lists, where the
+/// listing is scrolled to, and which row is lit.
+#[derive(Debug, Clone, Copy)]
+pub struct MediaPane<'a> {
+    pub dir: &'a str,
+    pub entries: &'a [MediaEntry],
+    pub scroll: usize,
+    pub sel: Option<usize>,
+}
+
+/// The explorer, painted.
+///
+/// **Every ink is a parameter and none is themed here**, because this pane
+/// is drawn on two different grounds: the drumpad's own dressed face and
+/// the sampler face's panel. Ink is a property of the SURFACE it lands on,
+/// and this function cannot know which surface that is — so its caller,
+/// which does, hands the four it uses. `light_ink` is that same fact said
+/// once for the two washes that depend on it: a full black recess on a pale
+/// face is a bruise, the editor's own darker-rows rule.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_media_pane(
+    painter: &Painter,
+    l: &MediaLayout,
+    view: &MediaPane<'_>,
+    ink: Color32,
+    face: Color32,
+    file_ink: Color32,
+    light_ink: bool,
+) {
+    if !l.pane.is_positive() {
+        return;
+    }
+    painter.rect_filled(l.pane, 2.0, Color32::from_black_alpha(if light_ink { 60 } else { 26 }));
+    // The header: UP, then where we stand.
+    if l.up.is_positive() {
+        chip(painter, l.up, "..", false, ink.gamma_multiply(0.6), face);
+    }
+    let label = Rect::from_min_max(Pos2::new(l.up.right() + 4.0, l.head.top()), l.head.max);
+    if label.is_positive() {
+        painter.text(
+            Pos2::new(label.left(), label.center().y),
+            Align2::LEFT_CENTER,
+            cut_text(painter, label.width(), view.dir, &font(10.5)),
+            font(10.5),
+            ink.gamma_multiply(0.55),
+        );
+    }
+    let rows = l.rows();
+    for (row, r) in rows.iter().enumerate() {
+        let Some(e) = view.entries.get(view.scroll + row) else {
+            break;
+        };
+        painter.rect_filled(
+            *r,
+            1.5,
+            if view.sel == Some(view.scroll + row) {
+                // The clicked file: lit, so the audition has a face. A
+                // dark olive, and it stays dark on purpose — over the
+                // dark faces it lifts, over a pale one it is a plate.
+                Color32::from_rgba_premultiplied(0x3D, 0x50, 0x2A, 120)
+            } else if row % 2 == 0 {
+                Color32::from_black_alpha(if light_ink { 40 } else { 16 })
+            } else {
+                Color32::TRANSPARENT
+            },
+        );
+        let word = if e.dir {
+            format!("\u{25B8} {}", e.name)
+        } else {
+            e.name.clone()
+        };
+        painter.text(
+            Pos2::new(r.left() + 5.0, r.center().y),
+            Align2::LEFT_CENTER,
+            cut_text(painter, r.width() - 10.0, &word, &font(11.0)),
+            font(11.0),
+            if e.dir { ink.gamma_multiply(0.85) } else { file_ink.gamma_multiply(0.9) },
+        );
+    }
+    // More below? A quiet count, so a long folder says so.
+    if view.entries.len() > view.scroll + rows.len() {
+        painter.text(
+            Pos2::new(l.pane.right() - 4.0, l.pane.bottom() - 3.0),
+            Align2::RIGHT_BOTTOM,
+            format!("+{}", view.entries.len() - view.scroll - rows.len()),
+            font(8.0),
+            ink.gamma_multiply(0.4),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1345,5 +1499,52 @@ mod tests {
             assert!(p.is_positive());
             assert!(screen.contains_rect(p), "{at:?} left the screen: {p:?}");
         }
+    }
+
+    /// **The lifted explorer is the SAME explorer.** When the pane moved
+    /// out of `draw_with` for the sampler to share, the danger was two
+    /// geometries that agree today and drift the first time either is
+    /// touched — the IR browser's whole story, told once already. So the
+    /// panel's own rects and rows are compared against the shared layout's,
+    /// and the panel's hit test against the shared hit, at a size where the
+    /// listing overflows the pane.
+    #[test]
+    fn the_drumpads_explorer_and_the_shared_one_are_one_explorer() {
+        let v = view();
+        let l = Layout::new(rect());
+        let ml = MediaLayout::new(l.media);
+        assert_eq!((ml.pane, ml.head, ml.up), (l.media, l.media_head, l.media_up));
+        assert_eq!(ml.rows(), l.media_rows());
+        let rows = l.media_rows();
+        assert!(rows.len() >= 3, "the pane draws no rows to compare");
+        let pane = MediaPane {
+            dir: v.media_dir,
+            entries: v.media,
+            scroll: v.media_scroll,
+            sel: v.media_sel,
+        };
+        for r in [l.media_up, rows[0], rows[1]] {
+            let shared = ml.hit(&pane, r.center()).map(|h| match h {
+                MediaHit::Up => Hit::MediaUp,
+                MediaHit::Row(i) => Hit::MediaRow(i),
+            });
+            assert_eq!(hit_test(rect(), &v, r.center()), shared, "{r:?}");
+        }
+    }
+
+    /// **One list of extensions, not one per panel.** The filter used to be
+    /// a `const AUDIO` inside `App::refresh_media`, where nothing else could
+    /// ask it; a sampler with its own copy is a browser that offers a file
+    /// the drumpad hides. Case is not part of the question — a camera writes
+    /// `.WAV`.
+    #[test]
+    fn the_explorer_takes_audio_by_name_whatever_its_case() {
+        assert!(is_audio_file("kick.wav"));
+        assert!(is_audio_file("Kick.WAV"));
+        assert!(is_audio_file("take 1.flac"));
+        assert!(!is_audio_file("kit.tgkit"));
+        assert!(!is_audio_file("notes.txt"));
+        assert!(!is_audio_file("wav"), "an extensionless file is not audio");
+        assert_eq!(MEDIA_EXTS.len(), 11);
     }
 }
