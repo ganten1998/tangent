@@ -2118,6 +2118,17 @@ impl Arrangement {
                 f.u64(u64::from(n.key));
                 f.u64(u64::from(n.vel));
             }
+            // The pedal, after the notes as the writer has it. Omitted when
+            // empty there, so the length is the one word that tells "no
+            // pedal" from "a pedal" — the notes' own arrangement. This was
+            // MISSING: the pedal lane shipped without a word here, and the
+            // title bar could not see a pedal edit until the next note moved.
+            f.len(c.pedal.len());
+            for e in &c.pedal {
+                f.f64(e.at_s);
+                f.u64(u64::from(e.cc));
+                f.u64(u64::from(e.value));
+            }
             f.u64(c.id);
             f.u64(match c.anchor {
                 Anchor::Time => 0,
@@ -2200,6 +2211,16 @@ impl Arrangement {
                 f.u64(u64::from(p.sig.beats));
                 f.u64(u64::from(p.sig.unit));
             }
+        }
+        // Markers, written only when there are any, so the length alone
+        // says "none" the way the writer's absent key does. Also MISSING
+        // until now — a marker placed, moved or renamed left the asterisk
+        // off; the quit prompt, being exact, still asked, which is the one
+        // reason nobody lost a marker to it.
+        f.len(self.markers.len());
+        for m in &self.markers {
+            f.f64(m.at_s);
+            f.str(&m.name);
         }
         f.map(&self.extra);
     }
@@ -2918,7 +2939,10 @@ mod tests {
         let mut extra = Map::new();
         extra.insert("a_newer_builds_key".into(), Value::from("kept"));
         a.add_clip(ArrClip {
-            pedal: Vec::new(),
+            pedal: vec![
+                ArrPedal { at_s: 0.5, cc: 64, value: 127 },
+                ArrPedal { at_s: 2.0, cc: 64, value: 0 },
+            ],
             kind: ClipKind::Midi,
             notes: vec![
                 ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 },
@@ -2992,6 +3016,7 @@ mod tests {
                 }],
             ),
         ]);
+        a.markers.push(ArrMarker { at_s: 12.5, name: "Verse".into() });
         a.extra.insert("song_of_the_future".into(), Value::from(9));
         a
     }
@@ -3093,6 +3118,13 @@ mod tests {
         moves_both("a note leaving", |a| {
             a.clips[0].notes.pop();
         });
+        moves_both("a pedal MOVED", |a| a.clips[0].pedal[0].at_s = 0.75);
+        moves_both("a pedal's depth", |a| a.clips[0].pedal[0].value = 64);
+        moves_both("which pedal", |a| a.clips[0].pedal[1].cc = 67);
+        moves_both("a pedal movement arriving", |a| {
+            a.clips[0].pedal.push(ArrPedal { at_s: 3.0, cc: 64, value: 127 });
+        });
+        moves_both("the pedal leaving", |a| a.clips[0].pedal.clear());
         moves_both("a clip's id", |a| a.clips[0].id += 100);
         moves_both("a clip's anchor", |a| a.clips[1].anchor = Anchor::Beat);
         moves_both("following the tempo", |a| a.clips[1].follow_tempo = true);
@@ -3181,6 +3213,12 @@ mod tests {
         moves_both("automation going away", |a| {
             a.automation = crate::automation::Automation::default();
         });
+        moves_both("a marker MOVED", |a| a.markers[0].at_s = 13.0);
+        moves_both("a marker renamed", |a| a.markers[0].name = "Chorus".into());
+        moves_both("a marker arriving", |a| {
+            a.markers.push(ArrMarker { at_s: 40.0, name: String::new() });
+        });
+        moves_both("the markers leaving", |a| a.markers.clear());
         moves_both("a stranger's key on the document", |a| {
             a.extra.insert("also_from_tomorrow".into(), Value::from(true));
         });
