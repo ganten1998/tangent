@@ -3819,11 +3819,9 @@ impl TangentApp {
         // the file carries the whole struct, faders included.
         self.settings_save_at.set(None);
         if self.caps.persist_global_settings {
-            #[cfg(test)]
-            self.settings_writes.set(self.settings_writes.get().saturating_add(1));
             self.settings.save();
             #[cfg(test)]
-            self.settings_writes.set(self.settings_writes.get() + 1);
+            self.settings_writes.set(self.settings_writes.get().saturating_add(1));
         }
     }
 
