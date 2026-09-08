@@ -689,9 +689,8 @@ pub fn lit_on(c: Color32, ground: Color32) -> Color32 {
     } else {
         Color32::BLACK
     };
-    let mut out = c;
     for step in 1u8..=40 {
-        out = toward(c, away, f32::from(step) * 0.025_f32);
+        let out = toward(c, away, f32::from(step) * 0.025_f32);
         if ok(out) {
             return out;
         }
