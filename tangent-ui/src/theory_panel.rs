@@ -428,13 +428,6 @@ pub fn band_bg(s: &Settings) -> Color32 {
     palette(s).bg
 }
 
-/// A themed line, darkened for dark mode, keeping its hue — dark mode and the
-/// theme are two controls and must compose rather than cancel.
-fn shade_line(c: Color32, k: f32) -> Color32 {
-    let f = |v: u8| (f32::from(v) * k).clamp(0.0, 255.0) as u8;
-    Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
-}
-
 fn palette(s: &Settings) -> Palette {
     // `faint` and `line` carry the outlines, the roman numerals and the key
     // signatures — everything that says what the shapes MEAN. They were

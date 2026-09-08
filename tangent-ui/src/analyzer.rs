@@ -362,10 +362,7 @@ impl Config {
     }
 }
 
-/// The frequency of MIDI note number `n`, and the reverse, both from A4.
-fn hz_of_midi(n: f32) -> f32 {
-    440.0 * 2.0_f32.powf((n - 69.0) / 12.0)
-}
+/// The MIDI note number of `hz`, from A4.
 fn midi_of_hz(hz: f32) -> f32 {
     69.0 + 12.0 * (hz / 440.0).log2()
 }

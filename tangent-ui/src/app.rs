@@ -406,14 +406,6 @@ const PACE_HOLD: Duration = Duration::from_millis(250);
 /// being the thing you look at while playing.
 const REC_OUTLINE_W: f32 = 2.0;
 
-/// How many timeline tracks a full-screen or tiled window shows.
-///
-/// Ten rather than sixteen: a track row carries a name, three dials, a meter,
-/// four switches and a rack, and sixteen of them on a laptop screen is a row
-/// too short to read any of that. The desk's strips are columns and have no
-/// such floor, so the mixer shows all sixteen.
-const ARR_LANES_FULL: usize = 10;
-
 /// How long after the detached window appears a size mismatch still counts as
 /// the window manager's doing rather than the user's. A tiling WM overrules
 /// the requested size at creation; a person reaching for the window edge takes
@@ -600,7 +592,6 @@ pub struct TangentApp {
     /// Per (SEAT, bay), the built-in compressor's gain-reduction meter in
     /// positive dB — forwarded each frame by the host for open faces.
     insert_gr: HashMap<(usize, usize), f32>,
-    arr_auto_params: HashMap<usize, crate::automation::AutoParam>,
     /// The point under the pointer or being dragged: `(lane, index)`.
     arr_auto_hot: Option<(usize, usize)>,
     /// **The automation row the keyboard is aimed at**, `(lane, slot)`.
@@ -3643,7 +3634,6 @@ impl TangentApp {
             wheel_arr_zoom: WheelSteps::default(),
             wheel_media: WheelSteps::default(),
             insert_gr: HashMap::new(),
-            arr_auto_params: HashMap::new(),
             arr_auto_hot: None,
             arr_auto_sel: None,
             arr_auto_nodes: Vec::new(),
@@ -3696,12 +3686,6 @@ impl TangentApp {
             me.notify(crate::notify::Kind::Error, why);
         }
         me
-    }
-
-    // ── Geometry (spec §3.2, integer truncation like Python) ───────────────
-
-    fn layout_sizes(&self) -> Bands {
-        band_sizes(&self.settings)
     }
 
     /// The channel every note arrives on, whoever is sending.
@@ -3821,7 +3805,7 @@ impl TangentApp {
 
     /// Ask the host for the height this band stack needs, keeping the width.
     ///
-    /// On the desktop the window simply follows `layout_sizes()` on the next
+    /// On the desktop the window simply follows `band_sizes()` on the next
     /// frame. A plugin's editor cannot: nothing resizes it unless it asks, and
     /// `SetSizePercent` was the only thing that ever did. So turning the
     /// guitar view on inside a DAW did not make the editor taller — it made
@@ -6667,18 +6651,6 @@ impl TangentApp {
     }
 
     /// One of the active palette's sixteen, as a bright shade for the heart.
-    /// A colour from a NAMED palette — the animated set's road.
-    fn heart_palette_slot_in(&self, palette: i64, i: usize) -> egui::Color32 {
-        let n = crate::mixer_panel::PALETTES.len();
-        let pal = &crate::mixer_panel::PALETTES[palette.rem_euclid(n as i64) as usize];
-        let idx = pal.slot(i % recorder::CHANNELS);
-        let (r, g, b) = crate::mixer_panel::STRIP_COLORS[idx];
-        recorder_panel::heart_shade(
-            egui::Color32::from_rgb(r, g, b),
-            recorder_panel::band_face(&self.settings),
-        )
-    }
-
     fn heart_palette_slot(&self, i: usize) -> egui::Color32 {
         let idx = self.palette().slot(i % recorder::CHANNELS);
         let (r, g, b) = crate::mixer_panel::STRIP_COLORS[idx];
@@ -19550,7 +19522,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if self.drumpad_claims_pointer(ctx) && self.arr_drag.is_none() {
             return;
         }
-        const MIN: f64 = 0.05;
         let Some(rect) = self.arrangement_rect else {
             return;
         };
@@ -27935,7 +27906,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.current_chord = None;
                 }
                 self.save_settings();
-                // Window resize follows from layout_sizes() on the next pass.
+                // Window resize follows from band_sizes() on the next pass.
                 self.request_natural_size();
             }
             MenuAction::DetachChordWindow => self.detach_chord_window(),
@@ -27971,7 +27942,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.settings.fretboard_detached = true; // remembered for next time
                 }
                 self.save_settings();
-                // The window height follows from layout_sizes() next pass.
+                // The window height follows from band_sizes() next pass.
                 self.voicing_tick(true);
                 self.request_natural_size();
             }
@@ -46695,7 +46666,7 @@ mod tests {
 
     /// Turning a band on must make the editor TALLER, not the picture smaller.
     ///
-    /// On the desktop the window follows `layout_sizes()` by itself. A plugin
+    /// On the desktop the window follows `band_sizes()` by itself. A plugin
     /// editor cannot: nothing resizes it unless it asks, and only
     /// `SetSizePercent` ever did. So "Show Fretboard" inside a DAW did not
     /// grow the editor — it shrank the whole layout to fit the height it
@@ -47912,7 +47883,7 @@ mod tests {
             pointer_frame(&ctx, &mut app, Vec::new());
             let r = app.last_drawn;
             assert!(r.is_positive(), "nothing was drawn");
-            let bands = app.layout_sizes();
+            let bands = band_sizes(&app.settings);
             let piano_top = r.min.y + bands.recorder_h + bands.theory_h + bands.chord_h;
             assert!(bands.piano_h > 0.0, "no piano on screen");
             let p = Pos2::new(r.min.x + r.width() * 0.5, piano_top + bands.piano_h * 0.85);
