@@ -55858,3 +55858,437 @@ mod dirty_cost_probe {
     }
 }
 
+
+/// **The perf probes that need the app**: open, undo, layout, views and a
+/// whole drawn frame, each per fixture size. Ignored by default; run them
+/// in RELEASE with
+///
+/// ```text
+/// cargo test --release -p tangent-ui --lib perf_probes -- --ignored --nocapture
+/// ```
+///
+/// They live here rather than beside the fixtures because every one of them
+/// reaches something private to `TangentApp`: `open_project_keeping` and
+/// `KeepPath`, `undo_state`, `undo_mark`, `desk_snapshot`, `arr_clip_views`,
+/// `arrange_view`, and the fields a headless frame has to set by hand. The
+/// documents come from `crate::perf_fixtures`, so a number here and a number
+/// there are about the same song. Every line says which build it is; a debug
+/// number is ten to fifteen times a shipping one.
+#[cfg(test)]
+mod perf_probes {
+    use super::*;
+    use crate::arrangement_panel::{clip_rect, draw, ArrangeView, ClipView, Layout};
+    use crate::perf_fixtures as fx;
+    use crate::perf_fixtures::{per_call, pct_frame, say, Size};
+
+    /// The two windows: the rect the panel's own tests draw into, and a
+    /// full-screen arrangement on a 1920-wide display.
+    const RECTS: [(&str, f32, f32); 2] =
+        [("1300x420", 1300.0, 420.0), ("1920x960", 1920.0, 960.0)];
+
+    fn rect_of(w: f32, h: f32) -> Rect {
+        Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))
+    }
+
+    fn reps(size: Size, s: u32, m: u32, l: u32, xl: u32) -> u32 {
+        match size {
+            Size::S => s,
+            Size::M => m,
+            Size::L => l,
+            Size::XL => xl,
+        }
+    }
+
+    /// A headless app with `size`'s document OPEN through the real open
+    /// road, the arrangement showing in `rect`, and a picture on every audio
+    /// clip the way the host would have pushed one after the decode.
+    fn app_with(size: Size, rect: Rect, dir: &std::path::Path) -> (egui::Context, TangentApp) {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+        let doc = fx::write_project(size, dir, false);
+        app.open_project_keeping(&doc, KeepPath::Leave);
+        app.arrangement_open = true;
+        app.arrangement_rect = Some(rect);
+        give_pictures(&mut app, size.spec().take_s);
+        (ctx, app)
+    }
+
+    /// What the host pushes once a take is decoded: the file's length and a
+    /// min/max picture over the clip's drawn span — 1024 pairs, about a
+    /// lane's width of columns at the windows above.
+    fn give_pictures(app: &mut TangentApp, take_s: f64) {
+        for c in &app.arrangement.clips {
+            if c.kind != crate::arrangement::ClipKind::Audio {
+                continue;
+            }
+            let wave: Vec<f32> = (0..1024)
+                .flat_map(|i| {
+                    let env = 0.8 * (-((i % 64) as f32) / 20.0).exp();
+                    [-env * 0.9, env]
+                })
+                .collect();
+            app.clip_infos.insert(
+                c.id,
+                crate::ports::ClipInfo {
+                    id: c.id,
+                    wave,
+                    file_s: take_s,
+                    wave_from_s: 0.0,
+                    wave_span_s: c.len_s,
+                },
+            );
+        }
+    }
+
+    /// The first MIDI clip's index — the one whose note an "edit" moves.
+    fn a_midi_clip(app: &TangentApp) -> usize {
+        app.arrangement
+            .clips
+            .iter()
+            .position(|c| !c.notes.is_empty())
+            .expect("the fixture has MIDI clips")
+    }
+
+    fn moment_bytes(m: &Moment) -> usize {
+        m.doc.len() + m.kits.len()
+    }
+
+    /// **doc_open**: the whole open, and the parts of it that are paid
+    /// again later — `undo_state`, `undo_mark`, `desk_snapshot`, the
+    /// fingerprint — beside the once-a-frame `project_dirty`.
+    #[test]
+    #[ignore]
+    fn perf_doc_open() {
+        println!(
+            "doc_open [{}]: open_project_keeping(doc, KeepPath::Leave) per size, and its parts",
+            fx::build()
+        );
+        let dir = fx::scratch("doc-open");
+        for size in Size::chosen() {
+            let tag = size.tag();
+            let doc = fx::write_project(size, &dir.join(tag), false);
+            let ctx = egui::Context::default();
+            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+            let n = reps(size, 5, 5, 3, 2);
+            let open = per_call(n, || app.open_project_keeping(&doc, KeepPath::Leave));
+            let c = fx::census(&app.arrangement);
+            println!(
+                "doc_open     {tag:<3} {} clips / {} notes / {:.0} s, doc {:.0} KB",
+                c.clips,
+                c.notes,
+                c.song_s,
+                std::fs::metadata(&doc).map(|m| m.len()).unwrap_or(0) / 1024
+            );
+            say("doc_open", tag, "open_project_keeping (whole call)", open, false);
+            let read = per_call(n, || {
+                std::hint::black_box(crate::arrangement::Arrangement::read_from(&doc));
+            });
+            say("doc_open", tag, "  of which: Arrangement::read_from", read, false);
+            let desk = app.arrangement.desk.clone().expect("the fixture carries a desk");
+            let apply = per_call(n, || app.apply_desk_snapshot(&desk));
+            say("doc_open", tag, "  of which: apply_desk_snapshot", apply, false);
+            let reset = per_call(n, || app.undo_reset());
+            say("doc_open", tag, "  of which: undo_reset (2x undo_state + mark)", reset, false);
+            let us = per_call(n, || {
+                std::hint::black_box(app.undo_state());
+            });
+            say("doc_open", tag, "undo_state (to_json_with_desk + kits)", us, true);
+            let um = per_call(n * 20, || {
+                std::hint::black_box(app.undo_mark());
+            });
+            say("doc_open", tag, "undo_mark (fingerprint, doc + kits)", um, true);
+            let ds = per_call(500, || {
+                std::hint::black_box(app.desk_snapshot());
+            });
+            say("doc_open", tag, "desk_snapshot", ds, true);
+            let fp = per_call(n * 20, || {
+                std::hint::black_box(app.arrangement.fingerprint_with_desk(Some(&desk)));
+            });
+            say("doc_open", tag, "Fingerprint over the doc (+desk)", fp, true);
+            let pd = per_call(n * 20, || {
+                std::hint::black_box(app.project_dirty());
+            });
+            say("doc_open", tag, "project_dirty (the title bar, per frame)", pd, true);
+            let m = app.undo_state();
+            println!(
+                "doc_open     {tag:<3} one Moment = {:.2} MB ({} doc + {} kits bytes); 100 Moments = {:.1} MB",
+                fx::mb(moment_bytes(&m)),
+                m.doc.len(),
+                m.kits.len(),
+                fx::mb(moment_bytes(&m) * 100)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **undo_commit**: one committed edit (the Moment build, the compare,
+    /// the push), a commit where nothing changed, and what a hundred
+    /// Moments weigh.
+    #[test]
+    #[ignore]
+    fn perf_undo_commit() {
+        println!("undo_commit [{}]: per committed edit, per size", fx::build());
+        let dir = fx::scratch("undo");
+        for size in Size::chosen() {
+            let tag = size.tag();
+            let doc = fx::write_project(size, &dir.join(tag), false);
+            let ctx = egui::Context::default();
+            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+            app.open_project_keeping(&doc, KeepPath::Leave);
+            let midi = a_midi_clip(&app);
+            let n = reps(size, 20, 20, 10, 5);
+            let t = Instant::now();
+            for i in 0..n {
+                app.arrangement.clips[midi].notes[0].at_s = f64::from(i + 1) * 0.001;
+                app.undo_commit();
+            }
+            let edit = t.elapsed() / n;
+            say("undo_commit", tag, "undo_commit (a real edit)", edit, true);
+            let same = per_call(n, || app.undo_commit());
+            say("undo_commit", tag, "undo_commit (nothing changed: build + compare)", same, true);
+            let state = per_call(n, || {
+                std::hint::black_box(app.undo_state());
+            });
+            say("undo_commit", tag, "  of which: undo_state", state, true);
+            let held = app.history.len();
+            let bytes: usize = app.history.iter().map(moment_bytes).sum();
+            println!(
+                "undo_commit  {tag:<3} history holds {held} Moments = {:.1} MB; one Moment {:.2} MB; 100 Moments = {:.1} MB",
+                fx::mb(bytes),
+                fx::mb(bytes / held.max(1)),
+                fx::mb(bytes / held.max(1) * 100)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `clip_rect` with the `Layout` handed in — the prototype: the same
+    /// arithmetic as `clip_rect` and `x_of`, minus the three `Layout::new`
+    /// calls per clip.
+    fn rect_from(l: &Layout, view: &ArrangeView<'_>, clip: &ClipView<'_>) -> Rect {
+        let Some(row) = l.lane_rows.get(clip.lane).copied().filter(Rect::is_positive) else {
+            return Rect::NOTHING;
+        };
+        let x = |t: f64| {
+            if !l.lanes_area.is_positive() || view.view_len_s <= 0.0 {
+                return l.lanes_area.left();
+            }
+            let f = ((t - view.view_start_s) / view.view_len_s) as f32;
+            l.lanes_area.left() + f * l.lanes_area.width()
+        };
+        let x0 = x(clip.start_s).max(l.lanes_area.left());
+        let x1 = x(clip.start_s + clip.len_s).min(l.lanes_area.right());
+        if x1 <= x0 {
+            return Rect::NOTHING;
+        }
+        Rect::from_min_max(Pos2::new(x0, row.top() + 1.5), Pos2::new(x1, row.bottom() - 1.5))
+    }
+
+    /// **layout**: `Layout::new` per size, and `clip_rect` over every clip
+    /// — which rebuilds the Layout three times per clip — against one
+    /// Layout and per-clip arithmetic.
+    #[test]
+    #[ignore]
+    fn perf_layout() {
+        println!(
+            "layout [{}]: Layout::new; clip_rect x every clip (3 Layouts each) vs one Layout + per-clip math; 1920x960",
+            fx::build()
+        );
+        let dir = fx::scratch("layout");
+        for size in Size::chosen() {
+            let tag = size.tag();
+            let r = rect_of(1920.0, 960.0);
+            let (_ctx, app) = app_with(size, r, &dir.join(tag));
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let layout = per_call(500, || {
+                std::hint::black_box(Layout::new(r, &view));
+            });
+            say("layout", tag, "Layout::new(rect, &view)", layout, true);
+            let n = reps(size, 50, 20, 10, 5);
+            let all = per_call(n, || {
+                for c in &clips {
+                    std::hint::black_box(clip_rect(r, &view, c));
+                }
+            });
+            say(
+                "layout",
+                tag,
+                &format!("clip_rect x {} clips (3 Layouts each)", clips.len()),
+                all,
+                true,
+            );
+            let fast = per_call(n * 20, || {
+                let l = Layout::new(r, &view);
+                for c in &clips {
+                    std::hint::black_box(rect_from(&l, &view, c));
+                }
+            });
+            say("layout", tag, "prototype: one Layout + per-clip math", fast, true);
+            let l = Layout::new(r, &view);
+            let mut worst = 0.0f32;
+            let mut visible = 0usize;
+            for c in &clips {
+                let a = clip_rect(r, &view, c);
+                let b = rect_from(&l, &view, c);
+                assert_eq!(a.is_positive(), b.is_positive(), "clip {} differs in existence", c.id);
+                if a.is_positive() {
+                    visible += 1;
+                    worst = worst.max((a.min - b.min).length()).max((a.max - b.max).length());
+                }
+            }
+            println!(
+                "layout       {tag:<3} prototype agrees on all {} clips ({visible} on screen; worst corner deviation {worst:e} pt); {:.0}x cheaper",
+                clips.len(),
+                all.as_secs_f64() / fast.as_secs_f64()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **views**: what the host's per-frame `arr_waves_stale` check pays —
+    /// `arr_clip_views`, `arrange_view` and a `Layout::new`, every frame,
+    /// to learn that the window has not moved.
+    #[test]
+    #[ignore]
+    fn perf_views() {
+        println!(
+            "views [{}]: arr_waves_stale per frame = arr_clip_views + arrange_view + Layout::new; 1920x960",
+            fx::build()
+        );
+        let dir = fx::scratch("views");
+        for size in Size::chosen() {
+            let tag = size.tag();
+            let r = rect_of(1920.0, 960.0);
+            let (_ctx, app) = app_with(size, r, &dir.join(tag));
+            assert!(app.arr_waves_stale(), "a fresh open has no pictures yet, so it is stale");
+            let stale = per_call(500, || {
+                std::hint::black_box(app.arr_waves_stale());
+            });
+            say("views", tag, "arr_waves_stale (the per-frame check)", stale, true);
+            let cv = per_call(500, || {
+                std::hint::black_box(app.arr_clip_views());
+            });
+            say("views", tag, "  arr_clip_views", cv, true);
+            let clips = app.arr_clip_views();
+            let av = per_call(500, || {
+                std::hint::black_box(app.arrange_view(&clips));
+            });
+            say("views", tag, "  arrange_view", av, true);
+            let view = app.arrange_view(&clips);
+            let ln = per_call(500, || {
+                std::hint::black_box(Layout::new(r, &view));
+            });
+            say("views", tag, "  Layout::new", ln, true);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A layer nothing else paints into, so the shapes read back are the
+    /// frame's and only the frame's — `miniature_cost_probe`'s method.
+    fn a_painter(ctx: &egui::Context) -> (egui::LayerId, egui::Painter) {
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("perf-draw"));
+        (layer, egui::Painter::new(ctx.clone(), layer, Rect::EVERYTHING))
+    }
+
+    fn shed(ctx: &egui::Context, layer: egui::LayerId) {
+        ctx.graphics_mut(|g| *g.entry(layer) = Default::default());
+    }
+
+    fn shapes(ctx: &egui::Context, layer: egui::LayerId) -> Vec<egui::epaint::ClippedShape> {
+        ctx.graphics(|g| {
+            g.get(layer).map(|list| list.all_entries().cloned().collect()).unwrap_or_default()
+        })
+    }
+
+    fn vertices(prims: &[egui::epaint::ClippedPrimitive]) -> (usize, usize) {
+        prims.iter().fold((0, 0), |(v, i), p| match &p.primitive {
+            egui::epaint::Primitive::Mesh(m) => (v + m.vertices.len(), i + m.indices.len()),
+            egui::epaint::Primitive::Callback(_) => (v, i),
+        })
+    }
+
+    /// **panel_draw**: one whole `arrangement_panel::draw` frame, per size,
+    /// at the whole song, eight bars and one bar, in both windows — shape
+    /// emission and tessellation timed apart, with the shape and vertex
+    /// counts that explain them.
+    #[test]
+    #[ignore]
+    fn perf_panel_draw() {
+        println!(
+            "panel_draw [{}]: arrangement_panel::draw, one frame = emit + tessellate, per size / window / zoom",
+            fx::build()
+        );
+        let dir = fx::scratch("draw");
+        for size in Size::chosen() {
+            let tag = size.tag();
+            for (rname, w, h) in RECTS {
+                let r = rect_of(w, h);
+                let (ctx, mut app) = app_with(size, r, &dir.join(format!("{tag}-{rname}")));
+                let song = app.arr_span();
+                let (layer, painter) = a_painter(&ctx);
+                // The two close zooms sit a tenth of the way in, on a bar
+                // line, where every lane has something standing.
+                let at = (song * 0.1 / fx::BAR_S).floor() * fx::BAR_S;
+                for (zname, window) in [
+                    ("whole song", None),
+                    ("8 bars", Some((at, 8.0 * fx::BAR_S))),
+                    ("1 bar", Some((at, fx::BAR_S))),
+                ] {
+                    app.arr_window = window;
+                    let clips = app.arr_clip_views();
+                    let view = app.arrange_view(&clips);
+                    let end = view.view_start_s + view.view_len_s;
+                    let in_view = clips
+                        .iter()
+                        .filter(|c| {
+                            c.start_s < end
+                                && c.start_s + c.len_s > view.view_start_s
+                                && c.lane >= view.lane_scroll
+                                && c.lane < view.lane_scroll + view.visible_lanes
+                        })
+                        .count();
+                    shed(&ctx, layer);
+                    draw(&painter, r, &view);
+                    let count = shapes(&ctx, layer).len();
+                    shed(&ctx, layer);
+
+                    let n = reps(size, 30, 20, 10, 6);
+                    let mut total = Duration::ZERO;
+                    for _ in 0..n {
+                        let t = Instant::now();
+                        draw(&painter, r, &view);
+                        total += t.elapsed();
+                        shed(&ctx, layer);
+                    }
+                    let emit = total / n;
+
+                    draw(&painter, r, &view);
+                    let m = 8;
+                    let mut tess = Duration::ZERO;
+                    for _ in 0..m {
+                        let s = shapes(&ctx, layer);
+                        let t = Instant::now();
+                        std::hint::black_box(ctx.tessellate(s, 1.0));
+                        tess += t.elapsed();
+                    }
+                    let tess = tess / m;
+                    let prims = ctx.tessellate(shapes(&ctx, layer), 1.0);
+                    let (verts, idx) = vertices(&prims);
+                    shed(&ctx, layer);
+
+                    println!(
+                        "panel_draw   {tag:<3} {rname:>9} {zname:<10} ({in_view:>4} clips in view, {:>7.1} s): {count:>6} shapes, {verts:>8} verts / {idx:>8} idx -> emit {emit:>10.3?} + tess {tess:>10.3?} = {:>10.3?}  {:>6.1}% frame  [{}]",
+                        view.view_len_s,
+                        emit + tess,
+                        pct_frame(emit + tess),
+                        fx::build()
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

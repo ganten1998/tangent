@@ -523,3 +523,110 @@ mod tests {
         assert!(clip.envelope(0).is_empty());
     }
 }
+
+/// **decode**: what a take costs to read through the platform decoder
+/// (`afconvert` on macOS, ffmpeg elsewhere) against the native road this
+/// file already has — `std::fs::read` plus `wav_stereo_f32`, which parses
+/// 16/24/32-bit PCM and float WAV on its own. Ignored; run in RELEASE:
+///
+/// ```text
+/// cargo test --release -p tangent-record --lib perf_decode -- --ignored --nocapture
+/// ```
+///
+/// The files are what the recorder writes: 24-bit PCM, stereo, 48 kHz,
+/// through this crate's own `WavWriter`.
+#[cfg(test)]
+mod perf_probe {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn per_call(n: u32, mut f: impl FnMut()) -> Duration {
+        let t = Instant::now();
+        for _ in 0..n {
+            f();
+        }
+        t.elapsed() / n.max(1)
+    }
+
+    /// A take of `seconds`: decaying sine bursts, a note every half second,
+    /// written a block at a time.
+    fn write_take(path: &Path, seconds: f64, rate: u32) -> u64 {
+        let spec = crate::wav::WavSpec {
+            sample_rate: rate,
+            channels: 2,
+            format: crate::wav::SampleFormat::Int24,
+        };
+        let bext = crate::wav::Bext::new(crate::wav::Wallclock::now_utc(), spec);
+        let mut w = crate::wav::WavWriter::create(path, spec, &bext).expect("writer");
+        let frames = (seconds * f64::from(rate)) as usize;
+        let mut block = vec![0.0f32; 4_800 * 2];
+        let mut at = 0usize;
+        while at < frames {
+            let n = (frames - at).min(4_800);
+            for k in 0..n {
+                let t = (at + k) as f64 / f64::from(rate);
+                let into = t - (t * 2.0).floor() / 2.0;
+                let env = 0.7 * (-into * 5.0).exp();
+                let ph = std::f64::consts::TAU * 220.0 * into;
+                let v = env * (ph.sin() + 0.4 * (2.0 * ph).sin());
+                block[k * 2] = v as f32;
+                block[k * 2 + 1] = (v * 0.9) as f32;
+            }
+            w.write_interleaved(&block[..n * 2]).expect("write");
+            at += n;
+        }
+        let bytes = w.total_bytes();
+        w.finish().expect("finish");
+        bytes
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_decode() {
+        let build = if cfg!(debug_assertions) { "DEBUG" } else { "release" };
+        println!(
+            "decode [{build}]: tangent_record::decode::decode (platform decoder) vs fs::read + wav_stereo_f32 (native), 24-bit stereo 48 kHz"
+        );
+        let rate = 48_000u32;
+        let dir = std::env::temp_dir().join(format!("tangent-perf-decode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        for (seconds, n) in [(5.0, 5u32), (60.0, 3), (180.0, 2)] {
+            let path = dir.join(format!("take-{seconds}s.wav"));
+            let bytes = write_take(&path, seconds, rate);
+            let platform = per_call(n, || {
+                let clip = decode(&path, rate).expect("the platform decoder");
+                std::hint::black_box(clip);
+            });
+            let native = per_call(n, || {
+                let raw = std::fs::read(&path).expect("read");
+                let (samples, got) = wav_stereo_f32(&raw).expect("parse");
+                assert_eq!(got, rate);
+                std::hint::black_box(samples);
+            });
+            let read_only = per_call(n, || {
+                std::hint::black_box(std::fs::read(&path).expect("read"));
+            });
+            // Both roads must produce the same audio, or the ratio compares
+            // two different jobs.
+            let a = decode(&path, rate).expect("decode");
+            let raw = std::fs::read(&path).expect("read");
+            let (b, _) = wav_stereo_f32(&raw).expect("parse");
+            assert_eq!(a.rate, rate);
+            assert_eq!(a.samples.len(), b.len(), "{seconds}s: the two roads disagree on length");
+            let dev = a
+                .samples
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "decode       {seconds:>5.0} s ({:>6.1} MB): platform {platform:>10.3?} | native {native:>10.3?} (of which fs::read {read_only:>9.3?}) | {:>5.1}x | max sample deviation {dev:e}  [{build}]",
+                bytes as f64 / 1_048_576.0,
+                platform.as_secs_f64() / native.as_secs_f64()
+            );
+            assert!(dev < 1e-6, "{seconds}s: the decoders disagree by {dev}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
