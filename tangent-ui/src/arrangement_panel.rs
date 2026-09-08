@@ -6470,7 +6470,85 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     }
 }
 
+/// **A label cut to `width` with an ellipsis, in a few layouts rather than
+/// one per character.**
+///
+/// It measured the whole text and then, on a miss, shrank it one character
+/// at a time, laying out every candidate — ten to thirty galleys per chip
+/// per frame, for every bay chip, input chip, routing button, lane name and
+/// clip name that did not fit, which on a busy header is most of them.
+/// Cached galleys are hash-and-probe hits, but a truncation point that
+/// moves (every clip name during a zoom) is that many real shapings.
+///
+/// The galley the first measure makes already carries every glyph's
+/// advance, so where the cut falls is ESTIMATED from it: the ellipsis after
+/// `k` glyphs lands about where their advances add up to. About, not
+/// exactly — the layout rounds each glyph's x to the pixel together with
+/// that glyph's own bearing, so `の` at 12.6 stands at 13 and `…` at 12.6
+/// stands at 12, and no prefix arithmetic reproduces it. So the estimate is
+/// given a pixel and a quarter of slack, which makes it an UPPER bound on
+/// what the walk would accept (a rounding of at most a pixel plus the
+/// sixteenth the galley's rect is quantised to), the candidate is measured
+/// once, and if it does not fit the old walk carries on DOWNWARD from
+/// there — one step, usually. The answer is therefore the walk's own answer
+/// by construction, in three or four layouts instead of twenty, two of
+/// them (the whole text, the ellipsis) stable strings the cache answers
+/// without shaping. `cut_to_gives_the_walk_its_own_answer` holds the two
+/// equal over a sweep of names, widths and both faces, CJK and runs of
+/// spaces included. Text with a newline has more than one row and goes to
+/// the walk as it always did.
 pub(crate) fn cut_to(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
+    let measure = |t: &str| painter.layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE);
+    let whole = measure(text);
+    if whole.rect.width() <= width {
+        return text.to_owned();
+    }
+    let mut keep = text.len();
+    if let [row] = whole.rows.as_slice() {
+        // A pixel for the glyph rounding (half from the cursor, half from a
+        // bearing), a sixteenth for the rect's quantum, and a little air.
+        const SLACK: f32 = 1.25;
+        let ell = measure("\u{2026}").rect.width();
+        // One glyph per char, in order, so the byte count walks with them
+        // and every stop is a char boundary. `fits` is the byte length of
+        // the glyphs BEFORE the one under the cursor: keep those, and the
+        // ellipsis takes that one's place.
+        let mut cursor = 0.0f32;
+        let mut bytes = 0usize;
+        let mut fits = 0usize;
+        for g in &row.glyphs {
+            if cursor + ell > width + SLACK {
+                break;
+            }
+            fits = bytes;
+            cursor += g.advance_width;
+            bytes += g.chr.len_utf8();
+        }
+        if fits < text.len() && text.is_char_boundary(fits) {
+            let cut = format!("{}\u{2026}", text[..fits].trim_end());
+            if measure(&cut).rect.width() <= width {
+                return cut;
+            }
+            keep = fits;
+        }
+    }
+    while keep > 0 {
+        keep -= 1;
+        while keep > 0 && !text.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        let cut = format!("{}\u{2026}", text[..keep].trim_end());
+        if measure(&cut).rect.width() <= width {
+            return cut;
+        }
+    }
+    String::new()
+}
+
+/// The walk `cut_to` replaced, kept as its oracle: every candidate laid out
+/// and the first that fits returned.
+#[cfg(test)]
+pub(crate) fn cut_to_reference(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
     let measure = |t: &str| {
         painter
             .layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE)
@@ -8449,6 +8527,83 @@ ArrangeView {
                 }
             }
         }
+    }
+
+    /// **`cut_to` answers exactly what the walk did**, over every name
+    /// shape the panel prints (plugin names, ROUTING counts, the input
+    /// words, accents, CJK, runs of spaces, a long run of one letter, the
+    /// empty string), widths swept at a quarter point from nothing to the
+    /// whole word, in both faces at the sizes the header uses. The walk
+    /// laid out every candidate; the shipped one reads the cut off the
+    /// first galley and checks it once. Same string or the test says where.
+    #[test]
+    fn cut_to_gives_the_walk_its_own_answer() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("cut-to"));
+        let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+        let names = [
+            "Tangent Compressor",
+            "Brusfri",
+            "Valhalla Supermassive",
+            "ROUTING 12",
+            "NO INPUT",
+            "a",
+            "",
+            "\u{dc}n\u{ef}c\u{f6}d\u{e9} N\u{e4}m\u{e9}",
+            "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30ad}\u{30b9}\u{30c8}",
+            "two  spaces  here ",
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "Vocal take 3 (comp) - final FINAL v2",
+        ];
+        let fonts = [
+            FontId::new(7.0, crate::fonts::courier()),
+            FontId::new(10.0, crate::fonts::courier()),
+            FontId::new(11.5, crate::fonts::courier()),
+            FontId::new(8.5, crate::fonts::courier_bold()),
+            FontId::new(12.0, crate::fonts::courier_bold()),
+        ];
+        let mut checked = 0usize;
+        let mut cut = 0usize;
+        for font in &fonts {
+            for name in names {
+                let full = painter
+                    .layout_no_wrap(name.to_owned(), font.clone(), Color32::WHITE)
+                    .rect
+                    .width();
+                let mut w = -1.0f32;
+                while w <= full + 2.0 {
+                    let want = cut_to_reference(&painter, w, name, font);
+                    let got = cut_to(&painter, w, name, font);
+                    assert_eq!(got, want, "{name:?} at {w} in {font:?}");
+                    checked += 1;
+                    cut += usize::from(got != name);
+                    w += 0.25;
+                }
+            }
+        }
+        assert!(checked > 2_000 && cut > 500, "{checked} checked, {cut} of them cut");
+
+        // **And the count.** Every distinct string laid out lands in the
+        // font's galley cache, so the cache's growth across one call is the
+        // number of layouts it made. The walk paid one per character it
+        // removed; the shipped one pays for the text, the ellipsis, the
+        // candidate and at most a step or two of the walk.
+        let layouts = |f: &dyn Fn(&Painter, f32, &str, &FontId) -> String| -> usize {
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+            let _ = ctx.run(Default::default(), |_| {});
+            let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+            let before = ctx.fonts(|f| f.num_galleys_in_cache());
+            let font = FontId::new(10.0, crate::fonts::courier());
+            let got = f(&painter, 40.0, "Tangent Compressor", &font);
+            assert!(got.ends_with('\u{2026}') && got.len() < 12, "{got:?}");
+            ctx.fonts(|f| f.num_galleys_in_cache()) - before
+        };
+        let (walk, now) = (layouts(&cut_to_reference), layouts(&cut_to));
+        assert!(walk >= 10, "the walk laid out only {walk} galleys");
+        assert!(now <= 5, "cut_to laid out {now} galleys against the walk's {walk}");
     }
 
     #[test]
