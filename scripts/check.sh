@@ -43,6 +43,19 @@ echo "==> cargo test -p tangent-core --test differential -- --ignored  (full 13,
 cargo test -p tangent-core --test differential -- --ignored
 
 echo "==> cargo clippy  (the Cargo.toml lint policy only — no broad groups)"
-cargo clippy --workspace --all-targets -- -A clippy::all -D warnings
+# **Our five packages by name, not --workspace.**
+#
+# The vendored crates are path dependencies, and cargo does not cap lints on a
+# path dependency the way it does on one from the registry — so `--workspace`
+# handed `-D warnings` to rfd, linuxvideo and cpal as well, and the gate failed
+# on about fifty warnings in code that MUST NOT be touched: those copies stay
+# byte-comparable to upstream, which is the whole argument in their vendor
+# READMEs. Naming our packages leaves them compiled but unjudged.
+#
+# A new crate of ours has to be added here. That is the cost of the approach
+# and it is the cheaper mistake: a package missing from this line is a package
+# nobody lints, which shows up as a warning count that never moves.
+cargo clippy -p tangent-core -p tangent-ui -p tangent -p tangent-record -p tangent-host \
+  --all-targets -- -A clippy::all -D warnings
 
 echo "==> check.sh: all green"
