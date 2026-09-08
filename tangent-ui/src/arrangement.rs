@@ -77,7 +77,37 @@ use std::path::PathBuf;
 /// and it is possible: sixty-four bits are not a document. What that costs
 /// decides where a fingerprint may be used and where the exact comparison
 /// has to stay; `TangentApp::project_dirty` writes that split down.
-pub struct Fingerprint(u64);
+///
+/// # The words themselves: the exact form
+///
+/// A [`Fingerprint::recording`] KEEPS every word it mixes, and that list
+/// is exact where the number is not. Two documents whose word lists are
+/// equal write the same text, because the encoding is injective and the
+/// walk mirrors the writer:
+///
+/// * every list is preceded by its length, every string by its byte
+///   length, every optional thing by a tag word — so the words parse back
+///   into exactly one walk;
+/// * a float is its bits, with the writer's own folding of the non-finite
+///   into one word (they are all "no key", or `null`, on the wire);
+/// * and the walk visits every field the writer emits under the writer's
+///   own conditions — the property the oracle tests
+///   `the_fingerprint_moves_when_the_document_moves` and
+///   `the_fingerprint_stands_when_the_document_stands` pin, and now pin
+///   for the words as well as the number.
+///
+/// This is what lets undo keep a document as a struct and still answer
+/// "would the saved file differ?" byte-exactly without serialising it:
+/// compare the words. One walk, kept, costs the notes' four words each
+/// and nothing per note that the fingerprint did not already pay. The
+/// remaining hazard is the one the oracle guards: a field the writer
+/// learns and this walk does not is invisible to BOTH answers, so the
+/// oracle test is not optional.
+pub struct Fingerprint {
+    acc: u64,
+    /// Every word mixed so far, when this fingerprint is recording.
+    words: Option<Vec<u64>>,
+}
 
 impl Default for Fingerprint {
     fn default() -> Self {
@@ -85,10 +115,19 @@ impl Default for Fingerprint {
     }
 }
 
+/// A large odd seed, so a document whose first word is zero still moves.
+const FINGERPRINT_SEED: u64 = 0x243f_6a88_85a3_08d3;
+
 impl Fingerprint {
-    /// A large odd seed, so a document whose first word is zero still moves.
     pub fn new() -> Self {
-        Self(0x243f_6a88_85a3_08d3)
+        Self { acc: FINGERPRINT_SEED, words: None }
+    }
+
+    /// A fingerprint that also keeps its words — see the type's doc.
+    /// `capacity` is a hint (the previous walk's length, usually) so the
+    /// list is allocated once rather than grown thirty thousand times.
+    pub fn recording(capacity: usize) -> Self {
+        Self { acc: FINGERPRINT_SEED, words: Some(Vec::with_capacity(capacity)) }
     }
 
     /// One word in. rustc's own FxHash step — rotate, mix, multiply by a
@@ -101,7 +140,10 @@ impl Fingerprint {
     /// per word is the difference between a fingerprint that disappears
     /// inside a frame's rounding error and one that does not.
     pub fn u64(&mut self, v: u64) {
-        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+        if let Some(words) = &mut self.words {
+            words.push(v);
+        }
+        self.acc = (self.acc.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
     }
 
     pub fn bool(&mut self, v: bool) {
@@ -205,13 +247,21 @@ impl Fingerprint {
     /// ones are stirred back in once, at the end, rather than thirty
     /// thousand times on the way.
     pub fn finish(self) -> u64 {
-        let mut x = self.0;
+        let mut x = self.acc;
         x ^= x >> 30;
         x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
         x ^= x >> 27;
         x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
         x ^= x >> 31;
         x
+    }
+
+    /// The words and the number, from the one walk. Empty words from a
+    /// fingerprint that was not recording — the caller asked for both, so
+    /// it built one with [`Fingerprint::recording`].
+    pub fn finish_recorded(mut self) -> (Vec<u64>, u64) {
+        let words = self.words.take().unwrap_or_default();
+        (words, self.finish())
     }
 }
 
@@ -1340,6 +1390,29 @@ impl Arrangement {
             return Self::default();
         };
         Self::from_map(map)
+    }
+
+    /// This document copied with `desk: None`.
+    ///
+    /// For undo, which keeps a moment as the struct rather than as text and
+    /// carries the LIVE desk beside it — so the desk this document happens
+    /// to be holding (the one it was opened or last saved with, thousands
+    /// of seat strings) must not be copied a hundred times over. Every
+    /// other field is named so a field added to the struct is a compile
+    /// error here rather than a moment that silently forgets it.
+    pub fn clone_without_desk(&self) -> Self {
+        Self {
+            clips: self.clips.clone(),
+            desk: None,
+            next_id: self.next_id,
+            named: self.named,
+            extra: self.extra.clone(),
+            automation: self.automation.clone(),
+            tempo: self.tempo.clone(),
+            meter: self.meter.clone(),
+            markers: self.markers.clone(),
+            version: self.version,
+        }
     }
 
     fn from_map(mut map: Map<String, Value>) -> Self {
@@ -3021,10 +3094,19 @@ mod tests {
         a
     }
 
-    /// The edit moved the document, and the fingerprint saw it.
+    /// The recorded walk — the exact form undo compares. See the
+    /// `Fingerprint` doc for why equal words mean equal text.
+    fn words(a: &Arrangement) -> Vec<u64> {
+        let mut f = Fingerprint::recording(0);
+        a.hash_into(a.desk.as_ref(), &mut f);
+        f.finish_recorded().0
+    }
+
+    /// The edit moved the document, and the fingerprint saw it — and so
+    /// did the words, which is the stronger claim undo now rests on.
     fn moves_both(name: &str, edit: impl Fn(&mut Arrangement)) {
         let a = a_document_with_everything_in_it();
-        let (json, fp) = (a.to_json(), a.fingerprint());
+        let (json, fp, w) = (a.to_json(), a.fingerprint(), words(&a));
         let mut b = a;
         edit(&mut b);
         assert_ne!(b.to_json(), json, "`{name}` did not change the document at all");
@@ -3033,13 +3115,14 @@ mod tests {
             fp,
             "`{name}` changed the document and the fingerprint did not move"
         );
+        assert_ne!(words(&b), w, "`{name}` changed the document and the words did not");
     }
 
     /// The edit did NOT move the document, so the fingerprint must not move
     /// either — a fingerprint that jumps where the file does not is an
     /// asterisk over work nobody did, and an undo moment for it.
     fn moves_neither(name: &str, base: Arrangement, edit: impl Fn(&mut Arrangement)) {
-        let (json, fp) = (base.to_json(), base.fingerprint());
+        let (json, fp, w) = (base.to_json(), base.fingerprint(), words(&base));
         let mut b = base;
         edit(&mut b);
         assert_eq!(b.to_json(), json, "`{name}` moved the document after all");
@@ -3048,6 +3131,7 @@ mod tests {
             fp,
             "`{name}` left the document alone and the fingerprint moved"
         );
+        assert_eq!(words(&b), w, "`{name}` left the document alone and the words moved");
     }
 
     /// **Every meaningful change moves the fingerprint.**
@@ -3269,6 +3353,31 @@ mod tests {
                 unit: 8,
             });
         });
+    }
+
+    /// **Recording changes nothing about the number.** The words are kept
+    /// beside the mix, never instead of it, so a moment's mark and the
+    /// title bar's answer come from one walk and cannot disagree.
+    #[test]
+    fn a_recording_fingerprint_answers_the_same_number() {
+        let a = a_document_with_everything_in_it();
+        let mut f = Fingerprint::recording(0);
+        a.hash_into(a.desk.as_ref(), &mut f);
+        let (w, mark) = f.finish_recorded();
+        assert_eq!(mark, a.fingerprint(), "recording moved the number");
+        assert!(!w.is_empty(), "nothing was recorded");
+        assert!(
+            Fingerprint::new().finish_recorded().0.is_empty(),
+            "a plain fingerprint kept words"
+        );
+        // And the copy undo keeps is the same document apart from its desk.
+        let bare = a.clone_without_desk();
+        assert!(bare.desk.is_none());
+        assert_eq!(
+            bare.to_json_with_desk(a.desk.as_ref()),
+            a.to_json(),
+            "the desk-less copy is a different document"
+        );
     }
 
     /// **A save and a load do not move the fingerprint.**
