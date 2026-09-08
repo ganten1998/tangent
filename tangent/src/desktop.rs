@@ -697,6 +697,23 @@ pub struct DesktopApp {
     /// `TangentApp::flush_settings_now`.
     window_focused: Option<bool>,
     window_minimized: Option<bool>,
+    /// **The host's half of the resting window's ledger** — see
+    /// `host_frame_due`. `meters_live` is decided in `fill_recorder_state`
+    /// from the numbers it just read (any meter, needle, hold, needle or
+    /// pad above the floor); `camera_wanted` is whether frames are being
+    /// asked of the capture thread, which arrive on its clock and not
+    /// ours; `activity_at` is the last input event, MIDI event or
+    /// session/transport edge, after which frames keep coming for
+    /// `ACTIVITY_GRACE` so the sound a gesture made reaches the meters.
+    #[cfg(feature = "recorder")]
+    meters_live: bool,
+    #[cfg(feature = "recorder")]
+    camera_wanted: bool,
+    activity_at: Option<std::time::Instant>,
+    #[cfg(feature = "recorder")]
+    last_session_state: std::mem::Discriminant<tangent_ui::recorder::RecordState>,
+    #[cfg(feature = "recorder")]
+    last_transport_playing: bool,
     /// The maps the engine was last given. Compared before pushing, because
     /// `Engine::set_maps` is a ring handover that WAITS for the displaced
     /// pair to come back — cheap once, and a stall if it ran every frame.
@@ -1814,6 +1831,37 @@ fn cartridge_info(
 #[cfg(feature = "recorder")]
 const DISK_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// **The resting window's three cadences.** See `DesktopApp::host_frame_due`.
+///
+/// `LIVE_TICK` is the frame rate while something on the engine's side is
+/// moving — the transport, a take, a meter above the floor, a camera
+/// delivering pictures: 33 ms, which is what the band's tick always was.
+/// `ENGINE_IDLE_POLL` is how often a window that has read nothing above the
+/// floor comes back to look while an engine is running at all: the engine
+/// can start making sound without telling the window (the free-running
+/// click, a plugin's own sequencer, a microphone being spoken into with
+/// monitoring on), the peaks it keeps are max-holds since the last read, so
+/// a look every quarter second sees any of it and loses at most that long of
+/// the onset — against the thirty looks a second an idle band used to pay.
+/// It also keeps the stall watch (`STALL_AFTER`, two seconds), the dropout
+/// log and the free-space check polled, all of which only ever ran because
+/// frames happened to come by. `ACTIVITY_GRACE` is how long frames keep
+/// coming after an input event, a MIDI event or a transport/take edge: the
+/// sound a gesture makes reaches the meters a buffer or two later, and a
+/// window that rested on the very next frame would read them at zero and
+/// never see the note it just played.
+#[cfg(feature = "recorder")]
+const LIVE_TICK: std::time::Duration = std::time::Duration::from_millis(33);
+#[cfg(feature = "recorder")]
+const ENGINE_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(feature = "recorder")]
+const ACTIVITY_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+/// The level below which a meter is not moving: -60 dBFS, well under the
+/// bottom of every scale the band draws, so a needle that reads this is a
+/// needle drawn at rest.
+#[cfg(feature = "recorder")]
+const METER_FLOOR: f32 = 1.0e-3;
+
 /// How long to wait before trying the monitor output again, and how many times.
 ///
 /// Half a second is long enough for CoreAudio to finish releasing a device that
@@ -2505,15 +2553,19 @@ impl DesktopApp {
         // smoothness. What a preview can afford is now measured where the
         // conversions happen. See `camera::FrameWant`.
         use tangent_record::camera::FrameWant;
-        self.recorder.session.set_camera_want(
+        let camera_want =
             if self.recorder.session.is_recording() && self.app.export_spec().video.wants_video() {
                 FrameWant::Every
             } else if self.app.recorder_band_open() || self.app.camera_pane_showing() {
                 FrameWant::Preview
             } else {
                 FrameWant::None
-            },
-        );
+            };
+        // Remembered for the frame ledger: a camera that is being asked for
+        // pictures delivers them on its own clock, so the window has to
+        // keep coming back to collect them. See `host_frame_due`.
+        self.camera_wanted = !matches!(camera_want, FrameWant::None);
+        self.recorder.session.set_camera_want(camera_want);
 
         // The camera. Uploaded here rather than in `after_frame` because the
         // texture has to exist before the band that draws it is painted.
@@ -3118,6 +3170,7 @@ impl DesktopApp {
         // The drumpad's peaks, read-and-reset like the strips' — exactly
         // once a frame, and pushed before the state borrow below takes the
         // app for the rest of this function.
+        let mut pads_live = false;
         if let Some(e) = self.recorder.engine.as_ref() {
             // **The pads light for the kit the window is SHOWING.** With a
             // full instance per channel there is a meter per lane, and the
@@ -3126,7 +3179,9 @@ impl DesktopApp {
             let lane = (0..tangent_ui::recorder::CHANNELS)
                 .find(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
                 .unwrap_or(0);
-            self.app.note_drumpad_peaks(e.pad_peaks(lane));
+            let pads = e.pad_peaks(lane);
+            pads_live = pads.iter().any(|p| *p > METER_FLOOR);
+            self.app.note_drumpad_peaks(pads);
         }
         // **The alias replaces the interface's name, once, for all of it.**
         // Read BEFORE the state borrow, like everything else here: the app is
@@ -3307,6 +3362,27 @@ impl DesktopApp {
                 clipped: false,
             };
         }
+        // **Is anything on the desk still moving?** Decided from the numbers
+        // just read, so the ledger and the picture cannot disagree: a meter,
+        // a hold line, a needle target, a limiter needle, a pad, a lane the
+        // timeline is sounding, or a loudness window still above silence.
+        // A resting window that reads nothing above the floor here has
+        // nothing to draw next frame — and `host_frame_due`'s idle poll is
+        // what brings it back to look again while an engine is running.
+        self.meters_live = {
+            let live = |l: &tangent_ui::recorder::Level| {
+                l.peak > METER_FLOOR || l.rms > METER_FLOOR || l.hold > METER_FLOOR
+            };
+            pads_live
+                || live(&state.meters.left)
+                || live(&state.meters.right)
+                || live(&state.master.left)
+                || live(&state.master.right)
+                || state.gr_db > 0.01
+                || state.strip_peaks.iter().any(|p| p[0] > METER_FLOOR || p[1] > METER_FLOOR)
+                || state.lane_sounding.iter().any(|m| *m != 0)
+                || state.loudness.momentary > tangent_ui::recorder::LUFS_SILENCE + 1.0
+        };
         state.dest = shorten_home(&root);
         // The other two standing folders, for the settings panel's PROJECT
         // tier. Shortened the same way, because a full path in a half-row
@@ -3690,16 +3766,12 @@ impl DesktopApp {
                 }
             }
         }
-        // And a repaint while the audition rolls, or the playhead only moves
-        // when the mouse does.
-        if self.recorder.transport.playing() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
-        }
-        // And a repaint while anything is live, or the meter and the clock
-        // update only when the mouse moves.
-        if self.recorder.session.is_recording() || open {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
-        }
+        // The frames the transport, the take, the meters and the camera
+        // need are asked for in ONE place, `host_frame_due`, at the end of
+        // `update`. Two arms used to live here, and one of them was `|| open`:
+        // a 33 ms tick for as long as the band was showing, whether or not
+        // anything on it moved — the multiplier on every per-frame cost in
+        // the host.
 
         // The in-app browser's three messages, pumped out here with the native
         // dialogs because listing a directory is disk I/O and `tangent-ui` does
@@ -14432,6 +14504,15 @@ impl DesktopApp {
             pace_since: None,
             window_focused: None,
             window_minimized: None,
+            #[cfg(feature = "recorder")]
+            meters_live: false,
+            #[cfg(feature = "recorder")]
+            camera_wanted: false,
+            activity_at: None,
+            #[cfg(feature = "recorder")]
+            last_session_state: std::mem::discriminant(&tangent_ui::recorder::RecordState::Idle),
+            #[cfg(feature = "recorder")]
+            last_transport_playing: false,
             pace_frames: 0,
             pace_dt: Vec::new(),
             reader_seen: false,
@@ -14801,6 +14882,7 @@ impl eframe::App for DesktopApp {
         self.paint_splash(ctx);
         self.paint_busy(ctx);
         self.painted_once = true;
+        self.host_frame_due(ctx);
         // **The geometry probe.** `IVORY_GEOM_PROBE=1` prints, once the
         // window has settled, everything the app believes about where it is
         // — then closes itself through the ordinary quit path, because an
@@ -15670,6 +15752,92 @@ struct Splash {
 }
 
 impl DesktopApp {
+
+    /// **What on the HOST's side still needs a frame with no hand on
+    /// anything**, asked once at the end of `update`.
+    ///
+    /// The other half of `TangentApp::animation_due`: the two combine
+    /// because `request_repaint_after` keeps the minimum asked. egui wakes
+    /// the window for input on its own and the MIDI thread wakes it for a
+    /// note; what is gathered here is everything that moves on the engine's
+    /// clock or on a timer of the host's — and it used to be one line,
+    /// `is_recording() || open`, which kept a band with nothing on it
+    /// repainting at 30 Hz for as long as it was showing.
+    ///
+    /// Asks `LIVE_TICK` while: the transport rolls (the playhead), a take is
+    /// anywhere but idle (the clock, the count-in, the file being closed),
+    /// any meter read this frame was above the floor (`meters_live`), the
+    /// camera is being asked for pictures (`camera_wanted`), the free-running
+    /// click is on (it sounds with nothing else moving), the IR road has a
+    /// capture or a worker out (its levels and its answer land on frames),
+    /// or anything happened inside `ACTIVITY_GRACE` — an input event, a MIDI
+    /// event, or the take or the transport changing state — because the
+    /// sound of that reaches the meters a buffer later than the frame that
+    /// caused it. Asks `ENGINE_IDLE_POLL` while an engine exists at all, so
+    /// a silent desk is looked at four times a second rather than thirty
+    /// and still catches sound the window was not told about. Asks for the
+    /// exact moment of a pending monitor retry, which was only ever polled.
+    ///
+    /// What already asks for itself and is deliberately NOT repeated here:
+    /// the first frame (`after_frame` before `painted_once`), the plugin
+    /// editors' 16 ms, the count-in's own tick, an insert bay outstanding,
+    /// the warm queue (one decode a frame), the reprobe (500 ms), the rate
+    /// poll (one second while an engine runs), the splash and the busy
+    /// cover, the developer hooks and the two probes.
+    #[cfg(feature = "recorder")]
+    fn host_frame_due(&mut self, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        let state = std::mem::discriminant(&self.recorder.session.state());
+        let playing = self.recorder.transport.playing();
+        let events = ctx.input(|i| !i.events.is_empty());
+        let midi = self.app.take_midi_activity();
+        if events
+            || midi
+            || state != self.last_session_state
+            || playing != self.last_transport_playing
+        {
+            self.activity_at = Some(now);
+        }
+        self.last_session_state = state;
+        self.last_transport_playing = playing;
+        let recent = self
+            .activity_at
+            .is_some_and(|t| now.duration_since(t) < ACTIVITY_GRACE);
+        let engine = self.recorder.engine.is_some();
+        let live = playing
+            || self.recorder.session.state().is_active()
+            || self.meters_live
+            || self.camera_wanted
+            || (engine && self.app.metronome_on())
+            || self.ir.pending.is_some()
+            || self.ir.worker.is_some()
+            || self.ir.live.capturing
+            || recent;
+        let mut due: Option<std::time::Duration> = None;
+        let mut sooner = |d: std::time::Duration| {
+            due = Some(due.map_or(d, |c: std::time::Duration| c.min(d)));
+        };
+        if live {
+            sooner(LIVE_TICK);
+        }
+        if engine {
+            sooner(ENGINE_IDLE_POLL);
+        }
+        if let Some((at, _)) = self.recorder.engine_retry {
+            sooner(at.saturating_duration_since(now));
+        }
+        if let Some(d) = due {
+            ctx.request_repaint_after(d);
+        }
+    }
+
+    /// Without the recorder there is no engine, no take and no camera: the
+    /// app's own ledger is the whole of it.
+    #[cfg(not(feature = "recorder"))]
+    fn host_frame_due(&mut self, _ctx: &egui::Context) {
+        let _ = self.app.take_midi_activity();
+        self.activity_at = None;
+    }
 
     /// Whether any insert bay still has a plugin to load.
     ///
@@ -17835,6 +18003,53 @@ mod tests {").expect("the tests module")];
         assert!(
             focus < flush && minimised < flush,
             "the flush in update is not driven by the focus and minimise edges"
+        );
+    }
+
+    /// **The host's frame ledger names every state that moves on its own.**
+    ///
+    /// The window rests when nothing asks for a frame, so a state that
+    /// animates on the engine's clock and is not in `host_frame_due` is a
+    /// state that freezes until the mouse moves. This pins the ledger's
+    /// membership, that `update` consults it after the covers have painted,
+    /// and that the old unconditional band tick (`is_recording() || open`)
+    /// has not come back in `after_frame`. A source scan for the reason the
+    /// tempo-map test below is one.
+    #[test]
+    fn the_host_frame_ledger_names_every_state_that_moves_on_its_own() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let start = src.find("fn host_frame_due(&mut self, ctx: &egui::Context)").expect("the ledger is gone");
+        let end = start + src[start..].find("\n    /// Without the recorder").expect("the no-recorder twin");
+        let ledger = &src[start..end];
+        for arm in [
+            "self.recorder.transport.playing()",
+            "self.recorder.session.state().is_active()",
+            "self.meters_live",
+            "self.camera_wanted",
+            "self.app.metronome_on()",
+            "self.ir.pending.is_some()",
+            "self.ir.worker.is_some()",
+            "self.ir.live.capturing",
+            "self.app.take_midi_activity()",
+            "!i.events.is_empty()",
+            "self.recorder.engine.is_some()",
+            "self.recorder.engine_retry",
+            "sooner(LIVE_TICK)",
+            "sooner(ENGINE_IDLE_POLL)",
+        ] {
+            assert!(ledger.contains(arm), "host_frame_due no longer consults `{arm}`");
+        }
+        let update_at = src.find("fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame)").expect("update");
+        let update = &src[update_at..];
+        let busy = update.find("self.paint_busy(ctx);").expect("the busy cover is painted in update");
+        let ledger_call = update.find("self.host_frame_due(ctx);").expect("update does not consult the frame ledger");
+        assert!(busy < ledger_call, "the ledger is consulted before the covers have painted");
+        let after = src.find("fn after_frame(&mut self").expect("after_frame");
+        let after_body = &src[after..src[after..].find("\n    fn ").map_or(src.len(), |n| after + n)];
+        assert!(
+            !after_body.contains("self.recorder.session.is_recording() || open"),
+            "the unconditional band tick is back in after_frame"
         );
     }
 
