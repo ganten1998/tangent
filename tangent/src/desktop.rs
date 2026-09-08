@@ -4530,6 +4530,14 @@ impl DesktopApp {
             }
         }
 
+        // **A bay that loaded changed the desk after the frame that would
+        // have drawn it.** The tick below covers a batch — it is asked while
+        // bays are still outstanding — but not the LAST bay of one: that
+        // frame's walk counts zero, the cover stands down, and the plugin's
+        // face, its parameter list and any sentence its failure left would
+        // have waited for the next mouse move. See `late_change`.
+        late_change(ctx, due.is_some());
+
         // One walk, two answers — the bay to announce and the size of the
         // wait. See `insert_walk`, which is where the reasoning lives. Taken
         // AFTER the load above, so what it counts is what is left.
@@ -4628,7 +4636,14 @@ impl DesktopApp {
         if self.app.take_clips_dirty() {
             self.clips_owed = true;
         } else if self.app.arr_waves_stale() {
-            self.refresh_pictures();
+            // The pictures are remade here, at the end of the frame that
+            // moved the view — so the frame that DRAWS them has to be asked
+            // for. `refresh_pictures` answers whether it made any: with no
+            // arrangement on screen it makes none and asks for nothing,
+            // which is what keeps a stale flag from spinning the window.
+            // See `late_change`.
+            let made = self.refresh_pictures();
+            late_change(ctx, made);
         }
 
         // **The drumpad's kit, on the same bargain**: a drop, a clear or a
@@ -4643,7 +4658,7 @@ impl DesktopApp {
         // **The click's sound, on the same bargain.** Decoded here, off the
         // audio thread, and handed over on the engine's own ring.
         if self.app.take_click_sample_dirty() {
-            self.reload_click();
+            self.reload_click(ctx);
         }
 
 
@@ -9410,7 +9425,7 @@ impl DesktopApp {
         }
         // What the crew finished since last frame goes into the caches
         // first; a landed clip is a schedule the engine has not heard.
-        if self.land_decodes() {
+        if self.land_decodes(ctx) {
             self.clips_owed = true;
         }
         if !self.clips_owed && !self.pads_owed && self.warm.is_empty() && self.pool.idle() {
@@ -9493,7 +9508,9 @@ impl DesktopApp {
             }
             self.warm_count = Counted::default();
             self.busy_chunk_done(Busied::Decode);
+            let mut reloaded = false;
             if std::mem::take(&mut self.clips_owed) {
+                reloaded = true;
                 self.clips_owed_at = None;
                 // A stretch still rendering keeps the debt open on the
                 // deadline's clock: the schedule is re-read when the render
@@ -9504,8 +9521,17 @@ impl DesktopApp {
                 }
             }
             if std::mem::take(&mut self.pads_owed) {
+                reloaded = true;
                 self.reload_pads();
             }
+            // **This is the road the decoded take arrives on**, and it is
+            // the only one here that does not ask for a frame of its own:
+            // the meter's tick below belongs to a queue with work left in
+            // it, and this road runs when there is none. A debt is only
+            // owed because something changed — an edit, a device, a file
+            // landing — so a reload having run IS the change, and a pass
+            // that answered nothing asks for nothing. See `late_change`.
+            late_change(ctx, reloaded);
             return;
         }
         // Outstanding is what is queued plus what is in the workers' hands;
@@ -9533,7 +9559,14 @@ impl DesktopApp {
     /// not have to visit the cache to leave it. A pad is kept as it lands;
     /// `reload_pads` sweeps its own cache against every drum lane. A
     /// refusal is remembered exactly as the inline road remembers one.
-    fn land_decodes(&mut self) -> bool {
+    ///
+    /// **A landing that had something to SAY asks for its own frame.** A
+    /// clip landing raises `clips_owed`, and the reload that answers it asks
+    /// for the frame that draws the new picture; a notification has no such
+    /// road behind it, and a render that failed while the file it belongs to
+    /// had already left the cache would otherwise put a message on a window
+    /// that is not going to paint again. See `late_change`.
+    fn land_decodes(&mut self, ctx: &egui::Context) -> bool {
         let rate = self
             .recorder
             .engine
@@ -9609,9 +9642,11 @@ impl DesktopApp {
                 }
             }
         }
+        let told = !notes.is_empty();
         for note in notes {
             self.app.notify(Kind::Error, note);
         }
+        late_change(ctx, told);
         clips
     }
 
@@ -9970,9 +10005,16 @@ impl DesktopApp {
     /// so would be asked again every frame for ever. The panel is being
     /// taught to read `ClipInfo.peaks` directly; when it does, `arr_waves_
     /// stale` will stop asking and this will simply never run.
-    fn refresh_pictures(&mut self) {
+    ///
+    /// **Answers whether it really pushed a set of pictures**, because the
+    /// caller has to ask for the frame that draws them and must not ask for
+    /// one it does not need — see `late_change`. With no window there is
+    /// nothing to make a picture FOR, and that road happens on every frame
+    /// for as long as the flag stands: an unconditional repaint there would
+    /// be a window that never rests again.
+    fn refresh_pictures(&mut self) -> bool {
         let Some(wave_view) = self.app.arr_wave_view() else {
-            return;
+            return false;
         };
         let rate = self
             .recorder
@@ -10003,6 +10045,7 @@ impl DesktopApp {
         }
         self.app.set_clip_infos(clip_infos);
         self.app.note_waves_drawn(wave_view);
+        true
     }
 
     /// The drumpad's samples: decode every slot at the engine's rate, push
@@ -10015,8 +10058,13 @@ impl DesktopApp {
     /// the setting is LEFT alone in the failure cases — a sound file living
     /// on a drive that is not plugged in today should come back tomorrow, not
     /// be forgotten because it was missing once.
+    ///
+    /// The refusal is the one thing here the window shows, so it is the one
+    /// thing that asks for a frame — this runs after the frame that would
+    /// have drawn it, and a rested window has nothing else coming. See
+    /// `late_change`.
     #[cfg(feature = "recorder")]
-    fn reload_click(&mut self) {
+    fn reload_click(&mut self, ctx: &egui::Context) {
         let path = self.app.click_sample().to_owned();
         let Some(engine) = self.recorder.engine.as_mut() else {
             return;
@@ -10033,6 +10081,7 @@ impl DesktopApp {
                     error: format!("that click sound would not load: {e}"),
                     ..Default::default()
                 });
+                late_change(ctx, true);
             }
         }
     }
@@ -17236,6 +17285,34 @@ fn run_decode_job(decoder: &Decoder, job: &DecodeJob) -> Result<Decoded, String>
 #[cfg(feature = "recorder")]
 const EXPORT_RUNNING: &str = "export-running";
 
+/// **Something changed AFTER the frame that would have drawn it — ask for
+/// the frame that will.**
+///
+/// The one door for the whole of `after_frame`, and it exists because the
+/// window RESTS now. `paint` no longer ends with an unconditional tick:
+/// a frame happens when an animator asks for one, and nothing else. But
+/// every slow thing in this file runs at the END of a frame, after the app
+/// has painted — a decode landing in the caches, a picture remade for a
+/// view that moved, a plugin's face arriving in its bay. Each of those
+/// changes what the window is showing at the one moment the window is not
+/// going to be shown again, so the new picture sat in the app's ports
+/// until the user happened to move the mouse. The decoded take was
+/// invisible; the file was open, the sound was there, the waveform was
+/// not.
+///
+/// **And it takes an answer rather than being called unconditionally.** A
+/// repaint on every pass through `after_frame` is the 50 ms tick back under
+/// another name — the whole of what the resting window bought, spent on a
+/// road that usually changed nothing. So every caller says whether it
+/// really changed something, and a caller that cannot honestly say so has
+/// to learn to.
+#[cfg(feature = "recorder")]
+fn late_change(ctx: &egui::Context, changed: bool) {
+    if changed {
+        ctx.request_repaint();
+    }
+}
+
 /// Whether a reload has anything to do in a bay: something is in it, or
 /// something is coming to it.
 ///
@@ -18527,6 +18604,117 @@ mod tests {
         // one reload: what matters is that it moved since the last one.
         assert_eq!(stretch_step(&mut seen, 7, &key(1_500_000), false), StretchStep::Wait);
         assert_eq!(stretch_step(&mut seen, 7, &key(1_500_000), false), StretchStep::Submit);
+    }
+
+    /// **A window that has come to rest**: two empty passes, because a
+    /// fresh `Context` is born owing one frame and spends it on the first.
+    /// After this `has_requested_repaint` is the honest question "does
+    /// anything want to be drawn", which is what these two tests ask.
+    fn rested_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |_| {});
+        }
+        assert!(!ctx.has_requested_repaint(), "the window would not settle");
+        ctx
+    }
+
+    /// **A landing wakes a window that is asleep.**
+    ///
+    /// The first half of the resting window's bargain: nothing asks for a
+    /// frame while nothing moves, so the crew has to ask for one itself
+    /// when it comes back with a file. A context nobody has touched has no
+    /// repaint pending; one landing is enough to give it one.
+    #[test]
+    fn a_decode_that_lands_asks_a_resting_window_for_a_frame() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = DecodePool::with_decoder(2, counting_decoder(calls));
+        let ctx = rested_context();
+        pool.submit(
+            Warm::Clip(std::path::PathBuf::from("/takes/late.wav")),
+            Work::Decode,
+            48_000,
+            &ctx,
+        );
+        assert_eq!(drain_until(&mut pool, 48_000, 1).len(), 1, "the file lands");
+        assert!(
+            ctx.has_requested_repaint(),
+            "the crew landed a file and nothing asked for the frame that \
+             draws it: the take is decoded and invisible until somebody \
+             moves the mouse"
+        );
+    }
+
+    /// **And the roads that run AFTER a frame ask for the one that draws
+    /// them — only when they really changed something.**
+    ///
+    /// `late_change` is the whole rule in one line, and both halves of it
+    /// matter: no repaint at all is the invisible take above; an
+    /// unconditional one is the 50 ms tick back under another name, on a
+    /// road that is walked on every frame and usually changes nothing.
+    #[test]
+    fn a_change_made_after_the_frame_asks_for_a_frame_and_nothing_else_does() {
+        let ctx = rested_context();
+        super::late_change(&ctx, false);
+        assert!(
+            !ctx.has_requested_repaint(),
+            "a pass that changed nothing must not wake the window"
+        );
+        super::late_change(&ctx, true);
+        assert!(ctx.has_requested_repaint(), "a pass that changed something must");
+    }
+
+    /// **Every road in `after_frame` that changes what is on screen goes
+    /// through `late_change`, and the road that changes nothing does not.**
+    ///
+    /// A source scan because `DesktopApp` cannot be built in a test (the
+    /// precedent is `every_one_launch_shuffle_is_reached_only_through_its_
+    /// own_taken_flag`), and every one of these is a road whose fault is
+    /// invisible: the work happens, the state is right, and the window
+    /// simply never paints it. What it pins is that each caller passes an
+    /// ANSWER rather than `true`, and that the warm-up's do-nothing return
+    /// asks for nothing at all.
+    #[test]
+    fn the_late_roads_ask_for_a_frame_and_the_idle_one_does_not() {
+        let src = include_str!("desktop.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        assert!(
+            body.contains("fn late_change(ctx: &egui::Context, changed: bool) {"),
+            "the one door for a change made after the frame is gone"
+        );
+        for (road, ask) in [
+            ("the view moved", "let made = self.refresh_pictures();\n            late_change(ctx, made);"),
+            ("a reload ran", "late_change(ctx, reloaded);"),
+            ("a landing spoke", "late_change(ctx, told);"),
+            ("a bay loaded", "late_change(ctx, due.is_some());"),
+        ] {
+            assert!(body.contains(ask), "{road}: the frame that draws it is not asked for");
+        }
+        // Nothing may ask unconditionally: `late_change(ctx, true)` is a
+        // repaint with the answer written out of the question, and the only
+        // place it is allowed is the click's refusal, which is reached
+        // solely on the failure arm.
+        assert_eq!(
+            body.matches("late_change(ctx, true)").count(),
+            1,
+            "an unconditional late repaint is the resting window undone"
+        );
+        // The warm-up's nothing-to-do return: no work, no change, no frame.
+        let warm = body
+            .find("fn run_warm")
+            .map(|at| &body[at..])
+            .expect("run_warm is still called that");
+        let warm = &warm[..warm.find("fn land_decodes").expect("land_decodes follows")];
+        let idle = warm
+            .find("if !self.clips_owed && !self.pads_owed")
+            .expect("the do-nothing door");
+        let after = &warm[idle..];
+        let door_end = after.find("\n        }").expect("the door closes");
+        assert!(
+            !after[..door_end].contains("request_repaint"),
+            "the pass that found nothing to do asks for another frame, which \
+             is a window that never rests again"
+        );
     }
 
     /// The ceiling on a render is the decoder's own, applied to what the
