@@ -92,7 +92,7 @@ impl Clip {
 /// it is what stops somebody who picked a two-hour podcast by mistake from
 /// finding out by watching the machine swap. The error says the length, so it
 /// reads as "that file is enormous" rather than as a failure.
-const MAX_FRAMES: usize = 20 * 60 * 48_000;
+pub const MAX_FRAMES: usize = 20 * 60 * 48_000;
 
 /// Decode `path` to interleaved stereo f32 at `rate`.
 ///
