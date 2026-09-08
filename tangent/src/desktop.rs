@@ -714,6 +714,39 @@ pub struct DesktopApp {
     last_session_state: std::mem::Discriminant<tangent_ui::recorder::RecordState>,
     #[cfg(feature = "recorder")]
     last_transport_playing: bool,
+    /// **Per-frame strings, kept between frames.** `fill_recorder_state`
+    /// used to rebuild every one of these on every frame — five shortened
+    /// paths (each a `dirs::home_dir` walk of the environment plus a
+    /// `format!`), the take folder's timestamped preview, the camera's
+    /// format line and four input labels — for text that changes on a
+    /// settings write, once a second, or never. Each is now rebuilt only
+    /// when its inputs differ from the ones that made it. See `Frozen`.
+    #[cfg(feature = "recorder")]
+    frozen: Frozen,
+    /// Which rows of the insert ledger hold the built-in compressor, so the
+    /// gain-reduction needles are read from a handful of rows rather than a
+    /// walk over twelve thousand mostly-empty ones every frame. Rebuilt when
+    /// a bay was announced for loading last frame (the ledger changes only
+    /// there), when the engine is replaced, and every couple of seconds as
+    /// a backstop; a row that stopped being a comp reads zero, so a stale
+    /// index costs nothing worse than one idle swap.
+    #[cfg(feature = "recorder")]
+    comp_rows: Vec<usize>,
+    #[cfg(feature = "recorder")]
+    comp_rows_stale: bool,
+    #[cfg(feature = "recorder")]
+    comp_rows_at: Option<std::time::Instant>,
+    /// Bumped every time `start_engine` seats a new engine, so every cache
+    /// that stands for "what THIS engine was told" can notice it is talking
+    /// to a different one. See `push_desk_if_changed`.
+    #[cfg(feature = "recorder")]
+    engine_epoch: u64,
+    #[cfg(feature = "recorder")]
+    comp_rows_epoch: u64,
+    /// The ReaStream config the sender was last handed. See
+    /// `reconcile_reastream`.
+    #[cfg(feature = "recorder")]
+    reastream_pushed: Option<Option<tangent_record::reastream::ReaStreamConfig>>,
     /// The maps the engine was last given. Compared before pushing, because
     /// `Engine::set_maps` is a ring handover that WAITS for the displaced
     /// pair to come back — cheap once, and a stall if it ran every frame.
@@ -1861,6 +1894,11 @@ const ACTIVITY_GRACE: std::time::Duration = std::time::Duration::from_millis(300
 /// needle drawn at rest.
 #[cfg(feature = "recorder")]
 const METER_FLOOR: f32 = 1.0e-3;
+/// How long the compressor-row index (`DesktopApp::comp_rows`) may go
+/// without a full look at the ledger. The index is refreshed on every edge
+/// that changes the ledger; this is the belt to those braces.
+#[cfg(feature = "recorder")]
+const COMP_ROWS_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long to wait before trying the monitor output again, and how many times.
 ///
@@ -3205,14 +3243,40 @@ impl DesktopApp {
         // `strip_peaks` rule, per bay). The walk is over the same ledger the
         // reconcile diffs every frame anyway, and a desk has a handful of
         // comps on twelve thousand mostly-`None` rows.
+        //
+        // **Indexed, not walked.** `comp_rows` names the rows that hold a
+        // comp; the walk that finds them runs only when the ledger can have
+        // changed (see the field), and the per-frame cost is one swap per
+        // loaded compressor.
         if let Some(e) = self.recorder.engine.as_ref() {
             let inserts = tangent_ui::recorder::INSERTS;
-            for (i, loaded) in self.recorder.inserts_loaded.iter().enumerate() {
-                if loaded.as_deref() == Some(crate::builtin_fx::COMP_PATH) {
-                    self.app
-                        .set_insert_gr(i / inserts, i % inserts, e.insert_gr_db(i / inserts, i % inserts));
-                }
+            let now = std::time::Instant::now();
+            let backstop = self
+                .comp_rows_at
+                .is_none_or(|t| now.duration_since(t) >= COMP_ROWS_BACKSTOP);
+            if self.comp_rows_stale || self.comp_rows_epoch != self.engine_epoch || backstop {
+                self.comp_rows.clear();
+                self.comp_rows.extend(
+                    self.recorder
+                        .inserts_loaded
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| l.as_deref() == Some(crate::builtin_fx::COMP_PATH))
+                        .map(|(i, _)| i),
+                );
+                self.comp_rows_stale = false;
+                self.comp_rows_epoch = self.engine_epoch;
+                self.comp_rows_at = Some(now);
             }
+            for &i in &self.comp_rows {
+                self.app
+                    .set_insert_gr(i / inserts, i % inserts, e.insert_gr_db(i / inserts, i % inserts));
+            }
+        }
+        // A bay announced last frame is loaded THIS frame, after this runs:
+        // the index is stale from the next frame on.
+        if self.insert_announced.is_some() {
+            self.comp_rows_stale = true;
         }
         // **The denoise learn drain**, same cadence and same reason as the
         // needles above: while a learn runs (and on the frame after it
@@ -3256,21 +3320,52 @@ impl DesktopApp {
             self.push_ir_rows();
         }
         self.ir_tick();
-        // **Read before the state is borrowed mutably.** Both are pure
-        // functions of the settings, so hoisting them changes nothing but
-        // the borrow.
-        let project_dest = shorten_home(&self.app.project_root());
-        let export_dest = shorten_home(&self.app.export_root());
-        let preset_dest = shorten_home(&self.app.preset_root());
-        let irs_dest = shorten_home(&self.app.irs_root());
+        // **Read before the state is borrowed mutably.** All pure functions
+        // of the settings, so hoisting them changes nothing but the borrow;
+        // and each rebuilt only when its root moved (see `Frozen`).
+        let roots = [
+            root.clone(),
+            self.app.project_root(),
+            self.app.export_root(),
+            self.app.preset_root(),
+            self.app.irs_root(),
+        ];
+        for (slot, path) in roots.into_iter().enumerate() {
+            let _ = self.frozen.dest(slot, path);
+        }
+        // The camera's format line, rebuilt on a format change only.
+        let camera_name = match self.recorder.session.camera_format() {
+            Some(f) => {
+                let key = (f.width, f.height, f.fps.round() as u32);
+                if self.frozen.camera.as_ref().is_none_or(|(k, _)| *k != key) {
+                    self.frozen.camera =
+                        Some((key, format!("{}x{} @ {:.0}fps", f.width, f.height, f.fps)));
+                }
+                self.frozen.camera.as_ref().map(|(_, s)| s.clone())
+            }
+            None => {
+                self.frozen.camera = None;
+                camera_uid.clone()
+            }
+        };
+        // The take folder's preview carries the clock to the second, so it
+        // is rebuilt when the second turns or the slug changes and not
+        // before: one `format!` a second instead of thirty.
+        {
+            let at = take::WallTime::now_utc();
+            let slug = name.as_deref().and_then(take::sanitise_slug);
+            let f = &mut self.frozen.folder;
+            if f.0 != at.unix_seconds || f.1 != slug || f.2.is_empty() {
+                f.2 = take::folder_name(&at, slug.as_deref());
+                f.0 = at.unix_seconds;
+                f.1 = slug;
+            }
+        }
         let state = self.app.recorder_state_mut();
         state.preview = preview;
-        state.camera_name = self
-            .recorder
-            .session
-            .camera_format()
-            .map(|f| format!("{}x{} @ {:.0}fps", f.width, f.height, f.fps))
-            .or_else(|| camera_uid.clone());
+        if state.camera_name != camera_name {
+            state.camera_name = camera_name;
+        }
         state.camera_missing = camera_uid.is_some() && !camera_open;
         state.state = self.recorder.session.state();
         state.elapsed_s = self.recorder.session.elapsed();
@@ -3328,7 +3423,11 @@ impl DesktopApp {
         // have to be LOOKED at rather than reasoned about. Pushed after the
         // engine's own numbers, because it is overriding them.
         //   IVORY_DEMO_LEVELS=1 /Applications/Tangent.app/Contents/MacOS/tangent
-        if std::env::var("IVORY_DEMO_LEVELS").is_ok() {
+        // Read ONCE: the same OnceLock discipline as every other diagnostic
+        // variable in this file. `var` walks the environment and allocates,
+        // and this ran every frame.
+        static DEMO_LEVELS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DEMO_LEVELS.get_or_init(|| std::env::var_os("IVORY_DEMO_LEVELS").is_some()) {
             for (i, peaks) in state.strip_peaks.iter_mut().enumerate() {
                 // Different on every channel and different on the two sides of
                 // each, so a bar drawn from the wrong lane is visible.
@@ -3383,18 +3482,28 @@ impl DesktopApp {
                 || state.lane_sounding.iter().any(|m| *m != 0)
                 || state.loudness.momentary > tangent_ui::recorder::LUFS_SILENCE + 1.0
         };
-        state.dest = shorten_home(&root);
-        // The other two standing folders, for the settings panel's PROJECT
-        // tier. Shortened the same way, because a full path in a half-row
-        // box is a path nobody can read the end of.
-        state.project_dest = project_dest;
-        state.export_dest = export_dest;
-        state.preset_dest = preset_dest;
-        state.irs_dest = irs_dest;
-        state.folder_preview = take::folder_name(
-            &take::WallTime::now_utc(),
-            name.as_deref().and_then(take::sanitise_slug).as_deref(),
-        );
+        // The standing folders, for the band and the settings panel's
+        // PROJECT tier. Shortened because a full path in a half-row box is a
+        // path nobody can read the end of; copied across only when the text
+        // differs from what the state already holds.
+        let frozen = &self.frozen;
+        for (slot, field) in [
+            &mut state.dest,
+            &mut state.project_dest,
+            &mut state.export_dest,
+            &mut state.preset_dest,
+            &mut state.irs_dest,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if *field != frozen.dests[slot].1 {
+                field.clone_from(&frozen.dests[slot].1);
+            }
+        }
+        if state.folder_preview != frozen.folder.2 {
+            state.folder_preview.clone_from(&frozen.folder.2);
+        }
         state.audio_name = open_name.or(audio_uid);
         // The playhead and the audition, as plain data. The rate is the
         // engine's own; with no engine the transport answers from its last
@@ -3414,27 +3523,38 @@ impl DesktopApp {
         // "Scarlett 18i20 USB  -  input 3" does not fit a mixer strip; "x - 3"
         // does, and the half worth shortening is the one that is the same on
         // every channel of the box.
-        for i in 0..tangent_ui::recorder::INPUTS {
-            let (device, channel, stereo) = open_inputs
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| (String::new(), String::new(), false));
-            let label = if device.is_empty() {
-                String::new()
-            } else {
-                let head = if alias.is_empty() {
-                    device.as_str()
+        //
+        // Rebuilt only when the open inputs or the alias differ from the
+        // ones the labels were made from — four `format!`s a frame for a
+        // device that was plugged in an hour ago.
+        if !self.frozen.inputs_made
+            || self.frozen.inputs.0 != open_inputs
+            || self.frozen.inputs.1 != alias
+        {
+            for i in 0..tangent_ui::recorder::INPUTS {
+                let (device, channel, stereo) = open_inputs
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| (String::new(), String::new(), false));
+                let label = if device.is_empty() {
+                    String::new()
                 } else {
-                    alias.as_str()
+                    let head = if alias.is_empty() {
+                        device.as_str()
+                    } else {
+                        alias.as_str()
+                    };
+                    if channel.is_empty() {
+                        head.to_owned()
+                    } else {
+                        format!("{head} - {channel}")
+                    }
                 };
-                if channel.is_empty() {
-                    head.to_owned()
-                } else {
-                    format!("{head} - {channel}")
-                }
-            };
-            self.recorder.input_names[i].clone_from(&label);
-            state.inputs[i] = tangent_ui::recorder::InputState { label, stereo };
+                self.recorder.input_names[i].clone_from(&label);
+                state.inputs[i] = tangent_ui::recorder::InputState { label, stereo };
+            }
+            self.frozen.inputs = (open_inputs, alias);
+            self.frozen.inputs_made = true;
         }
         state.audio_missing = audio_missing;
         state.disk_minutes = self
@@ -3494,12 +3614,18 @@ impl DesktopApp {
         // screen from a script at all — which is the one thing the hook exists
         // to make possible.
         //   IVORY_OPEN_EDITOR=0,1 tangent      # channel 1, bay 2: empty
-        let dev_editor_bay = match std::env::var("IVORY_OPEN_EDITOR").as_deref() {
-            Ok("1") | Ok("patch") => Some((0, 0)),
-            Ok(v) => v.split_once(',').and_then(|(s, b)| {
+        // Read ONCE, like every diagnostic variable in this file: this ran
+        // two environment walks a frame for a hook that ships inert.
+        static OPEN_EDITOR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let open_editor = OPEN_EDITOR
+            .get_or_init(|| std::env::var("IVORY_OPEN_EDITOR").ok())
+            .as_deref();
+        let dev_editor_bay = match open_editor {
+            Some("1") | Some("patch") => Some((0, 0)),
+            Some(v) => v.split_once(',').and_then(|(s, b)| {
                 Some((s.trim().parse().ok()?, b.trim().parse().ok()?))
             }),
-            Err(_) => None,
+            None => None,
         };
         if let (false, Some((dev_strip, dev_bay))) = (self.recorder.dev_editor_done, dev_editor_bay)
         {
@@ -3516,7 +3642,7 @@ impl DesktopApp {
                 self.app.open_insert_face(dev_strip, dev_bay);
                 // `=patch` goes one further, to the patch EDITOR, which is
                 // otherwise two clicks in and cannot be reached from a script.
-                if std::env::var("IVORY_OPEN_EDITOR").as_deref() == Ok("patch") {
+                if open_editor == Some("patch") {
                     self.app
                         .apply_dialog_action(tangent_ui::dialogs::DialogAction::EditPatch {
                             slot: 0,
@@ -3535,13 +3661,16 @@ impl DesktopApp {
         // notified because the user closes one with the OS's close button,
         // which the plugin's view knows about and we only find out by asking.
         if let Some(e) = self.recorder.engine.as_mut() {
-            let bays: Vec<(usize, usize)> = (0..=tangent_ui::recorder::STRIPS)
-                .flat_map(|s| (0..tangent_ui::recorder::INSERTS).map(move |b| (s, b)))
-                .collect();
-            let was: Vec<bool> = bays
-                .iter()
-                .map(|&(st, b)| e.insert_editor_open(st, b))
-                .collect();
+            // Fixed arrays, not two `Vec`s a frame: the bay list never
+            // changes size.
+            const EDITOR_BAYS: usize =
+                (tangent_ui::recorder::STRIPS + 1) * tangent_ui::recorder::INSERTS;
+            let bay_of = |i: usize| (i / tangent_ui::recorder::INSERTS, i % tangent_ui::recorder::INSERTS);
+            let bays = (0..EDITOR_BAYS).map(bay_of);
+            let was: [bool; EDITOR_BAYS] = std::array::from_fn(|i| {
+                let (st, b) = bay_of(i);
+                e.insert_editor_open(st, b)
+            });
             e.poll_editor();
             // **Ask the open plugins whether their latency moved.**
             //
@@ -3560,7 +3689,7 @@ impl DesktopApp {
             // An editor that has just closed is a preset that has just been
             // chosen. Save then, rather than only at quit, because the gap
             // between the two is where a force-quit loses the sound.
-            let closed = bays.iter().zip(&was).any(|(&(st, b), &w)| {
+            let closed = bays.clone().zip(was).any(|((st, b), w)| {
                 w && !self
                     .recorder
                     .engine
@@ -3581,7 +3710,7 @@ impl DesktopApp {
                 .recorder
                 .engine
                 .as_ref()
-                .is_some_and(|e| bays.iter().any(|&(st, b)| e.insert_editor_open(st, b)));
+                .is_some_and(|e| bays.clone().any(|(st, b)| e.insert_editor_open(st, b)));
             if any_open {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
@@ -9986,10 +10115,17 @@ impl DesktopApp {
             });
             if let Some(sender) = started {
                 self.recorder.reastream = Some(sender);
+                self.reastream_pushed = Some(target);
             }
         } else {
-            if let Some(sender) = self.recorder.reastream.as_ref() {
-                sender.set_config(target.clone());
+            // The sender keeps its config behind a mutex; handing it the
+            // same one sixty times a second is a lock and two String clones
+            // a frame for nothing. Pushed on change only.
+            if self.reastream_pushed.as_ref() != Some(&target) {
+                if let Some(sender) = self.recorder.reastream.as_ref() {
+                    sender.set_config(target.clone());
+                }
+                self.reastream_pushed = Some(target);
             }
             if let Some(engine) = self.recorder.engine.as_ref() {
                 engine.set_reastream_on(enabled);
@@ -10372,6 +10508,7 @@ impl DesktopApp {
                 // A new stream is a new callback to be measured.
                 self.recorder.out_block_logged = None;
                 self.recorder.engine = Some(e);
+                self.engine_epoch = self.engine_epoch.wrapping_add(1);
                 self.recorder.engine_error = None;
                 self.recorder.engine_retry = None;
                 self.recorder.engine_watch = crate::instrument::StallWatch::new();
@@ -12364,14 +12501,52 @@ fn write_insert_state(strip: usize, bay: usize, bundle: &str, state: &[u8]) {
 /// the user does not already know.
 #[cfg(feature = "recorder")]
 fn shorten_home(path: &std::path::Path) -> String {
+    // The home directory is read ONCE per process. `dirs::home_dir` walks
+    // the environment (and on Windows asks the shell) on every call, and
+    // this used to be called five times a frame for five paths that had not
+    // changed since the last settings write.
+    static HOME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let text = path.to_string_lossy().into_owned();
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = HOME.get_or_init(|| dirs::home_dir().map(|h| h.to_string_lossy().into_owned()))
+    else {
         return text;
     };
-    let home = home.to_string_lossy();
-    match text.strip_prefix(home.as_ref()) {
+    match text.strip_prefix(home.as_str()) {
         Some(rest) => format!("~{rest}"),
         None => text,
+    }
+}
+
+/// The per-frame strings `fill_recorder_state` keeps between frames, each
+/// beside the inputs that made it. See the field on `DesktopApp`.
+#[cfg(feature = "recorder")]
+#[derive(Default)]
+struct Frozen {
+    /// `(path, its shortened text)` for the record, project, export, preset
+    /// and IR roots, in that order.
+    dests: [(std::path::PathBuf, String); 5],
+    /// The take-folder preview: the second it was made for, the slug it was
+    /// made with, and the text.
+    folder: (i64, Option<String>, String),
+    /// The camera's format line, keyed on the format that made it.
+    camera: Option<((u32, u32, u32), String)>,
+    /// The input labels, keyed on the open inputs and the alias that made
+    /// them.
+    inputs: (Vec<(String, String, bool)>, String),
+    inputs_made: bool,
+}
+
+#[cfg(feature = "recorder")]
+impl Frozen {
+    /// The shortened text for root `slot`, rebuilt only when `path` differs
+    /// from the one it was made for.
+    fn dest(&mut self, slot: usize, path: std::path::PathBuf) -> &str {
+        let cell = &mut self.dests[slot.min(4)];
+        if cell.0 != path || cell.1.is_empty() {
+            cell.1 = shorten_home(&path);
+            cell.0 = path;
+        }
+        &cell.1
     }
 }
 
@@ -14513,6 +14688,20 @@ impl DesktopApp {
             last_session_state: std::mem::discriminant(&tangent_ui::recorder::RecordState::Idle),
             #[cfg(feature = "recorder")]
             last_transport_playing: false,
+            #[cfg(feature = "recorder")]
+            frozen: Frozen::default(),
+            #[cfg(feature = "recorder")]
+            comp_rows: Vec::new(),
+            #[cfg(feature = "recorder")]
+            comp_rows_stale: true,
+            #[cfg(feature = "recorder")]
+            comp_rows_at: None,
+            #[cfg(feature = "recorder")]
+            engine_epoch: 0,
+            #[cfg(feature = "recorder")]
+            comp_rows_epoch: u64::MAX,
+            #[cfg(feature = "recorder")]
+            reastream_pushed: None,
             pace_frames: 0,
             pace_dt: Vec::new(),
             reader_seen: false,
@@ -18051,6 +18240,190 @@ mod tests {").expect("the tests module")];
             !after_body.contains("self.recorder.session.is_recording() || open"),
             "the unconditional band tick is back in after_frame"
         );
+    }
+
+    /// **What the per-frame strings and the comp walk cost, before and
+    /// after.** `--ignored --nocapture`, release. "Before" is the sequence
+    /// `fill_recorder_state` ran every frame at ab2ccd5 — five
+    /// `shorten_home`s each calling `dirs::home_dir`, `folder_name` off the
+    /// clock, the camera line and four input labels — and the walk over
+    /// `INSERT_SPACE` ledger rows for the comp needles. "After" is the
+    /// `Frozen` cache with unchanged inputs and the `comp_rows` index.
+    #[test]
+    #[ignore]
+    fn what_the_per_frame_strings_and_the_comp_walk_cost_probe() {
+        use std::time::Instant;
+        let roots: [std::path::PathBuf; 5] = std::array::from_fn(|i| {
+            dirs::home_dir().unwrap_or_default().join(format!("Music/Tangent/root-{i}"))
+        });
+        let old_shorten = |path: &std::path::Path| -> String {
+            let text = path.to_string_lossy().into_owned();
+            let Some(home) = dirs::home_dir() else { return text };
+            let home = home.to_string_lossy();
+            match text.strip_prefix(home.as_ref()) {
+                Some(rest) => format!("~{rest}"),
+                None => text,
+            }
+        };
+        let inputs: Vec<(String, String, bool)> = (0..4)
+            .map(|i| ("Scarlett 18i20 USB".to_owned(), format!("input {}", i + 1), false))
+            .collect();
+        let n = 2_000u32;
+        // Before.
+        let t = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..n {
+            for r in &roots {
+                sink += old_shorten(r).len();
+            }
+            sink += tangent_record::take::folder_name(&tangent_record::take::WallTime::now_utc(), Some("take")).len();
+            sink += format!("{}x{} @ {:.0}fps", 1280, 720, 30.0).len();
+            for (device, channel, _) in &inputs {
+                sink += format!("{device} - {channel}").len();
+            }
+        }
+        let before = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+        // After.
+        let mut frozen = Frozen::default();
+        let t = Instant::now();
+        for _ in 0..n {
+            for (slot, r) in roots.iter().enumerate() {
+                sink += frozen.dest(slot, r.clone()).len();
+            }
+            let at = tangent_record::take::WallTime::now_utc();
+            let slug = Some("take".to_owned());
+            let f = &mut frozen.folder;
+            if f.0 != at.unix_seconds || f.1 != slug || f.2.is_empty() {
+                f.2 = tangent_record::take::folder_name(&at, slug.as_deref());
+                f.0 = at.unix_seconds;
+                f.1 = slug;
+            }
+            sink += f.2.len();
+            let key = (1280u32, 720u32, 30u32);
+            if frozen.camera.as_ref().is_none_or(|(k, _)| *k != key) {
+                frozen.camera = Some((key, format!("{}x{} @ {:.0}fps", 1280, 720, 30.0)));
+            }
+            if !frozen.inputs_made || frozen.inputs.0 != inputs || frozen.inputs.1 != "" {
+                frozen.inputs = (inputs.clone(), String::new());
+                frozen.inputs_made = true;
+            }
+        }
+        let after = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+        eprintln!("per-frame strings: before {before:.1} us, after {after:.1} us (sink {sink})");
+        // The comp walk.
+        let mut ledger: Vec<Option<String>> = vec![None; tangent_ui::recorder::INSERT_SPACE];
+        for i in [3usize, 7, 12, 40, 4149 * 3] {
+            ledger[i] = Some(crate::builtin_fx::COMP_PATH.to_owned());
+        }
+        let t = Instant::now();
+        let mut hits = 0usize;
+        for _ in 0..n {
+            for (_, loaded) in ledger.iter().enumerate() {
+                if loaded.as_deref() == Some(crate::builtin_fx::COMP_PATH) {
+                    hits += 1;
+                }
+            }
+        }
+        let walk = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+        let rows: Vec<usize> = ledger
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.as_deref() == Some(crate::builtin_fx::COMP_PATH))
+            .map(|(i, _)| i)
+            .collect();
+        let t = Instant::now();
+        for _ in 0..n {
+            for &i in &rows {
+                hits += usize::from(ledger[i].is_some());
+            }
+        }
+        let indexed = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+        eprintln!(
+            "comp needles over {} rows: walk {walk:.1} us, indexed {indexed:.2} us ({} comps, hits {hits})",
+            ledger.len(),
+            rows.len()
+        );
+    }
+
+    /// **No frame body reads the environment outside a once-only init.**
+    ///
+    /// `IVORY_DEMO_LEVELS` was read in `fill_recorder_state` and
+    /// `IVORY_OPEN_EDITOR` twice in `after_frame`, every frame, for hooks
+    /// that ship inert: three environment walks and three allocations a
+    /// frame to learn nothing. Every diagnostic variable in this file is
+    /// read once into a `OnceLock` now, and this holds the line for the
+    /// next hook: inside the per-frame bodies, `std::env::var` may appear
+    /// only as the initialiser of a `get_or_init`.
+    #[test]
+    fn no_frame_body_reads_the_environment_outside_a_once_init() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let body_of = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            let end = src[at + 1..].find("\n    fn ").map_or(src.len(), |n| at + 1 + n);
+            &src[at..end]
+        };
+        for name in [
+            "fn fill_recorder_state(&mut self",
+            "fn after_frame(&mut self",
+            "fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame)",
+            "fn push_monitor_settings(&mut self)",
+            "fn host_frame_due(&mut self, ctx: &egui::Context)",
+        ] {
+            let body = body_of(name);
+            let mut at = 0;
+            while let Some(rel) = body[at..].find("std::env::var") {
+                let here = at + rel;
+                at = here + 1;
+                let lead = &body[here.saturating_sub(120)..here];
+                assert!(
+                    lead.contains("get_or_init("),
+                    "{name} reads the environment every frame (`{}`); read it once into a OnceLock",
+                    &body[here..(here + 40).min(body.len())]
+                );
+            }
+        }
+    }
+
+    /// **The gain-reduction needles are read from an index, not a walk.**
+    ///
+    /// Twelve thousand `Option<String>` compares a frame found the same
+    /// handful of comp rows every time. The index stands in for the walk
+    /// and is refreshed on the one edge that changes the ledger — a bay
+    /// announced last frame loads this frame — plus a new engine and a
+    /// timed backstop. Pinned: the needle loop iterates `comp_rows`, and the
+    /// stale flag is raised off `insert_announced`.
+    #[test]
+    fn the_comp_needles_read_an_index_that_goes_stale_on_the_announce_edge() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let at = src.find("fn fill_recorder_state(&mut self").expect("fill_recorder_state");
+        let end = src[at + 1..].find("\n    fn ").map_or(src.len(), |n| at + 1 + n);
+        let body = &src[at..end];
+        assert!(body.contains("for &i in &self.comp_rows {"), "the needle loop no longer walks the index");
+        assert!(
+            !body.contains("for (i, loaded) in self.recorder.inserts_loaded.iter().enumerate()"),
+            "the per-frame walk over the whole ledger is back"
+        );
+        let stale = body.find("self.comp_rows_stale = true;").expect("nothing marks the index stale");
+        let gate = &body[stale.saturating_sub(120)..stale];
+        assert!(
+            gate.contains("if self.insert_announced.is_some()"),
+            "the index is not marked stale off the announce edge"
+        );
+    }
+
+    /// A shortened root is rebuilt only when the root moved.
+    #[test]
+    fn a_frozen_dest_is_rebuilt_only_when_its_root_moves() {
+        let mut f = Frozen::default();
+        let a = std::path::PathBuf::from("/tmp/a");
+        let first = f.dest(1, a.clone()).to_owned();
+        let ptr = f.dests[1].1.as_ptr();
+        assert_eq!(f.dest(1, a.clone()).as_ptr(), ptr, "an unchanged root rebuilt its text");
+        assert_eq!(f.dest(1, a), first);
+        let b = std::path::PathBuf::from("/tmp/b");
+        assert_ne!(f.dest(1, b), first, "a moved root kept the old text");
     }
 
     /// **A fresh engine is told the song's musical time.**
