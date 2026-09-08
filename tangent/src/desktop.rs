@@ -668,6 +668,11 @@ pub struct DesktopApp {
     /// bay.
     #[cfg(feature = "recorder")]
     insert_announced: Option<usize>,
+    /// How many bays the reconcile found outstanding THIS frame, with the
+    /// engine exclusion applied. `inserts_pending` reads it back for the
+    /// splash rather than walking the seat space a second time; see there.
+    #[cfg(feature = "recorder")]
+    insert_outstanding: usize,
     /// The MIDI port to open once the window is up: `Some(Some(name))` from
     /// `-p`, `Some(None)` for the priority chain, `None` once it has run.
     /// See where it is taken for why it is not done in the constructor.
@@ -4130,6 +4135,14 @@ impl DesktopApp {
         } else {
             0
         };
+        // Written down for `inserts_pending`, which used to make this walk
+        // again. The walk itself stays per frame: it measures 6.5 us
+        // settled (see `what_the_insert_reconcile_scans_every_frame`), and
+        // skipping it would need a revision counter from the desk's
+        // writers in `tangent-ui` to be honest about when the wanted table
+        // changed. MERGE-ME (ARRANGE/FRAME lanes): should `TangentApp` grow
+        // a settings/desk revision, gate this walk on it here.
+        self.insert_outstanding = outstanding;
         if outstanding == 0 {
             // **The last bay lands as "8 of 8", not as "7 of 8".** The
             // reading is taken from what is still outstanding, so the frame
@@ -14720,6 +14733,8 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             insert_announced: None,
             #[cfg(feature = "recorder")]
+            insert_outstanding: 0,
+            #[cfg(feature = "recorder")]
             cartridge: None,
             #[cfg(feature = "recorder")]
             cartridges: std::collections::HashMap::new(),
@@ -15903,21 +15918,20 @@ impl DesktopApp {
 
     /// Whether any insert bay still has a plugin to load.
     ///
-    /// The same comparison `reconcile_inserts` makes to pick the next one, so
-    /// the splash and the loader cannot disagree about whether the desk is
-    /// finished.
+    /// **The reconcile's own answer, read back, not asked again.** This
+    /// used to walk the thirteen-thousand-bay seat space a second time per
+    /// splash frame, allocating a `String` for every occupied bay to
+    /// compare it, to reach the very count `after_frame`'s reconcile had
+    /// computed a moment earlier in the same `update`. The two could not
+    /// disagree then and cannot now: one walk, one number, and the engine
+    /// exclusion — nothing can load without an engine, so a desk waiting
+    /// for one is not waiting for plugins and the splash must not hang on
+    /// it — is applied where the number is made. A frame in which
+    /// `after_frame` returned before its reconcile reads last frame's
+    /// count, which is what the splash would have seen a frame ago anyway.
     #[cfg(feature = "recorder")]
     fn inserts_pending(&self) -> bool {
-        // Nothing can load without an engine; a desk waiting for one is not
-        // waiting for plugins, and the splash must not hang on that.
-        if self.recorder.engine.is_none() {
-            return false;
-        }
-        let inserts = tangent_ui::recorder::INSERTS;
-        (0..self.recorder.inserts_loaded.len()).any(|i| {
-            self.app.insert(i / inserts, i % inserts).map(str::to_owned)
-                != self.recorder.inserts_loaded[i]
-        })
+        self.recorder.engine.is_some() && self.insert_outstanding > 0
     }
 
     /// Paint the splash, and decide when it goes.
@@ -22813,25 +22827,53 @@ mod sidecar_walk_probe {
             wanted[i] = "/plugins/thing.vst3".to_owned();
             loaded[i] = Some("/plugins/thing.vst3".to_owned());
         }
-        let want_at = |i: usize| -> Option<String> {
-            wanted
-                .get(i)
-                .map(String::as_str)
-                .filter(|p| !p.is_empty())
-                .map(str::to_owned)
+        // The shape `TangentApp::insert` answers with, and the compare the
+        // reconcile's `mismatched` closure makes: no allocation either side.
+        let want_at = |i: usize| -> Option<&str> {
+            wanted.get(i).map(String::as_str).filter(|p| !p.is_empty())
         };
+        let n = 200u32;
         let t = std::time::Instant::now();
-        let n = 60;
+        let mut outstanding = 0usize;
+        for _ in 0..n {
+            let (_, left) = super::insert_walk(loaded.len(), |i| want_at(i) != loaded[i].as_deref());
+            outstanding += left;
+        }
+        let walk = t.elapsed() / n;
+        // What `inserts_pending` used to do on top of it, per splash frame:
+        // the same walk with a String per occupied bay.
+        let t = std::time::Instant::now();
         let mut hits = 0usize;
         for _ in 0..n {
-            hits += usize::from((0..loaded.len()).any(|i| want_at(i) != loaded[i]));
+            hits += usize::from(
+                (0..loaded.len()).any(|i| want_at(i).map(str::to_owned) != loaded[i]),
+            );
         }
-        let per = t.elapsed() / n;
+        let owned = t.elapsed() / n;
         println!(
-            "reconcile scan over {INSERT_SPACE} seat/bays, settled ({hits} mismatches) = {per:?} \
-             per frame, {:.2}% of a 16.6ms frame",
-            per.as_secs_f64() / 0.0166 * 100.0
+            "reconcile walk over {INSERT_SPACE} seat/bays, settled ({outstanding} outstanding, {hits} pending) = {walk:?} per frame ({:.2}% of 16.6 ms); the retired inserts_pending walk was {owned:?} more under the splash",
+            walk.as_secs_f64() / 0.0166 * 100.0
         );
+    }
+
+    /// **The splash's question is the reconcile's count.** `inserts_pending`
+    /// reads back what `insert_walk` counted this frame instead of walking
+    /// again, so the two answers must be one: any mismatch at all is
+    /// exactly a positive outstanding count, on every shape of table.
+    #[test]
+    fn the_splash_reads_the_reconciles_count_rather_than_walking_again() {
+        for (len, mismatched) in [
+            (0usize, vec![]),
+            (5, vec![]),
+            (5, vec![0]),
+            (5, vec![4]),
+            (13_167, vec![1, 2, 13_166]),
+        ] {
+            let mismatch = |i: usize| mismatched.contains(&i);
+            let (_, outstanding) = super::insert_walk(len, mismatch);
+            assert_eq!(outstanding > 0, (0..len).any(mismatch), "{len} bays, {mismatched:?}");
+            assert_eq!(outstanding, mismatched.len());
+        }
     }
 
     /// **The one-launch shuffles are gated, and the gate is the only way in.**
