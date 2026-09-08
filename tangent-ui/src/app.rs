@@ -1,10 +1,19 @@
 //! The eframe App: fixed-size window mechanics, timers, MIDI state, and the
 //! wiring between piano, chord strip, menu, and dialogs.
 //!
-//! Timing model (D-UI-3): no busy loop AT REST. `request_repaint_after(50ms)`
-//! gives the Qt GUI-timer cadence, MIDI events wake the context immediately,
-//! and chord detection runs on its own 100ms gate (with immediate off-cadence
-//! runs after keytoggle clicks and note-preference changes).
+//! Timing model (D-UI-3): **no frames AT REST.** A window with nothing
+//! moving asks for no repaint at all: egui wakes it for input, the MIDI
+//! thread wakes it for a note (`request_repaint_of`), and everything that
+//! animates on its own — needles, the chord detector's 100 ms gate while
+//! notes are held, an armed deadline, the analyzer's decay, a notification
+//! ageing out — asks for exactly the frame it needs through
+//! `animation_due` at the end of `paint`. The host keeps its own ledger for
+//! the engine's side (`DesktopApp::host_frame_due`). It used to be a
+//! 50 ms tick regardless, which egui delivered as 33 ms: an idle desk paid
+//! the whole per-frame bill thirty times a second for nothing. That tick is
+//! one variable away — `IVORY_PACE=tick` — and it is still what a plugin
+//! editor gets, because a plugin's host drives its window on a cadence of
+//! its own.
 //!
 //! `IVORY_PACE=gesture` will instead pace the window to the DISPLAY while a
 //! gesture is in flight — a bare `request_repaint`, which puts eframe's loop
@@ -47,15 +56,24 @@ const GUI_TICK: Duration = Duration::from_millis(50);
 /// `paint`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pace {
-    /// The old behaviour: a 50 ms tick and nothing else.
+    /// Rest when nothing moves; every animator asks for its own frame. The
+    /// default — see the module doc and `animation_due`.
     Off,
+    /// The behaviour before resting existed: a 50 ms tick, always. Kept
+    /// reachable (`IVORY_PACE=tick`) so a state that stops animating under
+    /// `Off` can be confirmed as a missing ledger entry rather than argued
+    /// about, and so the owner can flip back in one launch.
+    Tick,
     /// Refresh-locked while a hand is on something, 50 ms at rest.
     Gesture,
     /// Refresh-locked always. Costs battery; measure before choosing it.
     Always,
 }
 
-/// `IVORY_PACE=off|gesture|always`, read once. **Off by default.**
+/// `IVORY_PACE=off|tick|gesture|always`, read once. **Off by default.**
+///
+/// `tick` is the escape hatch for the resting policy: the unconditional
+/// 50 ms tick every version before this one ran on.
 ///
 /// It shipped as `gesture` and is off again, because it cost more than it
 /// bought. What it bought was a smoother REDRAW during a gesture — about 155
@@ -79,6 +97,7 @@ fn pace_mode() -> Pace {
     *MODE.get_or_init(|| match std::env::var("IVORY_PACE").as_deref() {
         Ok("gesture") => Pace::Gesture,
         Ok("always") => Pace::Always,
+        Ok("tick") => Pace::Tick,
         _ => Pace::Off,
     })
 }
@@ -665,6 +684,11 @@ pub struct TangentApp {
     barre_drag: Option<(usize, u8)>,
     /// One-shot latch for the IVORY_INLINE=menu debug hook.
     demo_menu_done: bool,
+    /// A MIDI event was drained this frame. The host takes it
+    /// (`take_midi_activity`) to keep frames coming for a moment after a
+    /// note: the sound it made reaches the meters a buffer later, and a
+    /// window that rested on the very next frame would never see it move.
+    midi_activity: bool,
     /// Whether the main window currently has focus. Detached windows are
     /// raised with it and dropped with it, so the app moves as one thing.
     main_focused: bool,
@@ -3261,6 +3285,7 @@ impl TangentApp {
             manual_barre: None,
             barre_drag: None,
             demo_menu_done: false,
+            midi_activity: false,
             // Assume focused: a window that has just opened is, and the first
             // frames report None.
             main_focused: true,
@@ -4012,7 +4037,14 @@ impl TangentApp {
     fn process_midi_events(&mut self) {
         while let Ok(ev) = self.midi_rx.try_recv() {
             self.notes.apply(ev);
+            self.midi_activity = true;
         }
+    }
+
+    /// Whether a MIDI event arrived since this was last asked. See
+    /// `midi_activity`.
+    pub fn take_midi_activity(&mut self) -> bool {
+        std::mem::take(&mut self.midi_activity)
     }
 
     /// Whether a channel's MIDI reaches the theory view.
@@ -34095,7 +34127,7 @@ impl TangentApp {
         // reason, and `window_sizing` keeps a plugin editor from ever doing
         // it inside somebody else's host.
         let paced = match pace_mode() {
-            Pace::Off => false,
+            Pace::Off | Pace::Tick => false,
             Pace::Always => self.caps.window_sizing,
             Pace::Gesture => {
                 self.caps.window_sizing
@@ -34106,10 +34138,83 @@ impl TangentApp {
         };
         if paced {
             ctx.request_repaint();
-        } else {
-            // 50ms GUI cadence; MIDI events wake us sooner via request_repaint_of.
+        } else if pace_mode() == Pace::Tick || !self.caps.window_sizing {
+            // The old 50 ms cadence: asked for by name, or a plugin editor,
+            // whose host owns the window's clock and has no ledger of ours
+            // to consult. MIDI events wake us sooner via request_repaint_of.
             ctx.request_repaint_after(GUI_TICK);
+        } else if let Some(due) = self.animation_due(Instant::now()) {
+            // **Rest otherwise.** Only what is moving asks, and it asks for
+            // exactly when it next needs to be drawn — see `animation_due`.
+            ctx.request_repaint_after(due);
         }
+    }
+
+    /// **What on the app's side still needs a frame with no hand on
+    /// anything**, as the time until it does — `None` when nothing does.
+    ///
+    /// This is the ledger the resting window runs on. egui repaints for
+    /// input by itself and the MIDI thread wakes it for a note; every
+    /// animator that runs on the clock alone has to be listed here or ask
+    /// for its own frame where it animates, and most already do: the VU
+    /// needles (`advance_vu`), the selection ring's withheld off, the MIDI
+    /// editor's audition (`preview_until`), the input and swing menus, an
+    /// insert face's live values, the IR wizard, the export progress, the
+    /// heart, the confetti, the edge auto-scroll, the decoration nudge and a
+    /// notification ageing out — each with its own `request_repaint`. What
+    /// is gathered HERE is the rest: the deadlines that were only ever
+    /// POLLED in `paint`, on the assumption that a frame would come by
+    /// anyway, and the two readouts that move on time alone.
+    ///
+    /// The deadlines: the settings and geometry debounces (a fader drag's
+    /// write has to fire without the mouse moving again), the four startup
+    /// detach single-shots, the window-manager grace windows on the
+    /// detached windows, the uncover handshake, and the decoration nudge.
+    /// The cadences: the chord detector and the voicing solver run on a
+    /// 100 ms gate while notes are held — a chord that lands one event at a
+    /// time would otherwise read as its first note until the next event —
+    /// and the analyzer's smoothing and peak fall while it is showing and
+    /// the scope's envelope is still up or the curves have not reached the
+    /// floor.
+    ///
+    /// The host keeps the other half of the ledger — transport, take,
+    /// meters, camera, engine — in `DesktopApp::host_frame_due`; the two
+    /// combine because `request_repaint_after` keeps the MINIMUM asked.
+    fn animation_due(&self, now: Instant) -> Option<Duration> {
+        let mut due: Option<Duration> = None;
+        let mut sooner = |d: Duration| due = Some(due.map_or(d, |c: Duration| c.min(d)));
+        let by = |t: Instant| t.saturating_duration_since(now);
+        for deadline in [
+            self.settings_save_at.get(),
+            self.geometry_save_at,
+            self.startup_fret_detach_at,
+            self.startup_theory_detach_at,
+            self.startup_recorder_detach_at,
+            self.startup_detach_at,
+            self.decor_nudge_until,
+            self.fret_shown_at.map(|t| t + WM_GRACE),
+            self.detached_shown_at.map(|t| t + WM_GRACE),
+            self.uncover_asked_at
+                .filter(|_| self.pending_window_size.is_some())
+                .map(|t| t + UNCOVER_GRACE),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            sooner(by(deadline));
+        }
+        // Notes held on any instrument: the detector and the solver tick.
+        if !self.sounding.is_empty()
+            || !self.notes.held().is_empty()
+            || self.recorder.lane_sounding.iter().any(|m| *m != 0)
+        {
+            sooner(DETECT_TICK);
+        }
+        // The analyzer, while it is on screen and still has somewhere to go.
+        if self.analyzer_showing() && (self.scope.live() || !self.analyzer.settled()) {
+            sooner(Duration::from_millis(33));
+        }
+        due
     }
 }
 
@@ -48764,6 +48869,225 @@ mod tests {").expect("the tests module")];
         }
     }
 
+    /// One frame with no input; what the app asked egui for afterwards.
+    /// `Duration::MAX` is egui's word for "nothing".
+    fn frame_asks(ctx: &egui::Context, app: &mut TangentApp) -> Duration {
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |v| v.repaint_delay)
+    }
+
+    /// Frames until the app rests, or the last delay it asked for. The
+    /// startup single-shots (the detach restores, 100 ms in) are real
+    /// deadlines and are waited out rather than assumed away.
+    fn settle(ctx: &egui::Context, app: &mut TangentApp) -> Duration {
+        let mut asked = Duration::ZERO;
+        // Three seconds of wall time: the decoration nudge armed on the
+        // first frame is a 1.2 s window of 50 ms frames, and egui's own
+        // widget animations ask for immediate frames that still take time.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            asked = frame_asks(ctx, app);
+            if asked >= Duration::from_secs(1) {
+                break;
+            }
+            std::thread::sleep(asked.clamp(Duration::from_millis(16), Duration::from_millis(300)));
+        }
+        asked
+    }
+
+    /// Who asked for the last repaint, from egui's own record — the
+    /// message a resting test prints when something still wants a frame.
+    fn causes(ctx: &egui::Context) -> String {
+        ctx.repaint_causes()
+            .iter()
+            .map(|c| format!("{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// A desktop app with nothing chosen that animates on its own: no
+    /// Welcome card (it is modal) and no animated heart (a supporter's
+    /// setting, and the license on this machine is whatever is installed).
+    fn quiet_desktop(show_recorder: bool) -> (egui::Context, TangentApp) {
+        let mut s = Settings::default();
+        s.show_welcome = false;
+        s.show_recorder = show_recorder;
+        s.heart_animate = false;
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, s);
+        app.dialog = None;
+        (ctx, app)
+    }
+
+    /// **An idle desk asks for no repaint.**
+    ///
+    /// The whole point of the resting policy, pinned from the outside: after
+    /// the startup deadlines have passed, a desktop window with nothing
+    /// moving — band closed, then band open with silent meters and a
+    /// settled analyzer — ends its frame asking egui for nothing. Every
+    /// per-frame cost in the host used to be multiplied by the 30 Hz this
+    /// test would have measured.
+    #[test]
+    fn an_idle_desk_asks_for_no_repaint() {
+        let (ctx, mut app) = quiet_desktop(false);
+        if app.license.cheated() {
+            // The cheat marker animates the heart's crackle whatever the
+            // setting says; that machine cannot make this claim.
+            return;
+        }
+        let asked = settle(&ctx, &mut app);
+        assert!(
+            asked >= Duration::from_secs(1),
+            "an idle desk still asks for a frame in {asked:?}; asked by {}",
+            causes(&ctx)
+        );
+        // And with the band showing: the analyzer is on screen, unfed and
+        // settled; the needles rest at zero.
+        app.settings.show_recorder = true;
+        let asked = settle(&ctx, &mut app);
+        assert!(
+            asked >= Duration::from_secs(1),
+            "an idle band still asks for a frame in {asked:?}; asked by {}",
+            causes(&ctx)
+        );
+    }
+
+    /// **A debounced settings write earns its own frame.** The drain lives
+    /// in `paint`; a resting window that never painted again would never
+    /// write, and the fader's value would wait for the next mouse move.
+    #[test]
+    fn a_pending_settings_write_earns_its_frame() {
+        let (ctx, mut app) = quiet_desktop(false);
+        let _ = settle(&ctx, &mut app);
+        app.save_settings_soon();
+        let asked = frame_asks(&ctx, &mut app);
+        assert!(asked <= GEOMETRY_SAVE_DELAY, "the owed write earned no frame: {asked:?}");
+        app.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
+        app.settings_save_at.set(None);
+        let asked = frame_asks(&ctx, &mut app);
+        assert!(asked <= GEOMETRY_SAVE_DELAY, "the owed geometry write earned no frame: {asked:?}");
+    }
+
+    /// **Held notes keep the chord detector ticking.** Detection runs on a
+    /// 100 ms gate; a chord that arrives one event at a time would read as
+    /// its first note until the next event if nothing asked for the tick.
+    #[test]
+    fn held_notes_keep_the_detector_ticking() {
+        let (ctx, mut app) = quiet_desktop(false);
+        if app.license.cheated() {
+            return;
+        }
+        let _ = settle(&ctx, &mut app);
+        // A key held on the MIDI keyboard, by the road a real one takes.
+        app.notes.apply(MidiEvent::NoteOn { note: 60, velocity: 100 });
+        let asked = frame_asks(&ctx, &mut app);
+        assert!(asked <= DETECT_TICK, "a held note earned no detector tick: {asked:?}");
+        app.notes.apply(MidiEvent::NoteOff { note: 60 });
+        let asked = settle(&ctx, &mut app);
+        assert!(
+            asked >= Duration::from_secs(1),
+            "the desk did not rest once the note was let go: {asked:?}; asked by {}",
+            causes(&ctx)
+        );
+    }
+
+    /// **A live scope keeps the analyzer moving, and a settled one lets the
+    /// window rest.** The analyzer is fed by the host and decays on its own
+    /// clock; while its envelope is up or its curves are above the floor it
+    /// asks for 33 ms, and once everything has fallen it asks for nothing.
+    #[test]
+    fn a_live_scope_keeps_the_analyzer_moving_until_it_settles() {
+        let (ctx, mut app) = quiet_desktop(true);
+        if app.license.cheated() {
+            return;
+        }
+        let _ = settle(&ctx, &mut app);
+        assert!(app.analyzer_showing(), "the band is open with no camera, so the analyzer shows");
+        // A burst of full-scale sine, enough frames for one FFT.
+        let n = 8_192usize;
+        let loud: Vec<f32> = (0..n * 2)
+            .map(|i| ((i / 2) as f32 * 0.1).sin() * 0.9)
+            .collect();
+        app.scope_feed(&loud, n as f32 / 48_000.0, 48_000.0);
+        let asked = frame_asks(&ctx, &mut app);
+        assert!(asked <= Duration::from_millis(33), "a live analyzer earned no frame: {asked:?}");
+        // Silence, fed in big steps of time so the envelope and the peaks
+        // fall all the way; the window must then rest.
+        let quiet = vec![0.0f32; n * 2];
+        for _ in 0..60 {
+            app.scope_feed(&quiet, 1.0, 48_000.0);
+        }
+        assert!(!app.scope.live(), "the scope envelope did not fall");
+        let asked = settle(&ctx, &mut app);
+        assert!(
+            asked >= Duration::from_secs(1),
+            "a settled analyzer still asks for frames: {asked:?}; asked by {}",
+            causes(&ctx)
+        );
+    }
+
+    /// **How many frames an idle window paints in a second**, band closed
+    /// and band open, under the resting policy. Run with `--ignored
+    /// --nocapture`; the number to compare against is the thirty a second
+    /// the unconditional `GUI_TICK` produced (50 ms asked, 33 ms delivered).
+    #[test]
+    #[ignore]
+    fn idle_frames_in_one_second_probe() {
+        for band in [false, true] {
+            let (ctx, mut app) = quiet_desktop(band);
+            let _ = settle(&ctx, &mut app);
+            let start = Instant::now();
+            let mut frames = 0u32;
+            while start.elapsed() < Duration::from_secs(1) {
+                let asked = frame_asks(&ctx, &mut app);
+                frames += 1;
+                let left = Duration::from_secs(1).saturating_sub(start.elapsed());
+                if asked >= left {
+                    break;
+                }
+                std::thread::sleep(asked.max(Duration::from_millis(1)));
+            }
+            eprintln!(
+                "idle frames in one simulated second, band {}: {frames} (the old tick painted ~30)",
+                if band { "open" } else { "closed" }
+            );
+        }
+    }
+
+    /// **A plugin editor keeps the old tick.** Its host owns the window's
+    /// clock and has no ledger of ours; the 50 ms cadence every version ran
+    /// on is what it still gets.
+    #[test]
+    fn a_plugin_editor_keeps_the_old_tick() {
+        let (ctx, mut app) = headless(Caps::PLUGIN);
+        app.dialog = None;
+        let asked = settle(&ctx, &mut app);
+        assert!(asked <= GUI_TICK, "the plugin editor rested: {asked:?}");
+    }
+
+    /// **The old cadence is one variable away.** `IVORY_PACE=tick` is read
+    /// once into a `OnceLock`, so it cannot be flipped inside a test; the
+    /// arm is pinned by reading it instead.
+    #[test]
+    fn the_old_cadence_is_reachable_by_name() {
+        let whole = include_str!("app.rs");
+        let src = &whole[..whole.find("#[cfg(test)]
+mod tests {").expect("the tests module")];
+        assert!(src.contains("Ok(\"tick\") => Pace::Tick,"), "IVORY_PACE=tick no longer names the old cadence");
+        let tail = src.rfind("let paced = match pace_mode()").expect("the pacing decision");
+        assert!(
+            src[tail..].contains("pace_mode() == Pace::Tick || !self.caps.window_sizing"),
+            "Pace::Tick no longer restores the unconditional GUI_TICK"
+        );
+    }
+
     /// D-UI-15: the fretboard is a third band in the same stack, and the two
     /// places that compute the window height have to agree about it. They used
     /// to be two copies of the same arithmetic; drift between them is a window
@@ -56141,4 +56465,5 @@ mod dirty_cost_probe {
         say("AFTER  undo_commit (a real edit)", t.elapsed() / n);
     }
 }
+
 

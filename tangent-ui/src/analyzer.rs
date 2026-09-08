@@ -76,6 +76,10 @@ const PEAK_FALL_DB_S: f32 = 12.0;
 /// The lowest level the picture will ever show, whatever the range says.
 /// Below −140 the FFT is reading its own rounding.
 const FLOOR_DB: f32 = -140.0;
+/// Less than this much change in a frame is not motion — see
+/// [`Analyzer::settled`]. A tenth of a decibel is under a pixel on every
+/// scale the face draws.
+const SETTLED_DB: f32 = 0.1;
 
 /// How long the printed peak holds before it takes a new measurement.
 /// Three readings a second is what a person can follow; sixty is a blur.
@@ -450,6 +454,11 @@ pub struct Analyzer {
     fed: bool,
     re: Vec<f32>,
     im: Vec<f32>,
+    /// Whether the last `tick` changed anything an eye could see — see
+    /// `settled`. Interior-mutable because the question is asked from the
+    /// repaint decision, which holds the app by shared reference; atomic
+    /// rather than a `Cell` only so an `Analyzer` can sit in a `static`.
+    moved: std::sync::atomic::AtomicBool,
 }
 
 impl Analyzer {
@@ -472,6 +481,7 @@ impl Analyzer {
             fed: false,
             re: Vec::new(),
             im: Vec::new(),
+            moved: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -657,26 +667,52 @@ impl Analyzer {
         };
         let fall = PEAK_FALL_DB_S * dt.max(0.0);
         let peak_mode = self.cfg.peak;
-        let settle = |avg: &mut [f32], peak: &mut [f32], now: &[f32]| {
+        // Whether any series moved by more than the eye resolves — see
+        // `settled`, which the repaint policy asks.
+        let mut moved = false;
+        let mut settle = |avg: &mut [f32], peak: &mut [f32], now: &[f32]| {
             for i in 0..avg.len() {
+                let (was_avg, was_peak) = (avg[i], peak[i]);
                 avg[i] += (now[i] - avg[i]) * k;
                 peak[i] = match peak_mode {
                     Peak::Off => avg[i],
                     Peak::Decay => (peak[i] - fall).max(avg[i]),
                     Peak::Hold => peak[i].max(avg[i]),
                 };
+                moved |= (avg[i] - was_avg).abs() > SETTLED_DB || (peak[i] - was_peak).abs() > SETTLED_DB;
             }
         };
         let fine = self.fine.clone();
         settle(&mut self.avg, &mut self.peak, &fine);
         settle(&mut self.third, &mut self.third_peak, &thirds);
         settle(&mut self.octave, &mut self.octave_peak, &octaves);
+        self.moved.store(moved, std::sync::atomic::Ordering::Relaxed);
         self.fed = true;
     }
 
     /// The curve as drawn, dB per display bin — for tests and readouts.
     pub fn curve(&self) -> &[f32] {
         &self.avg
+    }
+
+    /// **Whether the last tick changed nothing an eye could see** — the
+    /// averaging has converged and no peak is still falling. The repaint
+    /// policy asks this: an analyzer that is settled draws the same picture
+    /// next frame, so a resting window loses nothing by not painting it.
+    ///
+    /// Motion rather than "at the floor", because the floor is not one
+    /// number: the tilt lifts a silent curve by up to twenty decibels at the
+    /// top of the scale, and a HELD peak sits wherever it was caught and is
+    /// still perfectly still. And it is measured in `tick` rather than
+    /// derived here, so the answer is exactly what the last feed did.
+    ///
+    /// **Consumed on read.** The host feeds the analyzer before the frame
+    /// paints and this is asked at the frame's end, so a tick that moved
+    /// something earns exactly one more frame; when the feed stops (the
+    /// engine went away) the flag is not renewed and the window rests on a
+    /// picture that would not have changed anyway.
+    pub fn settled(&self) -> bool {
+        !self.moved.swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The level under `x` (0..1 across the picture), on whichever series is

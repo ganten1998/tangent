@@ -134,6 +134,14 @@ impl Scope {
         self.filled
     }
 
+    /// Whether the envelope is still above its floor — sound was heard
+    /// inside the last ~350 ms, so the face and the analyzer fed from this
+    /// ring have something to draw or something to decay. The repaint
+    /// policy asks this to decide whether a frame is owed.
+    pub fn live(&self) -> bool {
+        self.env > ENV_FLOOR
+    }
+
     /// Stereo frame `i` frames BEHIND the newest — the analyzer's read,
     /// which needs both sides for its mid and side channels where the
     /// trace only ever needed the sum.
