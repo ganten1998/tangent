@@ -1294,6 +1294,12 @@ pub struct TangentApp {
     export_override: Option<recorder::ExportSpec>,
     /// A settings write owed once the user stops dragging a fader.
     settings_save_at: Option<Instant>,
+    /// How many times `save_settings` reached the disk. The open-path tests
+    /// pin the count — one per explicit open, none per undo — and a count
+    /// is deterministic where an mtime is not: two pretty-prints of the
+    /// same file can land inside one timestamp tick.
+    #[cfg(test)]
+    settings_writes: std::cell::Cell<u32>,
     /// Which insert the open picker is filling, if it is filling one.
     picker_insert: Option<(usize, usize)>,
     /// Every VST3 bundle the host found, for the picker.
@@ -3491,6 +3497,8 @@ impl TangentApp {
             reveal_request: None,
             export_override: None,
             settings_save_at: None,
+            #[cfg(test)]
+            settings_writes: std::cell::Cell::new(0),
             picker_insert: None,
             grabbed: None,
             num_edit: None,
@@ -3760,6 +3768,8 @@ impl TangentApp {
     /// set to. A plugin's state belongs in its own project file.
     fn save_settings(&self) {
         if self.caps.persist_global_settings {
+            #[cfg(test)]
+            self.settings_writes.set(self.settings_writes.get().saturating_add(1));
             self.settings.save();
         }
     }
@@ -8783,6 +8793,13 @@ impl TangentApp {
     /// Put a document's desk on the settings — the live desk — clamped the
     /// way every settings read is. The host is told to reload the bays with
     /// the states the project carries.
+    ///
+    /// **Does not write the settings file.** The callers own that write: an
+    /// explicit open writes once, after everything an open touches has
+    /// landed; undo owes a debounced one; a stencil read for adoption is
+    /// repointed and written by its adopter. This used to end in
+    /// `save_settings`, which made every open two synchronous pretty-prints
+    /// of a 15,000-line file and every Ctrl+Z one more.
     fn apply_desk_snapshot(&mut self, d: &crate::arrangement::DeskSnap) {
         // A document saved before the DRUM BUS carries ten-strip arrays:
         // its click, bus and master rows would land one seat early. Grown
@@ -8987,7 +9004,6 @@ impl TangentApp {
                 let _ = self.settings.routes.drop_into(ch);
             }
         }
-        self.save_settings();
         self.desk_reload = true;
     }
 
@@ -10460,7 +10476,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
         if keep == KeepPath::Write {
             self.settings.project_path = doc.to_string_lossy().into_owned();
-            self.save_settings();
         }
         self.clips_dirty = true;
         // **The session's DESK arrives with it** — kinds, bays, names,
@@ -10475,6 +10490,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // carries replaces the one in memory.
         self.load_drumpad_doc();
         self.reconcile_auto_bases();
+        // **One settings write per open, here, after everything an open
+        // touches has landed** — the path, the desk, whatever the reconcile
+        // moved. It used to be two synchronous writes: one for the path
+        // BEFORE the desk was applied, so it pretty-printed the previous
+        // session's desk, and one inside `apply_desk_snapshot`.
+        // `project_path` still reaches disk in the same call it changes
+        // in, which is what a relaunch after a crash depends on.
+        //
+        // A `Leave` open writes nothing: `adopt_template` repoints and
+        // writes on its next line, and a stencil opened from the dialog
+        // keeps the previous session's path and leaves the mirror of its
+        // desk to the next settings write — of which there is one for
+        // every control touched.
+        if keep == KeepPath::Write {
+            self.save_settings();
+        }
         self.undo_reset();
     }
 
@@ -13289,6 +13320,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // `Moment`. The document carries the moment's desk afterwards, as
         // the parsed one used to, for the two roads that read it.
         self.apply_desk_snapshot(&moment.desk);
+        // The settings file is a MIRROR of a desk the document already
+        // holds, so the write it is owed rides the fader debounce rather
+        // than landing synchronously on every Ctrl+Z — it was a 15,000-line
+        // pretty-print per keypress. The host flushes the debounce at quit.
+        // The one settings-only fact the apply changes, a route dropped for
+        // a restored folder, rides the same write. Do not put a synchronous
+        // `save_settings` back here.
+        self.save_settings_soon();
         let mut arr = (*moment.arr).clone();
         arr.desk = Some((*moment.desk).clone());
         self.arrangement = arr;
@@ -52524,6 +52563,92 @@ mod folder_tests {
         app.arrangement.clips[0].notes[0].at_s = f64::from_bits(0x7ff8_0000_0000_0001);
         app.undo_commit();
         assert_eq!(app.history.len(), depth + 1, "two NaNs made two moments");
+    }
+
+    /// A project folder with a document that carries a desk — the common
+    /// case, since every document the app saves carries one.
+    fn a_project_with_a_desk(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("song");
+        std::fs::create_dir_all(&dir).expect("project dir");
+        let doc = crate::arrangement::doc_in(&dir);
+        let mut arr = crate::arrangement::Arrangement::default();
+        arr.desk = Some(TangentApp::template_desk());
+        arr.save_to(&doc);
+        (root, doc)
+    }
+
+    /// **An explicit open writes the settings file once.** It was two: one
+    /// for the path before the desk was applied, and one inside
+    /// `apply_desk_snapshot`. Counted rather than timed — see
+    /// `settings_writes`.
+    #[test]
+    fn an_explicit_open_writes_the_settings_once() {
+        let (root, doc) = a_project_with_a_desk("open-once");
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings_writes.set(0);
+        app.open_project(&doc);
+        assert_eq!(
+            app.settings_writes.get(),
+            1,
+            "an explicit open wrote the settings {} times",
+            app.settings_writes.get()
+        );
+        assert!(app.settings_save_at.is_none(), "an explicit open also owes a debounced write");
+        assert_eq!(app.settings.project_path, doc.to_string_lossy(), "the path did not land");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Adopting the template writes once, after the repoint.** The inner
+    /// open is a `Leave` and owes nothing, so what reaches the disk names
+    /// the scratch and never the shelf.
+    #[test]
+    fn adopting_the_template_writes_the_settings_once_after_the_repoint() {
+        let (root, doc) = a_project_with_a_desk("adopt-once");
+        let template = doc.parent().expect("the template dir").to_path_buf();
+        let scratch = root.join("Untitled");
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings_writes.set(0);
+        app.adopt_template(&template, &scratch);
+        assert_eq!(
+            app.settings_writes.get(),
+            1,
+            "adopting wrote the settings {} times",
+            app.settings_writes.get()
+        );
+        let on_disk = Settings::load();
+        assert!(
+            std::path::Path::new(&on_disk.project_path).starts_with(&scratch),
+            "the one write named {}, not the scratch",
+            on_disk.project_path
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Undo owes a debounced settings write and makes no synchronous
+    /// one.** Every Ctrl+Z used to pretty-print the whole settings file
+    /// through `apply_desk_snapshot`.
+    #[test]
+    fn undo_owes_a_debounced_settings_write_and_makes_no_synchronous_one() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.undo_reset();
+        let was = app.settings.master_gain;
+        app.settings.master_gain = 0.25;
+        app.arr_save_edits();
+        app.settings_writes.set(0);
+        app.settings_save_at = None;
+        app.undo();
+        assert!((app.settings.master_gain - was).abs() < 1e-9, "undo did not restore the desk");
+        assert_eq!(app.settings_writes.get(), 0, "undo wrote the settings synchronously");
+        assert!(app.settings_save_at.is_some(), "undo owes no settings write at all");
+        app.redo();
+        assert!((app.settings.master_gain - 0.25).abs() < 1e-9, "redo did not restore the desk");
+        assert_eq!(app.settings_writes.get(), 0, "redo wrote the settings synchronously");
     }
 
     /// The document is a FIXED POINT: writing what was read gives the same
