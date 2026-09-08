@@ -9428,7 +9428,13 @@ impl DesktopApp {
         if self.land_decodes(ctx) {
             self.clips_owed = true;
         }
+        // **Nothing owed, nothing queued, nothing in the crew's hands** —
+        // which is also a decode meter with no work left under it. See
+        // `settle_warm_meter`: this return is reachable with the cover
+        // still standing, and the drain below is not the only road that
+        // owes it an exit.
         if !self.clips_owed && !self.pads_owed && self.warm.is_empty() && self.pool.idle() {
+            self.settle_warm_meter();
             return;
         }
         // **The notes do not wait on the decoder.** See
@@ -9497,17 +9503,7 @@ impl DesktopApp {
         // latency on every note anybody draws, since an edit marks the
         // clips dirty.
         if self.warm.is_empty() && self.pool.idle() {
-            // The same courtesy the insert meter gets: the frame the queue
-            // empties on is the only one that can read "12 of 12".
-            if !self.warm_count.idle() && self.busied == Busied::Decode {
-                let progress = self.warm_count.saw(0).progress();
-                if let Some(busy) = self.busy.as_mut() {
-                    busy.detail = None;
-                    busy.progress = Some(progress);
-                }
-            }
-            self.warm_count = Counted::default();
-            self.busy_chunk_done(Busied::Decode);
+            self.settle_warm_meter();
             let mut reloaded = false;
             if std::mem::take(&mut self.clips_owed) {
                 reloaded = true;
@@ -9548,6 +9544,44 @@ impl DesktopApp {
         // starting and the user touching something nothing else is asking
         // for one.
         ctx.request_repaint();
+    }
+
+    /// **The decode meter's last reading, and its cover's exit.**
+    ///
+    /// The frame the work runs out on is the only one that can read "45 of
+    /// 45": the reading is taken from what is still OUTSTANDING, so a meter
+    /// whose final state is one short of full is a meter that looks like it
+    /// gave up. The same courtesy the insert loader keeps, for the same
+    /// reason. Then the cover is let go — `busy.rs`'s law, which is that a
+    /// chunked driver owns the overlay until it says it has run out of
+    /// work, and nothing else can take it away.
+    ///
+    /// **Called from BOTH of `run_warm`'s quiet returns, because the second
+    /// one is reachable on its own.** It used to hang off the drain alone,
+    /// and this is the road that got past it: `queue_warm` fills the queue
+    /// while a debt is open, then the deadline door ANSWERS that debt —
+    /// every clip in the document cached or refused — while the queue still
+    /// holds paths no clip references any more, the edit that dropped them
+    /// having landed after they were queued. Those decode, come back, and
+    /// are dropped as unwanted (`land_decodes` keeps only what the document
+    /// still names), so nothing raises a debt again; the next pass arrives
+    /// at the do-nothing return with both flags false, an empty queue and
+    /// an idle crew, and the drain is never reached. "Loading audio" then
+    /// covers the desk for the rest of the session, repainting for ever,
+    /// because `paint_busy` keeps the frames coming while a cover is up.
+    /// Delete the audio clips of a project whose takes are still loading
+    /// and that is precisely what happened.
+    #[cfg(feature = "recorder")]
+    fn settle_warm_meter(&mut self) {
+        if !self.warm_count.idle() && self.busied == Busied::Decode {
+            let progress = self.warm_count.saw(0).progress();
+            if let Some(busy) = self.busy.as_mut() {
+                busy.detail = None;
+                busy.progress = Some(progress);
+            }
+        }
+        self.warm_count = Counted::default();
+        self.busy_chunk_done(Busied::Decode);
     }
 
     /// Take what the crew has finished into the caches. Answers whether a
@@ -18715,6 +18749,46 @@ mod tests {
             "the pass that found nothing to do asks for another frame, which \
              is a window that never rests again"
         );
+    }
+
+    /// **Every road out of the warm-up that leaves no work behind lets the
+    /// cover go.**
+    ///
+    /// `run_warm` has two quiet returns and only one of them used to settle
+    /// the meter, which left "Loading audio" over the desk for the rest of
+    /// the session on a road that is perfectly ordinary — see
+    /// `settle_warm_meter` for how it is reached. A source scan, because
+    /// `DesktopApp` cannot be built in a test; what it pins is that neither
+    /// return can be written again without the exit.
+    #[test]
+    fn a_warm_pass_with_nothing_left_lets_the_cover_go() {
+        let src = include_str!("desktop.rs");
+        let body = &src[..src.find("mod tests {").expect("the test module")];
+        let warm = body
+            .find("fn run_warm")
+            .map(|at| &body[at..])
+            .expect("run_warm is still called that");
+        let warm = &warm[..warm.find("fn settle_warm_meter").expect("the exit follows")];
+        // Both quiet returns: the one that found nothing to do, and the one
+        // that drains. Nothing else in the function returns.
+        assert_eq!(warm.matches("            return;").count(), 2, "run_warm's returns moved");
+        assert_eq!(
+            warm.matches("self.settle_warm_meter();").count(),
+            2,
+            "a road out of the warm-up leaves the decode cover standing with \
+             no work under it, and paint_busy repaints for ever behind it"
+        );
+        // And the exit really is an exit: the meter's last reading and the
+        // cover's release, in that order.
+        let exit = body
+            .find("fn settle_warm_meter")
+            .map(|at| &body[at..])
+            .expect("settle_warm_meter");
+        let saw = exit.find("self.warm_count.saw(0)").expect("the n-of-n courtesy");
+        let done = exit
+            .find("self.busy_chunk_done(Busied::Decode);")
+            .expect("the cover is let go");
+        assert!(saw < done, "the meter has to read n of n before the cover goes");
     }
 
     /// The ceiling on a render is the decoder's own, applied to what the
