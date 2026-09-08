@@ -53,6 +53,25 @@ pub struct Preset {
     /// this build does not know are KEPT: they are a newer build's knobs,
     /// and dropping them would make a round trip lossy.
     pub values: Vec<(String, f64)>,
+    /// **The unit's STATE that is not a knob**, as `(key, text)` — the
+    /// sampler's loaded file, the convolver's impulse.
+    ///
+    /// A preset that remembers only the knobs gives you back the right
+    /// envelope over silence: reopen a sampler patch and every crop, every
+    /// stage and every voice count is exactly where you left it, playing
+    /// nothing, because the FILE was never written down. That is not a
+    /// missing feature, it is a preset that lies about what it restored.
+    ///
+    /// Text and not numbers because what it holds is a PATH, which is the
+    /// same thing `ports::BuiltinFace::extra` carries across the firewall
+    /// and the same thing `builtin_fx::is_extra_symbol` gates on the engine
+    /// side — one shape for the one kind of state that is not a knob,
+    /// rather than a second per unit.
+    ///
+    /// Append-only by symbol, exactly as [`Self::values`] is: a key this
+    /// build does not know is a newer build's state and is carried, not
+    /// dropped, so a round trip through an older Tangent is lossless.
+    pub state: Vec<(String, String)>,
     /// Top-level keys this build does not know, preserved verbatim — the
     /// same courtesy the settings file and the drumpad sidecar extend.
     pub extra: Map<String, Value>,
@@ -60,7 +79,7 @@ pub struct Preset {
 
 /// The keys this build writes itself, so [`Preset::from_json`] knows what is
 /// somebody else's.
-const KNOWN_KEYS: &[&str] = &["version", "kind", "unit", "name", "values"];
+const KNOWN_KEYS: &[&str] = &["version", "kind", "unit", "name", "values", "state"];
 
 impl Preset {
     pub fn to_json(&self) -> String {
@@ -79,6 +98,15 @@ impl Preset {
             }
         }
         root.insert("values".into(), Value::Object(values));
+        // Written only when there IS state, so every preset written before
+        // this existed and every unit that has none looks exactly as it did.
+        if !self.state.is_empty() {
+            let mut state = Map::new();
+            for (key, text) in &self.state {
+                state.insert(key.clone(), Value::from(text.clone()));
+            }
+            root.insert("state".into(), Value::Object(state));
+        }
         for (k, v) in &self.extra {
             root.insert(k.clone(), v.clone());
         }
@@ -115,12 +143,20 @@ impl Preset {
                 .unwrap_or_default()
                 .to_owned(),
             values: Vec::new(),
+            state: Vec::new(),
             extra: Map::new(),
         };
         if let Some(Value::Object(values)) = root.get("values") {
             for (symbol, value) in values {
                 if let Some(v) = value.as_f64().filter(|v| v.is_finite()) {
                     out.values.push((symbol.clone(), v));
+                }
+            }
+        }
+        if let Some(Value::Object(state)) = root.get("state") {
+            for (key, text) in state {
+                if let Some(t) = text.as_str() {
+                    out.state.push((key.clone(), t.to_owned()));
                 }
             }
         }
@@ -176,6 +212,7 @@ mod tests {
             version: PRESET_VERSION,
             unit: "@tangent-eq".to_owned(),
             name: "Warm Bus".to_owned(),
+            state: Vec::new(),
             values: vec![
                 ("low_gain".to_owned(), 0.62),
                 ("high_gain".to_owned(), 0.41),
@@ -249,5 +286,60 @@ mod tests {
         // And an ordinary name is left alone.
         assert_eq!(safe_stem("Warm Bus 2"), "Warm Bus 2");
         assert_eq!(safe_stem(""), "preset");
+    }
+
+    /// **A preset remembers the SAMPLE, not only the knobs.**
+    ///
+    /// Without this a sampler patch reopens with every crop, every envelope
+    /// stage and every voice count exactly where it was left, playing
+    /// nothing — the right envelope over silence, which is not a missing
+    /// feature but a preset that lies about what it restored.
+    ///
+    /// The state round-trips as text and is APPEND-ONLY by key: a key this
+    /// build does not know is a newer build's state and is carried back out
+    /// rather than dropped, so a patch that has been through an older
+    /// Tangent still names its file.
+    #[test]
+    fn a_preset_remembers_the_sample_and_not_only_the_knobs() {
+        let p = Preset {
+            version: PRESET_VERSION,
+            unit: "@tangent-sampler".to_owned(),
+            name: "Room Kick".to_owned(),
+            values: vec![("start".to_owned(), 0.125), ("attack".to_owned(), 0.0)],
+            state: vec![
+                ("sample".to_owned(), "/m/Takes/kick 03.wav".to_owned()),
+                // A key from a build that does not exist yet.
+                ("from_tomorrow".to_owned(), "whatever it means".to_owned()),
+            ],
+            extra: Map::new(),
+        };
+        let back = Preset::from_json(&p.to_json()).expect("a preset it just wrote");
+        assert_eq!(back.state, p.state, "the sample did not survive the file");
+        assert_eq!(back.values, p.values);
+        assert_eq!(back.unit, p.unit);
+    }
+
+    /// **A preset with no state writes no `state` key**, so every file
+    /// written before this existed, and every unit that has none, looks
+    /// exactly as it did — and reads back the same.
+    #[test]
+    fn a_preset_with_nothing_to_remember_is_the_file_it_always_was() {
+        let p = Preset {
+            version: PRESET_VERSION,
+            unit: "@tangent-eq".to_owned(),
+            name: "Warm".to_owned(),
+            values: vec![("low_gain".to_owned(), 0.5)],
+            state: Vec::new(),
+            extra: Map::new(),
+        };
+        let text = p.to_json();
+        assert!(!text.contains("state"), "an empty state took a key:\n{text}");
+        assert!(Preset::from_json(&text).expect("round trip").state.is_empty());
+        // And a file written by an OLDER build simply has no state.
+        let old = r#"{"kind":"tangent-preset","version":1,"unit":"@tangent-sampler",
+                      "name":"Old","values":{"vol":0.5}}"#;
+        let back = Preset::from_json(old).expect("an older file is still a preset");
+        assert!(back.state.is_empty());
+        assert_eq!(back.values, vec![("vol".to_owned(), 0.5)]);
     }
 }
