@@ -1454,6 +1454,7 @@ impl Session {
         self.take.as_ref().map(Take::video)
     }
 
+    /// Seconds since the take started writing.
     pub fn elapsed(&self) -> f64 {
         match (self.state.is_writing(), self.started_instant) {
             (true, Some(at)) => at.elapsed().as_secs_f64(),
