@@ -3975,11 +3975,11 @@ fn on_ink(bg: Color32) -> Color32 {
     }
 }
 
-/// How many times `quiet` has been asked on this thread, for the test that
-/// holds a frame to a handful: each ask is a contrast walk, and a frame
-/// once made 124 of them for answers that do not change between frames.
-/// Thread-local because the tests run in parallel and a frame is drawn on
-/// the thread that asked for it.
+// How many times `quiet` has been asked on this thread, for the test that
+// holds a frame to a handful: each ask is a contrast walk, and a frame
+// once made 124 of them for answers that do not change between frames.
+// Thread-local because the tests run in parallel and a frame is drawn on
+// the thread that asked for it.
 #[cfg(test)]
 thread_local! {
     static QUIET_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

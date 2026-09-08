@@ -537,7 +537,7 @@ mod tests {
 
     /// A second of a 440 Hz tone at `rate`, written with this crate's own
     /// writer in `format`, under a directory of the test's own.
-    fn write_tone(name: &str, rate: u32, format: crate::wav::SampleFormat) -> Option<(std::path::PathBuf, Vec<f32>)> {
+    fn write_tone(name: &str, rate: u32, format: crate::wav::SampleFormat) -> Option<(PathBuf, Vec<f32>)> {
         let dir = std::env::temp_dir().join(format!("tangent-decode-{}-{name}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("tone.wav");

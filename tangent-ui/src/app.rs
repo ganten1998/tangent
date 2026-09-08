@@ -8999,7 +8999,7 @@ impl TangentApp {
             // where the drumpad stands, auto everywhere else — instead of
             // leaving the LAST project's badges on this one's tracks.
             for i in 0..crate::recorder::CHANNELS {
-                let bay0 = d.bay(i * crate::recorder::INSERTS);
+                let bay0 = d.bay(i * recorder::INSERTS);
                 self.settings.channel_icons[i] =
                     u8::from(bay0 == Some(dialogs::DRUMPAD_PATH));
             }
@@ -9034,7 +9034,7 @@ impl TangentApp {
         // for a snapshot built any other way: a seat past the space is
         // skipped, and the settings mirror was going to drop it at the
         // next launch anyway.
-        let mut dense = vec![String::new(); crate::recorder::INSERT_SPACE];
+        let mut dense = vec![String::new(); recorder::INSERT_SPACE];
         for (bay, path) in &d.inserts {
             if let Some(slot) = dense.get_mut(*bay) {
                 *slot = path.clone();
@@ -16544,16 +16544,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .desk
             .as_ref()
             .and_then(|d| {
-                (0..crate::recorder::CHANNELS).find(|ch| {
-                    d.bay(ch * crate::recorder::INSERTS) == Some(crate::dialogs::DRUMPAD_PATH)
+                (0..recorder::CHANNELS).find(|ch| {
+                    d.bay(ch * recorder::INSERTS) == Some(dialogs::DRUMPAD_PATH)
                 })
             })
             .or_else(|| {
-                (0..crate::recorder::CHANNELS).find(|ch| {
+                (0..recorder::CHANNELS).find(|ch| {
                     self.settings
                         .strip_inserts
-                        .get(ch * crate::recorder::INSERTS)
-                        .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH)
+                        .get(ch * recorder::INSERTS)
+                        .is_some_and(|p| p == dialogs::DRUMPAD_PATH)
                 })
             });
         let (kits, saved_lane) = match self.project_doc() {
@@ -21623,7 +21623,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             Some(self.settings.arr_header_w as f32)
         } else if self.last_band.is_positive() {
             Some(
-                (crate::recorder_panel::camera_split_x(
+                (recorder_panel::camera_split_x(
                     self.last_band,
                     &self.recorder_layout_view(),
                 ) - self.last_band.left()
@@ -30619,10 +30619,10 @@ impl TangentApp {
             self.settings.channel_kinds.hash(&mut h);
             h.finish()
         };
-        if self.input_chip_texts.len() != crate::recorder::CHANNELS
+        if self.input_chip_texts.len() != recorder::CHANNELS
             || self.input_chip_key != Some(chip_key)
         {
-            self.input_chip_texts = (0..crate::recorder::CHANNELS)
+            self.input_chip_texts = (0..recorder::CHANNELS)
                 .map(|ch| self.input_chip_text(ch))
                 .collect();
             self.input_chip_key = Some(chip_key);
@@ -35480,7 +35480,7 @@ mod tests {
         let read = crate::arrangement::Arrangement::load_from(&doc);
         let desk = read.desk.expect("the save left the desk out");
         assert_eq!(desk.kinds[2], app.settings.channel_kinds[2]);
-        assert_eq!(desk.bay(2 * crate::recorder::INSERTS), Some("/x/EP.vst3"));
+        assert_eq!(desk.bay(2 * recorder::INSERTS), Some("/x/EP.vst3"));
         assert!((desk.gains[2] - 0.42).abs() < 1e-9);
         assert!((desk.tempo_bpm - 93.0).abs() < 1e-9);
 
@@ -36819,7 +36819,7 @@ mod tests {
                 panic!("the fixture would not read back")
             };
             let d = a.desk.as_mut().expect("a desk");
-            d.set_bay(2 * INSERTS, crate::dialogs::BUILTIN_PATH);
+            d.set_bay(2 * INSERTS, dialogs::BUILTIN_PATH);
             a.save_to(&doc);
         }
         app.seed_template(&dir);
@@ -48973,7 +48973,7 @@ mod tests {
         assert!((app.settings.routes.0[0].gain - 119.0 / 120.0).abs() < 1e-6, "the drag did not land");
         for i in 0..120 {
             app.apply_mixer_hit(
-                crate::mixer_panel::Hit::RouteGain(crate::recorder::Column(0), 0),
+                crate::mixer_panel::Hit::RouteGain(recorder::Column(0), 0),
                 i as f32 / 240.0,
             );
         }
@@ -49223,10 +49223,10 @@ mod tests {").expect("the tests module")];
         }
         let _ = settle(&ctx, &mut app);
         // A key held on the MIDI keyboard, by the road a real one takes.
-        app.notes.apply(MidiEvent::NoteOn { note: 60, velocity: 100 });
+        app.notes.apply(NoteOn { note: 60, velocity: 100 });
         let asked = frame_asks(&ctx, &mut app);
         assert!(asked <= DETECT_TICK, "a held note earned no detector tick: {asked:?}");
-        app.notes.apply(MidiEvent::NoteOff { note: 60 });
+        app.notes.apply(NoteOff { note: 60 });
         let asked = settle(&ctx, &mut app);
         assert!(
             asked >= Duration::from_secs(1),
@@ -53603,7 +53603,7 @@ mod folder_tests {
         // The answered prompt's close comes back through `quit_allowed`,
         // and pays whatever is owed by then.
         app.quit_allowed = true;
-        app.settings_save_at.set(Some(std::time::Instant::now() + GEOMETRY_SAVE_DELAY));
+        app.settings_save_at.set(Some(Instant::now() + GEOMETRY_SAVE_DELAY));
         app.settings_writes.set(0);
         assert!(!app.intercept_quit());
         assert_eq!(app.settings_writes.get(), 1, "the answered quit did not pay");
@@ -53634,10 +53634,10 @@ mod folder_tests {
         // finding them proves the document's desk landed.
         let mut arr = crate::arrangement::Arrangement::load_from(&doc);
         let mut desk = arr.desk.take().expect("the fixture desk");
-        for ch in 0..crate::recorder::CHANNELS {
+        for ch in 0..recorder::CHANNELS {
             desk.set_bay(ch * INSERTS, "");
         }
-        desk.set_bay(3 * INSERTS, crate::dialogs::DRUMPAD_PATH);
+        desk.set_bay(3 * INSERTS, dialogs::DRUMPAD_PATH);
         desk.set_bay(2 * INSERTS, "/x/EP.vst3");
         arr.desk = Some(desk);
         arr.save_to(&doc);
@@ -53657,7 +53657,7 @@ mod folder_tests {
         app.open_project(&doc);
         let live = &app.settings.strip_inserts;
         assert_eq!(live.len(), INSERT_SPACE, "a bay in the file sized the desk");
-        assert_eq!(live[3 * INSERTS], crate::dialogs::DRUMPAD_PATH, "the drumpad's seat was lost");
+        assert_eq!(live[3 * INSERTS], dialogs::DRUMPAD_PATH, "the drumpad's seat was lost");
         assert_eq!(live[2 * INSERTS], "/x/EP.vst3", "the piano's seat was lost");
         assert_eq!(live[12447], "brusfri", "a real far seat was lost with the poison");
         assert_eq!(app.settings.project_path, doc.to_string_lossy(), "the open did not land");
@@ -53666,7 +53666,7 @@ mod folder_tests {
         let on_disk = Settings::load();
         assert_eq!(
             on_disk.strip_inserts.get(3 * INSERTS).map(String::as_str),
-            Some(crate::dialogs::DRUMPAD_PATH),
+            Some(dialogs::DRUMPAD_PATH),
             "the settings file was handed a desk without its drumpad"
         );
         assert!(on_disk.strip_inserts.len() <= INSERT_SPACE);
@@ -53682,7 +53682,7 @@ mod folder_tests {
         if let Some(b) = inserts.get_mut(plugin_at) {
             *b = "/x/Carried.vst3".to_owned();
         }
-        if let Some(b) = inserts.get_mut(5 * crate::recorder::INSERTS) {
+        if let Some(b) = inserts.get_mut(5 * recorder::INSERTS) {
             *b = "/x/Channel5.vst3".to_owned();
         }
         serde_json::json!({
@@ -57574,9 +57574,9 @@ mod perf_probes {
 
     /// The whole history's resident estimate, counting a shared `Arc` once.
     fn history_bytes(history: &[Moment]) -> usize {
-        let mut seen_arr = std::collections::HashSet::new();
-        let mut seen_desk = std::collections::HashSet::new();
-        let mut seen_words = std::collections::HashSet::new();
+        let mut seen_arr = HashSet::new();
+        let mut seen_desk = HashSet::new();
+        let mut seen_words = HashSet::new();
         let mut total = 0;
         for m in history {
             let (a, d, w, k) = moment_parts(m);
@@ -57589,7 +57589,7 @@ mod perf_probes {
             if seen_words.insert(std::sync::Arc::as_ptr(&m.words) as usize) {
                 total += w;
             }
-            total += k + std::mem::size_of::<Moment>();
+            total += k + size_of::<Moment>();
         }
         total
     }

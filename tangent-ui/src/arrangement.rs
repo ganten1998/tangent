@@ -344,7 +344,7 @@ const V5_MUSICAL_TIME: u64 = 5;
 /// (`DeskSnap::inserts`); the settings keep their dense `strip_inserts`
 /// and the two meet in `DeskRef`, where the walk reads either shape as
 /// the same sequence of occupied seats.
-const V7_SPARSE_SEATS: u64 = 7;
+pub const V7_SPARSE_SEATS: u64 = 7;
 
 /// The seats a document's desk carries as a plain array: every strip and
 /// the master, `(STRIPS + 1) * INSERTS`. See [`V7_SPARSE_SEATS`].
