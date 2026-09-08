@@ -25,7 +25,18 @@ rust-version.workspace = true
 tangent-core = { path = "../tangent-core", features = ["learning", "license"] }
 egui = { version = "0.33", default-features = false }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# `float_roundtrip` is load-bearing, not a nicety. Undo and "is there
+# anything unsaved?" both lean on `to_json(from_json(x)) == x`; without
+# this feature serde_json's fast float parser reads a 17-digit shortest
+# repr such as `0.9999999999999999` back as `1.0`, so a document carrying
+# one was NOT a fixed point and opened dirty, and an undo across it pushed
+# a moment for an edit nobody made. `a_seventeen_digit_float_is_a_fixed_point`
+# in arrangement.rs pins it. Upstream calls the exact parser slower; measured
+# in release on the perf fixtures it is inside the noise (`from_json` S 355 KB
+# 0.92 -> 0.93 ms, M 3.6 MB 11.5 -> 11.3 ms, L 22 MB 69 -> 68 ms), because
+# only a decimal the fast path cannot settle takes the slow road, and a real
+# document parses in about a millisecond either way.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 dirs = "6"
 log = "0.4"
 

@@ -3264,6 +3264,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **A float written at seventeen digits reads back as itself.**
+    ///
+    /// ryu writes the SHORTEST decimal that round-trips, and for a value
+    /// one ULP under 1.0 that is `0.9999999999999999`. serde_json's default
+    /// float parser takes a fast path on such inputs and answered `1.0`, so
+    /// a document carrying one was not a fixed point: it opened dirty, its
+    /// fingerprint moved on every load, and an undo across it pushed a
+    /// moment for an edit nobody made. `float_roundtrip` in Cargo.toml is
+    /// what makes this hold; the feature is a dependency flag, which is why
+    /// the property gets a test of its own rather than a comment.
+    #[test]
+    fn a_seventeen_digit_float_is_a_fixed_point() {
+        let awkward = 0.999_999_999_999_999_9_f64;
+        assert_ne!(awkward, 1.0, "the literal rounded to 1.0 at compile time");
+        let mut a = a_document_with_everything_in_it();
+        a.clips[0].fade_out_s = awkward;
+        let json = a.to_json();
+        assert!(
+            json.contains("0.9999999999999999"),
+            "the writer did not spell the value at seventeen digits"
+        );
+        let back = Arrangement::from_json(&json);
+        assert_eq!(
+            back.clips[0].fade_out_s.to_bits(),
+            awkward.to_bits(),
+            "the reader rounded the fade to a neighbour"
+        );
+        assert_eq!(back.to_json(), json, "the document is not a fixed point");
+        assert_eq!(
+            back.fingerprint(),
+            a.fingerprint(),
+            "a save and a load moved the fingerprint"
+        );
+    }
+
     /// **The awkward floats hash the way the WRITER treats them.**
     ///
     /// `-0.0` is a different document (ryu writes `-0.0`), so it is a
