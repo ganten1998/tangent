@@ -1297,6 +1297,25 @@ pub struct TangentApp {
     /// ever want to know, and a flag one reader clears is a flag the next
     /// reader never sees.
     ir_scan_gen: u64,
+    // ── the sampler's road ──────────────────────────────────────────────
+    /// **What the host knows about each sampler's file**, keyed by LANE.
+    ///
+    /// A channel's seat in the insert space and its lane number are the same
+    /// number (`recorder::STRIPS` counts the channels and the buses before
+    /// the master), which is why one map answers both `set_sampler_info`'s
+    /// caller — the host, which speaks lanes — and the face, which is opened
+    /// on a seat.
+    sampler_info: HashMap<usize, crate::ports::SamplerInfo>,
+    /// **Samples chosen but not yet handed over**, oldest first. The face
+    /// raises a path, this holds it, and the host drains it with
+    /// `take_sampler_load`. A queue and not a slot: two windows can be open
+    /// on two samplers, and dropping one of two loads is a load that
+    /// silently did not happen.
+    sampler_load: std::collections::VecDeque<(usize, std::path::PathBuf)>,
+    /// The generation the sampler's browser listing was read at, bumped
+    /// whenever anything could have changed the folder on screen — the
+    /// `ir_scan_gen` bargain.
+    sampler_scan_gen: u64,
     /// The IR road's live picture, pushed by the host while the wizard
     /// meters, captures or deconvolves. Copied into the open wizard each
     /// frame, the `InsertFace` live-refresh bargain.
@@ -3567,6 +3586,9 @@ impl TangentApp {
             preset_loaded: None,
             ir_rows: Vec::new(),
             ir_scan_gen: 0,
+            sampler_info: HashMap::new(),
+            sampler_load: std::collections::VecDeque::new(),
+            sampler_scan_gen: 0,
             ir_live: crate::ports::IrLive::default(),
             plugin_rescan: false,
             reveal_request: None,
@@ -16429,9 +16451,6 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Re-list the explorer's directory: folders first, then audio files,
     /// both sorted, dotfiles skipped.
     fn refresh_media(&mut self) {
-        const AUDIO: [&str; 11] = [
-            "wav", "aiff", "aif", "mp3", "m4a", "aac", "flac", "ogg", "opus", "caf", "wma",
-        ];
         // An EMPTY media_dir is the ROOTS view: every drive letter that
         // answers, or the one root everything else has. Portable — the
         // probe simply finds nothing but "/" off Windows.
@@ -16517,13 +16536,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 match std::fs::metadata(e.path()) {
                     Ok(t) if t.is_dir() => dirs.push(name),
                     Ok(t) if t.is_file() => {
-                        let audio = std::path::Path::new(&name)
-                            .extension()
-                            .and_then(|x| x.to_str())
-                            .is_some_and(|x| {
-                                AUDIO.contains(&x.to_ascii_lowercase().as_str())
-                            });
-                        if audio {
+                        // The filter is `drumpad_panel::is_audio_file` now,
+                        // shared with the sampler's explorer: two panels
+                        // that list different files out of one folder is a
+                        // panel offering what its sibling hides.
+                        if crate::drumpad_panel::is_audio_file(&name) {
                             files.push(name);
                         }
                     }
@@ -20865,6 +20882,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     self.save_settings_soon();
                 }
                 ArrDrag::Move { id, dt } => {
+                    // **A clip on the move is also a drag SOURCE.** The
+                    // owner: "the plugin must be reactive to dragging a clip
+                    // in tangent into its window." One gesture, two
+                    // meanings, and they cannot collide — the clip only
+                    // lands somewhere else on the timeline if it is
+                    // released over the timeline, and the payload only
+                    // lands in a sampler if it is released over one.
+                    self.arm_clip_drag(ctx, id);
                     // The row under the hand: a clip drags ACROSS lanes as
                     // well as along them — a MIDI item moves to another
                     // MIDI channel, an audio one to any lane that takes
@@ -22832,6 +22857,125 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.builtin_faces.get(&(strip, slot))
     }
 
+    // ── the sampler's two doors ─────────────────────────────────────────
+    //
+    // One in, one out, and nothing else crosses. The host PUSHES what it
+    // learned decoding a file and DRAINS what a face asked to load — the
+    // same shape every other road in this file has, and the reason it is
+    // two functions rather than one field is that a queue read by the host
+    // has to be emptied as it is read or the same load happens twice.
+    //
+    // MERGE-ME(engine): the host lane has to join this road up. In
+    // `desktop.rs`, beside where the other pushes happen:
+    //
+    //   * drain `app.take_sampler_load()` each tick, load the file into
+    //     the sampler seated at that lane's bay, and answer with
+    //     `app.set_sampler_info(lane, SamplerInfo { name, seconds, peaks,
+    //     missing })` — `peaks` is a `crate::peaks::Peaks` built beside
+    //     the decode, exactly as an arrangement clip's is, and `missing`
+    //     is the state for a bay whose file has moved (NOT an error
+    //     string: the envelope is still the one that was dialled in and
+    //     the face says so on the picture);
+    //   * push the loaded path in `BuiltinFace::extra` under the key
+    //     `"sample"`, and gate it in `builtin_fx::is_extra_symbol` the way
+    //     `ir_path` is gated — that key is what
+    //     `DialogAction::FaceSavePreset` now carries into a preset, and
+    //     what `load_unit_preset` must apply for a preset to restore the
+    //     sound rather than only the knobs;
+    //   * clear the entry (an empty `name`) when the bay unloads, so a
+    //     face draws its empty state rather than the last file;
+    //   * register the unit with `voice: true` and do NOT add it to
+    //     `desktop::is_instrument_sentinel` — a bay-seated voice filed
+    //     there is a synth that loads, names itself, draws its panel and
+    //     is silent.
+
+    /// **Publish the dragged clip as a `DraggedMedia` payload**, so a
+    /// window that takes samples can take it.
+    ///
+    /// The payload is the same one the two media explorers publish, which
+    /// is the whole point: a sampler that had to learn a second drag
+    /// contract for clips would be a second thing to keep in step, and the
+    /// path is all any of them carries.
+    ///
+    /// **A MIDI clip is refused out loud.** It is not a sample — it has no
+    /// sound of its own, only instructions for one — and the failure mode
+    /// of saying nothing is the drumpad's own `.tgkit` fault: a bay that
+    /// looks loaded, plays silence, and gives nobody a reason. The refusal
+    /// is `notify_insist` and not `notify`, because a drag is an EVENT the
+    /// hand will not repeat sixty times a second and a message that got
+    /// refused as a duplicate would be no message at all; the key holds one
+    /// sentence per drag, since `is_decidedly_dragging` is true on every
+    /// frame of it.
+    fn arm_clip_drag(&mut self, ctx: &egui::Context, id: u64) {
+        if !ctx.input(|i| i.pointer.is_decidedly_dragging()) {
+            return;
+        }
+        if egui::DragAndDrop::payload::<crate::drumpad_panel::DraggedMedia>(ctx).is_some() {
+            return;
+        }
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+            return;
+        };
+        if clip.kind == crate::arrangement::ClipKind::Midi {
+            self.notify_insist(
+                "clip-drag-is-midi",
+                crate::notify::Kind::Info,
+                "That is a MIDI part, not a sample - it has no sound of its own. \
+                 Bounce it to a take first, then drag the take.",
+            );
+            return;
+        }
+        let path = clip.path.clone();
+        if path.is_empty() {
+            return;
+        }
+        let Some(doc) = self.project_doc() else {
+            return;
+        };
+        // `Arrangement::resolve` is the one place a clip's path becomes a
+        // file: `media/<file>` inside a project, or an absolute path taken
+        // as it stands. A second spelling of that join is a clip that
+        // resolves one way for the timeline and another for a drag.
+        let file = crate::arrangement::Arrangement::resolve(doc, &path);
+        egui::DragAndDrop::set_payload(ctx, crate::drumpad_panel::DraggedMedia(file));
+    }
+
+    /// **What the host learned about the file in `lane`'s sampler**, pushed
+    /// after every load. See [`crate::ports::SamplerInfo`].
+    ///
+    /// A channel's seat in the insert space IS its lane number, which is
+    /// why the face — opened on a seat — reads this map with the seat it
+    /// was opened on. An entry with an empty name is a bay that has
+    /// nothing loaded, and is kept rather than removed so a face that has
+    /// just been cleared draws the empty state instead of the last file.
+    pub fn set_sampler_info(&mut self, lane: usize, info: crate::ports::SamplerInfo) {
+        self.sampler_info.insert(lane, info);
+    }
+
+    /// What `lane`'s sampler is playing, or the borrowable nothing.
+    pub fn sampler_info(&self, lane: usize) -> &crate::ports::SamplerInfo {
+        self.sampler_info
+            .get(&lane)
+            .unwrap_or(crate::ports::SamplerInfo::NONE)
+    }
+
+    /// **The next sample a face asked to load**, oldest first, taken off the
+    /// queue as it is read. `None` when nothing is waiting.
+    pub fn take_sampler_load(&mut self) -> Option<(usize, std::path::PathBuf)> {
+        self.sampler_load.pop_front()
+    }
+
+    /// Put a load on the queue. The one door: the browser row, the drop and
+    /// the OS file drag all arrive here, because they differ only in how the
+    /// path was found.
+    fn queue_sampler_load(&mut self, lane: usize, path: std::path::PathBuf) {
+        self.sampler_load.push_back((lane, path));
+        // The file may have landed in the folder the browser is standing in
+        // — a copy into the project's `media/`, say — so the listing is
+        // stale from here.
+        self.sampler_scan_gen = self.sampler_scan_gen.wrapping_add(1);
+    }
+
     /// **Turn one knob on a built-in bay.** Queues the request the host
     /// forwards to the engine, and mirrors the value into the local face
     /// first — optimistically, so the knob under the pointer never waits a
@@ -24179,6 +24323,90 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// itself. Durations are looked up from the host's own scan rather than
     /// re-measured here: reading a WAV header is the engine side's job and
     /// this crate has no WAV reader to do it honestly with.
+    /// **The sampler browser's listing, and its three shortcuts.**
+    ///
+    /// `refresh_ir_browser` next door with one difference, and the
+    /// difference is the whole of what the owner asked for: the shortcut
+    /// row. *"must be able to drag any item in or choose any midi or audio
+    /// clip recorded in tangent as well -- not just external exports."*
+    /// Tangent's own recordings live in exactly two places — the Takes
+    /// folder every capture lands in, and the open project's `media/`,
+    /// which is where a clip's audio is copied — and neither of them is
+    /// anywhere a person would find by walking up from their home folder.
+    /// So the browser names them.
+    ///
+    /// The PROJECT chip is empty when no project is open, and the face
+    /// draws a chip that says so rather than one that walks nowhere: a
+    /// shortcut to a folder that does not exist is a button that looks
+    /// broken.
+    ///
+    /// The scan itself is `drumpad_panel::is_audio_file` and the drumpad's
+    /// own rules — `metadata` and never `file_type`, so a symlinked folder
+    /// (the owner's `~/Dropbox`) is followed; dotfiles skipped; folders
+    /// first, then files, both sorted case-blind.
+    fn refresh_sampler_browser(&mut self, live: &mut crate::faces::FaceLive) {
+        let takes = self.settings.record_root();
+        let project = self
+            .project_doc()
+            .and_then(|d| d.parent().map(|p| p.join("media")))
+            .filter(|p| p.is_dir());
+        live.samp_roots = vec![
+            ("HOME".to_owned(), dirs_home().to_string_lossy().into_owned()),
+            ("TAKES".to_owned(), takes.to_string_lossy().into_owned()),
+            (
+                "PROJECT".to_owned(),
+                project.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            ),
+        ];
+        if live.samp_dir.is_empty() {
+            // A fresh panel opens on the Takes folder when there is one:
+            // the overwhelmingly likely sample, for somebody who has just
+            // recorded, is the thing they just recorded.
+            live.samp_dir = if takes.is_dir() {
+                takes.to_string_lossy().into_owned()
+            } else {
+                dirs_home().to_string_lossy().into_owned()
+            };
+        }
+        if live.samp_listed == live.samp_dir && live.samp_gen == self.sampler_scan_gen {
+            return;
+        }
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&live.samp_dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                match std::fs::metadata(e.path()) {
+                    Ok(t) if t.is_dir() => dirs.push(name),
+                    Ok(t) if t.is_file() && crate::drumpad_panel::is_audio_file(&name) => {
+                        files.push(name);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        dirs.sort_by_key(|n| n.to_lowercase());
+        files.sort_by_key(|n| n.to_lowercase());
+        live.samp_entries = dirs
+            .into_iter()
+            .map(|name| crate::drumpad_panel::MediaEntry { name, dir: true })
+            .chain(
+                files
+                    .into_iter()
+                    .map(|name| crate::drumpad_panel::MediaEntry { name, dir: false }),
+            )
+            .collect();
+        live.samp_listed = live.samp_dir.clone();
+        live.samp_gen = self.sampler_scan_gen;
+        live.samp_scroll = live
+            .samp_scroll
+            .min(live.samp_entries.len().saturating_sub(1));
+        live.samp_sel = None;
+    }
+
     fn refresh_ir_browser(&mut self, live: &mut crate::faces::FaceLive) {
         let root = self.irs_root().to_string_lossy().into_owned();
         live.ir_root = root.clone();
@@ -24698,6 +24926,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // of ONE of them; the host's shelf stays where it is, as the
             // place the durations in that listing are read from.
             self.refresh_ir_browser(&mut live);
+        }
+        if live.face.path == crate::faces_sampler::SAMPLER_PATH {
+            // The sampler's browser, listed the way the IR's is — a face
+            // says where it is standing and the app says what is there.
+            live.sampler = self.sampler_info(seat).clone();
+            self.refresh_sampler_browser(&mut live);
         }
         // **The amp face's pedal chips, indexed by the OWNING channel
         // rather than by the seat the amp happens to sit in.**
@@ -28757,10 +28991,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         .iter()
                         .map(|p| (p.symbol.clone(), f64::from(p.value)))
                         .collect();
+                    // **And the state that is NOT a knob**, which for the
+                    // sampler is the loaded file. It has always been pushed
+                    // in `BuiltinFace::extra` — the IR face reads its own
+                    // impulse path out of it — and it has never been saved,
+                    // because this road only ever carried numbers.
+                    let extra = face.extra.clone();
                     self.request_recorder(recorder::RecorderRequest::SavePreset {
                         unit,
                         name,
                         values,
+                        extra,
                     });
                 }
             }
@@ -28786,6 +29027,32 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     slot: bay,
                     path,
                 });
+            }
+            // **The sampler's load, refused out loud when it cannot be
+            // one.** A MIDI clip is not a sample and neither is a kit or a
+            // project file: the decoder cannot open them, so a bay that
+            // took one would go quiet with a plausible name under it and no
+            // message anywhere — the drumpad's own `.tgkit` fault, which is
+            // exactly how that lesson was learned.
+            DialogAction::PickSample { strip, slot, path } => {
+                let (seat, _bay) = recorder::seat_bay(strip, slot);
+                let file = std::path::PathBuf::from(&path);
+                let name = file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                if crate::drumpad_panel::is_audio_file(&name) {
+                    self.queue_sampler_load(seat, file);
+                } else {
+                    self.notify(
+                        crate::notify::Kind::Error,
+                        format!(
+                            "{name} is not audio the sampler can play. \
+                             A MIDI part has no sound of its own - bounce it \
+                             to a take first, then drag the take in."
+                        ),
+                    );
+                }
             }
             // The theme key from a plugin window's own bar: exactly the
             // main window's `K::CycleTheme`, arriving by the only road a
@@ -37225,7 +37492,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, TangentApp) {
+    pub(super) fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, TangentApp) {
         let ctx = egui::Context::default();
         let app = TangentApp::new(&ctx, settings, caps);
         (ctx, app)
@@ -58322,5 +58589,283 @@ mod arrange_peaks_tests {
         midi.arrangement_rect = app.arrangement_rect;
         midi.arrangement.add_clip(ArrClip { kind: ClipKind::Midi, path: String::new(), ..an_audio_clip(0, 1.0) });
         assert!(!midi.arr_waves_stale());
+    }
+}
+
+/// **The sampler's three import doors, and its one road out.**
+///
+/// The owner named three ways a sample gets in and the explorer is the main
+/// one; what these hold is the two that are not the explorer's own rows —
+/// an arrangement clip dragged onto the window, and anything else that
+/// arrives as a path — plus the queue the host drains.
+#[cfg(test)]
+mod sampler_road_tests {
+    use super::*;
+    use crate::arrangement::{ArrClip, Arrangement, ClipKind, DOC_NAME};
+
+    fn a_clip(kind: ClipKind, path: &str) -> ArrClip {
+        ArrClip {
+            pedal: Vec::new(),
+            kind,
+            notes: Vec::new(),
+            lane: 0,
+            path: path.into(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 4.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "take".into(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        }
+    }
+
+    /// Put the context's pointer into a state `is_decidedly_dragging`
+    /// answers `true` for: pressed, then moved well past egui's own
+    /// threshold, with the button still down.
+    fn a_drag_in_flight(ctx: &egui::Context) {
+        use egui::{Event, PointerButton};
+        let at = Pos2::new(200.0, 300.0);
+        for events in [
+            vec![Event::PointerMoved(at)],
+            vec![Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+            vec![Event::PointerMoved(at + Vec2::new(40.0, 0.0))],
+            vec![Event::PointerMoved(at + Vec2::new(80.0, 0.0))],
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    events,
+                    ..Default::default()
+                },
+                |_| {},
+            );
+        }
+    }
+
+    /// **An AUDIO clip dragged out of the arrangement is a sample**, and
+    /// the path it carries is the one `Arrangement::resolve` gives — the
+    /// same join the timeline plays it through. A second spelling of that
+    /// join is a clip that resolves one way for the timeline and another
+    /// for a drag, which nobody would find until a project moved.
+    #[test]
+    fn a_dragged_audio_clip_carries_the_file_the_timeline_plays() {
+        let (ctx, mut app) = tests::headless(Caps::DESKTOP);
+        app.project_doc = std::path::PathBuf::from("/p/song/project.tan");
+        let id = app.arrangement.add_clip(a_clip(ClipKind::Audio, "media/take.wav"));
+        a_drag_in_flight(&ctx);
+        app.arm_clip_drag(&ctx, id);
+        let got = egui::DragAndDrop::payload::<crate::drumpad_panel::DraggedMedia>(&ctx)
+            .expect("the clip published nothing");
+        assert_eq!(
+            got.0,
+            Arrangement::resolve(
+                std::path::Path::new("/p/song/project.tan"),
+                "media/take.wav"
+            )
+        );
+        assert!(app.said().is_empty(), "an ordinary drag said something");
+    }
+
+    /// **A MIDI clip is refused with a sentence, never silently.**
+    ///
+    /// It is not a sample: it has no sound of its own. Saying nothing is
+    /// the drumpad's own `.tgkit` fault — a bay that looks loaded, plays
+    /// silence, and gives nobody a reason to look at.
+    #[test]
+    fn a_dragged_midi_clip_is_refused_out_loud() {
+        let (ctx, mut app) = tests::headless(Caps::DESKTOP);
+        app.project_doc = std::path::PathBuf::from("/p/song/project.tan");
+        let id = app.arrangement.add_clip(a_clip(ClipKind::Midi, "media/part.mid"));
+        a_drag_in_flight(&ctx);
+        app.arm_clip_drag(&ctx, id);
+        assert!(
+            egui::DragAndDrop::payload::<crate::drumpad_panel::DraggedMedia>(&ctx).is_none(),
+            "a MIDI part was published as a sample"
+        );
+        let said: String = app.said().notes().iter().map(|n| n.text.as_str()).collect();
+        assert!(said.contains("MIDI"), "the refusal was silent: {said:?}");
+        // And it stays ONE sentence however many frames the hand drags for:
+        // `is_decidedly_dragging` is true on every one of them.
+        for _ in 0..30 {
+            app.arm_clip_drag(&ctx, id);
+        }
+        assert_eq!(app.said().len(), 1, "the refusal repeated itself");
+    }
+
+    /// **A load is taken once, and in the order it was asked for.** Two
+    /// windows can be open on two samplers, and a queue that dropped one of
+    /// two loads is a load that silently did not happen.
+    #[test]
+    fn the_sampler_takes_its_loads_in_order_and_only_once() {
+        let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
+        assert_eq!(app.take_sampler_load(), None);
+        app.apply_dialog_action(DialogAction::PickSample {
+            strip: 0,
+            slot: 0,
+            path: "/m/Takes/one.wav".to_owned(),
+        });
+        app.apply_dialog_action(DialogAction::PickSample {
+            strip: 1,
+            slot: 0,
+            path: "/m/Takes/two.aiff".to_owned(),
+        });
+        let first = app.take_sampler_load().expect("nothing queued");
+        assert_eq!(first.1, std::path::PathBuf::from("/m/Takes/one.wav"));
+        let second = app.take_sampler_load().expect("only one queued");
+        assert_eq!(second.1, std::path::PathBuf::from("/m/Takes/two.aiff"));
+        assert_ne!(first.0, second.0, "two seats collapsed into one lane");
+        assert_eq!(app.take_sampler_load(), None, "a load came back twice");
+    }
+
+    /// **A file the decoder cannot open is refused out loud**, wherever it
+    /// came from. The OS drop door takes any path at all, and a MIDI file
+    /// or a kit dropped on the window would otherwise load a bay that plays
+    /// silence with a plausible name under it.
+    #[test]
+    fn a_file_that_is_not_audio_is_refused_out_loud() {
+        let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
+        for bad in ["/m/part.mid", "/m/kit.tgkit", "/m/song.tan", "/m/notes.txt"] {
+            app.apply_dialog_action(DialogAction::PickSample {
+                strip: 0,
+                slot: 0,
+                path: bad.to_owned(),
+            });
+            assert_eq!(app.take_sampler_load(), None, "{bad} was queued as audio");
+        }
+        assert_eq!(app.said().len(), 4, "a refusal was silent");
+        let said: String = app.said().notes().iter().map(|n| n.text.as_str()).collect();
+        assert!(said.contains("not audio"), "{said}");
+    }
+
+    /// **The pushed info is what the face reads, keyed by lane**, and a
+    /// lane nobody has pushed for reads the borrowable nothing rather than
+    /// the last file some other lane loaded.
+    #[test]
+    fn a_lane_with_no_sample_reads_the_empty_state() {
+        let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
+        assert!(app.sampler_info(3).is_empty());
+        app.set_sampler_info(
+            3,
+            crate::ports::SamplerInfo {
+                name: "hit.wav".to_owned(),
+                seconds: 1.5,
+                peaks: None,
+                missing: false,
+            },
+        );
+        assert_eq!(app.sampler_info(3).name, "hit.wav");
+        assert!(app.sampler_info(4).is_empty(), "a lane read its neighbour's file");
+    }
+
+    /// **The browser reaches Tangent's OWN recordings**, which is the whole
+    /// of what the owner asked for beyond the drumpad's explorer: "must be
+    /// able to drag any item in or choose any midi or audio clip recorded
+    /// in tangent as well -- not just external exports". Neither the Takes
+    /// folder nor a project's `media/` is findable by walking up from a
+    /// home folder, so the browser names them.
+    #[test]
+    fn the_browser_offers_takes_and_the_open_projects_media() {
+        let root = std::env::temp_dir().join(format!("tangent-samp-roots-{}", std::process::id()));
+        let takes = root.join("Takes");
+        let song = root.join("Projects").join("song");
+        std::fs::create_dir_all(&takes).unwrap();
+        std::fs::create_dir_all(song.join("media")).unwrap();
+        std::fs::write(takes.join("one.wav"), b"x").unwrap();
+        std::fs::write(takes.join("notes.txt"), b"x").unwrap();
+        std::fs::create_dir_all(takes.join("older")).unwrap();
+
+        let mut settings = Settings::default();
+        settings.record_dir = Some(takes.to_string_lossy().into_owned());
+        let (_ctx, mut app) = tests::headless_with(Caps::DESKTOP, settings);
+        app.project_doc = song.join(DOC_NAME);
+        let mut live = crate::faces::FaceLive::default();
+        app.refresh_sampler_browser(&mut live);
+        let words: Vec<&str> = live.samp_roots.iter().map(|(w, _)| w.as_str()).collect();
+        assert_eq!(words, ["HOME", "TAKES", "PROJECT"]);
+        assert_eq!(live.samp_roots[1].1, takes.to_string_lossy());
+        assert_eq!(
+            live.samp_roots[2].1,
+            song.join("media").to_string_lossy(),
+            "the open project's media folder is not offered"
+        );
+        // A fresh panel opens on the Takes folder: whoever has just recorded
+        // is overwhelmingly likely to want the thing they just recorded.
+        assert_eq!(live.samp_dir, takes.to_string_lossy());
+        // Folders first, then audio only — the drumpad's own rules, through
+        // the one filter both explorers share.
+        let names: Vec<&str> = live.samp_entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["older", "one.wav"], "the listing took a text file");
+
+        // With no project open the chip is EMPTY rather than pointing
+        // nowhere: a shortcut to a folder that does not exist is a button
+        // that looks broken.
+        let mut settings = Settings::default();
+        settings.record_dir = Some(takes.to_string_lossy().into_owned());
+        let (_ctx, mut app) = tests::headless_with(Caps::DESKTOP, settings);
+        let mut live = crate::faces::FaceLive::default();
+        app.refresh_sampler_browser(&mut live);
+        assert!(live.samp_roots[2].1.is_empty(), "a project chip with no project");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Saving a preset carries the SAMPLE across, not only the knobs.**
+    ///
+    /// The path has always been pushed in `BuiltinFace::extra` — the IR
+    /// face reads its own impulse out of it — and it has never been saved,
+    /// because the preset road only ever carried numbers. A sampler patch
+    /// saved that way reopens with the right envelope over silence.
+    #[test]
+    fn saving_a_sampler_preset_carries_the_file_it_is_playing() {
+        let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
+        app.set_builtin_face(crate::ports::BuiltinFace {
+            strip: 0,
+            slot: 0,
+            path: crate::faces_sampler::SAMPLER_PATH.to_owned(),
+            params: vec![crate::ports::BuiltinFaceParam {
+                id: 0,
+                symbol: "vol".to_owned(),
+                name: "Volume".to_owned(),
+                units: String::new(),
+                default: 0.5,
+                reading: "0.0 dB".to_owned(),
+                choices: Vec::new(),
+                steps: 0,
+                value: 0.75,
+            }],
+            curve_db: Vec::new(),
+            extra: vec![("sample".to_owned(), "/m/Takes/kick 03.wav".to_owned())],
+        });
+        app.apply_dialog_action(DialogAction::FaceSavePreset {
+            strip: 0,
+            slot: 0,
+            name: "Room Kick".to_owned(),
+        });
+        let mut asked = None;
+        while let Some(r) = app.take_recorder_request() {
+            if let recorder::RecorderRequest::SavePreset { unit, values, extra, .. } = r {
+                asked = Some((unit, values, extra));
+            }
+        }
+        let asked = asked.expect("nothing was asked of the host");
+        assert_eq!(asked.0, crate::faces_sampler::SAMPLER_PATH);
+        assert_eq!(asked.1, vec![("vol".to_owned(), 0.75)]);
+        assert_eq!(
+            asked.2,
+            vec![("sample".to_owned(), "/m/Takes/kick 03.wav".to_owned())],
+            "the preset forgot which file it was playing"
+        );
     }
 }

@@ -1850,6 +1850,18 @@ pub enum DialogAction {
         slot: usize,
         path: PathBuf,
     },
+    /// **Load this file into the sampler in this bay.** Appended at the
+    /// END, this enum's law.
+    ///
+    /// Desk terms, like [`Self::SetInsertIr`] beside it — the app converts
+    /// to a seat and raises the load on the sampler's own road. A path and
+    /// nothing else: the face found where the file is, and the host owns
+    /// every byte that moves.
+    PickSample {
+        strip: usize,
+        slot: usize,
+        path: String,
+    },
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -3162,6 +3174,20 @@ pub const ANALOG_PATH: &str = "@tangent-analog";
 /// this is what the picker and the face's title say.
 pub const ANALOG_NAME: &str = "Tangent Analog";
 
+/// **The fifth built-in instrument's sentinel, and the second bay-seated
+/// VOICE.** It rides the picker exactly as the four above it do and, like
+/// the analog, the engine seats it in the rack rather than in
+/// `desktop::is_instrument_sentinel` — a voice filed with the instruments
+/// there is a synth that loads, names itself, draws its panel and is
+/// silent. The string is the contract with the engine's
+/// `builtin_fx::SAMPLER_PATH`; `faces_sampler`'s own test pins the pair
+/// this crate can see.
+pub const SAMPLER_PATH: &str = "@tangent-sampler";
+/// The display name. The preset folder is the engine's class, "Tangent
+/// Sampler", spelled by `desktop::preset_subfolder` from the unit's row;
+/// this is what the picker and the face's title say.
+pub const SAMPLER_NAME: &str = "Tangent Sampler";
+
 /// How many patches the modelled keyboard ships, and what they are called.
 ///
 /// **The names live here rather than only in the engine** because the picker,
@@ -3615,11 +3641,12 @@ pub const LABS_VENDOR: &str = "Tangent Labs";
 /// **The house's instruments, in the order the picker shows them** under
 /// [`LABS_VENDOR`], above the suite. Appended, never reordered: a beginner
 /// learns where the piano is.
-pub const INSTRUMENT_ROWS: [(&str, &str); 4] = [
+pub const INSTRUMENT_ROWS: [(&str, &str); 5] = [
     (BUILTIN_PATH, BUILTIN_NAME),
     (DRUMPAD_PATH, DRUMPAD_NAME),
     (KEYS_PATH, KEYS_NAME),
     (ANALOG_PATH, ANALOG_NAME),
+    (SAMPLER_PATH, SAMPLER_NAME),
 ];
 
 fn plugin_folder(entry: &PluginEntry) -> &str {
@@ -5256,6 +5283,13 @@ const FACE_SIZES: &[(&str, Vec2, Vec2, Vec2)] = &[
     // switches, the preset strip — and the brief's sizes (§6): the floor
     // is a promise `faces_analog` holds on every font.
     (ANALOG_PATH, Vec2::new(0.62, 0.52), Vec2::new(900.0, 560.0), Vec2::new(1400.0, 840.0)),
+    // **The sampler is a browser window**, the same kind of thing [`FACE_IR`]
+    // describes: a machine on the left, a list of files on the right. So it
+    // is sized the IR's way — wide enough that neither half collapses — with
+    // more HEIGHT than the IR, because this left half is a waveform with an
+    // envelope drawn on it and a grid of rows under that, where the IR's is
+    // two knobs.
+    (SAMPLER_PATH, Vec2::new(0.66, 0.69), Vec2::new(800.0, 620.0), Vec2::new(1280.0, 992.0)),
     ("@tangent-eq", Vec2::new(0.404, 0.622), Vec2::new(470.0, 470.0), Vec2::new(752.0, 752.0)),
     ("@tangent-imager", Vec2::new(0.292, 0.635), Vec2::new(340.0, 480.0), Vec2::new(544.0, 768.0)),
     ("@tangent-comp", Vec2::new(0.344, 0.569), Vec2::new(400.0, 430.0), Vec2::new(640.0, 688.0)),
@@ -7208,6 +7242,9 @@ fn show_on(
                                     }
                                     crate::faces::FaceAction::PickIr { path } => {
                                         Some(DialogAction::SetInsertIr { strip, slot, path })
+                                    }
+                                    crate::faces::FaceAction::PickSample { path } => {
+                                        Some(DialogAction::PickSample { strip, slot, path })
                                     }
                                     crate::faces::FaceAction::BrowseIr => {
                                         // **The face window goes down with
@@ -15894,6 +15931,7 @@ at: None,
                         DRUMPAD_NAME,
                         KEYS_NAME,
                         ANALOG_NAME,
+                        SAMPLER_NAME,
                         "Tangent EQ",
                         "Tangent Imager",
                         "Tangent Tape",
@@ -15923,12 +15961,12 @@ at: None,
                     .iter()
                     .filter(|p| !is_builtin(&p.path))
                     .all(|p| p.vendor.is_empty()));
-                // Eighteen, not one: the house shelf took the first
-                // seventeen rows — the four instruments and the thirteen-unit
+                // Nineteen, not one: the house shelf took the first
+                // eighteen rows — the five instruments and the thirteen-unit
                 // suite — and the number is derived from those two lists so
                 // the next instrument moves it rather than breaking it.
                 let shelf = INSTRUMENT_ROWS.len() + crate::faces::SUITE_UNITS.len();
-                assert_eq!(shelf, 17);
+                assert_eq!(shelf, 18);
                 assert_eq!(*selected, Some(shelf + 1), "it did not open on what is loaded");
                 assert_eq!(current.as_deref(), Some(loaded.as_str()));
                 assert!(filter.is_empty() && *focus);

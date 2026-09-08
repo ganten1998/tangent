@@ -1342,6 +1342,66 @@ impl Default for IrLive {
     }
 }
 
+// ── the sampler's loaded file ───────────────────────────────────────────────
+// Appended as a section of its own, the faces' section above's law: sibling
+// lanes edit this file in parallel worktrees and a block at the END merges
+// where a mid-file insertion conflicts.
+
+/// **What the sampler's face knows about the file in its bay**, pushed by
+/// the host after every load.
+///
+/// The face draws a waveform, a crop and an envelope over it, and every one
+/// of those is a question about a FILE — how long it is, what it looks like,
+/// whether it is still there. `tangent-ui` cannot answer any of them: it
+/// never opens a file, which is the whole of the firewall this module's own
+/// doc describes. So the host answers once per load and hands the answers
+/// over as plain data, exactly as [`TrackInfo`] and [`PadStatus`] do.
+///
+/// **`peaks` is the picture and not a second envelope.** [`PadStatus`] and
+/// [`TrackInfo`] each carry a `Vec<f32>` computed at one resolution, which
+/// is a bar chart of one zoom and blocky at every other; the arrangement
+/// stopped doing that when [`ClipInfo::peaks`] arrived, and the sampler is
+/// born after that. A pyramid answers any window the crop leaves at draw
+/// time, which is what lets a crop handle be dragged without asking the
+/// host anything.
+///
+/// **`missing` is a state and not an error string.** A sampler whose file
+/// has been moved out from under it is not broken — the preset still
+/// remembers the path, the envelope is still the one that was dialled in —
+/// and the face has to say so on the picture rather than in a box that
+/// appears once and is gone. Empty `name` with `missing` false is the
+/// EMPTY state: nothing has ever been loaded.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SamplerInfo {
+    /// The file's own name, or empty when nothing is loaded.
+    pub name: String,
+    /// How long the whole file is, before any crop.
+    pub seconds: f64,
+    /// The file's picture at every zoom, shared for the life of the file.
+    /// `None` until the host has decoded it, and for a file it could not
+    /// read.
+    pub peaks: Option<std::sync::Arc<crate::peaks::Peaks>>,
+    /// The bay names a file the host could not find or could not read.
+    pub missing: bool,
+}
+
+impl SamplerInfo {
+    /// Nothing loaded, as a borrowable constant — a face draws pushed data
+    /// and the empty view has to be borrowable without building a `String`,
+    /// the [`TrackInfo::NONE`] bargain.
+    pub const NONE: &'static SamplerInfo = &SamplerInfo {
+        name: String::new(),
+        seconds: 0.0,
+        peaks: None,
+        missing: false,
+    };
+
+    /// Whether anything is loaded at all.
+    pub fn is_empty(&self) -> bool {
+        self.name.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
