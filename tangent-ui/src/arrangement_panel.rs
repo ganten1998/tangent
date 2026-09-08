@@ -627,13 +627,6 @@ impl Hit {
 /// under 120.
 const HEADER_W: (f32, f32, f32) = (0.16, 150.0, 220.0);
 
-/// How tall the tempo lane is against a track lane.
-///
-/// Shorter, because it carries one curve and a handful of markers where a
-/// track carries clips with names, waveforms and fades in them. Tall enough
-/// that a tempo point is something you can aim at.
-const TEMPO_LANE_SHARE: f32 = 0.55;
-
 /// The same for an automation sub-lane: a curve needs less room than the
 /// clips it belongs under.
 ///
@@ -2048,16 +2041,8 @@ fn flag_body(p: &Ink, accent: (u8, u8, u8)) -> Color32 {
     on_ink(p.ruler)
 }
 
-/// The MASTER's cap. Black, and the only dial on the timeline that is.
-///
-/// Not pure black: the needle drawn across it is the row's own ink, and on a
-/// dark theme an ink-on-black needle is a needle nobody can find. This is
-/// dark enough to read as black beside the channels' blue and light enough
-/// that the needle still stands off it.
-const DIAL_MASTER: Color32 = Color32::from_rgb(0x14, 0x13, 0x12);
-
 /// The master dial's OUTLINE and its needle. Fixed on every theme — see the
-/// note where they are used, and `bus_strip`, which makes the same bargain.
+/// note where they are used.
 const DIAL_MASTER_RING: Color32 = Color32::from_rgb(0x0E, 0x0D, 0x0C);
 const DIAL_MASTER_NEEDLE: Color32 = Color32::from_rgb(0xF2, 0xEE, 0xE4);
 
@@ -2084,44 +2069,6 @@ fn master_dial_body(knob: (u8, u8, u8)) -> Color32 {
     c
 }
 
-
-/// One bus row's level dial: the track headers' own dial, drawn from a
-/// free function because the bus rows are painted before the header loop
-/// that owns the closure version.
-/// The master's level, as a black slot with a white bar in it.
-///
-/// **Not a dial**, at the owner's word. The master's plate is its own colour —
-/// red by default — and a dial drawn in the plate's ink sat on that red as one
-/// more round red thing. A slot reads as a level at a glance and at half a
-/// track's height, where a dial that small is a dot with a scratch on it.
-///
-/// The two colours are FIXED, the way `VU_FACE` is and for the same reason:
-/// this is an instrument let into the panel rather than a region of it, and a
-/// near-black slot with a near-white bar means the same thing on all sixteen
-/// themes. They are not the theme's ink, so they cannot be dragged dark-on-dark
-/// by a plate somebody painted.
-fn bus_strip(painter: &Painter, cell: Rect, t: f32) {
-    /// The slot, and the bar in it.
-    const SLOT: Color32 = Color32::from_rgb(0x0E, 0x0D, 0x0C);
-    const BAR: Color32 = Color32::from_rgb(0xF2, 0xEE, 0xE4);
-    let slot = cell.shrink2(Vec2::new(cell.width() * 0.18, 1.5));
-    if !slot.is_positive() {
-        return;
-    }
-    painter.rect_filled(slot, 1.5, SLOT);
-    // Fills upward, the way a fader reads.
-    let h = slot.height() * t.clamp(0.0, 1.0);
-    if h > 0.5 {
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(slot.left() + 1.0, slot.bottom() - h),
-                Pos2::new(slot.right() - 1.0, slot.bottom() - 1.0),
-            ),
-            1.0,
-            BAR,
-        );
-    }
-}
 
 /// Song seconds at `x`, through the zoom window. The one mapping.
 pub fn time_at(rect: Rect, view: &ArrangeView<'_>, x: f32) -> f64 {
@@ -5981,9 +5928,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     // one, and it says so in the theme's own master colour
                     // rather than in a fixed crimson laid over all sixteen.
                     //
-                    // The outline and the needle are FIXED, the way the bus
-                    // slot's two colours are and for the same reason: they
-                    // are the instrument, not the panel, and a near-black
+                    // The outline and the needle are FIXED, the way the VU
+                    // face's colours are and for the same reason: they are
+                    // the instrument, not the panel, and a near-black
                     // ring with a near-white needle means the same thing on
                     // every theme. Being fixed is also what stops them being
                     // dragged dark-on-dark by whatever red the theme brought.

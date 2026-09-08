@@ -2777,34 +2777,31 @@ pub fn num_field(hit: Hit) -> Option<NumField> {
 
 /// What a rectangle produces when it is pressed.
 ///
-/// Two kinds, because four of the controls are DRAGGED: their answer depends on
-/// where along the rectangle the press landed. Making that a property of the
-/// region rather than of the caller is what keeps [`hit_test`] a pure function
-/// of geometry — the same point always produces the same hit, so the caller can
+/// Two kinds, because the dials are DRAGGED: their answer depends on where
+/// along the rectangle the press landed. Making that a property of the region
+/// rather than of the caller is what keeps [`hit_test`] a pure function of
+/// geometry — the same point always produces the same hit, so the caller can
 /// simply ask again on every pointer move.
 #[derive(Debug, Clone, Copy)]
 enum Produces {
     /// The same hit wherever inside it you press.
     Fixed(Hit),
-    /// A hit carrying how far along the rect the press landed, 0..=1.
-    Along(fn(f32) -> Hit),
-    /// The same, measured UP the rect: 0 at the bottom, 1 at the top. For
-    /// round knobs, where left-to-right would be a control that goes the wrong
-    /// way half the time depending on which side of it you grabbed.
+    /// A hit carrying how far UP the rect the press landed: 0 at the bottom,
+    /// 1 at the top. Every travelling control in this band is a round knob,
+    /// where left-to-right would be a control that goes the wrong way half
+    /// the time depending on which side of it you grabbed.
     AlongV(fn(f32) -> Hit),
 }
 
 impl Produces {
     /// The hit for a press at `pos` inside `r`.
     ///
-    /// Takes the rect and the point rather than a fraction, because the two
-    /// travelling controls measure different axes and a caller that computed
-    /// the fraction would have to know which — the one thing this enum exists
-    /// to keep it from knowing.
+    /// Takes the rect and the point rather than a fraction, because WHICH
+    /// axis a travelling control measures is this enum's business and not the
+    /// caller's — a caller that computed the fraction would have to know.
     fn hit(self, r: Rect, pos: Pos2) -> Hit {
         match self {
             Produces::Fixed(h) => h,
-            Produces::Along(f) => f(along(r, pos)),
             Produces::AlongV(f) => f(up(r, pos)),
         }
     }
@@ -2856,7 +2853,6 @@ pub fn drag_axis(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<DragAx
         .into_iter()
         .find(|(r, k)| r.is_positive() && (*k).control().is_same_control(hit))
         .and_then(|(_, k)| match k {
-            Produces::Along(_) => Some(DragAxis::Horizontal),
             Produces::AlongV(_) => Some(DragAxis::Vertical),
             Produces::Fixed(_) => None,
         })
@@ -2879,7 +2875,6 @@ pub fn drag_travel(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<f32>
         .find(|(r, k)| r.is_positive() && (*k).control().is_same_control(hit))?;
     match k {
         Produces::AlongV(_) => Some(KNOB_TRAVEL),
-        Produces::Along(_) => Some(FADER_TRAVEL),
         Produces::Fixed(_) => None,
     }
 }
@@ -3269,7 +3264,6 @@ fn name_for(
                 _ => return None,
             }
         }
-        Produces::Along(_) => return None,
     })
 }
 
@@ -4088,10 +4082,6 @@ pub fn timeline_viewport_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
 pub fn timeline_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
     Layout::new(rect, view).timeline
 }
-
-/// The LCD's green — the one colour on the cluster's black face.
-const LCD_GREEN: Color32 = Color32::from_rgb(0xA3, 0xE0, 0x48);
-const LCD_FACE: Color32 = Color32::from_rgb(0x0B, 0x0E, 0x0A);
 
 /// `seconds` as `bars| beats| thousandths` — the parts, joined.
 pub fn bars_beats(seconds: f64, bpm: f64, sig: crate::recorder::TimeSignature) -> String {
@@ -6035,12 +6025,6 @@ const LIMITER_CAP: Color32 = Color32::from_rgb(0x2f, 0x8f, 0x5c);
 /// The gain's cap. Amber, because it is the one knob on the panel that can
 /// make a take clip — and it sits beside the one that stops it.
 const GAIN_CAP: Color32 = Color32::from_rgb(0xd8, 0x93, 0x2c);
-
-/// The master's cap.
-///
-/// Red, alone. It is the last thing in the chain and the only control here
-/// that can put the output past the ceiling the limiter just guaranteed.
-const MASTER_CAP: Color32 = Color32::from_rgb(0xc4, 0x2f, 0x22);
 
 /// A transport button's side, as a fraction of the tempo knob's diameter.
 ///
@@ -8397,9 +8381,15 @@ mod tests {
 
     #[test]
     fn the_limiter_and_the_master_are_told_apart_by_colour() {
-        assert_ne!(Fx::Limiter.cap(), MASTER_CAP);
+        // **The colour the master actually wears**, asked of the settings
+        // rather than of a constant. These two lines used to compare against
+        // `MASTER_CAP`, a hardcoded red this panel stopped painting when the
+        // knob became `master_knob_color` — so they were holding the effects
+        // apart from a colour nothing draws.
+        let master = Settings::default().master_knob_color.to_color32();
+        assert_ne!(Fx::Limiter.cap(), master);
         for fx in Fx::ALL {
-            assert_ne!(fx.cap(), MASTER_CAP, "{} wears the master's red", fx.title());
+            assert_ne!(fx.cap(), master, "{} wears the master's red", fx.title());
         }
         // **And under every theme, not just the stock colours.** Themes paint
         // the master; if one of them lands on the limiter's red, the two

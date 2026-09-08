@@ -1012,15 +1012,6 @@ impl StripStrip {
 /// Space around the rack, and between the strips.
 const PAD: f32 = 10.0;
 const GAP: f32 = 6.0;
-/// The master is the same width as every other channel.
-///
-/// **It used to be wider, "because it is the one you look at".** That bought
-/// the master a legible scale and left every other channel with a smear where
-/// its numbers should be — and a desk where one strip is a different size is a
-/// desk with two kinds of strip on it. The width it gave back is spread across
-/// all eleven, which is what makes the ticks readable everywhere.
-const MASTER_EXTRA: f32 = 0.0;
-
 /// How many channel columns the mixer shows at once; the rest scroll. The
 /// click and the master are pinned beside them and are not counted here.
 pub const PALETTE_RUN: usize = 16;
@@ -2707,16 +2698,6 @@ fn strip(
     }
 }
 
-/// The two rows of an open insert menu: delete on top, replace under it.
-///
-/// Anchored at the bay the right-click landed on, as wide as the strip, and
-/// clamped inside the panel — the palette's rule: a row that overhung the
-/// neighbour would be a menu whose press can land on someone else's fader.
-fn fx_menu_over(l: &StripStrip, bay: usize) -> [Rect; 2] {
-    let rows = fx_menu_rows(l, bay, 2);
-    [rows[0], rows[1]]
-}
-
 /// The same menu with however many rows it needs — a keyed-capable bay
 /// carries a third. One function for any count, so the two-row and
 /// three-row menus cannot disagree about where a row is.
@@ -3354,9 +3335,12 @@ mod tests {
         // next item.
         let from = src.find("\nfn strip(").expect("no strip painter");
         let body = &src[from..];
-        let end = body
-            .find("\n/// The two rows of an open insert menu")
-            .expect("the strip painter's end moved");
+        // **Its own closing brace, not the next item's doc comment.** This
+        // used to end the window at the sentence that opened the function
+        // below, so deleting that function moved the end of `strip` and the
+        // scan silently read the whole rest of the file. A `}` in the first
+        // column is where a top-level item ends and nowhere else.
+        let end = body.find("\n}\n").expect("the strip painter never closes");
         let body = &body[..end];
         let mut missing: Vec<&str> = Vec::new();
         for cell in [
@@ -4801,7 +4785,7 @@ mod tests {
         v.fx_menu = Some((Column(0), 1));
         let r = rect();
         let l = Layout::new(r, &v);
-        let rows = fx_menu_over(&l.strips[0], 1);
+        let rows = fx_menu_rows(&l.strips[0], 1, 2);
         for (i, row) in rows.iter().enumerate() {
             assert!(row.is_positive(), "row {i} has no area");
             assert!(
@@ -4862,7 +4846,7 @@ mod tests {
         // Without the capability the same menu has no third row: the space
         // where it would sit is a dismissal like any other stray press.
         v.fx_menu_key = false;
-        let two = fx_menu_over(&l.strips[0], 1);
+        let two = fx_menu_rows(&l.strips[0], 1, 2);
         assert_eq!(
             hit_test(r, &v, two[0].center()),
             Some(Hit::FxMenu(Column(0), 1, FxAction::Delete))
