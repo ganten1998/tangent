@@ -729,24 +729,13 @@ impl EpVoice {
         }
     }
 
-    pub fn strike(&mut self, pitch: u8, velocity: f32) {
-        self.strike_knobs(pitch, velocity, &EpKnobs::default());
-    }
-
-    /// `strike` with the whole panel: every knob this mechanism answers to,
-    /// on the Mk.1 harp. `strike_based` picks the harp.
+    /// The whole panel on the Mk.1 harp: every knob this mechanism answers
+    /// to, with the base pinned. A rung of the strike ladder the instrument
+    /// does not climb — `mod.rs` calls the base-picking `strike_based` —
+    /// kept because `mod.rs`'s own tests strike the Mk.1 through it.
+    #[allow(dead_code)]
     pub fn strike_knobs(&mut self, pitch: u8, velocity: f32, k: &EpKnobs) {
         self.strike_based(pitch, velocity, k, &TineBase::MK1);
-    }
-
-    /// `strike` with the panel's VOICING knob: it scales the hammer tip's
-    /// contact time, 1.3x at full mellow to 0.77x at full bright, the same
-    /// lever velocity itself pulls. The exponent form lands 0.5 on exactly
-    /// 1.0, so the shipped default is this file's tuning untouched.
-    pub fn strike_voiced(&mut self, pitch: u8, velocity: f32, voicing: f32) {
-        let mut k = EpKnobs::default();
-        k.voicing = voicing;
-        self.strike_based(pitch, velocity, &k, &TineBase::MK1);
     }
 
     /// The clamped-free bar this key's tine is, solved once per new spring

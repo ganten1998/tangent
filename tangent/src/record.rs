@@ -1320,6 +1320,11 @@ impl Session {
     }
 
     /// The picks the open stream is honouring, for the monitor's layout.
+    ///
+    /// The monitor takes them from `take_monitor` below instead, which hands
+    /// the ring and its layout over together so the two cannot disagree.
+    /// This is the accessor for anyone who wants the standing answer.
+    #[allow(dead_code)]
     pub fn picks(&self) -> audio::Picks {
         self.picks
     }
@@ -1423,7 +1428,6 @@ impl Session {
         }
     }
 
-    /// Seconds since the take started writing.
     /// Where the take being recorded is being written, while one is.
     ///
     /// The video file goes beside the `.wav` and the `.mid`, so the compositor
@@ -1431,7 +1435,11 @@ impl Session {
     /// ACTUALLY running, not one recomputed from the settings, or a take
     /// started before somebody changed the destination would write its video
     /// somewhere else.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    ///
+    /// The gate was `not(macos)` while the compositor asked for the folder;
+    /// it asks `take_video` now, which knows the name, so the accessor is
+    /// read by its own test on every platform and by nothing else.
+    #[allow(dead_code)]
     pub fn take_dir(&self) -> Option<&std::path::Path> {
         self.take.as_ref().map(|t| t.dir())
     }
@@ -1446,6 +1454,7 @@ impl Session {
         self.take.as_ref().map(Take::video)
     }
 
+    /// Seconds since the take started writing.
     pub fn elapsed(&self) -> f64 {
         match (self.state.is_writing(), self.started_instant) {
             (true, Some(at)) => at.elapsed().as_secs_f64(),

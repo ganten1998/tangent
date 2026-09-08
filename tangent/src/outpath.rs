@@ -86,8 +86,11 @@ pub fn probe(_device: Option<&str>) -> OutputPath {
 /// **The default output's nominal rate, without building an AudioUnit.**
 ///
 /// Off macOS there is no HAL to ask and the caller keeps its own road; see the
-/// macOS twin for why that road was worth leaving.
+/// macOS twin for why that road was worth leaving. Which is also why nothing
+/// calls this one: the rate follower asks the HAL only where there is a HAL,
+/// and the stub is here so the module has one shape on every platform.
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 pub fn nominal_rate(_device: Option<&str>) -> Option<u32> {
     None
 }
@@ -109,9 +112,13 @@ impl OverloadWatch {
     }
 }
 
+// Minimal links no audio backend, so nothing in that build asks the output
+// path anything: the re-export is read only where the recorder is compiled.
+#[cfg_attr(not(feature = "recorder"), allow(unused_imports))]
 #[cfg(target_os = "macos")]
 pub use mac::{nominal_rate, OverloadWatch};
 
+#[cfg_attr(not(feature = "recorder"), allow(unused_imports))]
 #[cfg(target_os = "macos")]
 pub use mac::probe;
 
@@ -607,6 +614,14 @@ mod mac {
         /// where either side cannot answer — a build machine with no audio
         /// device is not a machine with a bug — and that is honest, because
         /// the follower treats `None` from either road identically.
+        ///
+        /// **`recorder` only, because the expensive road IS cpal.** Minimal
+        /// does not link an audio backend at all (see the feature note in
+        /// `Cargo.toml`), so without this gate the whole test binary refuses
+        /// to compile there - `cargo test -p tangent --no-default-features`
+        /// died on `use cpal::traits`, which is a build the gate never runs
+        /// and so never reported.
+        #[cfg(feature = "recorder")]
         #[test]
         fn the_hal_rate_agrees_with_the_audio_unit_it_replaces() {
             use cpal::traits::{DeviceTrait, HostTrait};

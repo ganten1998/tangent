@@ -55,6 +55,9 @@ impl Biquad {
         y
     }
 
+    /// The other half of `Loudness::clear`, and dead for the same reason
+    /// it is: nothing in the app clears a meter, it builds a new one.
+    #[allow(dead_code)]
     fn clear(&mut self) {
         self.x1 = 0.0;
         self.x2 = 0.0;
@@ -375,6 +378,13 @@ impl Loudness {
     /// Everything back to silence: a new device, a new rate, a stopped
     /// engine. The filters go too — this is a discontinuity, and their state
     /// belongs to a signal that is not coming back.
+    ///
+    /// Unused today: the engine answers a new device or rate by constructing
+    /// a fresh `Loudness`, and `reset_integrated` is what the reset BUTTON
+    /// calls. It stays because it is the other half of the pair that doc
+    /// argues — the reset that does drop the filter state, for the case
+    /// where dropping it is right.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         for ch in &mut self.filters {
             for stage in ch {

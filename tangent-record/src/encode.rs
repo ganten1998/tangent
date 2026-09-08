@@ -634,11 +634,13 @@ mod tests {
                     }
                 }
             }
+            // The tail flush, and the last frame of the take: `encoded` is
+            // read to build this timestamp and by nothing after it, so it is
+            // not bumped again. The counters the assertions below check come
+            // off the encoder itself.
             if let Some(ready) = in_flight.take() {
                 let pts = if pump_clock { pts_of(ready) } else { pts_of(encoded) };
-                if enc.push(&frame, pts).is_ok() {
-                    encoded += 1;
-                }
+                let _ = enc.push(&frame, pts);
             }
             let out_of_order = enc.out_of_order();
             let written = enc.frames_written();

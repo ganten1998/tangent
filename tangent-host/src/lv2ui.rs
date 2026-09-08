@@ -143,7 +143,7 @@ unsafe extern "C" fn write_fn(
     // Format 0 is a plain float on a control port, which is the only thing this
     // host knows how to apply. Anything else is an atom — a patch message, a
     // file path — and dropping it is better than misreading it as a number.
-    if format != 0 || size as usize != std::mem::size_of::<f32>() || buffer.is_null() {
+    if format != 0 || size as usize != size_of::<f32>() || buffer.is_null() {
         return;
     }
     // SAFETY: checked non-null and the right size for an f32 just above.
@@ -341,7 +341,7 @@ impl Ui {
                 context: lv2_sys::LV2_Options_Context_LV2_OPTIONS_INSTANCE,
                 subject: 0,
                 key: key_sr,
-                size: std::mem::size_of::<f32>() as u32,
+                size: size_of::<f32>() as u32,
                 type_: type_float,
                 value: rate.as_ref() as *const f32 as *const c_void,
             },
@@ -475,7 +475,7 @@ impl Ui {
                 pe(
                     self.handle,
                     port,
-                    std::mem::size_of::<f32>() as u32,
+                    size_of::<f32>() as u32,
                     0,
                     &value as *const f32 as *const c_void,
                 );
@@ -575,7 +575,7 @@ mod tests {
                 write_fn(
                     who as *mut c_void,
                     port,
-                    std::mem::size_of::<f32>() as u32,
+                    size_of::<f32>() as u32,
                     0,
                     (&v as *const f32).cast(),
                 );

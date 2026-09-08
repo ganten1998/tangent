@@ -39,6 +39,11 @@ use super::voice::Voice;
 /// panels open: `~/Documents/Tangent Media/SYSEX`. The UI spells the same
 /// name in `Settings::sysex_root`, which is the one that resolves the
 /// media root; `the_two_crates_agree_on_the_sysex_shelf` holds them together.
+///
+/// The word is the point: `sysex_root()` builds the path from it and the
+/// test named above is what reads it, so the shipped build never mentions it
+/// by name.
+#[allow(dead_code)]
 pub const SYSEX_FOLDER: &str = "SYSEX";
 
 /// Slots in a bank. A cartridge's thirty-two, and not one more.
@@ -159,6 +164,10 @@ impl Staging {
     }
 
     /// The occupied slots, in order.
+    ///
+    /// The bank's own round-trip tests are what ask; the panels walk
+    /// `slots` directly.
+    #[allow(dead_code)]
     pub fn filled(&self) -> Vec<usize> {
         (0..self.slots.len()).filter(|&i| self.slots[i].is_some()).collect()
     }

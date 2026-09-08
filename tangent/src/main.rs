@@ -132,7 +132,17 @@ pub fn plugin_catalog(
 pub fn plugin_catalog_from(
     bundles: Vec<std::path::PathBuf>,
 ) -> Vec<(std::path::PathBuf, Option<String>, Option<String>)> {
-    let rows: Vec<(std::path::PathBuf, Option<String>, Option<String>)> = bundles
+    // **`mut`, and it is not spurious on the three platforms that never
+    // touch it.** The LV2 half below is the only writer and it is cfg'd out
+    // everywhere but Linux and FreeBSD, so a mechanical `unused_mut` fix took
+    // the `mut` away and broke both of those builds. The allow names the
+    // platforms that do not write to it rather than removing the binding's
+    // mutability from the ones that do.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "freebsd")),
+        allow(unused_mut)
+    )]
+    let mut rows: Vec<(std::path::PathBuf, Option<String>, Option<String>)> = bundles
         .into_iter()
         .map(|p| {
             let v = tangent_host::vendor_of(&p);
@@ -694,6 +704,11 @@ pub fn window_title(project: &str, dirty: bool) -> String {
 /// Not gated to X11. A 24 MB texture is waste on every platform, this is
 /// the one place all of them pass through, and a cap that only exists where
 /// somebody already got hurt is a cap that gets forgotten.
+///
+/// macOS is the one platform that does not reach it: the Dock tile wants
+/// `pad_icon_for_dock(shrink_icon_to(icon, 512))` instead, so on this build
+/// the only callers are the tests below.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn shrink_icon_for_x11(icon: egui::IconData) -> egui::IconData {
     /// Comfortably inside every limit: 128×128 is 65 544 bytes, under even
     /// the 262 140-byte classic maximum that applies without BIG-REQUESTS.

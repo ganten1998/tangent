@@ -1023,8 +1023,7 @@ struct MacScreen {
 /// arrive are the region at the backing scale — which is what
 /// [`WindowRegion::pixels`] reports as the format.
 fn crop_rect(region: WindowRegion) -> CGRect {
-    // SAFETY: two plain CoreGraphics reads with no preconditions.
-    let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+    let bounds = CGDisplayBounds(CGMainDisplayID());
     let display_h = bounds.size.height;
     let x = f64::from(region.x.max(0.0));
     let w = f64::from(region.w.max(1.0));

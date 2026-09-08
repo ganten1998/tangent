@@ -29,6 +29,15 @@ const FORMAT_PCM: u16 = 1;
 const FORMAT_FLOAT: u16 = 3;
 const FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
+/// Full scale for 32-bit PCM: 2^31, the magnitude of the most negative sample
+/// an `i32` can hold.
+///
+/// A shift rather than the literal `2_147_483_648.0` because clippy's
+/// `lossy_float_literal` reads that literal as a typo — f32's shortest
+/// round trip for the value is `2_147_483_600.0` and that is what it offers
+/// instead. The two are the SAME f32; only one of them is legibly 2^31.
+const FULL_SCALE_32: f32 = (1u32 << 31) as f32;
+
 fn u16_at(b: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
 }
@@ -93,7 +102,7 @@ pub fn read(path: &Path) -> Result<WavData, String> {
             (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8_388_608.0
         },
         (FORMAT_PCM, 32) => |b| {
-            i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0
+            i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / FULL_SCALE_32
         },
         (FORMAT_FLOAT, 32) => |b| {
             // A float file can hold anything, including the NaN that would

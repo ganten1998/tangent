@@ -233,6 +233,11 @@ use tangent_record::clock::Nanos;
 // The number of instrument slots is the GUI's, not this file's. Defining a
 // second one here is how the band ends up drawing three faders for four
 // renderers, or four for three, and neither side would fail to compile.
+//
+// The shipped build reaches it only through the `[`SLOTS`]` doc links in
+// this module — the code that reads the value is in the tests — so the
+// import is unused by the lint's reckoning and load-bearing by every other.
+#[allow(unused_imports)]
 use tangent_ui::recorder::SLOTS;
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -385,18 +390,6 @@ pub struct Loaded {
     /// The rate the plugin was set up for, which is always the device's. Nothing
     /// is resampled.
     pub sample_rate: u32,
-}
-
-/// What the warm-up concluded, so the band can be honest about it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WarmUp {
-    /// `false` means the instrument never made a sound and was declared ready by
-    /// timeout. The take may be silent and the UI should say so.
-    pub heard: bool,
-    pub elapsed: Duration,
-    /// Loudest peak seen while warming up. A value just under the readiness
-    /// threshold reads very differently from an exact zero.
-    pub peak: f32,
 }
 
 /// The open output device.
@@ -1547,6 +1540,16 @@ impl PadKit {
 /// FTZ + DAZ on this thread (x86 only; a no-op elsewhere). Bit 15 is
 /// flush-to-zero, bit 6 denormals-are-zero — a tail decaying into
 /// subnormals runs orders of magnitude slower on x86 without them.
+///
+/// **The deprecation is Rust's, and the replacement is hand-written inline
+/// assembly.** `_mm_getcsr`/`_mm_setcsr` are deprecated because LLVM does
+/// not model MXCSR, so the intrinsics can be reordered around the float
+/// work they are meant to govern; the sanctioned fix is `stmxcsr`/`ldmxcsr`
+/// through `asm!`. That is a change to the denormal handling of the audio
+/// thread on a target this machine cannot run, so it is not made in a lint
+/// pass: the call stays and this says why. Rust 1.97.1 offers no safe
+/// intrinsic to move to.
+#[allow(deprecated)]
 #[inline]
 fn flush_denormals() {
     #[cfg(target_arch = "x86_64")]
@@ -2754,13 +2757,13 @@ impl Backend {
                     let ch = (c.channel.clamp(0, 15)) as u8;
                     let at = c.offset.max(0) as i64;
                     let _ = match c.controller {
-                        tangent_host::Control::PITCH_BEND => {
+                        Control::PITCH_BEND => {
                             // 0..=16383 back into the two seven-bit halves the
                             // wire carries, LSB first.
                             let v = c.value.min(16383);
                             inst.push_midi(at, &[0xE0 | ch, (v & 0x7F) as u8, (v >> 7) as u8])
                         }
-                        tangent_host::Control::AFTERTOUCH => {
+                        Control::AFTERTOUCH => {
                             inst.push_midi(at, &[0xD0 | ch, c.value.min(127) as u8])
                         }
                         cc if (0..=127).contains(&cc) => inst.push_midi(
@@ -3004,6 +3007,10 @@ pub struct Placed {
 impl Placed {
     /// A clip that plays a whole file from 0:00, edges bare — what the old
     /// single backing track was, and what most callers still mean.
+    ///
+    /// The arrangement builds its own `Placed` with edges and gain, so the
+    /// bare constructor survives only in the tests that place one clip.
+    #[allow(dead_code)]
     pub fn whole(clip: Arc<tangent_record::decode::Clip>, start: u64) -> Self {
         let len = clip.frames() as u64;
         Self {
@@ -11712,6 +11719,12 @@ impl Engine {
     /// `Some` means the plugin came up with its defaults and the user's
     /// preset did not survive — worth saying out loud, because the symptom is
     /// "it keeps forgetting my piano" and nothing else in the app would know.
+    ///
+    /// **Read back by the engine's own tests and by nothing else in the
+    /// binary.** `tangent` is a bin crate, so `pub` roots nothing: an
+    /// accessor the desk happens not to ask for reads as dead however
+    /// thoroughly it is exercised.
+    #[allow(dead_code)]
     pub fn insert_state_error(&self, strip: usize, slot: usize) -> Option<&str> {
         self.insert_state_errors.get(strip)?.get(slot)?.as_deref()
     }
@@ -12407,15 +12420,6 @@ impl Engine {
         }
     }
 
-    /// Whether a backing track is loaded, playing or not.
-    ///
-    /// Loaded is the question, not playing: a take is armed before the
-    /// transport rolls, and a track that starts with it would otherwise decide
-    /// the take's sources one buffer too late.
-    pub fn track_loaded(&self) -> bool {
-        self.shared.track_loaded.load(Ordering::Relaxed)
-    }
-
     // ── the instruments' state ──────────────────────────────────────────────
 
     /// Which channels' rack voices ignore the note stream, as one mask.
@@ -12836,6 +12840,12 @@ impl Engine {
     /// Whether one bay is currently out of circuit, as the audio thread sees
     /// it. The engine's own answer, for tests and for anything that has to
     /// agree with what is actually being heard rather than with the desk.
+    ///
+    /// **Read back by the engine's own tests and by nothing else in the
+    /// binary.** `tangent` is a bin crate, so `pub` roots nothing: an
+    /// accessor the desk happens not to ask for reads as dead however
+    /// thoroughly it is exercised.
+    #[allow(dead_code)]
     pub fn insert_bypassed(&self, seat: usize, bay: usize) -> bool {
         self.shared
             .insert_bypass
@@ -13017,6 +13027,10 @@ impl Engine {
     /// ASIO: a stop and a start on a driver the SDK has unloaded is the null
     /// read the Windows crash of 2026-09-05 was made of, and the caller keeps
     /// this behind `cfg(target_os = "macos")` for exactly that reason.
+    ///
+    /// Which is why it reads as dead off macOS: there is no caller there,
+    /// deliberately.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn restart_output(&self) -> Result<(), String> {
         use cpal::traits::StreamTrait;
         let stream = self.stream.as_ref().ok_or("no output stream to start")?;
@@ -13759,6 +13773,12 @@ impl Engine {
     ///
     /// Not `max_latency`, which is the narrower number the aligners use. See
     /// both fields on `Shared`.
+    ///
+    /// **Read back by the engine's own tests and by nothing else in the
+    /// binary.** `tangent` is a bin crate, so `pub` roots nothing: an
+    /// accessor the desk happens not to ask for reads as dead however
+    /// thoroughly it is exercised.
+    #[allow(dead_code)]
     pub fn latency_frames(&self) -> ([u32; CHANNELS], u32) {
         (
             std::array::from_fn(|i| self.shared.lane_latency[i].load(Ordering::Relaxed)),
@@ -15025,6 +15045,12 @@ impl Default for StallWatch {
 /// before. A stall hours after a successful restart gets a fresh budget:
 /// the count having moved since the last try is what says the last try
 /// worked. Pure — fed the callback count — so it is tested without a device.
+///
+/// Only macOS acts on it — see `restart_output` — so off macOS the whole
+/// type is built, tested and never consulted. It stays ungated because the
+/// tests are the point: it is the one part of the stall answer that can be
+/// checked without a device, on whatever machine is to hand.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub struct StallRecovery {
     tries: u8,
@@ -15032,6 +15058,7 @@ pub struct StallRecovery {
     at: Option<u64>,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl StallRecovery {
     /// Restarts before a rebuild. Five is ten seconds at the watch's two,
     /// which is longer than any flap measured and shorter than anybody would

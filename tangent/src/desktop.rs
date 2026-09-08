@@ -598,9 +598,14 @@ pub struct DesktopApp {
     /// the presentation options once on the way out. Sending either every
     /// frame fights AppKit's own zoom animation, which is the same lesson the
     /// aspect snap already learned two hundred lines up.
+    ///
+    /// macOS is the only platform with a `macwin`, so this and
+    /// `decor_want_content` below are written and never read anywhere else.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     covering_screen: bool,
     /// The drawable size to restore after a decoration change, and how many
     /// frames it has been tried for. See `reconcile_decoration_size`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     decor_want_content: Option<(f64, f64, u8)>,
     /// The hardware MIDI fast lane, cloned out of `DeviceMidi` before the
     /// ports box swallows it. `start_engine` seats each fresh engine's ring
@@ -8246,7 +8251,6 @@ impl DesktopApp {
     /// saved states", and the difference is the export bug the stems chips
     /// were blamed for: see `desk_insert_state`.
     fn start_offline_bounce(&mut self, spec: tangent_ui::ports::ProjectExportSpec) {
-        use tangent_ui::ports::ExportFormat;
         // Every road out of here is a road out of a message that is already
         // standing — see `start_bounce`, which says why.
         macro_rules! refuse {
@@ -9298,23 +9302,6 @@ impl DesktopApp {
                 && TangentApp::scratch_is_disposable(&dir, template)
             {
                 let _ = std::fs::remove_dir_all(&dir);
-            }
-        }
-    }
-
-    /// The reload sentinel on the bays of the rows a permutation MOVED.
-    ///
-    /// `order[new] = old`, so a row with `order[n] == n` is a row whose
-    /// plugin, state and bays are all exactly where they were.
-    fn force_insert_reload_for(&mut self, order: &[usize]) {
-        let marks = reload_slots_for_loaded(
-            &tangent_ui::recorder::seat_order(order),
-            tangent_ui::recorder::INSERTS,
-            &self.recorder.inserts_loaded,
-        );
-        for i in marks {
-            if let Some(slot) = self.recorder.inserts_loaded.get_mut(i) {
-                *slot = Some("\u{1f}reload".to_owned());
             }
         }
     }
@@ -12289,6 +12276,15 @@ fn permute_loaded_rows(rows: &mut [Option<String>], order: &[usize]) {
     }
 }
 
+/// The bays a permutation MOVED something into or out of.
+///
+/// `reload_slots_for` wraps it for the caller that has no loaded table, and
+/// both are driven by the reconcile tests rather than by the app: the live
+/// path is `force_insert_reload`, which marks every bay that holds
+/// something. The reasoning both share — an empty bay on both sides of a
+/// move has nothing to do, and marking it costs the reconcile a frame to
+/// find that out — is what the tests hold.
+#[allow(dead_code)]
 fn reload_slots_for_loaded(order: &[usize], bays: usize, loaded: &[Option<String>]) -> Vec<usize> {
     let mut out = Vec::new();
     let held = |strip: usize, bay: usize| -> bool {
@@ -15401,6 +15397,9 @@ impl DesktopApp {
             }
         };
 
+        // Every `me.` call below that needs the mut is `cfg(feature =
+        // "recorder")`; Minimal builds the same value and only reads it.
+        #[cfg_attr(not(feature = "recorder"), allow(unused_mut))]
         let mut me = Self {
             pending_midi: Some(pending_midi),
             painted_once: false,
@@ -15843,10 +15842,10 @@ impl eframe::App for DesktopApp {
                         i.viewport().inner_rect,
                         i.viewport().outer_rect,
                         i.viewport().monitor_size,
-                        i.screen_rect(),
+                        i.content_rect(),
                     )
                 });
-                eprintln!("GEOM egui inner={:?} outer={:?} mon={:?} screen={:?}", vp.0, vp.1, vp.2, vp.3);
+                eprintln!("GEOM egui inner={:?} outer={:?} mon={:?} content={:?}", vp.0, vp.1, vp.2, vp.3);
                 eprintln!("GEOM app  {}", self.app.debug_geometry());
                 eprintln!("GEOM ppp  {}", ctx.pixels_per_point());
                 eprintln!(
@@ -16869,7 +16868,9 @@ impl DesktopApp {
             return;
         }
         let painter = ctx.layer_painter(tangent_ui::busy::cover_layer("tangent-splash"));
-        let rect = ctx.screen_rect();
+        // The CONTENT rectangle, which is the viewport minus whatever the OS
+        // has taken out of it. A cover belongs over what the app draws in.
+        let rect = ctx.content_rect();
         tangent_ui::splash::draw(&painter, rect, fade);
         // While it is up, the window must keep repainting — nothing else is
         // asking it to, and a splash that freezes mid-fade because no input
@@ -17820,7 +17821,8 @@ impl DesktopApp {
         let face = self.app.panel_face();
         let time = ctx.input(|i| i.time);
         let painter = ctx.layer_painter(tangent_ui::busy::cover_layer("tangent-busy"));
-        let rect = ctx.screen_rect();
+        // As the splash: the content rectangle, not the whole viewport.
+        let rect = ctx.content_rect();
         let Some(busy) = self.busy.as_mut() else {
             return;
         };
