@@ -394,7 +394,7 @@ fn install(window: &NSWindow) -> bool {
         // delegate is set, and winit set this one long before we patched its
         // class. Re-setting the same object forces that cache to be rebuilt.
         // Harmless: winit holds the strong reference, the property is weak.
-        unsafe { window.setDelegate(Some(&delegate)) };
+        window.setDelegate(Some(&delegate));
         Some(())
     })()
     .is_some();
@@ -1177,18 +1177,16 @@ pub fn cover_screen(frame: &eframe::Frame) -> bool {
     // The FULL frame, not `visibleFrame`: the latter is the work area, which
     // is exactly the rectangle being escaped.
     let full = screen.frame();
-    // SAFETY: `sharedApplication` on the main thread, which is the only
-    // thread eframe draws from and therefore the only one that reaches here.
-    unsafe {
-        if let Some(mtm) = MainThreadMarker::new() {
-            let app = NSApplication::sharedApplication(mtm);
-            app.setPresentationOptions(
-                objc2_app_kit::NSApplicationPresentationOptions::AutoHideDock
-                    | objc2_app_kit::NSApplicationPresentationOptions::AutoHideMenuBar,
-            );
-        }
-        window.setFrame_display(full, true);
+    // `MainThreadMarker::new()` is the main-thread proof; it answers `None`
+    // anywhere else and the presentation options are simply not touched.
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        app.setPresentationOptions(
+            objc2_app_kit::NSApplicationPresentationOptions::AutoHideDock
+                | objc2_app_kit::NSApplicationPresentationOptions::AutoHideMenuBar,
+        );
     }
+    window.setFrame_display(full, true);
     true
 }
 
@@ -1202,14 +1200,10 @@ pub fn cover_screen(frame: &eframe::Frame) -> bool {
 /// on its way from the app's own resize pass. Two things moving one window
 /// is how a window ends up flickering between two sizes.
 pub fn uncover_screen() {
-    // SAFETY: as `cover_screen`; main thread only.
-    unsafe {
-        if let Some(mtm) = MainThreadMarker::new() {
-            let app = NSApplication::sharedApplication(mtm);
-            app.setPresentationOptions(
-                objc2_app_kit::NSApplicationPresentationOptions::Default,
-            );
-        }
+    // As `cover_screen`: the marker is the main-thread proof.
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        app.setPresentationOptions(objc2_app_kit::NSApplicationPresentationOptions::Default);
     }
 }
 
@@ -1263,9 +1257,8 @@ pub fn keep_content_size(frame: &eframe::Frame, w: f64, h: f64) -> bool {
     );
     let mut want = window.frameRectForContentRect(wanted_content);
     want.origin.y = top - want.size.height;
-    // SAFETY: main thread, as everything else in this module; `want` is a
-    // finite rect derived from the window's own geometry.
-    unsafe { window.setFrame_display(want, true) };
+    // `want` is a finite rect derived from the window's own geometry.
+    window.setFrame_display(want, true);
     true
 }
 
@@ -1643,9 +1636,7 @@ pub fn hold_latency_critical() {
     let options =
         NSActivityOptions(USER_INITIATED_ALLOWING_IDLE_SLEEP | LATENCY_CRITICAL);
     let reason = NSString::from_str("Tangent is running an audio engine");
-    let token = unsafe {
-        NSProcessInfo::processInfo().beginActivityWithOptions_reason(options, &reason)
-    };
+    let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(options, &reason);
     std::mem::forget(token);
     log::info!(
         "TANGENT_ACTIVITY=1: told macOS this process is latency-critical \
