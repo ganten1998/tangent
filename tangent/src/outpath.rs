@@ -112,9 +112,13 @@ impl OverloadWatch {
     }
 }
 
+// Minimal links no audio backend, so nothing in that build asks the output
+// path anything: the re-export is read only where the recorder is compiled.
+#[cfg_attr(not(feature = "recorder"), allow(unused_imports))]
 #[cfg(target_os = "macos")]
 pub use mac::{nominal_rate, OverloadWatch};
 
+#[cfg_attr(not(feature = "recorder"), allow(unused_imports))]
 #[cfg(target_os = "macos")]
 pub use mac::probe;
 

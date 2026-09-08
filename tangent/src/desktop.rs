@@ -15397,6 +15397,9 @@ impl DesktopApp {
             }
         };
 
+        // Every `me.` call below that needs the mut is `cfg(feature =
+        // "recorder")`; Minimal builds the same value and only reads it.
+        #[cfg_attr(not(feature = "recorder"), allow(unused_mut))]
         let mut me = Self {
             pending_midi: Some(pending_midi),
             painted_once: false,
