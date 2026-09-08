@@ -704,8 +704,10 @@ pub struct DesktopApp {
     window_minimized: Option<bool>,
     /// **The host's half of the resting window's ledger** — see
     /// `host_frame_due`. `meters_live` is decided in `fill_recorder_state`
-    /// from the numbers it just read (any meter, needle, hold, needle or
-    /// pad above the floor); `camera_wanted` is whether frames are being
+    /// from the numbers it just read — an input or master meter, a hold
+    /// line, a strip peak, the limiter's gain reduction, a pad, a lane the
+    /// timeline is sounding, or a loudness window still above silence;
+    /// `camera_wanted` is whether frames are being
     /// asked of the capture thread, which arrive on its clock and not
     /// ours; `activity_at` is the last input event, MIDI event or
     /// session/transport edge, after which frames keep coming for
