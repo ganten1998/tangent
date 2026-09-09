@@ -37492,6 +37492,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A scratch has nowhere to keep a plugin state until its document is
+    /// written**, and that is why the owner's default template had no
+    /// `state/` folder in it.
+    ///
+    /// The host shelves the live plugin states into `<project>/state/`, and
+    /// `copy_states_to_project` refuses to CREATE the project folder to do it
+    /// — a state shelf is not a thing worth materialising a scratch for, and
+    /// the owner's rule is "no creating folders called untitled PERIOD". So
+    /// the folder is born in `save_project_doc`, at `materialize_project_dir`,
+    /// and any road that shelves the states before that call shelves them
+    /// into a folder that does not exist yet.
+    ///
+    /// `Save As Template` was such a road. It copies the session's folder to
+    /// `Projects/Templates/<name>`, and the session a launch stands on is
+    /// exactly this scratch — so the template it wrote carried `media/` and
+    /// the document, both made by the materialise, and nothing else. His
+    /// template names Brusfri in a folder's extra rack, the adopt at every
+    /// launch mirrors that empty shelf onto the live one, and the noise
+    /// profile he had learned went with it.
+    ///
+    /// `desktop`'s `a_road_that_writes_a_project_shelves_the_states_after_the_document`
+    /// is the other half: it pins the order in the host's own roads.
+    ///
+    /// Revert-check: make `save_project_doc` stop materialising and the
+    /// second half goes red.
+    #[test]
+    fn a_scratch_has_no_state_shelf_until_its_document_is_written() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-scratch-shelf-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(template.join("media")).expect("template media");
+        crate::arrangement::Arrangement::default()
+            .save_to(&crate::arrangement::doc_in(&template));
+
+        let scratch = root.join("Untitled");
+        let (_ctx, mut app) = headless(Caps::PLUGIN);
+        app.adopt_template(&template, &scratch);
+
+        // The guard `copy_states_to_project` asks, at the moment Save As
+        // Template used to ask it: the folder the shelf would go beside.
+        assert!(
+            !scratch.is_dir(),
+            "the adopt made the scratch folder, so this test is no longer \
+             standing where the fault is"
+        );
+        assert!(
+            !scratch.join("state").exists(),
+            "a scratch with no folder somehow has a state shelf"
+        );
+
+        // The document is what makes the folder real - so the states have to
+        // be shelved AFTER it, and a template copied before it carries none.
+        app.save_project_doc();
+        assert!(
+            scratch.is_dir(),
+            "writing the document did not materialise the project folder, so \
+             there is still no moment at which the plugin states can be \
+             shelved beside it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     pub(super) fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, TangentApp) {
         let ctx = egui::Context::default();
         let app = TangentApp::new(&ctx, settings, caps);
