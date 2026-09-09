@@ -9224,7 +9224,23 @@ impl DesktopApp {
                 }
                 let dst = self.templates_dir().join(&name);
                 let _ = std::fs::remove_dir_all(&dst);
-                let _ = copy_dir_all(&src, &dst);
+                // **And it says so, either way.** This row deletes a whole
+                // folder and writes another in its place - the stencil every
+                // New and every launch is made from, when the name is
+                // "default" - and it was the one write in this app that
+                // happened in silence. The Save row's own note says why that
+                // is not a style question: "a save is invisible otherwise",
+                // and a template nobody was told about is a template nobody
+                // checks. It matters more now that the copy carries the
+                // plugin shelf, because "did my noise profile go with it" is
+                // exactly the question this answers.
+                if let Err(e) = copy_dir_all(&src, &dst) {
+                    self.app.notify(
+                        Kind::Error,
+                        format!("could not write the template: {e}"),
+                    );
+                    return;
+                }
                 // **A template is a stencil, not a saved project.** The
                 // copy carries the session's `named` flag, and a clone of
                 // a named template is born "kept" — so launch could never
@@ -9238,6 +9254,7 @@ impl DesktopApp {
                     arr.named = false;
                     arr.save_to(&doc);
                 }
+                self.app.notify(Kind::Success, format!("Template saved - {name}"));
             }
             tangent_ui::ports::ProjectRequest::Export(spec) => {
                 // Raised, not pushed: from here until the files land this is
