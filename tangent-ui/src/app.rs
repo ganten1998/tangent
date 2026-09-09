@@ -2958,9 +2958,21 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
 /// **All arms off, save one**, by the owner's rule: a project must be
 /// openable without headphones and without being blasted, and the one
 /// exception is the channel that makes the piano sound — the one whose
-/// first bay holds the built-in DX7, or failing that the first MIDI channel
-/// carrying any instrument at all. A desk with neither opens silent, which
+/// first bay holds the built-in DX7. A desk without one opens silent, which
 /// is the honest reading of a desk with nothing to play.
+///
+/// **The "or failing that, any instrument at all" fallback is gone**, and it
+/// is worth saying why rather than leaving a shorter rule behind. It armed
+/// the first MIDI channel carrying anything, which on the owner's own
+/// template is a DRUM PAD — so every launch came up with channel one live,
+/// on a desk whose point is two microphones in a folder. A drum pad is not
+/// "the channel that makes the piano sound"; the fallback reached past the
+/// rule it was written under and armed something nobody asked to be armed.
+///
+/// Arming is not persisted — it is recomputed here on every launch — so this
+/// is imposed on a REOPENED project too, not only on a fresh desk. That is
+/// the other half of why the fallback had to go: a rule about what a new
+/// session should offer had become a rule about what every session does.
 fn default_armed(settings: &Settings) -> u32 {
     let kind = |n: usize| settings.channel_kinds.get(n).copied().unwrap_or(0);
     let bay0 = |n: usize| {
@@ -2971,8 +2983,73 @@ fn default_armed(settings: &Settings) -> u32 {
     };
     (0..recorder::CHANNELS)
         .find(|n| kind(*n) == 1 && bay0(*n) == dialogs::BUILTIN_PATH)
-        .or_else(|| (0..recorder::CHANNELS).find(|n| kind(*n) == 1 && !bay0(*n).is_empty()))
         .map_or(0, |n| 1 << n)
+}
+
+#[cfg(test)]
+mod default_arm_tests {
+    use super::*;
+
+    /// A desk built from NOTHING, because `Settings::default()` is the
+    /// SHIPPED desk — it already carries the drum pad and the DX7 — and a
+    /// test that only overrides the first channel is answered by the second
+    /// one it forgot about. That cost a red run here.
+    fn desk(kinds: &[u8], bay0: &[&str]) -> Settings {
+        let mut s = Settings::default();
+        s.channel_kinds.iter_mut().for_each(|k| *k = 0);
+        s.strip_inserts.iter_mut().for_each(String::clear);
+        for (n, k) in kinds.iter().enumerate() {
+            if let Some(slot) = s.channel_kinds.get_mut(n) {
+                *slot = *k;
+            }
+        }
+        for (n, p) in bay0.iter().enumerate() {
+            if let Some(slot) = s.strip_inserts.get_mut(n * recorder::INSERTS) {
+                *slot = (*p).to_owned();
+            }
+        }
+        s
+    }
+
+    /// **A desk of instruments that are not the piano opens with nothing
+    /// live.**
+    ///
+    /// The owner's own template is the case: channel one is a MIDI channel
+    /// whose first bay holds the DRUM PAD, and channel two the analog. The
+    /// rule this function is written under names one exception — "the channel
+    /// that makes the piano sound" — and a drum pad is not it, but the
+    /// fallback armed the first MIDI channel carrying anything at all. So
+    /// every launch came up with channel one record-ready and live, on a desk
+    /// whose point is two microphones in a folder, and the owner reported it
+    /// as "a remnant of default session code that's wrong".
+    ///
+    /// Arming is recomputed on every launch and never persisted, so this was
+    /// imposed on a reopened project too.
+    #[test]
+    fn a_desk_with_no_built_in_piano_opens_with_nothing_armed() {
+        let s = desk(&[1, 1, 0], &[dialogs::DRUMPAD_PATH, crate::faces_analog::ANALOG_PATH, ""]);
+        assert_eq!(
+            default_armed(&s),
+            0,
+            "a drum pad and an analog are not the piano; nothing should be live"
+        );
+    }
+
+    /// And the exception the rule DOES name still holds: a desk carrying the
+    /// built-in DX7 opens with that channel armed and no other, so somebody
+    /// who opens a fresh session can play without arming anything first.
+    #[test]
+    fn the_built_in_piano_is_still_the_one_channel_that_opens_live() {
+        let s = desk(&[1, 1], &[dialogs::DRUMPAD_PATH, dialogs::BUILTIN_PATH]);
+        assert_eq!(default_armed(&s), 1 << 1, "the DX7's channel, and only it");
+        // An AUDIO channel holding one changes nothing: the rule is about a
+        // channel that plays notes.
+        let audio = desk(&[0], &[dialogs::BUILTIN_PATH]);
+        assert_eq!(default_armed(&audio), 0);
+        // An empty desk is silent, which is the honest reading of a desk with
+        // nothing to play.
+        assert_eq!(default_armed(&desk(&[], &[])), 0);
+    }
 }
 
 /// The name at the end of a path, for a message. Empty when there is none.
