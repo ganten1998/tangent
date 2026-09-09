@@ -1935,11 +1935,17 @@ struct Ink {
     meter_lo: Color32,
     gr: Color32,
     meter_hi: Color32,
+    /// An unoccupied slot's ground, cut out of the wood — see
+    /// [`empty_ground_for`].
+    empty_ground: Color32,
+    /// The hairline round that hole, measured against the hole.
+    empty_edge: Color32,
 }
 
 fn ink(view: &MixerView<'_>) -> Ink {
     let (r, g, b) = view.wood;
     let wood = Color32::from_rgb(r, g, b);
+    let empty_ground = empty_ground_for(wood);
     // The strip faces are the band's own bone, lifted a little so a rack of
     // them does not read as one slab.
     // The strip face is a THEME role now (`fx_strip`): the insert bays are
@@ -1993,6 +1999,12 @@ fn ink(view: &MixerView<'_>) -> Ink {
         meter_lo: Color32::from_rgb(0x3D, 0xC0, 0x5A),
         gr: Color32::from_rgb(0xE8, 0x8C, 0x2A),
         meter_hi: Color32::from_rgb(0xE0, 0xA8, 0x22),
+        empty_ground,
+        empty_edge: crate::recorder_panel::distinct_surface_at(
+            recess(empty_ground, 0.34),
+            empty_ground,
+            1.6,
+        ),
     }
 }
 
@@ -2749,10 +2761,46 @@ fn fx_menu_rows(l: &StripStrip, bay: usize, count: usize) -> Vec<Rect> {
 /// and drawing it like one would be five faders that do nothing. The rack on
 /// the right of the band says "empty (click to load)"; this says the same
 /// thing in the shape a mixer says it in.
-/// The ground an unoccupied slot paints, fixed on every theme.
+/// **The ground an unoccupied slot paints — the desk's own wood, recessed.**
+///
+/// It was one fixed near-black grey on all nineteen themes, and on a pale desk
+/// that is a hole nobody can miss. On a dark one it is the wood again:
+/// measured across the factory set it sat at 1.01:1 against the band on
+/// Silverface — the same colour to two decimal places — 1.09:1 on Rhodes and
+/// Phosphor, and under 1.40:1 on twelve of the nineteen. The owner: "they are
+/// all gray, and some are imperceptible because of that."
+///
+/// So it is DERIVED, the way the arrangement's empty LANE already derives its
+/// ground from the lane field it cuts into: away from whichever end of the
+/// scale the wood is at — toward white under a dark desk, toward black under
+/// a pale one — by a step that reads either way, and then walked until it
+/// clears a floor. An empty slot keeps its theme's character and is still a
+/// hole in it.
 ///
 /// Named because the ink on it is measured against it — see `empty_slot_ink`.
-pub const EMPTY_GROUND: Color32 = Color32::from_rgb(0x2E, 0x2E, 0x2E);
+pub fn empty_ground_for(wood: Color32) -> Color32 {
+    /// A large flat surface has no text threshold to answer to, but it does
+    /// have to be seen from across the desk, and 1.4:1 is not seen.
+    const FLOOR: f32 = 1.7;
+    crate::recorder_panel::distinct_surface_at(recess(wood, 0.20), wood, FLOOR)
+}
+
+/// One step AWAY from a surface, in whichever direction that surface has room
+/// to move: toward white when it is dark, toward black when it is pale.
+///
+/// A multiplier cannot do this. Scaling brightness separates a pale ground
+/// nicely and does almost nothing to a near-black one — 0.78 of `0x1C2C16` is
+/// still `0x1C2C16` to the eye — which is exactly how twelve of these themes
+/// ended up with an invisible slot. The arrangement panel learned the same
+/// lesson about its grid and its seams and answers it the same way.
+fn recess(c: Color32, t: f32) -> Color32 {
+    let toward = if crate::recorder_panel::wants_light_ink(c) {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
+    mix(c, toward, t)
+}
 
 /// What is printed on [`EMPTY_GROUND`]: the circled plus, and the slot number.
 ///
@@ -2762,22 +2810,26 @@ pub const EMPTY_GROUND: Color32 = Color32::from_rgb(0x2E, 0x2E, 0x2E);
 /// owner confirmed reads — and then pushed until it clears the ground, which
 /// costs nothing on the themes where it already did.
 /// [`empty_slot_ink`] from the face alone, for the test that walks the themes.
-pub fn empty_slot_ink_for(face: Color32) -> Color32 {
-    crate::recorder_panel::distinct_surface_at(face.gamma_multiply(0.55), EMPTY_GROUND, 3.0)
+pub fn empty_slot_ink_for(face: Color32, ground: Color32) -> Color32 {
+    crate::recorder_panel::distinct_surface_at(face.gamma_multiply(0.55), ground, 3.0)
 }
 
 fn empty_slot_ink(p: &Ink) -> Color32 {
-    empty_slot_ink_for(p.face)
+    empty_slot_ink_for(p.face, p.empty_ground)
 }
 
 fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink, number: Option<usize>) {
-    // The empty slot's own ground — the owner's near-black grey — under
-    // the circled plus and the quiet space around it.
-    painter.rect_filled(l.panel, 3.0, EMPTY_GROUND);
+    // The empty slot's own ground, cut out of this theme's wood — under the
+    // circled plus and the quiet space around it.
+    painter.rect_filled(l.panel, 3.0, p.empty_ground);
+    // **And its rim is measured against the ground it rims.** It was the
+    // strip FACE at 22% alpha, which is a colour belonging to the panels
+    // either side of this hole rather than to the hole; on a dark theme it
+    // fell to within a point of the wood and the slot had no edge at all.
     painter.rect_stroke(
         l.panel,
         3.0,
-        Stroke::new(1.0_f32, p.face.gamma_multiply(0.22)),
+        Stroke::new(1.0_f32, p.empty_edge),
         egui::StrokeKind::Inside,
     );
     // **The number at the top**, in the same ink the plus below it wears —

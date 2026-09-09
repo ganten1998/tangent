@@ -10253,12 +10253,28 @@ mod tests {
                 theme.apply(&mut set);
                 set.dark_mode = dark;
                 let mode = if dark { "dark" } else { "light" };
-                // The mixer's unoccupied slot: a fixed ground, measured ink.
+                // The mixer's unoccupied slot: a ground cut out of this
+                // theme's own wood, and ink measured against THAT. The ground
+                // used to be one grey for all nineteen themes; see
+                // `mixer_panel::empty_ground_for`.
                 let face = set.fx_strip_color.to_color32();
-                let ink = crate::mixer_panel::empty_slot_ink_for(face);
-                let r = contrast_ratio(ink, crate::mixer_panel::EMPTY_GROUND);
+                let wood = set.recorder_bg_color.to_color32();
+                let ground = crate::mixer_panel::empty_ground_for(wood);
+                let ink = crate::mixer_panel::empty_slot_ink_for(face, ground);
+                let r = contrast_ratio(ink, ground);
                 if r < 3.0 {
                     bad.push(format!("{} {mode}: the mixer slot number is {r:.2}:1", theme.name));
+                }
+                // **And the hole itself can be seen.** This is the fault the
+                // owner reported — "they are all gray, and some are
+                // imperceptible because of that" — so it is asserted here
+                // rather than left to the eye.
+                let seen = contrast_ratio(ground, wood);
+                if seen < 1.65 {
+                    bad.push(format!(
+                        "{} {mode}: the mixer's empty slot is {seen:.2}:1 against the desk",
+                        theme.name
+                    ));
                 }
             }
         }

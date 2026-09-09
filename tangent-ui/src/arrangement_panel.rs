@@ -4556,16 +4556,15 @@ fn draw_auto_headers(
                 );
             }
             if h.readout.is_positive() {
-                let size = crate::fonts::px((h.readout.height() * 0.86).clamp(6.0, 9.0) * crate::fonts::size_scale(painter.ctx()));
-                if size >= 6.0 {
-                    painter.text(
-                        h.readout.center(),
-                        Align2::CENTER_CENTER,
-                        &format!("{:.0}%", auto.resting * 100.0),
-                        FontId::new(size, crate::fonts::courier()),
-                        quiet(ink, face, 0.22),
-                    );
-                }
+                fit_text(
+                    painter,
+                    h.readout,
+                    &format!("{:.0}%", auto.resting * 100.0),
+                    &crate::fonts::courier(),
+                    quiet(ink, face, 0.22),
+                    0.92,
+                    (7.0, 12.0),
+                );
             }
         }
     }
@@ -5962,30 +5961,28 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 } else {
                     format!("{:+.1}", 20.0 * g.log10())
                 };
-                let size = crate::fonts::px((r.knob_readout.height() * 0.86).clamp(6.0, 9.0) * crate::fonts::size_scale(painter.ctx()));
-                if size >= 6.0 {
-                    painter.text(
-                        r.knob_readout.center(),
-                        Align2::CENTER_CENTER,
-                        &db,
-                        FontId::new(size, crate::fonts::courier()),
-                        quiet(ink, face, 0.22),
-                    );
-                }
+                fit_text(
+                    painter,
+                    r.knob_readout,
+                    &db,
+                    &crate::fonts::courier(),
+                    quiet(ink, face, 0.22),
+                    0.92,
+                    (7.0, 12.0),
+                );
             }
             // The word under the meter, saying what the dial is — the track
             // rows write theirs under the knob and this row has no room
             // below, so it goes beside.
             if r.vol_label.is_positive() {
-                painter.text(
-                    r.vol_label.center(),
-                    Align2::CENTER_CENTER,
+                fit_text(
+                    painter,
+                    r.vol_label,
                     "VOL",
-                    FontId::new(
-                        (r.vol_label.height() * 0.62).clamp(6.0, 9.0),
-                        crate::fonts::courier(),
-                    ),
+                    &crate::fonts::courier(),
                     quiet(ink, face, 0.28),
+                    0.62,
+                    (6.0, 11.0),
                 );
             }
         }
@@ -6198,22 +6195,17 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             dial(painter, cell, t, cap, p.lane, p.clip_ink);
         };
         let readout = |painter: &Painter, cell: Rect, text: String| {
-            if !cell.is_positive() || cell.height() < 7.0 {
-                return;
-            }
-            // Sized to the CELL, width included: three readouts sit shoulder
-            // to shoulder up here, and a figure that overflows its dial runs
-            // into the next figure and reads as one number.
-            let fit = cell.width() / (text.chars().count().max(1) as f32 * 0.64);
-            painter.text(
-                cell.center(),
-                Align2::CENTER_CENTER,
-                text,
-                FontId::new(
-                    cell.height().clamp(7.0, 9.0).min(fit).max(5.5),
-                    crate::fonts::courier(),
-                ),
+            // Three readouts sit shoulder to shoulder up here, and a figure
+            // that overflows its dial runs into the next figure and reads as
+            // one number — so the width is a real measurement. See `fit_text`.
+            fit_text(
+                painter,
+                cell,
+                &text,
+                &crate::fonts::courier(),
                 ink_on,
+                0.92,
+                (7.0, 12.0),
             );
         };
         dial(painter, row.knob, crate::recorder::gain_to_fader(lane.gain), DIAL_VOLUME);
@@ -6255,21 +6247,38 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         readout(painter, row.pan_readout, pan_word);
         // The labels, under their dials — always visible, the standard.
         let label_ink = quiet(ink_on, face, 0.34);
+        // **The band a label stands in ENDS where the ROUTING button starts.**
+        //
+        // It used to run to the bottom of the panel and the word was hung
+        // from its top edge, which is two faults wearing each other's
+        // clothes: on a row with no routing button the band is half as tall
+        // again as the word, so the label sat jammed under its dial with a
+        // finger of empty panel below it — the owner's "proper vertical
+        // centering" — and on a row WITH one the band overlapped a button
+        // whose own rectangle starts nine points down. Naming the real floor
+        // is what lets the word be centred in it and lets it grow.
+        let label_floor = if row.routing.is_positive() {
+            row.routing.top()
+        } else {
+            row.panel.bottom() - 1.0
+        };
         for (dial, word) in [(row.pan, "PAN"), (row.knob, "VOL"), (row.send, "SND")] {
             if !dial.is_positive() {
                 continue;
             }
             let band = Rect::from_min_max(
                 Pos2::new(dial.left() - 2.0, dial.bottom()),
-                Pos2::new(dial.right() + 2.0, row.panel.bottom() - 1.0),
+                Pos2::new(dial.right() + 2.0, label_floor),
             );
             if band.height() >= 6.0 {
-                painter.text(
-                    Pos2::new(band.center().x, band.top()),
-                    Align2::CENTER_TOP,
+                fit_text(
+                    painter,
+                    band,
                     word,
-                    FontId::new(band.height().clamp(6.0, 8.0), crate::fonts::courier()),
+                    &crate::fonts::courier(),
                     label_ink,
+                    0.82,
+                    (6.0, 11.0),
                 );
             }
         }
@@ -6616,6 +6625,69 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
 /// equal over a sweep of names, widths and both faces, CJK and runs of
 /// spaces included. Text with a newline has more than one row and goes to
 /// the walk as it always did.
+/// **A figure written as big as its cell will carry it**, centred in that cell.
+///
+/// The dial readouts on a track header — `-12.3`, `100%`, `L50` — and the
+/// words under the dials that say which dial is which. Both used to be sized
+/// off the cell's HEIGHT and then cut down by a width budget of
+/// `chars * 0.64 * size`, which is Courier Prime's advance. Terminess, the
+/// face this app ships in, is a fifth narrower than that, so every readout on
+/// the timeline was drawn a fifth smaller than the room it actually had: at
+/// the default lane height the volume figure came out at six points against a
+/// cell that would carry eight. The owner asked for the knob text and the
+/// readouts to be bigger, and most of "bigger" was already there.
+///
+/// So the budget is MEASURED, in the face that is installed, and the cell's
+/// height only names the ceiling. `size_scale` rides along for the same
+/// reason it rides on every other size in this file: the three faces have
+/// different cap heights, and the point size that reads on one is small on
+/// another.
+///
+/// Rounded through `fonts::px` before it is used, so a figure that changes
+/// every frame while a dial is being turned does not mint a new galley for
+/// every fractional point size on the way.
+fn fit_text(
+    painter: &Painter,
+    cell: Rect,
+    text: &str,
+    family: &egui::FontFamily,
+    ink: Color32,
+    k: f32,
+    span: (f32, f32),
+) {
+    if !cell.is_positive() || text.is_empty() {
+        return;
+    }
+    let scale = crate::fonts::size_scale(painter.ctx());
+    let want = crate::fonts::px((cell.height() * k).clamp(span.0, span.1) * scale);
+    let measure = |size: f32| {
+        painter
+            .layout_no_wrap(text.to_owned(), FontId::new(size, family.clone()), ink)
+            .rect
+            .width()
+    };
+    let wide = measure(want);
+    // A hair of air either side, so a figure never touches the neighbour's.
+    let room = cell.width() - 2.0;
+    let size = if wide > room && wide > 0.0 {
+        crate::fonts::px(want * room / wide)
+    } else {
+        want
+    };
+    // Below the floor it is a smudge, and a smudge under a dial is worse than
+    // nothing: the dial itself still says where it is standing.
+    if size < 5.5 {
+        return;
+    }
+    painter.text(
+        cell.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::new(size, family.clone()),
+        ink,
+    );
+}
+
 pub(crate) fn cut_to(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
     let measure = |t: &str| painter.layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE);
     let whole = measure(text);
@@ -7509,6 +7581,120 @@ ArrangeView {
             dark_mode: true,
             wood: (0x4A, 0x3B, 0x2C),
         }
+    }
+
+    /// What size, and where, every word in a band was painted at.
+    fn sized_in_face(
+        v: &ArrangeView<'_>,
+        band: Rect,
+        face: crate::fonts::FontChoice,
+    ) -> Vec<(String, f32, Rect)> {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, face, None);
+        crate::fonts::apply_text_styles(&ctx);
+        let r = rect();
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(r), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(r);
+                    draw(ui.painter(), r, v);
+                });
+            },
+        );
+        out.shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if band.contains(t.visual_bounding_rect().center()) => Some((
+                    t.galley.job.text.clone(),
+                    t.galley.job.sections.first().map_or(0.0, |x| x.format.font_id.size),
+                    t.visual_bounding_rect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **The dial readouts and the words under them use the room they have.**
+    ///
+    /// The owner asked for the knob text and the readouts on a track header to
+    /// be bigger and to sit properly in the middle of their cells. Most of
+    /// "bigger" was room the drawing was already given and would not take: the
+    /// width budget was `chars * 0.64 * size`, Courier Prime's advance,
+    /// applied to whichever face was installed — and Terminess, which this app
+    /// ships in, is a fifth narrower than that. Measured at the default lane
+    /// height the volume figure came out at 6.2 points in a cell that carries
+    /// nine. See `fit_text`.
+    ///
+    /// Asserted on all three faces, because the fault was a face-specific
+    /// constant and a test pinned to one face would not have seen it.
+    #[test]
+    fn the_dial_readouts_and_their_labels_fill_their_cells() {
+        let c = clips();
+        let v = a_view(&c);
+        let l = Layout::new(rect(), &v);
+        let row = l.header_rows[0];
+        let band = Rect::from_min_max(
+            Pos2::new(row.pan.left() - 2.0, row.knob.bottom()),
+            Pos2::new(row.send.right() + 2.0, row.panel.bottom()),
+        );
+        // The floor the labels are centred in — the same one `draw` names.
+        let mid = (row.knob.bottom() + row.panel.bottom() - 1.0) * 0.5;
+        let mut bad: Vec<String> = Vec::new();
+        for face in [
+            crate::fonts::FontChoice::Courier,
+            crate::fonts::FontChoice::Terminess,
+            crate::fonts::FontChoice::JetBrains,
+        ] {
+            for (what, cell) in [
+                ("volume", row.knob_readout),
+                ("send", row.send_readout),
+                ("pan", row.pan_readout),
+            ] {
+                let painted = sized_in_face(&v, cell, face);
+                if painted.is_empty() {
+                    bad.push(format!("{face:?}: the {what} readout was not painted"));
+                }
+                for (text, size, at) in painted {
+                    // It fits. A figure that overflows its dial runs into the
+                    // next figure and the three read as one number.
+                    if at.width() > cell.width() {
+                        bad.push(format!(
+                            "{face:?}: the {what} readout {text:?} is {:.1} wide in {:.1}",
+                            at.width(),
+                            cell.width()
+                        ));
+                    }
+                    // And it is worth reading. Eight points is the floor the
+                    // measured budget clears on every face; the guessed one
+                    // did not.
+                    if size < 8.0 {
+                        bad.push(format!(
+                            "{face:?}: the {what} readout is {size:.1}pt"
+                        ));
+                    }
+                }
+            }
+            for (text, size, at) in sized_in_face(&v, band, face) {
+                if size < 10.0 {
+                    bad.push(format!("{face:?}: the {text:?} label is {size:.1}pt"));
+                }
+                // **Centred in the band, not hung from its top edge.**
+                let dy = at.center().y - mid;
+                if dy.abs() > 1.5 {
+                    bad.push(format!(
+                        "{face:?}: the {text:?} label is {dy:+.2} off the middle of its band"
+                    ));
+                }
+                if at.width() > band.width() / 3.0 {
+                    bad.push(format!(
+                        "{face:?}: the {text:?} label is {:.1} wide",
+                        at.width()
+                    ));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the header's figures:\n  {}", bad.join("\n  "));
     }
 
     pub(super) fn rect() -> Rect {
