@@ -1319,6 +1319,11 @@ pub struct TangentApp {
     /// is not a sampler, silently. A sampler in bay 1 or 2, or in any of the
     /// six a folder wears, took a file from the browser and never played it.
     sampler_load: std::collections::VecDeque<(usize, usize, std::path::PathBuf)>,
+    /// Whether a sampler's face was standing at the END of the last frame —
+    /// the edge that silences the browser's audition. See the call in
+    /// `update`; `close_drumpad` is the other explorer's single door and
+    /// there is no door like it for a face window.
+    sampler_face_up: bool,
     /// The generation the sampler's browser listing was read at, bumped
     /// whenever anything could have changed the folder on screen — the
     /// `ir_scan_gen` bargain.
@@ -3595,6 +3600,7 @@ impl TangentApp {
             ir_scan_gen: 0,
             sampler_info: HashMap::new(),
             sampler_load: std::collections::VecDeque::new(),
+            sampler_face_up: false,
             sampler_scan_gen: 0,
             ir_live: crate::ports::IrLive::default(),
             plugin_rescan: false,
@@ -16305,6 +16311,50 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Close it, saving whatever the session touched.
     // ── the drumpad ──────────────────────────────────────────────────────
 
+    /// **Audition one media file: press it, hear it once.**
+    ///
+    /// The drumpad's explorer has done this since it shipped, and it did it
+    /// INLINE, in the `Hit::MediaRow` arm — which is why the sampler's
+    /// browser did not: the two panels share the drawing
+    /// (`drumpad_panel::draw_media_pane`, lifted out of the drumpad when the
+    /// sampler was built) and shared nothing of the behaviour. The owner
+    /// found the gap the first time he opened it: *"there's no audition like
+    /// the drum media explorer has"*.
+    ///
+    /// So the one line both panels need lives here, at the level the
+    /// drumpad's audition already lived at, and both call it. Not in
+    /// `drumpad_panel`: a panel module draws and hit-tests, and asking the
+    /// host to make a sound is not drawing — the pane would have to grow a
+    /// second return channel to carry it, which is a road where a call
+    /// suffices.
+    ///
+    /// `RecorderRequest::PreviewFile` is the whole of the road, and it is the
+    /// SAME road: the host decodes at the engine's rate, hands the clip over
+    /// on the preview ring and never caches it (browsing a folder of songs
+    /// would otherwise hold every one of them for the session). One preview
+    /// at a time — a second file replaces the first from the top — so a
+    /// finger walking a listing sounds like a finger walking a listing.
+    fn audition_media(&mut self, path: &std::path::Path) {
+        self.request_recorder(recorder::RecorderRequest::PreviewFile(path.to_path_buf()));
+    }
+
+    /// Whether a sampler's face is standing right now — in the dialog slot
+    /// or in the pedal window over it, which are the two places one can be.
+    ///
+    /// Only for the audition's own quiet: see the call in `update`.
+    fn sampler_face_is_open(&self) -> bool {
+        let is_sampler = |d: &Dialog| {
+            matches!(d, Dialog::InsertFace { live, .. }
+                if live.face.path == crate::faces_sampler::SAMPLER_PATH)
+        };
+        self.dialog.as_ref().is_some_and(is_sampler)
+            || self
+                .pedal_stack
+                .as_ref()
+                .and_then(|s| s.dialog.as_ref())
+                .is_some_and(is_sampler)
+    }
+
     /// Put the drumpad away, releasing whatever it holds: the pressed pad's
     /// note-off, the gestures, the hover. Esc, the ×, a press outside and
     /// the toggle key all come through here, so no path can strand a note.
@@ -17386,9 +17436,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // lights, the file plays once.
                         self.media_drag = Some(i);
                         self.media_sel = Some(i);
-                        self.request_recorder(recorder::RecorderRequest::PreviewFile(
-                            self.media_dir.join(&e.name),
-                        ));
+                        // The one road, shared with the sampler's browser
+                        // since it grew the same gesture. See
+                        // [`Self::audition_media`].
+                        let file = self.media_dir.join(&e.name);
+                        self.audition_media(&file);
                     }
                 }
             }
@@ -29050,6 +29102,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.clone());
                 if crate::drumpad_panel::is_audio_file(&name) {
+                    // **And you HEAR it**, on the drumpad explorer's own
+                    // road — see [`Self::audition_media`]. The owner asked
+                    // for exactly that parity: "there's no audition like the
+                    // drum media explorer has". Auditioned before the load
+                    // is queued rather than after, so the sound starts on
+                    // this frame instead of waiting on a decode the host
+                    // does a frame or more from now.
+                    self.audition_media(&file);
                     self.queue_sampler_load(seat, bay, file);
                 } else {
                     self.notify(
@@ -34320,6 +34380,20 @@ impl TangentApp {
             st.dialog = self.refreshed_face(&ctx, st.dialog);
             self.pedal_stack = Some(st);
         }
+        // **And the audition goes quiet with the window that started it.**
+        //
+        // `close_drumpad` does this for the other explorer and there is no
+        // door like it here: a face window is dismissed from a dozen places
+        // — Escape, the ×, a bay being emptied, a project closing — so the
+        // honest test is whether one is STANDING, asked once a frame after
+        // the refresh has settled which are. The alternative is a six-second
+        // sample-pack hit still playing over a desk with nothing on screen
+        // to stop it.
+        let sampler_up = self.sampler_face_is_open();
+        if self.sampler_face_up && !sampler_up {
+            self.request_recorder(recorder::RecorderRequest::PreviewStop);
+        }
+        self.sampler_face_up = sampler_up;
 
         // **The top window owns Escape, and inline it has to TAKE it.**
         //
@@ -58751,6 +58825,55 @@ mod sampler_road_tests {
         );
         assert_ne!(first.0, second.0, "two seats collapsed into one lane");
         assert_eq!(app.take_sampler_load(), None, "a load came back twice");
+    }
+
+    /// **Pressing a file in the sampler's browser AUDITIONS it**, on the
+    /// drumpad explorer's own road — the owner's "there's no audition like
+    /// the drum media explorer has". The two panels share the drawing and
+    /// shared none of the behaviour, which is exactly the gap somebody meets
+    /// on the first click.
+    ///
+    /// Measured at the REQUEST, because that is where the two roads have to
+    /// be the same one: `PreviewFile` is what the host answers by decoding at
+    /// the engine's rate and handing the clip to the preview ring, and a
+    /// second road would be a second thing to keep in step.
+    #[test]
+    fn a_picked_sample_is_auditioned_on_the_drumpads_own_road() {
+        let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
+        app.apply_dialog_action(DialogAction::PickSample {
+            strip: 1,
+            slot: 0,
+            path: "/m/Takes/one.wav".to_owned(),
+        });
+        let mut asked = Vec::new();
+        while let Some(r) = app.take_recorder_request() {
+            asked.push(r);
+        }
+        assert!(
+            asked.iter().any(|r| matches!(
+                r,
+                recorder::RecorderRequest::PreviewFile(p)
+                    if p == std::path::Path::new("/m/Takes/one.wav")
+            )),
+            "the press did not audition: {asked:?}"
+        );
+        // And a file the sampler cannot play is not auditioned either — the
+        // refusal is the whole answer.
+        app.apply_dialog_action(DialogAction::PickSample {
+            strip: 1,
+            slot: 0,
+            path: "/m/part.mid".to_owned(),
+        });
+        let mut asked = Vec::new();
+        while let Some(r) = app.take_recorder_request() {
+            asked.push(r);
+        }
+        assert!(
+            !asked
+                .iter()
+                .any(|r| matches!(r, recorder::RecorderRequest::PreviewFile(_))),
+            "a MIDI part was auditioned: {asked:?}"
+        );
     }
 
     /// **A file the decoder cannot open is refused out loud**, wherever it
