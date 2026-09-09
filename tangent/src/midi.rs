@@ -3,8 +3,29 @@
 //!
 //! - Auto-connect priority: "USB-MIDI" -> "Scarlett" OR ("USB" AND "MIDI") -> first.
 //! - note_on vel>0 = on; note_off or note_on vel==0 = off; CC64 >= 64 = sustain down.
-//! - Channels merged (status high nibble only). Everything else ignored.
-//! - No reconnect logic (parity): if the port dies, events just stop.
+//! - Channels merged on the DISPLAY path (status high nibble only); the raw
+//!   tap and the fast lane keep the channel, and the desk routes on it.
+//! - No reconnect logic (parity) INSIDE a connection: if the port dies, its
+//!   events just stop. The desk notices on its own beat and reopens — see
+//!   `TangentApp::reconcile_midi_ports`.
+//!
+//! # Several devices, one tap, one lane
+//!
+//! **The app used to open exactly ONE port.** Every track's input chip already
+//! named a MIDI port and nothing downstream ever read it, so two tracks could
+//! not have separate keyboards while the chips said they could — the owner's
+//! "the gui selector ... is lying to the user".
+//!
+//! There is one [`MidiConnection`] per open device now, and every message it
+//! delivers is stamped with that device's SOURCE SLOT: into the fast lane, so
+//! the engine can decide which lane hears it, and into the raw tap, so a take
+//! lands on the track that asked for the keyboard it was played on.
+//!
+//! The slot is a plain `u8` captured by value when the port opens, and that is
+//! not an optimisation — it is what midir's sealed callback state can hold. A
+//! connection IS one device, so its slot is fixed for the connection's life;
+//! anything that has to CHANGE has to be app-lifetime behind an `Arc`, which
+//! is why [`RawMidiTap`] and [`MidiFastLane`] are.
 //!
 //! # Two consumers, one callback
 //!

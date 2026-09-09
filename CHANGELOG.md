@@ -12,6 +12,38 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **A track listens to several named MIDI devices, on a channel of its own.**
+  The input chip's MIDI row opens a dialog with a checkbox per device and a
+  channel chooser, for that track. Tick two keyboards and the track hears both;
+  tick none and it hears every device, including one plugged in later, which is
+  the default and what the app has always done. The channel is one of the
+  sixteen or all of them.
+
+  This was a lie the app had been telling. Each track's chip already named a
+  MIDI port, and the app opened exactly ONE device app-wide, chosen from a
+  global menu row nothing on the desk mentioned — so two tracks could not have
+  separate keyboards and every chip said they could. The owner found it while
+  setting up two tracks with two inputs.
+
+  The chip says what is true now, in a grammar that names the axis it is
+  talking about: `MIDI: ALL DEVICES`, `MIDI: Keystation 88 +1 CH 3`. A device a
+  track remembers and which is not plugged in right now is kept, not dropped —
+  unplugging a keyboard and plugging it back in costs nothing — and it is
+  marked, on the chip with a `!` and in the dialog with "not connected".
+
+  Two tracks may ask for the same device and channel, and both hear it. That is
+  what this desk already does everywhere else — two armed instruments both
+  sound — and layering a piano and a pad from one keyboard is the ordinary
+  reason to want it.
+
+  Recording follows the same rule, so a take of two players lands each
+  performance on its own track rather than both on both. The global menu's
+  "Select MIDI Input..." now opens the selected track's dialog; there is no
+  app-wide MIDI device left to pick.
+
+  Settings written by this build stay readable by an older one: `channel_inputs`
+  still says what it always said, and the sets ride beside it in an additive key.
+
 - **The MIDI editor has a pedal lane.** The chip marked PED, at the pencil's
   shoulder, swaps the lane along the foot of the editor between velocity and
   the sustain pedal. The pedal is drawn as a step — a shelf where it is held
