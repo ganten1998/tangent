@@ -502,6 +502,19 @@ pub enum FaceAction {
     /// a row out of either explorer), and an OS file drop — because they
     /// differ only in how the path was found.
     PickSample { path: String },
+    /// **Make this folder the media explorer's remembered default.**
+    /// Appended at the END, this enum's law.
+    ///
+    /// The drumpad's DEF chip, for the panel that shares its explorer. The
+    /// owner reported the gap as a missing button — "no default button for
+    /// the home media explorer" — and it is exactly that: the drumpad has
+    /// carried a DEF chip since its explorer shipped, the sampler's browser
+    /// was lifted out of that panel without it, and a library five folders
+    /// down had to be walked to from scratch every time a face opened.
+    ///
+    /// A PATH and nothing else, the [`Self::PickSample`] bargain: the face
+    /// knows where it is standing and the host owns the setting.
+    SetMediaDefault { path: String },
 }
 
 fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {

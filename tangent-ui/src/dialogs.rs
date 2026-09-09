@@ -1862,6 +1862,13 @@ pub enum DialogAction {
         slot: usize,
         path: String,
     },
+    /// **Remember this folder as where the media explorers open.**
+    ///
+    /// The sampler browser's DEF chip. No strip and no slot: the setting is
+    /// one folder for the app, not one per bay — see
+    /// `TangentApp::media_home`, which is what the drumpad's own DEF chip
+    /// has always written.
+    SetMediaDefault { path: String },
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -7245,6 +7252,12 @@ fn show_on(
                                     }
                                     crate::faces::FaceAction::PickSample { path } => {
                                         Some(DialogAction::PickSample { strip, slot, path })
+                                    }
+                                    // No strip, no slot: one default folder
+                                    // for the app, shared with the drumpad's
+                                    // own DEF chip.
+                                    crate::faces::FaceAction::SetMediaDefault { path } => {
+                                        Some(DialogAction::SetMediaDefault { path })
                                     }
                                     crate::faces::FaceAction::BrowseIr => {
                                         // **The face window goes down with
