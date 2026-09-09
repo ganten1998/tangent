@@ -20549,7 +20549,7 @@ mod midi_inputs_tests {
     /// hit-tests and does nothing is the fault this codebase has shipped four
     /// times, and the only way to know a press ARRIVES is to make one.
     fn press_at(pos: Pos2, start: Option<u8>) -> Option<DialogAction> {
-        let ctx = crate::face::fit::a_ctx(crate::fonts::FontChoice::default());
+        let ctx = crate::face::fit::a_ctx(fonts::FontChoice::default());
         let t = theme_of(Color32::from_rgb(0x2a, 0x2a, 0x2e));
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(MIDI_INPUTS_W, 400.0));
         let mut devices = rows();
@@ -20573,7 +20573,7 @@ mod midi_inputs_tests {
             }],
         ];
         for evs in events {
-            ctx.run(
+            let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(screen),
                     events: evs,
@@ -20709,7 +20709,7 @@ mod midi_inputs_tests {
                 _ => {}
             }
         }
-        let ctx = crate::face::fit::a_ctx(crate::fonts::FontChoice::default());
+        let ctx = crate::face::fit::a_ctx(fonts::FontChoice::default());
         let t = theme_of(Color32::from_rgb(0x2a, 0x2a, 0x2e));
         let mut devices = rows();
         let mut channel = None;
@@ -20823,7 +20823,7 @@ mod shot {
         };
         let t = theme_of(face);
         let surface = crate::recorder_panel::surface_of(face);
-        let ctx = crate::face::fit::a_ctx(crate::fonts::FontChoice::default());
+        let ctx = crate::face::fit::a_ctx(fonts::FontChoice::default());
         let mut devices = crate::app::demo_midi_rows();
         let mut channel = Some(2);
         let (w, h, rgba) = crate::face::fit::shoot(
@@ -20851,7 +20851,7 @@ mod shot {
                     });
             },
         );
-        crate::face::fit::write_png(std::path::Path::new(&out), &rgba, w, h);
+        crate::face::fit::write_png(Path::new(&out), &rgba, w, h);
         println!(
             "wrote {out} ({w}x{h}, {} mode)",
             if set.dark_mode { "dark" } else { "light" }

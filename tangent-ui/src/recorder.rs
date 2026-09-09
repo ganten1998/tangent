@@ -4642,10 +4642,10 @@ mod tests {
         // A hand-edited channel 99 is DROPPED, not wrapped: wrapped it would
         // become channel 3 and silently route somebody's keyboard to a track
         // they never named.
-        let bad: serde_json::Value = serde_json::json!({"1": {"channel": 99}});
+        let bad: Value = serde_json::json!({"1": {"channel": 99}});
         assert_eq!(read_midi_inputs(Some(&bad))[1], MidiInputSel::EVERYTHING);
         // And an empty device name is not a device.
-        let blank: serde_json::Value = serde_json::json!({"1": {"devices": ["", "A"]}});
+        let blank: Value = serde_json::json!({"1": {"devices": ["", "A"]}});
         assert_eq!(read_midi_inputs(Some(&blank))[1], sel(&["A"], None));
     }
 
