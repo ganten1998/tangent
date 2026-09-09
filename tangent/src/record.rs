@@ -1899,15 +1899,20 @@ impl Session {
     /// seals a connection's callback the moment the port opens, so there is no
     /// way to arm it later (see `midi.rs`) — and that turns out to be what a
     /// correct `.mid` needs anyway.
-    /// `on_event` sees every message as it is drained, in the timebase.
+    /// `on_event` sees every message as it is drained, in the timebase, **with
+    /// the SOURCE SLOT it arrived on** — see `midi::MidiEvent::src`. The take
+    /// needs it for the same reason the live path does: with several devices
+    /// open, a note from one keyboard must be written onto the track that
+    /// asked for that keyboard and no other, and a drain that had thrown the
+    /// identity away could only ever write it onto all of them.
     ///
     /// A fan-out rather than a second drain, because the tap is a QUEUE: two
     /// consumers means one of them gets each message and the other gets none.
     /// The monitor engine needs the same notes the take does — that is the
     /// whole point of hosting an instrument — so they come from one drain.
-    pub fn pump_midi(&mut self, mut on_event: impl FnMut(Nanos, &[u8])) {
+    pub fn pump_midi(&mut self, mut on_event: impl FnMut(u8, Nanos, &[u8])) {
         let now = self.timebase.now();
-        for (stamp, arrived, bytes) in self.tap.drain() {
+        for (src, stamp, arrived, bytes) in self.tap.drain() {
             // Pair the device stamp with the arrival reading taken in the midir
             // callback, not with `now`: this loop runs at frame rate, and a
             // uniformly late reading is exactly what a running-minimum anchor
@@ -1917,7 +1922,7 @@ impl Session {
                 .midi_clock
                 .to_timebase(stamp)
                 .unwrap_or_else(|| self.timebase.at(arrived));
-            on_event(t, &bytes);
+            on_event(src, t, &bytes);
             self.midi.push(Captured::new(t, bytes));
         }
         // A rolling window BEHIND the present, and — critically — behind T0 as
@@ -2207,7 +2212,7 @@ impl Session {
         // makes it an audio-versus-MIDI asymmetry rather than a rounding error.
         // `MidiTake::build` already filters to `<= t1`, so nothing past the end
         // can leak in.
-        self.pump_midi(|_, _| {});
+        self.pump_midi(|_, _, _| {});
         let Some(take) = self.take.take() else {
             self.state = RecordState::Idle;
             return;
@@ -2771,7 +2776,7 @@ pub fn record_test(seconds: Option<String>) {
     let until = Instant::now() + Duration::from_secs_f64(seconds);
     while Instant::now() < until {
         std::thread::sleep(Duration::from_millis(50));
-        session.pump_midi(|_, _| {});
+        session.pump_midi(|_, _, _| {});
     }
     session.stop();
 
@@ -4029,7 +4034,7 @@ mod tests {
         s.state = RecordState::Rolling;
         s.t0 = 5_000_000_000;
         s.midi.push(Captured::new(6_000_000_000, [0x90, 60, 90]));
-        s.pump_midi(|_, _| {});
+        s.pump_midi(|_, _, _| {});
         assert_eq!(
             s.midi.len(),
             2,
@@ -4050,7 +4055,7 @@ mod tests {
         // And one second before it, which is inside the window.
         s.midi
             .push(Captured::new(s.t0 - 1_000_000_000, [0xB0, 64, 127]));
-        s.pump_midi(|_, _| {});
+        s.pump_midi(|_, _, _| {});
         assert_eq!(
             s.midi.len(),
             1,

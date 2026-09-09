@@ -41,7 +41,13 @@ pub struct Rgb {
 /// array and the tail is an additive key, so a 20 reads here unchanged and a
 /// 21 reads on a 20 build with its head intact. The stamp records the shape
 /// the file was written in, which is what a stamp is for.
-const SETTINGS_VERSION: u64 = 21;
+///
+/// **22: a MIDI track names a SET of devices and a channel** — see
+/// `channel_midi_inputs`. No migration arm, for the reason 21 had none: the
+/// new key is additive and sparse, `channel_inputs` still says everything it
+/// ever said, and a file with no `channel_midi_inputs` derives one from
+/// `channel_inputs` at load whatever its stamp. The bump records the shape.
+const SETTINGS_VERSION: u64 = 22;
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -1182,7 +1188,27 @@ pub struct Settings {
     /// input 4 (zero-based), "0+1" the 1/2 pair, "midi:all" or
     /// "midi:<port>" for MIDI. Audio channels with every spec empty fall
     /// back to the old ordinal picks, so nothing anybody set up breaks.
+    ///
+    /// **Still the authority on a channel's KIND**, and still the whole story
+    /// for an AUDIO channel. For a MIDI channel it is now the SUMMARY of
+    /// `channel_midi_inputs` — "midi:all", or "midi:" and the first device of
+    /// the set — written on every save so that a build without the set still
+    /// reads something true here. See `MidiInputSel::legacy_spec`.
     pub channel_inputs: Vec<String>,
+    /// **Which MIDI DEVICES each channel listens to, and on which channel.**
+    ///
+    /// The fix for the fault the owner reported as "the gui selector ... is
+    /// lying to the user": the app opened exactly ONE device app-wide, chosen
+    /// from the global menu, while every track's chip offered a port of its
+    /// own that nothing downstream ever read. Two tracks could not have
+    /// separate keyboards.
+    ///
+    /// Parallel to `channel_inputs` and indexed the same way, grown lazily
+    /// like it — and **trimmed of trailing defaults on both read and write**,
+    /// so a desk nobody has narrowed writes nothing at all and its file keeps
+    /// its byte-for-byte shape. See `MidiInputSel`, whose default is every
+    /// device on every channel: the old behaviour, and what most people want.
+    pub channel_midi_inputs: Vec<crate::recorder::MidiInputSel>,
     /// What feeds each general channel: 0 unused, 1 MIDI, 2 AUDIO. See
     /// `recorder::ChannelKind` — kept as bytes so a hand-edited file cannot
     /// hold a kind this build has no picture for.
@@ -1879,6 +1905,7 @@ impl Default for Settings {
             channel_gains: [1.0; crate::recorder::CHANNELS],
             channel_pans: [0.0; crate::recorder::CHANNELS],
             channel_inputs: Vec::new(),
+            channel_midi_inputs: Vec::new(),
             drums_gain: 1.0,
             drums_pan: 0.0,
             auto_palette: true,
@@ -2514,6 +2541,13 @@ impl Settings {
             Ok(map) => Self::from_map(map),
             Err(_) => Self::default(),
         }
+    }
+
+    /// See `recorder::reconcile_midi_inputs` — the rule lives beside the
+    /// type, because the project document reconciles the same two values and
+    /// two copies of this would be two answers.
+    fn reconcile_midi_inputs(&mut self) {
+        crate::recorder::reconcile_midi_inputs(&mut self.channel_midi_inputs, &self.channel_inputs);
     }
 
     fn from_map(mut map: Map<String, Value>) -> Self {
@@ -3439,6 +3473,22 @@ impl Settings {
         if let Some(v) = map.shift_remove("analyzer").and_then(|v| v.as_str().map(str::to_owned)) {
             s.analyzer = v;
         }
+        // **The per-track MIDI device sets, read at the END like they are
+        // written at the end.** A sparse object keyed by channel index, the
+        // `strip_inserts_tail` shape and for its reason: writing thirty-two
+        // objects that nearly all say "everything" would put a hundred
+        // near-empty rows in every settings file and in every DAW project the
+        // plugin saves.
+        //
+        // **Reconciled against `channel_inputs` immediately, never trusted on
+        // its own.** A build without this feature carries this key through
+        // untouched as a stranger's key (see `extra`) while rewriting
+        // `channel_inputs` from its own one-device menu — so a downgrade
+        // round-trip can leave the two contradicting each other, and the key
+        // an older build actually WROTE has to win. See
+        // `reconcile_midi_inputs`.
+        let stored_midi = map.shift_remove("channel_midi_inputs");
+        s.channel_midi_inputs = crate::recorder::read_midi_inputs(stored_midi.as_ref());
 
         // Whatever is left, in the order the FILE had it.
         //
@@ -3467,6 +3517,14 @@ impl Settings {
                 );
             }
         }
+        // **After the migrations**, which are the last writers of
+        // `channel_inputs` — `was < 16` and `was < 17` both put "midi:all"
+        // into it, and a set reconciled before them would be reconciled
+        // against a string that had not finished changing. This is also the
+        // one place an OLD file grows a set at all: it has no
+        // `channel_midi_inputs`, so every MIDI channel arrives here holding
+        // the default and leaves holding what its legacy string says.
+        s.reconcile_midi_inputs();
         s
     }
 
@@ -4716,6 +4774,14 @@ impl Settings {
         if !tail.is_empty() {
             map.insert("strip_inserts_tail".into(), Value::Object(tail));
         }
+        // **The per-track MIDI device sets** — at the END like every additive
+        // key, sparse like the far seats above, and absent entirely until
+        // somebody narrows a track. A desk that listens to everything on
+        // every channel is every desk before this feature existed, so those
+        // files keep their byte-for-byte shape.
+        if let Some(v) = crate::recorder::write_midi_inputs(&self.channel_midi_inputs) {
+            map.insert("channel_midi_inputs".into(), v);
+        }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -5019,6 +5085,7 @@ impl Settings {
         self.channel_gains = fresh.channel_gains;
         self.channel_pans = fresh.channel_pans;
         self.channel_inputs = fresh.channel_inputs.clone();
+        self.channel_midi_inputs = fresh.channel_midi_inputs.clone();
         self.channel_kinds = fresh.channel_kinds;
         self.channel_icons = fresh.channel_icons;
         self.strip_names = fresh.strip_names.clone();

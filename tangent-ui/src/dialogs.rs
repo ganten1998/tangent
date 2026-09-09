@@ -105,11 +105,6 @@ pub enum Dialog {
         spec: crate::ports::ProjectExportSpec,
         sel: Option<(f64, f64)>,
     },
-    MidiPicker {
-        ports: Vec<String>,
-        selected: Option<usize>,
-        current: Option<String>,
-    },
     /// Choose a camera or an audio input for the recorder.
     ///
     /// One dialog for both, because the app does exactly the same thing with
@@ -690,6 +685,64 @@ pub enum Dialog {
     /// than any other dialog holds. Appended at the enum's END, the
     /// append-only law every parallel lane obeys.
     IrWizard { state: Box<IrWizardState> },
+    /// **Which MIDI devices this track listens to, and on which channel.**
+    ///
+    /// It replaces two things at once, and both of them lied.
+    ///
+    /// The first was `Dialog::MidiPicker`, opened from the global menu's
+    /// "Select MIDI Input...": one device for the whole app, chosen once, with
+    /// no track anywhere in the question. The second was the input chip's own
+    /// MIDI submenu, which offered a port PER TRACK and wrote it into the
+    /// settings where nothing downstream ever read it. So the app opened one
+    /// device and the chips said otherwise — the owner's report: "the gui
+    /// selector ... is lying to the user ... Not choose A midi device. Choose
+    /// MIDI DEVICE(s)."
+    ///
+    /// A checkbox each, because the answer is a SET; and a channel row,
+    /// because a keyboard split across channels is the other half of the same
+    /// ask. Both "every device" and "every channel" stay expressible and stay
+    /// the default: that is what most people want and it is what the app did
+    /// before any of this existed.
+    ///
+    /// **Applies as you tick**, like `Automation` and `InputChannels` and
+    /// unlike the pickers: ticking a keyboard is a thing you do while playing
+    /// it, and a dialog that made you press OK to hear the change would make
+    /// that impossible. Done is the only button.
+    ///
+    /// Appended at the enum's END, the append-only law every parallel lane
+    /// obeys.
+    MidiInputs {
+        lane: usize,
+        /// What the track is called, for the title.
+        who: String,
+        /// Every device this dialog offers, in the order it offers them:
+        /// the ones plugged in now, then the ones this track REMEMBERS and
+        /// cannot see. Filled by `TangentApp::open_midi_inputs_dialog`, the
+        /// one constructor.
+        devices: Vec<MidiDeviceRow>,
+        /// The wire channel 0..=15, or `None` for every channel.
+        channel: Option<u8>,
+        /// Bumped every time the window opens, so egui's remembered scroll
+        /// offset cannot come up halfway down a list somebody never
+        /// scrolled — `Dialog::Track`'s lesson, and its `id_salt`.
+        serial: u64,
+    },
+}
+
+/// One row of the MIDI Inputs dialog.
+///
+/// **`present` is not decoration.** A device this track names and which is
+/// not plugged in right now has to be visibly different from one that is, and
+/// it must NOT be dropped from the set — somebody who unplugs a keyboard and
+/// plugs it back in should not have to set this up again. So a missing device
+/// keeps its row, keeps its tick, and says it is not connected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidiDeviceRow {
+    pub name: String,
+    /// Whether this track listens to it.
+    pub on: bool,
+    /// Whether it is plugged in right now.
+    pub present: bool,
 }
 
 impl Dialog {
@@ -721,7 +774,6 @@ impl Dialog {
             | Dialog::Project { .. }
             | Dialog::Track { .. }
             | Dialog::ExportProject { .. }
-            | Dialog::MidiPicker { .. }
             | Dialog::DevicePicker { .. }
             | Dialog::FileBrowser { .. }
             | Dialog::Confirm { .. }
@@ -741,6 +793,7 @@ impl Dialog {
             | Dialog::CorrectChord { .. }
             | Dialog::LearnResult { .. }
             | Dialog::CustomTuning { .. }
+            | Dialog::MidiInputs { .. }
             | Dialog::Export { .. } => true,
         }
     }
@@ -1488,7 +1541,6 @@ pub enum DialogAction {
     ProjectExportBrowse,
     /// Bounce every used lane to its own WAV.
     ProjectExportStems,
-    ConnectPort(String),
     /// List this directory and hand the rows back. The host reads the disk;
     /// the dialog draws what it is given, the same division the plugin picker
     /// uses.
@@ -1869,6 +1921,20 @@ pub enum DialogAction {
     /// `TangentApp::media_home`, which is what the drumpad's own DEF chip
     /// has always written.
     SetMediaDefault { path: String },
+    /// **Tick or untick one device on one track.** The MIDI Inputs dialog's
+    /// checkbox, applied at once — see `Dialog::MidiInputs`.
+    ///
+    /// Named by DEVICE and not by row index: the row list is rebuilt whenever
+    /// something is plugged in, and an index would mean a different keyboard
+    /// the moment it was. The `ClipMenuAction` lesson, in a dialog.
+    MidiInputDevice {
+        lane: usize,
+        device: String,
+        on: bool,
+    },
+    /// **Which MIDI channel one track listens on.** `None` is every channel,
+    /// which is the default and what the app has always done.
+    MidiInputChannel { lane: usize, channel: Option<u8> },
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -2479,6 +2545,134 @@ fn clipped(s: &str, max: usize) -> String {
 }
 /// The channel chooser. Wide enough for eight buttons on a row, so a
 /// sixteen-in interface is two rows and not five.
+/// The MIDI Inputs dialog's width, and the tallest it may grow.
+const MIDI_INPUTS_W: f32 = 420.0;
+const MIDI_INPUTS_MAX_H: f32 = 560.0;
+
+/// **The MIDI Inputs dialog's whole content**, so that the `#[ignore]`d shot
+/// can render exactly what ships.
+///
+/// A dialog is a child viewport and `composite.rs`'s shot photographs the
+/// compositor's frame, which never runs an egui pass — so the only way to
+/// look at this before it reaches somebody's screen is to rasterise the body
+/// on its own. The ink law has been broken nine times in this codebase and
+/// every one was found by looking at a picture, so being able to take one is
+/// not a nicety.
+///
+/// Every control here draws and hit-tests through egui, so the press handler
+/// is the drawing — there is no second `match` to forget, which is the fault
+/// this codebase has shipped four times. What it CAN forget is an arm in
+/// `TangentApp::apply_dialog_action`, which is the dialog's form of the same
+/// rule; `every_midi_inputs_control_answers_a_press` is what proves both
+/// actions this can emit are handled.
+fn midi_inputs_body(
+    ui: &mut egui::Ui,
+    t: &DialogTheme,
+    lane: usize,
+    serial: u64,
+    devices: &mut [MidiDeviceRow],
+    channel: &mut Option<u8>,
+) -> Option<DialogAction> {
+    let mut action = None;
+    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+    let plain = |size: f32| FontId::new(size, fonts::courier());
+    // `faint`, never `gamma_multiply`: multiplying an ink's gamma is how this
+    // app has repeatedly produced text nobody can read on a pale ground.
+    let dim = t.faint;
+
+    ui.label(
+        RichText::new("Which devices this track listens to:")
+            .font(bold(12.0))
+            .color(t.text),
+    );
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new(if devices.iter().any(|d| d.on) {
+            "ticked devices only"
+        } else {
+            "none ticked \u{2014} every device, including ones plugged in later"
+        })
+        .font(plain(10.0))
+        .color(dim),
+    );
+    ui.add_space(6.0);
+
+    // The list, with the channel row and Done reserved below it. Room is
+    // computed from the window rather than from however tall the list ran, so
+    // the buttons cannot be pushed off the bottom by a machine with a lot of
+    // ports.
+    let room = (ui.available_height() - 96.0).clamp(60.0, 340.0);
+    egui::ScrollArea::vertical()
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        // The lane AND the serial: egui keys a scroll offset by id and keeps
+        // it for the life of the process, so without the serial this opens
+        // halfway down a list somebody never scrolled. `Dialog::Track`'s
+        // lesson.
+        .id_salt(("midi-inputs", lane, serial))
+        .max_height(room)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if devices.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "No MIDI input ports found, and this track names none.\n\
+                         Plug a keyboard in and it appears here.",
+                    )
+                    .font(plain(11.0))
+                    .color(dim),
+                );
+                return;
+            }
+            for row in devices.iter_mut() {
+                let mut on = row.on;
+                // **A missing device is drawn, ticked, and SAID to be
+                // missing.** Dropping it would mean unplugging a keyboard
+                // cost you the setup; drawing it the same as a live one
+                // would mean you could not tell why nothing was arriving.
+                let label = if row.present {
+                    row.name.clone()
+                } else {
+                    format!("{}  \u{2014} not connected", row.name)
+                };
+                let text = RichText::new(label)
+                    .font(plain(11.0))
+                    .color(if row.present { t.text } else { dim });
+                if ui.checkbox(&mut on, text).changed() {
+                    row.on = on;
+                    action = Some(DialogAction::MidiInputDevice {
+                        lane,
+                        device: row.name.clone(),
+                        on,
+                    });
+                }
+            }
+        });
+
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new("MIDI channel:")
+            .font(bold(12.0))
+            .color(t.text),
+    );
+    ui.add_space(2.0);
+    // Sixteen chips and ALL, wrapped: the AudioSetup idiom. 1-based, which is
+    // what every keyboard's own display says — the wire number is 0-based and
+    // stays inside `MidiInputSel`.
+    ui.horizontal_wrapped(|ui| {
+        let mut pick = |ui: &mut egui::Ui, label: String, val: Option<u8>| {
+            if ui.selectable_label(*channel == val, label).clicked() && *channel != val {
+                *channel = val;
+                action = Some(DialogAction::MidiInputChannel { lane, channel: val });
+            }
+        };
+        pick(ui, "ALL".to_owned(), None);
+        for c in 0..16u8 {
+            pick(ui, (c + 1).to_string(), Some(c));
+        }
+    });
+    action
+}
+
 const CHANNELS_W: f32 = 460.0;
 
 /// As tall as the chooser is ever allowed to get. Past this the two columns
@@ -8862,55 +9056,51 @@ fn show_on(
             )
         }
 
-        Dialog::MidiPicker {
-            ports,
-            selected,
-            current,
+        // **Which MIDI devices this track listens to, and on which channel.**
+        //
+        // Drawn from `midi_inputs_body`, which is a function of its own so
+        // that the `#[ignore]`d shot in `mod shot` can photograph exactly what
+        // ships. A dialog is a child viewport, so `composite.rs`'s shot cannot
+        // reach one; the body being separable is what makes the picture
+        // possible at all.
+        Dialog::MidiInputs {
+            lane,
+            who,
+            devices,
+            channel,
+            serial,
         } => {
-            let stock = stock_style(ctx);
+            let t = theme(face);
+            let lane = *lane;
+            let serial = *serial;
+            let rows = devices.len().max(1);
+            // Tall enough for the list it has, and no taller — an interface
+            // with two ports gets a small window, one with twelve gets a
+            // scroll rather than a window off the bottom of the screen.
+            let h = (250.0 + rows as f32 * 24.0).min(MIDI_INPUTS_MAX_H);
             show_dialog_viewport(
                 ctx,
                 placement,
-                "Select MIDI Input",
-                Vec2::new(400.0, 300.0),
-                Vec2::new(400.0, 200.0),
+                &format!("{who} \u{2014} MIDI Inputs"),
+                Vec2::new(MIDI_INPUTS_W, h),
+                Vec2::new(MIDI_INPUTS_W - 80.0, 220.0),
                 |ui, result| {
-                    *ui.style_mut() = stock.clone();
-                    let bg = ui.style().visuals.window_fill;
-                    ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+                    apply_theme(ui.style_mut(), &t);
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
                     egui::Frame::NONE
-                        .inner_margin(egui::Margin::same(10))
+                        .inner_margin(egui::Margin::same(14))
                         .show(ui, |ui| {
-                            ui.label("Select MIDI input port:");
-                            if let Some(current) = current.as_deref() {
-                                ui.label(format!("Current: {current}"));
+                            if let Some(a) =
+                                midi_inputs_body(ui, &t, lane, serial, devices, channel)
+                            {
+                                action = Some(a);
                             }
-                            ui.add_space(4.0);
-                            let bottom_h = 34.0;
-                            let list_h = (ui.available_height() - bottom_h).max(40.0);
-                            egui::ScrollArea::vertical()
-                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                                .max_height(list_h)
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    for (i, name) in ports.iter().enumerate() {
-                                        if ui.selectable_label(*selected == Some(i), name).clicked()
-                                        {
-                                            *selected = Some(i);
-                                        }
-                                    }
-                                });
-                            ui.add_space(6.0);
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("OK").clicked() {
-                                    if let Some(i) = *selected {
-                                        if let Some(name) = ports.get(i) {
-                                            action = Some(DialogAction::ConnectPort(name.clone()));
-                                        }
-                                    }
-                                    result.close = true;
-                                }
-                                if ui.button("Cancel").clicked() {
+                                if ui
+                                    .add(Button::new(RichText::new("Done").color(t.text)))
+                                    .clicked()
+                                {
                                     result.close = true;
                                 }
                             });

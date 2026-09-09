@@ -936,12 +936,35 @@ pub trait MidiPorts: Send {
     /// dialog opens: devices are unplugged while the app is running.
     fn list(&self) -> Vec<String>;
 
-    /// Open this port, closing whatever was open. `Err` carries a message
-    /// meant for the user, so it says what failed rather than which type did.
-    fn connect(&mut self, name: &str, tx: mpsc::Sender<MidiEvent>) -> Result<(), String>;
+    /// **Open exactly this SET of devices, closing anything not in it.**
+    ///
+    /// This replaced `connect(&str)`, and the replacement IS the feature. One
+    /// connection app-wide is why every track's input chip could name a port
+    /// and no track could actually listen to one: the owner's report was
+    /// "the gui selector ... is lying to the user". A track holds a SET now,
+    /// several tracks hold several sets, and the union of them is what has to
+    /// be open — so the door the app pushes on is a set and not a name.
+    ///
+    /// Reconciling rather than rebuilding is part of the contract: a device
+    /// already open and still wanted must keep the connection it has, or
+    /// adding a second keyboard on another track cuts the first one off
+    /// mid-note.
+    ///
+    /// Returns the devices that would NOT open, each with a message meant for
+    /// the user. An empty vector is complete success. Nothing is returned for
+    /// a device that is simply not plugged in — the caller only ever asks for
+    /// ports it has just seen.
+    fn open_set(&mut self, names: &[String], tx: mpsc::Sender<MidiEvent>) -> Vec<(String, String)>;
 
-    /// The port currently open, if any.
-    fn current(&self) -> Option<String>;
+    /// The devices open right now.
+    fn open_ports(&self) -> Vec<String>;
+
+    /// **Source slot -> device name.** `slots[i]` is the device whose
+    /// messages arrive stamped with source slot `i`; see
+    /// `crate::recorder::MIDI_SOURCES`. Append-only for the session, so a
+    /// device that is unplugged and plugged back in keeps its slot and every
+    /// route compiled against the table goes on meaning the same keyboard.
+    fn source_slots(&self) -> Vec<String>;
 
     /// Open whatever the startup priority chain picks — **deferred, and that
     /// is the point.**
@@ -1453,7 +1476,9 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         available: Vec<String>,
-        open: Option<String>,
+        open: Vec<String>,
+        /// Slot index -> device name, append-only, like the real one.
+        slots: Vec<String>,
         /// Whether the priority chain was asked to run, and when.
         auto_calls: usize,
     }
@@ -1462,20 +1487,39 @@ mod tests {
         fn list(&self) -> Vec<String> {
             self.available.clone()
         }
-        fn connect(&mut self, name: &str, _tx: mpsc::Sender<MidiEvent>) -> Result<(), String> {
-            if self.available.iter().any(|n| n == name) {
-                self.open = Some(name.to_owned());
-                Ok(())
-            } else {
-                Err(format!("no port named '{name}'"))
+        fn open_set(
+            &mut self,
+            names: &[String],
+            _tx: mpsc::Sender<MidiEvent>,
+        ) -> Vec<(String, String)> {
+            let mut failed = Vec::new();
+            self.open.clear();
+            for n in names {
+                if self.available.iter().any(|a| a == n) {
+                    if !self.slots.iter().any(|s| s == n) {
+                        self.slots.push(n.clone());
+                    }
+                    self.open.push(n.clone());
+                } else {
+                    failed.push((n.clone(), format!("no port named '{n}'")));
+                }
             }
+            failed
         }
-        fn current(&self) -> Option<String> {
+        fn open_ports(&self) -> Vec<String> {
             self.open.clone()
+        }
+        fn source_slots(&self) -> Vec<String> {
+            self.slots.clone()
         }
         fn auto_connect(&mut self, _tx: mpsc::Sender<MidiEvent>) {
             self.auto_calls += 1;
-            self.open = self.available.first().cloned();
+            self.open = self.available.first().cloned().into_iter().collect();
+            for n in &self.open {
+                if !self.slots.iter().any(|s| s == n) {
+                    self.slots.push(n.clone());
+                }
+            }
         }
     }
 
@@ -1500,11 +1544,11 @@ mod tests {
             ..Default::default()
         };
         // Built, and nothing is open: construction opens no device.
-        assert_eq!(p.current(), None);
+        assert!(p.open_ports().is_empty());
         assert_eq!(p.auto_calls, 0);
         p.auto_connect(tx);
         assert_eq!(p.auto_calls, 1, "the chain was never asked to run");
-        assert_eq!(p.current().as_deref(), Some("USB-MIDI 1"));
+        assert_eq!(p.open_ports(), vec!["USB-MIDI 1".to_owned()]);
     }
 
     /// A source that has no chain says nothing rather than erroring — the
@@ -1516,19 +1560,35 @@ mod tests {
             fn list(&self) -> Vec<String> {
                 Vec::new()
             }
-            fn connect(&mut self, _n: &str, _tx: mpsc::Sender<MidiEvent>) -> Result<(), String> {
-                Ok(())
+            fn open_set(
+                &mut self,
+                _n: &[String],
+                _tx: mpsc::Sender<MidiEvent>,
+            ) -> Vec<(String, String)> {
+                Vec::new()
             }
-            fn current(&self) -> Option<String> {
-                None
+            fn open_ports(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn source_slots(&self) -> Vec<String> {
+                Vec::new()
             }
         }
         let (tx, _rx) = mpsc::channel();
         let mut b = Bare;
         b.auto_connect(tx);
-        assert_eq!(b.current(), None);
+        assert!(b.open_ports().is_empty());
     }
 
+    /// **A set is opened, not a name — and a device that stays wanted keeps
+    /// its slot.**
+    ///
+    /// The trait's door was `connect(&str)` for every release before this
+    /// one, which is the mechanical reason two tracks could not have separate
+    /// keyboards: one connection, app-wide, while every track's input chip
+    /// named a port of its own. So the fake exercises what the real one has
+    /// to do — open several, close only what left, and never hand a slot to a
+    /// second device.
     #[test]
     fn a_port_source_can_be_faked_without_a_device() {
         let (tx, _rx) = mpsc::channel();
@@ -1536,14 +1596,36 @@ mod tests {
             available: vec!["Scarlett 2i2".into(), "USB-MIDI 1".into()],
             ..Default::default()
         };
-        assert_eq!(p.current(), None);
-        assert!(p.connect("USB-MIDI 1", tx.clone()).is_ok());
-        assert_eq!(p.current().as_deref(), Some("USB-MIDI 1"));
-        assert!(p.connect("Nothing", tx).is_err());
+        assert!(p.open_ports().is_empty());
+
+        // TWO at once, which is the whole point.
+        let both = vec!["Scarlett 2i2".to_owned(), "USB-MIDI 1".to_owned()];
+        assert!(p.open_set(&both, tx.clone()).is_empty());
+        assert_eq!(p.open_ports(), both);
+        assert_eq!(p.source_slots(), both, "the slots were not claimed in order");
+
+        // Narrowing closes the one that left and keeps the one that stayed —
+        // with the SAME slot, so every route compiled against the table goes
+        // on meaning the same keyboard.
+        let one = vec!["USB-MIDI 1".to_owned()];
+        assert!(p.open_set(&one, tx.clone()).is_empty());
+        assert_eq!(p.open_ports(), one);
         assert_eq!(
-            p.current().as_deref(),
-            Some("USB-MIDI 1"),
-            "a failed connect must not close the port that was working"
+            p.source_slots().iter().position(|n| n == "USB-MIDI 1"),
+            Some(1),
+            "a device that stayed open was given a different slot"
+        );
+
+        // A device that is not there is reported and does not take the others
+        // down with it.
+        let missing = vec!["USB-MIDI 1".to_owned(), "Nothing".to_owned()];
+        let failed = p.open_set(&missing, tx);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, "Nothing");
+        assert_eq!(
+            p.open_ports(),
+            one,
+            "a device that would not open closed one that had"
         );
     }
 

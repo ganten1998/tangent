@@ -485,6 +485,18 @@ impl OutputInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MidiEvent {
     pub(crate) stamp: Nanos,
+    /// **WHICH DEVICE this came from**, as a source slot — see
+    /// `tangent_ui::recorder::MIDI_SOURCES`, and
+    /// [`tangent_ui::recorder::MIDI_SRC_APP`] for the app's own notes.
+    ///
+    /// A byte, and it travels the whole way: the midir callback stamps it
+    /// when the port opens (the slot is fixed for a connection's life, which
+    /// is exactly what midir's sealed callback state can hold), the ring
+    /// carries it, and `collect_notes` is what finally asks the desk whether
+    /// this lane wanted it. Before this field the app opened ONE device and
+    /// every track heard it — two tracks could not have separate keyboards,
+    /// and the input chip said they could.
+    pub(crate) src: u8,
     pub(crate) status: u8,
     pub(crate) data1: u8,
     pub(crate) data2: u8,
@@ -1985,6 +1997,24 @@ struct Shared {
     /// had — an empty channel armed plays nothing, so five loaded instruments
     /// still layer, and switching a channel to AUDIO is what sets its bit.
     midi_off: AtomicU64,
+    /// **Which DEVICES each lane admits**, one bit per source slot; and
+    /// **which MIDI CHANNELS**, one bit per wire channel 0..=15.
+    ///
+    /// The sibling of `midi_off` and deliberately not folded into it: that
+    /// mask answers "is this lane listening at all" from arm and the editor,
+    /// these answer "to WHAT" from the track's own choice, and a lane hears a
+    /// message only when both say yes. Folding them would make a keyboard
+    /// being unplugged look like a disarm.
+    ///
+    /// `u32::MAX` in both is every device on every channel, which is the desk
+    /// as it has always been — so a build that never pushes these behaves
+    /// exactly as before, and so does every lane nobody has narrowed.
+    /// Computed host-side by `tangent_ui::recorder::live_midi_routes` and
+    /// pushed whole per frame, like the arms: a rule assembled a bit at a
+    /// time in the middle of a block is a rule that can be half-applied to
+    /// one note.
+    midi_src: [AtomicU32; CHANNELS],
+    midi_chan: [AtomicU32; CHANNELS],
     /// Which channels are ARMED — live to the room. Bits over the eight
     /// generals; an unarmed AUDIO channel's input still drains and still
     /// reaches a take, but contributes nothing to the monitor mix. The MIDI
@@ -2470,6 +2500,8 @@ impl Shared {
             out_block_seen: AtomicU32::new(0),
             out_ring_asked: AtomicU32::new(0),
             midi_off: AtomicU64::new(0),
+            midi_src: std::array::from_fn(|_| AtomicU32::new(u32::MAX)),
+            midi_chan: std::array::from_fn(|_| AtomicU32::new(u32::MAX)),
             armed: AtomicU32::new(u32::MAX),
             arr_capture: AtomicU32::new(0),
             cap_dropped: AtomicU64::new(0),
@@ -12599,6 +12631,19 @@ impl Engine {
         self.shared.midi_off.store(mask, Ordering::Relaxed);
     }
 
+    /// **Which devices and which MIDI channel each lane listens to.**
+    ///
+    /// Pushed whole every frame, like the arms and the mutes, from
+    /// `tangent_ui::recorder::live_midi_routes`. See `Shared::midi_src` for
+    /// why this is separate from `set_midi_off`, and `MidiEvent::src` for how
+    /// the device identity gets here at all.
+    pub fn set_midi_routes(&self, routes: &[tangent_ui::recorder::MidiRoute; CHANNELS]) {
+        for (ch, r) in routes.iter().enumerate() {
+            self.shared.midi_src[ch].store(r.src, Ordering::Relaxed);
+            self.shared.midi_chan[ch].store(r.chan, Ordering::Relaxed);
+        }
+    }
+
     /// Which channels are armed — live to the room. See `Shared::armed`.
     pub fn set_armed(&self, mask: u32) {
         self.shared.armed.store(mask, Ordering::Relaxed);
@@ -12893,6 +12938,11 @@ impl Engine {
         };
         let event = MidiEvent {
             stamp: stamp_host_ns,
+            // **The app's own slot, admitted by every lane.** A clicked key,
+            // a chord on the fretboard, a note off the lattice: none of these
+            // came from a device, so filtering them against a device set —
+            // which no app-made note can ever be in — would silence the app.
+            src: tangent_ui::recorder::MIDI_SRC_APP,
             status,
             data1: bytes.get(1).copied().unwrap_or(0),
             data2: bytes.get(2).copied().unwrap_or(0),
@@ -17041,6 +17091,7 @@ mod tests {
     fn queue(tx: &mut Producer<MidiEvent>, stamp: Nanos, bytes: [u8; 3]) {
         tx.push(MidiEvent {
             stamp,
+            src: tangent_ui::recorder::MIDI_SRC_APP,
             status: bytes[0],
             data1: bytes[1],
             data2: bytes[2],
@@ -17559,6 +17610,11 @@ mod tests {
         hw_tx
             .push(MidiEvent {
                 stamp: 0,
+                // Slot 0: this rig has one imaginary keyboard and the desk
+                // admits every device, so any slot serves. It is written
+                // rather than left to a default because the whole feature is
+                // that a message says which device it came from.
+                src: 0,
                 status: 0x90,
                 data1: 60,
                 data2: 100,
@@ -18248,6 +18304,245 @@ mod tests {
             peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
         }
         peak
+    }
+
+    /// **THE SEAM: a note from device A on channel 3 reaches the track that
+    /// asked for device A on channel 3, and reaches no other track.**
+    ///
+    /// This is the end-to-end claim of the whole feature, and it is written
+    /// as ONE test on purpose. Two lanes built the sampler yesterday, each
+    /// tested its own half, both passed, and the feature shipped mute because
+    /// nothing tested the seam between them. Here the seam runs:
+    ///
+    ///   the dialog's answer -> `Settings` JSON -> back off disk ->
+    ///   `live_midi_routes` against the slot table -> `Engine::set_midi_routes`
+    ///   -> the hardware ring -> `collect_notes` -> the lane's own synth.
+    ///
+    /// Every one of those is a place the identity could be dropped, and until
+    /// this feature existed it WAS dropped at the first of them: the app
+    /// opened one MIDI device app-wide while every track's input chip named a
+    /// port of its own, so two tracks could not have separate keyboards and
+    /// the chips said they could. The owner: "the gui selector ... is lying to
+    /// the user."
+    ///
+    /// Read off `strip_peaks`, per strip, in ONE render: two synths on two
+    /// lanes, one note, and each lane answers for itself. Measuring the master
+    /// would need two engines and could not tell "B was silent" from "B was
+    /// quiet".
+    ///
+    /// **Revert check performed**: making `MidiRoute::admits` return `true`
+    /// unconditionally reddens both leak assertions; dropping the channel half
+    /// of it (`self.src & sbit != 0` alone) reddens the channel leak only.
+    #[test]
+    fn a_note_from_one_keyboard_reaches_only_the_track_that_asked_for_it() {
+        use tangent_ui::recorder::{ChannelKind, MidiInputSel};
+        // Two tracks, two keyboards, one channel each — set up exactly as the
+        // MIDI Inputs dialog writes it.
+        const A: usize = 2;
+        const B: usize = 5;
+        let mut set = tangent_ui::settings::Settings::default();
+        set.channel_inputs = vec![String::new(); tangent_ui::recorder::CHANNELS];
+        set.channel_kinds = [0; tangent_ui::recorder::CHANNELS];
+        for ch in [A, B] {
+            set.channel_kinds[ch] = ChannelKind::as_u8(Some(ChannelKind::Midi));
+        }
+        set.channel_inputs[A] = "midi:Keyboard A".to_owned();
+        set.channel_inputs[B] = "midi:Keyboard B".to_owned();
+        set.channel_midi_inputs = vec![MidiInputSel::EVERYTHING; tangent_ui::recorder::CHANNELS];
+        // Wire channel 2 is what a keyboard's own display calls CH 3.
+        set.channel_midi_inputs[A] = MidiInputSel {
+            devices: vec!["Keyboard A".to_owned()],
+            channel: Some(2),
+        };
+        set.channel_midi_inputs[B] = MidiInputSel {
+            devices: vec!["Keyboard B".to_owned()],
+            channel: None,
+        };
+
+        // **Through the stored form and back**, because the store is part of
+        // the seam: a setup that survives the dialog and not the file is a
+        // setup somebody has to build again every launch.
+        let back = tangent_ui::settings::Settings::from_json(&set.to_json());
+        assert_eq!(
+            back.channel_midi_inputs[A], set.channel_midi_inputs[A],
+            "the device set did not survive the settings file"
+        );
+        assert_eq!(
+            back.channel_midi_inputs[B], set.channel_midi_inputs[B],
+            "the second track's set did not survive the settings file"
+        );
+
+        // The slot table the desktop's connections would have claimed.
+        let slots = vec!["Keyboard A".to_owned(), "Keyboard B".to_owned()];
+        let kinds: Vec<_> = (0..tangent_ui::recorder::CHANNELS)
+            .map(|ch| ChannelKind::from_u8(back.channel_kinds[ch]))
+            .collect();
+        let routes =
+            tangent_ui::recorder::live_midi_routes(&back.channel_midi_inputs, &kinds, &slots);
+
+        // Two synths, two lanes, both armed and both audible.
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_master_gain(1.0);
+        e.set_channel_gain(A, 1.0);
+        e.set_channel_gain(B, 1.0);
+        let mask = (1u32 << A) | (1u32 << B);
+        e.set_builtin_strips(mask);
+        e.sync_instrument_lanes(mask, 0);
+        // Nothing shut: the ONLY thing that can keep a note off a lane here
+        // is the route under test.
+        e.set_midi_off(0);
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; 1024 * 2];
+        // Warm-up drains the instrument hand-off rings. TWO instances have to
+        // arrive here, not one, and the control below is what makes a warm-up
+        // that was too short fail loudly instead of quietly passing every
+        // isolation assertion.
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let mut hw = e.take_hw_midi().expect("the hardware ring");
+        // **Both lanes off ONE reading.** `strip_peaks` SWAPS every meter to
+        // zero as it reads, so asking twice answers the second lane with the
+        // silence the first read left behind — which is a rig that reports
+        // perfect isolation whatever the routing does.
+        fn both(e: &Engine) -> (f32, f32) {
+            let p = e.strip_peaks();
+            let of = |ch: usize| {
+                let s = p[Strip::Channel(ch).index()];
+                s[0].max(s[1])
+            };
+            (of(A), of(B))
+        }
+        // Clear whatever the warm-up left in the meters.
+        let _ = e.strip_peaks();
+        // Let go, let the release ring out, and clear the meters — a free
+        // function so it borrows nothing the assertions below need.
+        fn settle(
+            e: &mut Engine,
+            hw: &mut Producer<MidiEvent>,
+            out: &mut [f32],
+            key: u8,
+            chan: u8,
+        ) {
+            let _ = hw.push(MidiEvent {
+                stamp: 0,
+                src: 0,
+                status: 0x80 | chan,
+                data1: key,
+                data2: 0,
+            });
+            for _ in 0..24 {
+                out.fill(0.0);
+                e.render_offline(out);
+            }
+            let _ = e.strip_peaks();
+        }
+
+        // ── the CONTROL: this rig CAN leak ──────────────────────────────────
+        //
+        // Without it every isolation assertion below is vacuous — a lane whose
+        // instance never arrived is silent for reasons that have nothing to do
+        // with routing, and would pass "no other track heard it" perfectly.
+        // So first, with every lane admitting everything (the desk as it was
+        // before any of this existed), one note has to reach BOTH.
+        e.set_midi_routes(&[tangent_ui::recorder::MidiRoute::EVERYTHING;
+            tangent_ui::recorder::CHANNELS]);
+        hw.push(MidiEvent {
+            stamp: 0,
+            src: 0,
+            status: 0x92,
+            data1: 60,
+            data2: 100,
+        })
+        .expect("the ring holds one note");
+        for _ in 0..3 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let (both_a, both_b) = both(&e);
+        assert!(
+            both_a > 1.0e-4 && both_b > 1.0e-4,
+            "the rig cannot leak, so proving it does not is worth nothing: \
+             A {both_a}, B {both_b}"
+        );
+        settle(&mut e, &mut hw, &mut out, 60, 2);
+
+        // ── and now the desk the dialog described ───────────────────────────
+        e.set_midi_routes(&routes);
+
+        // **Keyboard A, channel 3.** Slot 0, wire channel 2.
+        hw.push(MidiEvent {
+            stamp: 0,
+            src: 0,
+            status: 0x92,
+            data1: 60,
+            data2: 100,
+        })
+        .expect("the ring holds one note");
+        for _ in 0..3 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let (heard_a, leaked_b) = both(&e);
+        assert!(
+            heard_a > 1.0e-4,
+            "the track that asked for Keyboard A channel 3 heard nothing: {heard_a}"
+        );
+        assert!(
+            leaked_b < 1.0e-6,
+            "Keyboard A's note reached the track that asked for Keyboard B: {leaked_b}"
+        );
+        settle(&mut e, &mut hw, &mut out, 60, 2);
+
+        // **The CHANNEL half, on its own.** Same keyboard, wrong channel:
+        // track A asked for channel 3 and this is channel 1, so nothing on
+        // this desk may hear it — B did not ask for this keyboard at all.
+        hw.push(MidiEvent {
+            stamp: 0,
+            src: 0,
+            status: 0x90,
+            data1: 64,
+            data2: 100,
+        })
+        .expect("the ring holds one note");
+        for _ in 0..3 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let (wrong_chan, still_b) = both(&e);
+        assert!(
+            wrong_chan < 1.0e-6,
+            "a note on channel 1 reached the track that asked for channel 3: {wrong_chan}"
+        );
+        assert!(
+            still_b < 1.0e-6,
+            "Keyboard A's note reached Keyboard B's track: {still_b}"
+        );
+
+        // **And the other keyboard reaches the other track**, on any channel,
+        // because that is what "every channel" has to keep meaning.
+        hw.push(MidiEvent {
+            stamp: 0,
+            src: 1,
+            status: 0x97,
+            data1: 67,
+            data2: 100,
+        })
+        .expect("the ring holds one note");
+        for _ in 0..3 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let (leaked_a, heard_b) = both(&e);
+        assert!(
+            heard_b > 1.0e-4,
+            "the track that asked for Keyboard B heard nothing: {heard_b}"
+        );
+        assert!(
+            leaked_a < 1.0e-6,
+            "Keyboard B's note reached Keyboard A's track: {leaked_a}"
+        );
     }
 
     /// An engine with ONE built-in DX7, on `lane`, and the desk's routing

@@ -566,6 +566,434 @@ pub fn live_midi_off(
     off
 }
 
+// ── which DEVICES, and which CHANNEL, one track listens to ──────────────────
+
+/// How many distinct MIDI devices one session can tell apart.
+///
+/// **A bit per device in a `u32`**, which is what makes the routing decision
+/// a mask AND — see [`MidiRoute`]. Thirty-two is the same number the desk has
+/// channels, chosen for the same reason: it is past what anybody plugs in, and
+/// a slot is a few bytes. A thirty-third device opens and is heard by every
+/// lane that listens to everything, which is the safe direction to fail in —
+/// it plays, rather than being silently deaf.
+pub const MIDI_SOURCES: usize = 32;
+
+/// The source slot given to MIDI the APP itself made — a clicked key, the
+/// fretboard, a lattice note, the audition. Never a device, and admitted by
+/// every lane: those notes already name their lane or are meant for the room,
+/// and filtering them by a device set that no app-made note can ever be in
+/// would silence the whole app.
+pub const MIDI_SRC_APP: u8 = 0xFF;
+
+/// **What one track listens to: a SET of devices and a channel.**
+///
+/// # The fault this replaces
+///
+/// The app opened exactly ONE MIDI device, app-wide, chosen from the global
+/// menu — while every track's input chip offered a port of its own and wrote
+/// `"midi:<port>"` into the settings. Nothing downstream ever read that port.
+/// Two tracks could not have separate keyboards, and the chip said they could:
+/// the owner's report was "the gui selector ... is lying to the user".
+///
+/// So a track's MIDI input is two things, and neither of them is one device:
+///
+/// * `devices` — the device NAMES it listens to. **Empty is EVERY device**,
+///   which is the default and today's behaviour, and it stays expressible
+///   because it is what most people want. It is also the only form that
+///   keeps working when a device nobody has seen yet is plugged in.
+/// * `channel` — the wire channel 0..=15, or `None` for **every channel**,
+///   likewise the default. Stored on the wire (0-based) and shown 1-based,
+///   because that is the split every MIDI spec and every keyboard makes.
+///
+/// # Names, not indices
+///
+/// A device is remembered by its NAME and never by its position in the port
+/// list, because the list is re-enumerated whenever anything is plugged or
+/// unplugged and an index means a different keyboard afterwards. The cost is
+/// that two identical controllers on one machine can be indistinguishable —
+/// CoreMIDI numbers them ("USB MIDI 1", "USB MIDI 2") and ALSA does too, so
+/// in practice they are not, and a name that does collide fails by both being
+/// heard rather than by the wrong one being heard.
+///
+/// A remembered device that is not plugged in right now is KEPT. Dropping it
+/// would mean unplugging a keyboard and plugging it back in cost you the
+/// whole setup, which is exactly the thing the owner asked for a dialog to
+/// stop having to redo.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct MidiInputSel {
+    /// The device names this track listens to. **Empty is every device.**
+    pub devices: Vec<String>,
+    /// The wire channel 0..=15. **`None` is every channel.**
+    pub channel: Option<u8>,
+}
+
+impl MidiInputSel {
+    /// Every device, every channel — the default, and what `"midi:all"` has
+    /// always meant.
+    pub const EVERYTHING: Self = Self {
+        devices: Vec::new(),
+        channel: None,
+    };
+
+    /// Whether this is the default: every device, every channel. The chip and
+    /// the migration both ask, and asking in one place is what stops them
+    /// disagreeing about what "all" is.
+    pub fn is_everything(&self) -> bool {
+        self.devices.is_empty() && self.channel.is_none()
+    }
+
+    /// Read the OLD one-device grammar — `"midi:all"` or `"midi:<port>"` —
+    /// into the new shape. `None` for anything that is not a MIDI spec.
+    ///
+    /// **Every old value keeps meaning what it meant**, which for the old
+    /// grammar is easy to state exactly: it could only ever name one port and
+    /// never a channel, so `"midi:<port>"` becomes the one-element set on
+    /// every channel and `"midi:all"` becomes the default.
+    pub fn from_legacy(spec: &str) -> Option<Self> {
+        match spec.strip_prefix("midi:")? {
+            "all" | "" => Some(Self::EVERYTHING),
+            port => Some(Self {
+                devices: vec![port.to_owned()],
+                channel: None,
+            }),
+        }
+    }
+
+    /// Write the OLD one-device grammar back, so that a build without this
+    /// feature reads a file this build wrote and finds something TRUE in it.
+    ///
+    /// The repo's additive-key rule is not only "an old build must not
+    /// crash" — it is that the keys an old build understands must still say
+    /// what they said. `channel_inputs` is still the authority on a channel's
+    /// KIND (see `TangentApp::set_channel_input_spec`), so it is written on
+    /// every save from the selection, and the first device is what an old
+    /// build would have had: one port, the one it could have opened.
+    pub fn legacy_spec(&self) -> String {
+        match self.devices.first() {
+            None => "midi:all".to_owned(),
+            Some(port) => format!("midi:{port}"),
+        }
+    }
+
+    /// **Does this track want messages from `device` at all?** The device
+    /// axis on its own — what decides which ports the app OPENS, where the
+    /// channel is not yet known because no message has arrived.
+    pub fn wants_device(&self, device: &str) -> bool {
+        self.devices.is_empty() || self.devices.iter().any(|d| d == device)
+    }
+
+    /// **Does this track hear a message that arrived from `device` on wire
+    /// channel `chan`?** The whole routing rule, in one place, so the engine's
+    /// live path and the recorder's take path cannot come to disagree about
+    /// it — which is the seam two lanes shipped mute through yesterday.
+    pub fn accepts(&self, device: &str, chan: u8) -> bool {
+        let chan_ok = self.channel.is_none_or(|c| c == chan & 0x0F);
+        self.wants_device(device) && chan_ok
+    }
+
+    /// The same rule as [`Self::accepts`], compiled against a SLOT TABLE into
+    /// two masks the audio thread can test with an `and`.
+    ///
+    /// `slots[i]` is the device holding source slot `i` — see `MIDI_SOURCES`.
+    /// A device this track remembers but which is not in the table is not
+    /// plugged in, contributes no bit, and is simply not heard until it comes
+    /// back; it is never forgotten.
+    ///
+    /// An EMPTY device set compiles to every slot rather than to the slots
+    /// that happen to be filled now, so a keyboard plugged in a minute from
+    /// now is heard without anybody re-deriving anything.
+    pub fn route(&self, slots: &[String]) -> MidiRoute {
+        let src = if self.devices.is_empty() {
+            u32::MAX
+        } else {
+            let mut m = 0u32;
+            for (i, name) in slots.iter().enumerate().take(MIDI_SOURCES) {
+                if self.devices.iter().any(|d| d == name) {
+                    m |= 1u32 << i;
+                }
+            }
+            m
+        };
+        let chan = match self.channel {
+            None => u32::MAX,
+            Some(c) => 1u32 << (c & 0x0F),
+        };
+        MidiRoute { src, chan }
+    }
+
+    /// The remembered devices that are NOT in `present`, in the order they
+    /// were chosen. What the chip warns about and the dialog spells out.
+    pub fn missing<'a>(&'a self, present: &[String]) -> Vec<&'a str> {
+        self.devices
+            .iter()
+            .filter(|d| !present.iter().any(|p| p == *d))
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// **What the input chip says, and it says what is true.**
+    ///
+    /// The chip used to print `MIDI: ALL` or `MIDI: <port>`, and both were
+    /// wrong at once: `ALL` meant all PORTS while the app had exactly one open,
+    /// and `<port>` named a port nothing ever connected to. It also said
+    /// nothing about the channel, which is now a choice.
+    ///
+    /// The grammar, leading with the identity because the chip is CUT to its
+    /// width and the tail is what goes:
+    ///
+    /// * `MIDI: ALL DEVICES` — the default. The axis is named, so the word
+    ///   `ALL` can no longer be read as "all channels".
+    /// * `MIDI: Keystation 88` — one device, every channel.
+    /// * `MIDI: Keystation 88 +2` — three devices; the dialog names the rest.
+    /// * `MIDI: Keystation 88 CH 3` — a channel chosen, shown 1-based.
+    /// * `MIDI: !Keystation 88` — chosen, and NOT PLUGGED IN right now. The
+    ///   `!` is on the chip rather than the device being dropped from the set,
+    ///   because unplugging a keyboard must not cost you the setup.
+    pub fn chip_text(&self, present: &[String]) -> String {
+        let mut out = String::from("MIDI: ");
+        if !self.missing(present).is_empty() {
+            out.push('!');
+        }
+        match self.devices.split_first() {
+            None => out.push_str("ALL DEVICES"),
+            Some((first, rest)) => {
+                out.push_str(first);
+                if !rest.is_empty() {
+                    out.push_str(&format!(" +{}", rest.len()));
+                }
+            }
+        }
+        if let Some(c) = self.channel {
+            out.push_str(&format!(" CH {}", (c & 0x0F) + 1));
+        }
+        out
+    }
+}
+
+/// **Read the persisted device sets**, from either the settings file or a
+/// project document — one reader, because two would be two answers to what a
+/// stored `channel` of 99 means.
+///
+/// The shape is a SPARSE object keyed by channel index, the `strip_inserts`
+/// tail's shape and for its reason: thirty-two rows that nearly all say
+/// "everything" would be a hundred near-empty lines in every settings file
+/// and in every DAW project the plugin saves. Inside a row, `devices` absent
+/// means every device and `channel` absent means every channel — **absent
+/// rather than null**, which is the rule `custom_font_path` set: a key
+/// written as null is a key an older build has to know to ignore.
+pub fn read_midi_inputs(stored: Option<&Value>) -> Vec<MidiInputSel> {
+    let mut out: Vec<MidiInputSel> = Vec::new();
+    let Some(Value::Object(o)) = stored else {
+        return out;
+    };
+    for (k, v) in o {
+        let Ok(ch) = k.parse::<usize>() else { continue };
+        if ch >= CHANNELS {
+            continue;
+        }
+        let Some(row) = v.as_object() else { continue };
+        let devices = row
+            .get("devices")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_owned))
+                    .filter(|d| !d.is_empty())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        // An out-of-range channel is DROPPED rather than wrapped: a
+        // hand-edited 99 that became channel 3 would silently route
+        // somebody's keyboard to a track they never named.
+        let channel = row
+            .get("channel")
+            .and_then(Value::as_u64)
+            .filter(|c| *c < 16)
+            .map(|c| c as u8);
+        while out.len() <= ch {
+            out.push(MidiInputSel::EVERYTHING);
+        }
+        out[ch] = MidiInputSel { devices, channel };
+    }
+    out
+}
+
+/// The inverse of [`read_midi_inputs`]. `None` when there is nothing to say,
+/// so the key is ABSENT rather than an empty object on every desk nobody has
+/// narrowed.
+pub fn write_midi_inputs(sels: &[MidiInputSel]) -> Option<Value> {
+    let rows: Map<String, Value> = sels
+        .iter()
+        .enumerate()
+        .filter(|(_, sel)| !sel.is_everything())
+        .map(|(n, sel)| {
+            let mut row = Map::new();
+            if !sel.devices.is_empty() {
+                row.insert(
+                    "devices".into(),
+                    Value::Array(sel.devices.iter().map(|d| Value::String(d.clone())).collect()),
+                );
+            }
+            if let Some(c) = sel.channel {
+                row.insert("channel".into(), Value::Number(u64::from(c).into()));
+            }
+            (n.to_string(), Value::Object(row))
+        })
+        .collect();
+    (!rows.is_empty()).then(|| Value::Object(rows))
+}
+
+/// **Make a set of device selections agree with the old one-device strings,
+/// letting the string an OLDER build actually wrote win.**
+///
+/// Both places that persist a desk — the settings file and the project
+/// document — hold `channel_inputs` (the old grammar, still the authority on
+/// a channel's KIND) beside the sets, and both can be written by a build that
+/// understands only the first. Such a build rewrites the strings from its own
+/// one-device menu and carries the sets through untouched as a stranger's
+/// key, so after a downgrade round-trip the two can contradict each other and
+/// the one that was actually edited has to win.
+///
+/// The rule: a string that CONTRADICTS the set replaces its device list.
+/// `"midi:all"` against a narrowed set is somebody choosing every port on the
+/// old build; a named port that is not in the set is somebody choosing a
+/// keyboard this build never knew about. A named port that IS in the set
+/// contradicts nothing — the old build could only ever name one of them — so
+/// the set stands, which is what stops a downgrade that touched nothing from
+/// quietly costing somebody their setup.
+///
+/// **The CHANNEL survives a contradiction.** A build without this feature has
+/// no way to express a channel, so it cannot have meant to clear one; and the
+/// chip prints `CH n`, so a filter that is standing is a filter you can see.
+///
+/// A channel whose string is not a MIDI spec at all is reset to the default:
+/// anything stored for an audio or unbound channel is meaningless.
+pub fn reconcile_midi_inputs(sels: &mut Vec<MidiInputSel>, legacy: &[String]) {
+    for (ch, spec) in legacy.iter().enumerate() {
+        let Some(from_legacy) = MidiInputSel::from_legacy(spec) else {
+            if let Some(slot) = sels.get_mut(ch) {
+                *slot = MidiInputSel::EVERYTHING;
+            }
+            continue;
+        };
+        while sels.len() <= ch {
+            sels.push(MidiInputSel::EVERYTHING);
+        }
+        let held = &mut sels[ch];
+        let contradicts = match from_legacy.devices.first() {
+            None => !held.devices.is_empty(),
+            Some(port) => !held.devices.iter().any(|d| d == port),
+        };
+        if contradicts {
+            held.devices = from_legacy.devices;
+        }
+    }
+    trim_midi_inputs(sels);
+}
+
+/// Drop trailing defaults, so a desk nobody has narrowed holds an EMPTY
+/// vector — writes no key, and compares equal to a fresh one. Interior
+/// defaults stay: the vector is indexed by channel.
+pub fn trim_midi_inputs(sels: &mut Vec<MidiInputSel>) {
+    while sels.last().is_some_and(MidiInputSel::is_everything) {
+        sels.pop();
+    }
+}
+
+/// One lane's routing rule as the audio thread holds it: two masks, tested
+/// with an `and`.
+///
+/// Pushed whole per frame like `midi_off` and the arm mask, for the same
+/// reason: a rule assembled a bit at a time in the middle of a block is a rule
+/// that can be half-applied to one note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MidiRoute {
+    /// One bit per source slot; set = this lane hears that device.
+    pub src: u32,
+    /// One bit per wire channel 0..=15; set = this lane hears that channel.
+    pub chan: u32,
+}
+
+impl MidiRoute {
+    /// Every device, every channel — the desk as it has always been, and what
+    /// every lane holds until somebody narrows it.
+    pub const EVERYTHING: Self = Self {
+        src: u32::MAX,
+        chan: u32::MAX,
+    };
+
+    /// Whether a message from source slot `src` on wire channel `chan` is
+    /// admitted. [`MIDI_SRC_APP`] is admitted unconditionally — see the
+    /// constant.
+    pub fn admits(self, src: u8, chan: u8) -> bool {
+        if src == MIDI_SRC_APP {
+            return true;
+        }
+        let sbit = 1u32 << usize::from(src).min(MIDI_SOURCES - 1);
+        let cbit = 1u32 << (chan & 0x0F);
+        self.src & sbit != 0 && self.chan & cbit != 0
+    }
+}
+
+impl Default for MidiRoute {
+    fn default() -> Self {
+        Self::EVERYTHING
+    }
+}
+
+/// **Every lane's routing rule, compiled from the desk.**
+///
+/// The sibling of [`live_midi_off`], and deliberately separate from it: that
+/// one answers "is this lane listening at all" from arm and the editor, this
+/// one answers "to WHAT" from the track's own choice. Two questions, two
+/// masks, and a lane hears a message only when both say yes — which keeps the
+/// arm rule the one place arming is decided, rather than folding a device set
+/// into it and having a re-plug look like a disarm.
+///
+/// A lane that is not a MIDI channel gets [`MidiRoute::EVERYTHING`] rather than
+/// nothing: an AUDIO channel names an audio input, not a device set, and its
+/// rack's MIDI-listening effects have always heard the whole room. Narrowing
+/// them here would be a silent behaviour change nobody asked for, and
+/// `live_midi_off` already shuts an audio lane's live MIDI off.
+pub fn live_midi_routes(
+    sels: &[MidiInputSel],
+    kinds: &[Option<ChannelKind>],
+    slots: &[String],
+) -> [MidiRoute; CHANNELS] {
+    std::array::from_fn(|ch| {
+        if kinds.get(ch).copied().flatten() != Some(ChannelKind::Midi) {
+            return MidiRoute::EVERYTHING;
+        }
+        sels.get(ch)
+            .map_or(MidiRoute::EVERYTHING, |s| s.route(slots))
+    })
+}
+
+/// **Every device any track asks for, deduplicated, in desk order.**
+///
+/// What the app has to have OPEN. A track listening to everything (the empty
+/// set) asks for nothing by name and is served by whatever is open — which is
+/// why the caller adds the auto-connect pick when this comes back empty: a
+/// fresh desk names no device and must still hear the keyboard.
+///
+/// Only MIDI channels are asked. An audio channel's spec names an interface
+/// input and would put a nonsense name in the open set.
+pub fn wanted_midi_devices(sels: &[MidiInputSel], kinds: &[Option<ChannelKind>]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for ch in 0..CHANNELS {
+        if kinds.get(ch).copied().flatten() != Some(ChannelKind::Midi) {
+            continue;
+        }
+        let Some(sel) = sels.get(ch) else { continue };
+        for d in &sel.devices {
+            if !out.iter().any(|o| o == d) {
+                out.push(d.clone());
+            }
+        }
+    }
+    out
+}
+
 impl ChannelKind {
     /// The settings byte, and back. See `Settings::channel_kinds`.
     pub fn from_u8(n: u8) -> Option<Self> {
