@@ -4356,6 +4356,299 @@ mod tests {
     }
 
 
+    // ── what a track listens to ─────────────────────────────────────────────
+
+    fn sel(devices: &[&str], channel: Option<u8>) -> MidiInputSel {
+        MidiInputSel {
+            devices: devices.iter().map(|d| (*d).to_owned()).collect(),
+            channel,
+        }
+    }
+
+    fn slots() -> Vec<String> {
+        vec!["Keystation 88".to_owned(), "Scarlett 2i2".to_owned()]
+    }
+
+    /// **Every device and every channel is the DEFAULT, and stays sayable.**
+    ///
+    /// It is what the app did before any of this existed and it is what most
+    /// people want, so it has to survive being written down, read back, and
+    /// compiled into masks — and it must admit a keyboard nobody has plugged
+    /// in yet, which is the one thing a "list every port that is here right
+    /// now" answer could not do.
+    #[test]
+    fn every_device_and_every_channel_is_the_default_and_admits_one_plugged_in_later() {
+        let all = MidiInputSel::EVERYTHING;
+        assert!(all.is_everything());
+        assert!(all.accepts("a keyboard nobody has seen", 11));
+        assert_eq!(all.legacy_spec(), "midi:all");
+        assert_eq!(MidiInputSel::from_legacy("midi:all"), Some(all.clone()));
+
+        // Compiled against a table with TWO devices in it, the mask is every
+        // slot rather than those two — so slot 7, claimed an hour from now
+        // when somebody plugs a third keyboard in, is admitted without
+        // anybody re-deriving anything.
+        let r = all.route(&slots());
+        assert_eq!(r, MidiRoute::EVERYTHING);
+        assert!(r.admits(7, 0));
+        assert!(r.admits(0, 15));
+    }
+
+    /// **A narrowed track hears its devices on its channel, and nothing
+    /// else** — the two axes, and each on its own.
+    #[test]
+    fn a_narrowed_track_hears_its_devices_on_its_channel() {
+        let s = sel(&["Keystation 88"], Some(2));
+        assert!(s.accepts("Keystation 88", 2));
+        assert!(!s.accepts("Keystation 88", 3), "the channel was not honoured");
+        assert!(!s.accepts("Scarlett 2i2", 2), "the device was not honoured");
+
+        // And the same rule through the masks the audio thread tests.
+        let r = s.route(&slots());
+        assert!(r.admits(0, 2));
+        assert!(!r.admits(0, 3));
+        assert!(!r.admits(1, 2));
+        // The app's own notes go everywhere — a clicked key came from no
+        // device and can be in no device set.
+        assert!(r.admits(MIDI_SRC_APP, 9));
+    }
+
+    /// **A device this track names and which is not plugged in is KEPT, is
+    /// marked, and simply is not heard until it comes back.**
+    ///
+    /// Dropping it would mean unplugging a keyboard cost somebody the setup,
+    /// which is the thing the dialog exists to stop having to redo. Showing
+    /// it the same as a live one would mean nothing says why no notes arrive.
+    #[test]
+    fn a_device_that_has_gone_away_is_kept_and_said_to_be_gone() {
+        let s = sel(&["Keystation 88", "Scarlett 2i2"], None);
+        let present = vec!["Scarlett 2i2".to_owned()];
+        assert_eq!(s.missing(&present), vec!["Keystation 88"]);
+        // The set is untouched: it still names both.
+        assert_eq!(s.devices.len(), 2);
+        // And it is not heard, because no slot holds it.
+        let r = s.route(&present);
+        assert!(r.admits(0, 0), "the device that IS here went deaf");
+        assert!(!r.admits(1, 0), "a slot nobody holds admitted a message");
+    }
+
+    /// **What the chip says, in every state it can be in.**
+    ///
+    /// It said `MIDI: ALL` or `MIDI: <port>` and both were wrong at once:
+    /// `ALL` meant all PORTS while the app had exactly one open, and the port
+    /// named one nothing ever connected to. With a channel choice beside it,
+    /// a bare `ALL` would also read as all channels — so the axis is named.
+    #[test]
+    fn the_chip_says_what_the_track_is_actually_listening_to() {
+        let here = slots();
+        assert_eq!(
+            MidiInputSel::EVERYTHING.chip_text(&here),
+            "MIDI: ALL DEVICES"
+        );
+        assert_eq!(
+            sel(&[], Some(2)).chip_text(&here),
+            "MIDI: ALL DEVICES CH 3",
+            "the channel is shown 1-based, as every keyboard's own display is"
+        );
+        assert_eq!(
+            sel(&["Keystation 88"], None).chip_text(&here),
+            "MIDI: Keystation 88"
+        );
+        assert_eq!(
+            sel(&["Keystation 88"], Some(0)).chip_text(&here),
+            "MIDI: Keystation 88 CH 1"
+        );
+        assert_eq!(
+            sel(&["Keystation 88", "Scarlett 2i2"], None).chip_text(&here),
+            "MIDI: Keystation 88 +1",
+            "the dialog names the rest; the chip is cut to its width"
+        );
+        // **And a device that is not plugged in is visibly different.**
+        assert_eq!(
+            sel(&["Keystation 88"], None).chip_text(&[]),
+            "MIDI: !Keystation 88",
+            "an unplugged keyboard read exactly like a connected one"
+        );
+        assert_eq!(
+            sel(&["Keystation 88", "Scarlett 2i2"], Some(9)).chip_text(&here[1..]),
+            "MIDI: !Keystation 88 +1 CH 10"
+        );
+    }
+
+    /// **TWO TRACKS ASKING FOR THE SAME DEVICE AND CHANNEL BOTH HEAR IT.**
+    ///
+    /// The decision, written down where the rule is. It is not "the first
+    /// wins" and it is not refused, for three reasons.
+    ///
+    /// 1. **It is what this desk already does everywhere else.** Two armed
+    ///    instruments both sound; a duplicated DX7 track sounds twice; two
+    ///    drum lanes with the same kit both strike. Each of those was a
+    ///    reported bug whose fix was "every masked lane renders its own
+    ///    instance". A device that could only be claimed once would be the
+    ///    same bug, reintroduced one layer up.
+    /// 2. **Layering is the ordinary reason to want it.** A piano and a pad
+    ///    from one keyboard is not an edge case, it is the first thing
+    ///    anybody does with two instrument tracks.
+    /// 3. **The alternatives need machinery nobody asked for.** "The first"
+    ///    makes the answer depend on channel ORDER, which is invisible and
+    ///    changes when tracks are reordered. "Refused" needs an arbitration
+    ///    rule, a way to see who holds a device, and a way to take it — three
+    ///    things to design and explain so that a thing people want can be
+    ///    stopped from happening.
+    ///
+    /// The cost is stated plainly: somebody who ticks a keyboard on a second
+    /// track and did not mean to layer will hear both, and the chip on each
+    /// track is what says so.
+    #[test]
+    fn two_tracks_asking_for_the_same_device_and_channel_both_hear_it() {
+        let both = sel(&["Keystation 88"], Some(2));
+        let kinds: Vec<Option<ChannelKind>> = (0..CHANNELS)
+            .map(|ch| (ch == 1 || ch == 4).then_some(ChannelKind::Midi))
+            .collect();
+        let mut sels = vec![MidiInputSel::EVERYTHING; CHANNELS];
+        sels[1] = both.clone();
+        sels[4] = both;
+        let routes = live_midi_routes(&sels, &kinds, &slots());
+        assert!(routes[1].admits(0, 2), "the first track went deaf");
+        assert!(
+            routes[4].admits(0, 2),
+            "the second track was refused the device the first had claimed"
+        );
+        // And a track that asked for neither still hears neither.
+        assert!(!routes[1].admits(1, 2));
+    }
+
+    /// **A lane that is not a MIDI channel keeps hearing everything.**
+    ///
+    /// An audio channel names an interface input, not a device set, and its
+    /// rack's MIDI-listening effects — a wah, a tremolo — have always heard
+    /// the whole room. Narrowing them here would be a silent behaviour change
+    /// nobody asked for, and `live_midi_off` already shuts an audio lane's
+    /// live MIDI off where that is what is wanted.
+    #[test]
+    fn an_audio_lane_is_not_narrowed_by_a_stale_device_set() {
+        let kinds: Vec<Option<ChannelKind>> = (0..CHANNELS)
+            .map(|ch| (ch == 3).then_some(ChannelKind::Audio))
+            .collect();
+        let mut sels = vec![MidiInputSel::EVERYTHING; CHANNELS];
+        sels[3] = sel(&["Keystation 88"], Some(2));
+        let routes = live_midi_routes(&sels, &kinds, &slots());
+        assert_eq!(routes[3], MidiRoute::EVERYTHING);
+    }
+
+    /// **Every device any track asks for, and nothing an audio track's spec
+    /// happens to say.**
+    #[test]
+    fn the_wanted_devices_are_the_union_of_what_the_midi_tracks_name() {
+        let kinds: Vec<Option<ChannelKind>> = (0..CHANNELS)
+            .map(|ch| match ch {
+                1 | 2 => Some(ChannelKind::Midi),
+                3 => Some(ChannelKind::Audio),
+                _ => None,
+            })
+            .collect();
+        let mut sels = vec![MidiInputSel::EVERYTHING; CHANNELS];
+        sels[1] = sel(&["Keystation 88", "Scarlett 2i2"], None);
+        sels[2] = sel(&["Keystation 88"], Some(0));
+        sels[3] = sel(&["not a device"], None);
+        assert_eq!(
+            wanted_midi_devices(&sels, &kinds),
+            vec!["Keystation 88".to_owned(), "Scarlett 2i2".to_owned()],
+            "the union is wrong, or an audio lane's set leaked into it"
+        );
+    }
+
+    /// **A downgrade round-trip that rewrote the old string wins; one that
+    /// touched nothing costs nothing.**
+    ///
+    /// A build without this feature reads only `channel_inputs`, rewrites it
+    /// from its own one-device menu, and carries the sets through as a
+    /// stranger's key — so the two can end up contradicting each other and
+    /// the one that was actually edited has to win. But the ordinary case is
+    /// that nothing was edited, and there the whole set (its channel
+    /// included) has to survive, or a downgrade nobody noticed costs somebody
+    /// their setup.
+    #[test]
+    fn the_legacy_string_wins_only_when_it_contradicts_the_set() {
+        let mut sels = vec![
+            sel(&["Keystation 88", "Scarlett 2i2"], Some(2)),
+            sel(&["Keystation 88"], Some(5)),
+            sel(&["Keystation 88"], None),
+            MidiInputSel::EVERYTHING,
+        ];
+        let legacy = vec![
+            // Untouched: this build wrote the first device's name.
+            "midi:Keystation 88".to_owned(),
+            // An older build chose EVERY port. That contradicts a narrowed
+            // set, so the set widens — and the CHANNEL stands, because a
+            // build that cannot express one cannot have meant to clear it.
+            "midi:all".to_owned(),
+            // An older build chose a keyboard this set never named.
+            "midi:Nord Stage".to_owned(),
+            // Not a MIDI channel at all: anything stored is meaningless.
+            "0+1".to_owned(),
+        ];
+        reconcile_midi_inputs(&mut sels, &legacy);
+        assert_eq!(
+            sels[0],
+            sel(&["Keystation 88", "Scarlett 2i2"], Some(2)),
+            "a downgrade that touched nothing cost somebody their second keyboard"
+        );
+        assert_eq!(sels[1], sel(&[], Some(5)));
+        assert_eq!(sels[2], sel(&["Nord Stage"], None));
+        // The audio channel's row is reset AND then trimmed away with every
+        // other trailing default, which is why the vector is shorter than the
+        // legacy list it was reconciled against.
+        assert_eq!(sels.len(), 3, "a trailing default survived: {sels:?}");
+    }
+
+    /// **A desk nobody has narrowed holds an EMPTY vector**, so it writes no
+    /// key and compares equal to a fresh one. Interior defaults stay, because
+    /// the vector is indexed by channel.
+    #[test]
+    fn trailing_defaults_are_trimmed_and_interior_ones_are_not() {
+        let mut v = vec![
+            MidiInputSel::EVERYTHING,
+            sel(&["Keystation 88"], None),
+            MidiInputSel::EVERYTHING,
+            MidiInputSel::EVERYTHING,
+        ];
+        trim_midi_inputs(&mut v);
+        assert_eq!(v.len(), 2, "a trailing default survived: {v:?}");
+        assert!(v[0].is_everything(), "an interior default was squeezed out");
+        let mut all = vec![MidiInputSel::EVERYTHING; 8];
+        trim_midi_inputs(&mut all);
+        assert!(all.is_empty());
+    }
+
+    /// **The persisted shape, both ways** — sparse, absent when there is
+    /// nothing to say, and forgiving of a hand-edit that names a channel this
+    /// build has no wire for.
+    #[test]
+    fn the_device_sets_round_trip_through_their_sparse_object() {
+        assert!(
+            write_midi_inputs(&[MidiInputSel::EVERYTHING; 4]).is_none(),
+            "a desk nobody narrowed wrote a key"
+        );
+        let mut v = vec![MidiInputSel::EVERYTHING; 6];
+        v[2] = sel(&["Keystation 88"], Some(2));
+        v[5] = sel(&[], Some(15));
+        let written = write_midi_inputs(&v).expect("a narrowed desk writes");
+        let back = read_midi_inputs(Some(&written));
+        assert_eq!(back.len(), 6);
+        assert_eq!(back[2], v[2]);
+        assert_eq!(back[5], v[5]);
+        assert!(back[0].is_everything());
+        // A hand-edited channel 99 is DROPPED, not wrapped: wrapped it would
+        // become channel 3 and silently route somebody's keyboard to a track
+        // they never named.
+        let bad: serde_json::Value = serde_json::json!({"1": {"channel": 99}});
+        assert_eq!(read_midi_inputs(Some(&bad))[1], MidiInputSel::EVERYTHING);
+        // And an empty device name is not a device.
+        let blank: serde_json::Value = serde_json::json!({"1": {"devices": ["", "A"]}});
+        assert_eq!(read_midi_inputs(Some(&blank))[1], sel(&["A"], None));
+    }
+
     /// **A meter's numbers carry no sign, and 0 is not minus zero.**
     ///
     /// Every ladder descends from 0 and draws it, so the minus in front of

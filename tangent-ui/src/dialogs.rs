@@ -2610,7 +2610,13 @@ fn midi_inputs_body(
         // lesson.
         .id_salt(("midi-inputs", lane, serial))
         .max_height(room)
-        .auto_shrink([false, false])
+        // **Shrinks to its rows vertically, never horizontally.** `[false,
+        // false]` filled the room whatever the list held, which on a machine
+        // with two ports left a hand's width of empty ground between the last
+        // device and the channel row — a window that looks like it lost
+        // something. The height cap above is what still makes it scroll on a
+        // machine with twelve.
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             if devices.is_empty() {
                 ui.label(
@@ -2648,7 +2654,10 @@ fn midi_inputs_body(
             }
         });
 
-    ui.add_space(8.0);
+    // A clear break, not a row gap. With the list shrunk exactly to its
+    // content the two sections ran together and the channel label read as a
+    // fifth device.
+    ui.add_space(14.0);
     ui.label(
         RichText::new("MIDI channel:")
             .font(bold(12.0))
@@ -9077,7 +9086,12 @@ fn show_on(
             // Tall enough for the list it has, and no taller — an interface
             // with two ports gets a small window, one with twelve gets a
             // scroll rather than a window off the bottom of the screen.
-            let h = (250.0 + rows as f32 * 24.0).min(MIDI_INPUTS_MAX_H);
+            // The base is everything that is NOT the list: two lines of
+            // heading, the channel label and its two wrapped rows of chips,
+            // Done, and the margins. Measured off the shot rather than
+            // guessed — 250 left a hand's width of dead ground under the
+            // chips.
+            let h = (212.0 + rows as f32 * 24.0).min(MIDI_INPUTS_MAX_H);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -20524,3 +20538,323 @@ at: None,
     }
 }
 
+#[cfg(test)]
+mod midi_inputs_tests {
+    use super::*;
+
+    /// Drive one real click at `pos` through `midi_inputs_body`, on fresh
+    /// state, and answer whatever it emitted.
+    ///
+    /// egui's own input, not a call to a handler: a control that draws and
+    /// hit-tests and does nothing is the fault this codebase has shipped four
+    /// times, and the only way to know a press ARRIVES is to make one.
+    fn press_at(pos: Pos2, start: Option<u8>) -> Option<DialogAction> {
+        let ctx = crate::face::fit::a_ctx(crate::fonts::FontChoice::default());
+        let t = theme_of(Color32::from_rgb(0x2a, 0x2a, 0x2e));
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(MIDI_INPUTS_W, 400.0));
+        let mut devices = rows();
+        let mut channel = start;
+        let mut got = None;
+        // Hover, press, release — a click is the release, and egui wants the
+        // widget to have been laid out before the press lands on it.
+        let events = [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ];
+        for evs in events {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: evs,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            apply_theme(ui.style_mut(), &t);
+                            if let Some(a) =
+                                midi_inputs_body(ui, &t, 4, 0, &mut devices, &mut channel)
+                            {
+                                got = Some(a);
+                            }
+                        });
+                },
+            );
+        }
+        got
+    }
+
+    fn rows() -> Vec<MidiDeviceRow> {
+        vec![
+            MidiDeviceRow {
+                name: "Keystation 88".to_owned(),
+                on: true,
+                present: true,
+            },
+            MidiDeviceRow {
+                name: "Scarlett 2i2 USB".to_owned(),
+                on: false,
+                present: true,
+            },
+            MidiDeviceRow {
+                name: "Nord Stage 3".to_owned(),
+                on: true,
+                present: false,
+            },
+        ]
+    }
+
+    /// **Every control the dialog draws answers a press.**
+    ///
+    /// The whole surface is walked with real clicks and everything that comes
+    /// back is collected: every device row must produce its own toggle — the
+    /// UNPLUGGED one included, because a row you cannot untick is a setup you
+    /// cannot undo — and the channel chips must produce ALL and each of the
+    /// sixteen.
+    ///
+    /// A walk rather than a list of positions somebody typed: this codebase
+    /// has shipped controls that draw, hit-test and do nothing four separate
+    /// times, always because a match arm was missing, and the fix each time
+    /// was a test that pressed everything rather than a test that pressed
+    /// what the author remembered.
+    #[test]
+    fn every_midi_inputs_control_answers_a_press() {
+        let mut devices_seen: Vec<String> = Vec::new();
+        let mut channels_seen: Vec<Option<u8>> = Vec::new();
+        // **Two walks, from two different standing channels.** A chip that is
+        // already lit emits nothing when pressed — which is right, and which
+        // means one walk can never reach every chip. Starting once on ALL and
+        // once on 10 leaves no chip that is lit in both.
+        for start in [None, Some(9_u8)] {
+        let mut y = 0.0_f32;
+        while y < 260.0 {
+            let mut x = 4.0_f32;
+            while x < MIDI_INPUTS_W - 4.0 {
+                match press_at(Pos2::new(x, y), start) {
+                    Some(DialogAction::MidiInputDevice { lane, device, on }) => {
+                        assert_eq!(lane, 4, "the toggle named the wrong track");
+                        // The rows start on, off, on — so the press flips it.
+                        let want_on = !rows().iter().any(|r| r.name == device && r.on);
+                        assert_eq!(on, want_on, "{device} was toggled the wrong way");
+                        if !devices_seen.contains(&device) {
+                            devices_seen.push(device);
+                        }
+                    }
+                    Some(DialogAction::MidiInputChannel { lane, channel }) => {
+                        assert_eq!(lane, 4, "the chip named the wrong track");
+                        if !channels_seen.contains(&channel) {
+                            channels_seen.push(channel);
+                        }
+                    }
+                    Some(_) => panic!("the dialog emitted an action it has no control for"),
+                    None => {}
+                }
+                x += 8.0;
+            }
+            y += 3.0;
+        }
+        }
+        for row in rows() {
+            assert!(
+                devices_seen.contains(&row.name),
+                "\"{}\" draws a checkbox that answers no press; found {devices_seen:?}",
+                row.name
+            );
+        }
+        // ALL and all sixteen. `channel: None` is the ALL chip, and it is the
+        // one that must never go missing: it is the default and the way back.
+        assert!(
+            channels_seen.contains(&None),
+            "the ALL chip answers no press, so there is no way back to every channel"
+        );
+        for c in 0..16u8 {
+            assert!(
+                channels_seen.contains(&Some(c)),
+                "channel {} answers no press",
+                c + 1
+            );
+        }
+    }
+
+    /// **A device that is not plugged in is drawn, keeps its tick, and says
+    /// on the row that it is gone.**
+    ///
+    /// Read off the TEXT egui actually laid out, not off a string typed here:
+    /// the claim is about the picture. Dropping the row would mean unplugging
+    /// a keyboard cost somebody the setup — the thing the dialog exists to
+    /// stop having to redo — and drawing it the same as a live one would mean
+    /// nothing says why no notes arrive.
+    #[test]
+    fn an_unplugged_device_keeps_its_row_and_says_it_is_gone() {
+        fn words(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        words(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ctx = crate::face::fit::a_ctx(crate::fonts::FontChoice::default());
+        let t = theme_of(Color32::from_rgb(0x2a, 0x2a, 0x2e));
+        let mut devices = rows();
+        let mut channel = None;
+        let mut said: Vec<String> = Vec::new();
+        // Twice: egui lays a galley out on the frame after the one that sized
+        // it, so a single pass can come back with nothing to read.
+        for _ in 0..2 {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(MIDI_INPUTS_W, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            apply_theme(ui.style_mut(), &t);
+                            let _ = midi_inputs_body(ui, &t, 0, 0, &mut devices, &mut channel);
+                        });
+                },
+            );
+            said.clear();
+            for c in &out.shapes {
+                words(&c.shape, &mut said);
+            }
+        }
+        let gone = said
+            .iter()
+            .find(|w| w.starts_with("Nord Stage 3"))
+            .unwrap_or_else(|| panic!("the unplugged device was not drawn at all: {said:?}"));
+        assert!(
+            gone.contains("not connected"),
+            "an unplugged device is drawn exactly like a connected one: {gone:?}"
+        );
+        // The ones that ARE here say only their names.
+        let live = said
+            .iter()
+            .find(|w| w.starts_with("Keystation 88"))
+            .expect("a connected device was not drawn");
+        assert_eq!(live, "Keystation 88", "a connected device was marked");
+        // And the tick survived being drawn: the set is not narrowed by a
+        // device going away.
+        assert!(
+            devices.iter().any(|d| !d.present && d.on),
+            "the unplugged device lost its tick"
+        );
+    }
+}
+
+/// **Render the MIDI Inputs dialog to a file, so a person can look at it.**
+///
+/// Not a test of anything: an eye. Ink is a property of the SURFACE it lands
+/// on, and that law has been broken nine times in this codebase — every one of
+/// them found by looking at a rendering and none of them by a test. The theme
+/// sweeps measure contrast off numbers; they cannot see a checkbox that came
+/// out invisible on its own ground or a "not connected" row so quiet nobody
+/// notices it.
+///
+/// `composite.rs`'s shot photographs the COMPOSITOR's frame, which never runs
+/// an egui pass, and a dialog is a child viewport besides — so it cannot reach
+/// one. `face::fit` is `busy.rs`'s software rasteriser: no window, no GPU,
+/// every triangle egui would have sent to the card, text included. It is why
+/// `midi_inputs_body` is a function of its own.
+///
+///     IVORY_SHOT=/tmp/midi-dark.png \
+///       cargo test -p tangent-ui --lib dialogs::shot -- --ignored --nocapture
+///
+/// `IVORY_SHOT_THEME=<name>` and `IVORY_SHOT_LIGHT=1` pick the dress, the same
+/// two every other shot in this repo honours.
+///
+/// The rows are `app::demo_midi_rows`, shared with `IVORY_INLINE=midiinputs`,
+/// so the picture and the running app show the same thing: a device that is
+/// on, one that is off, and one that is on and NOT PLUGGED IN — which is the
+/// row nobody developing this can produce by hand.
+#[cfg(test)]
+mod shot {
+    use super::*;
+
+    #[test]
+    #[ignore = "writes a picture for a person to look at"]
+    fn midi_inputs() {
+        let Ok(out) = std::env::var("IVORY_SHOT") else {
+            eprintln!("IVORY_SHOT not set");
+            return;
+        };
+        let mut set = crate::settings::Settings::default();
+        if let Ok(name) = std::env::var("IVORY_SHOT_THEME") {
+            match crate::theme::factory().into_iter().find(|t| t.name == name) {
+                Some(t) => {
+                    t.apply(&mut set);
+                    set.theme_name = name;
+                }
+                None => eprintln!("no theme called {name}"),
+            }
+        }
+        if std::env::var("IVORY_SHOT_LIGHT").is_ok() {
+            set.dark_mode = false;
+        }
+        // The face the app hands `dialogs::show`, derived exactly as
+        // `TangentApp::panel_face` derives it.
+        let face = if set.dark_mode {
+            set.dark_role("fx_strip").map_or_else(
+                || crate::mixer_panel::shade_face(set.fx_strip_color.to_color32(), 0.88),
+                |c| c.to_color32(),
+            )
+        } else {
+            set.fx_strip_color.to_color32()
+        };
+        let t = theme_of(face);
+        let surface = crate::recorder_panel::surface_of(face);
+        let ctx = crate::face::fit::a_ctx(crate::fonts::FontChoice::default());
+        let mut devices = crate::app::demo_midi_rows();
+        let mut channel = Some(2);
+        let (w, h, rgba) = crate::face::fit::shoot(
+            &ctx,
+            // The height the draw arm computes for this many rows, so the
+            // picture is the window that ships and not a tall empty one.
+            Vec2::new(
+                MIDI_INPUTS_W,
+                (212.0 + devices.len() as f32 * 24.0).min(MIDI_INPUTS_MAX_H),
+            ),
+            "Rhodes \u{2014} MIDI Inputs",
+            &surface,
+            &mut |ui| {
+                apply_theme(ui.style_mut(), &t);
+                ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::same(14))
+                    .show(ui, |ui| {
+                        let _ = midi_inputs_body(ui, &t, 2, 0, &mut devices, &mut channel);
+                        ui.add_space(10.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let _ =
+                                ui.add(Button::new(RichText::new("Done").color(t.text)));
+                        });
+                    });
+            },
+        );
+        crate::face::fit::write_png(std::path::Path::new(&out), &rgba, w, h);
+        println!(
+            "wrote {out} ({w}x{h}, {} mode)",
+            if set.dark_mode { "dark" } else { "light" }
+        );
+    }
+}
