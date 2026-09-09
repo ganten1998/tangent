@@ -6762,6 +6762,14 @@ mod tests {
         let mut out = Settings::from_map(map);
         out.window_w = Some(1234);
         out.window_h = Some(567);
+        // **The device sets, by hand for the same reason.** `to_map` writes
+        // them only when a track has been narrowed, so a first launch is
+        // invisible to the perturbation — and a field the walk cannot see is
+        // a field `the_scopes_together_are_everything` cannot judge.
+        out.channel_midi_inputs = vec![crate::recorder::MidiInputSel {
+            devices: vec!["a keyboard".to_owned()],
+            channel: Some(3),
+        }];
         out
     }
 
@@ -7579,6 +7587,106 @@ mod tests {
         assert_eq!(s2.insert_keys.get(2, 0), Some(9), "first edge wins the bay");
         assert_eq!(s2.insert_keys.0.len(), 1, "the malformed row was skipped");
         assert!(s2.extra.contains_key("future_key"));
+    }
+
+    /// **A track's MIDI device set round-trips, sits at the END of the map,
+    /// and is absent until somebody narrows a track.**
+    ///
+    /// The additive-key law, with the extra thing this key has to prove: its
+    /// ABSENCE has to read as "every device on every channel", which is what
+    /// every settings file written before this existed means. The opposite
+    /// default would open every one of them with every MIDI track deaf.
+    #[test]
+    fn the_midi_device_sets_round_trip_at_the_end_and_are_absent_until_narrowed() {
+        assert!(
+            !Settings::default()
+                .to_map()
+                .contains_key("channel_midi_inputs"),
+            "a desk nobody has narrowed wrote the key"
+        );
+
+        let mut s = Settings::default();
+        s.channel_inputs = vec![String::new(); crate::recorder::CHANNELS];
+        s.channel_inputs[2] = "midi:Keystation 88".to_owned();
+        s.channel_midi_inputs = vec![crate::recorder::MidiInputSel::EVERYTHING; 3];
+        s.channel_midi_inputs[2] = crate::recorder::MidiInputSel {
+            devices: vec!["Keystation 88".to_owned()],
+            channel: Some(2),
+        };
+        let out = s.to_map();
+        assert_eq!(
+            out.keys().last().map(String::as_str),
+            Some("channel_midi_inputs"),
+            "the device sets are not the last of our own keys"
+        );
+        let back = Settings::from_map(out);
+        assert_eq!(back.channel_midi_inputs, s.channel_midi_inputs);
+
+        // Through the PLUGIN's road too — the same text, and the same
+        // constraint: a project saved by the plugin and a settings file
+        // written by the app say the same thing.
+        let json = Settings::from_json(&s.to_json());
+        assert_eq!(json.channel_midi_inputs, s.channel_midi_inputs);
+
+        // A file with sets AND an unknown future key keeps both.
+        let s2 = Settings::from_map(map_of(
+            r#"{"channel_inputs": ["midi:Nord Stage"],
+                "channel_midi_inputs": {"0": {"devices": ["Nord Stage"], "channel": 4}},
+                "future_key": true}"#,
+        ));
+        assert_eq!(
+            s2.channel_midi_inputs[0].devices,
+            vec!["Nord Stage".to_owned()]
+        );
+        assert_eq!(s2.channel_midi_inputs[0].channel, Some(4));
+        assert!(s2.extra.contains_key("future_key"));
+
+        // And a desk reset takes them: a wiped desk that kept a device set
+        // would be waiting to make the first MIDI track somebody binds deaf
+        // to the keyboard in front of them.
+        let mut wiped = s.clone();
+        wiped.reset(ResetScope::Everything);
+        assert!(wiped.channel_midi_inputs.is_empty());
+    }
+
+    /// **A file written before this feature derives its device sets from the
+    /// ports it named, and every old value goes on meaning what it meant.**
+    ///
+    /// `"midi:all"` could only ever have meant every port on every channel,
+    /// and `"midi:<port>"` could only ever have named one port on every
+    /// channel — the old grammar had no way to say anything else. So there is
+    /// no migration arm and no version gate: a file with no
+    /// `channel_midi_inputs` derives one at load whatever its stamp, which is
+    /// also what makes a downgrade round-trip land right.
+    #[test]
+    fn an_old_file_derives_its_device_sets_from_the_ports_it_named() {
+        let s = Settings::from_json(
+            r#"{"settings_version": 21,
+                "channel_kinds": [1, 1, 2, 0],
+                "channel_inputs": ["midi:all", "midi:Keystation 88", "0+1", ""]}"#,
+        );
+        assert!(
+            s.channel_midi_inputs[0].is_everything(),
+            "\"midi:all\" stopped meaning every device on every channel"
+        );
+        assert_eq!(
+            s.channel_midi_inputs[1].devices,
+            vec!["Keystation 88".to_owned()],
+            "the port an old file named was not carried into the set"
+        );
+        assert_eq!(
+            s.channel_midi_inputs[1].channel, None,
+            "an old file gained a channel filter it never asked for"
+        );
+        // The legacy strings are untouched, so an older build reading this
+        // file back finds exactly what it wrote.
+        assert_eq!(s.channel_inputs[1], "midi:Keystation 88");
+        // And saving it writes the summary an older build understands.
+        let text = s.to_json();
+        assert!(
+            text.contains("\"midi:Keystation 88\""),
+            "the old one-device summary was not written back"
+        );
     }
 
     /// **The bypassed bays round-trip, sit at the END of the map, and are

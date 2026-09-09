@@ -3288,6 +3288,39 @@ enum KeepPath {
     Leave,
 }
 
+/// **The MIDI Inputs dialog's demo rows**, shared by the `IVORY_INLINE` hook
+/// and by the `#[ignore]`d shot in `dialogs.rs`.
+///
+/// One place, because the whole point of both is to look at the same picture
+/// the owner will see, and two lists would drift. Every state the dialog has:
+/// a device that is on, one that is off, and one that is on and NOT PLUGGED
+/// IN — which is the row nobody developing this can produce by hand.
+#[cfg(any(test, debug_assertions))]
+pub fn demo_midi_rows() -> Vec<dialogs::MidiDeviceRow> {
+    vec![
+        dialogs::MidiDeviceRow {
+            name: "Keystation 88".to_owned(),
+            on: true,
+            present: true,
+        },
+        dialogs::MidiDeviceRow {
+            name: "Scarlett 2i2 USB".to_owned(),
+            on: false,
+            present: true,
+        },
+        dialogs::MidiDeviceRow {
+            name: "IAC Driver Bus 1".to_owned(),
+            on: false,
+            present: true,
+        },
+        dialogs::MidiDeviceRow {
+            name: "Nord Stage 3".to_owned(),
+            on: true,
+            present: false,
+        },
+    ]
+}
+
 impl TangentApp {
     /// `ctx` rather than an `eframe::CreationContext`, because eframe is one of
     /// three things that can hand this app a context and the other two have
@@ -31846,6 +31879,22 @@ impl TangentApp {
                 exposed: vec![(0, Some(1)), (3, Some(4)), (5, None)],
             });
         }
+        // And the MIDI Inputs dialog, which needs the hardware nobody
+        // developing this has TWICE OVER: two keyboards to tick, and a third
+        // that has been unplugged so the "not connected" row can be looked at
+        // at all. Every state the dialog has, in one picture.
+        //   IVORY_INLINE=midiinputs /Applications/Tangent.app/Contents/MacOS/tangent
+        if !self.demo_menu_done && inline_hook() == Some("midiinputs") {
+            self.demo_menu_done = true;
+            self.dialog_serial = self.dialog_serial.wrapping_add(1);
+            self.dialog = Some(Dialog::MidiInputs {
+                lane: 2,
+                who: "Rhodes".to_owned(),
+                devices: demo_midi_rows(),
+                channel: Some(2),
+                serial: self.dialog_serial,
+            });
+        }
 
         self.process_midi_events();
 
@@ -35842,6 +35891,195 @@ mod tests {
         app.me_delete_selected();
         assert_eq!(app.arrangement.clips[0].notes.len(), 3);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The MIDI Inputs dialog changes what the track listens to, the chip
+    /// says so, and the change survives the settings file.**
+    ///
+    /// The other half of the press-handler rule, in the shape a DIALOG has
+    /// it: `dialogs::every_midi_inputs_control_answers_a_press` proves the
+    /// controls emit; this proves the emissions LAND. An action with no arm
+    /// in `apply_dialog_action` is a control that draws, hit-tests and does
+    /// nothing, which is the fault this codebase has shipped four times.
+    #[test]
+    fn the_midi_inputs_dialog_binds_devices_and_a_channel_and_the_chip_says_so() {
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.set_channel_input_spec(4, "midi:all");
+        app.midi_ports_seen = vec!["Keystation 88".to_owned(), "Scarlett 2i2".to_owned()];
+        app.open_midi_inputs_dialog(4);
+        let Some(Dialog::MidiInputs { devices, .. }) = app.dialog.as_ref() else {
+            panic!("the dialog did not open");
+        };
+        assert_eq!(
+            devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["Keystation 88", "Scarlett 2i2"],
+            "the dialog did not offer the ports that are here"
+        );
+        assert!(
+            devices.iter().all(|d| !d.on),
+            "a track listening to everything came up with boxes already ticked"
+        );
+
+        // Tick one. The app narrows, the chip follows, and the LIVE dialog
+        // ticks too — or the box does not move under the hand until the
+        // window is closed and opened again.
+        app.apply_dialog_action(DialogAction::MidiInputDevice {
+            lane: 4,
+            device: "Keystation 88".to_owned(),
+            on: true,
+        });
+        assert_eq!(
+            app.channel_midi_sel(4).devices,
+            vec!["Keystation 88".to_owned()]
+        );
+        assert_eq!(app.input_chip_text(4), "MIDI: Keystation 88");
+        if let Some(Dialog::MidiInputs { devices, .. }) = app.dialog.as_ref() {
+            assert!(devices[0].on, "the box did not tick under the hand");
+        }
+        // **And the old one-device summary is written**, so a build without
+        // this feature reads the file and finds something true.
+        assert_eq!(app.channel_input_spec(4), "midi:Keystation 88");
+
+        // A second device: a SET, which is the whole ask.
+        app.apply_dialog_action(DialogAction::MidiInputDevice {
+            lane: 4,
+            device: "Scarlett 2i2".to_owned(),
+            on: true,
+        });
+        assert_eq!(app.channel_midi_sel(4).devices.len(), 2);
+        assert_eq!(app.input_chip_text(4), "MIDI: Keystation 88 +1");
+
+        // A channel.
+        app.apply_dialog_action(DialogAction::MidiInputChannel {
+            lane: 4,
+            channel: Some(2),
+        });
+        assert_eq!(app.channel_midi_sel(4).channel, Some(2));
+        assert_eq!(app.input_chip_text(4), "MIDI: Keystation 88 +1 CH 3");
+
+        // **Through the settings file and back**, because a setup that
+        // survives the dialog and not the file is one somebody rebuilds every
+        // launch.
+        let back = Settings::from_json(&app.settings_json());
+        assert_eq!(back.channel_midi_inputs[4], app.channel_midi_sel(4));
+
+        // Untick, and ALL comes back — the way out has to exist.
+        app.apply_dialog_action(DialogAction::MidiInputDevice {
+            lane: 4,
+            device: "Keystation 88".to_owned(),
+            on: false,
+        });
+        app.apply_dialog_action(DialogAction::MidiInputDevice {
+            lane: 4,
+            device: "Scarlett 2i2".to_owned(),
+            on: false,
+        });
+        app.apply_dialog_action(DialogAction::MidiInputChannel {
+            lane: 4,
+            channel: None,
+        });
+        assert!(app.channel_midi_sel(4).is_everything());
+        assert_eq!(app.input_chip_text(4), "MIDI: ALL DEVICES");
+        assert_eq!(app.channel_input_spec(4), "midi:all");
+    }
+
+    /// **A device that is not plugged in keeps its row, its tick and its
+    /// place in the set.**
+    ///
+    /// Somebody who unplugs a keyboard and plugs it back in must not have to
+    /// set this up again — which means the dialog has to OFFER a device that
+    /// is not there, and the chip has to say it is missing rather than
+    /// pretending everything is fine.
+    #[test]
+    fn a_track_keeps_a_device_that_has_been_unplugged() {
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.set_channel_input_spec(4, "midi:all");
+        app.midi_ports_seen = vec!["Keystation 88".to_owned()];
+        app.apply_dialog_action(DialogAction::MidiInputDevice {
+            lane: 4,
+            device: "Keystation 88".to_owned(),
+            on: true,
+        });
+        assert_eq!(app.input_chip_text(4), "MIDI: Keystation 88");
+
+        // Unplugged.
+        app.midi_ports_seen = Vec::new();
+        assert_eq!(
+            app.channel_midi_sel(4).devices,
+            vec!["Keystation 88".to_owned()],
+            "the device was dropped from the set the moment it went away"
+        );
+        assert_eq!(
+            app.input_chip_text(4),
+            "MIDI: !Keystation 88",
+            "the chip says nothing about a device that is gone"
+        );
+        // And the dialog still offers it, ticked, marked absent.
+        app.open_midi_inputs_dialog(4);
+        let Some(Dialog::MidiInputs { devices, .. }) = app.dialog.as_ref() else {
+            panic!("the dialog did not open");
+        };
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "Keystation 88");
+        assert!(devices[0].on, "the remembered device came up unticked");
+        assert!(!devices[0].present, "a device that is gone was drawn as present");
+
+        // Plugged back in: nothing to set up again.
+        app.midi_ports_seen = vec!["Keystation 88".to_owned()];
+        assert_eq!(app.input_chip_text(4), "MIDI: Keystation 88");
+    }
+
+    /// **The desk opens the devices its tracks ask for**, and only those.
+    #[test]
+    fn the_desk_opens_the_devices_its_tracks_ask_for() {
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        for ch in 0..recorder::CHANNELS {
+            app.set_channel_input_spec(ch, "");
+        }
+        app.midi_ports_seen = vec![
+            "Keystation 88".to_owned(),
+            "Scarlett 2i2".to_owned(),
+            "IAC Driver Bus 1".to_owned(),
+        ];
+        // **A MIDI track listening to everything opens everything.** That is
+        // what "ALL DEVICES" has to mean once several can be open at once,
+        // and it is strictly more than the ONE port the app used to open.
+        app.set_channel_input_spec(1, "midi:all");
+        assert_eq!(app.wanted_midi_ports(), app.midi_ports_seen);
+
+        // Narrowed, and only what is named is opened.
+        app.set_channel_midi_sel(
+            1,
+            recorder::MidiInputSel {
+                devices: vec!["Keystation 88".to_owned()],
+                channel: None,
+            },
+        );
+        assert_eq!(app.wanted_midi_ports(), vec!["Keystation 88".to_owned()]);
+
+        // A second track adds its own, and the union is what is open.
+        app.set_channel_input_spec(2, "midi:all");
+        app.set_channel_midi_sel(
+            2,
+            recorder::MidiInputSel {
+                devices: vec!["IAC Driver Bus 1".to_owned()],
+                channel: Some(0),
+            },
+        );
+        assert_eq!(
+            app.wanted_midi_ports(),
+            vec!["Keystation 88".to_owned(), "IAC Driver Bus 1".to_owned()],
+            "one track's set closed another track's keyboard"
+        );
+
+        // A device somebody named that is not plugged in is not asked for —
+        // there is nothing to open — but it is not forgotten either.
+        app.midi_ports_seen = vec!["IAC Driver Bus 1".to_owned()];
+        assert_eq!(app.wanted_midi_ports(), vec!["IAC Driver Bus 1".to_owned()]);
+        assert_eq!(
+            app.channel_midi_sel(1).devices,
+            vec!["Keystation 88".to_owned()]
+        );
     }
 
     /// **The input menu binds, and the INPUT IS THE KIND.** MIDI makes the
