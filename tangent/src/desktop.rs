@@ -26653,6 +26653,112 @@ mod arr_pedal {
         assert_eq!(only(&r).pedal.len(), 1, "{:?}", only(&r).pedal);
     }
 
+    /// **A take records each track's OWN keyboard, and the pedal with it.**
+    ///
+    /// The other end of the same seam the engine's
+    /// `a_note_from_one_keyboard_reaches_only_the_track_that_asked_for_it`
+    /// holds. `ArrRec` used to be a list of lane indices and ONE note list,
+    /// handed identically to every armed MIDI lane — which was true while the
+    /// app opened one device and every armed lane really did hear the same
+    /// stream. Recording two players at once would have written both
+    /// performances onto both tracks, and the take is the part nobody notices
+    /// is wrong until the session is over.
+    ///
+    /// `MidiRoute::admits` is the one authority both ends use, so a note that
+    /// SOUNDED on a track is a note recorded on it. Two answers to that
+    /// question is a take that comes back holding somebody else's playing.
+    #[test]
+    fn a_take_records_each_tracks_own_keyboard() {
+        use tangent_ui::recorder::MidiRoute;
+        // Lane 1 wants slot 0 on wire channel 2; lane 4 wants slot 1 on any.
+        let mut r = ArrRec {
+            start_s: 0.0,
+            start_ns: 0,
+            midi: vec![
+                ArrRecLane {
+                    lane: 1,
+                    route: MidiRoute {
+                        src: 1 << 0,
+                        chan: 1 << 2,
+                    },
+                    notes: Vec::new(),
+                    pedal: Vec::new(),
+                    pedal_at: [0; 3],
+                    open: std::collections::HashMap::new(),
+                },
+                ArrRecLane {
+                    lane: 4,
+                    route: MidiRoute {
+                        src: 1 << 1,
+                        chan: u32::MAX,
+                    },
+                    notes: Vec::new(),
+                    pedal: Vec::new(),
+                    pedal_at: [0; 3],
+                    open: std::collections::HashMap::new(),
+                },
+            ],
+            audio: Vec::new(),
+        };
+        // Keyboard A, channel 3 (wire 2): lane 1's, and nobody else's.
+        r.note_event(0, 0, &[0x92, 60, 100]);
+        r.note_event(0, SEC, &[0x82, 60, 0]);
+        // Keyboard A on the WRONG channel: nobody's — lane 4 did not ask for
+        // this keyboard and lane 1 did not ask for this channel.
+        r.note_event(0, SEC, &[0x90, 62, 100]);
+        r.note_event(0, 2 * SEC, &[0x80, 62, 0]);
+        // Keyboard B, on whatever channel it likes: lane 4's.
+        r.note_event(1, 2 * SEC, &[0x97, 67, 90]);
+        r.note_event(1, 3 * SEC, &[0x87, 67, 0]);
+        // And a damper on keyboard A. It must not reach lane 4, which never
+        // asked for that keyboard — a foot on one player's pedal holding the
+        // other player's notes is the same fault one layer down.
+        r.note_event(0, SEC / 2, &[0xB2, 64, 127]);
+
+        let keys = |l: &ArrRecLane| l.notes.iter().map(|n| n.key).collect::<Vec<_>>();
+        assert_eq!(keys(&r.midi[0]), vec![60], "lane 1 did not record its own keyboard");
+        assert_eq!(keys(&r.midi[1]), vec![67], "lane 4 did not record its own keyboard");
+        assert_eq!(r.midi[0].pedal.len(), 1, "lane 1 lost its damper");
+        assert!(
+            r.midi[1].pedal.is_empty(),
+            "another player's pedal was written into this track's take"
+        );
+    }
+
+    /// **The APP's own notes are recorded on every armed lane**, because they
+    /// came from no device and can be in no device set. A clicked key, the
+    /// fretboard, the lattice, a pad tapped by hand — filtering those would
+    /// mean a performer with no cable recorded silence.
+    #[test]
+    fn the_apps_own_notes_reach_every_armed_lane() {
+        use tangent_ui::recorder::{MidiRoute, MIDI_SRC_APP};
+        let narrow = MidiRoute {
+            src: 1 << 3,
+            chan: 1 << 9,
+        };
+        let mut r = ArrRec {
+            start_s: 0.0,
+            start_ns: 0,
+            midi: vec![ArrRecLane {
+                lane: 0,
+                route: narrow,
+                notes: Vec::new(),
+                pedal: Vec::new(),
+                pedal_at: [0; 3],
+                open: std::collections::HashMap::new(),
+            }],
+            audio: Vec::new(),
+        };
+        // A slot and a channel this lane admits neither of.
+        r.note_event(MIDI_SRC_APP, 0, &[0x90, 60, 100]);
+        r.note_event(MIDI_SRC_APP, SEC, &[0x80, 60, 0]);
+        assert_eq!(
+            r.midi[0].notes.len(),
+            1,
+            "the app's own note was filtered by a device set no app note can be in"
+        );
+    }
+
     /// **A pedal already DOWN when the red button is pressed is restated at
     /// the take's own zero** — `tangent_record::smf`'s rule 8, which the
     /// arrangement needed for the same reason the `.mid` did.
