@@ -911,11 +911,17 @@ fn row_ground(st: &FaceStyle) -> Color32 {
 ///
 /// **The pane is `drumpad_panel::draw_media_pane`**, the drumpad's own, and
 /// the listing is pushed by the app exactly as the IR browser's is: a face
-/// never opens a folder. What this adds over the drumpad's copy is the three
+/// never opens a folder. What this adds over the drumpad's copy is the
 /// SHORTCUTS, because the owner asked for Tangent's own recordings and not
 /// only for other people's exports — *"must be able to drag any item in or
 /// choose any midi or audio clip recorded in tangent as well"* — and the
-/// Takes folder and the project's `media/` are exactly where those live.
+/// project's `media/` is exactly where those live.
+///
+/// **A TAKES chip stood between them for one afternoon.** It was asked for
+/// and struck out in the same session — "the takes section as a whole can
+/// just go" — and it is gone rather than hidden: the row draws whatever the
+/// app pushes, so removing the root removed the chip, and the two that are
+/// left are wider for it.
 fn browser(
     ui: &mut egui::Ui,
     painter: &Painter,
@@ -1136,10 +1142,9 @@ mod tests_support {
                 missing: false,
             };
         }
-        live.samp_dir = "/m/Takes".to_owned();
+        live.samp_dir = "/m/Library/Kicks".to_owned();
         live.samp_roots = vec![
-            ("HOME".to_owned(), "/home".to_owned()),
-            ("TAKES".to_owned(), "/m/Takes".to_owned()),
+            ("HOME".to_owned(), "/home/Samples".to_owned()),
             ("PROJECT".to_owned(), "/p/media".to_owned()),
         ];
         live.samp_entries = (0..40)
@@ -1463,12 +1468,15 @@ mod tests {
             }
             assert!(answered, "no row answered for parameter {id}");
         }
-        // A shortcut chip walks the browser.
+        // A shortcut chip walks the browser. Asked with the number of chips
+        // the FIXTURE carries: the row is drawn from what the app pushed, so
+        // a hard-coded three would go on hit-testing a cell nothing draws.
         let mut live = a_face(true);
         let _ = draw_once(&ctx, &mut live, &st, Vec::new());
-        let chip = placed(&ctx).lay.shortcut_cells(3)[0];
+        let n = live.samp_roots.len();
+        let chip = placed(&ctx).lay.shortcut_cells(n)[0];
         let _ = click(&ctx, &mut live, &st, chip.center());
-        assert_eq!(live.samp_dir, "/home", "the HOME chip did not walk");
+        assert_eq!(live.samp_dir, "/home/Samples", "the HOME chip did not walk");
         // A FILE row asks for the sample under it.
         let mut live = a_face(true);
         live.samp_scroll = 1; // entry 1 is a file; entry 0 is a folder
@@ -1486,7 +1494,7 @@ mod tests {
         let _ = draw_once(&ctx, &mut live, &st, Vec::new());
         let ml = crate::drumpad_panel::MediaLayout::new(placed(&ctx).lay.browser);
         let _ = click(&ctx, &mut live, &st, ml.up.center());
-        assert_eq!(live.samp_dir, "/m", "the `..` chip did not walk out");
+        assert_eq!(live.samp_dir, "/m/Library", "the `..` chip did not walk out");
     }
 
     /// **The Fine knob prints the Hz it moves**, beside the cents the host
