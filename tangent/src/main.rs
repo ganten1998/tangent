@@ -1040,6 +1040,18 @@ fn main() {
     // (or falling off `main`) is precisely what detonates.
     //
     // Every serious host does this, for this exact reason.
+    //
+    // **And this is only ONE of the two roads out.** Being here at all means
+    // `run_native` returned, which happens when the window closed. macOS has
+    // a second road that does not: `-[NSApplication terminate:]` — the Quit
+    // menu item, Cmd+Q, the Dock's Quit, an AppleScript `quit`, a log-out —
+    // calls `exit()` from inside AppKit and tears the run loop down without
+    // ever coming back to `main`. That is the road the owner's crash reports
+    // were on, and the reason a fix written HERE was reported as not working:
+    // it was never reached. `macwin::should_terminate` refuses that
+    // termination and turns it into an ordinary window close, so both roads
+    // arrive at this line. Deleting the hook re-opens the second one, and
+    // nothing on this line can tell.
     // The graph clock goes back before the process does anything else —
     // `_exit` skips atexit, so nothing later can put it back for us.
     #[cfg(feature = "recorder")]
