@@ -3952,6 +3952,18 @@ struct Renderer {
     /// belongs to a later block lives here rather than being pushed back.
     pending: Option<MidiEvent>,
     notes: Vec<Note>,
+    /// **WHICH LANES may hear each of `notes`**, one bit per channel, in step
+    /// with it index for index.
+    ///
+    /// A parallel `Vec` rather than a field on `Note`, because `Note` is
+    /// `tangent_host`'s type and travels into every plugin: a routing mask is
+    /// this desk's business and has no meaning inside a VST3. Preallocated
+    /// beside `notes` and cleared with it, so the audio thread never grows
+    /// either.
+    ///
+    /// `u32::MAX` for an event from the app itself — see
+    /// `recorder::MIDI_SRC_APP`.
+    note_lanes: Vec<u32>,
     /// The instrument this app ships with.
     ///
     /// Rendered when a slot has asked for it, and when NO slot has anything at
@@ -3992,7 +4004,11 @@ struct Renderer {
     /// sends nothing — which was fine while the only consumer applied edges
     /// as they arrived, and is not fine now that a lane has to combine the
     /// live pedal with a clip's. Indexed by [`pedal_slot`].
-    live_pedal: [u8; 3],
+    ///
+    /// **Per LANE**, since a track can name its own keyboards: one global
+    /// level would let a foot on keyboard A's damper hold the notes on the
+    /// track that only ever asked for keyboard B.
+    live_pedal: [[u8; 3]; CHANNELS],
     /// What each lane was last TOLD its pedal was, so a level that has not
     /// moved costs nothing and a level that has is stated exactly once.
     ///
@@ -4274,6 +4290,10 @@ struct Renderer {
     /// real-time deadline. A pedal is one message per press, so this never
     /// needs to be large.
     controls: Vec<Control>,
+    /// The same for `controls`, in step index for index. A pedal is a message
+    /// from a device like any other: a foot on keyboard A's damper must not
+    /// hold keyboard B's track.
+    control_lanes: Vec<u32>,
 
     tap: Producer<f32>,
     /// Interleaved recorder mix for one block. Sized once.
@@ -4882,9 +4902,29 @@ impl Renderer {
     /// fire a burst of stale note-ons the instant an instrument appeared.
     fn collect_notes(&mut self, block_start: Nanos, frames: usize) {
         self.notes.clear();
+        self.note_lanes.clear();
         self.controls.clear();
+        self.control_lanes.clear();
         self.pad_hits.clear();
         self.pad_offs.clear();
+        // **The desk's routing table, read ONCE per block.**
+        //
+        // Two loads per channel however many messages arrive, and the
+        // per-event answer below is then pure arithmetic — which matters
+        // because this runs on the audio thread. Reading them per event would
+        // also mean a table that could change halfway through a block and
+        // deliver one note under two different rules.
+        //
+        // These say WHICH DEVICE and WHICH CHANNEL a lane admits.
+        // `midi_off`, read just below, says whether it is listening at all.
+        // Two questions, and a lane hears a message only when both say yes —
+        // see `Shared::midi_src` for why they are not one mask.
+        let routes: [tangent_ui::recorder::MidiRoute; CHANNELS] = std::array::from_fn(|ch| {
+            tangent_ui::recorder::MidiRoute {
+                src: self.shared.midi_src[ch].load(Ordering::Relaxed),
+                chan: self.shared.midi_chan[ch].load(Ordering::Relaxed),
+            }
+        });
         // Whether channel 10 belongs to the drums this block. Read once: a
         // kit swap lands in `mix_pads`, so this answers for the PREVIOUS
         // chunk's kit — one chunk of grace on a load, never a torn read.
@@ -4939,6 +4979,21 @@ impl Renderer {
                 }
                 Placement::At(offset) => offset,
             };
+            // **WHICH LANES may hear this one**, from the device it came from
+            // and the channel it arrived on. Before this line the answer was
+            // "every armed lane", which is why two tracks could not have
+            // separate keyboards while every input chip said they could.
+            //
+            // `MIDI_SRC_APP` short-circuits to every lane inside `admits`: an
+            // app-made note came from no device and can be in no device set,
+            // so filtering it would silence the on-screen piano, the
+            // fretboard and the lattice all at once.
+            let mut lanes = 0u32;
+            for (ch, route) in routes.iter().enumerate() {
+                if route.admits(event.src, event.status & 0x0F) {
+                    lanes |= 1u32 << ch;
+                }
+            }
             // ── channel 10: the drum channel ───────────────────────────────
             // While a kit is loaded, a channel-10 note is a pad strike and
             // nothing else — it never reaches the lanes, because a kick that
@@ -4964,6 +5019,12 @@ impl Renderer {
                         for &lane in &live_drum_lanes[..live_drum_n] {
                             if self.pad_offs.len() >= self.pad_offs.capacity() {
                                 break;
+                            }
+                            // The same routing rule the notes answer to: a
+                            // drum track that named its own pad controller
+                            // must not be struck by somebody else's.
+                            if lanes & (1u32 << lane.min(31)) == 0 {
+                                continue;
                             }
                             if self.shared.pad_obey[lane][pad >> 6].load(Ordering::Relaxed)
                                 & (1u64 << (pad & 63))
@@ -4995,6 +5056,9 @@ impl Renderer {
                         for &lane in &live_drum_lanes[..live_drum_n] {
                             if self.pad_hits.len() >= self.pad_hits.capacity() {
                                 break;
+                            }
+                            if lanes & (1u32 << lane.min(31)) == 0 {
+                                continue;
                             }
                             self.pad_hits.push(PadHit {
                                 offset,
@@ -5029,6 +5093,7 @@ impl Renderer {
                     }
                 }
                 self.notes.push(Note { offset, ..note });
+                self.note_lanes.push(lanes);
             } else if is_pedal(event.status, event.data1) {
                 // Delivered as a VST3 parameter change, which is the only door
                 // VST3 leaves open for a CC — see `tangent-host`'s `Control`.
@@ -5042,7 +5107,14 @@ impl Renderer {
                 // has to combine this with a clip's pedal cannot ask a list
                 // of changes where something stands.
                 if let Some(slot) = pedal_slot(event.data1 & 0x7F) {
-                    self.live_pedal[slot] = event.data2 & 0x7F;
+                    // **Only on the lanes that heard it.** One global level
+                    // let a foot on keyboard A's damper hold the notes on a
+                    // track that only ever asked for keyboard B.
+                    for ch in 0..CHANNELS {
+                        if lanes & (1u32 << ch.min(31)) != 0 {
+                            self.live_pedal[ch][slot] = event.data2 & 0x7F;
+                        }
+                    }
                 }
                 if self.controls.len() < self.controls.capacity() {
                     self.controls.push(Control {
@@ -5055,6 +5127,7 @@ impl Renderer {
                         // channel 3 moves the wrong piano.
                         channel: i16::from(event.status & 0x0F),
                     });
+                    self.control_lanes.push(lanes);
                 } else {
                     self.shared.pedal_dropped.fetch_add(1, Ordering::Relaxed);
                 }
@@ -8662,7 +8735,7 @@ impl Renderer {
             };
             let pedal_now: [u8; 3] = std::array::from_fn(|i| {
                 if armed_here {
-                    self.live_pedal[i].max(clip_pedal[i])
+                    self.live_pedal[ch][i].max(clip_pedal[i])
                 } else {
                     clip_pedal[i]
                 }
@@ -8758,7 +8831,19 @@ impl Renderer {
             // the arm, which is the whole point of the arm ──
             lane_notes.clear();
             if armed {
-                lane_notes.extend_from_slice(&self.notes);
+                // **This lane's OWN live notes**, not the block's. `armed`
+                // says whether the lane is listening; `note_lanes` says
+                // whether this message is one it asked for — the device it
+                // came from and the channel it arrived on, decided once per
+                // event in `collect_notes`. Copying the whole list here is
+                // what made two keyboards impossible: every armed lane heard
+                // every note, whatever its input chip claimed.
+                let bit = 1u32 << ch.min(31);
+                for (n, m) in self.notes.iter().zip(&self.note_lanes) {
+                    if m & bit != 0 {
+                        lane_notes.push(*n);
+                    }
+                }
             }
             // **This lane's controls: the live ones while armed, plus the
             // pedal its clips moved this block.**
@@ -8770,7 +8855,12 @@ impl Renderer {
             // move the wrong piano.
             lane_controls.clear();
             if armed {
-                lane_controls.extend_from_slice(&self.controls);
+                let bit = 1u32 << ch.min(31);
+                for (c, m) in self.controls.iter().zip(&self.control_lanes) {
+                    if m & bit != 0 {
+                        lane_controls.push(*c);
+                    }
+                }
             }
             for (lane, c) in &self.lane_pedal_out {
                 if usize::from(*lane) == ch
@@ -11019,6 +11109,7 @@ impl Engine {
             hw_midi: hw_midi_rx,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
+            note_lanes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             clips: Vec::new(),
             midi_clips: Vec::new(),
             midi_cursor: Vec::new(),
@@ -11026,7 +11117,7 @@ impl Engine {
             lane_notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
             // The live list plus at most three pedal moves of its own.
             lane_controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
-            live_pedal: [0; 3],
+            live_pedal: [[0; 3]; CHANNELS],
             lane_pedal_sent: [[0; 3]; CHANNELS],
             lane_pedal_out: Vec::with_capacity(CHANNELS * 3),
             pos: 0,
@@ -11106,6 +11197,7 @@ impl Engine {
             fx_return_gain: 1.0,
             effect_params: crate::effects::Params::default(),
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
+            control_lanes: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
             tap: tap_tx,
             tap_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
             frame: vec![0.0; widest],
@@ -16869,7 +16961,7 @@ mod tests {
             lane_notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
             // The live list plus at most three pedal moves of its own.
             lane_controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3),
-            live_pedal: [0; 3],
+            live_pedal: [[0; 3]; CHANNELS],
             lane_pedal_sent: [[0; 3]; CHANNELS],
             lane_pedal_out: Vec::with_capacity(CHANNELS * 3),
             pos: 0,
@@ -16916,6 +17008,7 @@ mod tests {
             hw_midi,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
+            note_lanes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             // Every lane empty, like a fresh desk; a test that wants an
             // instrument installs one directly, which is the assignment the
             // host's sync would have made.
@@ -16930,6 +17023,7 @@ mod tests {
             effects: crate::effects::Effects::new_send(RATE as f32),
             effect_params: crate::effects::Params::default(),
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
+            control_lanes: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
             tap,
             tap_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
             frame: vec![0.0; dev_ch.max(TAP_CHANNELS)],

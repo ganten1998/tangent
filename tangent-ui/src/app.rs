@@ -1247,7 +1247,7 @@ pub struct TangentApp {
     /// The input menu's submenu rows, built when the DEVICE arRIVES and
     /// refreshed only when it changes (or a 5 s TTL passes for MIDI
     /// hot-plug) — the menu itself never waits on an OS enumeration.
-    menu_rows_cache: Option<[Vec<String>; 3]>,
+    menu_rows_cache: Option<[Vec<String>; 2]>,
     menu_cache_key: (String, usize),
     menu_cache_at: Option<Instant>,
     /// The submenu row under the pointer, for the hover light.
@@ -2081,18 +2081,28 @@ struct InputMenu {
     at: Pos2,
     /// Which top row's submenu is open. Hover decides; a click confirms.
     hover: Option<usize>,
-    /// The three submenus' rows, SNAPSHOTTED when the menu opens — device
-    /// and MIDI-port enumeration go through the OS and were being asked
-    /// several times a frame, which is what the owner's "VERY laggy" was.
-    rows: [Vec<String>; 3],
+    /// The two submenus' rows, SNAPSHOTTED when the menu opens — device
+    /// enumeration goes through the OS and was being asked several times a
+    /// frame, which is what the owner's "VERY laggy" was.
+    ///
+    /// Two, not three: MIDI's list of ports went with the submenu. The
+    /// devices live in the MIDI Inputs dialog, and the port list it draws is
+    /// `TangentApp::midi_ports_seen`, kept warm on its own beat.
+    rows: [Vec<String>; 2],
     /// True while the rows list interfaces rather than inputs (no device
     /// open at snapshot time): a device pick re-snapshots.
     devices_offered: bool,
 }
 
-/// The menu's four top rows, in the owner's order. NONE closes the story;
-/// the other three open submenus.
-const INPUT_TOPS: [&str; 4] = ["INPUT: MONO", "INPUT: STEREO", "INPUT: MIDI", "NONE"];
+/// The menu's four top rows, in the owner's order.
+///
+/// **MIDI no longer opens a submenu**, and the ellipsis says so. It offered
+/// ALL and a list of ports, wrote one of them into `channel_inputs`, and
+/// nothing downstream ever read it — the owner's "the gui selector ... is
+/// lying to the user". It opens the MIDI Inputs dialog now, where a track
+/// picks a SET of devices and a channel, so the two remaining submenus are
+/// MONO and STEREO. NONE still closes the story.
+const INPUT_TOPS: [&str; 4] = ["INPUT: MONO", "INPUT: STEREO", "INPUT: MIDI...", "NONE"];
 
 /// The MIDI editor's session on one clip: its window, its selection, and
 /// the gesture in flight. Lives only while the popup is up.
@@ -9326,11 +9336,7 @@ impl TangentApp {
     /// (Re)build the submenu rows. Called when the device arrives or
     /// changes — never from the menu's own frame.
     fn refresh_menu_rows(&mut self) {
-        self.menu_rows_cache = Some([
-            self.input_menu_sub(0),
-            self.input_menu_sub(1),
-            self.input_menu_sub(2),
-        ]);
+        self.menu_rows_cache = Some([self.input_menu_sub(0), self.input_menu_sub(1)]);
         self.menu_cache_key = self.menu_cache_key_now();
         self.menu_cache_at = Some(Instant::now());
     }
@@ -9416,13 +9422,6 @@ impl TangentApp {
                     (0..width - 1).map(|c| format!("IN {}/{}", c + 1, c + 2)).collect()
                 }
             }
-            2 => {
-                let mut rows = vec!["ALL".to_owned()];
-                if let Some(src) = self.ports.as_ref() {
-                    rows.extend(src.list());
-                }
-                rows
-            }
             _ => Vec::new(),
         }
     }
@@ -9460,18 +9459,6 @@ impl TangentApp {
                 }
                 self.input_menu = None;
             }
-            2 => {
-                if i == 0 {
-                    self.set_channel_input_spec(ch, "midi:all");
-                } else if let Some(port) = self
-                    .ports
-                    .as_ref()
-                    .and_then(|src| src.list().into_iter().nth(i - 1))
-                {
-                    self.set_channel_input_spec(ch, &format!("midi:{port}"));
-                }
-                self.input_menu = None;
-            }
             _ => {
                 self.input_menu = None;
             }
@@ -9498,7 +9485,7 @@ impl TangentApp {
             })
             .collect();
         let subs = match m.hover {
-            Some(top) if top < 3 => {
+            Some(top) if top < 2 => {
                 let rows = &m.rows[top];
                 let sub_h = ROW * rows.len() as f32;
                 let sy = (y + ROW * top as f32).min((pane.y - sub_h).max(0.0));
@@ -9545,7 +9532,7 @@ impl TangentApp {
             if let Some(i) = tops.iter().position(|r| r.contains(pos)) {
                 // Lit for EVERY top row, including None.
                 self.menu_hover_top = Some(i);
-                if i < 3 {
+                if i < 2 {
                     m.hover = Some(i);
                 }
             }
@@ -9574,6 +9561,20 @@ impl TangentApp {
                         let ch = m.ch;
                         self.set_channel_input_spec(ch, "");
                         self.input_menu = None;
+                    } else if i == 2 {
+                        // **MIDI is a press, not a hover.** It BINDS the
+                        // track (the input is the kind, and binding is what
+                        // makes a track) and then opens the dialog where the
+                        // devices and the channel are actually chosen. The
+                        // bind is skipped when the track is already MIDI, so
+                        // opening the dialog on a track somebody set up does
+                        // not widen it back to every device.
+                        let ch = m.ch;
+                        if self.channel_kind(ch) != Some(recorder::ChannelKind::Midi) {
+                            self.set_channel_input_spec(ch, "midi:all");
+                        }
+                        self.input_menu = None;
+                        self.open_midi_inputs_dialog(ch);
                     } else {
                         m.hover = Some(i);
                         self.input_menu = Some(m);
@@ -9617,7 +9618,7 @@ impl TangentApp {
         };
         column(painter, &tops);
         for (i, r) in tops.iter().enumerate() {
-            if self.menu_hover_top == Some(i) || (m.hover == Some(i) && i < 3) {
+            if self.menu_hover_top == Some(i) || (m.hover == Some(i) && i < 2) {
                 painter.rect_filled(r.shrink(1.0), 2.0, lit);
             }
             painter.text(
@@ -9627,7 +9628,7 @@ impl TangentApp {
                 egui::FontId::new(11.0, crate::fonts::courier_bold()),
                 ink,
             );
-            if i < 3 {
+            if i < 2 {
                 painter.text(
                     Pos2::new(r.right() - 6.0, r.center().y),
                     egui::Align2::RIGHT_CENTER,
@@ -9638,7 +9639,7 @@ impl TangentApp {
             }
         }
         if let Some(top) = m.hover {
-            let rows = &m.rows[top.min(2)];
+            let rows = &m.rows[top.min(1)];
             column(painter, &subs);
             for (i, (r, label)) in subs.iter().zip(rows).enumerate() {
                 if self.menu_hover_row == Some(i) {
@@ -35843,25 +35844,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// **The input menu binds, and the INPUT IS THE KIND.** MIDI -> All
-    /// makes the channel MIDI on every port; an audio spec makes it AUDIO;
-    /// NONE clears both. The chip says each of them the short way and the
-    /// parser round-trips the specs the menu writes.
+    /// **The input menu binds, and the INPUT IS THE KIND.** MIDI makes the
+    /// channel MIDI on every device; an audio spec makes it AUDIO; NONE
+    /// clears both. The chip says each of them the short way and the parser
+    /// round-trips the specs the menu writes.
+    ///
+    /// The MIDI row is a PRESS now rather than a submenu: it binds and opens
+    /// the MIDI Inputs dialog, because the port list it used to offer wrote a
+    /// port nothing downstream ever read.
     #[test]
     fn the_input_menu_binds_a_channel_and_the_chip_says_so() {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-        app.input_menu = Some(InputMenu {
-            ch: 2,
-            at: Pos2::ZERO,
-            hover: Some(2),
-            rows: [Vec::new(), Vec::new(), vec!["ALL".to_owned()]],
-            devices_offered: false,
-        });
-        app.apply_input_pick(2, 0); // MIDI -> ALL
+        app.set_channel_input_spec(2, "midi:all");
         assert_eq!(app.channel_kind(2), Some(recorder::ChannelKind::Midi));
         assert_eq!(app.channel_input_spec(2), "midi:all");
-        assert_eq!(app.input_menu, None, "choosing closes the menu");
-        assert_eq!(app.input_chip_text(2), "MIDI: ALL");
+        // **The axis is NAMED.** "MIDI: ALL" could be read as all channels,
+        // and now that a channel is a real choice it would be read that way.
+        assert_eq!(app.input_chip_text(2), "MIDI: ALL DEVICES");
 
         // An audio spec MAKES the channel audio — no kind ask anywhere.
         app.set_channel_input_spec(3, "2");
