@@ -11610,6 +11610,33 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         }
     }
 
+    /// **Fit ALL of it** — the double-click on the band's scrubber.
+    ///
+    /// Not [`Self::arr_fit_view`], which fits the BIGGEST CLIP and is what `W`
+    /// has always done. The scrubber is the strip that draws the whole song at
+    /// once, so the gesture that lands on it means the whole song: from the
+    /// first thing on the timeline to the last, with a margin either side so
+    /// the outermost clips are not flush against the frame.
+    ///
+    /// An empty arrangement forgets the window rather than inventing one, the
+    /// same answer `arr_fit_view` gives: with nothing standing, the shipped
+    /// default is the honest picture.
+    fn arr_fit_all(&mut self) {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for c in &self.arrangement.clips {
+            lo = lo.min(c.start_s);
+            hi = hi.max(c.start_s + self.clip_len_resolved(c));
+        }
+        let span = hi - lo;
+        if !span.is_finite() || span <= 0.0 {
+            self.arr_window = None;
+            return;
+        }
+        let pad = (span * 0.04).max(0.25);
+        self.arr_steer((lo - pad).max(0.0), span + pad * 2.0);
+    }
+
     fn arr_window_now(&self) -> (f64, f64) {
         self.arr_window
             .unwrap_or_else(|| (0.0, (self.arr_span() * 1.05).max(30.0)))
@@ -20577,6 +20604,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         recorder::Column(n),
                     ));
                     self.undo_commit();
+                    self.arr_drag = None;
+                    return;
+                }
+                // **A double-click on the NAVIGATOR fits the whole song** —
+                // the owner's "double click scrubber in arrange view = fit
+                // all". The navigator is the box in the toolbar that draws
+                // the song end to end with the visible window lit inside it;
+                // a hand on it scrolls and up-and-down zooms, and the one
+                // thing it could not do was the obvious one — show all of it.
+                //
+                // Not [`Self::arr_fit_view`], which is `W` and fits the
+                // BIGGEST CLIP. This box IS the whole song, so a gesture that
+                // lands on it means the whole song. See `arr_fit_all`.
+                if let Some(A::ToolNav) = hit {
+                    self.arr_fit_all();
                     self.arr_drag = None;
                     return;
                 }
@@ -51927,6 +51969,103 @@ mod tests {").expect("the tests module")];
             .map(|v| v.repaint_delay)
             .min()
             .unwrap_or(Duration::MAX)
+    }
+
+    /// **A double-click on the arrangement's navigator fits the whole song.**
+    ///
+    /// The owner asked for it with three other bits of arrange-view polish:
+    /// "add double click scrubber in arrange view = fit all". The navigator is
+    /// the recessed box in the toolbar that draws the song end to end with the
+    /// visible window lit inside it — a hand on it scrolls and up-and-down
+    /// zooms, and the one thing it could not do was show all of it.
+    ///
+    /// Not `W`'s fit, which is the BIGGEST CLIP. Two clips far apart is what
+    /// makes those two different answers, so the test can tell which it got.
+    ///
+    /// Driven as a hand does it: arrive, press, release, press, release. The
+    /// pair is closed on the second RELEASE — the landmine every double-click
+    /// in this file steps around — and it is `primary_paired` that is read,
+    /// never egui's own flag, so a fourth gesture in the same spot still
+    /// counts. See `decide_primary_pair`.
+    #[test]
+    fn a_double_click_on_the_navigator_fits_the_whole_song() {
+        use crate::arrangement::{ArrClip, ClipKind};
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        app.arrangement_open = true;
+        let _ = run_frame(&ctx, &mut app);
+        for (start, len, id) in [(2.0_f64, 30.0_f64, 1_u64), (90.0, 4.0, 2)] {
+            app.arrangement.add_clip(ArrClip {
+                pedal: Vec::new(),
+                kind: ClipKind::Midi,
+                notes: Vec::new(),
+                lane: 0,
+                path: String::new(),
+                start_s: start,
+                offset_s: 0.0,
+                len_s: len,
+                loop_s: 0.0,
+                fade_in_s: 0.0,
+                fade_out_s: 0.0,
+                name: "c".into(),
+                id,
+                extra: Default::default(),
+                anchor: Default::default(),
+                follow_tempo: false,
+                stretch: 1.0,
+                stretch_mode: String::new(),
+                gain: 1.0,
+            });
+        }
+        // Wound right in, so any fit at all shows up in the numbers.
+        app.arr_window = Some((0.0, 3.0));
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.arrangement_rect.unwrap_or(Rect::NOTHING);
+        assert!(rect.is_positive(), "the arrangement drew nowhere");
+        let at = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let nav = crate::arrangement_panel::Layout::new(rect, &view).tool_nav;
+            assert!(nav.is_positive(), "the navigator has no box");
+            nav.center()
+        };
+        let click = |app: &mut TangentApp| {
+            for pressed in [true, false] {
+                pointer_frame(
+                    &ctx,
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        };
+        click(&mut app);
+        // ONE click is a grab, not a fit: a press in the middle of the box
+        // carries the window there, and its LENGTH does not change.
+        let (_, after_one) = app.arr_window_now();
+        assert!(
+            (after_one - 3.0).abs() < 0.001,
+            "a single click on the navigator zoomed the view to {after_one:.2}s"
+        );
+        click(&mut app);
+        let (start, len) = app.arr_window_now();
+        // The song runs 2s to 94s. The window has to hold all of it, with the
+        // margin that stops the outermost clips sitting flush against the
+        // frame — and not be so wide that the "fit" was really a surrender to
+        // the shipped default.
+        assert!(
+            start <= 2.0 && start + len >= 94.0,
+            "the fit shows {start:.2}s..{:.2}s, which is not the whole song",
+            start + len
+        );
+        assert!(len < 92.0 * 1.4, "the fit is {len:.2}s wide for a 92s song");
     }
 
     /// A MIDI clip with one fat note, the editor open on it and ZOOMED IN, one

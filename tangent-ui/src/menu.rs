@@ -1667,13 +1667,32 @@ fn draw_menu_backdrop(painter: &egui::Painter, rect: Rect, c: MenuColors, caps: 
         }
     }
     painter.rect_filled(rect, 0.0, c.bg);
+}
+
+/// **The edge, drawn LAST — over the rows and not under them.**
+///
+/// A menu row is justified to the full width of the menu and its padding is
+/// zero, because that is what makes a hovered row a full-width bar the way
+/// every native menu draws one. The consequence is that the highlight lands on
+/// the same pixels the border does — so the border simply disappeared under
+/// whichever row the pointer was on, and the menu lost its outline exactly
+/// where the eye was looking. The owner: "right click dialogue options, when
+/// hovered, are filled correctly, but they overlap the outline of the dialog."
+///
+/// Painting it after the content costs nothing — the same painter, one shape
+/// later in the same layer — and needs no change to the row geometry, which is
+/// what the menu's measured size was computed from. On the desktop the edge is
+/// the background colour (the OS window edge and its shadow do the separating
+/// there), so what it draws is a one-point inset around the highlight: the
+/// gap between a hovered row and the frame that a native menu has.
+fn draw_menu_edge(painter: &egui::Painter, rect: Rect, c: MenuColors, caps: Caps) {
     painter.rect_stroke(
-        rect.shrink(0.5),
+        rect,
         0.0,
         // Borderless on the desktop (the window edge does the work), a real
         // 1px edge inline.
         Stroke::new(1.0_f32, if caps.child_windows { c.bg } else { c.sep }),
-        egui::StrokeKind::Middle,
+        egui::StrokeKind::Inside,
     );
 }
 
@@ -1833,6 +1852,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
                 }
             }
         });
+        draw_menu_edge(ui.painter(), rect, c, caps);
     });
     close |= menu_report.close;
 
@@ -1951,6 +1971,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
                     }
                 }
             });
+            draw_menu_edge(ui.painter(), rect, c, caps);
         });
         close |= report.close;
         submenu_report = Some(report);
@@ -2157,6 +2178,92 @@ mod tests {
         assert_eq!(place(low, size, None), low);
     }
 
+
+    /// **A hovered row does not paint over the menu's own edge.**
+    ///
+    /// The rows are justified to the menu's full width with zero padding —
+    /// that is what makes a highlight a full-width bar the way a native menu
+    /// draws one — so the hover fill lands on exactly the pixels the border
+    /// occupies. Drawn in the old order the border vanished under whichever
+    /// row the pointer was on, which is the one row the eye is on. The owner:
+    /// "right click dialogue options, when hovered, are filled correctly, but
+    /// they overlap the outline of the dialog."
+    ///
+    /// Asserted on the ORDER the shapes were emitted in, because that is the
+    /// whole of the fix and the only thing that can regress: any shape landing
+    /// on the border band after the edge is a shape drawn over it.
+    #[test]
+    fn a_hovered_row_does_not_paint_over_the_menus_edge() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 800.0));
+        let _ = ctx.run(
+            egui::RawInput { screen_rect: Some(screen), ..Default::default() },
+            |_| {},
+        );
+        // The INLINE menu, because that is the one with a border of its own to
+        // lose. The desktop's is the same code drawing the same rectangle in
+        // the background colour, so the order it is drawn in is the same
+        // question with a quieter answer.
+        let mut v = view();
+        v.caps = Caps::PLUGIN;
+        let mut state = Some(MenuState::open(&ctx, v, Pos2::new(30.0, 30.0), Some(screen.size())));
+        let menu = {
+            let st = state.as_ref().expect("the menu did not open");
+            Rect::from_min_size(st.pos, st.size)
+        };
+        // A row well inside the list, and two frames: the first lays the rows
+        // out, the second is the one the pointer is over.
+        let over = Pos2::new(menu.center().x, menu.top() + 40.0);
+        let input = || egui::RawInput {
+            screen_rect: Some(screen),
+            focused: true,
+            events: vec![egui::Event::PointerMoved(over)],
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let _ = ctx.run(input(), |ctx| {
+                let _ = show(ctx, &mut state);
+            });
+        }
+        assert_eq!(
+            ctx.input(|i| i.pointer.hover_pos()),
+            Some(over),
+            "the pointer never reached the menu, so nothing was hovered"
+        );
+        let out = ctx.run(input(), |ctx| {
+            let _ = show(ctx, &mut state);
+        });
+        // The band the border lives in: one point inside the menu's outline.
+        let inner = menu.shrink(1.0);
+        let on_the_border = |r: Rect| r.intersects(menu) && !inner.contains_rect(r.shrink(0.01));
+        let mut edge: Option<usize> = None;
+        let mut over_it: Vec<usize> = Vec::new();
+        for (i, s) in out.shapes.iter().enumerate() {
+            let egui::Shape::Rect(rs) = &s.shape else { continue };
+            let is_edge = rs.stroke.width > 0.0 && rs.rect.expand(0.6).contains_rect(menu);
+            if is_edge {
+                edge = Some(i);
+            } else if rs.fill.a() > 0 && on_the_border(rs.rect) {
+                over_it.push(i);
+            }
+        }
+        let edge = edge.expect("the menu drew no edge at all");
+        // And the row really was lit: a test that hovers nothing would pass
+        // this whatever order the edge is drawn in, which is how the first
+        // draft of it passed against the old code.
+        assert!(
+            !over_it.is_empty(),
+            "no row was filled at all, so nothing could have covered the edge"
+        );
+        let after: Vec<usize> = over_it.into_iter().filter(|i| *i > edge).collect();
+        assert!(
+            after.is_empty(),
+            "{} filled rect(s) were painted over the menu's edge at {edge}: {after:?}",
+            after.len()
+        );
+    }
 
     fn view() -> MenuView {
         MenuView {
