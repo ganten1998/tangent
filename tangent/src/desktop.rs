@@ -9174,9 +9174,10 @@ impl DesktopApp {
                 );
             }
             tangent_ui::ports::ProjectRequest::Save => {
-                self.save_plugin_states();
-                self.copy_states_to_project();
-                self.app.save_project_doc();
+                // The document, then the shelf beside it — see
+                // `save_project_and_states` for why that order is the whole
+                // of it on a session that has never been written.
+                self.save_project_and_states();
                 // **A receipt, because a save is invisible otherwise.**
                 //
                 // Every other thing this app does to a file on disk says so
@@ -9196,10 +9197,14 @@ impl DesktopApp {
                 );
             }
             tangent_ui::ports::ProjectRequest::Template(name) => {
-                // Everything written down first, so the copy IS the session.
-                self.save_plugin_states();
-                self.copy_states_to_project();
-                self.app.save_project_doc();
+                // **Everything written down first, so the copy IS the
+                // session** — its plugins' knobs included, which is what
+                // `save_project_and_states` is for. This road is the reason
+                // that function exists: a template made from a launch's
+                // scratch used to be copied out of a folder that had only
+                // just been created, so it carried a rack and no state for
+                // it and handed every launch a plugin at its defaults.
+                self.save_project_and_states();
                 let Some(src) = self
                     .app
                     .project_doc()
@@ -9377,13 +9382,18 @@ impl DesktopApp {
                 // rewrite what New just agreed to clear.
                 if !discarding_current {
                     self.save_plugin_states();
-                    self.copy_states_to_project();
                     // **The EXACT question**, not the title bar's cheap one:
                     // a wrong "clean" here walks away from the outgoing
                     // session without writing it. See `project_dirty`.
                     if self.app.project_dirty_exact() {
                         self.app.save_project_doc();
                     }
+                    // AFTER that write, because it is the write that gives an
+                    // unmaterialised scratch a folder to be shelved into —
+                    // see `save_project_and_states`. Shelving first stranded
+                    // the outgoing session's knobs in a folder that came into
+                    // existence on the next line.
+                    self.copy_states_to_project();
                 }
                 // **A clean slate, and NOTHING new on disk** - the owner's
                 // "no creating folders called untitled PERIOD". A
@@ -9451,6 +9461,44 @@ impl DesktopApp {
         }
         let _ = std::fs::create_dir_all(&dir);
         mirror_sidecars(&global_state_dir(), &dir);
+    }
+
+    /// **Keep the session WHOLE: the document first, then the shelf beside
+    /// it.** The one spelling of an order that is not a matter of taste.
+    ///
+    /// [`Self::copy_states_to_project`] above refuses to make the project
+    /// folder for a state shelf alone, so the folder has to already exist
+    /// when it runs — and the thing that MAKES it exist is
+    /// `save_project_doc`, through `materialize_project_dir`. A road that
+    /// shelved the states first shelved them into a folder that did not
+    /// exist yet, and then created it, empty of state, one line later.
+    ///
+    /// **That is why the owner's default template had no `state/` folder in
+    /// it at all.** Save As Template copies the session's whole folder, and
+    /// the session a launch stands on is an unmaterialised scratch, so the
+    /// copy carried the two things the materialise had just made — `media/`
+    /// and the document — and nothing else. His template names Brusfri in a
+    /// folder's extra rack (seat 4136, out in the sparse tail); every launch
+    /// adopted that rack and mirrored the template's absent shelf onto the
+    /// live one, which CLEARS it, and the noise profile he had learned went
+    /// with it: "when I launch tangent fresh, the state it remembers about
+    /// noise cancelling is reset ... until i manually have brusfri relearn."
+    ///
+    /// A plain Save had the same order and was rescued by accident — the
+    /// folder is real from the second save onwards, and `on_exit` shelves
+    /// the states again at quit, so only the first save's worth was ever at
+    /// risk. A template is a COPY taken at that instant and nothing comes
+    /// back to fix it later, which is why the same fault was invisible on
+    /// one road and permanent on the other.
+    ///
+    /// `save_plugin_states` first, always: it is what puts the LIVE knobs on
+    /// the global shelf, and the mirror below only moves what is already
+    /// there.
+    #[cfg(feature = "recorder")]
+    fn save_project_and_states(&mut self) {
+        self.save_plugin_states();
+        self.app.save_project_doc();
+        self.copy_states_to_project();
     }
 
     /// Bring a project's plugin states OUT to the live sidecars. A bay the
@@ -9552,12 +9600,17 @@ impl DesktopApp {
         // reclaim stopped recognising its own scratch: one abandoned
         // "Untitled N" per New, forever.
         self.save_plugin_states();
-        self.copy_states_to_project();
         // **The EXACT question** — the outgoing session is about to be
         // replaced, and a wrong "clean" loses it. See `project_dirty`.
         if self.app.project_dirty_exact() {
             self.app.save_project_doc();
         }
+        // **And the shelf AFTER that write**, which is the line that gives an
+        // unmaterialised scratch a folder at all — see
+        // `save_project_and_states`. The other order shelved the outgoing
+        // knobs into a folder that did not exist until the next statement,
+        // and the session was gone by the time anything noticed.
+        self.copy_states_to_project();
         self.app.open_project(doc);
         // `open_project` applied the document's desk when it carried one;
         // the flag says so, and the states follow the desk.
@@ -21009,6 +21062,118 @@ mod tests {
         );
     }
 
+    /// **Every road that writes a project writes the DOCUMENT before it
+    /// shelves the plugin states, because the document is what makes the
+    /// folder exist.**
+    ///
+    /// The owner: "I have my default project with a folder containing two
+    /// mic tracks. That folder's first effect is Brusfri, and when I launch
+    /// tangent fresh, the state it remembers about noise cancelling is
+    /// reset, so enabling monitoring on a mic in that folder doesn't have it
+    /// until i manually have brusfri relearn."
+    ///
+    /// His template names Brusfri in the folder's extra rack and carries no
+    /// `state/` folder at ALL, and a launch mirrors the template's shelf onto
+    /// the live one — so the adopt cleared the profile he had learned and
+    /// handed that bay its defaults, every launch. The template could not
+    /// have carried it: `Save As Template` ran `copy_states_to_project`
+    /// BEFORE `save_project_doc`, and a launch's scratch has no folder until
+    /// `save_project_doc` materialises one, so the shelf copy returned
+    /// having written nothing and the folder it would have written into was
+    /// created, empty of state, on the next line. What the copy then carried
+    /// to `Projects/Templates/default` was `media/` and the document: exactly
+    /// the two entries his template has.
+    ///
+    /// `save_project_and_states` is the one spelling of the order now, and
+    /// the two roads that keep a session whole go through it. The two that
+    /// save the outgoing session only when it is dirty cannot (the write is
+    /// conditional), so they are asserted where they stand.
+    ///
+    /// A source scan because `DesktopApp` cannot be built in a test — the
+    /// precedent is `every_edge_where_frames_stop_flushes_the_settings_debounce`
+    /// below. `a_template_copied_with_its_shelf_hands_the_folder_its_noise_profile`
+    /// is the other half: it runs the adopt for real, at the folder-extra
+    /// seat, and watches the learned profile arrive.
+    ///
+    /// Revert-check: put `copy_states_to_project` back above
+    /// `save_project_doc` in any of the four and this goes red naming it.
+    #[test]
+    fn a_road_that_writes_a_project_shelves_the_states_after_the_document() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let between = |from: &str, to: &str| {
+            let a = src.find(from).unwrap_or_else(|| panic!("`{from}` is gone"));
+            let b = src[a..].find(to).unwrap_or_else(|| panic!("`{to}` after `{from}` is gone"));
+            src[a..a + b].to_owned()
+        };
+
+        // The one spelling of the order.
+        let helper = between("fn save_project_and_states(&mut self)", "\n    ///");
+        let doc = helper
+            .find("self.app.save_project_doc()")
+            .expect("`save_project_and_states` no longer writes the document");
+        let shelf = helper
+            .find("self.copy_states_to_project()")
+            .expect("`save_project_and_states` no longer shelves the plugin states");
+        assert!(
+            doc < shelf,
+            "`save_project_and_states` shelves the plugin states before the \
+             document is written, and an unmaterialised scratch has no folder \
+             to shelve them into — so a first Save and every Save As Template \
+             lose them"
+        );
+
+        // The two roads that keep a session whole go through it.
+        for (arm, next) in [
+            ("ProjectRequest::Save =>", "ProjectRequest::Template(name)"),
+            ("ProjectRequest::Template(name) =>", "ProjectRequest::Export(spec)"),
+        ] {
+            let body = between(arm, next);
+            assert!(
+                body.contains("self.save_project_and_states()"),
+                "the {arm} arm no longer keeps the session through \
+                 `save_project_and_states`, so it has an order of its own \
+                 again"
+            );
+            assert!(
+                !body.contains("self.copy_states_to_project()"),
+                "the {arm} arm shelves the plugin states itself as well, \
+                 which is a second spelling of an order that has exactly one"
+            );
+        }
+        // Save As Template copies the folder, so both writes have to have
+        // happened before the copy or the template is a session missing its
+        // shelf — which is the whole fault.
+        let template = between("ProjectRequest::Template(name) =>", "ProjectRequest::Export(spec)");
+        assert!(
+            template.find("self.save_project_and_states()")
+                < template.find("copy_dir_all(&src, &dst)"),
+            "Save As Template copies the session folder before it writes the \
+             session into it, so the template is a stencil with no plugin \
+             state in it"
+        );
+
+        // And the two that write the outgoing document only if it is dirty.
+        for (road, next) in [
+            ("if !discarding_current {", "// **A clean slate"),
+            ("fn switch_project(&mut self, doc:", "self.app.open_project(doc)"),
+        ] {
+            let body = between(road, next);
+            let doc = body
+                .find("self.app.save_project_doc()")
+                .unwrap_or_else(|| panic!("`{road}` no longer saves the outgoing document"));
+            let shelf = body
+                .find("self.copy_states_to_project()")
+                .unwrap_or_else(|| panic!("`{road}` no longer shelves the outgoing states"));
+            assert!(
+                doc < shelf,
+                "`{road}` shelves the outgoing session's plugin states before \
+                 the save that gives it a folder, so a scratch kept by that \
+                 very save is written without them"
+            );
+        }
+    }
+
     /// **Every edge where frames may stop drains the settings debounce.**
     ///
     /// The app coalesces drags, wheel notches and key repeats into one
@@ -25080,6 +25245,107 @@ mod sidecar_walk_probe {
         );
         let _ = std::fs::remove_dir_all(&from);
         let _ = std::fs::remove_dir_all(&to);
+    }
+
+    /// **The loss the owner reported, at the seat he reported it from.**
+    ///
+    /// "I have my default project with a folder containing two mic tracks.
+    /// That folder's first effect is Brusfri, and when I launch tangent
+    /// fresh, the state it remembers about noise cancelling is reset."
+    ///
+    /// A launch with nothing to reopen adopts the default template and then
+    /// mirrors the template's own `state/` onto the live shelf, and a shelf
+    /// that does not EXIST mirrors an empty one - which clears every sidecar
+    /// the last session left. That is deliberate and it is what New depends
+    /// on. It is also, for a template that NAMES a plugin and carries no
+    /// state for it, a plugin handed its defaults at every single launch: a
+    /// learned noise profile is not a default anybody can live with.
+    ///
+    /// The seat is the one his Brusfri really sits in - channel three's
+    /// FOLDER-extra rack, seat 4136 of the sparse tail, four thousand seats
+    /// past the 108-bay head - because a shelf road that works only for the
+    /// head is a road that misses exactly this desk.
+    #[test]
+    fn a_template_with_no_state_shelf_hands_its_plugins_their_defaults() {
+        let shelf = scratch("no-shelf-live");
+        // A template folder with a document and `media/` in it and no
+        // `state/` - the shape `Save As Template` really left on his disk.
+        let template = scratch("no-shelf-template");
+        std::fs::create_dir_all(template.join("media")).expect("template media");
+        std::fs::write(template.join(tangent_ui::arrangement::DOC_NAME), b"{}")
+            .expect("template document");
+        let seat = tangent_ui::recorder::folder_extra_seat(3);
+        let learned = shelf.join(sidecar_name(seat, 0));
+        std::fs::write(&learned, b"the noise Brusfri learned").expect("seed");
+
+        mirror_sidecars(&template.join("state"), &shelf);
+
+        assert!(
+            !learned.exists(),
+            "seat {seat}'s sidecar survived, so this is no longer the road \
+             that loses the noise profile and the fix above it is aimed at \
+             the wrong thing"
+        );
+        let _ = std::fs::remove_dir_all(&shelf);
+        let _ = std::fs::remove_dir_all(&template);
+    }
+
+    /// **And the cure: a template that carries its rack carries its state.**
+    ///
+    /// The same adopt, against a template whose folder was copied from a
+    /// session that had a shelf in it - which is what
+    /// `save_project_and_states` makes `Save As Template` produce. The
+    /// learned profile arrives on the live shelf and the plugin comes back
+    /// with it.
+    ///
+    /// **The leak is still shut.** A seat the template does NOT name still
+    /// loses its sidecar, which is the whole reason the mirror clears: "the
+    /// last session's reverb tail must not leak into this one's fresh
+    /// plugin." Both halves are asserted here, because a fix that kept the
+    /// profile by keeping everything would have traded one fault for the one
+    /// the mirror was written to prevent.
+    #[test]
+    fn a_template_copied_with_its_shelf_hands_the_folder_its_noise_profile() {
+        // The session on disk the moment Save As Template copies it: the
+        // document, `media/`, and the state shelf beside them.
+        let session = scratch("shelf-session");
+        std::fs::create_dir_all(session.join("media")).expect("session media");
+        std::fs::write(session.join(tangent_ui::arrangement::DOC_NAME), b"{}")
+            .expect("session document");
+        std::fs::create_dir_all(session.join("state")).expect("session shelf");
+        let seat = tangent_ui::recorder::folder_extra_seat(3);
+        std::fs::write(
+            session.join("state").join(sidecar_name(seat, 0)),
+            b"the noise Brusfri learned",
+        )
+        .expect("seed");
+
+        let template = scratch("shelf-template");
+        let _ = std::fs::remove_dir_all(&template);
+        copy_dir_all(&session, &template).expect("the template copy");
+
+        // The live shelf as a launch finds it: last session's states.
+        let shelf = scratch("shelf-live");
+        let stale = shelf.join(sidecar_name(0, 0));
+        std::fs::write(&stale, b"last session's reverb tail").expect("seed");
+
+        mirror_sidecars(&template.join("state"), &shelf);
+
+        assert_eq!(
+            std::fs::read(shelf.join(sidecar_name(seat, 0))).ok().as_deref(),
+            Some(&b"the noise Brusfri learned"[..]),
+            "the template carried a state for seat {seat} and the adopt did \
+             not put it on the live shelf, so the folder's Brusfri still \
+             comes up at its defaults"
+        );
+        assert!(
+            !stale.exists(),
+            "a seat the template does not name kept its sidecar - the last \
+             session's reverb tail is leaking into this one's fresh plugin"
+        );
+        let _ = std::fs::remove_dir_all(&session);
+        let _ = std::fs::remove_dir_all(&template);
+        let _ = std::fs::remove_dir_all(&shelf);
     }
 
     /// **A sidecar from outside today's seat space is left exactly alone.**
