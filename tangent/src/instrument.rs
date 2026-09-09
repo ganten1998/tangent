@@ -12762,6 +12762,61 @@ impl Engine {
             .unwrap_or(&[])
     }
 
+    /// **Write a built-in bay's extra state lines into the LEDGER, now.**
+    ///
+    /// [`Self::set_insert_param`]'s sibling for the state that is not a knob,
+    /// and it exists for the reason that method's own note gives: the ledger
+    /// is the durable truth — `save_insert_state` reads `insert_builtin` and
+    /// nothing else — so anything that must survive a save has to land here
+    /// rather than only in a sidecar on disk.
+    ///
+    /// **It was the sampler's mute.** A picked sample was written to the
+    /// bay's sidecar and the bay was marked for a RELOAD, and the reload was
+    /// the only thing that put the file's name where the host could read it
+    /// back (`sampler_bays` walks `builtin_extra`). That reload lands two
+    /// frames later at the earliest, and only if a frame arrives at all —
+    /// the walk that announces a bay runs BEFORE the drain that marks one, so
+    /// the frame that binds a sample asks for no repaint and owes itself
+    /// nothing. Until some unrelated thing woke the window, the engine had
+    /// been told about a bay that named a file the host had not read: the
+    /// panel drew, the state saved, and the lane played silence. Writing the
+    /// ledger here closes that window — the host can read the file back on
+    /// the same frame it was chosen — and the reload still follows, so
+    /// nothing about persistence changes.
+    ///
+    /// Only the symbols the unit CLAIMS are taken ([`crate::builtin_fx::
+    /// is_extra_symbol`]), because `state_text` writes only those and a line
+    /// the writer would drop is a line the reader must never have seen.
+    /// Everything the unit claims and this call does not name is REPLACED:
+    /// the caller holds the whole of a bay's extra state (it read it from
+    /// `builtin_extra` a moment ago), so a merge here would be a second
+    /// opinion about a list that already has an owner.
+    ///
+    /// `false` for a bay that is empty, out of range, or not a built-in —
+    /// the same three refusals `set_insert_param` makes, and reported rather
+    /// than swallowed so a caller can say what did not happen.
+    pub fn set_builtin_extra(
+        &mut self,
+        strip: usize,
+        slot: usize,
+        extra: Vec<(String, String)>,
+    ) -> bool {
+        let Some(bay) = self
+            .insert_builtin
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+            .and_then(Option::as_mut)
+        else {
+            return false;
+        };
+        let path = bay.spec.path;
+        bay.extra = extra
+            .into_iter()
+            .filter(|(s, _)| crate::builtin_fx::is_extra_symbol(path, s))
+            .collect();
+        true
+    }
+
     /// How many dB of gain reduction one built-in bay applied since the last
     /// read — max-hold, read-and-RESET, the `strip_peaks` contract. Zero for
     /// everything that is not a compressor working, including a bay out of
@@ -25872,6 +25927,64 @@ mod sampler_road {
             planar[0].iter().all(|s| *s == 0.0),
             "an unloaded sampler bay passed its input through instead of replacing it"
         );
+    }
+
+    /// **A sampler LOADED INTO A BAY plays a MIDI clip's note out of the
+    /// engine's own mix** — the analog's `the_builtin_analog_loads_as_a_voice_
+    /// and_a_note_sounds`, for the second voice, and the test whose absence
+    /// let the sampler ship mute.
+    ///
+    /// Everything above this in the module tests one link: a synthetic rack
+    /// built by hand, or the ring that carries a decoded file. None of them
+    /// go through `load_insert`, none of them roll the transport, and none
+    /// of them read the master mix — so all of them passed while a lane with
+    /// a sampler on it made no sound at all. The chain this walks is the one
+    /// the owner walks: seat the unit the way the loader seats it, hand the
+    /// lane its file the way `reload_sampler` hands it over, put a note in
+    /// front of the playhead, and listen to what comes out of the desk.
+    #[test]
+    fn a_note_through_a_seated_samplers_bay_comes_out_of_the_mix() {
+        const CH: usize = 3;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let loaded = e
+            .load_insert(CH, 0, Some(Path::new(crate::builtin_fx::SAMPLER_PATH)), None)
+            .expect("the sampler must load")
+            .expect("a load reports what it seated");
+        assert_eq!(loaded.class, "Tangent Sampler");
+        assert!(e.insert_state_error(CH, 0).is_none());
+
+        e.set_channel_gain(CH, 0.5);
+        e.set_master_gain(1.0);
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; 1024 * 2];
+        for _ in 0..3 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let quiet = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        assert!(quiet < 1e-6, "a bay with no file and no notes made sound: {quiet}");
+
+        assert!(
+            e.set_sampler_sample(CH, Some(a_sample("tone.wav", 0.8))),
+            "the engine refused the sample"
+        );
+        e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
+            strip: CH,
+            start: 0,
+            len: 96_000,
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 48_000, key: SAMPLER_ROOT_KEY, vel: 110 }]),
+        }]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            assert!(out.iter().all(|s| s.is_finite()));
+            peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+        }
+        assert!(peak > 0.005, "a note through the sampler's bay made no sound: {peak}");
     }
 
     /// **A sample swap takes the new file and gives the old one BACK, on the
