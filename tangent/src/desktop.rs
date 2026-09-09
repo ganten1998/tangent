@@ -15840,6 +15840,42 @@ impl DesktopApp {
         WindowFacts::default()
     }
 
+    /// **Has the OS been asked to terminate this process?** Taken once.
+    ///
+    /// macOS has a second road out of the app and it does not come through
+    /// the window. winit's default menu gives the Quit item the `terminate:`
+    /// action, so Cmd+Q, the Quit menu row, the Dock's Quit, an AppleScript
+    /// `quit` and Log Out all reach `-[NSApplication terminate:]` — which
+    /// calls `exit()` from AppKit and never returns to `main`. Two things are
+    /// lost on that road, and the smaller one is the crash:
+    ///
+    /// * `exit()` runs every loaded plugin's static destructors, and Kontakt
+    ///   8's Qt teardown segfaults in them. The `libc::_exit(0)` at the end of
+    ///   `main` exists to stop precisely that and is never reached, because
+    ///   `run_native` never returns. This is the fault the owner reported —
+    ///   "only when closing the app, and the process does die".
+    /// * winit tears the windows down with `-[NSWindow close]`, which does
+    ///   NOT ask `windowShouldClose:` — so no `CloseRequested` reaches egui,
+    ///   `intercept_quit` is never called, and an unsaved afternoon goes
+    ///   without a question. That is the bigger loss of the two.
+    ///
+    /// So termination is refused at the door (`macwin::should_terminate`
+    /// answers `NSTerminateCancel`) and turned into the close the red button
+    /// makes. Everything downstream is then the road that already worked: the
+    /// prompt, `on_exit`, `run_native` returning, `_exit(0)`.
+    #[cfg(target_os = "macos")]
+    fn quit_requested(ctx: &egui::Context) -> bool {
+        crate::macwin::quit_requested(ctx)
+    }
+
+    /// Everywhere else there is no such road: Alt+F4, the window manager's
+    /// close button and a session logout all arrive as the ordinary window
+    /// close the block below already handles.
+    #[cfg(not(target_os = "macos"))]
+    fn quit_requested(_ctx: &egui::Context) -> bool {
+        false
+    }
+
     /// **Borderless AND maximised means the whole screen**, and anything
     /// else means an ordinary window.
     ///
@@ -16502,6 +16538,14 @@ impl eframe::App for DesktopApp {
             if lost_focus || went_down {
                 self.app.flush_settings_now();
             }
+        }
+        // **A termination request becomes a window close, and that is the
+        // whole of the macOS quit fix.** Sent as the very command the answered
+        // prompt sends below, so the next frame's `close_requested` picks it
+        // up and `intercept_quit` gets its say — see
+        // `DesktopApp::quit_requested` for what is lost when it does not.
+        if Self::quit_requested(ctx) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // **The window is closing — is that all right?**
         //
@@ -21589,6 +21633,115 @@ mod tests {").expect("the tests module")];
         assert!(
             focus < flush && minimised < flush,
             "the flush in update is not driven by the focus and minimise edges"
+        );
+    }
+
+    /// **Every road out of this app ends at the hardened exit.**
+    ///
+    /// `main` finishes with `libc::_exit(0)` and a long comment saying why: a
+    /// normal `exit()` runs every loaded VST3's static destructors, Kontakt 8
+    /// segfaults in its Qt teardown there, and coreaudiod cannot tell that
+    /// crash from a force-kill — so it wedges audio on the whole machine.
+    /// That hardening is only reachable when `run_native` RETURNS, and the
+    /// app had a second road that never let it: macOS Cmd+Q goes to
+    /// `-[NSApplication terminate:]`, which calls `exit()` itself. The owner
+    /// saw the crash "often, and only when closing the app".
+    ///
+    /// So there are three things to keep true, and each is one deletion away
+    /// from being false again:
+    ///
+    /// 1. `main` still ends at `_exit` / `TerminateProcess` rather than
+    ///    falling off the end.
+    /// 2. eframe is never told to run-and-exit, because then IT calls
+    ///    `std::process::exit(0)` from inside the loop and `main` is never
+    ///    reached either.
+    /// 3. macOS termination is refused and turned into the ordinary window
+    ///    close, so the unsaved-work prompt, `on_exit` and the return from
+    ///    `run_native` all still happen.
+    ///
+    /// A source scan because `DesktopApp` cannot be built in a test and an
+    /// `NSApplication` cannot be quit in one; the precedent is
+    /// `every_edge_where_frames_stop_flushes_the_settings_debounce` above.
+    /// The half of the hook that CAN be executed is executed —
+    /// `macwin::quit_tests`.
+    ///
+    /// Revert-check: delete the `Self::quit_requested` block from `update`,
+    /// or answer `TerminateNow` in the hook, and this goes red naming it.
+    #[test]
+    fn every_road_out_of_the_app_ends_at_the_hardened_exit() {
+        let main = include_str!("main.rs");
+        let exit = main
+            .find("libc::_exit(0)")
+            .expect("`main` no longer leaves through `_exit`, so a loaded plugin's \
+                     static destructors run and Kontakt's Qt teardown crashes");
+        assert!(
+            main[exit..].contains("TerminateProcess"),
+            "the Windows arm of the hardened exit is gone"
+        );
+        assert!(
+            !main.contains("run_and_return: false"),
+            "eframe is told not to return from `run_native`, which makes IT \
+             call `std::process::exit(0)` — the atexit chain, and the crash, \
+             by another name"
+        );
+
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let body_of = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            let open = at + src[at..].find('{').expect("a body");
+            let end = src[open..]
+                .find("\n    fn ")
+                .map_or(src.len(), |n| open + n);
+            &src[open..end]
+        };
+        let update = body_of("fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame)");
+        let asked = update
+            .find("if Self::quit_requested(ctx) {")
+            .expect("`update` no longer turns a termination request into a close, \
+                     so Cmd+Q quits through `exit()` without asking about \
+                     unsaved work");
+        assert!(
+            update[asked..].starts_with(
+                "if Self::quit_requested(ctx) {\n            ctx.send_viewport_cmd(egui::ViewportCommand::Close);"
+            ),
+            "the termination request no longer becomes the same close the red \
+             button makes"
+        );
+        let intercept = update
+            .find("self.app.intercept_quit()")
+            .expect("`update` no longer asks about unsaved work at all");
+        assert!(
+            asked < intercept,
+            "the termination request is turned into a close AFTER the frame has \
+             already decided about closing, so Cmd+Q costs a whole extra frame \
+             and reads as a key that did nothing"
+        );
+        assert!(
+            body_of("fn quit_requested(ctx: &egui::Context)")
+                .contains("crate::macwin::quit_requested(ctx)"),
+            "the macOS arm no longer asks AppKit whether it was told to quit"
+        );
+
+        let macwin = include_str!("macwin.rs");
+        assert!(
+            macwin.contains("sel!(applicationShouldTerminate:)"),
+            "the `applicationShouldTerminate:` patch is gone, so nothing stands \
+             between Cmd+Q and `exit()`"
+        );
+        let hook = &macwin[macwin
+            .find("unsafe extern \"C-unwind\" fn should_terminate(")
+            .expect("the hook itself is gone")..];
+        // The body alone: everything after it names `NSTerminateNow` in prose.
+        let hook = &hook[..hook.find("\n}").expect("the hook has no end")];
+        assert!(
+            hook.contains("NSApplicationTerminateReply::TerminateCancel"),
+            "the hook no longer refuses the termination"
+        );
+        assert!(
+            !hook.contains("TerminateNow"),
+            "the hook can answer `NSTerminateNow`, which hands the process back \
+             to `-[NSApplication terminate:]` and its `exit()` — the crash"
         );
     }
 
