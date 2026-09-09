@@ -932,6 +932,25 @@ pub struct TangentApp {
     /// The hash of the settings the chip words were last built from. See
     /// `frame`.
     input_chip_key: Option<u64>,
+    /// **Which MIDI input ports exist right now**, refreshed on a TTL.
+    ///
+    /// Enumerating them is an OS round-trip — the same one that cost 695 ms
+    /// of the first frame before `auto_connect` was deferred — so it is asked
+    /// on a timer and read by everything that draws. The chip needs it to
+    /// mark a device that has gone away, and the MIDI Inputs dialog needs it
+    /// to say which rows are live; both would otherwise ask per frame.
+    ///
+    /// Empty on a plugin, which has no ports to enumerate: a track's set is
+    /// still remembered and still shown, just with nothing plugged in.
+    midi_ports_seen: Vec<String>,
+    /// When `midi_ports_seen` was last asked. `None` = never.
+    midi_ports_at: Option<Instant>,
+    /// **A port named on the COMMAND LINE**, which pins the whole session.
+    ///
+    /// `-p NAME` says something more specific than any track's set does, and
+    /// the desk's reconcile would otherwise close it on the next frame. See
+    /// `connect_midi_named`.
+    midi_port_override: Option<String>,
     /// The media explorer: where it stands, what it lists, and the scroll.
     media_dir: std::path::PathBuf,
     media_entries: Vec<crate::drumpad_panel::MediaEntry>,
@@ -3488,6 +3507,9 @@ impl TangentApp {
             menu_anchor: Pos2::ZERO,
             input_chip_texts: Vec::new(),
             input_chip_key: None,
+            midi_ports_seen: Vec::new(),
+            midi_ports_at: None,
+            midi_port_override: None,
             media_dir: dirs_home(),
             media_entries: Vec::new(),
             media_scroll: 0,
@@ -3741,12 +3763,145 @@ impl TangentApp {
     /// Run the MIDI priority chain now. Called once, after the first frame is
     /// on screen — see `MidiPorts::auto_connect`.
     /// Open a named MIDI port — the `-p NAME` path, deferred with the rest.
+    ///
+    /// **And it PINS that port for the session.** The desk now opens whatever
+    /// its tracks ask for (see `midi_port_override`), which would reconcile
+    /// this away on the very next frame; an operator who names a port on the
+    /// command line has said something more specific than any track has, so it
+    /// wins until the app is restarted.
     pub fn connect_midi_named(&mut self, name: &str) -> Result<(), String> {
         let tx = self.midi_sender();
-        match self.ports.as_mut() {
-            Some(p) => p.connect(name, tx),
-            None => Err("no MIDI ports".to_owned()),
+        let Some(p) = self.ports.as_mut() else {
+            return Err("no MIDI ports".to_owned());
+        };
+        let failed = p.open_set(std::slice::from_ref(&name.to_owned()), tx);
+        match failed.into_iter().next() {
+            Some((_, why)) => Err(why),
+            None => {
+                self.midi_port_override = Some(name.to_owned());
+                Ok(())
+            }
         }
+    }
+
+    /// **Every MIDI device the desk wants open right now.**
+    ///
+    /// The union of what the tracks ask for, resolved against the ports that
+    /// are actually there. A track listening to every device (the default)
+    /// accepts every port, so a fresh desk opens everything plugged in — which
+    /// is what "ALL DEVICES" has to mean once several devices can be open at
+    /// once, and is strictly more than the ONE port the app used to open.
+    ///
+    /// A desk with no MIDI track on it opens nothing here: `auto_connect`'s
+    /// single priority-chain pick is already standing and still feeds the
+    /// chord display, and widening that to every port on a desk nobody has
+    /// asked anything of would be a change nobody wanted.
+    ///
+    /// `-p NAME` overrides the lot — see `connect_midi_named`.
+    pub fn wanted_midi_ports(&self) -> Vec<String> {
+        if let Some(one) = self.midi_port_override.as_ref() {
+            return vec![one.clone()];
+        }
+        let kinds: Vec<_> = (0..recorder::CHANNELS)
+            .map(|ch| self.channel_kind(ch))
+            .collect();
+        if !kinds.iter().any(|k| *k == Some(recorder::ChannelKind::Midi)) {
+            return self
+                .ports
+                .as_ref()
+                .map(|p| p.open_ports())
+                .unwrap_or_default();
+        }
+        self.midi_ports_seen
+            .iter()
+            .filter(|port| {
+                (0..recorder::CHANNELS).any(|ch| {
+                    kinds[ch] == Some(recorder::ChannelKind::Midi)
+                        && self.channel_midi_sel(ch).wants_device(port)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// **Open exactly the devices the desk asks for, and say so when one
+    /// will not open.**
+    ///
+    /// Run every frame, and almost always a comparison of two short lists.
+    /// This is where several connections replace the one the app used to
+    /// hold: `wanted_midi_ports` says what the tracks want, `MidiPorts::
+    /// open_set` closes what is no longer wanted and opens what is new, and a
+    /// device already open and still wanted keeps the connection it has.
+    ///
+    /// A no-op in the plugin, which has no ports of its own — the host hands
+    /// it notes.
+    ///
+    /// The failure is a **CONDITION and not an event**: a port either opens or
+    /// it does not, so a message stands while it holds and goes when it stops,
+    /// rather than being a box somebody clicks away that says nothing about
+    /// whether the next attempt worked.
+    pub fn reconcile_midi_ports(&mut self) {
+        if self.ports.is_none() {
+            return;
+        }
+        let want = self.wanted_midi_ports();
+        // Sets, compared as sets: `open_set` keeps what it can and the order
+        // it hands back is the order things were opened in, which is not the
+        // order the desk asks in.
+        let open = self.ports.as_ref().map(|p| p.open_ports()).unwrap_or_default();
+        if want.len() == open.len() && want.iter().all(|w| open.iter().any(|o| o == w)) {
+            return;
+        }
+        let tx = self.midi_tx.clone();
+        let failed = self
+            .ports
+            .as_mut()
+            .map(|p| p.open_set(&want, tx))
+            .unwrap_or_default();
+        match failed.first() {
+            None => self.notify_lower(MIDI_PORT_KEY),
+            // `notify_raise` and not `insist`: this is a per-frame re-check,
+            // so a dismissal has to stick — the refusal is never silence,
+            // because the next frame says it again. See `notify_insist` for
+            // which callers want the other door.
+            Some((name, why)) => self.notify_raise(
+                MIDI_PORT_KEY,
+                crate::notify::Kind::Error,
+                format!(
+                    "Could not open the MIDI device \u{201c}{name}\u{201d}: {why}. \
+                     Its track hears nothing until it comes back."
+                ),
+            ),
+        }
+    }
+
+    /// **Every lane's routing rule, compiled against the live slot table.**
+    ///
+    /// The one place a `MidiInputSel` becomes something the audio thread and
+    /// the recorder can both test, and deliberately ONE place: the engine
+    /// decides which lane hears a live note and the take decides which lane
+    /// records it, and two answers to that question is a take that comes back
+    /// holding somebody else's performance.
+    ///
+    /// A device this desk names and which is not open contributes no bit and
+    /// is simply not heard — it is never forgotten. See
+    /// `recorder::live_midi_routes`.
+    pub fn midi_routes(&self) -> [recorder::MidiRoute; recorder::CHANNELS] {
+        let kinds: Vec<_> = (0..recorder::CHANNELS)
+            .map(|ch| self.channel_kind(ch))
+            .collect();
+        let slots = self
+            .ports
+            .as_ref()
+            .map(|p| p.source_slots())
+            .unwrap_or_default();
+        recorder::live_midi_routes(&self.settings.channel_midi_inputs, &kinds, &slots)
+    }
+
+    /// The ports the app has just seen, for the chip and the dialog. Kept
+    /// warm on a 5 s beat — see `tend_menu_cache`.
+    pub fn midi_ports_present(&self) -> &[String] {
+        &self.midi_ports_seen
     }
 
     pub fn midi_auto_connect(&mut self) {
@@ -9005,6 +9160,7 @@ impl TangentApp {
             gains: &s.channel_gains,
             pans: &s.channel_pans,
             inputs: &s.channel_inputs,
+            midi_inputs: &s.channel_midi_inputs,
             drums_gain: s.drums_gain,
             drums_pan: s.drums_pan,
             metronome_gain: s.metronome_gain,
@@ -9096,6 +9252,15 @@ impl TangentApp {
             self.settings.channel_pans[i] = v.clamp(-1.0, 1.0);
         }
         self.settings.channel_inputs = d.inputs.clone();
+        // **The device sets travel with the inputs**, because they ARE the
+        // input for a MIDI track. Restored through the same reconcile the
+        // file loaders use, so an undo of a desk captured by a build without
+        // them lands on what its strings say rather than on nothing.
+        self.settings.channel_midi_inputs = d.midi_inputs.to_vec();
+        recorder::reconcile_midi_inputs(
+            &mut self.settings.channel_midi_inputs,
+            &self.settings.channel_inputs,
+        );
         self.settings.drums_gain = d.drums_gain.clamp(0.0, 8.0);
         self.settings.drums_pan = d.drums_pan.clamp(-1.0, 1.0);
         self.settings.metronome_gain = d.metronome_gain.clamp(0.0, 2.0);
@@ -9174,6 +9339,25 @@ impl TangentApp {
     /// the rows are rebuilt — so the first open of the menu is as instant
     /// as every other. Runs once a frame; rebuilds only on a real change.
     fn tend_menu_cache(&mut self) {
+        // **The MIDI ports, on the same 5 s beat the menu cache uses.**
+        // Devices are plugged and unplugged while the app runs, and every
+        // chip on the desk says whether the ones it names are there — so this
+        // is asked on a timer rather than per frame (an enumeration is an OS
+        // round-trip) and rather than only when a menu opens (a chip that
+        // only tells the truth while a menu is up is not telling it).
+        let due = self
+            .midi_ports_at
+            .is_none_or(|at| at.elapsed() > Duration::from_secs(5));
+        if due {
+            let now = self.ports.as_ref().map(|p| p.list()).unwrap_or_default();
+            self.midi_ports_at = Some(Instant::now());
+            // Compared before it is stored: this feeds the chip hash, and a
+            // fresh `Vec` with the same names in it would rebuild every chip
+            // on the desk every five seconds for ever.
+            if now != self.midi_ports_seen {
+                self.midi_ports_seen = now;
+            }
+        }
         // Compared in place: `menu_cache_key_now` clones the device name,
         // and this runs every frame to answer "unchanged" almost always.
         let name = self.settings.record_audio_device.as_deref().unwrap_or("");
@@ -9472,13 +9656,20 @@ impl TangentApp {
     }
 
     /// What the input chip SAYS: the channel's current source, short.
+    ///
+    /// **And it says what is TRUE.** It used to print `MIDI: ALL` or
+    /// `MIDI: <port>` off `channel_inputs` alone, while the app had exactly
+    /// one device open app-wide and nothing downstream had ever read that
+    /// port — the owner's "the gui selector ... is lying to the user". The
+    /// words now come from the track's own selection, and the whole grammar
+    /// (including the `!` on a device that is not plugged in) is
+    /// `MidiInputSel::chip_text`.
     fn input_chip_text(&self, ch: usize) -> String {
         let spec = self.channel_input_spec(ch);
         match self.channel_kind(ch) {
-            Some(recorder::ChannelKind::Midi) => match spec.strip_prefix("midi:") {
-                Some("all") | None => "MIDI: ALL".to_owned(),
-                Some(port) => format!("MIDI: {port}"),
-            },
+            Some(recorder::ChannelKind::Midi) => {
+                self.channel_midi_sel(ch).chip_text(&self.midi_ports_seen)
+            }
             Some(recorder::ChannelKind::Audio) => match Self::parse_input_spec(spec) {
                 Some((a, None)) => format!("IN {}", a + 1),
                 Some((a, Some(b))) => format!("IN {}/{}", a + 1, b + 1),
@@ -9486,6 +9677,45 @@ impl TangentApp {
             },
             None => String::new(),
         }
+    }
+
+    /// **What MIDI devices channel `ch` listens to, and on which channel.**
+    ///
+    /// The default — every device, every channel — for a channel that has
+    /// never been narrowed, which is every channel until somebody opens the
+    /// MIDI Inputs dialog. See `recorder::MidiInputSel`.
+    pub fn channel_midi_sel(&self, ch: usize) -> recorder::MidiInputSel {
+        self.settings
+            .channel_midi_inputs
+            .get(ch)
+            .cloned()
+            .unwrap_or(recorder::MidiInputSel::EVERYTHING)
+    }
+
+    /// **Narrow (or widen) what channel `ch` listens to.** The dialog's one
+    /// door.
+    ///
+    /// Writes BOTH halves: the set itself, and the old one-device summary in
+    /// `channel_inputs` that is still the authority on the channel's KIND and
+    /// still what a build without this feature reads. Going through
+    /// `set_channel_input_spec` for the second half is deliberate — that is
+    /// where a fresh binding's kind, send and undo commit are decided, and a
+    /// second path that wrote the string directly would be a second set of
+    /// those rules.
+    pub fn set_channel_midi_sel(&mut self, ch: usize, sel: recorder::MidiInputSel) {
+        while self.settings.channel_midi_inputs.len() <= ch {
+            self.settings
+                .channel_midi_inputs
+                .push(recorder::MidiInputSel::EVERYTHING);
+        }
+        self.settings.channel_midi_inputs[ch] = sel.clone();
+        // **Written BEFORE the spec, and trimmed after it.**
+        // `set_channel_input_spec` resets the set from the string it is given
+        // (that is how the shipped "midi:all" call sites and the old menu keep
+        // working), so a set written after it would be thrown away — and one
+        // written before it survives, because the spec it is handed is this
+        // very set's own summary and therefore contradicts nothing.
+        self.set_channel_input_spec(ch, &sel.legacy_spec());
     }
 
     /// One channel's INPUT spec — see `Settings::channel_inputs`.
@@ -9504,6 +9734,21 @@ impl TangentApp {
         if let Some(slot) = self.settings.channel_inputs.get_mut(ch) {
             *slot = spec.to_owned();
         }
+        // **And the device set follows the string.**
+        //
+        // `reconcile_midi_inputs` is the one rule for "these two disagree,
+        // who wins", and it is used here for the same reason the loaders use
+        // it: every caller that hands this function a MIDI spec means the
+        // string. The shipped desk and the + circle say "midi:all" and mean
+        // every device; `set_channel_midi_sel` hands over the set's own
+        // summary, which by construction contradicts nothing and so leaves
+        // the set — and its channel — exactly as written. A spec that is not
+        // MIDI at all resets the row, because a set on an audio channel is
+        // meaningless.
+        recorder::reconcile_midi_inputs(
+            &mut self.settings.channel_midi_inputs,
+            &self.settings.channel_inputs,
+        );
         // **The input IS the kind** — the REAPER model, the owner's ruling.
         // The icon follows what is actually bound, and binding the first
         // input is what ADDS the track: it opens armed with its send up,
@@ -10141,6 +10386,62 @@ impl TangentApp {
     /// `removable` is "there is a track here". An empty CHANNEL slot passes
     /// false and gets the short menu whose one row is Paste Track; the buses
     /// pass false too and get neither, because `lane` is past the channels.
+    /// **The MIDI Inputs dialog, from ONE place.**
+    ///
+    /// Three doors reach it — the input chip's MIDI row on the arrangement
+    /// header and on the mixer strip, and the global menu — and
+    /// `open_track_dialog`'s law applies for the same reason: a field added
+    /// to the dialog must not have to be added three times or one door
+    /// silently offers less than the others.
+    ///
+    /// The list is **ports first, then the devices this track remembers and
+    /// cannot see.** A remembered device is never dropped — unplugging a
+    /// keyboard must not cost somebody the setup — and it is never silently
+    /// mixed in with the live ones either: `present` is what the row says out
+    /// loud.
+    fn open_midi_inputs_dialog(&mut self, lane: usize) {
+        let sel = self.channel_midi_sel(lane);
+        let present = self.midi_ports_seen.clone();
+        let mut devices: Vec<dialogs::MidiDeviceRow> = present
+            .iter()
+            .map(|name| dialogs::MidiDeviceRow {
+                on: sel.devices.iter().any(|d| d == name),
+                name: name.clone(),
+                present: true,
+            })
+            .collect();
+        for gone in sel.missing(&present) {
+            devices.push(dialogs::MidiDeviceRow {
+                name: gone.to_owned(),
+                on: true,
+                present: false,
+            });
+        }
+        self.dialog_serial = self.dialog_serial.wrapping_add(1);
+        self.dialog = Some(Dialog::MidiInputs {
+            lane,
+            who: {
+                // The header's own word, so the title and the chip it was
+                // opened from say the same thing — `Dialog::Automation`'s
+                // rule, and the same derivation.
+                let name = self
+                    .settings
+                    .strip_names
+                    .get(lane)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if name.is_empty() {
+                    format!("Track {}", lane + 1)
+                } else {
+                    name.to_owned()
+                }
+            },
+            devices,
+            channel: sel.channel,
+            serial: self.dialog_serial,
+        });
+    }
+
     fn open_track_dialog(&mut self, lane: usize, removable: bool) {
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         self.dialog = Some(Dialog::Track {
@@ -28148,45 +28449,53 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 }
             }
             MenuAction::SelectMidiInput => {
-                // Unreachable without `caps.midi_ports` — the menu drops the
-                // row — but `ports` is what actually decides, so the two
-                // cannot disagree about whether there is a device to pick.
-                let Some(src) = self.ports.as_ref() else {
+                // **The global row opens the SELECTED TRACK's dialog now.**
+                //
+                // It used to open a picker that chose one device for the whole
+                // app, which is the fault: a track's chip named a port, this
+                // row named a different one, and the app obeyed this one. There
+                // is no app-wide MIDI device any more — there is a set per
+                // track — so the row leads to the track the hand is already on.
+                //
+                // Unreachable without `caps.midi_ports` (the menu drops it),
+                // but `ports` is what actually decides, so the two cannot
+                // disagree about whether there is anything to pick.
+                if self.ports.is_none() {
                     return;
-                };
-                // Both readings taken before anything borrows `self` mutably:
-                // the port source is behind a shared borrow and raising a
-                // message is a mutable one.
-                let (ports, current) = (src.list(), src.current());
-                if ports.is_empty() {
-                    // **A CONDITION, not an event.** There either are MIDI
-                    // input ports or there are not, and the box that used to
-                    // say so was a modal question with an OK button. Raised
-                    // against a key so that asking again once a keyboard is
-                    // plugged in takes the message down rather than leaving a
-                    // stale one standing.
-                    //
-                    // **INSISTED, because this row is a press.** A raise is
-                    // refused while the message is muted, which is right for
-                    // a per-frame re-check and silence for a menu: having
-                    // dismissed this once, choosing MIDI Input again did
-                    // nothing at all — no message, no picker — and went on
-                    // doing nothing for the rest of the session. The user
-                    // asking a second time is owed the answer a second time.
+                }
+                if self.midi_ports_seen.is_empty() && self.ports.is_some() {
+                    // Asked again rather than trusted: the row is a press, and
+                    // a hand-plugged keyboard should not have to wait out the
+                    // five-second beat before this says something true.
+                    self.midi_ports_seen =
+                        self.ports.as_ref().map(|p| p.list()).unwrap_or_default();
+                    self.midi_ports_at = Some(Instant::now());
+                }
+                // The track the dialog is about. The selected one when it is a
+                // MIDI track, otherwise the first MIDI track on the desk —
+                // and if there is none, a message rather than a dialog about
+                // nothing.
+                let lane = self
+                    .selected_channel()
+                    .filter(|n| self.channel_kind(*n) == Some(recorder::ChannelKind::Midi))
+                    .or_else(|| {
+                        (0..recorder::CHANNELS)
+                            .find(|n| self.channel_kind(*n) == Some(recorder::ChannelKind::Midi))
+                    });
+                let Some(lane) = lane else {
+                    // **A CONDITION, not an event**, and INSISTED because
+                    // this row is a press: having dismissed it once, asking
+                    // again must not be silence.
                     self.notify_insist(
                         MIDI_IN_KEY,
                         crate::notify::Kind::Error,
-                        "No MIDI input ports found. Keytoggle mode still \
-                         works - turn it on in the context menu.",
+                        "No MIDI track on the desk. An input chip's MIDI row \
+                         makes one, and its inputs are chosen there.",
                     );
                     return;
-                }
+                };
                 self.notify_lower(MIDI_IN_KEY);
-                self.dialog = Some(Dialog::MidiPicker {
-                    ports,
-                    selected: None,
-                    current,
-                });
+                self.open_midi_inputs_dialog(lane);
             }
             MenuAction::PickColor(target) => {
                 let seed = match target {
@@ -30139,29 +30448,33 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // fitting and the piano being clipped.
                 self.request_natural_size();
             }
-            DialogAction::ConnectPort(name) => {
-                if let Some(src) = self.ports.as_mut() {
-                    // **A CONDITION, like the empty port list beside it.** The
-                    // port is either open or it is not, so a failure STANDS
-                    // and a success takes it down — rather than a box that has
-                    // to be clicked away and then says nothing about whether
-                    // the next attempt worked.
-                    //
-                    // Insisted for the same reason the menu row is: this is a
-                    // button being pressed, not a condition being re-checked,
-                    // so a dismissal of the last failure must not turn the
-                    // next press into silence. See `notify_insist`.
-                    match src.connect(&name, self.midi_tx.clone()) {
-                        Ok(()) => self.notify_lower(MIDI_PORT_KEY),
-                        Err(e) => self.notify_insist(
-                            MIDI_PORT_KEY,
-                            crate::notify::Kind::Error,
-                            format!(
-                                "Could not open the MIDI port \u{201c}{name}\u{201d}: {e}. \
-                                 Keytoggle mode still works."
-                            ),
-                        ),
+            // **The MIDI Inputs dialog's checkbox and its channel row.**
+            //
+            // Both apply at once and leave the window up: ticking a keyboard
+            // is a thing you do while playing it, and picking a channel often
+            // means trying two. Each writes the app's state AND the live
+            // dialog's own copy, or the tick would not move under the hand
+            // until the window was closed and opened again — the lesson
+            // `SetInputChannels` and `AutomationToggle` both carry.
+            DialogAction::MidiInputDevice { lane, device, on } => {
+                let mut sel = self.channel_midi_sel(lane);
+                sel.devices.retain(|d| *d != device);
+                if on {
+                    sel.devices.push(device.clone());
+                }
+                self.set_channel_midi_sel(lane, sel);
+                if let Some(Dialog::MidiInputs { devices, .. }) = self.dialog.as_mut() {
+                    for row in devices.iter_mut().filter(|r| r.name == device) {
+                        row.on = on;
                     }
+                }
+            }
+            DialogAction::MidiInputChannel { lane, channel } => {
+                let mut sel = self.channel_midi_sel(lane);
+                sel.channel = channel;
+                self.set_channel_midi_sel(lane, sel);
+                if let Some(Dialog::MidiInputs { channel: live, .. }) = self.dialog.as_mut() {
+                    *live = channel;
                 }
             }
             DialogAction::ApplyColor(target, color) => {
@@ -30998,6 +31311,13 @@ impl TangentApp {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             self.settings.channel_inputs.hash(&mut h);
             self.settings.channel_kinds.hash(&mut h);
+            // **The device sets and the ports that are OPEN.** The chip says
+            // which devices a track listens to and marks the ones that are
+            // not plugged in; a key that hashed neither would leave a stale
+            // label standing for the rest of the session — which is the class
+            // of fault this whole change is about.
+            self.settings.channel_midi_inputs.hash(&mut h);
+            self.midi_ports_seen.hash(&mut h);
             h.finish()
         };
         if self.input_chip_texts.len() != recorder::CHANNELS
@@ -31011,6 +31331,12 @@ impl TangentApp {
         // The input menu's rows, kept warm: rebuilt the frame the device
         // arrives or changes, so the menu never opens against a cold cache.
         self.tend_menu_cache();
+        // **And the DEVICES the desk asks for are opened.** Every frame, and
+        // almost always a comparison of two short lists — see
+        // `reconcile_midi_ports`. This is what makes a track's set real: the
+        // app opened exactly one device before this line existed, and every
+        // input chip said otherwise.
+        self.reconcile_midi_ports();
         // **Cleared before the paint, set during it.** The nodes are laid
         // over the panels as they draw, so whichever one holds focus writes
         // itself here; a frame where nothing does leaves it empty rather than
@@ -45311,103 +45637,145 @@ mod tests {
 
     /// **The two MIDI messages are CONDITIONS, and behave like conditions.**
     ///
-    /// "No MIDI input ports found" and "that port would not open" were modal
-    /// boxes with OK buttons, which is the wrong shape twice over: asking
-    /// again while the fault held opened a second box, and clicking OK said
-    /// nothing about whether the thing was still true. A condition is said
-    /// once, stands while it holds, and goes when it stops holding — which
-    /// here means when a list comes back with something in it, when a port
-    /// opens, or when the host swaps the source out from under both.
+    /// "No MIDI track to choose inputs for" and "that device would not open"
+    /// were modal boxes with OK buttons, which is the wrong shape twice over:
+    /// asking again while the fault held opened a second box, and clicking OK
+    /// said nothing about whether the thing was still true. A condition is
+    /// said once, stands while it holds, and goes when it stops holding.
+    ///
+    /// **Both of them changed shape with the device SET.** The first used to
+    /// be "no MIDI input ports found", asked by a menu row that opened an
+    /// app-wide picker; there is no app-wide device any more, so the row
+    /// opens the selected TRACK's dialog and the condition is about the desk.
+    /// The second used to be raised by the picker's OK button; it is raised by
+    /// the per-frame reconcile now, which is a better fit for a condition —
+    /// the answer is re-checked rather than remembered.
     #[test]
     fn the_midi_messages_stand_while_they_are_true_and_go_when_they_are_not() {
+        #[derive(Default)]
         struct Ports {
             available: Vec<String>,
+            open: Vec<String>,
         }
         impl MidiPorts for Ports {
             fn list(&self) -> Vec<String> {
                 self.available.clone()
             }
-            fn connect(
+            fn open_set(
                 &mut self,
-                name: &str,
+                names: &[String],
                 _tx: mpsc::Sender<MidiEvent>,
-            ) -> Result<(), String> {
-                if self.available.iter().any(|n| n == name) {
-                    Ok(())
-                } else {
-                    Err("the device is not there any more".to_owned())
+            ) -> Vec<(String, String)> {
+                let mut failed = Vec::new();
+                self.open.clear();
+                for n in names {
+                    if self.available.iter().any(|a| a == n) {
+                        self.open.push(n.clone());
+                    } else {
+                        failed.push((n.clone(), "the device is not there any more".to_owned()));
+                    }
                 }
+                failed
             }
-            fn current(&self) -> Option<String> {
-                None
+            fn open_ports(&self) -> Vec<String> {
+                self.open.clone()
+            }
+            fn source_slots(&self) -> Vec<String> {
+                self.available.clone()
             }
         }
         let (ctx, mut app) = headless(Caps::DESKTOP);
         app.dialog = None;
-        app.set_ports(Some(Box::new(Ports {
-            available: Vec::new(),
-        })));
+        // A desk with no MIDI track on it: nothing to choose inputs FOR.
+        for ch in 0..recorder::CHANNELS {
+            app.set_channel_input_spec(ch, "");
+        }
+        app.set_ports(Some(Box::new(Ports::default())));
 
-        // Nothing plugged in. Asking five times says it once, and never opens
-        // a window.
+        // Asking five times says it once, and never opens a window.
         for _ in 0..5 {
             app.apply_menu_action(&ctx, MenuAction::SelectMidiInput);
         }
         assert_eq!(app.said().len(), 1, "asking again stacked another message");
-        assert!(app.dialog.is_none(), "the refusal opened a picker");
+        assert!(app.dialog.is_none(), "the refusal opened a dialog");
         assert!(app.said().is_raised(MIDI_IN_KEY));
         let standing = app.said().notes()[0].clone();
         assert!(standing.is_standing(), "a condition was given a clock");
         assert_eq!(standing.kind, crate::notify::Kind::Error);
 
-        // A keyboard is plugged in and the user asks again: the message goes
-        // and the picker opens.
+        // A MIDI track exists and the user asks again: the message goes and
+        // the dialog opens, on that track.
         app.set_ports(Some(Box::new(Ports {
             available: vec!["Keystation".to_owned()],
+            open: Vec::new(),
         })));
-        assert!(!app.said().is_raised(MIDI_IN_KEY), "swapping the source left it standing");
+        assert!(
+            !app.said().is_raised(MIDI_IN_KEY),
+            "swapping the source left it standing"
+        );
+        app.set_channel_input_spec(3, "midi:all");
         app.apply_menu_action(&ctx, MenuAction::SelectMidiInput);
-        assert!(matches!(app.dialog, Some(Dialog::MidiPicker { .. })));
+        assert!(
+            matches!(app.dialog, Some(Dialog::MidiInputs { lane: 3, .. })),
+            "the row did not open the MIDI track's own dialog"
+        );
         // A lowered message LEAVES rather than blinking out, so it is still in
         // the queue for the half-second its tail takes — on its way out, which
         // is what "went" means here.
         assert!(
             app.said().notes().iter().all(crate::notify::Note::leaving),
-            "the picker opened with a complaint standing beside it"
+            "the dialog opened with a complaint standing beside it"
         );
 
-        // A port that will not open is the other condition, and it stands the
-        // same way.
-        app.apply_dialog_action(DialogAction::ConnectPort("Gone".to_owned()));
+        // A device the track names and which will not open is the other
+        // condition, and it stands the same way.
+        app.set_channel_midi_sel(
+            3,
+            recorder::MidiInputSel {
+                devices: vec!["Gone".to_owned()],
+                channel: None,
+            },
+        );
+        app.midi_ports_seen = vec!["Gone".to_owned()];
+        app.reconcile_midi_ports();
         assert!(app.said().is_raised(MIDI_PORT_KEY));
-        // By KEY, not by position: the message the picker just lowered is
-        // still in the queue finishing its tail, and it is the older of the
-        // two.
         let standing_now = |app: &TangentApp| {
             app.said()
                 .notes()
                 .iter()
                 .find(|n| n.key() == Some(MIDI_PORT_KEY))
                 .cloned()
-                .expect("nothing was raised against the port")
+                .expect("nothing was raised against the device")
         };
         let failed = standing_now(&app);
         assert!(
             failed.text.contains("Gone"),
-            "the message does not name the port: {}",
+            "the message does not name the device: {}",
             failed.text
         );
         assert!(failed.is_standing());
-        // Asking again while it is still broken changes the words, not the
-        // number of messages.
-        app.apply_dialog_action(DialogAction::ConnectPort("Gone Too".to_owned()));
+        // Asking again while it is still broken changes nothing: one message.
+        app.reconcile_midi_ports();
         let again = standing_now(&app);
-        assert_eq!(again.id, failed.id, "a second attempt minted a second message");
-        assert!(again.text.contains("Gone Too"), "the words did not follow: {}", again.text);
+        assert_eq!(
+            again.id, failed.id,
+            "a second reconcile minted a second message"
+        );
 
-        // And the one that opens takes it down.
-        app.apply_dialog_action(DialogAction::ConnectPort("Keystation".to_owned()));
-        assert!(!app.said().is_raised(MIDI_PORT_KEY), "a working port left the failure up");
+        // And a device that DOES open takes it down.
+        app.set_channel_midi_sel(
+            3,
+            recorder::MidiInputSel {
+                devices: vec!["Keystation".to_owned()],
+                channel: None,
+            },
+        );
+        app.midi_ports_seen = vec!["Keystation".to_owned()];
+        app.reconcile_midi_ports();
+        assert!(
+            !app.said().is_raised(MIDI_PORT_KEY),
+            "a working device left the failure up"
+        );
     }
 
     /// **A press on the export window does not reach the desk under it.**
