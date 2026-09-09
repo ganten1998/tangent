@@ -3500,14 +3500,11 @@ mod tests {
             soloed: 0b0100,
             gains: vec![1.0, 0.5],
             pans: vec![0.0, -0.5],
-            inputs: vec!["in 1".into(), String::new()],
-            midi_inputs: vec![
-                crate::recorder::MidiInputSel::EVERYTHING,
-                crate::recorder::MidiInputSel {
-                    devices: vec!["Keystation 88".into()],
-                    channel: Some(2),
-                },
-            ],
+            inputs: vec!["midi:Keystation 88".into(), String::new()],
+            midi_inputs: vec![crate::recorder::MidiInputSel {
+                devices: vec!["Keystation 88".into()],
+                channel: Some(2),
+            }],
             drums_gain: 0.9,
             drums_pan: 0.1,
             metronome_gain: 0.7,
