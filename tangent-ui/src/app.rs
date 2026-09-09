@@ -16463,8 +16463,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // would land on — which is the DEF chip's own folder when one has
             // been chosen and home when none has. Reading only the setting
             // left the chip dark on a fresh install standing in exactly the
-            // right place. See `drum_media_home`.
-            def_lit: self.drum_media_home() == self.media_dir,
+            // right place. See `media_home`.
+            def_lit: self.media_home() == self.media_dir,
             typing: self
                 .drumpad_num
                 .as_ref()
@@ -24416,15 +24416,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .and_then(|d| d.parent().map(|p| p.join("media")))
             .filter(|p| p.is_dir());
         live.samp_roots = vec![
-            ("HOME".to_owned(), dirs_home().to_string_lossy().into_owned()),
+            ("HOME".to_owned(), self.media_home().to_string_lossy().into_owned()),
             (
                 "PROJECT".to_owned(),
                 project.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
             ),
         ];
         if live.samp_dir.is_empty() {
-            // A fresh panel opens where HOME points.
-            live.samp_dir = dirs_home().to_string_lossy().into_owned();
+            // A fresh panel opens where HOME points — the folder the DEF
+            // chip remembered, or the home directory until one is set. See
+            // [`Self::media_home`].
+            live.samp_dir = self.media_home().to_string_lossy().into_owned();
         }
         if live.samp_listed == live.samp_dir && live.samp_gen == self.sampler_scan_gen {
             return;
@@ -24699,7 +24701,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// to look for a kit and the wrong place to look for a snare. Home is
     /// where somebody's samples actually are, and the DEF chip still honours
     /// a folder they chose for themselves.
-    fn drum_media_home(&self) -> std::path::PathBuf {
+    ///
+    /// **It was `drum_media_home` and it is not the drumpad's alone any
+    /// more.** The sampler's browser is the same explorer — the pane was
+    /// lifted out of the drumpad when the sampler was built — and it opens
+    /// on this folder and offers the same DEF chip to set it. ONE setting
+    /// rather than two, because "where my samples live" is one fact about a
+    /// person's disk and two copies of it are two things to keep in step;
+    /// whichever explorer is in front can set it, and both then land there.
+    fn media_home(&self) -> std::path::PathBuf {
         let chosen = std::path::PathBuf::from(&self.settings.media_default_dir);
         if !self.settings.media_default_dir.is_empty() && chosen.is_dir() {
             return chosen;
@@ -24711,8 +24721,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.drumpad_open = true;
         self.drumpad_focus(Self::HOME_KEY);
         // A remembered default folder is where a fresh open LANDS — and
-        // without one, home. See `drum_media_home`.
-        let def = self.drum_media_home();
+        // without one, home. See `media_home`.
+        let def = self.media_home();
         if def.is_dir() && def != self.media_dir {
             self.media_dir = def;
             self.media_sel = None;
@@ -28612,7 +28622,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **And the explorer STANDING somewhere goes with the setting.**
         //
         // `take_devices` puts `media_default_dir` back to empty, which is the
-        // "nobody has chosen" state that `drum_media_home` answers with HOME.
+        // "nobody has chosen" state that `media_home` answers with HOME.
         // That is the right answer for the next OPEN;
         // it does nothing for a drumpad already on screen, which would sit in
         // whatever folder the reset was supposed to forget. The owner asked
@@ -28622,7 +28632,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // not move somebody out of the directory they were browsing.
         use crate::settings::ResetScope as R;
         if matches!(scope, R::Devices | R::Everything) {
-            let home = self.drum_media_home();
+            let home = self.media_home();
             if home != self.media_dir {
                 self.media_dir = home;
                 self.media_sel = None;
@@ -29123,6 +29133,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The theme key from a plugin window's own bar: exactly the
             // main window's `K::CycleTheme`, arriving by the only road a
             // child window's keys have.
+            // **The sampler browser's DEF chip: this folder is where the
+            // media explorers open from now on.** The drumpad's `Hit::Def`
+            // arm, reached from the other panel — one setting, written by
+            // whichever explorer is in front. See [`Self::media_home`].
+            DialogAction::SetMediaDefault { path } => {
+                self.settings.media_default_dir = path;
+                self.save_settings();
+                // The chip lights off the roots the browser is pushed each
+                // frame, and those are rebuilt from the setting — but the
+                // LISTING is cached against a generation, and a default set
+                // while standing somewhere else has to be able to move the
+                // panel on the next refresh.
+                self.sampler_scan_gen = self.sampler_scan_gen.wrapping_add(1);
+            }
             DialogAction::CycleTheme => self.cycle_theme(),
             DialogAction::SetInsertKeySource { strip, slot, from } => {
                 // A settings write and nothing else — the `SetRouteGain`
@@ -37341,7 +37365,7 @@ mod tests {
     /// a fresh open LANDS, the second is a drumpad already on screen that
     /// would otherwise sit in the folder the reset was meant to forget.
     ///
-    /// Revert-checks: make `drum_media_home` return the kit drawer again and
+    /// Revert-checks: make `media_home` return the kit drawer again and
     /// the first assert goes red; drop the `Devices | Everything` arm in
     /// `reset_settings` and the last one does.
     #[test]
@@ -37363,26 +37387,26 @@ mod tests {
         // (1) Nobody has chosen: a fresh open lands at HOME — and NOT in the
         // kit drawer, which is the specific wrong answer this went through.
         assert_eq!(
-            app.drum_media_home(),
+            app.media_home(),
             dirs_home(),
             "a sample explorer with no chosen folder should open at home"
         );
         assert_ne!(
-            app.drum_media_home(),
+            app.media_home(),
             drawer,
             "the explorer is back on the kit drawer, which holds no samples"
         );
 
         // (2) A chosen folder still wins — the chip is not overridden.
         app.settings.media_default_dir = elsewhere.to_string_lossy().into_owned();
-        assert_eq!(app.drum_media_home(), elsewhere, "the DEF chip was ignored");
+        assert_eq!(app.media_home(), elsewhere, "the DEF chip was ignored");
 
         // (3) A chosen folder that has gone falls through rather than
         // landing nowhere.
         app.settings.media_default_dir =
             root.join("deleted").to_string_lossy().into_owned();
         assert_eq!(
-            app.drum_media_home(),
+            app.media_home(),
             dirs_home(),
             "a missing DEF folder stranded it"
         );
@@ -58972,6 +58996,62 @@ mod sampler_road_tests {
         app.refresh_sampler_browser(&mut live);
         assert!(live.samp_roots[1].1.is_empty(), "a project chip with no project");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The DEF chip sets where the sampler's browser opens, and it is the
+    /// drumpad's own setting.**
+    ///
+    /// The owner's third fault with the panel — "no default button for the
+    /// home media explorer" — and it is the fault it sounds like: the
+    /// browser's folder lives in `FaceLive`, which does not outlive the
+    /// window, so a library five folders down had to be walked to again
+    /// every time a face opened. The drumpad has had a DEF chip since its
+    /// explorer shipped; the sampler's browser was lifted out of that panel
+    /// without one.
+    ///
+    /// ONE setting for both, `media_default_dir`. Two would be two things to
+    /// keep in step for one fact about a person's disk, and this asserts the
+    /// sharing rather than describing it: the drumpad's own home moves too.
+    #[test]
+    fn the_def_chip_sets_where_the_sampler_browser_opens() {
+        let root = std::env::temp_dir().join(format!("tangent-samp-def-{}", std::process::id()));
+        let library = root.join("Library").join("Pianos");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join("upright.wav"), b"x").unwrap();
+        let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
+
+        // Unset, HOME is the home directory and a fresh panel opens there.
+        let mut live = crate::faces::FaceLive::default();
+        app.refresh_sampler_browser(&mut live);
+        assert_eq!(live.samp_roots[0].0, "HOME");
+        assert_eq!(live.samp_roots[0].1, dirs_home().to_string_lossy());
+        assert_eq!(live.samp_dir, dirs_home().to_string_lossy());
+
+        // The chip, from the folder the browser is standing in.
+        app.apply_dialog_action(DialogAction::SetMediaDefault {
+            path: library.to_string_lossy().into_owned(),
+        });
+        assert_eq!(app.settings.media_default_dir, library.to_string_lossy());
+        assert_eq!(
+            app.media_home(),
+            library,
+            "the DEF chip did not reach the shared media home"
+        );
+
+        // A face opened after it lands there, which is the whole complaint.
+        let mut fresh = crate::faces::FaceLive::default();
+        app.refresh_sampler_browser(&mut fresh);
+        assert_eq!(fresh.samp_dir, library.to_string_lossy());
+        assert_eq!(fresh.samp_roots[0].1, library.to_string_lossy(), "HOME did not follow");
+        let names: Vec<&str> = fresh.samp_entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["upright.wav"]);
+
+        // A folder that has been deleted since falls back to home rather
+        // than opening on nothing — `media_home`'s own rule, inherited.
+        let _ = std::fs::remove_dir_all(&root);
+        let mut gone = crate::faces::FaceLive::default();
+        app.refresh_sampler_browser(&mut gone);
+        assert_eq!(gone.samp_dir, dirs_home().to_string_lossy());
     }
 
     /// **Saving a preset carries the SAMPLE across, not only the knobs.**
