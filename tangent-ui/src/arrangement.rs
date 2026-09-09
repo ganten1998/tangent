@@ -906,6 +906,18 @@ pub struct DeskSnap {
     pub gains: Vec<f64>,
     pub pans: Vec<f64>,
     pub inputs: Vec<String>,
+    /// **Which MIDI devices each channel listens to, and on which channel.**
+    ///
+    /// Beside `inputs` rather than folded into it, because `inputs` is what a
+    /// build without this feature reads and it must go on saying exactly what
+    /// it said. Trimmed of trailing defaults, so a document whose tracks all
+    /// listen to everything carries nothing extra — see
+    /// `recorder::trim_midi_inputs`.
+    ///
+    /// Absent in every document written before this, and derived from
+    /// `inputs` when it is: see `from_value`, which reconciles the two the
+    /// same way the settings file does.
+    pub midi_inputs: Vec<crate::recorder::MidiInputSel>,
     pub drums_gain: f64,
     pub drums_pan: f64,
     pub metronome_gain: f64,
@@ -1020,6 +1032,7 @@ pub struct DeskRef<'a> {
     pub gains: &'a [f64],
     pub pans: &'a [f64],
     pub inputs: &'a [String],
+    pub midi_inputs: &'a [crate::recorder::MidiInputSel],
     pub drums_gain: f64,
     pub drums_pan: f64,
     pub metronome_gain: f64,
@@ -1050,6 +1063,7 @@ impl DeskRef<'_> {
             gains: self.gains.to_vec(),
             pans: self.pans.to_vec(),
             inputs: self.inputs.to_vec(),
+            midi_inputs: self.midi_inputs.to_vec(),
             drums_gain: self.drums_gain,
             drums_pan: self.drums_pan,
             metronome_gain: self.metronome_gain,
@@ -1121,6 +1135,19 @@ impl DeskRef<'_> {
         for i in self.inputs {
             f.str(i);
         }
+        // The device sets, in the hash for the reason everything else is: the
+        // dirty bit is what offers to save, and a setup somebody built in the
+        // MIDI Inputs dialog that the document did not notice is a setup they
+        // lose on the next close. 255 for "every channel" — never a real wire
+        // channel, so it cannot collide with one.
+        f.len(self.midi_inputs.len());
+        for sel in self.midi_inputs {
+            f.len(sel.devices.len());
+            for d in &sel.devices {
+                f.str(d);
+            }
+            f.u64(u64::from(sel.channel.unwrap_or(255)));
+        }
         f.f64(self.drums_gain);
         f.f64(self.drums_pan);
         f.f64(self.metronome_gain);
@@ -1155,6 +1182,7 @@ impl DeskSnap {
             gains: &self.gains,
             pans: &self.pans,
             inputs: &self.inputs,
+            midi_inputs: &self.midi_inputs,
             drums_gain: self.drums_gain,
             drums_pan: self.drums_pan,
             metronome_gain: self.metronome_gain,
@@ -1288,6 +1316,13 @@ impl DeskSnap {
         m.insert("is_folder".into(), bools(&self.is_folder));
         m.insert("in_folder".into(), bools(&self.in_folder));
         m.insert("folder_shut".into(), bools(&self.folder_shut));
+        // **The MIDI device sets, at the END and sparse** — the settings
+        // file's own rule and its own shape, so a document from a desk
+        // nobody has narrowed keeps its byte-for-byte form and an older
+        // build meets no key it has to know to ignore.
+        if let Some(v) = crate::recorder::write_midi_inputs(&self.midi_inputs) {
+            m.insert("midi_inputs".into(), v);
+        }
         // Appended, at the END, and only when a seat past the head is
         // occupied: a desk that never had one keeps its shape, and a build
         // that has never heard of the key reads the head as it always did.
@@ -1397,6 +1432,19 @@ impl DeskSnap {
             gains: floats("gains"),
             pans: floats("pans"),
             inputs: strings("inputs"),
+            // **Absent in every older document, and derived from `inputs`
+            // rather than assumed empty** — the `tracks_added` rule below,
+            // for the same reason: a document that named a port per track
+            // still says which keyboards those tracks wanted, and reading
+            // nothing would silently widen every one of them to the whole
+            // room. `reconcile_midi_inputs` does both jobs at once, because
+            // an older build that rewrote `inputs` and carried this key
+            // through unread leaves exactly the same disagreement.
+            midi_inputs: {
+                let mut sels = crate::recorder::read_midi_inputs(m.get("midi_inputs"));
+                crate::recorder::reconcile_midi_inputs(&mut sels, &inputs_v);
+                sels
+            },
             drums_gain: f("drums_gain", 1.0),
             drums_pan: f("drums_pan", 0.0),
             metronome_gain: f("metronome_gain", 0.7),
@@ -3452,7 +3500,11 @@ mod tests {
             soloed: 0b0100,
             gains: vec![1.0, 0.5],
             pans: vec![0.0, -0.5],
-            inputs: vec!["in 1".into(), String::new()],
+            inputs: vec!["midi:Keystation 88".into(), String::new()],
+            midi_inputs: vec![crate::recorder::MidiInputSel {
+                devices: vec!["Keystation 88".into()],
+                channel: Some(2),
+            }],
             drums_gain: 0.9,
             drums_pan: 0.1,
             metronome_gain: 0.7,

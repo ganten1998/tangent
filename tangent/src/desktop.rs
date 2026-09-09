@@ -35,7 +35,30 @@ use std::sync::Mutex;
 /// needs no equivalent — the host calls `process()` and then the editor.
 pub struct DeviceMidi {
     ctx: egui::Context,
-    conn: Option<midi::MidiConnection>,
+    /// **One connection PER OPEN DEVICE**, not one for the app.
+    ///
+    /// This was `Option<MidiConnection>` for every release before this one,
+    /// which is the mechanical cause of the fault the owner reported as "the
+    /// gui selector ... is lying to the user": each track's input chip named
+    /// a port, and exactly one port was ever open, so two tracks could not
+    /// have separate keyboards no matter what the chips said.
+    ///
+    /// Kept alive as the set changes rather than torn down and rebuilt: a
+    /// device that is still wanted keeps the connection it has, so its slot,
+    /// its driver handle and any state the driver holds survive somebody
+    /// adding a second keyboard on another track.
+    conns: Vec<midi::MidiConnection>,
+    /// **Source slot -> device name, append-only for the session.**
+    ///
+    /// A slot is claimed the first time a device is opened and is never
+    /// handed to another device afterwards, so unplugging a keyboard and
+    /// plugging it back in gets its slot back — which is what stops a
+    /// re-plug from being heard as a different instrument by every route
+    /// compiled against the old table. Capped at
+    /// `recorder::MIDI_SOURCES`; a device past the cap opens with no slot
+    /// of its own and is heard by whoever listens to everything, which is
+    /// the safe direction to fail in.
+    slots: Vec<String>,
     /// The recorder's raw feed. Owned here rather than by the recorder, and
     /// **created once per app** rather than once per connection, because midir
     /// seals a callback's captured state the moment the port opens — see
@@ -55,7 +78,8 @@ impl DeviceMidi {
     pub fn new(ctx: egui::Context) -> Self {
         Self {
             ctx,
-            conn: None,
+            conns: Vec::new(),
+            slots: Vec::new(),
             // ~10 minutes of dense playing before anything is shed, which is
             // far more than the pre-roll needs and cheap: a few hundred KB.
             tap: Arc::new(midi::RawMidiTap::new(60_000)),
@@ -68,12 +92,37 @@ impl DeviceMidi {
     /// The startup priority chain (spec §10). Silent on failure by design: the
     /// app runs without MIDI rather than opening a dialog nobody asked for.
     pub fn auto_connect(&mut self, tx: mpsc::Sender<MidiEvent>) {
-        self.conn = midi::auto_connect(
+        // Slot 0, which `midi::auto_connect` also passes: this runs before
+        // any track has named a device, so the table is empty and the pick
+        // is the first thing in it. A later `open_set` finds the name
+        // already seated and keeps the connection.
+        if let Some(c) = midi::auto_connect(
             tx,
             self.ctx.clone(),
             Arc::clone(&self.tap),
             Arc::clone(&self.lane),
-        );
+        ) {
+            self.slot_for(&c.port_name);
+            self.conns.push(c);
+        }
+    }
+
+    /// This device's source slot, claimed if it does not have one.
+    ///
+    /// **Never reassigns.** See `slots`: a slot handed to a second device
+    /// would make every route compiled against the old table point at the
+    /// wrong keyboard, silently. Past the cap the device gets
+    /// `MIDI_SRC_APP`, which every lane admits — a device that cannot be
+    /// told apart is better heard by everyone than by nobody.
+    fn slot_for(&mut self, name: &str) -> u8 {
+        if let Some(i) = self.slots.iter().position(|n| n == name) {
+            return i as u8;
+        }
+        if self.slots.len() >= tangent_ui::recorder::MIDI_SOURCES {
+            return tangent_ui::recorder::MIDI_SRC_APP;
+        }
+        self.slots.push(name.to_owned());
+        (self.slots.len() - 1) as u8
     }
 
     /// The fast lane, for the desktop to seat each engine's ring in.
@@ -109,23 +158,48 @@ impl MidiPorts for DeviceMidi {
         DeviceMidi::auto_connect(self, tx);
     }
 
-    fn connect(&mut self, name: &str, tx: mpsc::Sender<MidiEvent>) -> Result<(), String> {
-        // Close the old port FIRST (parity): some drivers refuse a second open
-        // of the same device, so holding both across the switch fails on the
-        // machines that matter and works on the ones that do not.
-        self.conn = None;
-        self.conn = Some(midi::connect_by_name(
-            name,
-            tx,
-            self.ctx.clone(),
-            Arc::clone(&self.tap),
-            Arc::clone(&self.lane),
-        )?);
-        Ok(())
+    fn open_set(&mut self, names: &[String], tx: mpsc::Sender<MidiEvent>) -> Vec<(String, String)> {
+        // **Close what is no longer wanted FIRST**, and keep what is.
+        //
+        // Closing first is the old `connect`'s rule and it still holds: some
+        // drivers refuse a second open of the same device, so a set that
+        // dropped one keyboard and added another would fail on exactly the
+        // machines where it matters if both were held at once. Keeping the
+        // ones that stay is the other half, and it is why this is a
+        // reconcile rather than a rebuild: tearing every connection down to
+        // add a second keyboard would cut the first one off mid-note.
+        self.conns.retain(|c| names.iter().any(|n| *n == c.port_name));
+        let mut failed = Vec::new();
+        for name in names {
+            if self.conns.iter().any(|c| c.port_name == *name) {
+                continue;
+            }
+            let src = self.slot_for(name);
+            match midi::connect_by_name(
+                name,
+                src,
+                tx.clone(),
+                self.ctx.clone(),
+                Arc::clone(&self.tap),
+                Arc::clone(&self.lane),
+            ) {
+                Ok(c) => self.conns.push(c),
+                // The NAME keeps its slot even so. A device that will not
+                // open today is a device somebody's track still names, and
+                // forgetting it here would hand it a different slot when it
+                // does open — the re-plug fault this table exists to stop.
+                Err(e) => failed.push((name.clone(), e)),
+            }
+        }
+        failed
     }
 
-    fn current(&self) -> Option<String> {
-        self.conn.as_ref().map(|c| c.port_name.clone())
+    fn open_ports(&self) -> Vec<String> {
+        self.conns.iter().map(|c| c.port_name.clone()).collect()
+    }
+
+    fn source_slots(&self) -> Vec<String> {
+        self.slots.clone()
     }
 }
 
@@ -490,12 +564,27 @@ struct ArrRec {
     start_s: f64,
     /// The same instant on the MIDI tap's clock, for stamping notes.
     start_ns: i64,
-    /// Armed MIDI lanes at the press. Each gets an identical note clip — the
-    /// live stream feeds every armed MIDI lane, so the record says what the
-    /// room heard.
-    midi_lanes: Vec<usize>,
+    /// **One collection PER ARMED MIDI LANE, each with its own route.**
+    ///
+    /// This used to be a list of lane indices and ONE note list, given
+    /// identically to every one of them — which was right while the app
+    /// opened one device and every armed lane really did hear the same
+    /// stream. It stopped being right the moment a track could name its own
+    /// keyboards: recording two players at once would have written both
+    /// performances onto both tracks. The route is snapshotted at the press
+    /// for the reason the arm mask is: what a take records must not change
+    /// under it because somebody opened the MIDI Inputs dialog mid-take.
+    midi: Vec<ArrRecLane>,
     /// Armed AUDIO lanes at the press: (input pick, lane, frames so far).
     audio: Vec<(usize, usize, Vec<f32>)>,
+}
+
+/// One armed MIDI lane's take, and the rule that says which messages are its.
+#[cfg(feature = "recorder")]
+struct ArrRecLane {
+    lane: usize,
+    /// The lane's routing rule at the press. See `ArrRec::midi`.
+    route: tangent_ui::recorder::MidiRoute,
     /// Finished notes, clip-relative seconds.
     notes: Vec<tangent_ui::arrangement::ArrNote>,
     /// **Pedal movements, clip-relative seconds**, in arrival order — which
@@ -504,7 +593,7 @@ struct ArrRec {
     /// Where each of the three pedals STANDS, so an unchanged value is not
     /// written down twice. A sustain pedal held through a phrase sends its
     /// 127 once; a half-pedalling one sweeps, and every step of the sweep is
-    /// a real change and is kept. Indexed by `Self::pedal_slot`.
+    /// a real change and is kept. Indexed by `ArrRec::pedal_slot`.
     pedal_at: [u8; 3],
     /// Keys currently down: when they landed, and how hard.
     open: std::collections::HashMap<u8, (f64, u8)>,
@@ -532,11 +621,32 @@ impl ArrRec {
     /// down, and playback dutifully cut every note at its key-up. The fix is
     /// not to stretch the notes — see `ArrPedal` for why — it is to keep the
     /// controller, which is what the take's own `.mid` has always done.
-    fn note_event(&mut self, t: i64, bytes: &[u8]) {
+    fn note_event(&mut self, src: u8, t: i64, bytes: &[u8]) {
         let [status, data1, data2] = *bytes else {
             return;
         };
         let rel = ((t - self.start_ns) as f64 / 1e9).max(0.0);
+        let chan = status & 0x0F;
+        for lane in &mut self.midi {
+            // **The same rule the live path uses, asked lane by lane.**
+            // `MidiRoute::admits` is the one authority, so a note that
+            // SOUNDED on this track is a note that gets RECORDED on it —
+            // and one that sounded on the other track is not written here.
+            // Two answers to this question is how a take comes back holding
+            // somebody else's performance.
+            if !lane.route.admits(src, chan) {
+                continue;
+            }
+            lane.note_event(rel, status, data1, data2);
+        }
+    }
+}
+
+#[cfg(feature = "recorder")]
+impl ArrRecLane {
+    /// One message this lane has already agreed to hear, at clip-relative
+    /// `rel` seconds.
+    fn note_event(&mut self, rel: f64, status: u8, data1: u8, data2: u8) {
         let key = data1 & 0x7F;
         match status & 0xF0 {
             0x90 if data2 > 0 => {
@@ -555,7 +665,7 @@ impl ArrRec {
             0xB0 => {
                 let cc = data1 & 0x7F;
                 let value = data2 & 0x7F;
-                let Some(slot) = Self::pedal_slot(cc) else {
+                let Some(slot) = ArrRec::pedal_slot(cc) else {
                     return;
                 };
                 // **A value that changes nothing is not an event.** Some
@@ -4039,7 +4149,7 @@ impl DesktopApp {
         // a mutable borrow of `self.recorder`, and three bytes copied twice a
         // frame is cheaper than restructuring the drain around it.
         let mut pedal_live = self.recorder.pedal_live;
-        self.recorder.session.pump_midi(|t, bytes| {
+        self.recorder.session.pump_midi(|src, t, bytes| {
             // Where the pedals stand, kept whether or not a take is running —
             // so the NEXT press knows what it inherits. See `pedal_live`.
             if let [status, data1, data2] = *bytes {
@@ -4052,7 +4162,7 @@ impl DesktopApp {
             // The arrangement's own collection: raw note edges, stamped
             // against the record's T0, on the clock the engine hears.
             if let Some(rec) = arr.as_deref_mut() {
-                rec.note_event(t, bytes);
+                rec.note_event(src, t, bytes);
             }
         });
         self.recorder.pedal_live = pedal_live;
@@ -4075,21 +4185,31 @@ impl DesktopApp {
                 .engine
                 .as_ref()
                 .map_or(0.0, |e| (e.timebase().now() - rec.start_ns) as f64 / 1e9);
-            let mut notes = rec.notes.clone();
-            for (key, (at, vel)) in &rec.open {
-                notes.push(tangent_ui::arrangement::ArrNote {
-                    at_s: *at,
-                    dur_s: (now - at).max(0.05),
-                    key: *key,
-                    vel: *vel,
-                });
+            // **The notes the view draws are every armed lane's, together.**
+            // The arrangement paints one growing take behind the playhead
+            // and takes one note list for it; with two keyboards on two
+            // tracks that picture is the union, which is what the room is
+            // playing. Each lane's clip is carved from its OWN list at the
+            // end — see `finish_arr_record` — so the picture being a union
+            // costs nothing but the picture.
+            let mut notes: Vec<tangent_ui::arrangement::ArrNote> =
+                rec.midi.iter().flat_map(|l| l.notes.iter().cloned()).collect();
+            for l in &rec.midi {
+                for (key, (at, vel)) in &l.open {
+                    notes.push(tangent_ui::arrangement::ArrNote {
+                        at_s: *at,
+                        dur_s: (now - at).max(0.05),
+                        key: *key,
+                        vel: *vel,
+                    });
+                }
             }
             tangent_ui::recorder::ArrRecView {
                 start_s: rec.start_s,
                 lanes: rec
-                    .midi_lanes
+                    .midi
                     .iter()
-                    .map(|l| (*l, true))
+                    .map(|l| (l.lane, true))
                     .chain(rec.audio.iter().map(|(_, l, _)| (*l, false)))
                     .collect(),
                 notes,
@@ -5043,7 +5163,7 @@ impl DesktopApp {
                             // with no cable recorded silence on every
                             // platform without one.
                             if let Some(rec) = self.recorder.arr_rec.as_mut() {
-                                rec.note_event(at, &ev);
+                                rec.note_event(tangent_ui::recorder::MIDI_SRC_APP, at, &ev);
                             }
                         }
                     }
@@ -5075,7 +5195,7 @@ impl DesktopApp {
                         // the app-injected strike as well, or pads played
                         // by hand never landed in the recorded clip.
                         if let Some(rec) = self.recorder.arr_rec.as_mut() {
-                            rec.note_event(at, &ev);
+                            rec.note_event(tangent_ui::recorder::MIDI_SRC_APP, at, &ev);
                         }
                     }
                 }
@@ -7924,7 +8044,7 @@ impl DesktopApp {
         // own zero. Rule 8: without it a pedal held from before the press is
         // released, in the clip, by an edge with no cause.
         let pedal_at = self.recorder.pedal_live;
-        let pedal = [64_u8, 66, 67]
+        let pedal: Vec<tangent_ui::arrangement::ArrPedal> = [64_u8, 66, 67]
             .into_iter()
             .enumerate()
             .filter(|&(slot, _)| pedal_at[slot] > 0)
@@ -7934,15 +8054,30 @@ impl DesktopApp {
                 value: pedal_at[slot],
             })
             .collect();
+        // **The routes, snapshotted at the press**, exactly as the arm mask
+        // is: what a take records must not change under it because somebody
+        // opened the MIDI Inputs dialog halfway through. The SAME function
+        // the live path pushes into the engine, so a note that sounded on
+        // this track is a note recorded on it.
+        let routes = self.app.midi_routes();
         self.recorder.arr_rec = Some(ArrRec {
             start_s,
             start_ns,
-            midi_lanes,
+            midi: midi_lanes
+                .into_iter()
+                .map(|lane| ArrRecLane {
+                    route: routes
+                        .get(lane)
+                        .copied()
+                        .unwrap_or(tangent_ui::recorder::MidiRoute::EVERYTHING),
+                    lane,
+                    notes: Vec::new(),
+                    pedal: pedal.clone(),
+                    pedal_at,
+                    open: std::collections::HashMap::new(),
+                })
+                .collect(),
             audio,
-            notes: Vec::new(),
-            pedal,
-            pedal_at,
-            open: std::collections::HashMap::new(),
         });
     }
 
@@ -7971,35 +8106,42 @@ impl DesktopApp {
             .transport
             .position_s(self.recorder.engine.as_ref(), rate);
         let len_s = (end_s - rec.start_s).max(0.0);
-        // The keys still down end where the record does.
-        for (key, (at, vel)) in rec.open.drain() {
-            rec.notes.push(tangent_ui::arrangement::ArrNote {
-                at_s: at,
-                dur_s: (len_s - at).max(0.05),
-                key,
-                vel,
-            });
+        // The keys still down end where the record does — per lane now, since
+        // each lane heard its own keyboards.
+        for l in &mut rec.midi {
+            for (key, (at, vel)) in l.open.drain() {
+                l.notes.push(tangent_ui::arrangement::ArrNote {
+                    at_s: at,
+                    dur_s: (len_s - at).max(0.05),
+                    key,
+                    vel,
+                });
+            }
+            l.notes.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
         }
-        rec.notes.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
         let mut out: Vec<tangent_ui::arrangement::RecordedClip> = Vec::new();
         // Delivered even with NO notes: the punch promised destruction,
         // and a take of silence over a clip is an erase — the app carves
         // and simply lands nothing.
         if len_s >= 0.05 {
-            for lane in &rec.midi_lanes {
+            for l in &rec.midi {
                 out.push(tangent_ui::arrangement::RecordedClip {
-                    lane: *lane,
+                    lane: l.lane,
                     start_s: rec.start_s,
                     len_s,
                     path: None,
-                    notes: rec.notes.clone(),
+                    // **This lane's OWN notes.** They used to be one list
+                    // handed to every armed lane, which was true while the
+                    // app opened one device; recording two keyboards onto
+                    // two tracks would have put both performances on both.
+                    notes: l.notes.clone(),
                     // No closing lift is written: a clip's pedal is released
                     // when the clip ENDS, which the timeline does for every
                     // clip whether or not anybody wrote it down. Writing one
                     // would also have to decide where — and the take is not
                     // extended to fit a pedal, for the same reason the take's
                     // `.mid` is not.
-                    pedal: rec.pedal.clone(),
+                    pedal: l.pedal.clone(),
                 });
             }
         }
@@ -12139,6 +12281,12 @@ impl DesktopApp {
             tangent_ui::recorder::live_midi_off(&kinds, armed, self.app.midi_editor_lane());
         crate::devices::set_channel_picks(&self.recorder.audio, explicit);
         e.set_midi_off(u64::from(midi_off));
+        // **And WHAT each lane is listening to**, pushed whole beside the arm
+        // mask every frame. Two separate questions on purpose: `midi_off` says
+        // whether a lane is listening at all (arm, the editor), this says to
+        // which devices and which channel. Folding them would make a keyboard
+        // being unplugged look like a disarm.
+        e.set_midi_routes(&self.app.midi_routes());
         e.set_armed(armed);
         e.set_pick_strips(picks);
         // **The live punch**: while the arrangement records over a lane,
@@ -12151,9 +12299,9 @@ impl DesktopApp {
             if let Some(rec) = self.recorder.arr_rec.as_ref() {
                 let rate = f64::from(e.output().sample_rate).max(1.0);
                 let at = frames_at(rate, rec.start_s);
-                for l in &rec.midi_lanes {
-                    if *l < punches.len() {
-                        punches[*l] = Some(at);
+                for l in &rec.midi {
+                    if l.lane < punches.len() {
+                        punches[l.lane] = Some(at);
                     }
                 }
                 for (_, l, _) in &rec.audio {
@@ -26399,18 +26547,35 @@ pub fn denoise_test(arg: Option<String>) {
 mod arr_pedal {
     use super::*;
 
-    /// A record that began at T0 with nothing held.
+    /// A record that began at T0 with nothing held, on one lane that listens
+    /// to every device on every channel — the desk before anybody narrows it.
     fn rec() -> ArrRec {
+        rec_with(Vec::new(), [0; 3])
+    }
+
+    /// The same, with a pedal state already standing at the press.
+    fn rec_with(
+        pedal: Vec<tangent_ui::arrangement::ArrPedal>,
+        pedal_at: [u8; 3],
+    ) -> ArrRec {
         ArrRec {
             start_s: 0.0,
             start_ns: 0,
-            midi_lanes: vec![0],
+            midi: vec![ArrRecLane {
+                lane: 0,
+                route: tangent_ui::recorder::MidiRoute::EVERYTHING,
+                notes: Vec::new(),
+                pedal,
+                pedal_at,
+                open: std::collections::HashMap::new(),
+            }],
             audio: Vec::new(),
-            notes: Vec::new(),
-            pedal: Vec::new(),
-            pedal_at: [0; 3],
-            open: std::collections::HashMap::new(),
         }
+    }
+
+    /// The one lane's collection, for a test that is about what it kept.
+    fn only(r: &ArrRec) -> &ArrRecLane {
+        &r.midi[0]
     }
 
     /// One second, in the nanoseconds the tap stamps with.
@@ -26429,23 +26594,23 @@ mod arr_pedal {
     #[test]
     fn the_pedal_is_written_down_with_the_notes() {
         let mut r = rec();
-        r.note_event(0, &[0xB0, 64, 127]);
-        r.note_event(SEC / 2, &[0x90, 60, 100]);
-        r.note_event(SEC, &[0x80, 60, 0]);
-        r.note_event(2 * SEC, &[0xB0, 64, 0]);
-        assert_eq!(r.pedal.len(), 2, "{:?}", r.pedal);
-        assert_eq!(r.pedal[0].cc, 64);
-        assert_eq!(r.pedal[0].value, 127);
-        assert!((r.pedal[0].at_s - 0.0).abs() < 1e-9);
-        assert_eq!(r.pedal[1].value, 0);
-        assert!((r.pedal[1].at_s - 2.0).abs() < 1e-9);
+        r.note_event(0, 0, &[0xB0, 64, 127]);
+        r.note_event(0, SEC / 2, &[0x90, 60, 100]);
+        r.note_event(0, SEC, &[0x80, 60, 0]);
+        r.note_event(0, 2 * SEC, &[0xB0, 64, 0]);
+        assert_eq!(only(&r).pedal.len(), 2, "{:?}", only(&r).pedal);
+        assert_eq!(only(&r).pedal[0].cc, 64);
+        assert_eq!(only(&r).pedal[0].value, 127);
+        assert!((only(&r).pedal[0].at_s - 0.0).abs() < 1e-9);
+        assert_eq!(only(&r).pedal[1].value, 0);
+        assert!((only(&r).pedal[1].at_s - 2.0).abs() < 1e-9);
         // And the NOTE is untouched: it still ends where the key came up.
         // The damper is the pedal's job, not a longer note's — see `ArrPedal`.
-        assert_eq!(r.notes.len(), 1);
+        assert_eq!(only(&r).notes.len(), 1);
         assert!(
-            (r.notes[0].dur_s - 0.5).abs() < 1e-9,
+            (only(&r).notes[0].dur_s - 0.5).abs() < 1e-9,
             "the note was stretched to the pedal lift: {:?}",
-            r.notes[0]
+            only(&r).notes[0]
         );
     }
 
@@ -26454,12 +26619,12 @@ mod arr_pedal {
     #[test]
     fn sostenuto_and_soft_travel_and_a_mod_wheel_does_not() {
         let mut r = rec();
-        r.note_event(0, &[0xB0, 64, 127]);
-        r.note_event(SEC, &[0xB0, 66, 64]);
-        r.note_event(2 * SEC, &[0xB0, 67, 10]);
-        r.note_event(3 * SEC, &[0xB0, 1, 127]);
-        r.note_event(4 * SEC, &[0xB0, 11, 90]);
-        let ccs: Vec<u8> = r.pedal.iter().map(|e| e.cc).collect();
+        r.note_event(0, 0, &[0xB0, 64, 127]);
+        r.note_event(0, SEC, &[0xB0, 66, 64]);
+        r.note_event(0, 2 * SEC, &[0xB0, 67, 10]);
+        r.note_event(0, 3 * SEC, &[0xB0, 1, 127]);
+        r.note_event(0, 4 * SEC, &[0xB0, 11, 90]);
+        let ccs: Vec<u8> = only(&r).pedal.iter().map(|e| e.cc).collect();
         assert_eq!(ccs, vec![64, 66, 67]);
     }
 
@@ -26470,9 +26635,9 @@ mod arr_pedal {
     fn a_sweep_is_kept_as_a_sweep() {
         let mut r = rec();
         for (i, v) in [20_u8, 50, 80, 110, 127].into_iter().enumerate() {
-            r.note_event(i as i64 * SEC / 10, &[0xB0, 64, v]);
+            r.note_event(0, i as i64 * SEC / 10, &[0xB0, 64, v]);
         }
-        let vals: Vec<u8> = r.pedal.iter().map(|e| e.value).collect();
+        let vals: Vec<u8> = only(&r).pedal.iter().map(|e| e.value).collect();
         assert_eq!(vals, vec![20, 50, 80, 110, 127]);
     }
 
@@ -26483,9 +26648,115 @@ mod arr_pedal {
     fn a_restated_pedal_is_not_a_second_edge() {
         let mut r = rec();
         for i in 0..64 {
-            r.note_event(i * SEC / 64, &[0xB0, 64, 127]);
+            r.note_event(0, i * SEC / 64, &[0xB0, 64, 127]);
         }
-        assert_eq!(r.pedal.len(), 1, "{:?}", r.pedal);
+        assert_eq!(only(&r).pedal.len(), 1, "{:?}", only(&r).pedal);
+    }
+
+    /// **A take records each track's OWN keyboard, and the pedal with it.**
+    ///
+    /// The other end of the same seam the engine's
+    /// `a_note_from_one_keyboard_reaches_only_the_track_that_asked_for_it`
+    /// holds. `ArrRec` used to be a list of lane indices and ONE note list,
+    /// handed identically to every armed MIDI lane — which was true while the
+    /// app opened one device and every armed lane really did hear the same
+    /// stream. Recording two players at once would have written both
+    /// performances onto both tracks, and the take is the part nobody notices
+    /// is wrong until the session is over.
+    ///
+    /// `MidiRoute::admits` is the one authority both ends use, so a note that
+    /// SOUNDED on a track is a note recorded on it. Two answers to that
+    /// question is a take that comes back holding somebody else's playing.
+    #[test]
+    fn a_take_records_each_tracks_own_keyboard() {
+        use tangent_ui::recorder::MidiRoute;
+        // Lane 1 wants slot 0 on wire channel 2; lane 4 wants slot 1 on any.
+        let mut r = ArrRec {
+            start_s: 0.0,
+            start_ns: 0,
+            midi: vec![
+                ArrRecLane {
+                    lane: 1,
+                    route: MidiRoute {
+                        src: 1 << 0,
+                        chan: 1 << 2,
+                    },
+                    notes: Vec::new(),
+                    pedal: Vec::new(),
+                    pedal_at: [0; 3],
+                    open: std::collections::HashMap::new(),
+                },
+                ArrRecLane {
+                    lane: 4,
+                    route: MidiRoute {
+                        src: 1 << 1,
+                        chan: u32::MAX,
+                    },
+                    notes: Vec::new(),
+                    pedal: Vec::new(),
+                    pedal_at: [0; 3],
+                    open: std::collections::HashMap::new(),
+                },
+            ],
+            audio: Vec::new(),
+        };
+        // Keyboard A, channel 3 (wire 2): lane 1's, and nobody else's.
+        r.note_event(0, 0, &[0x92, 60, 100]);
+        r.note_event(0, SEC, &[0x82, 60, 0]);
+        // Keyboard A on the WRONG channel: nobody's — lane 4 did not ask for
+        // this keyboard and lane 1 did not ask for this channel.
+        r.note_event(0, SEC, &[0x90, 62, 100]);
+        r.note_event(0, 2 * SEC, &[0x80, 62, 0]);
+        // Keyboard B, on whatever channel it likes: lane 4's.
+        r.note_event(1, 2 * SEC, &[0x97, 67, 90]);
+        r.note_event(1, 3 * SEC, &[0x87, 67, 0]);
+        // And a damper on keyboard A. It must not reach lane 4, which never
+        // asked for that keyboard — a foot on one player's pedal holding the
+        // other player's notes is the same fault one layer down.
+        r.note_event(0, SEC / 2, &[0xB2, 64, 127]);
+
+        let keys = |l: &ArrRecLane| l.notes.iter().map(|n| n.key).collect::<Vec<_>>();
+        assert_eq!(keys(&r.midi[0]), vec![60], "lane 1 did not record its own keyboard");
+        assert_eq!(keys(&r.midi[1]), vec![67], "lane 4 did not record its own keyboard");
+        assert_eq!(r.midi[0].pedal.len(), 1, "lane 1 lost its damper");
+        assert!(
+            r.midi[1].pedal.is_empty(),
+            "another player's pedal was written into this track's take"
+        );
+    }
+
+    /// **The APP's own notes are recorded on every armed lane**, because they
+    /// came from no device and can be in no device set. A clicked key, the
+    /// fretboard, the lattice, a pad tapped by hand — filtering those would
+    /// mean a performer with no cable recorded silence.
+    #[test]
+    fn the_apps_own_notes_reach_every_armed_lane() {
+        use tangent_ui::recorder::{MidiRoute, MIDI_SRC_APP};
+        let narrow = MidiRoute {
+            src: 1 << 3,
+            chan: 1 << 9,
+        };
+        let mut r = ArrRec {
+            start_s: 0.0,
+            start_ns: 0,
+            midi: vec![ArrRecLane {
+                lane: 0,
+                route: narrow,
+                notes: Vec::new(),
+                pedal: Vec::new(),
+                pedal_at: [0; 3],
+                open: std::collections::HashMap::new(),
+            }],
+            audio: Vec::new(),
+        };
+        // A slot and a channel this lane admits neither of.
+        r.note_event(MIDI_SRC_APP, 0, &[0x90, 60, 100]);
+        r.note_event(MIDI_SRC_APP, SEC, &[0x80, 60, 0]);
+        assert_eq!(
+            r.midi[0].notes.len(),
+            1,
+            "the app's own note was filtered by a device set no app note can be in"
+        );
     }
 
     /// **A pedal already DOWN when the red button is pressed is restated at
@@ -26510,12 +26781,12 @@ mod arr_pedal {
                 value: pedal_at[slot],
             })
             .collect();
-        let mut r = ArrRec { pedal, pedal_at, ..rec() };
+        let mut r = rec_with(pedal, pedal_at);
         // The lift, two seconds in, is the only thing the tap ever sees.
-        r.note_event(2 * SEC, &[0xB0, 64, 0]);
-        assert_eq!(r.pedal.len(), 2, "{:?}", r.pedal);
-        assert!((r.pedal[0].at_s - 0.0).abs() < 1e-9);
-        assert_eq!(r.pedal[0].value, 127, "the take opened with the pedal up");
-        assert_eq!(r.pedal[1].value, 0);
+        r.note_event(0, 2 * SEC, &[0xB0, 64, 0]);
+        assert_eq!(only(&r).pedal.len(), 2, "{:?}", only(&r).pedal);
+        assert!((only(&r).pedal[0].at_s - 0.0).abs() < 1e-9);
+        assert_eq!(only(&r).pedal[0].value, 127, "the take opened with the pedal up");
+        assert_eq!(only(&r).pedal[1].value, 0);
     }
 }

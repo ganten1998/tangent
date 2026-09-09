@@ -315,6 +315,7 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
         gains: s.channel_gains.to_vec(),
         pans: s.channel_pans.to_vec(),
         inputs: s.channel_inputs.clone(),
+        midi_inputs: s.channel_midi_inputs.clone(),
         drums_gain: s.drums_gain,
         drums_pan: s.drums_pan,
         metronome_gain: s.metronome_gain,

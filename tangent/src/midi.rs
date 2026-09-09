@@ -3,8 +3,29 @@
 //!
 //! - Auto-connect priority: "USB-MIDI" -> "Scarlett" OR ("USB" AND "MIDI") -> first.
 //! - note_on vel>0 = on; note_off or note_on vel==0 = off; CC64 >= 64 = sustain down.
-//! - Channels merged (status high nibble only). Everything else ignored.
-//! - No reconnect logic (parity): if the port dies, events just stop.
+//! - Channels merged on the DISPLAY path (status high nibble only); the raw
+//!   tap and the fast lane keep the channel, and the desk routes on it.
+//! - No reconnect logic (parity) INSIDE a connection: if the port dies, its
+//!   events just stop. The desk notices on its own beat and reopens — see
+//!   `TangentApp::reconcile_midi_ports`.
+//!
+//! # Several devices, one tap, one lane
+//!
+//! **The app used to open exactly ONE port.** Every track's input chip already
+//! named a MIDI port and nothing downstream ever read it, so two tracks could
+//! not have separate keyboards while the chips said they could — the owner's
+//! "the gui selector ... is lying to the user".
+//!
+//! There is one [`MidiConnection`] per open device now, and every message it
+//! delivers is stamped with that device's SOURCE SLOT: into the fast lane, so
+//! the engine can decide which lane hears it, and into the raw tap, so a take
+//! lands on the track that asked for the keyboard it was played on.
+//!
+//! The slot is a plain `u8` captured by value when the port opens, and that is
+//! not an optimisation — it is what midir's sealed callback state can hold. A
+//! connection IS one device, so its slot is fixed for the connection's life;
+//! anything that has to CHANGE has to be app-lifetime behind an `Arc`, which
+//! is why [`RawMidiTap`] and [`MidiFastLane`] are.
 //!
 //! # Two consumers, one callback
 //!
@@ -80,7 +101,15 @@ use std::time::Instant;
 /// converts on the way out.
 #[derive(Debug)]
 pub struct RawMidiTap {
-    queue: Mutex<VecDeque<(u64, Instant, Vec<u8>)>>,
+    /// `(source slot, device stamp, arrival, bytes)`.
+    ///
+    /// **The slot is a FACT and not a routing decision**, which is why it is
+    /// what the tap keeps. The route a track had when a message arrived can
+    /// change before the take is built — somebody opens the MIDI Inputs
+    /// dialog mid-session — and a decision baked into the history would then
+    /// be wrong with nothing to say so. Which keyboard it came from cannot
+    /// stop being true.
+    queue: Mutex<VecDeque<(u8, u64, Instant, Vec<u8>)>>,
     capacity: usize,
     dropped: AtomicU64,
 }
@@ -101,7 +130,7 @@ impl RawMidiTap {
     /// fails: a poisoned lock is recovered from rather than propagated, because
     /// losing MIDI is worse than losing whatever invariant a panicking drainer
     /// broke.
-    fn push(&self, stamp_us: u64, bytes: &[u8]) {
+    fn push(&self, src: u8, stamp_us: u64, bytes: &[u8]) {
         // BEFORE the lock. Whatever this costs, it must not include however
         // long another thread held the queue — that would put the drain's
         // contention into the clock pairing this reading exists to make.
@@ -117,7 +146,7 @@ impl RawMidiTap {
             q.pop_front();
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
-        q.push_back((stamp_us, arrived, bytes.to_vec()));
+        q.push_back((src, stamp_us, arrived, bytes.to_vec()));
     }
 
     /// Take everything captured so far.
@@ -129,7 +158,7 @@ impl RawMidiTap {
     /// costs a few hundred bytes and is worth more than a second code path
     /// through the MIDI callback.
     #[cfg(feature = "recorder")]
-    pub fn drain(&self) -> Vec<(u64, Instant, Vec<u8>)> {
+    pub fn drain(&self) -> Vec<(u8, u64, Instant, Vec<u8>)> {
         let mut q = match self.queue.lock() {
             Ok(q) => q,
             Err(poisoned) => poisoned.into_inner(),
@@ -212,7 +241,7 @@ impl MidiFastLane {
     /// would bloat the ring. A full ring or a mid-install collision sheds the
     /// event silently: the tap still has it, so the RECORD is whole either
     /// way, and a shed here only costs the monitor one note.
-    pub fn play(&self, bytes: &[u8]) {
+    pub fn play(&self, src: u8, bytes: &[u8]) {
         #[cfg(feature = "recorder")]
         {
             let Some(&status) = bytes.first() else {
@@ -223,6 +252,7 @@ impl MidiFastLane {
             }
             let event = crate::instrument::MidiEvent {
                 stamp: 0,
+                src,
                 status,
                 data1: bytes.get(1).copied().unwrap_or(0),
                 data2: bytes.get(2).copied().unwrap_or(0),
@@ -246,6 +276,7 @@ impl MidiFastLane {
             {
                 let _ = tx.push(crate::instrument::MidiEvent {
                     stamp: 0,
+                    src,
                     status: kind | 9,
                     data1: event.data1,
                     data2: event.data2,
@@ -253,7 +284,7 @@ impl MidiFastLane {
             }
         }
         #[cfg(not(feature = "recorder"))]
-        let _ = bytes;
+        let _ = (src, bytes);
     }
 }
 
@@ -323,8 +354,25 @@ pub fn print_port_list() {
 /// timestamp, always. Switching ports drops this connection and builds a new
 /// closure holding a clone of the **same** `Arc`, so a port switch mid-session
 /// keeps both the pre-roll and the controller-state history.
+///
+/// # `src`, and why a plain byte is exactly what midir can carry
+///
+/// The app used to open ONE port, app-wide, so nothing downstream ever had to
+/// ask which keyboard a note came from — and two tracks therefore could not
+/// have separate inputs while the input chip on every track said they could.
+/// The fix is one connection per device, each stamping its own SLOT onto
+/// every message it delivers.
+///
+/// A slot rather than the name, and captured by value rather than looked up:
+/// midir takes its callback by value and seals the captured state the moment
+/// the port opens (see [`RawMidiTap`]), so anything the closure needs must be
+/// either app-lifetime behind an `Arc` — which is why the tap and the lane are
+/// — or **fixed for the connection's life**, which a device's slot is, because
+/// a connection IS one device. A `u8` copied into the closure costs nothing on
+/// the callback thread and cannot go stale.
 pub fn connect_by_name(
     name: &str,
+    src: u8,
     tx: mpsc::Sender<MidiEvent>,
     ctx: egui::Context,
     tap: Arc<RawMidiTap>,
@@ -355,8 +403,8 @@ pub fn connect_by_name(
                 // scheduling on top.
                 // SOUND before bookkeeping: the fast lane is why the note is
                 // audible this block instead of after the next UI frame.
-                lane.play(message);
-                tap.push(stamp_us, message);
+                lane.play(src, message);
+                tap.push(src, stamp_us, message);
                 if let Some(event) = parse_message(message) {
                     let _ = tx.send(event);
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -373,6 +421,12 @@ pub fn connect_by_name(
 
 /// Startup auto-connect (spec §10 priority chain). Returns None when there are
 /// no ports or opening fails — the app runs without MIDI, silently.
+///
+/// **Still one port, and that is deliberate.** This is the desk with no MIDI
+/// track on it: nothing has named a device, so there is nothing to honour, and
+/// the priority chain's guess is what has always fed the chord display. The
+/// moment a MIDI track exists, `DeviceMidi::reconcile` takes over and opens
+/// whatever the desk asks for — see `wanted_midi_ports`.
 pub fn auto_connect(
     tx: mpsc::Sender<MidiEvent>,
     ctx: egui::Context,
@@ -381,7 +435,7 @@ pub fn auto_connect(
 ) -> Option<MidiConnection> {
     let names = list_port_names();
     let chosen = pick_auto_port(&names)?;
-    connect_by_name(&chosen, tx, ctx, tap, lane).ok()
+    connect_by_name(&chosen, 0, tx, ctx, tap, lane).ok()
 }
 
 /// Developer probe: open a port and print the raw tap until interrupted.
@@ -417,6 +471,7 @@ pub fn dump_raw(port: Option<String>) {
     let lane = Arc::new(MidiFastLane::new());
     let conn = match connect_by_name(
         &chosen,
+        0,
         tx,
         egui::Context::default(),
         Arc::clone(&tap),
@@ -445,7 +500,7 @@ pub fn dump_raw(port: Option<String>) {
     let mut prev_stamp: Option<u64> = None;
 
     loop {
-        for (stamp, arrived, bytes) in tap.drain() {
+        for (_src, stamp, arrived, bytes) in tap.drain() {
             // The tap's own arrival reading, not `epoch.elapsed()` here. This
             // loop runs on a sleep, so a reading taken now would be up to a
             // whole poll interval late — and `SourceClock` anchors on the
@@ -518,16 +573,16 @@ mod tests {
         // Pitch bend, poly aftertouch and a non-64 CC all parse to None on the
         // display path (`midi_event.rs:36`), and CC64 is collapsed to a bool at
         // 64. The recorder must see all of it, verbatim, with the timestamp.
-        tap.push(10, &[0xE5, 0x00, 0x40]);
-        tap.push(20, &[0xA0, 60, 70]);
-        tap.push(30, &[0xB3, 1, 64]);
-        tap.push(40, &[0xB0, 64, 63]);
-        tap.push(50, &[0x83, 60, 33]);
+        tap.push(0, 10, &[0xE5, 0x00, 0x40]);
+        tap.push(0, 20, &[0xA0, 60, 70]);
+        tap.push(0, 30, &[0xB3, 1, 64]);
+        tap.push(0, 40, &[0xB0, 64, 63]);
+        tap.push(0, 50, &[0x83, 60, 33]);
 
         let got: Vec<(u64, Vec<u8>)> = tap
             .drain()
             .into_iter()
-            .map(|(stamp, _arrived, bytes)| (stamp, bytes))
+            .map(|(_src, stamp, _arrived, bytes)| (stamp, bytes))
             .collect();
         assert_eq!(
             got,
@@ -547,11 +602,11 @@ mod tests {
     fn a_full_tap_sheds_the_oldest_and_says_how_many() {
         let tap = RawMidiTap::new(3);
         for i in 0..6u64 {
-            tap.push(i, &[0x90, 60, 100]);
+            tap.push(0, i, &[0x90, 60, 100]);
         }
         let got = tap.drain();
         assert_eq!(
-            got.iter().map(|(t, ..)| *t).collect::<Vec<_>>(),
+            got.iter().map(|(_, t, ..)| *t).collect::<Vec<_>>(),
             vec![3, 4, 5],
             "a tap that shed the NEWEST would record the start of a take and \
              silently nothing after it"
@@ -563,7 +618,7 @@ mod tests {
     #[test]
     fn a_fresh_tap_has_dropped_nothing() {
         let tap = RawMidiTap::new(4);
-        tap.push(1, &[0x90, 60, 1]);
+        tap.push(0, 1, &[0x90, 60, 1]);
         assert_eq!(tap.dropped(), 0);
         assert_eq!(tap.drain().len(), 1);
     }
@@ -579,25 +634,25 @@ mod tests {
     fn the_fast_lane_delivers_and_mirrors_the_pads() {
         let lane = MidiFastLane::new();
         // Bare: no producer seated. Must simply do nothing.
-        lane.play(&[0x90, 60, 100]);
+        lane.play(0, &[0x90, 60, 100]);
 
         let (tx, mut rx) = rtrb::RingBuffer::<crate::instrument::MidiEvent>::new(16);
         lane.install(tx);
 
         // A plain note, pads down: one event, stamp 0 (the far past).
-        lane.play(&[0x90, 60, 100]);
+        lane.play(0, &[0x90, 60, 100]);
         let e = rx.pop().expect("the note was not delivered");
         assert_eq!((e.stamp, e.status, e.data1, e.data2), (0, 0x90, 60, 100));
         assert!(rx.pop().is_err(), "a note was doubled with pads down");
 
         // Realtime never sounds.
-        lane.play(&[0xF8]);
+        lane.play(0, &[0xF8]);
         assert!(rx.pop().is_err(), "a realtime byte reached the ring");
 
         // Pads live: a note inside 36..52 arrives twice — itself, then its
         // channel-10 copy.
         lane.set_pads_live(true);
-        lane.play(&[0x90, 40, 90]);
+        lane.play(0, &[0x90, 40, 90]);
         let a = rx.pop().expect("the original vanished");
         let b = rx.pop().expect("the pad mirror vanished");
         assert_eq!(a.status, 0x90);
@@ -605,7 +660,7 @@ mod tests {
         assert_eq!((b.data1, b.data2), (40, 90));
 
         // Already channel 10: no double.
-        lane.play(&[0x99, 40, 90]);
+        lane.play(0, &[0x99, 40, 90]);
         assert!(rx.pop().is_ok());
         assert!(
             rx.pop().is_err(),
@@ -613,7 +668,7 @@ mod tests {
         );
 
         // EVERY key is a pad now: high notes mirror too.
-        lane.play(&[0x90, 72, 90]);
+        lane.play(0, &[0x90, 72, 90]);
         assert!(rx.pop().is_ok());
         assert!(
             rx.pop().is_ok_and(|e| e.status == 0x99),
