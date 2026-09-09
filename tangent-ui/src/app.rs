@@ -9653,19 +9653,7 @@ impl TangentApp {
                         self.set_channel_input_spec(ch, "");
                         self.input_menu = None;
                     } else if i == 2 {
-                        // **MIDI is a press, not a hover.** It BINDS the
-                        // track (the input is the kind, and binding is what
-                        // makes a track) and then opens the dialog where the
-                        // devices and the channel are actually chosen. The
-                        // bind is skipped when the track is already MIDI, so
-                        // opening the dialog on a track somebody set up does
-                        // not widen it back to every device.
-                        let ch = m.ch;
-                        if self.channel_kind(ch) != Some(recorder::ChannelKind::Midi) {
-                            self.set_channel_input_spec(ch, "midi:all");
-                        }
-                        self.input_menu = None;
-                        self.open_midi_inputs_dialog(ch);
+                        self.open_midi_row(m.ch);
                     } else {
                         m.hover = Some(i);
                         self.input_menu = Some(m);
@@ -10478,6 +10466,26 @@ impl TangentApp {
     /// `removable` is "there is a track here". An empty CHANNEL slot passes
     /// false and gets the short menu whose one row is Paste Track; the buses
     /// pass false too and get neither, because `lane` is past the channels.
+    /// **The input menu's MIDI row, pressed.**
+    ///
+    /// A press and not a hover: the row used to open a submenu of ALL and
+    /// every port, write one of them into `channel_inputs`, and be read by
+    /// nothing — which is the fault the owner reported. It BINDS the track
+    /// (the input is the kind, and binding is what makes a track) and then
+    /// opens the dialog where the devices and the channel are really chosen.
+    ///
+    /// **The bind is skipped when the track is already MIDI.** Otherwise
+    /// opening the dialog on a track somebody set up last week would widen it
+    /// back to every device on the way in — a menu row that undoes the thing
+    /// it is about to show you.
+    fn open_midi_row(&mut self, ch: usize) {
+        if self.channel_kind(ch) != Some(recorder::ChannelKind::Midi) {
+            self.set_channel_input_spec(ch, "midi:all");
+        }
+        self.input_menu = None;
+        self.open_midi_inputs_dialog(ch);
+    }
+
     /// **The MIDI Inputs dialog, from ONE place.**
     ///
     /// Three doors reach it — the input chip's MIDI row on the arrangement
@@ -36039,6 +36047,46 @@ mod tests {
         assert!(app.channel_midi_sel(4).is_everything());
         assert_eq!(app.input_chip_text(4), "MIDI: ALL DEVICES");
         assert_eq!(app.channel_input_spec(4), "midi:all");
+    }
+
+    /// **The input menu's MIDI row binds the track and opens the dialog — and
+    /// does not undo a setup on the way in.**
+    ///
+    /// The row draws, hit-tests, and until this feature existed wrote a port
+    /// nothing read. Its press handler is one call now, tested here, because
+    /// a control that draws and does nothing is the fault this codebase has
+    /// shipped four separate times.
+    #[test]
+    fn the_menus_midi_row_binds_the_track_and_opens_the_dialog() {
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.midi_ports_seen = vec!["Keystation 88".to_owned()];
+        // An unbound channel: the row makes it a MIDI track on every device.
+        app.set_channel_input_spec(6, "");
+        app.open_midi_row(6);
+        assert_eq!(app.channel_kind(6), Some(recorder::ChannelKind::Midi));
+        assert!(app.channel_midi_sel(6).is_everything());
+        assert!(
+            matches!(app.dialog, Some(Dialog::MidiInputs { lane: 6, .. })),
+            "the row did not open the dialog on the track it was pressed on"
+        );
+        assert_eq!(app.input_menu, None, "the menu stayed up behind the dialog");
+
+        // A track somebody has already set up: opening the dialog must not
+        // widen it back to every device on the way in.
+        app.set_channel_midi_sel(
+            6,
+            recorder::MidiInputSel {
+                devices: vec!["Keystation 88".to_owned()],
+                channel: Some(4),
+            },
+        );
+        app.open_midi_row(6);
+        assert_eq!(
+            app.channel_midi_sel(6).devices,
+            vec!["Keystation 88".to_owned()],
+            "opening the dialog undid the setup it was about to show"
+        );
+        assert_eq!(app.channel_midi_sel(6).channel, Some(4));
     }
 
     /// **A device that is not plugged in keeps its row, its tick and its
