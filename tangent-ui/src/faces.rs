@@ -294,10 +294,13 @@ pub struct FaceLive {
     /// folder in it, exactly as [`Self::ir_dir`] works.
     pub samp_dir: String,
     /// The shortcut chips over the listing: `(word, path)`, left to right.
-    /// Pushed, because two of the three are Tangent's own folders and only
-    /// the app knows where those are — the Takes folder and the open
-    /// project's `media/`. An empty path draws a chip that says so rather
-    /// than one that walks nowhere.
+    /// Pushed, because only the app knows where these folders are — the one
+    /// the owner set as HOME, and the open project's `media/`. An empty path
+    /// draws a chip that says so rather than one that walks nowhere.
+    ///
+    /// There was a TAKES chip here and the owner struck it out the first
+    /// time he used the panel: "the takes section as a whole can just go."
+    /// Nothing is reserved for it; the row is as wide as the list.
     pub samp_roots: Vec<(String, String)>,
     /// What [`Self::samp_dir`] holds, pushed: folders first, then the audio
     /// this build can read.
@@ -499,6 +502,19 @@ pub enum FaceAction {
     /// a row out of either explorer), and an OS file drop — because they
     /// differ only in how the path was found.
     PickSample { path: String },
+    /// **Make this folder the media explorer's remembered default.**
+    /// Appended at the END, this enum's law.
+    ///
+    /// The drumpad's DEF chip, for the panel that shares its explorer. The
+    /// owner reported the gap as a missing button — "no default button for
+    /// the home media explorer" — and it is exactly that: the drumpad has
+    /// carried a DEF chip since its explorer shipped, the sampler's browser
+    /// was lifted out of that panel without it, and a library five folders
+    /// down had to be walked to from scratch every time a face opened.
+    ///
+    /// A PATH and nothing else, the [`Self::PickSample`] bargain: the face
+    /// knows where it is standing and the host owns the setting.
+    SetMediaDefault { path: String },
 }
 
 fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {

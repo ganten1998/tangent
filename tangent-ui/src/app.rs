@@ -1306,12 +1306,24 @@ pub struct TangentApp {
     /// caller — the host, which speaks lanes — and the face, which is opened
     /// on a seat.
     sampler_info: HashMap<usize, crate::ports::SamplerInfo>,
-    /// **Samples chosen but not yet handed over**, oldest first. The face
-    /// raises a path, this holds it, and the host drains it with
-    /// `take_sampler_load`. A queue and not a slot: two windows can be open
-    /// on two samplers, and dropping one of two loads is a load that
-    /// silently did not happen.
-    sampler_load: std::collections::VecDeque<(usize, std::path::PathBuf)>,
+    /// **Samples chosen but not yet handed over**, oldest first: the SEAT,
+    /// the BAY, and the file. The face raises a path, this holds it, and the
+    /// host drains it with `take_sampler_load`. A queue and not a slot: two
+    /// windows can be open on two samplers, and dropping one of two loads is
+    /// a load that silently did not happen.
+    ///
+    /// **The bay travels with the seat, and it did not use to.** This carried
+    /// `(lane, path)` alone; `seat_bay` had worked the bay out and the arm
+    /// that queued the load threw it away, so the host bound every sample
+    /// into bay 0 — and `bind_insert_sample` answers `false` for a bay that
+    /// is not a sampler, silently. A sampler in bay 1 or 2, or in any of the
+    /// six a folder wears, took a file from the browser and never played it.
+    sampler_load: std::collections::VecDeque<(usize, usize, std::path::PathBuf)>,
+    /// Whether a sampler's face was standing at the END of the last frame —
+    /// the edge that silences the browser's audition. See the call in
+    /// `update`; `close_drumpad` is the other explorer's single door and
+    /// there is no door like it for a face window.
+    sampler_face_up: bool,
     /// The generation the sampler's browser listing was read at, bumped
     /// whenever anything could have changed the folder on screen — the
     /// `ir_scan_gen` bargain.
@@ -3588,6 +3600,7 @@ impl TangentApp {
             ir_scan_gen: 0,
             sampler_info: HashMap::new(),
             sampler_load: std::collections::VecDeque::new(),
+            sampler_face_up: false,
             sampler_scan_gen: 0,
             ir_live: crate::ports::IrLive::default(),
             plugin_rescan: false,
@@ -16298,6 +16311,50 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// Close it, saving whatever the session touched.
     // ── the drumpad ──────────────────────────────────────────────────────
 
+    /// **Audition one media file: press it, hear it once.**
+    ///
+    /// The drumpad's explorer has done this since it shipped, and it did it
+    /// INLINE, in the `Hit::MediaRow` arm — which is why the sampler's
+    /// browser did not: the two panels share the drawing
+    /// (`drumpad_panel::draw_media_pane`, lifted out of the drumpad when the
+    /// sampler was built) and shared nothing of the behaviour. The owner
+    /// found the gap the first time he opened it: *"there's no audition like
+    /// the drum media explorer has"*.
+    ///
+    /// So the one line both panels need lives here, at the level the
+    /// drumpad's audition already lived at, and both call it. Not in
+    /// `drumpad_panel`: a panel module draws and hit-tests, and asking the
+    /// host to make a sound is not drawing — the pane would have to grow a
+    /// second return channel to carry it, which is a road where a call
+    /// suffices.
+    ///
+    /// `RecorderRequest::PreviewFile` is the whole of the road, and it is the
+    /// SAME road: the host decodes at the engine's rate, hands the clip over
+    /// on the preview ring and never caches it (browsing a folder of songs
+    /// would otherwise hold every one of them for the session). One preview
+    /// at a time — a second file replaces the first from the top — so a
+    /// finger walking a listing sounds like a finger walking a listing.
+    fn audition_media(&mut self, path: &std::path::Path) {
+        self.request_recorder(recorder::RecorderRequest::PreviewFile(path.to_path_buf()));
+    }
+
+    /// Whether a sampler's face is standing right now — in the dialog slot
+    /// or in the pedal window over it, which are the two places one can be.
+    ///
+    /// Only for the audition's own quiet: see the call in `update`.
+    fn sampler_face_is_open(&self) -> bool {
+        let is_sampler = |d: &Dialog| {
+            matches!(d, Dialog::InsertFace { live, .. }
+                if live.face.path == crate::faces_sampler::SAMPLER_PATH)
+        };
+        self.dialog.as_ref().is_some_and(is_sampler)
+            || self
+                .pedal_stack
+                .as_ref()
+                .and_then(|s| s.dialog.as_ref())
+                .is_some_and(is_sampler)
+    }
+
     /// Put the drumpad away, releasing whatever it holds: the pressed pad's
     /// note-off, the gestures, the hover. Esc, the ×, a press outside and
     /// the toggle key all come through here, so no path can strand a note.
@@ -16406,8 +16463,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // would land on — which is the DEF chip's own folder when one has
             // been chosen and home when none has. Reading only the setting
             // left the chip dark on a fresh install standing in exactly the
-            // right place. See `drum_media_home`.
-            def_lit: self.drum_media_home() == self.media_dir,
+            // right place. See `media_home`.
+            def_lit: self.media_home() == self.media_dir,
             typing: self
                 .drumpad_num
                 .as_ref()
@@ -17379,9 +17436,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         // lights, the file plays once.
                         self.media_drag = Some(i);
                         self.media_sel = Some(i);
-                        self.request_recorder(recorder::RecorderRequest::PreviewFile(
-                            self.media_dir.join(&e.name),
-                        ));
+                        // The one road, shared with the sampler's browser
+                        // since it grew the same gesture. See
+                        // [`Self::audition_media`].
+                        let file = self.media_dir.join(&e.name);
+                        self.audition_media(&file);
                     }
                 }
             }
@@ -22959,17 +23018,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .unwrap_or(crate::ports::SamplerInfo::NONE)
     }
 
-    /// **The next sample a face asked to load**, oldest first, taken off the
-    /// queue as it is read. `None` when nothing is waiting.
-    pub fn take_sampler_load(&mut self) -> Option<(usize, std::path::PathBuf)> {
+    /// **The next sample a face asked to load** — seat, bay and file, oldest
+    /// first, taken off the queue as it is read. `None` when nothing is
+    /// waiting.
+    pub fn take_sampler_load(&mut self) -> Option<(usize, usize, std::path::PathBuf)> {
         self.sampler_load.pop_front()
     }
 
     /// Put a load on the queue. The one door: the browser row, the drop and
     /// the OS file drag all arrive here, because they differ only in how the
     /// path was found.
-    fn queue_sampler_load(&mut self, lane: usize, path: std::path::PathBuf) {
-        self.sampler_load.push_back((lane, path));
+    fn queue_sampler_load(&mut self, lane: usize, bay: usize, path: std::path::PathBuf) {
+        self.sampler_load.push_back((lane, bay, path));
         // The file may have landed in the folder the browser is standing in
         // — a copy into the project's `media/`, say — so the listing is
         // stale from here.
@@ -24323,17 +24383,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// itself. Durations are looked up from the host's own scan rather than
     /// re-measured here: reading a WAV header is the engine side's job and
     /// this crate has no WAV reader to do it honestly with.
-    /// **The sampler browser's listing, and its three shortcuts.**
+    /// **The sampler browser's listing, and its shortcuts.**
     ///
     /// `refresh_ir_browser` next door with one difference, and the
     /// difference is the whole of what the owner asked for: the shortcut
     /// row. *"must be able to drag any item in or choose any midi or audio
     /// clip recorded in tangent as well -- not just external exports."*
-    /// Tangent's own recordings live in exactly two places — the Takes
-    /// folder every capture lands in, and the open project's `media/`,
-    /// which is where a clip's audio is copied — and neither of them is
-    /// anywhere a person would find by walking up from their home folder.
-    /// So the browser names them.
+    /// The open project's `media/` is where a clip's audio is copied and it
+    /// is not anywhere a person would find by walking up from their home
+    /// folder, so the browser names it.
+    ///
+    /// **There was a TAKES chip beside it and the owner struck it out**:
+    /// *"the takes section as a whole can just go."* He had asked for it
+    /// earlier the same session and changed his mind, so it is removed
+    /// rather than hidden — no chip, no root, and not the folder a fresh
+    /// panel opens on either. The argument for it was that somebody who has
+    /// just recorded wants the thing they just recorded; the answer is that
+    /// a sampler is loaded from a library far more often than from a take.
     ///
     /// The PROJECT chip is empty when no project is open, and the face
     /// draws a chip that says so rather than one that walks nowhere: a
@@ -24345,28 +24411,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// (the owner's `~/Dropbox`) is followed; dotfiles skipped; folders
     /// first, then files, both sorted case-blind.
     fn refresh_sampler_browser(&mut self, live: &mut crate::faces::FaceLive) {
-        let takes = self.settings.record_root();
         let project = self
             .project_doc()
             .and_then(|d| d.parent().map(|p| p.join("media")))
             .filter(|p| p.is_dir());
         live.samp_roots = vec![
-            ("HOME".to_owned(), dirs_home().to_string_lossy().into_owned()),
-            ("TAKES".to_owned(), takes.to_string_lossy().into_owned()),
+            ("HOME".to_owned(), self.media_home().to_string_lossy().into_owned()),
             (
                 "PROJECT".to_owned(),
                 project.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
             ),
         ];
         if live.samp_dir.is_empty() {
-            // A fresh panel opens on the Takes folder when there is one:
-            // the overwhelmingly likely sample, for somebody who has just
-            // recorded, is the thing they just recorded.
-            live.samp_dir = if takes.is_dir() {
-                takes.to_string_lossy().into_owned()
-            } else {
-                dirs_home().to_string_lossy().into_owned()
-            };
+            // A fresh panel opens where HOME points — the folder the DEF
+            // chip remembered, or the home directory until one is set. See
+            // [`Self::media_home`].
+            live.samp_dir = self.media_home().to_string_lossy().into_owned();
         }
         if live.samp_listed == live.samp_dir && live.samp_gen == self.sampler_scan_gen {
             return;
@@ -24641,7 +24701,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// to look for a kit and the wrong place to look for a snare. Home is
     /// where somebody's samples actually are, and the DEF chip still honours
     /// a folder they chose for themselves.
-    fn drum_media_home(&self) -> std::path::PathBuf {
+    ///
+    /// **It was `drum_media_home` and it is not the drumpad's alone any
+    /// more.** The sampler's browser is the same explorer — the pane was
+    /// lifted out of the drumpad when the sampler was built — and it opens
+    /// on this folder and offers the same DEF chip to set it. ONE setting
+    /// rather than two, because "where my samples live" is one fact about a
+    /// person's disk and two copies of it are two things to keep in step;
+    /// whichever explorer is in front can set it, and both then land there.
+    fn media_home(&self) -> std::path::PathBuf {
         let chosen = std::path::PathBuf::from(&self.settings.media_default_dir);
         if !self.settings.media_default_dir.is_empty() && chosen.is_dir() {
             return chosen;
@@ -24653,8 +24721,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.drumpad_open = true;
         self.drumpad_focus(Self::HOME_KEY);
         // A remembered default folder is where a fresh open LANDS — and
-        // without one, home. See `drum_media_home`.
-        let def = self.drum_media_home();
+        // without one, home. See `media_home`.
+        let def = self.media_home();
         if def.is_dir() && def != self.media_dir {
             self.media_dir = def;
             self.media_sel = None;
@@ -28554,7 +28622,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **And the explorer STANDING somewhere goes with the setting.**
         //
         // `take_devices` puts `media_default_dir` back to empty, which is the
-        // "nobody has chosen" state that `drum_media_home` answers with HOME.
+        // "nobody has chosen" state that `media_home` answers with HOME.
         // That is the right answer for the next OPEN;
         // it does nothing for a drumpad already on screen, which would sit in
         // whatever folder the reset was supposed to forget. The owner asked
@@ -28564,7 +28632,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // not move somebody out of the directory they were browsing.
         use crate::settings::ResetScope as R;
         if matches!(scope, R::Devices | R::Everything) {
-            let home = self.drum_media_home();
+            let home = self.media_home();
             if home != self.media_dir {
                 self.media_dir = home;
                 self.media_sel = None;
@@ -29035,14 +29103,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // message anywhere — the drumpad's own `.tgkit` fault, which is
             // exactly how that lesson was learned.
             DialogAction::PickSample { strip, slot, path } => {
-                let (seat, _bay) = recorder::seat_bay(strip, slot);
+                let (seat, bay) = recorder::seat_bay(strip, slot);
                 let file = std::path::PathBuf::from(&path);
                 let name = file
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.clone());
                 if crate::drumpad_panel::is_audio_file(&name) {
-                    self.queue_sampler_load(seat, file);
+                    // **And you HEAR it**, on the drumpad explorer's own
+                    // road — see [`Self::audition_media`]. The owner asked
+                    // for exactly that parity: "there's no audition like the
+                    // drum media explorer has". Auditioned before the load
+                    // is queued rather than after, so the sound starts on
+                    // this frame instead of waiting on a decode the host
+                    // does a frame or more from now.
+                    self.audition_media(&file);
+                    self.queue_sampler_load(seat, bay, file);
                 } else {
                     self.notify(
                         crate::notify::Kind::Error,
@@ -29057,6 +29133,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // The theme key from a plugin window's own bar: exactly the
             // main window's `K::CycleTheme`, arriving by the only road a
             // child window's keys have.
+            // **The sampler browser's DEF chip: this folder is where the
+            // media explorers open from now on.** The drumpad's `Hit::Def`
+            // arm, reached from the other panel — one setting, written by
+            // whichever explorer is in front. See [`Self::media_home`].
+            DialogAction::SetMediaDefault { path } => {
+                self.settings.media_default_dir = path;
+                self.save_settings();
+                // The chip lights off the roots the browser is pushed each
+                // frame, and those are rebuilt from the setting — but the
+                // LISTING is cached against a generation, and a default set
+                // while standing somewhere else has to be able to move the
+                // panel on the next refresh.
+                self.sampler_scan_gen = self.sampler_scan_gen.wrapping_add(1);
+            }
             DialogAction::CycleTheme => self.cycle_theme(),
             DialogAction::SetInsertKeySource { strip, slot, from } => {
                 // A settings write and nothing else — the `SetRouteGain`
@@ -34312,6 +34402,20 @@ impl TangentApp {
             st.dialog = self.refreshed_face(&ctx, st.dialog);
             self.pedal_stack = Some(st);
         }
+        // **And the audition goes quiet with the window that started it.**
+        //
+        // `close_drumpad` does this for the other explorer and there is no
+        // door like it here: a face window is dismissed from a dozen places
+        // — Escape, the ×, a bay being emptied, a project closing — so the
+        // honest test is whether one is STANDING, asked once a frame after
+        // the refresh has settled which are. The alternative is a six-second
+        // sample-pack hit still playing over a desk with nothing on screen
+        // to stop it.
+        let sampler_up = self.sampler_face_is_open();
+        if self.sampler_face_up && !sampler_up {
+            self.request_recorder(recorder::RecorderRequest::PreviewStop);
+        }
+        self.sampler_face_up = sampler_up;
 
         // **The top window owns Escape, and inline it has to TAKE it.**
         //
@@ -37261,7 +37365,7 @@ mod tests {
     /// a fresh open LANDS, the second is a drumpad already on screen that
     /// would otherwise sit in the folder the reset was meant to forget.
     ///
-    /// Revert-checks: make `drum_media_home` return the kit drawer again and
+    /// Revert-checks: make `media_home` return the kit drawer again and
     /// the first assert goes red; drop the `Devices | Everything` arm in
     /// `reset_settings` and the last one does.
     #[test]
@@ -37283,26 +37387,26 @@ mod tests {
         // (1) Nobody has chosen: a fresh open lands at HOME — and NOT in the
         // kit drawer, which is the specific wrong answer this went through.
         assert_eq!(
-            app.drum_media_home(),
+            app.media_home(),
             dirs_home(),
             "a sample explorer with no chosen folder should open at home"
         );
         assert_ne!(
-            app.drum_media_home(),
+            app.media_home(),
             drawer,
             "the explorer is back on the kit drawer, which holds no samples"
         );
 
         // (2) A chosen folder still wins — the chip is not overridden.
         app.settings.media_default_dir = elsewhere.to_string_lossy().into_owned();
-        assert_eq!(app.drum_media_home(), elsewhere, "the DEF chip was ignored");
+        assert_eq!(app.media_home(), elsewhere, "the DEF chip was ignored");
 
         // (3) A chosen folder that has gone falls through rather than
         // landing nowhere.
         app.settings.media_default_dir =
             root.join("deleted").to_string_lossy().into_owned();
         assert_eq!(
-            app.drum_media_home(),
+            app.media_home(),
             dirs_home(),
             "a missing DEF folder stranded it"
         );
@@ -58771,9 +58875,18 @@ mod sampler_road_tests {
         assert_eq!(app.said().len(), 1, "the refusal repeated itself");
     }
 
-    /// **A load is taken once, and in the order it was asked for.** Two
-    /// windows can be open on two samplers, and a queue that dropped one of
-    /// two loads is a load that silently did not happen.
+    /// **A load is taken once, in the order it was asked for, and it names
+    /// the BAY it came from.** Two windows can be open on two samplers, and
+    /// a queue that dropped one of two loads is a load that silently did not
+    /// happen.
+    ///
+    /// **The bay is what made the sampler mute for anybody who did not seat
+    /// it first.** `seat_bay` has always worked one out and this arm threw it
+    /// away, so every chosen file was bound into bay 0 — and the host's
+    /// binder answers `false`, without a word, for a bay that is not holding
+    /// a sampler. A sampler in bay 1 or 2 (or in any of the six a folder
+    /// wears) took a file from its browser and went on playing nothing. So
+    /// the third slot of the queue is a contract, not a convenience.
     #[test]
     fn the_sampler_takes_its_loads_in_order_and_only_once() {
         let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
@@ -58785,15 +58898,70 @@ mod sampler_road_tests {
         });
         app.apply_dialog_action(DialogAction::PickSample {
             strip: 1,
-            slot: 0,
+            slot: 2,
             path: "/m/Takes/two.aiff".to_owned(),
         });
         let first = app.take_sampler_load().expect("nothing queued");
-        assert_eq!(first.1, std::path::PathBuf::from("/m/Takes/one.wav"));
+        assert_eq!(first.2, std::path::PathBuf::from("/m/Takes/one.wav"));
+        assert_eq!(first.1, 0, "the first bay came back as something else");
         let second = app.take_sampler_load().expect("only one queued");
-        assert_eq!(second.1, std::path::PathBuf::from("/m/Takes/two.aiff"));
+        assert_eq!(second.2, std::path::PathBuf::from("/m/Takes/two.aiff"));
+        assert_eq!(
+            second.1, 2,
+            "the bay was thrown away, so the host would bind this into bay 0 \
+             and the sampler in bay 2 would play nothing"
+        );
         assert_ne!(first.0, second.0, "two seats collapsed into one lane");
         assert_eq!(app.take_sampler_load(), None, "a load came back twice");
+    }
+
+    /// **Pressing a file in the sampler's browser AUDITIONS it**, on the
+    /// drumpad explorer's own road — the owner's "there's no audition like
+    /// the drum media explorer has". The two panels share the drawing and
+    /// shared none of the behaviour, which is exactly the gap somebody meets
+    /// on the first click.
+    ///
+    /// Measured at the REQUEST, because that is where the two roads have to
+    /// be the same one: `PreviewFile` is what the host answers by decoding at
+    /// the engine's rate and handing the clip to the preview ring, and a
+    /// second road would be a second thing to keep in step.
+    #[test]
+    fn a_picked_sample_is_auditioned_on_the_drumpads_own_road() {
+        let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
+        app.apply_dialog_action(DialogAction::PickSample {
+            strip: 1,
+            slot: 0,
+            path: "/m/Takes/one.wav".to_owned(),
+        });
+        let mut asked = Vec::new();
+        while let Some(r) = app.take_recorder_request() {
+            asked.push(r);
+        }
+        assert!(
+            asked.iter().any(|r| matches!(
+                r,
+                recorder::RecorderRequest::PreviewFile(p)
+                    if p == std::path::Path::new("/m/Takes/one.wav")
+            )),
+            "the press did not audition: {asked:?}"
+        );
+        // And a file the sampler cannot play is not auditioned either — the
+        // refusal is the whole answer.
+        app.apply_dialog_action(DialogAction::PickSample {
+            strip: 1,
+            slot: 0,
+            path: "/m/part.mid".to_owned(),
+        });
+        let mut asked = Vec::new();
+        while let Some(r) = app.take_recorder_request() {
+            asked.push(r);
+        }
+        assert!(
+            !asked
+                .iter()
+                .any(|r| matches!(r, recorder::RecorderRequest::PreviewFile(_))),
+            "a MIDI part was auditioned: {asked:?}"
+        );
     }
 
     /// **A file the decoder cannot open is refused out loud**, wherever it
@@ -58843,7 +59011,7 @@ mod sampler_road_tests {
     /// folder nor a project's `media/` is findable by walking up from a
     /// home folder, so the browser names them.
     #[test]
-    fn the_browser_offers_takes_and_the_open_projects_media() {
+    fn the_browser_offers_home_and_the_open_projects_media_and_no_takes() {
         let root = std::env::temp_dir().join(format!("tangent-samp-roots-{}", std::process::id()));
         let takes = root.join("Takes");
         let song = root.join("Projects").join("song");
@@ -58860,18 +59028,27 @@ mod sampler_road_tests {
         let mut live = crate::faces::FaceLive::default();
         app.refresh_sampler_browser(&mut live);
         let words: Vec<&str> = live.samp_roots.iter().map(|(w, _)| w.as_str()).collect();
-        assert_eq!(words, ["HOME", "TAKES", "PROJECT"]);
-        assert_eq!(live.samp_roots[1].1, takes.to_string_lossy());
+        // **No TAKES.** The owner asked for that chip earlier in the same
+        // session and struck it out the moment he used it — "the takes
+        // section as a whole can just go" — so it is gone, not hidden.
+        assert_eq!(words, ["HOME", "PROJECT"]);
+        assert!(
+            !live.samp_roots.iter().any(|(_, p)| *p == takes.to_string_lossy()),
+            "the Takes folder is still a shortcut under another name"
+        );
         assert_eq!(
-            live.samp_roots[2].1,
+            live.samp_roots[1].1,
             song.join("media").to_string_lossy(),
             "the open project's media folder is not offered"
         );
-        // A fresh panel opens on the Takes folder: whoever has just recorded
-        // is overwhelmingly likely to want the thing they just recorded.
-        assert_eq!(live.samp_dir, takes.to_string_lossy());
+        // And a fresh panel no longer opens on it either: that was the other
+        // half of the takes road.
+        assert_ne!(live.samp_dir, takes.to_string_lossy());
         // Folders first, then audio only — the drumpad's own rules, through
-        // the one filter both explorers share.
+        // the one filter both explorers share. Asked of the Takes folder by
+        // standing in it, since nothing points there any more.
+        live.samp_dir = takes.to_string_lossy().into_owned();
+        app.refresh_sampler_browser(&mut live);
         let names: Vec<&str> = live.samp_entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["older", "one.wav"], "the listing took a text file");
 
@@ -58883,8 +59060,64 @@ mod sampler_road_tests {
         let (_ctx, mut app) = tests::headless_with(Caps::DESKTOP, settings);
         let mut live = crate::faces::FaceLive::default();
         app.refresh_sampler_browser(&mut live);
-        assert!(live.samp_roots[2].1.is_empty(), "a project chip with no project");
+        assert!(live.samp_roots[1].1.is_empty(), "a project chip with no project");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The DEF chip sets where the sampler's browser opens, and it is the
+    /// drumpad's own setting.**
+    ///
+    /// The owner's third fault with the panel — "no default button for the
+    /// home media explorer" — and it is the fault it sounds like: the
+    /// browser's folder lives in `FaceLive`, which does not outlive the
+    /// window, so a library five folders down had to be walked to again
+    /// every time a face opened. The drumpad has had a DEF chip since its
+    /// explorer shipped; the sampler's browser was lifted out of that panel
+    /// without one.
+    ///
+    /// ONE setting for both, `media_default_dir`. Two would be two things to
+    /// keep in step for one fact about a person's disk, and this asserts the
+    /// sharing rather than describing it: the drumpad's own home moves too.
+    #[test]
+    fn the_def_chip_sets_where_the_sampler_browser_opens() {
+        let root = std::env::temp_dir().join(format!("tangent-samp-def-{}", std::process::id()));
+        let library = root.join("Library").join("Pianos");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join("upright.wav"), b"x").unwrap();
+        let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
+
+        // Unset, HOME is the home directory and a fresh panel opens there.
+        let mut live = crate::faces::FaceLive::default();
+        app.refresh_sampler_browser(&mut live);
+        assert_eq!(live.samp_roots[0].0, "HOME");
+        assert_eq!(live.samp_roots[0].1, dirs_home().to_string_lossy());
+        assert_eq!(live.samp_dir, dirs_home().to_string_lossy());
+
+        // The chip, from the folder the browser is standing in.
+        app.apply_dialog_action(DialogAction::SetMediaDefault {
+            path: library.to_string_lossy().into_owned(),
+        });
+        assert_eq!(app.settings.media_default_dir, library.to_string_lossy());
+        assert_eq!(
+            app.media_home(),
+            library,
+            "the DEF chip did not reach the shared media home"
+        );
+
+        // A face opened after it lands there, which is the whole complaint.
+        let mut fresh = crate::faces::FaceLive::default();
+        app.refresh_sampler_browser(&mut fresh);
+        assert_eq!(fresh.samp_dir, library.to_string_lossy());
+        assert_eq!(fresh.samp_roots[0].1, library.to_string_lossy(), "HOME did not follow");
+        let names: Vec<&str> = fresh.samp_entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["upright.wav"]);
+
+        // A folder that has been deleted since falls back to home rather
+        // than opening on nothing — `media_home`'s own rule, inherited.
+        let _ = std::fs::remove_dir_all(&root);
+        let mut gone = crate::faces::FaceLive::default();
+        app.refresh_sampler_browser(&mut gone);
+        assert_eq!(gone.samp_dir, dirs_home().to_string_lossy());
     }
 
     /// **Saving a preset carries the SAMPLE across, not only the knobs.**

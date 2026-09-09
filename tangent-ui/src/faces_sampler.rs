@@ -911,11 +911,17 @@ fn row_ground(st: &FaceStyle) -> Color32 {
 ///
 /// **The pane is `drumpad_panel::draw_media_pane`**, the drumpad's own, and
 /// the listing is pushed by the app exactly as the IR browser's is: a face
-/// never opens a folder. What this adds over the drumpad's copy is the three
+/// never opens a folder. What this adds over the drumpad's copy is the
 /// SHORTCUTS, because the owner asked for Tangent's own recordings and not
 /// only for other people's exports — *"must be able to drag any item in or
 /// choose any midi or audio clip recorded in tangent as well"* — and the
-/// Takes folder and the project's `media/` are exactly where those live.
+/// project's `media/` is exactly where those live.
+///
+/// **A TAKES chip stood between them for one afternoon.** It was asked for
+/// and struck out in the same session — "the takes section as a whole can
+/// just go" — and it is gone rather than hidden: the row draws whatever the
+/// app pushes, so removing the root removed the chip, and the two that are
+/// left are wider for it.
 fn browser(
     ui: &mut egui::Ui,
     painter: &Painter,
@@ -924,11 +930,13 @@ fn browser(
     lay: &Layout,
 ) -> Option<FaceAction> {
     let mut out = None;
-    let cells = lay.shortcut_cells(live.samp_roots.len());
+    // The roots the app pushed, and then DEF — which is not a place but an
+    // act, so it is drawn here rather than pushed as a fourth root with a
+    // path that would walk somewhere on a press.
+    let cells = lay.shortcut_cells(live.samp_roots.len() + 1);
     let mut want: Option<String> = None;
-    for (cell, (word, path)) in cells.iter().zip(live.samp_roots.iter()) {
-        let lit = !path.is_empty() && *path == live.samp_dir;
-        let resp = ui.interact(*cell, ui.id().with(("samp-root", word.as_str())), Sense::click());
+    let chip = |ui: &mut egui::Ui, cell: Rect, id: &str, word: &str, lit: bool, hint: &str| {
+        let resp = ui.interact(cell, ui.id().with(("samp-chip", id)), Sense::click());
         let ground = if lit {
             st.s.ink
         } else if resp.hovered() {
@@ -936,8 +944,8 @@ fn browser(
         } else {
             st.s.raised
         };
-        painter.rect_filled(*cell, 3.0, ground);
-        painter.rect_stroke(*cell, 3.0, Stroke::new(1.0_f32, st.s.edge), StrokeKind::Inside);
+        painter.rect_filled(cell, 3.0, ground);
+        painter.rect_stroke(cell, 3.0, Stroke::new(1.0_f32, st.s.edge), StrokeKind::Inside);
         painter.text(
             cell.center(),
             Align2::CENTER_CENTER,
@@ -953,13 +961,41 @@ fn browser(
             // surface, and this surface just changed.
             if lit { st.s.bg } else { face::quiet_ink(st, ground) },
         );
-        resp.clone().on_hover_text(if path.is_empty() {
-            "nothing there yet"
-        } else {
-            path.as_str()
-        });
-        if resp.clicked() && !path.is_empty() {
+        resp.clone().on_hover_text(hint.to_owned());
+        resp.clicked()
+    };
+    for (cell, (word, path)) in cells.iter().zip(live.samp_roots.iter()) {
+        let lit = !path.is_empty() && *path == live.samp_dir;
+        let hint = if path.is_empty() { "nothing there yet" } else { path.as_str() };
+        if chip(ui, *cell, word, word, lit, hint) && !path.is_empty() {
             want = Some(path.clone());
+        }
+    }
+    // **DEF: make the folder you are standing in the one HOME opens on.**
+    //
+    // The drumpad's chip, word for word, for the explorer this panel shares
+    // with it. The owner reported its absence as the panel's third fault —
+    // "no default button for the home media explorer" — and it is the fault
+    // it sounds like: a library five folders down had to be walked to from
+    // scratch every time a face opened, because a face's browser state does
+    // not outlive the window.
+    //
+    // Lit while the open folder already IS home, which is the drumpad's
+    // `def_lit` exactly. Nothing extra is pushed for it: HOME's own root is
+    // that folder, so the chip reads the answer off the row beside it.
+    if let Some(cell) = cells.last() {
+        let home = live.samp_roots.first().map(|(_, p)| p.as_str()).unwrap_or_default();
+        let lit = !home.is_empty() && home == live.samp_dir;
+        let hint = if lit {
+            "HOME opens here".to_owned()
+        } else {
+            format!("open HOME here from now on (now {home})")
+        };
+        if chip(ui, *cell, "def", "DEF", lit, &hint) && !live.samp_dir.is_empty() {
+            face::keep(
+                &mut out,
+                Some(FaceAction::SetMediaDefault { path: live.samp_dir.clone() }),
+            );
         }
     }
 
@@ -1136,10 +1172,9 @@ mod tests_support {
                 missing: false,
             };
         }
-        live.samp_dir = "/m/Takes".to_owned();
+        live.samp_dir = "/m/Library/Kicks".to_owned();
         live.samp_roots = vec![
-            ("HOME".to_owned(), "/home".to_owned()),
-            ("TAKES".to_owned(), "/m/Takes".to_owned()),
+            ("HOME".to_owned(), "/home/Samples".to_owned()),
             ("PROJECT".to_owned(), "/p/media".to_owned()),
         ];
         live.samp_entries = (0..40)
@@ -1463,12 +1498,34 @@ mod tests {
             }
             assert!(answered, "no row answered for parameter {id}");
         }
-        // A shortcut chip walks the browser.
+        // A shortcut chip walks the browser. Asked with the number of chips
+        // the FIXTURE carries: the row is drawn from what the app pushed, so
+        // a hard-coded three would go on hit-testing a cell nothing draws.
         let mut live = a_face(true);
         let _ = draw_once(&ctx, &mut live, &st, Vec::new());
-        let chip = placed(&ctx).lay.shortcut_cells(3)[0];
+        let n = live.samp_roots.len();
+        let chip = placed(&ctx).lay.shortcut_cells(n)[0];
         let _ = click(&ctx, &mut live, &st, chip.center());
-        assert_eq!(live.samp_dir, "/home", "the HOME chip did not walk");
+        assert_eq!(live.samp_dir, "/home/Samples", "the HOME chip did not walk");
+        // **And the DEF chip asks for the folder it is standing in.** It is
+        // the last cell of the row and it is not a root, so the sweep above
+        // cannot reach it — and a chip that draws, hit-tests and does
+        // nothing is this codebase's most-shipped defect.
+        let mut live = a_face(true);
+        let _ = draw_once(&ctx, &mut live, &st, Vec::new());
+        let cells = placed(&ctx).lay.shortcut_cells(live.samp_roots.len() + 1);
+        let asked = click(&ctx, &mut live, &st, cells.last().expect("a DEF cell").center());
+        assert!(
+            asked.iter().any(|a| matches!(
+                a,
+                FaceAction::SetMediaDefault { path } if *path == live.samp_dir
+            )),
+            "the DEF chip asked for nothing"
+        );
+        // And it walks nowhere: DEF says where HOME goes, it does not go
+        // there itself.
+        assert_eq!(live.samp_dir, "/m/Library/Kicks", "the DEF chip moved the browser");
+
         // A FILE row asks for the sample under it.
         let mut live = a_face(true);
         live.samp_scroll = 1; // entry 1 is a file; entry 0 is a folder
@@ -1486,7 +1543,7 @@ mod tests {
         let _ = draw_once(&ctx, &mut live, &st, Vec::new());
         let ml = crate::drumpad_panel::MediaLayout::new(placed(&ctx).lay.browser);
         let _ = click(&ctx, &mut live, &st, ml.up.center());
-        assert_eq!(live.samp_dir, "/m", "the `..` chip did not walk out");
+        assert_eq!(live.samp_dir, "/m/Library", "the `..` chip did not walk out");
     }
 
     /// **The Fine knob prints the Hz it moves**, beside the cents the host

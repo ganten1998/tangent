@@ -4708,13 +4708,35 @@ impl DesktopApp {
         // is what a project writes down. `bind_insert_ir` further down this
         // file is the same three writes for an impulse, and this road was
         // built to match it.
-        while let Some((lane, path)) = self.app.take_sampler_load() {
-            self.bind_insert_sample(
+        while let Some((lane, bay, path)) = self.app.take_sampler_load() {
+            // **The bay the face was opened on, not bay 0.** It used to be a
+            // literal zero here and a discarded `_bay` at the other end, so a
+            // sampler anywhere but the first bay — a folder wears six — took
+            // a file from its browser and went on playing nothing.
+            //
+            // **And a refusal is SAID.** All three of the binder's guards
+            // answer `false` and none of them can speak; this arm is the only
+            // place that knows a person just pressed a file and expects a
+            // sound. Without it "the bay is not a sampler any more" and "the
+            // audio device is gone" both read as a browser that does nothing.
+            if !self.bind_insert_sample(
                 lane,
-                0,
+                bay,
                 &path.to_string_lossy(),
                 crate::instrument::SAMPLER_ROOT_KEY,
-            );
+            ) {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                self.app.notify(
+                    Kind::Error,
+                    format!(
+                        "{name} could not be loaded: that bay is not holding a \
+                         sampler any more."
+                    ),
+                );
+            }
         }
         if std::mem::take(&mut self.recorder.sampler_retry) {
             self.sampler_owed = true;
@@ -5843,12 +5865,38 @@ impl DesktopApp {
 
     /// **Point a sampler bay at a file**, and reload the bay so it is heard.
     ///
-    /// `bind_insert_ir`'s twin, one screen down, and the same three writes:
-    /// the extras into the bay's state sidecar, the sidecar to disk, and the
-    /// reload sentinel that makes the reconcile build the bay again. The
-    /// third is what carries the change into the engine — `reload_sampler`
-    /// reads the file out of the BAY, so a state blob that has not been
-    /// re-read is a bay still playing yesterday's sample.
+    /// `bind_insert_ir`'s twin, one screen down, and it makes the same writes
+    /// with one more in front of them: the bay's extras into the ENGINE's own
+    /// ledger, then the state sidecar to disk, then the reload sentinel that
+    /// makes the reconcile build the bay again.
+    ///
+    /// **THE LEDGER IS WRITTEN HERE, and that is what makes the bay sound.**
+    ///
+    /// The first version of this wrote the sidecar and the reload sentinel
+    /// and stopped, on the argument that the reload would carry the file into
+    /// the engine's own record of the bay. It does — eventually — and
+    /// "eventually" was the sampler's mute. [`reload_sampler`] reads the file
+    /// out of `Engine::builtin_extra`, which is filled by `load_insert` and
+    /// by nothing else, so until the bay had been torn down and built again
+    /// the host's answer to "what file does lane 3 want" was *none*. And that
+    /// rebuild is not this frame's: the walk that ANNOUNCES the next bay to
+    /// load runs earlier in `after_frame` than the drain that marks one, so
+    /// the frame that binds a sample counts zero bays outstanding, asks for
+    /// no repaint, and owes itself nothing. The file reached the engine when
+    /// something unrelated happened to wake the window, and not before.
+    ///
+    /// So the ledger is written first and directly, and the debt is raised on
+    /// the spot: `sampler_owed` is what [`run_warm`] answers, a file at a
+    /// time, in front of the decode meter. The sidecar and the reload stay
+    /// exactly as they were — the sidecar because a project's bays are
+    /// restored from it, the reload because a fresh instance is the honest
+    /// answer to "the sample under your fingers just changed" — but neither
+    /// is on the road to the sound any more.
+    ///
+    /// `slot` is the bay the face was opened on. It used to be a literal `0`
+    /// at the call site with the real bay computed and thrown away one crate
+    /// over, which made every one of the three refusals below reachable for a
+    /// perfectly good sampler seated one bay down.
     ///
     /// An empty `path` empties the bay. Unlike the IR's road there is no
     /// separate clearing function, because there is no reason to refuse one:
@@ -5862,7 +5910,11 @@ impl DesktopApp {
     /// unity travels with it; out of the wire's range it is the middle C
     /// `SAMPLER_ROOT_KEY` names, which is what an unset one has always meant.
     ///
-    /// Called once a frame from `per_frame`, draining the app's
+    /// `false` when the bay cannot take it — no engine, an empty bay, or a
+    /// bay holding something that is not a sampler. The caller SAYS so; see
+    /// the drain in `after_frame`.
+    ///
+    /// Called once a frame from `after_frame`, draining the app's
     /// `take_sampler_load` queue — the road a face's chosen file travels.
     #[cfg(feature = "recorder")]
     fn bind_insert_sample(&mut self, lane: usize, slot: usize, path: &str, root_key: u8) -> bool {
@@ -5891,6 +5943,23 @@ impl DesktopApp {
         extra.push(("root_key".to_owned(), root.to_string()));
         let blob = crate::builtin_fx::state_text(spec, values, &extra).into_bytes();
         write_insert_state(lane, slot, spec.path, &blob);
+        // **The engine's own record, now.** See this function's head: this
+        // line is the difference between a bay that plays the file and one
+        // that plays silence until something else wakes the window.
+        if let Some(e) = self.recorder.engine.as_mut() {
+            e.set_builtin_extra(lane, slot, extra);
+        }
+        // And the debt that carries it: `run_warm` decodes the file and
+        // `reload_sampler` hands it to the audio thread, both a frame from
+        // here, both in front of the meter.
+        self.sampler_owed = true;
+        // The face draws the name and the waveform off what the host pushes,
+        // and the push happens where a bay LOADS. Nothing has loaded here, so
+        // the panel would go on printing the previous file's name until the
+        // reload landed.
+        if let Some(e) = self.recorder.engine.as_ref() {
+            push_builtin_faces(&mut self.app, e, lane);
+        }
         let bays = tangent_ui::recorder::INSERTS;
         if let Some(cell) = self.recorder.inserts_loaded.get_mut(lane * bays + slot) {
             *cell = Some("\u{1f}reload".to_owned());
@@ -10568,6 +10637,22 @@ impl DesktopApp {
         let Some(e) = self.recorder.engine.as_ref() else {
             return Vec::new();
         };
+        Self::sampler_bays_of(e)
+    }
+
+    /// The walk itself, over an engine and nothing else.
+    ///
+    /// Split out so it can be DRIVEN. This is the reader on the far side of
+    /// the sampler's mute — a bay is bound by writing the file into the
+    /// engine's ledger and this is what reads it back — and while it was a
+    /// method on the app there was no headless way to ask whether a bound
+    /// bay is a bay this can see. `a_bound_bay_is_a_bay_the_host_can_hear`
+    /// asks exactly that, and it is the test whose absence let the sampler
+    /// ship silent.
+    #[cfg(feature = "recorder")]
+    fn sampler_bays_of(
+        e: &crate::instrument::Engine,
+    ) -> Vec<(usize, Option<std::path::PathBuf>, u8)> {
         let bays = tangent_ui::recorder::INSERTS;
         let mut out = Vec::new();
         for lane in 0..tangent_ui::recorder::CHANNELS {
@@ -19972,6 +20057,119 @@ mod tests {
             "the refusal sweep has to keep a sampler's refusal while a lane \
              still names the file"
         );
+    }
+
+    /// **A bay bound to a file is a bay the host can hear — from ANY bay.**
+    ///
+    /// The test the sampler shipped without, and the reason it shipped mute.
+    /// Every test either side of this one held one link: the kernel plays
+    /// what it is handed, the ring carries a decoded file to the right lane,
+    /// the engine seats the unit as a voice. Not one of them walked the
+    /// distance between "a person pressed a file in the browser" and "the
+    /// audio thread has that file", which is where both faults lived:
+    ///
+    /// 1. **The bay was thrown away.** `seat_bay` worked one out, the arm
+    ///    that queued the load discarded it, and the host bound every sample
+    ///    into bay 0 — so a sampler in bay 1 or 2 (or in any of the six a
+    ///    folder wears) refused the file without a word. This seats it in
+    ///    **bay 1** for exactly that reason.
+    /// 2. **The engine's own record was written by the RELOAD alone.** The
+    ///    walk below reads `builtin_extra`, and that is filled by
+    ///    `load_insert` and nothing else; the binder wrote a sidecar and a
+    ///    reload sentinel and left. See `bind_insert_sample`, which writes
+    ///    the ledger now.
+    ///
+    /// Driven through `Engine` and `sampler_bays_of` — the two ends the
+    /// binder joins — because a `DesktopApp` cannot be built without a
+    /// window, and a test that could only be written with one is a test that
+    /// does not get written.
+    #[test]
+    fn a_bound_bay_is_a_bay_the_host_can_hear() {
+        use crate::instrument::{ClipNote, Engine, PlacedMidi, SamplerSample};
+        use tangent_record::audio::Timebase;
+        use std::sync::Arc;
+        const LANE: usize = 3;
+        // **Bay ONE.** Bay 0 is the bay the broken road happened to work in.
+        const BAY: usize = 1;
+        let file = std::path::PathBuf::from("/samples/piano.wav");
+
+        let mut e = Engine::offline(44_100, Timebase::new()).expect("offline");
+        e.load_insert(LANE, BAY, Some(std::path::Path::new(crate::builtin_fx::SAMPLER_PATH)), None)
+            .expect("the sampler must load")
+            .expect("a load reports what it seated");
+        assert!(
+            DesktopApp::sampler_bays_of(&e)
+                .iter()
+                .any(|(lane, path, _)| *lane == LANE && path.is_none()),
+            "a seated bay with nothing in it has to be REPORTED, or emptying \
+             one would leave its old samples playing"
+        );
+
+        // What `bind_insert_sample` writes, in its own order and by its own
+        // symbols — the ledger first, which is the line that was missing.
+        let (spec, values) = e.builtin_insert(LANE, BAY).expect("the bay is a built-in");
+        let extra = vec![
+            ("sample_path".to_owned(), file.to_string_lossy().into_owned()),
+            ("sample_name".to_owned(), "piano.wav".to_owned()),
+            ("root_key".to_owned(), crate::instrument::SAMPLER_ROOT_KEY.to_string()),
+        ];
+        // The sidecar carries the same text; written here only to prove the
+        // two spellings agree, since a symbol `state_text` drops is a symbol
+        // the reader must never have seen.
+        let blob = crate::builtin_fx::state_text(spec, values, &extra);
+        for symbol in ["sample_path", "sample_name", "root_key"] {
+            assert!(blob.contains(&format!("{symbol}=")), "{symbol} was not persisted");
+        }
+        assert!(e.set_builtin_extra(LANE, BAY, extra), "the engine refused the bind");
+
+        // **The host can now answer "what file does this lane want".** This
+        // is the assertion that fails on the code that shipped.
+        let bays = DesktopApp::sampler_bays_of(&e);
+        assert_eq!(
+            bays.iter()
+                .find(|(lane, ..)| *lane == LANE)
+                .map(|(_, path, root)| (path.clone(), *root)),
+            Some((Some(file.clone()), crate::instrument::SAMPLER_ROOT_KEY)),
+            "the bound file never reached the host's own walk: {bays:?}"
+        );
+
+        // And the rest of the road: decode (stood in for here), hand over,
+        // play a note, listen. Nothing about the sound is taken on trust.
+        let sample = SamplerSample {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: vec![0.6; 44_100 * 2],
+                rate: 44_100,
+                source: file.clone(),
+            }),
+            name: "piano.wav".to_owned(),
+            source: file,
+            root_key: crate::instrument::SAMPLER_ROOT_KEY,
+        };
+        assert!(e.set_sampler_sample(LANE, Some(sample)), "the engine refused the sample");
+        e.set_channel_gain(LANE, 0.5);
+        e.set_master_gain(1.0);
+        e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
+            strip: LANE,
+            start: 0,
+            len: 88_200,
+            notes: Arc::new(vec![ClipNote {
+                at: 0,
+                dur: 44_100,
+                key: crate::instrument::SAMPLER_ROOT_KEY,
+                vel: 110,
+            }]),
+        }]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 1024 * 2];
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+        }
+        assert!(peak > 0.005, "a bound sampler in bay {BAY} made no sound: {peak}");
     }
 
     /// **The sampler's file is read out of the BAY, and one bay per lane.**
