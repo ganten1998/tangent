@@ -1,4 +1,4 @@
-//! **Three AppKit facts winit does not surface, and one hook it does not
+//! **Three AppKit facts winit does not surface, and two hooks it does not
 //! install.**
 //!
 //! The app's layout is aspect-locked by construction: every band's height is a
@@ -70,6 +70,30 @@
 //! window to be a child *of*". This module is handed the main window every
 //! frame, so it reaches both from the other side — `NSApp.windows` is the one
 //! list that has all of them on it.
+//!
+//! # The second hook: Cmd+Q does not come through the window at all
+//!
+//! **`applicationShouldTerminate:`** is the only place this process can be
+//! standing when macOS decides to end it.
+//!
+//! The app hardens its exit: the last statement of `main` is `libc::_exit(0)`,
+//! because a normal `exit()` runs every loaded VST3's static destructors and
+//! Kontakt 8's Qt teardown segfaults in `~QApplication` -> `qAccessibleCleanup`
+//! — a crash coreaudiod cannot tell from a force-kill, which wedges audio on
+//! the whole machine. That hardening is only reachable when `run_native`
+//! RETURNS, and Cmd+Q never lets it: winit's default menu gives the Quit item
+//! the `terminate:` action, `-[NSApplication terminate:]` calls `exit()`
+//! itself, and the run loop is torn down from underneath `main` rather than
+//! handed back to it.
+//!
+//! winit's `WinitApplicationDelegate` implements `applicationDidFinishLaunching:`
+//! and `applicationWillTerminate:` and does not implement
+//! `applicationShouldTerminate:` — so, exactly as with the resize hook above,
+//! the selector can be ADDED to its class rather than swizzled onto anything.
+//! It answers `NSTerminateCancel` unconditionally and asks the app for a
+//! frame, and that frame sends the same `ViewportCommand::Close` the red
+//! button sends. Every road out of the app is then one road: the prompt about
+//! unsaved work, `on_exit`, `run_native` returning, `_exit(0)`.
 //!
 //! # Safety
 //!
@@ -1634,4 +1658,229 @@ pub fn hold_latency_critical() {
         "TANGENT_ACTIVITY=1: told macOS this process is latency-critical \
          (App Nap and timer coalescing off; idle sleep still allowed)"
     );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The other road out of the app
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A termination AppKit has asked for and the frame has not yet turned into
+/// an ordinary window close.
+///
+/// An atomic rather than a `Cell`, because the two halves are written by
+/// AppKit and read by the frame; both are the main thread today and a flag
+/// that went missing if that ever stopped being true would go missing in the
+/// direction of quitting without asking.
+static TERMINATION_ASKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The context to wake when it has been.
+///
+/// **Without this the fix does nothing on an idle window.** Cmd+Q is eaten by
+/// `-[NSMenu performKeyEquivalent:]` before winit sees a key at all, so no
+/// window event arrives, no repaint is requested, and an app resting between
+/// frames (see `host_frame_due`) would sit on the flag until the owner moved
+/// the mouse. The hook asks for the frame that drains it.
+static WAKE: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
+thread_local! {
+    /// Whether the class patch has been attempted, and what it answered.
+    static QUIT_HOOKED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// **Has something asked this process to terminate?** Taken once, like
+/// `TangentApp::take_quit_now`.
+///
+/// Installs the hook on the first call — which is the first frame, and the
+/// earliest reachable moment: winit's application delegate does not exist
+/// until `EventLoop::new`, which is inside `run_native`.
+pub fn quit_requested(ctx: &egui::Context) -> bool {
+    install_quit_hook(ctx);
+    TERMINATION_ASKED.swap(false, Ordering::AcqRel)
+}
+
+/// Add `applicationShouldTerminate:` to winit's application delegate, once.
+///
+/// # Why this hook and not a swizzle of `-[NSApplication terminate:]`
+///
+/// Both are reachable and both would catch Cmd+Q. `applicationShouldTerminate:`
+/// wins on three counts:
+///
+/// * It is the extension point AppKit *documents* for exactly this question,
+///   and the only one with a documented way to answer "no"
+///   (`NSTerminateCancel`). `terminate:` is documented as never returning, so
+///   a swizzle of it has to not-call-super and leave AppKit's own teardown
+///   bookkeeping in a state nothing describes.
+/// * winit's `WinitApplicationDelegate` implements `applicationDidFinishLaunching:`
+///   and `applicationWillTerminate:` and nothing else, so the selector can be
+///   ADDED to the class — no swizzling, nothing displaced. This is the same
+///   move, for the same reason, as `install` above; read its comment.
+/// * `terminate:` is a method on `NSApplication`, a class this process shares
+///   with every plugin bundle loaded into it. The delegate class is ours to
+///   patch in a way a system class is not.
+///
+/// It is also the wider net: the Quit menu item, Cmd+Q, the Dock's Quit, an
+/// AppleScript `quit`, and Log Out / Restart / Shut Down all arrive here.
+/// Answering `TerminateCancel` to a log-out is the same thing every document
+/// app on the machine does when it has a question to ask first — macOS says
+/// "Tangent cancelled logout" and the owner answers the prompt.
+///
+/// Answers whether the hook is live. A `false` here means Cmd+Q still takes
+/// the road through `exit()`, which is worth saying out loud.
+fn install_quit_hook(ctx: &egui::Context) -> bool {
+    if let Some(done) = QUIT_HOOKED.with(std::cell::Cell::get) {
+        return done;
+    }
+    // Stored before the patch, so the callback can never fire against an
+    // empty slot.
+    let _ = WAKE.set(ctx.clone());
+    let ok = (|| {
+        let mtm = MainThreadMarker::new()?;
+        let app = NSApplication::sharedApplication(mtm);
+        let delegate = app.delegate()?;
+        let raw: *const AnyObject = objc2::rc::Retained::as_ptr(&delegate).cast();
+        // SAFETY: a live delegate object; `class` reads its isa pointer.
+        let cls: &AnyClass = unsafe { (*raw).class() };
+        // **Refuse anything that is not the class we studied.** A future winit
+        // that renames its delegate, or answers this selector itself, must not
+        // be patched blind — its answer would be the one that counted, and
+        // ours would be silently dead.
+        if cls.name().to_str().ok()? != "WinitApplicationDelegate" {
+            return None;
+        }
+        // SAFETY: `should_terminate` has exactly the signature the encoding
+        // describes — `NSUInteger` return, `id` self, `SEL` _cmd, `id` sender
+        // — and `Imp` is `extern "C-unwind"`.
+        let added = unsafe {
+            objc2::ffi::class_addMethod(
+                (cls as *const AnyClass).cast_mut().cast(),
+                sel!(applicationShouldTerminate:),
+                std::mem::transmute::<
+                    unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
+                    unsafe extern "C-unwind" fn(),
+                >(should_terminate),
+                c"Q@:@".as_ptr(),
+            )
+        };
+        if !added.as_bool() {
+            return None;
+        }
+        // AppKit asks a delegate once, when it is SET, which of these methods
+        // it responds to, and winit set this one long before the class grew
+        // the selector. Re-setting the same object rebuilds that cache.
+        // Harmless: winit's `EventLoop` holds the strong reference and the
+        // property is weak.
+        app.setDelegate(Some(&delegate));
+        Some(())
+    })()
+    .is_some();
+    QUIT_HOOKED.with(|h| h.set(Some(ok)));
+    if !ok {
+        eprintln!(
+            "could not hook applicationShouldTerminate: — Cmd+Q will not ask \
+             about unsaved work and will quit through exit(), which is the \
+             road a loaded plugin's static destructors can crash on"
+        );
+    }
+    ok
+}
+
+/// **The hook. Always says no, and asks for a frame instead.**
+///
+/// Saying no is the entire point: `NSTerminateNow` hands the process straight
+/// back to `-[NSApplication terminate:]`, which calls `exit()` — and `exit()`
+/// is the detonator this app already went to the trouble of avoiding once.
+/// See the block at the end of `main`.
+///
+/// # Safety
+///
+/// Runs on the main thread from AppKit's menu dispatch. A Rust panic unwinding
+/// across the Objective-C boundary is undefined behaviour, so the one call
+/// here that could panic — egui's context lock — is caught. The flag is set
+/// before it either way: waking the app is an optimisation on top of the
+/// answer, never the answer itself.
+unsafe extern "C-unwind" fn should_terminate(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    _sender: *mut AnyObject,
+) -> usize {
+    TERMINATION_ASKED.store(true, Ordering::Release);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(ctx) = WAKE.get() {
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
+    }));
+    objc2_app_kit::NSApplicationTerminateReply::TerminateCancel.0
+}
+
+#[cfg(test)]
+mod quit_tests {
+    use super::{should_terminate, Ordering, TERMINATION_ASKED};
+    use objc2::runtime::{AnyClass, AnyObject, NSObject};
+    use objc2::{msg_send, sel, ClassType};
+
+    /// **The answer is always "no", and the request is never dropped.**
+    ///
+    /// A real dispatch and not a direct call: the whole patch rests on
+    /// `class_addMethod` accepting this exact function pointer under this
+    /// exact type encoding and the Objective-C runtime then calling it with
+    /// the ABI the encoding promised. So the test builds a throwaway class,
+    /// patches it the way `install_quit_hook` patches winit's delegate, and
+    /// sends it the message the menu sends — the one thing about this hook
+    /// that can be checked without an `NSApplication` and a Kontakt.
+    ///
+    /// `NSTerminateNow` here would be the whole fault back: it hands the
+    /// process to `-[NSApplication terminate:]`, which calls `exit()`, which
+    /// runs the loaded plugins' static destructors.
+    #[test]
+    fn a_termination_request_is_refused_and_recorded() {
+        // A name per process, because a class pair cannot be registered twice
+        // and the test binary may be run more than once against one machine.
+        let name = std::ffi::CString::new(format!("TangentQuitProbe{}", std::process::id()))
+            .expect("a class name");
+        // SAFETY: a fresh name under NSObject, registered before any use, and
+        // never disposed — the runtime owns it for the life of the process.
+        let cls = unsafe {
+            objc2::ffi::objc_allocateClassPair(NSObject::class(), name.as_ptr(), 0)
+        };
+        assert!(!cls.is_null(), "could not allocate the probe class");
+        // The same transmute and the same encoding as `install_quit_hook`.
+        // If either is wrong, this is where it shows.
+        let added = unsafe {
+            objc2::ffi::class_addMethod(
+                cls,
+                sel!(applicationShouldTerminate:),
+                std::mem::transmute::<
+                    unsafe extern "C-unwind" fn(*mut AnyObject, objc2::runtime::Sel, *mut AnyObject) -> usize,
+                    unsafe extern "C-unwind" fn(),
+                >(should_terminate),
+                c"Q@:@".as_ptr(),
+            )
+        };
+        assert!(added.as_bool(), "class_addMethod refused the hook");
+        unsafe { objc2::ffi::objc_registerClassPair(cls) };
+
+        // Nothing owed before the message.
+        TERMINATION_ASKED.store(false, Ordering::Release);
+        // SAFETY: the class is registered; `new` on an NSObject subclass with
+        // no ivars, then one message it now answers.
+        let reply: usize = unsafe {
+            let cls: &AnyClass = &*cls;
+            let obj: *mut AnyObject = msg_send![cls, new];
+            let reply: usize =
+                msg_send![&*obj, applicationShouldTerminate: std::ptr::null_mut::<AnyObject>()];
+            let () = msg_send![&*obj, release];
+            reply
+        };
+        assert_eq!(
+            reply,
+            objc2_app_kit::NSApplicationTerminateReply::TerminateCancel.0,
+            "the hook let AppKit terminate the process, which is the crash"
+        );
+        assert!(
+            TERMINATION_ASKED.swap(false, Ordering::AcqRel),
+            "the hook refused the quit and then forgot it was asked, so Cmd+Q \
+             would do nothing at all"
+        );
+    }
 }
