@@ -1306,12 +1306,19 @@ pub struct TangentApp {
     /// caller — the host, which speaks lanes — and the face, which is opened
     /// on a seat.
     sampler_info: HashMap<usize, crate::ports::SamplerInfo>,
-    /// **Samples chosen but not yet handed over**, oldest first. The face
-    /// raises a path, this holds it, and the host drains it with
-    /// `take_sampler_load`. A queue and not a slot: two windows can be open
-    /// on two samplers, and dropping one of two loads is a load that
-    /// silently did not happen.
-    sampler_load: std::collections::VecDeque<(usize, std::path::PathBuf)>,
+    /// **Samples chosen but not yet handed over**, oldest first: the SEAT,
+    /// the BAY, and the file. The face raises a path, this holds it, and the
+    /// host drains it with `take_sampler_load`. A queue and not a slot: two
+    /// windows can be open on two samplers, and dropping one of two loads is
+    /// a load that silently did not happen.
+    ///
+    /// **The bay travels with the seat, and it did not use to.** This carried
+    /// `(lane, path)` alone; `seat_bay` had worked the bay out and the arm
+    /// that queued the load threw it away, so the host bound every sample
+    /// into bay 0 — and `bind_insert_sample` answers `false` for a bay that
+    /// is not a sampler, silently. A sampler in bay 1 or 2, or in any of the
+    /// six a folder wears, took a file from the browser and never played it.
+    sampler_load: std::collections::VecDeque<(usize, usize, std::path::PathBuf)>,
     /// The generation the sampler's browser listing was read at, bumped
     /// whenever anything could have changed the folder on screen — the
     /// `ir_scan_gen` bargain.
@@ -22959,17 +22966,18 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             .unwrap_or(crate::ports::SamplerInfo::NONE)
     }
 
-    /// **The next sample a face asked to load**, oldest first, taken off the
-    /// queue as it is read. `None` when nothing is waiting.
-    pub fn take_sampler_load(&mut self) -> Option<(usize, std::path::PathBuf)> {
+    /// **The next sample a face asked to load** — seat, bay and file, oldest
+    /// first, taken off the queue as it is read. `None` when nothing is
+    /// waiting.
+    pub fn take_sampler_load(&mut self) -> Option<(usize, usize, std::path::PathBuf)> {
         self.sampler_load.pop_front()
     }
 
     /// Put a load on the queue. The one door: the browser row, the drop and
     /// the OS file drag all arrive here, because they differ only in how the
     /// path was found.
-    fn queue_sampler_load(&mut self, lane: usize, path: std::path::PathBuf) {
-        self.sampler_load.push_back((lane, path));
+    fn queue_sampler_load(&mut self, lane: usize, bay: usize, path: std::path::PathBuf) {
+        self.sampler_load.push_back((lane, bay, path));
         // The file may have landed in the folder the browser is standing in
         // — a copy into the project's `media/`, say — so the listing is
         // stale from here.
@@ -29035,14 +29043,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // message anywhere — the drumpad's own `.tgkit` fault, which is
             // exactly how that lesson was learned.
             DialogAction::PickSample { strip, slot, path } => {
-                let (seat, _bay) = recorder::seat_bay(strip, slot);
+                let (seat, bay) = recorder::seat_bay(strip, slot);
                 let file = std::path::PathBuf::from(&path);
                 let name = file
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.clone());
                 if crate::drumpad_panel::is_audio_file(&name) {
-                    self.queue_sampler_load(seat, file);
+                    self.queue_sampler_load(seat, bay, file);
                 } else {
                     self.notify(
                         crate::notify::Kind::Error,
@@ -58705,9 +58713,18 @@ mod sampler_road_tests {
         assert_eq!(app.said().len(), 1, "the refusal repeated itself");
     }
 
-    /// **A load is taken once, and in the order it was asked for.** Two
-    /// windows can be open on two samplers, and a queue that dropped one of
-    /// two loads is a load that silently did not happen.
+    /// **A load is taken once, in the order it was asked for, and it names
+    /// the BAY it came from.** Two windows can be open on two samplers, and
+    /// a queue that dropped one of two loads is a load that silently did not
+    /// happen.
+    ///
+    /// **The bay is what made the sampler mute for anybody who did not seat
+    /// it first.** `seat_bay` has always worked one out and this arm threw it
+    /// away, so every chosen file was bound into bay 0 — and the host's
+    /// binder answers `false`, without a word, for a bay that is not holding
+    /// a sampler. A sampler in bay 1 or 2 (or in any of the six a folder
+    /// wears) took a file from its browser and went on playing nothing. So
+    /// the third slot of the queue is a contract, not a convenience.
     #[test]
     fn the_sampler_takes_its_loads_in_order_and_only_once() {
         let (_ctx, mut app) = tests::headless(Caps::DESKTOP);
@@ -58719,13 +58736,19 @@ mod sampler_road_tests {
         });
         app.apply_dialog_action(DialogAction::PickSample {
             strip: 1,
-            slot: 0,
+            slot: 2,
             path: "/m/Takes/two.aiff".to_owned(),
         });
         let first = app.take_sampler_load().expect("nothing queued");
-        assert_eq!(first.1, std::path::PathBuf::from("/m/Takes/one.wav"));
+        assert_eq!(first.2, std::path::PathBuf::from("/m/Takes/one.wav"));
+        assert_eq!(first.1, 0, "the first bay came back as something else");
         let second = app.take_sampler_load().expect("only one queued");
-        assert_eq!(second.1, std::path::PathBuf::from("/m/Takes/two.aiff"));
+        assert_eq!(second.2, std::path::PathBuf::from("/m/Takes/two.aiff"));
+        assert_eq!(
+            second.1, 2,
+            "the bay was thrown away, so the host would bind this into bay 0 \
+             and the sampler in bay 2 would play nothing"
+        );
         assert_ne!(first.0, second.0, "two seats collapsed into one lane");
         assert_eq!(app.take_sampler_load(), None, "a load came back twice");
     }
