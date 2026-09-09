@@ -37,6 +37,16 @@ pub struct LaneView<'a> {
     pub name: &'a str,
     /// What the input chip says: "IN 3", "MIDI: ALL", or "" for none.
     pub input: String,
+    /// **The same fact in as few characters as it can be told in**, for the
+    /// button beside the name.
+    ///
+    /// The selector used to have a band of the column to itself and could
+    /// carry a sentence; every lane wears six bays now and the second rack
+    /// took that band, so the button has a third of the width it had. "MIDI:
+    /// Scarlett 2i2" in twenty-six points is "MIDI:..." — a word nobody can
+    /// read is not a button. The long form stays: the mixer strip still
+    /// prints it, and it is what this header's screen-reader node says.
+    pub input_short: String,
     /// Index into [`STRIP_COLORS`]. Zero is the desk's own wood.
     pub color: usize,
     /// What feeds the lane live: keys, a microphone, or nothing. A lane with
@@ -1707,13 +1717,73 @@ impl Layout {
                 )
             }
         };
-        // **Two dials now — volume, then send — a shade smaller than the
-        // one was**, each with a readout under it: the number is the other
-        // half of a dial this size.
-        let kd = (h * 0.46).clamp(11.0, 18.0);
-        // The dial standard: the VALUE reads above the knob, the LABEL
-        // under it — so the dials drop to make room for the numbers.
-        let dial_top = r.top() + h * 0.26;
+        // ── **The three horizontal bands, decided before anything sits in
+        // them.** ────────────────────────────────────────────────────────
+        //
+        // They used to be worked out at the bottom of this function, after
+        // the dials, because only the name column used them. Both columns
+        // use them now — the racks stack in one and the dial stack has to
+        // END where the second rack begins — so they are settled first. They
+        // depend on the row's HEIGHT alone; only the columns' widths depend
+        // on anything below.
+        //
+        // **What a short header sheds, and in what order.** The lane count is
+        // adjustable (Shift+wheel), so a header can be as tall as a third of
+        // the view or as short as a strip. Three bands hold the name, the
+        // first rack and the second; two drop the second rack; one keeps the
+        // name alone. The owner's rule — never the NAME — is unchanged; what
+        // changed is what the middle band holds, because the INPUT moved up
+        // beside the name and left its band to the second rack.
+        const ROW_MIN: f32 = 15.0;
+        let band_top = r.top();
+        let band_h = (r.bottom() - 1.0 - band_top).max(0.0);
+        let band_y = |a: f32, b: f32| (band_top + band_h * a, band_top + band_h * b);
+        let none_y = (f32::INFINITY, f32::NEG_INFINITY);
+        let [top_y, rack_y, rack2_y] = if band_h >= 3.0 * ROW_MIN {
+            [band_y(0.0, 0.30), band_y(0.34, 0.63), band_y(0.67, 1.0)]
+        } else if band_h >= 2.0 * ROW_MIN {
+            [band_y(0.0, 0.46), band_y(0.50, 1.0), none_y]
+        } else {
+            [band_y(0.0, 1.0), none_y, none_y]
+        };
+        // **The dial column is a STACK, and it ends above the second rack.**
+        //
+        // The readout reads above the knob and the label under it — the dial
+        // standard — and both used to be whatever was left after the knob had
+        // taken a fixed share of the whole row. That gave the label a nine
+        // point band by way of a constant, `DIAL_LABEL_H`, and a nine point
+        // band carries an eight point word however the size is worked out:
+        // the owner asked for the knob text to be bigger, got the arithmetic
+        // fixed underneath it, and saw no change at all, because the constant
+        // was the binding one. There is no constant now. The stack is given
+        // the room above the ROUTING button, the knob takes its share of
+        // that, and the readout and the label split what is left — so a
+        // taller lane makes both of them bigger, which is what a taller lane
+        // is for.
+        let stack_top = r.top() + 1.0;
+        let stack_bot = if rack2_y.1 > rack2_y.0 { rack2_y.0 - 2.0 } else { r.bottom() - 1.0 };
+        let stack = (stack_bot - stack_top).max(0.0);
+        // Twelve points held back for the two figures, and never so much that
+        // the knob stops being a knob.
+        //
+        // **Eighteen is still the ceiling**, unchanged, and that is a
+        // HORIZONTAL fact rather than a vertical one: three dials and their
+        // gaps come out of the same width the name column is cut from, so a
+        // knob allowed to grow on a tall row takes the column with it —
+        // measured, a 22-point ceiling pushed `dials_fit` false on a tall
+        // window and the whole set vanished. It reaches the ceiling on a tall
+        // row and the spare goes to the two figures, which is what the owner
+        // asked for.
+        let kd = (stack * 0.44).clamp(11.0, 18.0).min((stack - 12.0).max(9.0));
+        let spare = (stack - kd).max(0.0);
+        // The readout takes a shade under half of what the knob left, and the
+        // label the rest: a four-figure number is shorter than the word under
+        // it and needs less room to say so. No cap on either — a band with
+        // more room than its word needs draws the word at the size its own
+        // clamp allows, centred, with air around it, and the stack stays in
+        // the middle of the column. See `fit_text`.
+        let readout_h = spare * 0.46;
+        let dial_top = stack_top + readout_h;
         let send = Rect::from_min_size(
             Pos2::new(meter.left() - 5.0 - kd, dial_top),
             Vec2::splat(kd),
@@ -1730,7 +1800,7 @@ impl Layout {
         );
         let readout = |dial: Rect| {
             Rect::from_min_max(
-                Pos2::new(dial.left() - 1.0, r.top() + 1.0),
+                Pos2::new(dial.left() - 1.0, stack_top),
                 Pos2::new(dial.right() + 1.0, dial.top() - 1.0),
             )
         };
@@ -1749,64 +1819,95 @@ impl Layout {
         } else {
             (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING)
         };
-        // **ROUTING sits under the dials** — the owner's placement. It goes
-        // with the dials rather than with the name column because it is the
-        // same kind of thing they are: what this lane DOES with its signal,
-        // not what it is called. So it shares their fate on a narrow header
-        // and their room on a short one: no dials, no button, and no button
-        // when the space under them would make it a sliver to aim at.
-        // **Under the LABELS, not on them.** The dials print VOL / SND / PAN
-        // in the band between their own bottom and the row's, so a button
-        // pinned straight under the dial covered the words that say which
-        // dial is which. It goes below that band, and only when the row is
-        // tall enough to hold the labels AND a button worth aiming at.
-        const DIAL_LABEL_H: f32 = 9.0;
-        let routing_top = dial_top + kd + DIAL_LABEL_H;
-        let routing = if dials_fit && r.bottom() - 1.0 - routing_top >= 11.0 {
+        // **ROUTING sits at the BOTTOM, level with the second rack** — the
+        // owner's placement: "the routing button can be at the bottom the
+        // same height of the fx inserts". It stays in the dial column rather
+        // than the name column because it is the same kind of thing the dials
+        // are — what this lane DOES with its signal, not what it is called —
+        // and it shares their fate on a narrow header: no dials, no button.
+        //
+        // It used to hang nine points under the dials by a constant, which
+        // put it in the middle of the header at some heights and squeezed the
+        // labels above it at every height. Level with the rack beside it, the
+        // bottom of the row reads as one band across both columns, and the
+        // labels get the whole of what is left.
+        let routing = if dials_fit && rack2_y.1 > rack2_y.0 && pan.is_positive() {
             Rect::from_min_max(
-                Pos2::new(pan.left(), routing_top),
-                Pos2::new(send.right(), r.bottom() - 1.0),
+                Pos2::new(pan.left(), rack2_y.0),
+                Pos2::new(send.right(), rack2_y.1),
             )
         } else {
             Rect::NOTHING
         };
-        // **Top-down: LABEL, then INPUT, then the THREE BAYS** — the
-        // owner's order. Each row takes the column's whole width, so the
-        // input strip and the slots are both WIDER; a short window trades
-        // legibility for it, and that trade was accepted out loud.
+        // **Top-down: the NAME with its INPUT beside it, then the two
+        // RACKS** — the owner's order, revised. It used to be name, then the
+        // input selector on a band of its own, then three bays; every track
+        // and folder wears SIX bays now, so the second rack needs a band and
+        // the input moved up beside the name to give it one.
         let col = Rect::from_min_max(
             // After the T switch, which sits between the arm and the name.
             Pos2::new(theory.right() + 4.0, r.top()),
             Pos2::new(col_right - 6.0, r.bottom() - 1.0),
         );
-        let slice = |a: f32, b: f32| {
-            Rect::from_min_max(
-                Pos2::new(col.left(), col.top() + col.height() * a),
-                Pos2::new(col.right(), col.top() + col.height() * b),
+        let band = |(a, b): (f32, f32)| {
+            if b <= a {
+                return Rect::NOTHING;
+            }
+            Rect::from_min_max(Pos2::new(col.left(), a), Pos2::new(col.right(), b))
+        };
+        let top_band = band(top_y);
+        let rack_band = band(rack_y);
+        let rack2_band = band(rack2_y);
+        // **The NAME and, on a track, the INPUT button at its right end.**
+        //
+        // The selector had a whole band to itself and the second rack needed
+        // one; the owner's call was to make it a button next to the name. It
+        // takes a share of the band rather than a fixed width, so it grows
+        // with a header the grip has widened, and it SHEDS rather than
+        // squeezing the name below what a name needs — the same rule the rest
+        // of this column follows.
+        //
+        // A FOLDER has nothing to select, so its whole band is name.
+        //
+        // **And a column too narrow to hold both gives the selector its old
+        // band back** rather than shedding it: binding an input is how a bare
+        // lane becomes a track, so it is the last thing on this column to go,
+        // ahead of every bay. The racks then shed from the bottom, which is
+        // the order they shed in anyway. A header dragged wider crosses the
+        // floor and the second rack appears.
+        const NAME_MIN: f32 = 26.0;
+        const CHIP_MIN: f32 = 24.0;
+        let chip_w = (top_band.width() * 0.48).min(96.0);
+        let beside = !folder
+            && top_band.is_positive()
+            && chip_w >= CHIP_MIN
+            && top_band.width() - chip_w - 3.0 >= NAME_MIN;
+        let (name, input, rack_a, rack_b) = if folder {
+            // A folder has nothing to select, so its whole band is name and
+            // both racks keep their own.
+            (top_band, Rect::NOTHING, rack_band, rack2_band)
+        } else if beside {
+            (
+                Rect::from_min_max(
+                    top_band.min,
+                    Pos2::new(top_band.right() - chip_w - 3.0, top_band.bottom()),
+                ),
+                Rect::from_min_max(
+                    Pos2::new(top_band.right() - chip_w, top_band.top()),
+                    top_band.max,
+                ),
+                rack_band,
+                rack2_band,
             )
-        };
-        // **What a short header sheds, and in what order.** The lane count
-        // is adjustable now (Shift+wheel), so a header can be as tall as a
-        // third of the view or as short as a strip. When it cannot hold all
-        // three stacked rows legibly, the owner's rule is: drop the INSERT
-        // BAYS first, then the INPUT selector only if it is still too tight,
-        // and never the NAME. Each surviving row takes an equal share.
-        const ROW_MIN: f32 = 15.0;
-        let rows_h = col.height();
-        let (name, input, bays_row) = if rows_h >= 3.0 * ROW_MIN {
-            (slice(0.0, 0.30), slice(0.34, 0.63), slice(0.67, 1.0))
-        } else if rows_h >= 2.0 * ROW_MIN {
-            // Bays gone; the name and the input split the column.
-            (slice(0.0, 0.46), slice(0.50, 1.0), Rect::NOTHING)
         } else {
-            // Only the name survives — the last thing a track cannot do without.
-            (slice(0.0, 1.0), Rect::NOTHING, Rect::NOTHING)
+            (top_band, rack_band, rack2_band, Rect::NOTHING)
         };
-        // **THREE ON THREE for a folder** - the owner's ruling: a folder
-        // is a grouper, not a track, so it has no input to select, and the
-        // second rack takes the input selector's band. Bays 0..2 sit where
-        // every track's bays sit; 3..5 ride the band above. A plain track
-        // keeps its three across the bays band, as ever.
+        // **SIX bays on every lane** — the owner's ruling, folder or not. The
+        // seat map has always answered slots 3..5 out of the channel's own
+        // folder-extra seat whether or not it was a group (`seat_bay`); the
+        // folder flag was only ever gating what got drawn. Bays 0..2 take the
+        // middle band and 3..5 the bottom one, which is the order the chain
+        // runs in and the order the mixer's rack shows them in.
         let three = |band: Rect, offset: usize, out: &mut [Rect; crate::recorder::INSERTS * 2]| {
             let n = crate::recorder::INSERTS;
             let w = (band.width() - 3.0 * (n as f32 - 1.0)) / n as f32;
@@ -1822,22 +1923,11 @@ impl Layout {
             }
         };
         let mut bays = [Rect::NOTHING; crate::recorder::INSERTS * 2];
-        if folder {
-            if bays_row.is_positive() {
-                three(bays_row, 0, &mut bays);
-                three(input, 3, &mut bays);
-            } else {
-                // The squeezed header keeps one band: the FIRST rack takes
-                // it, the second sheds - the same order a track's controls
-                // shed in.
-                three(input, 0, &mut bays);
-            }
-        } else {
-            three(bays_row, 0, &mut bays);
-        }
-        // And the folder sheds the selector and the arm whole: nothing to
-        // choose, nothing to record.
-        let input = if folder { Rect::NOTHING } else { input };
+        // The squeezed header keeps one rack band: the FIRST rack takes it
+        // and the second sheds, the same order every other control here
+        // sheds in.
+        three(rack_a, 0, &mut bays);
+        three(rack_b, 3, &mut bays);
         // **The folder box: bottom-left, under the number.**
         //
         // Sized off the row like every other switch, and SHED like them too —
@@ -3776,6 +3866,61 @@ fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, bypassed: bool, p
         inner.center(),
         Align2::CENTER_CENTER,
         cut_to(painter, inner.width() - 4.0, word, &font),
+        font,
+        word_ink,
+    );
+}
+
+/// **A chip whose word shrinks to fit rather than being cut off.**
+///
+/// [`bay_chip`]'s twin for the one chip on this header that carries a
+/// SENTENCE rather than a plugin's four-letter short name. A bay says "COMP"
+/// or "+"; the input says "NO INPUT" or "MIDI: Scarlett", and it now shares
+/// the name's row instead of having a band of the column to itself — so at
+/// the header widths this app opens at, printing at the box's own height and
+/// truncating gave "NO...", which is not a button, it is a smudge with a
+/// border.
+///
+/// The height names the ceiling and the WIDTH decides, measured in the face
+/// that is installed (the lesson `fit_text` records). Under the floor —
+/// seven points, below which shrinking is the other way of being unreadable —
+/// it stops shrinking and `cut_to` takes over, which is the honest failure:
+/// an ellipsis says there is more, a four-point word says nothing.
+fn input_chip(painter: &Painter, r: Rect, word: &str, has: bool, p: &Ink) {
+    if !r.is_positive() {
+        return;
+    }
+    let bone = p.hdr_face;
+    let ink = p.engrave;
+    painter.rect_filled(r, 2.0, bone);
+    painter.rect_stroke(
+        r,
+        2.0,
+        Stroke::new(1.0_f32, ink.gamma_multiply(0.4)),
+        egui::StrokeKind::Inside,
+    );
+    let scale = crate::fonts::size_scale(painter.ctx());
+    let ceiling = crate::fonts::px((r.height() * 0.62).clamp(7.0, 11.0) * scale);
+    let family = crate::fonts::courier();
+    let word_ink = if has { p.bay_ink[0] } else { p.bay_ink[1] };
+    let room = r.width() - 6.0;
+    let measure = |size: f32, text: &str| {
+        painter
+            .layout_no_wrap(text.to_owned(), FontId::new(size, family.clone()), word_ink)
+            .rect
+            .width()
+    };
+    let wide = measure(ceiling, word);
+    let size = if wide > room && wide > 0.0 {
+        crate::fonts::px(ceiling * room / wide).max(6.5)
+    } else {
+        ceiling
+    };
+    let font = FontId::new(size, family);
+    painter.text(
+        r.center(),
+        Align2::CENTER_CENTER,
+        cut_to(painter, room, word, &font),
         font,
         word_ink,
     );
@@ -6088,6 +6233,18 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let chip = |painter: &Painter, r: Rect, word: &str, has: bool| {
             bay_chip(painter, r, word, has, false, &p);
         };
+        // **The INPUT button shrinks its word rather than cutting it.**
+        //
+        // It used to have a band of the column to itself and now it shares
+        // the name's, which is a third of the room — and a bay chip prints at
+        // the size its BOX is tall and truncates whatever does not fit, so
+        // "NO INPUT" came out as "NO...". A word nobody can read is not a
+        // button, it is a smudge with a border. This one is sized to the
+        // WIDTH and falls back to truncating only under the floor where
+        // shrinking further would be a smudge of another kind.
+        let input_button = |painter: &Painter, r: Rect, word: &str, has: bool| {
+            input_chip(painter, r, word, has, &p);
+        };
         if !lane.used {
             if row.add.is_positive() {
                 let c = row.add.center();
@@ -6155,9 +6312,15 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 );
             }
         }
-        // The INPUT CHIP under the name, the mixer strip's own idiom.
-        let word = if lane.input.is_empty() { "NO INPUT" } else { lane.input.as_str() };
-        chip(painter, row.input, word, !lane.input.is_empty());
+        // **The INPUT BUTTON, at the right end of the name's own row** — the
+        // owner's placement. It had a band of the column to itself; every
+        // lane wears six bays now and the second rack took that band.
+        let word = if lane.input_short.is_empty() {
+            "IN"
+        } else {
+            lane.input_short.as_str()
+        };
+        input_button(painter, row.input, word, !lane.input.is_empty());
         // The three bays beside it — the mixer's insert slots, worded the
         // same: the plugin's short name, or a plus for an empty seat.
         for (b, r) in row.bays.iter().enumerate() {
@@ -6278,7 +6441,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     &crate::fonts::courier(),
                     label_ink,
                     0.82,
-                    (6.0, 11.0),
+                    (6.0, 13.0),
                 );
             }
         }
@@ -6913,6 +7076,7 @@ LaneView {
             bypassed: [false; crate::recorder::INSERTS * 2],
             name: "KEYS",
             input: String::new(),
+            input_short: String::new(),
             color: 0,
             kind: used.then_some(ChannelKind::Midi),
             used,
@@ -7420,6 +7584,74 @@ LaneView {
         );
     }
 
+    /// **Render the timeline's track headers to a file, so a person can
+    /// look at them.**
+    ///
+    /// Not a test of anything: an eye. Every layout fault this panel has had
+    /// was found by looking at a picture and none of them by a test — a
+    /// number that fits its cell arithmetically can still be a word jammed
+    /// under a knob, and a test that measures rectangles cannot see it.
+    ///
+    /// `face::fit` is `busy.rs`'s software rasteriser: no window, no GPU,
+    /// every triangle egui would have sent to the card, text included.
+    ///
+    ///     IVORY_SHOT=/tmp/headers.png \
+    ///       cargo test -p tangent-ui --lib arrangement_panel::shot \
+    ///       -- --ignored --nocapture
+    ///
+    /// `IVORY_SHOT_W` / `IVORY_SHOT_H` set the window and `IVORY_SHOT_HDR`
+    /// the header column, because this panel's whole shape is a function of
+    /// how much room it was given. `IVORY_SHOT_PANEL` draws a panel WIDER
+    /// than the window and lets the window clip it, which is how to get a
+    /// picture of the header column alone at full size rather than a
+    /// thumbnail of the whole timeline.
+    #[test]
+    #[ignore = "writes a picture for a person to look at"]
+    fn headers() {
+        let Ok(out) = std::env::var("IVORY_SHOT") else {
+            eprintln!("IVORY_SHOT not set");
+            return;
+        };
+        let num = |k: &str, d: f32| {
+            std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d)
+        };
+        let (w, hgt) = (num("IVORY_SHOT_W", 1512.0), num("IVORY_SHOT_H", 620.0));
+        let hdr = std::env::var("IVORY_SHOT_HDR").ok().and_then(|v| v.parse::<f32>().ok());
+        let c = clips();
+        let mut v = a_view(&c);
+        v.lanes[1].is_folder = true;
+        if let Some(x) = hdr {
+            v.header_w = Some(x);
+        }
+        let names = ["VOX", "GTR BUS", "SNARE"];
+        let ins = ["IN 1", "", "MIDI+ 10"];
+        for (i, lane) in v.lanes.iter_mut().enumerate().take(3) {
+            lane.name = names[i];
+            lane.input = ins[i].to_owned();
+            lane.input_short = ins[i].to_owned();
+        }
+        let ctx = crate::face::fit::a_ctx(crate::fonts::FontChoice::default());
+        let surface = crate::recorder_panel::surface_of(Color32::from_rgb(0x61, 0x37, 0x3A));
+        let panel_w = num("IVORY_SHOT_PANEL", w);
+        let (pw, ph, rgba) = crate::face::fit::shoot(
+            &ctx,
+            Vec2::new(w, hgt + crate::shell::CHROME_BAR_H),
+            "Tangent \u{2014} arrangement",
+            &surface,
+            &mut |ui| {
+                let win = ui.max_rect();
+                ui.set_clip_rect(win);
+                draw(
+                    ui.painter(),
+                    Rect::from_min_size(win.min, Vec2::new(panel_w, win.height())),
+                    &v,
+                );
+            },
+        );
+        crate::face::fit::write_png(std::path::Path::new(&out), &rgba, pw, ph);
+        println!("wrote {out} ({pw}x{ph}) from a {w}x{hgt} panel");
+    }
+
     /// The words one frame painted inside `band`.
     fn painted_in(v: &ArrangeView<'_>, band: Rect) -> Vec<String> {
         let ctx = egui::Context::default();
@@ -7589,10 +7821,18 @@ ArrangeView {
         band: Rect,
         face: crate::fonts::FontChoice,
     ) -> Vec<(String, f32, Rect)> {
+        sized_in_face_at(v, band, face, rect())
+    }
+
+    fn sized_in_face_at(
+        v: &ArrangeView<'_>,
+        band: Rect,
+        face: crate::fonts::FontChoice,
+        r: Rect,
+    ) -> Vec<(String, f32, Rect)> {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, face, None);
         crate::fonts::apply_text_styles(&ctx);
-        let r = rect();
         let out = ctx.run(
             egui::RawInput { screen_rect: Some(r), ..Default::default() },
             |ctx| {
@@ -7665,12 +7905,21 @@ ArrangeView {
                             cell.width()
                         ));
                     }
-                    // And it is worth reading. Eight points is the floor the
-                    // measured budget clears on every face; the guessed one
-                    // did not.
-                    if size < 8.0 {
+                    // And it is worth reading. Seven points is the floor a
+                    // five-figure number can hold in a cell as wide as the
+                    // dial under it on the WIDEST of the three faces; the
+                    // shipped one does better, and is checked for it below.
+                    if size < 7.0 {
                         bad.push(format!(
                             "{face:?}: the {what} readout is {size:.1}pt"
+                        ));
+                    }
+                    // **The face this app actually ships in**, held to what
+                    // the room really carries rather than to what the widest
+                    // face can manage. This is the number the owner sees.
+                    if face == crate::fonts::FontChoice::Terminess && size < 9.0 {
+                        bad.push(format!(
+                            "Terminess: the {what} readout is only {size:.1}pt"
                         ));
                     }
                 }
@@ -7678,6 +7927,14 @@ ArrangeView {
             for (text, size, at) in sized_in_face(&v, band, face) {
                 if size < 10.0 {
                     bad.push(format!("{face:?}: the {text:?} label is {size:.1}pt"));
+                }
+                // The owner's actual complaint, on the owner's actual face:
+                // "the vol/snd/pan font is what was wrong more than the
+                // readouts, and it hasn't visibly changed". It was eight
+                // points, because `DIAL_LABEL_H` gave it a nine point band
+                // however the size was worked out. See `HeaderRow::of`.
+                if face == crate::fonts::FontChoice::Terminess && size < 12.0 {
+                    bad.push(format!("Terminess: the {text:?} label is only {size:.1}pt"));
                 }
                 // **Centred in the band, not hung from its top edge.**
                 let dy = at.center().y - mid;
@@ -7695,6 +7952,101 @@ ArrangeView {
             }
         }
         assert!(bad.is_empty(), "the header's figures:\n  {}", bad.join("\n  "));
+    }
+
+    /// **Six bays on every lane, the input beside the name, ROUTING level
+    /// with the bottom rack.**
+    ///
+    /// Three rulings in one header, all the owner's: "ALL tracks and folders
+    /// now have 6 fx slots", "move the input selector on tracks in
+    /// arrangement view to be a button to the right of the name field", and
+    /// "the routing button can be at the bottom the same height of the fx
+    /// inserts". They are one test because they are one rearrangement — the
+    /// second rack needed a band, the input gave up the one it had, and
+    /// routing came down to sit level with the rack it now shares a row with.
+    ///
+    /// Measured at a header the size this app actually opens at rather than
+    /// the narrow fixture: the fixture's column is 38 points wide, which is
+    /// under the floor for both a second rack and a chip beside the name, so
+    /// it would assert the fallback and never the arrangement.
+    #[test]
+    fn every_lane_wears_six_bays_with_its_input_beside_its_name() {
+        let c = clips();
+        let mut v = a_view(&c);
+        v.lanes[1].is_folder = true;
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(1512.0, 620.0));
+        let l = Layout::new(r, &v);
+        for i in [0usize, 1] {
+            let row = l.header_rows[i];
+            let what = if v.lanes[i].is_folder { "folder" } else { "track" };
+            for (b, cell) in row.bays.iter().enumerate() {
+                assert!(cell.is_positive(), "{what}: bay {b} was shed");
+            }
+            // The chain reads DOWN the column: 0..2 above 3..5, which is the
+            // order the mixer's rack shows and the order the audio takes.
+            assert!(
+                row.bays[2].bottom() <= row.bays[3].top() + 0.5,
+                "{what}: the second rack is not under the first"
+            );
+            // **ROUTING is level with the bottom rack**, to the point.
+            assert!(row.routing.is_positive(), "{what}: no routing button");
+            assert!(
+                (row.routing.top() - row.bays[3].top()).abs() < 0.5
+                    && (row.routing.bottom() - row.bays[3].bottom()).abs() < 0.5,
+                "{what}: routing spans {:?} and the bays beside it {:?}",
+                (row.routing.top(), row.routing.bottom()),
+                (row.bays[3].top(), row.bays[3].bottom()),
+            );
+            // And it is in the DIAL column, not the name column.
+            assert!(
+                row.routing.left() >= row.bays[3].right(),
+                "{what}: routing is over the rack"
+            );
+        }
+        // The INPUT: on a track, beside the name and to its right, sharing
+        // the band. On a folder there is nothing to select and no button.
+        let track = l.header_rows[0];
+        assert!(track.input.is_positive(), "the track lost its input button");
+        assert!(
+            track.input.left() >= track.name.right(),
+            "the input button is not to the right of the name"
+        );
+        assert!(
+            (track.input.top() - track.name.top()).abs() < 0.5
+                && (track.input.bottom() - track.name.bottom()).abs() < 0.5,
+            "the input button is not on the name's own row"
+        );
+        assert!(
+            track.input.bottom() <= track.bays[0].top() + 0.5,
+            "the input button is not above the first rack"
+        );
+        assert!(
+            !l.header_rows[1].input.is_positive(),
+            "the folder grew an input selector"
+        );
+    }
+
+    /// **A column too narrow for both gives the input its own band back.**
+    ///
+    /// Binding an input is how a bare lane becomes a track, so it is the last
+    /// thing on this column to go — ahead of every bay. At the narrow
+    /// fixture the chip cannot sit beside the name, and what must NOT happen
+    /// is that it simply disappears.
+    #[test]
+    fn a_narrow_header_keeps_its_input_and_sheds_bays_instead() {
+        let c = clips();
+        let v = a_view(&c);
+        let l = Layout::new(rect(), &v);
+        let row = l.header_rows[0];
+        assert!(row.input.is_positive(), "the narrow header shed its input");
+        assert!(
+            row.input.top() >= row.name.bottom() - 0.5,
+            "the input did not fall back to its own band"
+        );
+        assert!(
+            !row.bays[3].is_positive(),
+            "the second rack survived a header too narrow for the input"
+        );
     }
 
     pub(super) fn rect() -> Rect {

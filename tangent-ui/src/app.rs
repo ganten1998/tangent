@@ -9836,6 +9836,25 @@ impl TangentApp {
         }
     }
 
+    /// **The input chip's word for the arrangement's BUTTON**, which has a
+    /// quarter of the room the mixer's chip has — see
+    /// `ArrangeView`'s `input_short` and `MidiInputSel::short_text`. Empty
+    /// for a lane with no kind, exactly like the long form.
+    fn input_chip_short(&self, ch: usize) -> String {
+        let spec = self.channel_input_spec(ch);
+        match self.channel_kind(ch) {
+            Some(recorder::ChannelKind::Midi) => {
+                self.channel_midi_sel(ch).short_text(&self.midi_ports_seen)
+            }
+            Some(recorder::ChannelKind::Audio) => match Self::parse_input_spec(spec) {
+                Some((a, None)) => format!("IN {}", a + 1),
+                Some((a, Some(b))) => format!("{}/{}", a + 1, b + 1),
+                None => "IN \u{2014}".to_owned(),
+            },
+            None => String::new(),
+        }
+    }
+
     /// **What MIDI devices channel `ch` listens to, and on which channel.**
     ///
     /// The default — every device, every channel — for a channel that has
@@ -12832,8 +12851,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // where they have always pointed, and the new rack takes 3..5. A
         // saved curve therefore still names the plugin it was drawn for.
         // `master_bay` is the one place that rule lives.
-        let two_racks = master || self.is_folder(lane);
-        for bay in 0..recorder::INSERTS * if two_racks { 2 } else { 1 } {
+        // **Six bays on every lane now**, so both racks are always offered —
+        // the owner's ruling, see `recorder::bays_on`. It used to be the
+        // master and whichever channels happened to be FOLDERS, which meant
+        // an automation lane you could draw on a group vanished from the menu
+        // the moment the group stopped being one.
+        for bay in 0..recorder::INSERTS * 2 {
             let (bay_owner, seat_bay) = if master {
                 Self::master_bay(bay)
             } else {
@@ -22430,6 +22453,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     route_count: self.settings.routes.from(n).len(),
                     name: self.channel_display_name(n),
                     input: self.input_chip_text(n),
+                    input_short: self.input_chip_short(n),
                     stereo: match kind {
                         Some(recorder::ChannelKind::Audio) => self
                             .audio_ordinal(n)
@@ -36343,6 +36367,28 @@ mod tests {
         app.set_channel_input_spec(3, "");
         assert_eq!(app.channel_input_spec(3), "");
         assert_eq!(app.channel_kind(3), None);
+
+        // **And the SHORT form, for the arrangement header's button.**
+        //
+        // The selector had a band of the timeline column to itself; every
+        // lane wears six bays now and the second rack took that band, so the
+        // button beside the lane's name has about a quarter of the room the
+        // mixer's chip has — and "MIDI: ALL DEVICES" in twenty-six points is
+        // "MIDI:...", which is not a button. The long form is unchanged and
+        // is still what the desk prints and what this header's screen-reader
+        // node says.
+        assert_eq!(app.input_chip_short(2), "MIDI");
+        let mut sel = app.channel_midi_sel(2);
+        sel.channel = Some(9);
+        app.set_channel_midi_sel(2, sel);
+        assert_eq!(app.input_chip_short(2), "MIDI 10");
+        app.set_channel_input_spec(4, "2");
+        assert_eq!(app.input_chip_short(4), "IN 3");
+        app.set_channel_input_spec(4, "0+1");
+        assert_eq!(app.input_chip_short(4), "1/2");
+        // A lane with no kind says nothing, exactly as the long form does —
+        // the header draws its own word for that, so the two cannot drift.
+        assert_eq!(app.input_chip_short(3), "");
     }
 
     /// **A record PUNCHES.** What the take covers on its lane, it owns:
@@ -57589,14 +57635,21 @@ mod folder_tests {
             "the folder kept a record arm"
         );
         // Three on three: all six bays laid out, the second rack's row
-        // strictly above the first's.
+        // strictly BELOW the first's.
+        //
+        // It used to be above. A folder was the only lane with two racks, and
+        // its extra three took the band the INPUT selector had — the band
+        // over the bays — so that its 0..2 stayed where a plain track's three
+        // were. Every lane wears six now (`recorder::bays_on`), the input has
+        // moved up beside the name, and the two racks read down the column in
+        // the order the chain runs in and the order the mixer shows them in.
         let bays = l.header_rows[1].bays;
         for (b, r) in bays.iter().enumerate() {
             assert!(r.is_positive(), "folder bay {b} was shed at full width");
         }
         assert!(
-            bays[3].bottom() <= bays[0].top() + 0.5,
-            "the second rack's row is not above the first's"
+            bays[0].bottom() <= bays[3].top() + 0.5,
+            "the second rack's row is not below the first's"
         );
     }
 

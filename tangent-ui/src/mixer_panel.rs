@@ -1294,12 +1294,19 @@ impl Layout {
             // six bays at every size the master already manages - the
             // owner's "at 100 percent size, adapt to fit all 6". The name
             // yields room exactly as the master's does when the strip
-            // shrinks.
+            // shrinks. A folder can start this high because it has no input
+            // chip and no detail line; a plain channel has both, and its
+            // rack begins under them.
             cut(0.100, 0.345)
         } else {
             cut(0.195, 0.345)
         };
-        let bays = crate::recorder::bays_of(view.strip, view.is_folder);
+        // **Six on every channel now**, folder or not — the owner's ruling,
+        // see `recorder::bays_on`. A plain channel fits them into the band it
+        // has always had rather than reaching up over its own icon and input
+        // chip, so its bays are shorter than a folder's and nothing else on
+        // the strip moved. The two buses keep their three.
+        let bays = crate::recorder::bays_on(view.strip);
         let inserts: [Rect; INSERTS * 2] = std::array::from_fn(|i| {
             if !rack.is_positive() || i >= bays {
                 return Rect::NOTHING;
@@ -3455,6 +3462,49 @@ mod tests {
     }
 
     /// Every slot filled, so the ordinary strip is what is being measured.
+    /// **Render the desk to a file, so a person can look at it.**
+    ///
+    /// Not a test of anything: an eye. Every channel wears six bays now
+    /// (`recorder::bays_on`) and a plain channel fits them into the band that
+    /// held three, so what a test cannot see is whether a bay is still tall
+    /// enough to read a plugin's name in.
+    ///
+    ///     IVORY_SHOT=/tmp/desk.png IVORY_SHOT_W=900 IVORY_SHOT_H=700 \
+    ///       cargo test -p tangent-ui --lib mixer_panel::tests::desk \
+    ///       -- --ignored --nocapture
+    #[test]
+    #[ignore = "writes a picture for a person to look at"]
+    fn desk() {
+        let Ok(out) = std::env::var("IVORY_SHOT") else {
+            eprintln!("IVORY_SHOT not set");
+            return;
+        };
+        let num = |k: &str, d: f32| {
+            std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d)
+        };
+        let (w, hgt) = (num("IVORY_SHOT_W", 900.0), num("IVORY_SHOT_H", 700.0));
+        let mut v = a_view();
+        v.strips[1].is_folder = true;
+        for i in 0..3 {
+            v.strips[i].inserts = ["COMP", "EQ", "VERB", "TAPE", "", ""];
+        }
+        let ctx = crate::face::fit::a_ctx(crate::fonts::FontChoice::default());
+        let surface = crate::recorder_panel::surface_of(Color32::from_rgb(0x61, 0x37, 0x3A));
+        let (pw, ph, rgba) = crate::face::fit::shoot(
+            &ctx,
+            Vec2::new(w, hgt + crate::shell::CHROME_BAR_H),
+            "Tangent \u{2014} mixer",
+            &surface,
+            &mut |ui| {
+                let r = ui.max_rect();
+                ui.set_clip_rect(r);
+                draw(ui.painter(), r, &v);
+            },
+        );
+        crate::face::fit::write_png(std::path::Path::new(&out), &rgba, pw, ph);
+        println!("wrote {out} ({pw}x{ph})");
+    }
+
     fn a_view() -> MixerView<'static> {
         let channels = Strip::shown();
         MixerView {

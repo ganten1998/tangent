@@ -292,8 +292,8 @@ pub struct KeyEdge {
     /// holds the keyed effect. Channel indices move with a reorder; the
     /// buses and the master sit past the channels and hold still.
     pub strip: usize,
-    /// The strip's visible slot, `0..bays_of` — six on the master and on a
-    /// folder. Stored as the SLOT and translated to a rack (seat, bay) only
+    /// The strip's visible slot, `0..bays_on` — six on the master and on
+    /// every channel. Stored as the SLOT and translated to a rack (seat, bay) only
     /// at publish time through `recorder::seat_bay`, because seats renumber
     /// under migrations and desk indices do not.
     pub slot: usize,
