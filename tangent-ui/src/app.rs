@@ -3295,7 +3295,6 @@ enum KeepPath {
 /// the owner will see, and two lists would drift. Every state the dialog has:
 /// a device that is on, one that is off, and one that is on and NOT PLUGGED
 /// IN — which is the row nobody developing this can produce by hand.
-#[cfg(any(test, debug_assertions))]
 pub fn demo_midi_rows() -> Vec<dialogs::MidiDeviceRow> {
     vec![
         dialogs::MidiDeviceRow {
@@ -3884,7 +3883,12 @@ impl TangentApp {
     /// rather than being a box somebody clicks away that says nothing about
     /// whether the next attempt worked.
     pub fn reconcile_midi_ports(&mut self) {
-        if self.ports.is_none() {
+        // **Nothing until the ports have been asked once.** Before
+        // `midi_auto_connect` runs, `midi_ports_seen` is empty because it has
+        // not been READ, not because nothing is plugged in — and acting on
+        // that would close the port the priority chain is about to open and
+        // leave the app deaf until the first refresh five seconds later.
+        if self.ports.is_none() || self.midi_ports_at.is_none() {
             return;
         }
         let want = self.wanted_midi_ports();
@@ -3952,6 +3956,13 @@ impl TangentApp {
         if let Some(p) = self.ports.as_mut() {
             p.auto_connect(tx);
         }
+        // **The first port reading, taken HERE and nowhere earlier.** The
+        // subsystem is already up — `auto_connect` just paid for it — so this
+        // costs nothing now and would have cost the whole launch on frame
+        // one. Everything that draws a device name reads this; see
+        // `midi_ports_seen`, and `tend_menu_cache` for the refresh.
+        self.midi_ports_seen = self.ports.as_ref().map(|p| p.list()).unwrap_or_default();
+        self.midi_ports_at = Some(Instant::now());
     }
 
     pub fn set_ports(&mut self, ports: Option<Box<dyn MidiPorts>>) {
@@ -9384,9 +9395,19 @@ impl TangentApp {
         // is asked on a timer rather than per frame (an enumeration is an OS
         // round-trip) and rather than only when a menu opens (a chip that
         // only tells the truth while a menu is up is not telling it).
+        //
+        // **Never on the FIRST frame**, which is why this is `is_some_and`
+        // and not `is_none_or`. Enumerating MIDI ports opens a MIDI client,
+        // which is the first CoreMIDI call the process makes and pays for the
+        // whole subsystem coming up — measured at 695 ms of the 790 ms before
+        // the first frame, which is exactly why `auto_connect` was deferred
+        // in the first place. A refresh here on frame one would have quietly
+        // put all of it back. `midi_auto_connect` takes the first reading, on
+        // the frame after the splash is up, and this keeps it fresh from
+        // there.
         let due = self
             .midi_ports_at
-            .is_none_or(|at| at.elapsed() > Duration::from_secs(5));
+            .is_some_and(|at| at.elapsed() > Duration::from_secs(5));
         if due {
             let now = self.ports.as_ref().map(|p| p.list()).unwrap_or_default();
             self.midi_ports_at = Some(Instant::now());
@@ -45974,6 +45995,11 @@ mod tests {
             },
         );
         app.midi_ports_seen = vec!["Gone".to_owned()];
+        // As `midi_auto_connect` leaves it: the ports have been READ once, so
+        // the reconcile is allowed to act. Before that first reading an empty
+        // list means "not asked yet" and closing on it would leave the app
+        // deaf — see `reconcile_midi_ports`.
+        app.midi_ports_at = Some(Instant::now());
         app.reconcile_midi_ports();
         assert!(app.said().is_raised(MIDI_PORT_KEY));
         let standing_now = |app: &TangentApp| {

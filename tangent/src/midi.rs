@@ -277,9 +277,6 @@ impl Default for MidiFastLane {
 pub struct MidiConnection {
     _conn: midir::MidiInputConnection<()>,
     pub port_name: String,
-    /// The source slot this port's messages are stamped with, fixed for the
-    /// connection's life — see [`connect_by_name`].
-    pub src: u8,
 }
 
 fn new_input(client_name: &str) -> Option<midir::MidiInput> {
@@ -398,7 +395,6 @@ pub fn connect_by_name(
     Ok(MidiConnection {
         _conn: conn,
         port_name,
-        src,
     })
 }
 
