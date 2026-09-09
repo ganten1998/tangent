@@ -945,6 +945,14 @@ pub struct TangentApp {
     midi_ports_seen: Vec<String>,
     /// When `midi_ports_seen` was last asked. `None` = never.
     midi_ports_at: Option<Instant>,
+    /// The device set `open_set` was last asked for, and when. See
+    /// `reconcile_midi_ports`: comparing against what is OPEN would retry a
+    /// device that refuses sixty times a second.
+    midi_open_asked: Vec<String>,
+    midi_open_at: Option<Instant>,
+    /// What would not open last time it was asked, so the condition can be
+    /// said every frame without asking again.
+    midi_open_failed: Vec<(String, String)>,
     /// **A port named on the COMMAND LINE**, which pins the whole session.
     ///
     /// `-p NAME` says something more specific than any track's set does, and
@@ -3551,6 +3559,9 @@ impl TangentApp {
             input_chip_key: None,
             midi_ports_seen: Vec::new(),
             midi_ports_at: None,
+            midi_open_asked: Vec::new(),
+            midi_open_at: None,
+            midi_open_failed: Vec::new(),
             midi_port_override: None,
             media_dir: dirs_home(),
             media_entries: Vec::new(),
@@ -3892,19 +3903,45 @@ impl TangentApp {
             return;
         }
         let want = self.wanted_midi_ports();
-        // Sets, compared as sets: `open_set` keeps what it can and the order
-        // it hands back is the order things were opened in, which is not the
-        // order the desk asks in.
-        let open = self.ports.as_ref().map(|p| p.open_ports()).unwrap_or_default();
-        if want.len() == open.len() && want.iter().all(|w| open.iter().any(|o| o == w)) {
+        // **Compared against what was ASKED FOR, not against what is open.**
+        //
+        // A device that will not open is never in `open_ports`, so comparing
+        // the two would differ for ever and this would call `open_set` sixty
+        // times a second — hammering the driver that just refused. The desk's
+        // ask is what changes when something real changes, so it is the thing
+        // to compare.
+        //
+        // A standing failure is retried on the port list's own five-second
+        // beat and no faster: a driver that is busy usually stops being busy,
+        // and "never again until you change something" would mean plugging a
+        // keyboard back in did nothing when the name had not changed.
+        let stale = !self.midi_open_failed.is_empty()
+            && self
+                .midi_open_at
+                .is_none_or(|at| at.elapsed() > Duration::from_secs(5));
+        if want == self.midi_open_asked && !stale {
+            // The condition still stands or still does not — said below from
+            // the remembered answer, every frame, which is what makes it a
+            // condition rather than an event.
+            self.say_midi_open_failure();
             return;
         }
         let tx = self.midi_tx.clone();
-        let failed = self
+        self.midi_open_asked = want.clone();
+        self.midi_open_at = Some(Instant::now());
+        self.midi_open_failed = self
             .ports
             .as_mut()
             .map(|p| p.open_set(&want, tx))
             .unwrap_or_default();
+        self.say_midi_open_failure();
+    }
+
+    /// Say whether a device the desk asked for would not open — from the
+    /// remembered answer, so it can be said every frame without re-opening
+    /// anything. See `reconcile_midi_ports`.
+    fn say_midi_open_failure(&mut self) {
+        let failed = self.midi_open_failed.clone();
         match failed.first() {
             None => self.notify_lower(MIDI_PORT_KEY),
             // `notify_raise` and not `insist`: this is a per-frame re-check,
@@ -46017,12 +46054,20 @@ mod tests {
             failed.text
         );
         assert!(failed.is_standing());
-        // Asking again while it is still broken changes nothing: one message.
+        // **Asking again while it is still broken opens nothing and says the
+        // same thing.** Comparing against what is OPEN rather than what was
+        // ASKED would call `open_set` every frame — sixty attempts a second
+        // at a driver that just refused.
+        let tries_before = app.midi_open_asked.clone();
         app.reconcile_midi_ports();
         let again = standing_now(&app);
         assert_eq!(
             again.id, failed.id,
             "a second reconcile minted a second message"
+        );
+        assert_eq!(
+            app.midi_open_asked, tries_before,
+            "a failing device was asked for again on the very next frame"
         );
 
         // And a device that DOES open takes it down.
