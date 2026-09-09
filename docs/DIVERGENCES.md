@@ -239,17 +239,31 @@ renderings of every affected row.
 - **D-UI-3**: no busy-loop rendering; repaint scheduled on MIDI/timer
   events at Python cadences (50ms GUI / 100ms detection). Keytoggle clicks
   trigger an immediate off-cadence detection + repaint (as Python did).
-- **D-UI-4** (corrected 2026-08-11 — the previous wording described a feature
-  that was never built): there is **no liveness indicator and no
-  auto-reconnect**. `Select MIDI Input...` calls `midi::list_port_names()` at
-  open time (`app.rs`), so the list is always a fresh enumeration of the ports
-  that exist right now; the dialog prints `Current: <port name>` taken from the
-  live `MidiConnection` — the name it was opened with, never a status — and
-  pre-selects nothing. If the port dies, events simply stop arriving
-  (`tangent/src/midi.rs`: "No reconnect logic (parity): if the port dies, events
-  just stop") and the app keeps drawing its last state until the user re-picks.
-  Picking a port drops the old connection before opening the new one, and a
-  failed open raises the `MIDI Error` dialog.
+- **D-UI-4** (corrected 2026-08-11; rewritten 2026-09-08 when the app stopped
+  having ONE MIDI device): a track names a **SET** of devices and a MIDI
+  channel, in the MIDI Inputs dialog its input chip opens, and the app holds
+  one connection per device any track asks for. Both "every device" and "every
+  channel" stay expressible and remain the default.
+
+  What was here before described the single-device world and the picker that
+  chose for the whole app. That picker was the fault: every track's chip
+  already named a port, exactly one was ever open, and nothing downstream read
+  the chips — so two tracks could not have separate keyboards while the desk
+  said they could. `Dialog::MidiPicker` and the chip's MIDI submenu are both
+  gone; `Select MIDI Input...` opens the selected TRACK's dialog.
+
+  There is still **no liveness indicator and no auto-reconnect** in the old
+  sense, but the shape has changed: the port list is enumerated on a five-second
+  beat (`TangentApp::midi_ports_seen`, first read in `midi_auto_connect` so the
+  launch is not charged for it), and `reconcile_midi_ports` opens and closes
+  connections to match what the desk asks for — so a keyboard plugged in while
+  the app runs is picked up within five seconds without anybody re-picking
+  anything. A device a track names and which is not there is **kept in the set**
+  and marked: `!` on the chip, "not connected" on its dialog row. If a port dies
+  mid-session its events simply stop (`tangent/src/midi.rs`: "No reconnect logic
+  (parity): if the port dies, events just stop") until the reconcile notices it
+  has gone. A device that will not open raises a standing condition naming it,
+  re-checked every frame rather than a box to click away.
 - **D-UI-5**: teach-layer additions, precisely scoped: two context-menu
   items inside the chord-detection block, immediately after the
   Detach/Attach entry, preceded by their own separator — `Teach Chord
