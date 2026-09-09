@@ -768,6 +768,31 @@ impl MidiInputSel {
         }
         out
     }
+
+    /// **The same fact in as few characters as it can be told in.**
+    ///
+    /// For the arrangement header's input BUTTON, which sits beside the lane
+    /// name and has about a quarter of the room [`Self::chip_text`] was
+    /// written for. The two things a glance needs are that this is MIDI and
+    /// which channel it is narrowed to; the device names are what the mixer
+    /// strip, the button's own dialog and the screen-reader node are for.
+    ///
+    /// The `!` keeps its meaning — a device this track was told to listen to
+    /// is not plugged in — because that is the one fact whose absence is
+    /// silent, and a mark nobody can miss is worth two characters anywhere.
+    /// A `+` says there are device names not shown.
+    pub fn short_text(&self, present: &[String]) -> String {
+        let mut out = String::from("MIDI");
+        if !self.missing(present).is_empty() {
+            out.push('!');
+        } else if !self.devices.is_empty() {
+            out.push('+');
+        }
+        if let Some(c) = self.channel {
+            out.push_str(&format!(" {}", (c & 0x0F) + 1));
+        }
+        out
+    }
 }
 
 /// **Read the persisted device sets**, from either the settings file or a
@@ -1123,16 +1148,24 @@ pub const MASTER_SEAT: usize = STRIPS;
 /// anything.
 pub const MASTER_EXTRA_SEAT: usize = STRIPS + 1 + DRUM_PADS;
 
-/// How many bays a strip shows. The master has two racks' worth.
+/// **How many bays a strip shows: six on the master and on every CHANNEL.**
+///
+/// It used to be three on a channel, six on the master, and six on a channel
+/// only while that channel happened to be a FOLDER — so the size of a track's
+/// rack changed under it when it was made a group and changed back when it
+/// stopped being one, and three plugins had to go somewhere when it did. The
+/// owner's ruling: "ALL tracks and folders now have 6 fx slots."
+///
+/// It costs nothing in the seat map. `seat_bay` has always answered slots
+/// 3..5 for any channel out of that channel's folder-extra seat, folder or
+/// not; the flag was only ever gating what got DRAWN. The two buses — the
+/// click and the effects return — keep their three: they are not tracks, and
+/// neither has ever had a second rack to inherit.
+///
+/// `folder` is no longer asked, so there is one function again rather than a
+/// pair with a flag the answer does not depend on.
 pub fn bays_on(strip: Option<Strip>) -> usize {
-    bays_of(strip, false)
-}
-
-/// The same question asked with the one fact `Strip` cannot carry: whether
-/// the channel is currently a FOLDER. A folder shows two racks' worth,
-/// like the master - see `folder_extra_seat`.
-pub fn bays_of(strip: Option<Strip>, folder: bool) -> usize {
-    if strip.is_none() || (folder && matches!(strip, Some(Strip::Channel(_)))) {
+    if matches!(strip, None | Some(Strip::Channel(_))) {
         INSERTS * 2
     } else {
         INSERTS
@@ -4693,7 +4726,7 @@ mod tests {
             bays_on, seat_bay, Strip, INSERTS, INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT,
         };
         assert_eq!(bays_on(None), INSERTS * 2, "the master lost its second rack");
-        assert_eq!(bays_on(Some(Strip::Channel(0))), INSERTS);
+        assert_eq!(bays_on(Some(Strip::Channel(0))), INSERTS * 2);
 
         // **The first three are the EXTRA rack and the last three the
         // original**, because the new bays were drawn ABOVE the old ones and
@@ -4741,16 +4774,17 @@ mod tests {
     #[test]
     fn a_folders_six_slots_have_their_own_appended_seats() {
         use super::{
-            amp_pedal_of, amp_pedal_seat, bays_of, folder_extra_seat, pad_rack_index, seat_bay,
+            amp_pedal_of, amp_pedal_seat, bays_on, folder_extra_seat, pad_rack_index, seat_bay,
             seat_order, Strip, AMP_PEDALS, CHANNELS, DRUM_PADS, INSERTS, INSERT_SPACE,
             MASTER_EXTRA_SEAT, MASTER_SEAT, STRIPS, TOTAL_SEATS,
         };
-        // The counts: a folder wears six, a plain channel three, the click
-        // never folds, and the master keeps its six either way.
-        assert_eq!(bays_of(Some(Strip::Channel(3)), true), INSERTS * 2);
-        assert_eq!(bays_of(Some(Strip::Channel(3)), false), INSERTS);
-        assert_eq!(bays_of(Some(Strip::Click), true), INSERTS);
-        assert_eq!(bays_of(None, false), INSERTS * 2);
+        // The counts: **every channel wears six**, folder or not — the
+        // owner's ruling, see `bays_on`. The two buses keep their three; the
+        // master keeps its six.
+        assert_eq!(bays_on(Some(Strip::Channel(3))), INSERTS * 2);
+        assert_eq!(bays_on(Some(Strip::Channel(0))), INSERTS * 2);
+        assert_eq!(bays_on(Some(Strip::Click)), INSERTS);
+        assert_eq!(bays_on(None), INSERTS * 2);
 
         // The mapping, plain order, both ends of the desk.
         for ch in [0usize, 7, CHANNELS - 1] {
