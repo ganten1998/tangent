@@ -24383,17 +24383,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// itself. Durations are looked up from the host's own scan rather than
     /// re-measured here: reading a WAV header is the engine side's job and
     /// this crate has no WAV reader to do it honestly with.
-    /// **The sampler browser's listing, and its three shortcuts.**
+    /// **The sampler browser's listing, and its shortcuts.**
     ///
     /// `refresh_ir_browser` next door with one difference, and the
     /// difference is the whole of what the owner asked for: the shortcut
     /// row. *"must be able to drag any item in or choose any midi or audio
     /// clip recorded in tangent as well -- not just external exports."*
-    /// Tangent's own recordings live in exactly two places — the Takes
-    /// folder every capture lands in, and the open project's `media/`,
-    /// which is where a clip's audio is copied — and neither of them is
-    /// anywhere a person would find by walking up from their home folder.
-    /// So the browser names them.
+    /// The open project's `media/` is where a clip's audio is copied and it
+    /// is not anywhere a person would find by walking up from their home
+    /// folder, so the browser names it.
+    ///
+    /// **There was a TAKES chip beside it and the owner struck it out**:
+    /// *"the takes section as a whole can just go."* He had asked for it
+    /// earlier the same session and changed his mind, so it is removed
+    /// rather than hidden — no chip, no root, and not the folder a fresh
+    /// panel opens on either. The argument for it was that somebody who has
+    /// just recorded wants the thing they just recorded; the answer is that
+    /// a sampler is loaded from a library far more often than from a take.
     ///
     /// The PROJECT chip is empty when no project is open, and the face
     /// draws a chip that says so rather than one that walks nowhere: a
@@ -24405,28 +24411,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// (the owner's `~/Dropbox`) is followed; dotfiles skipped; folders
     /// first, then files, both sorted case-blind.
     fn refresh_sampler_browser(&mut self, live: &mut crate::faces::FaceLive) {
-        let takes = self.settings.record_root();
         let project = self
             .project_doc()
             .and_then(|d| d.parent().map(|p| p.join("media")))
             .filter(|p| p.is_dir());
         live.samp_roots = vec![
             ("HOME".to_owned(), dirs_home().to_string_lossy().into_owned()),
-            ("TAKES".to_owned(), takes.to_string_lossy().into_owned()),
             (
                 "PROJECT".to_owned(),
                 project.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
             ),
         ];
         if live.samp_dir.is_empty() {
-            // A fresh panel opens on the Takes folder when there is one:
-            // the overwhelmingly likely sample, for somebody who has just
-            // recorded, is the thing they just recorded.
-            live.samp_dir = if takes.is_dir() {
-                takes.to_string_lossy().into_owned()
-            } else {
-                dirs_home().to_string_lossy().into_owned()
-            };
+            // A fresh panel opens where HOME points.
+            live.samp_dir = dirs_home().to_string_lossy().into_owned();
         }
         if live.samp_listed == live.samp_dir && live.samp_gen == self.sampler_scan_gen {
             return;
@@ -58923,7 +58921,7 @@ mod sampler_road_tests {
     /// folder nor a project's `media/` is findable by walking up from a
     /// home folder, so the browser names them.
     #[test]
-    fn the_browser_offers_takes_and_the_open_projects_media() {
+    fn the_browser_offers_home_and_the_open_projects_media_and_no_takes() {
         let root = std::env::temp_dir().join(format!("tangent-samp-roots-{}", std::process::id()));
         let takes = root.join("Takes");
         let song = root.join("Projects").join("song");
@@ -58940,18 +58938,27 @@ mod sampler_road_tests {
         let mut live = crate::faces::FaceLive::default();
         app.refresh_sampler_browser(&mut live);
         let words: Vec<&str> = live.samp_roots.iter().map(|(w, _)| w.as_str()).collect();
-        assert_eq!(words, ["HOME", "TAKES", "PROJECT"]);
-        assert_eq!(live.samp_roots[1].1, takes.to_string_lossy());
+        // **No TAKES.** The owner asked for that chip earlier in the same
+        // session and struck it out the moment he used it — "the takes
+        // section as a whole can just go" — so it is gone, not hidden.
+        assert_eq!(words, ["HOME", "PROJECT"]);
+        assert!(
+            !live.samp_roots.iter().any(|(_, p)| *p == takes.to_string_lossy()),
+            "the Takes folder is still a shortcut under another name"
+        );
         assert_eq!(
-            live.samp_roots[2].1,
+            live.samp_roots[1].1,
             song.join("media").to_string_lossy(),
             "the open project's media folder is not offered"
         );
-        // A fresh panel opens on the Takes folder: whoever has just recorded
-        // is overwhelmingly likely to want the thing they just recorded.
-        assert_eq!(live.samp_dir, takes.to_string_lossy());
+        // And a fresh panel no longer opens on it either: that was the other
+        // half of the takes road.
+        assert_ne!(live.samp_dir, takes.to_string_lossy());
         // Folders first, then audio only — the drumpad's own rules, through
-        // the one filter both explorers share.
+        // the one filter both explorers share. Asked of the Takes folder by
+        // standing in it, since nothing points there any more.
+        live.samp_dir = takes.to_string_lossy().into_owned();
+        app.refresh_sampler_browser(&mut live);
         let names: Vec<&str> = live.samp_entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["older", "one.wav"], "the listing took a text file");
 
@@ -58963,7 +58970,7 @@ mod sampler_road_tests {
         let (_ctx, mut app) = tests::headless_with(Caps::DESKTOP, settings);
         let mut live = crate::faces::FaceLive::default();
         app.refresh_sampler_browser(&mut live);
-        assert!(live.samp_roots[2].1.is_empty(), "a project chip with no project");
+        assert!(live.samp_roots[1].1.is_empty(), "a project chip with no project");
         let _ = std::fs::remove_dir_all(&root);
     }
 

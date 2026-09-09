@@ -294,10 +294,13 @@ pub struct FaceLive {
     /// folder in it, exactly as [`Self::ir_dir`] works.
     pub samp_dir: String,
     /// The shortcut chips over the listing: `(word, path)`, left to right.
-    /// Pushed, because two of the three are Tangent's own folders and only
-    /// the app knows where those are — the Takes folder and the open
-    /// project's `media/`. An empty path draws a chip that says so rather
-    /// than one that walks nowhere.
+    /// Pushed, because only the app knows where these folders are — the one
+    /// the owner set as HOME, and the open project's `media/`. An empty path
+    /// draws a chip that says so rather than one that walks nowhere.
+    ///
+    /// There was a TAKES chip here and the owner struck it out the first
+    /// time he used the panel: "the takes section as a whole can just go."
+    /// Nothing is reserved for it; the row is as wide as the list.
     pub samp_roots: Vec<(String, String)>,
     /// What [`Self::samp_dir`] holds, pushed: folders first, then the audio
     /// this build can read.
