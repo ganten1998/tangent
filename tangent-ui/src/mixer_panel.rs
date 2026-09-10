@@ -2720,7 +2720,15 @@ fn strip(
         // switch: framed, lit while the channel's MIDI feeds the theory view.
         // Lit in the SELECT colour, not engrave: the owner pressed the old
         // engrave-lit letter and saw nothing change.
-        switch(painter, l.theory, "\u{266a}", v.to_theory, p.lit, p);
+        switch_in(
+            painter,
+            l.theory,
+            crate::fonts::GLYPH_NOTE,
+            v.to_theory,
+            p.lit,
+            p,
+            crate::fonts::icon(),
+        );
     }
 }
 
@@ -3225,19 +3233,32 @@ fn switch_face(on: bool, lit: Color32, p: &Ink) -> (Color32, Color32) {
 }
 
 fn switch(painter: &Painter, r: Rect, label: &str, on: bool, lit: Color32, p: &Ink) {
+    switch_in(painter, r, label, on, lit, p, crate::fonts::courier_bold());
+}
+
+/// [`switch`] with the family named, for the one switch that wears a GLYPH
+/// rather than a letter.
+///
+/// The theory send is an eighth note, and neither Courier Prime nor JetBrains
+/// Mono carries U+266A — read out of their cmaps, not assumed. Drawn in the
+/// text family it is a tofu box on two faces out of three, so it asks for
+/// `fonts::icon`, which is Terminess whatever the user chose.
+fn switch_in(
+    painter: &Painter,
+    r: Rect,
+    label: &str,
+    on: bool,
+    lit: Color32,
+    p: &Ink,
+    family: egui::FontFamily,
+) {
     if !r.is_positive() {
         return;
     }
     let (ground, ink) = switch_face(on, lit, p);
     painter.rect_filled(r, 2.0, ground);
     let size = (r.height() * 0.62).clamp(8.0, 13.0);
-    centred(
-        painter,
-        r,
-        label,
-        FontId::new(size, crate::fonts::courier_bold()),
-        ink,
-    );
+    centred(painter, r, label, FontId::new(size, family), ink);
 }
 
 /// Centred, and **cut to the cell rather than run out of it**.
