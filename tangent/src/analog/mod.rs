@@ -1249,9 +1249,9 @@ impl Analog {
                         r += b * fade;
                         c.left -= 1;
                         if c.left == 0 {
+                            // **The LANE stays until the span ends** — see the
+                            // sweep at the bottom of this function.
                             c.voice.vacate();
-                            self.bank.release(self.corpse_lane[ci]);
-                            self.corpse_lane[ci] = NO_LANE;
                         }
                     }
                 }
@@ -1290,9 +1290,9 @@ impl Analog {
                     r += b * g;
                     c.left -= 1;
                     if c.left == 0 {
+                        // The laned road's rule, kept here too so the two
+                        // roads do not disagree about when a lane is free.
                         c.voice.vacate();
-                        self.bank.release(self.corpse_lane[ci]);
-                        self.corpse_lane[ci] = NO_LANE;
                     }
                 } else {
                     let _ = c.voice.post(taps);
@@ -1308,6 +1308,33 @@ impl Analog {
             if !self.voices[v].active() {
                 self.bank.release(self.voice_lane[v]);
                 self.voice_lane[v] = NO_LANE;
+            }
+        }
+        // **And a CORPSE that ran out inside the span, on the same terms.**
+        //
+        // It used to give its lane back the sample its fade reached zero,
+        // in the middle of the loop above — and `dead` is decided ONCE, at
+        // the top of this function, precisely so that a voice falling silent
+        // inside a span "ticks on for a few samples of nothing". A corpse
+        // that dropped its lane broke that: every remaining sample of the
+        // span still walked it, `split(NO_LANE)` answers group 31 of three,
+        // and the index panicked on the audio thread — "index out of bounds:
+        // the len is 3 but the index is 31", the owner's crash, at his line.
+        //
+        // The reason it took this long to show is arithmetic. The fade is
+        // eight milliseconds, which at 48 kHz is 384 samples — a whole number
+        // of every block this app renders, so the fade always ended ON a
+        // boundary and there were never any samples left to walk. At 44.1 kHz
+        // it is 352, which is not; and any MIDI event splits a block into
+        // spans of whatever length the event landed at, on any rate.
+        //
+        // So the lane goes back HERE, where the voices' already did, and the
+        // rule is one rule again: nothing in `live` or `dead` loses its lane
+        // before the span it was decided for is over.
+        for ci in 0..CORPSES {
+            if self.corpses[ci].left == 0 && self.corpse_lane[ci] != NO_LANE {
+                self.bank.release(self.corpse_lane[ci]);
+                self.corpse_lane[ci] = NO_LANE;
             }
         }
     }
@@ -1545,6 +1572,70 @@ mod tests {
         assert!(
             out.iter().any(|s| s.abs() > 1.0e-6),
             "the guard silenced the whole synth rather than the one bad voice"
+        );
+    }
+
+    /// **A corpse whose fade runs out MID-SPAN does not take the audio
+    /// thread with it.**
+    ///
+    /// The owner's crash, from the CoreAudio render thread: `index out of
+    /// bounds: the len is 3 but the index is 31`, at the laned pre-mix.
+    /// `NO_LANE` is `u8::MAX` and `split(255)` is `(31, 7)`, so 31 is not a
+    /// wild number — it is the arithmetic of a lane that is not there, and 3
+    /// is `GROUPS`.
+    ///
+    /// `render_span` decides who is sounding ONCE, at the top, so that a
+    /// voice falling silent inside the span "ticks on for a few samples of
+    /// nothing". A corpse used to break that by handing its lane back the
+    /// instant its fade reached zero, in the middle of the sample loop: every
+    /// remaining sample of the span still walked it, and the pre-mix indexed
+    /// group 31 of three.
+    ///
+    /// **Why it took this long to show is arithmetic.** The fade is eight
+    /// milliseconds, which at 48 kHz is 384 samples — a whole number of every
+    /// block this app renders — so it always ended ON a boundary and there
+    /// were never any samples left over. At 44.1 kHz it is 352, which is not;
+    /// and a MIDI event splits a block into spans of whatever length the
+    /// event landed at, at any rate. So the fixture forces the remainder
+    /// rather than hoping for it: five samples of fade and a whole block to
+    /// run.
+    ///
+    /// Revert check performed: put the release back inside the loop and this
+    /// panics with the owner's message, at his line.
+    #[test]
+    fn a_corpse_that_fades_out_mid_span_does_not_take_the_audio_thread_with_it() {
+        let mut synth = Analog::new(SR);
+        synth.set_laned(true);
+        let mut out = vec![0.0_f32; BLOCK * 2];
+        synth.note_on(60, 0.8);
+        synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+        // Nine keys into eight voices: the ninth steals, and the stolen
+        // voice becomes a corpse holding its lane.
+        for k in [48u8, 50, 52, 53, 55, 57, 59, 60] {
+            synth.note_on(k, 0.8);
+        }
+        synth.note_on(72, 0.8);
+        let c = (0..CORPSES)
+            .find(|&i| synth.corpses[i].left > 0)
+            .expect("the steal made no corpse, so this proves nothing");
+        assert_ne!(synth.corpse_lane[c], NO_LANE, "the corpse did not inherit a lane");
+        // Five samples of fade against a whole block: the fade ends at sample
+        // five and a hundred and twenty three follow it.
+        synth.corpses[c].left = 5;
+        synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+        // And the lane really did come back — deferring it must not leak one,
+        // or the bank fills up and `acquire` starts stealing lane zero.
+        assert_eq!(
+            synth.corpse_lane[c], NO_LANE,
+            "the corpse kept its lane past the span it died in"
+        );
+        assert_eq!(synth.corpses[c].left, 0, "the corpse did not finish fading");
+        // The desk still works: another note sounds.
+        synth.note_on(79, 0.8);
+        synth.render(&mut out, BLOCK, 2, &[], Transport::default());
+        assert!(
+            out.iter().any(|s| s.abs() > 1.0e-6),
+            "the fix silenced the synth rather than the one dead corpse"
         );
     }
 
