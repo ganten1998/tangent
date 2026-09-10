@@ -74,9 +74,17 @@ pub fn icon() -> FontFamily {
 /// **The eighth note the theory switch wears**, in both views.
 ///
 /// One constant, because the desk and the timeline draw the same switch and a
-/// second spelling of it is how they come to disagree. U+266A, from Terminess
-/// through [`FAMILY_ICON`].
-pub const GLYPH_NOTE: &str = "\u{266a}";
+/// second spelling of it is how they come to disagree.
+///
+/// **`nf-md-music-note`, not U+266A.** The Unicode eighth note in a terminal
+/// face is a terminal's idea of one: a square head and a straight flag, which
+/// at switch size reads as a letter P rather than as a note — the owner's
+/// "an actual note glyph". Terminess carries the whole Nerd Font icon set as
+/// well, and Material Design's note is drawn as a note: a round head, a
+/// curved flag, a stem with some weight to it. Rendered side by side at both
+/// sizes before choosing; Font Awesome's `nf-fa-music` (U+F001, a beamed
+/// pair) was the other candidate and is a fine second.
+pub const GLYPH_NOTE: &str = "\u{f0389}";
 
 /// **The wrench the automation button wears.** `nf-fa-wrench`, U+F0AD, in the
 /// Nerd Font private use area — so it is Terminess or nothing, which is what
@@ -363,9 +371,6 @@ pub fn apply_text_styles(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-
-    use super::{apply_text_styles, icon, install, FontChoice, GLYPH_NOTE, GLYPH_WRENCH};
-    use egui::FontFamily;
 
     /// **The two glyphs drawn as controls really come from Terminess, on
     /// every face the user can choose.**
