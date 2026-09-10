@@ -37,6 +37,25 @@ pub static JETBRAINS_BOLD: &[u8] = include_bytes!("../../assets/fonts/JetBrainsM
 
 pub const FAMILY_COURIER: &str = "courier";
 pub const FAMILY_COURIER_BOLD: &str = "courier-bold";
+/// **The ICON family: Terminess first, whatever face the user chose.**
+///
+/// Terminess is a Nerd Font and carries about eleven thousand seven hundred
+/// glyphs against JetBrains Mono's thirteen hundred and Courier Prime's three
+/// hundred and eighty. Two of them are drawn as controls in this app — the
+/// eighth note on the theory switch and the wrench on the automation button —
+/// and neither of the other two bundled faces has either. Read out of the
+/// cmaps rather than assumed; Courier Prime has no U+266A and JetBrains Mono
+/// has only the accidentals, U+266D and U+266F.
+///
+/// A family of its own rather than pushing Terminess onto the bottom of the
+/// two text chains, because that would quietly change which face draws every
+/// symbol the chosen face happens to lack — arrows, box rule, ticks — for
+/// people who did not pick it. This is asked for by name at the two sites
+/// that want an icon and changes nothing anywhere else.
+///
+/// It costs no binary: the face is compiled in already for the third
+/// typeface option.
+pub const FAMILY_ICON: &str = "tangent-icons";
 
 pub fn courier() -> FontFamily {
     FontFamily::Name(FAMILY_COURIER.into())
@@ -45,6 +64,24 @@ pub fn courier() -> FontFamily {
 pub fn courier_bold() -> FontFamily {
     FontFamily::Name(FAMILY_COURIER_BOLD.into())
 }
+
+/// The family for a glyph drawn as a CONTROL rather than as text. See
+/// [`FAMILY_ICON`].
+pub fn icon() -> FontFamily {
+    FontFamily::Name(FAMILY_ICON.into())
+}
+
+/// **The eighth note the theory switch wears**, in both views.
+///
+/// One constant, because the desk and the timeline draw the same switch and a
+/// second spelling of it is how they come to disagree. U+266A, from Terminess
+/// through [`FAMILY_ICON`].
+pub const GLYPH_NOTE: &str = "\u{266a}";
+
+/// **The wrench the automation button wears.** `nf-fa-wrench`, U+F0AD, in the
+/// Nerd Font private use area — so it is Terminess or nothing, which is what
+/// [`FAMILY_ICON`] is for.
+pub const GLYPH_WRENCH: &str = "\u{f0ad}";
 
 /// A built-in UI typeface the user can pick from the menu.
 ///
@@ -236,9 +273,20 @@ pub fn install(ctx: &egui::Context, choice: FontChoice, custom_font_path: Option
     bold.extend(default_fallback.iter().cloned());
 
     defs.families
-        .insert(FontFamily::Name(FAMILY_COURIER.into()), regular);
+        .insert(FontFamily::Name(FAMILY_COURIER.into()), regular.clone());
     defs.families
         .insert(FontFamily::Name(FAMILY_COURIER_BOLD.into()), bold);
+    // **The icon family**: Terminess first, then whatever the text chain
+    // already had underneath, so a glyph it somehow lacks still lands
+    // somewhere rather than as a tofu box. See [`FAMILY_ICON`].
+    defs.font_data.insert(
+        "Terminess-Icons".to_owned(),
+        Arc::new(FontData::from_static(TERMINESS_REGULAR)),
+    );
+    let mut icons = vec!["Terminess-Icons".to_owned()];
+    icons.extend(regular);
+    defs.families
+        .insert(FontFamily::Name(FAMILY_ICON.into()), icons);
 
     ctx.set_fonts(defs);
     // Park what a named size will actually draw at, for the panels whose
@@ -315,6 +363,73 @@ pub fn apply_text_styles(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
+
+    use super::{apply_text_styles, icon, install, FontChoice, GLYPH_NOTE, GLYPH_WRENCH};
+    use egui::FontFamily;
+
+    /// **The two glyphs drawn as controls really come from Terminess, on
+    /// every face the user can choose.**
+    ///
+    /// The theory switch wears an eighth note and the automation button a
+    /// wrench. Neither Courier Prime nor JetBrains Mono has either — read out
+    /// of their cmaps, not assumed: Courier Prime carries three hundred and
+    /// eighty glyphs and no U+266A, JetBrains thirteen hundred and only the
+    /// accidentals. Drawn in the text family they would be a tofu box on two
+    /// faces out of three, which is exactly the failure `draw_tick` exists to
+    /// avoid for the check mark.
+    ///
+    /// The proof is the SUB-FONT: `Glyph::font_impl_ascent` is the ascent of
+    /// whichever face in the chain actually supplied the glyph, so a glyph
+    /// that matches an ASCII letter's came from the same face — Terminess,
+    /// which is first in `FAMILY_ICON` whatever was chosen. A fallback would
+    /// have some other face's metrics, and a missing glyph would have the
+    /// replacement character's.
+    ///
+    /// Revert check performed: point either constant at the text family and
+    /// the ascents part company on Courier and JetBrains.
+    #[test]
+    fn the_icon_family_carries_the_note_and_the_wrench_on_every_face() {
+        let mut bad: Vec<String> = Vec::new();
+        for face in FontChoice::ALL {
+            let ctx = egui::Context::default();
+            install(&ctx, face, None);
+            apply_text_styles(&ctx);
+            let _ = ctx.run(Default::default(), |_| {});
+            let one = |text: &str, family: FontFamily| -> Option<(f32, f32)> {
+                let g = ctx.fonts_mut(|f| {
+                    f.layout_no_wrap(
+                        text.to_owned(),
+                        egui::FontId::new(24.0, family),
+                        egui::Color32::WHITE,
+                    )
+                });
+                let row = g.rows.first()?;
+                let glyph = row.glyphs.first()?;
+                Some((glyph.font_impl_ascent, glyph.uv_rect.size[0] as f32))
+            };
+            let Some((terminess_ascent, _)) = one("M", icon()) else {
+                bad.push(format!("{face:?}: the icon family drew no letter at all"));
+                continue;
+            };
+            for (what, glyph) in [("note", GLYPH_NOTE), ("wrench", GLYPH_WRENCH)] {
+                match one(glyph, icon()) {
+                    None => bad.push(format!("{face:?}: the {what} laid out no glyph")),
+                    Some((ascent, w)) => {
+                        if (ascent - terminess_ascent).abs() > 0.01 {
+                            bad.push(format!(
+                                "{face:?}: the {what} came from a face with ascent {ascent}                                  rather than the icon family's own {terminess_ascent}"
+                            ));
+                        }
+                        // And it rasterised something rather than nothing.
+                        if w <= 0.0 {
+                            bad.push(format!("{face:?}: the {what} is a blank"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the icon glyphs:\n  {}", bad.join("\n  "));
+    }
 
     /// **Every face reads back as the face it wrote.**
     ///

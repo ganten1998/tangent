@@ -1222,15 +1222,27 @@ impl Layout {
                 ruler_h: 0.0,
             };
         }
-        let (share, lo, hi) = HEADER_W;
+        let (share, lo, _hi) = HEADER_W;
         // Chained rather than clamp(): a rect narrower than the floor would
         // hand clamp a min above its max, which is a panic in a painter.
         // A dragged width wins over the automatic share, inside the same
         // sanity bounds.
+        //
+        // **The ceiling is HALF THE VIEW, and nothing tighter.** It used to be
+        // four hundred points as well, which is a number two things quietly
+        // disagreed with. The grip clamps a drag to `[150, width/2]`, so a
+        // column dragged past four hundred was stored at one width and drawn
+        // at another. And the DEFAULT is tied to the band's camera/timecode
+        // seam — one column across two surfaces, the owner's rule — so on a
+        // maximised window, where that seam sits well past four hundred, the
+        // tie simply stopped: "make the default track length at maximized
+        // tied to the separator line between camera and timecode". It was
+        // tied; it was being clipped. `the_default_track_header_lines_up_with_
+        // the_camera_seam` used to dodge this by choosing two window sizes
+        // under the ceiling, and now asserts a maximised one as well.
         let header_w = header_w
             .unwrap_or(rect.width() * share)
             .max(lo)
-            .min(hi.max(400.0))
             .min(rect.width() * 0.5);
         let (rshare, rlo, rhi) = RULER_H;
         let ruler_h = (rect.height() * rshare).clamp(rlo, rhi);
@@ -1774,7 +1786,27 @@ impl Layout {
         // window and the whole set vanished. It reaches the ceiling on a tall
         // row and the spare goes to the two figures, which is what the owner
         // asked for.
-        let kd = (stack * 0.44).clamp(11.0, 18.0).min((stack - 12.0).max(9.0));
+        let kd = (stack * 0.44).clamp(11.0, 24.0).min((stack - 12.0).max(9.0));
+        // **And never wider than the room the NAME column can spare.**
+        //
+        // The ceiling used to be eighteen, and eighteen was a horizontal fact
+        // wearing a vertical one's clothes: three dials and their gaps come
+        // out of the same width the name column is cut from, so a knob
+        // allowed to grow on a tall row took the column with it and the whole
+        // set SHED — a cliff, at a size where a slightly smaller dial would
+        // have been fine.
+        //
+        // Named properly, the two rules compose: the height says how big a
+        // knob this row would like, the width says how big it may be, and the
+        // set only sheds when even the floor will not fit. A wide header —
+        // and the default is tied to the band's camera seam, so on a big
+        // display it IS wide — now spends that width on bigger dials and, with
+        // them, on figures under the dials somebody can read. That is most of
+        // "the volume readout text needs to be bigger": the figure is capped
+        // by the cell, and the cell is the dial.
+        const COL_MIN: f32 = 40.0;
+        let dial_room = meter.left() - 5.0 - (arm_seat.right() + 4.0 + COL_MIN + 6.0);
+        let kd = kd.min(((dial_room - 8.0) / 3.0).max(0.0));
         let spare = (stack - kd).max(0.0);
         // The readout takes a shade under half of what the knob left, and the
         // label the rest: a four-figure number is shorter than the word under
@@ -1798,10 +1830,15 @@ impl Layout {
             Pos2::new(knob.left() - 4.0 - kd, dial_top),
             Vec2::splat(kd),
         );
+        // **The readout takes its dial's whole share of the column**, gaps
+        // included — the dials sit four points apart and a figure is centred,
+        // so the two points either side are room the number can have and the
+        // dial cannot. Two points of a five-character figure is most of a
+        // point of type. See `fit_text` and `dial_type_size`.
         let readout = |dial: Rect| {
             Rect::from_min_max(
-                Pos2::new(dial.left() - 1.0, stack_top),
-                Pos2::new(dial.right() + 1.0, dial.top() - 1.0),
+                Pos2::new(dial.left() - 1.75, stack_top),
+                Pos2::new(dial.right() + 1.75, dial.top() - 1.0),
             )
         };
         // **What a NARROW header sheds: the three dials.** The vertical
@@ -1811,8 +1848,7 @@ impl Layout {
         // vanished, rename and both menus dead with them. The mixer
         // carries the same three dials, so they are the horizontal
         // sacrifice — never the NAME.
-        const COL_MIN: f32 = 40.0;
-        let dials_fit = pan.left() - 6.0 - (arm_seat.right() + 4.0) >= COL_MIN;
+        let dials_fit = kd >= 11.0 && pan.left() - 6.0 - (arm_seat.right() + 4.0) >= COL_MIN;
         let col_right = if dials_fit { pan.left() } else { meter.left() };
         let (send, knob, pan) = if dials_fit {
             (send, knob, pan)
@@ -1831,10 +1867,13 @@ impl Layout {
         // labels above it at every height. Level with the rack beside it, the
         // bottom of the row reads as one band across both columns, and the
         // labels get the whole of what is left.
+        // **And it keeps the rack's margin too** — "routing to match as
+        // well". It ran from the pan dial's left edge to the send's right,
+        // which is the dial column's full width and flush against the meter.
         let routing = if dials_fit && rack2_y.1 > rack2_y.0 && pan.is_positive() {
             Rect::from_min_max(
-                Pos2::new(pan.left(), rack2_y.0),
-                Pos2::new(send.right(), rack2_y.1),
+                Pos2::new(pan.left() + RACK_INSET, rack2_y.0),
+                Pos2::new(send.right() - RACK_INSET, rack2_y.1),
             )
         } else {
             Rect::NOTHING
@@ -1858,6 +1897,20 @@ impl Layout {
         let top_band = band(top_y);
         let rack_band = band(rack_y);
         let rack2_band = band(rack2_y);
+        // **A rack keeps a margin at both ends of its band.** The three ran
+        // edge to edge of the column, so the outer two sat flush against the
+        // switches on one side and the dial column on the other and the rack
+        // read as a bar rather than as three things — the owner's "they have
+        // breathing room between them and the margin of the element".
+        const RACK_INSET: f32 = 3.0;
+        // **A bay's width, for the controls that are asked to match one.**
+        // Worked out from the same arithmetic `three` uses rather than read
+        // back off a laid-out bay, because the racks shed and this is wanted
+        // whether or not any bay survived.
+        let bay_w = {
+            let n = crate::recorder::INSERTS as f32;
+            ((top_band.width() - RACK_INSET * 2.0 - 3.0 * (n - 1.0)) / n).max(0.0)
+        };
         // **The NAME and, on a track, the INPUT button at its right end.**
         //
         // The selector had a whole band to itself and the second rack needed
@@ -1882,9 +1935,14 @@ impl Layout {
         // rack slot was the biggest box on it. A bay's height is the measure
         // it takes now, and it sits in the middle of the band rather than
         // filling it.
+        // **A BAY's width, to the point** — the owner's "lower the width of
+        // the input selector button so it matches the dimensions of the fx
+        // inserts". It had a share of the band, which made it wider than
+        // anything else on the column and the odd one out on a panel whose
+        // whole idiom is a row of equal chips.
         const NAME_MIN: f32 = 26.0;
-        const CHIP_MIN: f32 = 22.0;
-        let chip_w = (top_band.width() * 0.40).min(84.0);
+        const CHIP_MIN: f32 = 16.0;
+        let chip_w = bay_w;
         let beside = !folder
             && top_band.is_positive()
             && chip_w >= CHIP_MIN
@@ -1903,10 +1961,13 @@ impl Layout {
             (
                 Rect::from_min_max(
                     top_band.min,
-                    Pos2::new(top_band.right() - chip_w - 3.0, top_band.bottom()),
+                    Pos2::new(top_band.right() - RACK_INSET - chip_w - 3.0, top_band.bottom()),
                 ),
+                // Its right edge on the rack's right edge, so the column
+                // reads as one stack of chips rather than one that starts
+                // three points further out than the two under it.
                 Rect::from_center_size(
-                    Pos2::new(top_band.right() - chip_w * 0.5, top_band.center().y),
+                    Pos2::new(top_band.right() - RACK_INSET - chip_w * 0.5, top_band.center().y),
                     Vec2::new(chip_w, chip_h),
                 ),
                 rack_band,
@@ -1923,12 +1984,13 @@ impl Layout {
         // runs in and the order the mixer's rack shows them in.
         let three = |band: Rect, offset: usize, out: &mut [Rect; crate::recorder::INSERTS * 2]| {
             let n = crate::recorder::INSERTS;
-            let w = (band.width() - 3.0 * (n as f32 - 1.0)) / n as f32;
+            let inner = band.width() - RACK_INSET * 2.0;
+            let w = (inner - 3.0 * (n as f32 - 1.0)) / n as f32;
             if w < 16.0 || !band.is_positive() {
                 return;
             }
             for b in 0..n {
-                let x0 = band.left() + b as f32 * (w + 3.0);
+                let x0 = band.left() + RACK_INSET + b as f32 * (w + 3.0);
                 out[offset + b] = Rect::from_min_max(
                     Pos2::new(x0, band.top()),
                     Pos2::new(x0 + w, band.bottom()),
@@ -6037,8 +6099,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     painter.text(
                         r.automation.center(),
                         Align2::CENTER_CENTER,
-                        "A",
-                        FontId::new(size, crate::fonts::courier_bold()),
+                        // The wrench the track headers below wear, for the
+                        // same button. See the switch loop down there.
+                        crate::fonts::GLYPH_WRENCH,
+                        FontId::new(size, crate::fonts::icon()),
                         on_ink(plate),
                     );
                 }
@@ -6370,21 +6434,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let dial = |painter: &Painter, cell: Rect, t: f32, cap: Color32| {
             dial(painter, cell, t, cap, p.lane, p.clip_ink);
         };
-        let readout = |painter: &Painter, cell: Rect, text: String| {
-            // Three readouts sit shoulder to shoulder up here, and a figure
-            // that overflows its dial runs into the next figure and reads as
-            // one number — so the width is a real measurement. See `fit_text`.
-            fit_text(
-                painter,
-                cell,
-                &text,
-                &crate::fonts::courier(),
-                ink_on,
-                0.92,
-                (7.0, 12.0),
-            );
-        };
-        dial(painter, row.knob, crate::recorder::gain_to_fader(lane.gain), DIAL_VOLUME);
         // Compact: the unit has no room at this size, and a number under a
         // VOLUME dial needs none.
         let db = if lane.gain <= 0.001 {
@@ -6392,6 +6441,23 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         } else {
             format!("{:+.1}", 20.0 * lane.gain.log10())
         };
+        // **One size for the whole column** — the three figures and the three
+        // words under them, decided by the volume's, which is the longest.
+        // See `dial_type_size`.
+        let type_size = dial_type_size(painter, row.knob_readout, &db);
+        let readout = |painter: &Painter, cell: Rect, text: String| {
+            if !cell.is_positive() || type_size < 5.5 {
+                return;
+            }
+            painter.text(
+                cell.center(),
+                Align2::CENTER_CENTER,
+                text,
+                FontId::new(type_size, crate::fonts::courier()),
+                ink_on,
+            );
+        };
+        dial(painter, row.knob, crate::recorder::gain_to_fader(lane.gain), DIAL_VOLUME);
         readout(painter, row.knob_readout, db);
         dial(
             painter,
@@ -6446,15 +6512,16 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 Pos2::new(dial.left() - 2.0, dial.bottom()),
                 Pos2::new(dial.right() + 2.0, label_floor),
             );
-            if band.height() >= 6.0 {
-                fit_text(
-                    painter,
-                    band,
+            // The same size the figures above wear, and shed rather than
+            // shrunk when the band cannot carry it: three words at three
+            // sizes was the fault, and a fourth size here would be it again.
+            if band.height() >= type_size && type_size >= 5.5 {
+                painter.text(
+                    band.center(),
+                    Align2::CENTER_CENTER,
                     word,
-                    &crate::fonts::courier(),
+                    FontId::new(type_size, crate::fonts::courier()),
                     label_ink,
-                    0.70,
-                    (6.0, 11.0),
                 );
             }
         }
@@ -6494,23 +6561,54 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 }
             }
         }
-        // **T**, beside the arm: this track's MIDI reaches the theory view.
+        // **The NOTE**, beside the arm: this track's MIDI reaches the theory
+        // view. It was a **T** here and an eighth note on the mixer's own
+        // switch, which is one control with two faces — the owner's "use the
+        // note glyph globally for the theory routing button". The desk had it
+        // right; the timeline follows.
         //
         // Drawn with the M and the S rather than on its own, so a hand that
         // has learned those two recognises it — in the theme's own selection
         // colour, because it is neither a mute nor a solo and three switches
         // wearing two colours is one of them being mistaken for another.
-        for (r, label, on, lit) in [
-            (row.theory, "T", lane.to_theory, p.select),
-            // **A** — lit when this track is showing any automation row, so
-            // the header says at a glance that the rows below belong to it.
-            (row.automation, "A", !lane.automation.is_empty(), p.select),
-            // Ø on the theme's own selection ink, like T and A above it: it
+        //
+        // **And the WRENCH** where the automation button said A. A letter
+        // standing for a word is a legend to learn; a wrench is what every
+        // other tool this owner uses puts on the thing that adjusts a thing.
+        //
+        // Both come out of `fonts::icon`, which is Terminess whatever face is
+        // chosen — neither Courier Prime nor JetBrains Mono has either glyph,
+        // read out of their cmaps, so drawn in the text family they would be
+        // a tofu box on two faces out of three.
+        for (r, label, on, lit, family) in [
+            (
+                row.theory,
+                crate::fonts::GLYPH_NOTE,
+                lane.to_theory,
+                p.select,
+                crate::fonts::icon(),
+            ),
+            // Lit when this track is showing any automation row, so the
+            // header says at a glance that the rows below belong to it.
+            (
+                row.automation,
+                crate::fonts::GLYPH_WRENCH,
+                !lane.automation.is_empty(),
+                p.select,
+                crate::fonts::icon(),
+            ),
+            // Ø on the theme's own selection ink, like the two above it: it
             // is neither a mute nor a solo, and a third warning colour on a
             // header carrying two would read as a third kind of danger.
-            (row.phase, "\u{d8}", lane.phase, p.select),
-            (row.mute, "M", lane.muted, p.mute),
-            (row.solo, "S", lane.soloed, p.solo),
+            (
+                row.phase,
+                "\u{d8}",
+                lane.phase,
+                p.select,
+                crate::fonts::courier_bold(),
+            ),
+            (row.mute, "M", lane.muted, p.mute, crate::fonts::courier_bold()),
+            (row.solo, "S", lane.soloed, p.solo, crate::fonts::courier_bold()),
         ] {
             if !r.is_positive() {
                 continue;
@@ -6520,7 +6618,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 r.center(),
                 Align2::CENTER_CENTER,
                 label,
-                FontId::new(((r.height() * 0.6).clamp(8.0, 12.0)) * crate::fonts::size_scale(painter.ctx()), crate::fonts::courier_bold()),
+                FontId::new(((r.height() * 0.6).clamp(8.0, 12.0)) * crate::fonts::size_scale(painter.ctx()), family),
                 if on { on_ink(lit) } else { p.switch_off },
             );
         }
@@ -6822,6 +6920,48 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
 /// Rounded through `fonts::px` before it is used, so a figure that changes
 /// every frame while a dial is being turned does not mint a new galley for
 /// every fractional point size on the way.
+/// **One size for every figure and word in a track's dial column.**
+///
+/// The three readouts and the three labels used to be sized one at a time,
+/// each against its own cell and its own string — so `C` under the pan dial
+/// came out at its cell's full height while `-12.3` under the volume was cut
+/// to two thirds of it by its own width, and the words below were bigger than
+/// either. Three sizes in an inch of panel, none of them agreeing. The owner:
+/// "make sure that text is made larger, while the pan/send readouts must be
+/// smaller to match even though they have less characters".
+///
+/// So the row picks ONE size and everything wears it. It is what the WIDEST
+/// thing the row can ever show will fit in — five characters, the volume's
+/// `-12.3` — measured in the face that is installed, which is the lesson
+/// `fit_text` records.
+///
+/// **The VOLUME's own figure is what decides it**, because it is the longest
+/// — a sign, two digits, a point and a tenth against the pan's `C` and the
+/// send's `0%`. That is the owner's rule stated in his own terms: the volume
+/// readout is the one that has to fit, and everything else comes down to
+/// meet it rather than the other way round.
+fn dial_type_size(painter: &Painter, cell: Rect, longest: &str) -> f32 {
+    if !cell.is_positive() || longest.is_empty() {
+        return 0.0;
+    }
+    let scale = crate::fonts::size_scale(painter.ctx());
+    let ceiling = crate::fonts::px((cell.height() * 0.92).clamp(7.0, 13.0) * scale);
+    let wide = painter
+        .layout_no_wrap(
+            longest.to_owned(),
+            FontId::new(ceiling, crate::fonts::courier()),
+            Color32::WHITE,
+        )
+        .rect
+        .width();
+    let room = cell.width() - 2.0;
+    if wide > room && wide > 0.0 {
+        crate::fonts::px(ceiling * room / wide)
+    } else {
+        ceiling
+    }
+}
+
 fn fit_text(
     painter: &Painter,
     cell: Rect,
@@ -7638,10 +7778,15 @@ LaneView {
         }
         let names = ["VOX", "GTR BUS", "SNARE"];
         let ins = ["IN 1", "", "MIDI+ 10"];
+        let gains = [1.0_f32, 0.25, 0.5];
+        let pans = [0.0_f32, -0.5, 0.32];
         for (i, lane) in v.lanes.iter_mut().enumerate().take(3) {
             lane.name = names[i];
             lane.input = ins[i].to_owned();
             lane.input_short = ins[i].to_owned();
+            lane.gain = gains[i];
+            lane.pan = pans[i];
+            lane.send = 0.4;
         }
         let ctx = crate::face::fit::a_ctx(crate::fonts::FontChoice::default());
         let surface = crate::recorder_panel::surface_of(Color32::from_rgb(0x61, 0x37, 0x3A));
@@ -7829,14 +7974,6 @@ ArrangeView {
     }
 
     /// What size, and where, every word in a band was painted at.
-    fn sized_in_face(
-        v: &ArrangeView<'_>,
-        band: Rect,
-        face: crate::fonts::FontChoice,
-    ) -> Vec<(String, f32, Rect)> {
-        sized_in_face_at(v, band, face, rect())
-    }
-
     fn sized_in_face_at(
         v: &ArrangeView<'_>,
         band: Rect,
@@ -7868,43 +8005,63 @@ ArrangeView {
             .collect()
     }
 
-    /// **The dial readouts and the words under them use the room they have.**
+    /// **Every figure and word in a track's dial column is ONE size, and it
+    /// is the size the VOLUME's own figure fits in.**
     ///
-    /// The owner asked for the knob text and the readouts on a track header to
-    /// be bigger and to sit properly in the middle of their cells. Most of
-    /// "bigger" was room the drawing was already given and would not take: the
-    /// width budget was `chars * 0.64 * size`, Courier Prime's advance,
-    /// applied to whichever face was installed — and Terminess, which this app
-    /// ships in, is a fifth narrower than that. Measured at the default lane
-    /// height the volume figure came out at 6.2 points in a cell that carries
-    /// nine. See `fit_text`.
+    /// They used to be sized one at a time, each against its own cell and its
+    /// own string, so `C` under the pan dial came out at the cell's full
+    /// height while `-12.3` under the volume was cut to two thirds of it by
+    /// its own width — and the words below were bigger than either. Three
+    /// sizes in an inch of panel. The owner: "make sure that text is made
+    /// larger, while the pan/send readouts must be smaller to match even
+    /// though they have less characters".
     ///
-    /// Asserted on all three faces, because the fault was a face-specific
-    /// constant and a test pinned to one face would not have seen it.
+    /// Asserted on all three faces, because the width budget is measured in
+    /// whichever face is installed and a test pinned to one would not see a
+    /// face-specific fault. See `dial_type_size`.
     #[test]
-    fn the_dial_readouts_and_their_labels_fill_their_cells() {
+    fn one_size_dresses_a_tracks_whole_dial_column() {
         let c = clips();
-        let v = a_view(&c);
-        let l = Layout::new(rect(), &v);
+        let mut v = a_view(&c);
+        // A lane whose volume figure is the LONG one — five characters, which
+        // is the case the size is decided by. At unity it is four and the
+        // test would be measuring the easy half.
+        v.lanes[0].gain = 0.25;
+        v.lanes[0].pan = -0.5;
+        v.lanes[0].send = 0.4;
+        // Measured at a header the size this app opens at rather than the
+        // narrow fixture: the fixture's dial column is thirty-eight points
+        // wide, where a five-character figure is six points however it is
+        // sized, and the floor below would be asserting the squeeze rather
+        // than the rule.
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 900.0));
+        let l = Layout::new(r, &v);
         let row = l.header_rows[0];
+        // The label band ENDS where ROUTING starts, or its own chip's word
+        // would be sampled as a fourth label.
+        let floor_y = if row.routing.is_positive() {
+            row.routing.top()
+        } else {
+            row.panel.bottom() - 1.0
+        };
         let band = Rect::from_min_max(
             Pos2::new(row.pan.left() - 2.0, row.knob.bottom()),
-            Pos2::new(row.send.right() + 2.0, row.panel.bottom()),
+            Pos2::new(row.send.right() + 2.0, floor_y),
         );
-        // The floor the labels are centred in — the same one `draw` names.
-        let mid = (row.knob.bottom() + row.panel.bottom() - 1.0) * 0.5;
+        let mid = (row.knob.bottom() + floor_y) * 0.5;
         let mut bad: Vec<String> = Vec::new();
         for face in [
             crate::fonts::FontChoice::Courier,
             crate::fonts::FontChoice::Terminess,
             crate::fonts::FontChoice::JetBrains,
         ] {
+            let mut seen: Vec<(String, f32)> = Vec::new();
             for (what, cell) in [
                 ("volume", row.knob_readout),
                 ("send", row.send_readout),
                 ("pan", row.pan_readout),
             ] {
-                let painted = sized_in_face(&v, cell, face);
+                let painted = sized_in_face_at(&v, cell, face, r);
                 if painted.is_empty() {
                     bad.push(format!("{face:?}: the {what} readout was not painted"));
                 }
@@ -7918,45 +8075,10 @@ ArrangeView {
                             cell.width()
                         ));
                     }
-                    // And it is worth reading. Seven points is the floor a
-                    // five-figure number can hold in a cell as wide as the
-                    // dial under it on the WIDEST of the three faces; the
-                    // shipped one does better, and is checked for it below.
-                    if size < 7.0 {
-                        bad.push(format!(
-                            "{face:?}: the {what} readout is {size:.1}pt"
-                        ));
-                    }
-                    // **The face this app actually ships in**, held to what
-                    // the room really carries rather than to what the widest
-                    // face can manage. This is the number the owner sees.
-                    if face == crate::fonts::FontChoice::Terminess && size < 9.0 {
-                        bad.push(format!(
-                            "Terminess: the {what} readout is only {size:.1}pt"
-                        ));
-                    }
+                    seen.push((format!("{what} {text:?}"), size));
                 }
             }
-            for (text, size, at) in sized_in_face(&v, band, face) {
-                // Nine is the floor the WIDEST of the three faces reaches in
-                // a band as wide as the dial under it; the shipped one does
-                // better and is held to it two lines down.
-                if size < 9.0 {
-                    bad.push(format!("{face:?}: the {text:?} label is {size:.1}pt"));
-                }
-                // The owner's actual complaint, on the owner's actual face:
-                // "the vol/snd/pan font is what was wrong more than the
-                // readouts, and it hasn't visibly changed". It was eight
-                // points, because `DIAL_LABEL_H` gave it a nine point band
-                // however the size was worked out. See `HeaderRow::of`.
-                //
-                // Eleven and not thirteen: the first cut of the fix went too
-                // far the other way and the owner asked for it back a little.
-                // The floor is what matters — it is the eight that must not
-                // come back — so this is where the ceiling was left.
-                if face == crate::fonts::FontChoice::Terminess && size < 11.0 {
-                    bad.push(format!("Terminess: the {text:?} label is only {size:.1}pt"));
-                }
+            for (text, size, at) in sized_in_face_at(&v, band, face, r) {
                 // **Centred in the band, not hung from its top edge.**
                 let dy = at.center().y - mid;
                 if dy.abs() > 1.5 {
@@ -7964,12 +8086,30 @@ ArrangeView {
                         "{face:?}: the {text:?} label is {dy:+.2} off the middle of its band"
                     ));
                 }
-                if at.width() > band.width() / 3.0 {
-                    bad.push(format!(
-                        "{face:?}: the {text:?} label is {:.1} wide",
-                        at.width()
-                    ));
+                seen.push((format!("label {text:?}"), size));
+            }
+            // **The whole point: one size.**
+            if let Some(first) = seen.first().map(|(_, s)| *s) {
+                for (what, size) in &seen {
+                    if (size - first).abs() > 0.01 {
+                        bad.push(format!(
+                            "{face:?}: {what} is {size:.1}pt against {first:.1}pt elsewhere                              in the same column: {seen:?}"
+                        ));
+                    }
                 }
+                // And worth reading. Seven is the floor a five-character
+                // figure reaches in a cell as wide as the dial under it on
+                // the WIDEST of the three faces; the shipped one does better.
+                // Nine on the shipped face at a maximised pane, which is
+                // where the owner works and where he asked for the volume
+                // figure to be bigger. It was seven before the dials were let
+                // grow into spare header width.
+                let floor = if face == crate::fonts::FontChoice::Terminess { 9.0 } else { 7.0 };
+                if first < floor {
+                    bad.push(format!("{face:?}: the whole column is {first:.1}pt"));
+                }
+            } else {
+                bad.push(format!("{face:?}: the dial column painted nothing at all"));
             }
         }
         assert!(bad.is_empty(), "the header's figures:\n  {}", bad.join("\n  "));
@@ -8046,6 +8186,42 @@ ArrangeView {
             track.input.height(),
             track.bays[0].height()
         );
+        // **And a bay's WIDTH** — "lower the width of the input selector
+        // button so it matches the dimensions of the fx inserts". It had a
+        // share of the band, which made it the widest chip on a column whose
+        // whole idiom is a row of equal ones.
+        assert!(
+            (track.input.width() - track.bays[0].width()).abs() < 0.5,
+            "the input button is {:.1} wide against a bay's {:.1}",
+            track.input.width(),
+            track.bays[0].width()
+        );
+        assert!(
+            (track.input.right() - track.bays[2].right()).abs() < 0.5,
+            "the input button does not end where the rack under it ends"
+        );
+        // **Breathing room at both ends of the rack**, and ROUTING keeping
+        // the same margin — the owner's "so they have breathing room between
+        // them and the margin of the element", and "routing to match as
+        // well". The bays used to run edge to edge of the column.
+        // The FOLDER's name band is the column's full width — it has no input
+        // button eating its right end — so it is the column both rows'
+        // margins are measured against.
+        let col = l.header_rows[1].name;
+        for (what, row) in [("track", track), ("folder", l.header_rows[1])] {
+            assert!(
+                row.bays[0].left() - col.left() > 1.5,
+                "{what}: the first bay is flush with the column's left edge"
+            );
+            assert!(
+                col.right() - row.bays[2].right() > 1.5,
+                "{what}: the last bay is flush with the column's right edge"
+            );
+            assert!(
+                row.routing.left() > row.knob.left() - row.knob.width() - 4.0,
+                "{what}: routing runs past the dial column's own margin"
+            );
+        }
         assert!(
             track.input.bottom() <= track.bays[0].top() + 0.5,
             "the input button is not above the first rack"

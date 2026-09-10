@@ -47386,12 +47386,20 @@ mod tests {
         app.settings.arr_header_w = 0.0;
         app.arrangement_open = true;
 
-        // Both sizes are chosen to sit under the header's 400-point ceiling, so
-        // the tie is exact rather than clamped. The seam sits well right of the
-        // 150-point header floor at each.
+        // **Three sizes, and the third is a MAXIMISED one.** The first two
+        // used to be chosen to sit under a 400-point ceiling the layout also
+        // applied, which is exactly where the tie stopped holding: on a big
+        // display the seam is past four hundred and the header was clipped to
+        // it, so the two columns came apart at the one size the owner works
+        // at. The ceiling is half the view now and nothing tighter — see
+        // `Layout::frame`.
         let mut seams = Vec::new();
         let mut gutters = Vec::new();
-        for size in [Vec2::new(1000.0, 700.0), Vec2::new(1500.0, 950.0)] {
+        for size in [
+            Vec2::new(1000.0, 700.0),
+            Vec2::new(1500.0, 950.0),
+            Vec2::new(2560.0, 1440.0),
+        ] {
             let _ = run_one_frame(&ctx, &mut app, size);
             let band = app.last_band;
             let arr = app.arrangement_rect.expect("the arrangement did not open");
@@ -47424,9 +47432,15 @@ mod tests {
             "the camera seam did not move between window sizes: {seams:?}"
         );
         assert!(
-            (gutters[1] - gutters[0]).abs() < 0.5,
-            "the header did not track the seam: gutters {gutters:?}"
+            (seams[2] - seams[1]).abs() > 40.0,
+            "the camera seam did not move at the maximised size: {seams:?}"
         );
+        for g in &gutters {
+            assert!(
+                (g - gutters[0]).abs() < 0.5,
+                "the header did not track the seam: gutters {gutters:?}"
+            );
+        }
 
         // **A manual width overrides the tie** — the tie is the default and the
         // reset value, never a cage. A dragged header sits where it was put.
