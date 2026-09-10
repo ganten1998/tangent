@@ -1675,14 +1675,23 @@ impl Layout {
             Pos2::new(solo.left() - 2.0 - sw, r.center().y - sw * 0.5),
             Vec2::splat(sw),
         );
-        // Polarity, above the mute and two thirds its size — shed entirely
-        // when the row is too short for it to sit clear of the mute's top
-        // edge, rather than drawn on top of it.
+        // **Polarity, in the row's bottom-right corner** — the owner's
+        // placement. It used to sit above the mute, which put a third switch
+        // in the M/S column and made the three read as one set of three; it
+        // is not one of that set. Two thirds their size, because it is a
+        // thing you set once and they are things you reach for while playing.
+        //
+        // Shed when the row is too short for it to sit clear of the switches
+        // above it, rather than drawn on top of them.
         let phase = {
             let d = (sw * 0.62).clamp(8.0, 12.0);
-            let top = mute.top() - 1.5 - d;
-            if d >= 8.0 && top >= r.top() + 1.0 {
-                Rect::from_min_size(Pos2::new(mute.center().x - d * 0.5, top), Vec2::splat(d))
+            // Inside the corner rather than on it: the plate this stands on
+            // is the row shrunk by two, so a switch flush with `r` overhangs
+            // its own panel.
+            const CORNER: f32 = 2.0;
+            let top = r.bottom() - CORNER - d;
+            if d >= 8.0 && top >= solo.bottom() + 2.0 {
+                Rect::from_min_size(Pos2::new(r.right() - CORNER - d, top), Vec2::splat(d))
             } else {
                 Rect::NOTHING
             }
@@ -1708,8 +1717,12 @@ impl Layout {
         // on the row's middle; putting A under it and leaving T where it was
         // would push the pair off-centre, so the two are placed together and
         // the centre falls between them.
+        // **The same square the mute and the solo wear** — the owner's word.
+        // They were a third smaller, which said "these two are lesser
+        // controls"; they are not, and a note and a wrench need the room a
+        // letter does not.
         let (theory, automation) = {
-            let d = (h * 0.34).clamp(8.0, 13.0);
+            let d = sw;
             let x = arm_seat.right() + 3.0 + d * 0.5;
             let gap = 1.5;
             let top = r.center().y - d - gap * 0.5;
@@ -1786,7 +1799,7 @@ impl Layout {
         // window and the whole set vanished. It reaches the ceiling on a tall
         // row and the spare goes to the two figures, which is what the owner
         // asked for.
-        let kd = (stack * 0.44).clamp(11.0, 24.0).min((stack - 12.0).max(9.0));
+        let kd = (stack * 0.44).clamp(11.0, 30.0).min((stack - 12.0).max(9.0));
         // **And never wider than the room the NAME column can spare.**
         //
         // The ceiling used to be eighteen, and eighteen was a horizontal fact
@@ -3892,7 +3905,20 @@ struct Ink {
 /// deliberately so: these chips already wear the mixer's own strip face
 /// (`hdr_face`), and a hand that has learned "amber bar, grey word" on one
 /// desk has learned it on both.
-fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, bypassed: bool, p: &Ink) {
+fn bay_chip(
+    painter: &Painter,
+    r: Rect,
+    word: &str,
+    has: bool,
+    bypassed: bool,
+    p: &Ink,
+    // **The ROW's size, not this box's.** Every word on a header row is one
+    // size — see `header_type_size` — and a chip that worked its own out from
+    // its own height is how ROUTING came to be bigger than the figure beside
+    // it. The master row, which has no dial column to be held down by, passes
+    // its own.
+    size: f32,
+) {
     if !r.is_positive() {
         return;
     }
@@ -3924,7 +3950,7 @@ fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, bypassed: bool, p
     } else {
         0.0
     };
-    let font = FontId::new(((r.height() * 0.62).clamp(7.0, 10.0)) * crate::fonts::size_scale(painter.ctx()), crate::fonts::courier());
+    let font = FontId::new(size, crate::fonts::courier());
     // **And the word goes as quiet as a bypassed automation row's does** —
     // 0.45, the figure two hundred lines down where the same state is drawn
     // on a lane. `quiet` re-measures against this chip's own ground and
@@ -3961,7 +3987,7 @@ fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, bypassed: bool, p
 /// seven points, below which shrinking is the other way of being unreadable —
 /// it stops shrinking and `cut_to` takes over, which is the honest failure:
 /// an ellipsis says there is more, a four-point word says nothing.
-fn input_chip(painter: &Painter, r: Rect, word: &str, has: bool, p: &Ink) {
+fn input_chip(painter: &Painter, r: Rect, word: &str, has: bool, p: &Ink, size: f32) {
     if !r.is_positive() {
         return;
     }
@@ -3974,8 +4000,7 @@ fn input_chip(painter: &Painter, r: Rect, word: &str, has: bool, p: &Ink) {
         Stroke::new(1.0_f32, ink.gamma_multiply(0.4)),
         egui::StrokeKind::Inside,
     );
-    let scale = crate::fonts::size_scale(painter.ctx());
-    let ceiling = crate::fonts::px((r.height() * 0.62).clamp(7.0, 11.0) * scale);
+    let ceiling = size;
     let family = crate::fonts::courier();
     let word_ink = if has { p.bay_ink[0] } else { p.bay_ink[1] };
     let room = r.width() - 6.0;
@@ -6138,6 +6163,13 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // **The master's own rack, six bays wide.** The same chips the
             // track headers carry and the same door behind them, so the
             // output chain is reachable from the timeline as well as the desk.
+            // The master has no dial column to be held down by, so its chips
+            // work their size out from their own height — `header_type_size`
+            // is a TRACK row's rule.
+            let bay_size = crate::fonts::px(
+                (r.bays[0].height() * 0.62).clamp(7.0, 10.0)
+                    * crate::fonts::size_scale(painter.ctx()),
+            );
             for (b, cell) in r.bays.iter().enumerate() {
                 let word = view.master_inserts.get(b).copied().unwrap_or("");
                 bay_chip(
@@ -6147,6 +6179,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     !word.is_empty(),
                     view.master_bypassed.get(b).copied().unwrap_or(false),
                     &p,
+                    bay_size,
                 );
             }
             if r.knob.is_positive() {
@@ -6301,6 +6334,17 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 p.empty_ink
             },
         );
+        // Compact: the unit has no room at this size, and a number under a
+        // VOLUME dial needs none.
+        let db = if lane.gain <= 0.001 {
+            "-inf".to_owned()
+        } else {
+            format!("{:+.1}", 20.0 * lane.gain.log10())
+        };
+        // **One size for every word on this row** — the name, the input
+        // button, the six bays, ROUTING, the three figures and the three
+        // words under the dials. See `header_type_size`.
+        let type_size = header_type_size(painter, row, &db);
         // The input chip draws on EVERY lane — binding an input is how a
         // bare lane becomes a track — in bone whatever the theme, so the
         // words read on a painted header and on the grey field alike.
@@ -6308,7 +6352,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // borrow the bay's LOOK and are not bays, so they pass `false` and
         // the bays below call `bay_chip` themselves with their own flag.
         let chip = |painter: &Painter, r: Rect, word: &str, has: bool| {
-            bay_chip(painter, r, word, has, false, &p);
+            bay_chip(painter, r, word, has, false, &p, type_size);
         };
         // **The INPUT button shrinks its word rather than cutting it.**
         //
@@ -6320,7 +6364,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // WIDTH and falls back to truncating only under the floor where
         // shrinking further would be a smudge of another kind.
         let input_button = |painter: &Painter, r: Rect, word: &str, has: bool| {
-            input_chip(painter, r, word, has, &p);
+            input_chip(painter, r, word, has, &p, type_size);
         };
         if !lane.used {
             if row.add.is_positive() {
@@ -6359,10 +6403,12 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
         // The name, on its plate — or the rename field mid-typing.
         if row.name.is_positive() {
-            let font = FontId::new(
-                (row.name.height() * 0.56).clamp(8.5, 12.0),
-                crate::fonts::courier_bold(),
-            );
+            // The row's own size — see `header_type_size`. Bold, because a
+            // name is the thing being read; the same size as everything else
+            // on the row, because the owner asked for one size and a name a
+            // point and a half taller than its own bays was the largest part
+            // of what made the row look like three panels.
+            let font = FontId::new(type_size, crate::fonts::courier_bold());
             let naming = view.naming.filter(|(at, _)| *at == i).map(|(_, b)| b);
             if let Some(buf) = naming {
                 painter.rect_filled(row.name, 2.0, p.hdr_face);
@@ -6414,6 +6460,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 !bay_word.is_empty(),
                 lane.bypassed.get(b).copied().unwrap_or(false),
                 &p,
+                type_size,
             );
         }
         // ROUTING, under the dials: the same door the mixer's button opens,
@@ -6434,17 +6481,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let dial = |painter: &Painter, cell: Rect, t: f32, cap: Color32| {
             dial(painter, cell, t, cap, p.lane, p.clip_ink);
         };
-        // Compact: the unit has no room at this size, and a number under a
-        // VOLUME dial needs none.
-        let db = if lane.gain <= 0.001 {
-            "-inf".to_owned()
-        } else {
-            format!("{:+.1}", 20.0 * lane.gain.log10())
-        };
-        // **One size for the whole column** — the three figures and the three
-        // words under them, decided by the volume's, which is the longest.
-        // See `dial_type_size`.
-        let type_size = dial_type_size(painter, row.knob_readout, &db);
         let readout = |painter: &Painter, cell: Rect, text: String| {
             if !cell.is_positive() || type_size < 5.5 {
                 return;
@@ -6580,13 +6616,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // chosen — neither Courier Prime nor JetBrains Mono has either glyph,
         // read out of their cmaps, so drawn in the text family they would be
         // a tofu box on two faces out of three.
-        for (r, label, on, lit, family) in [
+        for (r, label, on, lit, family, icon) in [
             (
                 row.theory,
                 crate::fonts::GLYPH_NOTE,
                 lane.to_theory,
                 p.select,
                 crate::fonts::icon(),
+                true,
             ),
             // Lit when this track is showing any automation row, so the
             // header says at a glance that the rows below belong to it.
@@ -6596,6 +6633,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 !lane.automation.is_empty(),
                 p.select,
                 crate::fonts::icon(),
+                true,
             ),
             // Ø on the theme's own selection ink, like the two above it: it
             // is neither a mute nor a solo, and a third warning colour on a
@@ -6606,19 +6644,27 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 lane.phase,
                 p.select,
                 crate::fonts::courier_bold(),
+                false,
             ),
-            (row.mute, "M", lane.muted, p.mute, crate::fonts::courier_bold()),
-            (row.solo, "S", lane.soloed, p.solo, crate::fonts::courier_bold()),
+            (row.mute, "M", lane.muted, p.mute, crate::fonts::courier_bold(), false),
+            (row.solo, "S", lane.soloed, p.solo, crate::fonts::courier_bold(), false),
         ] {
             if !r.is_positive() {
                 continue;
             }
             painter.rect_filled(r, 2.0, if on { lit } else { p.hdr_lane });
+            // **A glyph fills more of its box than a letter does.** A capital
+            // M is drawn to sit on a baseline with room over it for an
+            // ascender; a note and a wrench are drawn to fill the em, and at
+            // a letter's fraction they came out small and lost in a switch
+            // the same size. The owner asked for them bigger "to fit the
+            // button better", and this is the whole of it.
+            let k = if icon { 0.86 } else { 0.6 };
             painter.text(
                 r.center(),
                 Align2::CENTER_CENTER,
                 label,
-                FontId::new(((r.height() * 0.6).clamp(8.0, 12.0)) * crate::fonts::size_scale(painter.ctx()), family),
+                FontId::new(((r.height() * k).clamp(8.0, 17.0)) * crate::fonts::size_scale(painter.ctx()), family),
                 if on { on_ink(lit) } else { p.switch_off },
             );
         }
@@ -6959,6 +7005,47 @@ fn dial_type_size(painter: &Painter, cell: Rect, longest: &str) -> f32 {
         crate::fonts::px(ceiling * room / wide)
     } else {
         ceiling
+    }
+}
+
+/// **One size for every word on a track's header row.**
+///
+/// The name, the input button, the six bays, ROUTING, the three figures over
+/// the dials and the three words under them. The owner's rule, in his own
+/// terms: the knob text and ROUTING "must not be bigger than the text for the
+/// track label and fx insert text — make all text on these the same size".
+///
+/// So it is the SMALLEST of what each cell can carry, and the tightest is
+/// almost always the dial's figure: `-12.0` is five characters in a cell as
+/// wide as the knob under it, while a bay has room for four in a box three
+/// times that. Taking the minimum is what makes the "must not be bigger"
+/// half true by construction rather than by a number somebody tuned.
+///
+/// A cell that has SHED contributes nothing — a narrow header with no dials
+/// must not size the whole row off a rectangle that is not there.
+fn header_type_size(painter: &Painter, row: &HeaderRow, db: &str) -> f32 {
+    let scale = crate::fonts::size_scale(painter.ctx());
+    let mut size = f32::INFINITY;
+    let mut take = |v: f32| {
+        if v > 0.0 && v < size {
+            size = v;
+        }
+    };
+    take(dial_type_size(painter, row.knob_readout, db));
+    // The chip rule, `bay_chip`'s own: a box's height at 0.62, floored and
+    // capped where a chip stops being readable and stops being a chip.
+    for cell in [row.bays[0], row.input, row.routing] {
+        if cell.is_positive() {
+            take(crate::fonts::px((cell.height() * 0.62).clamp(7.0, 10.0) * scale));
+        }
+    }
+    if row.name.is_positive() {
+        take(crate::fonts::px((row.name.height() * 0.56).clamp(8.5, 12.0) * scale));
+    }
+    if size.is_finite() {
+        size
+    } else {
+        crate::fonts::px(9.0 * scale)
     }
 }
 
@@ -8005,22 +8092,27 @@ ArrangeView {
             .collect()
     }
 
-    /// **Every figure and word in a track's dial column is ONE size, and it
-    /// is the size the VOLUME's own figure fits in.**
+    /// **Every word on a track's header row is ONE size.**
     ///
-    /// They used to be sized one at a time, each against its own cell and its
-    /// own string, so `C` under the pan dial came out at the cell's full
-    /// height while `-12.3` under the volume was cut to two thirds of it by
-    /// its own width — and the words below were bigger than either. Three
-    /// sizes in an inch of panel. The owner: "make sure that text is made
-    /// larger, while the pan/send readouts must be smaller to match even
-    /// though they have less characters".
+    /// The name, the input button, the bays, ROUTING, the three figures over
+    /// the dials and the three words under them. The owner's rule in his own
+    /// terms: the knob text and ROUTING "must not be bigger than the text for
+    /// the track label and fx insert text — make all text on these the same
+    /// size".
+    ///
+    /// They used to be four rules in four places — a name off its own band's
+    /// height, a chip off its own box's, a figure off its cell's width and a
+    /// word under a dial off the band below it — so the row read as three
+    /// panels that happened to be adjacent. Now one number is worked out from
+    /// the tightest cell (almost always the volume figure: five characters in
+    /// a cell as wide as the knob) and everything wears it. See
+    /// `header_type_size`.
     ///
     /// Asserted on all three faces, because the width budget is measured in
     /// whichever face is installed and a test pinned to one would not see a
-    /// face-specific fault. See `dial_type_size`.
+    /// face-specific fault.
     #[test]
-    fn one_size_dresses_a_tracks_whole_dial_column() {
+    fn one_size_dresses_a_tracks_whole_header_row() {
         let c = clips();
         let mut v = a_view(&c);
         // A lane whose volume figure is the LONG one — five characters, which
@@ -8029,22 +8121,24 @@ ArrangeView {
         v.lanes[0].gain = 0.25;
         v.lanes[0].pan = -0.5;
         v.lanes[0].send = 0.4;
+        v.lanes[0].name = "VOX";
+        v.lanes[0].input = "IN 1".to_owned();
+        v.lanes[0].input_short = "IN 1".to_owned();
+        v.lanes[0].inserts = ["COMP", "", "", "", "", ""];
         // Measured at a header the size this app opens at rather than the
-        // narrow fixture: the fixture's dial column is thirty-eight points
-        // wide, where a five-character figure is six points however it is
-        // sized, and the floor below would be asserting the squeeze rather
-        // than the rule.
+        // narrow fixture, whose dial column is thirty-eight points wide and
+        // would be asserting the squeeze rather than the rule.
         let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 900.0));
         let l = Layout::new(r, &v);
         let row = l.header_rows[0];
-        // The label band ENDS where ROUTING starts, or its own chip's word
-        // would be sampled as a fourth label.
+        // The label band ENDS where ROUTING starts, or ROUTING's own word
+        // would be sampled twice.
         let floor_y = if row.routing.is_positive() {
             row.routing.top()
         } else {
             row.panel.bottom() - 1.0
         };
-        let band = Rect::from_min_max(
+        let labels = Rect::from_min_max(
             Pos2::new(row.pan.left() - 2.0, row.knob.bottom()),
             Pos2::new(row.send.right() + 2.0, floor_y),
         );
@@ -8057,62 +8151,119 @@ ArrangeView {
         ] {
             let mut seen: Vec<(String, f32)> = Vec::new();
             for (what, cell) in [
+                ("name", row.name),
+                ("input", row.input),
+                ("bay", row.bays[0]),
+                ("routing", row.routing),
                 ("volume", row.knob_readout),
                 ("send", row.send_readout),
                 ("pan", row.pan_readout),
+                ("labels", labels),
             ] {
                 let painted = sized_in_face_at(&v, cell, face, r);
                 if painted.is_empty() {
-                    bad.push(format!("{face:?}: the {what} readout was not painted"));
+                    bad.push(format!("{face:?}: {what} painted nothing"));
                 }
                 for (text, size, at) in painted {
-                    // It fits. A figure that overflows its dial runs into the
-                    // next figure and the three read as one number.
-                    if at.width() > cell.width() {
+                    // It fits its cell. A figure that overflows its dial runs
+                    // into the next figure and the three read as one number.
+                    if what != "labels" && at.width() > cell.width() {
                         bad.push(format!(
-                            "{face:?}: the {what} readout {text:?} is {:.1} wide in {:.1}",
+                            "{face:?}: {what} {text:?} is {:.1} wide in {:.1}",
                             at.width(),
                             cell.width()
                         ));
                     }
+                    // And a word under a dial is CENTRED in its band, not
+                    // hung from the top edge.
+                    if what == "labels" && (at.center().y - mid).abs() > 1.5 {
+                        bad.push(format!(
+                            "{face:?}: the {text:?} label is {:+.2} off the middle of its band",
+                            at.center().y - mid
+                        ));
+                    }
                     seen.push((format!("{what} {text:?}"), size));
                 }
-            }
-            for (text, size, at) in sized_in_face_at(&v, band, face, r) {
-                // **Centred in the band, not hung from its top edge.**
-                let dy = at.center().y - mid;
-                if dy.abs() > 1.5 {
-                    bad.push(format!(
-                        "{face:?}: the {text:?} label is {dy:+.2} off the middle of its band"
-                    ));
-                }
-                seen.push((format!("label {text:?}"), size));
             }
             // **The whole point: one size.**
             if let Some(first) = seen.first().map(|(_, s)| *s) {
                 for (what, size) in &seen {
                     if (size - first).abs() > 0.01 {
                         bad.push(format!(
-                            "{face:?}: {what} is {size:.1}pt against {first:.1}pt elsewhere                              in the same column: {seen:?}"
+                            "{face:?}: {what} is {size:.1}pt against {first:.1}pt elsewhere \
+                             on the same row: {seen:?}"
                         ));
                     }
                 }
-                // And worth reading. Seven is the floor a five-character
-                // figure reaches in a cell as wide as the dial under it on
-                // the WIDEST of the three faces; the shipped one does better.
-                // Nine on the shipped face at a maximised pane, which is
-                // where the owner works and where he asked for the volume
-                // figure to be bigger. It was seven before the dials were let
-                // grow into spare header width.
+                // And worth reading. Nine on the shipped face at a maximised
+                // pane, which is where the owner works.
                 let floor = if face == crate::fonts::FontChoice::Terminess { 9.0 } else { 7.0 };
                 if first < floor {
-                    bad.push(format!("{face:?}: the whole column is {first:.1}pt"));
+                    bad.push(format!("{face:?}: the whole row is {first:.1}pt"));
                 }
             } else {
-                bad.push(format!("{face:?}: the dial column painted nothing at all"));
+                bad.push(format!("{face:?}: the header row painted nothing at all"));
             }
         }
-        assert!(bad.is_empty(), "the header's figures:\n  {}", bad.join("\n  "));
+        assert!(bad.is_empty(), "the header's type:\n  {}", bad.join("\n  "));
+    }
+
+    /// **Four switches of one size, and Ø in the corner on its own.**
+    ///
+    /// The theory send and the automation button were a third smaller than
+    /// the mute and the solo, which said "these two are lesser controls";
+    /// they are not, and a note and a wrench need room a letter does not.
+    /// The owner: "same size buttons now for theory view route, automation,
+    /// mute, and solo", and "move the phase button to the bottom right".
+    ///
+    /// Ø is deliberately NOT one of the four. It is a thing you set once and
+    /// they are things you reach for while playing, and it sat in their
+    /// column making three switches read as one set of three.
+    #[test]
+    fn the_four_switches_are_one_size_and_phase_sits_in_the_corner() {
+        let c = clips();
+        let v = a_view(&c);
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 900.0));
+        let l = Layout::new(r, &v);
+        let row = l.header_rows[0];
+        let four = [
+            ("theory", row.theory),
+            ("automation", row.automation),
+            ("mute", row.mute),
+            ("solo", row.solo),
+        ];
+        for (what, cell) in four {
+            assert!(cell.is_positive(), "{what} was shed at a full-size header");
+            assert!(
+                (cell.width() - row.mute.width()).abs() < 0.5
+                    && (cell.height() - row.mute.height()).abs() < 0.5,
+                "{what} is {:?} against the mute's {:?}",
+                cell.size(),
+                row.mute.size()
+            );
+        }
+        // **Ø, in the bottom-right corner**: below the switches, right of the
+        // meter, inside its own plate.
+        assert!(row.phase.is_positive(), "the polarity switch was shed");
+        assert!(
+            row.phase.top() > row.solo.bottom(),
+            "Ø is still up in the switch column"
+        );
+        assert!(
+            row.phase.right() <= row.panel.right() && row.phase.bottom() <= row.panel.bottom(),
+            "Ø overhangs its own row"
+        );
+        assert!(
+            row.panel.right() - row.phase.right() < 6.0
+                && row.panel.bottom() - row.phase.bottom() < 6.0,
+            "Ø is not in the corner: {:?} in a row ending at {:?}",
+            row.phase.max,
+            row.panel.max
+        );
+        assert!(
+            row.phase.width() < row.mute.width(),
+            "Ø is one of the four rather than the quiet one beside them"
+        );
     }
 
     /// **Six bays on every lane, the input beside the name, ROUTING level
@@ -10504,6 +10655,13 @@ selected: false,
                 row.meter,
                 row.mute,
                 row.solo,
+                // **Ø joined the sweep when it MOVED.** It used to sit above
+                // the mute, in the column this list already covered; it is in
+                // the row's bottom-right corner now, which is a corner two
+                // other things reach toward.
+                row.phase,
+                row.theory,
+                row.automation,
             ];
             for (a, ra) in cells.iter().enumerate() {
                 for (b, rb) in cells.iter().enumerate().skip(a + 1) {
