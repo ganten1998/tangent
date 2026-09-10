@@ -1875,13 +1875,26 @@ impl Layout {
         // ahead of every bay. The racks then shed from the bottom, which is
         // the order they shed in anyway. A header dragged wider crosses the
         // floor and the second rack appears.
+        //
+        // **As thin as an fx slot, and centred on the name's line** — the
+        // owner's revision. It filled the name band's whole height, which is
+        // taller than a bay, so the one control on this column that is not a
+        // rack slot was the biggest box on it. A bay's height is the measure
+        // it takes now, and it sits in the middle of the band rather than
+        // filling it.
         const NAME_MIN: f32 = 26.0;
-        const CHIP_MIN: f32 = 24.0;
-        let chip_w = (top_band.width() * 0.48).min(96.0);
+        const CHIP_MIN: f32 = 22.0;
+        let chip_w = (top_band.width() * 0.40).min(84.0);
         let beside = !folder
             && top_band.is_positive()
             && chip_w >= CHIP_MIN
             && top_band.width() - chip_w - 3.0 >= NAME_MIN;
+        // A bay's own height, or the band's when there are no bays to match.
+        let chip_h = if rack_band.is_positive() {
+            rack_band.height().min(top_band.height())
+        } else {
+            top_band.height()
+        };
         let (name, input, rack_a, rack_b) = if folder {
             // A folder has nothing to select, so its whole band is name and
             // both racks keep their own.
@@ -1892,9 +1905,9 @@ impl Layout {
                     top_band.min,
                     Pos2::new(top_band.right() - chip_w - 3.0, top_band.bottom()),
                 ),
-                Rect::from_min_max(
-                    Pos2::new(top_band.right() - chip_w, top_band.top()),
-                    top_band.max,
+                Rect::from_center_size(
+                    Pos2::new(top_band.right() - chip_w * 0.5, top_band.center().y),
+                    Vec2::new(chip_w, chip_h),
                 ),
                 rack_band,
                 rack2_band,
@@ -6440,8 +6453,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     word,
                     &crate::fonts::courier(),
                     label_ink,
-                    0.82,
-                    (6.0, 13.0),
+                    0.70,
+                    (6.0, 11.0),
                 );
             }
         }
@@ -7925,7 +7938,10 @@ ArrangeView {
                 }
             }
             for (text, size, at) in sized_in_face(&v, band, face) {
-                if size < 10.0 {
+                // Nine is the floor the WIDEST of the three faces reaches in
+                // a band as wide as the dial under it; the shipped one does
+                // better and is held to it two lines down.
+                if size < 9.0 {
                     bad.push(format!("{face:?}: the {text:?} label is {size:.1}pt"));
                 }
                 // The owner's actual complaint, on the owner's actual face:
@@ -7933,7 +7949,12 @@ ArrangeView {
                 // readouts, and it hasn't visibly changed". It was eight
                 // points, because `DIAL_LABEL_H` gave it a nine point band
                 // however the size was worked out. See `HeaderRow::of`.
-                if face == crate::fonts::FontChoice::Terminess && size < 12.0 {
+                //
+                // Eleven and not thirteen: the first cut of the fix went too
+                // far the other way and the owner asked for it back a little.
+                // The floor is what matters — it is the eight that must not
+                // come back — so this is where the ceiling was left.
+                if face == crate::fonts::FontChoice::Terminess && size < 11.0 {
                     bad.push(format!("Terminess: the {text:?} label is only {size:.1}pt"));
                 }
                 // **Centred in the band, not hung from its top edge.**
@@ -8011,10 +8032,19 @@ ArrangeView {
             track.input.left() >= track.name.right(),
             "the input button is not to the right of the name"
         );
+        // **Thin as an fx slot and centred on the name's line**, the owner's
+        // revision: it used to fill the band's whole height, which made the
+        // one control on this column that is not a rack slot the biggest box
+        // on it.
         assert!(
-            (track.input.top() - track.name.top()).abs() < 0.5
-                && (track.input.bottom() - track.name.bottom()).abs() < 0.5,
-            "the input button is not on the name's own row"
+            (track.input.center().y - track.name.center().y).abs() < 0.5,
+            "the input button is not centred on the name's own line"
+        );
+        assert!(
+            track.input.height() <= track.bays[0].height() + 0.5,
+            "the input button is taller than a bay: {:.1} against {:.1}",
+            track.input.height(),
+            track.bays[0].height()
         );
         assert!(
             track.input.bottom() <= track.bays[0].top() + 0.5,
