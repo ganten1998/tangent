@@ -3512,6 +3512,33 @@ fn run_rack(
             beat: pos / rate * bpm / 60.0,
         }
     };
+    // **The scratch buffers are SHARED, and a hosted plugin SHRINKS them.**
+    //
+    // `tangent_host::Instance::process` clears and resizes the caller's
+    // output buffers to ITS block's frame count. That is documented, and it
+    // is why they are allocated at `MAX_BLOCK` — so the resize never
+    // allocates. What it misses is that `fx_out` is ONE buffer used by every
+    // rack on the desk: a hosted plugin that ran a 217-frame block leaves it
+    // 217 long, and a BUILT-IN in the next 218-frame block writes through
+    // `.take(frames)` and never grows it back. The copy-back at the end of
+    // this loop then slices 218 out of 217 — "range end index 218 out of
+    // range for slice of length 217", on the audio thread, which is the whole
+    // app and not just the block.
+    //
+    // Variable block sizes are not exotic here. Varispeed resamples, so the
+    // number of source frames a callback needs alternates by one; a callback
+    // that is not a multiple of `MAX_BLOCK` leaves a remainder chunk that
+    // changes with it. Either is enough.
+    //
+    // GROWN rather than clamped at the copy, because a buffer shorter than
+    // the block is a block with samples missing however it is sliced, and
+    // growing is what makes it whole again. Allocation-free: the capacity is
+    // still `MAX_BLOCK`, so this is a length write and a short zero fill.
+    for b in planar.iter_mut().chain(out.iter_mut()) {
+        if b.len() < frames {
+            b.resize(frames, 0.0);
+        }
+    }
     for (bay, slot) in rack.slots.iter_mut().enumerate() {
         let Some(p) = slot.0.as_mut() else {
             // **An armed EMPTY bay taps what the bay WOULD see** — the
@@ -3629,6 +3656,18 @@ fn run_rack(
             // Replaces rather than mixes: a MIDI channel's signal IS its
             // instrument, and whatever was in `planar` before bay 1 ran is
             // silence or an upstream voice being superseded.
+            // A voice's own buffers, on the same terms as the shared
+            // scratch above: a hosted one shrinks them to its block and a
+            // built-in writes through `.take(frames)` without growing them.
+            // They are this slot's alone, so only a backend swapped under a
+            // loaded bay can leave them short — but the copy-back reads them
+            // by the same strict slice, and the price of being wrong here is
+            // the app.
+            for b in &mut p.bufs {
+                if b.len() < frames {
+                    b.resize(frames, 0.0);
+                }
+            }
             if p.backend
                 .process_voice(notes, controls, bay_params, transport, sample, frames, &mut p.bufs)
                 .is_err()
@@ -26235,6 +26274,85 @@ mod sampler_road {
 
     /// A rack with a sampler in bay 0, seated exactly as `load_insert` seats
     /// one: a built-in behind a `Backend`, flagged `voice` from its table row.
+    /// The same rack with a built-in EFFECT in bay 0 — the backend that
+    /// writes through `.take(frames)` and never grows the buffer it was
+    /// handed, which is half of what
+    /// `a_short_scratch_buffer_does_not_kill_the_audio_thread` is about.
+    fn rack_with_a_trim() -> Rack {
+        let mut rack = rack_with_a_sampler();
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH)
+            .expect("the trim is in the table");
+        rack.slots[0] = PluginBox(Some(Box::new(Hosted {
+            backend: Backend::Builtin(spec.create(48_000.0, &spec.defaults())),
+            bufs: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            channels: TAP_CHANNELS,
+            voice: spec.voice,
+        })));
+        rack
+    }
+
+    /// **A scratch buffer left short by the last block does not kill the app.**
+    ///
+    /// The crash: "range end index 218 out of range for slice of length 217",
+    /// `instrument.rs` copy-back, on the audio thread. `fx_out` is ONE buffer
+    /// shared by every rack on the desk, and `tangent_host::Instance::process`
+    /// clears and resizes the caller's outputs to ITS block's frame count — so
+    /// a hosted plugin that ran 217 frames leaves it 217 long. A BUILT-IN in
+    /// the next block writes through `.take(frames)` and never grows it back,
+    /// and the copy-back then slices 218 out of 217.
+    ///
+    /// One frame, because that is the size of the real fault: varispeed
+    /// resamples, so the number of source frames a callback needs alternates
+    /// by one. Both backends are exercised — the effect path reads the shared
+    /// `out` and the voice path reads the slot's own `bufs`, and each has to
+    /// be whole.
+    ///
+    /// Revert check performed: drop either `resize` loop at the top of
+    /// `run_rack` and this panics exactly as the report did.
+    #[test]
+    fn a_short_scratch_buffer_does_not_kill_the_audio_thread() {
+        let shared = Shared::new();
+        let params: [&[tangent_host::ParamPoint]; INSERTS] = [&[], &[], &[]];
+        let notes = [Note { offset: 0, pitch: 60, velocity: 1.0, on: true }];
+        // 217 and 218: the report's own numbers.
+        const WAS: usize = 217;
+        const NOW: usize = 218;
+        for (what, mut rack, voice) in [
+            ("a built-in effect", rack_with_a_trim(), false),
+            ("a built-in voice", rack_with_a_sampler(), true),
+        ] {
+            let mut planar = vec![vec![0.2f32; WAS]; TAP_CHANNELS];
+            let mut out = vec![vec![0.0f32; WAS]; TAP_CHANNELS];
+            if voice {
+                // What a hosted voice in this bay would have left behind.
+                if let Some(p) = rack.slots[0].0.as_mut() {
+                    for b in &mut p.bufs {
+                        b.truncate(WAS);
+                    }
+                }
+            }
+            // **NOT-A-CHANNEL:** a synthetic rack built by this test.
+            run_rack(
+                &mut rack, &mut planar, NOW, &mut out, &notes, &[], &params, &shared, 0, None,
+                None,
+            );
+            for (c, b) in planar.iter().enumerate() {
+                assert!(
+                    b.len() >= NOW,
+                    "{what}: channel {c} came back {} long for a {NOW} frame block",
+                    b.len()
+                );
+            }
+            for (c, b) in out.iter().enumerate() {
+                assert!(
+                    b.len() >= NOW,
+                    "{what}: the scratch's channel {c} is still {} long",
+                    b.len()
+                );
+            }
+        }
+    }
+
     fn rack_with_a_sampler() -> Rack {
         let mut inc = Vec::new();
         let mut ret = Vec::new();
