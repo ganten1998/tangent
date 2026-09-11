@@ -729,6 +729,65 @@ pub fn distinct_surface_at(face: Color32, ground: Color32, floor: f32) -> Color3
     out
 }
 
+/// **An eighth note, DRAWN.**
+///
+/// The theory send's switch. It was a font glyph — U+266A out of a terminal
+/// face, then `nf-md-music-note` out of the Nerd Font set — and the owner's
+/// note on both was the same: it does not read as a note. The Unicode one is
+/// a square head on a straight flag; the Nerd Font one is rounder but the
+/// head is a circle, and a notehead is not a circle. It is an OBLONG, and it
+/// is TILTED, and that tilt is most of what the eye recognises.
+///
+/// So it is two shapes and a line, which is the road [`crate::app`]'s tick
+/// mark already takes and for the same reasons: a shape the painter emits is
+/// one this app decides the proportions of, one that scales to a
+/// seventeen-point switch without a hinting engine's opinion, and one a test
+/// can read back out of the shape list. A rasterised glyph is none of those.
+///
+/// Drawn to fill `r` — give it the switch's rect and it sizes itself.
+pub fn draw_note(painter: &Painter, r: Rect, ink: Color32) {
+    if !r.is_positive() {
+        return;
+    }
+    let s = r.width().min(r.height());
+    let c = r.center();
+    // **The head: an oblong, tilted up to the right.** Twenty degrees is
+    // engraving's own angle — far enough to read as deliberate at seventeen
+    // points, not so far that it looks like it is falling over.
+    let (rx, ry) = (s * 0.225, s * 0.150);
+    let (sa, ca) = (-0.35_f32).sin_cos();
+    let head = Pos2::new(c.x - s * 0.09, c.y + s * 0.21);
+    let ring: Vec<Pos2> = (0..20_u8)
+        .map(|i| {
+            let t = f32::from(i) / 20.0 * std::f32::consts::TAU;
+            let (x, y) = (rx * t.cos(), ry * t.sin());
+            Pos2::new(head.x + x * ca - y * sa, head.y + x * sa + y * ca)
+        })
+        .collect();
+    painter.add(egui::Shape::convex_polygon(ring, ink, Stroke::NONE));
+    // **The stem, off the head's right shoulder**, which is where a stem
+    // goes on a note that points up.
+    let stem_x = head.x + rx * ca;
+    let top = c.y - s * 0.40;
+    let w = (s * 0.085).max(1.2);
+    painter.line_segment(
+        [Pos2::new(stem_x, head.y - ry * 0.2), Pos2::new(stem_x, top)],
+        Stroke::new(w, ink),
+    );
+    // **The flag**, as a pennant rather than a curve. A quaver's flag really
+    // is a curve, and a curve two pixels thick at this size is a smudge; the
+    // straight one keeps the silhouette, which is the part that reads.
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(stem_x - w * 0.5, top),
+            Pos2::new(stem_x + s * 0.26, top + s * 0.17),
+            Pos2::new(stem_x - w * 0.5, top + s * 0.34),
+        ],
+        ink,
+        Stroke::NONE,
+    ));
+}
+
 pub fn legible_surface(c: Color32) -> Color32 {
     let light = contrast_ratio(c, INK_LIGHT);
     let dark = contrast_ratio(c, INK_DARK);
