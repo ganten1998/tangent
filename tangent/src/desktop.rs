@@ -4458,6 +4458,7 @@ impl DesktopApp {
         // compare.
         if let Some(e) = self.recorder.engine.as_ref() {
             e.set_master_mono(self.app.master_mono());
+            e.set_master_mute(self.app.master_muted());
         }
         if let Some(order) = self.app.take_desk_state_perm() {
             // **Only the rows this permutation touches.** See

@@ -147,6 +147,10 @@ pub struct MixerView<'a> {
     /// an app whose strips appear and disappear as things are loaded is a desk
     /// that changes shape under your hands.
     pub strips: [StripView<'a>; COLUMNS],
+    /// **What the click is playing**, as a word: the chosen file's name, or
+    /// the bundled click's. Drawn on the click's own button, which opens the
+    /// metronome panel.
+    pub click_sound: &'a str,
     /// How far the CHANNEL region is scrolled, in PIXELS — the desk has more
     /// channels than fit, so a window of them shows and this says where it
     /// stands. Pixels and not a column index, so the wheel moves the desk
@@ -234,6 +238,8 @@ pub enum Hit {
     Pan(Column),
     /// The input chip under the icon: open the channel's INPUT menu.
     InputChip(Column),
+    /// The click's sound button: open the metronome panel.
+    MetFile,
     Mute(Column),
     /// **Ø** — invert this strip's polarity.
     Phase(Column),
@@ -317,6 +323,9 @@ impl Hit {
             | Hit::InputChip(i)
             | Hit::Routing(i)
             | Hit::RouteGain(i, _) => i,
+            // The click's sound button is on the click's column, which is
+            // where it is drawn.
+            Hit::MetFile => Column(Strip::Click.index()),
         }
     }
 
@@ -337,6 +346,7 @@ impl Hit {
             Hit::Mute(_) | Hit::Phase(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::Folder(_)
             | Hit::ToTheory(_) | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_)
+            | Hit::MetFile
             | Hit::Routing(_) => None,
         }
     }
@@ -351,6 +361,7 @@ impl Hit {
             Hit::Mute(_) | Hit::Phase(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::Folder(_)
             | Hit::ToTheory(_) | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_)
+            | Hit::MetFile
             | Hit::Routing(_) => None,
         }
     }
@@ -940,6 +951,11 @@ pub struct StripStrip {
     pub pan: Rect,
     /// The input chip — the detail row, pressable on general channels.
     pub input_chip: Rect,
+    /// **The click's own sound**, in the band a channel spends on its input
+    /// chip. It reads the file that is playing and it opens the metronome
+    /// panel — the same one the arrangement's toolbar opens, because there is
+    /// one metronome and it should not have two menus.
+    pub met: Rect,
     /// The F switch — the folder cycle, leftmost of the switch row.
     pub folder: Rect,
     pub fader: Rect,
@@ -994,6 +1010,7 @@ impl StripStrip {
         send: Rect::NOTHING,
         pan: Rect::NOTHING,
         input_chip: Rect::NOTHING,
+        met: Rect::NOTHING,
         folder: Rect::NOTHING,
         fader: Rect::NOTHING,
         db: Rect::NOTHING,
@@ -1287,20 +1304,17 @@ impl Layout {
         // many.** Its three extra bays took the empty paint between the
         // title and the original three — the owner's spot for them. A
         // channel's rack is exactly where it was.
-        let rack = if view.strip.is_none() && !view.empty {
-            cut(0.100, 0.345)
-        } else if view.is_folder && !view.empty {
-            // **A folder's rack IS the master's**: same start, same end,
-            // six bays at every size the master already manages - the
-            // owner's "at 100 percent size, adapt to fit all 6". The name
-            // yields room exactly as the master's does when the strip
-            // shrinks. A folder can start this high because it has no input
-            // chip and no detail line; a plain channel has both, and its
-            // rack begins under them.
-            cut(0.100, 0.345)
-        } else {
-            cut(0.195, 0.345)
-        };
+        // **ONE rack band, on every strip on the desk.**
+        //
+        // The master's and a folder's used to start at 0.100 — reaching up
+        // over the band the ICON sits in, which is why a group's badge was
+        // covered by its own first bay. The owner: "lower the height of
+        // folders' fx sends such that their icons are visible", and then
+        // "make sure at the end that all fx sends are visually at the same
+        // level through the whole mixer view to be the same as the current
+        // tracks'". One band, the track's, and the bays inside it divide by
+        // however many the strip wears.
+        let rack = cut(0.195, 0.345);
         // **Six on every channel now**, folder or not — the owner's ruling,
         // see `recorder::bays_on`. A plain channel fits them into the band it
         // has always had rather than reaching up over its own icon and input
@@ -1318,7 +1332,16 @@ impl Layout {
                 Pos2::new(rack.right() - 2.0, y + h - 1.0),
             )
         });
-        let switches = if switchable { cut(0.902, 0.975) } else { Rect::NOTHING };
+        // **The master has a switch row too**, now that it carries a mute and
+        // a solo — see the pair below. It is not `switchable`, deliberately:
+        // that flag also arms the polarity switch and the theory note, and
+        // neither means anything on a sum of everything.
+        let master_live = view.strip.is_none() && !view.empty;
+        let switches = if switchable || master_live {
+            cut(0.902, 0.975)
+        } else {
+            Rect::NOTHING
+        };
         // **Polarity shares the dB row**, at its right end.
         //
         // There is no band of its own to have: the gap between the readout
@@ -1348,8 +1371,12 @@ impl Layout {
         // those, so the row was empty paint at the foot of the one strip
         // that had nothing there. A mix check belongs at the end of the
         // signal path, which is where this strip is.
-        let mono = if view.strip.is_none() && !view.empty {
-            let row = cut(0.902, 0.975);
+        // **The master's fold, ABOVE the fader** — the owner's placement,
+        // and it is what frees the switch row for a mute and a solo so the
+        // master and the click read as the same kind of column. It takes the
+        // band a channel spends on ROUTING, which the master has no use for.
+        let mono = if master_live {
+            let row = cut(0.352, 0.404);
             Rect::from_min_max(
                 Pos2::new(row.left() + 2.0, row.top()),
                 Pos2::new(row.right() - 2.0, row.bottom()),
@@ -1383,7 +1410,14 @@ impl Layout {
                 )
             };
             (cell(0.0), cell(1.0), cell(2.0))
-        } else if switchable {
+        } else if switchable || master_live {
+            // **The master takes the pair too.** It is the one strip that
+            // could not be silenced or soloed from the desk, which made it
+            // the odd column out beside the click — the owner's "for click
+            // and master looking the same in mixer view". `switchable` is
+            // not widened to cover it: that flag also arms the polarity
+            // switch and the theory note, and neither means anything on a
+            // sum of everything.
             let mid = switches.center().x;
             (
                 Rect::from_min_max(switches.min, Pos2::new(mid - 3.0, switches.max.y)),
@@ -1464,10 +1498,13 @@ impl Layout {
         // is their KIND, and clicking it cycles the kind), the backing track,
         // and now the click. The bus and the master have nothing to pick and
         // keep the room for their names.
+        // **And the MASTER**, which has a drawing of its own now — see
+        // `auto_icon`. It was the one strip on the desk with a hole where
+        // every other one has a badge.
         let has_icon = matches!(
             view.strip,
-            Some(Strip::Channel(_) | Strip::Click | Strip::Drums)
-        );
+            None | Some(Strip::Channel(_) | Strip::Click | Strip::Drums)
+        ) && !view.empty;
         // **The way OFF the desk, where every window puts it.** Subtle — a
         // small mark in faded ink, drawn by `strip` — but a real target, and
         // only on a channel there is something to remove from. The name band
@@ -1503,11 +1540,12 @@ impl Layout {
             // reaches down through it. If a bus is ever given a second line,
             // `the_strip_badge_clears_the_name_above_it_and_the_chip_below`
             // is what fails.
-            let r = if matches!(view.strip, Some(Strip::Channel(_))) {
-                cut(0.082, 0.149)
-            } else {
-                cut(0.098, 0.186)
-            };
+            // **The track's band, on every strip that wears a badge.** The
+            // buses used to take a taller one because they drew nothing in
+            // the detail row beneath — and the owner's "for click, match the
+            // track icon size" settles it: a badge is a badge, and the click
+            // has something to put in that row now.
+            let r = cut(0.082, 0.149);
             // Centred, and no longer nudged down. The nudge was there because
             // a badge two thirds the size of its band floated high in it; a
             // badge that fills the band has nowhere to float, and any offset
@@ -1561,6 +1599,14 @@ impl Layout {
                 && !view.empty
                 && !view.is_folder
             {
+                cut(0.152, 0.19)
+            } else {
+                Rect::NOTHING
+            },
+            // The CLICK's band, the same one — the owner's "add the met menu
+            // from arrange view as its own button ... it should read as the
+            // file chosen".
+            met: if matches!(view.strip, Some(Strip::Click)) && !view.empty {
                 cut(0.152, 0.19)
             } else {
                 Rect::NOTHING
@@ -1628,6 +1674,7 @@ impl Layout {
                 (s.send, Hit::Send(i)),
                 (s.pan, Hit::Pan(i)),
                 (s.input_chip, Hit::InputChip(i)),
+                (s.met, Hit::MetFile),
                 (s.mute, Hit::Mute(i)),
                 (s.solo, Hit::Solo(i)),
                 (s.arm, Hit::Arm(i)),
@@ -1773,6 +1820,12 @@ pub fn a11y_nodes_from(view: &MixerView<'_>, hits: &[(Rect, Hit)]) -> Vec<crate:
                 format!("{who} input"),
                 if s.detail.is_empty() { "none".to_owned() } else { s.detail.to_owned() },
             ),
+            Hit::MetFile => Node::readout(
+                id,
+                r,
+                "metronome sound".to_owned(),
+                view.click_sound.to_owned(),
+            ),
             Hit::Db(_) => Node::readout(
                 id,
                 r,
@@ -1840,6 +1893,7 @@ fn hit_column(hit: Hit) -> Option<Column> {
         | Hit::Name(i)
         | Hit::Folder(i)
         | Hit::Remove(i) => i,
+        Hit::MetFile => Column(Strip::Click.index()),
         Hit::Insert(i, _) | Hit::RouteGain(i, _) | Hit::FxMenu(i, _, _) => i,
     })
 }
@@ -2034,7 +2088,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
         let heard = view.heard(i);
         let typed = view.typing.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
         let naming = view.naming.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
-        strip(painter, s, v, &p, view.routes, heard, typed, naming);
+        strip(painter, s, v, &p, view.routes, heard, typed, naming, view.click_sound);
         // The selected channels' faint rim — the owner's slight light.
         if view
             .selected_tracks
@@ -2120,13 +2174,21 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
 /// owner's "leave the main icon empty for users to choose" - and so does
 /// anything with no source at all, the master included.
 pub(crate) fn auto_icon(strip: Option<Strip>, is_folder: bool) -> Option<crate::icons::Icon> {
+    // **A folder has a drawing of its own now**, and it is a folder. It used
+    // to answer `None` — "leave the main icon empty for users to choose" —
+    // which left a group as the one strip on the desk with a hole where every
+    // other one has a badge. Choosing still overrides it, exactly as it does
+    // on a track; what changed is what it falls back to.
     if is_folder {
-        return None;
+        return Some(crate::icons::Icon::Folder);
     }
     match strip {
         Some(Strip::Channel(_)) => Some(crate::recorder_panel::DEFAULT_TRACK_ICON),
         Some(Strip::Drums) => Some(crate::icons::Icon::Drumset),
         Some(Strip::Click) => Some(crate::icons::Icon::Metronome),
+        // **The master wears its own**, for the same reason. `None` here was
+        // "nothing to choose", which is true and was drawn as nothing at all.
+        None => Some(crate::icons::Icon::Master),
         _ => None,
     }
 }
@@ -2140,6 +2202,9 @@ fn strip(
     heard: bool,
     typed: Option<&str>,
     naming: Option<&str>,
+    // What the click is playing. Only the click's strip has a rect to put
+    // it in; every other column is handed it and ignores it.
+    met_word: &str,
 ) {
     if v.empty {
         // The slot's own NUMBER, so an empty desk still says which column is
@@ -2391,6 +2456,27 @@ fn strip(
             v.detail,
             plain((h * 0.024).clamp(7.0, 11.0)),
             ink.gamma_multiply(0.72),
+        );
+    }
+    // **The CLICK's own sound**, in the band a channel spends on its input
+    // chip and wearing the same panel — it is the same kind of control,
+    // "what is feeding this strip", and it opens the metronome panel. The
+    // owner's "add the met menu from arrange view as its own button ... it
+    // should read as the file chosen".
+    if l.met.is_positive() {
+        painter.rect_filled(l.met, 2.0, p.chip);
+        painter.rect_stroke(
+            l.met,
+            2.0,
+            Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.4)),
+            egui::StrokeKind::Inside,
+        );
+        centred(
+            painter,
+            l.met,
+            met_word,
+            plain((h * 0.024).clamp(7.0, 11.0)),
+            p.engrave.gamma_multiply(0.85),
         );
     }
 
@@ -3477,6 +3563,13 @@ mod tests {
     /// held three, so what a test cannot see is whether a bay is still tall
     /// enough to read a plugin's name in.
     ///
+    /// **It cannot photograph the ICONS.** `face::fit` soaks one texture —
+    /// egui's font atlas, `TextureId::Managed(0)` — so a mesh drawn with any
+    /// other texture is rasterised against the glyph coverage and every badge
+    /// comes out as the same scribble. That is the tool, not the drawings.
+    /// To look at those, render `assets/icons/*.a8` directly: it is a bare
+    /// 192x192 block of 8-bit coverage with no header.
+    ///
     ///     IVORY_SHOT=/tmp/desk.png IVORY_SHOT_W=900 IVORY_SHOT_H=700 \
     ///       cargo test -p tangent-ui --lib mixer_panel::tests::desk \
     ///       -- --ignored --nocapture
@@ -3506,7 +3599,20 @@ mod tests {
             &mut |ui| {
                 let r = ui.max_rect();
                 ui.set_clip_rect(r);
-                draw(ui.painter(), r, &v);
+                // `IVORY_SHOT_PANEL` draws a desk WIDER than the window and
+                // `IVORY_SHOT_FROM` slides it left, so a strip at the right
+                // end can be photographed at full size rather than as a
+                // thumbnail of the whole desk.
+                let panel_w = num("IVORY_SHOT_PANEL", w);
+                let from = num("IVORY_SHOT_FROM", 0.0);
+                draw(
+                    ui.painter(),
+                    Rect::from_min_size(
+                        Pos2::new(r.left() - from, r.top()),
+                        Vec2::new(panel_w, r.height()),
+                    ),
+                    &v,
+                );
             },
         );
         crate::face::fit::write_png(std::path::Path::new(&out), &rgba, pw, ph);
@@ -3523,6 +3629,7 @@ mod tests {
             strips: std::array::from_fn(|i| {
                 a_strip(channels.get(i).copied(), false)
             }),
+            click_sound: "CLICK",
             any_solo: false,
             scroll_px: 0.0,
             active: CHANNELS,
@@ -3574,11 +3681,18 @@ mod tests {
                 "a {kind:?} track drew something other than the wave"
             );
         }
-        // The two buses keep pictures of their own, and a folder stays empty.
+        // The two buses keep pictures of their own — and so, now, do a
+        // FOLDER and the MASTER. Both used to answer `None`, which was true
+        // ("nothing to choose") and was drawn as a hole where every other
+        // strip has a badge. Choosing still overrides either.
         assert_eq!(auto_icon(Some(Strip::Drums), false), Some(Icon::Drumset));
         assert_eq!(auto_icon(Some(Strip::Click), false), Some(Icon::Metronome));
-        assert_eq!(auto_icon(Some(Strip::Channel(0)), true), None, "a folder drew a badge");
-        assert_eq!(auto_icon(None, false), None, "the master drew a badge");
+        assert_eq!(
+            auto_icon(Some(Strip::Channel(0)), true),
+            Some(Icon::Folder),
+            "a folder did not draw the folder"
+        );
+        assert_eq!(auto_icon(None, false), Some(Icon::Master), "the master drew nothing");
         // And the default is spelt in ONE place, which is what the strip and
         // the arrangement both read.
         assert_eq!(crate::recorder_panel::DEFAULT_TRACK_ICON, Icon::Wave);
@@ -4002,6 +4116,85 @@ mod tests {
         }
     }
 
+    /// **Every rack on the desk is at the same height, and holds six.**
+    ///
+    /// The master's and a folder's used to start at 0.100 — reaching up over
+    /// the band the ICON sits in, which is why a group's badge was covered by
+    /// its own first bay. The owner: "lower the height of folders' fx sends
+    /// such that their icons are visible", then "make sure at the end that
+    /// all fx sends are visually at the same level through the whole mixer
+    /// view to be the same as the current tracks'".
+    ///
+    /// The CLICK is in the sweep because it grew a second rack to be here
+    /// with: six slots seated in `recorder::BUS_EXTRA_SEATS`, and the engine
+    /// runs them.
+    #[test]
+    fn every_rack_on_the_desk_is_at_one_height() {
+        let mut v = a_view();
+        v.strips[1].is_folder = true;
+        let l = Layout::new(rect(), &v);
+        let track = l.strips[0].inserts[0];
+        assert!(track.is_positive(), "the reference track has no rack");
+        for (what, col) in [("folder", 1), ("click", CLICK), ("master", MASTER)] {
+            let bays = &l.strips[col].inserts;
+            assert!(bays[0].is_positive(), "{what}: no rack at all");
+            assert!(
+                (bays[0].top() - track.top()).abs() < 0.5,
+                "{what}'s rack starts at {:.1} and a track's at {:.1}",
+                bays[0].top(),
+                track.top()
+            );
+            // Six, and the last one ends where a track's last one ends.
+            assert!(bays[5].is_positive(), "{what}: only three bays");
+            assert!(
+                (bays[5].bottom() - l.strips[0].inserts[5].bottom()).abs() < 0.5,
+                "{what}'s rack ends somewhere else"
+            );
+        }
+        // **And a folder's ICON is clear of it**, which is the fault that
+        // started this: the rack used to be drawn over the badge.
+        let folder = &l.strips[1];
+        assert!(folder.icon.is_positive(), "the folder has no icon seat");
+        assert!(
+            folder.icon.bottom() <= folder.inserts[0].top() + 0.5,
+            "the folder's rack still covers its badge"
+        );
+    }
+
+    /// **The click's own sound button**, where a channel keeps its input
+    /// chip: it reads the file that is playing and opens the metronome panel.
+    /// The owner's "add the met menu from arrange view as its own button —
+    /// it should read as the file chosen".
+    #[test]
+    fn the_click_carries_the_metronomes_own_button() {
+        let v = a_view();
+        let l = Layout::new(rect(), &v);
+        let click = &l.strips[CLICK];
+        assert!(click.met.is_positive(), "the click has no sound button");
+        assert!(!click.input_chip.is_positive(), "the click grew an input chip");
+        // In the band a channel spends on its input, so the two columns line
+        // up row for row.
+        let track = &l.strips[0];
+        assert!(
+            (click.met.top() - track.input_chip.top()).abs() < 0.5
+                && (click.met.bottom() - track.input_chip.bottom()).abs() < 0.5,
+            "the click's button is not on the input chip's own row"
+        );
+        // And it is reachable.
+        assert_eq!(
+            hit_test(rect(), &v, click.met.center()),
+            Some(Hit::MetFile),
+            "the click's sound button cannot be pressed"
+        );
+        // Every other column keeps its own; nobody else grew one.
+        for (i, s) in l.strips.iter().enumerate() {
+            assert!(
+                i == CLICK || !s.met.is_positive(),
+                "column {i} grew a metronome button"
+            );
+        }
+    }
+
     /// No two controls overlap, or one of them is unreachable.
     #[test]
     fn no_two_controls_are_in_the_same_place() {
@@ -4017,21 +4210,39 @@ mod tests {
         }
     }
 
-    /// **The master takes no send and cannot be muted.**
+    /// **The master takes no send; it takes a mute and a solo now.**
     ///
-    /// Muting the master is turning it down and soloing it means nothing, so a
-    /// strip that could do either would be offering a control with no meaning
-    /// behind it. The effects return takes no send either: a bus that can feed
-    /// itself is a bus that howls.
+    /// It could do neither, on the argument that muting the master is turning
+    /// it down and soloing it means nothing — and it left the master as the
+    /// one column on the desk shaped unlike every other. The owner's call:
+    /// "for click and master looking the same in mixer view … add mute and
+    /// solo to the bottom". The mute is a real control (`Shared::master_mute`
+    /// — a hard zero, the same one its automation lane could already write);
+    /// the solo is a light, and the engine masks the master's bit out of the
+    /// solo test so it cannot silence the desk it belongs to.
+    ///
+    /// The effects return still takes no send: a bus that can feed itself is
+    /// a bus that howls.
     #[test]
     fn the_master_and_the_bus_are_not_offered_what_they_cannot_do() {
         let v = a_view();
         let l = Layout::new(rect(), &v);
         let master = &l.strips[MASTER];
         assert!(!master.send.is_positive(), "the master was given a send");
-        assert!(!master.mute.is_positive(), "the master was given a mute");
-        assert!(!master.solo.is_positive(), "the master was given a solo");
+        assert!(master.mute.is_positive(), "the master lost its mute");
+        assert!(master.solo.is_positive(), "the master lost its solo");
         assert!(master.fader.is_positive(), "the master has no fader");
+        // **Its fold moved ABOVE the fader**, which is what freed the switch
+        // row for the pair.
+        assert!(master.mono.is_positive(), "the master lost its mono fold");
+        assert!(
+            master.mono.bottom() <= master.fader.top(),
+            "the master's fold is not above its fader"
+        );
+        assert!(
+            master.mute.top() >= master.fader.bottom(),
+            "the master's mute is not below its fader"
+        );
 
         // The click, before the master: a fader and both switches but NO
         // send — a metronome feeding the reverb is not a thing, and the send

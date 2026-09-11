@@ -1255,6 +1255,12 @@ pub struct TangentApp {
     /// The input menu's submenu rows, built when the DEVICE arRIVES and
     /// refreshed only when it changes (or a 5 s TTL passes for MIDI
     /// hot-plug) — the menu itself never waits on an OS enumeration.
+    /// **What the click is playing**, as a word for its own strip button.
+    ///
+    /// Cached rather than formatted in `mixer_view`, which hands out
+    /// borrowed `&str` and cannot own a `String` for the length of a frame.
+    /// Refreshed where the other per-frame words are — see `tend_menu_cache`.
+    click_sound_word: String,
     menu_rows_cache: Option<[Vec<String>; 2]>,
     menu_cache_key: (String, usize),
     menu_cache_at: Option<Instant>,
@@ -3734,6 +3740,7 @@ impl TangentApp {
             click_pass: None,
             tapring: crate::tapring::TapRing::new(48_000.0),
             time_sel: None,
+            click_sound_word: String::new(),
             menu_rows_cache: None,
             menu_cache_key: (String::new(), 0),
             menu_cache_at: None,
@@ -5242,6 +5249,8 @@ impl TangentApp {
         use crate::mixer_panel::Hit as H;
         let view = self.mixer_view();
         match hit {
+            // A button, not a value: it opens a panel.
+            H::MetFile => 0.0,
             H::Phase(i) => {
                 f32::from(u8::from(self.settings.strip_phase & (1 << i.desk_index()) != 0))
             }
@@ -5496,6 +5505,12 @@ impl TangentApp {
         self.record_automation_move(hit, v);
         let gain = f64::from(recorder::fader_to_gain(v));
         match hit {
+            // **The click's sound button opens the metronome panel** — the
+            // same one the arrangement's toolbar opens, because there is one
+            // metronome and two menus for it would be two answers. Opening
+            // needs an anchor and this has none, so it sets the flag the
+            // frame reads, exactly as the toolbar's own right-press does.
+            H::MetFile => self.met_menu = Some(()),
             // **The folder glyph COLLAPSES, and does nothing else** - the
             // owner's ruling: folders are groupers, made and unmade by
             // Cmd/Ctrl+F alone; the glyph on the strip hides or shows the
@@ -6553,6 +6568,10 @@ impl TangentApp {
         };
         let channels = Strip::shown();
         crate::mixer_panel::MixerView {
+            // **What the click is playing**, for its own button. The chosen
+            // file's name; the bundled click has no path, so it says what it
+            // is. Cached on the app because a `&str` cannot be built here.
+            click_sound: &self.click_sound_word,
             routes: &self.route_labels,
             fx_strip: self.settings.fx_strip_color.to_color32(),
             input_chip: self.settings.input_chip_color.to_color32(),
@@ -9502,6 +9521,28 @@ impl TangentApp {
     /// Keep the cache warm: the moment the interface reports (or changes),
     /// the rows are rebuilt — so the first open of the menu is as instant
     /// as every other. Runs once a frame; rebuilds only on a real change.
+    /// **The click's sound as a WORD**, kept in step with the setting.
+    ///
+    /// The file's own name, which is the only part anybody recognises — a
+    /// strip is a hundred points wide and a truncated path names nothing,
+    /// which is the argument the metronome panel's own row already makes. The
+    /// bundled click has no path and says what it is.
+    fn tend_click_word(&mut self) {
+        let want = if self.settings.click_sample.is_empty() {
+            "CLICK".to_owned()
+        } else {
+            std::path::Path::new(&self.settings.click_sample)
+                .file_stem()
+                .map_or_else(
+                    || self.settings.click_sample.clone(),
+                    |n| n.to_string_lossy().to_uppercase(),
+                )
+        };
+        if self.click_sound_word != want {
+            self.click_sound_word = want;
+        }
+    }
+
     fn tend_menu_cache(&mut self) {
         // **The MIDI ports, on the same 5 s beat the menu cache uses.**
         // Devices are plugged and unplugged while the app runs, and every
@@ -14898,10 +14939,29 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// The metronome tool's rect, which the panel hangs off.
+    /// **What the metronome panel hangs off**, on whichever surface is up.
+    ///
+    /// The toolbar's own cell in the arrangement, and the click strip's sound
+    /// button on the desk — the owner's "add the met menu from arrange view
+    /// as its own button". One panel, two doors, and the anchor decides where
+    /// it opens rather than each caller deciding.
     fn met_anchor(&self, rect: Rect) -> Rect {
-        let clips = self.arr_clip_views();
-        let view = self.arrange_view(&clips);
-        crate::arrangement_panel::Layout::new(rect, &view).tool_met
+        if self.arrangement_rect.is_some() {
+            let clips = self.arr_clip_views();
+            let view = self.arrange_view(&clips);
+            return crate::arrangement_panel::Layout::new(rect, &view).tool_met;
+        }
+        let view = self.mixer_view();
+        crate::mixer_panel::Layout::new(rect, &view)
+            .strips
+            .get(recorder::Strip::Click.index())
+            .map_or(Rect::NOTHING, |s| s.met)
+    }
+
+    /// The surface the metronome panel is drawn on and pressed in: the
+    /// arrangement when it is open, the desk otherwise.
+    fn met_stage(&self) -> Option<Rect> {
+        self.arrangement_rect.or(self.mixer_rect)
     }
 
     /// Draw the metronome's panel, when it is up.
@@ -20021,7 +20081,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // Before the bay menu and before the lanes, because it is drawn in
         // front of both — a panel that is painted over something it does not
         // take presses from is a panel you can click through.
-        if let (true, Some(rect)) = (self.met_menu.is_some(), self.arrangement_rect) {
+        if let (true, Some(rect)) = (self.met_menu.is_some(), self.met_stage()) {
             let (down, released, pointer) = ctx.input(|i| {
                 (
                     i.pointer.primary_pressed(),
@@ -24102,6 +24162,15 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// how to turn one into the other.
     /// Whether the master is folded to mono on the way out. The host pushes
     /// it to the engine; see `Settings::master_mono`.
+    /// **Whether the master's own MUTE switch is down.**
+    ///
+    /// The master's bit in `strip_muted`, which is `STRIPS` — the index
+    /// `Column::desk_index` hands back for a column with no `Strip`. The
+    /// switch is new; the bit has always been reachable.
+    pub fn master_muted(&self) -> bool {
+        self.settings.strip_muted & (1 << recorder::STRIPS) != 0
+    }
+
     pub fn master_mono(&self) -> bool {
         self.settings.master_mono
     }
@@ -31543,6 +31612,7 @@ impl TangentApp {
         self.band_pointer = ctx
             .input(|i| i.pointer.hover_pos())
             .filter(|p| self.last_band.contains(*p));
+        self.tend_click_word();
         // The input chips' words, refreshed before anything borrows a view
         // — and only when the words can have changed. Thirty-two `format!`s
         // a frame for text that changes on a settings write; the key is a
@@ -33381,6 +33451,11 @@ impl TangentApp {
             if on_desk.is_some() {
                 self.a11y_on = on_desk;
             }
+            // The metronome's panel, over the desk: the click strip's sound
+            // button opens it, so this surface has to be able to draw it.
+            if let Some(rect) = self.mixer_rect {
+                self.draw_met_menu(ui.painter(), rect);
+            }
         } else if let Some(rect) = arrangement_rect {
             let clips = self.arr_clip_views();
             let view = self.arrange_view(&clips);
@@ -34262,6 +34337,12 @@ impl TangentApp {
                         | crate::mixer_panel::Hit::Folder(_)
                         | crate::mixer_panel::Hit::FxMenu(..)
                         | crate::mixer_panel::Hit::InputChip(_)
+                        // The click's own sound button. A DOOR like the two
+                        // above it, and on this list for the same reason:
+                        // everything not named here falls through to the
+                        // drag branch, where a button arms a grab that can
+                        // never land and the press does nothing at all.
+                        | crate::mixer_panel::Hit::MetFile
                         // A door, not a fader: without this it fell through
                         // to the drag branch and a click did nothing at all.
                         | crate::mixer_panel::Hit::Routing(_)

@@ -2049,6 +2049,16 @@ struct Shared {
     /// speakers both get it, because a fold you cannot record is a fold you
     /// cannot compare against.
     master_mono: AtomicBool,
+    /// **The master's own MUTE**, from the desk's switch.
+    ///
+    /// The master used to have no mute at all on the strip — its lane's
+    /// automation could write one (`auto.master_mute`) and nothing else
+    /// could. The owner asked for the switch, so there are two writers now
+    /// and they OR: a curve that says silence is silence whatever the switch
+    /// says, and a switch that says silence is silence whatever the curve
+    /// says. Neither is a fade; both are a hard zero, for the reason the
+    /// curve's own note gives.
+    master_mute: AtomicBool,
     /// Decibels of gain reduction the limiter has applied since the UI last
     /// looked — a positive number, zero for none. Read and reset.
     gr_db: AtomicU32,
@@ -2510,6 +2520,7 @@ impl Shared {
             drums_pan: AtomicU32::new(0.0f32.to_bits()),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
             master_mono: AtomicBool::new(false),
+            master_mute: AtomicBool::new(false),
             // The first channel — the desk's default instrument — sends
             // everything and nothing else sends anything, which is the same
             // sound the old five-slots-send-all default made. See the UI's
@@ -3494,7 +3505,11 @@ fn run_extra_rack(
     planar: &mut [Vec<f32>],
     out: &mut [Vec<f32>],
     shared: &Shared,
-    ch: usize,
+    // The EXTRA seat itself, not the strip it belongs to: a channel's comes
+    // from `folder_extra_seat` and a bus's from `bus_extra_seat`, and the two
+    // blocks are appended in different places. Naming the seat here is what
+    // keeps this one function honest for both.
+    extra: usize,
     frames: usize,
     notes: &[Note],
     controls: &[Control],
@@ -3504,7 +3519,6 @@ fn run_extra_rack(
     if is_folder {
         return;
     }
-    let extra = tangent_ui::recorder::folder_extra_seat(ch);
     if racks.get(extra).is_none_or(Rack::is_empty) {
         return;
     }
@@ -5380,7 +5394,14 @@ impl Renderer {
         // all.** Read here with the gains, for the same reason and at the same
         // cost: they are published at human speed.
         let muted = self.shared.muted.load(Ordering::Relaxed);
-        let soloed = self.shared.soloed.load(Ordering::Relaxed);
+        // **The MASTER's solo bit is not a solo.** It has a switch on the
+        // desk now, for the symmetry the owner asked for between it and the
+        // click — and the solo test downstream is `soloed != 0 && is_source`,
+        // so a bit set on a strip that is not a source would silence every
+        // strip that is. Masked off here, once, rather than at each of the
+        // three readers: a mute on the master is a real control (see
+        // `Shared::master_mute`) and a solo on it is a light.
+        let soloed = self.shared.soloed.load(Ordering::Relaxed) & !(1u64 << STRIPS);
         let metro_target = Shared::f32_of(&self.shared.metro_gain).clamp(0.0, 8.0);
         // A chosen click arriving — and the one it displaces going back, by
         // the clip list's protocol. No room to return the old one, no swap
@@ -5878,7 +5899,14 @@ impl Renderer {
             // push a take into the limiter and never be ducked by one.
             // Bit-identical for an empty rack, which is every desk until
             // somebody fills a bay.
-            if !self.racks[Strip::Click.index()].is_empty() {
+            // **Either of the click's two racks.** Reading the first alone
+            // is how a cue strip with a plugin in bay 4 and nothing in 1..3
+            // would skip the block and never be processed — the same fault
+            // `rack_live` had on a channel.
+            if !self.racks[Strip::Click.index()].is_empty()
+                || !self.racks[tangent_ui::recorder::bus_extra_seat(Strip::Click.index())]
+                    .is_empty()
+            {
                 for c in 0..TAP_CHANNELS {
                     if let Some(dst) = self.fx_in.get_mut(c) {
                         for (f, d) in dst.iter_mut().take(n).enumerate() {
@@ -5925,6 +5953,24 @@ impl Renderer {
                         None,
                         // Not a key pass: the click is a cue, and nobody
                         // keys a cue. See `KeyFeed`.
+                        None,
+                    );
+                    // **NOT-A-CHANNEL:** and bays 3..5 of the same cue strip,
+                    // over what bays 0..2 just left. The click wears six now
+                    // (`recorder::bays_on`), seated past everything in
+                    // `BUS_EXTRA_SEATS`, and six bays are one chain.
+                    run_extra_rack(
+                        &mut self.racks,
+                        false,
+                        &self.auto_params,
+                        &mut self.fx_in,
+                        &mut self.fx_out,
+                        &self.shared,
+                        tangent_ui::recorder::bus_extra_seat(Strip::Click.index()),
+                        n,
+                        notes,
+                        controls,
+                        None,
                         None,
                     );
                 }
@@ -6279,7 +6325,9 @@ impl Renderer {
             // the fade is the curve author's job - and balance rides the
             // same equal-power law as a channel, applied here with the
             // gain, before the mono fold, after the limiter.
-            let master = if self.auto.master_mute == Some(true) {
+            let master = if self.auto.master_mute == Some(true)
+                || self.shared.master_mute.load(Ordering::Relaxed)
+            {
                 0.0
             } else {
                 master
@@ -7405,7 +7453,7 @@ impl Renderer {
                             &mut self.fx_in,
                             &mut self.fx_out,
                             &self.shared,
-                            strip.index(),
+                            tangent_ui::recorder::folder_extra_seat(strip.index()),
                             n,
                             notes,
                             controls,
@@ -9626,7 +9674,7 @@ impl Renderer {
                     &mut self.fx_in,
                     &mut self.fx_out,
                     &self.shared,
-                    ch,
+                    tangent_ui::recorder::folder_extra_seat(ch),
                     frames,
                     &lane_notes,
                     &lane_controls,
@@ -14243,6 +14291,11 @@ impl Engine {
         self.shared
             .fx_return
             .store(linear.clamp(0.0, 8.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Silence the master, or stop. See [`Shared::master_mute`].
+    pub fn set_master_mute(&self, on: bool) {
+        self.shared.master_mute.store(on, Ordering::Relaxed);
     }
 
     /// Fold the master to mono, or stop. See [`Shared::master_mono`].
