@@ -1395,7 +1395,35 @@ pub const PALETTE_AUTO: i64 = -1;
 /// A constant rather than a literal because it is now one term of a sum —
 /// see [`track_export_row_h`] — and a magic number that is added to is a
 /// magic number somebody will change in one place.
-const TRACK_DIALOG_H: f32 = 648.0;
+const TRACK_DIALOG_H: f32 = 700.0;
+
+/// **The icon picker's grid**, in one place so its arithmetic cannot drift
+/// from the window that has to hold it.
+///
+/// The set grew from thirty-six drawings to forty-eight and the owner asked
+/// for the cells to be bigger with it — "resized such that the icons are more
+/// visible (10-15% bump in icon size in the chooser)". Twenty-eight points
+/// went to thirty-one, which is eleven per cent, and the row count went from
+/// three to four rather than the cells being squeezed to keep it at three:
+/// sixteen across would need 652 points of a frame that has 496.
+///
+/// `ICON_PICKER_FITS` is what holds this to the frame. It is a const
+/// assertion, so a thirteenth column or a wider cell fails to COMPILE rather
+/// than hanging the last icon off the edge where only a screenshot would find
+/// it.
+const ICON_CELL: Vec2 = Vec2::new(37.0, 36.0);
+/// The drawing inside a cell. See [`ICON_CELL`].
+const ICON_SIDE: f32 = 31.0;
+/// The gap between cells. egui's own default is eight, which does not fit.
+const ICON_GAP: f32 = 4.0;
+/// How many cells a row holds.
+const ICON_PER_ROW: usize = 12;
+/// What the track menu's frame gives the picker, once its margins are taken.
+const ICON_FRAME_W: f32 = 496.0;
+const ICON_PICKER_FITS: () = assert!(
+    ICON_CELL.x * ICON_PER_ROW as f32 + ICON_GAP * (ICON_PER_ROW as f32 - 1.0) <= ICON_FRAME_W,
+    "the icon picker's row is wider than the track menu's frame"
+);
 
 /// The Export MIDI row's button height, and the gap under it.
 ///
@@ -10742,16 +10770,16 @@ fn show_on(
                                 // Offering the horn four times would write
                                 // three codes nobody can tell apart.
                                 //
-                                // Three rows because thirty-six will not fit
-                                // two at any cell worth having: eighteen
-                                // across leaves 23.8pt a cell, so a 21pt icon
-                                // - smaller than the 22 this row used to draw
-                                // when it held far fewer. Twelve across gives
-                                // 37 and a 28pt icon, which is what makes the
-                                // harp's strings resolve at all.
+                                // Twelve across and as many rows as that
+                                // takes — four, for forty-eight drawings.
+                                // Fixing the COLUMN count rather than the row
+                                // count is what lets the set grow without the
+                                // cells shrinking: see `ICON_CELL`, where the
+                                // arithmetic is, and `ICON_PICKER_FITS`, which
+                                // fails to compile if a row stops fitting.
                                 let all = crate::recorder_panel::ICON_PICKS;
-                                let per_row = all.len().div_ceil(3);
-                                for row in all.chunks(per_row) {
+                                let () = ICON_PICKER_FITS;
+                                for row in all.chunks(ICON_PER_ROW) {
                                     ui.horizontal(|ui| {
                                         // Twelve cells of 37 at the 4pt gap
                                         // this row sets need 488pt and the
@@ -10760,11 +10788,11 @@ fn show_on(
                                         // would need 532 and hang the last
                                         // cell off the edge, which is what
                                         // this line is here to stop.
-                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        ui.spacing_mut().item_spacing.x = ICON_GAP;
                                         for (code, name) in row {
                                             let chosen = current_icon == *code;
                                             let (rect, resp) = ui.allocate_exact_size(
-                                                Vec2::new(37.0, 32.0),
+                                                ICON_CELL,
                                                 egui::Sense::click(),
                                             );
                                             ui.painter().rect_filled(
@@ -10780,7 +10808,7 @@ fn show_on(
                                             let cell_bg = if chosen { t.text } else { t.bg };
                                             let b = Rect::from_center_size(
                                                 rect.center(),
-                                                Vec2::splat(28.0),
+                                                Vec2::splat(ICON_SIDE),
                                             );
                                             if !crate::recorder_panel::draw_badge(
                                                 ui.painter(),

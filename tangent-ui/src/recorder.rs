@@ -1165,7 +1165,12 @@ pub const MASTER_EXTRA_SEAT: usize = STRIPS + 1 + DRUM_PADS;
 /// `folder` is no longer asked, so there is one function again rather than a
 /// pair with a flag the answer does not depend on.
 pub fn bays_on(strip: Option<Strip>) -> usize {
-    if matches!(strip, None | Some(Strip::Channel(_))) {
+    // **Six on the CLICK too**, now that it has a seat for them
+    // (`BUS_EXTRA_SEATS`) and the engine runs it: the owner's "make the click
+    // have 6 fx slots so it matches the layout of the other tracks". The
+    // other two buses have no column on the desk, so nobody can fill a rack
+    // they would be given — they keep three until they do.
+    if matches!(strip, None | Some(Strip::Channel(_) | Strip::Click)) {
         INSERTS * 2
     } else {
         INSERTS
@@ -1193,6 +1198,10 @@ pub fn seat_bay(desk_index: usize, slot: usize) -> (usize, usize) {
         // numbering agree with the automation's and no `master_bay` twin
         // is needed. See `FOLDER_EXTRA_SEATS`.
         (folder_extra_seat(desk_index), slot - INSERTS)
+    } else if desk_index < STRIPS && slot >= INSERTS {
+        // A BUS's slots 3..5, in the same plain order a channel's take. See
+        // `BUS_EXTRA_SEATS`.
+        (bus_extra_seat(desk_index), slot - INSERTS)
     } else {
         (desk_index, slot)
     }
@@ -1325,10 +1334,40 @@ pub fn pedal_owner(seat: usize) -> Option<usize> {
     folder_extra_of(seat)
 }
 
+/// **Where the BUSES' extra bays begin** — one appended seat per bus, so a
+/// bus can wear six the way a channel and the master already do.
+///
+/// The CLICK is the one bus with a column on the desk, and the owner asked
+/// for it to match a track: "make the click have 6 fx slots so it matches the
+/// layout of the other tracks". The other two are mapped anyway rather than
+/// special-cased, because a seat map with a hole in it is a hole somebody
+/// finds by loading a plugin into it.
+///
+/// Appended, for the reason `MASTER_EXTRA_SEAT` records at length: an
+/// appended seat changes no index anybody has already written down, and this
+/// array grows by appending.
+pub const BUS_EXTRA_SEATS: usize = AMP_PEDAL_SEATS + CHANNELS * AMP_PEDALS;
+
+/// The number of buses — every strip past the channels. Three: the drum bus,
+/// the click and the effects return.
+pub const BUSES: usize = STRIPS - CHANNELS;
+
+/// Bus `desk_index`'s extra seat. `desk_index` is a DESK index in
+/// `Strip::index` space, so `CHANNELS..STRIPS`; anything else is not a bus
+/// and gets the first seat, which is the same "answer rather than panic"
+/// `pad_rack_index` and its neighbours make.
+pub const fn bus_extra_seat(desk_index: usize) -> usize {
+    if desk_index < CHANNELS || desk_index >= STRIPS {
+        return BUS_EXTRA_SEATS;
+    }
+    BUS_EXTRA_SEATS + (desk_index - CHANNELS)
+}
+
 /// Every rack seat: strips, master, the first pad block, the master's
 /// extra, a pad block for each channel after the first, a folder-extra
-/// seat per channel, and seven pedal seats per channel.
-pub const TOTAL_SEATS: usize = AMP_PEDAL_SEATS + CHANNELS * AMP_PEDALS;
+/// seat per channel, seven pedal seats per channel, and one extra seat per
+/// bus.
+pub const TOTAL_SEATS: usize = BUS_EXTRA_SEATS + BUSES;
 
 /// **The channel permutation lifted onto the WHOLE seat space.** Channel
 /// rows move, each folder-extra seat follows its channel, and every other
@@ -4783,7 +4822,8 @@ mod tests {
         // master keeps its six.
         assert_eq!(bays_on(Some(Strip::Channel(3))), INSERTS * 2);
         assert_eq!(bays_on(Some(Strip::Channel(0))), INSERTS * 2);
-        assert_eq!(bays_on(Some(Strip::Click)), INSERTS);
+        assert_eq!(bays_on(Some(Strip::Click)), INSERTS * 2);
+        assert_eq!(bays_on(Some(Strip::Drums)), INSERTS);
         assert_eq!(bays_on(None), INSERTS * 2);
 
         // The mapping, plain order, both ends of the desk.

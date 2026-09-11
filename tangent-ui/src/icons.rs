@@ -125,6 +125,23 @@ icon_set! {
     UprightBass => "upright-bass",
     Violin => "violin",
     Wave => "wave",
+    // **The second set**, nine drawings: seven percussion and two the app
+    // itself reaches for. `Folder` is what a group wears when nobody has
+    // chosen otherwise and `Master` is the master strip's own, so those two
+    // are named in `mixer_panel::auto_icon` as well as offered in the picker.
+    //
+    // `Mariba` is the owner's own file name — see the note on this macro
+    // about spellings — and the picker calls it "marimba", which is the
+    // instrument.
+    Djembe => "djembe",
+    Folder => "folder",
+    Kalimba => "kalimba",
+    Mariba => "mariba",
+    Master => "master",
+    Vibraphone => "vibraphone",
+    Vibraslap => "vibraslap",
+    Xylophone1 => "xylophone1",
+    Xylophone2 => "xylophone2",
 }
 
 /// **Where a drawing really lands inside the rect it was given.**
@@ -229,7 +246,7 @@ mod tests {
     /// convenience and reopens the smear.
     #[test]
     fn every_asset_is_a_full_block_of_coverage() {
-        assert_eq!(Icon::ALL.len(), 35, "the set is thirty-five drawings");
+        assert_eq!(Icon::ALL.len(), 44, "the set is forty-four drawings");
         for icon in Icon::ALL {
             assert_eq!(
                 icon.coverage().len(),

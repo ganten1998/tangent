@@ -1657,7 +1657,9 @@ impl Layout {
         // "slightly less in height, but keep the length" — the width is what
         // makes a word readable and the height is only what makes the box a
         // box. Centred in the band, so the air is shared top and bottom.
-        const CHIP_FILL: f32 = 0.82;
+        // 0.88, up from 0.82: the first cut of this took too much off and the
+        // owner said so — "it was overcorrected".
+        const CHIP_FILL: f32 = 0.88;
         let chip_band = |band: Rect| {
             if !band.is_positive() {
                 return Rect::NOTHING;

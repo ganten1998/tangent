@@ -4571,6 +4571,17 @@ pub const ICONS: &[(u8, &str)] = &[
     (36, "tuba"),
     (37, "upright bass"),
     (38, "violin"),
+    (39, "djembe"),
+    (40, "folder"),
+    (41, "kalimba"),
+    // The owner's file is `mariba.svg`; the instrument is a marimba, and the
+    // picker says what the instrument is. The slug stays his.
+    (42, "marimba"),
+    (43, "master"),
+    (44, "vibraphone"),
+    (45, "vibraslap"),
+    (46, "xylophone"),
+    (47, "xylophone 2"),
 ];
 
 /// **What the picker offers**: every DRAWING once, rather than every code.
@@ -4621,10 +4632,21 @@ pub const ICON_PICKS: &[(u8, &str)] = &[
     (36, "tuba"),
     (37, "upright bass"),
     (38, "violin"),
+    (39, "djembe"),
+    (40, "folder"),
+    (41, "kalimba"),
+    // The owner's file is `mariba.svg`; the instrument is a marimba, and the
+    // picker says what the instrument is. The slug stays his.
+    (42, "marimba"),
+    (43, "master"),
+    (44, "vibraphone"),
+    (45, "vibraslap"),
+    (46, "xylophone"),
+    (47, "xylophone 2"),
 ];
 
 /// The highest badge code. What the clamp on loaded desks answers to.
-pub const ICON_MAX: u8 = 38;
+pub const ICON_MAX: u8 = 47;
 
 /// **What a track with no chosen badge draws.**
 ///
@@ -4679,6 +4701,17 @@ pub(crate) const fn glyph(code: u8) -> Option<crate::icons::Icon> {
         36 => Icon::Tuba,
         37 => Icon::UprightBass,
         38 => Icon::Violin,
+        // The second set. Appended, as every code in this table is: a number
+        // is written into every desk and every document that used it.
+        39 => Icon::Djembe,
+        40 => Icon::Folder,
+        41 => Icon::Kalimba,
+        42 => Icon::Mariba,
+        43 => Icon::Master,
+        44 => Icon::Vibraphone,
+        45 => Icon::Vibraslap,
+        46 => Icon::Xylophone1,
+        47 => Icon::Xylophone2,
         _ => return None,
     })
 }
