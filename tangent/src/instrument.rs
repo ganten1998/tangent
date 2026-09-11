@@ -546,11 +546,62 @@ fn note_from_midi(status: u8, data1: u8, data2: u8) -> Option<Note> {
     }
 }
 
-/// Sustain, sostenuto or soft: the three pedals, which cannot be delivered.
+/// Raw MIDI bytes to a VST3 control, or `None` for anything that is not one.
 ///
-/// See the module docs. They are recognised only so they can be counted, and
-/// they are counted so the gap is visible in the UI instead of being discovered
-/// by a pianist in the middle of a phrase.
+/// [`note_from_midi`]'s sibling, and it did not exist: the live drain asked
+/// [`is_pedal`] and pushed a `Control` only for the three pedal CCs, so a MOD
+/// WHEEL, a PITCH WHEEL and CHANNEL PRESSURE were read off the wire, placed in
+/// the block, and then dropped on the floor. The owner played a DX7 into the
+/// analog and its wheel did nothing — and the analog has understood
+/// `Event::Wheel`, `Event::Bend` and `Event::Pressure` since it was written
+/// (`analog::mod`), as does any VST3 instrument that publishes a mapping for
+/// them. Nothing downstream needed teaching. The wire message simply never
+/// got past here.
+///
+/// **Every CC, not a list of the ones we thought of.** A named set is a set
+/// somebody has to come back and extend for breath, for expression, for a
+/// pedal that is not one of the three — and the DX7 alone sends CC 2, 4, 5,
+/// 6, 64, 65, 96 and 97. The host counts what an instrument publishes no
+/// mapping for (`Rendered::unmapped`), so an unwanted CC costs a counter
+/// rather than a surprise.
+///
+/// **Pitch bend is 14-bit and its two bytes are LSB first.** Reading it as a
+/// 7-bit CC leaves an instrument a whole tone sharp for the rest of the
+/// session, which is why [`tangent_host::Control::pitch_bend`] owns the
+/// arithmetic and this defers to it. Its value is `0..=16383`, centred at
+/// 8192, and `Control::normalised` is what knows the difference.
+///
+/// POLY pressure (0xA0) is not here: it is per-NOTE and `Control` carries no
+/// note, so there is nowhere to put it. Dropped as it always was, rather than
+/// flattened onto the channel where it would press every key at once.
+fn control_from_midi(status: u8, data1: u8, data2: u8) -> Option<Control> {
+    if status < 0x80 {
+        return None;
+    }
+    let channel = i16::from(status & 0x0F);
+    match status & 0xF0 {
+        0xB0 => Some(Control::cc(0, channel, i16::from(data1 & 0x7F), data2)),
+        // Channel pressure carries its value in the FIRST data byte. A
+        // keyboard that leans on a key sends one of these; reading `data2`
+        // would make the analog's `Event::Pressure` a constant zero.
+        0xD0 => Some(Control {
+            offset: 0,
+            controller: Control::AFTERTOUCH,
+            value: u16::from(data1 & 0x7F),
+            channel,
+        }),
+        0xE0 => Some(Control::pitch_bend(0, channel, data1, data2)),
+        _ => None,
+    }
+}
+
+/// Sustain, sostenuto or soft: the three pedals, which a lane keeps a LEVEL
+/// for as well as an event.
+///
+/// Every CC travels now (see [`control_from_midi`]); what is special about
+/// these three is the ledger beside the push — `live_pedal`, which a lane
+/// reads to combine a foot with a clip's own pedal. A wheel must never land
+/// in that seat, and [`pedal_slot`] is what keeps it out.
 fn is_pedal(status: u8, data1: u8) -> bool {
     status >= 0x80 && status & 0xF0 == 0xB0 && matches!(data1, 64 | 66 | 67)
 }
@@ -5216,39 +5267,50 @@ impl Renderer {
                 }
                 self.notes.push(Note { offset, ..note });
                 self.note_lanes.push(lanes);
-            } else if is_pedal(event.status, event.data1) {
+            } else if let Some(control) = control_from_midi(
+                event.status,
+                event.data1,
+                event.data2,
+            ) {
                 // Delivered as a VST3 parameter change, which is the only door
                 // VST3 leaves open for a CC — see `tangent-host`'s `Control`.
                 // Whether it ARRIVES depends on the plugin publishing a
                 // mapping; `Rendered::unmapped` is what counts the ones that
                 // did not, so `pedal_dropped` now means "this instrument has no
                 // pedal" rather than "we never tried".
+                //
+                // **This branch asked `is_pedal`**, and so only the three
+                // pedal CCs ever became a `Control`. A wheel, a bend and
+                // channel pressure were read, placed, and dropped — see
+                // `control_from_midi`, which is the whole of the fix.
                 // The LEVEL, kept beside the event — every path that
                 // delivers a pedal also records where it left it, exactly as
                 // `sounding` is kept beside the note push above. A lane that
                 // has to combine this with a clip's pedal cannot ask a list
                 // of changes where something stands.
-                if let Some(slot) = pedal_slot(event.data1 & 0x7F) {
-                    // **Only on the lanes that heard it.** One global level
-                    // let a foot on keyboard A's damper hold the notes on a
-                    // track that only ever asked for keyboard B.
-                    for ch in 0..CHANNELS {
-                        if lanes & (1u32 << ch.min(31)) != 0 {
-                            self.live_pedal[ch][slot] = event.data2 & 0x7F;
+                //
+                // Still the three pedals ALONE: `pedal_slot` answers `None`
+                // for everything else, which is what keeps a mod wheel out of
+                // the damper's seat now that it gets this far.
+                if is_pedal(event.status, event.data1) {
+                    if let Some(slot) = pedal_slot(event.data1 & 0x7F) {
+                        // **Only on the lanes that heard it.** One global
+                        // level let a foot on keyboard A's damper hold the
+                        // notes on a track that only ever asked for keyboard B.
+                        for ch in 0..CHANNELS {
+                            if lanes & (1u32 << ch.min(31)) != 0 {
+                                self.live_pedal[ch][slot] = event.data2 & 0x7F;
+                            }
                         }
                     }
                 }
                 if self.controls.len() < self.controls.capacity() {
-                    self.controls.push(Control {
-                        offset,
-                        controller: i16::from(event.data1),
-                        value: u16::from(event.data2),
-                        // The channel is NOT decoration: the modelled piano publishes a
-                        // different parameter for each channel's CC64, so
-                        // sending channel 0 for a keyboard transmitting on
-                        // channel 3 moves the wrong piano.
-                        channel: i16::from(event.status & 0x0F),
-                    });
+                    // The controller number, the value and the CHANNEL are
+                    // the message's own — the channel is NOT decoration:
+                    // the modelled piano publishes a different parameter for each
+                    // channel's CC64, so sending channel 0 for a keyboard
+                    // transmitting on channel 3 moves the wrong piano.
+                    self.controls.push(Control { offset, ..control });
                     self.control_lanes.push(lanes);
                 } else {
                     self.shared.pedal_dropped.fetch_add(1, Ordering::Relaxed);
@@ -24911,7 +24973,6 @@ mod tests {
     fn the_sustain_pedal_becomes_a_control_for_the_instrument() {
         let (mut r, mut tx, shared) = renderer_with_midi(2);
         queue(&mut tx, 0, [0xB3, 64, 127]); // sustain DOWN, channel 3
-        queue(&mut tx, 0, [0xB0, 1, 64]); // mod wheel: not a pedal
         let mut out = vec![0.0f32; 128 * 2];
         r.render(&mut out, 0, 0);
 
@@ -24929,6 +24990,70 @@ mod tests {
             0,
             "nothing is dropped merely for being a pedal any more"
         );
+    }
+
+    /// **The WHEELS travel too, and they did not.**
+    ///
+    /// The owner played a DX7 into the analog and its modulation wheel did
+    /// nothing. The drain asked `is_pedal` and pushed a `Control` only for
+    /// CC 64, 66 and 67, so a mod wheel, a pitch wheel and channel pressure
+    /// were read off the wire, placed in the block, and dropped — while
+    /// `analog::mod` had understood `Event::Wheel`, `Event::Bend` and
+    /// `Event::Pressure` since the day it was written. The line this test
+    /// replaces was a comment in the sustain test reading "mod wheel: not a
+    /// pedal", asserting the drop.
+    ///
+    /// Revert-check performed: restoring the `is_pedal` guard leaves
+    /// `r.controls` empty and fails the first assertion.
+    #[test]
+    fn the_mod_wheel_the_pitch_wheel_and_pressure_reach_the_instrument() {
+        let (mut r, mut tx, _shared) = renderer_with_midi(2);
+        queue(&mut tx, 0, [0xB0, 1, 64]); // modulation wheel, half up
+        queue(&mut tx, 0, [0xE2, 0x00, 0x60]); // pitch bend, channel 2
+        queue(&mut tx, 0, [0xD0, 90, 0]); // channel pressure
+        let mut out = vec![0.0f32; 128 * 2];
+        r.render(&mut out, 0, 0);
+
+        assert_eq!(r.controls.len(), 3, "{:?}", r.controls);
+        assert_eq!(r.controls[0].controller, 1, "the mod wheel is CC 1");
+        assert_eq!(r.controls[0].value, 64);
+
+        // **14-bit, LSB first.** Read as a 7-bit CC this is 0, and an
+        // instrument sits a whole tone flat for the rest of the session.
+        assert_eq!(r.controls[1].controller, Control::PITCH_BEND);
+        assert_eq!(r.controls[1].value, 0x60 << 7);
+        assert_eq!(r.controls[1].channel, 2, "the bend lost its channel");
+        assert!(
+            (r.controls[1].normalised() - 0.75).abs() < 0.01,
+            "the bend normalised to {}",
+            r.controls[1].normalised()
+        );
+
+        // Channel pressure carries its value in the FIRST data byte. Reading
+        // `data2` would make it a constant zero.
+        assert_eq!(r.controls[2].controller, Control::AFTERTOUCH);
+        assert_eq!(r.controls[2].value, 90);
+    }
+
+    /// **A wheel still never reaches the damper's seat.** `live_pedal` is the
+    /// LEVEL a lane combines with its clips' own pedal, and it is the three
+    /// pedal CCs and nothing else — the guard that used to be the whole
+    /// branch is now one `pedal_slot` call inside it, which is a thing to
+    /// prove rather than to assume.
+    #[test]
+    fn a_mod_wheel_does_not_land_in_the_pedals_ledger() {
+        let (mut r, mut tx, _shared) = renderer_with_midi(2);
+        queue(&mut tx, 0, [0xB0, 1, 127]); // wheel all the way up
+        queue(&mut tx, 0, [0xB0, 11, 127]); // expression, all the way up
+        let mut out = vec![0.0f32; 128 * 2];
+        r.render(&mut out, 0, 0);
+        assert_eq!(r.controls.len(), 2, "both should travel as controls");
+        for (ch, pedals) in r.live_pedal.iter().enumerate() {
+            assert_eq!(
+                *pedals, [0_u8; 3],
+                "lane {ch} has a pedal down that nobody pressed"
+            );
+        }
     }
 
     /// All three pedals travel, not just sustain.
