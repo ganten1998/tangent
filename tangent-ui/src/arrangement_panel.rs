@@ -1649,6 +1649,25 @@ impl Layout {
             return HeaderRow { panel: row, input, add, name, ..HeaderRow::NONE };
         }
         let h = r.height();
+        // **How much of its band a chip actually fills.**
+        //
+        // The bays, the input button and ROUTING took the whole of their
+        // band's height, so the column read as a stack of slabs with hairline
+        // gaps rather than as a rack of chips. The owner asked for them
+        // "slightly less in height, but keep the length" — the width is what
+        // makes a word readable and the height is only what makes the box a
+        // box. Centred in the band, so the air is shared top and bottom.
+        const CHIP_FILL: f32 = 0.82;
+        let chip_band = |band: Rect| {
+            if !band.is_positive() {
+                return Rect::NOTHING;
+            }
+            let hh = band.height() * CHIP_FILL;
+            Rect::from_min_max(
+                Pos2::new(band.left(), band.center().y - hh * 0.5),
+                Pos2::new(band.right(), band.center().y + hh * 0.5),
+            )
+        };
         // The number and the arm keep FIXED seats at the left — the
         // proportional cuts walked the dot into the track title whenever
         // the header widened.
@@ -1665,16 +1684,37 @@ impl Layout {
             )
         };
         let arm = if folder { Rect::NOTHING } else { arm_seat };
-        // The switches keep the right end; the meter stands inside them.
+        // **The switches keep the right end, STACKED**; the meter stands
+        // inside them.
+        //
+        // Side by side they cost the row two switches' width out of the
+        // middle, which is width the dials and the name column were
+        // competing for. Stacked they cost one — the owner's "make mute and
+        // solo atop one another" — and they read as the pair they are, the
+        // way the note and the wrench beside the arm already do. Mute above
+        // solo: it is the one you reach for.
         let sw = (h * 0.44).clamp(11.0, 17.0);
-        let solo = Rect::from_min_size(
-            Pos2::new(r.right() - sw, r.center().y - sw * 0.5),
-            Vec2::splat(sw),
-        );
-        let mute = Rect::from_min_size(
-            Pos2::new(solo.left() - 2.0 - sw, r.center().y - sw * 0.5),
-            Vec2::splat(sw),
-        );
+        let gap = 1.5;
+        let stack_of_two = |top: f32| Rect::from_min_size(Pos2::new(r.right() - sw, top), Vec2::splat(sw));
+        let (mute, solo) = if r.height() >= sw * 2.0 + gap {
+            let top = r.center().y - sw - gap * 0.5;
+            (stack_of_two(top), stack_of_two(top + sw + gap))
+        } else {
+            // Too short to stack: side by side, the way they were, rather
+            // than one of them shed. A row this short has no dials to
+            // reclaim the width for anyway.
+            let solo = Rect::from_min_size(
+                Pos2::new(r.right() - sw, r.center().y - sw * 0.5),
+                Vec2::splat(sw),
+            );
+            (
+                Rect::from_min_size(
+                    Pos2::new(solo.left() - 2.0 - sw, r.center().y - sw * 0.5),
+                    Vec2::splat(sw),
+                ),
+                solo,
+            )
+        };
         // **Polarity, in the row's bottom-right corner** — the owner's
         // placement. It used to sit above the mute, which put a third switch
         // in the M/S column and made the three read as one set of three; it
@@ -1799,7 +1839,13 @@ impl Layout {
         // window and the whole set vanished. It reaches the ceiling on a tall
         // row and the spare goes to the two figures, which is what the owner
         // asked for.
-        let kd = (stack * 0.44).clamp(11.0, 30.0).min((stack - 12.0).max(9.0));
+        // **A shade smaller than they were** — the owner's eye, twice: the
+        // ceiling went up so the figure under the knob could reach the row's
+        // size, and then the knobs themselves were a touch large for the
+        // panel. The figure keeps its room because the READOUT cell is a
+        // share of the dial column rather than the knob's own width, and the
+        // column did not move.
+        let kd = (stack * 0.41).clamp(11.0, 27.0).min((stack - 12.0).max(9.0));
         // **And never wider than the room the NAME column can spare.**
         //
         // The ceiling used to be eighteen, and eighteen was a horizontal fact
@@ -1884,10 +1930,10 @@ impl Layout {
         // well". It ran from the pan dial's left edge to the send's right,
         // which is the dial column's full width and flush against the meter.
         let routing = if dials_fit && rack2_y.1 > rack2_y.0 && pan.is_positive() {
-            Rect::from_min_max(
+            chip_band(Rect::from_min_max(
                 Pos2::new(pan.left() + RACK_INSET, rack2_y.0),
                 Pos2::new(send.right() - RACK_INSET, rack2_y.1),
-            )
+            ))
         } else {
             Rect::NOTHING
         };
@@ -1962,9 +2008,9 @@ impl Layout {
             && top_band.width() - chip_w - 3.0 >= NAME_MIN;
         // A bay's own height, or the band's when there are no bays to match.
         let chip_h = if rack_band.is_positive() {
-            rack_band.height().min(top_band.height())
+            (rack_band.height() * CHIP_FILL).min(top_band.height())
         } else {
-            top_band.height()
+            top_band.height() * CHIP_FILL
         };
         let (name, input, rack_a, rack_b) = if folder {
             // A folder has nothing to select, so its whole band is name and
@@ -1996,6 +2042,7 @@ impl Layout {
         // middle band and 3..5 the bottom one, which is the order the chain
         // runs in and the order the mixer's rack shows them in.
         let three = |band: Rect, offset: usize, out: &mut [Rect; crate::recorder::INSERTS * 2]| {
+            let band = chip_band(band);
             let n = crate::recorder::INSERTS;
             let inner = band.width() - RACK_INSET * 2.0;
             let w = (inner - 3.0 * (n as f32 - 1.0)) / n as f32;
@@ -6616,15 +6663,21 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // chosen — neither Courier Prime nor JetBrains Mono has either glyph,
         // read out of their cmaps, so drawn in the text family they would be
         // a tofu box on two faces out of three.
+        // **The theory send's note is DRAWN**, not set — see
+        // `recorder_panel::draw_note`. A notehead is an oblong and it is
+        // tilted, and no glyph in any face this app bundles is both.
+        if row.theory.is_positive() {
+            let on = lane.to_theory;
+            let plate = if on { p.select } else { p.hdr_lane };
+            painter.rect_filled(row.theory, 2.0, plate);
+            crate::recorder_panel::draw_note(
+                painter,
+                row.theory.shrink(row.theory.width() * 0.12),
+                if on { on_ink(plate) } else { p.switch_off },
+            );
+        }
         for (r, label, on, lit, family, icon) in [
-            (
-                row.theory,
-                crate::fonts::GLYPH_NOTE,
-                lane.to_theory,
-                p.select,
-                crate::fonts::icon(),
-                true,
-            ),
+
             // Lit when this track is showing any automation row, so the
             // header says at a glance that the rows below belong to it.
             (
@@ -8263,6 +8316,122 @@ ArrangeView {
         assert!(
             row.phase.width() < row.mute.width(),
             "Ø is one of the four rather than the quiet one beside them"
+        );
+        // **The mute above the solo, not beside it** — the owner's "make mute
+        // and solo atop one another". Side by side they cost the row two
+        // switches' width out of the middle, which is width the dials and the
+        // name column were competing for.
+        assert!(
+            (row.mute.left() - row.solo.left()).abs() < 0.5,
+            "M and S are not in one column: {:?} and {:?}",
+            row.mute.min,
+            row.solo.min
+        );
+        assert!(
+            row.mute.bottom() <= row.solo.top() + 0.5,
+            "the mute is not above the solo"
+        );
+    }
+
+    /// **A chip keeps its width and gives up a little height.**
+    ///
+    /// The bays, the input button and ROUTING took the whole of their band,
+    /// so the column read as a stack of slabs with hairline gaps rather than
+    /// as a rack of chips — the owner's "slightly less in height, but keep
+    /// the length". The width is what makes a word readable; the height is
+    /// only what makes the box a box.
+    #[test]
+    fn a_chip_keeps_its_width_and_gives_up_a_little_height() {
+        let c = clips();
+        let v = a_view(&c);
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 900.0));
+        let l = Layout::new(r, &v);
+        let row = l.header_rows[0];
+        // The band a rack was cut from: the gap between one rack's row and
+        // the next is what the chips gave back.
+        let pitch = row.bays[3].center().y - row.bays[0].center().y;
+        for (what, cell) in [
+            ("bay", row.bays[0]),
+            ("input", row.input),
+            ("routing", row.routing),
+        ] {
+            assert!(cell.is_positive(), "{what} was shed at a full-size header");
+            assert!(
+                cell.height() < pitch * 0.92,
+                "{what} still fills its band: {:.1} tall on a {:.1} pitch",
+                cell.height(),
+                pitch
+            );
+            assert!(
+                cell.height() > pitch * 0.60,
+                "{what} gave up more than a little: {:.1} tall on a {:.1} pitch",
+                cell.height(),
+                pitch
+            );
+        }
+        // And the WIDTH did not move: a bay still spans its third of the
+        // column, and the input button still matches one.
+        assert!(
+            (row.input.width() - row.bays[0].width()).abs() < 0.5,
+            "the input button stopped matching a bay's width"
+        );
+    }
+
+    /// **The theory switch's note is DRAWN, not set.**
+    ///
+    /// Two faces were tried and neither read as a note: U+266A out of a
+    /// terminal face is a square head on a straight flag, and the Nerd Font's
+    /// is a round OPEN head, which is a minim. A notehead is a filled oblong
+    /// and it is tilted, and that tilt is most of what the eye recognises —
+    /// the owner's "fill in the note glyph, make it oblong and angled like a
+    /// real note".
+    ///
+    /// So the assertion is about the shapes in the frame: a filled polygon
+    /// inside the switch, and no TEXT there at all. See
+    /// `recorder_panel::draw_note`.
+    #[test]
+    fn the_theory_switch_draws_its_note_rather_than_setting_it() {
+        let c = clips();
+        let mut v = a_view(&c);
+        v.lanes[0].to_theory = true;
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 900.0));
+        let cell = Layout::new(r, &v).header_rows[0].theory;
+        assert!(cell.is_positive(), "the theory switch was shed");
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(r), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(r);
+                    draw(ui.painter(), r, &v);
+                });
+            },
+        );
+        let mut polys = 0usize;
+        for s in &out.shapes {
+            match &s.shape {
+                egui::Shape::Path(pp) => {
+                    if pp.fill.a() > 0 && cell.contains(pp.visual_bounding_rect().center()) {
+                        polys += 1;
+                    }
+                }
+                egui::Shape::Text(t) => {
+                    assert!(
+                        !cell.contains(t.visual_bounding_rect().center()),
+                        "the theory switch is setting {:?} rather than drawing a note",
+                        t.galley.text()
+                    );
+                }
+                _ => {}
+            }
+        }
+        // The head and the flag: two filled polygons, plus a stroked stem
+        // which is a line and not counted here.
+        assert!(
+            polys >= 2,
+            "the theory switch drew {polys} filled shapes; the note is a head and a flag"
         );
     }
 

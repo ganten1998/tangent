@@ -71,21 +71,6 @@ pub fn icon() -> FontFamily {
     FontFamily::Name(FAMILY_ICON.into())
 }
 
-/// **The eighth note the theory switch wears**, in both views.
-///
-/// One constant, because the desk and the timeline draw the same switch and a
-/// second spelling of it is how they come to disagree.
-///
-/// **`nf-md-music-note`, not U+266A.** The Unicode eighth note in a terminal
-/// face is a terminal's idea of one: a square head and a straight flag, which
-/// at switch size reads as a letter P rather than as a note — the owner's
-/// "an actual note glyph". Terminess carries the whole Nerd Font icon set as
-/// well, and Material Design's note is drawn as a note: a round head, a
-/// curved flag, a stem with some weight to it. Rendered side by side at both
-/// sizes before choosing; Font Awesome's `nf-fa-music` (U+F001, a beamed
-/// pair) was the other candidate and is a fine second.
-pub const GLYPH_NOTE: &str = "\u{f0389}";
-
 /// **The wrench the automation button wears.** `nf-fa-wrench`, U+F0AD, in the
 /// Nerd Font private use area — so it is Terminess or nothing, which is what
 /// [`FAMILY_ICON`] is for.
@@ -372,16 +357,18 @@ pub fn apply_text_styles(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
 
-    /// **The two glyphs drawn as controls really come from Terminess, on
-    /// every face the user can choose.**
+    /// **The wrench really comes from Terminess, on every face the user can
+    /// choose.**
     ///
-    /// The theory switch wears an eighth note and the automation button a
-    /// wrench. Neither Courier Prime nor JetBrains Mono has either — read out
-    /// of their cmaps, not assumed: Courier Prime carries three hundred and
-    /// eighty glyphs and no U+266A, JetBrains thirteen hundred and only the
-    /// accidentals. Drawn in the text family they would be a tofu box on two
-    /// faces out of three, which is exactly the failure `draw_tick` exists to
-    /// avoid for the check mark.
+    /// The automation button wears `nf-fa-wrench`, which lives in the Nerd
+    /// Font private use area — so it is Terminess or nothing. Courier Prime
+    /// carries three hundred and eighty glyphs and JetBrains Mono thirteen
+    /// hundred; read out of their cmaps, not assumed. Drawn in the text
+    /// family it would be a tofu box on two faces out of three, which is
+    /// exactly the failure `draw_tick` exists to avoid for the check mark.
+    ///
+    /// The theory switch's NOTE was here too until it stopped being a glyph:
+    /// see `recorder_panel::draw_note`.
     ///
     /// The proof is the SUB-FONT: `Glyph::font_impl_ascent` is the ascent of
     /// whichever face in the chain actually supplied the glyph, so a glyph
@@ -393,7 +380,7 @@ mod tests {
     /// Revert check performed: point either constant at the text family and
     /// the ascents part company on Courier and JetBrains.
     #[test]
-    fn the_icon_family_carries_the_note_and_the_wrench_on_every_face() {
+    fn the_icon_family_carries_the_wrench_on_every_face() {
         let mut bad: Vec<String> = Vec::new();
         for face in FontChoice::ALL {
             let ctx = egui::Context::default();
@@ -416,7 +403,7 @@ mod tests {
                 bad.push(format!("{face:?}: the icon family drew no letter at all"));
                 continue;
             };
-            for (what, glyph) in [("note", GLYPH_NOTE), ("wrench", GLYPH_WRENCH)] {
+            for (what, glyph) in [("wrench", GLYPH_WRENCH)] {
                 match one(glyph, icon()) {
                     None => bad.push(format!("{face:?}: the {what} laid out no glyph")),
                     Some((ascent, w)) => {
