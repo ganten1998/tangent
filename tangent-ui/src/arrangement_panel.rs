@@ -1763,7 +1763,7 @@ impl Layout {
         // They were a third smaller, which said "these two are lesser
         // controls"; they are not, and a note and a wrench need the room a
         // letter does not.
-        let (theory, automation) = {
+        let (theory_seat, automation) = {
             let d = sw;
             let x = arm_seat.right() + 3.0 + d * 0.5;
             let gap = 1.5;
@@ -1784,6 +1784,15 @@ impl Layout {
                 )
             }
         };
+        // **A FOLDER has no note.** It carries no MIDI of its own, so there
+        // is nothing for it to send to the theory view - the desk has said
+        // so since the T left the switch row (`mixer_panel`'s `has_arm`),
+        // and the timeline went on drawing a glyph for a routing that could
+        // never be on. The SEAT stands where the note would be, the way the
+        // arm's does on this same row: the name column anchors off it, and a
+        // column that moves on folders is a header that does not line up
+        // with the tracks under it.
+        let theory = if folder { Rect::NOTHING } else { theory_seat };
         // ── **The three horizontal bands, decided before anything sits in
         // them.** ────────────────────────────────────────────────────────
         //
@@ -1806,8 +1815,14 @@ impl Layout {
         let band_h = (r.bottom() - 1.0 - band_top).max(0.0);
         let band_y = |a: f32, b: f32| (band_top + band_h * a, band_top + band_h * b);
         let none_y = (f32::INFINITY, f32::NEG_INFINITY);
+        // **The two racks are the SAME height**, and they were not: 0.34..0.63
+        // against 0.67..1.00 is a top rack an eighth thinner than the bottom
+        // one, which is what the owner saw - "it feels like the top one is
+        // slightly thinner". Six bays of one size is the whole point of the
+        // band; the fractions split what is left under the name evenly and
+        // keep the same gap between them that the name already has above.
         let [top_y, rack_y, rack2_y] = if band_h >= 3.0 * ROW_MIN {
-            [band_y(0.0, 0.30), band_y(0.34, 0.63), band_y(0.67, 1.0)]
+            [band_y(0.0, 0.30), band_y(0.34, 0.655), band_y(0.685, 1.0)]
         } else if band_h >= 2.0 * ROW_MIN {
             [band_y(0.0, 0.46), band_y(0.50, 1.0), none_y]
         } else {
@@ -1945,8 +1960,10 @@ impl Layout {
         // and folder wears SIX bays now, so the second rack needs a band and
         // the input moved up beside the name to give it one.
         let col = Rect::from_min_max(
-            // After the T switch, which sits between the arm and the name.
-            Pos2::new(theory.right() + 4.0, r.top()),
+            // After the T switch's SEAT, which sits between the arm and the
+            // name - the seat and not the field, or a folder (which wears no
+            // note) would start its name column off the left of the row.
+            Pos2::new(theory_seat.right() + 4.0, r.top()),
             Pos2::new(col_right - 6.0, r.bottom() - 1.0),
         );
         let band = |(a, b): (f32, f32)| {
@@ -8377,6 +8394,88 @@ ArrangeView {
             (row.input.width() - row.bays[0].width()).abs() < 0.5,
             "the input button stopped matching a bay's width"
         );
+    }
+
+    /// **A FOLDER wears no note, and the name column does not move because
+    /// of it.**
+    ///
+    /// A group carries no MIDI of its own, so there is nothing for it to
+    /// send to the theory view — the desk has said so since the T left the
+    /// switch row, and this header went on drawing a glyph for a routing
+    /// that could never be on. The owner: "the note glyph needs to be gone
+    /// on folders in arrangement view."
+    ///
+    /// The second half is the fault this kind of change invites: shed the
+    /// CELL and the name column, which anchors off it, starts somewhere else
+    /// on a folder's row — a header whose columns do not line up with the
+    /// tracks under it. The SEAT stands; only the field goes.
+    #[test]
+    fn a_folder_wears_no_note_and_keeps_the_name_column_where_it_is() {
+        let c = clips();
+        let mut v = a_view(&c);
+        v.lanes[1].is_folder = true;
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 900.0));
+        let l = Layout::new(r, &v);
+        let track = l.header_rows[0];
+        let folder = l.header_rows[1];
+        assert!(track.theory.is_positive(), "a track lost its note");
+        assert!(
+            !folder.theory.is_positive(),
+            "a folder still wears the theory note"
+        );
+        // And it cannot be pressed, which is the other half of gone: the
+        // seat the note WOULD have had, on the folder's own row.
+        let seat = Pos2::new(track.theory.center().x, folder.panel.center().y);
+        assert_ne!(
+            hit_test(r, &v, seat),
+            Some(Hit::ToTheory(1)),
+            "the folder's absent note still answers a press"
+        );
+        assert!(
+            (track.name.left() - folder.name.left()).abs() < 0.5,
+            "the folder's name column moved: {} against the track's {}",
+            folder.name.left(),
+            track.name.left()
+        );
+        // The wrench below it stays: a group's rows are automatable.
+        assert!(
+            folder.automation.is_positive(),
+            "the folder lost its automation button with the note"
+        );
+    }
+
+    /// **The two racks are the same height.**
+    ///
+    /// Six bays on a lane is six bays of ONE size; the bands were 0.34..0.63
+    /// and 0.67..1.00, which is a top rack an eighth thinner than the bottom
+    /// one — the owner's "right now it feels like the top one is slightly
+    /// thinner". Measured on the bays themselves rather than on the bands,
+    /// because the bays are what anybody looks at.
+    #[test]
+    fn the_two_racks_are_the_same_height() {
+        let c = clips();
+        let v = a_view(&c);
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 900.0));
+        let l = Layout::new(r, &v);
+        let bays = l.header_rows[0].bays;
+        for b in &bays {
+            assert!(b.is_positive(), "a bay was shed at a full-size header");
+        }
+        let top = bays[0].height();
+        let bottom = bays[crate::recorder::INSERTS].height();
+        assert!(
+            (top - bottom).abs() < 0.5,
+            "the top rack is {top:.2} tall against the bottom's {bottom:.2}"
+        );
+        // And every bay in a rack matches its neighbours, which is what
+        // makes the pair of racks read as one set of six.
+        for (i, b) in bays.iter().enumerate() {
+            assert!(
+                (b.height() - top).abs() < 0.5,
+                "bay {i} is {:.2} tall against bay 0's {top:.2}",
+                b.height()
+            );
+        }
     }
 
     /// **The theory switch's note is DRAWN, not set.**

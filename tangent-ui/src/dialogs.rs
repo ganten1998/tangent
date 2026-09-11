@@ -1448,6 +1448,28 @@ fn track_export_row_h(midi_clips: usize) -> f32 {
     }
 }
 
+/// What the OVERWRITE row costs a live track's menu, or nothing when there is
+/// nothing on the clipboard to paste.
+///
+/// An empty slot's paste row is inside the height the window already has: it
+/// is drawn where a live track draws Remove, so the two never add up. A live
+/// track's is a row nothing else pays for, and this menu has no scroll area
+/// to absorb it — see the argument at its `show_dialog_viewport` call.
+///
+/// **Hidden rather than greyed here**, which is the opposite of the empty
+/// slot's choice and deliberate, for `Export MIDI`'s reason: an empty slot's
+/// menu exists largely IN ORDER to offer the paste, so the row is what tells
+/// somebody the slot can receive a track. A live track's menu is about the
+/// track; a permanently dead OVERWRITE row on every one of them would be a
+/// row that teaches people to stop reading this menu.
+fn track_paste_row_h(removable: bool, can_paste: bool) -> f32 {
+    if removable && can_paste {
+        TRACK_EXPORT_ROW_H + TRACK_EXPORT_ROW_GAP
+    } else {
+        0.0
+    }
+}
+
 /// How wide each of `count` cells may be to fit `available` with `gap`
 /// between them.
 ///
@@ -10603,8 +10625,18 @@ fn show_on(
                 // visible of the two faults; growing only when the row does
                 // keeps the window sized for what it actually holds, which
                 // is what the paragraph above already promises.
-                Vec2::new(520.0, TRACK_DIALOG_H + track_export_row_h(midi_clips)),
-                Vec2::new(520.0, TRACK_DIALOG_H + track_export_row_h(midi_clips)),
+                Vec2::new(
+                    520.0,
+                    TRACK_DIALOG_H
+                        + track_export_row_h(midi_clips)
+                        + track_paste_row_h(removable, can_paste),
+                ),
+                Vec2::new(
+                    520.0,
+                    TRACK_DIALOG_H
+                        + track_export_row_h(midi_clips)
+                        + track_paste_row_h(removable, can_paste),
+                ),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
@@ -10666,6 +10698,32 @@ fn show_on(
                                     action = Some(DialogAction::TrackCopy(lane));
                                 }
                                 ui.add_space(6.0);
+                                // **And paste one OVER this track** — the
+                                // owner's ask. Under Copy, because the two
+                                // are the pair and this is the half that
+                                // destroys something; the label says so
+                                // rather than leaving the row to be found
+                                // out. Shown only when something is held:
+                                // see `track_paste_row_h`.
+                                if can_paste {
+                                    if ui
+                                        .add_sized(
+                                            Vec2::new(
+                                                ui.available_width(),
+                                                TRACK_EXPORT_ROW_H,
+                                            ),
+                                            Button::new(
+                                                RichText::new("Paste Track (overwrite)")
+                                                    .font(plain(11.0))
+                                                    .color(t.text),
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some(DialogAction::TrackPaste(lane));
+                                    }
+                                    ui.add_space(TRACK_EXPORT_ROW_GAP);
+                                }
                                 // **Export MIDI, and HIDDEN when the lane has
                                 // no MIDI on it** — not greyed, which is the
                                 // opposite of the choice Paste Track makes

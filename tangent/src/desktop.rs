@@ -4565,9 +4565,16 @@ impl DesktopApp {
                 tangent_ui::recorder::Strip::Channel(from).index(),
                 tangent_ui::recorder::Strip::Channel(to).index(),
             );
-            for bay in 0..tangent_ui::recorder::INSERTS {
-                let src = insert_state_path(from, bay);
-                let dst = insert_state_path(to, bay);
+            // **All SIX slots, through the seat map.** A track's 3..5 live
+            // in an appended rack seat, so a loop over `INSERTS` copied the
+            // states of half the rack and left the other half's plugins
+            // coming up at their defaults. `paste_track` writes all six.
+            let bays = tangent_ui::recorder::INSERTS;
+            for slot in 0..tangent_ui::recorder::bays_at(from) {
+                let (from_seat, from_bay) = tangent_ui::recorder::seat_bay(from, slot);
+                let (to_seat, to_bay) = tangent_ui::recorder::seat_bay(to, slot);
+                let src = insert_state_path(from_seat, from_bay);
+                let dst = insert_state_path(to_seat, to_bay);
                 // A bay the source never used leaves the destination's own
                 // file alone rather than deleting it: the paste has already
                 // cleared that bay through `set_insert`, and a stale file
@@ -4575,6 +4582,21 @@ impl DesktopApp {
                 // `saved_insert_state` anyway.
                 if src.exists() {
                     let _ = std::fs::copy(&src, &dst);
+                }
+                // **And the bay is rebuilt even when its NAME did not
+                // change.** A paste that overwrites a live track can land
+                // the same plugin in the same bay the target already held —
+                // the settings then read the same on both sides of the
+                // paste, the reconcile finds no mismatch, and the instance
+                // goes on playing its own settings with the state just
+                // copied sitting unread beside it. The marker is
+                // `force_insert_reload`'s, for the same reason.
+                if self.app.insert(to_seat, to_bay).is_some() {
+                    if let Some(cell) =
+                        self.recorder.inserts_loaded.get_mut(to_seat * bays + to_bay)
+                    {
+                        *cell = Some("\u{1f}reload".to_owned());
+                    }
                 }
             }
         }
@@ -5112,8 +5134,11 @@ impl DesktopApp {
                 R::SwapInserts { a_strip, a_bay, b_strip, b_bay } => {
                     self.swap_inserts(a_strip, a_bay, b_strip, b_bay);
                 }
-                R::MoveInsert { strip, from_bay, to_bay } => {
-                    self.move_insert(strip, from_bay, to_bay);
+                R::MoveInsert { from_strip, from_bay, to_strip, to_bay } => {
+                    self.move_insert(from_strip, from_bay, to_strip, to_bay);
+                }
+                R::PasteInsert { from_strip, from_bay, to_strip, to_bay } => {
+                    self.paste_insert(from_strip, from_bay, to_strip, to_bay);
                 }
                 R::ResetLoudness => {
                     if let Some(e) = self.recorder.engine.as_ref() {
@@ -11068,16 +11093,15 @@ impl DesktopApp {
         &mut self,
         from_strip: usize,
         from_bay: usize,
-        to_strip: usize,
+        mut to_strip: usize,
         to_bay: Option<usize>,
     ) {
         let Some(bundle) = self.app.insert(from_strip, from_bay).map(str::to_owned) else {
             return;
         };
-        if from_strip == to_strip {
+        if (from_strip, from_bay) == (to_strip, to_bay.unwrap_or(usize::MAX)) {
             return;
         }
-        let bays = tangent_ui::recorder::INSERTS;
         // **The bay the hand chose, or the next free one where it chose a
         // channel.** An aimed bay that is occupied is a refusal, not a
         // silent replacement — the drop rules send a loaded target to the
@@ -11093,18 +11117,37 @@ impl DesktopApp {
                 );
                 return;
             }
-            None => match (0..bays).find(|b| self.app.insert(to_strip, *b).is_none()) {
-                Some(b) => b,
-                None => {
-                    // **Every bay full is a refusal with a reason.** Silently
-                    // replacing one would be throwing away an effect somebody
-                    // dialled in, from a gesture that says "copy".
-                    let where_to = self.app.channel_display_name(to_strip);
-                    self.app
-                        .notify(Kind::Error, format!("{where_to} has no free insert bay"));
-                    return;
+            // **No bay under the hand: the strip's next free SLOT**, and a
+            // strip's slots are not one rack — a channel's 3..5 live in an
+            // appended seat. This walked the target seat's own three and
+            // refused a track whose first rack was full while three bays
+            // stood empty under it. `to_strip` is a desk index on this road
+            // (the drop landed on a column or a header row, not on a bay),
+            // which is what `seat_bay` wants.
+            None => {
+                let slots = tangent_ui::recorder::bays_at(to_strip);
+                let free = (0..slots)
+                    .map(|slot| tangent_ui::recorder::seat_bay(to_strip, slot))
+                    .find(|(seat, bay)| self.app.insert(*seat, *bay).is_none());
+                match free {
+                    Some((seat, bay)) => {
+                        // The seat the slot really lives in; from here on
+                        // `to_strip` is that seat, like the aimed road's.
+                        to_strip = seat;
+                        bay
+                    }
+                    None => {
+                        // **Every bay full is a refusal with a reason.**
+                        // Silently replacing one would be throwing away an
+                        // effect somebody dialled in, from a gesture that
+                        // says "copy".
+                        let where_to = self.app.channel_display_name(to_strip);
+                        self.app
+                            .notify(Kind::Error, format!("{where_to} has no free insert bay"));
+                        return;
+                    }
                 }
-            },
+            }
         };
         // The state it is playing at, not the one on disk: a plugin somebody
         // has been turning knobs on has not written a sidecar since it
@@ -11146,20 +11189,32 @@ impl DesktopApp {
         self.app.follow_insert_face(from, to);
     }
 
-    /// **Carry a unit to an empty bay of its own rack**, state and window
+    /// **Carry a unit to an empty bay of the same STRIP**, state and window
     /// with it. The verb between copy and swap: see
     /// `RecorderRequest::MoveInsert`. A loaded target is handed to the swap,
     /// which is what a drop on a loaded bay means everywhere.
+    ///
+    /// **Two seats, because one strip's six bays are two racks.** A move
+    /// from slot 1 to slot 5 of one track crosses from the channel's own
+    /// seat into its folder-extra one, and the caller has already decided
+    /// that both belong to the same strip (`recorder::rack_owner`). Nothing
+    /// here asks: a move is a move wherever the two ends sit.
     #[cfg(feature = "recorder")]
-    fn move_insert(&mut self, strip: usize, from_bay: usize, to_bay: usize) {
-        if from_bay == to_bay {
+    fn move_insert(
+        &mut self,
+        from_strip: usize,
+        from_bay: usize,
+        to_strip: usize,
+        to_bay: usize,
+    ) {
+        if (from_strip, from_bay) == (to_strip, to_bay) {
             return;
         }
-        let Some(bundle) = self.app.insert(strip, from_bay).map(str::to_owned) else {
+        let Some(bundle) = self.app.insert(from_strip, from_bay).map(str::to_owned) else {
             return;
         };
-        if self.app.insert(strip, to_bay).is_some() {
-            self.swap_inserts(strip, from_bay, strip, to_bay);
+        if self.app.insert(to_strip, to_bay).is_some() {
+            self.swap_inserts(from_strip, from_bay, to_strip, to_bay);
             return;
         }
         // Its live state, written under the bay that is going to read it —
@@ -11168,15 +11223,63 @@ impl DesktopApp {
             .recorder
             .engine
             .as_ref()
-            .and_then(|e| e.save_insert_state(strip, from_bay))
+            .and_then(|e| e.save_insert_state(from_strip, from_bay))
         {
-            write_insert_state(strip, to_bay, &bundle, &state);
+            write_insert_state(to_strip, to_bay, &bundle, &state);
         }
-        self.app.set_insert(strip, to_bay, Some(&bundle));
-        self.app.set_insert(strip, from_bay, None);
-        self.follow_insert_window((strip, from_bay), (strip, to_bay));
+        self.app.set_insert(to_strip, to_bay, Some(&bundle));
+        self.app.set_insert(from_strip, from_bay, None);
+        self.follow_insert_window((from_strip, from_bay), (to_strip, to_bay));
     }
 
+
+    /// **The right-click road's PASTE FX**: the copied unit into this bay,
+    /// with the state it is playing at, over whatever was there.
+    ///
+    /// [`Self::copy_insert`]'s sibling — see `RecorderRequest::PasteInsert`
+    /// for why replacing rather than refusing is right here. What it adds
+    /// over a copy is the RELOAD: pasting a plugin onto a bay that already
+    /// holds the same bundle changes nothing in the settings, so the
+    /// reconcile has no mismatch to act on and the instance would go on
+    /// playing its own settings with the pasted sidecar sitting unread
+    /// beside it. The marker is the one `force_insert_reload` uses, for the
+    /// same reason: it makes the bay mismatch itself.
+    #[cfg(feature = "recorder")]
+    fn paste_insert(
+        &mut self,
+        from_strip: usize,
+        from_bay: usize,
+        to_strip: usize,
+        to_bay: usize,
+    ) {
+        if (from_strip, from_bay) == (to_strip, to_bay) {
+            return;
+        }
+        let Some(bundle) = self.app.insert(from_strip, from_bay).map(str::to_owned) else {
+            // The bay the clipboard names has been emptied since. Nothing to
+            // paste, and nothing destroyed by finding that out.
+            self.app
+                .notify(Kind::Error, "the copied effect is no longer there".to_owned());
+            return;
+        };
+        // Its state BEFORE either bay is re-pointed — `copy_insert`'s
+        // ordering rule, for its reason: the reconcile reads the sidecar as
+        // it constructs the instance.
+        if let Some(state) = self
+            .recorder
+            .engine
+            .as_ref()
+            .and_then(|e| e.save_insert_state(from_strip, from_bay))
+        {
+            write_insert_state(to_strip, to_bay, &bundle, &state);
+        }
+        let bays = tangent_ui::recorder::INSERTS;
+        if let Some(cell) = self.recorder.inserts_loaded.get_mut(to_strip * bays + to_bay) {
+            *cell = Some("\u{1f}reload".to_owned());
+        }
+        self.app.set_insert(to_strip, to_bay, Some(&bundle));
+        self.follow_insert_window((from_strip, from_bay), (to_strip, to_bay));
+    }
 
     /// **Exchange two loaded bays, with the settings each is playing at.**
     ///

@@ -1177,6 +1177,14 @@ pub fn bays_on(strip: Option<Strip>) -> usize {
     }
 }
 
+/// **How many bays the strip at a DESK index shows.** [`bays_on`] keyed by
+/// index rather than by `Strip`, for the callers that hold one — the master
+/// is `STRIPS` and is not in `Strip::all()`, which is the convention
+/// [`Column::desk_index`] already writes down.
+pub fn bays_at(desk_index: usize) -> usize {
+    bays_on(Strip::all().get(desk_index).copied())
+}
+
 /// **Which rack seat and which bay a strip's Nth slot really is.**
 ///
 /// Everything but the master answers itself. The master's first three slots
@@ -1205,6 +1213,48 @@ pub fn seat_bay(desk_index: usize, slot: usize) -> (usize, usize) {
     } else {
         (desk_index, slot)
     }
+}
+
+/// **Which STRIP a rack seat belongs to**, and the exact inverse of
+/// [`seat_bay`] in the only respect anybody asks about: the desk index whose
+/// slots live in that seat.
+///
+/// [`seat_bay`] is a one-way street and was enough while the only question
+/// anybody asked of a bay was where to read it. The question a DRAG asks is
+/// different — "is this the same strip I picked it up from" — and in seat
+/// space the answer was wrong for exactly the bays that live in a second
+/// rack: a channel's slots 0..2 are its own seat and its 3..5 are its
+/// folder-extra one, so carrying a plugin from slot 1 to slot 5 of ONE track
+/// read as a move between two tracks and copied it instead of moving it.
+/// That is the owner's "drag only works between each group of 3".
+///
+/// A seat that is nobody's rack — a drum pad, an amp pedal — answers `None`.
+/// Those are racks a strip OWNS but not racks a strip SHOWS, and a carry
+/// that is not between two shown bays is not a carry this answers for.
+pub fn rack_owner(seat: usize) -> Option<usize> {
+    if seat <= MASTER_SEAT {
+        // The channels, the three buses, and the master's own seat.
+        return Some(seat);
+    }
+    if seat == MASTER_EXTRA_SEAT {
+        return Some(MASTER_SEAT);
+    }
+    if let Some(ch) = folder_extra_of(seat) {
+        return Some(ch);
+    }
+    if let Some(bus) = bus_extra_of(seat) {
+        return Some(bus);
+    }
+    None
+}
+
+/// The BUS whose extra seat this is, if it is one — [`bus_extra_seat`]'s
+/// inverse, and [`folder_extra_of`]'s sibling. See [`rack_owner`], which is
+/// the question both of them exist to answer.
+pub fn bus_extra_of(seat: usize) -> Option<usize> {
+    seat.checked_sub(BUS_EXTRA_SEATS)
+        .filter(|i| *i < BUSES)
+        .map(|i| CHANNELS + i)
 }
 
 /// **Where the pads of drum lanes past the FIRST block begin.**
@@ -2570,16 +2620,26 @@ pub enum RecorderRequest {
         b_strip: usize,
         b_bay: usize,
     },
-    /// **Carry a unit to an EMPTY bay of the same rack.** The owner: "drag
+    /// **Carry a unit to an EMPTY bay of the SAME STRIP.** The owner: "drag
     /// slot 1 into unoccupied slot two? it moves." A swap needs two units
     /// and a copy is a second instance of the same effect on one channel,
     /// which is never what dragging within a rack means; this is the third
     /// verb, and the one that lets a rack be re-ordered when there is a gap
     /// to move into. Host-side for `CopyInsert`'s reason: the unit's live
     /// state travels with it.
+    ///
+    /// **Two seats, not one**, because a strip's six slots are not one rack:
+    /// a channel's 0..2 are its own seat and its 3..5 its folder-extra one
+    /// (see [`seat_bay`] and [`rack_owner`]). One `strip` field could only
+    /// ever express a move INSIDE a group of three, which is precisely the
+    /// fault the owner reported — "drag only works between each group of 3".
+    /// Whether the two seats are the same STRIP is the caller's question and
+    /// `rack_owner` is where it is answered; this carries whatever the
+    /// caller decided a move.
     MoveInsert {
-        strip: usize,
+        from_strip: usize,
         from_bay: usize,
+        to_strip: usize,
         to_bay: usize,
     },
     // ── the DX7 bank builder ────────────────────────────────────────────
@@ -2641,6 +2701,28 @@ pub enum RecorderRequest {
     /// in this app has been an on paired with an off somebody had to remember
     /// to send, and two of them have shipped ringing for ever.
     AuditionStrip { strip: usize, key: Option<u8> },
+    /// **Put the copied effect in this bay**, with the settings the copied
+    /// one is playing at — the right-click road's PASTE FX, and the answer
+    /// to what a drag stopped doing when a carry inside one strip became a
+    /// MOVE rather than a copy. The owner: "to overcome the copy paste issue
+    /// this creates, add copy FX and paste FX to right click menu for FX
+    /// inserts."
+    ///
+    /// [`Self::CopyInsert`]'s sibling, and it differs in exactly one thing:
+    /// a LOADED target is replaced rather than refused. A drop that lands on
+    /// a full bay is an accident of aim and gets a message saying so; a row
+    /// somebody chose off that bay's own menu is not, and refusing it would
+    /// be a menu row that does nothing on most of the bays it appears on.
+    ///
+    /// Host-side for [`Self::CopyInsert`]'s reason: the state a plugin is
+    /// PLAYING at is the thing being pasted, and only the host can ask a
+    /// live instance for it. Appended at the END, this enum's law.
+    PasteInsert {
+        from_strip: usize,
+        from_bay: usize,
+        to_strip: usize,
+        to_bay: usize,
+    },
 }
 
 /// How hard an auditioned note is struck.

@@ -1019,6 +1019,9 @@ pub struct TangentApp {
     click_sample_dirty: bool,
     /// A whole track, copied and waiting for an empty slot. See `copy_track`.
     track_clipboard: Option<TrackCopy>,
+    /// **The bay an effect was copied FROM**, in seat space, waiting for a
+    /// PASTE FX. See `copy_fx`.
+    fx_clipboard: Option<(usize, usize)>,
     /// A paste asked the host to copy plugin state from one strip to
     /// another. Taken once, like `clips_dirty`.
     insert_state_copy: Option<(usize, usize)>,
@@ -3673,6 +3676,7 @@ impl TangentApp {
             // the setting holds a path and nothing has decoded it yet.
             click_sample_dirty: click_chosen,
             track_clipboard: None,
+            fx_clipboard: None,
             insert_state_copy: None,
             arr_window: None,
             arr_selected: None,
@@ -5797,6 +5801,14 @@ impl TangentApp {
                         let (seat, bay) = self.slot_seat(i, n);
                         self.open_insert_picker(seat, bay);
                     }
+                    crate::mixer_panel::FxAction::Copy => {
+                        let (seat, bay) = self.slot_seat(i, n);
+                        self.copy_fx(seat, bay);
+                    }
+                    crate::mixer_panel::FxAction::Paste => {
+                        let (seat, bay) = self.slot_seat(i, n);
+                        self.paste_fx(seat, bay);
+                    }
                     crate::mixer_panel::FxAction::Sidechain => {
                         // DESK terms, not the seat: the picker's action is
                         // stored by (strip, slot) so it survives seat
@@ -6454,7 +6466,13 @@ impl TangentApp {
                     !self.channel_used(n),
                 ),
                 Strip::Drums => ("DRUM BUS", "", self.settings.drums_gain as f32, false),
-                Strip::Click => ("CLICK", "", g.metronome, false),
+                // **The click's detail is the sound it is playing**, which
+                // is what its chip reads. It was the empty string and the
+                // chip read `click_sound`; the two are one fact and the
+                // strip's own field is where it belongs, so the detail row,
+                // the screen reader's readout and the chip cannot disagree
+                // about what the metronome is playing.
+                Strip::Click => ("CLICK", self.click_sound_word.as_str(), g.metronome, false),
                 Strip::Fx => ("FX BUS", "reverb · delay · chorus", g.fx_return, false),
             };
             crate::mixer_panel::StripView {
@@ -6666,6 +6684,16 @@ impl TangentApp {
             fx_menu_key: self
                 .mixer_fx_menu
                 .is_some_and(|(at, bay)| self.bay_offers_key(at, bay)),
+            // And what is IN it, and whether anything is held: the other two
+            // facts that decide which rows the menu has, asked in the same
+            // one place for the same reason.
+            fx_menu_loaded: self.mixer_fx_menu.is_some_and(|(at, bay)| {
+                let (seat, b) = self.slot_seat(at, bay);
+                self.insert(seat, b).is_some()
+            }),
+            fx_menu_paste: self.mixer_fx_menu.is_some_and(|(at, bay)| {
+                self.fx_on_clipboard(Some(self.slot_seat(at, bay)))
+            }),
             typing: self
                 .mixer_typing
                 .as_ref()
@@ -9528,8 +9556,21 @@ impl TangentApp {
     /// which is the argument the metronome panel's own row already makes. The
     /// bundled click has no path and says what it is.
     fn tend_click_word(&mut self) {
+        /// **What the bundled click is CALLED.**
+        ///
+        /// `assets/click.wav` is a 48 kHz mono 24-bit UREI click — the
+        /// owner's own file, and `docs/RECORDER-PLAN.md` is where that is
+        /// written down. Spelled the way a chosen file's name is spelled on
+        /// this chip, which is upper case.
+        const BUNDLED_CLICK_WORD: &str = "UREI CLICK";
         let want = if self.settings.click_sample.is_empty() {
-            "CLICK".to_owned()
+            // **The file that SHIPS, by its own name.** It read "CLICK",
+            // which is the word already on the strip's name plate two bands
+            // above the chip — one control saying what the strip is called
+            // rather than what it is playing. `assets/click.wav` is a UREI
+            // click (docs/RECORDER-PLAN.md records where it came from), and
+            // that is the thing to name.
+            BUNDLED_CLICK_WORD.to_owned()
         } else {
             std::path::Path::new(&self.settings.click_sample)
                 .file_stem()
@@ -10473,8 +10514,17 @@ impl TangentApp {
             pan: self.settings.channel_pans.get(n).copied().unwrap_or(0.0),
             send: self.settings.strip_sends.get(at).copied().unwrap_or(0.0),
             input: self.channel_input_spec(n).to_owned(),
-            inserts: (0..recorder::INSERTS)
-                .map(|b| self.insert(at, b).unwrap_or_default().to_owned())
+            // **All SIX slots**, through the seat map, because a track's
+            // 3..5 live in an appended seat and a copy that took three of
+            // six is a copy that quietly drops half a rack. It mattered less
+            // while a paste could only land on an empty slot; a paste that
+            // OVERWRITES would have cleared the target's lower rack and put
+            // nothing back.
+            inserts: (0..recorder::bays_on(Some(recorder::Strip::Channel(n))))
+                .map(|slot| {
+                    let (seat, bay) = recorder::seat_bay(at, slot);
+                    self.insert(seat, bay).unwrap_or_default().to_owned()
+                })
                 .collect(),
             clips: self
                 .arrangement
@@ -10499,23 +10549,92 @@ impl TangentApp {
         self.track_clipboard.is_some()
     }
 
+    /// **Hold this bay's effect for a later paste.**
+    ///
+    /// A REFERENCE — the seat and bay it is sitting in — and not the unit
+    /// itself, because the thing worth copying is the state the plugin is
+    /// PLAYING at and only the host can ask a live instance for that (see
+    /// `RecorderRequest::CopyInsert`'s note). The paste asks the host, which
+    /// reads the source at that moment; a source that has been emptied in
+    /// between is a paste that says so and destroys nothing.
+    pub fn copy_fx(&mut self, seat: usize, bay: usize) {
+        if self.insert(seat, bay).is_none() {
+            return;
+        }
+        self.fx_clipboard = Some((seat, bay));
+    }
+
+    /// **Is an effect held, and is it still there to be pasted?**
+    ///
+    /// Asked by every menu that offers the row, so a bay whose plugin was
+    /// deleted after being copied stops offering a paste that could only
+    /// fail. `into` is the bay the menu belongs to: a row offering to paste
+    /// a bay's own effect over itself is a row that does nothing.
+    pub fn fx_on_clipboard(&self, into: Option<(usize, usize)>) -> bool {
+        match self.fx_clipboard {
+            Some(at) => Some(at) != into && self.insert(at.0, at.1).is_some(),
+            None => false,
+        }
+    }
+
+    /// **Put the held effect in this bay**, over whatever is there.
+    ///
+    /// The deed is the host's — see `RecorderRequest::PasteInsert` — because
+    /// the unit's live state is what makes a paste a paste rather than a
+    /// second copy of the plugin at its factory defaults.
+    pub fn paste_fx(&mut self, seat: usize, bay: usize) {
+        let Some((from_strip, from_bay)) = self.fx_clipboard else {
+            return;
+        };
+        if (from_strip, from_bay) == (seat, bay) {
+            return;
+        }
+        self.request_recorder(recorder::RecorderRequest::PasteInsert {
+            from_strip,
+            from_bay,
+            to_strip: seat,
+            to_bay: bay,
+        });
+    }
+
     /// **Put the copied track on `into`.**
     ///
-    /// Refuses a lane that is already a track: pasting over one would either
-    /// destroy it silently or merge two tracks into a thing that is neither.
-    /// The menu only offers this on empty slots, and this is the guard that
-    /// makes that a rule rather than a convention.
+    /// **A lane that is already a track is OVERWRITTEN**, which is the
+    /// owner's ask: "copy a track, right click on another track should have
+    /// the option Paste Track to overwrite the selected right clicked track."
+    /// It used to refuse outright, on the argument that pasting over a track
+    /// either destroys it silently or merges two into a thing that is
+    /// neither — and the first half of that is exactly what a row named
+    /// OVERWRITE is for. The second half is what `remove_channel` prevents:
+    /// the lane is taken off the desk first, clips, bays, keys and all, so
+    /// what lands is the copy and nothing of what was there.
+    ///
+    /// **A FOLDER is never overwritten.** A group is a container, not a
+    /// track; clearing one re-parents its children (see `remove_channel`),
+    /// which is a great deal to do from a row that says "paste". The menu
+    /// does not offer the row on a folder and this is what makes that a rule
+    /// rather than a convention.
+    ///
+    /// The paths that paste without a menu keep their own guard: Ctrl/Cmd+V
+    /// asks for an EMPTY selected slot before it comes here (`arr_paste`),
+    /// so the chord still cannot destroy a live track by aiming at it.
     ///
     /// The clips are cloned with FRESH ids — `add_clip` stamps them — because
     /// two clips sharing an id is a document that cannot say which one an
     /// edit meant.
     pub fn paste_track(&mut self, into: usize) {
-        if into >= recorder::CHANNELS || self.channel_used(into) {
+        if into >= recorder::CHANNELS || self.is_folder(into) {
             return;
         }
         let Some(copy) = self.track_clipboard.clone() else {
             return;
         };
+        // Everything that was on the lane goes first — the row said
+        // overwrite, and a half-cleared lane would wear the copy's plugins
+        // over its own clips.
+        if self.channel_used(into) {
+            self.remove_channel(into);
+        }
         let at = recorder::Strip::Channel(into).index();
         self.settings.tracks_added |= 1 << into;
         self.set_channel_kind(into, copy.kind);
@@ -10553,10 +10672,12 @@ impl TangentApp {
             *inp = copy.input.clone();
         }
         // Through `set_insert`, so the host's reconcile loads each bay the
-        // same way it loads one picked by hand.
-        for (bay, path) in copy.inserts.iter().enumerate() {
+        // same way it loads one picked by hand — and through `seat_bay`,
+        // because slots 3..5 are a rack of their own. See `copy_track`.
+        for (slot, path) in copy.inserts.iter().enumerate() {
             let want = (!path.is_empty()).then_some(path.as_str());
-            self.set_insert(at, bay, want);
+            let (seat, bay) = recorder::seat_bay(at, slot);
+            self.set_insert(seat, bay, want);
         }
         // The clips, onto the new lane.
         for clip in &copy.clips {
@@ -10687,9 +10808,12 @@ impl TangentApp {
             serial: self.dialog_serial,
             lane,
             removable,
-            can_paste: !removable
-                && lane < recorder::CHANNELS
-                && self.track_on_clipboard(),
+            // **Offered on a live track too, where it OVERWRITES** — the
+            // owner's ask. It was empty slots only, which is why the flag
+            // used to ask `!removable`. Never on a folder: see `paste_track`.
+            can_paste: lane < recorder::CHANNELS
+                && self.track_on_clipboard()
+                && !self.is_folder(lane),
             icon: self.settings.channel_icons.get(lane).copied().unwrap_or(0),
             // Counted here rather than tested in the dialog, because the
             // dialog has no arrangement to look at — and counted at OPEN
@@ -14798,6 +14922,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// effect to that channel's next free bay — which is what a drop on a
     /// strip's paint, on an empty bay, or on a header row still does.
     ///
+    /// **Whether a drop is a MOVE or a COPY is decided by the STRIP, not by
+    /// the seat.** A strip's six slots live in two racks — 0..2 in its own
+    /// seat, 3..5 in an appended one (`recorder::seat_bay`) — so comparing
+    /// seats made "the same track" false for every carry that crossed the
+    /// middle of a rack, and slot 1 dragged onto slot 5 of one track was
+    /// copied rather than moved. The owner: "make it such that fx inserts
+    /// 1-3 can drag between themselves AND between 4-6 ... fx dragged
+    /// BETWEEN different TRACKS should still auto copy."
+    /// `recorder::rack_owner` is the one place that turns a seat back into
+    /// the strip that shows it.
+    ///
     /// One function for both surfaces, so the mixer's rack and the
     /// arrangement's header cannot disagree about what a drop means. The
     /// callers answer only what is under the hand, which is the one thing
@@ -14824,6 +14959,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // Dropped where it was picked up: nothing at all.
                 return;
             }
+            // The same STRIP, however many racks its slots are spread
+            // across — see the note above.
+            let home = recorder::rack_owner(strip);
+            let same_strip = home.is_some() && home == recorder::rack_owner(to_strip);
             let req = if self.insert(to_strip, to_bay).is_some() {
                 recorder::RecorderRequest::SwapInserts {
                     a_strip: strip,
@@ -14831,10 +14970,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     b_strip: to_strip,
                     b_bay: to_bay,
                 }
-            } else if to_strip == strip {
+            } else if same_strip {
                 recorder::RecorderRequest::MoveInsert {
-                    strip,
+                    from_strip: strip,
                     from_bay: bay,
+                    to_strip,
                     to_bay,
                 }
             } else {
@@ -14851,7 +14991,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // **On a channel's paint or its header there is no bay to mean**, so
         // the host picks the next free one — the gesture's oldest meaning,
         // kept for the surface that has nothing finer to aim at.
-        if let Some(to) = to.filter(|t| *t != strip) {
+        //
+        // `to` is a DESK index here (which column the hand is over), so the
+        // strip it is compared against is the carry's owner rather than its
+        // seat: dropping a plugin from a track's lower rack onto that same
+        // track's paint is a drop where it already is, and used to copy it
+        // back into the track's first free bay.
+        let home = recorder::rack_owner(strip);
+        if let Some(to) = to.filter(|t| home != Some(*t)) {
             self.request_recorder(recorder::RecorderRequest::CopyInsert {
                 from_strip: strip,
                 from_bay: bay,
@@ -14951,10 +15098,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             let view = self.arrange_view(&clips);
             return crate::arrangement_panel::Layout::new(rect, &view).tool_met;
         }
+        // **The click's COLUMN, not its desk index.** `Strip::index` is
+        // where a strip's settings live and `Layout::strips` is laid out in
+        // column order, and the click is not at the same number in both: it
+        // is desk index `CHANNELS + 1` and column `CHANNELS`. So this read
+        // the MASTER's rectangles, whose `met` is `NOTHING` — the panel
+        // opened anchored to nothing and landed wherever a degenerate rect
+        // put it, which is the whole of "the chip was never wired to the
+        // menu". The type exists to prevent exactly this; see `Column`.
         let view = self.mixer_view();
-        crate::mixer_panel::Layout::new(rect, &view)
-            .strips
-            .get(recorder::Strip::Click.index())
+        let l = crate::mixer_panel::Layout::new(rect, &view);
+        recorder::Strip::Click
+            .column_of()
+            .and_then(|c| l.strips.get(c.0))
             .map_or(Rect::NOTHING, |s| s.met)
     }
 
@@ -14983,6 +15139,49 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             },
             &self.settings,
         );
+    }
+
+    /// **While the metronome's panel is up it owns every press**, on
+    /// whichever surface is showing it. Answers whether the caller should
+    /// stand down for the frame.
+    ///
+    /// **One function for both surfaces**, and it had to become one: this
+    /// was written inline in `arrangement_input` and nowhere else, so on the
+    /// DESK — where the click strip's own chip opens it, and where
+    /// `draw_met_menu` has always painted it — nothing took presses for its
+    /// rows and nothing dismissed it. The panel came up over the mixer as
+    /// paint you could click straight through. The other half of that fault
+    /// is in `met_anchor`, which was reading the master's rectangles.
+    fn met_menu_owns_press(&mut self, ctx: &egui::Context) -> bool {
+        let Some(rect) = self.met_stage().filter(|_| self.met_menu.is_some()) else {
+            return false;
+        };
+        let (down, released, pointer) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                !i.pointer.primary_down(),
+                i.pointer.interact_pos(),
+            )
+        });
+        if released {
+            self.met_drag = false;
+        }
+        if let Some(p) = pointer {
+            // Outside it: the press closes it and is spent, the way
+            // every other menu on this desk dismisses.
+            let inside =
+                recorder_panel::met_popup_rect(rect, self.met_anchor(rect)).contains(p);
+            if down && !inside && !self.met_drag {
+                self.met_menu = None;
+                self.met_drag = false;
+                self.menu_ate_press = true;
+                return true;
+            }
+            if self.met_menu_press(rect, p, down) {
+                return true;
+            }
+        }
+        self.met_menu.is_some()
     }
 
     /// A press or a drag inside the metronome panel. Answers whether the
@@ -15127,6 +15326,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         painter.line_segment([elbow, Pos2::new(right, mid - h * 0.62)], stroke);
     }
 
+    /// **What the timeline's bay menu offers**, from the desk's own list.
+    ///
+    /// No SIDECHAIN row: that picker is the desk's (`open_key_picker` is
+    /// reached through `Hit::FxMenu` on a column), and the header has never
+    /// offered one. Everything else is the same menu on both surfaces, which
+    /// is the whole point of asking one function.
+    fn arr_fx_menu_actions(&self, seat: usize, bay: usize) -> Vec<crate::mixer_panel::FxAction> {
+        crate::mixer_panel::fx_menu_actions(
+            self.insert(seat, bay).is_some(),
+            false,
+            self.fx_on_clipboard(Some((seat, bay))),
+        )
+    }
+
     fn draw_clip_menu(&self, painter: &egui::Painter) {
         // `(label, ticked)`. Only the clip menu has a row that carries a
         // state; the FX and flag menus are pure verbs and tick nothing.
@@ -15138,13 +15351,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     .map(|(label, _, ticked)| (label, ticked))
                     .collect(),
             )
-        } else if let Some((.., at)) = self.arr_fx_menu {
+        } else if let Some((seat, bay, at)) = self.arr_fx_menu {
             (
                 at,
-                vec![
-                    ("Delete FX".to_owned(), false),
-                    ("Replace FX".to_owned(), false),
-                ],
+                self.arr_fx_menu_actions(seat, bay)
+                    .into_iter()
+                    .map(|a| (a.label().to_owned(), false))
+                    .collect(),
             )
         } else if let Some((on, at)) = self.arr_flag_menu {
             (
@@ -20081,35 +20294,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // Before the bay menu and before the lanes, because it is drawn in
         // front of both — a panel that is painted over something it does not
         // take presses from is a panel you can click through.
-        if let (true, Some(rect)) = (self.met_menu.is_some(), self.met_stage()) {
-            let (down, released, pointer) = ctx.input(|i| {
-                (
-                    i.pointer.primary_pressed(),
-                    !i.pointer.primary_down(),
-                    i.pointer.interact_pos(),
-                )
-            });
-            if released {
-                self.met_drag = false;
-            }
-            if let Some(p) = pointer {
-                // Outside it: the press closes it and is spent, the way
-                // every other menu on this desk dismisses.
-                let inside =
-                    recorder_panel::met_popup_rect(rect, self.met_anchor(rect)).contains(p);
-                if down && !inside && !self.met_drag {
-                    self.met_menu = None;
-                    self.met_drag = false;
-                    self.menu_ate_press = true;
-                    return;
-                }
-                if self.met_menu_press(rect, p, down) {
-                    return;
-                }
-            }
-            if self.met_menu.is_some() {
-                return;
-            }
+        if self.met_menu_owns_press(ctx) {
+            return;
         }
         // The BAY's FX menu: while it is up it owns every press.
         // The stored pair is a SEAT and bay - resolved at the click.
@@ -20142,15 +20328,31 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             });
             if pressed || sec {
                 self.arr_fx_menu = None;
-                let rows = Self::clip_menu_rows(at, 2);
-                match pointer {
-                    Some(p) if pressed && rows[0].contains(p) => {
+                // **The desk's own row list**, so a bay's menu offers the
+                // same things on both surfaces — see `fx_menu_actions`. The
+                // rows were two literals and an index each; a row added to
+                // the desk alone would have been a gesture that exists in
+                // one view and not the other.
+                let actions = self.arr_fx_menu_actions(seat, bay);
+                let rows = Self::clip_menu_rows(at, actions.len());
+                let hit = pointer.filter(|_| pressed).and_then(|p| {
+                    rows.iter()
+                        .position(|r| r.contains(p))
+                        .and_then(|i| actions.get(i).copied())
+                });
+                match hit {
+                    Some(crate::mixer_panel::FxAction::Delete) => {
                         self.set_insert(seat, bay, None);
                     }
-                    Some(p) if pressed && rows[1].contains(p) => {
+                    Some(crate::mixer_panel::FxAction::Replace) => {
                         self.open_insert_picker(seat, bay);
                     }
-                    _ => {
+                    Some(crate::mixer_panel::FxAction::Copy) => self.copy_fx(seat, bay),
+                    Some(crate::mixer_panel::FxAction::Paste) => self.paste_fx(seat, bay),
+                    // The timeline's header has no sidechain picker of its
+                    // own and never offered one; `arr_fx_menu_actions` does
+                    // not put the row in the list.
+                    Some(_) | None => {
                         self.menu_ate_press = true;
                     }
                 }
@@ -20388,7 +20590,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // delete and replace act on the bay that was clicked and
                     // never the neighbour's.
                     let (seat, bay) = recorder::seat_bay(n, b);
-                    if self.insert(seat, bay).is_some() {
+                    // An EMPTY bay answers too when an effect is held, the
+                    // way the desk's does: its menu is the paste row alone.
+                    if self.insert(seat, bay).is_some()
+                        || self.fx_on_clipboard(Some((seat, bay)))
+                    {
                         self.arr_fx_menu = Some((seat, bay, p));
                         return;
                     }
@@ -27298,6 +27504,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     pub fn open_mixer_for_shot(&mut self) {
         self.mixer_open = true;
+        // **The per-frame words the desk prints**, which a photograph does
+        // not run a frame to get: the click's chip reads its sound's name
+        // and the name is cached (see `tend_click_word`), so a shot taken
+        // without this shows the one chip on the desk blank.
+        self.tend_click_word();
         let strips = recorder::STRIPS;
         // A plausible desk: two MIDI channels, one AUDIO, the rest unused —
         // through the ordinary setters, so the picture is what a settings
@@ -34016,10 +34227,20 @@ impl TangentApp {
         // — every surface below stands down for the frame.
         let input_menu_owns = self.input_menu_frame(&ctx);
         let drumpad_owns = self.drumpad_claims_pointer(&ctx);
+        // **The metronome's panel owns every press while it is up, HERE
+        // too.** The desk has painted it since the click strip grew its
+        // sound chip and nothing on this surface ever took a press for it —
+        // its rows were a picture. `met_stage` answers the mixer only when
+        // the timeline is shut, so the two surfaces cannot both claim it.
+        let met_owns = self.mixer_rect.is_some()
+            && !input_menu_owns
+            && !self.dialog_blocks_pointer(&ctx)
+            && self.met_menu_owns_press(&ctx);
         if let Some(rect) = self
             .mixer_rect
             .filter(|_| {
-                !input_menu_owns
+                !met_owns
+                    && !input_menu_owns
                     && !self.band_popup_owns()
                     // The context menu can open OVER the mixer now, so the
                     // mixer honours it — and the press that dismissed it.
@@ -34188,7 +34409,15 @@ impl TangentApp {
                         // deed and its gentler sibling: delete, or replace.
                         Some(crate::mixer_panel::Hit::Insert(i, n)) => {
                             let (seat, bay) = self.slot_seat(i, n);
-                            if self.insert(seat, bay).is_some() {
+                            // **An EMPTY bay answers too, when something is
+                            // held.** Its menu is one row and that row is
+                            // the paste — the bay's own question, asked at
+                            // the bay. With nothing held there is nothing to
+                            // say about an empty bay and the press falls
+                            // through to the strip's menu, as it always has.
+                            if self.insert(seat, bay).is_some()
+                                || self.fx_on_clipboard(Some((seat, bay)))
+                            {
                                 self.mixer_fx_menu = Some((i, n));
                             } else if i.strip().is_some_and(|s| matches!(
                                 s,
@@ -37185,6 +37414,10 @@ mod tests {
         app.settings.channel_pans[1] = -0.3;
         app.settings.strip_sends[at] = 0.75;
         app.set_insert(at, 0, Some("/x/Piano.vst3"));
+        // And one in the LOWER rack, which is a seat of its own: a copy that
+        // took only the first three would drop it silently.
+        let lower_src = recorder::folder_extra_seat(at);
+        app.set_insert(lower_src, 1, Some("/x/Saturn 2.vst3"));
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
             pedal: Vec::new(),
             kind: crate::arrangement::ClipKind::Midi,
@@ -37216,15 +37449,6 @@ mod tests {
         app.copy_track(1);
         assert!(app.track_on_clipboard(), "the copy took nothing");
 
-        // **Never over a track that is already there.** The menu only offers
-        // this on empty slots; this is what makes that a rule.
-        app.paste_track(1);
-        assert_eq!(
-            app.arrangement.clips.iter().filter(|c| c.lane == 1).count(),
-            1,
-            "pasting over a live track doubled its clips"
-        );
-
         let to = 4usize;
         let to_at = recorder::Strip::Channel(to).index();
         assert!(!app.channel_used(to));
@@ -37237,6 +37461,11 @@ mod tests {
         assert!((app.settings.channel_pans[to] + 0.3).abs() < 1e-9, "the pan");
         assert!((app.settings.strip_sends[to_at] - 0.75).abs() < 1e-9, "the send");
         assert_eq!(app.insert(to_at, 0), Some("/x/Piano.vst3"), "the bay");
+        assert_eq!(
+            app.insert(recorder::folder_extra_seat(to_at), 1),
+            Some("/x/Saturn 2.vst3"),
+            "the lower rack did not travel"
+        );
         // Named as a copy: two tracks with one name is a mixer nobody reads.
         assert_eq!(app.settings.strip_names[to_at], "Rhodes 2");
 
@@ -37252,6 +37481,55 @@ mod tests {
         // loads the same plugin at its defaults.
         assert_eq!(app.take_insert_state_copy(), Some((1, to)));
         assert_eq!(app.take_insert_state_copy(), None, "taken twice");
+
+        // **A LIVE track is overwritten, not refused** — the owner's ask.
+        // What was on the lane goes: its clip, its plugin, its name. What
+        // lands is the copy and nothing of what was there.
+        let over = 6usize;
+        let over_at = recorder::Strip::Channel(over).index();
+        app.set_channel_kind(over, Some(recorder::ChannelKind::Audio));
+        app.settings.strip_names[over_at] = "Guitar".to_owned();
+        app.set_insert(over_at, 0, Some("/x/Amp.vst3"));
+        app.arrangement.add_clip(crate::arrangement::ArrClip {
+            lane: over,
+            len_s: 4.0,
+            name: "OLD".to_owned(),
+            ..Default::default()
+        });
+        assert!(app.channel_used(over));
+        app.paste_track(over);
+        assert_eq!(
+            app.channel_kind(over),
+            Some(recorder::ChannelKind::Midi),
+            "the overwritten lane kept its own kind"
+        );
+        assert_eq!(app.settings.strip_names[over_at], "Rhodes 2");
+        assert_eq!(app.insert(over_at, 0), Some("/x/Piano.vst3"), "the bay");
+        let left: Vec<_> = app
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| c.lane == over)
+            .collect();
+        assert_eq!(left.len(), 1, "the overwritten lane kept its own clips");
+        assert_eq!(left[0].name, "MIDI", "the old clip survived the overwrite");
+        assert_eq!(app.take_insert_state_copy(), Some((1, over)));
+
+        // **And never a FOLDER**, which is a container rather than a track:
+        // clearing one re-parents its children, which is a great deal to do
+        // from a row that says paste.
+        let group = 7usize;
+        app.set_channel_kind(group, Some(recorder::ChannelKind::Midi));
+        app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
+        app.settings.strip_is_folder[group] = true;
+        app.settings.strip_names[recorder::Strip::Channel(group).index()] =
+            "GROUP".to_owned();
+        app.paste_track(group);
+        assert_eq!(
+            app.settings.strip_names[recorder::Strip::Channel(group).index()],
+            "GROUP",
+            "a folder was overwritten"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -47171,6 +47449,100 @@ mod tests {
         );
     }
 
+    /// **The desk's metronome panel hangs off the CLICK strip's chip.**
+    ///
+    /// It hung off nothing: `met_anchor` looked the click's rectangles up by
+    /// `Strip::index`, which is a DESK index, in an array laid out in COLUMN
+    /// order — and the click is `CHANNELS + 1` in one and `CHANNELS` in the
+    /// other, so what came back was the MASTER's, whose `met` is `NOTHING`.
+    /// The panel opened anchored to a degenerate rectangle. That is half of
+    /// "the chip was never wired to the menu"; the other half is
+    /// `met_menu_owns_press`, which the desk never called.
+    ///
+    /// The two spaces have two types precisely so this cannot be written by
+    /// accident — see `recorder::Column` — and this is the test that says so
+    /// about the one place that did it anyway.
+    #[test]
+    fn the_desks_metronome_panel_hangs_off_the_clicks_own_chip() {
+        let (_ctx, app) = headless(Caps::DESKTOP);
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1300.0, 500.0));
+        let view = app.mixer_view();
+        let l = crate::mixer_panel::Layout::new(rect, &view);
+        let chip = recorder::Strip::Click
+            .column_of()
+            .and_then(|c| l.strips.get(c.0))
+            .map(|s| s.met)
+            .expect("the click has no column");
+        assert!(chip.is_positive(), "the click strip wears no sound chip");
+        assert_eq!(
+            app.met_anchor(rect),
+            chip,
+            "the desk's metronome panel is anchored somewhere that is not the chip"
+        );
+        // And the popup it puts up lands on the desk rather than off it.
+        let popup = recorder_panel::met_popup_rect(rect, chip);
+        assert!(popup.is_positive(), "the panel has no area");
+        assert!(
+            rect.contains(popup.min) && rect.contains(popup.max),
+            "the panel opens off the surface: {popup:?} in {rect:?}"
+        );
+    }
+
+    /// **COPY FX holds a bay; PASTE FX asks the host to put it somewhere.**
+    ///
+    /// The pair the right-click menus grew when a carry inside one strip
+    /// became a MOVE — the owner's "to overcome the copy paste issue this
+    /// creates, add copy FX and paste FX to right click menu for FX
+    /// inserts". The clipboard is a REFERENCE, so what it holds can be
+    /// emptied under it; the row stops being offered when it is, rather
+    /// than pasting nothing over something.
+    #[test]
+    fn copy_fx_holds_a_bay_and_paste_fx_asks_the_host_for_it() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.set_insert(0, 1, Some("/x/Comp.vst3"));
+        assert!(!app.fx_on_clipboard(None), "something was held before a copy");
+
+        // An EMPTY bay cannot be copied: there is nothing in it.
+        app.copy_fx(0, 2);
+        assert!(!app.fx_on_clipboard(None), "an empty bay filled the clipboard");
+
+        app.copy_fx(0, 1);
+        assert!(app.fx_on_clipboard(None), "the copy took nothing");
+        assert!(
+            !app.fx_on_clipboard(Some((0, 1))),
+            "the bay offered to paste its own effect over itself"
+        );
+
+        // Into the SAME track's lower rack, which is another seat — the case
+        // the drag no longer covers, because inside one strip a carry moves.
+        let lower = recorder::folder_extra_seat(0);
+        app.paste_fx(lower, 0);
+        let req = app.take_recorder_request();
+        assert!(
+            matches!(
+                req,
+                Some(recorder::RecorderRequest::PasteInsert {
+                    from_strip: 0,
+                    from_bay: 1,
+                    to_bay: 0,
+                    to_strip,
+                }) if to_strip == lower
+            ),
+            "paste asked for {req:?}"
+        );
+        assert!(
+            app.insert(lower, 0).is_none(),
+            "the app wrote the target itself; the STATE is the host's half"
+        );
+
+        // The source emptied since: the row stops being offered.
+        app.set_insert(0, 1, None);
+        assert!(
+            !app.fx_on_clipboard(None),
+            "a bay that was emptied after the copy still offers a paste"
+        );
+    }
+
     /// **Carrying an insert to another channel asks for a COPY, and a press
     /// that never travels still opens the plugin.**
     ///
@@ -47295,8 +47667,54 @@ mod tests {
         app.land_bay_carry(Some(0), Some((0, 2)));
         assert!(matches!(
             app.take_recorder_request(),
-            Some(recorder::RecorderRequest::MoveInsert { strip: 0, from_bay: 1, to_bay: 2 })
+            Some(recorder::RecorderRequest::MoveInsert {
+                from_strip: 0,
+                from_bay: 1,
+                to_strip: 0,
+                to_bay: 2,
+            })
         ));
+
+        // **And the same channel's OTHER RACK is still the same channel** —
+        // the owner's "make it such that fx inserts 1-3 can drag between
+        // themselves AND between 4-6". Slots 3..5 of a channel live in an
+        // appended seat (`recorder::seat_bay`), so a carry across the middle
+        // of the rack used to read as a drop on another strip and COPY.
+        let lower = recorder::folder_extra_seat(0);
+        assert!(app.insert(lower, 0).is_none());
+        app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
+        app.land_bay_carry(Some(0), Some((lower, 0)));
+        assert!(
+            matches!(
+                app.take_recorder_request(),
+                Some(recorder::RecorderRequest::MoveInsert {
+                    from_strip: 0,
+                    from_bay: 1,
+                    to_bay: 0,
+                    to_strip,
+                }) if to_strip == lower
+            ),
+            "a carry into the same track's lower rack was not a move"
+        );
+
+        // ...and ANOTHER track's lower rack is still another track, which
+        // copies. "FX dragged BETWEEN different TRACKS should still auto
+        // copy."
+        let elsewhere = recorder::folder_extra_seat(4);
+        app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
+        app.land_bay_carry(Some(4), Some((elsewhere, 1)));
+        assert!(
+            matches!(
+                app.take_recorder_request(),
+                Some(recorder::RecorderRequest::CopyInsert {
+                    from_strip: 0,
+                    from_bay: 1,
+                    to_bay: Some(1),
+                    to_strip,
+                }) if to_strip == elsewhere
+            ),
+            "a carry into another track's lower rack was not a copy"
+        );
 
         // And a drop on the bay it started in is nothing at all.
         app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
@@ -47304,6 +47722,17 @@ mod tests {
         assert!(
             app.take_recorder_request().is_none(),
             "a bay dropped on itself asked for something"
+        );
+
+        // **And a drop on the track's own PAINT is nothing**, wherever the
+        // carry came from: it is already on that track. The paint road
+        // compares the carry's OWNER to the column under the hand, which is
+        // the only comparison that is true of a bay in a second rack.
+        app.bay_carry = Some((lower, 0, Pos2::new(10.0, 10.0), true));
+        app.land_bay_carry(Some(0), None);
+        assert!(
+            app.take_recorder_request().is_none(),
+            "a lower-rack bay dropped on its own track's paint asked for a copy"
         );
     }
 

@@ -209,6 +209,14 @@ pub struct MixerView<'a> {
     /// because at most one menu is up, and the app is the side that can ask
     /// the host's pushed facts about the bay under it.
     pub fx_menu_key: bool,
+    /// Whether the OPEN insert menu's bay has anything IN it, which is what
+    /// earns it every row but the paste. An empty bay's menu is one row long
+    /// and exists only because something is on the effect clipboard.
+    pub fx_menu_loaded: bool,
+    /// Whether an effect is held for pasting, which is what earns the open
+    /// menu its PASTE FX row. On the view for `fx_menu_key`'s reason: at
+    /// most one menu is up, and the app is the side that knows.
+    pub fx_menu_paste: bool,
 }
 
 impl MixerView<'_> {
@@ -293,11 +301,78 @@ pub enum FxAction {
     Delete,
     /// Open the picker aimed at this bay, so choosing swaps it in place.
     Replace,
+    /// **Hold this bay's effect**, state and all, for a later `Paste`.
+    ///
+    /// The road a DRAG stopped offering. A carry inside one strip is a MOVE
+    /// now (the owner's "fx inserts 1-3 can drag between themselves AND
+    /// between 4-6"), and a move is not a copy — so duplicating an effect
+    /// into another bay of the same track had no gesture left. "To overcome
+    /// the copy paste issue this creates, add copy FX and paste FX to right
+    /// click menu for FX inserts."
+    Copy,
+    /// **Put the held effect in this bay**, over whatever is there. Offered
+    /// only when something is held — see `MixerView::fx_menu_paste`.
+    Paste,
     /// Open the sidechain source picker on this bay. Offered only when the
     /// view says the tenant can take a key — see `MixerView::fx_menu_key`.
     Sidechain,
     /// Anywhere that is not a row: close the menu and do nothing.
     Dismiss,
+}
+
+impl FxAction {
+    /// The row's word on the DESK, where a strip is ninety points wide and
+    /// everything printed on it is capitals.
+    pub fn word(self) -> &'static str {
+        match self {
+            FxAction::Delete => "DELETE FX",
+            FxAction::Replace => "REPLACE FX",
+            FxAction::Copy => "COPY FX",
+            FxAction::Paste => "PASTE FX",
+            FxAction::Sidechain => "SIDECHAIN...",
+            FxAction::Dismiss => "",
+        }
+    }
+
+    /// The row's word in the ARRANGEMENT's floating menu, which is a list of
+    /// sentences beside the clip menu's and is written like one.
+    pub fn label(self) -> &'static str {
+        match self {
+            FxAction::Delete => "Delete FX",
+            FxAction::Replace => "Replace FX",
+            FxAction::Copy => "Copy FX",
+            FxAction::Paste => "Paste FX",
+            FxAction::Sidechain => "Sidechain...",
+            FxAction::Dismiss => "",
+        }
+    }
+}
+
+/// **The rows an open bay menu offers, in order.**
+///
+/// One list, and both surfaces read it: the desk paints these rows into the
+/// strip and the timeline paints them into a floating menu, and a row that
+/// existed on one and not the other would be a gesture that works in one
+/// view and quietly does something else in the other. It is also what makes
+/// the hit test and the painter twins — the actions are POSITIONAL, so a
+/// conditional row must not be able to re-point the rows above it.
+///
+/// An EMPTY bay gets a menu at all only for the paste: there is nothing to
+/// delete, replace, copy or key.
+pub fn fx_menu_actions(loaded: bool, key: bool, paste: bool) -> Vec<FxAction> {
+    let mut out = Vec::with_capacity(5);
+    if loaded {
+        out.push(FxAction::Delete);
+        out.push(FxAction::Replace);
+        out.push(FxAction::Copy);
+    }
+    if paste {
+        out.push(FxAction::Paste);
+    }
+    if loaded && key {
+        out.push(FxAction::Sidechain);
+    }
+    out
 }
 
 impl Hit {
@@ -951,10 +1026,21 @@ pub struct StripStrip {
     pub pan: Rect,
     /// The input chip — the detail row, pressable on general channels.
     pub input_chip: Rect,
+    /// **A FOLDER's chip, and it reads FOLDER.** The band a track spends on
+    /// its input was empty paint on a group — a group has no input to bind —
+    /// and a row of chips across the desk with holes in it reads as chips
+    /// that failed to draw rather than as strips that have none. It says
+    /// what the strip IS, which is the one true thing there is to say there,
+    /// and it is not pressable: there is nothing to choose.
+    pub folder_chip: Rect,
     /// **The click's own sound**, in the band a channel spends on its input
     /// chip. It reads the file that is playing and it opens the metronome
     /// panel — the same one the arrangement's toolbar opens, because there is
     /// one metronome and it should not have two menus.
+    ///
+    /// The WORD on it is the strip's `detail`, like every other chip on the
+    /// desk: the bundled file's own name rather than "CLICK", which is what
+    /// the name plate two bands above it already says.
     pub met: Rect,
     /// The F switch — the folder cycle, leftmost of the switch row.
     pub folder: Rect,
@@ -1010,6 +1096,7 @@ impl StripStrip {
         send: Rect::NOTHING,
         pan: Rect::NOTHING,
         input_chip: Rect::NOTHING,
+        folder_chip: Rect::NOTHING,
         met: Rect::NOTHING,
         folder: Rect::NOTHING,
         fader: Rect::NOTHING,
@@ -1053,6 +1140,13 @@ const MIN_STRIP_W: f32 = 46.0;
 /// where its children's strips begin, so the eye reads containment as a
 /// step down.
 pub const CHILD_INDENT: f32 = 12.0;
+
+/// **How much of a folder's top edge the chop takes**, as a share of the
+/// strip's width. Written down rather than spelled twice: the notch is
+/// painted in `strip` and the SELECTION RIM has to follow the same corner,
+/// and a rim that traced a chop of its own would be a folder with two
+/// different top-right corners depending on whether it was picked.
+pub const NOTCH_W: f32 = 0.28;
 
 impl Layout {
     /// The column unit width and pitch (unit + gap) at `rect` with `visible`
@@ -1603,9 +1697,18 @@ impl Layout {
             } else {
                 Rect::NOTHING
             },
+            // **A FOLDER says so, in the band a track names its input in.**
+            // See the field: a group has no input, and the hole that left
+            // was the only gap in the desk's one continuous row of chips.
+            folder_chip: if view.is_folder && has_icon {
+                cut(0.152, 0.19)
+            } else {
+                Rect::NOTHING
+            },
             // The CLICK's band, the same one — the owner's "add the met menu
             // from arrange view as its own button ... it should read as the
-            // file chosen".
+            // file chosen". And only when there IS a file chosen: see the
+            // field.
             met: if matches!(view.strip, Some(Strip::Click)) && !view.empty {
                 cut(0.152, 0.19)
             } else {
@@ -1935,10 +2038,12 @@ pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
     // exists to prevent is exactly a press that lands somewhere it should not.
     if let Some((at, bay)) = view.fx_menu {
         if let Some(s) = l.strips.get(at.0) {
-            // The third row exists only where a key can go; the actions
-            // are positional, so the list must match the painter's.
-            let rows = fx_menu_rows(s, bay, if view.fx_menu_key { 3 } else { 2 });
-            let actions = [FxAction::Delete, FxAction::Replace, FxAction::Sidechain];
+            // The rows the menu is offering, from the one list the painter
+            // draws from: the actions are POSITIONAL and a conditional row
+            // must not re-point the rows above it. See `fx_menu_actions`.
+            let actions =
+                fx_menu_actions(view.fx_menu_loaded, view.fx_menu_key, view.fx_menu_paste);
+            let rows = fx_menu_rows(s, bay, actions.len());
             for (r, action) in rows.iter().zip(actions) {
                 if r.contains(pos) {
                     return Some(Hit::FxMenu(at, bay, action));
@@ -2088,7 +2193,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
         let heard = view.heard(i);
         let typed = view.typing.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
         let naming = view.naming.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
-        strip(painter, s, v, &p, view.routes, heard, typed, naming, view.click_sound);
+        strip(painter, s, v, &p, view.routes, heard, typed, naming);
         // The selected channels' faint rim — the owner's slight light.
         if view
             .selected_tracks
@@ -2105,11 +2210,11 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
             } else {
                 p.face
             };
-            painter.rect_stroke(
+            selection_outline(
+                painter,
                 s.panel,
-                3.0,
-                Stroke::new(1.2_f32, crate::recorder_panel::selection_rim(under)),
-                egui::StrokeKind::Inside,
+                v.is_folder,
+                crate::recorder_panel::selection_rim(under),
             );
         }
     }
@@ -2143,16 +2248,12 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
     };
     if let Some((at, bay)) = view.fx_menu {
         if let Some(s) = l.strips.get(at.0) {
-            // Row order is the hit test's: the two lists must stay twins.
-            if view.fx_menu_key {
-                two_rows(
-                    s,
-                    &fx_menu_rows(s, bay, 3),
-                    &["DELETE FX", "REPLACE FX", "SIDECHAIN..."],
-                );
-            } else {
-                two_rows(s, &fx_menu_rows(s, bay, 2), &["DELETE FX", "REPLACE FX"]);
-            }
+            // Row order is the hit test's: the two lists must stay twins,
+            // which is why neither of them writes one down.
+            let actions =
+                fx_menu_actions(view.fx_menu_loaded, view.fx_menu_key, view.fx_menu_paste);
+            let labels: Vec<&str> = actions.iter().map(|a| a.word()).collect();
+            two_rows(s, &fx_menu_rows(s, bay, actions.len()), &labels);
         }
     }
 }
@@ -2202,9 +2303,6 @@ fn strip(
     heard: bool,
     typed: Option<&str>,
     naming: Option<&str>,
-    // What the click is playing. Only the click's strip has a rect to put
-    // it in; every other column is handed it and ignores it.
-    met_word: &str,
 ) {
     if v.empty {
         // The slot's own NUMBER, so an empty desk still says which column is
@@ -2254,7 +2352,7 @@ fn strip(
     // to child.
     if v.is_folder {
         let notch = Rect::from_min_max(
-            Pos2::new(l.panel.right() - l.panel.width() * 0.28, l.panel.top() - 1.0),
+            Pos2::new(l.panel.right() - l.panel.width() * NOTCH_W, l.panel.top() - 1.0),
             Pos2::new(l.panel.right() + 1.0, l.panel.top() + CHILD_INDENT),
         );
         painter.rect_filled(notch, 0.0, p.wood);
@@ -2449,13 +2547,36 @@ fn strip(
             plain((h * 0.024).clamp(7.0, 11.0)),
             p.engrave.gamma_multiply(if v.detail.is_empty() { 0.55 } else { 0.85 }),
         );
-    } else if !v.detail.is_empty() {
+    } else if !v.detail.is_empty() && !l.met.is_positive() {
+        // Not under the click's chip: the click's detail IS its sound's name,
+        // and the chip above is already drawing it on a panel.
         centred(
             painter,
             l.detail,
             v.detail,
             plain((h * 0.024).clamp(7.0, 11.0)),
             ink.gamma_multiply(0.72),
+        );
+    }
+    // **A FOLDER's chip, wearing the panel a track's input wears** — the
+    // same ground, the same edge, the same band — because it answers the
+    // same question the chip under every other badge answers: what is this
+    // strip. It is a READOUT and not a door: a group has no input to pick,
+    // so it is drawn here and registered in no target list.
+    if l.folder_chip.is_positive() {
+        painter.rect_filled(l.folder_chip, 2.0, p.chip);
+        painter.rect_stroke(
+            l.folder_chip,
+            2.0,
+            Stroke::new(1.0_f32, p.engrave.gamma_multiply(0.4)),
+            egui::StrokeKind::Inside,
+        );
+        centred(
+            painter,
+            l.folder_chip,
+            "FOLDER",
+            plain((h * 0.024).clamp(7.0, 11.0)),
+            p.engrave.gamma_multiply(0.85),
         );
     }
     // **The CLICK's own sound**, in the band a channel spends on its input
@@ -2474,7 +2595,12 @@ fn strip(
         centred(
             painter,
             l.met,
-            met_word,
+            // **The strip's own detail**, which is what the app puts the
+            // playing sound's name in — the chip used to be handed a second
+            // copy of the same string through its own parameter, and two
+            // roads to one word is one of them eventually saying something
+            // else.
+            v.detail,
             plain((h * 0.024).clamp(7.0, 11.0)),
             p.engrave.gamma_multiply(0.85),
         );
@@ -2827,6 +2953,58 @@ fn strip(
 /// The same menu with however many rows it needs — a keyed-capable bay
 /// carries a third. One function for any count, so the two-row and
 /// three-row menus cannot disagree about where a row is.
+/// **How heavy the selected strip's rim is.**
+///
+/// It was 1.2 and the owner could not find the selection on a full desk -
+/// "make the selector overall bigger in mixer view, just a slight bump for
+/// visibility". A bump and not a frame: a rim thick enough to read as a
+/// border would be a strip that changes SIZE when it is picked, and the one
+/// thing a desk must not do is move under the hand.
+const RIM_W: f32 = 2.2;
+
+/// The selected strip's rim, in the shape the strip actually is.
+///
+/// **A folder is not a rectangle.** Its top-right corner is chopped
+/// (`CHILD_INDENT`, and see the notch in `strip`), so a rounded rectangle
+/// drawn round one cut the corner off the wrong way: the rim crossed the
+/// empty paint above the chop and told the eye the group reached somewhere
+/// it does not. The outline follows the notch instead, which is the same
+/// six points the chop itself is drawn from.
+///
+/// One function for both shapes so the selection cannot be drawn one way on
+/// a track and another on a group by two pieces of code that disagree.
+fn selection_outline(painter: &Painter, panel: Rect, folder: bool, ink: Color32) {
+    if !panel.is_positive() {
+        return;
+    }
+    let stroke = Stroke::new(RIM_W, ink);
+    if !folder {
+        painter.rect_stroke(panel, 3.0, stroke, egui::StrokeKind::Inside);
+        return;
+    }
+    // Half the stroke inward on every edge, because a closed line is
+    // CENTRED on its path where `StrokeKind::Inside` is not - without it
+    // half the rim hangs over the strip's own border and over the gap.
+    let i = RIM_W * 0.5;
+    let r = Rect::from_min_max(
+        Pos2::new(panel.left() + i, panel.top() + i),
+        Pos2::new(panel.right() - i, panel.bottom() - i),
+    );
+    let chop_x = r.right() - panel.width() * NOTCH_W;
+    let chop_y = r.top() + CHILD_INDENT;
+    painter.add(egui::Shape::closed_line(
+        vec![
+            Pos2::new(r.left(), r.top()),
+            Pos2::new(chop_x, r.top()),
+            Pos2::new(chop_x, chop_y),
+            Pos2::new(r.right(), chop_y),
+            Pos2::new(r.right(), r.bottom()),
+            Pos2::new(r.left(), r.bottom()),
+        ],
+        stroke,
+    ));
+}
+
 fn fx_menu_rows(l: &StripStrip, bay: usize, count: usize) -> Vec<Rect> {
     let panel = l.panel;
     if !panel.is_positive() {
@@ -3639,6 +3817,8 @@ mod tests {
             naming: None,
             fx_menu: None,
             fx_menu_key: false,
+            fx_menu_loaded: true,
+            fx_menu_paste: false,
             dark_mode: true,
             wood: (0x4A, 0x3B, 0x2C),
         }
@@ -4116,6 +4296,135 @@ mod tests {
         }
     }
 
+    /// **A FOLDER wears a chip, and it reads FOLDER.**
+    ///
+    /// The band a track names its input in was empty paint on a group — a
+    /// group has no input to bind — and a desk whose one continuous row of
+    /// chips has holes in it reads as chips that failed to draw. The owner:
+    /// "add an input chip that reads FOLDER on folders in mixer view to
+    /// close the gap."
+    ///
+    /// It is a READOUT: it sits on the track's own chip row and answers no
+    /// press, because there is nothing on a group to choose.
+    #[test]
+    fn a_folder_wears_a_chip_reading_folder() {
+        let mut v = a_view();
+        v.strips[1].is_folder = true;
+        let r = rect();
+        let l = Layout::new(r, &v);
+        let chip = l.strips[1].folder_chip;
+        let track = l.strips[0].input_chip;
+        assert!(chip.is_positive(), "the folder's band is still a hole");
+        assert!(track.is_positive(), "the reference track has no input chip");
+        assert!(
+            (chip.top() - track.top()).abs() < 0.5
+                && (chip.bottom() - track.bottom()).abs() < 0.5,
+            "the folder's chip is not on the input chip's own row"
+        );
+        assert!(
+            !l.strips[1].input_chip.is_positive(),
+            "a folder grew an input chip it could bind nothing with"
+        );
+        // Nothing to press: it is not in the target list at all.
+        assert!(
+            !l.targets().iter().any(|(rect, _)| *rect == chip),
+            "the folder's chip answers a press"
+        );
+        // And the word is drawn on it.
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(r), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(r);
+                    draw(ui.painter(), r, &v);
+                });
+            },
+        );
+        let said = out.shapes.iter().any(|s| match &s.shape {
+            egui::Shape::Text(t) => {
+                t.galley.text() == "FOLDER" && chip.contains(t.visual_bounding_rect().center())
+            }
+            _ => false,
+        });
+        assert!(said, "the folder's chip is blank");
+    }
+
+    /// **The selected strip's rim follows the shape of the strip.**
+    ///
+    /// A folder's top-right corner is chopped (`NOTCH_W`, `CHILD_INDENT`),
+    /// and a rounded rectangle drawn round one crosses the empty paint above
+    /// the chop — a rim that says the group reaches somewhere it does not.
+    /// The owner: "make it so it matches the shape of a folder (has cutout
+    /// at top right) when one is selected."
+    ///
+    /// A track keeps the rectangle, and both are drawn at `RIM_W`, which is
+    /// the "slight bump for visibility" the same ask came with.
+    #[test]
+    fn a_selected_folder_is_rimmed_in_the_shape_of_a_folder() {
+        let mut v = a_view();
+        v.strips[1].is_folder = true;
+        let picked = [0usize, 1];
+        v.selected_tracks = &picked;
+        let r = rect();
+        let l = Layout::new(r, &v);
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let out = ctx.run(
+            egui::RawInput { screen_rect: Some(r), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_clip_rect(r);
+                    draw(ui.painter(), r, &v);
+                });
+            },
+        );
+        // The FOLDER's rim is a path, and it keeps out of the chop: no point
+        // on it stands in the notch the strip cuts out of its own corner.
+        let panel = l.strips[1].panel;
+        let notch = Rect::from_min_max(
+            Pos2::new(panel.right() - panel.width() * NOTCH_W + 1.0, panel.top()),
+            Pos2::new(panel.right(), panel.top() + CHILD_INDENT - 1.0),
+        );
+        let mut rim = None;
+        for s in &out.shapes {
+            if let egui::Shape::Path(pp) = &s.shape {
+                if pp.stroke.width > 0.0 && panel.contains(pp.visual_bounding_rect().center()) {
+                    rim = Some(pp.clone());
+                }
+            }
+        }
+        let rim = rim.expect("the selected folder was not rimmed");
+        assert!(
+            (rim.stroke.width - RIM_W).abs() < 0.01,
+            "the rim is {} wide, not the bumped {RIM_W}",
+            rim.stroke.width
+        );
+        assert!(
+            !rim.points.iter().any(|p| notch.contains(*p)),
+            "the folder's rim runs through its own chop"
+        );
+        assert!(
+            rim.points.iter().any(|p| notch.right() - p.x < 1.5
+                && (p.y - (panel.top() + CHILD_INDENT)).abs() < 2.0),
+            "the rim does not come back out to the strip's edge under the chop"
+        );
+        // A plain track keeps the rectangle, at the same weight.
+        let track = l.strips[0].panel;
+        let rect_rim = out.shapes.iter().any(|s| match &s.shape {
+            egui::Shape::Rect(rr) => {
+                (rr.stroke.width - RIM_W).abs() < 0.01
+                    && track.contains(rr.rect.center())
+                    && rr.fill.a() == 0
+            }
+            _ => false,
+        });
+        assert!(rect_rim, "a selected track lost its rectangular rim");
+    }
+
     /// **Every rack on the desk is at the same height, and holds six.**
     ///
     /// The master's and a folder's used to start at 0.100 — reaching up over
@@ -4165,9 +4474,16 @@ mod tests {
     /// chip: it reads the file that is playing and opens the metronome panel.
     /// The owner's "add the met menu from arrange view as its own button —
     /// it should read as the file chosen".
+    ///
+    /// **And the word on it is the SOUND**, which is the strip's own detail
+    /// — the file that ships has a name of its own ("UREI CLICK") and it is
+    /// not "CLICK", which is what the name plate two bands above it already
+    /// says. The owner: "make the name what the actual default file urei
+    /// click is."
     #[test]
     fn the_click_carries_the_metronomes_own_button() {
-        let v = a_view();
+        let mut v = a_view();
+        v.strips[CLICK].detail = "UREI CLICK";
         let l = Layout::new(rect(), &v);
         let click = &l.strips[CLICK];
         assert!(click.met.is_positive(), "the click has no sound button");
@@ -5141,12 +5457,15 @@ mod tests {
         );
     }
 
-    /// **A key-capable bay's menu grows a third row, and only then.**
+    /// **A key-capable bay's menu grows a SIDECHAIN row, and only then** —
+    /// and every conditional row is positional under the same painter, so
+    /// what this pins is that the hit test and the row list stay twins: a
+    /// press on row N means the Nth thing `fx_menu_actions` offers, never a
+    /// mis-aimed DELETE.
     ///
-    /// The row is positional under the same painter as the other two, so
-    /// what this pins is that the hit test and the row list stay twins:
-    /// three rows when the view says the bay can take a key, and the third
-    /// press means SIDECHAIN — never a mis-aimed DELETE.
+    /// Driven from that list rather than from hard indices, because the list
+    /// is what both sides read; a test carrying its own copy of the order
+    /// would go on agreeing with itself after the menu had grown.
     #[test]
     fn the_sidechain_row_appears_only_where_a_key_can_go() {
         let mut v = a_view();
@@ -5154,7 +5473,12 @@ mod tests {
         v.fx_menu_key = true;
         let r = rect();
         let l = Layout::new(r, &v);
-        let rows = fx_menu_rows(&l.strips[0], 1, 3);
+        let actions = fx_menu_actions(v.fx_menu_loaded, v.fx_menu_key, v.fx_menu_paste);
+        assert!(
+            actions.contains(&FxAction::Sidechain),
+            "a key-capable bay was offered no sidechain row"
+        );
+        let rows = fx_menu_rows(&l.strips[0], 1, actions.len());
         for (i, row) in rows.iter().enumerate() {
             assert!(row.is_positive(), "row {i} has no area");
             assert!(
@@ -5162,31 +5486,61 @@ mod tests {
                 "row {i} hangs outside its own strip"
             );
         }
-        assert_eq!(
-            hit_test(r, &v, rows[2].center()),
-            Some(Hit::FxMenu(Column(0), 1, FxAction::Sidechain))
-        );
-        // The first two rows still mean what they always meant.
-        assert_eq!(
-            hit_test(r, &v, rows[0].center()),
-            Some(Hit::FxMenu(Column(0), 1, FxAction::Delete))
-        );
-        // Without the capability the same menu has no third row: the space
+        for (row, action) in rows.iter().zip(&actions) {
+            assert_eq!(
+                hit_test(r, &v, row.center()),
+                Some(Hit::FxMenu(Column(0), 1, *action)),
+                "the rows and the actions have come apart"
+            );
+        }
+        // Without the capability the same menu is one row shorter: the space
         // where it would sit is a dismissal like any other stray press.
         v.fx_menu_key = false;
-        let two = fx_menu_rows(&l.strips[0], 1, 2);
+        let plain = fx_menu_actions(v.fx_menu_loaded, v.fx_menu_key, v.fx_menu_paste);
+        assert!(!plain.contains(&FxAction::Sidechain));
+        let short = fx_menu_rows(&l.strips[0], 1, plain.len());
         assert_eq!(
-            hit_test(r, &v, two[0].center()),
+            hit_test(r, &v, short[0].center()),
             Some(Hit::FxMenu(Column(0), 1, FxAction::Delete))
         );
-        let below = Pos2::new(two[1].center().x, two[1].bottom() + two[1].height());
-        if !two[0].contains(below) && !two[1].contains(below) {
+        let last = short[short.len() - 1];
+        let below = Pos2::new(last.center().x, last.bottom() + last.height());
+        if !short.iter().any(|r| r.contains(below)) {
             assert_eq!(
                 hit_test(r, &v, below),
                 Some(Hit::FxMenu(Column(0), 1, FxAction::Dismiss)),
-                "a plain bay's menu answered a third row it does not have"
+                "a plain bay's menu answered a row it does not have"
             );
         }
+    }
+
+    /// **COPY FX and PASTE FX, and what earns each row.**
+    ///
+    /// The pair is the answer to what a drag stopped doing when a carry
+    /// inside one strip became a MOVE — see `FxAction::Copy`. A bay with
+    /// nothing in it offers the paste ALONE: there is nothing there to
+    /// delete, replace or copy, and a menu of dead rows is a menu people
+    /// learn not to open.
+    #[test]
+    fn a_bay_offers_copy_always_and_paste_only_when_something_is_held() {
+        let loaded = fx_menu_actions(true, false, false);
+        assert!(loaded.contains(&FxAction::Copy), "a loaded bay cannot be copied");
+        assert!(!loaded.contains(&FxAction::Paste), "a paste row with nothing held");
+        let held = fx_menu_actions(true, false, true);
+        assert_eq!(
+            held,
+            vec![FxAction::Delete, FxAction::Replace, FxAction::Copy, FxAction::Paste],
+            "the held-effect menu is not the plain one plus a paste"
+        );
+        assert_eq!(
+            fx_menu_actions(false, false, true),
+            vec![FxAction::Paste],
+            "an empty bay's menu is the paste and nothing else"
+        );
+        assert!(
+            fx_menu_actions(false, true, false).is_empty(),
+            "an empty bay with nothing held has a menu at all"
+        );
     }
 
     /// **Only a removable channel wears the ×, and it can be pressed.**
