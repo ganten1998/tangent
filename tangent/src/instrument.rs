@@ -3461,6 +3461,75 @@ struct KeyFeed<'a> {
     io: &'a mut [Vec<f32>],
 }
 
+/// **A channel's SECOND rack — bays 3..5 — over the audio its first one just
+/// left behind.**
+///
+/// Every track and folder wears six bays (`recorder::bays_on`), and the seat
+/// map has always answered slots 3..5 out of the channel's own folder-extra
+/// seat whether or not it is a group. What did not follow was the engine:
+/// that seat's rack ran in exactly ONE place, inside the fold, so a plugin
+/// dropped into the second row of a LOOSE track was loaded, drawn, given a
+/// state file, saved into the document — and never clocked. The owner's
+/// `error1.tan`: an imager in the first row audible, a reverb in the second
+/// doing nothing at all.
+///
+/// It runs after the first rack and over the same buffer, which is what makes
+/// six bays one chain rather than two.
+///
+/// A FREE function taking its fields rather than a method on the renderer,
+/// and not for taste: the monitor pass holds `&self.notes` across the call,
+/// so a `&mut self` method there is a borrow error. This is the shape
+/// `run_rack` itself already has and for the same reason.
+///
+/// `is_folder`: a folder's pair belongs to `fold_folders`, which runs both
+/// over the summed group, and a second run here would process that audio
+/// twice a block. The guard is inside so that no caller can hold a different
+/// opinion — and it is the word `no_writer_runs_a_folders_rack_except_the_fold`
+/// looks for above the call below.
+#[allow(clippy::too_many_arguments)]
+fn run_extra_rack(
+    racks: &mut [Rack],
+    is_folder: bool,
+    auto_params: &[Vec<tangent_host::ParamPoint>],
+    planar: &mut [Vec<f32>],
+    out: &mut [Vec<f32>],
+    shared: &Shared,
+    ch: usize,
+    frames: usize,
+    notes: &[Note],
+    controls: &[Control],
+    sample: Option<&SamplerSample>,
+    key: Option<KeyFeed<'_>>,
+) {
+    if is_folder {
+        return;
+    }
+    let extra = tangent_ui::recorder::folder_extra_seat(ch);
+    if racks.get(extra).is_none_or(Rack::is_empty) {
+        return;
+    }
+    // This seat's own parameter queue, exactly as the first rack takes its
+    // own: automation on bay 4 files to seat `extra`, bay 1.
+    let seat_params: [&[tangent_host::ParamPoint]; INSERTS] = std::array::from_fn(|b| {
+        auto_params
+            .get(extra * INSERTS + b)
+            .map_or(&[][..], Vec::as_slice)
+    });
+    run_rack(
+        &mut racks[extra],
+        planar,
+        frames,
+        out,
+        notes,
+        controls,
+        &seat_params,
+        shared,
+        extra,
+        sample,
+        key,
+    );
+}
+
 fn run_rack(
     rack: &mut Rack,
     planar: &mut [Vec<f32>],
@@ -7324,6 +7393,27 @@ impl Renderer {
                         // monitor run. See `KeyFeed`.
                             None,
                         );
+                        // And bays 3..5, over what bays 0..2 just left — the
+                        // room hears the whole chain or it hears half of it.
+                        // Not a key pass either, for the same reason. Still
+                        // inside the `!is_folder` arm; `run_extra_rack` holds
+                        // the guard as well, so neither can drift.
+                        run_extra_rack(
+                            &mut self.racks,
+                            is_folder,
+                            &self.auto_params,
+                            &mut self.fx_in,
+                            &mut self.fx_out,
+                            &self.shared,
+                            strip.index(),
+                            n,
+                            notes,
+                            controls,
+                            self.sampler_samples
+                                .get(strip.index())
+                                .and_then(Option::as_ref),
+                            None,
+                        );
                     }
                 }
             }
@@ -7690,14 +7780,15 @@ impl Renderer {
                 .racks
                 .get(lane)
                 .map_or(0, |_| Rack::latency(&self.shared, lane));
-            // A FOLDER lane's own cost is BOTH its racks - six bays, one
-            // figure, or the readout hides half of what the group pays.
-            if self.folder_is.get(lane).copied().unwrap_or(false) {
-                l = l.saturating_add(Rack::latency(
-                    &self.shared,
-                    tangent_ui::recorder::folder_extra_seat(lane),
-                ));
-            }
+            // **BOTH racks on every lane** — six bays, one figure, or the
+            // readout hides half of what the lane pays. It was gated on
+            // FOLDER while a folder was the only thing with a second rack;
+            // every track has one now, and this and the wait in the lane pass
+            // must not drift or a lane waits for its own plugins.
+            l = l.saturating_add(Rack::latency(
+                &self.shared,
+                tangent_ui::recorder::folder_extra_seat(lane),
+            ));
             // An amp-bearing lane's chain includes its seven pedal racks —
             // they run in series before the amp, so the lane's figure and
             // the alignment target both carry their sum, or a lookahead
@@ -8859,7 +8950,12 @@ impl Renderer {
             // still decoding.
             let is_builtin =
                 builtin_mask & (1 << ch.min(31)) != 0 && self.dx7s.get(ch).is_some_and(Option::is_some);
-            let rack_live = !self.racks[ch].is_empty();
+            // **Either seat.** A channel with its first three bays empty and
+            // a plugin in bay 4 has a live rack; reading only seat `ch` is
+            // how such a lane skipped the whole block and its second rack
+            // never ran at all.
+            let rack_live = !self.racks[ch].is_empty()
+                || !self.racks[tangent_ui::recorder::folder_extra_seat(ch)].is_empty();
             // An AUDIO channel's bit is set and its rack runs in
             // `mix_monitor`, over its input — running it here too would fold
             // its effect tails twice.
@@ -9520,6 +9616,27 @@ impl Renderer {
                         io: &mut self.key_io,
                     }),
                 );
+                // **And bays 3..5, over what bays 0..2 just left.** Six bays
+                // are one chain; see `run_extra_rack`, which holds the
+                // is_folder guard this block's head already applied.
+                run_extra_rack(
+                    &mut self.racks,
+                    is_folder,
+                    &self.auto_params,
+                    &mut self.fx_in,
+                    &mut self.fx_out,
+                    &self.shared,
+                    ch,
+                    frames,
+                    &lane_notes,
+                    &lane_controls,
+                    self.sampler_samples.get(ch).and_then(Option::as_ref),
+                    self.keys_live.then(|| KeyFeed {
+                        prev: &self.key_prev,
+                        prev_frames: self.key_prev_frames,
+                        io: &mut self.key_io,
+                    }),
+                );
             }
             // **And the lane waits for the slowest of its neighbours.**
             //
@@ -9555,15 +9672,14 @@ impl Renderer {
                 // which is why the special case that used to sit here was
                 // both unnecessary and wrong: it left a group a bus
                 // compressor's lookahead late.
-                let mut own = Rack::latency(&self.shared, ch);
-                if self.folder_is[ch] {
-                    // A folder's own row pays its SECOND rack at the fold
-                    // too - see THE-FOLD - so the wait subtracts both.
-                    own = own.saturating_add(Rack::latency(
-                        &self.shared,
-                        tangent_ui::recorder::folder_extra_seat(ch),
-                    ));
-                }
+                // **Both racks, folder or not.** A folder pays its second at
+                // the fold and a loose lane pays its own a line above this
+                // one (`run_channel_extra`); either way the audio has been
+                // through six bays by the time it leaves, so the wait
+                // subtracts six bays' worth.
+                let mut own = Rack::latency(&self.shared, ch).saturating_add(
+                    Rack::latency(&self.shared, tangent_ui::recorder::folder_extra_seat(ch)),
+                );
                 // An amp-bearing lane also pays its pedal racks on the way
                 // out, so the wait subtracts them too — `publish_latency`
                 // counts them into the target by the same rule, and the two
@@ -18329,6 +18445,94 @@ mod tests {
             peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
         }
         peak
+    }
+
+    /// A loose track's level with a loud TRIM in one of its six bays, or in
+    /// none of them. `slot` is the SLOT as the strip numbers them: 0..2 are
+    /// the channel's own seat, 3..5 its second one.
+    fn dx7_through_a_bay(slot: Option<usize>) -> f32 {
+        use std::sync::Arc;
+        const CH: usize = 2;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).unwrap();
+        let loud = crate::builtin_fx::state_text(spec, &[1.0], &[]).into_bytes();
+        if let Some(slot) = slot {
+            // Through the seat map, like every other caller: it is what
+            // answers 3..5 out of the channel's own folder-extra seat.
+            let (seat, bay) = tangent_ui::recorder::seat_bay(CH, slot);
+            e.load_insert(seat, bay, Some(Path::new(crate::builtin_fx::TRIM_PATH)), Some(&loud))
+                .expect("the seat admits a built-in")
+                .expect("the bay reports it");
+        }
+        e.set_channel_gain(CH, 0.02);
+        e.set_master_gain(1.0);
+        e.set_builtin_strips(1 << CH);
+        e.sync_instrument_lanes(1 << CH, 0);
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; 1024 * 2];
+        for _ in 0..3 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        e.set_midi_clips(vec![PlacedMidi {
+            pedal: Arc::new(Vec::new()),
+            strip: CH,
+            start: 0,
+            len: 96_000,
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 48_000, key: 48, vel: 127 }]),
+        }]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+        }
+        peak
+    }
+
+    /// **A plugin in a LOOSE track's second rack is in the chain.**
+    ///
+    /// The owner's `error1.tan`: an imager in bay 1 of a plain track audible,
+    /// a reverb in bay 4 of the same track doing nothing whatever. Every
+    /// track wears six bays now (`recorder::bays_on`) and the seat map has
+    /// always answered slots 3..5 out of the channel's own folder-extra seat
+    /// — but the ENGINE ran that seat in exactly one place, inside the fold.
+    /// So on a track that was not a group the second rack was loaded, drawn,
+    /// given a state file, saved into the document, and never clocked.
+    ///
+    /// Measured against the SAME trim in bay 1, not merely against silence:
+    /// "bay 4 does something" would pass on a rack that ran at the wrong
+    /// point in the chain or twice, and the two bays are the same plugin at
+    /// the same setting over the same signal, so they have to land on the
+    /// same number.
+    ///
+    /// Revert check performed: drop the `run_extra_rack` call from the lane
+    /// pass and the second figure falls back to the bare one.
+    #[test]
+    fn a_loose_tracks_second_rack_is_in_the_chain() {
+        let bare = dx7_through_a_bay(None);
+        assert!(bare > 1.0e-6, "the fixture makes no sound at all: {bare}");
+        let first = dx7_through_a_bay(Some(1));
+        let second = dx7_through_a_bay(Some(4));
+        // Whether the trim's top of travel lifts or cuts is the trim's
+        // business; that it CHANGES the level is this test's.
+        assert!(
+            (first - bare).abs() > bare * 0.2,
+            "a trim in bay 2 changed nothing: {first} against {bare} bare"
+        );
+        assert!(
+            (second - bare).abs() > bare * 0.2,
+            "a trim in bay 5 of a LOOSE track changed nothing: {second} against \
+             {bare} bare — the second rack is not running"
+        );
+        // The same plugin at the same setting over the same signal: the two
+        // rows are one chain, so they land on the same number.
+        assert!(
+            (second - first).abs() < first * 0.02,
+            "the same trim reads differently in the two rows: {second} against {first}"
+        );
     }
 
     /// **A pedal runs BEFORE the amp; the same effect in the next bay runs
