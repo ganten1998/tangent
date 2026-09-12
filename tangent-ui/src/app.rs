@@ -9427,6 +9427,22 @@ impl TangentApp {
             // and the constructor resolves that once (see `default_armed`)
             // — so by the time anything asks this it is always `Some`.
             armed: s.channel_armed.unwrap_or(0),
+            // **The LIVE desk always says.** These six are `Option` on the
+            // snapshot because a DOCUMENT may predate them; the settings
+            // never do, so every one of them is `Some` here — which is what
+            // makes a save always write them and the document win from then
+            // on. See the block on `DeskSnap`.
+            phase: Some(s.strip_phase),
+            to_theory: Some(&s.strip_to_theory),
+            routes: Some(&s.routes),
+            insert_keys: Some(&s.insert_keys),
+            bypass: Some(&s.insert_bypass),
+            instruments: Some(crate::arrangement::InstrumentsRef {
+                dx7_cartridge: &s.strip_dx7_cartridge,
+                dx7_patch: &s.strip_dx7_patch,
+                keys_patch: &s.strip_keys_patch,
+                keys_params: &s.strip_keys_params,
+            }),
         }
     }
 
@@ -9563,6 +9579,48 @@ impl TangentApp {
         // instead, resolved from its OWN desk by `DeskSnap::from_value`, so
         // an old project opens exactly as it always did.
         self.settings.channel_armed = Some(d.armed);
+        // **And the six that used to live in the settings alone.**
+        //
+        // Applied only when the document SAYS — `None` is a file written
+        // before the key, and the live value stands for it, so no project
+        // changes what it sounds like because a field was added. See the
+        // block on `DeskSnap`. A document that says anything wins outright:
+        // that is the whole point of carrying them.
+        if let Some(v) = d.phase {
+            self.settings.strip_phase = v;
+        }
+        if let Some(v) = d.to_theory.as_ref() {
+            for (i, slot) in self.settings.strip_to_theory.iter_mut().enumerate() {
+                *slot = v.get(i).copied().unwrap_or(false);
+            }
+        }
+        if let Some(v) = d.routes.as_ref() {
+            self.settings.routes = v.clone();
+        }
+        if let Some(v) = d.insert_keys.as_ref() {
+            self.settings.insert_keys = v.clone();
+        }
+        if let Some(v) = d.bypass.as_ref() {
+            self.settings.insert_bypass = v.clone();
+        }
+        if let Some(i) = d.instruments.as_ref() {
+            // Length-clamped like every other vector read out of a
+            // document: the file is content and may say anything, and the
+            // settings' own vectors are sized by the desk.
+            let put = |dst: &mut Vec<usize>, src: &[usize]| {
+                for (n, slot) in dst.iter_mut().enumerate() {
+                    *slot = src.get(n).copied().unwrap_or(0);
+                }
+            };
+            for (n, slot) in self.settings.strip_dx7_cartridge.iter_mut().enumerate() {
+                *slot = i.dx7_cartridge.get(n).cloned().unwrap_or_default();
+            }
+            put(&mut self.settings.strip_dx7_patch, &i.dx7_patch);
+            put(&mut self.settings.strip_keys_patch, &i.keys_patch);
+            for (n, slot) in self.settings.strip_keys_params.iter_mut().enumerate() {
+                *slot = i.keys_params.get(n).copied().unwrap_or(*slot);
+            }
+        }
         // A group is not a send destination — `set_is_folder` enforces
         // that at the gesture, but a document's folder arrives here, and
         // the routes it must displace live in settings, not in the
@@ -41449,6 +41507,136 @@ mod tests {
             2,
             "the arm is not on the desk a save would write"
         );
+    }
+
+    /// **Everything the desk is now travels with the document** — polarity,
+    /// the theory sends, the routing, the sidechains, the bypasses and what
+    /// the built-in instruments are playing.
+    ///
+    /// Every one of these lived in the settings alone, which made it a
+    /// property of the MACHINE: open any project and it wore the last
+    /// session's. The owner, shown the list: "all the things you flagged
+    /// should be in document."
+    ///
+    /// Revert-check performed: dropping any one of the six `if let Some`
+    /// blocks from `apply_desk_snapshot` fails the matching assertion here.
+    #[test]
+    fn a_project_gives_back_its_routing_switches_and_instrument_patches() {
+        let root = project_scratch("desksave");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+
+        // A desk with an opinion about all six.
+        app.settings.strip_phase = 0b1010;
+        app.settings.strip_to_theory[2] = true;
+        app.settings.routes = crate::routing::Routes(vec![crate::routing::Route {
+            from: 1,
+            target: crate::routing::Target::Channel(4),
+            gain: 0.5,
+        }]);
+        app.settings.insert_keys.set(3, 1, Some(0));
+        app.settings.insert_bypass.set(2, 1, true);
+        app.settings.strip_dx7_patch[1] = 17;
+        app.settings.strip_keys_patch[1] = 4;
+        app.settings.strip_dx7_cartridge[1] = "ROM3A.syx".to_owned();
+        app.save_project_doc();
+        let doc = app.project_doc.clone();
+        let want = (
+            app.settings.strip_phase,
+            app.settings.strip_to_theory.clone(),
+            app.settings.routes.clone(),
+            app.settings.insert_keys.clone(),
+            app.settings.insert_bypass.clone(),
+            app.settings.strip_dx7_patch.clone(),
+            app.settings.strip_keys_patch.clone(),
+            app.settings.strip_dx7_cartridge.clone(),
+        );
+
+        // The session moves on and changes every one of them.
+        app.settings.strip_phase = 0;
+        app.settings.strip_to_theory[2] = false;
+        app.settings.routes = crate::routing::Routes::default();
+        app.settings.insert_keys = crate::routing::KeyEdges::default();
+        app.settings.insert_bypass = crate::settings::BypassBays::default();
+        app.settings.strip_dx7_patch[1] = 0;
+        app.settings.strip_keys_patch[1] = 0;
+        app.settings.strip_dx7_cartridge[1] = String::new();
+
+        app.open_project(&doc);
+        assert_eq!(app.settings.strip_phase, want.0, "polarity");
+        assert_eq!(app.settings.strip_to_theory, want.1, "the theory sends");
+        assert_eq!(app.settings.routes, want.2, "the routing");
+        assert_eq!(app.settings.insert_keys, want.3, "the sidechain keys");
+        assert_eq!(app.settings.insert_bypass, want.4, "the bypasses");
+        assert_eq!(app.settings.strip_dx7_patch, want.5, "the DX7 patches");
+        assert_eq!(app.settings.strip_keys_patch, want.6, "the Keys patches");
+        assert_eq!(app.settings.strip_dx7_cartridge, want.7, "the DX7 cartridges");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A document written before those keys changes nothing about them.**
+    ///
+    /// `None` means the file does not SAY, which is not the same as saying
+    /// "none" — and the difference is audible: zeroing a routing table or
+    /// resetting every piano to patch 0 on first open would change what an
+    /// old project SOUNDS like, silently. Nothing may change because a field
+    /// was added. (That is the opposite of the folder fields' rule, and
+    /// deliberately: a stale folder flag HIDES lanes, so there the harm ran
+    /// the other way.)
+    #[test]
+    fn a_document_from_before_these_keys_leaves_the_live_desk_alone() {
+        let root = project_scratch("deskold");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.save_project_doc();
+        let doc = app.project_doc.clone();
+
+        // Strip the six keys out of the document on disk, the way a file
+        // written by an older build simply would not have them.
+        let text = std::fs::read_to_string(&doc).expect("the document");
+        let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let desk = value
+            .get_mut("desk")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("a desk");
+        for k in [
+            "phase",
+            "to_theory",
+            "routes",
+            "insert_keys",
+            "insert_bypass",
+            "instruments",
+        ] {
+            assert!(desk.remove(k).is_some(), "{k} was never written");
+        }
+        std::fs::write(&doc, serde_json::to_string(&value).expect("json")).expect("write");
+
+        // A session with opinions of its own opens it, and keeps every one.
+        app.settings.strip_phase = 0b0110;
+        app.settings.strip_to_theory[1] = true;
+        app.settings.routes = crate::routing::Routes(vec![crate::routing::Route {
+            from: 2,
+            target: crate::routing::Target::Channel(5),
+            gain: 0.25,
+        }]);
+        app.settings.strip_dx7_patch[1] = 23;
+        let keep = (
+            app.settings.strip_phase,
+            app.settings.strip_to_theory.clone(),
+            app.settings.routes.clone(),
+            app.settings.strip_dx7_patch.clone(),
+        );
+        app.open_project(&doc);
+        assert_eq!(app.settings.strip_phase, keep.0, "polarity was cleared");
+        assert_eq!(app.settings.strip_to_theory, keep.1, "the theory sends were cleared");
+        assert_eq!(app.settings.routes, keep.2, "the routing was cleared");
+        assert_eq!(app.settings.strip_dx7_patch, keep.3, "the patches were reset");
+        // And it does not read as unsaved work merely for being old.
+        assert!(
+            !app.project_dirty(),
+            "an old document opened wearing an asterisk it did not earn"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **A project remembers what was armed, and gives it back on open.**

@@ -330,6 +330,17 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
         in_folder: s.strip_in_folder.clone(),
         folder_shut: s.strip_folder_shut.clone(),
         armed: s.channel_armed.unwrap_or(0),
+        phase: Some(s.strip_phase),
+        to_theory: Some(s.strip_to_theory.clone()),
+        routes: Some(s.routes.clone()),
+        insert_keys: Some(s.insert_keys.clone()),
+        bypass: Some(s.insert_bypass.clone()),
+        instruments: Some(crate::arrangement::Instruments {
+            dx7_cartridge: s.strip_dx7_cartridge.clone(),
+            dx7_patch: s.strip_dx7_patch.clone(),
+            keys_patch: s.strip_keys_patch.clone(),
+            keys_params: s.strip_keys_params.clone(),
+        }),
     }
 }
 
