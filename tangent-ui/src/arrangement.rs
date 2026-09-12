@@ -983,6 +983,74 @@ pub struct DeskSnap {
     /// honest: a document whose desk differs from the live one only in a
     /// field it does not carry is not a document with unsaved changes.
     pub armed: u32,
+    // ── **What a desk is, continued** ──────────────────────────────────
+    //
+    // Everything below travels the same road as everything above, and
+    // every one of them reached this struct late — they lived in the
+    // SETTINGS alone, which made each of them a property of the machine
+    // rather than of the song: open any project and it wore the last
+    // session's polarity, its theory sends, its routing, its sidechains,
+    // its bypasses and its piano patches. The owner, having been shown the
+    // list: "all the things you flagged should be in document."
+    //
+    // **`None` means the document does not SAY**, and is not the same as an
+    // empty one — which is why each is an `Option` where the fields above
+    // are plain. A file written before its key predates the whole idea of
+    // carrying it, so the live value stands and nothing changes for that
+    // project; a file written since always carries one (`to_snap` has an
+    // opinion for every field), and then the document wins outright.
+    //
+    // This is deliberately NOT the folder fields' rule one screen up, where
+    // absent reads as FLAT. That rule is a judgement about HARM, not a law:
+    // a stale folder flag HIDES lanes, so keeping it was worse than
+    // dropping it. Here the harm runs the other way — zeroing a routing
+    // table or resetting every piano to patch 0 would change what an old
+    // project SOUNDS like, silently, on first open. Nothing audible may
+    // change because a field was added.
+    /// **Which strips are polarity-inverted**, one bit each — `strip_phase`,
+    /// the Ø switch. The one per-strip signal switch that never travelled
+    /// beside `muted` and `soloed`.
+    pub phase: Option<u64>,
+    /// **Which channels send their MIDI to the theory view** — the note
+    /// switch, `strip_to_theory`.
+    pub to_theory: Option<Vec<bool>>,
+    /// **The desk's routing table** — `Routes`, every route's source,
+    /// destination and gain. Song content by any reading: where a channel's
+    /// audio GOES is not a property of the computer it is played on.
+    pub routes: Option<crate::routing::Routes>,
+    /// **The sidechain key edges** — which channel keys which bay. Desk
+    /// topology, as `KeyEdge`'s own note says, which is exactly why it
+    /// belongs to the desk the document describes.
+    pub insert_keys: Option<crate::routing::KeyEdges>,
+    /// **Which bays are bypassed** — out of circuit but still loaded.
+    pub bypass: Option<crate::settings::BypassBays>,
+    /// **What the built-in instruments are playing.** The DX7's cartridge
+    /// and patch per strip, the Keys patch and its knobs. The most audible
+    /// of the six: without it a saved song's pianos play whatever patch the
+    /// last session happened to leave on that channel.
+    pub instruments: Option<Instruments>,
+}
+
+/// **What the built-in instruments are set to**, per strip.
+///
+/// One field of [`DeskSnap`] rather than four, because they are one fact —
+/// what the desk's own instruments are playing — and because four keys that
+/// must be read and written together are four chances to carry three of
+/// them. The vectors are the settings' own, trimmed of nothing: they are
+/// short (one entry per strip) and a sparse form would buy bytes at the cost
+/// of a second shape to get right.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Instruments {
+    /// `strip_dx7_cartridge`: the file each strip's DX7 has open.
+    pub dx7_cartridge: Vec<String>,
+    /// `strip_dx7_patch`: which voice of it is selected.
+    pub dx7_patch: Vec<usize>,
+    /// `strip_keys_patch`: which Keys patch the strip plays.
+    pub keys_patch: Vec<usize>,
+    /// `strip_keys_params`: the Keys knobs, stride-8 per strip. See
+    /// `Settings::strip_keys_params`, whose own note explains why the
+    /// stride is what it is and why it may never shrink.
+    pub keys_params: Vec<f64>,
 }
 
 /// **Which channels a desk arms when nothing says otherwise.**
@@ -1085,6 +1153,30 @@ pub struct DeskRef<'a> {
     pub folder_shut: &'a [bool],
     /// See [`DeskSnap::armed`]. A mask, like `muted` and `soloed` beside it.
     pub armed: u32,
+    /// The six that arrived late — see the block on [`DeskSnap`]. Borrowed
+    /// like everything else here so the once-a-frame walk clones nothing;
+    /// `None` is a document that does not say, and the LIVE desk always
+    /// says, so `desk_view` fills every one of them.
+    pub phase: Option<u64>,
+    /// See [`DeskSnap::to_theory`].
+    pub to_theory: Option<&'a [bool]>,
+    /// See [`DeskSnap::routes`].
+    pub routes: Option<&'a crate::routing::Routes>,
+    /// See [`DeskSnap::insert_keys`].
+    pub insert_keys: Option<&'a crate::routing::KeyEdges>,
+    /// See [`DeskSnap::bypass`].
+    pub bypass: Option<&'a crate::settings::BypassBays>,
+    /// See [`DeskSnap::instruments`].
+    pub instruments: Option<InstrumentsRef<'a>>,
+}
+
+/// [`Instruments`] borrowed — see [`DeskRef`].
+#[derive(Clone, Copy)]
+pub struct InstrumentsRef<'a> {
+    pub dx7_cartridge: &'a [String],
+    pub dx7_patch: &'a [usize],
+    pub keys_patch: &'a [usize],
+    pub keys_params: &'a [f64],
 }
 
 impl DeskRef<'_> {
@@ -1117,6 +1209,17 @@ impl DeskRef<'_> {
             in_folder: self.in_folder.to_vec(),
             folder_shut: self.folder_shut.to_vec(),
             armed: self.armed,
+            phase: self.phase,
+            to_theory: self.to_theory.map(<[bool]>::to_vec),
+            routes: self.routes.cloned(),
+            insert_keys: self.insert_keys.cloned(),
+            bypass: self.bypass.cloned(),
+            instruments: self.instruments.map(|i| Instruments {
+                dx7_cartridge: i.dx7_cartridge.to_vec(),
+                dx7_patch: i.dx7_patch.to_vec(),
+                keys_patch: i.keys_patch.to_vec(),
+                keys_params: i.keys_params.to_vec(),
+            }),
         }
     }
 
@@ -1205,6 +1308,75 @@ impl DeskRef<'_> {
             }
         }
         f.u64(u64::from(self.armed));
+        // **The six that arrived late.** Each hashes its ABSENCE distinctly
+        // from an empty one — a document that does not carry routes and a
+        // document that carries none are different documents, and the whole
+        // meaning of `None` here rests on telling them apart.
+        let opt = |f: &mut Fingerprint, present: bool| f.bool(present);
+        opt(f, self.phase.is_some());
+        f.u64(self.phase.unwrap_or(0));
+        opt(f, self.to_theory.is_some());
+        if let Some(v) = self.to_theory {
+            f.len(v.len());
+            for b in v {
+                f.bool(*b);
+            }
+        }
+        opt(f, self.routes.is_some());
+        if let Some(r) = self.routes {
+            f.len(r.0.len());
+            for route in &r.0 {
+                f.u64(route.from as u64);
+                match route.target {
+                    crate::routing::Target::Hardware { first, stereo } => {
+                        f.u64(0);
+                        f.u64(first as u64);
+                        f.bool(stereo);
+                    }
+                    crate::routing::Target::Channel(n) => {
+                        f.u64(1);
+                        f.u64(n as u64);
+                    }
+                }
+                f.f64(f64::from(route.gain));
+            }
+        }
+        opt(f, self.insert_keys.is_some());
+        if let Some(k) = self.insert_keys {
+            f.len(k.0.len());
+            for e in &k.0 {
+                f.u64(e.strip as u64);
+                f.u64(e.slot as u64);
+                f.u64(e.from as u64);
+            }
+        }
+        opt(f, self.bypass.is_some());
+        if let Some(b) = self.bypass {
+            f.len(b.0.len());
+            for (seat, bay) in &b.0 {
+                f.u64(*seat as u64);
+                f.u64(*bay as u64);
+            }
+        }
+        opt(f, self.instruments.is_some());
+        if let Some(i) = self.instruments {
+            f.len(i.dx7_cartridge.len());
+            for c in i.dx7_cartridge {
+                f.str(c);
+            }
+            f.len(i.dx7_patch.len());
+            for p in i.dx7_patch {
+                f.u64(*p as u64);
+            }
+            f.len(i.keys_patch.len());
+            for p in i.keys_patch {
+                f.u64(*p as u64);
+            }
+            f.len(i.keys_params.len());
+            for v in i.keys_params {
+                f.f64(*v);
+            }
+        }
     }
 }
 
@@ -1238,6 +1410,17 @@ impl DeskSnap {
             in_folder: &self.in_folder,
             folder_shut: &self.folder_shut,
             armed: self.armed,
+            phase: self.phase,
+            to_theory: self.to_theory.as_deref(),
+            routes: self.routes.as_ref(),
+            insert_keys: self.insert_keys.as_ref(),
+            bypass: self.bypass.as_ref(),
+            instruments: self.instruments.as_ref().map(|i| InstrumentsRef {
+                dx7_cartridge: &i.dx7_cartridge,
+                dx7_patch: &i.dx7_patch,
+                keys_patch: &i.keys_patch,
+                keys_params: &i.keys_params,
+            }),
         }
     }
 
@@ -1364,6 +1547,51 @@ impl DeskSnap {
         // build meets no key it has to know to ignore.
         if let Some(v) = crate::recorder::write_midi_inputs(&self.midi_inputs) {
             m.insert("midi_inputs".into(), v);
+        }
+        // **The six late fields, at the END and only when they are SAID.**
+        //
+        // `None` is a snapshot taken from a document that predates the key
+        // (see the block on the struct), and writing a default for it would
+        // invent an opinion the document never held. A LIVE desk always has
+        // one — `desk_view` fills every field — so a document saved by this
+        // build carries all six, and one that carries none is one nobody
+        // has re-saved yet.
+        if let Some(v) = self.phase {
+            m.insert("phase".into(), Value::Number(v.into()));
+        }
+        if let Some(v) = self.to_theory.as_ref() {
+            m.insert(
+                "to_theory".into(),
+                Value::Array(v.iter().map(|b| Value::Bool(*b)).collect()),
+            );
+        }
+        if let Some(v) = self.routes.as_ref() {
+            m.insert("routes".into(), v.to_json());
+        }
+        if let Some(v) = self.insert_keys.as_ref() {
+            m.insert("insert_keys".into(), v.to_json());
+        }
+        if let Some(v) = self.bypass.as_ref() {
+            m.insert("insert_bypass".into(), v.to_json());
+        }
+        if let Some(i) = self.instruments.as_ref() {
+            let mut im = Map::new();
+            im.insert(
+                "dx7_cartridge".into(),
+                Value::Array(
+                    i.dx7_cartridge.iter().map(|c| Value::String(c.clone())).collect(),
+                ),
+            );
+            let nums = |v: &[usize]| {
+                Value::Array(v.iter().map(|n| Value::from(*n as u64)).collect())
+            };
+            im.insert("dx7_patch".into(), nums(&i.dx7_patch));
+            im.insert("keys_patch".into(), nums(&i.keys_patch));
+            im.insert(
+                "keys_params".into(),
+                Value::Array(i.keys_params.iter().map(|v| serde_json::json!(v)).collect()),
+            );
+            m.insert("instruments".into(), Value::Object(im));
         }
         // **The ARM mask, at the END and always written**, all-zero
         // included. A desk with nothing armed is an OPINION — the same
@@ -1566,6 +1794,54 @@ impl DeskSnap {
                 },
                 |v| v as u32,
             ),
+            // **The six late fields: absent is `None`, which means the
+            // document does not SAY** — see the block on the struct. Not
+            // "empty", and not a default: the live value stands for a
+            // document written before the key, so nothing an old project
+            // sounds like changes because a field was added.
+            phase: m.get("phase").and_then(Value::as_u64),
+            to_theory: m.get("to_theory").and_then(Value::as_array).map(|a| {
+                a.iter().map(|v| v.as_bool().unwrap_or(false)).collect()
+            }),
+            routes: m.get("routes").map(crate::routing::Routes::from_json),
+            insert_keys: m
+                .get("insert_keys")
+                .map(crate::routing::KeyEdges::from_json),
+            bypass: m
+                .get("insert_bypass")
+                .map(crate::settings::BypassBays::from_json),
+            instruments: m.get("instruments").and_then(Value::as_object).map(|im| {
+                let strings = |k: &str| {
+                    im.get(k)
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .map(|v| v.as_str().unwrap_or_default().to_owned())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let counts = |k: &str| {
+                    im.get(k)
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter().map(|v| v.as_u64().unwrap_or(0) as usize).collect()
+                        })
+                        .unwrap_or_default()
+                };
+                Instruments {
+                    dx7_cartridge: strings("dx7_cartridge"),
+                    dx7_patch: counts("dx7_patch"),
+                    keys_patch: counts("keys_patch"),
+                    keys_params: im
+                        .get("keys_params")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            }),
             inserts,
         })
     }
@@ -3593,6 +3869,28 @@ mod tests {
             in_folder: vec![false, true],
             folder_shut: vec![false, false],
             armed: 0b0101,
+            // The six late fields, every one of them SAID — this fixture is
+            // the round-trip's subject and a `None` here would test the
+            // absent road twice and the present one never.
+            phase: Some(0b0010),
+            to_theory: Some(vec![true, false, true]),
+            routes: Some(crate::routing::Routes(vec![crate::routing::Route {
+                from: 1,
+                target: crate::routing::Target::Hardware { first: 2, stereo: true },
+                gain: 0.8,
+            }])),
+            insert_keys: Some(crate::routing::KeyEdges(vec![crate::routing::KeyEdge {
+                strip: 3,
+                slot: 1,
+                from: 0,
+            }])),
+            bypass: Some(crate::settings::BypassBays(vec![(4, 2)])),
+            instruments: Some(Instruments {
+                dx7_cartridge: vec!["ROM1A.syx".into(), String::new()],
+                dx7_patch: vec![7, 0],
+                keys_patch: vec![2, 3],
+                keys_params: vec![0.25, 0.5],
+            }),
         });
         let mut extra = Map::new();
         extra.insert("a_newer_builds_key".into(), Value::from("kept"));
@@ -3815,6 +4113,60 @@ mod tests {
             a.desk.as_mut().unwrap().folder_shut[0] = true;
         });
         moves_both("an ARM", |a| a.desk.as_mut().unwrap().armed ^= 1);
+        // The six that arrived late, each moved and each REMOVED: absence is
+        // a different document from an empty one, and the whole meaning of
+        // `None` rests on the walk telling them apart.
+        moves_both("a polarity", |a| {
+            *a.desk.as_mut().unwrap().phase.as_mut().unwrap() ^= 1;
+        });
+        moves_both("polarity going unsaid", |a| a.desk.as_mut().unwrap().phase = None);
+        moves_both("a theory send", |a| {
+            a.desk.as_mut().unwrap().to_theory.as_mut().unwrap()[0] ^= true;
+        });
+        moves_both("the theory sends going unsaid", |a| {
+            a.desk.as_mut().unwrap().to_theory = None;
+        });
+        moves_both("a route's gain", |a| {
+            a.desk.as_mut().unwrap().routes.as_mut().unwrap().0[0].gain = 0.25;
+        });
+        moves_both("a route's destination", |a| {
+            a.desk.as_mut().unwrap().routes.as_mut().unwrap().0[0].target =
+                crate::routing::Target::Channel(5);
+        });
+        moves_both("the routing going unsaid", |a| {
+            a.desk.as_mut().unwrap().routes = None;
+        });
+        moves_both("an empty routing table", |a| {
+            a.desk.as_mut().unwrap().routes = Some(crate::routing::Routes::default());
+        });
+        moves_both("a sidechain key", |a| {
+            a.desk.as_mut().unwrap().insert_keys.as_mut().unwrap().0[0].from = 4;
+        });
+        moves_both("the sidechains going unsaid", |a| {
+            a.desk.as_mut().unwrap().insert_keys = None;
+        });
+        moves_both("a bypassed bay", |a| {
+            a.desk.as_mut().unwrap().bypass.as_mut().unwrap().0[0] = (5, 0);
+        });
+        moves_both("the bypasses going unsaid", |a| {
+            a.desk.as_mut().unwrap().bypass = None;
+        });
+        moves_both("a DX7 patch", |a| {
+            a.desk.as_mut().unwrap().instruments.as_mut().unwrap().dx7_patch[0] = 31;
+        });
+        moves_both("a DX7 cartridge", |a| {
+            a.desk.as_mut().unwrap().instruments.as_mut().unwrap().dx7_cartridge[0] =
+                "ROM2A.syx".into();
+        });
+        moves_both("a Keys patch", |a| {
+            a.desk.as_mut().unwrap().instruments.as_mut().unwrap().keys_patch[1] = 6;
+        });
+        moves_both("a Keys knob", |a| {
+            a.desk.as_mut().unwrap().instruments.as_mut().unwrap().keys_params[0] = 0.9;
+        });
+        moves_both("the instruments going unsaid", |a| {
+            a.desk.as_mut().unwrap().instruments = None;
+        });
         moves_both("having been named", |a| a.named = false);
         moves_both("a clip arriving", |a| {
             a.add_clip(ArrClip { path: "media/x.wav".into(), ..Default::default() });
