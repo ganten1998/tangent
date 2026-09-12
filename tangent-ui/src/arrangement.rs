@@ -963,6 +963,43 @@ pub struct DeskSnap {
     /// flag is the worst of the three: it HIDES the next project's real
     /// lanes, not just indents its empty ones.
     pub folder_shut: Vec<bool>,
+    /// **Which channels are ARMED** — record-ready and live — one bit each.
+    ///
+    /// Appended, and absent in every document written before this. Arming
+    /// used to be recomputed at every launch and never written down: a
+    /// session opened with the DX7's channel live and nothing else, whatever
+    /// the project had been left holding. The owner: "record arming and
+    /// other related states like mute and solo are also remembered and
+    /// respected by loading projects ... load my default with the piano
+    /// still hooked up and theory-view bound and arm a few extra tracks."
+    /// Mute and solo have ridden this snapshot since it existed; the arm is
+    /// the one desk switch that did not, which is the whole of the fault.
+    ///
+    /// Absent reads as [`armed_by_default`] — the shipped rule, computed
+    /// from THIS snapshot's own kinds and bays — never as "keep whatever
+    /// the session had". An old project therefore opens exactly as it
+    /// always did, and one written since opens as it was left. Deriving
+    /// rather than defaulting to zero is also what keeps the asterisk
+    /// honest: a document whose desk differs from the live one only in a
+    /// field it does not carry is not a document with unsaved changes.
+    pub armed: u32,
+}
+
+/// **Which channels a desk arms when nothing says otherwise.**
+///
+/// All arms off, save one, by the owner's rule: a project must be openable
+/// without headphones and without being blasted, and the one exception is the
+/// channel that makes the piano sound — the one whose first bay holds the
+/// built-in DX7.
+///
+/// One rule, two callers: `app::default_armed` asks it about a `Settings` and
+/// [`DeskSnap::from_value`] asks it about a document that carries no `armed`
+/// key. A second copy of it is a launch and an open that disagree about what
+/// a silent desk means.
+pub fn armed_by_default(kinds: &[u8], mut bay0: impl FnMut(usize) -> bool) -> u32 {
+    (0..crate::recorder::CHANNELS.min(32))
+        .find(|n| kinds.get(*n).copied().unwrap_or(0) == 1 && bay0(*n))
+        .map_or(0, |n| 1 << n)
 }
 
 /// **The insert seats a `DeskRef` looks at, in whichever shape their owner
@@ -1046,6 +1083,8 @@ pub struct DeskRef<'a> {
     pub is_folder: &'a [bool],
     pub in_folder: &'a [bool],
     pub folder_shut: &'a [bool],
+    /// See [`DeskSnap::armed`]. A mask, like `muted` and `soloed` beside it.
+    pub armed: u32,
 }
 
 impl DeskRef<'_> {
@@ -1077,6 +1116,7 @@ impl DeskRef<'_> {
             is_folder: self.is_folder.to_vec(),
             in_folder: self.in_folder.to_vec(),
             folder_shut: self.folder_shut.to_vec(),
+            armed: self.armed,
         }
     }
 
@@ -1164,6 +1204,7 @@ impl DeskRef<'_> {
                 f.bool(*b);
             }
         }
+        f.u64(u64::from(self.armed));
     }
 }
 
@@ -1196,6 +1237,7 @@ impl DeskSnap {
             is_folder: &self.is_folder,
             in_folder: &self.in_folder,
             folder_shut: &self.folder_shut,
+            armed: self.armed,
         }
     }
 
@@ -1323,6 +1365,12 @@ impl DeskSnap {
         if let Some(v) = crate::recorder::write_midi_inputs(&self.midi_inputs) {
             m.insert("midi_inputs".into(), v);
         }
+        // **The ARM mask, at the END and always written**, all-zero
+        // included. A desk with nothing armed is an OPINION — the same
+        // argument the folder bools above make — and omitting it would send
+        // the reader to `armed_by_default`, which would arm the piano on a
+        // project somebody deliberately left silent.
+        m.insert("armed".into(), Value::Number(u64::from(self.armed).into()));
         // Appended, at the END, and only when a seat past the head is
         // occupied: a desk that never had one keeps its shape, and a build
         // that has never heard of the key reads the head as it always did.
@@ -1492,6 +1540,32 @@ impl DeskSnap {
             is_folder: bools("is_folder"),
             in_folder: bools("in_folder"),
             folder_shut: bools("folder_shut"),
+            // **Absent in older documents, and DERIVED rather than assumed
+            // empty** — the `tracks_added` bargain one field up, for the
+            // same two reasons. A project from before the arm was written
+            // down opens the way it always opened (the DX7's channel live,
+            // nothing else), and the fingerprint sees the same mask the live
+            // desk resolved to, so an old document does not come up wearing
+            // an asterisk it did not earn. Read AFTER the era lifts, like
+            // `tracks_added`, so a channel row is a channel row.
+            armed: m.get("armed").and_then(Value::as_u64).map_or_else(
+                || {
+                    armed_by_default(&kinds_v, |n| {
+                        // `bay_at` only answers WHETHER a seat is occupied;
+                        // the rule asks WHAT is in it, so the pairs are read
+                        // directly. Seat 0 of the channel's own rack, which
+                        // is where an instrument sits.
+                        let seat = crate::recorder::Strip::Channel(n).index()
+                            * crate::recorder::INSERTS;
+                        inserts
+                            .binary_search_by_key(&seat, |(b, _)| *b)
+                            .ok()
+                            .and_then(|i| inserts.get(i))
+                            .is_some_and(|(_, p)| p == crate::dialogs::BUILTIN_PATH)
+                    })
+                },
+                |v| v as u32,
+            ),
             inserts,
         })
     }
@@ -3518,6 +3592,7 @@ mod tests {
             is_folder: vec![true, false],
             in_folder: vec![false, true],
             folder_shut: vec![false, false],
+            armed: 0b0101,
         });
         let mut extra = Map::new();
         extra.insert("a_newer_builds_key".into(), Value::from("kept"));
@@ -3644,6 +3719,45 @@ mod tests {
         assert_eq!(words(&b), w, "`{name}` left the document alone and the words moved");
     }
 
+    /// **A document from before the arm was written down opens as it always
+    /// did**, and does not come up wearing an asterisk for it.
+    ///
+    /// The shipped rule is the answer for a desk that has never said — the
+    /// channel holding the built-in DX7 live, and nothing else — and it is
+    /// derived from the document's OWN kinds and bays. Defaulting to zero
+    /// would silence every old project; keeping whatever the session had
+    /// would be the bleed the folder fields were written to end.
+    ///
+    /// And a desk that says it is SILENT stays silent, which is why the key
+    /// is written even when it is zero: `Some(0)` is an opinion.
+    #[test]
+    fn a_desk_with_no_arm_key_falls_back_to_the_shipped_rule() {
+        let mut snap = a_document_with_everything_in_it().desk.take().unwrap();
+        // The piano's channel, the way the shipped desk has it: a MIDI kind
+        // with the built-in in bay 0.
+        let seat = crate::recorder::Strip::Channel(1).index() * crate::recorder::INSERTS;
+        snap.kinds = vec![0, 1, 0];
+        snap.set_bay(seat, crate::dialogs::BUILTIN_PATH);
+        snap.armed = 1 << 1;
+
+        let mut value = snap.to_value();
+        let obj = value.as_object_mut().expect("a desk object");
+        assert!(obj.remove("armed").is_some(), "the key was never written");
+        let back = DeskSnap::from_value(&value).expect("the desk should read");
+        assert_eq!(
+            back.armed,
+            1 << 1,
+            "a document with no arm key did not fall back to the shipped rule"
+        );
+
+        // Written, and read back as itself — including the silent desk.
+        for mask in [0u32, 1 << 1, 0b1010] {
+            snap.armed = mask;
+            let read = DeskSnap::from_value(&snap.to_value()).expect("the desk should read");
+            assert_eq!(read.armed, mask, "the arm mask did not round trip");
+        }
+    }
+
     /// **Every meaningful change moves the fingerprint.**
     ///
     /// The list is one entry per thing `to_json` writes, because the
@@ -3700,6 +3814,7 @@ mod tests {
         moves_both("a shut folder", |a| {
             a.desk.as_mut().unwrap().folder_shut[0] = true;
         });
+        moves_both("an ARM", |a| a.desk.as_mut().unwrap().armed ^= 1);
         moves_both("having been named", |a| a.named = false);
         moves_both("a clip arriving", |a| {
             a.add_clip(ArrClip { path: "media/x.wav".into(), ..Default::default() });

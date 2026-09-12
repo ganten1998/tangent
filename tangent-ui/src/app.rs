@@ -843,11 +843,6 @@ pub struct TangentApp {
     /// after a successful `load_insert`; see `take_open_insert_on_load`.
     open_insert_on_load: Option<(usize, usize)>,
     /// The empty channel being asked MIDI or AUDIO, if any.
-    /// Which channels are ARMED — record-ready and LIVE — as a bitmask.
-    /// Session state, never saved: a project must be openable without
-    /// headphones, so every launch starts with only the default instrument
-    /// live. See `default_armed` and docs/ARRANGEMENT.md.
-    armed: u32,
     /// Whether SHIFT is down this frame — the arm button's ADDITIVE
     /// modifier. Refreshed at the top of `paint`, read where the hit
     /// handlers no longer have a `ctx` in reach.
@@ -2978,21 +2973,24 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
 /// "the channel that makes the piano sound"; the fallback reached past the
 /// rule it was written under and armed something nobody asked to be armed.
 ///
-/// Arming is not persisted — it is recomputed here on every launch — so this
-/// is imposed on a REOPENED project too, not only on a fresh desk. That is
-/// the other half of why the fallback had to go: a rule about what a new
-/// session should offer had become a rule about what every session does.
+/// **Arming IS persisted now**, and this is what answers for a desk that has
+/// never said: a settings file from before the key, and a document from
+/// before the key (`DeskSnap::from_value` asks the same rule about its own
+/// desk). It is no longer imposed on a reopened project — that was the other
+/// half of why the fallback had to go, and it was also the fault the owner
+/// finally named: "record arming and other related states like mute and solo
+/// are also remembered and respected by loading projects."
+///
+/// The rule itself lives in `arrangement::armed_by_default`, because a launch
+/// and an open that disagree about what a silent desk means is two rules.
 fn default_armed(settings: &Settings) -> u32 {
-    let kind = |n: usize| settings.channel_kinds.get(n).copied().unwrap_or(0);
-    let bay0 = |n: usize| {
+    crate::arrangement::armed_by_default(&settings.channel_kinds, |n| {
         settings
             .strip_inserts
             .get(n * recorder::INSERTS)
             .map_or("", String::as_str)
-    };
-    (0..recorder::CHANNELS)
-        .find(|n| kind(*n) == 1 && bay0(*n) == dialogs::BUILTIN_PATH)
-        .map_or(0, |n| 1 << n)
+            == dialogs::BUILTIN_PATH
+    })
 }
 
 #[cfg(test)]
@@ -3538,8 +3536,16 @@ impl TangentApp {
         let startup_recorder_detach_at = (settings.recorder_detached && settings.show_recorder)
             .then(|| Instant::now() + DEBOUNCE_100MS);
 
-        // Computed BEFORE the literal takes `settings`. See `default_armed`.
-        let armed = default_armed(&settings);
+        // **Resolved BEFORE the literal takes `settings`, and only when the
+        // file does not say.** Arming is remembered now — it rides the desk
+        // like the mute and the solo masks — so this is the answer for a
+        // settings file written before it was, and for the very first launch.
+        // A stored `Some(0)` is a desk somebody disarmed and is left alone;
+        // that difference is why the field is an `Option`. See
+        // `default_armed` and `Settings::channel_armed`.
+        if settings.channel_armed.is_none() {
+            settings.channel_armed = Some(default_armed(&settings));
+        }
         let mut me = Self {
             settings,
             detector,
@@ -3624,7 +3630,6 @@ impl TangentApp {
             mixer_naming: None,
             swing_menu: None,
             mixer_fx_menu: None,
-            armed,
             shift_down: false,
             alt_down: false,
             menu_ate_press: false,
@@ -5491,7 +5496,7 @@ impl TangentApp {
         match hit {
             H::Mute(_) => self.settings.strip_muted & (1 << bit) != 0,
             H::Solo(_) => self.settings.strip_soloed & (1 << bit) != 0,
-            H::Arm(_) => self.armed & (1 << n) != 0,
+            H::Arm(_) => self.armed_mask() & (1 << n) != 0,
             H::ToTheory(_) => self.to_theory(n),
             _ => false,
         }
@@ -5779,12 +5784,14 @@ impl TangentApp {
                     // it touches ONE lane, where a plain press carries the
                     // whole strip selection with it. See the guard in
                     // `apply_mixer_hit`.
-                    let only_this = self.armed == 1 << n;
-                    if self.alt_down {
-                        self.armed = if only_this { 0 } else { 1 << n };
+                    let live = self.armed_mask();
+                    let only_this = live == 1 << n;
+                    let next = if self.alt_down {
+                        if only_this { 0 } else { 1 << n }
                     } else {
-                        self.armed ^= 1 << n;
-                    }
+                        live ^ (1 << n)
+                    };
+                    self.set_armed_mask(next);
                 }
                 return;
             }
@@ -5986,7 +5993,7 @@ impl TangentApp {
         }
         self.settings.strip_muted &= !(1 << at);
         self.settings.strip_soloed &= !(1 << at);
-        self.armed &= !(1 << n);
+        self.set_armed_mask(self.armed_mask() & !(1 << n));
         // And the lane's CLIPS: a removed channel that kept invisible clips
         // would keep playing them. The media copies stay in the project.
         let had = self.arrangement.clips.iter().any(|c| c.lane == n);
@@ -6579,7 +6586,7 @@ impl TangentApp {
                     && (kind.is_some()
                         || matches!(s, Strip::Channel(n) if self.lane_has_clips(n))),
                 armed: match s {
-                    Strip::Channel(n) => self.armed & (1 << n) != 0,
+                    Strip::Channel(n) => self.armed_mask() & (1 << n) != 0,
                     _ => false,
                 },
             }
@@ -8658,8 +8665,34 @@ impl TangentApp {
 
     /// Which channels are armed — record-ready and LIVE — for the host to
     /// push at the engine every frame.
+    ///
+    /// **The desk's own state now, not the session's.** It was a field on the
+    /// app, recomputed at every launch and written down nowhere, so a project
+    /// opened with the DX7's channel live whatever it had been left holding —
+    /// the owner: "record arming and other related states like mute and solo
+    /// are also remembered and respected by loading projects." It lives in
+    /// the settings beside the mute and the solo masks, rides `DeskSnap` the
+    /// way they do, and so travels in the document, in the template a New
+    /// project is made from, and in every undo moment.
+    ///
+    /// `unwrap_or(0)` is not a default: the constructor resolves `None`
+    /// through `default_armed` before anything can ask, so by here it is
+    /// always `Some`. See `Settings::channel_armed`.
     pub fn armed_mask(&self) -> u32 {
-        self.armed
+        self.settings.channel_armed.unwrap_or(0)
+    }
+
+    /// Put the arm mask back, and mark the desk changed.
+    ///
+    /// Every write goes through here rather than at the field, because the
+    /// arm is a saved fact now: a toggle that skipped this would move a
+    /// switch the title bar could not see and the next save would not carry.
+    fn set_armed_mask(&mut self, mask: u32) {
+        if self.settings.channel_armed == Some(mask) {
+            return;
+        }
+        self.settings.channel_armed = Some(mask);
+        self.save_settings_soon();
     }
 
     // ── the project ────────────────────────────────────────────────────────
@@ -9389,6 +9422,11 @@ impl TangentApp {
             is_folder: &s.strip_is_folder,
             in_folder: &s.strip_in_folder,
             folder_shut: &s.strip_folder_shut,
+            // **The arm is desk state**, like the mute and the solo two
+            // lines up. `None` is a settings file written before it was,
+            // and the constructor resolves that once (see `default_armed`)
+            // — so by the time anything asks this it is always `Some`.
+            armed: s.channel_armed.unwrap_or(0),
         }
     }
 
@@ -9514,6 +9552,17 @@ impl TangentApp {
                 *slot = src.get(i).copied().unwrap_or(false);
             }
         }
+        // **And what is ARMED comes from the document too.**
+        //
+        // It came from the launch and nowhere else: every open, every New
+        // from the template and every undo left the session's own arms
+        // standing over a desk that had been saved with others. The owner
+        // wants the project's back — "load my default ... and arm a few
+        // extra tracks, then new track and have the original record states
+        // back". A document written before the key carries the shipped rule
+        // instead, resolved from its OWN desk by `DeskSnap::from_value`, so
+        // an old project opens exactly as it always did.
+        self.settings.channel_armed = Some(d.armed);
         // A group is not a send destination — `set_is_folder` enforces
         // that at the gesture, but a document's folder arrives here, and
         // the routes it must displace live in settings, not in the
@@ -10217,7 +10266,7 @@ impl TangentApp {
             }
             out
         };
-        self.armed = move_bits_u32(self.armed);
+        self.settings.channel_armed = Some(move_bits_u32(self.armed_mask()));
         self.settings.strip_muted = move_bits_u64(self.settings.strip_muted);
         self.settings.strip_soloed = move_bits_u64(self.settings.strip_soloed);
         {
@@ -11120,6 +11169,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // This function's own doc already said it is built from
         // `Settings::default()`. It is, now, and the test beside it holds the
         // two together.
+        // **And the shipped ARM, resolved here.** `Settings::default()`
+        // carries `None` — nobody has written an arm down — and a snapshot
+        // reads that as zero, which would hand every New project a desk with
+        // the piano loaded and dead. The constructor resolves the same rule
+        // for a settings file that does not say; this is the template's turn
+        // to. See `default_armed`.
+        s.channel_armed = Some(default_armed(&s));
         let mut d = Self::desk_snapshot_of(&s);
         // Two rows, and only two.
         d.tracks_added = 0b11;
@@ -22743,7 +22799,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     color: self.strip_color(n),
                     kind,
                     used: self.channel_used(n),
-                    armed: self.armed & (1 << n) != 0,
+                    armed: self.armed_mask() & (1 << n) != 0,
                     muted: desk.muted[n],
                     phase: self.settings.strip_phase & (1 << n) != 0,
                     soloed: desk.soloed[n],
@@ -36665,7 +36721,7 @@ mod tests {
         assert_eq!(app.input_chip_text(3), "IN 3");
         // Binding a fresh track raises its send and touches NO arms —
         // the self-arm stole the player's standing arms twice over.
-        assert_eq!(app.armed & (1 << 3), 0, "a new track armed itself");
+        assert_eq!(app.armed_mask() & (1 << 3), 0, "a new track armed itself");
         app.set_channel_input_spec(3, "0+1");
         assert_eq!(app.input_chip_text(3), "IN 1/2");
         assert_eq!(TangentApp::parse_input_spec("2"), Some((2, None)));
@@ -38292,6 +38348,20 @@ mod tests {
     #[test]
     fn the_stock_desk_list_ends_with_what_a_fresh_install_writes() {
         let shipped = TangentApp::template_desk();
+        // **The template carries the shipped ARM.** `Settings::default()`
+        // says nothing about arming, and a snapshot reads silence as zero —
+        // so without the resolution in `template_desk` every New project
+        // would open with the piano loaded and dead.
+        assert_eq!(
+            shipped.armed,
+            crate::arrangement::armed_by_default(&shipped.kinds, |n| {
+                shipped
+                    .bay(recorder::Strip::Channel(n).index() * recorder::INSERTS)
+                    == Some(dialogs::BUILTIN_PATH)
+            }),
+            "the template's arm is not the shipped rule"
+        );
+        assert_ne!(shipped.armed, 0, "a New project opens with nothing live");
         let last = TangentApp::STOCK_DESKS
             .last()
             .expect("there has always been at least one shipped desk");
@@ -41321,7 +41391,15 @@ mod tests {
     /// **Arm is the live switch, and a session opens with one arm up: the
     /// DX7's.** All others off — the owner's no-headphones rule — and the R
     /// switch toggles it, a fresh track opens armed, and a removed channel
-    /// gives its arm back. Session state: nothing here touches settings.
+    /// gives its arm back.
+    ///
+    /// **And it is WRITTEN DOWN now**, which is the one thing here that
+    /// changed: the last assertion used to be that no "armed" key reached
+    /// the settings file. Arming rides the desk beside the mute and the solo
+    /// masks, so it survives a relaunch and travels in a document — see
+    /// `Settings::channel_armed`. The no-headphones rule is unharmed: it is
+    /// what answers for a desk that has never said, which is what this test
+    /// opens with.
     #[test]
     fn arm_opens_on_the_dx7_alone_and_follows_the_desk() {
         use crate::mixer_panel::Hit;
@@ -41358,11 +41436,71 @@ mod tests {
         app.apply_mixer_hit(Hit::Remove(Column(n)), 0.0);
         assert_eq!(app.armed_mask() & (1 << n), 0, "a removed channel stayed armed");
 
-        // Session state only: none of that wrote an "armed" key.
+        // **And the desk carries it.** The mask is in the settings file and
+        // in the snapshot a document is saved from, so the next launch and
+        // the next open find the arms this session left.
+        assert_eq!(app.settings.channel_armed, Some(2), "the arm was not kept");
         assert!(
-            !app.settings.to_json().contains("armed"),
-            "arm leaked into the settings file"
+            app.settings.to_json().contains("\"channel_armed\""),
+            "the arm never reached the settings file"
         );
+        assert_eq!(
+            TangentApp::desk_snapshot_of(&app.settings).armed,
+            2,
+            "the arm is not on the desk a save would write"
+        );
+    }
+
+    /// **A project remembers what was armed, and gives it back on open.**
+    ///
+    /// The owner's ask, in his own scenario: "load my default with the piano
+    /// still hooked up and theory-view bound and arm a few extra tracks,
+    /// then new track and have the original record states back." Arming was
+    /// recomputed at every launch and written nowhere, so the second half of
+    /// that was impossible — a reopened project wore the session's arms, and
+    /// a New one wore the launch's.
+    ///
+    /// Mute and solo are asserted beside it because they are the "other
+    /// related states" the ask names: they have ridden `DeskSnap` all along,
+    /// and this is what says so rather than assuming it.
+    ///
+    /// Revert-check performed: dropping the `channel_armed` line from
+    /// `apply_desk_snapshot` leaves the reopened desk wearing the session's
+    /// arms and fails the first assertion.
+    #[test]
+    fn a_project_gives_back_the_arms_mutes_and_solos_it_was_saved_with() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::Column;
+        let root = project_scratch("armsave");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+
+        // Arm two more tracks beside the piano, mute one and solo another —
+        // the desk somebody actually leaves behind.
+        for n in [3_usize, 5] {
+            app.apply_mixer_hit(Hit::Arm(Column(n)), 0.0);
+        }
+        app.apply_mixer_hit(Hit::Mute(Column(4)), 0.0);
+        app.apply_mixer_hit(Hit::Solo(Column(6)), 0.0);
+        let armed = app.armed_mask();
+        let muted = app.settings.strip_muted;
+        let soloed = app.settings.strip_soloed;
+        assert_eq!(armed, 2 | (1 << 3) | (1 << 5), "the arms did not stack");
+        app.save_project_doc();
+        let doc = app.project_doc.clone();
+
+        // The session moves on: everything disarmed, the mute lifted.
+        app.set_armed_mask(0);
+        app.apply_mixer_hit(Hit::Mute(Column(4)), 0.0);
+        app.apply_mixer_hit(Hit::Solo(Column(6)), 0.0);
+        assert_eq!(app.armed_mask(), 0);
+
+        // Open it again: the desk that was saved is the desk that comes back.
+        app.open_project(&doc);
+        assert_eq!(app.armed_mask(), armed, "the project's arms did not come back");
+        assert_eq!(app.settings.strip_muted, muted, "the mute did not come back");
+        assert_eq!(app.settings.strip_soloed, soloed, "the solo did not come back");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **A plain arm TOGGLES; Shift arms one lane alone; the SILENT arms
@@ -41469,7 +41607,7 @@ mod tests {
 
         // And SHIFT is one lane too: picking arms out one at a time is what
         // it is for, so a three-strip selection must not flip together.
-        app.armed = 0;
+        app.set_armed_mask(0);
         app.shift_down = true;
         app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
         app.shift_down = false;
@@ -41544,7 +41682,7 @@ mod tests {
             app.settings.strip_sends[at].abs() < 1e-9,
             "a fresh track's send should rest at ZERO - only the shipped DX7 is wired"
         );
-        assert_eq!(app.armed & (1 << n), 0, "a fresh track armed itself");
+        assert_eq!(app.armed_mask() & (1 << n), 0, "a fresh track armed itself");
 
         // The same press on the now-EXISTING track opens the input menu.
         app.apply_mixer_hit(Hit::Add(Column(n)), 0.0);

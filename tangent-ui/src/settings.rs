@@ -1398,6 +1398,23 @@ pub struct Settings {
     /// whole desk is one number.
     pub strip_phase: u64,
     pub strip_soloed: u64,
+    /// **Which channels are ARMED** — record-ready and live — one bit each,
+    /// beside `strip_muted` and `strip_soloed` because it is the same kind of
+    /// thing: a per-strip switch, held as bits so a whole desk is one number.
+    ///
+    /// **`None` means nobody has written it down yet**, which is every
+    /// settings file from before arming was remembered at all. The app
+    /// resolves that exactly once, at construction, through
+    /// `app::default_armed` — the shipped rule, which arms the channel
+    /// holding the built-in DX7 and nothing else — and from then on it is
+    /// always `Some`. A stored `Some(0)` is therefore a real desk with
+    /// nothing armed, and it stays that way; the difference between "silent"
+    /// and "unsaid" is exactly why this is an `Option`.
+    ///
+    /// CHANNEL space, not strip space: only a channel can be armed, so a
+    /// `u32` covers the desk with no bits nobody can set. The masks above are
+    /// `u64` because they reach the buses too.
+    pub channel_armed: Option<u32>,
     /// Whether the after-a-take report appears. A take with a PROBLEM ignores
     /// this: see `App::report_take`.
     ///
@@ -1989,6 +2006,9 @@ impl Default for Settings {
             },
             input_alias: String::new(),
             strip_muted: 0,
+            // Nothing written down: the app resolves the shipped rule once.
+            // See the field.
+            channel_armed: None,
             strip_phase: 0,
             strip_soloed: 0,
             show_take_summary: true,
@@ -3464,6 +3484,13 @@ impl Settings {
         if let Some(v) = map.shift_remove("record_export") {
             s.record_export = crate::recorder::ExportSpec::from_value(&v);
         }
+        // The arm mask — read at the END, like it is written at the end, and
+        // ABSENT is not zero: a file from before this key says nothing about
+        // arming and the app resolves the shipped rule for it. See
+        // `Settings::channel_armed` and `app::default_armed`.
+        if let Some(n) = map.shift_remove("channel_armed").and_then(|v| v.as_u64()) {
+            s.channel_armed = Some(n as u32);
+        }
         // The presets' own folder — read at the END, like it is written at
         // the end, because it joined after every key above it.
         take_opt_str(&mut map, "preset_dir", &mut s.preset_dir);
@@ -4760,6 +4787,15 @@ impl Settings {
         // byte-for-byte shape.
         if self.midi_pedal_lane {
             map.insert("midi_pedal_lane".into(), Value::Bool(true));
+        }
+        // **The arm mask, at the END like every additive key**, and written
+        // the moment it is RESOLVED rather than only when it is non-zero:
+        // `Some(0)` is a desk somebody disarmed and it has to survive a
+        // relaunch, which is the whole point of writing it down. `None` is a
+        // file from before this key and is left unwritten, so an upgrade
+        // adds one line rather than rewriting the desk. See the field.
+        if let Some(mask) = self.channel_armed {
+            map.insert("channel_armed".into(), Value::from(u64::from(mask)));
         }
         // The far seats — see `strip_inserts` above. At the END like every
         // additive key, only when one is occupied, in ascending order.
