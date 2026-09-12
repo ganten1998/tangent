@@ -329,6 +329,7 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
         is_folder: s.strip_is_folder.clone(),
         in_folder: s.strip_in_folder.clone(),
         folder_shut: s.strip_folder_shut.clone(),
+        armed: s.channel_armed.unwrap_or(0),
     }
 }
 
