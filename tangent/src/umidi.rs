@@ -93,6 +93,12 @@ const MAX_SYSEX: usize = 256 * 1024;
 /// (`0xF9`); `ActiveSense` drops `0xFE`; `Sysex` drops `0xF0`-`0xF7`. Note what
 /// `Time` does NOT drop — Start/Continue/Stop (`0xFA`-`0xFC`) and Reset
 /// (`0xFF`) are transport, not timing, and midir passes them through.
+///
+/// Only `None` and `TimeAndActiveSense` are constructed today. The rest are
+/// carried because "mirrors midir variant for variant" is the point of the
+/// type — dropping the unused ones would make the next call site that wants
+/// `Ignore::Sysex` a porting job rather than a one-word change.
+#[expect(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Ignore {
     #[default]
@@ -239,6 +245,9 @@ impl MidiInput {
         out
     }
 
+    /// Part of midir's `MidiInput` surface. Nothing in this app calls it; it
+    /// exists so the shim is a drop-in rather than a near-miss.
+    #[expect(dead_code)]
     pub fn port_count(&self) -> usize {
         self.ports().len()
     }
@@ -360,6 +369,7 @@ impl<T> MidiInputConnection<T> {
     /// midir's `close` returns the input and the user data. Nothing in this
     /// app calls it; it exists so the shim is a drop-in rather than a
     /// near-miss.
+    #[expect(dead_code)]
     pub fn close(mut self) -> (MidiInput, T) {
         let data = self.shutdown().expect("connection joined twice");
         (
