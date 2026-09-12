@@ -54,6 +54,19 @@ TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 # ALSA_NO_PKG_CONFIG does NOT work for this: alsa-sys panics on it deliberately
 # ("Aborted because ALSA_NO_PKG_CONFIG is set", build.rs:13).
 #
+# **And a stub for LILV, for the same reason and the same way.** The moment
+# LV2 arrived this function stopped working: `lilv 0.2.4`'s build script asks
+# pkg-config for `lilv-0 >= 0.24.2` and panics when it is absent, so
+# `check-linux` died in a build script before it type-checked a single line —
+# the same class of silent loss the `--features` note below records, and the
+# second time this one check has been broken without anybody hearing about
+# it. `--version` is what the `>=` is tested against, so the stub claims a
+# version that satisfies the floor; `Requires:` is deliberately EMPTY, since
+# sord, sratom and lv2 only matter to a link that never happens here. SERD is
+# the exception and gets a stub of its own: `lilv/build.rs` probes it as a
+# SECOND package in its own right (`atleast_version("0.30.0")`), so an empty
+# `Requires:` does not hide it.
+#
 # Without this, Rust code that is Linux-only — the `#[cfg(unix)]` statvfs
 # branch, the non-macOS camera stub — is never type-checked on this machine at
 # all, and the first thing that finds a mistake in it is the Linux box.
@@ -71,7 +84,29 @@ Version: 1.2.11
 Libs: -L${libdir} -lasound
 Cflags: -I${includedir}
 PC
-  echo "==> type-checking $target (stub alsa.pc, no sysroot)"
+  cat > "$pcdir/lilv-0.pc" <<'PC'
+prefix=/usr
+libdir=${prefix}/lib
+includedir=${prefix}/include/lilv-0
+
+Name: lilv
+Description: stub for cross TYPE-CHECKING only; never linked against
+Version: 0.24.26
+Libs: -L${libdir} -llilv-0
+Cflags: -I${includedir}
+PC
+  cat > "$pcdir/serd-0.pc" <<'PC'
+prefix=/usr
+libdir=${prefix}/lib
+includedir=${prefix}/include/serd-0
+
+Name: serd
+Description: stub for cross TYPE-CHECKING only; never linked against
+Version: 0.32.4
+Libs: -L${libdir} -lserd-0
+Cflags: -I${includedir}
+PC
+  echo "==> type-checking $target (stub alsa/lilv/serd .pc, no sysroot)"
   # **The library targets only.** `--all-targets` was tried and cannot work
   # from here: it drags `alsa-sys`'s build script into a HOST build, where
   # there is no ALSA and the stub .pc above does not apply. The Linux-only
