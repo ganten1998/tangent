@@ -46,6 +46,14 @@ repository = "https://github.com/SludgePhD/LinuxVideo.git"
 name = "linuxvideo"
 path = "src/lib.rs"
 
+# `ffi_enum!` declares every V4L2 constant the kernel defines, and we call a
+# handful of them — so `PowerLineFrequency`, `ColorFx` and `TunerType` are dead
+# code by construction and always will be. Silenced here rather than with
+# `#[allow]` in `src/`, because "`src/` is untouched" (see the note at the top
+# of this file) is worth more than the six warnings are.
+[lints.rust]
+dead_code = "allow"
+
 [dependencies.bitflags]
 version = "1.2.1"
 

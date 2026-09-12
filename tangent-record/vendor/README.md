@@ -33,6 +33,16 @@ number is the only way to tell whether the fix did anything.
 the root `Cargo.toml`, so it stays out of ivory's lints and `cargo test
 --workspace`.
 
+It also now carries `[lints.rust] dead_code = "allow"`. Being excluded from the
+workspace keeps ivory's lints off this crate but not rustc's own defaults, and
+`dead_code` is on by default — so `ffi_enum!` declaring every V4L2 constant the
+kernel defines, against the handful we call, produced six warnings on every
+build (`PowerLineFrequency`, `ColorFx`, `TunerType` and their associated
+constants). They are dead by construction and always will be. Silencing them in
+the manifest is what keeps the line above this one — **`src/` is untouched** —
+true; the alternative was scattering `#[allow]` through upstream's source to
+suppress warnings about upstream's own completeness.
+
 Regenerate the diff with:
 
     diff -ru ~/.cargo/registry/src/*/linuxvideo-0.3.5/src tangent-record/vendor/linuxvideo/src
@@ -82,6 +92,12 @@ here: `[patch.crates-io]` is not target-conditional, so this copy is what
 *every* platform builds, and the moment it diverges where an unfeatured
 platform can see it, it stops being a patch and becomes a fork of everybody's
 audio.
+
+One later addition does touch a file every platform compiles — a single
+`#[allow(dead_code)]` in `src/platform/mod.rs`, described under "The fifth
+change" below. It is a lint attribute and emits no code, so "the same binary"
+above still holds exactly; it is called out here rather than buried because the
+rule it brushes against is the one rule this directory has.
 
 The three are one finding wearing three hats, and it is worth saying once
 here: **cpal's error callback is the only channel its backends have, and they
@@ -249,6 +265,32 @@ A backend that reports nothing leaves a host no move at all; a backend that
 reports everything as fatal leaves it a bad one.
 
 Upstream-able, and the `TODO` says upstream already wanted it.
+
+## The fifth change: three lines of lint housekeeping
+
+Unrelated to the OSS host, and listed separately because it is not a behaviour
+change at all — 0.16.0 warns three times on every build here:
+
+| Where | Was | Now |
+| --- | --- | --- |
+| `src/host/jack/stream.rs:244` | `#[allow(too_many_arguments)]` | `#[allow(clippy::too_many_arguments)]` |
+| `src/host/jack/stream.rs:240` | `error_callback_ptr` unread | `#[allow(dead_code)]` on the field |
+| `src/platform/mod.rs:779` | `NotSendSyncAcrossAllPlatforms` unconstructed | `#[allow(dead_code)]` on the struct |
+
+The first is a real bug in upstream's source rather than a style point: the lint
+is `clippy::too_many_arguments`, so unqualified it names a lint that does not
+exist, rustc says so under `unknown_lints`, and the suppression upstream wrote
+was never actually suppressing anything.
+
+The other two are genuine dead code in 0.16.0 and are suppressed at the two
+sites rather than crate-wide, deliberately. A blanket `dead_code = "allow"` in
+this crate's `Cargo.toml` — the approach taken for `linuxvideo` above — would
+also cover the OSS host, which is **our** code and the whole reason this copy
+exists. Dead code there is a defect we want to hear about.
+
+`#[allow]` and not `#[expect]` for both: which cpal host and which platform
+macros compile varies by target, so an expectation fulfilled on FreeBSD/OSS
+would be unfulfilled — and so warn — somewhere else.
 
 ## Upstream
 

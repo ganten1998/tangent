@@ -772,7 +772,6 @@ pub struct ClassIter {
 impl Iterator for ClassIter {
     type Item = Class;
 
-    #[must_use]
     fn next(&mut self) -> Option<Class> {
         let _life = self.life.inner.lock();
         let ptr = unsafe { lib::lilv_plugin_classes_get(self.classes, self.iter) };

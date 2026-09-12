@@ -237,11 +237,14 @@ struct LocalProcessHandler {
     playing: Arc<AtomicBool>,
     creation_timestamp: std::time::Instant,
     /// This should not be called on `process`, only on `buffer_size` because it can block.
+    // Stored but never read upstream: `buffer_size` was never wired up to use
+    // it. Kept rather than deleted so the field is still here when it is.
+    #[allow(dead_code)]
     error_callback_ptr: ErrorCallbackPtr,
 }
 
 impl LocalProcessHandler {
-    #[allow(too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         out_ports: Vec<jack::Port<jack::AudioOut>>,
         in_ports: Vec<jack::Port<jack::AudioIn>>,
