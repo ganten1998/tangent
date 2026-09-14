@@ -1433,9 +1433,11 @@ pub struct Settings {
     /// and the file on disk is the thing the user thinks they chose.
     pub track_path: String,
     /// The open PROJECT's document (`…/project.tangent`). Empty until the
-    /// host bootstraps the first one; the app reopens it at every launch —
-    /// with every record arm off but the default instrument's, which is the
-    /// arm rule, not this field's. See docs/ARRANGEMENT.md.
+    /// host bootstraps the first one. **A launch no longer reopens it** —
+    /// since 2026-09-13 every launch stands on the default template, on the
+    /// owner's instruction; the field is still written on every open and
+    /// save so the road back (`reopen_remembered_project`) has something to
+    /// read. See docs/ARRANGEMENT.md.
     pub project_path: String,
     /// The arrangement's magnet: edits snap to the grid. ON out of the box.
     pub arr_snap: bool,
@@ -2310,6 +2312,57 @@ impl Settings {
     /// reads the file before and after and another test running in parallel
     /// would change it in between. A test that mutates the machine it runs on
     /// is a test nobody can trust twice.
+    /// **A channel with an input bound and no KIND cannot exist**, and this
+    /// is what says so about a desk that already has one.
+    ///
+    /// "The input IS the kind" is the model (`set_channel_input_spec`, the
+    /// owner's REAPER ruling): a non-empty spec makes the channel Audio or
+    /// MIDI, an empty one makes it neither. `remove_channel` broke that in
+    /// one direction — it cleared the kind, the added-bit, the name, the
+    /// colour, the clips and the bays, and left `channel_inputs` holding the
+    /// interface channel the deleted track used to listen to.
+    ///
+    /// What that produces is a slot nothing can repair by hand. It is not
+    /// "used", so the desk draws it as an empty plus; press the plus and
+    /// `add_bare_track` sets the added-bit WITHOUT touching the kind, so the
+    /// strip comes back wearing switches, its R toggles, its arm bit sets —
+    /// and `audio_ordinal` still answers `None`, because that asks for
+    /// `ChannelKind::Audio`. The result is a track that looks armed and can
+    /// never monitor or record, which is how the owner found it: "track 8 in
+    /// a folder no longer works for record arming and monitoring ... it
+    /// worked for another track then it now won't work at all."
+    ///
+    /// **The orphan INPUT goes, not the other way round.** Deriving the kind
+    /// from the leftover string would resurrect a track somebody deleted —
+    /// on their template, on every launch, without being asked. The removal's
+    /// intent was that the track is gone; this finishes the job it left half
+    /// done. Rebinding is one press of the chip and it now works, which is
+    /// the state the model always promised.
+    ///
+    /// Answers how many it healed, so a caller can say so.
+    pub fn heal_orphan_inputs(&mut self) -> usize {
+        let mut healed = 0;
+        for n in 0..crate::recorder::CHANNELS {
+            let has_kind = self.channel_kinds.get(n).copied().unwrap_or(0) != 0;
+            let bound = self.channel_inputs.get(n).is_some_and(|s| !s.is_empty());
+            if !has_kind && bound {
+                if let Some(slot) = self.channel_inputs.get_mut(n) {
+                    slot.clear();
+                }
+                healed += 1;
+            }
+        }
+        if healed > 0 {
+            // The device set follows the string, exactly as it does at the
+            // binding: a set on a channel with no input is meaningless.
+            crate::recorder::reconcile_midi_inputs(
+                &mut self.channel_midi_inputs,
+                &self.channel_inputs,
+            );
+        }
+        healed
+    }
+
     pub fn path() -> PathBuf {
         // **An override honoured in EVERY build, not just this crate's tests.**
         //
@@ -3552,6 +3605,11 @@ impl Settings {
         // `channel_midi_inputs`, so every MIDI channel arrives here holding
         // the default and leaves holding what its legacy string says.
         s.reconcile_midi_inputs();
+        // **And an orphan input loses its binding**, after the migrations for
+        // the same reason the reconcile is: they are the last writers of
+        // `channel_inputs`, and a heal run before them would judge a string
+        // that had not finished changing. See `heal_orphan_inputs`.
+        s.heal_orphan_inputs();
         s
     }
 
@@ -7644,6 +7702,15 @@ mod tests {
         let mut s = Settings::default();
         s.channel_inputs = vec![String::new(); crate::recorder::CHANNELS];
         s.channel_inputs[2] = "midi:Keystation 88".to_owned();
+        // **And the KIND that input implies.** "The input IS the kind", so a
+        // channel bound to a keyboard is a MIDI channel — a fixture that
+        // bound one without saying so described a desk that cannot exist,
+        // and `heal_orphan_inputs` now takes the binding off exactly that
+        // shape. The sets under test are unaffected either way; what changed
+        // is that the desk they hang on is a real one.
+        s.channel_kinds[2] = crate::recorder::ChannelKind::as_u8(Some(
+            crate::recorder::ChannelKind::Midi,
+        ));
         s.channel_midi_inputs = vec![crate::recorder::MidiInputSel::EVERYTHING; 3];
         s.channel_midi_inputs[2] = crate::recorder::MidiInputSel {
             devices: vec!["Keystation 88".to_owned()],

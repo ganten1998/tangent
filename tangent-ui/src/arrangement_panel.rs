@@ -2752,7 +2752,8 @@ fn loop_seam_xs(r: Rect, full_x: (f32, f32), clip: &ClipView<'_>) -> Vec<f32> {
     }
     // The same count and the same ceiling the miniature and the schedule use,
     // so the picture cannot claim a pass the sound does not play.
-    let passes = ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 512);
+    let passes = (((clip.len_s + clip.offset_s.max(0.0)) / clip.loop_s).ceil() as usize)
+        .clamp(1, 512);
     let lo = ((r.left() - fx0) / pass_w).ceil();
     let hi = ((r.right() - fx0) / pass_w).floor();
     if !lo.is_finite() || !hi.is_finite() || hi < lo {
@@ -2852,7 +2853,8 @@ fn draw_note_miniature(
     // How many passes the clip's length holds. One when it does not loop,
     // which is every clip written before looping existed.
     let passes: usize = if clip.loop_s > 1.0e-6 {
-        ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 512)
+        (((clip.len_s + clip.offset_s.max(0.0)) / clip.loop_s).ceil() as usize)
+            .clamp(1, 512)
     } else {
         1
     };
@@ -11162,7 +11164,8 @@ selected: false,
     ) {
         let len = clip.len_s.max(1.0e-9);
         let passes: usize = if clip.loop_s > 1.0e-6 {
-            ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 512)
+            (((clip.len_s + clip.offset_s.max(0.0)) / clip.loop_s).ceil() as usize)
+                .clamp(1, 512)
         } else {
             1
         };
