@@ -284,7 +284,18 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // every row below them each time the band opens. "Space" is also not a
     // single letter, which is why the key column is measured rather than
     // assumed — see `key_col_w`.
-    (Key::Enter, "Enter", KeyAction::StartRecording, true),
+    // **Enter is NOT bound here**, and the gap is the point. It was
+    // `StartRecording`, on the argument in the paragraph below that the key
+    // which begins a performance must not be the one that ends it. Cmd+R
+    // begins and ends it — one chord, a toggle, on the card as `C-R` — and a
+    // second binding on a bare, enormous, centre-of-the-keyboard key is a
+    // take started by every stray press. The owner, once the MIDI editor
+    // wanted Enter for writing a note: "Remove enter for record -- we already
+    // have command r."
+    //
+    // `StartRecording` keeps its variant, its gate and its words: nothing
+    // reaches it from this table today, and a future key can be pointed at it
+    // without rebuilding what it means.
     (Key::Space, "Space", KeyAction::StopRecording, true),
     // Escape only closes the card; it is not worth a row of its own.
     (Key::Escape, "Esc", KeyAction::CloseHelp, false),
@@ -479,6 +490,23 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
                 {
                     return false;
                 }
+                // **And `J`**, for the third time on the same argument: over
+                // the roll it JOINS the selected notes, and the editor's
+                // section below says so. Reader mode is still one press away
+                // anywhere else.
+                if matches!(view, HelpView::MidiEdit)
+                    && matches!(a, KeyAction::ToggleReaderMode)
+                {
+                    return false;
+                }
+                // **And `M`**, the fourth: over the roll it MUTES the
+                // selected notes. The metronome keeps the letter everywhere
+                // else, including the arrangement one layer down.
+                if matches!(view, HelpView::MidiEdit)
+                    && matches!(a, KeyAction::ManageTaughtChords)
+                {
+                    return false;
+                }
                 // **In reader mode the Tab row is a lie**, and this card is
                 // being read to exactly the audience with the least means of
                 // discovering that: egui takes Tab to walk the controls
@@ -605,14 +633,27 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("S-EDG", "shift-drag a note's edge: stretch the selection to the grid"),
             ("S-CLK", "shift-click: add to the selection"),
             ("C-DRG", "cmd-drag empty room: rubber-band select"),
-            ("R-CLK", "erase a note · empty room: the app menu"),
+            ("R-CLK", "a note: its menu · empty room: rubber-band select"),
+            ("M", "mute the selected notes · again to unmute"),
+            ("J", "join the selected notes"),
+            ("S", "split the selection at the playhead"),
             ("DEL", "delete the selection"),
             ("Q", "quantise the selection to the grid"),
+            ("S-H", "humanize the selection: timing and velocity, by percent"),
             ("-/=", "zoom out / in, in steps, around the playhead"),
             ("W", "fit the clip"),
             ("C-A", "select every note"),
             ("C-D", "duplicate one grid step later"),
-            ("ARROWS", "nudge: left/right a step · up/down a semitone"),
+            ("ENTER", "write a note at the playhead, on the cursor's pitch"),
+            // **One row for the bare arrows and three for the chords**, in
+            // the order a hand meets them: the plain keys do the work, the
+            // modifiers refine it. The bare row has to say BOTH its jobs
+            // because which one it does is a property of the moment and not
+            // of the key — see the arrows' own note in `midi_editor_input`.
+            ("ARROWS", "a note in hand: nudge it · nothing in hand: playhead and pitch cursor"),
+            ("S-L/R", "lengthen / shorten the selection by a step"),
+            ("S-U/D", "take the note above / below into the selection"),
+            ("C-A-U/D", "the selection an octave up / down"),
             ("Z", "fit the clip back in the window"),
             ("N", "draw mode"),
             // **The pedal lane gets rows and no LETTER.** Every mnemonic
@@ -629,7 +670,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("O", "swing grid on/off"),
             ("C-G", "glue the selected notes"),
             ("C-C/V", "copy · paste notes"),
-            ("ESC", "close the editor"),
+            ("ESC", "let go of the selection · again to close the editor"),
             ("WHEEL", "zoom at the playhead - click a bar, wheel zooms there"),
             ("A-WHL", "alt: move the viewport (the editor's own)"),
             ("C-WHL", "ctrl: walk the piano roll up and down"),
@@ -960,6 +1001,10 @@ mod tests {
             "-/=" => vec!["Minus", "Equals"],
             "W" => vec!["W"],
             "Q" => vec!["Q"],
+            "H" => vec!["H"],
+            "ENTER" => vec!["Enter"],
+            "S-H" => vec!["H"],
+            "J" => vec!["J"],
             "Z" => vec!["Z"],
             "N" => vec!["N"],
             "O" => vec!["O"],
@@ -1158,6 +1203,23 @@ mod tests {
             // The laptop half of the same key, answering wherever Delete
             // does — an alias, like F1 for help, not a second shortcut.
             ("Backspace", "DEL's unlisted alias"),
+            // **`S` is on the editor's card and cannot be spelled here.**
+            // `keys_of` maps a LABEL to keys for every view at once, and the
+            // arrangement already has an `S` row that it dispatches through
+            // `BINDINGS` rather than by reading `Key::S` itself — so mapping
+            // the label would demand a read from `arrangement_input` that
+            // does not and should not exist. The editor's own `S` is read in
+            // `midi_editor_input`, it is on the MidiEdit card in words, and
+            // this line is what says the pair was considered rather than
+            // missed.
+            ("S", "the editor's split; the arrangement's S is table-dispatched"),
+            // **`M` for the same reason as `S`**, one surface further out:
+            // the mixer and the arrangement both carry an `M` row for the
+            // metronome and both dispatch it through `BINDINGS` rather than
+            // reading `Key::M`, so a label mapping would demand a read from
+            // `paint` that should not exist. The editor's own `M` is read in
+            // `midi_editor_input` and is on the MidiEdit card in words.
+            ("M", "the editor's mute; the metronome's M is table-dispatched"),
         ];
         for (name, views) in [
             ("arrangement_input", vec![HelpView::Arrange]),
@@ -1399,7 +1461,13 @@ mod tests {
                 assert!(!has(&rows, "N"), "{name}: `N` is dead here");
             }
             // The window's own switches stay everywhere.
-            for live in ["H", "D", "F", "Z", "Tab", "Enter", "Space"] {
+            //
+            // **`Enter` is not among them any more.** It was the recorder's
+            // start key and so appeared on every card; Cmd+R does that job
+            // now and Enter belongs to the MIDI editor, where it writes a
+            // note — the editor's card spells it `ENTER` in its own section,
+            // which is not this list's business.
+            for live in ["H", "D", "F", "Z", "Tab", "Space"] {
                 assert!(has(&rows, live), "{name}: `{live}` went missing");
             }
         }
@@ -1432,8 +1500,23 @@ mod tests {
         let editor = card(HelpView::MidiEdit);
         assert!(desc(&editor, "G").contains("snap"));
         assert!(desc(&editor, "P").contains("triplet"));
-        assert!(!has(&editor, "S"), "S is the arrangement's split, not the editor's");
-        assert!(!has(&editor, "M"), "M is not an editor key");
+        // **S is BOTH now**, one level apart: the arrangement splits a clip
+        // and the editor splits a note. The editor's is read in
+        // `midi_editor_input` and the arrangement's key stands down while the
+        // hand is on the roll — see the `ShowSupporterKey` arm in `paint`.
+        assert!(
+            desc(&editor, "S").contains("split"),
+            "S on the editor should be its own split: {:?}",
+            desc(&editor, "S")
+        );
+        // **M is the editor's MUTE now**, and the metronome's everywhere
+        // else — the same one-level-down split S makes between the
+        // arrangement's clip and the editor's note.
+        assert!(
+            desc(&editor, "M").contains("mute"),
+            "M on the editor should be its own mute: {:?}",
+            desc(&editor, "M")
+        );
 
         let mixer = card(HelpView::Mixer);
         assert!(desc(&mixer, "S").contains("supporter"), "S on the mixer is the supporter card");
@@ -1551,12 +1634,11 @@ mod tests {
         );
         // The card follows the same gate, listed under GENERAL: advertised
         // exactly where it fires, on every view.
-        for view in [
-            HelpView::Piano,
-            HelpView::Mixer,
-            HelpView::Arrange,
-            HelpView::MidiEdit,
-        ] {
+        //
+        // **Except the editor**, where J is the roll's JOIN and reader mode
+        // is not on the card at all — the same stand-down H and Z make, for
+        // the same reason. See `card_rows`.
+        for view in [HelpView::Piano, HelpView::Mixer, HelpView::Arrange] {
             let rows = card_rows(ours, view);
             let j = rows
                 .iter()
@@ -1646,14 +1728,18 @@ mod tests {
             press(Key::Space, Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() }),
             Some(KeyAction::StopRecording)
         );
-        // And Enter, which is the other half of the same gate. **Two keys, not
-        // one that toggles**: the key that begins a performance must not be the
-        // key that ends it, because the difference between the two is a state
-        // you cannot read from the bench.
+        // **And Enter is bound to NOTHING**, gate open or shut. It began a
+        // take once, on the argument that the key which starts a performance
+        // must not be the one that ends it; Cmd+R does both now, and Enter is
+        // the MIDI editor's key for writing a note. A bare Enter that could
+        // still roll tape from any surface is a take started by a stray
+        // press — which is what the owner met: "Remove enter for record -- we
+        // already have command r."
         assert_eq!(press(Key::Enter, Gates::default()), None);
         assert_eq!(
             press(Key::Enter, Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() }),
-            Some(KeyAction::StartRecording)
+            None,
+            "Enter still rolls tape"
         );
         // The gate is Space's alone: nothing else changes with it.
         for (key, want) in [
@@ -1695,13 +1781,16 @@ mod tests {
             },
             HelpView::Piano,
         );
-        // TWO rows now: starting and stopping are separate keys — the key
-        // which begins a performance is not the key that ends it. (The
-        // drumpad's W retired with the recorder's V as unused clutter.)
+        // **ONE row now.** Starting and stopping were separate keys, on the
+        // argument that the key which begins a performance must not be the
+        // one that ends it — and Enter was the start. Cmd+R does both, and a
+        // bare Enter that could still roll tape is a take begun by a stray
+        // press, so the start key is gone and only Space's stop is gated
+        // here. See `BINDINGS`, where the gap is written down.
         assert_eq!(
             shown.len(),
-            hidden.len() + 2,
-            "opening the band added something other than Enter and Space"
+            hidden.len() + 1,
+            "opening the band added something other than Space"
         );
         assert!(
             shown

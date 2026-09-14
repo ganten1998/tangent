@@ -104,6 +104,24 @@ pub const LIFE_S: f64 = 4.0;
 /// longest.
 pub const LIFE_ERROR_S: f64 = 5.0;
 
+/// How long an ANSWER stays up — the explanatory message a press asks for and
+/// nothing re-checks. See [`Notifications::insist`].
+///
+/// **These used to stand for ever**, because `insist` borrowed `raise`'s note
+/// and a raised note has no clock: it is a CONDITION, and a condition ends
+/// when it stops being true. An answer is not a condition. Nothing was ever
+/// going to lower "That is a MIDI part, not a sample", so it sat in the
+/// corner until somebody clicked it — which is one more thing to do in the
+/// middle of whatever the message interrupted. The owner, testing: "Make the
+/// helper notifs also fade on their own after a set interval. These interfere
+/// with testing."
+///
+/// Ten rather than the error's five: these are the app's longest messages, two
+/// sentences of explanation rather than a receipt, and a reader who has just
+/// been told why the thing they tried did not work deserves to finish the
+/// sentence. Asking again restarts it.
+pub const LIFE_ANSWER_S: f64 = 10.0;
+
 /// The tail, seconds. A message that vanishes between two frames reads as a
 /// glitch; one that leaves reads as an ending.
 pub const FADE_S: f64 = 0.45;
@@ -317,6 +335,16 @@ impl Note {
             stood: 0.0,
             life: None,
             key: Some(key),
+        }
+    }
+
+    /// An ANSWER: a message keyed to a condition like a standing one, and
+    /// given a clock like an ordinary one, because it is the reply to a press
+    /// rather than a report of a state. See [`LIFE_ANSWER_S`].
+    fn answered(id: NoteId, kind: Kind, text: String, key: String) -> Self {
+        Self {
+            life: Some(LIFE_ANSWER_S),
+            ..Self::standing(id, kind, text, key)
         }
     }
 
@@ -660,12 +688,19 @@ impl Notifications {
     /// in a way it would not be in `raise`: this is one message per press,
     /// not five conditions rotating through four slots sixty times a second.
     ///
-    /// Everything else is `raise`'s: the message STANDS with no clock, it is
-    /// one message however often it is asked for, and [`Self::lower`] is
-    /// still what ends it when the condition genuinely clears. A note already
-    /// on screen for this key takes the new words and keeps its identity — a
-    /// note on its way OUT does not, because handing an explicit request back
-    /// a box that is already fading is the same silence in slower motion.
+    /// Everything else is `raise`'s: it is one message however often it is
+    /// asked for, and [`Self::lower`] still ends it early when the condition
+    /// genuinely clears. A note already on screen for this key takes the new
+    /// words and keeps its identity — a note on its way OUT does not, because
+    /// handing an explicit request back a box that is already fading is the
+    /// same silence in slower motion.
+    ///
+    /// **Except the clock, which is the one thing this does NOT borrow.** A
+    /// raised message stands because a condition is a state and states end
+    /// when they end; an answer is a reply to a press, and nothing on earth
+    /// was ever going to lower "That is a MIDI part, not a sample". So an
+    /// answer ages out on its own after [`LIFE_ANSWER_S`], and asking again
+    /// restarts it.
     pub fn insist(
         &mut self,
         key: impl Into<String>,
@@ -688,10 +723,16 @@ impl Notifications {
             if n.text != text {
                 n.text = text;
             }
+            // **Asking again restarts the clock**, and gives one to a note
+            // that was raised as a condition and is now being ANSWERED. A
+            // press that gets the same box back three seconds from its end
+            // has been answered in name only.
+            n.age = 0.0;
+            n.life = Some(LIFE_ANSWER_S);
             return n.id;
         }
         let id = self.mint();
-        self.items.push(Note::standing(id, kind, text, key));
+        self.items.push(Note::answered(id, kind, text, key));
         self.cap();
         id
     }
@@ -1929,15 +1970,97 @@ mod tests {
     /// answer — and went on producing nothing for the rest of the session,
     /// because the only thing that forgot a mute was a `lower` nothing was
     /// ever going to call for a condition that never stopped being true.
+    /// **An answer leaves on its own; a condition still waits to be told.**
+    ///
+    /// The owner, testing: "Make the helper notifs also fade on their own
+    /// after a set interval. These interfere with testing." The helper
+    /// messages are the ones [`Notifications::insist`] puts up — "That is a
+    /// MIDI part, not a sample", "No MIDI track on the desk" — and they stood
+    /// for ever because `insist` borrowed `raise`'s clockless note. Nothing
+    /// was ever going to lower them: they are replies to a press, not reports
+    /// of a state, and the only way out was a click in the middle of whatever
+    /// the message had just interrupted.
+    ///
+    /// Both halves matter. A raised CONDITION must not pick up a clock from
+    /// this — an input device that has genuinely vanished is the one message
+    /// that must not quietly leave — so the two are pinned side by side under
+    /// the same clock.
+    ///
+    /// Revert check performed: mint an answer with `Note::standing` again and
+    /// the first half fails with the box still up after a minute.
+    #[test]
+    fn an_answer_ages_out_but_a_condition_stands() {
+        let mut n = Notifications::new();
+        n.tick(0.0);
+        let answer = n.insist("clip-drag-is-midi", Kind::Info, "That is a MIDI part");
+        let condition = n
+            .raise("midi-port", Kind::Error, "The MIDI device went away")
+            .expect("a fresh condition was refused");
+
+        // Walked rather than jumped: `MAX_STEP` clamps one tick's ageing, so
+        // a single leap to the far side ages the stack by half a second and
+        // proves nothing.
+        let mut t = 0.0;
+        let mut gone_at = None;
+        while t < 60.0 {
+            t += 0.25;
+            n.tick(t);
+            if gone_at.is_none() && n.get(answer).is_none() {
+                gone_at = Some(t);
+            }
+        }
+        let gone_at = gone_at.expect("the answer never left");
+        assert!(
+            gone_at >= LIFE_ANSWER_S,
+            "the answer left after {gone_at}s, inside its {LIFE_ANSWER_S}s"
+        );
+        assert!(
+            gone_at <= LIFE_ANSWER_S + FADE_S + 1.0,
+            "the answer took {gone_at}s to leave"
+        );
+        assert!(
+            n.get(condition).is_some(),
+            "a standing condition was aged out with the answers"
+        );
+
+        // And asking again restarts it rather than handing back a box that
+        // is three seconds from its end.
+        let mut n = Notifications::new();
+        n.tick(0.0);
+        let first = n.insist("clip-drag-is-midi", Kind::Info, "That is a MIDI part");
+        for k in 1..=16 {
+            n.tick(f64::from(k) * 0.5);
+        }
+        assert_eq!(
+            n.insist("clip-drag-is-midi", Kind::Info, "That is a MIDI part"),
+            first,
+            "a second asking minted a second message"
+        );
+        let mut t = 8.0;
+        while t < 8.0 + LIFE_ANSWER_S - 1.0 {
+            t += 0.25;
+            n.tick(t);
+        }
+        assert!(
+            n.get(first).is_some(),
+            "asking again did not restart the clock"
+        );
+    }
+
     #[test]
     fn an_explicit_request_is_answered_however_often_it_was_dismissed() {
         let mut n = Notifications::new();
         n.tick(0.0);
         let first = n.insist("midi-in", Kind::Error, "No MIDI input ports found");
         assert!(n.is_raised("midi-in"), "an insisted condition forgot itself");
-        assert!(
-            n.get(first).is_some_and(Note::is_standing),
-            "a condition was given a clock"
+        // **And it has a CLOCK**, which is the one thing an answer does not
+        // borrow from the condition it is keyed like. Nothing was ever going
+        // to lower this message, so without one it sat in the corner until
+        // somebody clicked it — see `LIFE_ANSWER_S`.
+        assert_eq!(
+            n.get(first).and_then(|n| n.expires_at()),
+            Some(LIFE_ANSWER_S),
+            "an answer was left standing for ever"
         );
         // Asking again while it stands is one message with new words, exactly
         // as `raise` would have it.
@@ -1967,8 +2090,13 @@ mod tests {
         assert_ne!(again, first, "the dismissed message came back from the dead");
         assert!(!n.is_muted("midi-in"), "the mute survived the asking");
         assert!(
-            n.get(again).is_some_and(Note::is_standing),
+            n.get(again).is_some_and(|x| !x.leaving()),
             "the answer to an explicit request was not on screen"
+        );
+        assert_eq!(
+            n.get(again).and_then(|x| x.expires_at()),
+            Some(LIFE_ANSWER_S),
+            "the second answer was left standing for ever"
         );
 
         // And a full column is not an answer either. `raise` waits for a slot

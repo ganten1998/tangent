@@ -209,6 +209,7 @@ pub fn read(bytes: &[u8]) -> Option<MidiImport> {
                         dur_s: (s - from).max(0.02),
                         key,
                         vel,
+                    muted: false,
                     });
                     len_s = len_s.max(s);
                 }
@@ -218,7 +219,7 @@ pub fn read(bytes: &[u8]) -> Option<MidiImport> {
     }
     // A note the file never closed still deserves to exist.
     for (key, vel, from) in open {
-        notes.push(ArrNote { at_s: from, dur_s: 0.25, key, vel });
+        notes.push(ArrNote { at_s: from, dur_s: 0.25, key, vel, muted: false });
         len_s = len_s.max(from + 0.25);
     }
     if notes.is_empty() {

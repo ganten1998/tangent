@@ -1543,6 +1543,16 @@ pub struct Settings {
     /// standard shuffle, 50 is straight. One decimal, the SWG menu's rule.
     pub midi_swing_pct: f64,
     pub midi_triplet: bool,
+    /// **How far HUMANIZE may pull a note off the grid**, as a percentage of
+    /// one grid step, and **how far it may push a velocity**, as a percentage
+    /// of the velocity it already has. Both zero is a no-op, which is why the
+    /// menu ships with something in them.
+    ///
+    /// Remembered rather than asked for every time: humanizing is something
+    /// somebody does to one part after another with the same feel, and a menu
+    /// that forgot would be two extra presses on every one of them.
+    pub midi_humanize_timing: u8,
+    pub midi_humanize_vel: u8,
     /// **The MIDI editor's draw mode**, and it ships OFF.
     ///
     /// The editor always drew a note wherever you pressed on empty roll,
@@ -2064,6 +2074,10 @@ impl Default for Settings {
             // now, and its light face is the arrange view's greys.
             me_dark: true,
             midi_swing_pct: 66.7,
+            // A quiet default: enough to be heard as a hand rather than a
+            // grid, not enough to be heard as a mistake.
+            midi_humanize_timing: 25,
+            midi_humanize_vel: 15,
             midi_triplet: false,
             midi_draw_mode: false,
             midi_pedal_lane: false,
@@ -3497,6 +3511,16 @@ impl Settings {
             }
         }
         take_bool(&mut map, "midi_triplet", &mut s.midi_triplet);
+        for (key, slot) in [
+            ("midi_humanize_timing", &mut s.midi_humanize_timing),
+            ("midi_humanize_vel", &mut s.midi_humanize_vel),
+        ] {
+            if let Some(Value::Number(n)) = map.shift_remove(key) {
+                if let Some(v) = n.as_u64() {
+                    *slot = u8::try_from(v.min(100)).unwrap_or(100);
+                }
+            }
+        }
         take_bool(&mut map, "midi_draw_mode", &mut s.midi_draw_mode);
         take_bool(&mut map, "midi_pedal_lane", &mut s.midi_pedal_lane);
         take_bool(&mut map, "arr_master_row", &mut s.arr_master_row);
@@ -4549,6 +4573,14 @@ impl Settings {
                 .map_or(Value::Null, Value::Number),
         );
         map.insert("midi_triplet".into(), Value::Bool(self.midi_triplet));
+        map.insert(
+            "midi_humanize_timing".into(),
+            Value::Number(u64::from(self.midi_humanize_timing).into()),
+        );
+        map.insert(
+            "midi_humanize_vel".into(),
+            Value::Number(u64::from(self.midi_humanize_vel).into()),
+        );
         for (key, gain) in [
             ("metronome_gain", self.metronome_gain),
             ("master_gain", self.master_gain),

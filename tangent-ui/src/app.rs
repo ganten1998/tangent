@@ -836,6 +836,15 @@ pub struct TangentApp {
     mixer_naming: Option<(recorder::Column, String)>,
     /// The SWG menu, while it hangs under its chip.
     swing_menu: Option<SwingMenu>,
+    /// The NOTE menu's rectangle while it hangs over the roll, laid out where
+    /// the right-click landed. The selection is what it acts on, so it needs
+    /// no index of its own — a right-click that lands on a note outside the
+    /// selection selects it first.
+    note_menu: Option<Rect>,
+    /// The HUMANIZE menu's rectangle while it hangs over the roll, laid out
+    /// when H was pressed. No typing state, unlike the SWG menu's: both rows
+    /// are tracks a press reads a percentage off directly.
+    humanize_menu: Option<Rect>,
     /// The loaded insert bay whose Delete/Replace menu is open, if any.
     mixer_fx_menu: Option<(recorder::Column, usize)>,
     /// The bay whose editor should open the moment its plugin loads — the
@@ -2146,6 +2155,16 @@ struct MidiEdit {
     last_vel: u8,
     /// A marquee in flight, both corners in screen space.
     marquee: Option<(Pos2, Pos2)>,
+    /// **The pitch the keyboard is standing on** — where Enter puts a note,
+    /// and what the bare up/down arrows move when nothing is selected.
+    ///
+    /// The roll has always had a playhead for the time axis and nothing at
+    /// all for the pitch axis, because the mouse carries both at once. A
+    /// keyboard needs the second one written down, or Enter has no answer to
+    /// "which note". It follows the selection whenever the arrows transpose
+    /// one, so laying a note, adjusting its pitch and laying the next is
+    /// three presses rather than a re-aim.
+    cursor_key: u8,
 }
 
 /// What a save prompt is standing in front of.
@@ -3244,6 +3263,12 @@ struct SwingMenu {
 /// One row of the SWG menu is this tall.
 const SWING_ROW_H: f32 = 24.0;
 
+/// **The shortest a note may be made**, in seconds. The same floor the drag
+/// resize and every clamp in `me_nudge` already use, named once now that the
+/// keyboard can reach it too — a note shortened to nothing is a note deleted
+/// by a key that does not say so.
+const ME_MIN_DUR_S: f64 = 0.05;
+
 /// Where the SWG menu stands: hanging under its chip, held inside the
 /// editor's panel.
 /// Where a point falls along the metronome panel's tempo track, 0..=1.
@@ -3272,6 +3297,95 @@ fn swing_menu_row(menu: Rect, i: usize) -> Rect {
     Rect::from_min_size(
         Pos2::new(menu.left() + 4.0, menu.top() + 4.0 + SWING_ROW_H * i as f32),
         Vec2::new(menu.width() - 8.0, SWING_ROW_H),
+    )
+}
+
+/// The HUMANIZE menu's three rows: timing, velocity, and the press that
+/// does it.
+const HUMANIZE_ROWS: usize = 3;
+
+/// One HUMANIZE row, and the menu's width.
+///
+/// **Both bigger than the SWG menu's**, which this borrowed at first and
+/// should not have: that menu's rows are a list to pick from and these are
+/// TRACKS to drag a percentage along, so the row has to be tall enough to
+/// aim at and wide enough that a point of travel is not four per cent. The
+/// owner: "make the humanize menu come up at the cursor location and have it
+/// be bigger."
+const HUMANIZE_ROW_H: f32 = 34.0;
+const HUMANIZE_W: f32 = 340.0;
+
+/// Where the HUMANIZE menu stands: **under the pointer**, because H is a key
+/// and there is no chip for it to hang under — so the hand is already where
+/// the menu is going to be, and the first press does not cost a journey
+/// across the panel.
+///
+/// Held inside the panel on both axes, so a press near an edge does not open
+/// a menu half off the roll. The pointer sits just inside the menu's top
+/// left rather than at its centre: a menu that opens centred on the cursor
+/// puts a row under it straight away, and the next press lands on whichever
+/// row that was.
+fn humanize_menu_rect(panel: Rect, at: Option<Pos2>) -> Rect {
+    let size = Vec2::new(HUMANIZE_W, HUMANIZE_ROW_H * HUMANIZE_ROWS as f32 + 10.0);
+    let want = at.map_or_else(
+        || Pos2::new(panel.center().x - size.x * 0.5, panel.center().y - size.y * 0.5),
+        |p| Pos2::new(p.x - 12.0, p.y - 10.0),
+    );
+    let min = Pos2::new(
+        want.x.clamp(panel.left() + 4.0, (panel.right() - size.x - 4.0).max(panel.left() + 4.0)),
+        want.y.clamp(panel.top() + 4.0, (panel.bottom() - size.y - 4.0).max(panel.top() + 4.0)),
+    );
+    Rect::from_min_size(min, size)
+}
+
+/// Row `i` of the HUMANIZE menu.
+fn humanize_menu_row(menu: Rect, i: usize) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(menu.left() + 5.0, menu.top() + 5.0 + HUMANIZE_ROW_H * i as f32),
+        Vec2::new(menu.width() - 10.0, HUMANIZE_ROW_H),
+    )
+}
+
+/// **The note menu's rows, in the order the owner listed them**: "Copy, Cut,
+/// Paste, Delete, Mute, and Join/Split".
+///
+/// Join and Split are one pair and two rows, because they are two verbs and a
+/// row that did both would have to guess which. Mute's row says which way it
+/// is about to go, like BYPASS FX in the insert menu.
+const NOTE_MENU_ROWS: [&str; 7] =
+    ["Copy", "Cut", "Paste", "Delete", "Mute", "Join", "Split"];
+const NOTE_MENU_ROW_H: f32 = 24.0;
+const NOTE_MENU_W: f32 = 190.0;
+
+/// Where the note menu stands: under the pointer that opened it, held inside
+/// the roll so a right-click near an edge does not open it half off-screen.
+fn note_menu_rect(panel: Rect, at: Pos2) -> Rect {
+    let size = Vec2::new(
+        NOTE_MENU_W,
+        NOTE_MENU_ROW_H * NOTE_MENU_ROWS.len() as f32 + 8.0,
+    );
+    let min = Pos2::new(
+        (at.x - 6.0).clamp(panel.left() + 4.0, (panel.right() - size.x - 4.0).max(panel.left() + 4.0)),
+        (at.y - 6.0).clamp(panel.top() + 4.0, (panel.bottom() - size.y - 4.0).max(panel.top() + 4.0)),
+    );
+    Rect::from_min_size(min, size)
+}
+
+/// Row `i` of the note menu.
+fn note_menu_row(menu: Rect, i: usize) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(menu.left() + 4.0, menu.top() + 4.0 + NOTE_MENU_ROW_H * i as f32),
+        Vec2::new(menu.width() - 8.0, NOTE_MENU_ROW_H),
+    )
+}
+
+/// The part of a HUMANIZE row a press reads as a percentage — the row less
+/// the label on its left and the reading on its right, so the number under
+/// the finger is the number the track shows.
+fn humanize_menu_track(row: Rect) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(row.left() + 96.0, row.top() + 10.0),
+        Pos2::new(row.right() - 58.0, row.bottom() - 10.0),
     )
 }
 
@@ -3629,6 +3743,8 @@ impl TangentApp {
             mixer_typing: None,
             mixer_naming: None,
             swing_menu: None,
+            note_menu: None,
+            humanize_menu: None,
             mixer_fx_menu: None,
             shift_down: false,
             alt_down: false,
@@ -6207,6 +6323,7 @@ impl TangentApp {
             dur_s: 0.45,
             key,
             vel: 96,
+        muted: false,
         })
         .collect();
         arr.add_clip(crate::arrangement::ArrClip {
@@ -6237,7 +6354,7 @@ impl TangentApp {
         // ramp reads as a ramp and whether a chip collides with a bar
         // number.
         self.arrangement.tempo = crate::tempo::TempoMap::sanitised(vec![
-            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 132.0, ramp: false },
+            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 132.0, ramp: false  },
             crate::tempo::TempoPoint { at_beat: 32.0, bpm: 132.0, ramp: true },
             crate::tempo::TempoPoint { at_beat: 48.0, bpm: 76.0, ramp: false },
             crate::tempo::TempoPoint { at_beat: 80.0, bpm: 108.0, ramp: false },
@@ -6295,6 +6412,7 @@ impl TangentApp {
                     dur_s: 0.8,
                     key,
                     vel: 96,
+                muted: false,
                 })
                 .collect(),
         });
@@ -10663,6 +10781,101 @@ impl TangentApp {
         self.arr_save_edits();
     }
 
+    /// **Open an empty lane directly below `n`**, the rows under it shifting
+    /// down a place, and answer where the hole landed.
+    ///
+    /// The desk is thirty-two fixed channels, so "insert" is not a growth —
+    /// it is a PERMUTATION. A lane nobody is using is spent to make the gap,
+    /// and [`Self::reorder_channels`] carries everything that names a lane
+    /// (clips, routes, automation, the bays' saved plugin states, the
+    /// selection) along with it, which is the whole reason this is one call
+    /// to that and not thirty assignments here.
+    ///
+    /// **The spare lane is taken from BELOW the insertion point**, always.
+    /// Any free lane would make a hole in the right place, but one taken from
+    /// above would shift every track between it and `n` UP a row — tracks the
+    /// gesture never mentioned, moving in the opposite direction to the one
+    /// the user asked for. Taken from below, the only rows that move are the
+    /// ones under the click, which is what "insert below" looks like. A desk
+    /// with nothing free under `n` answers `None`, and the caller says so.
+    fn open_lane_below(&mut self, n: usize) -> Option<usize> {
+        use recorder::CHANNELS;
+        if n >= CHANNELS {
+            return None;
+        }
+        let free = (n + 1..CHANNELS).find(|c| !self.channel_used(*c) && !self.is_folder(*c))?;
+        // `free > n`, so removing it leaves every index up to `n` alone and
+        // the gap belongs at `n + 1`.
+        let mut order: Vec<usize> = (0..CHANNELS).filter(|c| *c != free).collect();
+        let at = n + 1;
+        order.insert(at, free);
+        // **The clipboard names a LANE, and the lanes are about to move.** A
+        // track copy carries the index it came from so the host can find that
+        // track's plugin-state files on disk; paste-below shifts the source
+        // down a row whenever it sat under the click, and a stale index would
+        // send the host to somebody else's sidecars. Remapped BEFORE the
+        // reorder, while `order` is still the description of the move.
+        if let Some(c) = self.track_clipboard.as_mut() {
+            if let Some(moved) = order.iter().position(|old| *old == c.from) {
+                c.from = moved;
+            }
+        }
+        self.reorder_channels(&order);
+        // **Folder membership is the one thing the permutation cannot get
+        // right**, because the lane that was spent came from outside every
+        // group and brings that flag with it. A row opened under a folder's
+        // header, or between two of its children, belongs to that folder —
+        // otherwise the group is split in two by a track that is not in it,
+        // and `folder_of`'s walk stops at the stranger.
+        let member = self.is_folder(n) || self.in_folder(n);
+        if self.settings.strip_in_folder.len() > at {
+            self.settings.strip_in_folder[at] = member;
+        }
+        Some(at)
+    }
+
+    /// **A new empty track directly under `n`** — the track menu's Insert
+    /// Track. `false` when there is no free lane below to make room with.
+    pub fn insert_track_below(&mut self, n: usize) -> bool {
+        let Some(at) = self.open_lane_below(n) else {
+            return false;
+        };
+        self.add_bare_track(at);
+        self.selected_channel = Some(at);
+        self.selected_tracks = vec![at];
+        self.save_settings();
+        self.undo_commit();
+        true
+    }
+
+    /// **The copied track, directly under `n`.** The track menu's Paste
+    /// Track, and the gesture that used to overwrite what was under the
+    /// cursor — the owner: "make paste track actually non-destructive,
+    /// change it from the overwrite to add below inbetween selected track and
+    /// track below it."
+    pub fn paste_track_below(&mut self, n: usize) -> bool {
+        if !self.track_on_clipboard() {
+            return false;
+        }
+        let Some(at) = self.open_lane_below(n) else {
+            return false;
+        };
+        self.paste_track(at);
+        true
+    }
+
+    /// **Where a paste aimed at `n` should land**, so the menu row, the
+    /// arrangement's Ctrl+V and the mixer's agree without each deciding for
+    /// itself: an empty slot receives the track, a live one keeps it and the
+    /// copy goes under it.
+    pub fn paste_track_at(&mut self, n: usize) {
+        if n < recorder::CHANNELS && !self.channel_used(n) {
+            self.paste_track(n);
+        } else {
+            self.paste_track_below(n);
+        }
+    }
+
     fn add_bare_track(&mut self, n: usize) {
         if n >= recorder::CHANNELS {
             return;
@@ -10795,42 +11008,38 @@ impl TangentApp {
 
     /// **Put the copied track on `into`.**
     ///
-    /// **A lane that is already a track is OVERWRITTEN**, which is the
-    /// owner's ask: "copy a track, right click on another track should have
-    /// the option Paste Track to overwrite the selected right clicked track."
-    /// It used to refuse outright, on the argument that pasting over a track
-    /// either destroys it silently or merges two into a thing that is
-    /// neither — and the first half of that is exactly what a row named
-    /// OVERWRITE is for. The second half is what `remove_channel` prevents:
-    /// the lane is taken off the desk first, clips, bays, keys and all, so
-    /// what lands is the copy and nothing of what was there.
+    /// **A lane that is already a track is REFUSED**, and this function is
+    /// the "into" half of a pair: [`Self::paste_track_below`] is the one a
+    /// menu row aims at a live track, and it opens a lane rather than
+    /// spending one.
     ///
-    /// **A FOLDER is never overwritten.** A group is a container, not a
-    /// track; clearing one re-parents its children (see `remove_channel`),
-    /// which is a great deal to do from a row that says "paste". The menu
-    /// does not offer the row on a folder and this is what makes that a rule
-    /// rather than a convention.
+    /// **This overwrote for a while**, on the owner's first ask — "right
+    /// click on another track should have the option Paste Track to
+    /// overwrite the selected right clicked track" — and the row said
+    /// OVERWRITE so that nobody met it by surprise. The owner's second look
+    /// retired it: "make paste track actually non-destructive, change it
+    /// from the overwrite to add below inbetween selected track and track
+    /// below it." A paste that costs a track is a paste people check twice
+    /// before using, and there is nothing the destructive form could do that
+    /// paste-below then Remove cannot.
     ///
-    /// The paths that paste without a menu keep their own guard: Ctrl/Cmd+V
-    /// asks for an EMPTY selected slot before it comes here (`arr_paste`),
-    /// so the chord still cannot destroy a live track by aiming at it.
+    /// **A FOLDER is refused too.** A group is a container, not a track, and
+    /// a copy landing on one would have to say what became of its children.
+    ///
+    /// So no caller here can destroy a track: `arr_paste` aims at an empty
+    /// slot, the menu rows aim at an empty slot or at `paste_track_below`,
+    /// and this refuses anything else.
     ///
     /// The clips are cloned with FRESH ids — `add_clip` stamps them — because
     /// two clips sharing an id is a document that cannot say which one an
     /// edit meant.
     pub fn paste_track(&mut self, into: usize) {
-        if into >= recorder::CHANNELS || self.is_folder(into) {
+        if into >= recorder::CHANNELS || self.is_folder(into) || self.channel_used(into) {
             return;
         }
         let Some(copy) = self.track_clipboard.clone() else {
             return;
         };
-        // Everything that was on the lane goes first — the row said
-        // overwrite, and a half-cleared lane would wear the copy's plugins
-        // over its own clips.
-        if self.channel_used(into) {
-            self.remove_channel(into);
-        }
         let at = recorder::Strip::Channel(into).index();
         self.settings.tracks_added |= 1 << into;
         self.set_channel_kind(into, copy.kind);
@@ -16083,6 +16292,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             dur_s: dur,
             key: key.min(127),
             vel,
+        muted: false,
         });
         let i = clip.notes.len() - 1;
         self.me_audition(vec![key.min(127)], true);
@@ -16725,6 +16935,104 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.arr_save_edits();
     }
 
+    /// **One grid step, in seconds** — the reference HUMANIZE measures its
+    /// timing against.
+    ///
+    /// Asked of the same snapper the editor snaps with, rather than computed
+    /// from the tempo here, so swing and triplets are already in the answer
+    /// and there is no second opinion about what a step is.
+    fn me_step_s(&self) -> f64 {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return 0.0;
+        };
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == st.id) else {
+            return 0.0;
+        };
+        let view = self.midi_edit_view(st, clip);
+        let base = crate::midi_editor::snap_t(&view, clip.start_s);
+        (crate::midi_editor::snap_next_t(&view, base) - base).max(0.0)
+    }
+
+    /// **HUMANIZE the selection**: pull each note off the grid and off its
+    /// velocity by a little, at random, so a part that was typed in sounds
+    /// like a part that was played.
+    ///
+    /// The owner: "a midi editor command H for humanize - Timing percentage
+    /// change, Velocity percentage change." Two independent amounts, because
+    /// the two are not the same wish — a drum part often wants its velocities
+    /// moved and its timing left exactly where it is, and a held pad the
+    /// reverse.
+    ///
+    /// **Timing is a percentage of one GRID STEP**, not of a note's length: a
+    /// semiquaver and a semibreve on the same grid should be pulled about by
+    /// the same amount, because what the ear hears is the distance from the
+    /// beat. A hundred per cent may move a note a full step either way, which
+    /// is as far as the idea goes before it stops being the same part.
+    ///
+    /// **Velocity is a percentage of the note's OWN velocity**, which keeps
+    /// the part's shape: a ghost note at 30 moves by a few and an accent at
+    /// 120 by a dozen, so the accents stay accents. Nothing is ever pushed to
+    /// silence — 1 is the floor, because a note at velocity 0 is a note-off
+    /// wearing a note's clothes.
+    ///
+    /// **The selection only**, as `me_quantise` does, and for the same
+    /// reason: these are the two keys that rewrite notes in place, and one of
+    /// them taking the whole clip while the other took the selection is the
+    /// kind of difference nobody remembers in time.
+    ///
+    /// Notes are kept inside their clip, exactly as the quantiser keeps them.
+    fn me_humanize(&mut self, timing_pct: u8, vel_pct: u8, seed: u64) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let sel = st.selected.clone();
+        if sel.is_empty() || (timing_pct == 0 && vel_pct == 0) {
+            return;
+        }
+        let step = self.me_step_s();
+        let spread = step * f64::from(timing_pct.min(100)) / 100.0;
+        let vel_spread = f64::from(vel_pct.min(100)) / 100.0;
+        // The house LCG, seeded per call so a run is repeatable in a test and
+        // different every time a hand presses the key.
+        let mut state = seed | 1;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            // The top 53 bits into -1.0..1.0, which is where the useful
+            // entropy of an LCG is.
+            f64::from((state >> 11) as u32) / f64::from(u32::MAX) * 2.0 - 1.0
+        };
+        let mut edits: Vec<(usize, f64, u8)> = Vec::new();
+        {
+            let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+                return;
+            };
+            for &i in &sel {
+                let Some(n) = clip.notes.get(i) else { continue };
+                let abs = clip.start_s + (n.at_s - clip.offset_s) + next() * spread;
+                let to = abs.clamp(
+                    clip.start_s,
+                    (clip.start_s + clip.len_s - n.dur_s.max(0.05)).max(clip.start_s),
+                );
+                let vel = (f64::from(n.vel) * (1.0 + next() * vel_spread))
+                    .round()
+                    .clamp(1.0, 127.0) as u8;
+                edits.push((i, clip.offset_s + (to - clip.start_s), vel));
+            }
+        }
+        if let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) {
+            for (i, at, vel) in edits {
+                if let Some(n) = clip.notes.get_mut(i) {
+                    n.at_s = at;
+                    n.vel = vel;
+                }
+            }
+        }
+        self.arr_save_edits();
+    }
+
     /// DUPLICATE the selection one grid step later; the copies become the
     /// selection, ready to ride.
     fn me_duplicate(&mut self) {
@@ -16849,6 +17157,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 dur_s: n.dur_s.min(c1 - abs).max(0.02),
                 key: n.key,
                 vel: n.vel,
+            muted: false,
             });
         }
         let count = clip.notes.len() - first;
@@ -16932,6 +17241,371 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 n.key = (i32::from(n.key) + dk_all).clamp(0, 127) as u8;
             }
         }
+        self.arr_save_edits();
+    }
+
+    /// **A note at the playhead, on the cursor's pitch** — Enter, the key
+    /// that makes the roll writable without a mouse.
+    ///
+    /// The owner asked for "a system where-in proper arrow controls can be
+    /// used to create and edit midi clips intuitively, and from the beginning
+    /// to the end", and this is the first half of it: the mouse's create
+    /// needs a position AND a pitch, and a keyboard has to get the second one
+    /// from somewhere. `MidiEdit::cursor_key` is where.
+    ///
+    /// **The playhead walks on by the length just laid**, which is what makes
+    /// this step ENTRY rather than one note. `me_create_note` sizes a note to
+    /// the next grid line, so Enter pressed four times writes four notes in a
+    /// row rather than four notes in a stack — and the arrows between two
+    /// presses move the cursor, so a melody is a run of Enter with the
+    /// occasional Up or Down in it.
+    ///
+    /// The new note stays SELECTED, so Shift+Left/Right can lengthen it and
+    /// the arrows can move it without a re-aim; the cursor follows those
+    /// arrows, so the next note starts from wherever the last one ended up.
+    fn me_insert_at_playhead(&mut self) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let (id, key) = (st.id, st.cursor_key);
+        let Some((c0, c1)) = self
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| (c.start_s, c.start_s + c.len_s))
+        else {
+            return;
+        };
+        // A playhead parked outside the clip writes at the nearest end of it
+        // rather than nowhere: the alternative is a key that silently does
+        // nothing, which is the thing this editor's notes keep warning about.
+        let at = self.playhead_s().clamp(c0, c1 - 1.0e-6);
+        self.me_create_note(at, key);
+        // **The mouse's create leaves a DRAG standing** so the hand can size
+        // the note by pulling before it lets go. A keyboard insert has no
+        // hand to let go, and a drag left in flight takes the next click.
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.drag = None;
+        }
+        let to = self.arrangement.clips.iter().find(|c| c.id == id).and_then(|c| {
+            let n = c.notes.last()?;
+            Some(c.start_s + (n.at_s - c.offset_s) + n.dur_s)
+        });
+        if let Some(to) = to.filter(|t| *t < c1 - 1.0e-9) {
+            self.me_locate(to);
+        }
+    }
+
+    /// Put the playhead here, on the engine and on this side at once.
+    ///
+    /// Both, because the two answer different questions: the request is what
+    /// actually moves the transport, and the local write is what the NEXT
+    /// keypress in the same frame reads. A run of Enter presses that waited a
+    /// round trip each would stack every note on one grid line.
+    fn me_locate(&mut self, to: f64) {
+        let to = to.max(0.0);
+        self.recorder.position_s = to;
+        self.request_recorder(recorder::RecorderRequest::Locate(to));
+    }
+
+    /// **The playhead a grid step along** — the bare left/right arrows with
+    /// nothing selected, so a hand that has not picked a note up can still
+    /// walk the clip and choose where the next one goes.
+    fn me_step_playhead(&mut self, steps: f64) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+            return;
+        };
+        let view = self.midi_edit_view(st, clip);
+        let at = self.playhead_s();
+        // Through the snapper, so a swung grid walks its own uneven lines
+        // rather than a uniform hop that lands between them.
+        let to = if view.snap_on {
+            if steps > 0.0 {
+                crate::midi_editor::snap_next_t(&view, at)
+            } else {
+                crate::midi_editor::snap_floor_t(&view, at - 1.0e-6)
+            }
+        } else {
+            at + steps * crate::midi_editor::grid_step_s(&view).max(0.01)
+        };
+        let (c0, c1) = (clip.start_s, clip.start_s + clip.len_s);
+        self.me_locate(to.clamp(c0, c1));
+    }
+
+    /// **How long a cursor step is held**, seconds.
+    ///
+    /// **It used to be one frame.** The step sounded its note and set no
+    /// deadline, and `me_preview_tick` reads a preview with no deadline as
+    /// one a HAND is holding — so with no button down it was released on the
+    /// very next tick. Long enough to be a click, not long enough to be a
+    /// pitch, and the lit key blinked rather than lit. The owner: "make the
+    /// arrow audition a bit longer unless interrupted by another audition."
+    ///
+    /// Short enough that walking the keyboard does not turn into a chord —
+    /// and it cannot anyway, since the next step releases this one — and long
+    /// enough that a single press is a note somebody can name.
+    const ME_CURSOR_AUDITION_S: f64 = 0.4;
+
+    /// **Move the pitch cursor**, and sound the note it lands on so the ear
+    /// knows where the hand is. The bare up/down arrows with nothing
+    /// selected.
+    ///
+    /// **The step before it is released first**, which is the whole of
+    /// "unless interrupted by another audition": the note is now held past
+    /// the frame it started in, so walking the keyboard without this would
+    /// leave every key it passed still ringing — silent on an instrument that
+    /// decays and endless on one that does not, which is the fault
+    /// `me_hold_preview_for_the_note_just_written` records from the other
+    /// direction.
+    fn me_step_cursor(&mut self, dk: i32) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let to = (i32::from(st.cursor_key) + dk).clamp(0, 127) as u8;
+        self.me_quiet_preview();
+        self.me_audition(vec![to], true);
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.cursor_key = to;
+            st.preview_keys = vec![to];
+            st.preview_until =
+                Some(Instant::now() + Duration::from_secs_f64(Self::ME_CURSOR_AUDITION_S));
+        }
+    }
+
+    /// **Lengthen or shorten the selection by a grid step** — Shift with the
+    /// left and right arrows, the owner's "Shift+Left/Right arrow = elongate
+    /// note".
+    ///
+    /// Every selected note by the same amount rather than to the same length,
+    /// so a chord of unequal notes keeps its shape. A note can never be
+    /// shortened out of existence or lengthened past its clip's end.
+    fn me_resize_selection(&mut self, steps: f64) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let (id, sel) = (st.id, st.selected.clone());
+        if sel.is_empty() {
+            return;
+        }
+        let step = {
+            let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+                return;
+            };
+            crate::midi_editor::grid_step_s(&self.midi_edit_view(st, clip)).max(0.01)
+        };
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let end = clip.offset_s + clip.len_s;
+        for &i in &sel {
+            if let Some(n) = clip.notes.get_mut(i) {
+                let room = (end - n.at_s).max(ME_MIN_DUR_S);
+                n.dur_s = (n.dur_s + steps * step).clamp(ME_MIN_DUR_S, room);
+            }
+        }
+        self.arr_save_edits();
+    }
+
+    /// **Take the next note above or below into the selection** — Shift with
+    /// the up and down arrows, the owner's "Shift+Arrows to multi-select".
+    ///
+    /// **The axis is the split.** Shift+Left/Right is already the length, so
+    /// selection had to be the vertical pair — which is the useful one
+    /// anyway: the notes that stack on top of each other are a chord, and
+    /// building one up a note at a time is what this is for.
+    ///
+    /// A candidate has to OVERLAP the selection in time, or Shift+Up on a
+    /// melody would reach across the bar for whatever happened to be higher
+    /// somewhere else. Nearest in pitch wins, then nearest in time, so the
+    /// walk is up the chord rather than to the far end of it.
+    fn me_extend_selection(&mut self, dk: i32) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let (id, sel) = (st.id, st.selected.clone());
+        if sel.is_empty() || dk == 0 {
+            return;
+        }
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+            return;
+        };
+        let mut t0 = f64::MAX;
+        let mut t1 = f64::MIN;
+        let mut edge = if dk > 0 { i32::MIN } else { i32::MAX };
+        for &i in &sel {
+            let Some(n) = clip.notes.get(i) else { continue };
+            t0 = t0.min(n.at_s);
+            t1 = t1.max(n.at_s + n.dur_s);
+            let k = i32::from(n.key);
+            edge = if dk > 0 { edge.max(k) } else { edge.min(k) };
+        }
+        if t0 > t1 {
+            return;
+        }
+        let mut best: Option<(usize, i32, f64)> = None;
+        for (i, n) in clip.notes.iter().enumerate() {
+            if sel.contains(&i) {
+                continue;
+            }
+            let k = i32::from(n.key);
+            let beyond = if dk > 0 { k > edge } else { k < edge };
+            if !beyond || n.at_s >= t1 - 1.0e-9 || n.at_s + n.dur_s <= t0 + 1.0e-9 {
+                continue;
+            }
+            let (gap, away) = ((k - edge).abs(), (n.at_s - t0).abs());
+            if best.is_none_or(|(_, g, a)| gap < g || (gap == g && away < a)) {
+                best = Some((i, gap, away));
+            }
+        }
+        let Some((i, ..)) = best else {
+            return;
+        };
+        let key = clip.notes[i].key;
+        if let Some(st) = self.midi_edit.as_mut() {
+            // **Inserted in ORDER, not pushed.** `selected` is sorted by
+            // contract — the field says so and `me_select` keeps it that way
+            // — because the painter asks `binary_search` whether each note it
+            // draws is picked. Appending broke that the moment the note taken
+            // in had a lower index than one already held, which in a chord is
+            // most of the time: the notes are indexed in the order they were
+            // written and the one above is as often older as newer. The
+            // selection was right and INVISIBLE, until some later operation
+            // rebuilt it in order and the whole thing appeared at once. The
+            // owner: "it just doesn't show a visual indicator as notes are
+            // added in a stacked note/chordal situation. it only shows after
+            // an operation like pasting the selection."
+            if let Err(at) = st.selected.binary_search(&i) {
+                st.selected.insert(at, i);
+            }
+            st.cursor_key = key;
+        }
+        self.me_audition(vec![key], true);
+    }
+
+    /// The selection an octave up or down — Ctrl/Cmd+Alt with the up and down
+    /// arrows. Through [`Self::me_nudge`], which already clamps a whole set
+    /// against the keyboard's ends as one, so a chord straddling the top of
+    /// the range moves as far as it can and keeps its shape.
+    fn me_octave(&mut self, d: i32) {
+        self.me_nudge(0.0, d * 12);
+        self.me_cursor_follows();
+    }
+
+    /// **The cursor follows the selection.** Called after anything that moves
+    /// a note's pitch, so the next Enter starts from where the hand left off
+    /// rather than from where it last aimed.
+    fn me_cursor_follows(&mut self) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let (id, first) = (st.id, st.selected.first().copied());
+        let Some(key) = first.and_then(|i| {
+            self.arrangement
+                .clips
+                .iter()
+                .find(|c| c.id == id)
+                .and_then(|c| c.notes.get(i))
+                .map(|n| n.key)
+        }) else {
+            return;
+        };
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.cursor_key = key;
+        }
+    }
+
+    /// **Copy the selection and take it away** — the menu's Cut, and the
+    /// chord's, which had a copy and a delete and no single word for the two
+    /// of them.
+    fn me_cut_selection(&mut self) {
+        if self.midi_edit.as_ref().is_none_or(|st| st.selected.is_empty()) {
+            return;
+        }
+        self.me_copy();
+        self.me_delete_selected();
+    }
+
+    /// **Mute the selection, or unmute it.**
+    ///
+    /// One row rather than two, and the direction is decided by what is
+    /// selected: anything still audible means the press MUTES, and only a
+    /// selection that is already wholly muted comes back. A chord half muted
+    /// goes silent on the first press and returns on the second, which is
+    /// what a single toggle over a set has to mean if it is to be pressed
+    /// twice and leave things where they started.
+    fn me_toggle_mute(&mut self) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let (id, sel) = (st.id, st.selected.clone());
+        if sel.is_empty() {
+            return;
+        }
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let want = sel
+            .iter()
+            .filter_map(|&i| clip.notes.get(i))
+            .any(|n| !n.muted);
+        for &i in &sel {
+            if let Some(n) = clip.notes.get_mut(i) {
+                n.muted = want;
+            }
+        }
+        self.arr_save_edits();
+    }
+
+    /// **Cut the selection in two at the playhead** — the menu's Split, and
+    /// `S` in the editor, which is the arrangement's own key one level down:
+    /// there it splits a clip, here a note.
+    ///
+    /// Only the notes the playhead actually stands INSIDE are split, and only
+    /// where both halves would still be notes — a split a hair from an end
+    /// makes a note nobody can see and one that is imperceptibly shorter. A
+    /// selection the playhead misses entirely is left alone rather than being
+    /// cut at some other place it did not ask for.
+    ///
+    /// The heads keep the selection. The tails are new notes, which is what
+    /// makes a second Split on the same spot do nothing rather than shave
+    /// another sliver off.
+    fn me_split_selection(&mut self) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let (id, sel) = (st.id, st.selected.clone());
+        if sel.is_empty() {
+            return;
+        }
+        let at = self.playhead_s();
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let cut = clip.offset_s + (at - clip.start_s);
+        let mut tails: Vec<crate::arrangement::ArrNote> = Vec::new();
+        for &i in &sel {
+            let Some(n) = clip.notes.get_mut(i) else { continue };
+            if cut <= n.at_s + ME_MIN_DUR_S || cut >= n.at_s + n.dur_s - ME_MIN_DUR_S {
+                continue;
+            }
+            tails.push(crate::arrangement::ArrNote {
+                at_s: cut,
+                dur_s: n.at_s + n.dur_s - cut,
+                key: n.key,
+                vel: n.vel,
+                muted: n.muted,
+            });
+            n.dur_s = cut - n.at_s;
+        }
+        if tails.is_empty() {
+            return;
+        }
+        clip.notes.extend(tails);
         self.arr_save_edits();
     }
 
@@ -17186,6 +17860,19 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let sig = self.time_signature();
         let nav = self.me_nav_domain_for(st, clip);
         crate::midi_editor::MidiEditView {
+            // **Everything currently sounding, from both roads.** A press on
+            // the piano column parks its key in `down_key` and everything
+            // else — an arrow moving the pitch cursor, a note written, a note
+            // grabbed — parks in `preview_keys`; the painter wants one
+            // answer, so the two are folded here rather than at the four
+            // places that write them.
+            lit: {
+                let mut lit = [false; 128];
+                for k in st.preview_keys.iter().chain(st.down_key.iter()) {
+                    lit[usize::from(*k).min(127)] = true;
+                }
+                lit
+            },
             draw_mode: self.settings.midi_draw_mode,
             pedal: &clip.pedal,
             pedal_lane: self.settings.midi_pedal_lane,
@@ -17310,6 +17997,11 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             preview_until: None,
             last_vel: DEFAULT_VELOCITY,
             marquee: None,
+            // The middle of what the window opens on, which for an empty
+            // clip is middle C and for a written one is the part's own
+            // register — the same number the view is centred on, so the
+            // cursor starts where the eye does.
+            cursor_key: centre.round().clamp(0.0, 127.0) as u8,
         });
     }
 
@@ -18729,6 +19421,261 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// Paint the open SWG menu. Pure: the frame's own state was settled in
     /// [`Self::swing_menu_frame`].
+    /// **Open the note menu over note `i`.**
+    ///
+    /// A right-click on a note that is NOT in the selection selects it first,
+    /// and one on a note already in the selection leaves the selection alone
+    /// — the rule every desktop list uses, and the one that makes a menu
+    /// usable on a chord: right-clicking one note of six selected must act on
+    /// the six, not throw five away.
+    fn me_open_note_menu(&mut self, i: usize, panel: Rect, at: Pos2) {
+        let in_sel = self
+            .midi_edit
+            .as_ref()
+            .is_some_and(|st| st.selected.contains(&i));
+        if !in_sel {
+            self.me_select(i, false);
+        }
+        self.me_quiet_preview();
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.drag = None;
+        }
+        self.note_menu = Some(note_menu_rect(panel, at));
+    }
+
+    /// **Whether the selection is wholly muted** — what the note menu's row
+    /// says, and the direction its press will go. See [`Self::me_toggle_mute`].
+    fn me_selection_muted(&self) -> bool {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return false;
+        };
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == st.id) else {
+            return false;
+        };
+        !st.selected.is_empty()
+            && st
+                .selected
+                .iter()
+                .filter_map(|&i| clip.notes.get(i))
+                .all(|n| n.muted)
+    }
+
+    /// **The note menu's frame.** Modal over the roll while it hangs, on the
+    /// same terms as the SWG and HUMANIZE menus, and a press outside is
+    /// SWALLOWED as well as closing — see `swing_menu_frame`, which records
+    /// the hazard: an editor floating over the arrangement would otherwise
+    /// let the closing press through to the lanes underneath.
+    fn note_menu_frame(&mut self, ctx: &egui::Context, pressed: bool, pointer: Option<Pos2>) {
+        ctx.request_repaint();
+        let Some(menu) = self.note_menu else {
+            return;
+        };
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.note_menu = None;
+            return;
+        }
+        if !pressed {
+            return;
+        }
+        let Some(p) = pointer else {
+            return;
+        };
+        self.menu_ate_press = true;
+        if !menu.contains(p) {
+            self.note_menu = None;
+            return;
+        }
+        let Some(row) = (0..NOTE_MENU_ROWS.len()).find(|i| note_menu_row(menu, *i).contains(p))
+        else {
+            return;
+        };
+        match row {
+            0 => self.me_copy(),
+            1 => self.me_cut_selection(),
+            2 => self.me_paste(),
+            3 => self.me_delete_selected(),
+            4 => self.me_toggle_mute(),
+            5 => self.me_glue_selection(),
+            _ => self.me_split_selection(),
+        }
+        self.note_menu = None;
+    }
+
+    /// The note menu's picture. See [`Self::note_menu_frame`].
+    fn draw_note_menu(&self, painter: &egui::Painter, pointer: Option<Pos2>) {
+        let Some(menu) = self.note_menu else {
+            return;
+        };
+        let face = egui::Color32::from_rgb(0x24, 0x20, 0x1C);
+        let ink = egui::Color32::from_rgb(0xFF, 0xF4, 0xE0);
+        painter.rect_filled(menu, 4.0, face);
+        painter.rect_stroke(
+            menu,
+            4.0,
+            egui::Stroke::new(1.2_f32, ink.gamma_multiply(0.5)),
+            egui::StrokeKind::Inside,
+        );
+        let font = egui::FontId::new(12.0, crate::fonts::courier());
+        // **Paste is live with nothing selected**, and everything else is
+        // not: a menu opened on a note always has one, but the clipboard is
+        // the one row whose subject is not the selection.
+        let has_sel = self
+            .midi_edit
+            .as_ref()
+            .is_some_and(|st| !st.selected.is_empty());
+        let pastable = !self.note_clipboard.is_empty();
+        let muted = self.me_selection_muted();
+        for (i, label) in NOTE_MENU_ROWS.iter().enumerate() {
+            let r = note_menu_row(menu, i);
+            let live = match i {
+                2 => pastable,
+                5 => self.midi_edit.as_ref().is_some_and(|st| st.selected.len() >= 2),
+                _ => has_sel,
+            };
+            if pointer.is_some_and(|p| r.contains(p)) && live {
+                painter.rect_filled(r, 3.0, ink.gamma_multiply(0.18));
+            }
+            // Mute's row says which way the press will go, the insert menu's
+            // BYPASS FX rule: a row that always reads the same is a row that
+            // has to be pressed to find out what it does.
+            let word = if i == 4 && muted { "Unmute" } else { *label };
+            painter.text(
+                Pos2::new(r.left() + 10.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                word,
+                font.clone(),
+                if live { ink } else { ink.gamma_multiply(0.35) },
+            );
+        }
+    }
+
+    /// **The HUMANIZE menu's frame**: two tracks and a press that does it.
+    ///
+    /// Modal over the roll while it hangs, exactly as the SWG menu is, and a
+    /// press outside is SWALLOWED as well as closing — see
+    /// `swing_menu_frame`'s note, which is the same hazard: an editor
+    /// floating over the arrangement would otherwise let the closing press
+    /// through to the lanes underneath.
+    fn humanize_menu_frame(&mut self, ctx: &egui::Context, pressed: bool, pointer: Option<Pos2>) {
+        ctx.request_repaint();
+        let Some(menu) = self.humanize_menu else {
+            return;
+        };
+        // Escape closes without doing anything, the way every other little
+        // menu over this roll gives up.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.humanize_menu = None;
+            return;
+        }
+        // **Enter is the same press as APPLY**, because H is a keyboard
+        // gesture and finishing one on the mouse is a change of hands.
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            self.humanize_apply();
+            return;
+        }
+        if !pressed {
+            return;
+        }
+        let Some(p) = pointer else {
+            return;
+        };
+        if !menu.contains(p) {
+            self.humanize_menu = None;
+            self.menu_ate_press = true;
+            return;
+        }
+        self.menu_ate_press = true;
+        for (row, timing) in [(0usize, true), (1, false)] {
+            let track = humanize_menu_track(humanize_menu_row(menu, row));
+            if !humanize_menu_row(menu, row).contains(p) || !track.is_positive() {
+                continue;
+            }
+            let pct = (((p.x - track.left()) / track.width()).clamp(0.0, 1.0) * 100.0).round();
+            let pct = pct as u8;
+            if timing {
+                self.settings.midi_humanize_timing = pct;
+            } else {
+                self.settings.midi_humanize_vel = pct;
+            }
+            self.save_settings();
+            return;
+        }
+        if humanize_menu_row(menu, 2).contains(p) {
+            self.humanize_apply();
+        }
+    }
+
+    /// Do it, and close. The seed is the clock, so pressing H twice on the
+    /// same notes gives two different hands rather than the same one twice.
+    fn humanize_apply(&mut self) {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0x9E37_79B9_7F4A_7C15, |d| d.as_nanos() as u64);
+        let (t, v) = (
+            self.settings.midi_humanize_timing,
+            self.settings.midi_humanize_vel,
+        );
+        self.me_humanize(t, v, seed);
+        self.humanize_menu = None;
+    }
+
+    /// The HUMANIZE menu's picture. See [`Self::humanize_menu_frame`].
+    fn draw_humanize_menu(&self, painter: &egui::Painter, pointer: Option<Pos2>) {
+        let Some(menu) = self.humanize_menu else {
+            return;
+        };
+        let face = egui::Color32::from_rgb(0x24, 0x20, 0x1C);
+        let ink = egui::Color32::from_rgb(0xFF, 0xF4, 0xE0);
+        painter.rect_filled(menu, 4.0, face);
+        painter.rect_stroke(
+            menu,
+            4.0,
+            egui::Stroke::new(1.2_f32, ink.gamma_multiply(0.5)),
+            egui::StrokeKind::Inside,
+        );
+        let font = egui::FontId::new(13.0, crate::fonts::courier());
+        for (i, label, pct) in [
+            (0usize, "TIMING", self.settings.midi_humanize_timing),
+            (1, "VELOCITY", self.settings.midi_humanize_vel),
+        ] {
+            let r = humanize_menu_row(menu, i);
+            painter.text(
+                Pos2::new(r.left() + 6.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                font.clone(),
+                ink.gamma_multiply(0.55),
+            );
+            let track = humanize_menu_track(r);
+            painter.rect_filled(track, 2.0, ink.gamma_multiply(0.14));
+            let w = track.width() * f32::from(pct.min(100)) / 100.0;
+            if w > 0.5 {
+                painter.rect_filled(
+                    Rect::from_min_size(track.min, Vec2::new(w, track.height())),
+                    2.0,
+                    ink.gamma_multiply(0.62),
+                );
+            }
+            painter.text(
+                Pos2::new(r.right() - 6.0, r.center().y),
+                egui::Align2::RIGHT_CENTER,
+                format!("{pct}%"),
+                font.clone(),
+                ink,
+            );
+        }
+        let r = humanize_menu_row(menu, 2);
+        let hot = pointer.is_some_and(|p| r.contains(p));
+        painter.rect_filled(r.shrink2(Vec2::new(0.0, 5.0)), 3.0, ink.gamma_multiply(if hot { 0.24 } else { 0.12 }));
+        painter.text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            "HUMANIZE",
+            font,
+            ink,
+        );
+    }
+
     fn draw_swing_menu(&self, painter: &egui::Painter, pointer: Option<Pos2>) {
         let Some(menu) = self.swing_menu.as_ref() else {
             return;
@@ -19010,6 +19957,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // this too, harmlessly: there is no press for it to spend.
         self.menu_ate_press = true;
         self.swing_menu = None;
+        self.humanize_menu = None;
+        self.note_menu = None;
         if let Some(st) = self.midi_edit.as_ref() {
             let mut quiet = st.preview_keys.clone();
             if let Some(key) = st.down_key {
@@ -19219,6 +20168,21 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if self.swing_menu.take().is_some() {
                 return;
             }
+            // **Escape LETS GO before it leaves**, which is what puts the bare
+            // arrows back on the playhead after a note has been laid or picked
+            // up — see the arrows' note in `midi_editor_input`. Without the
+            // step the only way out of a selection is the mouse, and a
+            // keyboard editor with a mouse in the middle of it is not one.
+            //
+            // An escalation rather than a second key: one press drops the
+            // selection, the next closes the editor, which is the order
+            // somebody in trouble presses it in anyway.
+            if self.midi_edit.as_ref().is_some_and(|st| !st.selected.is_empty()) {
+                if let Some(st) = self.midi_edit.as_mut() {
+                    st.selected.clear();
+                }
+                return;
+            }
             self.close_midi_editor();
             return;
         }
@@ -19267,11 +20231,23 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.swing_menu_frame(ctx, pressed, pointer);
             return;
         }
+        // ── and HUMANIZE's, on the same terms ────────────────────────────
+        if self.humanize_menu.is_some() {
+            self.humanize_menu_frame(ctx, pressed, pointer);
+            return;
+        }
+        // ── and the NOTE menu's ─────────────────────────────────────────
+        if self.note_menu.is_some() {
+            self.note_menu_frame(ctx, pressed, pointer);
+            return;
+        }
 
         // ── the keys the editor owns while the hand is on it ─────────────
         let keys_ok = !self.dialog_blocks_keys(ctx)
             && self.menu_state.is_none()
             && self.swing_menu.is_none()
+            && self.humanize_menu.is_none()
+            && self.note_menu.is_none()
             && !self.text_entry_active();
         if keys_ok && over {
             // **N puts the pen down and picks it up again.** The editor's
@@ -19294,6 +20270,53 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // step later. The arrows nudge — a step along, a semitone up.
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Q)) {
                 self.me_quantise();
+            }
+            // **H hangs the HUMANIZE menu** — the owner's "a midi editor
+            // command H for humanize - Timing percentage change, Velocity
+            // percentage change". A menu rather than a bare apply, because
+            // the two amounts ARE the command: humanizing a hi-hat and
+            // humanizing a pad want different numbers, and a key that used
+            // whatever was set last with nothing on screen saying what that
+            // was would be a key nobody trusts. The amounts are remembered,
+            // so the second part costs one more press than the first.
+            // **Shift+H, and the shift is not a preference.** Bare `H` is
+            // HELD for the shortcut card, and the editor has a card of its
+            // own — "MIDI EDITOR PANEL" — so taking the letter outright cost
+            // the one surface whose card is hardest to do without.
+            //
+            // **Cmd+H was the obvious sidestep and is not available.** winit
+            // installs the standard macOS application menu, whose "Hide
+            // Tangent" item carries the key equivalent Cmd+H (and Cmd+Shift+H
+            // for Hide Others), and `-[NSMenu performKeyEquivalent:]` eats
+            // both before winit sees a key at all — the same road Cmd+Q takes,
+            // written down in `macwin.rs`'s quit hook. Bound there, Humanize
+            // would have hidden the app.
+            if ctx.input(|i| {
+                i.modifiers.shift
+                    && !i.modifiers.command
+                    && !i.modifiers.ctrl
+                    && !i.modifiers.alt
+                    && i.key_pressed(egui::Key::H)
+            }) {
+                self.humanize_menu = Some(humanize_menu_rect(rect, pointer));
+            }
+            // **J joins and S splits**, the two the owner named beside their
+            // menu rows: "join should also be mapped to j and split should
+            // work with s in midi editor". S is the arrangement's own key one
+            // level down — there it splits a clip, here a note — and the
+            // editor's keys only answer while the hand is over the roll, so
+            // the two never both hear a press.
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::J)) {
+                self.me_glue_selection();
+            }
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::S)) {
+                self.me_split_selection();
+            }
+            // **M mutes the selection**, the menu's row on a key — the owner:
+            // "Add M to mute the midi notes". Elsewhere M is the metronome,
+            // and it stands down over the roll the way S, J and Z do.
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::M)) {
+                self.me_toggle_mute();
             }
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Z)) {
                 self.me_fit_clip();
@@ -19363,18 +20386,98 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             if paste_ev {
                 self.me_paste();
             }
-            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::ArrowLeft)) {
-                self.me_nudge(-1.0, 0);
+            // ── THE ARROWS, which are the whole keyboard editor ──────────
+            //
+            // The owner: "a system where-in proper arrow controls can be used
+            // to create and edit midi clips intuitively, and from the
+            // beginning to the end."
+            //
+            // **One key, two jobs, and WHAT IS SELECTED decides which** —
+            // which is the same grammar the rest of the app uses (Ctrl+C
+            // takes the clips when clips are chosen and the track when none
+            // are). With a note in hand the bare arrows EDIT it: a step
+            // along, a semitone up. With nothing in hand they DRIVE: the
+            // playhead along the clip, the pitch cursor up the keyboard. So
+            // the same four keys carry both halves of "create and edit"
+            // without a mode to be in the wrong one of.
+            //
+            // **Shift splits by axis.** Left and right are the note's LENGTH
+            // — the owner's "Shift+Left/Right arrow = elongate note" — so up
+            // and down are what is left for "Shift+Arrows to multi-select",
+            // and vertical is the useful direction for it anyway: the notes
+            // stacked on one another are a chord, and Shift+Up builds one a
+            // note at a time.
+            //
+            // **Cmd+Alt is the octave**, both arrows, per the owner's ask.
+            // Read before the bare arrows below and with its own modifier
+            // test, because egui reports a chord as every key that is down.
+            let (shift_k, cmd_k, alt_k) =
+                ctx.input(|i| (i.modifiers.shift, i.modifiers.command, i.modifiers.alt));
+            let bare = !shift_k && !cmd_k && !alt_k;
+            let octave = (cmd_k || ctx.input(|i| i.modifiers.ctrl)) && alt_k;
+            let arrow = |k: egui::Key| ctx.input(|i| i.key_pressed(k));
+            if octave {
+                if arrow(egui::Key::ArrowUp) {
+                    self.me_octave(1);
+                }
+                if arrow(egui::Key::ArrowDown) {
+                    self.me_octave(-1);
+                }
+            } else if shift_k {
+                if arrow(egui::Key::ArrowLeft) {
+                    self.me_resize_selection(-1.0);
+                }
+                if arrow(egui::Key::ArrowRight) {
+                    self.me_resize_selection(1.0);
+                }
+                if arrow(egui::Key::ArrowUp) {
+                    self.me_extend_selection(1);
+                }
+                if arrow(egui::Key::ArrowDown) {
+                    self.me_extend_selection(-1);
+                }
+            } else if bare {
+                let holding = self
+                    .midi_edit
+                    .as_ref()
+                    .is_some_and(|st| !st.selected.is_empty());
+                if arrow(egui::Key::ArrowLeft) {
+                    if holding {
+                        self.me_nudge(-1.0, 0);
+                    } else {
+                        self.me_step_playhead(-1.0);
+                    }
+                }
+                if arrow(egui::Key::ArrowRight) {
+                    if holding {
+                        self.me_nudge(1.0, 0);
+                    } else {
+                        self.me_step_playhead(1.0);
+                    }
+                }
+                if arrow(egui::Key::ArrowUp) {
+                    if holding {
+                        self.me_nudge(0.0, 1);
+                        self.me_cursor_follows();
+                    } else {
+                        self.me_step_cursor(1);
+                    }
+                }
+                if arrow(egui::Key::ArrowDown) {
+                    if holding {
+                        self.me_nudge(0.0, -1);
+                        self.me_cursor_follows();
+                    } else {
+                        self.me_step_cursor(-1);
+                    }
+                }
             }
-            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::ArrowRight)) {
-                self.me_nudge(1.0, 0);
+            // **Enter writes a note where the two cursors cross**, and walks
+            // the playhead past it so the next press lands after this one.
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Enter)) {
+                self.me_insert_at_playhead();
             }
-            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::ArrowUp)) {
-                self.me_nudge(0.0, 1);
-            }
-            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::ArrowDown)) {
-                self.me_nudge(0.0, -1);
-            }
+
             if ctx.input(|i| {
                 i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
             }) {
@@ -19781,8 +20884,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             return;
                         }
                         if secondary {
-                            self.me_delete_note(i);
-                            self.me_quiet_preview();
+                            // **The right button opens the note's MENU now**,
+                            // where it used to erase on the spot. The owner
+                            // asked for "right click to midi notes
+                            // themselves: Copy, Cut, Paste, Delete, Mute, and
+                            // Join/Split", and Delete is one of its rows — so
+                            // the old gesture is still there, one press
+                            // further in and named.
+                            self.me_open_note_menu(i, rect, p);
                         } else {
                             self.me_select(i, shift);
                             let in_sel = self
@@ -19841,7 +20950,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                     Some(H::NoteRight(i)) => {
                         if secondary {
-                            self.me_delete_note(i);
+                            self.me_open_note_menu(i, rect, p);
                         } else if shift {
                             // Shift from the TAIL: the selection STRETCHES,
                             // the head end standing still.
@@ -19853,7 +20962,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     }
                     Some(H::NoteLeft(i)) => {
                         if secondary {
-                            self.me_delete_note(i);
+                            self.me_open_note_menu(i, rect, p);
                         } else if shift {
                             // Shift from the HEAD: the stretch anchored at
                             // the selection's far end.
@@ -24000,13 +25109,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
             return;
         };
+        // **A MIDI part carries no file, so there is nothing to arm** — and
+        // nothing to SAY about it either. This used to raise "That is a MIDI
+        // part, not a sample", which the owner retired: "I'm not [sure] that
+        // message is actually useful in any way." It answered a question
+        // nobody asked, since a drag that does nothing is already the whole
+        // answer, and it arrived on the one gesture most likely to be a slip
+        // of the hand.
         if clip.kind == crate::arrangement::ClipKind::Midi {
-            self.notify_insist(
-                "clip-drag-is-midi",
-                crate::notify::Kind::Info,
-                "That is a MIDI part, not a sample - it has no sound of its own. \
-                 Bounce it to a take first, then drag the take.",
-            );
             return;
         }
         let path = clip.path.clone();
@@ -30456,6 +31566,14 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.dialog = None;
                 self.paste_track(lane);
             }
+            DialogAction::TrackInsert(lane) => {
+                self.dialog = None;
+                self.insert_track_below(lane);
+            }
+            DialogAction::TrackPasteBelow(lane) => {
+                self.dialog = None;
+                self.paste_track_below(lane);
+            }
             // **The whole lane**, which is the argument on the variant: the
             // door that was opened was the track's. The dialog closes first,
             // because what follows it is a native save panel and one of those
@@ -32811,7 +33929,20 @@ impl TangentApp {
                 } else if editor_focus && action == keys::KeyAction::ShowSupporterKey {
                     // S is the arrangement's SPLIT — cutting a clip you
                     // cannot see, under the editor, is a footgun; the key
-                    // waits until the hand leaves the popup.
+                    // waits until the hand leaves the popup. The editor
+                    // SPENDS it, on the note under the playhead.
+                } else if editor_focus && action == keys::KeyAction::ManageTaughtChords {
+                    // **M is the editor's MUTE**, spent in
+                    // `midi_editor_input`. On the desk surfaces this is the
+                    // metronome; letting it through here would have started
+                    // the click on every note somebody silenced.
+                } else if editor_focus && action == keys::KeyAction::ToggleReaderMode {
+                    // **J is the editor's JOIN**, spent in
+                    // `midi_editor_input`. Nothing consumes an egui key, so
+                    // without this arm one press over the roll glued the
+                    // selected notes AND put the whole app into reader mode
+                    // — which is the fault the `TeachChordName` arm above
+                    // records, arriving the same way twice.
                 } else if editor_focus
                     && matches!(
                         action,
@@ -34081,6 +35212,8 @@ impl TangentApp {
                         self.midi_edit_rect = Some(r);
                         let at = ui.ctx().input(|i| i.pointer.interact_pos());
                         self.draw_swing_menu(ui.painter(), at);
+                        self.draw_humanize_menu(ui.painter(), at);
+                        self.draw_note_menu(ui.painter(), at);
                     }
                 }
             }
@@ -34567,7 +35700,14 @@ impl TangentApp {
                 }
                 if paste_ev {
                     if let Some(n) = self.selected_channel {
-                        self.paste_track(n);
+                        // **Through the one decision**, so the chord and the
+                        // menu row land the copy in the same place: an empty
+                        // slot receives it, a live track keeps its life and
+                        // the copy arrives under it. This called
+                        // `paste_track` straight, which overwrote whatever
+                        // was selected — the mixer had no empty-slot guard
+                        // the arrangement's Ctrl+V has always had.
+                        self.paste_track_at(n);
                     }
                 }
                 if cut_ev {
@@ -35123,7 +36263,13 @@ impl TangentApp {
             &ctx,
             !self.dialog_blocks_keys(&ctx)
                 && self.menu_state.is_none()
-                && !self.text_entry_active(),
+                && !self.text_entry_active()
+                // Not over an open HUMANIZE menu, which is modal: a card
+                // sliding over the menu somebody just opened is two surfaces
+                // answering one hand. The ROLL itself no longer stands the
+                // card down — Humanize took Shift+H so that it would not have
+                // to; see the binding in `midi_editor_input`.
+                && self.humanize_menu.is_none(),
         );
         if help > 0.0 {
             let face = self.panel_face();
@@ -36492,6 +37638,7 @@ mod tests {
             dur_s: 0.5,
             key: 60,
             vel: 96,
+        muted: false,
         };
         let rec = |lane: usize, len_s: f64, path: Option<&str>, notes: Vec<crate::arrangement::ArrNote>| {
             crate::arrangement::RecordedClip {
@@ -36539,6 +37686,576 @@ mod tests {
 
     /// **The editor works on SETS now.** Select-all takes every note;
     /// quantise puts their starts on the grid; duplicate lays the copies
+    /// **A cursor step is held, and the step after it takes over cleanly.**
+    ///
+    /// Two things that have to be true together. The note has to OUTLAST the
+    /// frame it started in — it did not, and a preview with no deadline is
+    /// read as one a hand is holding, so with no button down it was released
+    /// on the next tick and the owner got a click rather than a pitch. And
+    /// the step after it has to RELEASE the one before, or holding the note
+    /// longer turns walking the keyboard into a stuck chord: silent on an
+    /// instrument that decays, endless on one that does not.
+    ///
+    /// Revert checks performed: drop the deadline and the first half fails
+    /// with the note already gone; drop the `me_quiet_preview` and the second
+    /// half fails with two keys lit at once.
+    #[test]
+    fn a_cursor_step_is_held_and_the_next_one_takes_over() {
+        let root = project_scratch("me-cursor-hold");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 1,
+            len_s: 4.0,
+            name: "MIDI".to_owned(),
+            ..Default::default()
+        });
+        app.open_midi_editor(id);
+
+        app.me_step_cursor(1);
+        let first = app.midi_edit.as_ref().unwrap().cursor_key;
+        // **It has a deadline, and the deadline is in the future.** Without
+        // one, `me_preview_tick` treats it as hand-held and drops it at once.
+        let until = app
+            .midi_edit
+            .as_ref()
+            .unwrap()
+            .preview_until
+            .expect("the cursor step set no deadline");
+        assert!(until > Instant::now(), "the step expired before it sounded");
+        assert_eq!(app.midi_edit.as_ref().unwrap().preview_keys, vec![first]);
+
+        // **The next step RELEASES the one before it**, and that is asked of
+        // the instrument rather than of `preview_keys` — which the step
+        // overwrites either way, and so cannot tell a released note from a
+        // forgotten one. This half of the test passed a revert until it was
+        // asked the right question.
+        app.recorder_request.clear();
+        app.me_step_cursor(1);
+        let second = app.midi_edit.as_ref().unwrap().cursor_key;
+        assert_eq!(second, first + 1);
+        let mut sent: Vec<(Vec<u8>, bool)> = Vec::new();
+        while let Some(r) = app.take_recorder_request() {
+            if let recorder::RecorderRequest::Audition { notes, on } = r {
+                sent.push((notes, on));
+            }
+        }
+        assert!(
+            sent.contains(&(vec![first], false)),
+            "the step before it was never released: {sent:?}"
+        );
+        assert!(
+            sent.contains(&(vec![second], true)),
+            "the new step never sounded: {sent:?}"
+        );
+        // The release comes FIRST, or the instrument is handed an overlap it
+        // has to resolve on its own.
+        let off = sent.iter().position(|(n, on)| n == &vec![first] && !on);
+        let on = sent.iter().position(|(n, on)| n == &vec![second] && *on);
+        assert!(off < on, "the new note sounded before the old one let go: {sent:?}");
+        assert_eq!(app.midi_edit.as_ref().unwrap().preview_keys, vec![second]);
+        assert!(
+            app.midi_edit.as_ref().unwrap().preview_until.is_some(),
+            "the second step lost its deadline"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Both audition roads reach the picture.**
+    ///
+    /// The painter lights whatever `MidiEditView::lit` says, and the whole
+    /// fault was that nothing filled it. There are two places a sounding key
+    /// is recorded — `down_key` for a press on the piano column, and
+    /// `preview_keys` for everything else — so a fold that read one of them
+    /// would light the clicks and not the arrows, or the arrows and not the
+    /// clicks, which is exactly the half-fix the owner would have found.
+    #[test]
+    fn a_sounding_key_reaches_the_view_from_either_road() {
+        let root = project_scratch("me-lit");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 1,
+            len_s: 4.0,
+            name: "MIDI".to_owned(),
+            ..Default::default()
+        });
+        app.open_midi_editor(id);
+        let lit_now = |app: &TangentApp| -> Vec<usize> {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == st.id).unwrap();
+            let v = app.midi_edit_view(st, clip);
+            (0..128).filter(|k| v.lit[*k]).collect()
+        };
+        assert!(lit_now(&app).is_empty(), "a resting editor lit a key");
+
+        // The ARROW road: moving the pitch cursor sounds the key it lands on.
+        app.me_step_cursor(1);
+        let key = usize::from(app.midi_edit.as_ref().unwrap().cursor_key);
+        assert_eq!(lit_now(&app), vec![key], "the arrow's note did not light");
+
+        // The CLICK road, which parks somewhere else entirely.
+        app.midi_edit.as_mut().unwrap().preview_keys.clear();
+        app.midi_edit.as_mut().unwrap().down_key = Some(40);
+        assert_eq!(lit_now(&app), vec![40], "a pressed key did not light");
+
+        // And both at once, which is a hand on the keys while a chord rings.
+        app.midi_edit.as_mut().unwrap().preview_keys = vec![60, 64];
+        assert_eq!(lit_now(&app), vec![40, 60, 64], "the two roads did not add up");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The note menu's three new verbs**: Cut, Mute and Split.
+    ///
+    /// The owner: "add right click to midi notes themselves: Copy, Cut,
+    /// Paste, Delete, Mute, and Join/Split (join should also be mapped to j
+    /// and split should work with s in midi editor". Copy, Paste, Delete and
+    /// Join already existed and are tested where they live; these three are
+    /// new, and each has a corner worth pinning.
+    #[test]
+    fn a_note_can_be_cut_muted_and_split() {
+        let root = project_scratch("me-notemenu");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.midi_grid_exp = -4;
+        let note = |at: f64, dur: f64, key: u8| crate::arrangement::ArrNote {
+            at_s: at,
+            dur_s: dur,
+            key,
+            vel: 90,
+            muted: false,
+        };
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![note(0.0, 1.0, 60), note(2.0, 1.0, 64)],
+            lane: 1,
+            start_s: 0.0,
+            len_s: 8.0,
+            name: "MIDI".to_owned(),
+            ..Default::default()
+        });
+        app.open_midi_editor(id);
+
+        // ── MUTE toggles over the set, and it is a DOCUMENT change ───
+        app.me_select_all();
+        app.me_toggle_mute();
+        assert!(
+            app.arrangement.clips[0].notes.iter().all(|n| n.muted),
+            "the selection did not mute"
+        );
+        // **A muted note is not scheduled**, which is the whole point of it —
+        // asked of the one walk every road to sound goes through.
+        assert!(
+            crate::arrangement::clip_notes_in_song_time(&app.arrangement.clips[0]).is_empty(),
+            "a muted note reached the schedule"
+        );
+        app.me_toggle_mute();
+        assert!(
+            app.arrangement.clips[0].notes.iter().all(|n| !n.muted),
+            "a second press did not bring it back"
+        );
+        // **A HALF-muted selection goes silent first.** A toggle over a set
+        // has to pick a direction, and "anything still audible means mute" is
+        // the one that leaves things where they started after two presses.
+        app.arrangement.clips[0].notes[0].muted = true;
+        app.me_toggle_mute();
+        assert!(
+            app.arrangement.clips[0].notes.iter().all(|n| n.muted),
+            "a half-muted chord came back instead of going quiet"
+        );
+        app.me_toggle_mute();
+        assert!(app.arrangement.clips[0].notes.iter().all(|n| !n.muted));
+
+        // ── SPLIT cuts at the playhead, and only where it stands ─────
+        app.midi_edit.as_mut().unwrap().selected = vec![0, 1];
+        app.recorder.position_s = 0.5;
+        app.me_split_selection();
+        let notes = &app.arrangement.clips[0].notes;
+        assert_eq!(notes.len(), 3, "split made {} notes from two", notes.len());
+        // The note the playhead stood in became two halves that meet.
+        assert!((notes[0].dur_s - 0.5).abs() < 1e-9, "the head is {}", notes[0].dur_s);
+        let tail = notes.iter().find(|n| (n.at_s - 0.5).abs() < 1e-9).expect("no tail");
+        assert!((tail.dur_s - 0.5).abs() < 1e-9);
+        assert_eq!(tail.key, 60, "the tail is a different note");
+        // The one the playhead missed is untouched — a split does not reach
+        // across the selection for somewhere else to cut.
+        let far = notes.iter().find(|n| n.key == 64).expect("the far note went");
+        assert!((far.dur_s - 1.0).abs() < 1e-9, "an untouched note was cut");
+
+        // A split with the playhead off every note does nothing at all.
+        let before = app.arrangement.clips[0].notes.len();
+        app.recorder.position_s = 6.0;
+        app.me_select_all();
+        app.me_split_selection();
+        assert_eq!(app.arrangement.clips[0].notes.len(), before, "split cut thin air");
+        // And one a hair from an end makes no slivers.
+        app.recorder.position_s = 2.0 + 1.0e-4;
+        app.me_split_selection();
+        assert_eq!(app.arrangement.clips[0].notes.len(), before, "split made a sliver");
+
+        // ── CUT is a copy and a delete, in that order ────────────────
+        app.midi_edit.as_mut().unwrap().selected = vec![0];
+        let taken = app.arrangement.clips[0].notes[0].key;
+        app.me_cut_selection();
+        assert_eq!(
+            app.arrangement.clips[0].notes.len(),
+            before - 1,
+            "cut did not remove the note"
+        );
+        app.me_paste();
+        assert!(
+            app.arrangement.clips[0].notes.iter().any(|n| n.key == taken),
+            "cut did not leave the note on the clipboard"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A clip can be written and edited from the keyboard alone**, which is
+    /// the owner's ask in one sentence: "a system where-in proper arrow
+    /// controls can be used to create and edit midi clips intuitively, and
+    /// from the beginning to the end."
+    ///
+    /// Driven as a SESSION rather than as five separate calls, because the
+    /// thing being tested is that the pieces hand over to each other — the
+    /// cursor the playhead leaves behind, the selection Enter hands to the
+    /// resize, the pitch the arrows hand to the next Enter. Any one of them
+    /// works alone and the workflow is still broken if the handovers are not
+    /// there.
+    ///
+    /// Revert checks performed: stop `me_insert_at_playhead` advancing the
+    /// playhead and the second note lands on top of the first; drop
+    /// `me_cursor_follows` from the bare up arrow and the third note comes
+    /// back at the first note's pitch.
+    #[test]
+    fn a_clip_can_be_written_and_edited_from_the_keyboard() {
+        let root = project_scratch("me-keyboard");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        // A sixteenth at 120 bpm: 0.125 s.
+        app.settings.midi_grid_exp = -4;
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 1,
+            path: String::new(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 4.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        app.open_midi_editor(id);
+        app.recorder.position_s = 0.0;
+        // An empty clip opens on middle C, which is where the cursor starts.
+        assert_eq!(app.midi_edit.as_ref().unwrap().cursor_key, 60);
+
+        // ── ENTER writes, and the playhead walks on ──────────────────
+        app.me_insert_at_playhead();
+        app.me_insert_at_playhead();
+        let notes = &app.arrangement.clips[0].notes;
+        assert_eq!(notes.len(), 2, "two presses did not write two notes");
+        assert!(
+            (notes[1].at_s - notes[0].at_s - notes[0].dur_s).abs() < 1e-9,
+            "the second note landed at {} rather than after the first",
+            notes[1].at_s
+        );
+        assert_eq!(notes[0].key, 60);
+        assert_eq!(notes[1].key, 60);
+
+        // ── the bare arrows EDIT while a note is in hand, and the ────
+        //    cursor comes with them
+        app.me_nudge(0.0, 1);
+        app.me_cursor_follows();
+        assert_eq!(app.arrangement.clips[0].notes[1].key, 61, "the note did not move");
+        assert_eq!(
+            app.midi_edit.as_ref().unwrap().cursor_key,
+            61,
+            "the cursor did not follow the note it just moved"
+        );
+        // So the NEXT note is written at the pitch the hand left off at.
+        app.me_insert_at_playhead();
+        assert_eq!(
+            app.arrangement.clips[0].notes[2].key,
+            61,
+            "the third note ignored where the hand was"
+        );
+
+        // ── SHIFT+LEFT/RIGHT is the length ───────────────────────────
+        let was = app.arrangement.clips[0].notes[2].dur_s;
+        app.me_resize_selection(1.0);
+        let now = app.arrangement.clips[0].notes[2].dur_s;
+        assert!((now - was - 0.125).abs() < 1e-9, "a step longer made it {now} from {was}");
+        app.me_resize_selection(-1.0);
+        assert!(
+            (app.arrangement.clips[0].notes[2].dur_s - was).abs() < 1e-9,
+            "shorten did not undo lengthen"
+        );
+        // And it cannot be shortened out of existence.
+        for _ in 0..40 {
+            app.me_resize_selection(-1.0);
+        }
+        assert!(
+            app.arrangement.clips[0].notes[2].dur_s >= ME_MIN_DUR_S - 1e-9,
+            "a note was shortened to nothing"
+        );
+
+        // ── CMD+ALT+UP/DOWN is the octave ────────────────────────────
+        let before = app.arrangement.clips[0].notes[2].key;
+        app.me_octave(1);
+        assert_eq!(app.arrangement.clips[0].notes[2].key, before + 12, "not an octave");
+        app.me_octave(-1);
+        assert_eq!(app.arrangement.clips[0].notes[2].key, before);
+
+        // ── SHIFT+UP takes the note above into the selection ─────────
+        //
+        // The first two notes are a second apart in TIME, so neither is a
+        // candidate for the third; a note stacked on it is. That is the
+        // point of the overlap test — without it this would reach across
+        // the clip for whatever happened to be higher somewhere else.
+        let at = app.arrangement.clips[0].notes[2].at_s;
+        let dur = app.arrangement.clips[0].notes[2].dur_s;
+        // **The chord's upper notes are given LOWER indices than the one in
+        // hand**, which is the case that found the fault. `selected` is
+        // sorted by contract and the roll asks `binary_search` whether each
+        // note it draws is picked, so a selection APPENDED to rather than
+        // inserted into is right and invisible. Notes are indexed in the
+        // order they were written, and in a real chord the note above is as
+        // often the older one as the newer — which is why the owner met this
+        // and a test that stacked its chord on top did not: "it just doesn't
+        // show a visual indicator as notes are added in a stacked note /
+        // chordal situation. it only shows after an operation like pasting
+        // the selection."
+        let anchor = app.arrangement.clips[0].notes.remove(2);
+        for key in [before + 7, before + 4] {
+            app.arrangement.clips[0].notes.insert(
+                0,
+                crate::arrangement::ArrNote {
+                    at_s: at,
+                    dur_s: dur,
+                    key,
+                    vel: 90,
+                    muted: false,
+                },
+            );
+        }
+        app.arrangement.clips[0].notes.push(anchor);
+        let held = app.arrangement.clips[0].notes.len() - 1;
+        app.midi_edit.as_mut().unwrap().selected = vec![held];
+
+        let keys_of = |app: &TangentApp| -> Vec<u8> {
+            let st = app.midi_edit.as_ref().unwrap();
+            let clip = app.arrangement.clips.iter().find(|c| c.id == st.id).unwrap();
+            let mut k: Vec<u8> = st
+                .selected
+                .iter()
+                .filter_map(|&i| clip.notes.get(i))
+                .map(|n| n.key)
+                .collect();
+            k.sort_unstable();
+            k
+        };
+        // **The invariant the picture stands on**, asserted every step: a
+        // selection out of order draws as though the notes were never taken.
+        let sorted = |app: &TangentApp| {
+            app.midi_edit.as_ref().unwrap().selected.windows(2).all(|w| w[0] < w[1])
+        };
+
+        app.me_extend_selection(1);
+        assert_eq!(
+            keys_of(&app),
+            vec![before, before + 4],
+            "it reached past the nearer note"
+        );
+        assert!(sorted(&app), "the selection came back out of order: the roll cannot draw it");
+        app.me_extend_selection(1);
+        assert_eq!(
+            keys_of(&app),
+            vec![before, before + 4, before + 7],
+            "the chord did not build"
+        );
+        assert!(sorted(&app), "the selection came back out of order");
+        // Nothing above the top: the walk stops rather than wrapping.
+        app.me_extend_selection(1);
+        assert_eq!(
+            app.midi_edit.as_ref().unwrap().selected.len(),
+            3,
+            "it took a note that is not above the chord"
+        );
+
+        // ── and with NOTHING in hand the arrows drive ────────────────
+        app.midi_edit.as_mut().unwrap().selected.clear();
+        app.recorder.position_s = 0.0;
+        app.me_step_playhead(1.0);
+        assert!(
+            (app.playhead_s() - 0.125).abs() < 1e-9,
+            "the playhead stepped to { }",
+            app.playhead_s()
+        );
+        let key = app.midi_edit.as_ref().unwrap().cursor_key;
+        app.me_step_cursor(1);
+        assert_eq!(
+            app.midi_edit.as_ref().unwrap().cursor_key,
+            key + 1,
+            "the pitch cursor did not move with nothing selected"
+        );
+        // The playhead cannot be walked out of its clip.
+        for _ in 0..200 {
+            app.me_step_playhead(1.0);
+        }
+        assert!(app.playhead_s() <= 4.0 + 1e-9, "walked past the clip's end");
+        for _ in 0..400 {
+            app.me_step_playhead(-1.0);
+        }
+        assert!(app.playhead_s() >= -1e-9, "walked behind the clip's start");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **HUMANIZE pulls the selection off the grid and off its velocities**,
+    /// by no more than the two percentages allow, and never out of the clip.
+    ///
+    /// The owner: "a midi editor command H for humanize - Timing percentage
+    /// change, Velocity percentage change."
+    ///
+    /// A random operation is tested by its BOUNDS and its invariants rather
+    /// than by pinning the numbers a particular seed happens to give: the
+    /// seed is an implementation detail, and a test that spells out its
+    /// output would fail the day the generator is touched while saying
+    /// nothing about whether humanizing still works.
+    ///
+    /// Three properties, and each one is a way this has been got wrong:
+    /// something has to MOVE (a version reading the percentages the wrong way
+    /// round moved nothing at all); nothing may move further than it was
+    /// allowed to; and nothing may leave the clip or fall silent.
+    #[test]
+    fn humanize_moves_the_selection_within_its_percentages() {
+        let root = project_scratch("me-humanize");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        // A sixteenth at 120 bpm: 0.125 s, the step the timing percentage is
+        // measured against.
+        app.settings.midi_grid_exp = -4;
+        let note = |at: f64, key: u8, vel: u8| crate::arrangement::ArrNote {
+            at_s: at,
+            dur_s: 0.1,
+            key,
+            vel,
+        muted: false,
+        };
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
+            kind: crate::arrangement::ClipKind::Midi,
+            // One on the very first tick, so the clip's left wall is in play,
+            // and a ghost at 2 so the velocity floor is.
+            notes: vec![
+                note(0.0, 60, 100),
+                note(0.5, 64, 100),
+                note(1.0, 67, 2),
+                note(1.5, 72, 127),
+            ],
+            lane: 1,
+            path: String::new(),
+            start_s: 8.0,
+            offset_s: 0.0,
+            len_s: 4.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        app.open_midi_editor(id);
+        let before: Vec<(f64, u8)> = app.arrangement.clips[0]
+            .notes
+            .iter()
+            .map(|n| (n.at_s, n.vel))
+            .collect();
+
+        // **Nothing selected is nothing done**, as the quantiser has it.
+        app.me_humanize(50, 50, 1);
+        let now: Vec<(f64, u8)> = app.arrangement.clips[0]
+            .notes
+            .iter()
+            .map(|n| (n.at_s, n.vel))
+            .collect();
+        assert_eq!(now, before, "an empty selection was humanized anyway");
+
+        app.me_select_all();
+        // **And both amounts at zero is nothing done**, so the menu's rest
+        // position cannot quietly smear a part.
+        app.me_humanize(0, 0, 2);
+        let now: Vec<(f64, u8)> = app.arrangement.clips[0]
+            .notes
+            .iter()
+            .map(|n| (n.at_s, n.vel))
+            .collect();
+        assert_eq!(now, before, "zero per cent still moved something");
+
+        let step = app.me_step_s();
+        assert!((step - 0.125).abs() < 1e-9, "the grid step is {step}");
+        app.me_humanize(40, 30, 0xC0FF_EE12_3456_789A);
+        let clip = &app.arrangement.clips[0];
+        let mut moved = 0;
+        let mut revoiced = 0;
+        for (i, n) in clip.notes.iter().enumerate() {
+            let (was_at, was_vel) = before[i];
+            // Inside what forty per cent of a step allows, plus the slack the
+            // clip's own walls take.
+            assert!(
+                (n.at_s - was_at).abs() <= step * 0.40 + 1e-9,
+                "note {i} moved {} s, more than 40% of a {step} s step",
+                n.at_s - was_at
+            );
+            // Inside thirty per cent of the velocity it had, and never mute.
+            let allowed = f64::from(was_vel) * 0.30 + 1.0;
+            assert!(
+                (f64::from(n.vel) - f64::from(was_vel)).abs() <= allowed,
+                "note {i} went from {was_vel} to {}, further than 30%",
+                n.vel
+            );
+            assert!(n.vel >= 1, "note {i} was humanized to silence");
+            // Never out of its own clip, the quantiser's wall.
+            assert!(n.at_s >= -1e-9, "note {i} was pushed before the clip at {}", n.at_s);
+            assert!(
+                n.at_s + n.dur_s.max(0.05) <= clip.len_s + 1e-9,
+                "note {i} was pushed out of the clip's end"
+            );
+            if (n.at_s - was_at).abs() > 1e-9 {
+                moved += 1;
+            }
+            if n.vel != was_vel {
+                revoiced += 1;
+            }
+        }
+        // **Something actually happened.** Two counts rather than one,
+        // because the two amounts are independent and a version that read
+        // only one of them would pass a test that asked "did anything
+        // change".
+        assert!(moved >= 2, "only {moved} of four notes were moved off the grid");
+        assert!(revoiced >= 2, "only {revoiced} of four velocities moved");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// one step later and hands them the selection; a nudge moves the set
     /// together inside the clip's walls; delete takes them all at once.
     #[test]
@@ -36555,6 +38272,7 @@ mod tests {
             dur_s: 0.3,
             key,
             vel: 90,
+        muted: false,
         };
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
             pedal: Vec::new(),
@@ -36587,7 +38305,7 @@ mod tests {
         app.settings.midi_grid_exp = -4;
         app.me_quantise();
         let ats: Vec<f64> = app.arrangement.clips[0].notes.iter().map(|n| n.at_s).collect();
-        assert!((ats[0] - 0.0).abs() < 1e-9, "{ats:?}");
+        assert!((ats[0] - 0.0).abs() < 1e-9, "{ats:? }");
         assert!((ats[1] - 1.0).abs() < 1e-9);
         assert!((ats[2] - 2.125).abs() < 1e-9, "{ats:?}");
 
@@ -36641,7 +38359,7 @@ mod tests {
         app.set_channel_input_spec(4, "midi:all");
         app.midi_ports_seen = vec!["Keystation 88".to_owned(), "Scarlett 2i2".to_owned()];
         app.open_midi_inputs_dialog(4);
-        let Some(Dialog::MidiInputs { devices, .. }) = app.dialog.as_ref() else {
+        let Some(Dialog::MidiInputs { devices, ..  }) = app.dialog.as_ref() else {
             panic!("the dialog did not open");
         };
         assert_eq!(
@@ -36934,6 +38652,7 @@ mod tests {
             dur_s: 0.5,
             key: 60,
             vel: 100,
+        muted: false,
         };
         app.arrangement.add_clip(crate::arrangement::ArrClip {
             pedal: Vec::new(),
@@ -37000,6 +38719,7 @@ mod tests {
                 dur_s: 0.5,
                 key: 60,
                 vel: 100,
+            muted: false,
             }],
             lane: 0,
             path: String::new(),
@@ -37480,6 +39200,7 @@ mod tests {
                 dur_s: dur,
                 key,
                 vel: 100,
+            muted: false,
             });
         }
         app.midi_edit.as_mut().unwrap().selected = vec![0, 1, 2];
@@ -37582,6 +39303,7 @@ mod tests {
             dur_s: 0.25,
             key: 60,
             vel: 100,
+        muted: false,
         }];
 
         // -4 is a sixteenth note in 4/4: lines every 0.125 s at 120 bpm.
@@ -37641,6 +39363,7 @@ mod tests {
                 dur_s: 0.5,
                 key: 60,
                 vel: 100,
+            muted: false,
             }],
             lane: 1,
             path: String::new(),
@@ -37697,9 +39420,11 @@ mod tests {
         assert_eq!(app.take_insert_state_copy(), Some((1, to)));
         assert_eq!(app.take_insert_state_copy(), None, "taken twice");
 
-        // **A LIVE track is overwritten, not refused** — the owner's ask.
-        // What was on the lane goes: its clip, its plugin, its name. What
-        // lands is the copy and nothing of what was there.
+        // **A LIVE track is never overwritten** — the owner's second look at
+        // this row: "make paste track actually non-destructive, change it
+        // from the overwrite to add below inbetween selected track and track
+        // below it." The track under the cursor keeps everything it had and
+        // the copy arrives on a row opened beneath it.
         let over = 6usize;
         let over_at = recorder::Strip::Channel(over).index();
         app.set_channel_kind(over, Some(recorder::ChannelKind::Audio));
@@ -37711,29 +39436,53 @@ mod tests {
             name: "OLD".to_owned(),
             ..Default::default()
         });
+        // **And a track on the row under it**, or the insertion is the
+        // identity — the row below is already free, nothing shifts, and the
+        // half of this that matters would not be exercised at all.
+        let below = 7usize;
+        app.set_channel_kind(below, Some(recorder::ChannelKind::Midi));
+        app.settings.strip_names[recorder::Strip::Channel(below).index()] =
+            "Bass".to_owned();
         assert!(app.channel_used(over));
-        app.paste_track(over);
+        assert!(app.paste_track_below(over), "no lane was opened");
+
+        // Nothing of the track that was clicked has moved or gone.
         assert_eq!(
             app.channel_kind(over),
-            Some(recorder::ChannelKind::Midi),
-            "the overwritten lane kept its own kind"
+            Some(recorder::ChannelKind::Audio),
+            "the live lane lost its own kind"
         );
-        assert_eq!(app.settings.strip_names[over_at], "Rhodes 2");
-        assert_eq!(app.insert(over_at, 0), Some("/x/Piano.vst3"), "the bay");
-        let left: Vec<_> = app
+        assert_eq!(app.settings.strip_names[over_at], "Guitar");
+        assert_eq!(app.insert(over_at, 0), Some("/x/Amp.vst3"), "its bay");
+        let kept: Vec<_> = app
             .arrangement
             .clips
             .iter()
             .filter(|c| c.lane == over)
             .collect();
-        assert_eq!(left.len(), 1, "the overwritten lane kept its own clips");
-        assert_eq!(left[0].name, "MIDI", "the old clip survived the overwrite");
-        assert_eq!(app.take_insert_state_copy(), Some((1, over)));
+        assert_eq!(kept.len(), 1, "the clicked lane lost its clips");
+        assert_eq!(kept[0].name, "OLD", "the clicked lane's clip was replaced");
+
+        // The copy is on the row directly under it.
+        let landed = over + 1;
+        let landed_at = recorder::Strip::Channel(landed).index();
+        assert_eq!(app.settings.strip_names[landed_at], "Rhodes 2", "where it landed");
+        assert_eq!(app.insert(landed_at, 0), Some("/x/Piano.vst3"), "the bay");
+        assert_eq!(app.channel_kind(landed), Some(recorder::ChannelKind::Midi));
+
+        // And the track that WAS under it moved down a row rather than being
+        // eaten, which is the whole difference from the overwrite.
+        assert_eq!(
+            app.settings.strip_names[recorder::Strip::Channel(below + 1).index()],
+            "Bass",
+            "the row below was displaced instead of shifted"
+        );
+        assert_eq!(app.take_insert_state_copy(), Some((1, landed)));
 
         // **And never a FOLDER**, which is a container rather than a track:
         // clearing one re-parents its children, which is a great deal to do
         // from a row that says paste.
-        let group = 7usize;
+        let group = 12usize;
         app.set_channel_kind(group, Some(recorder::ChannelKind::Midi));
         app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
         app.settings.strip_is_folder[group] = true;
@@ -37745,6 +39494,97 @@ mod tests {
             "GROUP",
             "a folder was overwritten"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Insert Track opens an empty row under the one clicked**, and the
+    /// rows beneath shift down rather than being written over.
+    ///
+    /// The owner: "Need a rightclick option for channels to insert track."
+    /// The desk is thirty-two fixed lanes, so this is a PERMUTATION and not
+    /// a growth — a lane nobody is using is spent to make the gap — and the
+    /// two things worth pinning are which lane gets spent and what happens
+    /// to a folder the gap opens inside.
+    ///
+    /// Revert check performed: take the spare lane from anywhere free rather
+    /// than from below the click, and the track above the insertion moves —
+    /// the wrong direction, and rows the gesture never mentioned.
+    #[test]
+    fn insert_track_opens_a_row_below_and_pushes_the_rest_down() {
+        let root = project_scratch("trackinsert");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.strip_names.resize(recorder::STRIPS + 1, String::new());
+        app.settings.strip_is_folder.resize(recorder::CHANNELS, false);
+        app.settings.strip_in_folder.resize(recorder::CHANNELS, false);
+        let name_of = |app: &TangentApp, ch: usize| {
+            app.settings.strip_names[recorder::Strip::Channel(ch).index()].clone()
+        };
+        let name = |app: &mut TangentApp, ch: usize, s: &str| {
+            app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
+            app.settings.strip_names[recorder::Strip::Channel(ch).index()] = s.to_owned();
+        };
+        // Three in a row, and one ABOVE the click that must not budge.
+        name(&mut app, 1, "TOP");
+        name(&mut app, 2, "CLICKED");
+        name(&mut app, 3, "UNDER");
+
+        assert!(app.insert_track_below(2), "no lane was opened");
+        assert_eq!(name_of(&app, 1), "TOP", "a row above the click moved");
+        assert_eq!(name_of(&app, 2), "CLICKED", "the clicked row moved");
+        assert_eq!(name_of(&app, 3), "", "the new row is not empty");
+        assert!(app.channel_used(3), "the new row is not a track");
+        assert_eq!(app.channel_kind(3), None, "a fresh track has no input yet");
+        assert_eq!(name_of(&app, 4), "UNDER", "the row below was overwritten");
+        assert_eq!(app.selected_channel, Some(3), "the new track is not selected");
+
+        // ── and a folder keeps its children ──────────────────────────
+        //
+        // The lane that is spent comes from outside every group, so it
+        // arrives carrying "not in a folder". Dropped into the middle of a
+        // group that way it is a stranger between two children, and
+        // `folder_of`'s walk stops at it — the rows under it fall out of
+        // the group they were in. So the new row takes the membership of
+        // the row it was inserted under.
+        let group = 8usize;
+        name(&mut app, group, "GROUP");
+        app.settings.strip_is_folder[group] = true;
+        name(&mut app, group + 1, "KID A");
+        app.settings.strip_in_folder[group + 1] = true;
+        name(&mut app, group + 2, "KID B");
+        app.settings.strip_in_folder[group + 2] = true;
+
+        // Under the HEADER: the new row is the group's first child.
+        assert!(app.insert_track_below(group));
+        assert!(app.in_folder(group + 1), "a row under the header fell outside");
+        assert_eq!(app.folder_of(group + 1), Some(group));
+        assert_eq!(name_of(&app, group + 2), "KID A", "the children did not shift");
+        assert!(app.in_folder(group + 3), "the last child fell out of the group");
+        assert_eq!(app.folder_of(group + 3), Some(group), "the group was split");
+
+        // Under a CHILD: still inside.
+        assert!(app.insert_track_below(group + 2));
+        assert!(app.in_folder(group + 3), "a row between two children fell outside");
+        assert_eq!(app.folder_of(group + 3), Some(group));
+        assert_eq!(name_of(&app, group + 4), "KID B", "the last child was eaten");
+        assert_eq!(app.folder_of(group + 4), Some(group), "the group was split");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A desk with nothing free below the click refuses**, rather than
+    /// spending a lane from above and shifting the wrong rows.
+    #[test]
+    fn insert_track_refuses_when_there_is_no_room_below() {
+        let root = project_scratch("trackinsertfull");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        for ch in 0..recorder::CHANNELS {
+            app.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
+        }
+        assert!(!app.insert_track_below(4), "a full desk opened a lane anyway");
+        // The last channel is the one a naive search would have spent.
+        assert!(app.channel_used(recorder::CHANNELS - 1), "a track was eaten");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -37862,6 +39702,7 @@ mod tests {
                 dur_s: dur,
                 key,
                 vel,
+            muted: false,
             });
         }
         app.midi_edit.as_mut().unwrap().selected = vec![0, 1, 2];
@@ -37905,6 +39746,7 @@ mod tests {
                 dur_s: 0.5,
                 key: 60,
                 vel: 90,
+            muted: false,
             }],
         });
         let views = app.arr_clip_views();
@@ -38107,7 +39949,7 @@ mod tests {
         for (k, n) in (2..=5).enumerate() {
             assert!(
                 (after[k] - before[k] - moved).abs() < 0.01,
-                "track {n} moved {} where the one dragged moved {moved}",
+                "track {n } moved {} where the one dragged moved {moved}",
                 after[k] - before[k]
             );
         }
@@ -38289,7 +40131,7 @@ mod tests {
         // source 2.5 and lifts at source 5.5 — either side of the cut.
         app.arrangement.clips.push(ArrClip {
             kind: ClipKind::Midi,
-            notes: vec![ArrNote { at_s: 2.0, dur_s: 0.5, key: 60, vel: 100 }],
+            notes: vec![ArrNote { at_s: 2.0, dur_s: 0.5, key: 60, vel: 100, muted: false }],
             pedal: vec![
                 ArrPedal { at_s: 2.5, cc: 64, value: 127 },
                 ArrPedal { at_s: 5.5, cc: 64, value: 0 },
@@ -38348,7 +40190,7 @@ mod tests {
     fn splitting_a_midi_clip_keeps_its_notes_where_they_were() {
         use crate::arrangement::{ArrClip, ArrNote, ClipKind};
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-        let note = |at: f64, dur: f64, key: u8| ArrNote { at_s: at, dur_s: dur, key, vel: 100 };
+        let note = |at: f64, dur: f64, key: u8| ArrNote { at_s: at, dur_s: dur, key, vel: 100, muted: false };
         // Source times 2..6; the clip shows source 2..6 starting at song time 10.
         let clip = ArrClip {
             pedal: Vec::new(),
@@ -39172,6 +41014,7 @@ mod tests {
                     dur_s: 0.4,
                     key: 60,
                     vel: 90,
+                muted: false,
                 }],
                 ..clip_at("", lane, start_s)
             });
@@ -39388,7 +41231,7 @@ mod tests {
         assert_eq!(on, Some(FlagMenuOn::Sig(4)));
         assert!(
             rows(on.unwrap()).iter().any(|w| w == "Edit time sig."),
-            "a right-click on a signature chip offers no Edit: {:?}",
+            "a right-click on a signature chip offers no Edit: {:? }",
             rows(on.unwrap())
         );
 
@@ -44213,7 +46056,7 @@ mod tests {
                 kind: ClipKind::Midi,
                 start_s: at,
                 len_s: len,
-                notes: vec![ArrNote { at_s: note_at, dur_s: 0.25, key: 60, vel: 100 }],
+                notes: vec![ArrNote { at_s: note_at, dur_s: 0.25, key: 60, vel: 100, muted: false }],
                 ..Default::default()
             });
         };
@@ -44294,6 +46137,7 @@ mod tests {
                     dur_s: beat * 0.5,
                     key: 60 + [0u8, 2, 4, 5][i as usize],
                     vel: 100,
+                muted: false,
                 })
                 .collect(),
             ..Default::default()
@@ -44418,7 +46262,7 @@ mod tests {
                 kind: ClipKind::Midi,
                 start_s: at,
                 len_s: 1.0,
-                notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100 }],
+                notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100, muted: false }],
                 ..Default::default()
             });
         };
@@ -44514,7 +46358,7 @@ mod tests {
                 kind: ClipKind::Midi,
                 start_s: at,
                 len_s: 1.0,
-                notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100 }],
+                notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100, muted: false  }],
                 ..Default::default()
             });
         }
@@ -44572,7 +46416,7 @@ mod tests {
             kind: ClipKind::Midi,
             start_s: 0.0,
             len_s: 1.0,
-            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100 }],
+            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100, muted: false }],
             ..Default::default()
         });
         // A STRETCHED AUDIO clip: the four rows, and no Export — the stretch
@@ -44890,7 +46734,7 @@ mod tests {
                 kind,
                 start_s: 0.0,
                 len_s: 1.0,
-                notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100 }],
+                notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 100, muted: false }],
                 ..Default::default()
             });
         }
@@ -45129,7 +46973,7 @@ mod tests {
             start_s: 0.0,
             len_s: 2.0,
             loop_s: 0.5,
-            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.2, key: 60, vel: 100 }],
+            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.2, key: 60, vel: 100, muted: false }],
             ..Default::default()
         });
         app.arr_export_midi(vec![1]);
@@ -45356,7 +47200,7 @@ mod tests {
             .iter()
             .find(|n| n.label == "Piano keyboard")
             .expect("the keyboard has no readout");
-        assert!(keys.spoken().contains("nothing held"), "{:?}", keys.spoken());
+        assert!(keys.spoken().contains("nothing held"), "{:? }", keys.spoken());
 
         // A C minor triad, in pitch order and by name.
         let held: HashSet<u8> = [60, 63, 67].into_iter().collect();
@@ -45833,7 +47677,7 @@ mod tests {
         app.arrangement.add_clip(ArrClip {
             pedal: Vec::new(),
             kind: ClipKind::Midi,
-            notes: vec![ArrNote { at_s: 0.5, dur_s: 0.5, key: 60, vel: 100 }],
+            notes: vec![ArrNote { at_s: 0.5, dur_s: 0.5, key: 60, vel: 100, muted: false }],
             lane: 0,
             path: String::new(),
             start_s: 2.0,
@@ -45904,6 +47748,7 @@ mod tests {
                 dur_s: 0.25,
                 key: 60 + i as u8,
                 vel: 100,
+            muted: false,
             })
             .collect();
         app.arrangement.add_clip(ArrClip {
@@ -47143,7 +48988,14 @@ mod tests {
         assert!(app.dialog.is_none(), "the refusal opened a dialog");
         assert!(app.said().is_raised(MIDI_IN_KEY));
         let standing = app.said().notes()[0].clone();
-        assert!(standing.is_standing(), "a condition was given a clock");
+        // An ANSWER, so it ages out on its own rather than waiting for a
+        // click nobody in the middle of something wants to give it — see
+        // `notify::LIFE_ANSWER_S`.
+        assert_eq!(
+            standing.expires_at(),
+            Some(crate::notify::LIFE_ANSWER_S),
+            "an answer was left standing for ever"
+        );
         assert_eq!(standing.kind, crate::notify::Kind::Error);
 
         // A MIDI track exists and the user asks again: the message goes and
@@ -53230,7 +55082,7 @@ mod tests {").expect("the tests module")];
         app.arrangement.add_clip(ArrClip {
             pedal: Vec::new(),
             kind: ClipKind::Midi,
-            notes: vec![ArrNote { at_s: 0.5, dur_s: 1.0, key: 60, vel: 100 }],
+            notes: vec![ArrNote { at_s: 0.5, dur_s: 1.0, key: 60, vel: 100, muted: false }],
             lane: 0,
             path: String::new(),
             start_s: 4.0,
@@ -53812,7 +55664,7 @@ mod tests {").expect("the tests module")];
         app.arrangement.add_clip(ArrClip {
             pedal: Vec::new(),
             kind: ClipKind::Midi,
-            notes: vec![ArrNote { at_s: 0.5, dur_s: 1.0, key: 60, vel: 100 }],
+            notes: vec![ArrNote { at_s: 0.5, dur_s: 1.0, key: 60, vel: 100, muted: false }],
             lane: 0,
             path: String::new(),
             start_s: 4.0,
@@ -55738,6 +57590,7 @@ mod velocity_selection_tests {
                 dur_s: 0.25,
                 key: 60 + i as u8,
                 vel: *v,
+            muted: false,
             })
             .collect();
         app.arrangement.add_clip(ArrClip {
@@ -56037,7 +57890,7 @@ mod folder_tests {
         let pts = app.arrangement.automation.get(0, AutoParam::Gain).unwrap().points().to_vec();
         assert!(
             pts.iter().any(|p| (p.at_s - 20.0).abs() < 1e-6),
-            "nothing landed at the playhead: {:?}",
+            "nothing landed at the playhead: {:? }",
             pts.iter().map(|p| p.at_s).collect::<Vec<_>>()
         );
         assert!(pts.iter().any(|p| (p.at_s - 24.0).abs() < 1e-6), "the second did not follow");
@@ -57696,6 +59549,7 @@ mod folder_tests {
                 dur_s: 1.0,
                 key: 60,
                 vel: 100,
+            muted: false,
             }],
             ..Default::default()
         });
@@ -58094,6 +59948,7 @@ mod folder_tests {
                 dur_s: 0.5,
                 key: 60,
                 vel: 100,
+            muted: false,
             }],
         }]);
         let c = a.arrangement.clips.last().expect("the take landed");
@@ -58274,6 +60129,7 @@ mod folder_tests {
                 dur_s: 0.25,
                 key: 60,
                 vel: 100,
+            muted: false,
             }],
             ..Default::default()
         });
@@ -58842,8 +60698,8 @@ mod folder_tests {
             lane: 1,
             len_s: 4.0,
             notes: vec![
-                crate::arrangement::ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 },
-                crate::arrangement::ArrNote { at_s: 1.0, dur_s: 0.5, key: 64, vel: 80 },
+                crate::arrangement::ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100, muted: false },
+                crate::arrangement::ArrNote { at_s: 1.0, dur_s: 0.5, key: 64, vel: 80, muted: false },
             ],
             ..Default::default()
         });
@@ -58876,6 +60732,7 @@ mod folder_tests {
                     dur_s: 0.25,
                     key: 67,
                     vel: 90,
+                muted: false,
                 });
             })),
             ("a note deleted", Box::new(|a: &mut TangentApp| {
@@ -59110,7 +60967,7 @@ mod fullscreen_proportion_tests {
         let full = fill_bands(&s, avail);
         assert!(
             full.total().y <= avail.y + 1.0,
-            "the layout overflowed a short screen: {} against {}",
+            "the layout overflowed a short screen: {  } against {}",
             full.total().y,
             avail.y
         );
@@ -60005,6 +61862,7 @@ mod dirty_cost_probe {
                         dur_s: 0.05,
                         key: 36 + (n % 36) as u8,
                         vel: 100,
+                    muted: false,
                     });
                 }
                 app.arrangement.clips.push(clip);
@@ -60942,30 +62800,37 @@ mod sampler_road_tests {
         assert!(app.said().is_empty(), "an ordinary drag said something");
     }
 
-    /// **A MIDI clip is refused with a sentence, never silently.**
+    /// **A MIDI clip publishes nothing, and says nothing about it.**
     ///
-    /// It is not a sample: it has no sound of its own. Saying nothing is
-    /// the drumpad's own `.tgkit` fault — a bay that looks loaded, plays
-    /// silence, and gives nobody a reason to look at.
+    /// It was refused out loud — "That is a MIDI part, not a sample" — on the
+    /// argument that silence is the drumpad's own `.tgkit` fault, a bay that
+    /// looks loaded and plays nothing with no reason given. That argument
+    /// does not survive contact with the gesture: this fires on a DRAG, which
+    /// is as often a slip of the hand as an intention, and a drag that
+    /// publishes nothing has already said so by not moving anything. The
+    /// owner: "I'm not [sure] that message is actually useful in any way."
+    ///
+    /// So the assert is inverted rather than deleted: the refusal is still a
+    /// refusal, and the SILENCE is now the thing worth pinning, or the
+    /// message comes back the next time somebody reads the old argument.
     #[test]
-    fn a_dragged_midi_clip_is_refused_out_loud() {
+    fn a_dragged_midi_clip_is_refused_quietly() {
         let (ctx, mut app) = tests::headless(Caps::DESKTOP);
         app.project_doc = std::path::PathBuf::from("/p/song/project.tan");
         let id = app.arrangement.add_clip(a_clip(ClipKind::Midi, "media/part.mid"));
         a_drag_in_flight(&ctx);
-        app.arm_clip_drag(&ctx, id);
+        for _ in 0..30 {
+            app.arm_clip_drag(&ctx, id);
+        }
         assert!(
             egui::DragAndDrop::payload::<crate::drumpad_panel::DraggedMedia>(&ctx).is_none(),
             "a MIDI part was published as a sample"
         );
-        let said: String = app.said().notes().iter().map(|n| n.text.as_str()).collect();
-        assert!(said.contains("MIDI"), "the refusal was silent: {said:?}");
-        // And it stays ONE sentence however many frames the hand drags for:
-        // `is_decidedly_dragging` is true on every one of them.
-        for _ in 0..30 {
-            app.arm_clip_drag(&ctx, id);
-        }
-        assert_eq!(app.said().len(), 1, "the refusal repeated itself");
+        assert!(
+            app.said().is_empty(),
+            "the refused drag said something: {:?}",
+            app.said().notes().iter().map(|n| n.text.as_str()).collect::<String>()
+        );
     }
 
     /// **A load is taken once, in the order it was asked for, and it names

@@ -1448,8 +1448,22 @@ fn track_export_row_h(midi_clips: usize) -> f32 {
     }
 }
 
-/// What the OVERWRITE row costs a live track's menu, or nothing when there is
-/// nothing on the clipboard to paste.
+/// What the Insert Track row costs a live track's menu.
+///
+/// Unconditional on a live track, unlike its two neighbours: inserting does
+/// not depend on holding anything, and a lane can always be opened under a
+/// track unless the desk is full below it — which is a refusal at the moment
+/// of pressing, not a reason to keep the row off the menu.
+fn track_insert_row_h(removable: bool) -> f32 {
+    if removable {
+        TRACK_EXPORT_ROW_H + TRACK_EXPORT_ROW_GAP
+    } else {
+        0.0
+    }
+}
+
+/// What the paste-BELOW row costs a live track's menu, or nothing when there
+/// is nothing on the clipboard to paste.
 ///
 /// An empty slot's paste row is inside the height the window already has: it
 /// is drawn where a live track draws Remove, so the two never add up. A live
@@ -1460,8 +1474,8 @@ fn track_export_row_h(midi_clips: usize) -> f32 {
 /// slot's choice and deliberate, for `Export MIDI`'s reason: an empty slot's
 /// menu exists largely IN ORDER to offer the paste, so the row is what tells
 /// somebody the slot can receive a track. A live track's menu is about the
-/// track; a permanently dead OVERWRITE row on every one of them would be a
-/// row that teaches people to stop reading this menu.
+/// track; a permanently dead paste row on every one of them would be a row
+/// that teaches people to stop reading this menu.
 fn track_paste_row_h(removable: bool, can_paste: bool) -> f32 {
     if removable && can_paste {
         TRACK_EXPORT_ROW_H + TRACK_EXPORT_ROW_GAP
@@ -1985,6 +1999,17 @@ pub enum DialogAction {
     /// **Which MIDI channel one track listens on.** `None` is every channel,
     /// which is the default and what the app has always done.
     MidiInputChannel { lane: usize, channel: Option<u8> },
+    /// **Open a new empty track directly under this one**, the rows below it
+    /// shifting down a place. Appended at the END, this enum's law.
+    TrackInsert(usize),
+    /// **Put the copied track directly under this one**, the rows below it
+    /// shifting down a place — [`Self::TrackPaste`] without the casualty.
+    ///
+    /// `TrackPaste` is kept and still means what it always meant, "put the
+    /// copy on THIS lane", which is what an empty slot's row asks for; it no
+    /// longer overwrites a live one, so the two variants are now "into" and
+    /// "below" rather than "destroy" and "refuse".
+    TrackPasteBelow(usize),
 }
 
 /// **The `path` that means "raise the file chooser for this bay" rather
@@ -10629,13 +10654,15 @@ fn show_on(
                     520.0,
                     TRACK_DIALOG_H
                         + track_export_row_h(midi_clips)
-                        + track_paste_row_h(removable, can_paste),
+                        + track_paste_row_h(removable, can_paste)
+                        + track_insert_row_h(removable),
                 ),
                 Vec2::new(
                     520.0,
                     TRACK_DIALOG_H
                         + track_export_row_h(midi_clips)
-                        + track_paste_row_h(removable, can_paste),
+                        + track_paste_row_h(removable, can_paste)
+                        + track_insert_row_h(removable),
                 ),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
@@ -10698,13 +10725,19 @@ fn show_on(
                                     action = Some(DialogAction::TrackCopy(lane));
                                 }
                                 ui.add_space(6.0);
-                                // **And paste one OVER this track** — the
-                                // owner's ask. Under Copy, because the two
-                                // are the pair and this is the half that
-                                // destroys something; the label says so
-                                // rather than leaving the row to be found
-                                // out. Shown only when something is held:
-                                // see `track_paste_row_h`.
+                                // **And paste one UNDER this track** — the
+                                // owner's ask, twice. It was Paste Track
+                                // (overwrite) and it took the track it
+                                // landed on; the label carried the warning
+                                // because the row needed one. It does not
+                                // need one now: "make paste track actually
+                                // non-destructive, change it from the
+                                // overwrite to add below inbetween selected
+                                // track and track below it." The label still
+                                // says where the copy goes, which is the
+                                // half of the old label worth keeping.
+                                // Shown only when something is held: see
+                                // `track_paste_row_h`.
                                 if can_paste {
                                     if ui
                                         .add_sized(
@@ -10713,17 +10746,37 @@ fn show_on(
                                                 TRACK_EXPORT_ROW_H,
                                             ),
                                             Button::new(
-                                                RichText::new("Paste Track (overwrite)")
+                                                RichText::new("Paste Track Below")
                                                     .font(plain(11.0))
                                                     .color(t.text),
                                             ),
                                         )
                                         .clicked()
                                     {
-                                        action = Some(DialogAction::TrackPaste(lane));
+                                        action = Some(DialogAction::TrackPasteBelow(lane));
                                     }
                                     ui.add_space(TRACK_EXPORT_ROW_GAP);
                                 }
+                                // **A new empty track under this one.** Beside
+                                // the paste rather than up with the name,
+                                // because the two are the same gesture with
+                                // and without something on the clipboard, and
+                                // somebody reaching for one reads past the
+                                // other. See `track_insert_row_h`.
+                                if ui
+                                    .add_sized(
+                                        Vec2::new(ui.available_width(), TRACK_EXPORT_ROW_H),
+                                        Button::new(
+                                            RichText::new("Insert Track Below")
+                                                .font(plain(11.0))
+                                                .color(t.text),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::TrackInsert(lane));
+                                }
+                                ui.add_space(TRACK_EXPORT_ROW_GAP);
                                 // **Export MIDI, and HIDDEN when the lane has
                                 // no MIDI on it** — not greyed, which is the
                                 // opposite of the choice Paste Track makes

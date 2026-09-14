@@ -545,7 +545,7 @@ mod tests {
     use crate::tempo::{MeterPoint, TempoPoint};
 
     fn note(at_s: f64, dur_s: f64, key: u8, vel: u8) -> ArrNote {
-        ArrNote { at_s, dur_s, key, vel }
+        ArrNote { at_s, dur_s, key, vel, muted: false }
     }
 
     /// **The bytes a reader gets back are the notes that went in.**
@@ -779,7 +779,7 @@ mod pedal_tests {
     use crate::recorder::TimeSignature;
 
     fn note(at: f64, dur: f64, key: u8, vel: u8) -> ArrNote {
-        ArrNote { at_s: at, dur_s: dur, key, vel }
+        ArrNote { at_s: at, dur_s: dur, key, vel, muted: false }
     }
 
     /// **The pedal makes the round trip through a real file**, at its own
