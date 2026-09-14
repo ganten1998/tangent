@@ -1508,7 +1508,31 @@ impl ChannelPick {
 /// **One interface, several inputs.** A second DEVICE is a second clock and is
 /// declined on purpose; anyone with that rig makes an aggregate device, which
 /// presents as one device with one clock and arrives here as the ordinary case.
-pub const MAX_PICKS: usize = 4;
+///
+/// **One per CHANNEL of the desk, which is thirty-two.** It was four, and the
+/// four was a leftover: the reason written on `Picks::from_slice` was "a desk
+/// with a fixed number of input strips cannot show them", and that desk was
+/// the old band with four input strips. Every one of the desk's channels has
+/// its own input chip now, so a cap below the channel count means a track
+/// that can be bound, armed and metered and can never receive a sample — the
+/// owner, having hit it on his fifth audio track: "I do not think the input
+/// cap is a good thing at all and it at least needs to be the size of the
+/// tracks." No other DAW has one; REAPER, Pro Tools and Logic expose whatever
+/// the interface reports.
+///
+/// **It costs almost nothing, and that is a fact about the RING rather than
+/// an optimism.** The capture rings carry whole DEVICE frames — see the note
+/// on `Recorder::monitor`, "the monitor ring's width is the DEVICE's, not the
+/// take's ... so that choosing an input costs nothing" — so the picks are a
+/// MAP from the stream's columns to strips, not a thing that sizes a buffer.
+/// What grows with this number is a handful of fixed arrays indexed by it
+/// (`pick_strip`, `monitor_gain`, `monitor_widths`, the sink widths, the UI's
+/// `inputs`) and the per-input loop in `mix_monitor`, which does frame work
+/// only for an input that is bound AND heard.
+///
+/// `tangent_ui::recorder::INPUTS` must equal this; the host asserts it, since
+/// neither crate can see the other's constant.
+pub const MAX_PICKS: usize = 32;
 
 /// The inputs to keep, in the order they appear in the stream.
 ///

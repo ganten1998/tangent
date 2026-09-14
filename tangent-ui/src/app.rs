@@ -5800,6 +5800,19 @@ impl TangentApp {
             H::FxMenu(i, n, action) => {
                 self.mixer_fx_menu = None;
                 match action {
+                    // A STATED position, not a toggle: the row that was
+                    // pressed said which way it goes, so a second press on
+                    // the same word cannot flip it back. Guarded on a tenant
+                    // for shift+click's reason — a bypass flag on an empty
+                    // bay would wait to silence whatever lands there next.
+                    crate::mixer_panel::FxAction::Bypass
+                    | crate::mixer_panel::FxAction::Unbypass => {
+                        let (seat, bay) = self.slot_seat(i, n);
+                        if self.insert(seat, bay).is_some() {
+                            let on = action == crate::mixer_panel::FxAction::Bypass;
+                            self.set_insert_bypass(seat, bay, on);
+                        }
+                    }
                     crate::mixer_panel::FxAction::Delete => {
                         let (seat, bay) = self.slot_seat(i, n);
                         self.set_insert(seat, bay, None);
@@ -5979,6 +5992,23 @@ impl TangentApp {
         if let Some(k) = self.settings.channel_kinds.get_mut(n) {
             *k = recorder::ChannelKind::as_u8(None);
         }
+        // **And the INPUT goes with the kind**, because they are one fact:
+        // "the input IS the kind" (`set_channel_input_spec`). This line was
+        // missing, and what it left behind was a slot with no kind still
+        // holding the interface channel the deleted track listened to — a
+        // state the model says cannot exist and nothing could repair from
+        // the desk. Pressing the empty slot's plus then produced a track
+        // wearing switches whose R toggled and which could never monitor or
+        // record, because `audio_ordinal` asks for `ChannelKind::Audio` and
+        // the kind was still none. See `Settings::heal_orphan_inputs`, which
+        // is the same rule applied to desks that already carry one.
+        if let Some(slot) = self.settings.channel_inputs.get_mut(n) {
+            slot.clear();
+        }
+        recorder::reconcile_midi_inputs(
+            &mut self.settings.channel_midi_inputs,
+            &self.settings.channel_inputs,
+        );
         if let Some(g) = self.settings.channel_gains.get_mut(n) {
             *g = d.channel_gains.get(n).copied().unwrap_or(1.0);
         }
@@ -6700,6 +6730,12 @@ impl TangentApp {
             }),
             fx_menu_paste: self.mixer_fx_menu.is_some_and(|(at, bay)| {
                 self.fx_on_clipboard(Some(self.slot_seat(at, bay)))
+            }),
+            // And whether it is already out of circuit, which is what turns
+            // the first row from BYPASS FX into UNBYPASS FX.
+            fx_menu_bypassed: self.mixer_fx_menu.is_some_and(|(at, bay)| {
+                let (seat, b) = self.slot_seat(at, bay);
+                self.insert_bypassed(seat, b)
             }),
             typing: self
                 .mixer_typing
@@ -8704,8 +8740,17 @@ impl TangentApp {
     // the host's. See docs/ARRANGEMENT.md.
 
     /// **Put back the project the settings remember**, and say whether there
-    /// was one. This is the whole of what a launch owes somebody who quit
+    /// was one. This was the whole of what a launch owed somebody who quit
     /// with a song on screen: the same song, at the next launch.
+    ///
+    /// **Not the launch's road since 2026-09-13.** The owner: "make it so
+    /// every launch opens the default session, and doesn't open the
+    /// previously open session." `Desktop::open_project_at_launch` stands on
+    /// the default template unconditionally and asks this file only for
+    /// [`Self::reopen_dev_hook_project`]. The road stays: `bootstrap_project`
+    /// and the tests take it, File > Open reaches the same document, and the
+    /// answer has flipped twice already (the history is on that launch
+    /// function), so a re-enable is one call away rather than a rewrite.
     ///
     /// It is its own function because the HOST needs to ask the question and
     /// then decide. `bootstrap_project` used to hold this road inside itself
@@ -8734,13 +8779,7 @@ impl TangentApp {
     /// the last document write. An open is a session ARRIVING at a document
     /// it was not standing on; a relaunch is the same session coming back.
     pub fn reopen_remembered_project(&mut self) -> bool {
-        // The dev hook: an explicit document, no settings touched.
-        if let Some(p) = std::env::var_os("IVORY_ARRANGEMENT_PATH") {
-            self.project_doc = std::path::PathBuf::from(p);
-            self.arrangement = crate::arrangement::Arrangement::load_from(&self.project_doc);
-            self.clips_dirty = true;
-            self.load_drumpad_doc();
-            self.undo_reset();
+        if self.reopen_dev_hook_project() {
             return true;
         }
         if self.settings.project_path.is_empty() {
@@ -8783,8 +8822,27 @@ impl TangentApp {
         true
     }
 
+    /// **The dev hook alone.** `IVORY_ARRANGEMENT_PATH` names an explicit
+    /// document; a launch that finds it set stands on that and touches no
+    /// settings — a developer aiming the app at a file, not a session coming
+    /// back. Answers `false` when the variable is unset, and is the only part
+    /// of [`Self::reopen_remembered_project`] the host still asks for at
+    /// launch — see `Desktop::open_project_at_launch`.
+    pub fn reopen_dev_hook_project(&mut self) -> bool {
+        let Some(p) = std::env::var_os("IVORY_ARRANGEMENT_PATH") else {
+            return false;
+        };
+        self.project_doc = std::path::PathBuf::from(p);
+        self.arrangement = crate::arrangement::Arrangement::load_from(&self.project_doc);
+        self.clips_dirty = true;
+        self.load_drumpad_doc();
+        self.undo_reset();
+        true
+    }
+
     /// Open the remembered project, or make the first one — called by the
-    /// host once at launch, never in `new` (a test constructing an app must
+    /// tests once per app, never by the host any more and never in `new` (a
+    /// test constructing an app must
     /// not create directories in anybody's real music folder).
     ///
     /// The first project of the project era carries the v12 world across:
@@ -9530,6 +9588,12 @@ impl TangentApp {
             &mut self.settings.channel_midi_inputs,
             &self.settings.channel_inputs,
         );
+        // **A document can carry the orphan too**, and this is where one
+        // arrives. Every project saved while the fault was live holds the
+        // deleted track's input on a channel with no kind — see
+        // `Settings::heal_orphan_inputs` — so the desk is made consistent as
+        // it lands rather than only when the settings file is read.
+        self.settings.heal_orphan_inputs();
         self.settings.drums_gain = d.drums_gain.clamp(0.0, 8.0);
         self.settings.drums_pan = d.drums_pan.clamp(-1.0, 1.0);
         self.settings.metronome_gain = d.metronome_gain.clamp(0.0, 2.0);
@@ -10016,11 +10080,28 @@ impl TangentApp {
             Some(recorder::ChannelKind::Midi) => {
                 self.channel_midi_sel(ch).chip_text(&self.midi_ports_seen)
             }
-            Some(recorder::ChannelKind::Audio) => match Self::parse_input_spec(spec) {
-                Some((a, None)) => format!("IN {}", a + 1),
-                Some((a, Some(b))) => format!("IN {}/{}", a + 1, b + 1),
-                None => "IN: \u{2014}".to_owned(),
-            },
+            // **And a channel PAST THE CAP says so.** The desk carries four
+            // audio inputs (`recorder::INPUTS`, which must equal
+            // `tangent_record::audio::MAX_PICKS`) and `audio_ordinal` is
+            // positional: the fifth audio channel answers `None` and can
+            // never reach a capture channel, whatever its spec says. The
+            // chip printed the spec anyway — so a fifth audio track read
+            // "IN 3", armed, metered nothing and recorded nothing, and the
+            // owner reported it as a track that stopped working. That is the
+            // same fault this function's own note above records having had:
+            // the selector lying to the user. The spec is still shown,
+            // because it is what they chose and it is what will be honoured
+            // the moment a seat frees up.
+            Some(recorder::ChannelKind::Audio) => {
+                let room = self.audio_ordinal(ch).is_some();
+                match (Self::parse_input_spec(spec), room) {
+                    (Some((a, None)), true) => format!("IN {}", a + 1),
+                    (Some((a, Some(b))), true) => format!("IN {}/{}", a + 1, b + 1),
+                    (Some((a, _)), false) => format!("IN {} \u{b7} NO ROOM", a + 1),
+                    (None, true) => "IN: \u{2014}".to_owned(),
+                    (None, false) => "NO ROOM".to_owned(),
+                }
+            }
             None => String::new(),
         }
     }
@@ -10035,11 +10116,19 @@ impl TangentApp {
             Some(recorder::ChannelKind::Midi) => {
                 self.channel_midi_sel(ch).short_text(&self.midi_ports_seen)
             }
-            Some(recorder::ChannelKind::Audio) => match Self::parse_input_spec(spec) {
-                Some((a, None)) => format!("IN {}", a + 1),
-                Some((a, Some(b))) => format!("{}/{}", a + 1, b + 1),
-                None => "IN \u{2014}".to_owned(),
-            },
+            // Past the cap, in the room this button has: the `!` the MIDI
+            // grammar already uses for a selection that is not being
+            // honoured. See `input_chip_text` for what it means here.
+            Some(recorder::ChannelKind::Audio) => {
+                let room = self.audio_ordinal(ch).is_some();
+                match (Self::parse_input_spec(spec), room) {
+                    (Some((a, None)), true) => format!("IN {}", a + 1),
+                    (Some((a, Some(b))), true) => format!("{}/{}", a + 1, b + 1),
+                    (Some((a, _)), false) => format!("IN {a}!", a = a + 1),
+                    (None, true) => "IN \u{2014}".to_owned(),
+                    (None, false) => "IN !".to_owned(),
+                }
+            }
             None => String::new(),
         }
     }
@@ -15451,6 +15540,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.insert(seat, bay).is_some(),
             false,
             self.fx_on_clipboard(Some((seat, bay))),
+            self.insert_bypassed(seat, bay),
         )
     }
 
@@ -20455,6 +20545,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                         .and_then(|i| actions.get(i).copied())
                 });
                 match hit {
+                    // The desk's own arm exactly: a stated position, and
+                    // only over a tenant — see `apply_mixer_hit`.
+                    Some(
+                        a @ (crate::mixer_panel::FxAction::Bypass
+                        | crate::mixer_panel::FxAction::Unbypass),
+                    ) => {
+                        if self.insert(seat, bay).is_some() {
+                            let on = a == crate::mixer_panel::FxAction::Bypass;
+                            self.set_insert_bypass(seat, bay, on);
+                        }
+                    }
                     Some(crate::mixer_panel::FxAction::Delete) => {
                         self.set_insert(seat, bay, None);
                     }
@@ -25733,7 +25834,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         //
         // **Shift is free on a bay.** Every other modifier on a rack is
         // already spoken for: alt empties it (above), right-click opens
-        // delete/replace/sidechain, a plain press arms the CARRY that copies
+        // bypass/delete/replace/sidechain, a plain press arms the CARRY that copies
         // an effect to another channel, and a double-click is the desk's
         // reset. Shift on a bay did nothing at all in either view — the only
         // thing it touched was the press-anywhere-on-a-strip SELECT the
@@ -39002,6 +39103,12 @@ mod tests {
     /// remembered could not reach the screen. From outside the window that is
     /// indistinguishable from a song being deleted.
     ///
+    /// Since 2026-09-13 the launch stands on the default template by the
+    /// owner's own instruction, and this pins the ROAD rather than the
+    /// launch: `reopen_remembered_project` is what `bootstrap_project`, the
+    /// tests and any re-enable read, and a song it cannot put back whole is
+    /// the same fault wherever it is asked from.
+    ///
     /// The document here is his, in shape: twelve MIDI clips on lanes 0..=6
     /// at his own starts and lengths, `named`, with a desk. The assertion is
     /// deliberately in TWO parts, because "the clips are in memory" is only
@@ -41639,6 +41746,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **Every channel can hold an input**, because the capture cap is the
+    /// channel count.
+    ///
+    /// It was FOUR, and four was a leftover from a desk with four input
+    /// strips (`tangent_record::audio::MAX_PICKS`, where the history is
+    /// written). The desk has thirty-two channels each with its own input
+    /// chip, so a lower cap meant a track that could be bound, armed and
+    /// metered and could never receive a sample — the owner's fifth audio
+    /// track, which is how it was found. No other DAW has one.
+    ///
+    /// `audio_ordinal` is still positional, and that is still right: the
+    /// k-th audio channel takes the k-th column of the capture stream. What
+    /// changed is that it cannot run out.
+    #[test]
+    fn every_channel_can_take_an_input_because_the_cap_is_the_channel_count() {
+        assert_eq!(
+            recorder::INPUTS,
+            recorder::CHANNELS,
+            "the capture cap and the channel count have parted company; a \
+             channel that cannot reach an input is a track that can be armed \
+             and can never record"
+        );
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        for n in 0..recorder::CHANNELS {
+            app.set_channel_input_spec(n, "");
+        }
+        // Every channel, bound in turn: each takes the next column and says
+        // so. The fifth is the one that used to fall off the end.
+        for n in 0..recorder::CHANNELS {
+            app.set_channel_input_spec(n, &format!("{n}"));
+            assert_eq!(
+                app.channel_kind(n),
+                Some(recorder::ChannelKind::Audio),
+                "channel {n} did not bind"
+            );
+            assert_eq!(
+                app.audio_ordinal(n),
+                Some(n),
+                "channel {n} was shut out of the capture stream"
+            );
+            assert_eq!(
+                app.input_chip_text(n),
+                format!("IN {}", n + 1),
+                "channel {n}'s chip does not name its input"
+            );
+        }
+    }
+
+    /// **A removed track takes its INPUT with it**, and a desk that already
+    /// lost one is healed on the way in.
+    ///
+    /// The owner: "track 8 in a folder no longer works for record arming and
+    /// monitoring ... it worked for another track then it now won't work at
+    /// all." Track 8 was not a track any more — `remove_channel` had cleared
+    /// its kind and its added-bit and left `channel_inputs` holding "3", and
+    /// "the input IS the kind" (`set_channel_input_spec`) says that state
+    /// cannot exist.
+    ///
+    /// The trap is the second half: an unused slot draws a plus, and
+    /// `add_bare_track` sets the added-bit WITHOUT touching the kind — so
+    /// pressing it brought back a strip with switches whose R toggled and
+    /// which could never monitor or record, because `audio_ordinal` asks for
+    /// `ChannelKind::Audio`. That is the shape this test pins.
+    ///
+    /// Revert-check performed: dropping the `channel_inputs` clear from
+    /// `remove_channel` fails the first assertion, and dropping the
+    /// `heal_orphan_inputs` call from `apply_desk_snapshot` fails the last.
+    #[test]
+    fn a_removed_track_takes_its_input_with_it_and_an_orphan_is_healed() {
+        let root = project_scratch("orphanin");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        const N: usize = 7;
+
+        app.set_channel_input_spec(N, "3");
+        assert_eq!(app.channel_kind(N), Some(recorder::ChannelKind::Audio));
+        assert_eq!(app.audio_ordinal(N).is_some(), true, "a bound track has an input");
+
+        app.remove_channel(N);
+        assert_eq!(
+            app.settings.channel_inputs[N], "",
+            "a removed track kept its input, which is the state nothing can repair"
+        );
+        assert!(!app.channel_used(N), "the slot is still a track");
+
+        // And the plus brings back a track that can ACTUALLY be armed: the
+        // slot is consistent now, so binding is the one gesture it needs.
+        app.add_bare_track(N);
+        assert!(app.channel_used(N), "the plus did not make a track");
+        app.set_channel_input_spec(N, "3");
+        assert_eq!(app.channel_kind(N), Some(recorder::ChannelKind::Audio));
+        assert!(
+            app.audio_ordinal(N).is_some(),
+            "a rebound track still cannot reach an input"
+        );
+
+        // **A desk that already carries the orphan is healed as it lands.**
+        // Built by hand, because the fixed `remove_channel` can no longer
+        // produce one — this is what every project saved while the fault was
+        // live looks like.
+        let mut hurt = TangentApp::desk_snapshot_of(&app.settings);
+        hurt.kinds[N] = 0;
+        hurt.inputs[N] = "3".to_owned();
+        hurt.tracks_added &= !(1 << N);
+        app.apply_desk_snapshot(&hurt);
+        assert_eq!(
+            app.settings.channel_inputs[N], "",
+            "a document's orphan input survived the open"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **A project remembers what was armed, and gives it back on open.**
     ///
     /// The owner's ask, in his own scenario: "load my default with the piano
@@ -41806,10 +42025,11 @@ mod tests {
         );
     }
 
-    /// **The insert menu: delete deletes, replace opens the picker, and a
-    /// dismissal does nothing at all.** The one-gesture right-click delete is
-    /// gone — the menu is what stands between an evening of dialled-in
-    /// settings and a mis-click.
+    /// **The insert menu: delete deletes, replace opens the picker, bypass
+    /// and unbypass each set the flag one way, and a dismissal does nothing
+    /// at all.** The one-gesture right-click delete is gone — the menu is
+    /// what stands between an evening of dialled-in settings and a
+    /// mis-click.
     #[test]
     fn the_insert_menu_deletes_replaces_or_does_nothing() {
         use crate::mixer_panel::{FxAction, Hit};
@@ -41846,6 +42066,36 @@ mod tests {
         assert!(app.insert(0, 1).is_some(), "a dismissal deleted something");
         assert!(app.dialog.is_none());
         assert_eq!(app.mixer_fx_menu, None);
+
+        // BYPASS takes the tenant out of circuit and KEEPS it; UNBYPASS
+        // puts it back. Each row is a stated position, so BYPASS pressed
+        // twice is not a toggle that comes back on.
+        app.mixer_fx_menu = Some((Column(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Bypass), 0.0);
+        assert!(app.insert(0, 1).is_some(), "bypass unloaded the bay");
+        assert!(app.insert_bypassed(0, 1), "bypass did not bypass");
+        assert_eq!(app.mixer_fx_menu, None, "the menu answers one press");
+        app.mixer_fx_menu = Some((Column(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Bypass), 0.0);
+        assert!(
+            app.insert_bypassed(0, 1),
+            "a second BYPASS press flipped the flag back"
+        );
+        app.mixer_fx_menu = Some((Column(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Unbypass), 0.0);
+        assert!(!app.insert_bypassed(0, 1), "unbypass did not put the tenant back");
+        assert!(app.insert(0, 1).is_some(), "unbypass unloaded the bay");
+        // The timeline's menu offers the same row, facing the same way.
+        assert_eq!(app.arr_fx_menu_actions(0, 1).first(), Some(&FxAction::Bypass));
+        app.set_insert_bypass(0, 1, true);
+        assert_eq!(app.arr_fx_menu_actions(0, 1).first(), Some(&FxAction::Unbypass));
+        // An EMPTY bay is never bypassed through the menu: nothing to take
+        // out of circuit, and a flag left there would wait for a tenant.
+        app.set_insert(0, 1, None);
+        assert!(!app.insert_bypassed(0, 1), "the tenant left and its flag stayed");
+        app.mixer_fx_menu = Some((Column(0), 1));
+        app.apply_mixer_hit(Hit::FxMenu(Column(0), 1, FxAction::Bypass), 0.0);
+        assert!(!app.insert_bypassed(0, 1), "a bypass flag landed on an empty bay");
     }
 
     /// **The + circle ADDS a bare track on the spot** — armed, send up, no

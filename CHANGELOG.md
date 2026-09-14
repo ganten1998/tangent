@@ -12,6 +12,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **BYPASS FX in the insert menu.** Right-click a loaded insert bay, on the
+  desk or in the timeline's header, and the first row is BYPASS FX: the
+  plugin stays loaded, keeps its settings and its window, and the signal
+  goes past it. Over a bay that is already out the same row reads UNBYPASS
+  FX, so the row always says what the press will do. Shift+click on the chip
+  did this already and nothing on screen said so. The bay's chip wears the
+  amber tab either way. The owner: "add 'Bypass FX' option to the right click
+  menu for inserts."
+
 - **A track listens to several named MIDI devices, on a channel of its own.**
   The input chip's MIDI row opens a dialog with a checkbox per device and a
   channel chooser, for that track. Tick two keyboards and the track hears both;
@@ -230,6 +239,13 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Reverb, with the red jewel pilot lamp as the master.
 
 ### Changed
+
+- **Every launch opens the default session.** Tangent no longer reopens the
+  project that was on screen when it quit; it stands on a fresh copy of the
+  default template every time, and the last session is a File > Open away.
+  A scratch with takes or edits in it stays on disk for that panel. The
+  owner: "make it so every launch opens the default session, and doesn't
+  open the previously open session."
 
 - **A project opens in the time its audio takes to read, not in the time
   forty child processes take to spawn.** Every take used to go out to
@@ -451,6 +467,58 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   ships, this stops being a note and becomes something the loader has to do.
 
 ### Fixed
+
+- **Soloing a track inside a folder no longer mutes the whole desk.** The
+  rule that decides what a solo leaves audible walked only UP the folder
+  tree: a channel is heard if it, or a group it sits in, is the thing
+  soloed. Nothing asked whether a group had a soloed track INSIDE it — so
+  the folder itself fell through as not-heard, its fold took a gain of zero,
+  and because a foldered lane reaches the master through its group and
+  nowhere else, the soloed track silenced itself along with everything. A
+  group is heard when anything in it is soloed; its own mute still wins,
+  because nothing overrides a group being switched off. The owner: "track 7s
+  solo is a mute for everything."
+
+- **A drum kit inside a folder answers to the group.** The pad pass asked
+  the flat question, which knows nothing about folders, so a kit on a lane
+  inside a group went silent whenever anything else was soloed — including
+  when its own group was the thing soloed — and a mute on the group never
+  reached it. Same rule as every other lane now. Found by the test for the
+  solo above rather than by anybody playing it.
+
+- **The four-input cap is gone: every channel can take an input.** The desk
+  opened at most four capture inputs, handed out to audio channels in index
+  order, so a fifth audio track could be bound, armed, metered and could
+  never receive a sample — it simply read its input's name and stayed
+  silent. The cap was a leftover from a band with four input strips; every
+  channel has had its own input chip for a long time. It is the channel
+  count now, thirty-two. It costs nothing: the capture rings already carry
+  whole device frames, so a pick is a map from the stream's columns to a
+  strip rather than a thing that sizes a buffer. The owner, on his fifth
+  audio track: "I do not think the input cap is a good thing at all and it
+  at least needs to be the size of the tracks."
+
+- **A removed track takes its input with it.** Deleting a track cleared its
+  kind, its name, its colour, its clips and its bays and left the interface
+  channel it listened to sitting in `channel_inputs` — a state the desk's
+  own model ("the input IS the kind") says cannot exist, and one nothing
+  could repair by hand. The slot then drew as an empty plus; pressing it
+  made a track that wore switches, whose R toggled and which could never
+  monitor or record, because the kind was still none. Desks already carrying
+  one are healed as they load: the orphan binding goes, rebinding is one
+  press. The owner: "track 8 in a folder no longer works for record arming
+  and monitoring ... it worked for another track then it now won't work at
+  all."
+
+- **A trimmed MIDI loop fills its tail.** Every unroll counted passes as the
+  clip's length over its loop, while placing each note at `at_s - offset_s`
+  — so a clip trimmed from its front starts mid-loop and the walk ran out
+  exactly the offset before the clip's end. Trim half a loop off the front
+  and precisely the last half held no notes, in the sound, in the export and
+  in the drawing. The offset is part of the span to cover. Audio loops were
+  never affected: their passes place the clip's own start and hand the file
+  offset to the player. The owner: "midi loops that are clipped leave a
+  latter half that is empty."
 
 - **Phosphor's and Nocturne's light mode is a light mode.** Those two are the
   only themes whose light ground is a near-black — it is what makes them what

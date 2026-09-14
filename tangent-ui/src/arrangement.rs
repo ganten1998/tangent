@@ -767,8 +767,18 @@ impl ArrClip {
 /// and rings past it rings past it, which is what playback does and therefore
 /// what an export has to write.
 pub fn clip_notes_in_song_time(clip: &ArrClip) -> Vec<ArrNote> {
+    // **The clip's OFFSET is part of the span to cover.** The notes are
+    // placed at `at_s - offset_s + shift`, so a clip trimmed from its front
+    // starts mid-loop — and a pass count of `len_s / loop_s` then runs out
+    // exactly `offset_s` before the clip's end, leaving the tail with no
+    // notes in it at all. Trim half a loop off the front and the last half
+    // is empty, which is how the owner found it: "midi loops that are
+    // clipped leave a latter half that is empty." Covering `len_s +
+    // offset_s` is what makes the last pass reach the end; the `at >= len_s`
+    // skip below is what stops it running past.
     let passes: usize = if clip.loop_s > 1.0e-6 {
-        ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 4_096)
+        (((clip.len_s + clip.offset_s.max(0.0)) / clip.loop_s).ceil() as usize)
+            .clamp(1, 4_096)
     } else {
         1
     };
@@ -819,7 +829,8 @@ pub fn clip_pedal_in_song_time(clip: &ArrClip) -> Vec<ArrPedal> {
         return Vec::new();
     }
     let passes: usize = if clip.loop_s > 1.0e-6 {
-        ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 4_096)
+        (((clip.len_s + clip.offset_s.max(0.0)) / clip.loop_s).ceil() as usize)
+            .clamp(1, 4_096)
     } else {
         1
     };
@@ -4054,6 +4065,63 @@ mod tests {
             let read = DeskSnap::from_value(&snap.to_value()).expect("the desk should read");
             assert_eq!(read.armed, mask, "the arm mask did not round trip");
         }
+    }
+
+    /// **A trimmed loop fills its whole length**, tail included.
+    ///
+    /// The unroll places each note at `at_s - offset_s + shift`, so a clip
+    /// whose front has been trimmed starts mid-loop. The pass count was
+    /// `len_s / loop_s`, which then runs out exactly `offset_s` before the
+    /// clip ends — trim half a loop off the front and the last half of the
+    /// clip holds no notes at all. The owner: "midi loops that are clipped
+    /// leave a latter half that is empty."
+    ///
+    /// Revert-check performed: dropping `+ offset_s` from the pass count
+    /// leaves the second half empty and fails the tail assertion.
+    #[test]
+    fn a_loop_trimmed_from_its_front_still_fills_its_tail() {
+        // One note at the top of a four-second loop, trimmed two seconds in,
+        // eight seconds long: notes are due at 2, 6 — and, before the fix,
+        // the walk stopped after the pass that lands at 2.
+        let clip = ArrClip {
+            kind: ClipKind::Midi,
+            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 }],
+            start_s: 10.0,
+            offset_s: 2.0,
+            len_s: 8.0,
+            loop_s: 4.0,
+            ..Default::default()
+        };
+        let at: Vec<f64> = clip_notes_in_song_time(&clip)
+            .into_iter()
+            .map(|n| n.at_s - clip.start_s)
+            .collect();
+        assert_eq!(at.len(), 2, "the trimmed loop played {at:?}");
+        assert!((at[0] - 2.0).abs() < 1e-9, "{at:?}");
+        assert!(
+            (at[1] - 6.0).abs() < 1e-9,
+            "the clip's last four seconds hold no notes: {at:?}"
+        );
+
+        // Nothing runs PAST the clip: the `at >= len_s` skip still holds.
+        // Notes fall at 4k - 2, so eleven seconds holds 2, 6 and 10 and the
+        // pass due at 14 is not played.
+        let long = ArrClip { len_s: 11.0, ..clip.clone() };
+        let at: Vec<f64> = clip_notes_in_song_time(&long)
+            .into_iter()
+            .map(|n| n.at_s - long.start_s)
+            .collect();
+        assert_eq!(at.len(), 3, "{at:?}");
+        assert!(at.iter().all(|a| *a < long.len_s), "a pass ran past the clip: {at:?}");
+
+        // An untrimmed loop is unchanged — the arithmetic adds nothing when
+        // there is no offset to cover.
+        let flush = ArrClip { offset_s: 0.0, len_s: 8.0, ..clip.clone() };
+        let at: Vec<f64> = clip_notes_in_song_time(&flush)
+            .into_iter()
+            .map(|n| n.at_s - flush.start_s)
+            .collect();
+        assert_eq!(at, vec![0.0, 4.0], "an untrimmed loop changed: {at:?}");
     }
 
     /// **Every meaningful change moves the fingerprint.**

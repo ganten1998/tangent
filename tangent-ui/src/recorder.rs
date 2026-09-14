@@ -1125,7 +1125,7 @@ pub const INSERTS: usize = 3;
 /// **Must equal `tangent_record::audio::MAX_PICKS`**, which is the same number
 /// counted where the capture happens. This crate cannot reach that one — see
 /// the firewall — so the host asserts they agree.
-pub const INPUTS: usize = 4;
+pub const INPUTS: usize = CHANNELS;
 
 /// How many channels the desk has, master aside.
 pub const STRIPS: usize = CHANNELS + 3;

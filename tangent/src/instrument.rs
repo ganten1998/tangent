@@ -805,6 +805,40 @@ fn channel_is_heard(ch: usize, parents: &[i32; CHANNELS], muted: u64, soloed: u6
         up = parents.get(n).copied().filter(|p| *p >= 0).map(|p| p as usize);
         hops += 1;
     }
+    // **A GROUP is heard when something INSIDE it is soloed**, and this walk
+    // is the one that was missing. The one above goes UP — a channel is heard
+    // if it, or a folder it sits in, is the thing soloed — which answers for
+    // every child and for nothing else. A FOLDER has no ancestor holding the
+    // solo and is not itself soloed, so it fell through to `false`, its fold
+    // took a gain target of zero, and the group went silent.
+    //
+    // That silences the soloed track TOO, which is what makes it a bug rather
+    // than a curiosity: `route_direct` is closed for a foldered lane (see the
+    // derivation in `render`), so a child reaches the master through its
+    // group and nowhere else. Soloing a track in a folder therefore muted the
+    // entire desk, itself included — the owner: "track 7s solo is a mute for
+    // everything".
+    //
+    // Its own mute still wins, for the reason stated at the top of this
+    // function: nothing overrides a group being switched off, and soloing a
+    // track inside a muted group is not a request to un-switch the group.
+    for kid in 0..CHANNELS {
+        if kid == ch || soloed & bit(kid) == 0 {
+            continue;
+        }
+        let mut up = parents.get(kid).copied().filter(|p| *p >= 0).map(|p| p as usize);
+        let mut hops = 0;
+        while let Some(n) = up {
+            if hops > CHANNELS {
+                break;
+            }
+            if n == ch {
+                return muted & bit(ch) == 0;
+            }
+            up = parents.get(n).copied().filter(|p| *p >= 0).map(|p| p as usize);
+            hops += 1;
+        }
+    }
     false
 }
 
@@ -8306,7 +8340,13 @@ impl Renderer {
             let drum_mask = self.shared.drum_strips.load(Ordering::Relaxed);
             for ch in 0..CHANNELS {
                 let target = if drum_mask & (1 << ch.min(31)) != 0 {
-                    if strip_is_heard(Strip::Channel(ch), muted, soloed) {
+                    // **Through the FOLDER TREE**, like every other lane. A
+                    // kit's lane can sit in a group, and the flat rule here
+                    // knew nothing about one: soloing the group silenced the
+                    // kit inside it, and a mute on the group did not reach
+                    // it. Same disease as the fold's own, one writer over —
+                    // see `channel_is_heard`, which is the one rule.
+                    if channel_is_heard(ch, &self.folders, muted, soloed) {
                         self.lane_gain(ch)
                     } else {
                         0.0
@@ -8396,7 +8436,14 @@ impl Renderer {
         // first-lane index, which is what made every lane fold onto the
         // first one's strip.
         let bus_strip = drum_lane.map_or(Strip::Drums, Strip::Channel);
-        let master = if strip_is_heard(bus_strip, muted, soloed) {
+        // **A LANE answers to the folder tree; the bare pad window does
+        // not** — it has no lane and so no group. See the target walk above,
+        // and `channel_is_heard` for the rule itself.
+        let heard = match drum_lane {
+            Some(ch) => channel_is_heard(ch, &self.folders, muted, soloed),
+            None => strip_is_heard(bus_strip, muted, soloed),
+        };
+        let master = if heard {
             match drum_lane {
                 Some(ch) => self.lane_gain(ch),
                 None => Shared::f32_of(&self.shared.drums_gain).clamp(0.0, 8.0),
@@ -17452,6 +17499,19 @@ mod tests {
         assert!(r.auto_params.iter().all(Vec::is_empty));
     }
 
+
+    /// **An `INPUTS`-wide array from the entries that matter.** The fixtures
+    /// used to write `[a, b, c, d]` literals, which pinned them to a cap of
+    /// four — see `tangent_record::audio::MAX_PICKS`, now one per channel.
+    /// The interesting slots are the leading ones in every one of them.
+    fn inputs_array<T: Copy + Default, const N: usize>(head: [T; N]) -> [T; INPUTS] {
+        let mut out = [T::default(); INPUTS];
+        for (slot, v) in out.iter_mut().zip(head) {
+            *slot = v;
+        }
+        out
+    }
+
     fn queue(tx: &mut Producer<MidiEvent>, stamp: Nanos, bytes: [u8; 3]) {
         tx.push(MidiEvent {
             stamp,
@@ -18100,6 +18160,115 @@ mod tests {
     }
 
     /// **The folder's METER is the group's**, which is the thing the owner
+    /// **Soloing a track INSIDE a folder is not a mute for the whole desk.**
+    ///
+    /// `channel_is_heard` walked only UP the tree, so a soloed child was
+    /// heard and its FOLDER was not — and a foldered lane reaches the master
+    /// through its group and nowhere else (`route_direct` is closed for it).
+    /// The fold took a gain target of zero and the soloed track silenced
+    /// itself along with everything else. The owner: "track 7s solo is a
+    /// mute for everything".
+    ///
+    /// Revert-check performed: removing the descendant walk from
+    /// `channel_is_heard` makes `soloed_kid` fall to silence and fails the
+    /// first assertion.
+    #[test]
+    fn soloing_a_track_inside_a_folder_is_heard_and_not_a_desk_wide_mute() {
+        use std::sync::Arc;
+        const KID: usize = 5;
+        const OTHER: usize = 6;
+        const GROUP: usize = 2;
+        // The loudest block, and the LAST one: a mute is a fader, so what it
+        // leaves in the first block after it lands is its own smoothing
+        // residue rather than a path. Measured, it decays geometrically —
+        // 7.7e-5, 9.2e-6, 1.1e-6, 1.3e-7, 1.5e-8, 0 — so silence is asked of
+        // the tail, where the claim is actually about routing.
+        let render = |soloed: u64, muted: u64| -> (f32, f32) {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            for l in [KID, OTHER] {
+                e.set_pad_kit(l, test_kit(&[0], 4_800, 0.5));
+                e.set_channel_gain(l, 1.0);
+            }
+            e.set_drum_strips((1 << KID) | (1 << OTHER));
+            let mut parents = [-1i32; CHANNELS];
+            parents[KID] = GROUP as i32;
+            assert!(e.set_folders(parents), "the tree was refused");
+            e.set_channel_gain(GROUP, 1.0);
+            // The desk is pushed WHOLE, the way the host pushes it — the
+            // masks are built inside `set_desk` so "is anything soloed"
+            // cannot disagree with itself. See its own note.
+            let mut desk = tangent_ui::recorder::Desk::default();
+            for n in 0..CHANNELS {
+                let at = tangent_ui::recorder::Strip::Channel(n).index();
+                desk.muted[at] = muted & (1u64 << n) != 0;
+                desk.soloed[at] = soloed & (1u64 << n) != 0;
+            }
+            e.set_desk(&desk);
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 1024 * 2];
+            for _ in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            let clip = |lane: usize| PlacedMidi {
+                pedal: Arc::new(Vec::new()),
+                strip: lane,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+            };
+            e.set_midi_clips(vec![clip(KID), clip(OTHER)]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut peak = 0.0f32;
+            let mut last = 0.0f32;
+            for b in 0..5 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                last = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                peak = peak.max(last);
+                let _ = b;
+            }
+            (peak, last)
+        };
+        let (nothing_soloed, _) = render(0, 0);
+        assert!(nothing_soloed > 0.05, "the fixture makes no sound: {nothing_soloed}");
+
+        // **The child alone, and it is HEARD.**
+        let (soloed_kid, _) = render(1 << KID, 0);
+        assert!(
+            soloed_kid > 0.05,
+            "soloing a track inside a folder silenced the desk: {soloed_kid}"
+        );
+
+        // And it really is a solo: the track outside the group is gone, so
+        // the level is the one source rather than both.
+        assert!(
+            soloed_kid < nothing_soloed * 0.9,
+            "the solo did not stand the other track down: {soloed_kid} of {nothing_soloed}"
+        );
+
+        // Soloing the GROUP still works, and still carries its child.
+        let (soloed_group, _) = render(1 << GROUP, 0);
+        assert!(soloed_group > 0.05, "soloing the group silenced it: {soloed_group}");
+
+        // Soloing something ELSE still silences the group.
+        let (soloed_other, _) = render(1 << OTHER, 0);
+        assert!(
+            (soloed_other - soloed_kid).abs() < nothing_soloed * 0.5,
+            "the other track's solo did not behave like the child's"
+        );
+
+        // **A muted group stays muted.** Nothing overrides a group being
+        // switched off — soloing a track inside one is not a request to
+        // un-switch it.
+        let (_, group_muted) = render(1 << KID, 1 << GROUP);
+        assert!(
+            group_muted < 1.0e-6,
+            "a soloed child un-muted its group: {group_muted}"
+        );
+    }
+
     /// could see was dead.
     #[test]
     fn a_folders_meter_reads_the_sum_of_what_is_in_it() {
@@ -19307,7 +19476,7 @@ mod tests {
         // An AUDIO lane: no live MIDI, and armed to the room.
         e.set_midi_off(1 << CH);
         e.set_armed(1 << CH);
-        e.set_pick_strips([Some(CH), None, None, None]);
+        e.set_pick_strips(inputs_array([Some(CH)]));
         e.set_monitor_on(true);
         e.set_rolling(false);
         let mut out = vec![0.0f32; FRAMES * 2];
@@ -19323,7 +19492,7 @@ mod tests {
         e.set_monitor(Some((
             ring,
             1,
-            [1, 0, 0, 0],
+            inputs_array([1]),
             FRAMES as u32,
             tangent_record::audio::Picks::EVERYTHING,
         )));
@@ -19519,7 +19688,7 @@ mod tests {
         e.set_master_gain(1.0);
         e.set_midi_off(1 << CH);
         e.set_armed(1 << CH);
-        e.set_pick_strips([Some(CH), None, None, None]);
+        e.set_pick_strips(inputs_array([Some(CH)]));
         e.set_monitor_on(false);
         e.set_rolling(false);
         let mut out = vec![0.0f32; FRAMES * 2];
@@ -19531,7 +19700,7 @@ mod tests {
         e.set_monitor(Some((
             ring,
             1,
-            [1, 0, 0, 0],
+            inputs_array([1]),
             FRAMES as u32,
             tangent_record::audio::Picks::EVERYTHING,
         )));
@@ -20988,13 +21157,13 @@ mod tests {
             // **Armed with an input open** — the state a lane is left in the
             // moment a record finishes, and the whole point of the fixture.
             e.set_armed(1 << CH);
-            e.set_pick_strips([None, None, None, Some(CH)]);
+            e.set_pick_strips(inputs_array([None, None, None, Some(CH)]));
             e.set_monitor_on(monitoring);
             let (mut jack, ring) = RingBuffer::<f32>::new(1 << 15);
             e.set_monitor(Some((
                 ring,
                 1,
-                [0, 0, 0, 1],
+                inputs_array([0, 0, 0, 1]),
                 FRAMES as u32,
                 tangent_record::audio::Picks::EVERYTHING,
             )));
@@ -22922,7 +23091,7 @@ mod tests {
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 15);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
-            r.monitor_widths = [1, 0, 0, 0];
+            r.monitor_widths = inputs_array([1]);
             r.monitor_block = BLOCK;
             r.monitor_scratch = vec![0.0; 8192];
             shared.pick_strip[0].store(1, Ordering::Relaxed);
@@ -23013,7 +23182,7 @@ mod tests {
             let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 15);
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
-            r.monitor_widths = [1, 0, 0, 0];
+            r.monitor_widths = inputs_array([1]);
             r.monitor_block = BLOCK;
             r.monitor_scratch = vec![0.0; 8192];
             shared.pick_strip[0].store(1, Ordering::Relaxed);
@@ -25219,7 +25388,7 @@ mod tests {
         }
         r.monitor = Some(in_rx);
         r.monitor_channels = 1;
-        r.monitor_widths = [1, 0, 0, 0];
+        r.monitor_widths = inputs_array([1]);
         r.monitor_block = BLOCK;
         r.monitor_scratch = vec![0.0; 8192];
         // Pick 0 feeds channel 1 — an AUDIO channel by assignment, exactly
@@ -25287,7 +25456,7 @@ mod tests {
         }
         r.monitor = Some(in_rx);
         r.monitor_channels = 3;
-        r.monitor_widths = [1, 2, 0, 0];
+        r.monitor_widths = inputs_array([1, 2]);
         r.monitor_block = 512;
         // NOT a multiple of three, exactly as `widest * 4096` is not a
         // multiple of eighteen.
@@ -25327,7 +25496,7 @@ mod tests {
             }
             r.monitor = Some(in_rx);
             r.monitor_channels = 1;
-            r.monitor_widths = [1, 0, 0, 0];
+            r.monitor_widths = inputs_array([1]);
             r.monitor_scratch = vec![0.0; 8192];
             // At the fader's destination rather than on its way there: the
             // slews are per sample and this test is about routing. The pick

@@ -97,6 +97,13 @@ where it was dropped. That is the one way in; no picker, no menu row.
   a remembered v12 `track_path` becomes an audio clip at 0:00 on the first
   unused channel (named BACKING, old track gain kept) inside it — nobody's
   backing track vanishes.
+- **Every launch stands on the default template (2026-09-13).** The owner:
+  "make it so every launch opens the default session, and doesn't open the
+  previously open session." The remembered `project_path` is not reopened
+  at launch any more; the last session is a File > Open away, and a
+  materialised Untitled (takes or edits in it) stays on disk for that panel.
+  Third answer to this question — the history, including the "moscow"
+  scare that reversed the second one, is on `open_project_at_launch`.
 - New / Open / Save As / Recent live under a PROJECT subject in the menu
   (the 18-row top-level budget holds; these are rows *under* a subject).
 

@@ -187,7 +187,8 @@ pub struct MixerView<'a> {
     pub typing: Option<(Column, &'a str)>,
     /// The channel whose NAME is being typed, and what is in the field.
     pub naming: Option<(Column, &'a str)>,
-    /// A loaded insert bay whose two-entry menu is open: delete or replace.
+    /// A loaded insert bay whose menu is open — `fx_menu_actions` says
+    /// which rows.
     ///
     /// **A right-click used to unload the bay outright.** One gesture, no
     /// confirmation, aimed at a chip twelve points tall — which is how a
@@ -217,6 +218,10 @@ pub struct MixerView<'a> {
     /// menu its PASTE FX row. On the view for `fx_menu_key`'s reason: at
     /// most one menu is up, and the app is the side that knows.
     pub fx_menu_paste: bool,
+    /// Whether the OPEN insert menu's bay is already out of circuit, which
+    /// decides whether its first row reads BYPASS FX or UNBYPASS FX. Same
+    /// bargain as the three above: one menu, and the app answers.
+    pub fx_menu_bypassed: bool,
 }
 
 impl MixerView<'_> {
@@ -289,7 +294,7 @@ pub enum Hit {
     /// — not a folder, an open folder, a shut folder, and around. The
     /// owner's one-button answer to the arrangement's box-and-arrow pair.
     Folder(Column),
-    /// One of the two rows of an open insert menu — or, with
+    /// One of the rows of an open insert menu — or, with
     /// [`FxAction::Dismiss`], a press anywhere else while it is up.
     FxMenu(Column, usize, FxAction),
 }
@@ -297,6 +302,22 @@ pub enum Hit {
 /// What a press on an open insert menu means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FxAction {
+    /// **Take the bay's tenant out of circuit** — kept, loaded, editable,
+    /// and not applied. See `settings::BypassBays`.
+    ///
+    /// The owner's "add 'Bypass FX' option to the right click menu for
+    /// inserts" (2026-09-13). Shift+click on the chip already flipped the
+    /// flag and nothing on screen said so; a row in the menu is the
+    /// discoverable road to the same flag. The FIRST row, on purpose: it
+    /// sits under the hand that just right-clicked the chip, and it moves
+    /// DELETE one row further from the mis-click this menu exists to
+    /// prevent — the row a stray second press lands on is now the one a
+    /// third press undoes.
+    Bypass,
+    /// **Put a bypassed tenant back in circuit.** Offered in `Bypass`'s
+    /// place when the bay is already out, so the row always says what the
+    /// press will do rather than which way a toggle happens to be facing.
+    Unbypass,
     /// Take the plugin out of the bay.
     Delete,
     /// Open the picker aimed at this bay, so choosing swaps it in place.
@@ -325,6 +346,8 @@ impl FxAction {
     /// everything printed on it is capitals.
     pub fn word(self) -> &'static str {
         match self {
+            FxAction::Bypass => "BYPASS FX",
+            FxAction::Unbypass => "UNBYPASS FX",
             FxAction::Delete => "DELETE FX",
             FxAction::Replace => "REPLACE FX",
             FxAction::Copy => "COPY FX",
@@ -338,6 +361,8 @@ impl FxAction {
     /// sentences beside the clip menu's and is written like one.
     pub fn label(self) -> &'static str {
         match self {
+            FxAction::Bypass => "Bypass FX",
+            FxAction::Unbypass => "Unbypass FX",
             FxAction::Delete => "Delete FX",
             FxAction::Replace => "Replace FX",
             FxAction::Copy => "Copy FX",
@@ -358,10 +383,15 @@ impl FxAction {
 /// conditional row must not be able to re-point the rows above it.
 ///
 /// An EMPTY bay gets a menu at all only for the paste: there is nothing to
-/// delete, replace, copy or key.
-pub fn fx_menu_actions(loaded: bool, key: bool, paste: bool) -> Vec<FxAction> {
-    let mut out = Vec::with_capacity(5);
+/// bypass, delete, replace, copy or key.
+///
+/// `bypassed` picks which face the first row wears — BYPASS FX over a
+/// tenant in circuit, UNBYPASS FX over one already out — so the row names
+/// the thing the press does. One of the two is always there on a loaded bay.
+pub fn fx_menu_actions(loaded: bool, key: bool, paste: bool, bypassed: bool) -> Vec<FxAction> {
+    let mut out = Vec::with_capacity(6);
     if loaded {
+        out.push(if bypassed { FxAction::Unbypass } else { FxAction::Bypass });
         out.push(FxAction::Delete);
         out.push(FxAction::Replace);
         out.push(FxAction::Copy);
@@ -2041,8 +2071,12 @@ pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
             // The rows the menu is offering, from the one list the painter
             // draws from: the actions are POSITIONAL and a conditional row
             // must not re-point the rows above it. See `fx_menu_actions`.
-            let actions =
-                fx_menu_actions(view.fx_menu_loaded, view.fx_menu_key, view.fx_menu_paste);
+            let actions = fx_menu_actions(
+                view.fx_menu_loaded,
+                view.fx_menu_key,
+                view.fx_menu_paste,
+                view.fx_menu_bypassed,
+            );
             let rows = fx_menu_rows(s, bay, actions.len());
             for (r, action) in rows.iter().zip(actions) {
                 if r.contains(pos) {
@@ -2250,8 +2284,12 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
         if let Some(s) = l.strips.get(at.0) {
             // Row order is the hit test's: the two lists must stay twins,
             // which is why neither of them writes one down.
-            let actions =
-                fx_menu_actions(view.fx_menu_loaded, view.fx_menu_key, view.fx_menu_paste);
+            let actions = fx_menu_actions(
+                view.fx_menu_loaded,
+                view.fx_menu_key,
+                view.fx_menu_paste,
+                view.fx_menu_bypassed,
+            );
             let labels: Vec<&str> = actions.iter().map(|a| a.word()).collect();
             two_rows(s, &fx_menu_rows(s, bay, actions.len()), &labels);
         }
@@ -3819,6 +3857,7 @@ mod tests {
             fx_menu_key: false,
             fx_menu_loaded: true,
             fx_menu_paste: false,
+            fx_menu_bypassed: false,
             dark_mode: true,
             wood: (0x4A, 0x3B, 0x2C),
         }
@@ -5417,19 +5456,27 @@ mod tests {
         );
     }
 
-    /// **The insert menu offers two rows and swallows everything else.**
+    /// **The insert menu offers its rows and swallows everything else.**
     ///
     /// A right-click used to unload the bay in one gesture; the menu is what
     /// stands between an evening of dialled-in settings and a mis-click. It
-    /// is modal across the whole mixer: while it is up, a press is DELETE,
-    /// REPLACE, or a dismissal — never someone else's fader.
+    /// is modal across the whole mixer: while it is up, a press is BYPASS,
+    /// DELETE, REPLACE, or a dismissal — never someone else's fader. And
+    /// BYPASS is the row under the hand with DELETE below it: the row a
+    /// stray second press lands on is the one a third press undoes.
     #[test]
-    fn the_insert_menu_offers_delete_and_replace_and_nothing_else() {
+    fn the_insert_menu_offers_bypass_delete_and_replace_and_nothing_else() {
         let mut v = a_view();
         v.fx_menu = Some((Column(0), 1));
         let r = rect();
         let l = Layout::new(r, &v);
-        let rows = fx_menu_rows(&l.strips[0], 1, 2);
+        let actions = fx_menu_actions(
+            v.fx_menu_loaded,
+            v.fx_menu_key,
+            v.fx_menu_paste,
+            v.fx_menu_bypassed,
+        );
+        let rows = fx_menu_rows(&l.strips[0], 1, actions.len());
         for (i, row) in rows.iter().enumerate() {
             assert!(row.is_positive(), "row {i} has no area");
             assert!(
@@ -5439,10 +5486,14 @@ mod tests {
         }
         assert_eq!(
             hit_test(r, &v, rows[0].center()),
-            Some(Hit::FxMenu(Column(0), 1, FxAction::Delete))
+            Some(Hit::FxMenu(Column(0), 1, FxAction::Bypass))
         );
         assert_eq!(
             hit_test(r, &v, rows[1].center()),
+            Some(Hit::FxMenu(Column(0), 1, FxAction::Delete))
+        );
+        assert_eq!(
+            hit_test(r, &v, rows[2].center()),
             Some(Hit::FxMenu(Column(0), 1, FxAction::Replace))
         );
         // A press on ANOTHER strip's fader is a dismissal, not a fader.
@@ -5473,7 +5524,12 @@ mod tests {
         v.fx_menu_key = true;
         let r = rect();
         let l = Layout::new(r, &v);
-        let actions = fx_menu_actions(v.fx_menu_loaded, v.fx_menu_key, v.fx_menu_paste);
+        let actions = fx_menu_actions(
+            v.fx_menu_loaded,
+            v.fx_menu_key,
+            v.fx_menu_paste,
+            v.fx_menu_bypassed,
+        );
         assert!(
             actions.contains(&FxAction::Sidechain),
             "a key-capable bay was offered no sidechain row"
@@ -5496,12 +5552,17 @@ mod tests {
         // Without the capability the same menu is one row shorter: the space
         // where it would sit is a dismissal like any other stray press.
         v.fx_menu_key = false;
-        let plain = fx_menu_actions(v.fx_menu_loaded, v.fx_menu_key, v.fx_menu_paste);
+        let plain = fx_menu_actions(
+            v.fx_menu_loaded,
+            v.fx_menu_key,
+            v.fx_menu_paste,
+            v.fx_menu_bypassed,
+        );
         assert!(!plain.contains(&FxAction::Sidechain));
         let short = fx_menu_rows(&l.strips[0], 1, plain.len());
         assert_eq!(
             hit_test(r, &v, short[0].center()),
-            Some(Hit::FxMenu(Column(0), 1, FxAction::Delete))
+            Some(Hit::FxMenu(Column(0), 1, FxAction::Bypass))
         );
         let last = short[short.len() - 1];
         let below = Pos2::new(last.center().x, last.bottom() + last.height());
@@ -5523,24 +5584,60 @@ mod tests {
     /// learn not to open.
     #[test]
     fn a_bay_offers_copy_always_and_paste_only_when_something_is_held() {
-        let loaded = fx_menu_actions(true, false, false);
+        let loaded = fx_menu_actions(true, false, false, false);
         assert!(loaded.contains(&FxAction::Copy), "a loaded bay cannot be copied");
         assert!(!loaded.contains(&FxAction::Paste), "a paste row with nothing held");
-        let held = fx_menu_actions(true, false, true);
+        let held = fx_menu_actions(true, false, true, false);
         assert_eq!(
             held,
-            vec![FxAction::Delete, FxAction::Replace, FxAction::Copy, FxAction::Paste],
+            vec![
+                FxAction::Bypass,
+                FxAction::Delete,
+                FxAction::Replace,
+                FxAction::Copy,
+                FxAction::Paste
+            ],
             "the held-effect menu is not the plain one plus a paste"
         );
         assert_eq!(
-            fx_menu_actions(false, false, true),
+            fx_menu_actions(false, false, true, false),
             vec![FxAction::Paste],
             "an empty bay's menu is the paste and nothing else"
         );
         assert!(
-            fx_menu_actions(false, true, false).is_empty(),
+            fx_menu_actions(false, true, false, false).is_empty(),
             "an empty bay with nothing held has a menu at all"
         );
+    }
+
+    /// **BYPASS FX leads a loaded bay's menu, and becomes UNBYPASS FX when
+    /// the bay is already out.**
+    ///
+    /// The row says what the press does. A single "Bypass" row over a
+    /// bypassed bay would be a toggle whose direction the reader infers
+    /// from a chip's amber tab; two words leave nothing to infer. First row
+    /// on purpose — see `FxAction::Bypass`.
+    #[test]
+    fn bypass_leads_a_loaded_bays_menu_and_says_which_way_it_flips() {
+        let live = fx_menu_actions(true, false, false, false);
+        assert_eq!(live.first(), Some(&FxAction::Bypass), "bypass is not the first row");
+        assert!(!live.contains(&FxAction::Unbypass));
+        let out = fx_menu_actions(true, false, false, true);
+        assert_eq!(
+            out.first(),
+            Some(&FxAction::Unbypass),
+            "a bypassed bay still offers BYPASS"
+        );
+        assert!(!out.contains(&FxAction::Bypass));
+        assert_eq!(live.len(), out.len(), "the row's two faces changed the menu's length");
+        assert_eq!(&live[1..], &out[1..], "the rows below the first moved");
+        // An EMPTY bay has nothing to take out of circuit, whichever way a
+        // stale flag on it happens to face.
+        assert!(fx_menu_actions(false, false, false, true).is_empty());
+        assert_eq!(fx_menu_actions(false, false, true, true), vec![FxAction::Paste]);
+        // And the two faces read differently on both surfaces.
+        assert_ne!(FxAction::Bypass.word(), FxAction::Unbypass.word());
+        assert_ne!(FxAction::Bypass.label(), FxAction::Unbypass.label());
     }
 
     /// **Only a removable channel wears the ×, and it can be pressed.**
