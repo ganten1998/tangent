@@ -12,6 +12,125 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Added
 
+- **Shift+Up/Down shows the notes it takes.** The selection was right and
+  invisible: `selected` is sorted by contract because the roll asks a binary
+  search whether each note it draws is picked, and the walk APPENDED rather
+  than inserting in order. The moment the note taken in had a lower index than
+  one already held — which in a chord is most of the time, since notes are
+  indexed in the order they were written and the one above is as often older
+  as newer — the search could no longer find it and the note drew unselected.
+  It appeared later, all at once, whenever some other operation rebuilt the
+  selection in order. The owner: "it just doesn't show a visual indicator as
+  notes are added in a stacked note/chordal situation. it only shows after an
+  operation like pasting the selection."
+
+- **An arrow's audition is held long enough to be a pitch.** A cursor step
+  sounded its note and set no deadline, and a preview with no deadline is read
+  as one a hand is holding — so with no button down it was released on the
+  very next frame. A click rather than a note, and the key it lit blinked. It
+  is held for four tenths of a second now, and the step after it releases it
+  first, so walking the keyboard cannot leave a chord ringing behind. The
+  owner: "make the arrow audition a bit longer unless interrupted by another
+  audition."
+
+- **A sounding key is visible.** The editor auditions on three roads — a
+  press on the piano column, an arrow that moves the pitch cursor, a note
+  written or grabbed — and not one of them drew anything: the sound came out
+  and the picture said nothing, so a player walking up the keyboard on the
+  arrows had to count rows, and a press that produced no sound looked exactly
+  like one that had not registered. A key that is sounding now lights amber in
+  the piano column and washes its lane all the way across the roll, because
+  the eye editing a part is on the notes and not on a strip eighty points away
+  at the far left. The owner: "we need proper visual feedback for arrow and
+  click keyboard auditioning in the midi editor."
+
+- **The MIDI editor's grid chip reads "1/4" rather than the note glyph**, the
+  same numerals the arrange toolbar has used since the owner asked for them
+  there. The two spellings had been kept apart on purpose — he asked about
+  ARRANGE, and a shared helper would have moved this chip in the same edit
+  without anyone deciding to — with a test pinning the editor's glyph in both
+  directions until he said otherwise. He has: "Replace the note glyph with 1/4
+  in midi editor."
+
+- **Right-click a note for its own menu**, and two keys beside it. Copy,
+  Cut, Paste, Delete, Mute, Join and Split — the owner's list. Right-click
+  used to erase the note on the spot; Delete is one of the rows now, one
+  press further in and named. **M mutes the selection** from the keyboard, the
+  menu's row on a key. A right-click on a note outside the selection
+  selects it first, and one on a note already in it leaves the selection
+  alone, so a menu opened on one note of a chord acts on the chord. **J
+  joins and S splits**, the two the owner asked to have on keys as well; over
+  the roll both stand down from their app-wide meanings, the way H and Z
+  already do.
+
+  **A muted note is written but not played.** It keeps its place, its length,
+  its pitch and its velocity, is still there to be dragged and selected, and
+  is skipped by every walk that turns a clip into sound — so it is not the
+  same as deleting and undoing. It draws hollow rather than dimmed, because
+  this roll already paints velocity as colour and a washed-out note means
+  something else here. A flag rather than velocity zero, so unmuting gives
+  back the velocity the note had.
+
+  Split cuts at the playhead and only the notes the playhead stands inside,
+  never a sliver: a selection the playhead misses is left where it is rather
+  than being cut somewhere it did not ask for.
+
+- **The MIDI editor can be driven from the keyboard, start to finish.** The
+  owner: "a system where-in proper arrow controls can be used to create and
+  edit midi clips intuitively, and from the beginning to the end."
+
+  **Enter writes a note** at the playhead on the pitch cursor, and walks the
+  playhead past it — so Enter pressed four times writes four notes in a row
+  rather than four in a stack, and a melody is a run of Enter with the odd Up
+  or Down in it. The roll has a playhead for the time axis and now a cursor
+  for the pitch axis, which the mouse never needed because a hand carries
+  both at once.
+
+  **The bare arrows do one of two jobs and the selection decides which** —
+  the grammar the rest of the app already uses. With a note in hand they
+  edit it: a step along, a semitone up, and the pitch cursor comes with it so
+  the next note starts where the hand left off. With nothing in hand they
+  drive: the playhead along the clip, the cursor up the keyboard, sounding
+  each note it lands on.
+
+  **Shift splits by axis.** Left and right are the note's length; up and down
+  take the note above or below into the selection, which is how a chord is
+  built a note at a time — a candidate has to overlap the selection in time,
+  so it climbs the chord rather than reaching across the bar. **Ctrl/Cmd+Alt
+  with up and down** moves the selection an octave. **Escape lets go** of the
+  selection, and closes the editor on the second press — which is the order
+  somebody in trouble presses it in anyway, and it is what puts the bare
+  arrows back on the playhead without reaching for the mouse.
+
+- **Shift+H humanizes the selection in the MIDI editor.** The chord hangs a
+  small menu under the pointer with two amounts — TIMING, a percentage of one grid
+  step, and VELOCITY, a percentage of the velocity each note already has —
+  and HUMANIZE (or Enter) applies them to the selected notes. Two
+  independent amounts because the two are not the same wish: a drum part
+  often wants its velocities moved and its timing left where it is, and a
+  held pad the reverse. Velocity moves by a proportion rather than a fixed
+  number so the part keeps its shape — a ghost note shifts by a few and an
+  accent by a dozen, and nothing is ever pushed to silence. The amounts are
+  remembered, so the second part costs one press. Notes stay inside their
+  clip, exactly as the quantiser keeps them.
+
+  **The shift is not a preference.** Bare H is held for the shortcut card and
+  the editor has a card of its own, so taking the letter outright cost the one
+  surface whose card is hardest to do without. Cmd+H was the obvious sidestep
+  and is not available: winit installs the standard macOS application menu,
+  whose Hide item carries Cmd+H (and Cmd+Shift+H for Hide Others), and AppKit
+  eats both before the app sees a key — so bound there, Humanize would have
+  hidden Tangent.
+
+- **Insert Track, on a channel's right-click.** A new empty track opens
+  directly under the one clicked and the rows beneath shift down a place.
+  The desk is thirty-two fixed lanes, so this spends an unused one from
+  BELOW the insertion point — a lane taken from above would shift tracks
+  the gesture never mentioned, in the opposite direction to the one asked
+  for. A row opened inside a folder joins that folder, or the group would be
+  split in two by a track that is not in it. The owner: "Need a rightclick
+  option for channels to insert track."
+
 - **BYPASS FX in the insert menu.** Right-click a loaded insert bay, on the
   desk or in the timeline's header, and the first row is BYPASS FX: the
   plugin stays loaded, keeps its settings and its window, and the signal
@@ -510,6 +629,89 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   and monitoring ... it worked for another track then it now won't work at
   all."
 
+- **Paste Track no longer destroys the track you aim it at.** The row was
+  Paste Track (overwrite) and it took the lane it landed on, clips, bays and
+  all — it said so on the label, which is the least a row like that can do,
+  but a paste that costs a track is a paste people check twice before using.
+  It is now Paste Track Below: the copy arrives on a row opened under the one
+  clicked and everything beneath shifts down. The owner: "make paste track
+  actually non-destructive, change it from the overwrite to add below
+  inbetween selected track and track below it."
+
+  The mixer's Cmd+V went the same way, and it had never had the guard the
+  arrangement's has: aimed at a live track it overwrote silently, with no
+  label anywhere to warn. Both surfaces now go through one decision — an
+  empty slot receives the copy, a live track keeps its life and the copy
+  lands under it.
+
+- **The "That is a MIDI part, not a sample" message is gone.** It answered a
+  question nobody asked, on a DRAG — as often a slip of the hand as an
+  intention — and a drag that publishes nothing has already said so by not
+  moving anything. The refusal stands; the sentence does not. The owner: "I'm
+  not [sure] that message is actually useful in any way."
+
+- **An explanatory message ages out on its own.** The app's helper answers —
+  the ones a press asks for and nothing re-checks — borrowed the machinery
+  built for CONDITIONS, which have no clock because they end when they stop
+  being true. Nothing was ever going to lower "No MIDI track on the desk", so
+  it sat in the corner until it was clicked, which is one more thing to do in
+  the middle of whatever it interrupted. They leave after ten seconds now, and
+  asking again restarts the clock. A real condition still stands until it
+  clears: a device that has genuinely vanished is the one message that must
+  not quietly leave. The owner: "Make the helper notifs also fade on their own
+  after a set interval. These interfere with testing."
+
+- **Enter no longer starts a take.** It began one from any surface, on the
+  argument that the key which starts a performance must not be the one that
+  ends it. Cmd+R does both, and a bare, enormous, centre-of-the-keyboard key
+  that rolls tape is a take started by a stray press — and the MIDI editor
+  now wants Enter for writing a note. The owner: "Remove enter for record --
+  we already have command r."
+
+- **The Humanize menu opens under the pointer, and is bigger.** It opened
+  centred on the roll and wore the swing menu's rows, which are a list to pick
+  from; these are tracks to drag a percentage along, and they have to be tall
+  enough to aim at and wide enough that a point of travel is not four per
+  cent.
+
+- **A parked desk stops running its effect chains, so an idle project is
+  silent.** Every loaded plugin ran every block, whatever the transport was
+  doing — deliberately, so that a reverb tail is not cut in half at every gap
+  or chopped the instant somebody presses stop. The cost of that was reckoned
+  as "plugins process silence", which is free only for a plugin that is
+  transparent on silence. An amp simulation is not: fed digital silence it
+  emits the hiss and hum it exists to simulate. With an amp sim on a bass DI
+  and a compressor behind it lifting that noise, a project sitting untouched
+  with nothing armed and nothing playing put about -40 dBFS of buzz on the
+  master for as long as it was open. The owner heard it three times before it
+  had a name: "a chorusy buzz constant at around -40dB on the master meter."
+
+  A lane's chain now stops after eight seconds of stopped transport, which is
+  past the tail of any reverb anybody mixes with, and wakes instantly on play,
+  on arm, on a note, on an audition. **A lane carrying an instrument never
+  parks at all** — an effect fed nothing has nothing of its own to lose, but a
+  voice may be holding a note, so the rule asks each plugin's own box whether
+  it generates and stands down for the whole lane if any of them does. It also
+  gives the CPU back: an idle desk of twenty plugins was running all of them.
+
+- **A preset reaches the instrument, not its first sixteen values.** The
+  queue a knob crosses to the audio thread held sixteen points a bay, and
+  loading a preset is one point per knob all at once — so Tangent Analog,
+  which publishes sixty-one, had sixteen of them applied and forty-five left
+  standing at the patch before, and Tangent EQ lost nine of its twenty-five.
+  Nothing showed it: the face, the host's ledger and a saved project all
+  carry the full preset, because those are written on the host side and never
+  cross that queue. Only the SOUND was a mongrel of two patches, which on a
+  synth can drone. The owner found it as "presets require manual updates of
+  values to register" — nudging a knob afterwards sends a single point, and a
+  single point always fitted.
+
+  The cap was sized for automation curves, where a point that does not fit is
+  genuinely re-sent by the next block; the knob road is drained destructively
+  and had no such luck. It is now the widest built-in's own complement, and
+  the drain folds repeats of one knob together so a bay can never be asked
+  for more parameters than the unit in it has.
+
 - **A trimmed MIDI loop fills its tail.** Every unroll counted passes as the
   clip's length over its loop, while placing each note at `at_s - offset_s`
   — so a clip trimmed from its front starts mid-loop and the walk ran out
@@ -519,6 +721,23 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   never affected: their passes place the clip's own start and hand the file
   offset to the player. The owner: "midi loops that are clipped leave a
   latter half that is empty."
+
+- **A trimmed clip is notched where its loop actually turns over.** The
+  divots along a looping clip's edges were laid a whole loop apart from the
+  clip's LEFT EDGE, which is right only for a clip that begins on a
+  boundary. Trim a quarter of a bar off the front — the same trim behind the
+  empty tail above, and the same cause — and every notch sat a quarter of a
+  bar late, over the middle of a pass, on the one mark whose whole job is to
+  say where the loop restarts. The first pass of a trimmed clip is short by
+  however far into the loop it starts; the rest follow a loop apart from
+  there. A clip SHORTER than its own loop is notched too now, once, if its
+  offset leaves a boundary inside it: that clip does turn over, and the old
+  test called it unlooped and drew it flat.
+
+  An AUDIO clip's notches do not move, because the same number means
+  something else there: its trim chooses which seconds of the file play and
+  every pass gets the same ones, so an audio loop turns over a whole loop in
+  however far it has been trimmed. The seams read the clip's kind now.
 
 - **Phosphor's and Nocturne's light mode is a light mode.** Those two are the
   only themes whose light ground is a near-black — it is what makes them what

@@ -659,6 +659,7 @@ impl ArrRecLane {
                         dur_s: (rel - at).max(0.05),
                         key,
                         vel,
+                    muted: false,
                     });
                 }
             }
@@ -2747,6 +2748,14 @@ fn midi_clip_notes(
         .flat_map(|pass| {
             let shift = clip.loop_s * pass as f64;
             clip.notes.iter().filter_map(move |n| {
+                // **A muted note is not pushed to the engine.** The twin of
+                // the skip in `clip_notes_in_song_time`, and it has to be
+                // here as well for the same reason that function's own note
+                // gives: this is the engine's own expansion and it does not
+                // go through that one.
+                if n.muted {
+                    return None;
+                }
                 let at = n.at_s - clip.offset_s + shift;
                 if at < -1.0e-9 {
                     return None;
@@ -4202,6 +4211,7 @@ impl DesktopApp {
                         dur_s: (now - at).max(0.05),
                         key: *key,
                         vel: *vel,
+                    muted: false,
                     });
                 }
             }
@@ -8144,6 +8154,7 @@ impl DesktopApp {
                     dur_s: (len_s - at).max(0.05),
                     key,
                     vel,
+                muted: false,
                 });
             }
             l.notes.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
@@ -21008,6 +21019,7 @@ mod tests {
                     dur_s: 0.01,
                     key: 60,
                     vel: 100,
+                muted: false,
                 })
                 .collect(),
             ..Default::default()
@@ -21033,6 +21045,7 @@ mod tests {
                     dur_s: 0.05,
                     key: 60,
                     vel: 100,
+                muted: false,
                 })
                 .collect(),
             ..Default::default()

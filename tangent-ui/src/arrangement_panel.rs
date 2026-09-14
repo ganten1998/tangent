@@ -2605,9 +2605,10 @@ fn loop_pass_w(full_x: (f32, f32), clip: &ClipView<'_>) -> f32 {
 
 /// **Where a looped clip's seams fall**, as x in points, left to right.
 ///
-/// One boundary per multiple of `loop_s` strictly inside `len_s` — the places
-/// [`crate::arrangement::clip_notes_in_song_time`] starts another pass — and
-/// only the ones that land inside the drawn rect with room to be seen.
+/// One boundary per place [`crate::arrangement::clip_notes_in_song_time`]
+/// starts another pass — the first at [`clip_head_s`], the rest a loop apart
+/// after it — and only the ones that land inside the drawn rect with room to
+/// be seen.
 ///
 /// `full_x` is the clip's UNCLAMPED pixel span, the same one the miniature is
 /// mapped through and for the same reason: the drawn rect is cut to the
@@ -2618,14 +2619,52 @@ fn loop_pass_w(full_x: (f32, f32), clip: &ClipView<'_>) -> f32 {
 /// Arithmetic and not a walk. The passes are evenly spaced, so the two that
 /// bound the rect invert directly, and a clip holding five hundred passes of
 /// which four are on screen costs four.
+/// **Where a looped clip's FIRST pass ends**, in seconds from its left edge,
+/// or `None` for a clip that never turns over inside itself.
+///
+/// A whole loop only for a clip that begins ON a boundary — and **the two
+/// kinds of clip disagree about what beginning on one means**, so this
+/// follows the sound rather than picking a rule.
+///
+/// On a MIDI clip the trim moves the material past a fixed grid: the notes
+/// are placed at `at_s - offset_s + loop_s * pass`
+/// ([`crate::arrangement::clip_notes_in_song_time`]), so a clip trimmed into
+/// its bar starts mid-loop and its first pass is short by exactly how far in
+/// it starts. On an AUDIO clip the trim chooses which seconds of the FILE
+/// play, and every pass gets the same one: `audio_clip_passes` places pass
+/// `k` at `start_s + loop_s * k` whatever the offset, which `wave_band`
+/// mirrors by folding with `rem_euclid` before adding it. So an audio clip
+/// turns over a whole loop in however far it has been trimmed, and giving it
+/// the MIDI phase would slide its notches off its own wave.
+///
+/// Every boundary after the first is a whole loop along either way, which is
+/// why one number answers the whole question.
+///
+/// **Shorter than a loop is not the same as not looping.** A MIDI clip half a
+/// bar long that begins three quarters of the way through its bar does turn
+/// over, once, in the middle; the `len_s <= loop_s` test that used to stand
+/// here called that clip unlooped and drew it flat.
+fn clip_head_s(clip: &ClipView<'_>) -> Option<f64> {
+    if clip.loop_s <= 1.0e-6 || !clip.loop_s.is_finite() || !clip.len_s.is_finite() {
+        return None;
+    }
+    let head_s = if clip.midi {
+        // `max` yields the other side of a NaN, so a clip with no offset
+        // written reads as no trim rather than poisoning the arithmetic; an
+        // infinite one falls out of the comparison below as `None`.
+        let phase_s = clip.offset_s.max(0.0) % clip.loop_s;
+        if phase_s <= 1.0e-9 { clip.loop_s } else { clip.loop_s - phase_s }
+    } else {
+        clip.loop_s
+    };
+    (clip.len_s > head_s + 1.0e-9).then_some(head_s)
+}
+
 /// **Does this clip show a seam at all?** — the loop question without the
 /// pixels, so the fill, the miniature's inset and `loop_seam_xs` cannot
 /// disagree about whether a clip is bitten.
 fn clip_has_seam(clip: &ClipView<'_>) -> bool {
-    clip.loop_s > 1.0e-6
-        && clip.loop_s.is_finite()
-        && clip.len_s.is_finite()
-        && clip.len_s > clip.loop_s + 1.0e-9
+    clip_head_s(clip).is_some()
 }
 
 /// How deep a divot bites into the clip's top and bottom edge.
@@ -2740,9 +2779,6 @@ fn loop_seam_xs(r: Rect, full_x: (f32, f32), clip: &ClipView<'_>) -> Vec<f32> {
         || clip.loop_s <= 1.0e-6
         || !clip.loop_s.is_finite()
         || !clip.len_s.is_finite()
-        // A clip no longer than one pass has no seam: there is no second
-        // pass for the first one to end against.
-        || clip.len_s <= clip.loop_s + 1.0e-9
     {
         return Vec::new();
     }
@@ -2750,22 +2786,32 @@ fn loop_seam_xs(r: Rect, full_x: (f32, f32), clip: &ClipView<'_>) -> Vec<f32> {
     if pass_w < SEAM_MIN_PASS_W {
         return Vec::new();
     }
-    // The same count and the same ceiling the miniature and the schedule use,
-    // so the picture cannot claim a pass the sound does not play.
-    let passes = (((clip.len_s + clip.offset_s.max(0.0)) / clip.loop_s).ceil() as usize)
-        .clamp(1, 512);
-    let lo = ((r.left() - fx0) / pass_w).ceil();
-    let hi = ((r.right() - fx0) / pass_w).floor();
+    // **A trimmed MIDI clip's first pass is short**, and every seam after it
+    // carries that shift. Laid at whole loops from the clip's left edge
+    // instead — right for audio, and for a MIDI clip that begins on a
+    // boundary — the notches sat a phase out, over the middle of a pass,
+    // claiming the loop restarts where it does not.
+    let Some(head_s) = clip_head_s(clip) else {
+        return Vec::new();
+    };
+    let head_px = (f64::from(fx1 - fx0) * head_s / clip.len_s) as f32;
+    let first = fx0 + head_px;
+    // The boundaries that fall INSIDE the clip: one at `head_s`, then every
+    // loop after it. A boundary landing exactly on the clip's end is its end
+    // rather than a seam.
+    let count = (((clip.len_s - head_s) / clip.loop_s).ceil() as usize).clamp(1, 512);
+    let lo = ((r.left() - first) / pass_w).ceil();
+    let hi = ((r.right() - first) / pass_w).floor();
     if !lo.is_finite() || !hi.is_finite() || hi < lo {
         return Vec::new();
     }
     // `as` saturates rather than wrapping, which is what is wanted at both
     // ends: a clip scrolled off to the left asks for a negative first seam
     // and gets the first one there is.
-    let from = (lo.max(1.0) as usize).clamp(1, passes);
-    let to = ((hi.max(0.0) as usize).saturating_add(1)).clamp(from, passes);
+    let from = (lo.max(0.0) as usize).min(count);
+    let to = ((hi.max(0.0) as usize).saturating_add(1)).clamp(from, count);
     (from..to)
-        .map(|k| fx0 + pass_w * k as f32)
+        .map(|k| first + pass_w * k as f32)
         // Clear of the clip's own border, which would otherwise swallow a
         // seam sitting on it and leave a pass that looks like it has none.
         .filter(|x| *x > r.left() + 1.0 && *x < r.right() - 1.0)
@@ -11223,6 +11269,7 @@ selected: false,
                 dur_s: bar_s / 32.0,
                 key: 48 + u8::try_from((i * 7) % 36).unwrap_or(0),
                 vel: 100,
+            muted: false,
             })
             .collect()
     }
@@ -11241,6 +11288,7 @@ selected: false,
             dur_s: bar_s,
             key: 36,
             vel: 100,
+        muted: false,
         });
         notes
     }
@@ -12034,6 +12082,144 @@ selected: false,
         );
     }
 
+    /// **A clip trimmed from its front is notched where the loop actually
+    /// turns over**, which is not a whole loop from its left edge.
+    ///
+    /// The owner: "midi loops that are clipped leave a latter half that is
+    /// empty." That fault was the SCHEDULE's, and it was fixed in
+    /// `clip_notes_in_song_time` by covering `len_s + offset_s`. The PICTURE
+    /// had the same fault from the same cause and outlived the fix: seams
+    /// were laid at whole loops from the clip's left edge, which is right
+    /// only for a clip that begins ON a boundary. Trim a quarter of a bar off
+    /// the front and every notch sat a quarter of a bar late, over the middle
+    /// of a pass — the one control whose whole job is to say where a loop
+    /// restarts, pointing somewhere it does not.
+    ///
+    /// The notes are placed at `at_s - offset_s + loop_s * pass`, so the
+    /// boundaries inside a clip are at `loop_s * p - offset_s`: a two-second
+    /// bar trimmed half a second in turns over at 1.5s, 3.5s, 5.5s and 7.5s
+    /// across four bars of clip. FOUR seams, not the three an untrimmed clip
+    /// of the same length gets — the short head pushes the last boundary half
+    /// a second clear of the end instead of onto it.
+    ///
+    /// Two corners ride along. A clip trimmed by exactly one WHOLE loop is
+    /// untrimmed as far as the seams are concerned, so a phase of zero must
+    /// not put a seam on the clip's own left edge. And a clip SHORTER than
+    /// its loop still turns over if its offset leaves a boundary inside it,
+    /// which the old `len_s <= loop_s` early-out refused outright.
+    #[test]
+    fn a_clip_trimmed_from_its_front_is_notched_where_the_loop_turns_over() {
+        let bar_s = 2.0;
+        let notes = a_looped_bar(bar_s);
+        let none: [crate::arrangement::ArrNote; 0] = [];
+        let area = rect();
+        let face = Color32::from_rgb(0x2E, 0x6B, 0x46);
+        let fill = crate::recorder_panel::legible_surface(face);
+        for (what, offset_s, bars, want_s) in [
+            ("trimmed a quarter of a bar in", 0.5, 4.0, vec![1.5, 3.5, 5.5, 7.5]),
+            ("trimmed by one whole bar", bar_s, 4.0, vec![2.0, 4.0, 6.0]),
+            ("shorter than its loop, trimmed across a boundary", 1.5, 0.75, vec![0.5]),
+        ] {
+            let clips =
+                [ClipView { notes: &none, offset_s, ..a_looped_clip(&notes, bar_s, bars) }];
+            let mut v = a_view(&clips);
+            v.view_start_s = 0.0;
+            v.view_len_s = 12.0;
+            v.song_s = 12.0;
+            let r = clip_rect(area, &v, &clips[0]);
+            assert!(r.is_positive(), "{what}: the fixture is not on screen");
+            let full_x = (
+                x_of(area, &v, clips[0].start_s),
+                x_of(area, &v, clips[0].start_s + clips[0].len_s),
+            );
+            let want: Vec<f32> = want_s.iter().map(|t| x_of(area, &v, *t)).collect();
+            let got = loop_seam_xs(r, full_x, &clips[0]);
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "{what}: seams at {got:?}, wanted {want:?} ({want_s:?}s)"
+            );
+            for (g, w) in got.iter().zip(&want) {
+                assert!((g - w).abs() < 0.5, "{what}: a seam at {g} belongs at {w}");
+            }
+
+            // **And the clip's own outline carries them**, one piece a pass,
+            // each seam a bite out of both edges. The geometry half alone
+            // would pass on a function nobody draws with.
+            let pieces = clip_pieces_in(&v, r, fill);
+            assert_eq!(
+                pieces.len(),
+                got.len() + 1,
+                "{what}: {} pieces of outline for {} seams",
+                pieces.len(),
+                got.len()
+            );
+            let d = clip_bite_d(r);
+            assert!(d >= 2.0, "a bite {d} deep is not a bite");
+            let on = |pts: &[Pos2], x: f32, y: f32| {
+                pts.iter().any(|p| (p.x - x).abs() < 0.75 && (p.y - y).abs() < 0.75)
+            };
+            for (n, x) in got.iter().enumerate() {
+                let (left, right) = (&pieces[n], &pieces[n + 1]);
+                assert!(
+                    on(left, *x, r.top() + d) && on(right, *x, r.top() + d),
+                    "{what}: seam {n} at {x} has no top bite"
+                );
+                assert!(
+                    on(left, *x, r.bottom() - d) && on(right, *x, r.bottom() - d),
+                    "{what}: seam {n} at {x} has no bottom bite"
+                );
+            }
+
+            // **And the miniature was moved out of the bites' way**, which is
+            // the agreement `clip_has_seam` exists to keep. The third case is
+            // where the two used to part company: it is shorter than its own
+            // loop, so the old question answered "this clip does not turn
+            // over" while the seams — correctly — bit it anyway, and a note
+            // bar would have hung in the lane through the hole.
+            let band = miniature_band(r, &clips[0]);
+            assert!(
+                band.top() >= r.top() + d - 0.01 && band.bottom() <= r.bottom() - d + 0.01,
+                "{what}: the miniature band {band:?} reaches into a {d}-point bite"
+            );
+        }
+
+        // ── and an AUDIO clip's trim does NOT move its seams ──────────
+        //
+        // The two kinds mean different things by the same number. A MIDI
+        // trim slides the material across a fixed grid; an audio trim picks
+        // which seconds of the FILE play, and `audio_clip_passes` hands the
+        // same offset to every pass while placing pass `k` at `loop_s * k`
+        // from the clip's start. So the identical trim that moves the MIDI
+        // seams above must leave these where they were, on the loop, over
+        // the wave that really does restart there.
+        let clips = [ClipView {
+            notes: &none,
+            midi: false,
+            offset_s: 0.5,
+            ..a_looped_clip(&notes, bar_s, 4.0)
+        }];
+        let mut v = a_view(&clips);
+        v.view_start_s = 0.0;
+        v.view_len_s = 12.0;
+        v.song_s = 12.0;
+        let r = clip_rect(area, &v, &clips[0]);
+        let full_x = (
+            x_of(area, &v, clips[0].start_s),
+            x_of(area, &v, clips[0].start_s + clips[0].len_s),
+        );
+        let want: Vec<f32> = [2.0, 4.0, 6.0].iter().map(|t| x_of(area, &v, *t)).collect();
+        let got = loop_seam_xs(r, full_x, &clips[0]);
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "a trimmed audio clip: seams at {got:?}, wanted {want:?} (2, 4, 6s)"
+        );
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 0.5, "a trimmed audio clip: a seam at {g} belongs at {w}");
+        }
+    }
+
     /// **An AUDIO clip that loops is bitten too, and the bite clears its
     /// waveform.**
     ///
@@ -12248,16 +12434,16 @@ selected: false,
     fn a_note_with_impossible_times_survives_the_drawing() {
         use crate::arrangement::ArrNote;
         let wild = [
-            ArrNote { at_s: f64::NAN, dur_s: 0.25, key: 60, vel: 100 },
-            ArrNote { at_s: 0.0, dur_s: f64::NAN, key: 61, vel: 100 },
-            ArrNote { at_s: f64::INFINITY, dur_s: 1.0, key: 62, vel: 100 },
-            ArrNote { at_s: f64::NEG_INFINITY, dur_s: 1.0, key: 63, vel: 100 },
-            ArrNote { at_s: -1.0e9, dur_s: 1.0e9, key: 64, vel: 100 },
-            ArrNote { at_s: 1.0e18, dur_s: 1.0e18, key: 65, vel: 100 },
-            ArrNote { at_s: f64::MAX, dur_s: f64::MAX, key: 66, vel: 100 },
-            ArrNote { at_s: 0.5, dur_s: -4.0, key: 67, vel: 100 },
+            ArrNote { at_s: f64::NAN, dur_s: 0.25, key: 60, vel: 100, muted: false },
+            ArrNote { at_s: 0.0, dur_s: f64::NAN, key: 61, vel: 100, muted: false },
+            ArrNote { at_s: f64::INFINITY, dur_s: 1.0, key: 62, vel: 100, muted: false },
+            ArrNote { at_s: f64::NEG_INFINITY, dur_s: 1.0, key: 63, vel: 100, muted: false },
+            ArrNote { at_s: -1.0e9, dur_s: 1.0e9, key: 64, vel: 100, muted: false },
+            ArrNote { at_s: 1.0e18, dur_s: 1.0e18, key: 65, vel: 100, muted: false },
+            ArrNote { at_s: f64::MAX, dur_s: f64::MAX, key: 66, vel: 100, muted: false },
+            ArrNote { at_s: 0.5, dur_s: -4.0, key: 67, vel: 100, muted: false },
             // One ordinary note, so the clip has a picture to lose.
-            ArrNote { at_s: 1.0, dur_s: 0.5, key: 68, vel: 100 },
+            ArrNote { at_s: 1.0, dur_s: 0.5, key: 68, vel: 100, muted: false },
         ];
         let ctx = egui::Context::default();
         let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("wild-mini"));
@@ -12410,6 +12596,7 @@ mod miniature_cost_probe {
                 dur_s: bar_s / 32.0,
                 key: 48 + u8::try_from((i * 7) % 36).unwrap_or(0),
                 vel: 100,
+            muted: false,
             })
             .collect()
     }
@@ -12430,6 +12617,7 @@ mod miniature_cost_probe {
                 dur_s: bar_s - f64::from(i / 4) * (bar_s / 16.0),
                 key: held,
                 vel: 100,
+            muted: false,
             });
         }
         notes

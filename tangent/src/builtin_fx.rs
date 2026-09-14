@@ -517,6 +517,26 @@ fn build_sampler(sample_rate: f32) -> BuiltinUnit {
     BuiltinUnit::Sampler(SamplerUnit::new(sample_rate))
 }
 
+/// **The most parameters any one built-in publishes.** Computed over
+/// [`UNITS`] rather than written down, so a unit with a bigger panel carries
+/// its own answer here the day it is added.
+///
+/// This is a SIZE somebody else has to respect, not a fact about this file:
+/// a built-in's knobs reach its instance over the audio thread's per-bay
+/// parameter queue, and a queue shorter than this silently drops the tail of
+/// every bulk set — a preset, an Init. See `AUTO_PARAMS_PER_BAY`.
+pub const MAX_UNIT_PARAMS: usize = {
+    let mut most = 0;
+    let mut i = 0;
+    while i < UNITS.len() {
+        if UNITS[i].params.len() > most {
+            most = UNITS[i].params.len();
+        }
+        i += 1;
+    }
+    most
+};
+
 /// Every effect this build ships. Order is nothing; the path is the key.
 pub const UNITS: &[UnitSpec] = &[
     UnitSpec {

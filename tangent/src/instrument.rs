@@ -3349,6 +3349,68 @@ impl Rack {
     fn is_empty(&self) -> bool {
         self.slots.iter().all(|s| s.0.is_none())
     }
+
+    /// **Does any bay in this rack GENERATE?** — see [`Hosted::voice`], which
+    /// is where the flag comes from and why it is trusted: it is decided at
+    /// load from the class's own `subCategories` and carried in the box, so
+    /// the audio thread need not consult an index a UI thread wrote.
+    ///
+    /// Asked by the park rule in `mix_channels`, which is allowed to stop
+    /// running an EFFECT chain over a parked desk and is never allowed to
+    /// stop running a voice: an effect fed nothing has nothing of its own to
+    /// lose, and an instrument may be holding a note.
+    fn holds_a_voice(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.0.as_ref().is_some_and(|h| h.voice))
+    }
+}
+
+/// **How long a stopped desk goes on running an effect chain before it
+/// parks it**, in seconds.
+///
+/// Long enough for the thing the always-run rule exists to protect. Racks run
+/// for any lane carrying clips, deliberately not "under the playhead" and not
+/// "while rolling", so that a reverb tail is not cut in half at every gap or
+/// chopped the instant the transport stops — see `clip_lanes`. Eight seconds
+/// is past the tail of any reverb anybody mixes with; what is left after it
+/// is not a tail, it is the chain idling.
+///
+/// **And idling is not free or silent.** The owner's bass DI carries an amp
+/// simulation, and an amp simulation fed digital silence emits the hiss and
+/// hum it is simulating — through the compressor behind it, into the reverb
+/// on its send, and out of a parked desk at about -40 dBFS for as long as the
+/// project is open. "A chorusy buzz constant at around -40dB on the master
+/// meter", with nothing armed, nothing playing and nothing to hear.
+const RACK_PARK_S: f64 = 8.0;
+
+/// **Whether a lane's rack may stop running this block**, advancing the
+/// lane's quiet counter as it decides.
+///
+/// A free function so the rule can be read and tested on its own — without an
+/// audio device, a plugin, or a block of samples — which is what its two
+/// halves deserve: one of them stops a chain from making noise a parked desk
+/// should not make, and the other is the promise that it will never do that
+/// to something holding a note.
+///
+/// A lane with no counter (an index past the table) never parks, which is the
+/// same "answer rather than panic" the seat map makes.
+fn park_lane(
+    quiet: Option<&mut u64>,
+    holds_voice: bool,
+    live_now: bool,
+    frames: usize,
+    rate: f64,
+) -> bool {
+    let Some(quiet) = quiet else {
+        return false;
+    };
+    if holds_voice || live_now {
+        *quiet = 0;
+        return false;
+    }
+    *quiet = quiet.saturating_add(frames as u64);
+    *quiet as f64 >= RACK_PARK_S * rate.max(1.0)
 }
 
 /// Run a rack over one channel's PLANAR audio, in place.
@@ -3366,13 +3428,47 @@ impl Rack {
 /// Named rather than written out, so a site that SHOULD carry automation is
 /// visibly different from one that has none rather than differing by an
 /// easily-missed `&[]`.
-/// How many automated parameters one bay may carry in a block.
+/// How many parameters one bay may carry in a block.
 ///
 /// The cap exists because the audio thread may not allocate, so the vectors
-/// are grown once and never past their capacity. Sixteen is well past what
-/// any song has automated on a single effect, and going over it costs the
-/// SEVENTEENTH parameter its movement rather than costing the block.
-const AUTO_PARAMS_PER_BAY: usize = 16;
+/// are grown once and never past their capacity.
+///
+/// **Sixteen was this number, and sixteen was wrong**, because two roads
+/// share these queues and only one of them can afford to lose a point. An
+/// automation CURVE is re-walked from the document every block, so a point
+/// that does not fit is genuinely delivered by the next one — which is what
+/// the old note here claimed, and it claimed it for both roads. The other
+/// road is `ui_params`, the ring a knob and a PRESET arrive on, and that
+/// drain is DESTRUCTIVE: the point is popped off the ring, and a point that
+/// does not fit is gone for good. Nothing re-sends it.
+///
+/// So a bulk set larger than the cap applied its first sixteen values and
+/// silently dropped the rest. The analog publishes sixty-one, so loading a
+/// preset on it moved sixteen knobs on the instance and left forty-five
+/// standing at the patch before — while the host's ledger, the face and a
+/// saved project all showed the preset in full, because those are written on
+/// the host side and never crossed this ring. The owner found it as
+/// "presets require manual updates of values to register": nudging a knob by
+/// hand afterwards sends ONE point, which fits, and that one registers.
+///
+/// The number is now the widest built-in's own complement
+/// ([`crate::builtin_fx::MAX_UNIT_PARAMS`]), floored at the sixteen the
+/// curves were sized for. With the drain coalescing by id (see
+/// `resolve_automation`) a bay cannot be asked for more distinct parameters
+/// than the unit seated in it HAS, so this is a ceiling the road can reach
+/// and not merely a generous guess.
+///
+/// The price is memory: one vector per seat per bay, grown at load, so the
+/// table goes from about three megabytes to about thirteen. That is the
+/// honest cost of a road that does not lose what it is given.
+const AUTO_PARAMS_PER_BAY: usize = {
+    let most = crate::builtin_fx::MAX_UNIT_PARAMS;
+    if most > 16 {
+        most
+    } else {
+        16
+    }
+};
 
 /// One knob a plugin's OWN window just turned, on its way to the audio thread.
 ///
@@ -4477,6 +4573,12 @@ struct Renderer {
     /// contents are identical; only where they live changes, and indexing a
     /// `Vec` costs the callback nothing over indexing an array.
     racks: Vec<Rack>,
+    /// **How long each lane's rack has had nothing to do**, in frames, and
+    /// the counter the park rule reads. Zeroed the moment the lane has any
+    /// reason to be live — the transport rolling, the lane armed, a note on
+    /// it, an audition — and never counted at all for a lane that could be
+    /// holding a note. See `RACK_PARK_S`.
+    lane_quiet: Vec<u64>,
     /// Deinterleaved in and out for it. Preallocated, like everything else the
     /// audio thread touches.
     fx_in: Vec<Vec<f32>>,
@@ -7729,11 +7831,24 @@ impl Renderer {
             let Some(q) = self.auto_params.get_mut(lane * INSERTS + bay) else {
                 continue;
             };
-            // The same pre-grown capacity the curves respect, and the same
-            // reason: this thread may not allocate. Overflowing costs the
-            // seventeenth simultaneous knob its movement for one block, and
-            // the next block delivers it.
-            if q.len() < q.capacity() {
+            // **The LAST value for an id wins, in place.** A knob dragged
+            // across three frames lands three points in one block and only
+            // the last is the position the hand is in; a preset sends each
+            // of its parameters once. Coalescing costs a short scan of a
+            // queue that holds tens of entries and buys the guarantee this
+            // capacity is chosen under — a bay can be asked for no more
+            // distinct parameters than the unit in it has, so a bulk set
+            // that fits the unit fits the queue.
+            //
+            // Only the ui road coalesces, and only here: this runs on a
+            // queue the line above has just cleared, before a single curve
+            // point is in it. A CURVE may legitimately put several points
+            // for one id in a block — that is what a ramp is — and folding
+            // those together would flatten every automation ramp to one
+            // step a block.
+            if let Some(seat) = q.iter_mut().find(|p| p.id == u.id) {
+                seat.value = u.value;
+            } else if q.len() < q.capacity() {
                 q.push(tangent_host::ParamPoint {
                     offset: 0,
                     id: u.id,
@@ -9538,7 +9653,53 @@ impl Renderer {
             let has_audio = self.clip_lanes & (1u32 << ch.min(CHANNELS - 1)) != 0;
             let feeds =
                 armed || lane_has_clips || has_audio || !lane_notes.is_empty() || auditioning;
-            if !feeds || (!is_builtin && !is_keys && !rack_live && !has_audio) {
+            // ── **the PARK**: a stopped desk stops running its effects ────
+            //
+            // Racks run for any lane that has a rack at all, every block,
+            // whatever the transport is doing. That is deliberate and the
+            // reason is written on `clip_lanes`: a per-block or rolling-only
+            // answer would cut a reverb tail in half at every gap and chop it
+            // the instant somebody pressed stop. The cost was reckoned as
+            // "plugins process silence", which was assumed to be free.
+            //
+            // It is not free when the plugin MODELS something. The owner's
+            // bass DI carries an amp simulation and a compressor; fed digital
+            // silence the amp emits the hiss and hum it exists to simulate,
+            // the compressor lifts it, its send smears it through the reverb,
+            // and a project sitting untouched with nothing armed and nothing
+            // playing put about -40 dBFS of it on the master for as long as
+            // it was open. The owner heard it three times before it had a
+            // name: "a chorusy buzz constant at around -40dB on the master
+            // meter."
+            //
+            // **A voice never parks**, which is the whole care in this. An
+            // effect fed nothing has nothing of its own to lose; an
+            // instrument may be holding a note, and a park would cut it. So
+            // the rule asks the BOX — `Hosted::voice`, decided at load from
+            // the class's own subCategories — and stands down for a lane
+            // carrying any generator at all, built-in or plugin.
+            //
+            // The counter is per lane and zeroed by any reason to be live, so
+            // a note played over a parked desk wakes its lane for a further
+            // `RACK_PARK_S` rather than being the one note that does not
+            // sound.
+            let holds_voice = is_builtin
+                || is_keys
+                || self.racks[ch].holds_a_voice()
+                || self.racks[tangent_ui::recorder::folder_extra_seat(ch)].holds_a_voice();
+            let live_now = rolling
+                || auditioning
+                || !lane_notes.is_empty()
+                || self.shared.armed.load(Ordering::Relaxed) & (1u32 << ch.min(31)) != 0;
+            let rate = self.rate;
+            let parked = park_lane(
+                self.lane_quiet.get_mut(ch),
+                holds_voice,
+                live_now,
+                frames,
+                rate,
+            );
+            if parked || !feeds || (!is_builtin && !is_keys && !rack_live && !has_audio) {
                 // **The gain is advanced whether or not anything renders.** A
                 // fader moved during a rest has to have arrived by the next
                 // note, or it comes in at the old level and slides.
@@ -11501,6 +11662,7 @@ impl Engine {
             room_gain: 0.0,
             aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             racks,
+            lane_quiet: vec![0; CHANNELS],
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
@@ -17258,6 +17420,7 @@ mod tests {
             board_live: 0,
             room_rack: 0,
             racks,
+            lane_quiet: vec![0; CHANNELS],
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             master_effects: crate::effects::Effects::new(RATE as f32),
@@ -17443,6 +17606,83 @@ mod tests {
         assert!((0.0..=1.0).contains(&flat));
     }
 
+    /// **A parked desk stops running an effect chain, and never stops running
+    /// a voice.**
+    ///
+    /// Racks run for every lane that has one, every block, whatever the
+    /// transport is doing — see the note on `clip_lanes`, which is right
+    /// about reverb tails and was wrong about the cost. A plugin that MODELS
+    /// something is not silent on silence: the owner's bass DI carries an amp
+    /// simulation, and it put its hiss through the compressor behind it and
+    /// onto the master of a project nobody was touching, at about -40 dBFS,
+    /// for as long as the project was open. "A chorusy buzz constant at
+    /// around -40dB on the master meter", with nothing armed and nothing
+    /// playing.
+    ///
+    /// The care is all in the second half. An effect fed nothing has nothing
+    /// of its own to lose; an INSTRUMENT may be holding a note, and parking
+    /// one would cut it off. So a lane carrying any generator never parks at
+    /// all, however long the desk stands still.
+    ///
+    /// Revert checks performed: drop the `holds_voice` term and the voice
+    /// lane parks with the rest; drop the `live_now` term and a lane parks
+    /// while the transport is rolling.
+    #[test]
+    fn a_parked_desk_parks_its_effects_and_never_its_instruments() {
+        let rate = 48_000.0_f64;
+        let frames = 512usize;
+        // Eight seconds of stopped transport, in blocks.
+        let blocks = (RACK_PARK_S * rate / frames as f64).ceil() as usize;
+
+        // ── an EFFECT chain: parks, and not before its time ──────────
+        let mut quiet = 0u64;
+        let mut parked_at = None;
+        for b in 0..blocks + 4 {
+            if park_lane(Some(&mut quiet), false, false, frames, rate) && parked_at.is_none() {
+                parked_at = Some(b);
+            }
+        }
+        let at = parked_at.expect("an idle effect chain never parked");
+        let seconds = (at * frames) as f64 / rate;
+        assert!(
+            seconds >= RACK_PARK_S - 0.05,
+            "parked after {seconds}s, inside the {RACK_PARK_S}s a reverb tail is given"
+        );
+        assert!(
+            seconds <= RACK_PARK_S + 0.05,
+            "took {seconds}s to park, well past the tail it was waiting out"
+        );
+
+        // ── a VOICE: never, however long the desk stands still ───────
+        let mut quiet = 0u64;
+        for _ in 0..blocks * 10 {
+            assert!(
+                !park_lane(Some(&mut quiet), true, false, frames, rate),
+                "a lane holding an instrument was parked"
+            );
+        }
+        assert_eq!(quiet, 0, "a voice lane counted quiet it can never spend");
+
+        // ── and any reason to be live puts the counter back ──────────
+        //
+        // Rolling, armed, a note, an audition: each arrives as `live_now`,
+        // and what matters is that the wait starts AGAIN rather than
+        // resuming — a note played over a parked desk must wake its lane for
+        // a full eight seconds, or it is the one note that does not sound.
+        let mut quiet = 0u64;
+        for _ in 0..blocks - 1 {
+            assert!(!park_lane(Some(&mut quiet), false, false, frames, rate));
+        }
+        assert!(quiet > 0, "the counter never ran");
+        assert!(!park_lane(Some(&mut quiet), false, true, frames, rate));
+        assert_eq!(quiet, 0, "a live block did not reset the wait");
+        // And one block later it is nowhere near parking again.
+        assert!(!park_lane(Some(&mut quiet), false, false, frames, rate));
+
+        // A lane with no counter answers rather than panicking.
+        assert!(!park_lane(None, false, false, frames, rate));
+    }
+
     /// A knob turned in a plugin's own window reaches the audio thread — and
     /// reaches it on a PAD, which is the seat this road did not used to serve.
     ///
@@ -17479,6 +17719,94 @@ mod tests {
         // And it is consumed, not re-applied for ever: a knob is an event.
         r.resolve_automation(1);
         assert!(r.auto_params[pad * INSERTS + 1].is_empty());
+    }
+
+    /// **A whole preset reaches the instance, not its first sixteen values.**
+    ///
+    /// The queue a knob crosses on held sixteen points and the analog
+    /// publishes sixty-one, so loading a preset moved sixteen of its knobs
+    /// and left forty-five standing at the patch before. It could not be seen
+    /// from the outside: the host's ledger, the face and a saved project all
+    /// carry the full preset, because those are written on the host side and
+    /// never cross this ring — only the SOUND was a mongrel of two patches.
+    /// The owner found it as "presets require manual updates of values to
+    /// register", which is the tell: nudging one knob by hand afterwards
+    /// sends a single point, and a single point always fitted.
+    ///
+    /// Every unit is walked rather than the analog alone, because the cap is
+    /// derived from the widest one and a unit added with a bigger panel than
+    /// the constant knows about is exactly the regression this guards.
+    ///
+    /// Revert check performed: put the cap back to sixteen and this fails on
+    /// the analog with forty-five values missing.
+    #[test]
+    fn a_bulk_set_as_wide_as_the_widest_unit_arrives_whole() {
+        for spec in crate::builtin_fx::UNITS {
+            let (mut r, _midi, _shared) = renderer_with_midi(2);
+            let (mut tx, rx) = RingBuffer::<UiParam>::new(1024);
+            r.ui_params = rx;
+            // Every parameter the unit has, at once, on one bay — which is
+            // what a preset load is: one `set_insert_param` per knob, all in
+            // the frame the file was read.
+            for (n, p) in spec.params.iter().enumerate() {
+                tx.push(UiParam {
+                    lane: 3,
+                    bay: 2,
+                    id: p.id,
+                    value: (n as f64 + 1.0) / 1000.0,
+                })
+                .expect("the ring holds a preset");
+            }
+            r.resolve_automation(0);
+            let q = &r.auto_params[3 * INSERTS + 2];
+            assert_eq!(
+                q.len(),
+                spec.params.len(),
+                "{}: {} of {} values reached the instance",
+                spec.class,
+                q.len(),
+                spec.params.len()
+            );
+            for (n, p) in spec.params.iter().enumerate() {
+                let got = q.iter().find(|got| got.id == p.id);
+                let got = got.unwrap_or_else(|| panic!("{}: {} never arrived", spec.class, p.symbol));
+                assert!(
+                    (got.value - (n as f64 + 1.0) / 1000.0).abs() < 1e-9,
+                    "{}: {} arrived as {}",
+                    spec.class,
+                    p.symbol,
+                    got.value
+                );
+            }
+        }
+    }
+
+    /// **One knob moved twice in a block arrives once, at the second value.**
+    ///
+    /// The coalescing the capacity above is chosen under. A drag lands a
+    /// point per UI frame and several frames can fall inside one audio block;
+    /// without this, a bay could be asked for more points than the unit has
+    /// parameters and the guarantee that a preset fits would not hold.
+    ///
+    /// It is also what the hand means: the last position is where the knob
+    /// is, and the ones on the way are not separate instructions.
+    #[test]
+    fn a_knob_moved_twice_in_one_block_arrives_at_its_last_value() {
+        let (mut r, _midi, _shared) = renderer_with_midi(2);
+        let (mut tx, rx) = RingBuffer::<UiParam>::new(16);
+        r.ui_params = rx;
+        for v in [0.1, 0.4, 0.9] {
+            tx.push(UiParam { lane: 1, bay: 0, id: 5, value: v }).expect("room");
+        }
+        // A second id alongside, so this is coalescing and not collapsing.
+        tx.push(UiParam { lane: 1, bay: 0, id: 6, value: 0.2 }).expect("room");
+        r.resolve_automation(0);
+        let q = &r.auto_params[INSERTS];
+        assert_eq!(q.len(), 2, "two knobs came through as {} points", q.len());
+        let five = q.iter().find(|p| p.id == 5).expect("the dragged knob");
+        assert!((five.value - 0.9).abs() < 1e-9, "the drag settled at {}", five.value);
+        let six = q.iter().find(|p| p.id == 6).expect("the other knob");
+        assert!((six.value - 0.2).abs() < 1e-9);
     }
 
     /// A UI edit for a seat or bay that does not exist is dropped, not indexed

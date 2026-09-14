@@ -112,6 +112,23 @@ pub struct MidiEditView<'a> {
     pub pedal_lane: bool,
     /// The SELECTED notes, sorted indices — the editor works on sets now.
     pub selected: &'a [usize],
+    /// **Which keys are SOUNDING right now**, indexed by MIDI number.
+    ///
+    /// The editor auditions a note on three roads — a press on the piano
+    /// column, an arrow that moves the pitch cursor, a note written or
+    /// grabbed — and until this field existed not one of them showed
+    /// anything. The sound came out and the picture said nothing, so a
+    /// player walking up the keyboard on the arrows had no way to see where
+    /// they were except by counting rows, and a press on a key that produced
+    /// no sound (a lane with no instrument) was indistinguishable from one
+    /// that had not registered at all. The owner: "we need proper visual
+    /// feedback for arrow and click keyboard auditioning in the midi editor.
+    /// Right now both of those actions provide no visual feedback."
+    ///
+    /// An array rather than a slice of keys: it is read once per drawn row
+    /// and a linear search per row over a held chord is the wrong shape for
+    /// the inner loop of a painter. 128 bytes on the stack, copied in.
+    pub lit: [bool; 128],
     /// A marquee in flight, in screen space, drawn as a dashed box.
     pub marquee: Option<(Pos2, Pos2)>,
     /// The window, absolute seconds.
@@ -654,21 +671,36 @@ pub fn grid_lines(view: &MidiEditView<'_>, from: f64, to: f64, mut f: impl FnMut
     }
 }
 
+/// **What a sounding key is drawn in.** One colour for both the piano column
+/// and the roll's lane, so the two halves of the same signal cannot drift.
+///
+/// A warm amber rather than the theme's ink: this is the one mark on the
+/// editor that means "right now", and every other thing here — selection,
+/// velocity, the grid — is already spending the theme's own range. A player
+/// has to be able to tell a key that is SOUNDING from a note that is
+/// selected at a glance, and two shades of the same hue would not do it.
+const LIT_KEY: Color32 = Color32::from_rgb(0xFF, 0xB0, 0x3A);
+
 /// The gridbox's word: the arrangement's bars-as-a-power-of-two, with the
 /// grid's shape appended — `1/8T`, `1/8 sw`.
 pub fn grid_word(view: &MidiEditView<'_>) -> String {
     // The editor's own meter, so the word matches the magnet here too —
     // see `grid_label`, which now derives the name from the division.
     //
-    // **`grid_label` and NOT `grid_label_text`, on purpose.** The two
+    // **`grid_label_text`, and he has now said otherwise.** The two
     // spellings split when the owner asked for the arrange toolbar's quarter
-    // rung to read "1/4" instead of `\u{266a}`; he asked about ARRANGE, and a
-    // shared helper would have moved this chip in the same edit without
-    // anyone deciding to. So this call stays on the glyph until he says
-    // otherwise, and `the_gridbox_word_carries_the_shape` pins it at exp -2
-    // in both directions — it fails if a future edit here drifts, and it
-    // fails if somebody changes the editor without changing the test.
-    let base = crate::arrangement_panel::grid_label(
+    // rung to read "1/4" instead of `\u{266a}` — he asked about ARRANGE, and
+    // a shared helper would have moved this chip in the same edit without
+    // anyone deciding to, so this call was left on the glyph with a note
+    // saying it waited on him. It was not waiting long: "Replace the note
+    // glyph with 1/4 in midi editor."
+    //
+    // The two spellings stay two functions even though both callers now want
+    // the same one. The split is not dead weight: it is the record of a
+    // decision that was made twice, and collapsing it would take the next
+    // surface with it by accident, which is the fault the split was built to
+    // prevent in the first place.
+    let base = crate::arrangement_panel::grid_label_text(
         view.grid_exp,
         view.sig_top.clamp(1, 32) as u8,
         view.sig_bottom.clamp(1, 32) as u8,
@@ -1156,14 +1188,21 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             Pos2::new(l.roll.left(), y0.max(l.roll.top())),
             Pos2::new(l.roll.right(), (y0 + kh).min(l.roll.bottom())),
         );
+        let lit = view.lit[usize::from(key)];
         if row_keys.is_positive() {
+            // **A sounding key is LIT, and the same ink either colour of
+            // key.** A white key pressed is drawn down toward the face and a
+            // black key up toward the ink, which is what a real keyboard
+            // does — the key moves toward the instrument — and it means the
+            // highlight reads on both without needing two colours somebody
+            // has to keep in step.
             painter.rect_filled(
                 row_keys,
                 0.0,
-                if is_black(key) {
-                    Color32::from_rgb(0x1A, 0x16, 0x12)
-                } else {
-                    ink.gamma_multiply(0.85)
+                match (lit, is_black(key)) {
+                    (true, _) => LIT_KEY,
+                    (false, true) => Color32::from_rgb(0x1A, 0x16, 0x12),
+                    (false, false) => ink.gamma_multiply(0.85),
                 },
             );
             if key % 12 == 0 && kh >= 7.0 {
@@ -1172,7 +1211,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                     Align2::RIGHT_CENTER,
                     format!("C{}", i32::from(key / 12) - 1),
                     font((kh * 0.7).min(10.0)),
-                    if is_black(key) { ink } else { face },
+                    if lit || !is_black(key) { face } else { ink },
                 );
             }
             // **The kit's own names on its keys** — inverse ink, so a
@@ -1187,7 +1226,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                             Align2::LEFT_CENTER,
                             name,
                             font((kh * 0.62).clamp(6.0, 9.5)),
-                            if is_black(key) { ink } else { face },
+                            if lit || !is_black(key) { face } else { ink },
                         );
                     }
                 }
@@ -1196,6 +1235,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         if row_roll.is_positive() {
             if is_black(key) {
                 painter.rect_filled(row_roll, 0.0, face_row_dark);
+            }
+            // **And the ROLL says so too**, faintly, all the way across. The
+            // piano column is eighty points wide at the far left and the eye
+            // editing a part is not on it; a lane that lights under the notes
+            // is what makes an arrow walking the keyboard visible without
+            // looking away from the work.
+            if lit {
+                painter.rect_filled(row_roll, 0.0, LIT_KEY.gamma_multiply(0.22));
             }
             // Every C draws its line: the octave is the roll's ruler.
             if key % 12 == 0 {
@@ -1287,12 +1334,26 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         // note and its own velocity handle showing DIFFERENT colours for the
         // same number is worse. One reading, one colour: drag a shaft and the
         // note above it turns to match, exactly.
-        painter.rect_filled(r, 2.0, velocity_hue(vel_loud, vel_quiet, face, n.vel));
+        // **A MUTED note is drawn HOLLOW.** It keeps its place, its length
+        // and its outline — it is still there to be dragged, resized and
+        // selected — and loses the fill, which is the part that says a note
+        // sounds. Dimming the fill instead would have read as a quiet note,
+        // which is the one thing it must not be confused with: this roll
+        // paints velocity as colour, so a washed-out note already means
+        // something else here.
+        let hue = velocity_hue(vel_loud, vel_quiet, face, n.vel);
+        if n.muted {
+            painter.rect_filled(r, 2.0, hue.gamma_multiply(0.16));
+        } else {
+            painter.rect_filled(r, 2.0, hue);
+        }
         painter.rect_stroke(
             r,
             2.0,
             if picked {
                 Stroke::new(2.0_f32, ink)
+            } else if n.muted {
+                Stroke::new(1.0_f32, hue)
             } else {
                 Stroke::new(1.0_f32, Color32::from_black_alpha(140))
             },
@@ -2020,7 +2081,7 @@ mod tests {
     /// aim at, and there is nothing behind it to click past to.
     #[test]
     fn the_ped_chip_swaps_the_lane_and_the_lane_reads_the_hands_height() {
-        let notes = [ArrNote { at_s: 0.5, dur_s: 0.25, key: 60, vel: 100 }];
+        let notes = [ArrNote { at_s: 0.5, dur_s: 0.25, key: 60, vel: 100, muted: false }];
         let r = rect();
         let mut v = view(&notes);
         let l = Layout::new(r);
@@ -2081,7 +2142,7 @@ mod tests {
     /// answers only at a note's TOP.
     #[test]
     fn the_pen_decides_what_the_velocity_lane_answers() {
-        let notes = [ArrNote { at_s: 0.5, dur_s: 0.25, key: 60, vel: 100 }];
+        let notes = [ArrNote { at_s: 0.5, dur_s: 0.25, key: 60, vel: 100, muted: false }];
         let r = rect();
         let mut v = view(&notes);
 
@@ -2209,6 +2270,7 @@ mod tests {
 
     pub(super) fn view<'a>(notes: &'a [ArrNote]) -> MidiEditView<'a> {
         MidiEditView {
+            lit: [false; 128],
             draw_mode: true,
             pedal: &[],
             pedal_lane: false,
@@ -2375,6 +2437,7 @@ mod tests {
             dur_s: 1.0,
             key: 60,
             vel: 96,
+        muted: false,
         }];
         let v = view(&notes);
         let l = Layout::new(rect());
@@ -2437,7 +2500,7 @@ mod tests {
     /// `click_hit` and both halves go red.
     #[test]
     fn a_click_reads_past_a_notes_resize_zone() {
-        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 100 }];
+        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 100, muted: false }];
         let v = view(&notes);
         let r = rect();
         let l = Layout::new(r);
@@ -2468,7 +2531,7 @@ mod tests {
                     "the cell beside the note read as {t}, at or before the note itself"
                 );
             }
-            other => panic!("the empty cell beside a note answered {other:?}"),
+            other => panic!("the empty cell beside a note answered {other:? }"),
         }
 
         // And everything that is not an edge is left exactly as it was.
@@ -2491,6 +2554,7 @@ mod tests {
             dur_s: 1.0,
             key: 60,
             vel: 96,
+        muted: false,
         }];
         let v = view(&notes);
         let l = Layout::new(rect());
@@ -2521,6 +2585,7 @@ mod tests {
             dur_s: 0.02,
             key: 60,
             vel: 96,
+        muted: false,
         }];
         let v = view(&short);
         let r = note_rect(&l, &v, &short[0]);
@@ -2565,7 +2630,7 @@ mod tests {
     /// and the first assertion on the window goes red with `None`.
     #[test]
     fn the_navigator_is_laid_out_and_every_part_of_it_answers_a_press() {
-        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 96 }];
+        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 96, muted: false }];
         let mut v = view(&notes);
         // A window with somewhere to go: four seconds of the twenty.
         v.view_start_s = 8.0;
@@ -2630,7 +2695,7 @@ mod tests {
     /// box's own edges, which is what is pinned here.
     #[test]
     fn the_navigators_window_fills_its_box_when_the_clip_fits_and_its_edges_still_answer() {
-        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 96 }];
+        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 96, muted: false }];
         // The fixture as it stands: the window IS the world.
         let v = view(&notes);
         let r = rect();
@@ -2655,7 +2720,7 @@ mod tests {
     /// assertion goes red at a fraction of a point.
     #[test]
     fn a_narrow_navigator_window_keeps_its_face_and_finds_its_edges_outside() {
-        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 96 }];
+        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 96, muted: false }];
         let mut v = view(&notes);
         v.view_start_s = 10.0;
         v.view_len_s = 0.02;
@@ -2664,7 +2729,7 @@ mod tests {
         let w = nav_window(&l, &v);
         assert!(
             w.width() >= NAV_WINDOW_MIN_W - 0.01 && w.width() < 14.0,
-            "the window is {} points wide",
+            "the window is { } points wide",
             w.width()
         );
         let y = l.tool_nav.center().y;
@@ -2685,7 +2750,7 @@ mod tests {
     /// narrow editor's assertion goes red with a box a few points wide.
     #[test]
     fn the_navigator_stands_down_when_the_strip_has_no_room_for_it() {
-        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 96 }];
+        let notes = [ArrNote { at_s: 2.0, dur_s: 1.0, key: 60, vel: 96, muted: false }];
         let v = view(&notes);
         let narrow = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(380.0, 300.0));
         let l = Layout::new(narrow);
@@ -2698,7 +2763,7 @@ mod tests {
         let l = Layout::new(wide);
         assert!(
             (l.tool_nav.width() - NAV_MAX_W).abs() < 0.01,
-            "on a 2000-point strip the navigator is {} wide",
+            "on a 2000-point strip the navigator is { } wide",
             l.tool_nav.width()
         );
     }
@@ -2722,8 +2787,8 @@ mod tests {
     #[test]
     fn the_miniature_draws_the_notes_inside_the_box_with_pitch_rising() {
         let notes = [
-            ArrNote { at_s: 2.0, dur_s: 1.0, key: 48, vel: 96 },
-            ArrNote { at_s: 10.0, dur_s: 1.0, key: 72, vel: 96 },
+            ArrNote { at_s: 2.0, dur_s: 1.0, key: 48, vel: 96, muted: false },
+            ArrNote { at_s: 10.0, dur_s: 1.0, key: 72, vel: 96, muted: false },
         ];
         let v = view(&notes);
         let ctx = egui::Context::default();
@@ -2755,9 +2820,9 @@ mod tests {
                 .unwrap_or_default()
         });
         marks.sort_by(|a, b| a.left().total_cmp(&b.left()));
-        assert_eq!(marks.len(), 2, "two notes drew {} marks: {marks:?}", marks.len());
+        assert_eq!(marks.len(), 2, "two notes drew { } marks: {marks:?}", marks.len());
         let (low, high) = (marks[0], marks[1]);
-        assert!((low.left() - nav_x_of(&l, &v, 10.0)).abs() < 1.5, "C3 is at {}", low.left());
+        assert!((low.left() - nav_x_of(&l, &v, 10.0)).abs() < 1.5, "C3 is at { }", low.left());
         assert!((high.left() - nav_x_of(&l, &v, 18.0)).abs() < 1.5, "C5 is at {}", high.left());
         assert!(
             high.bottom() < low.top(),
@@ -2799,20 +2864,101 @@ mod tests {
     }
 
     /// The grid word says the shape, not just the size — and the quarter
-    /// rung of THIS chip is still the note glyph.
+    /// rung of THIS chip is "1/4", the same numerals the arrange toolbar
+    /// uses.
     ///
-    /// The second half is new, and it is here because this test used to
-    /// exercise exp -3 only. That pinned nothing about the one rung the two
-    /// panels now spell differently: the arrange gridbox reads "1/4" as
-    /// text, on the owner's word that a beginner spots a fraction faster
-    /// than a five-point picture, and the editor's chip was not part of that
-    /// request. With only the eighth asserted, a blunt edit to the shared
-    /// `note_label` would have moved this chip in the same stroke with the
-    /// whole suite staying green — which is exactly how a surface gets
-    /// changed that nobody asked to change. So the glyph rung is pinned in
-    /// both directions: it fails if the editor drifts by accident, and it
-    /// fails if somebody moves the editor on purpose without coming through
-    /// here to say so.
+    /// **It was the note glyph, pinned here in both directions** so that a
+    /// blunt edit to the shared label could not move the editor's chip in
+    /// the arrangement's stroke. That guard did its job: the owner came here
+    /// to say so — "Replace the note glyph with 1/4 in midi editor" — and the
+    /// assert was changed on purpose rather than the two surfaces drifting
+    /// apart unnoticed. The pin stays, pointing the other way now.
+    /// **A sounding key is visible, in the piano column AND across the
+    /// roll.**
+    ///
+    /// The editor auditions on three roads — a press on the piano column, an
+    /// arrow that moves the pitch cursor, a note written or grabbed — and not
+    /// one of them drew anything: the sound came out and the picture said
+    /// nothing. The owner: "we need proper visual feedback for arrow and
+    /// click keyboard auditioning in the midi editor. Right now both of those
+    /// actions provide no visual feedback."
+    ///
+    /// Both halves are asserted because they answer different needs. The
+    /// piano column is the literal answer to "which key"; the roll's lane is
+    /// what makes it visible to an eye that is on the notes rather than on a
+    /// strip eighty points away at the far left.
+    ///
+    /// Revert check performed: drop either `rect_filled` and the matching
+    /// half fails while the other still passes.
+    #[test]
+    fn a_sounding_key_is_lit_on_the_keys_and_across_the_roll() {
+        let n: [ArrNote; 0] = [];
+        let paint = |lit: [bool; 128]| -> Vec<(Rect, Color32)> {
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+            let _ = ctx.run(Default::default(), |_| {});
+            let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("lit"));
+            let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+            let v = MidiEditView { lit, ..view(&n) };
+            draw(&painter, rect(), &v);
+            ctx.graphics(|g| {
+                g.get(layer)
+                    .map(|list| {
+                        list.all_entries()
+                            .filter_map(|c| match &c.shape {
+                                egui::Shape::Rect(r) => Some((r.rect, r.fill)),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+        };
+        // **Nothing sounding: no amber anywhere.** The floor this stands on —
+        // without it a painter that lit every key would pass the half below.
+        let quiet = paint([false; 128]);
+        assert!(
+            !quiet.iter().any(|(_, c)| *c == LIT_KEY),
+            "a silent editor lit a key"
+        );
+
+        let mut lit = [false; 128];
+        lit[60] = true;
+        let loud = paint(lit);
+        let l = Layout::new(rect());
+        let solid: Vec<Rect> = loud
+            .iter()
+            .filter(|(_, c)| *c == LIT_KEY)
+            .map(|(r, _)| *r)
+            .collect();
+        assert_eq!(solid.len(), 1, "the piano column lit {} keys", solid.len());
+        assert!(
+            l.keys.contains(solid[0].center()),
+            "the lit key was painted outside the piano column"
+        );
+        // And the roll carries the same colour, washed, all the way across.
+        let wash: Vec<Rect> = loud
+            .iter()
+            .filter(|(r, c)| {
+                *c == LIT_KEY.gamma_multiply(0.22) && l.roll.contains(r.center())
+            })
+            .map(|(r, _)| *r)
+            .collect();
+        assert_eq!(wash.len(), 1, "the roll lane did not light");
+        assert!(
+            wash[0].width() > l.roll.width() * 0.9,
+            "the roll's lane stopped short: {} of {}",
+            wash[0].width(),
+            l.roll.width()
+        );
+        // The two are the same ROW, or they are two marks about one key that
+        // point at different notes.
+        assert!(
+            (wash[0].center().y - solid[0].center().y).abs() < 1.0,
+            "the column and the roll lit different rows"
+        );
+    }
+
     #[test]
     fn the_gridbox_word_carries_the_shape() {
         let n: [ArrNote; 0] = [];
@@ -2826,19 +2972,24 @@ mod tests {
         v.triplet = false;
         v.swing = true;
         assert_eq!(grid_word(&v), "1/8 sw");
-        // exp -2 in 4/4 is the quarter note: the rung that split.
+        // exp -2 in 4/4 is the quarter note: the rung that split, and the
+        // rung that has now been put back together.
         v.swing = false;
         v.grid_exp = -2;
-        assert_eq!(grid_word(&v), "\u{266a}");
+        assert_eq!(grid_word(&v), "1/4");
         v.triplet = true;
-        assert_eq!(grid_word(&v), "\u{266a}T");
+        assert_eq!(grid_word(&v), "1/4T");
         v.triplet = false;
         v.swing = true;
-        assert_eq!(grid_word(&v), "\u{266a} sw");
-        // The arrange box, at the same exponent and the same meter, prints
-        // the other spelling. Asserted side by side so the split is visible
-        // as a decision rather than as a difference somebody has to notice.
+        assert_eq!(grid_word(&v), "1/4 sw");
+        // **The two surfaces agree again**, asserted side by side for the
+        // reason they were asserted side by side while they DISAGREED: so
+        // that the state of the pair is a decision somebody wrote down, not a
+        // difference the next reader has to go and discover.
         assert_eq!(crate::arrangement_panel::grid_label_text(-2, 4, 4), "1/4");
+        // And the glyph spelling still exists, unused by either chip today.
+        // It is the record of the first decision; see `grid_word`.
+        assert_eq!(crate::arrangement_panel::grid_label(-2, 4, 4), "\u{266a}");
     }
 
     /// **The loop bar is drawn where the pass ends, and it answers a press
@@ -2959,7 +3110,7 @@ mod tests {
         // A note ending exactly at the pass's end: clip starts at 8, the loop
         // is 4, so a note from source second 2 running two seconds ends at
         // absolute 12 — the bar's own column.
-        let notes = [ArrNote { at_s: 2.0, dur_s: 2.0, key: 72, vel: 96 }];
+        let notes = [ArrNote { at_s: 2.0, dur_s: 2.0, key: 72, vel: 96, muted: false }];
         let v = MidiEditView { loop_s: 4.0, ..view(&notes) };
         let r = rect();
         let l = Layout::new(r);
@@ -3145,6 +3296,7 @@ mod cull_tests {
                 dur_s: 0.1,
                 key: 48 + u8::try_from(i % keys.max(1)).unwrap_or(0),
                 vel: 40 + u8::try_from(i % vels.max(1)).unwrap_or(0) * 6,
+            muted: false,
             })
             .collect()
     }
@@ -3358,6 +3510,7 @@ mod editor_cost_probe {
                 dur_s: 0.1,
                 key: 48 + u8::try_from((i * 7) % 36).unwrap_or(0),
                 vel: 40 + u8::try_from((i * 11) % 88).unwrap_or(0),
+            muted: false,
             })
             .collect();
         let kit: Vec<ArrNote> = (0..15_360u32)
@@ -3366,6 +3519,7 @@ mod editor_cost_probe {
                 dur_s: 0.1,
                 key: 48 + u8::try_from((i * 5) % 8).unwrap_or(0),
                 vel: if i % 8 == 0 { 118 } else { 64 + u8::try_from(i % 3).unwrap_or(0) * 12 },
+            muted: false,
             })
             .collect();
         let r = rect();

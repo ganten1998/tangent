@@ -214,6 +214,7 @@ fn midi_clip(lane: usize, index: usize, start_s: f64, len_s: f64, notes: usize) 
             dur_s: if n % 2 == 0 { step * 7.0 / 8.0 } else { step * 15.0 / 8.0 },
             key,
             vel: 60 + ((n * 7 + lane * 3) % 60) as u8,
+        muted: false,
         });
     }
     let mut pedal = Vec::new();
@@ -974,6 +975,7 @@ fn perf_doc_bytes() {
                 dur_s: 0.125,
                 key: 36 + (n % 48) as u8,
                 vel: 100,
+            muted: false,
             });
         }
         arr.add_clip(part);

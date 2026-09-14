@@ -466,6 +466,17 @@ pub struct ArrNote {
     pub dur_s: f64,
     pub key: u8,
     pub vel: u8,
+    /// **Written but not played.** A muted note keeps everything it is —
+    /// its place, its length, its pitch, its velocity — and is skipped by
+    /// every walk that turns a clip into sound.
+    ///
+    /// A FLAG rather than velocity zero, which is the cheap version and
+    /// loses the thing that makes mute worth having: unmuting has to give
+    /// the note back the velocity it had, and a velocity of zero has
+    /// nowhere to have kept it. It is also not the same as deleting and
+    /// undoing — a muted note is still there to be dragged, resized and
+    /// read while it is silent, which is what an arrangement is for.
+    pub muted: bool,
 }
 
 /// **One pedal movement inside a MIDI clip**, in the same source seconds a
@@ -791,6 +802,14 @@ pub fn clip_notes_in_song_time(clip: &ArrClip) -> Vec<ArrNote> {
     for pass in 0..passes {
         let shift = clip.loop_s * pass as f64;
         for n in &clip.notes {
+            // **A muted note is not scheduled.** This is the one walk every
+            // road to sound goes through — the engine's push, the glue, the
+            // MIDI export — so muting is honoured everywhere by being
+            // honoured here, and a note that is still drawn, still dragged
+            // and still selectable simply does not reach a synth.
+            if n.muted {
+                continue;
+            }
             let at = n.at_s - clip.offset_s + shift;
             if at < -1.0e-9 {
                 continue;
@@ -803,6 +822,7 @@ pub fn clip_notes_in_song_time(clip: &ArrClip) -> Vec<ArrNote> {
                 dur_s: n.dur_s,
                 key: n.key,
                 vel: n.vel,
+            muted: false,
             });
         }
     }
@@ -2352,6 +2372,11 @@ impl Arrangement {
                             key: key as u8,
                             vel: n.get("vel").and_then(Value::as_u64).unwrap_or(100).min(127)
                                 as u8,
+                            // **Absent means AUDIBLE**, the migration rule this
+                            // format keeps: a document written before mute
+                            // existed does not say a note is muted, and the
+                            // only honest reading of silence is "no".
+                            muted: n.get("muted").and_then(Value::as_bool).unwrap_or(false),
                         });
                     }
                 }
@@ -2764,6 +2789,21 @@ impl Arrangement {
                                                 "vel".into(),
                                                 Value::Number(u64::from(n.vel).into()),
                                             );
+                                            // **Written only when TRUE**, the
+                                            // rule `pedal` states below: a
+                                            // document full of notes nobody
+                                            // has muted stays byte-identical
+                                            // to the one this build would have
+                                            // written before the flag existed,
+                                            // which is what keeps undo's
+                                            // `to_json(from_json(x)) == x`
+                                            // honest.
+                                            if n.muted {
+                                                o.insert(
+                                                    "muted".into(),
+                                                    Value::Bool(true),
+                                                );
+                                            }
                                             Value::Object(o)
                                         })
                                         .collect(),
@@ -3057,6 +3097,11 @@ impl Arrangement {
                 f.f64(n.dur_s);
                 f.u64(u64::from(n.key));
                 f.u64(u64::from(n.vel));
+                // **Muting is a change**, so it has to reach this hash or
+                // the project would not know it needs saving and undo would
+                // not know a step happened — which is the exact fault the
+                // pedal's own note below records from the other side.
+                f.u64(u64::from(n.muted));
             }
             // The pedal, after the notes as the writer has it. Omitted when
             // empty there, so the length is the one word that tells "no
@@ -3280,7 +3325,7 @@ mod tests {
             start_s: 1.0,
             len_s: 8.0,
             loop_s: 2.0,
-            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 }],
+            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100, muted: false }],
             ..Default::default()
         });
         let back = Arrangement::from_json(&arr.to_json());
@@ -3293,7 +3338,7 @@ mod tests {
 
         // A document with no `loop_s` at all reads as not looping, rather
         // than as some default that would start repeating old work.
-        let older = r#"{"version":3,"clips":[{"kind":"midi","lane":0,"start_s":0.0,"len_s":4.0,"notes":[]}]}"#;
+        let older = r#"{"version":3,"clips":[{"kind":"midi","lane":0,"start_s":0.0,"len_s":4.0,"notes":[]}] }"#;
         let old = Arrangement::from_json(older);
         assert_eq!(old.clips.len(), 1);
         assert_eq!(old.clips[0].loop_s, 0.0, "an old clip came back looping");
@@ -3350,8 +3395,8 @@ mod tests {
             len_s: 8.0,
             name: "MIDI".into(),
             notes: vec![
-                ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 },
-                ArrNote { at_s: 1.25, dur_s: 2.0, key: 67, vel: 88 },
+                ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100, muted: false },
+                ArrNote { at_s: 1.25, dur_s: 2.0, key: 67, vel: 88, muted: false },
             ],
             ..a_clip(1, "", 4.0)
         };
@@ -3698,7 +3743,7 @@ mod tests {
         let mut a = Arrangement::default();
         a.add_clip(ArrClip {
             kind: ClipKind::Midi,
-            notes: vec![ArrNote { at_s: 0.5, dur_s: 1.0, key: 64, vel: 99 }],
+            notes: vec![ArrNote { at_s: 0.5, dur_s: 1.0, key: 64, vel: 99, muted: false }],
             pedal: vec![ArrPedal { at_s: 0.5, cc: 64, value: 127 }],
             lane: 2,
             path: String::new(),
@@ -3760,7 +3805,7 @@ mod tests {
         let mut a = Arrangement::default();
         a.add_clip(ArrClip {
             kind: ClipKind::Midi,
-            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 90 }],
+            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.25, key: 60, vel: 90, muted: false }],
             // Half-pedalling: the values are the point, not a boolean at 64.
             pedal: vec![
                 ArrPedal { at_s: 0.0, cc: 64, value: 127 },
@@ -3776,7 +3821,7 @@ mod tests {
         assert!(back.clips[0].extra.is_empty(), "the pedal read as a stranger");
 
         // A document from before the pedal existed.
-        let older = r#"{"version":3,"clips":[{"kind":"midi","lane":0,"start_s":0.0,"len_s":4.0,"notes":[]}]}"#;
+        let older = r#"{"version":3,"clips":[{"kind":"midi","lane":0,"start_s":0.0,"len_s":4.0,"notes":[]}] }"#;
         assert!(Arrangement::from_json(older).clips[0].pedal.is_empty());
 
         // And a clip with no pedal writes no key, so every document written
@@ -3912,8 +3957,8 @@ mod tests {
             ],
             kind: ClipKind::Midi,
             notes: vec![
-                ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 },
-                ArrNote { at_s: 1.5, dur_s: 0.25, key: 64, vel: 33 },
+                ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100, muted: false },
+                ArrNote { at_s: 1.5, dur_s: 0.25, key: 64, vel: 33, muted: false },
             ],
             lane: 2,
             path: String::new(),
@@ -4085,7 +4130,7 @@ mod tests {
         // the walk stopped after the pass that lands at 2.
         let clip = ArrClip {
             kind: ClipKind::Midi,
-            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 }],
+            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100, muted: false }],
             start_s: 10.0,
             offset_s: 2.0,
             len_s: 8.0,
@@ -4100,7 +4145,7 @@ mod tests {
         assert!((at[0] - 2.0).abs() < 1e-9, "{at:?}");
         assert!(
             (at[1] - 6.0).abs() < 1e-9,
-            "the clip's last four seconds hold no notes: {at:?}"
+            "the clip's last four seconds hold no notes: {at:? }"
         );
 
         // Nothing runs PAST the clip: the `at >= len_s` skip still holds.
@@ -4251,7 +4296,7 @@ mod tests {
         moves_both("a note's pitch", |a| a.clips[0].notes[0].key = 61);
         moves_both("a note's VELOCITY", |a| a.clips[0].notes[0].vel = 101);
         moves_both("a note arriving", |a| {
-            a.clips[0].notes.push(ArrNote { at_s: 3.0, dur_s: 0.1, key: 48, vel: 90 });
+            a.clips[0].notes.push(ArrNote { at_s: 3.0, dur_s: 0.1, key: 48, vel: 90, muted: false });
         });
         moves_both("a note leaving", |a| {
             a.clips[0].notes.pop();
