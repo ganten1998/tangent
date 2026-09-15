@@ -818,6 +818,21 @@ pub struct DesktopApp {
     pace_since: Option<std::time::Instant>,
     pace_frames: u32,
     pace_dt: Vec<f32>,
+    /// **Who asked for the frames**, by file and line, with how many of the
+    /// second's frames each one asked for. egui records the call site of
+    /// every `request_repaint*`; this is the one answer to "why is the
+    /// window not resting" that needs no theory.
+    pace_causes: std::collections::BTreeMap<String, u32>,
+    /// The smallest delay the app's own ledger and the host's ledger each
+    /// asked for in the second — beside `pace_causes`, this says not only
+    /// WHO asked but for HOW SOON.
+    pace_app_min: Option<std::time::Duration>,
+    pace_host_min: Option<std::time::Duration>,
+    /// What `host_frame_due` last asked for, or `None` when it rested.
+    host_due: Option<std::time::Duration>,
+    /// Which of `host_frame_due`'s reasons to be live held, as a union over
+    /// the probe's second — see `LIVE_TERMS` for the names.
+    pace_live: u16,
     /// A screen reader has been seen. Stops the probe below from running
     /// again — see `screen_reader_attached`, which is not free of side
     /// effects.
@@ -831,16 +846,18 @@ pub struct DesktopApp {
     window_minimized: Option<bool>,
     /// **The host's half of the resting window's ledger** — see
     /// `host_frame_due`. `meters_live` is decided in `fill_recorder_state`
-    /// from the numbers it just read — an input or master meter, a hold
-    /// line, a strip peak, the limiter's gain reduction, a pad, a lane the
-    /// timeline is sounding, or a loudness window still above silence;
-    /// `camera_wanted` is whether frames are being
+    /// from the numbers it just read, and it means **the meters' PICTURE
+    /// moved** — not "there is signal". See [`MeterPicture`], which holds
+    /// what was last drawn and answers whether the new numbers would draw
+    /// differently; `camera_wanted` is whether frames are being
     /// asked of the capture thread, which arrive on its clock and not
     /// ours; `activity_at` is the last input event, MIDI event or
     /// session/transport edge, after which frames keep coming for
     /// `ACTIVITY_GRACE` so the sound a gesture made reaches the meters.
     #[cfg(feature = "recorder")]
     meters_live: bool,
+    #[cfg(feature = "recorder")]
+    meter_picture: MeterPicture,
     #[cfg(feature = "recorder")]
     camera_wanted: bool,
     activity_at: Option<std::time::Instant>,
@@ -2277,6 +2294,165 @@ const ACTIVITY_GRACE: std::time::Duration = std::time::Duration::from_millis(300
 /// needle drawn at rest.
 #[cfg(feature = "recorder")]
 const METER_FLOOR: f32 = 1.0e-3;
+
+/// **Whether the window owes frames to a capture thread**: pictures are
+/// being ASKED for, and something is actually running to deliver them.
+///
+/// The second half is the whole fix. This was `want != None` alone, and
+/// `want` is `Preview` whenever the recorder band is open — so a desk with
+/// the band showing and NO camera at all told the frame ledger a capture
+/// thread was delivering pictures, and the ledger held the window at
+/// `LIVE_TICK` for as long as the band was open, collecting frames from a
+/// thread that did not exist. The owner's desk, 2026-09-15, after every
+/// other pin had been found and removed: `IVORY_PACE_PROBE` read
+/// `host_live=[camera]` on every second, at 55 fps, with no camera
+/// selected. A capture that is still opening owes nothing yet either: the
+/// gesture that opened it keeps the window live through `ACTIVITY_GRACE`,
+/// and the idle poll collects its first picture within a quarter second.
+///
+/// A free function so the rule can be read and tested without a session.
+#[cfg(feature = "recorder")]
+fn camera_frames_owed(want: tangent_record::camera::FrameWant, running: bool) -> bool {
+    !matches!(want, tangent_record::camera::FrameWant::None) && running
+}
+
+/// **How far a level must move before the ladder shows it**, in decibels.
+///
+/// The master ladder is twenty-two LEDs over sixty decibels, so one LED is
+/// 2.73 dB, and a level that has moved by less than one has lit nothing
+/// new. Chosen at one LED rather than a fraction of one so the noise floor
+/// of an idle rack — which wanders about a decibel from frame to frame,
+/// peak to peak — sits inside it, and so a level that IS moving crosses it
+/// every few frames. The hold line falls at 20 dB/s, which crosses this
+/// every 150 ms: well inside [`METER_GRACE`], so a falling hold line is
+/// drawn every frame all the way down.
+const METER_STEP_DB: f32 = 3.0;
+
+/// The limiter's needle is drawn as a bar over sixty decibels with no
+/// LEDs to quantise it, so its step is a fraction of what a level's is.
+const GR_STEP_DB: f32 = 0.5;
+
+/// A loudness window that has moved less than this has not moved a
+/// reading anybody rides a mix by.
+const LUFS_STEP: f32 = 1.0;
+
+/// **How long the meters stay live after their picture last moved.** The
+/// same figure as `ACTIVITY_GRACE`, for the same reason: a change that
+/// crossed a step is usually the first of several, and a window that went
+/// back to its 250 ms poll between two LEDs of a decaying transient would
+/// draw the transient as a staircase.
+const METER_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// **Everything the desk's meters draw, as read this frame** — borrowed
+/// from the recorder state so the picture can be judged without copying it.
+#[cfg(feature = "recorder")]
+struct MeterReading<'a> {
+    /// The VU's two channels and the master's two, in that order.
+    levels: [tangent_ui::recorder::Level; 4],
+    /// The VU's lamp and the master's.
+    clipped: [bool; 2],
+    gr_db: f32,
+    strips: &'a [[f32; 2]],
+    lanes: &'a [u128],
+    /// Momentary, short-term, integrated.
+    lufs: [f32; 3],
+    pads: &'a [f32],
+}
+
+/// **What the desk's meters last DREW**, in the units the pixels use, and
+/// the one question the resting window asks of it: would these new numbers
+/// draw differently?
+///
+/// Levels are kept in decibels floored at the ladder's bottom, so a value
+/// under the floor is the floor and two values under it are the same
+/// picture; the LUFS windows are clamped to their ladder for the same
+/// reason. The stored picture is replaced only when something crossed a
+/// step, so a slow fade accumulates towards its step rather than being
+/// forgiven one frame at a time, and a transient that crossed several is
+/// followed down them by [`METER_GRACE`].
+#[cfg(feature = "recorder")]
+#[derive(Default)]
+struct MeterPicture {
+    /// The RMS of each level — **not the `peak.max(rms)` the ladder fills
+    /// by**, and that is deliberate. A per-frame peak is an extreme value:
+    /// on an interface's idle noise floor it wanders a couple of decibels
+    /// around its mean from frame to frame, and a picture stored AT each
+    /// move parks on one of those extremes, so the next ordinary frame is
+    /// a step away again. Ping-pong, live for ever — the owner's desk with
+    /// an input open, measured 2026-09-15 at 56 fps with `host_asks=33ms`
+    /// on every second. The RMS is tightly distributed and the hold line
+    /// already carries every real transient, so nothing a person would
+    /// look for is lost by judging on it.
+    bars: [f32; 4],
+    holds: [f32; 4],
+    clipped: [bool; 2],
+    gr_db: f32,
+    strips: Vec<[f32; 2]>,
+    lanes: Vec<u128>,
+    lufs: [f32; 3],
+    pads: Vec<f32>,
+    /// When the picture last moved — `None` before the first reading, which
+    /// is itself a move.
+    moved_at: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "recorder")]
+impl MeterPicture {
+    /// A linear level in decibels, floored at the ladder's bottom: what the
+    /// fill and the hold line are positioned by (`master_fraction`), and
+    /// what the strip and pad meters are lit by.
+    fn db(linear: f32) -> f32 {
+        const FLOOR_DB: f32 = -60.0;
+        if linear <= METER_FLOOR {
+            return FLOOR_DB;
+        }
+        (20.0 * linear.log10()).max(FLOOR_DB)
+    }
+
+    /// A LUFS reading as the ladder shows it: nothing below its bottom rung.
+    fn lu(v: f32) -> f32 {
+        v.clamp(tangent_ui::recorder::LUFS_RANGE.0, tangent_ui::recorder::LUFS_RANGE.1)
+    }
+
+    /// **Whether the meters are live**: their picture moved by at least a
+    /// step this frame, or did inside [`METER_GRACE`]. Takes the new
+    /// picture when it moved.
+    fn moved(&mut self, r: &MeterReading<'_>, now: std::time::Instant) -> bool {
+        let bars: [f32; 4] = std::array::from_fn(|i| Self::db(r.levels[i].rms));
+        let holds: [f32; 4] = std::array::from_fn(|i| Self::db(r.levels[i].hold));
+        let lufs: [f32; 3] = std::array::from_fn(|i| Self::lu(r.lufs[i]));
+        let stepped = |a: f32, b: f32, step: f32| (a - b).abs() >= step;
+        let mut moved = self.moved_at.is_none();
+        moved |= bars.iter().zip(self.bars).any(|(a, b)| stepped(*a, b, METER_STEP_DB));
+        moved |= holds.iter().zip(self.holds).any(|(a, b)| stepped(*a, b, METER_STEP_DB));
+        moved |= r.clipped != self.clipped;
+        moved |= stepped(r.gr_db, self.gr_db, GR_STEP_DB);
+        moved |= lufs.iter().zip(self.lufs).any(|(a, b)| stepped(*a, b, LUFS_STEP));
+        moved |= r.strips.len() != self.strips.len()
+            || r.strips.iter().zip(&self.strips).any(|(a, b)| {
+                stepped(Self::db(a[0]), b[0], METER_STEP_DB)
+                    || stepped(Self::db(a[1]), b[1], METER_STEP_DB)
+            });
+        moved |= r.lanes.len() != self.lanes.len() || r.lanes.iter().zip(&self.lanes).any(|(a, b)| a != b);
+        moved |= r.pads.len() != self.pads.len()
+            || r.pads.iter().zip(&self.pads).any(|(a, b)| stepped(Self::db(*a), *b, METER_STEP_DB));
+        if moved {
+            self.bars = bars;
+            self.holds = holds;
+            self.clipped = r.clipped;
+            self.gr_db = r.gr_db;
+            self.strips.clear();
+            self.strips.extend(r.strips.iter().map(|p| [Self::db(p[0]), Self::db(p[1])]));
+            self.lanes.clear();
+            self.lanes.extend_from_slice(r.lanes);
+            self.lufs = lufs;
+            self.pads.clear();
+            self.pads.extend(r.pads.iter().map(|p| Self::db(*p)));
+            self.moved_at = Some(now);
+        }
+        self.moved_at.is_some_and(|t| now.duration_since(t) < METER_GRACE)
+    }
+}
 /// How long the compressor-row index (`DesktopApp::comp_rows`) may go
 /// without a full look at the ledger. The index is refreshed on every edge
 /// that changes the ledger; this is the belt to those braces.
@@ -3027,8 +3203,12 @@ impl DesktopApp {
             };
         // Remembered for the frame ledger: a camera that is being asked for
         // pictures delivers them on its own clock, so the window has to
-        // keep coming back to collect them. See `host_frame_due`.
-        self.camera_wanted = !matches!(camera_want, FrameWant::None);
+        // keep coming back to collect them. See `host_frame_due` — and
+        // `camera_frames_owed` for the half of this that was missing.
+        self.camera_wanted = camera_frames_owed(
+            camera_want,
+            self.recorder.session.camera_running() || self.recorder.session.window_running(),
+        );
         self.recorder.session.set_camera_want(camera_want);
 
         // The camera. Uploaded here rather than in `after_frame` because the
@@ -3634,7 +3814,7 @@ impl DesktopApp {
         // The drumpad's peaks, read-and-reset like the strips' — exactly
         // once a frame, and pushed before the state borrow below takes the
         // app for the rest of this function.
-        let mut pads_live = false;
+        let mut pad_levels = [0.0f32; tangent_ui::recorder::DRUM_PADS];
         if let Some(e) = self.recorder.engine.as_ref() {
             // **The pads light for the kit the window is SHOWING.** With a
             // full instance per channel there is a meter per lane, and the
@@ -3644,7 +3824,7 @@ impl DesktopApp {
                 .find(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
                 .unwrap_or(0);
             let pads = e.pad_peaks(lane);
-            pads_live = pads.iter().any(|p| *p > METER_FLOOR);
+            pad_levels = pads;
             self.app.note_drumpad_peaks(pads);
         }
         // **The alias replaces the interface's name, once, for all of it.**
@@ -3887,27 +4067,36 @@ impl DesktopApp {
                 clipped: false,
             };
         }
-        // **Is anything on the desk still moving?** Decided from the numbers
-        // just read, so the ledger and the picture cannot disagree: a meter,
-        // a hold line, a needle target, a limiter needle, a pad, a lane the
-        // timeline is sounding, or a loudness window still above silence.
-        // A resting window that reads nothing above the floor here has
-        // nothing to draw next frame — and `host_frame_due`'s idle poll is
-        // what brings it back to look again while an engine is running.
-        self.meters_live = {
-            let live = |l: &tangent_ui::recorder::Level| {
-                l.peak > METER_FLOOR || l.rms > METER_FLOOR || l.hold > METER_FLOOR
-            };
-            pads_live
-                || live(&state.meters.left)
-                || live(&state.meters.right)
-                || live(&state.master.left)
-                || live(&state.master.right)
-                || state.gr_db > 0.01
-                || state.strip_peaks.iter().any(|p| p[0] > METER_FLOOR || p[1] > METER_FLOOR)
-                || state.lane_sounding.iter().any(|m| *m != 0)
-                || state.loudness.momentary > tangent_ui::recorder::LUFS_SILENCE + 1.0
-        };
+        // **Would the desk's picture DRAW differently next frame?** Decided
+        // from the numbers just read, so the ledger and the picture cannot
+        // disagree — and asked of the picture rather than of the signal.
+        // This used to be "is anything above the floor", which is true of
+        // every desk with a plugin loaded in it for as long as the project
+        // is open: an idle rack's noise floor sat a few LEDs up the ladder,
+        // wandering by less than a pixel, and the window painted it thirty
+        // times a second all afternoon. `host_frame_due`'s idle poll is what
+        // brings a resting window back to look again while an engine runs.
+        self.meters_live = self.meter_picture.moved(
+            &MeterReading {
+                levels: [
+                    state.meters.left,
+                    state.meters.right,
+                    state.master.left,
+                    state.master.right,
+                ],
+                clipped: [state.meters.clipped, state.master.clipped],
+                gr_db: state.gr_db,
+                strips: &state.strip_peaks,
+                lanes: &state.lane_sounding,
+                lufs: [
+                    state.loudness.momentary,
+                    state.loudness.short,
+                    state.loudness.integrated,
+                ],
+                pads: &pad_levels,
+            },
+            std::time::Instant::now(),
+        );
         // The standing folders, for the band and the settings panel's
         // PROJECT tier. Shortened because a full path in a half-row box is a
         // path nobody can read the end of; copied across only when the text
@@ -16302,6 +16491,8 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             meters_live: false,
             #[cfg(feature = "recorder")]
+            meter_picture: MeterPicture::default(),
+            #[cfg(feature = "recorder")]
             camera_wanted: false,
             activity_at: None,
             #[cfg(feature = "recorder")]
@@ -16329,6 +16520,11 @@ impl DesktopApp {
             pushed_pads: [None; tangent_ui::recorder::CHANNELS],
             pace_frames: 0,
             pace_dt: Vec::new(),
+            pace_causes: std::collections::BTreeMap::new(),
+            pace_app_min: None,
+            pace_host_min: None,
+            host_due: None,
+            pace_live: 0,
             reader_seen: false,
             #[cfg(feature = "recorder")]
             pushed_maps: None,
@@ -16782,6 +16978,22 @@ impl eframe::App for DesktopApp {
             if dt.is_finite() && dt > 0.0 {
                 self.pace_dt.push(dt);
             }
+            for cause in ctx.repaint_causes() {
+                *self.pace_causes.entry(cause.to_string()).or_insert(0) += 1;
+            }
+            let least = |slot: &mut Option<std::time::Duration>, v: Option<std::time::Duration>| {
+                if let Some(v) = v {
+                    *slot = Some(slot.map_or(v, |c| c.min(v)));
+                }
+            };
+            least(&mut self.pace_app_min, self.app.debug_asked());
+            least(&mut self.pace_host_min, self.host_due);
+            /// The bits of `host_frame_due`'s mask, in its order.
+            const LIVE_TERMS: [&str; 11] = [
+                "playing", "take", "meters", "camera", "click", "ir_pending", "ir_worker",
+                "ir_capture", "recent", "events", "midi",
+            ];
+            let _ = LIVE_TERMS;
             if now.duration_since(since).as_secs_f32() >= 1.0 {
                 let secs = now.duration_since(since).as_secs_f32();
                 self.pace_dt.sort_by(f32::total_cmp);
@@ -16792,18 +17004,41 @@ impl eframe::App for DesktopApp {
                     ))
                     .copied()
                     .unwrap_or(0.0);
+                let causes = self
+                    .pace_causes
+                    .iter()
+                    .map(|(c, n)| format!("{c}x{n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                const LIVE_TERMS: [&str; 11] = [
+                    "playing", "take", "meters", "camera", "click", "ir_pending", "ir_worker",
+                    "ir_capture", "recent", "events", "midi",
+                ];
+                let live = LIVE_TERMS
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| self.pace_live & (1 << i) != 0)
+                    .map(|(_, n)| *n)
+                    .collect::<Vec<_>>()
+                    .join(",");
                 eprintln!(
-                    "PACE fps={:.0} p99={:.2}ms sends={} wm={} oslock={} curve_rebuilds={}",
+                    "PACE fps={:.0} p99={:.2}ms sends={} wm={} oslock={} curve_rebuilds={} app_asks={:?} host_asks={:?} host_live=[{live}] asked_by=[{causes}]",
                     self.pace_frames as f32 / secs,
                     p99 * 1000.0,
                     self.app.debug_inner_size_sends(),
                     self.app.debug_wm_managed(),
                     self.app.debug_os_aspect_lock(),
                     Self::curve_rebuilds(),
+                    self.pace_app_min,
+                    self.pace_host_min,
                 );
+                self.pace_live = 0;
                 self.pace_since = Some(now);
                 self.pace_frames = 0;
                 self.pace_dt.clear();
+                self.pace_causes.clear();
+                self.pace_app_min = None;
+                self.pace_host_min = None;
             }
         }
     }
@@ -17651,15 +17886,23 @@ impl DesktopApp {
             .activity_at
             .is_some_and(|t| now.duration_since(t) < ACTIVITY_GRACE);
         let engine = self.recorder.engine.is_some();
-        let live = playing
-            || self.recorder.session.state().is_active()
-            || self.meters_live
-            || self.camera_wanted
-            || (engine && self.app.metronome_on())
-            || self.ir.pending.is_some()
-            || self.ir.worker.is_some()
-            || self.ir.live.capturing
-            || recent;
+        // Each reason on its own bit, so the probe can say WHICH one held.
+        let terms = [
+            playing,
+            self.recorder.session.state().is_active(),
+            self.meters_live,
+            self.camera_wanted,
+            engine && self.app.metronome_on(),
+            self.ir.pending.is_some(),
+            self.ir.worker.is_some(),
+            self.ir.live.capturing,
+            recent,
+            events,
+            midi,
+        ];
+        let mask = terms.iter().enumerate().fold(0u16, |m, (i, t)| m | (u16::from(*t) << i));
+        self.pace_live |= mask;
+        let live = mask & !(1 << 9) & !(1 << 10) != 0;
         let mut due: Option<std::time::Duration> = None;
         let mut sooner = |d: std::time::Duration| {
             due = Some(due.map_or(d, |c: std::time::Duration| c.min(d)));
@@ -17673,6 +17916,7 @@ impl DesktopApp {
         if let Some((at, _)) = self.recorder.engine_retry {
             sooner(at.saturating_duration_since(now));
         }
+        self.host_due = due;
         if let Some(d) = due {
             ctx.request_repaint_after(d);
         }
@@ -21875,6 +22119,177 @@ mod tests {").expect("the tests module")];
     /// and that the old unconditional band tick (`is_recording() || open`)
     /// has not come back in `after_frame`. A source scan for the reason the
     /// tempo-map test below is one.
+    /// **An open band with no camera owes the ledger nothing.** The band
+    /// asks for a preview whenever it is open; the ledger must only count
+    /// that once something is running to answer it.
+    #[cfg(feature = "recorder")]
+    #[test]
+    fn a_preview_is_owed_frames_only_while_a_capture_is_running() {
+        use tangent_record::camera::FrameWant;
+        assert!(!camera_frames_owed(FrameWant::Preview, false), "no camera, yet frames were owed");
+        assert!(camera_frames_owed(FrameWant::Preview, true), "a running preview earned no frames");
+        assert!(camera_frames_owed(FrameWant::Every, true), "a take's camera earned no frames");
+        assert!(!camera_frames_owed(FrameWant::None, true), "an unwatched camera was collected");
+        // A take whose camera has died: the pictures are not coming, and the
+        // take's own term on the ledger is what keeps the window live.
+        assert!(!camera_frames_owed(FrameWant::Every, false));
+    }
+
+    /// A reading with every level at one linear value and nothing else lit.
+    #[cfg(feature = "recorder")]
+    fn flat_reading(level: f32) -> (
+        [tangent_ui::recorder::Level; 4],
+        [[f32; 2]; 3],
+        [u128; 2],
+        [f32; 4],
+    ) {
+        let l = tangent_ui::recorder::Level { peak: level, rms: level * 0.7, hold: level, vu: 0.0 };
+        ([l; 4], [[level; 2]; 3], [0; 2], [0.0; 4])
+    }
+
+    /// **An idle rack's noise floor does not keep the meters live.**
+    ///
+    /// The picture is asked, not the signal: a level a few LEDs up the
+    /// ladder that wanders by a decibel from frame to frame lights nothing
+    /// new, and after `METER_GRACE` the window rests on it. This is the
+    /// case the old "anything above the floor" rule could never pass — and
+    /// the reason the owner's desk painted thirty frames a second with
+    /// nothing playing.
+    #[cfg(feature = "recorder")]
+    #[test]
+    fn a_wandering_noise_floor_lets_the_meters_rest() {
+        let mut pic = MeterPicture::default();
+        let t0 = std::time::Instant::now();
+        // -40 dBFS, wandering plus or minus a decibel: 0.0089..0.0112.
+        let hiss = |i: u32| 0.01 * 10f32.powf(((i % 7) as f32 - 3.0) / 3.0 / 20.0);
+        let mut live_late = 0;
+        for i in 0..120u32 {
+            let now = t0 + std::time::Duration::from_millis(33 * u64::from(i));
+            let (levels, strips, lanes, pads) = flat_reading(hiss(i));
+            let live = pic.moved(
+                &MeterReading {
+                    levels,
+                    clipped: [false; 2],
+                    gr_db: 0.0,
+                    strips: &strips,
+                    lanes: &lanes,
+                    lufs: [-43.0 + (i % 3) as f32 * 0.2, -43.0, -43.0],
+                    pads: &pads,
+                },
+                now,
+            );
+            // The first reading is a move and earns its grace; after that
+            // the floor must read as the same picture.
+            if i > 20 && live {
+                live_late += 1;
+            }
+        }
+        assert_eq!(live_late, 0, "a wandering noise floor kept the meters live for {live_late} frames");
+    }
+
+    /// **An interface's idle noise floor does not keep the meters live
+    /// either** — the case the wandering-floor test above misses, because
+    /// it wanders both peak and RMS together. A real input's per-frame
+    /// PEAK is an extreme value and swings a couple of decibels around a
+    /// steady RMS; judged on the peak, the picture stored at each move
+    /// parks on an extreme and the next ordinary frame is a step away
+    /// again, for ever.
+    #[cfg(feature = "recorder")]
+    #[test]
+    fn a_noisy_input_with_a_steady_rms_lets_the_meters_rest() {
+        let mut pic = MeterPicture::default();
+        let t0 = std::time::Instant::now();
+        let mut live_late = 0;
+        // The hold as the engine keeps it: falling 20 dB/s, lifted by any
+        // peak above it — so on a noisy floor it rides the max envelope.
+        let mut hold = 0.0f32;
+        for i in 0..120u32 {
+            let now = t0 + std::time::Duration::from_millis(33 * u64::from(i));
+            // -50 dBFS RMS, and a peak that swings between -53 and -46.
+            let rms = 10f32.powf(-50.0 / 20.0);
+            let peak_db = if i % 2 == 0 { -53.0 } else { -46.0 } + (i % 3) as f32 * 0.5;
+            let peak = 10f32.powf(peak_db / 20.0);
+            hold = (hold * 10f32.powf(-20.0 * 0.033 / 20.0)).max(peak);
+            let l = tangent_ui::recorder::Level { peak, rms, hold, vu: 0.0 };
+            let (_, strips, lanes, pads) = flat_reading(0.0);
+            let live = pic.moved(
+                &MeterReading { levels: [l; 4], clipped: [false; 2], gr_db: 0.0, strips: &strips, lanes: &lanes, lufs: [-70.0; 3], pads: &pads },
+                now,
+            );
+            if i > 20 && live {
+                live_late += 1;
+            }
+        }
+        assert_eq!(live_late, 0, "a noisy input kept the meters live for {live_late} frames");
+    }
+
+    /// **A transient is drawn every frame all the way down.** The hold
+    /// line falls at 20 dB/s; every step it crosses lands inside the grace
+    /// the last one earned, so the decay is never drawn as a staircase.
+    #[cfg(feature = "recorder")]
+    #[test]
+    fn a_falling_hold_line_stays_live_until_it_lands() {
+        let mut pic = MeterPicture::default();
+        let t0 = std::time::Instant::now();
+        // Settle on silence first, past the grace.
+        for i in 0..20u32 {
+            let (levels, strips, lanes, pads) = flat_reading(0.0);
+            pic.moved(
+                &MeterReading { levels, clipped: [false; 2], gr_db: 0.0, strips: &strips, lanes: &lanes, lufs: [-70.0; 3], pads: &pads },
+                t0 + std::time::Duration::from_millis(33 * u64::from(i)),
+            );
+        }
+        // Then a hit at -6 dBFS whose hold falls 20 dB/s over the next
+        // two seconds, while the bar itself has dropped straight back.
+        let mut dead_frames = 0;
+        for i in 0..60u32 {
+            let s = i as f32 * 0.033;
+            let hold_db = -6.0 - 20.0 * s;
+            let hold = 10f32.powf(hold_db / 20.0);
+            let l = tangent_ui::recorder::Level { peak: 0.0, rms: 0.0, hold, vu: 0.0 };
+            let (_, strips, lanes, pads) = flat_reading(0.0);
+            let live = pic.moved(
+                &MeterReading { levels: [l; 4], clipped: [false; 2], gr_db: 0.0, strips: &strips, lanes: &lanes, lufs: [-70.0; 3], pads: &pads },
+                t0 + std::time::Duration::from_millis(33 * (20 + u64::from(i))),
+            );
+            // Live for as long as the line is above the floor and falling.
+            if hold_db > -57.0 && !live {
+                dead_frames += 1;
+            }
+        }
+        assert_eq!(dead_frames, 0, "the falling hold line went unpainted for {dead_frames} frames");
+    }
+
+    /// **The things that are a picture in themselves.** A lamp, a lane
+    /// bit, the limiter's needle: each moves the picture by definition, and
+    /// each is answered on its own without a level having moved at all.
+    #[cfg(feature = "recorder")]
+    #[test]
+    fn a_lamp_a_lane_and_the_limiter_each_move_the_picture() {
+        let mut pic = MeterPicture::default();
+        let t0 = std::time::Instant::now();
+        let mut at = 0u64;
+        let mut frame = |pic: &mut MeterPicture, clipped: bool, gr: f32, lane: u128| -> bool {
+            at += 1;
+            let (levels, strips, pads) = {
+                let (l, s, _, p) = flat_reading(0.01);
+                (l, s, p)
+            };
+            pic.moved(
+                &MeterReading { levels, clipped: [clipped; 2], gr_db: gr, strips: &strips, lanes: &[lane, 0], lufs: [-70.0; 3], pads: &pads },
+                // Well past the grace each time, so only a real move answers.
+                t0 + std::time::Duration::from_millis(400 * at),
+            )
+        };
+        assert!(frame(&mut pic, false, 0.0, 0), "the first reading is a move");
+        assert!(!frame(&mut pic, false, 0.0, 0), "the same picture again is not");
+        assert!(frame(&mut pic, true, 0.0, 0), "the clip lamp lighting");
+        assert!(frame(&mut pic, true, 1.0, 0), "the limiter needle moving a decibel");
+        assert!(!frame(&mut pic, true, 1.2, 0), "the limiter needle moving a fifth of one");
+        assert!(frame(&mut pic, true, 1.2, 1 << 60), "a lane starting to sound");
+        assert!(!frame(&mut pic, true, 1.2, 1 << 60), "the same lane still sounding");
+    }
+
     #[test]
     fn the_host_frame_ledger_names_every_state_that_moves_on_its_own() {
         let whole = include_str!("desktop.rs");

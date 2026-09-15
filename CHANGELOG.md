@@ -10,7 +10,101 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An open band with no camera no longer holds the window at 30 fps.** The
+  band asks the capture thread for a preview whenever it is open, and the
+  frame ledger read "a preview is wanted" as "pictures are arriving", so a desk
+  with the recorder showing and no camera selected at all was held at
+  `LIVE_TICK` for as long as the band was open, collecting frames from a thread
+  that did not exist. Found last, after every other pin below had been removed
+  and `IVORY_PACE_PROBE` still read `host_live=[camera]` on every second with
+  nothing selected. The ledger now counts the camera only while a capture is
+  actually running. `IVORY_PACE_PROBE` prints `host_live=[...]`, the host's
+  reasons for staying awake, so the next one of these names itself.
+
+- **The heart no longer sets the pace of the whole window.** The animated
+  heart - the supporter's palette wave and the cheater's crackle alike - asked
+  for a repaint 33 ms out on every frame it was drawn, and since egui keeps the
+  MINIMUM asked, that one line beat every resting cadence the rest of the app
+  had negotiated: with nothing playing, the owner's desk painted fifty-six
+  frames a second for as long as it was open, about half a core, for a sprite
+  seven pixels wide. Found by adding `asked_by=` to `IVORY_PACE_PROBE`, which
+  prints egui's own record of every call site that asked for a frame that
+  second; it named this one on every frame. Every resting test had passed,
+  because the test fixture turns the heart off - the one animator this machine
+  always has was the one no test ever saw. The heart now asks for 100 ms (its
+  wave is stepped and advances one band every 375 ms; the swirl turns once in
+  ten seconds) and only while the window is focused and not minimised; unseen,
+  it still moves at the idle poll, for free. The analyzer answers to the same
+  rule, since a noise floor moves its bins by more than its settling threshold
+  on every frame. `IVORY_PACE_PROBE` now also prints the smallest delay the
+  app's ledger and the host's ledger each asked for in the second.
+
+- **An idle desk rests, whatever is loaded on it.** Two more reasons a
+  window with nothing playing kept painting, both the same shape as the VU
+  needle below. The host's meter ledger asked "is anything above the floor",
+  which is true of every desk with a plugin in it for as long as the project
+  is open: an idle rack's noise floor sat a few LEDs up the ladder, wandering
+  by less than a pixel, and the window painted it thirty times a second all
+  afternoon. It now asks whether the meters' PICTURE would draw differently -
+  a level that has not moved one LED, a hold line that has not moved one LED,
+  a lamp and a lane bit unchanged - and rests when it would not, with a grace
+  so a transient is followed down its decay every frame. And a lane carrying
+  an instrument never parked its rack at all, the class of the plugin deciding
+  that at load, so the owner's Pianoteq ran its physical model over nothing
+  for the life of the session. A voice now parks on a stricter rule than an
+  effect: nothing above -80 dBFS at its pre-fader output, its own instrument
+  reporting no voice where it can be asked, and no note or control event, for
+  thirty seconds rather than the effects' eight - the extra margin is for a
+  patch that swells from silence. A control event wakes a parked lane the way
+  a note always did, so a sustain-down that arrives while the lane is parked
+  is not the one message its instrument never received.
+
+- **An idle window no longer paints sixty frames a second.** The VU needles
+  chase the meters through a one-pole, which APPROACHES its target and never
+  arrives, and the test deciding whether they were still moving asked whether
+  they were exactly there, to within `1.0e-4` - about -80 dBFS, four orders of
+  magnitude below anything a VU face can draw. A desk with anything loaded in
+  it is never digitally silent, its noise floor wanders every frame, and so
+  every frame re-opened a gap the test could see and the screen could not. The
+  needles asked for a repaint 16 ms out, and because `request_repaint_after`
+  keeps the MINIMUM asked, that one request beat every resting cadence the
+  rest of the app had negotiated. The window ran at 59 frames a second for as
+  long as it was open, with nothing playing, at about half a core. A needle
+  within a quarter of a pixel of its reading now SNAPS to it and stops asking;
+  the ballistics are untouched.
+
+  Measured on the owner's machine with Pianoteq and Brusfri loaded and the
+  transport stopped: `IVORY_PACE_PROBE=1` read `fps=59 p99=18.3ms`, which is
+  the 16 ms request plus the frame it buys, and `TANGENT_FRAME_LOG=1` priced
+  that frame at `update 1.0/1.1/1.1 | cpu(prev) 2.7/3.0/3.1`. The resting
+  policy had a test for an idle desk already; it rested its meters at exactly
+  zero, which is a reading no real desk ever gives.
+
 ### Added
+
+- **A session carries its rack, its levels and its feel.** The eight knobs
+  across the recorder's band — reverb, delay, chorus, phaser, the two filters,
+  the output gain and the limiter — and every parameter row behind them lived
+  in the settings file alone, which made each of them a property of the
+  MACHINE rather than of the song: opening any project wore whatever reverb
+  the last one was using, and there was no way to leave a mix set up and come
+  back to it. The same was true of the backing track's level, the mono fold,
+  the loudness window, the varispeed dial, the click's division and sound,
+  whether the click prints into the take, the transpose, the count-in, the
+  take name, the MIDI editor's magnet, grid, swing, triplet and humanize, and
+  the staff's key signature with the guitar's tuning and capo. All of them
+  ride the document's desk now, captured on every save and applied on an
+  explicit open, beside the faders and bays that already did. The owner: "I
+  need the desk settings (all send knobs in recorder and levels) to be saved
+  per session. They currently don't count in the parameters set by a session
+  file. Everything should be session dependent."
+
+  A document that does not carry a key keeps the LIVE value, which is the
+  rule the desk's earlier late arrivals already answer to — nothing an old
+  project sounds like changes because a field was added, and a project opened
+  from before this wears no asterisk it did not earn.
 
 - **Shift+Up/Down shows the notes it takes.** The selection was right and
   invisible: `selected` is sorted by contract because the roll asks a binary

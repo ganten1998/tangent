@@ -3384,20 +3384,65 @@ impl Rack {
 /// meter", with nothing armed, nothing playing and nothing to hear.
 const RACK_PARK_S: f64 = 8.0;
 
+/// **How long a lane carrying an INSTRUMENT must be silent at its output
+/// before its rack may stop**, in seconds.
+///
+/// A voice used to never park at all — the class of the plugin decided it,
+/// at load — because an instrument may be holding a note and a park would
+/// cut it. That kept every instrument lane on the desk rendering every
+/// block for as long as the project was open: the owner's Pianoteq lane,
+/// armed and untouched, ran its physical model over nothing all afternoon,
+/// and the meter it fed never read zero, so the window it fed never
+/// rested. See `desktop.rs`'s `MeterPicture` for the other half of that.
+///
+/// So a voice parks on a stricter rule than an effect: not "nothing is
+/// feeding it" but **"nothing is coming OUT of it"** — its pre-fader output
+/// below [`PARK_FLOOR`] for this long, with its own instrument (where it can
+/// be asked, see `lane_instrument_active`) reporting no voice, and no note
+/// or control event on the lane. Any of those puts the wait back to the
+/// start, so a note played over a parked lane wakes it for a full window.
+///
+/// Thirty seconds and not the effects' eight, because the one thing an
+/// output-level test cannot see is a voice that is silent NOW and will not
+/// be later: an envelope with a long delay before its attack, a patch that
+/// swells from nothing. A held note has to sit in digital silence for the
+/// whole of this window before its lane is stood down, and a swell that
+/// waits longer than that is a sound design this app will not chase.
+const VOICE_PARK_S: f64 = 30.0;
+
+/// **What counts as silence at a lane's output**, linear. -80 dBFS.
+///
+/// Far below anything a room can carry — a tail this quiet is under the
+/// dither of a 16-bit master — and far above the denormal floor a physical
+/// model idles at, so a resting instrument reads as silent and a real tail
+/// does not. Compared against the lane's PRE-fader output, so a muted or
+/// faded-down instrument still holding a note is still heard by this test.
+const PARK_FLOOR: f32 = 1.0e-4;
+
 /// **Whether a lane's rack may stop running this block**, advancing the
 /// lane's quiet counter as it decides.
 ///
 /// A free function so the rule can be read and tested on its own — without an
-/// audio device, a plugin, or a block of samples — which is what its two
-/// halves deserve: one of them stops a chain from making noise a parked desk
-/// should not make, and the other is the promise that it will never do that
-/// to something holding a note.
+/// audio device, a plugin, or a block of samples — which is what its halves
+/// deserve: one stops a chain from making noise a parked desk should not
+/// make, and the other is the promise that it will never do that to
+/// something that is sounding.
+///
+/// `holds_voice` is whether the lane carries an instrument at all, decided
+/// from the plugin's class at load; `sounding` is whether that instrument
+/// is audibly doing anything — its own voice report where it has one, or
+/// its output above [`PARK_FLOOR`] last block. An effect ignores `sounding`
+/// on purpose: an amp simulation fed silence is loudly "sounding", and
+/// parking it is the whole point. A voice that is sounding never parks; a
+/// voice that is not waits out [`VOICE_PARK_S`] rather than the effects'
+/// [`RACK_PARK_S`], for the reason written on the constant.
 ///
 /// A lane with no counter (an index past the table) never parks, which is the
 /// same "answer rather than panic" the seat map makes.
 fn park_lane(
     quiet: Option<&mut u64>,
     holds_voice: bool,
+    sounding: bool,
     live_now: bool,
     frames: usize,
     rate: f64,
@@ -3405,12 +3450,13 @@ fn park_lane(
     let Some(quiet) = quiet else {
         return false;
     };
-    if holds_voice || live_now {
+    if live_now || (holds_voice && sounding) {
         *quiet = 0;
         return false;
     }
     *quiet = quiet.saturating_add(frames as u64);
-    *quiet as f64 >= RACK_PARK_S * rate.max(1.0)
+    let wait = if holds_voice { VOICE_PARK_S } else { RACK_PARK_S };
+    *quiet as f64 >= wait * rate.max(1.0)
 }
 
 /// Run a rack over one channel's PLANAR audio, in place.
@@ -4575,10 +4621,19 @@ struct Renderer {
     racks: Vec<Rack>,
     /// **How long each lane's rack has had nothing to do**, in frames, and
     /// the counter the park rule reads. Zeroed the moment the lane has any
-    /// reason to be live — the transport rolling, the lane armed, a note on
-    /// it, an audition — and never counted at all for a lane that could be
-    /// holding a note. See `RACK_PARK_S`.
+    /// reason to be live — the transport rolling, the lane armed, a note or
+    /// a control on it, an audition — and, for a lane carrying an
+    /// instrument, whenever that instrument is sounding. See `RACK_PARK_S`
+    /// and `VOICE_PARK_S`.
     lane_quiet: Vec<u64>,
+    /// **Whether each lane's rack put anything above [`PARK_FLOOR`] out last
+    /// block**, pre-fader — the `sounding` the park rule reads for a lane
+    /// carrying an instrument. Written by the fold, one block behind the
+    /// decision that reads it, which is the cheapest honest answer: the
+    /// block that goes quiet is rendered, and the next one is judged on it.
+    /// A parked lane does not fold and so keeps its last answer, which was
+    /// `false` or it would not have parked.
+    lane_loud: Vec<bool>,
     /// Deinterleaved in and out for it. Preallocated, like everything else the
     /// audio thread touches.
     fx_in: Vec<Vec<f32>>,
@@ -9672,29 +9727,42 @@ impl Renderer {
             // name: "a chorusy buzz constant at around -40dB on the master
             // meter."
             //
-            // **A voice never parks**, which is the whole care in this. An
-            // effect fed nothing has nothing of its own to lose; an
-            // instrument may be holding a note, and a park would cut it. So
-            // the rule asks the BOX — `Hosted::voice`, decided at load from
-            // the class's own subCategories — and stands down for a lane
-            // carrying any generator at all, built-in or plugin.
+            // **A voice that is SOUNDING never parks**, which is the whole
+            // care in this. An effect fed nothing has nothing of its own to
+            // lose; an instrument may be holding a note, and a park would cut
+            // it. So the rule asks the BOX — `Hosted::voice`, decided at load
+            // from the class's own subCategories — for whether the lane
+            // carries a generator at all, and then asks the generator whether
+            // it is doing anything: its own voice count where it has one (the
+            // built-ins), and otherwise what came out of it last block. A
+            // lane that carries an instrument and has put nothing above
+            // `PARK_FLOOR` out for `VOICE_PARK_S` is stood down like any
+            // other; before that rule every instrument lane on the desk
+            // rendered every block for the life of the project.
             //
             // The counter is per lane and zeroed by any reason to be live, so
             // a note played over a parked desk wakes its lane for a further
-            // `RACK_PARK_S` rather than being the one note that does not
-            // sound.
+            // full window rather than being the one note that does not
+            // sound. **A CONTROL wakes it too**: a parked lane skips its rack,
+            // and the rack is where a hosted instrument is handed its pedal
+            // and its wheel — a sustain-down that arrived while the lane was
+            // parked would otherwise be the one message it never received.
             let holds_voice = is_builtin
                 || is_keys
                 || self.racks[ch].holds_a_voice()
                 || self.racks[tangent_ui::recorder::folder_extra_seat(ch)].holds_a_voice();
+            let sounding = self.lane_instrument_active(ch)
+                || self.lane_loud.get(ch).copied().unwrap_or(true);
             let live_now = rolling
                 || auditioning
                 || !lane_notes.is_empty()
+                || !lane_controls.is_empty()
                 || self.shared.armed.load(Ordering::Relaxed) & (1u32 << ch.min(31)) != 0;
             let rate = self.rate;
             let parked = park_lane(
                 self.lane_quiet.get_mut(ch),
                 holds_voice,
+                sounding,
                 live_now,
                 frames,
                 rate,
@@ -10077,6 +10145,12 @@ impl Renderer {
                 continue;
             };
             let mut peak = [0.0f32; 2];
+            // **The rack's own output, before the fader** — what the park
+            // rule reads next block to decide whether this lane's instrument
+            // is sounding. Pre-fader on purpose: a note held on a muted or
+            // faded-down lane is still a note, and parking it would leave a
+            // fader that comes back up onto silence.
+            let mut raw = 0.0f32;
             for f in 0..frames {
                 let g = if is_folder {
                     1.0
@@ -10084,8 +10158,11 @@ impl Renderer {
                     self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
                     self.channel_gain[ch]
                 };
-                let l = self.fx_in.first().map_or(0.0, |b| b[f]) * g * pan_l;
-                let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
+                let s0 = self.fx_in.first().map_or(0.0, |b| b[f]);
+                let s1 = self.fx_in.get(1).map_or(0.0, |b| b[f]);
+                raw = raw.max(s0.abs()).max(s1.abs());
+                let l = s0 * g * pan_l;
+                let r = s1 * g * pan_r;
                 peak[0] = peak[0].max(l.abs());
                 peak[1] = peak[1].max(r.abs());
                 // `direct` is zero for anything in a group — see where
@@ -10117,6 +10194,9 @@ impl Renderer {
                         d[f * CHANNELS * 2 + ch * 2 + 1] += dr;
                     }
                 }
+            }
+            if let Some(loud) = self.lane_loud.get_mut(ch) {
+                *loud = raw > PARK_FLOOR;
             }
             // The folder's meter is the GROUP's, and the fold reports it.
             if !is_folder {
@@ -11663,6 +11743,7 @@ impl Engine {
             aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             racks,
             lane_quiet: vec![0; CHANNELS],
+            lane_loud: vec![false; CHANNELS],
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
@@ -17421,6 +17502,7 @@ mod tests {
             room_rack: 0,
             racks,
             lane_quiet: vec![0; CHANNELS],
+            lane_loud: vec![false; CHANNELS],
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             master_effects: crate::effects::Effects::new(RATE as f32),
@@ -17624,26 +17706,26 @@ mod tests {
     /// one would cut it off. So a lane carrying any generator never parks at
     /// all, however long the desk stands still.
     ///
-    /// Revert checks performed: drop the `holds_voice` term and the voice
-    /// lane parks with the rest; drop the `live_now` term and a lane parks
-    /// while the transport is rolling.
+    /// Revert checks performed: drop the `holds_voice && sounding` term and
+    /// a sounding voice parks with the rest; drop the `live_now` term and a
+    /// lane parks while the transport is rolling; make the voice wait the
+    /// effects' eight seconds and the silent-voice check below trips.
     #[test]
-    fn a_parked_desk_parks_its_effects_and_never_its_instruments() {
+    fn a_parked_desk_parks_its_effects_and_its_silent_instruments_and_never_a_sounding_one() {
         let rate = 48_000.0_f64;
         let frames = 512usize;
         // Eight seconds of stopped transport, in blocks.
         let blocks = (RACK_PARK_S * rate / frames as f64).ceil() as usize;
+        // When a lane parks, in seconds, given how it answers each block.
+        let parks_after = |holds_voice: bool, sounding: bool, limit: usize| -> Option<f64> {
+            let mut quiet = 0u64;
+            (0..limit)
+                .find(|_| park_lane(Some(&mut quiet), holds_voice, sounding, false, frames, rate))
+                .map(|b| (b * frames) as f64 / rate)
+        };
 
         // ── an EFFECT chain: parks, and not before its time ──────────
-        let mut quiet = 0u64;
-        let mut parked_at = None;
-        for b in 0..blocks + 4 {
-            if park_lane(Some(&mut quiet), false, false, frames, rate) && parked_at.is_none() {
-                parked_at = Some(b);
-            }
-        }
-        let at = parked_at.expect("an idle effect chain never parked");
-        let seconds = (at * frames) as f64 / rate;
+        let seconds = parks_after(false, false, blocks + 4).expect("an idle effect chain never parked");
         assert!(
             seconds >= RACK_PARK_S - 0.05,
             "parked after {seconds}s, inside the {RACK_PARK_S}s a reverb tail is given"
@@ -17652,35 +17734,67 @@ mod tests {
             seconds <= RACK_PARK_S + 0.05,
             "took {seconds}s to park, well past the tail it was waiting out"
         );
+        // **And an effect that is loud parks all the same** — an amp
+        // simulation fed silence is loudly "sounding", and parking it is the
+        // whole point of the rule.
+        assert!(
+            parks_after(false, true, blocks + 4).is_some(),
+            "a hissing effect chain was kept running because it hissed"
+        );
 
-        // ── a VOICE: never, however long the desk stands still ───────
+        // ── a SOUNDING voice: never, however long the desk stands still ──
+        let long = (VOICE_PARK_S * rate / frames as f64).ceil() as usize * 10;
         let mut quiet = 0u64;
-        for _ in 0..blocks * 10 {
+        for _ in 0..long {
             assert!(
-                !park_lane(Some(&mut quiet), true, false, frames, rate),
-                "a lane holding an instrument was parked"
+                !park_lane(Some(&mut quiet), true, true, false, frames, rate),
+                "a lane holding a sounding instrument was parked"
             );
         }
-        assert_eq!(quiet, 0, "a voice lane counted quiet it can never spend");
+        assert_eq!(quiet, 0, "a sounding voice counted quiet it can never spend");
+
+        // ── a SILENT voice: parks, on its own longer clock ───────────
+        let seconds = parks_after(true, false, long).expect("a silent instrument lane never parked");
+        assert!(
+            seconds >= VOICE_PARK_S - 0.05,
+            "a silent voice parked after {seconds}s, inside the {VOICE_PARK_S}s a delayed swell is given"
+        );
+        assert!(
+            seconds <= VOICE_PARK_S + 0.05,
+            "a silent voice took {seconds}s to park, past its own window"
+        );
+        assert!(
+            seconds > RACK_PARK_S + 1.0,
+            "a voice parked on the effects' clock ({seconds}s); its own is {VOICE_PARK_S}s"
+        );
 
         // ── and any reason to be live puts the counter back ──────────
         //
-        // Rolling, armed, a note, an audition: each arrives as `live_now`,
-        // and what matters is that the wait starts AGAIN rather than
-        // resuming — a note played over a parked desk must wake its lane for
-        // a full eight seconds, or it is the one note that does not sound.
+        // Rolling, armed, a note, a control, an audition: each arrives as
+        // `live_now`, and what matters is that the wait starts AGAIN rather
+        // than resuming — a note played over a parked desk must wake its
+        // lane for a full window, or it is the one note that does not sound.
         let mut quiet = 0u64;
         for _ in 0..blocks - 1 {
-            assert!(!park_lane(Some(&mut quiet), false, false, frames, rate));
+            assert!(!park_lane(Some(&mut quiet), false, false, false, frames, rate));
         }
         assert!(quiet > 0, "the counter never ran");
-        assert!(!park_lane(Some(&mut quiet), false, true, frames, rate));
+        assert!(!park_lane(Some(&mut quiet), false, false, true, frames, rate));
         assert_eq!(quiet, 0, "a live block did not reset the wait");
         // And one block later it is nowhere near parking again.
-        assert!(!park_lane(Some(&mut quiet), false, false, frames, rate));
+        assert!(!park_lane(Some(&mut quiet), false, false, false, frames, rate));
+        // **A voice that goes quiet and then sounds again starts over too**:
+        // one loud block anywhere in the window is a full window more.
+        let mut quiet = 0u64;
+        for _ in 0..(long / 10) - 1 {
+            assert!(!park_lane(Some(&mut quiet), true, false, false, frames, rate));
+        }
+        assert!(quiet > 0);
+        assert!(!park_lane(Some(&mut quiet), true, true, false, frames, rate));
+        assert_eq!(quiet, 0, "a sounding block did not reset a voice's wait");
 
         // A lane with no counter answers rather than panicking.
-        assert!(!park_lane(None, false, false, frames, rate));
+        assert!(!park_lane(None, false, false, false, frames, rate));
     }
 
     /// A knob turned in a plugin's own window reaches the audio thread — and
