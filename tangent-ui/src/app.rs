@@ -1482,6 +1482,16 @@ pub struct TangentApp {
     vu_needle: [f32; 4],
     /// When the needles were last advanced, in egui's clock.
     vu_at: f64,
+    /// **Whether anybody can see the window this frame** — focused and not
+    /// minimised, as egui last heard from the window manager, and `true`
+    /// until it has heard. Read once at the top of `paint` and consulted by
+    /// the two animators whose whole job is to be looked at, the heart and
+    /// the analyzer. See [`Self::HEART_TICK`].
+    looked_at: bool,
+    /// The delay `frame` last asked egui for on the app's own account, or
+    /// `None` when it rested — for `IVORY_PACE_PROBE`, which prints the
+    /// smallest seen in a second beside who asked.
+    debug_asked: Option<Duration>,
     /// **Everything the app has to SAY**, as opposed to ask.
     ///
     /// The one queue behind `notify`, `notify_raise` and `notify_lower`, drawn
@@ -3720,6 +3730,8 @@ impl TangentApp {
             dismiss_message: false,
             fx_choice: None,
             vu_needle: [0.0; 4],
+            looked_at: true,
+            debug_asked: None,
             vu_at: 0.0,
             messages: crate::notify::Notifications::new(),
             // Until the first paint has said what is actually under the
@@ -7188,6 +7200,27 @@ impl TangentApp {
     /// the owner's word was that it has to move.
     const HEART_CYCLE_S: f64 = 6.0;
 
+    /// **How often an animated heart asks to be drawn**, while the window is
+    /// looked at.
+    ///
+    /// It asked for 33 ms, and since `request_repaint_after` keeps the
+    /// MINIMUM asked, that one line set the pace of the whole window: with
+    /// nothing playing, the owner's desk painted fifty-six frames a second
+    /// for as long as the app was open — about half a core — for a sprite
+    /// seven pixels wide. Measured 2026-09-15: `IVORY_PACE_PROBE=1` named
+    /// this call site on every frame of every second, and egui subtracts
+    /// its predicted frame time from every ask, so 33 ms lands as an 18 ms
+    /// cadence. Every resting test had passed, because `quiet_desktop`
+    /// turns the heart off — the one animator this machine always has was
+    /// the one no test ever saw.
+    ///
+    /// The wave is STEPPED (see `heart_wave`) and advances one band every
+    /// `HEART_CYCLE_S / 16`, 375 ms; the cheater's swirl turns once in ten
+    /// seconds. A hundred milliseconds draws every pixel either can change.
+    /// And an unfocused or minimised window asks for nothing at all: a heart
+    /// nobody is looking at still moves, at the idle poll, for free.
+    const HEART_TICK: Duration = Duration::from_millis(100);
+
     /// How many of the sixteen are on the heart at once.
     ///
     /// The sprite is eleven diagonal steps corner to corner, so four colours
@@ -7224,6 +7257,15 @@ impl TangentApp {
             egui::Color32::from_rgb(r, g, b),
             recorder_panel::band_face(&self.settings),
         )
+    }
+
+    /// The animated heart's next frame — asked only while somebody can see
+    /// it, and at [`Self::HEART_TICK`]. See the constant for what asking
+    /// unconditionally cost.
+    fn ask_heart_frame(&self, ctx: &egui::Context) {
+        if self.looked_at {
+            ctx.request_repaint_after(Self::HEART_TICK);
+        }
     }
 
     fn heart_color(&self, t: f64) -> Option<egui::Color32> {
@@ -9619,6 +9661,61 @@ impl TangentApp {
                 keys_patch: &s.strip_keys_patch,
                 keys_params: &s.strip_keys_params,
             }),
+            // **And the second late wave**, `Some` for the same reason the
+            // six above are: the settings never predate a key, so the live
+            // desk always says, every save writes all eleven, and the
+            // document wins from then on.
+            //
+            // The eight rack knobs are named in `recorder::FxSends`' order,
+            // which is the order `Settings::knobs` hands them to the engine
+            // — one list, so a knob cannot be spelled into the rack here and
+            // out of the engine there.
+            rack: Some(crate::arrangement::RackRef {
+                reverb: s.reverb_mix,
+                delay: s.delay_mix,
+                chorus: s.chorus_mix,
+                phaser: s.phaser_mix,
+                hpf: s.hpf_mix,
+                lpf: s.lpf_mix,
+                gain: s.gain_mix,
+                limiter: s.limiter_mix,
+                params: &s.effect_params,
+            }),
+            track_gain: Some(s.track_gain),
+            master_mono: Some(s.master_mono),
+            lufs_window: Some(s.lufs_window),
+            varispeed: Some(s.varispeed),
+            click: Some(crate::arrangement::ClickRef {
+                div: s.metronome_div,
+                in_take: s.metronome_in_take,
+                sample: &s.click_sample,
+            }),
+            transpose: Some(s.transpose),
+            count_in: Some(crate::arrangement::CountIn {
+                bars: s.record_count_in_bars,
+                beats: s.record_count_in_beats,
+                in_take: s.record_count_in_in_take,
+            }),
+            // **No name is the empty string here**, never a missing key:
+            // `None` on this field means the DOCUMENT did not say, and a
+            // live desk always does. See `DeskSnap::take_name`.
+            take_name: Some(s.record_take_name.as_deref().unwrap_or_default()),
+            feel: Some(crate::arrangement::Feel {
+                snap: s.midi_snap,
+                grid_exp: s.midi_grid_exp,
+                swing: s.midi_swing,
+                swing_pct: s.midi_swing_pct,
+                triplet: s.midi_triplet,
+                humanize_timing: s.midi_humanize_timing,
+                humanize_vel: s.midi_humanize_vel,
+            }),
+            notation: Some(crate::arrangement::NotationRef {
+                staff_key: s.staff_key,
+                prefer_flats: s.prefer_flats,
+                capo: s.fretboard_capo,
+                capo_style: &s.capo_style,
+                tuning: &s.fretboard_tuning,
+            }),
         }
     }
 
@@ -9801,6 +9898,112 @@ impl TangentApp {
             put(&mut self.settings.strip_keys_patch, &i.keys_patch);
             for (n, slot) in self.settings.strip_keys_params.iter_mut().enumerate() {
                 *slot = i.keys_params.get(n).copied().unwrap_or(*slot);
+            }
+        }
+        // **And the second late wave** — the rack, the levels and the rest
+        // of what a song is. Same rule as the six above: applied only when
+        // the document SAYS, clamped the way the settings' own reader
+        // clamps, and silent otherwise.
+        if let Some(r) = d.rack.as_ref() {
+            // **A knob the document cannot express is LEFT ALONE.** The
+            // settings' reader writes 0.0 for a non-finite value, which is
+            // right for a wet mix and wrong for the limiter, whose rest is
+            // the TOP of its travel — a NaN arriving on an in-memory
+            // snapshot would slam a threshold shut across somebody's mix.
+            // A value that is not a number is not an opinion about a knob,
+            // so it does not get to become one.
+            let put = |dst: &mut f64, v: f64| {
+                if v.is_finite() {
+                    *dst = v.clamp(0.0, 1.0);
+                }
+            };
+            for (dst, v) in [
+                (&mut self.settings.reverb_mix, r.reverb),
+                (&mut self.settings.delay_mix, r.delay),
+                (&mut self.settings.chorus_mix, r.chorus),
+                (&mut self.settings.phaser_mix, r.phaser),
+                (&mut self.settings.hpf_mix, r.hpf),
+                (&mut self.settings.lpf_mix, r.lpf),
+                (&mut self.settings.gain_mix, r.gain),
+                (&mut self.settings.limiter_mix, r.limiter),
+            ] {
+                put(dst, v);
+            }
+            // The rows whole — a parameter this build has never heard of
+            // belongs to the document, not to the reader.
+            self.settings.effect_params = r.params.clone();
+        }
+        if let Some(v) = d.track_gain {
+            self.settings.track_gain = v.clamp(0.0, 8.0);
+        }
+        if let Some(v) = d.master_mono {
+            self.settings.master_mono = v;
+        }
+        if let Some(v) = d.lufs_window {
+            self.settings.lufs_window = v;
+        }
+        if let Some(v) = d.varispeed {
+            // Already through `Varispeed`'s own setters — the type cannot
+            // hold a range that has lost its invariant, which is the whole
+            // reason it travels as the model and not as three numbers.
+            self.settings.varispeed = v;
+        }
+        if let Some(c) = d.click.as_ref() {
+            // 0 is "once a bar"; anything past 8 is a buzz, not a click —
+            // the settings reader's own bound, in its own words.
+            self.settings.metronome_div = c.div.clamp(0, 8);
+            self.settings.metronome_in_take = c.in_take;
+            self.settings.click_sample = c.sample.clone();
+        }
+        if let Some(v) = d.transpose {
+            self.settings.transpose =
+                v.clamp(-crate::settings::TRANSPOSE_MAX, crate::settings::TRANSPOSE_MAX);
+        }
+        if let Some(c) = d.count_in {
+            // Unclamped on the way in, like the settings' own road: the
+            // bound lives in `count_in_bars`, where the count is read.
+            self.settings.record_count_in_bars = c.bars;
+            self.settings.record_count_in_beats = c.beats;
+            self.settings.record_count_in_in_take = c.in_take;
+        }
+        if let Some(v) = d.take_name.as_ref() {
+            // **Empty is NO name, which is `None`** — see
+            // `DeskSnap::take_name`. A document gets to CLEAR a name the
+            // session is holding, not only to replace it.
+            self.settings.record_take_name = (!v.is_empty()).then(|| v.clone());
+        }
+        if let Some(t) = d.feel {
+            self.settings.midi_snap = t.snap;
+            self.settings.midi_grid_exp = t.grid_exp.clamp(-7, 3);
+            self.settings.midi_swing = t.swing;
+            if t.swing_pct.is_finite() {
+                // One decimal, the SWG menu's rule — rounded here as the
+                // settings reader rounds it, or a document would round-trip
+                // to a number the menu cannot show.
+                self.settings.midi_swing_pct =
+                    (t.swing_pct.clamp(50.0, 95.0) * 10.0).round() / 10.0;
+            }
+            self.settings.midi_triplet = t.triplet;
+            self.settings.midi_humanize_timing = t.humanize_timing.min(100);
+            self.settings.midi_humanize_vel = t.humanize_vel.min(100);
+        }
+        if let Some(n) = d.notation.as_ref() {
+            self.settings.staff_key =
+                n.staff_key.clamp(-staff::MAX_KEY, staff::MAX_KEY);
+            self.settings.prefer_flats = n.prefer_flats;
+            // **The capo is clamped AT USE and never on the way in** — this
+            // one field's own rule, which the settings reader keeps too.
+            self.settings.fretboard_capo = n.capo;
+            // **Verbatim, both — but never EMPTY.** Neither has an empty
+            // default, so the only way to meet one is a hand-edited
+            // document, and the live tuning is a better answer than the
+            // silent fall back to Standard that an empty name would take at
+            // the point of use.
+            if !n.capo_style.is_empty() {
+                self.settings.capo_style = n.capo_style.to_owned();
+            }
+            if !n.tuning.is_empty() {
+                self.settings.fretboard_tuning = n.tuning.to_owned();
             }
         }
         // A group is not a send destination — `set_is_folder` enforces
@@ -26335,6 +26538,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         self.main_wm_managed
     }
 
+    /// What `frame` last asked egui for on the app's own account, if
+    /// anything. For `IVORY_PACE_PROBE` only.
+    pub fn debug_asked(&self) -> Option<Duration> {
+        self.debug_asked
+    }
+
     /// Whether the HOST is constraining the drag. For the probes.
     pub fn debug_os_aspect_lock(&self) -> bool {
         self.os_aspect_lock
@@ -33560,6 +33769,34 @@ impl TangentApp {
     /// under what was going in.
     const VU_SINE: f32 = std::f32::consts::SQRT_2;
 
+    /// **How far a needle must still have to travel for another frame to be
+    /// worth drawing**, as a fraction of full deflection.
+    ///
+    /// A one-pole APPROACHES its target and never arrives, so "the needle is
+    /// not yet exactly on its target" is a condition a chasing needle never
+    /// leaves — and a meter's target always moves, because a desk with
+    /// anything loaded in it is never digitally silent. The old test used
+    /// `1.0e-4`, about -80 dBFS, which is four orders of magnitude below
+    /// anything a VU face can show; every idle rack in the world clears it.
+    ///
+    /// So the needles asked for a frame they had no visible use for, sixteen
+    /// milliseconds apart, for as long as the app was open — and since
+    /// `request_repaint_after` keeps the MINIMUM asked, that one request beat
+    /// every resting cadence the rest of the app had negotiated. Measured on
+    /// the owner's machine 2026-09-15 with `IVORY_PACE_PROBE=1`: `fps=59
+    /// p99=18.3ms` with nothing playing, against the 4 Hz
+    /// `ENGINE_IDLE_POLL` the window is supposed to rest at, at a cost of
+    /// about half a core. `TANGENT_FRAME_LOG=1` priced the frame it was
+    /// buying: `update 1.0/1.1/1.1 | cpu(prev) 2.7/3.0/3.1`.
+    ///
+    /// Two thousandths of full scale. A VU face is on the order of a hundred
+    /// points across, so this is a quarter of a pixel; below it there is
+    /// nothing on screen that could change. **The BALLISTICS are untouched**
+    /// — `VU_RISE_S` still governs the needle whenever it is moving, which is
+    /// the whole of what makes a VU a VU. This decides only when it has
+    /// stopped.
+    const VU_VISIBLE: f32 = 0.002;
+
     /// Advance every needle by the time that has actually passed.
     ///
     /// A one-pole whose coefficient is computed from `dt` rather than assumed,
@@ -33585,20 +33822,43 @@ impl TangentApp {
         ];
         for (n, target) in self.vu_needle.iter_mut().zip(targets) {
             *n += (target - *n) * a;
+            // **Arrived counts as arrived.** Without this the needle sits an
+            // ever-smaller hair short of its target for ever, and a target
+            // that jitters by less than a pixel — which an idle rack's noise
+            // floor does, every frame — keeps re-opening a gap the test below
+            // can see and the screen cannot.
+            if (*n - target).abs() <= Self::VU_VISIBLE {
+                *n = target;
+            }
         }
         self.recorder.meters.left.vu = self.vu_needle[0];
         self.recorder.meters.right.vu = self.vu_needle[1];
         self.recorder.master.left.vu = self.vu_needle[2];
         self.recorder.master.right.vu = self.vu_needle[3];
         // A needle that is still moving is a repaint that has to happen, or it
-        // freezes wherever the last mouse move left it.
-        if self.vu_needle.iter().zip(targets).any(|(n, t)| (n - t).abs() > 1.0e-4) {
+        // freezes wherever the last mouse move left it. **Still moving means
+        // it has visible travel LEFT** — see [`Self::VU_VISIBLE`] for what the
+        // old hair-fine test cost. Asked on the remaining distance and not on
+        // the step the next frame would take: at a high refresh the step is
+        // small however far the needle still has to go, and a needle that
+        // stopped three points short of its reading would be a meter that
+        // lies.
+        if self
+            .vu_needle
+            .iter()
+            .zip(targets)
+            .any(|(n, t)| (n - t).abs() > Self::VU_VISIBLE)
+        {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 
     fn paint(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.looked_at = ctx.input(|i| {
+            let v = i.viewport();
+            v.focused != Some(false) && v.minimized != Some(true)
+        });
         self.advance_vu(&ctx);
         self.shift_down = ctx.input(|i| i.modifiers.shift);
         // **A hand on a fader is a gesture too.** The window frame is not the
@@ -34793,9 +35053,7 @@ impl TangentApp {
                         // animated, no wave, no flat fallback, whatever the
                         // heart settings say. The glow is the theme's own
                         // master colour: crimson on Default, per spec.
-                        ui.ctx().request_repaint_after(
-                            Duration::from_millis(33),
-                        );
+                        self.ask_heart_frame(ui.ctx());
                         chord_strip::draw_heart_crackle(
                             ui.painter(),
                             hr,
@@ -34803,9 +35061,7 @@ impl TangentApp {
                             now as f32,
                         );
                     } else if self.settings.heart_animate && self.license.is_supporter() {
-                        ui.ctx().request_repaint_after(
-                            Duration::from_millis(33),
-                        );
+                        self.ask_heart_frame(ui.ctx());
                         chord_strip::draw_heart_wave(ui.painter(), hr, &|phase| {
                             let fill = self.heart_wave(phase, now);
                             (fill, self.heart_border(fill))
@@ -37028,17 +37284,21 @@ impl TangentApp {
                         || ctx.is_using_pointer())
             }
         };
+        self.debug_asked = None;
         if paced {
             ctx.request_repaint();
+            self.debug_asked = Some(Duration::ZERO);
         } else if pace_mode() == Pace::Tick || !self.caps.window_sizing {
             // The old 50 ms cadence: asked for by name, or a plugin editor,
             // whose host owns the window's clock and has no ledger of ours
             // to consult. MIDI events wake us sooner via request_repaint_of.
             ctx.request_repaint_after(GUI_TICK);
+            self.debug_asked = Some(GUI_TICK);
         } else if let Some(due) = self.animation_due(Instant::now()) {
             // **Rest otherwise.** Only what is moving asks, and it asks for
             // exactly when it next needs to be drawn — see `animation_due`.
             ctx.request_repaint_after(due);
+            self.debug_asked = Some(due);
         }
     }
 
@@ -37103,7 +37363,15 @@ impl TangentApp {
             sooner(DETECT_TICK);
         }
         // The analyzer, while it is on screen and still has somewhere to go.
-        if self.analyzer_showing() && (self.scope.live() || !self.analyzer.settled()) {
+        // **And only while somebody can see it.** A noise floor moves the
+        // analyzer's bins by more than `SETTLED_DB` every frame, so an
+        // unfocused window over a loaded desk would never rest on this line;
+        // it still redraws at the idle poll, which is all a picture nobody
+        // is looking at is owed.
+        if self.looked_at
+            && self.analyzer_showing()
+            && (self.scope.live() || !self.analyzer.settled())
+        {
             sooner(Duration::from_millis(33));
         }
         due
@@ -53672,6 +53940,181 @@ mod tests {").expect("the tests module")];
         );
     }
 
+    /// **A desk that is LOADED but idle rests too** — the case the test
+    /// above cannot see, because it rests its meters at exactly zero and no
+    /// real desk ever reads that.
+    ///
+    /// A rack with anything in it has a noise floor, and a noise floor
+    /// wanders a little every frame. The VU needles chase the meters through
+    /// a one-pole, which APPROACHES its target and never arrives, and the
+    /// test that decided whether they were still moving asked whether they
+    /// were exactly there, to within `1.0e-4` — about -80 dBFS, four orders
+    /// of magnitude below anything a VU face can draw. Every wandering
+    /// target therefore re-opened a gap the test could see and the screen
+    /// could not, the needles asked for a frame 16 ms out, and because
+    /// `request_repaint_after` keeps the MINIMUM asked that one request beat
+    /// every resting cadence the rest of the app had negotiated.
+    ///
+    /// The window ran at 59 frames a second for as long as it was open, at
+    /// about half a core, on the owner's machine with the modelled piano and Brusfri
+    /// loaded and nothing playing. Measured 2026-09-15 with
+    /// `IVORY_PACE_PROBE=1`: `fps=59 p99=18.3ms`, which is the 16 ms request
+    /// plus the frame it buys. See [`TangentApp::VU_VISIBLE`].
+    #[test]
+    fn a_loaded_but_idle_desk_rests_although_its_meters_never_read_zero() {
+        let (ctx, mut app) = quiet_desktop(true);
+        if app.license.cheated() {
+            return;
+        }
+        let _ = settle(&ctx, &mut app);
+        // An idle rack: about -40 dBFS, wandering by a fraction of a pixel's
+        // worth of deflection every frame, for four seconds at 60 Hz.
+        //
+        // **The hiss keeps wandering while the answer is read.** Letting it
+        // go constant first and then settling is what a test can do and a
+        // session cannot: a constant target IS reached, so the needles come
+        // to rest and the old code looks innocent. The fault only exists
+        // while the floor moves, which on a loaded desk is always.
+        let hiss = |i: u32| 0.010 + (i % 5) as f32 * 0.000_2;
+        let feed = |app: &mut TangentApp, i: u32| {
+            app.recorder.meters.left.rms = hiss(i);
+            app.recorder.meters.right.rms = hiss(i + 2);
+            app.recorder.master.left.rms = hiss(i + 1);
+            app.recorder.master.right.rms = hiss(i + 3);
+            frame_asks(&ctx, app)
+        };
+        for i in 0..240 {
+            let _ = feed(&mut app, i);
+        }
+        // The last second of it, so one lucky frame cannot carry the claim.
+        let busy = (240..300).filter(|i| feed(&mut app, *i) <= Duration::from_millis(16)).count();
+        assert!(
+            busy == 0,
+            "a loaded idle desk painted {busy} of 60 frames at 60 Hz; asked by {}",
+            causes(&ctx)
+        );
+    }
+
+    /// **And a needle with real travel left still gets its frames.** The
+    /// resting rule above must not buy its quiet by freezing the instrument:
+    /// a meter that jumps from silence to a loud reading has a needle to
+    /// move, and `VU_RISE_S` of moving to do.
+    #[test]
+    fn a_needle_with_somewhere_to_go_still_earns_its_frames() {
+        let (ctx, mut app) = quiet_desktop(true);
+        let _ = settle(&ctx, &mut app);
+        app.recorder.meters.left.rms = 0.8;
+        app.recorder.meters.right.rms = 0.8;
+        let asked = frame_asks(&ctx, &mut app);
+        assert!(
+            asked <= Duration::from_millis(16),
+            "a needle mid-swing earned no frame: {asked:?}"
+        );
+        // And it actually arrives, rather than stalling short of the reading.
+        for _ in 0..240 {
+            let _ = frame_asks(&ctx, &mut app);
+        }
+        let reading = app.recorder.meters.left.vu;
+        let want = 0.8 * TangentApp::VU_SINE;
+        assert!(
+            (reading - want).abs() <= TangentApp::VU_VISIBLE,
+            "the needle stopped at {reading} instead of {want}"
+        );
+    }
+
+    /// `frame_asks`, with the window manager's word on whether anybody can
+    /// see the window: focused and not minimised, or neither.
+    fn frame_asks_seen(ctx: &egui::Context, app: &mut TangentApp, seen: bool) -> Duration {
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                focused: Some(seen),
+                minimized: Some(!seen),
+                ..Default::default()
+            },
+        );
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                viewports,
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |v| v.repaint_delay)
+    }
+
+    /// **The heart animates for a window somebody can see, and rests for
+    /// one nobody can** — and asks for `HEART_TICK`, not the 33 ms that set
+    /// the pace of the whole window. See the constant. The cheater's heart
+    /// is the one animated heart a test can wear without a supporter's key,
+    /// and it answers to the same two rules.
+    #[test]
+    fn the_heart_animates_for_a_window_that_is_looked_at_and_rests_for_one_that_is_not() {
+        let (ctx, mut app) = quiet_desktop(true);
+        app.settings.show_heart = true;
+        app.license.unlock_cheat();
+        assert!(app.license.cheated(), "the cheat marker did not take");
+        for _ in 0..30 {
+            let _ = frame_asks_seen(&ctx, &mut app, true);
+        }
+        let asked = frame_asks_seen(&ctx, &mut app, true);
+        assert!(
+            asked <= TangentApp::HEART_TICK,
+            "a looked-at heart earned no frame: {asked:?}; asked by {}",
+            causes(&ctx)
+        );
+        assert!(
+            asked > Duration::from_millis(33),
+            "the heart still asks at the old cadence: {asked:?}"
+        );
+        // Losing focus is a window-manager event, and the decoration nudge
+        // answers one with 1.2 s of 50 ms frames — real, short, and not
+        // what is under test. One unseen frame arms it; it is then waited
+        // out by hand rather than by the clock.
+        let _ = frame_asks_seen(&ctx, &mut app, false);
+        app.decor_nudge_until = None;
+        let busy = (0..30)
+            .filter(|_| frame_asks_seen(&ctx, &mut app, false) <= TangentApp::HEART_TICK)
+            .count();
+        assert_eq!(
+            busy, 0,
+            "an unseen heart asked for {busy} of 30 frames; asked by {}",
+            causes(&ctx)
+        );
+        app.license.relock_cheat();
+    }
+
+    /// **A live analyzer rests when nobody can see it.** Its bins move by
+    /// more than `SETTLED_DB` on any noise floor, so without this an
+    /// unfocused window over a loaded desk asked for 33 ms for ever.
+    #[test]
+    fn a_live_analyzer_rests_when_nobody_can_see_it() {
+        let (ctx, mut app) = quiet_desktop(true);
+        if app.license.cheated() {
+            return;
+        }
+        let _ = settle(&ctx, &mut app);
+        assert!(app.analyzer_showing(), "the band is open with no camera, so the analyzer shows");
+        let n = 8_192usize;
+        let loud: Vec<f32> = (0..n * 2)
+            .map(|i| ((i / 2) as f32 * 0.1).sin() * 0.9)
+            .collect();
+        app.scope_feed(&loud, n as f32 / 48_000.0, 48_000.0);
+        let asked = frame_asks_seen(&ctx, &mut app, true);
+        assert!(asked <= Duration::from_millis(33), "a looked-at live analyzer earned no frame: {asked:?}");
+        app.scope_feed(&loud, n as f32 / 48_000.0, 48_000.0);
+        let asked = frame_asks_seen(&ctx, &mut app, false);
+        assert!(
+            asked > Duration::from_millis(33),
+            "an unseen analyzer still asks for {asked:?}; asked by {}",
+            causes(&ctx)
+        );
+    }
+
     /// **A debounced settings write earns its own frame.** The drain lives
     /// in `paint`; a resting window that never painted again would never
     /// write, and the fader's value would wait for the next mouse move.
@@ -58094,6 +58537,236 @@ mod folder_tests {
         );
         assert!(app.settings_save_at.get().is_none(), "an explicit open also owes a debounced write");
         assert_eq!(app.settings.project_path, doc.to_string_lossy(), "the path did not land");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A session carries its RACK, its levels and its feel** — the owner's
+    /// "I need the desk settings (all send knobs in recorder and levels) to be
+    /// saved per session ... Everything should be session dependent."
+    ///
+    /// Every one of them used to live in the settings alone, so the desk a
+    /// project opened with was whatever the LAST project had left on the
+    /// machine: its reverb, its varispeed, its click division, its key
+    /// signature, its editor feel. The test sets a session up, writes it,
+    /// moves every field somewhere else — which is what another session
+    /// does — and opens the first one back.
+    #[test]
+    fn a_session_carries_its_rack_its_levels_and_its_feel() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-desk-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("song");
+        std::fs::create_dir_all(&dir).expect("project dir");
+        let doc = crate::arrangement::doc_in(&dir);
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+
+        // The session somebody set up.
+        let s = &mut app.settings;
+        s.reverb_mix = 0.42;
+        s.delay_mix = 0.31;
+        s.chorus_mix = 0.22;
+        s.phaser_mix = 0.13;
+        s.hpf_mix = 0.24;
+        s.lpf_mix = 0.65;
+        s.gain_mix = 0.16;
+        s.limiter_mix = 0.77;
+        s.effect_params.insert("reverb_size".into(), serde_json::Value::from(0.61));
+        s.track_gain = 0.55;
+        s.master_mono = true;
+        s.lufs_window = recorder::LoudnessWindow::Integrated;
+        s.varispeed = crate::varispeed::Varispeed::with_range(70, 140);
+        s.metronome_div = 2;
+        s.metronome_in_take = true;
+        s.click_sample = "clave.wav".into();
+        s.transpose = -3;
+        s.record_count_in_bars = 2;
+        s.record_count_in_in_take = true;
+        s.record_take_name = Some("nocturne".into());
+        s.midi_snap = false;
+        s.midi_grid_exp = -5;
+        // **Swing and triplet are exclusive** — turning the triplet on
+        // retires the swing, and the percentage outlives the switch. So the
+        // session under test is a triplet grid that remembers 58.5.
+        s.midi_swing = false;
+        s.midi_swing_pct = 58.5;
+        s.midi_triplet = true;
+        s.midi_humanize_timing = 40;
+        s.midi_humanize_vel = 35;
+        s.staff_key = -3;
+        s.prefer_flats = false;
+        s.fretboard_capo = 2;
+        s.capo_style = "silver".into();
+        s.fretboard_tuning = "Drop D".into();
+
+        // Written into the document exactly as a save writes one.
+        let mut arr = crate::arrangement::Arrangement::default();
+        arr.desk = Some(TangentApp::desk_snapshot_of(&app.settings));
+        arr.save_to(&doc);
+
+        // **Another session, and it disagrees about every one of them.**
+        // This is the state the fault actually presented as: the values
+        // standing here are the ones that used to survive the open.
+        let s = &mut app.settings;
+        s.reverb_mix = 0.0;
+        s.delay_mix = 0.0;
+        s.chorus_mix = 0.0;
+        s.phaser_mix = 0.0;
+        s.hpf_mix = 0.0;
+        s.lpf_mix = 1.0;
+        s.gain_mix = 0.0;
+        s.limiter_mix = 1.0;
+        s.effect_params.clear();
+        s.track_gain = 1.0;
+        s.master_mono = false;
+        s.lufs_window = recorder::LoudnessWindow::Momentary;
+        s.varispeed = crate::varispeed::Varispeed::default();
+        s.metronome_div = 1;
+        s.metronome_in_take = false;
+        s.click_sample = String::new();
+        s.transpose = 0;
+        s.record_count_in_bars = 1;
+        s.record_count_in_in_take = false;
+        s.record_take_name = None;
+        s.midi_snap = true;
+        s.midi_grid_exp = -3;
+        s.midi_swing = true;
+        s.midi_swing_pct = 66.7;
+        s.midi_triplet = false;
+        s.midi_humanize_timing = 25;
+        s.midi_humanize_vel = 15;
+        s.staff_key = 0;
+        s.prefer_flats = true;
+        s.fretboard_capo = 0;
+        s.capo_style = "wood".into();
+        s.fretboard_tuning = "Standard".into();
+
+        app.open_project(&doc);
+
+        let s = &app.settings;
+        let near = |got: f64, want: f64, what: &str| {
+            assert!((got - want).abs() < 1e-9, "{what} came back as {got}, not {want}");
+        };
+        near(s.reverb_mix, 0.42, "the reverb send");
+        near(s.delay_mix, 0.31, "the delay send");
+        near(s.chorus_mix, 0.22, "the chorus send");
+        near(s.phaser_mix, 0.13, "the phaser send");
+        near(s.hpf_mix, 0.24, "the high-pass");
+        near(s.lpf_mix, 0.65, "the low-pass");
+        near(s.gain_mix, 0.16, "the output gain");
+        near(s.limiter_mix, 0.77, "the limiter threshold");
+        assert_eq!(
+            s.effect_params.get("reverb_size").and_then(serde_json::Value::as_f64),
+            Some(0.61),
+            "an effect's parameter row did not travel"
+        );
+        near(s.track_gain, 0.55, "the backing track's level");
+        assert!(s.master_mono, "the mono fold");
+        assert_eq!(
+            s.lufs_window,
+            recorder::LoudnessWindow::Integrated,
+            "the loudness window"
+        );
+        assert_eq!(
+            s.varispeed,
+            crate::varispeed::Varispeed::with_range(70, 140),
+            "the varispeed"
+        );
+        assert_eq!(s.metronome_div, 2, "the click's division");
+        assert!(s.metronome_in_take, "the click going into the take");
+        assert_eq!(s.click_sample, "clave.wav", "the click's sound");
+        assert_eq!(s.transpose, -3, "the transpose");
+        assert_eq!(s.record_count_in_bars, 2, "the count-in");
+        assert!(s.record_count_in_in_take, "the count-in going into the take");
+        assert_eq!(s.record_take_name.as_deref(), Some("nocturne"), "the take name");
+        assert!(!s.midi_snap, "the editor's magnet");
+        assert_eq!(s.midi_grid_exp, -5, "the editor's grid");
+        assert!(!s.midi_swing, "the swing switch");
+        near(s.midi_swing_pct, 58.5, "where the swung off-beat sits");
+        assert!(s.midi_triplet, "the triplet grid");
+        assert_eq!(s.midi_humanize_timing, 40, "how far humanize pulls");
+        assert_eq!(s.midi_humanize_vel, 35, "how far humanize pushes");
+        assert_eq!(s.staff_key, -3, "the key signature");
+        assert!(!s.prefer_flats, "reading accidentals as sharps");
+        assert_eq!(s.fretboard_capo, 2, "the capo");
+        assert_eq!(s.capo_style, "silver", "what the capo is made of");
+        assert_eq!(s.fretboard_tuning, "Drop D", "the guitar's tuning");
+
+        // **And it opens CLEAN.** A document whose desk the settings now
+        // match is not a document with unsaved changes, and an asterisk here
+        // would be one on every project ever opened.
+        assert!(!app.project_dirty_exact(), "the project opened dirty");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A project from before any of it leaves the live desk alone.**
+    ///
+    /// `None` means the document does not SAY, which is not the same as
+    /// saying nothing — zeroing a rack or resetting a tuning would change
+    /// what an old project sounds like, silently, on its first open. The
+    /// rule the six fields before these already answer to.
+    #[test]
+    fn a_project_from_before_the_rack_keeps_the_live_one() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-olddesk-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("song");
+        std::fs::create_dir_all(&dir).expect("project dir");
+        let doc = crate::arrangement::doc_in(&dir);
+
+        // A desk with every one of the new keys unsaid — byte for byte what
+        // a build from before them wrote.
+        let mut desk = TangentApp::template_desk();
+        desk.rack = None;
+        desk.track_gain = None;
+        desk.master_mono = None;
+        desk.lufs_window = None;
+        desk.varispeed = None;
+        desk.click = None;
+        desk.transpose = None;
+        desk.count_in = None;
+        desk.take_name = None;
+        desk.feel = None;
+        desk.notation = None;
+        let mut arr = crate::arrangement::Arrangement::default();
+        arr.desk = Some(desk);
+        arr.save_to(&doc);
+        assert!(
+            !std::fs::read_to_string(&doc).expect("the document").contains("\"rack\""),
+            "the fixture wrote a rack after all"
+        );
+
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.reverb_mix = 0.37;
+        app.settings.track_gain = 0.44;
+        app.settings.transpose = 5;
+        app.settings.fretboard_tuning = "Open G".into();
+        app.settings.lufs_window = recorder::LoudnessWindow::ShortTerm;
+        app.open_project(&doc);
+
+        assert!(
+            (app.settings.reverb_mix - 0.37).abs() < 1e-9,
+            "an old project zeroed the reverb"
+        );
+        assert!(
+            (app.settings.track_gain - 0.44).abs() < 1e-9,
+            "an old project moved the track level"
+        );
+        assert_eq!(app.settings.transpose, 5, "an old project reset the transpose");
+        assert_eq!(
+            app.settings.fretboard_tuning, "Open G",
+            "an old project reset the tuning"
+        );
+        assert_eq!(
+            app.settings.lufs_window,
+            recorder::LoudnessWindow::ShortTerm,
+            "an old project reset the loudness window"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

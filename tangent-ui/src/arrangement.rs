@@ -1060,6 +1060,53 @@ pub struct DeskSnap {
     /// of the six: without it a saved song's pianos play whatever patch the
     /// last session happened to leave on that channel.
     pub instruments: Option<Instruments>,
+    // ── **The rack, the levels, and the rest of what a song is** ───────
+    //
+    // The SECOND wave to reach this struct late, and it reached it for the
+    // reason the block above gives: every one of these lived in the
+    // settings alone, so opening any project wore the last session's
+    // reverb, its varispeed, its click division, its key signature and its
+    // editor feel. The owner: "I need the desk settings (all send knobs in
+    // recorder and levels) to be saved per session. They currently don't
+    // count in the parameters set by a session file. Everything should be
+    // session dependent."
+    //
+    // They answer to the block above in every particular — `None` is a
+    // document that does not SAY, the live value stands for it, and a LIVE
+    // desk always says — so there is one rule here and not two.
+    /// **The effects rack**: the eight band knobs and their parameter rows.
+    /// The most audible of this wave by a distance — without it a saved song
+    /// opens through whatever reverb the last one was using. See [`Rack`].
+    pub rack: Option<Rack>,
+    /// `track_gain`, the backing track's level — the one member of
+    /// `recorder::Gains` that never travelled. `channels`, `metronome`,
+    /// `master` and `fx_return` are the plain fields above.
+    pub track_gain: Option<f64>,
+    /// `master_mono`: the master folded to mono on the way out.
+    pub master_mono: Option<bool>,
+    /// `lufs_window`: which window the loudness ladder reads. Carried as the
+    /// enum and written as its INDEX, the settings file's own append-only
+    /// rule — a saved 2 has to go on meaning Integrated.
+    pub lufs_window: Option<crate::recorder::LoudnessWindow>,
+    /// `varispeed`: the dial and its range, **as the model and never as
+    /// three loose numbers** — see `Settings::varispeed`, whose invariant is
+    /// the whole reason it is not taken apart.
+    pub varispeed: Option<crate::varispeed::Varispeed>,
+    /// See [`Click`].
+    pub click: Option<Click>,
+    /// `transpose`, in semitones.
+    pub transpose: Option<i64>,
+    /// See [`CountIn`].
+    pub count_in: Option<CountIn>,
+    /// `record_take_name`. **An empty string is "no name", not "does not
+    /// say"** — the outer `Option` is the only thing that means that, which
+    /// is what lets a document CLEAR a name the live session is holding
+    /// rather than only replace it.
+    pub take_name: Option<String>,
+    /// See [`Feel`].
+    pub feel: Option<Feel>,
+    /// See [`Notation`].
+    pub notation: Option<Notation>,
 }
 
 /// **What the built-in instruments are set to**, per strip.
@@ -1082,6 +1129,100 @@ pub struct Instruments {
     /// `Settings::strip_keys_params`, whose own note explains why the
     /// stride is what it is and why it may never shrink.
     pub keys_params: Vec<f64>,
+}
+
+/// **The recorder's EFFECTS RACK** — the eight knobs across the band and
+/// every parameter row behind them.
+///
+/// One field of [`DeskSnap`] rather than nine, on [`Instruments`]' argument:
+/// they are one fact — how the effects bus is set — and nine keys that must
+/// be read and written together are nine chances to carry eight of them.
+///
+/// The eight are the eight `Settings::knobs` hands the engine as
+/// `recorder::FxSends`, in that order and in that spelling, so a knob added
+/// to the band is a field added here rather than a knob that silently stops
+/// travelling. `params` is `Settings::effect_params` whole — a flat map of
+/// 0..=1 values keyed by the names the right-click menu uses, plus the
+/// delay's division, which is a name and not a number. Copied rather than
+/// filtered: the keys belong to the menu, and a build that has not learned a
+/// parameter must still round-trip a document written by one that has.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Rack {
+    pub reverb: f64,
+    pub delay: f64,
+    pub chorus: f64,
+    pub phaser: f64,
+    pub hpf: f64,
+    pub lpf: f64,
+    pub gain: f64,
+    pub limiter: f64,
+    pub params: Map<String, Value>,
+}
+
+/// **The click, past its switch and its fader.**
+///
+/// `metronome_on` and `metronome_gain` have ridden the desk since it
+/// existed; these three never did — so a song in 6/8 left clicking twice a
+/// bar opened clicking however the last song clicked, and a take could be
+/// printed with a click somebody had turned off two projects ago.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Click {
+    /// `metronome_div`: clicks per beat, 0 for one per BAR.
+    pub div: i64,
+    /// `metronome_in_take`: the click is mixed into the RECORDING.
+    pub in_take: bool,
+    /// `click_sample`: the sound file, empty for the one that ships.
+    pub sample: String,
+}
+
+/// **The count-in** — its length in bars, the legacy beats key that length
+/// was converted from, and whether it is printed into the take.
+///
+/// The beats travel beside the bars because `Settings::convert_count_in_to_bars`
+/// still reads them: carrying one without the other would leave a document
+/// able to re-run that conversion against a number its other half no longer
+/// agrees with.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CountIn {
+    pub bars: i64,
+    pub beats: i64,
+    pub in_take: bool,
+}
+
+/// **How the MIDI editor places a note** — its magnet, its grid, its swing
+/// and how far HUMANIZE may pull one off both.
+///
+/// A feel dialled in for one song, which is precisely the thing that should
+/// not follow somebody into the next one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Feel {
+    pub snap: bool,
+    pub grid_exp: i64,
+    pub swing: bool,
+    pub swing_pct: f64,
+    pub triplet: bool,
+    pub humanize_timing: u8,
+    pub humanize_vel: u8,
+}
+
+/// **What the music is written in** — the staff's key signature, whether
+/// accidentals read as flats, and the guitar's tuning and capo.
+///
+/// Song facts under any reading: a piece in E flat is in E flat on every
+/// machine, and a capo at the second fret is a property of the arrangement
+/// rather than of somebody's install.
+///
+/// `tuning` and `capo_style` are carried VERBATIM, which is the settings'
+/// own rule for both: an unknown name falls back at the point of use and is
+/// never rewritten, so a document that meets an older build keeps what it
+/// said for the build that can read it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Notation {
+    pub staff_key: i32,
+    pub prefer_flats: bool,
+    pub capo: i64,
+    pub capo_style: String,
+    pub tuning: String,
 }
 
 /// **Which channels a desk arms when nothing says otherwise.**
@@ -1199,6 +1340,62 @@ pub struct DeskRef<'a> {
     pub bypass: Option<&'a crate::settings::BypassBays>,
     /// See [`DeskSnap::instruments`].
     pub instruments: Option<InstrumentsRef<'a>>,
+    /// The second late wave — see the block on [`DeskSnap`]. Borrowed on
+    /// the same terms as the six above: the once-a-frame walk clones
+    /// nothing, and `desk_view` fills every one of them.
+    pub rack: Option<RackRef<'a>>,
+    /// See [`DeskSnap::track_gain`].
+    pub track_gain: Option<f64>,
+    /// See [`DeskSnap::master_mono`].
+    pub master_mono: Option<bool>,
+    /// See [`DeskSnap::lufs_window`].
+    pub lufs_window: Option<crate::recorder::LoudnessWindow>,
+    /// See [`DeskSnap::varispeed`].
+    pub varispeed: Option<crate::varispeed::Varispeed>,
+    /// See [`DeskSnap::click`].
+    pub click: Option<ClickRef<'a>>,
+    /// See [`DeskSnap::transpose`].
+    pub transpose: Option<i64>,
+    /// See [`DeskSnap::count_in`].
+    pub count_in: Option<CountIn>,
+    /// See [`DeskSnap::take_name`].
+    pub take_name: Option<&'a str>,
+    /// See [`DeskSnap::feel`].
+    pub feel: Option<Feel>,
+    /// See [`DeskSnap::notation`].
+    pub notation: Option<NotationRef<'a>>,
+}
+
+/// [`Rack`] borrowed — see [`DeskRef`].
+#[derive(Clone, Copy)]
+pub struct RackRef<'a> {
+    pub reverb: f64,
+    pub delay: f64,
+    pub chorus: f64,
+    pub phaser: f64,
+    pub hpf: f64,
+    pub lpf: f64,
+    pub gain: f64,
+    pub limiter: f64,
+    pub params: &'a Map<String, Value>,
+}
+
+/// [`Click`] borrowed — see [`DeskRef`].
+#[derive(Clone, Copy)]
+pub struct ClickRef<'a> {
+    pub div: i64,
+    pub in_take: bool,
+    pub sample: &'a str,
+}
+
+/// [`Notation`] borrowed — see [`DeskRef`].
+#[derive(Clone, Copy)]
+pub struct NotationRef<'a> {
+    pub staff_key: i32,
+    pub prefer_flats: bool,
+    pub capo: i64,
+    pub capo_style: &'a str,
+    pub tuning: &'a str,
 }
 
 /// [`Instruments`] borrowed — see [`DeskRef`].
@@ -1250,6 +1447,37 @@ impl DeskRef<'_> {
                 dx7_patch: i.dx7_patch.to_vec(),
                 keys_patch: i.keys_patch.to_vec(),
                 keys_params: i.keys_params.to_vec(),
+            }),
+            rack: self.rack.map(|r| Rack {
+                reverb: r.reverb,
+                delay: r.delay,
+                chorus: r.chorus,
+                phaser: r.phaser,
+                hpf: r.hpf,
+                lpf: r.lpf,
+                gain: r.gain,
+                limiter: r.limiter,
+                params: r.params.clone(),
+            }),
+            track_gain: self.track_gain,
+            master_mono: self.master_mono,
+            lufs_window: self.lufs_window,
+            varispeed: self.varispeed,
+            click: self.click.map(|c| Click {
+                div: c.div,
+                in_take: c.in_take,
+                sample: c.sample.to_owned(),
+            }),
+            transpose: self.transpose,
+            count_in: self.count_in,
+            take_name: self.take_name.map(str::to_owned),
+            feel: self.feel,
+            notation: self.notation.map(|n| Notation {
+                staff_key: n.staff_key,
+                prefer_flats: n.prefer_flats,
+                capo: n.capo,
+                capo_style: n.capo_style.to_owned(),
+                tuning: n.tuning.to_owned(),
             }),
         }
     }
@@ -1408,6 +1636,74 @@ impl DeskRef<'_> {
                 f.f64(*v);
             }
         }
+        // **The second late wave**, on the first wave's terms: each hashes
+        // its ABSENCE distinctly from any value it could hold, because a
+        // document that does not carry a rack and a document that carries a
+        // dry one are different documents.
+        opt(f, self.rack.is_some());
+        if let Some(r) = self.rack {
+            for v in [r.reverb, r.delay, r.chorus, r.phaser, r.hpf, r.lpf, r.gain, r.limiter]
+            {
+                f.f64(v);
+            }
+            // **The parameter rows by SORTED key.** The map is an
+            // `IndexMap`, whose equality ignores order, so a walk in
+            // insertion order would call two equal racks different — an
+            // asterisk on a document nobody had touched, and a save prompt
+            // on the way out of a session somebody only looked at.
+            let mut rows: Vec<(&String, &Value)> = r.params.iter().collect();
+            rows.sort_by(|a, b| a.0.cmp(b.0));
+            f.len(rows.len());
+            for (k, v) in rows {
+                f.str(k);
+                f.str(&v.to_string());
+            }
+        }
+        f.maybe_f64(self.track_gain);
+        opt(f, self.master_mono.is_some());
+        f.bool(self.master_mono.unwrap_or(false));
+        opt(f, self.lufs_window.is_some());
+        f.len(self.lufs_window.unwrap_or_default().index());
+        opt(f, self.varispeed.is_some());
+        if let Some(v) = self.varispeed {
+            f.f64(f64::from(v.pos()));
+            f.u64(u64::from(v.min()));
+            f.u64(u64::from(v.max()));
+        }
+        opt(f, self.click.is_some());
+        if let Some(c) = self.click {
+            f.u64(c.div as u64);
+            f.bool(c.in_take);
+            f.str(c.sample);
+        }
+        opt(f, self.transpose.is_some());
+        f.u64(self.transpose.unwrap_or(0) as u64);
+        opt(f, self.count_in.is_some());
+        if let Some(c) = self.count_in {
+            f.u64(c.bars as u64);
+            f.u64(c.beats as u64);
+            f.bool(c.in_take);
+        }
+        opt(f, self.take_name.is_some());
+        f.str(self.take_name.unwrap_or(""));
+        opt(f, self.feel.is_some());
+        if let Some(t) = self.feel {
+            f.bool(t.snap);
+            f.u64(t.grid_exp as u64);
+            f.bool(t.swing);
+            f.f64(t.swing_pct);
+            f.bool(t.triplet);
+            f.u64(u64::from(t.humanize_timing));
+            f.u64(u64::from(t.humanize_vel));
+        }
+        opt(f, self.notation.is_some());
+        if let Some(n) = self.notation {
+            f.u64(n.staff_key as u64);
+            f.bool(n.prefer_flats);
+            f.u64(n.capo as u64);
+            f.str(n.capo_style);
+            f.str(n.tuning);
+        }
     }
 }
 
@@ -1451,6 +1747,37 @@ impl DeskSnap {
                 dx7_patch: &i.dx7_patch,
                 keys_patch: &i.keys_patch,
                 keys_params: &i.keys_params,
+            }),
+            rack: self.rack.as_ref().map(|r| RackRef {
+                reverb: r.reverb,
+                delay: r.delay,
+                chorus: r.chorus,
+                phaser: r.phaser,
+                hpf: r.hpf,
+                lpf: r.lpf,
+                gain: r.gain,
+                limiter: r.limiter,
+                params: &r.params,
+            }),
+            track_gain: self.track_gain,
+            master_mono: self.master_mono,
+            lufs_window: self.lufs_window,
+            varispeed: self.varispeed,
+            click: self.click.as_ref().map(|c| ClickRef {
+                div: c.div,
+                in_take: c.in_take,
+                sample: &c.sample,
+            }),
+            transpose: self.transpose,
+            count_in: self.count_in,
+            take_name: self.take_name.as_deref(),
+            feel: self.feel,
+            notation: self.notation.as_ref().map(|n| NotationRef {
+                staff_key: n.staff_key,
+                prefer_flats: n.prefer_flats,
+                capo: n.capo,
+                capo_style: &n.capo_style,
+                tuning: &n.tuning,
             }),
         }
     }
@@ -1635,6 +1962,89 @@ impl DeskSnap {
         // that has never heard of the key reads the head as it always did.
         if !tail.is_empty() {
             m.insert("inserts_tail".into(), Value::Object(tail));
+        }
+        // **The second late wave, at the END and only when SAID** — the six
+        // above's rule, word for word, and appended after `inserts_tail` so
+        // that not one key a previous build wrote moves position. A LIVE
+        // desk always says, so a document saved by this build carries all
+        // eleven and wins outright from then on.
+        if let Some(r) = self.rack.as_ref() {
+            let mut rm = Map::new();
+            for (k, v) in [
+                ("reverb", r.reverb),
+                ("delay", r.delay),
+                ("chorus", r.chorus),
+                ("phaser", r.phaser),
+                ("hpf", r.hpf),
+                ("lpf", r.lpf),
+                ("gain", r.gain),
+                ("limiter", r.limiter),
+            ] {
+                rm.insert(k.into(), serde_json::json!(v));
+            }
+            // The parameter rows whole, under their own key, so a row this
+            // build has never heard of survives a save by it.
+            rm.insert("params".into(), Value::Object(r.params.clone()));
+            m.insert("rack".into(), Value::Object(rm));
+        }
+        if let Some(v) = self.track_gain {
+            m.insert("track_gain".into(), serde_json::json!(v));
+        }
+        if let Some(v) = self.master_mono {
+            m.insert("master_mono".into(), Value::Bool(v));
+        }
+        if let Some(v) = self.lufs_window {
+            // By INDEX, and the table is append-only — the settings file's
+            // own rule for this enum, and the same one, because the two
+            // files are read by the same builds.
+            m.insert("lufs_window".into(), Value::Number(v.index().into()));
+        }
+        if let Some(v) = self.varispeed {
+            let mut vm = Map::new();
+            vm.insert("pos".into(), serde_json::json!(f64::from(v.pos())));
+            vm.insert("min".into(), Value::Number(v.min().into()));
+            vm.insert("max".into(), Value::Number(v.max().into()));
+            m.insert("varispeed".into(), Value::Object(vm));
+        }
+        if let Some(c) = self.click.as_ref() {
+            let mut cm = Map::new();
+            cm.insert("div".into(), Value::Number(c.div.into()));
+            cm.insert("in_take".into(), Value::Bool(c.in_take));
+            cm.insert("sample".into(), Value::String(c.sample.clone()));
+            m.insert("click".into(), Value::Object(cm));
+        }
+        if let Some(v) = self.transpose {
+            m.insert("transpose".into(), Value::Number(v.into()));
+        }
+        if let Some(c) = self.count_in {
+            let mut cm = Map::new();
+            cm.insert("bars".into(), Value::Number(c.bars.into()));
+            cm.insert("beats".into(), Value::Number(c.beats.into()));
+            cm.insert("in_take".into(), Value::Bool(c.in_take));
+            m.insert("count_in".into(), Value::Object(cm));
+        }
+        if let Some(v) = self.take_name.as_ref() {
+            m.insert("take_name".into(), Value::String(v.clone()));
+        }
+        if let Some(t) = self.feel {
+            let mut fm = Map::new();
+            fm.insert("snap".into(), Value::Bool(t.snap));
+            fm.insert("grid_exp".into(), Value::Number(t.grid_exp.into()));
+            fm.insert("swing".into(), Value::Bool(t.swing));
+            fm.insert("swing_pct".into(), serde_json::json!(t.swing_pct));
+            fm.insert("triplet".into(), Value::Bool(t.triplet));
+            fm.insert("humanize_timing".into(), Value::Number(t.humanize_timing.into()));
+            fm.insert("humanize_vel".into(), Value::Number(t.humanize_vel.into()));
+            m.insert("feel".into(), Value::Object(fm));
+        }
+        if let Some(n) = self.notation.as_ref() {
+            let mut nm = Map::new();
+            nm.insert("staff_key".into(), Value::Number(n.staff_key.into()));
+            nm.insert("prefer_flats".into(), Value::Bool(n.prefer_flats));
+            nm.insert("capo".into(), Value::Number(n.capo.into()));
+            nm.insert("capo_style".into(), Value::String(n.capo_style.clone()));
+            nm.insert("tuning".into(), Value::String(n.tuning.clone()));
+            m.insert("notation".into(), Value::Object(nm));
         }
         Value::Object(m)
     }
@@ -1871,6 +2281,123 @@ impl DeskSnap {
                             a.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect()
                         })
                         .unwrap_or_default(),
+                }
+            }),
+            // **The second late wave: absent is `None`**, on the first
+            // wave's rule — the live value stands for a document written
+            // before the key, so no project changes what it sounds like
+            // because a field was added.
+            rack: m.get("rack").and_then(Value::as_object).map(|rm| {
+                let g = |k: &str| rm.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+                Rack {
+                    reverb: g("reverb"),
+                    delay: g("delay"),
+                    chorus: g("chorus"),
+                    phaser: g("phaser"),
+                    hpf: g("hpf"),
+                    lpf: g("lpf"),
+                    gain: g("gain"),
+                    // **The one knob whose rest is the TOP of its travel.**
+                    // A threshold missing from a hand-written rack has to
+                    // read as bypass; zero would be a limiter slammed shut
+                    // over a mix, which is the loudest possible way to be
+                    // wrong about a default.
+                    limiter: rm.get("limiter").and_then(Value::as_f64).unwrap_or(1.0),
+                    params: rm
+                        .get("params")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default(),
+                }
+            }),
+            track_gain: m.get("track_gain").and_then(Value::as_f64),
+            master_mono: m.get("master_mono").and_then(Value::as_bool),
+            lufs_window: m
+                .get("lufs_window")
+                .and_then(Value::as_u64)
+                .map(|n| crate::recorder::LoudnessWindow::from_index(n as usize)),
+            varispeed: m.get("varispeed").and_then(Value::as_object).map(|vm| {
+                let num = |k: &str, d: u16| {
+                    vm.get(k)
+                        .and_then(Value::as_u64)
+                        .and_then(|n| u16::try_from(n).ok())
+                        .unwrap_or(d)
+                };
+                // **The range first, then the position.** `set_pos` snaps
+                // against the range it is handed, so a position read against
+                // the default 85..115 and then given a range of 50..200 is a
+                // different speed from the one that was saved. The settings
+                // reader says exactly this at its own door.
+                let mut v = crate::varispeed::Varispeed::with_range(
+                    num("min", crate::varispeed::DEFAULT_MIN),
+                    num("max", crate::varispeed::DEFAULT_MAX),
+                );
+                if let Some(pos) = vm.get("pos").and_then(Value::as_f64) {
+                    // Through the setter, for the reason the settings give:
+                    // a NaN or a 12.0 in a file is a dial that resamples the
+                    // master by a nonsense ratio, and the place to stop it is
+                    // where it enters.
+                    v.set_pos(pos as f32);
+                }
+                v
+            }),
+            click: m.get("click").and_then(Value::as_object).map(|cm| Click {
+                div: cm.get("div").and_then(Value::as_i64).unwrap_or(1),
+                in_take: cm.get("in_take").and_then(Value::as_bool).unwrap_or(false),
+                sample: cm
+                    .get("sample")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            }),
+            transpose: m.get("transpose").and_then(Value::as_i64),
+            count_in: m.get("count_in").and_then(Value::as_object).map(|cm| {
+                let n = |k: &str, d: i64| cm.get(k).and_then(Value::as_i64).unwrap_or(d);
+                CountIn {
+                    bars: n("bars", 1),
+                    beats: n("beats", 4),
+                    in_take: cm
+                        .get("in_take")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                }
+            }),
+            take_name: m.get("take_name").and_then(Value::as_str).map(str::to_owned),
+            feel: m.get("feel").and_then(Value::as_object).map(|fm| {
+                let b = |k: &str, d: bool| fm.get(k).and_then(Value::as_bool).unwrap_or(d);
+                let n = |k: &str, d: u64| fm.get(k).and_then(Value::as_u64).unwrap_or(d);
+                Feel {
+                    snap: b("snap", true),
+                    grid_exp: fm.get("grid_exp").and_then(Value::as_i64).unwrap_or(-3),
+                    swing: b("swing", false),
+                    swing_pct: fm
+                        .get("swing_pct")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(66.7),
+                    triplet: b("triplet", false),
+                    humanize_timing: n("humanize_timing", 25).min(255) as u8,
+                    humanize_vel: n("humanize_vel", 15).min(255) as u8,
+                }
+            }),
+            notation: m.get("notation").and_then(Value::as_object).map(|nm| {
+                let s = |k: &str, d: &str| {
+                    nm.get(k).and_then(Value::as_str).unwrap_or(d).to_owned()
+                };
+                Notation {
+                    staff_key: nm
+                        .get("staff_key")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
+                        .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                        as i32,
+                    prefer_flats: nm
+                        .get("prefer_flats")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    capo: nm.get("capo").and_then(Value::as_i64).unwrap_or(0),
+                    // Verbatim, both of them — see [`Notation`].
+                    capo_style: s("capo_style", ""),
+                    tuning: s("tuning", ""),
                 }
             }),
             inserts,
@@ -3947,6 +4474,54 @@ mod tests {
                 keys_patch: vec![2, 3],
                 keys_params: vec![0.25, 0.5],
             }),
+            // The second late wave, every one of them SAID, for the reason
+            // the six above are: this fixture is the round-trip's subject,
+            // and a `None` here would test the absent road twice and the
+            // present one never.
+            rack: Some(Rack {
+                reverb: 0.3,
+                delay: 0.15,
+                chorus: 0.0,
+                phaser: 0.05,
+                hpf: 0.1,
+                lpf: 0.9,
+                gain: 0.2,
+                limiter: 0.8,
+                params: {
+                    let mut p = Map::new();
+                    p.insert("reverb_size".into(), Value::from(0.6));
+                    p.insert("delay_div".into(), Value::from("1/8"));
+                    p
+                },
+            }),
+            track_gain: Some(0.75),
+            master_mono: Some(true),
+            lufs_window: Some(crate::recorder::LoudnessWindow::ShortTerm),
+            varispeed: Some(crate::varispeed::Varispeed::with_range(80, 130)),
+            click: Some(Click {
+                div: 2,
+                in_take: true,
+                sample: "clave.wav".into(),
+            }),
+            transpose: Some(-3),
+            count_in: Some(CountIn { bars: 2, beats: 8, in_take: true }),
+            take_name: Some("nocturne".into()),
+            feel: Some(Feel {
+                snap: true,
+                grid_exp: -4,
+                swing: true,
+                swing_pct: 66.7,
+                triplet: true,
+                humanize_timing: 30,
+                humanize_vel: 12,
+            }),
+            notation: Some(Notation {
+                staff_key: -3,
+                prefer_flats: true,
+                capo: 2,
+                capo_style: "silver".into(),
+                tuning: "Drop D".into(),
+            }),
         });
         let mut extra = Map::new();
         extra.insert("a_newer_builds_key".into(), Value::from("kept"));
@@ -4280,6 +4855,118 @@ mod tests {
         moves_both("the instruments going unsaid", |a| {
             a.desk.as_mut().unwrap().instruments = None;
         });
+        // ── **The second late wave** ───────────────────────────────────
+        //
+        // Every knob of the rack on its own line. The eight hash in one
+        // loop, and a loop is exactly where two of them can end up on the
+        // same word — which would make a session that moved its delay look
+        // like a session that moved its reverb, and neither of them look
+        // unsaved. This list is the thing that would notice.
+        fn rack(a: &mut Arrangement) -> &mut Rack {
+            a.desk.as_mut().unwrap().rack.as_mut().unwrap()
+        }
+        moves_both("the REVERB send", |a| rack(a).reverb = 0.9);
+        moves_both("the DELAY send", |a| rack(a).delay = 0.9);
+        moves_both("the CHORUS send", |a| rack(a).chorus = 0.9);
+        moves_both("the PHASER send", |a| rack(a).phaser = 0.9);
+        moves_both("the high-pass", |a| rack(a).hpf = 0.9);
+        moves_both("the low-pass", |a| rack(a).lpf = 0.4);
+        moves_both("the output gain", |a| rack(a).gain = 0.9);
+        moves_both("the limiter threshold", |a| rack(a).limiter = 0.4);
+        moves_both("an effect's parameter", |a| {
+            rack(a).params.insert("reverb_size".into(), Value::from(0.9));
+        });
+        moves_both("an effect's parameter arriving", |a| {
+            rack(a).params.insert("chorus_rate".into(), Value::from(0.2));
+        });
+        moves_both("an effect's parameter leaving", |a| {
+            rack(a).params.shift_remove("delay_div");
+        });
+        moves_both("the rack going unsaid", |a| a.desk.as_mut().unwrap().rack = None);
+        fn desk(a: &mut Arrangement) -> &mut DeskSnap {
+            a.desk.as_mut().unwrap()
+        }
+        moves_both("the backing track's level", |a| desk(a).track_gain = Some(0.25));
+        moves_both("that level going unsaid", |a| desk(a).track_gain = None);
+        moves_both("the mono fold", |a| desk(a).master_mono = Some(false));
+        moves_both("the fold going unsaid", |a| desk(a).master_mono = None);
+        moves_both("the loudness window", |a| {
+            desk(a).lufs_window = Some(crate::recorder::LoudnessWindow::Integrated);
+        });
+        moves_both("that window going unsaid", |a| desk(a).lufs_window = None);
+        moves_both("the varispeed's range", |a| {
+            desk(a).varispeed = Some(crate::varispeed::Varispeed::with_range(70, 140));
+        });
+        moves_both("the varispeed's position", |a| {
+            let mut v = crate::varispeed::Varispeed::with_range(80, 130);
+            v.set_pos(0.75);
+            desk(a).varispeed = Some(v);
+        });
+        moves_both("the varispeed going unsaid", |a| desk(a).varispeed = None);
+        moves_both("the click's division", |a| {
+            desk(a).click.as_mut().unwrap().div = 0;
+        });
+        moves_both("the click going into the take", |a| {
+            desk(a).click.as_mut().unwrap().in_take = false;
+        });
+        moves_both("the click's sound", |a| {
+            desk(a).click.as_mut().unwrap().sample = "rim.wav".into();
+        });
+        moves_both("the click going unsaid", |a| desk(a).click = None);
+        moves_both("the transpose", |a| desk(a).transpose = Some(5));
+        moves_both("the transpose going unsaid", |a| desk(a).transpose = None);
+        moves_both("the count-in", |a| {
+            desk(a).count_in.as_mut().unwrap().bars = 4;
+        });
+        moves_both("the count-in's legacy beats", |a| {
+            desk(a).count_in.as_mut().unwrap().beats = 12;
+        });
+        moves_both("the count-in going into the take", |a| {
+            desk(a).count_in.as_mut().unwrap().in_take = false;
+        });
+        moves_both("the count-in going unsaid", |a| desk(a).count_in = None);
+        moves_both("the take name", |a| desk(a).take_name = Some("etude".into()));
+        // **A CLEARED name is not an unsaid one.** The empty string is a
+        // document saying "no name", which a session holding one has to be
+        // able to read as an edit — see `DeskSnap::take_name`.
+        moves_both("the take name cleared", |a| desk(a).take_name = Some(String::new()));
+        moves_both("the take name going unsaid", |a| desk(a).take_name = None);
+        moves_both("the editor's magnet", |a| {
+            desk(a).feel.as_mut().unwrap().snap = false;
+        });
+        moves_both("the editor's grid", |a| {
+            desk(a).feel.as_mut().unwrap().grid_exp = -2;
+        });
+        moves_both("the swing switch", |a| {
+            desk(a).feel.as_mut().unwrap().swing = false;
+        });
+        moves_both("where the swung off-beat sits", |a| {
+            desk(a).feel.as_mut().unwrap().swing_pct = 58.5;
+        });
+        moves_both("the triplet grid", |a| {
+            desk(a).feel.as_mut().unwrap().triplet = false;
+        });
+        moves_both("how far humanize pulls a note", |a| {
+            desk(a).feel.as_mut().unwrap().humanize_timing = 40;
+        });
+        moves_both("how far humanize pushes a velocity", |a| {
+            desk(a).feel.as_mut().unwrap().humanize_vel = 40;
+        });
+        moves_both("the feel going unsaid", |a| desk(a).feel = None);
+        moves_both("the key signature", |a| {
+            desk(a).notation.as_mut().unwrap().staff_key = 4;
+        });
+        moves_both("reading accidentals as sharps", |a| {
+            desk(a).notation.as_mut().unwrap().prefer_flats = false;
+        });
+        moves_both("the capo", |a| desk(a).notation.as_mut().unwrap().capo = 5);
+        moves_both("what the capo is made of", |a| {
+            desk(a).notation.as_mut().unwrap().capo_style = "wood".into();
+        });
+        moves_both("the guitar's tuning", |a| {
+            desk(a).notation.as_mut().unwrap().tuning = "Open G".into();
+        });
+        moves_both("the notation going unsaid", |a| desk(a).notation = None);
         moves_both("having been named", |a| a.named = false);
         moves_both("a clip arriving", |a| {
             a.add_clip(ArrClip { path: "media/x.wav".into(), ..Default::default() });
