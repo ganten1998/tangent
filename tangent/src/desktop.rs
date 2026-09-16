@@ -4033,22 +4033,6 @@ impl DesktopApp {
             if !self.recorder.session.has_meter_source() {
                 state.meters = state.master;
             }
-            // **An ARMED input is metered whatever the mute does.** The take
-            // is the desk, and the desk drops a strip nobody can hear — a
-            // muted one, or every other one while something is soloed — so
-            // the needle over a vocal being recorded armed-and-muted read
-            // nothing while the arrangement recorded it just fine (the
-            // owner's words, and the same hole the strip meters had). What
-            // the desk records with a strip armed is that strip's INPUT,
-            // before mute, fader and rack, so that is what the needle
-            // follows while anything is armed; with nothing armed it is the
-            // take, as before. The take's own clip latch is kept: the lamp
-            // answers "did anything clip", not "what is the needle on".
-            if let Some(armed) = e.armed_input_meters() {
-                let take_clipped = state.meters.clipped;
-                state.meters = armed;
-                state.meters.clipped |= take_clipped;
-            }
             // **And the lamp means "something clipped", whatever the needle is
             // showing.** With an input selected the VU meters the INPUT, so a
             // built-in FM driven into the ceiling clipped the output and lit
@@ -22724,25 +22708,6 @@ mod tests {").expect("the tests module")];
     /// announced last frame loads this frame — plus a new engine and a
     /// timed backstop. Pinned: the needle loop iterates `comp_rows`, and the
     /// stale flag is raised off `insert_announced`.
-    /// The band's VU follows the ARMED inputs while anything is armed, and
-    /// the take otherwise — pinned in the fill, after both take-side
-    /// readings, so neither can overwrite it. See `Shared::arm_inputs`.
-    #[test]
-    fn the_band_meters_the_armed_inputs_over_the_take() {
-        let whole = include_str!("desktop.rs");
-        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
-        let at = src.find("fn fill_recorder_state(&mut self").expect("fill_recorder_state");
-        let end = src[at + 1..].find("\n    fn ").map_or(src.len(), |n| at + 1 + n);
-        let body = &src[at..end];
-        let take = body.find("state.meters = self.recorder.session.meters();").expect("the take's meters");
-        let fallback = body.find("state.meters = state.master;").expect("the no-source fallback");
-        let armed = body.find("if let Some(armed) = e.armed_input_meters() {").expect("the armed inputs are no longer read");
-        assert!(take < fallback && fallback < armed, "the armed inputs are read before a take-side reading that overwrites them");
-        let block = &body[armed..armed + 240];
-        assert!(block.contains("state.meters = armed;"), "the armed reading no longer drives the band");
-        assert!(block.contains("state.meters.clipped |= take_clipped;"), "the take's clip latch is dropped with its meters");
-    }
-
     #[test]
     fn the_comp_needles_read_an_index_that_goes_stale_on_the_announce_edge() {
         let whole = include_str!("desktop.rs");

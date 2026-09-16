@@ -867,19 +867,6 @@ fn add_return(
     peak
 }
 
-/// One frame's reading of the armed inputs. See [`Shared::arm_inputs`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ArmedLevels {
-    /// Loudest sample per side since the last read.
-    pub peak: [f32; 2],
-    /// RMS per side over the last block.
-    pub rms: [f32; 2],
-    /// Whether any armed input was wider than mono.
-    pub wide: bool,
-    /// Whether an armed input has hit `CLIP_LEVEL` since the lamp was put out.
-    pub clipped: bool,
-}
-
 impl Shared {
     /// Keep the loudest sample a strip has made since the UI last looked.
     ///
@@ -2392,29 +2379,6 @@ struct Shared {
     rms_r: AtomicU32,
     clipped: AtomicBool,
 
-    /// **What the ARMED inputs are getting**, before mute, fader and rack —
-    /// the signal the arrangement records off them. Same discipline as the
-    /// four above: peaks `fetch_max`ed and cleared by the reader, RMS a
-    /// plain store of the last block's, the clip a latch the UI puts out.
-    ///
-    /// Published beside the take's meters and not folded into them because
-    /// the take is the DESK, and the desk drops a strip nobody can hear: a
-    /// muted one, or every other one while something is soloed. That is
-    /// right for the file and wrong for the needle over a vocal being
-    /// recorded armed-and-muted, which read nothing while the arrangement
-    /// recorded it just fine (the owner's words). `arm_inputs` is which
-    /// picks were metered here in the last block, so a reader can tell "no
-    /// armed input" from "an armed input at silence" and fall back to the
-    /// take for the first. `arm_wide` is whether any of them was wider than
-    /// mono, which decides how many faces the band draws.
-    arm_peak_l: AtomicU32,
-    arm_peak_r: AtomicU32,
-    arm_rms_l: AtomicU32,
-    arm_rms_r: AtomicU32,
-    arm_clipped: AtomicBool,
-    arm_inputs: AtomicU32,
-    arm_wide: AtomicBool,
-
     /// How far ahead of the callback its audio is heard, as the backend
     /// reports it. Published every callback because it is the only latency
     /// number that is measured rather than assumed — see [`output_delay_ns`].
@@ -2718,13 +2682,6 @@ impl Shared {
             rms_l: AtomicU32::new(0),
             rms_r: AtomicU32::new(0),
             clipped: AtomicBool::new(false),
-            arm_peak_l: AtomicU32::new(0),
-            arm_peak_r: AtomicU32::new(0),
-            arm_rms_l: AtomicU32::new(0),
-            arm_rms_r: AtomicU32::new(0),
-            arm_clipped: AtomicBool::new(false),
-            arm_inputs: AtomicU32::new(0),
-            arm_wide: AtomicBool::new(false),
             tap_dropped: AtomicU64::new(0),
             midi_dropped: AtomicU64::new(0),
             pedal_dropped: AtomicU64::new(0),
@@ -2757,24 +2714,6 @@ impl Shared {
 
     fn f32_of(cell: &AtomicU32) -> f32 {
         f32::from_bits(cell.load(Ordering::Relaxed))
-    }
-
-    /// What the armed inputs got — see [`Shared::arm_inputs`] — or `None`
-    /// when nothing is armed. Peaks are read-and-cleared like the take's,
-    /// so this is read exactly once a frame, by the desktop.
-    pub fn armed_input_levels(&self) -> Option<ArmedLevels> {
-        if self.arm_inputs.load(Ordering::Relaxed) == 0 {
-            return None;
-        }
-        Some(ArmedLevels {
-            peak: [
-                f32::from_bits(self.arm_peak_l.swap(0, Ordering::Relaxed)),
-                f32::from_bits(self.arm_peak_r.swap(0, Ordering::Relaxed)),
-            ],
-            rms: [Self::f32_of(&self.arm_rms_l), Self::f32_of(&self.arm_rms_r)],
-            wide: self.arm_wide.load(Ordering::Relaxed),
-            clipped: self.arm_clipped.load(Ordering::Relaxed),
-        })
     }
 
     fn set_track_gain(&self, linear: f32) {
@@ -4831,6 +4770,12 @@ struct Renderer {
     monitor_channels: usize,
     /// Slewed, so switching monitoring on is a fade rather than a bang.
     monitor_gain: [f32; INPUTS],
+    /// **Whether the ROOM may hear each input**, slewed like `monitor_gain`
+    /// and multiplied into the room's share of it. One per input because it
+    /// follows that input's strip: a muted strip, or every other one while
+    /// something is soloed, is withheld from the speakers while the take
+    /// still gets it. See the arm rule in `mix_monitor`.
+    room_audible: [f32; INPUTS],
     /// Channels per input strip, in stream order. Zero for one not open.
     monitor_widths: [usize; INPUTS],
     /// **Which DEVICE column each strip's channels live in.** The capture
@@ -7172,9 +7117,6 @@ impl Renderer {
         // and the ring is a `&mut` into the same struct.
         let vs = self.varispeed_ratio();
         let Some(ring) = self.monitor.as_mut() else {
-            // No input at all: nothing armed is getting anything, and a
-            // reader must not go on showing the last block that had one.
-            self.shared.arm_inputs.store(0, Ordering::Relaxed);
             return;
         };
         let ch_in = self.monitor_channels.max(1);
@@ -7458,12 +7400,6 @@ impl Renderer {
         let room_from = self.room_gain;
         let mut room_to = room_from;
         let mut withheld = 0.0f32;
-        // **What the armed inputs are getting**, gathered across the picks
-        // below and published once — see `Shared::arm_inputs`.
-        let mut arm_peak = [0.0f32; 2];
-        let mut arm_sumsq = [0.0f64; 2];
-        let mut arm_inputs = 0u32;
-        let mut arm_wide = false;
         // **Whether anybody is PLAYING through this desk right now.**
         //
         // The room used to split from the take only when the two differed in
@@ -7534,19 +7470,36 @@ impl Renderer {
                 self.monitor_gain[input] = 0.0;
                 continue;
             };
-            // **Arm is the live switch.** An unarmed audio channel's input
-            // still drains (the ring must keep moving) and still reaches a
-            // take — mute decides the take, and arm is not mute — but the
-            // ROOM gets none of it: a project must open without headphones.
+            // **Arm is the record switch, and it beats the mute in the
+            // TAKE.** An armed strip's input goes into the take whatever the
+            // mute does: the arrangement already records it raw whatever the
+            // mute does, and a take that dropped it — while the band's VU
+            // followed the take — read nothing over a vocal being recorded
+            // armed-and-muted, the owner's "the VU meter no longer activates
+            // visually at all". The MUTE still rules the ROOM: a muted strip,
+            // or every other one while something is soloed, is withheld from
+            // the speakers by `room_audible` below, exactly as monitoring-off
+            // withholds a live input. An unarmed input still drains (the ring
+            // must keep moving) and reaches nothing once its gain has faded:
+            // a project must open without headphones.
             let live =
                 self.shared.armed.load(Ordering::Relaxed) & (1 << strip.index().min(31)) != 0;
-            let heard = live && strip_is_heard(strip, muted, soloed);
+            let audible = strip_is_heard(strip, muted, soloed);
+            let heard = live && audible;
             live_in_room |= heard;
-            let target = if heard {
+            let target = if live {
                 lane_gain_of(&self.auto, &self.shared, strip.index())
             } else {
                 0.0
             };
+            let audible_to = if audible { 1.0 } else { 0.0 };
+            if self.monitor_gain[input] <= 1.0e-6 {
+                // Nothing of this input is sounding yet, so the room's answer
+                // is taken outright rather than slewed from the last one: a
+                // strip that is muted when its input opens never reaches the
+                // speakers for even the length of a fade.
+                self.room_audible[input] = audible_to;
+            }
             // Silent and already faded out: the drain above was the whole job
             // for this one. The others still get their turn.
             // An ARMED strip runs whether or not the room can hear it: its
@@ -7582,7 +7535,6 @@ impl Renderer {
             let mut peak = [0.0f32; 2];
             // The jack's own level, pre-fader, for an armed strip's meter.
             let mut raw_peak = [0.0f32; 2];
-            let mut raw_sumsq = [0.0f64; 2];
             // **This strip's own audio first, then its BOARD, then its rack,
             // then the fold.**
             //
@@ -7643,7 +7595,6 @@ impl Renderer {
                     };
                     let jack = self.monitor_scratch[i * ch_in + col] + clip;
                     raw_peak[c.min(1)] = raw_peak[c.min(1)].max(jack.abs());
-                    raw_sumsq[c.min(1)] += f64::from(jack) * f64::from(jack);
                     let src = jack * self.monitor_gain[input];
                     if let Some(dst) = self.fx_in.get_mut(c) {
                         dst[i] = src;
@@ -7819,6 +7770,7 @@ impl Renderer {
                 }
             }
             let mut room = room_from;
+            let mut room_in = self.room_audible[input];
             // **A LIVE INPUT is on the lane too, and it routes with it.**
             // The routed-away gate was put on the clip, pad and instrument
             // folds and missed this one, so a channel with an input open went
@@ -7833,8 +7785,12 @@ impl Renderer {
                 // recomputing it in this pass is exact because both passes
                 // walk the same frames in the same order.
                 room += (room_target - room) * self.gain_coeff;
+                room_in += (audible_to - room_in) * self.gain_coeff;
+                // The room's share of THIS input: the monitoring switch and
+                // the strip's own mute, both slewed.
+                let heard_now = room * room_in;
                 // How much of this frame the room is NOT being given.
-                let keep_out = 1.0 - room;
+                let keep_out = 1.0 - heard_now;
                 withheld = withheld.max(keep_out);
                 let at = i * TAP_CHANNELS;
                 for c in 0..TAP_CHANNELS {
@@ -7876,26 +7832,18 @@ impl Renderer {
                     // the room: a channel nobody can hear must not arrive back
                     // in the speakers through the reverb.
                     if let Some(a) = self.aux.get_mut(at + c) {
-                        *a += src * send * room;
+                        *a += src * send * heard_now;
                     }
                 }
             }
             room_to = room;
-            if live {
-                arm_inputs |= 1u32 << input.min(31);
-                arm_wide |= width > 1;
-                for c in 0..2 {
-                    arm_peak[c] = arm_peak[c].max(raw_peak[c]);
-                    arm_sumsq[c] += raw_sumsq[c];
-                }
-            }
+            self.room_audible[input] = room_in;
             let peak = meter_source(live, peak, raw_peak);
             // A folder's meter is the GROUP's, and the fold reports it.
             if !is_folder {
                 self.shared.note_strip_peak(strip, peak);
             }
         }
-        self.publish_arm_meters(n, arm_peak, arm_sumsq, arm_inputs, arm_wide);
         self.room_gain = room_to;
         // A hundredth of a decibel of an input still withheld is still two
         // mixes. The threshold is what stops a fully-monitored rig from
@@ -10794,37 +10742,6 @@ impl Renderer {
         }
     }
 
-    /// Publish what the armed inputs got this block — see
-    /// `Shared::arm_inputs`. `frames` is how many input frames the block
-    /// carried; with none the RMS keeps its last value, like the take's.
-    fn publish_arm_meters(
-        &self,
-        frames: usize,
-        peak: [f32; 2],
-        sumsq: [f64; 2],
-        inputs: u32,
-        wide: bool,
-    ) {
-        let s = &self.shared;
-        s.arm_inputs.store(inputs, Ordering::Relaxed);
-        if inputs == 0 {
-            return;
-        }
-        s.arm_wide.store(wide, Ordering::Relaxed);
-        s.arm_peak_l.fetch_max(peak[0].to_bits(), Ordering::Relaxed);
-        s.arm_peak_r.fetch_max(peak[1].to_bits(), Ordering::Relaxed);
-        if frames > 0 {
-            let n = frames as f64;
-            s.arm_rms_l
-                .store(((sumsq[0] / n).sqrt() as f32).to_bits(), Ordering::Relaxed);
-            s.arm_rms_r
-                .store(((sumsq[1] / n).sqrt() as f32).to_bits(), Ordering::Relaxed);
-        }
-        if peak[0] >= CLIP_LEVEL || peak[1] >= CLIP_LEVEL {
-            s.arm_clipped.store(true, Ordering::Relaxed);
-        }
-    }
-
     fn publish_meters(
         &self,
         frames: usize,
@@ -11343,9 +11260,6 @@ pub struct Engine {
     /// Meter hold, decayed on the UI thread because that is where it is read.
     hold: Cell<(f32, f32)>,
     hold_at: Cell<Instant>,
-    /// The armed inputs' own hold, on the same clock. See `armed_input_meters`.
-    arm_hold: Cell<(f32, f32)>,
-    arm_hold_at: Cell<Instant>,
 }
 
 /// Sum an interleaved stereo buffer to mono, in place.
@@ -11915,6 +11829,7 @@ impl Engine {
             monitor: None,
             monitor_channels: 0,
             monitor_gain: [0.0; INPUTS],
+            room_audible: [1.0; INPUTS],
             monitor_widths: [0; INPUTS],
             monitor_picks: tangent_record::audio::Picks::EVERYTHING,
             monitor_block: 0,
@@ -12065,8 +11980,6 @@ impl Engine {
             insert_state_errors: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             hold: Cell::new((0.0, 0.0)),
             hold_at: Cell::new(Instant::now()),
-            arm_hold: Cell::new((0.0, 0.0)),
-            arm_hold_at: Cell::new(Instant::now()),
         })
     }
 
@@ -14000,36 +13913,6 @@ impl Engine {
     /// their hands when it happened.
     pub fn clear_clip(&self) {
         self.shared.clipped.store(false, Ordering::Relaxed);
-        self.shared.arm_clipped.store(false, Ordering::Relaxed);
-    }
-
-    /// What the armed inputs are getting, as the band's meters, or `None`
-    /// while nothing is armed. See `Shared::arm_inputs` for why this is
-    /// published beside `meters` rather than inside it. Read exactly once a
-    /// frame, like `meters`: the peaks clear on read, and the hold is
-    /// decayed here on real time.
-    pub fn armed_input_meters(&self) -> Option<tangent_ui::recorder::Meters> {
-        let a = self.shared.armed_input_levels()?;
-        let now = Instant::now();
-        let dt = now.duration_since(self.arm_hold_at.get()).as_secs_f32();
-        self.arm_hold_at.set(now);
-        let decay = 10f32.powf(-HOLD_DECAY_DB_PER_SEC * dt / 20.0);
-        let (hl, hr) = self.arm_hold.get();
-        let hold = ((hl * decay).max(a.peak[0]), (hr * decay).max(a.peak[1]));
-        self.arm_hold.set(hold);
-        let level = |i: usize, h: f32| tangent_ui::recorder::Level {
-            peak: a.peak[i],
-            rms: a.rms[i],
-            hold: h,
-            // Ballistics are the app's — see `Level::vu`.
-            vu: 0.0,
-        };
-        Some(tangent_ui::recorder::Meters {
-            left: level(0, hold.0),
-            right: level(1, hold.1),
-            mono: !a.wide,
-            clipped: a.clipped,
-        })
     }
 
     /// Which pitches each lane's CLIPS are sounding right now.
@@ -17627,6 +17510,7 @@ mod tests {
             monitor: None,
             monitor_channels: 0,
             monitor_gain: [0.0; INPUTS],
+            room_audible: [1.0; INPUTS],
             monitor_widths: [0; INPUTS],
             monitor_picks: tangent_record::audio::Picks::EVERYTHING,
             monitor_block: 0,
@@ -26179,22 +26063,30 @@ mod tests {
         }
     }
 
-    /// **An armed input is metered for the band whatever the mute does.**
+    /// **Arm beats mute in the take; mute still rules the room.**
     ///
-    /// The take is the desk, and the desk drops a strip nobody can hear —
-    /// a muted one, or every other one while something is soloed. That is
-    /// right for the file and wrong for the needle over a vocal being
-    /// recorded armed-and-muted, which read nothing while the arrangement
-    /// recorded it just fine. So the engine publishes what the armed inputs
-    /// got, before mute, fader and rack, beside the take's own meters.
+    /// The take is the desk, and the desk used to drop a strip nobody could
+    /// hear, armed or not, so the band's VU — which follows the take — read
+    /// nothing over a vocal being recorded armed-and-muted while the
+    /// arrangement recorded it just fine. An armed strip is in the take now
+    /// whatever the mute does; the mute, or a solo elsewhere, still keeps it
+    /// out of the speakers, with monitoring on or off. An unarmed input
+    /// reaches neither once its gain has faded.
     ///
-    /// Run for forty seconds of blocks, past both park horizons
-    /// (`RACK_PARK_S`, `VOICE_PARK_S`), because the test above this one
-    /// renders a single block and a rule that parks a lane after eight
-    /// seconds could not have failed it.
+    /// Ten seconds of blocks, past `RACK_PARK_S`, because the single-block
+    /// test above this one reads the gains before they have slewed anywhere.
     #[test]
-    fn an_armed_input_is_metered_for_the_band_whatever_the_mute_does() {
-        for (armed, muted) in [(true, false), (true, true), (false, false)] {
+    fn an_armed_strip_is_in_the_take_whatever_the_mute_does_and_the_room_obeys_the_mute() {
+        // (armed, muted, solo elsewhere, monitoring) -> (in the take, in the room)
+        let cases = [
+            (true, true, false, true, true, false),
+            (true, true, false, false, true, false),
+            (true, false, true, true, true, false),
+            (true, false, false, true, true, true),
+            (true, false, false, false, true, false),
+            (false, false, false, true, false, false),
+        ];
+        for (armed, muted, solo_other, monitoring, take_wants, room_wants) in cases {
             let shared = Arc::new(Shared::new());
             let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
             let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
@@ -26206,16 +26098,16 @@ mod tests {
             shared.pick_strip[0].store(1, Ordering::Relaxed);
             shared.midi_off.store(1 << 1, Ordering::Relaxed);
             shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
-            // `Shared::new` arms EVERYTHING until the desktop pushes a mask,
-            // so the unarmed case has to say so.
+            // `Shared::new` arms EVERYTHING until the desk pushes a mask.
             shared.armed.store(if armed { 1 << 1 } else { 0 }, Ordering::Relaxed);
             if muted {
                 shared.muted.store(1 << 1, Ordering::Relaxed);
             }
+            if solo_other {
+                shared.soloed.store(1 << 2, Ordering::Relaxed);
+            }
             r.channel_gain[1] = 1.0;
-            r.monitor_gain[0] = 1.0;
-            shared.monitor_on.store(false, Ordering::Relaxed);
-            r.room_gain = 0.0;
+            shared.monitor_on.store(monitoring, Ordering::Relaxed);
             let mut tap = RecorderTap {
                 rx: tap_rx,
                 channels: TAP_CHANNELS,
@@ -26224,8 +26116,8 @@ mod tests {
             };
             let mut out = vec![0.0f32; 256 * 2];
             let mut captured = Vec::new();
-            let mut taped = 0.0f32;
-            let blocks = 48_000 * 40 / 256;
+            let (mut taped, mut room) = (0.0f32, 0.0f32);
+            let blocks = 48_000 * 10 / 256;
             for b in 0..blocks {
                 for _ in 0..256 {
                     let _ = in_tx.push(0.5);
@@ -26235,57 +26127,22 @@ mod tests {
                 captured.clear();
                 tap.drain(&mut captured);
                 taped = captured.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+                room = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
             }
-            let levels = shared.armed_input_levels();
-            match (armed, muted) {
-                (true, _) => {
-                    let a = levels.unwrap_or_else(|| {
-                        panic!("armed={armed} muted={muted}: nothing published for the armed input")
-                    });
-                    assert!(
-                        (a.peak[0] - 0.5).abs() < 1.0e-3 && (a.rms[0] - 0.5).abs() < 1.0e-3,
-                        "armed={armed} muted={muted}: the armed input read {a:?}, not the 0.5 at the jack"
-                    );
-                    assert!(!a.wide, "a mono pick read as wide");
-                    assert!(!a.clipped, "a half-scale input lit the clip");
-                }
-                (false, _) => {
-                    assert_eq!(levels, None, "nothing is armed and something was published: {levels:?}");
-                }
-            }
-            // **The take's own rule is untouched**: a strip nobody can hear
-            // stays out of the file, and so does an unarmed pick once its
-            // room gain has faded, which is what the desk did before this.
-            if armed && !muted {
-                assert!(taped > 0.4, "the input is missing from the take (peak {taped}) after 40 s");
+            let case = format!(
+                "armed={armed} muted={muted} solo_other={solo_other} monitoring={monitoring}"
+            );
+            if take_wants {
+                assert!(taped > 0.4, "{case}: the input is missing from the take (peak {taped})");
             } else {
-                assert!(
-                    taped < 1.0e-3,
-                    "armed={armed} muted={muted}: the input reached the take (peak {taped})"
-                );
+                assert!(taped < 1.0e-3, "{case}: the input reached the take (peak {taped})");
             }
-            // Read-and-clear: a second read in the same frame sees no peak.
-            if armed {
-                let again = shared.armed_input_levels().expect("still armed");
-                assert_eq!(again.peak, [0.0, 0.0], "the peak did not clear on read");
+            if room_wants {
+                assert!(room > 0.4, "{case}: the speakers got nothing (peak {room})");
+            } else {
+                assert!(room < 1.0e-3, "{case}: the input reached the speakers (peak {room})");
             }
         }
-    }
-
-    /// And a desk with no input at all publishes nothing, whatever is armed:
-    /// the band falls back to the take rather than showing the last block
-    /// that had an input.
-    #[test]
-    fn an_armed_strip_with_no_input_publishes_no_armed_levels() {
-        let shared = Arc::new(Shared::new());
-        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 12);
-        let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
-        shared.arm_inputs.store(1, Ordering::Relaxed);
-        shared.armed.store(1 << 1, Ordering::Relaxed);
-        r.monitor = None;
-        let mut out = vec![0.0f32; 256 * 2];
-        r.render(&mut out, 0, 0);
-        assert_eq!(shared.armed_input_levels(), None);
     }
 
     #[test]
