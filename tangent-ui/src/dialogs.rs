@@ -5870,6 +5870,7 @@ pub fn show_export_progress(
     ctx: &egui::Context,
     p: &crate::ports::ExportProgress,
     placement: Placement,
+    cover: Option<&crate::busy::Busy>,
 ) {
     // The desk's own face, like every dialog — read from the frame's record
     // rather than taken as a parameter, because this window does not come
@@ -5924,6 +5925,16 @@ pub fn show_export_progress(
     // contract now.
     let _ = crate::shell::surface(ctx, placement.caps, &spec, &mut |ui, _want_close| {
         apply_theme(ui.style_mut(), &t);
+        // **The host's cover, over THIS window too.** This window is
+        // `Uncovered` and AlwaysOnTop, so the cover painted in the main
+        // viewport sat behind it and the user saw a render window over an
+        // app that seemed frozen. On the cover's own layer, which is above
+        // everything drawn below whatever order the calls come in.
+        if let Some(b) = cover {
+            let vc = ui.ctx().clone();
+            let painter = vc.layer_painter(crate::busy::cover_layer("tangent-busy-export"));
+            b.paint_over(&painter, vc.content_rect(), live_face(&vc), vc.input(|i| i.time));
+        }
         let rect = ui.max_rect();
         let painter = ui.painter_at(rect);
         // Rounded inline, where there is no window edge to tell the surface
@@ -15750,6 +15761,50 @@ at: None,
     /// OS window and the ladder is `shell::SurfaceTier`'s, which
     /// `a_cover_is_painted_above_every_surface_this_app_can_open` reads from
     /// the other end.
+    /// **The export window paints the cover it is handed.** The cover is
+    /// painted in the main viewport, and this window is a child window the
+    /// operating system keeps in front of it, so a decode or a write that
+    /// started under a render showed the render over an app that seemed
+    /// frozen — "the loading splash loads behind the export menu". Handed
+    /// the host's cover, the window paints it over itself; handed none, it
+    /// paints what it always did.
+    #[test]
+    fn the_export_window_paints_the_cover_it_is_handed() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        let progress = crate::ports::ExportProgress {
+            fraction: 0.4,
+            label: "Rendering".into(),
+            peaks: vec![(0.0, 0.0); crate::ports::EXPORT_PEAKS],
+        };
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 900.0))),
+            ..Default::default()
+        };
+        let mut busy = crate::busy::Busy::new("Loading audio");
+        busy.delay = std::time::Duration::ZERO;
+        // Shown once, so the mirror has something to mirror.
+        let _ = ctx.run(input(), |ctx| {
+            let p = ctx.layer_painter(crate::busy::cover_layer("tangent-busy"));
+            busy.draw(&p, ctx.content_rect(), FALLBACK_FACE, 0.0);
+        });
+        assert!(busy.is_visible(), "the cover never became visible; the test proves nothing");
+        let count = |cover: Option<&crate::busy::Busy>| {
+            let mut n = 0;
+            // Two passes: an `Area` places itself from what it measured last time.
+            for _ in 0..2 {
+                n = ctx
+                    .run(input(), |ctx| show_export_progress(ctx, &progress, cover_placement(), cover))
+                    .shapes
+                    .len();
+            }
+            n
+        };
+        let bare = count(None);
+        let with = count(Some(&busy));
+        assert!(with > bare, "the cover added nothing to the export window ({bare} -> {with} shapes)");
+    }
+
     fn cover_placement() -> Placement {
         Placement {
             at: None,
@@ -15902,7 +15957,7 @@ at: None,
             peaks: vec![(0.0, 0.0); 8],
         };
         let (bare, with) = frame_with_and_without_cover("Writing files", |ctx| {
-            show_export_progress(ctx, &progress, cover_placement());
+            show_export_progress(ctx, &progress, cover_placement(), None);
         });
         // The window prints its own label with a percentage after it, so
         // "Rendering  100%" is the string only IT paints and "Writing files"
@@ -17007,7 +17062,7 @@ at: None,
                 },
                 |ctx| {
                     show(ctx, &mut None, olive, placement);
-                    show_export_progress(ctx, &p, placement);
+                    show_export_progress(ctx, &p, placement, None);
                 },
             );
             fills = painted_fills(&out);
@@ -17617,7 +17672,7 @@ at: None,
                 },
                 |ctx| {
                     show(ctx, dialog, Color32::from_rgb(0x6B, 0x71, 0x3E), placement);
-                    show_export_progress(ctx, &p, placement);
+                    show_export_progress(ctx, &p, placement, None);
                 },
             );
         };
@@ -17710,7 +17765,7 @@ at: None,
                     ..Default::default()
                 },
                 |ctx| {
-                    show_export_progress(ctx, &p, placement);
+                    show_export_progress(ctx, &p, placement, None);
                     if i > 0 {
                         over_middle = pointer_over_export(ctx);
                     }
@@ -17725,7 +17780,7 @@ at: None,
                 ..Default::default()
             },
             |ctx| {
-                show_export_progress(ctx, &p, placement);
+                show_export_progress(ctx, &p, placement, None);
                 over_corner = pointer_over_export(ctx);
             },
         );

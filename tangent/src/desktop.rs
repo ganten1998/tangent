@@ -520,7 +520,7 @@ struct OfflineBounce {
     done: u64,
     block: Vec<f32>,
     master: Option<(std::path::PathBuf, tangent_record::wav::WavWriter)>,
-    stems: Vec<(usize, std::path::PathBuf, tangent_record::wav::WavWriter)>,
+    stems: Vec<StemWriter>,
     stem_scratch: Vec<f32>,
     out_dir: std::path::PathBuf,
     /// The wave as it is heard, one (min, max) per drawn column. Written by
@@ -535,6 +535,31 @@ struct OfflineBounce {
     writing: bool,
 }
 
+/// **One stem being written, and whether anything has reached it yet.**
+///
+/// A lane that is USED — a plugin in a bay, a folder with children — is not
+/// a lane that SOUNDS, and the export wrote a file of digital silence for
+/// every one of the first kind: the owner's stems folder held four of them
+/// (2026-09-16), one per empty track with something seated on it. The
+/// writer stays open for the whole render, because a lane can be silent
+/// for a minute and then play; what decides is whether one sample off
+/// digital zero ever arrived, and a stem that never got one is removed
+/// when the render finishes rather than shipped. See [`any_sound`].
+struct StemWriter {
+    lane: usize,
+    path: std::path::PathBuf,
+    writer: tangent_record::wav::WavWriter,
+    loud: bool,
+}
+
+/// Whether a block of samples carries anything at all. One sample off
+/// digital zero is enough: the question is "did this lane ever sound", and
+/// a lane that sounds for one sample is a lane with a stem. Digital silence
+/// is exactly zero, so a fade-out, a reverb tail or dither all count.
+fn any_sound(samples: &[f32]) -> bool {
+    samples.iter().any(|s| *s != 0.0)
+}
+
 #[cfg(feature = "recorder")]
 struct Bounce {
     /// Stop when the playhead passes this — the span plus a tail for the
@@ -545,7 +570,7 @@ struct Bounce {
     stems: bool,
     /// One WAV per used lane, fed from the engine's stem tap as the pass
     /// runs — never buffered whole: a long song is a lot of floats.
-    stem_writers: Vec<(usize, tangent_record::wav::WavWriter)>,
+    stem_writers: Vec<StemWriter>,
     /// The drain buffer, reused.
     stem_scratch: Vec<f32>,
 }
@@ -8578,7 +8603,7 @@ impl DesktopApp {
                     let bext =
                         tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
                     if let Ok(w) = tangent_record::wav::WavWriter::create(&path, spec, &bext) {
-                        stem_writers.push((lane, w));
+                        stem_writers.push(StemWriter { lane, path: path.clone(), writer: w, loud: false });
                     }
                 }
                 // The same door the offline twin arms its tap through, so the
@@ -8618,13 +8643,14 @@ impl DesktopApp {
             return;
         }
         let mut lane_buf = Vec::with_capacity(frames * 2);
-        for (lane, w) in &mut b.stem_writers {
+        for s in &mut b.stem_writers {
             lane_buf.clear();
             for f in 0..frames {
-                lane_buf.push(b.stem_scratch[f * wide + *lane * 2]);
-                lane_buf.push(b.stem_scratch[f * wide + *lane * 2 + 1]);
+                lane_buf.push(b.stem_scratch[f * wide + s.lane * 2]);
+                lane_buf.push(b.stem_scratch[f * wide + s.lane * 2 + 1]);
             }
-            let _ = w.write_interleaved(&lane_buf);
+            s.loud |= any_sound(&lane_buf);
+            let _ = s.writer.write_interleaved(&lane_buf);
         }
     }
 
@@ -8664,9 +8690,15 @@ impl DesktopApp {
                 };
                 let stems = b.stems;
                 let mut wrote = 0usize;
-                for (_, w) in b.stem_writers {
-                    if w.finish().is_ok() {
-                        wrote += 1;
+                for s in b.stem_writers {
+                    if s.writer.finish().is_ok() {
+                        if s.loud {
+                            wrote += 1;
+                        } else {
+                            // A used lane that never sounded is not a stem.
+                            // See `StemWriter`.
+                            let _ = std::fs::remove_file(&s.path);
+                        }
                     }
                 }
                 // **The same format pass the offline export runs**, and the
@@ -9232,7 +9264,7 @@ impl DesktopApp {
                 let path = dir.join(format!("{:02}-{}.wav", lane + 1, name.trim()));
                 let _ = std::fs::remove_file(&path);
                 if let Ok(w) = tangent_record::wav::WavWriter::create(&path, wav_spec, &bext) {
-                    stems.push((lane, path, w));
+                    stems.push(StemWriter { lane, path, writer: w, loud: false });
                 }
             }
         }
@@ -9306,11 +9338,11 @@ impl DesktopApp {
                 b.stem_scratch.clear();
                 b.e.drain_stems(&mut b.stem_scratch);
                 let frames = b.stem_scratch.len() / wide;
-                for (lane, _, w) in &mut b.stems {
+                for s in &mut b.stems {
                     fold.clear();
                     for f in 0..frames {
-                        let l = b.stem_scratch[f * wide + *lane * 2];
-                        let r = b.stem_scratch[f * wide + *lane * 2 + 1];
+                        let l = b.stem_scratch[f * wide + s.lane * 2];
+                        let r = b.stem_scratch[f * wide + s.lane * 2 + 1];
                         if b.spec.mono {
                             fold.push((l + r) * 0.5);
                         } else {
@@ -9318,7 +9350,8 @@ impl DesktopApp {
                             fold.push(r);
                         }
                     }
-                    let _ = w.write_interleaved(&fold);
+                    s.loud |= any_sound(&fold);
+                    let _ = s.writer.write_interleaved(&fold);
                 }
             }
             // The wave, bucketed by where this block sits in the whole
@@ -9413,11 +9446,20 @@ impl DesktopApp {
             master_path = Some(path);
         }
         let mut stem_paths = Vec::new();
-        for (_, path, w) in stems {
-            if let Err(e) = w.finish() {
+        let mut silent = 0usize;
+        for s in stems {
+            if let Err(e) = s.writer.finish() {
                 problem = Some(e.to_string());
             }
-            stem_paths.push(path);
+            if s.loud {
+                stem_paths.push(s.path);
+            } else {
+                // A used lane that never sounded is not a stem. See
+                // `StemWriter`; the count goes in the notice below so the
+                // folder's contents and the message agree.
+                let _ = std::fs::remove_file(&s.path);
+                silent += 1;
+            }
         }
         if let Some(p) = problem {
             self.app.notify_lower(EXPORT_RUNNING);
@@ -9436,8 +9478,13 @@ impl DesktopApp {
             return;
         }
         self.app.notify_lower(EXPORT_RUNNING);
+        let skipped = match silent {
+            0 => String::new(),
+            1 => "  (one silent lane skipped)".to_owned(),
+            n => format!("  ({n} silent lanes skipped)"),
+        };
         self.app
-            .notify(Kind::Success, format!("Exported  {}", out_dir.display()));
+            .notify(Kind::Success, format!("Exported  {}{skipped}", out_dir.display()));
         self.app.set_export_progress(None);
         if spec.open_when_done {
             reveal(&out_dir);
@@ -18957,6 +19004,7 @@ impl DesktopApp {
     fn paint_busy(&mut self, ctx: &egui::Context) {
         if self.splash.is_some() || self.busy.is_none() {
             self.busy_up = false;
+            self.app.set_surface_cover(None);
             return;
         }
         // **Asked BEFORE the draw, because the draw is what would stamp it as
@@ -18974,6 +19022,7 @@ impl DesktopApp {
             self.busy = None;
             self.busied = Busied::Nothing;
             self.busy_up = false;
+            self.app.set_surface_cover(None);
             return;
         }
         // The desk's own face, which is what every floating surface in this
@@ -18987,7 +19036,16 @@ impl DesktopApp {
         let Some(busy) = self.busy.as_mut() else {
             return;
         };
-        self.busy_up = busy.draw(&painter, rect, face, time);
+        let up = busy.draw(&painter, rect, face, time);
+        // **Mirrored into the export window**, which the operating system
+        // keeps in FRONT of this one. Painted here alone, the cover landed
+        // behind the window the user was looking at — "when clicking export
+        // button, the loading splash loads behind the export menu" — and
+        // the app looked frozen with nothing on screen saying why. See
+        // `Busy::paint_over` and `show_export_progress`.
+        let mirror = up.then(|| busy.clone());
+        self.busy_up = up;
+        self.app.set_surface_cover(mirror);
         // While it is up the window must keep repainting: a chunked operation
         // only advances on a frame, and nothing else in the app is asking for
         // one while the desk is covered. The close is decided at the top of
@@ -22133,6 +22191,16 @@ mod tests {").expect("the tests module")];
         // A take whose camera has died: the pictures are not coming, and the
         // take's own term on the ledger is what keeps the window live.
         assert!(!camera_frames_owed(FrameWant::Every, false));
+    }
+
+    /// **Digital silence is not a stem, and one sample off it is.** The
+    /// rule the export's silent-lane skip rests on.
+    #[test]
+    fn a_stem_sounds_when_one_sample_leaves_digital_zero() {
+        assert!(!any_sound(&[0.0; 512]));
+        assert!(!any_sound(&[]));
+        assert!(any_sound(&[0.0, 0.0, 1.0e-9, 0.0]));
+        assert!(any_sound(&[-1.0e-12]));
     }
 
     /// A reading with every level at one linear value and nothing else lit.

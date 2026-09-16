@@ -178,6 +178,49 @@ pub const DENOISE_RATIO: (f32, f32) = (1.7, 4.5);
 /// takes to re-engage once signal leaves a band. 60 ms breathes audibly on
 /// speech pauses; 800 ms lets a whole bar of noise through after each note.
 pub const DENOISE_RELEASE_MS: (f32, f32) = (60.0, 800.0);
+/// **How fast a band OPENS** on the spectral kernels, across this range in
+/// ms, geometric: the rise of a band's gain from the floor toward the signal
+/// it has decided is there. The bank has its own fixed [`DENOISE_OPEN_MS`].
+///
+/// The shipped 10 ms is the owner's number. Measured on his take against the
+/// reference render: the old kernel snapped a band from −12 dB to unity in
+/// four frames, and every bit of room noise inside that band came up with
+/// the note and dropped out after it — the "digital" sound, written down as
+/// a gain that moved 12 dB in 25 ms and back again at every word.
+pub const DENOISE_ATTACK_MS: (f32, f32) = (1.0, 100.0);
+/// **The treble boost's reach**, in dB: the dial at the top of its travel is
+/// this much lift on the SIGNAL above the shelf, and none on the residual.
+pub const DENOISE_TREBLE_DB: f32 = 6.0;
+/// Where the treble shelf begins to rise and where it has fully risen, Hz.
+/// A denoiser dulls — the bands it cuts hardest are the ones where a room's
+/// noise lives and a voice's air lives too — and a shelf on the part that
+/// survives is the compensation; on the residual it would only be more
+/// hiss, which is why the shelf rides the presence and not the output.
+const TREBLE_SHELF_HZ: (f32, f32) = (2_500.0, 6_000.0);
+/// **How far over its print a band must read before it starts to open, and
+/// where it is fully open**, in dB of band energy over the band's own
+/// learned floor — at SMOOTH's softest and at its hardest.
+///
+/// This is the second half of the digital sound. The band presence `p`
+/// is a detection statistic that SATURATES: a bin 12 dB over its print
+/// reads as signal at 0.99999 whether it holds a syllable or a chair, so a
+/// chair opened its band to unity. Measured on the owner's take, events
+/// 6–20 dB over the floor came through at −1 to −4 dB where the reference
+/// held them at −5 to −7. The knee below puts a chair PART way open and a
+/// note fully open, and the SMOOTH dial is how wide that knee is.
+///
+/// **Where the knee sits was measured, not guessed**, and the first guess
+/// was wrong. Events up to about 12 dB over the print need no knee at all:
+/// the broadband gate ([`VAD_QUIET_DB`]) reads such a frame as room, the
+/// tracker absorbs the level within 50 ms and the decision-directed SNR
+/// never rises, so the mixture lands under the floor and clamps to it —
+/// traced frame by frame in `a_quiet_event_opens_a_band_only_part_way`'s
+/// first draft. What came through on the take was the 15–20 dB events,
+/// which a knee ending at 18 left fully open. So the knee starts where the
+/// gate's programme side does and runs well past it: a 20 dB event opens
+/// about two thirds of the way, a 30 dB note all the way.
+pub const OPEN_SOFT_DB: (f32, f32) = (9.0, 27.0);
+pub const OPEN_HARD_DB: (f32, f32) = (9.0, 15.0);
 
 /// Where the sidechain high-pass sweeps, in Hz, geometric; the bottom of
 /// the dial is OFF. It blinds the DETECTOR only — an intentional bass part
@@ -326,6 +369,13 @@ const TINY: f32 = 1.0e-20;
 
 /// Zero anything too small to hear, before it becomes expensive to add.
 #[inline]
+/// Hermite ease over 0..=1, clamped: the knee shape the opening rule and
+/// the treble shelf both use, so the two curves are one curve.
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn flush(x: f32) -> f32 {
     if x.abs() < TINY {
         0.0
@@ -853,23 +903,53 @@ pub struct DenoiseParams {
     /// persisted forever, so a new parameter takes a new number at the end
     /// of the road rather than moving anything already written down.
     pub kernel: f32,
+    /// **How fast a band opens** on the spectral kernels, across
+    /// [`DENOISE_ATTACK_MS`], geometric. Appended after `kernel`, as every
+    /// parameter after the first seven must be: ids and symbols are
+    /// persisted forever. Ignored by the bank, which has [`DENOISE_OPEN_MS`].
+    pub attack: f32,
+    /// **Treble boost** on the signal that survives, across
+    /// 0..[`DENOISE_TREBLE_DB`], linear. Never on the residual — see
+    /// [`TREBLE_SHELF_HZ`]. Appended after `attack`. Ignored by the bank.
+    pub treble: f32,
 }
 
-/// The shipped sound: nothing learned yet (a wire), 12 dB cap, middle
-/// ratio and release, detector hearing everything, lookahead on — and the
+/// The shipped sound: nothing learned yet (a wire), 12 dB cap, the
+/// SOFTEST knee, a 10 ms attack and a 100 ms release, 2 dB of treble on
+/// what survives, detector hearing everything, lookahead on — and the
 /// SPECTRAL STUDIO kernel, because it is the one that delivers the dial the
 /// panel is promising. The bank is a deliberate choice, not the default one.
+///
+/// The four numbers are the owner's (2026-09-16): "Attack=10ms
+/// Release=100ms Smooth=0 Treble Boost = 2 dB". `release` is 100 ms on the
+/// geometric [`DENOISE_RELEASE_MS`] sweep, which
+/// `the_shipped_release_is_a_hundred_milliseconds` pins.
 impl Default for DenoiseParams {
     fn default() -> Self {
         Self {
             learn: 0.0,
             reduce: 0.5,
-            smooth: 0.5,
-            release: 0.5,
+            smooth: 0.0,
+            release: 0.197,
             sc_hpf: 0.0,
             lookahead: 1.0,
             kernel: 0.5,
+            attack: 0.5,
+            treble: 2.0 / DENOISE_TREBLE_DB,
         }
+    }
+}
+
+#[cfg(test)]
+impl DenoiseParams {
+    /// Read any knob this build knows from `TANGENT_DN_<NAME>`, for the
+    /// offline render harness. Kept beside the struct so a knob added here
+    /// is added here too.
+    fn apply_env_overrides(&mut self, dial: &dyn Fn(&str, f32) -> f32) {
+        self.sc_hpf = dial("TANGENT_DN_SC_HPF", self.sc_hpf);
+        self.lookahead = dial("TANGENT_DN_LOOKAHEAD", self.lookahead);
+        self.attack = dial("TANGENT_DN_ATTACK", self.attack);
+        self.treble = dial("TANGENT_DN_TREBLE", self.treble);
     }
 }
 
@@ -1233,6 +1313,15 @@ struct Spectral {
     /// is what makes 1024 points at 48 kHz and 2048 at 96 behave alike.
     a_ph1: f32,
     a_psd: f32,
+    /// **Each band's gain as the ear last heard it**, dB, the state the
+    /// attack and release move — a frame writes a TARGET and this follows
+    /// it. Unity at rest.
+    g_db: [f32; DENOISE_BANDS],
+    /// Each band's learned floor as energy, the print the opening rule
+    /// measures a frame's band energy against. Laid down by `refloor`.
+    floor_b: [f32; DENOISE_BANDS],
+    /// How much of the treble dial each band gets, 0..=1 up the shelf.
+    shelf: [f32; DENOISE_BANDS],
 }
 
 impl Spectral {
@@ -1275,6 +1364,9 @@ impl Spectral {
             s_prev: [0.0; DENOISE_BANDS],
             a_ph1: 0.0,
             a_psd: 0.0,
+            g_db: [0.0; DENOISE_BANDS],
+            floor_b: [1.0; DENOISE_BANDS],
+            shelf: [0.0; DENOISE_BANDS],
         }
     }
 
@@ -1326,6 +1418,7 @@ impl Spectral {
         self.ph1mean.fill(0.5);
         self.ph1.fill(0.0);
         self.s_prev = [0.0; DENOISE_BANDS];
+        self.g_db = [0.0; DENOISE_BANDS];
         self.restart_learn();
     }
 
@@ -1425,6 +1518,11 @@ impl Spectral {
         }
         let mut centres = [0.0_f64; DENOISE_BANDS];
         walk(0.5 * (lo + hi), Some(&mut centres));
+        // The treble shelf, by band centre — see `TREBLE_SHELF_HZ`.
+        for (s, c) in self.shelf.iter_mut().zip(centres.iter()) {
+            let (lo_hz, hi_hz) = TREBLE_SHELF_HZ;
+            *s = smoothstep((*c as f32 - lo_hz) / (hi_hz - lo_hz));
+        }
 
         // Onto the bin grid, strictly increasing and inside the spectrum.
         // Rounding can collide two centres at silly rates; the max() below
@@ -1631,6 +1729,16 @@ struct SpectralPlan {
     /// The dialled floor as a SIGNED gain in dB, so it can be mixed with a
     /// gain rather than subtracted from one: −24 dB at the top of REDUCE.
     floor_db: f32,
+    /// Per-frame one-pole coefficients for a band gain rising (opening)
+    /// and falling (closing), from the ATTACK and RELEASE dials.
+    a_att: f32,
+    a_rel: f32,
+    /// The opening knee, dB over the band's print: closed at or below the
+    /// first, fully open at or above the second. From SMOOTH.
+    open_lo: f32,
+    open_hi: f32,
+    /// The treble lift at the top of the shelf, dB, from the TREBLE dial.
+    treble_db: f32,
 }
 
 // ── the denoiser ────────────────────────────────────────────────────────────
@@ -2608,9 +2716,19 @@ impl Denoise {
                 rest
             }
         };
+        let geo = |range: (f32, f32), t: f32| range.0 * (range.1 / range.0).powf(t);
+        let frame_ms = 1_000.0 * self.sp.hop.max(1) as f32 / self.sample_rate.max(1.0);
+        let coef = |ms: f32| 1.0 - (-frame_ms / ms.max(0.1)).exp();
+        let d = DenoiseParams::default();
+        let smooth = dial(params.smooth, d.smooth);
         SpectralPlan {
             learning: self.learning,
             floor_db: -(dial(params.reduce, 0.5) * DENOISE_REDUCE_DB),
+            a_att: coef(geo(DENOISE_ATTACK_MS, dial(params.attack, d.attack))),
+            a_rel: coef(geo(DENOISE_RELEASE_MS, dial(params.release, d.release))),
+            open_lo: OPEN_SOFT_DB.0 + (OPEN_HARD_DB.0 - OPEN_SOFT_DB.0) * smooth,
+            open_hi: OPEN_SOFT_DB.1 + (OPEN_HARD_DB.1 - OPEN_SOFT_DB.1) * smooth,
+            treble_db: dial(params.treble, d.treble) * DENOISE_TREBLE_DB,
         }
     }
 
@@ -2957,6 +3075,31 @@ impl Denoise {
         }
 
         // ── the gain ────────────────────────────────────────────────────
+        //
+        // Three things changed here on 2026-09-16, all measured on the
+        // owner's take against a render he prefers (the numbers are on
+        // `DENOISE_ATTACK_MS` and `OPEN_SOFT_DB`):
+        //
+        // **The presence is gated by how far the band is over its print.**
+        // `p` saturates on any evidence at all, so a quiet noise opened its
+        // band as fully as a note. `open` is a knee on the band's excess
+        // over its learned floor: a chair reads ~10 dB and opens part way,
+        // a note reads 30 and opens fully, and the room between words
+        // reads nothing and stays exactly on the dial.
+        //
+        // **The gain is a TARGET, and a one-pole in dB follows it** — up at
+        // the attack, down at the release. The old gain was written fresh
+        // every frame, which is a multiband gate switching at 5 ms, and
+        // that switching was the digital sound. The mixture still lands
+        // exactly on the dial in a noise-only frame, so the dial-truth
+        // tests hold; they hold on the settled value, and the settling is
+        // now a release rather than a step.
+        //
+        // **The treble shelf rides the presence.** It lifts what survives,
+        // by up to the dial above `TREBLE_SHELF_HZ`, and never the residual:
+        // the term is `p · shelf`, so a closed band gets none of it, and the
+        // clamp's ceiling is the shelf rather than unity so the lift can be
+        // heard at all.
         let mut g_lin = [1.0_f32; DENOISE_BANDS];
         for b in 0..DENOISE_BANDS {
             let off = self.band[b].thr_norm < DENOISE_OFF;
@@ -2971,15 +3114,26 @@ impl Denoise {
                 // be all zeroes and mean "this unit is a wire".
                 g_lin[b] = 1.0;
                 self.band[b].depth_db = 0.0;
+                self.sp.g_db[b] = 0.0;
                 continue;
             }
-            let p = pres[b].clamp(0.0, 1.0);
+            let excess_db = 10.0
+                * (self.sp.e[b] / self.sp.floor_b[b].max(TINY)).max(TINY).log10();
+            let open = smoothstep((excess_db - plan.open_lo) / (plan.open_hi - plan.open_lo));
+            let p = pres[b].clamp(0.0, 1.0) * open;
             let h1_db = 20.0 * g_h1.max(1.0e-6).log10();
-            let db = (p * h1_db + (1.0 - p) * plan.floor_db).clamp(plan.floor_db, 0.0);
-            g_lin[b] = 10.0_f32.powf(db / 20.0);
-            // The meter reads the same number the audio gets, per band,
-            // whichever kernel is running.
-            self.band[b].depth_db = -db;
+            let lift = plan.treble_db * self.sp.shelf[b];
+            let target = (p * (h1_db + lift) + (1.0 - p) * plan.floor_db)
+                .clamp(plan.floor_db, lift.max(0.0));
+            let was = self.sp.g_db[b];
+            let a = if target > was { plan.a_att } else { plan.a_rel };
+            let now = was + a * (target - was);
+            let now = if now.is_finite() { now } else { plan.floor_db };
+            self.sp.g_db[b] = now;
+            g_lin[b] = 10.0_f32.powf(now / 20.0);
+            // The meter reads the CUT the audio gets, per band, whichever
+            // kernel is running; a lifted band reads as no cut.
+            self.band[b].depth_db = -now.min(0.0);
         }
 
         // ── back onto the bins, and mirrored ────────────────────────────
@@ -3017,6 +3171,7 @@ impl Denoise {
             *p = 10.0_f32.powf(b.thr_db / 10.0) * n as f32;
         }
         let mut sum = 0.0_f32;
+        let mut fb = [0.0_f32; DENOISE_BANDS];
         for k in 0..=bins {
             let (b, frac) = (self.sp.map_lo[k] as usize, self.sp.map_frac[k]);
             let hi = if b + 1 < DENOISE_BANDS { per_band[b + 1] } else { per_band[b] };
@@ -3029,12 +3184,19 @@ impl Denoise {
             // below the floor would just be one clamp's worth of nothing.
             self.sp.lambda[k] = floor;
             self.sp.ph1mean[k] = 0.5;
+            // The band's own print, through the same weights `band_power`
+            // sums a frame's energy with, so the two are comparable.
+            fb[b] += (1.0 - frac) * floor;
+            if b + 1 < DENOISE_BANDS {
+                fb[b + 1] += frac * floor;
+            }
         }
         // The whole print as one number, for the broadband gate. Summed
         // HERE and not per frame because it is a property of the profile,
         // not of the audio — the same reason `wsum` and `tau_dd` are laid
         // down in `lay_out_bands` rather than recomputed in the hot loop.
         self.sp.floor_sum = sum;
+        self.sp.floor_b = fb.map(|v| v.max(1.0e-30));
         self.sp.s_prev = [0.0; DENOISE_BANDS];
     }
 
@@ -3678,9 +3840,296 @@ mod tests {
     /// ABOUT the selector says which engine it means, because the two
     /// answer differently on purpose and a test that does not name one is
     /// a test whose meaning changes when the default does.
+    /// **Render a real recording through the unit, offline**, so a change
+    /// to the kernel is measured against a reference on the owner's own
+    /// take rather than felt. Ignored: it reads paths from the environment.
+    ///
+    /// ```text
+    /// TANGENT_DN_IN=/path/control.wav TANGENT_DN_OUT=/path/out.wav \
+    /// TANGENT_DN_LEARN=26.95,28.85 [TANGENT_DN_REDUCE=0.5] \
+    /// [TANGENT_DN_ATTACK=..] [TANGENT_DN_RELEASE=..] [TANGENT_DN_SMOOTH=..] \
+    /// [TANGENT_DN_TREBLE=..] [TANGENT_DN_KERNEL=0.5] \
+    /// cargo test -p tangent --bin tangent -- render_a_take_through_the_denoiser --ignored --nocapture
+    /// ```
+    ///
+    /// The learn pass is the named stretch of the SAME file, played once
+    /// with the toggle up; then the whole file goes through in 512-frame
+    /// blocks, which is what the host does. Written as 32-bit float at the
+    /// file's own rate, delayed by exactly the unit's reported latency so
+    /// the output lines up with the input sample for sample.
+    #[test]
+    #[ignore]
+    fn render_a_take_through_the_denoiser() {
+        let var = |k: &str| std::env::var(k).ok();
+        let Some(input) = var("TANGENT_DN_IN") else {
+            eprintln!("TANGENT_DN_IN not set; nothing rendered");
+            return;
+        };
+        let out = var("TANGENT_DN_OUT").expect("TANGENT_DN_OUT");
+        let learn = var("TANGENT_DN_LEARN").expect("TANGENT_DN_LEARN=start,end seconds");
+        let (l0, l1) = learn.split_once(',').expect("start,end");
+        let (l0, l1): (f32, f32) = (l0.trim().parse().unwrap(), l1.trim().parse().unwrap());
+        let dial = |k: &str, rest: f32| var(k).and_then(|v| v.parse().ok()).unwrap_or(rest);
+        let wav = crate::wavread::read(std::path::Path::new(&input)).expect("read input");
+        let sr = wav.rate as f32;
+        let left = &wav.channels[0];
+        let right = wav.channels.get(1).unwrap_or(left);
+        let frames = left.len().min(right.len());
+        let mut dn = Denoise::new(sr);
+        let mut params = DenoiseParams {
+            reduce: dial("TANGENT_DN_REDUCE", 0.5),
+            release: dial("TANGENT_DN_RELEASE", DenoiseParams::default().release),
+            smooth: dial("TANGENT_DN_SMOOTH", DenoiseParams::default().smooth),
+            kernel: dial("TANGENT_DN_KERNEL", DenoiseParams::default().kernel),
+            ..DenoiseParams::default()
+        };
+        // Every knob a newer build may have grown is read the same way, so
+        // this harness need not be edited when one lands.
+        params.apply_env_overrides(&dial);
+        // The print: either the bay's own saved state — `TANGENT_DN_STATE`
+        // names an `insert-state-<seat>-<bay>.bin`, the text blob the host
+        // writes, and its `t0..t31` lines ARE the thresholds — or the named
+        // stretch of this file, toggle up, then the toggle down.
+        let mut tiny = [0.0_f32; 8];
+        if let Some(state) = var("TANGENT_DN_STATE") {
+            let text = std::fs::read_to_string(&state).expect("read state blob");
+            let mut thr = [0.0_f32; DENOISE_BANDS];
+            let mut found = 0;
+            for line in text.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    if let Some(i) = k.strip_prefix('t').and_then(|n| n.parse::<usize>().ok()) {
+                        if i < DENOISE_BANDS {
+                            thr[i] = v.trim().parse().unwrap_or(0.0);
+                            found += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(found, DENOISE_BANDS, "the blob carried {found} thresholds");
+            dn.process(&mut tiny, 4, 2, &params);
+            dn.set_thresholds(&thr);
+            eprintln!("thresholds from {state}; latency {} frames", dn.latency());
+        } else {
+            let (a, b) = (((l0 * sr) as usize).min(frames), ((l1 * sr) as usize).min(frames));
+            let mut seg: Vec<f32> = (a..b).flat_map(|i| [left[i], right[i]]).collect();
+            let learning = DenoiseParams { learn: 1.0, ..params };
+            for chunk in seg.chunks_mut(1024) {
+                dn.process(chunk, chunk.len() / 2, 2, &learning);
+            }
+            dn.process(&mut tiny, 4, 2, &params);
+            eprintln!("learned {:?} over {:.2}s; latency {} frames", dn.last_learn(), l1 - l0, dn.latency());
+        }
+        // The take, in host-sized blocks, then flushed by the latency.
+        let lat = dn.latency() as usize;
+        let mut buf: Vec<f32> = (0..frames).flat_map(|i| [left[i], right[i]]).collect();
+        buf.extend(std::iter::repeat_n(0.0, lat * 2));
+        for chunk in buf.chunks_mut(512 * 2) {
+            dn.process(chunk, chunk.len() / 2, 2, &params);
+        }
+        let spec = tangent_record::wav::WavSpec {
+            sample_rate: wav.rate,
+            channels: 2,
+            format: tangent_record::wav::SampleFormat::Float32,
+        };
+        let bext = tangent_record::wav::Bext::new(tangent_record::wav::Wallclock::now_utc(), spec);
+        let mut w = tangent_record::wav::WavWriter::create(std::path::Path::new(&out), spec, &bext)
+            .expect("create output");
+        w.write_interleaved(&buf[lat * 2..(lat + frames) * 2]).expect("write");
+        w.finish().expect("finish");
+        eprintln!("wrote {out}");
+    }
+
+    /// The band a frequency lands in, for the spectral kernel that is up.
+    fn band_at(dn: &Denoise, hz: f32, sr: f32) -> usize {
+        let k = (hz * dn.sp.n as f32 / sr).round() as usize;
+        dn.sp.map_lo[k.min(dn.sp.n / 2)] as usize
+    }
+
+    /// Run `buf` through in hop-sized blocks and return band `b`'s smoothed
+    /// gain in dB after every block — the thing the ear hears move.
+    fn gain_db_trace(dn: &mut Denoise, buf: &mut [f32], p: &DenoiseParams, b: usize) -> Vec<f32> {
+        let hop = dn.sp.hop.max(1);
+        let frames = buf.len() / 2;
+        let mut out = Vec::with_capacity(frames / hop + 1);
+        let mut done = 0;
+        while done < frames {
+            let n = hop.min(frames - done);
+            dn.process(&mut buf[done * 2..(done + n) * 2], n, 2, p);
+            out.push(dn.sp.g_db[b]);
+            done += n;
+        }
+        out
+    }
+
+    /// **The shipped release is a hundred milliseconds** on the geometric
+    /// sweep — the owner's number, pinned so a change to the range moves
+    /// the default with it rather than silently shipping a different time.
+    #[test]
+    fn the_shipped_release_is_a_hundred_milliseconds() {
+        let d = DenoiseParams::default();
+        let ms = |r: (f32, f32), t: f32| r.0 * (r.1 / r.0).powf(t);
+        let release = ms(DENOISE_RELEASE_MS, d.release);
+        assert!((release - 100.0).abs() < 1.0, "the shipped release is {release:.1} ms");
+        let attack = ms(DENOISE_ATTACK_MS, d.attack);
+        assert!((attack - 10.0).abs() < 0.1, "the shipped attack is {attack:.2} ms");
+        assert_eq!(d.smooth, 0.0, "the shipped knee is not the softest");
+        assert!((d.treble * DENOISE_TREBLE_DB - 2.0).abs() < 1e-6, "the shipped treble boost is not 2 dB");
+    }
+
+    /// **A band opens at the attack and closes at the release**, and the
+    /// two dials move those times. This is the gate-switching-at-5-ms
+    /// fault, written as the numbers it has to be instead of.
+    #[test]
+    fn a_band_opens_at_the_attack_and_closes_at_the_release() {
+        let sr = SR;
+        let kernel = DenoiseKernel::SpectralStudio;
+        // A burst of a 1 kHz tone, 30 dB over the room, between two
+        // stretches of the room alone. Returns the band's gain trace, the
+        // frame in ms, and the indices where the tone starts and stops.
+        let burst = |attack: f32, release: f32| -> (Vec<f32>, f32, usize, usize) {
+            let mut dn = learned_full_band(kernel, 0xA77A, 0.05, sr, 1.0);
+            let p = DenoiseParams { attack, release, ..on(kernel) };
+            let (pre, on_len, post) = (sr as usize, (0.4 * sr) as usize, (1.5 * sr) as usize);
+            let mut buf = FullBandNoise::new(0xA77A, 0.05).frames(pre + on_len + post);
+            add(&mut buf[pre * 2..(pre + on_len) * 2], &sine(1_000.0, 0.3, on_len, sr));
+            let b = band_at(&dn, 1_000.0, sr);
+            let hop = dn.sp.hop;
+            let t = gain_db_trace(&mut dn, &mut buf, &p, b);
+            (t, 1_000.0 * hop as f32 / sr, pre / hop, (pre + on_len) / hop)
+        };
+        let floor = -(0.5 * DENOISE_REDUCE_DB);
+        let (t, ms, on_at, off_at) = burst(0.5, 0.197);
+        let at = |t: &[f32], from: usize, ms_after: f32| t[(from as f32 + ms_after / ms).round() as usize];
+        assert!(
+            (at(&t, on_at, -20.0) - floor).abs() < 0.75,
+            "before the burst the band was not on the dial: {:.2}",
+            at(&t, on_at, -20.0)
+        );
+        let plateau = t[off_at - 20..off_at].iter().sum::<f32>() / 20.0;
+        assert!(plateau > -1.0, "a 30 dB tone did not open its band: plateau {plateau:.2} dB");
+        let opened = (0..40)
+            .find(|&i| t[on_at + i] > plateau - 1.0)
+            .map(|i| i as f32 * ms);
+        assert!(opened.is_some_and(|o| o <= 60.0), "the band took {opened:?} ms to open at a 10 ms attack");
+        assert!(
+            at(&t, off_at, 40.0) > floor + 4.0,
+            "40 ms after the tone a 100 ms release had already shut the band: {:.2}",
+            at(&t, off_at, 40.0)
+        );
+        assert!(
+            (at(&t, off_at, 700.0) - floor).abs() < 1.0,
+            "700 ms after the tone the band was not back on the dial: {:.2}",
+            at(&t, off_at, 700.0)
+        );
+        // Release at the top of its travel: still well open 250 ms later.
+        let (t8, _, _, off8) = burst(0.5, 1.0);
+        assert!(at(&t8, off8, 250.0) > floor + 4.0, "an 800 ms release had shut the band within 250 ms");
+        // Attack at the top of its travel is slower than the shipped one.
+        let (t1, _, on1, off1) = burst(1.0, 0.197);
+        let plateau1 = t1[off1 - 20..off1].iter().sum::<f32>() / 20.0;
+        let opened1 = (0..80)
+            .find(|&i| t1[on1 + i] > plateau1 - 1.0)
+            .map(|i| i as f32 * ms);
+        assert!(opened1.is_some_and(|o| o >= 80.0), "a 100 ms attack opened in {opened1:?} ms");
+    }
+
+    /// **A quiet event opens its band only part way**: the chair, the
+    /// breath, the thing 10 dB over the room — the sounds the owner asked
+    /// this pass to look for — no longer bring the whole band to unity.
+    #[test]
+    fn a_quiet_event_opens_a_band_only_part_way() {
+        let sr = SR;
+        let kernel = DenoiseKernel::SpectralStudio;
+        // **A BROADBAND event, like the ones on the take.** A lone quiet
+        // tone is a different case: it moves one band of thirty-two, the
+        // frame reads as room to the broadband gate, and the tracker absorbs
+        // it into the noise estimate — which is that gate's whole purpose. A
+        // chair, a breath, a page turn are broadband; the frame reads over
+        // the gate, the estimate freezes, and the presence alone decides.
+        //
+        // Sustained and well over the gate's top, because anything under
+        // about 12 dB the tracker absorbs on its own (see `OPEN_SOFT_DB`).
+        // The expectation is derived from the knee rather than written as
+        // a number, so a retuned knee moves the test with it.
+        let run = |over_db: f32| -> (f32, f32) {
+            let mut dn = learned_full_band(kernel, 0xC0DE, 0.05, sr, 1.0);
+            let p = on(kernel);
+            let (pre, on_len) = (sr as usize, (0.8 * sr) as usize);
+            let mut dry = FullBandNoise::new(0xC0DE, 0.05).frames(pre + on_len);
+            let amp = 0.05 * 10.0_f32.powf(over_db / 20.0);
+            add(&mut dry[pre * 2..], &FullBandNoise::new(0xE4E47, amp).frames(on_len));
+            let b = band_at(&dn, 1_000.0, sr);
+            // `process` writes its output over its input, so the trace and
+            // the probe each get their own copy of the dry signal.
+            let mut buf = dry.clone();
+            let t = gain_db_trace(&mut dn, &mut buf, &p, b);
+            let settled = t[t.len() - 30..].iter().sum::<f32>() / 30.0;
+            let mut probe = learned_full_band(kernel, 0xC0DE, 0.05, sr, 1.0);
+            let mut most = dry[..(pre + on_len * 3 / 4) * 2].to_vec();
+            let _ = gain_db_trace(&mut probe, &mut most, &p, b);
+            let excess = 10.0 * (probe.sp.e[b] / probe.sp.floor_b[b]).log10();
+            (settled, excess)
+        };
+        let floor = -(0.5 * DENOISE_REDUCE_DB);
+        let expect = |excess: f32| {
+            let open = smoothstep((excess - OPEN_SOFT_DB.0) / (OPEN_SOFT_DB.1 - OPEN_SOFT_DB.0));
+            (1.0 - open) * floor
+        };
+        let (mid, ex_m) = run(18.0);
+        let (loud, ex_l) = run(32.0);
+        assert!(
+            (15.0..=25.0).contains(&ex_m),
+            "the mid burst reads {ex_m:.1} dB over the print; the test wants it inside the knee"
+        );
+        assert!(ex_l > OPEN_SOFT_DB.1, "the loud burst reads only {ex_l:.1} dB over the print");
+        let want = expect(ex_m);
+        assert!(
+            (mid - want).abs() < 2.0 && mid < -1.5 && mid > floor + 1.0,
+            "a {ex_m:.0} dB event settled at {mid:.2} dB; the knee says {want:.2} (floor {floor})"
+        );
+        assert!(loud > -1.0, "a {ex_l:.0} dB burst settled at {loud:.2} dB");
+    }
+
+    /// **The treble boost lifts the signal and never the residual.**
+    #[test]
+    fn the_treble_boost_lifts_the_signal_and_never_the_residual() {
+        let sr = SR;
+        let kernel = DenoiseKernel::SpectralStudio;
+        let run = |treble: f32| -> (f32, f32) {
+            let mut dn = learned_full_band(kernel, 0x7EB1E, 0.05, sr, 1.0);
+            let p = DenoiseParams { treble, ..on(kernel) };
+            let (pre, on_len) = (sr as usize, (0.6 * sr) as usize);
+            let mut buf = FullBandNoise::new(0x7EB1E, 0.05).frames(pre + on_len);
+            add(&mut buf[pre * 2..], &sine(8_000.0, 0.3, on_len, sr));
+            let b = band_at(&dn, 8_000.0, sr);
+            let hop = dn.sp.hop;
+            let t = gain_db_trace(&mut dn, &mut buf, &p, b);
+            let gap = t[pre / hop - 20..pre / hop].iter().sum::<f32>() / 20.0;
+            (gap, t[t.len() - 20..].iter().sum::<f32>() / 20.0)
+        };
+        let floor = -(0.5 * DENOISE_REDUCE_DB);
+        let (gap2, sig2) = run(2.0 / DENOISE_TREBLE_DB);
+        let (gap0, sig0) = run(0.0);
+        assert!(
+            (gap2 - floor).abs() < 0.75 && (gap0 - floor).abs() < 0.75,
+            "the residual moved with the treble dial: {gap0:.2} vs {gap2:.2} (dial {floor})"
+        );
+        assert!((sig2 - 2.0).abs() < 0.8, "a +2 dB boost lifted an 8 kHz tone by {sig2:.2} dB");
+        assert!(sig0.abs() < 0.8, "with the boost off the tone read {sig0:.2} dB");
+    }
+
     fn on(kernel: DenoiseKernel) -> DenoiseParams {
         DenoiseParams {
             kernel: kernel.dial(),
+            // SMOOTH is the bank's expansion RATIO, and every bank
+            // measurement in this module was taken at the 2.8:1 the dial's
+            // middle gives. The shipped default is the spectral kernels'
+            // softest knee, which on the bank is 1.7:1 and cuts less; the
+            // bank is tested where it was measured.
+            smooth: if kernel == DenoiseKernel::Bank { 0.5 } else { DenoiseParams::default().smooth },
+            // And its RELEASE, for the same reason: the bank's block-by-block
+            // step sizes were measured at the 219 ms the middle gives.
+            release: if kernel == DenoiseKernel::Bank { 0.5 } else { DenoiseParams::default().release },
             ..DenoiseParams::default()
         }
     }
@@ -3833,6 +4282,11 @@ mod tests {
                 sc_hpf: d(4),
                 lookahead: d(5),
                 kernel: kernel.dial(),
+                // The two late dials ride bits already in the sweep, so
+                // both extremes of each are met without four times the
+                // combinations: attack with reduce, treble with lookahead.
+                attack: d(1),
+                treble: d(5),
             };
             let mut dn = Denoise::new(SR);
             for pass in 0..2 {
@@ -3964,8 +4418,13 @@ mod tests {
             let clean_db = tone_db(&clean, 1_000.0, sr, from - lat, len);
             let got_db = tone_db(&buf, 1_000.0, sr, from, len);
 
+            // 2.5 dB and not 1.5 since the opening knee (2026-09-16): a
+            // tone this far over its band's room — about 24 dB on the Live
+            // kernel's wider bands — opens the band most but not all of the
+            // way, and costs up to 2 dB by design. The reference render the
+            // knee was tuned against takes 4–5 dB off the same signal.
             assert!(
-                (got_db - clean_db).abs() <= 1.5,
+                (got_db - clean_db).abs() <= 2.5,
                 "{}: the tone moved from {clean_db:.2} to {got_db:.2} dB under suppression",
                 kernel.label()
             );

@@ -10,6 +10,55 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+### Changed
+
+- **The denoiser's spectral kernels open and close like an instrument, not a
+  gate.** Measured on the owner's take against a render he prefers: the old
+  kernel wrote every band's gain fresh every 5 ms frame and snapped a band from
+  the floor to unity in four frames whenever a note landed in it, so every bit
+  of room noise inside that band came up with the note and dropped out after
+  it - the "digital" sound, as a gain moving 12 dB in 25 ms and back at every
+  word. Three changes, each measured on that take: a band's gain is now a
+  TARGET that a one-pole follows in dB, up at ATTACK and down at RELEASE, both
+  live on the spectral kernels for the first time (they were "Bank only");
+  the presence is gated on how far a band reads over its own learned print,
+  so a chair opens a band part way and a note all the way, with SMOOTH as the
+  width of that knee; and a new TREBLE BOOST lifts what survives above about
+  3 kHz and never the residual. New defaults, the owner's numbers: attack
+  10 ms, release 100 ms, smooth 0 (the softest knee), treble boost 2 dB. On
+  the take the largest single-frame gain jump fell from 4.2 dB to 1.7 dB
+  (the reference: 3.6), quiet events in the 500 Hz-2 kHz region went from
+  -3.8 dB to -5.2 dB (reference -6.9), signal frames are untouched below
+  3 kHz and +1.2 dB above, and the gap residual is about 2 dB shallower than
+  before at the same REDUCE, which is the cost of the release holding each
+  word's tail - the reference pays it too, from a deeper floor; turn REDUCE
+  up to have both. The bank keeps its own ratio, open time and readings.
+  `TANGENT_DN_*`: an ignored test, `render_a_take_through_the_denoiser`,
+  renders any WAV through the unit from a bay's saved print, and reproduces
+  the plugin's own output to within 3e-3, so the next change is measured on
+  a real take too.
+
+### Fixed
+
+- **Empty tracks are no longer exported as stems.** A lane counted as
+  "sounding" if it merely held a plugin, so the stems folder carried a file of
+  digital silence for every instrument track with nothing on it - four of
+  them in the owner's export. A stem that never receives one sample off
+  digital zero is removed when the render finishes, in both the realtime and
+  the offline bounce, and the notice says how many were skipped.
+
+- **A record-armed track is metered even while muted.** It records muted just
+  fine, and its meter read nothing, which said the opposite. An armed strip -
+  audio or MIDI - now meters its INPUT, the signal the take is getting,
+  whatever the fader and mute do to what the room hears; unarmed strips
+  meter as before.
+
+- **The loading splash no longer loads behind the export window.** The
+  cover is painted in the main viewport, and the export window is a child
+  window the operating system keeps in front of it, so a decode or a write
+  that started under a render showed the render window over an app that
+  seemed frozen. The cover is now mirrored into that window as well.
+
 ### Added
 
 - **FreeBSD is a release platform.** `scripts/release.sh` on a FreeBSD host

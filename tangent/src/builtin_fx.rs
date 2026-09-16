@@ -251,20 +251,27 @@ const COMP_FACE_PARAMS: &[ParamSpec] = &[
 /// the extra-state symbols `t0..t31` (see [`is_extra_symbol`]), because a
 /// threshold is a measurement, not a dial an automation lane should sweep.
 ///
-/// `kernel` sits at the END, at id 6, and stays there. Ids and symbols are
-/// persisted forever and a value must never move one knob to the left
-/// because a parameter was added, so a new one takes a new number at the
-/// end of the road — which is also why a session written before this
-/// parameter existed reads it as the spec's default (Spectral Studio) and
-/// not as position zero.
+/// `kernel` was appended at id 6, and `attack` and `treble` after it at 7
+/// and 8, and all three stay where they are. Ids and symbols are persisted
+/// forever and a value must never move one knob to the left because a
+/// parameter was added, so a new one takes a new number at the end of the
+/// road — which is also why a session written before a parameter existed
+/// reads it as the spec's default (Spectral Studio; 10 ms; 2 dB) and not
+/// as position zero.
+///
+/// The defaults for `smooth` and `release` moved on 2026-09-16 (the
+/// softest knee, 100 ms) with the owner's new numbers; a bay saved before
+/// that keeps the values it was saved with, as it should.
 const DENOISE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 0, symbol: "learn", name: "Learn", units: "", default: 0.0, steps: 2 },
     ParamSpec { id: 1, symbol: "reduce", name: "Reduce", units: "dB", default: 0.5, steps: 0 },
-    ParamSpec { id: 2, symbol: "smooth", name: "Smooth", units: ":1", default: 0.5, steps: 0 },
-    ParamSpec { id: 3, symbol: "release", name: "Release", units: "ms", default: 0.5, steps: 0 },
+    ParamSpec { id: 2, symbol: "smooth", name: "Smooth", units: "", default: 0.0, steps: 0 },
+    ParamSpec { id: 3, symbol: "release", name: "Release", units: "ms", default: 0.197, steps: 0 },
     ParamSpec { id: 4, symbol: "sc_hpf", name: "Detector HPF", units: "Hz", default: 0.0, steps: 0 },
     ParamSpec { id: 5, symbol: "lookahead", name: "Lookahead", units: "", default: 1.0, steps: 2 },
     ParamSpec { id: 6, symbol: "kernel", name: "Kernel", units: "", default: 0.5, steps: DENOISE_KERNEL_STEPS },
+    ParamSpec { id: 7, symbol: "attack", name: "Attack", units: "ms", default: 0.5, steps: 0 },
+    ParamSpec { id: 8, symbol: "treble", name: "Treble Boost", units: "dB", default: 1.0 / 3.0, steps: 0 },
 ];
 
 /// How many positions the denoise's KERNEL menu has. A literal so the table
@@ -661,15 +668,14 @@ pub const UNITS: &[UnitSpec] = &[
 /// know — which the loader reports rather than swallows, because a session
 /// from a NEWER build naming a unit this one lacks deserves a sentence, not a
 /// silently empty bay.
-/// Whether the denoiser's bay is on the engine that reads the gate knobs.
+/// Whether the denoiser's bay is on the BANK engine, whose SMOOTH is an
+/// expansion ratio and which has no attack or treble dial to read.
 ///
-/// The kernel is the LAST parameter and it is last for the reason its own doc
-/// gives — it was appended, and appended things stay appended — so this finds
-/// it by SYMBOL through the spec rather than by position, and answers "Bank"
-/// for a bay whose values have not arrived yet. Unknown reads as Bank because
-/// Bank is the only engine for which these knobs are live, and a face that
-/// briefly printed a real number for a live knob is a smaller wrong than one
-/// that printed "Bank only" over a knob that works.
+/// The kernel was appended, and appended things stay appended, so this
+/// finds it by SYMBOL through the spec rather than by position, and
+/// answers "Bank" for a bay whose values have not arrived yet: a face that
+/// briefly printed a ratio over a knee is a smaller wrong than one that
+/// printed "Spectral only" over a knob that works.
 fn denoise_reads_the_gate(siblings: &[f32]) -> bool {
     let Some(spec) = spec_for(DENOISE_PATH) else {
         return true;
@@ -690,24 +696,22 @@ fn denoise_reads_the_gate(siblings: &[f32]) -> bool {
 /// reuse is free and the firewall is untouched (data flows outward only).
 ///
 /// **`siblings` is the whole of that bay's values, and it is here because a
-/// knob can be INERT.**
+/// knob can mean two things.**
 ///
-/// The denoiser has three engines behind one face and they do not read the
-/// same knobs: `process` sends everything but Bank to `process_spectral` and
-/// returns, and SMOOTH and RELEASE are read below that line. So on Spectral
-/// Studio — which is what the unit SHIPS on — two of the five continuous
-/// controls did nothing at all, and the face printed a confident "2.8:1" and
-/// "219 ms" under both. Measured rather than read: the same take rendered at
-/// smooth 0.0 and 1.0 and at release 0.0 and 1.0 comes back byte for byte
-/// identical, all four hashes equal to the untouched render.
+/// The denoiser has three engines behind one face. SMOOTH is an expansion
+/// RATIO on the bank and the opening KNEE on the spectral kernels, so its
+/// reading depends on which engine is up; and the bank has no attack or
+/// treble dial at all — `process` sends everything but Bank to
+/// `process_spectral`, and those two are read on that side only.
 ///
-/// A knob that does nothing is worse than a knob that is not there, because
-/// the first thing anybody does with a denoiser that sounds wrong is reach
-/// for the smoothing. Making them WORK on the spectral path was the other
-/// answer and it is not free — a release envelope on the band gain was built
-/// and measured during this same pass and made the residual worse — so the
-/// face says so instead, and says it where the reading is composed rather
-/// than in a second table somebody has to keep in step.
+/// This used to say "Bank only" over SMOOTH and RELEASE, because on the
+/// spectral path they did nothing and a knob that does nothing is worse
+/// than a knob that is not there. They work there now (2026-09-16): the
+/// release is the fall of a band's gain, the attack its rise, SMOOTH the
+/// width of the knee a band opens over. An earlier release envelope had
+/// made the residual worse; the difference is that the presence is now
+/// gated on the band's excess over its print, so the envelope releases
+/// from a gain that was allowed to open by a note and not by a chair.
 ///
 /// The whole slice rather than the one sibling it needs: the caller has it,
 /// every other arm ignores it, and the day a second unit has a mode that
@@ -780,12 +784,24 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
                         fmt_db(-(v * DENOISE_REDUCE_DB))
                     }
                 }
-                // SMOOTH and RELEASE belong to the Bank alone. See this
-                // function's own doc for the measurement, and for why the
-                // answer is a word rather than a working knob.
-                2 | 3 if !denoise_reads_the_gate(siblings) => "Bank only".to_owned(),
-                2 => format!("{:.1}:1", sweep(DENOISE_RATIO)),
+                // SMOOTH is a ratio on the bank and a knee on the spectral
+                // kernels — see this function's own doc.
+                2 if denoise_reads_the_gate(siblings) => format!("{:.1}:1", sweep(DENOISE_RATIO)),
+                2 => {
+                    let width = lerp((OPEN_SOFT_DB.1 - OPEN_SOFT_DB.0, OPEN_HARD_DB.1 - OPEN_HARD_DB.0));
+                    format!("{width:.0} dB knee")
+                }
                 3 => fmt_ms(sweep(DENOISE_RELEASE_MS)),
+                // The bank has neither of these dials.
+                7 | 8 if denoise_reads_the_gate(siblings) => "Spectral only".to_owned(),
+                7 => fmt_ms(sweep(DENOISE_ATTACK_MS)),
+                8 => {
+                    if v <= 0.0 {
+                        "off".to_owned()
+                    } else {
+                        fmt_db(v * DENOISE_TREBLE_DB)
+                    }
+                }
                 4 => {
                     if v <= 0.0 {
                         "off".to_owned()
@@ -1888,7 +1904,9 @@ impl DenoiseUnit {
             3 => self.params.release = v,
             4 => self.params.sc_hpf = v,
             5 => self.params.lookahead = v,
-            _ => self.params.kernel = v,
+            6 => self.params.kernel = v,
+            7 => self.params.attack = v,
+            _ => self.params.treble = v,
         }
         // **The selector and the lookahead toggle move LATENCY, and the
         // kernel answers about them from its own fields, not from these.**
@@ -3018,7 +3036,8 @@ mod tests {
         // And the wave-4 nine, same disease, same cure.
         let d = crate::units::denoise::DenoiseParams::default();
         for (spec, want) in DENOISE_FACE_PARAMS.iter().zip([
-            d.learn, d.reduce, d.smooth, d.release, d.sc_hpf, d.lookahead, d.kernel,
+            d.learn, d.reduce, d.smooth, d.release, d.sc_hpf, d.lookahead, d.kernel, d.attack,
+            d.treble,
         ]) {
             assert_eq!(spec.default, want, "{} drifted from DenoiseParams::default", spec.symbol);
         }
@@ -3690,29 +3709,24 @@ mod tests {
             v
         };
 
-        // The Bank reads both, so both print their own mapping.
+        // The Bank reads SMOOTH as a ratio and RELEASE as its own release,
+        // and has neither an attack nor a treble dial — and says so.
         let bank = bay(DenoiseKernel::Bank);
         assert_eq!(describe(DENOISE_PATH, 2, 0.5, &bank), "2.8:1");
         assert_eq!(describe(DENOISE_PATH, 3, 0.5, &bank), "219 ms");
+        assert_eq!(describe(DENOISE_PATH, 7, 0.5, &bank), "Spectral only");
+        assert_eq!(describe(DENOISE_PATH, 8, 0.5, &bank), "Spectral only");
 
-        // Neither spectral kernel does, and the face says so rather than
-        // quoting a number that changes nothing.
+        // On the spectral kernels SMOOTH is the opening knee, not a ratio,
+        // and RELEASE, ATTACK and TREBLE are live.
         for k in [DenoiseKernel::SpectralStudio, DenoiseKernel::SpectralLive] {
             let v = bay(k);
-            assert_eq!(
-                describe(DENOISE_PATH, 2, 0.5, &v),
-                "Bank only",
-                "SMOOTH printed a live reading on {}",
-                k.label()
-            );
-            assert_eq!(
-                describe(DENOISE_PATH, 3, 0.5, &v),
-                "Bank only",
-                "RELEASE printed a live reading on {}",
-                k.label()
-            );
-            // Everything else on that face IS read by the spectral path and
-            // must keep its own reading.
+            assert_eq!(describe(DENOISE_PATH, 2, 0.5, &v), "12 dB knee", "SMOOTH on {}", k.label());
+            assert_eq!(describe(DENOISE_PATH, 3, 0.5, &v), "219 ms", "RELEASE on {}", k.label());
+            assert_eq!(describe(DENOISE_PATH, 7, 0.5, &v), "10 ms", "ATTACK on {}", k.label());
+            assert_eq!(describe(DENOISE_PATH, 8, 0.5, &v), "+3.0 dB", "TREBLE on {}", k.label());
+            assert_eq!(describe(DENOISE_PATH, 8, 0.0, &v), "off");
+            // Everything else on that face keeps its own reading.
             assert_eq!(describe(DENOISE_PATH, 1, 0.5, &v), "-12.0 dB");
         }
 

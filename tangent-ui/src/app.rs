@@ -1563,6 +1563,11 @@ pub struct TangentApp {
     /// A render in flight, for the window that floats over everything while
     /// it runs. `None` when nothing is exporting.
     export_progress: Option<crate::ports::ExportProgress>,
+    /// **The host's busy cover, to be mirrored into any surface the
+    /// operating system keeps in front of the main window.** `Some` only
+    /// while the cover is actually showing; the export window paints it
+    /// over itself. See `Busy::paint_over`.
+    surface_cover: Option<crate::busy::Busy>,
     /// How many outputs the open device has, pushed by the host. Only the
     /// host knows; the routing picker cannot offer jacks without it.
     device_outs: usize,
@@ -3920,6 +3925,7 @@ impl TangentApp {
             fx_defaults: crate::ports::EffectDefaults::default(),
             device_outs: 2,
             export_progress: None,
+            surface_cover: None,
             route_labels: Vec::new(),
             sounding: std::collections::BTreeSet::new(),
             clicked: std::collections::BTreeSet::new(),
@@ -24852,6 +24858,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// Push (or clear) the export progress the floating window draws.
+    /// The host's cover as it stands this frame, or `None` — see
+    /// `surface_cover`.
+    pub fn set_surface_cover(&mut self, cover: Option<crate::busy::Busy>) {
+        self.surface_cover = cover;
+    }
+
     pub fn set_export_progress(&mut self, p: Option<crate::ports::ExportProgress>) {
         self.export_progress = p;
     }
@@ -37191,7 +37203,7 @@ impl TangentApp {
         // It also has to keep painting, so it asks for the next frame itself
         // rather than waiting for a pointer to move.
         if let Some(p) = self.export_progress.clone() {
-            dialogs::show_export_progress(&ctx, &p, placement);
+            dialogs::show_export_progress(&ctx, &p, placement, self.surface_cover.as_ref());
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 

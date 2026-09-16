@@ -918,6 +918,18 @@ impl Busy {
         paint(painter, rect, face, self, time);
         true
     }
+
+    /// **The same cover, painted again somewhere else** — a child window
+    /// the operating system keeps in front of the main one, where a cover
+    /// painted in the main viewport alone lands BEHIND the window the user
+    /// is looking at. Draws exactly what `draw` last drew and mutates
+    /// nothing: `draw` keeps the clock, this is its mirror, and a mirror of
+    /// a cover that is not yet showing shows nothing either.
+    pub fn paint_over(&self, painter: &Painter, rect: Rect, face: Color32, time: f64) {
+        if rect.is_positive() && self.is_visible() {
+            paint(painter, rect, face, self, time);
+        }
+    }
 }
 
 /// The drawing itself, once the decision to draw has been made.

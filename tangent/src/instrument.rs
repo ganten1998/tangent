@@ -3419,6 +3419,27 @@ const VOICE_PARK_S: f64 = 30.0;
 /// faded-down instrument still holding a note is still heard by this test.
 const PARK_FLOOR: f32 = 1.0e-4;
 
+/// **What a strip's meter shows: the fader's output, or the INPUT while the
+/// strip is armed.**
+///
+/// A record-armed track is metered pre-fader and pre-mute — the signal at
+/// the jack, which is what the take is getting — whatever the fader and the
+/// mute are doing to what the room hears. A muted armed track records
+/// exactly as well as an unmuted one, and its meter used to read nothing at
+/// all, which said the opposite of the truth to somebody deciding whether
+/// to press record. The owner: "when record armed, a track should be
+/// metered even if muted as it records muted just fine."
+///
+/// One rule, two callers — the input pass and the channel fold — so a MIDI
+/// lane and an audio lane cannot disagree about what an arm means.
+fn meter_source(armed: bool, heard: [f32; 2], input: [f32; 2]) -> [f32; 2] {
+    if armed {
+        input
+    } else {
+        heard
+    }
+}
+
 /// **Whether a lane's rack may stop running this block**, advancing the
 /// lane's quiet counter as it decides.
 ///
@@ -7458,7 +7479,11 @@ impl Renderer {
             };
             // Silent and already faded out: the drain above was the whole job
             // for this one. The others still get their turn.
-            if !heard && self.monitor_gain[input] <= 1.0e-6 {
+            // An ARMED strip runs whether or not the room can hear it: its
+            // meter reads the input the take is getting — see `meter_source`.
+            // A strip that is neither armed nor still fading has nothing to
+            // meter and nothing to mix.
+            if !live && self.monitor_gain[input] <= 1.0e-6 {
                 self.monitor_gain[input] = 0.0;
                 continue;
             }
@@ -7485,6 +7510,8 @@ impl Renderer {
                 pan_gains(lane_pan_of(&self.auto, &self.shared, lane))
             };
             let mut peak = [0.0f32; 2];
+            // The jack's own level, pre-fader, for an armed strip's meter.
+            let mut raw_peak = [0.0f32; 2];
             // **This strip's own audio first, then its BOARD, then its rack,
             // then the fold.**
             //
@@ -7543,8 +7570,9 @@ impl Renderer {
                     } else {
                         0.0
                     };
-                    let src =
-                        (self.monitor_scratch[i * ch_in + col] + clip) * self.monitor_gain[input];
+                    let jack = self.monitor_scratch[i * ch_in + col] + clip;
+                    raw_peak[c.min(1)] = raw_peak[c.min(1)].max(jack.abs());
+                    let src = jack * self.monitor_gain[input];
                     if let Some(dst) = self.fx_in.get_mut(c) {
                         dst[i] = src;
                     }
@@ -7781,6 +7809,7 @@ impl Renderer {
                 }
             }
             room_to = room;
+            let peak = meter_source(live, peak, raw_peak);
             // A folder's meter is the GROUP's, and the fold reports it.
             if !is_folder {
                 self.shared.note_strip_peak(strip, peak);
@@ -10151,6 +10180,8 @@ impl Renderer {
             // faded-down lane is still a note, and parking it would leave a
             // fader that comes back up onto silence.
             let mut raw = 0.0f32;
+            // And per channel, for an armed lane's meter — see `meter_source`.
+            let mut raw_pk = [0.0f32; 2];
             for f in 0..frames {
                 let g = if is_folder {
                     1.0
@@ -10161,6 +10192,8 @@ impl Renderer {
                 let s0 = self.fx_in.first().map_or(0.0, |b| b[f]);
                 let s1 = self.fx_in.get(1).map_or(0.0, |b| b[f]);
                 raw = raw.max(s0.abs()).max(s1.abs());
+                raw_pk[0] = raw_pk[0].max(s0.abs());
+                raw_pk[1] = raw_pk[1].max(s1.abs());
                 let l = s0 * g * pan_l;
                 let r = s1 * g * pan_r;
                 peak[0] = peak[0].max(l.abs());
@@ -10198,6 +10231,7 @@ impl Renderer {
             if let Some(loud) = self.lane_loud.get_mut(ch) {
                 *loud = raw > PARK_FLOOR;
             }
+            let peak = meter_source(armed, peak, raw_pk);
             // The folder's meter is the GROUP's, and the fold reports it.
             if !is_folder {
                 self.shared.note_strip_peak(Strip::Channel(ch), peak);
@@ -17706,6 +17740,17 @@ mod tests {
     /// one would cut it off. So a lane carrying any generator never parks at
     /// all, however long the desk stands still.
     ///
+    /// **An armed strip meters its input; an unarmed one meters what is
+    /// heard.** The whole of the muted-while-armed fix, as the rule.
+    #[test]
+    fn an_armed_strip_meters_the_jack_and_an_unarmed_one_the_fader() {
+        let heard = [0.0, 0.0];
+        let jack = [0.4, 0.3];
+        assert_eq!(meter_source(true, heard, jack), jack, "a muted armed strip read nothing");
+        assert_eq!(meter_source(false, heard, jack), heard, "an unarmed strip ignored its fader");
+        assert_eq!(meter_source(true, [0.9, 0.9], jack), jack, "an armed strip read its fader, not its input");
+    }
+
     /// Revert checks performed: drop the `holds_voice && sounding` term and
     /// a sounding voice parks with the rest; drop the `live_now` term and a
     /// lane parks while the transport is rolling; make the voice wait the
@@ -20485,7 +20530,7 @@ mod tests {
             (IMAGER_PATH, "Tangent Imager", 3),
             (TAPE_PATH, "Tangent Tape", 6),
             (COMP_PATH, "Tangent Comp", 7),
-            (DENOISE_PATH, "Tangent Denoise", 7),
+            (DENOISE_PATH, "Tangent Denoise", 9),
             (AMP_PATH, "Tangent Amp", 9),
             (DRIVE_PATH, "Tangent Drive", 4),
             (TREM_PATH, "Tangent Trem", 3),
