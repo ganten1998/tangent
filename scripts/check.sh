@@ -58,4 +58,22 @@ echo "==> cargo clippy  (the Cargo.toml lint policy only — no broad groups)"
 cargo clippy -p tangent-core -p tangent-ui -p tangent -p tangent-record -p tangent-host \
   --all-targets -- -A clippy::all -D warnings
 
+echo "==> the FreeBSD version spelling is ONE expression in three scripts"
+# pkg(8) spells a prerelease its own way (5.0.0-rc.1 is 5.0.0.r1), and
+# build-freebsd.sh names the artifact, release.sh checks and checksums it,
+# and publish-github.sh uploads it — each with the same sed. A second
+# spelling anywhere is a FreeBSD artifact that builds, passes nothing, and
+# never ships; so the three are held byte-identical here rather than by
+# memory.
+SPELLINGS="$(grep -ho "sed -E 's/-beta[^']*'" \
+  scripts/build-freebsd.sh scripts/release.sh scripts/publish-github.sh | sort -u)"
+if [ "$(printf '%s\n' "$SPELLINGS" | grep -c .)" != 1 ]; then
+  echo "the FreeBSD version sed differs between scripts:" >&2
+  printf '%s\n' "$SPELLINGS" | sed 's/^/    /' >&2
+  exit 1
+fi
+for s in scripts/build-freebsd.sh scripts/release.sh scripts/publish-github.sh; do
+  grep -q "sed -E 's/-beta" "$s" || { echo "$s lost its FreeBSD version sed" >&2; exit 1; }
+done
+
 echo "==> check.sh: all green"

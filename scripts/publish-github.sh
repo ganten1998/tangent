@@ -87,6 +87,9 @@ elif ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
 fi
 
 # ── Collect this version's artifacts ─────────────────────────────────────────
+# FreeBSD's pkg spells a prerelease its own way (5.0.0-rc.1 is 5.0.0.r1); the
+# same expression release.sh and build-freebsd.sh use, so the three agree.
+PKG_VERSION="$(printf '%s' "$VERSION" | sed -E 's/-beta\.?/.b/; s/-alpha\.?/.a/; s/-rc\.?/.r/; s/-/./g')"
 shopt -s nullglob
 ARTIFACTS=()
 # Tangent-* since the 2.3.0 rename. This glob still said Ivory-* long after
@@ -94,7 +97,8 @@ ARTIFACTS=()
 # artifacts in dist/" on the first release it was asked to publish.
 for f in dist/Tangent-"${VERSION}"-macos-*.zip dist/Tangent-"${VERSION}"-macos-*.dmg \
          dist/tangent-"${VERSION}"-linux-*.tar.gz dist/tangent-"${VERSION}"-windows-*.zip \
-         dist/Tangent-"${VERSION}"-macos.pkg dist/Tangent-"${VERSION}"-windows-setup.exe; do
+         dist/Tangent-"${VERSION}"-macos.pkg dist/Tangent-"${VERSION}"-windows-setup.exe \
+         dist/tangent-"${PKG_VERSION}"-freebsd-*.pkg dist/tangent-"${PKG_VERSION}"-freebsd-*.tar.gz; do
   [ -f "$f" ] && ARTIFACTS+=("$f")
 done
 shopt -u nullglob
