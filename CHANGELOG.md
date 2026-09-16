@@ -40,6 +40,16 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The band's VU meters an armed input whatever the mute does.** The needle
+  follows the take, and the take is the desk, which drops a strip nobody can
+  hear: a muted one, or every other one while something is soloed. So the VU
+  over a vocal being recorded armed-and-muted sat at rest while the
+  arrangement recorded it just fine, the same hole the strip meters had. The
+  engine now publishes what the armed inputs are getting, before mute, fader
+  and rack, and the band's needle follows that while anything is armed and
+  the take otherwise. The take's own content is unchanged, and the clip lamp
+  still answers for both.
+
 - **Empty tracks are no longer exported as stems.** A lane counted as
   "sounding" if it merely held a plugin, so the stems folder carried a file of
   digital silence for every instrument track with nothing on it - four of
