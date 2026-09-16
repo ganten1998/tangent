@@ -40,15 +40,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
-- **The band's VU meters an armed input whatever the mute does.** The needle
-  follows the take, and the take is the desk, which drops a strip nobody can
-  hear: a muted one, or every other one while something is soloed. So the VU
-  over a vocal being recorded armed-and-muted sat at rest while the
-  arrangement recorded it just fine, the same hole the strip meters had. The
-  engine now publishes what the armed inputs are getting, before mute, fader
-  and rack, and the band's needle follows that while anything is armed and
-  the take otherwise. The take's own content is unchanged, and the clip lamp
-  still answers for both.
+- **An armed strip is in the take whatever the mute does, and the band's
+  VU follows it.** The take is the desk, and the desk dropped a strip nobody
+  could hear, armed or not, so the VU over a vocal being recorded
+  armed-and-muted sat at rest while the arrangement recorded it just fine,
+  the same hole the strip meters had. Arm is the record switch now and it
+  beats the mute in the take: the strip goes in through its rack, its fader
+  and the master's limiter, which is what the needle reads. The mute, or a
+  solo elsewhere, still keeps it out of the speakers, with monitoring on or
+  off, exactly as monitoring-off withholds a live input.
 
 - **Empty tracks are no longer exported as stems.** A lane counted as
   "sounding" if it merely held a plugin, so the stems folder carried a file of
