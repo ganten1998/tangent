@@ -16,6 +16,9 @@
 #   macOS host -> scripts/build-macos.sh + scripts/build-installer.sh macos
 #                 + scripts/build-cross.sh (Linux tarballs, Windows zip + setup.exe)
 #   Linux host -> scripts/build-linux-native.sh
+#   FreeBSD host -> scripts/build-freebsd.sh (the .pkg always; the two offline
+#                 bundles only as root or with doas/sudo, which the check
+#                 below turns into a problem on the record when they are missing)
 #
 # Run it on each OS (and each Linux arch), copy the artifacts into one dist/,
 # then `scripts/release.sh --sums-only` there so SHA256SUMS covers everything.
@@ -37,7 +40,81 @@ FAIL=0
 note() { echo "!! $*"; FAIL=1; }
 sha256() {  # shasum is Perl's and is not on every minimal Linux install
   if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$@"
-  else sha256sum "$@"; fi
+  elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"
+  # FreeBSD base has neither; its sha256(1) prints "hash file" with ONE space
+  # under -r, and `sha256sum -c` wants two. `command` so this is the tool and
+  # not this function calling itself.
+  else command sha256 -r "$@" | sed 's/ /  /'; fi
+}
+
+# ── FreeBSD's spelling of the version ────────────────────────────────────────
+# pkg(8) uses the hyphen to split a package NAME from its VERSION in a
+# filename, so build-freebsd.sh writes 5.0.0-rc.1 as 5.0.0.r1 (FreeBSD's own
+# prerelease convention, which also sorts before the release). The SAME sed
+# expression, character for character, so this script and that one cannot
+# disagree about what a FreeBSD artifact is called; scripts/check.sh holds
+# the three copies (build, release, publish) byte-identical.
+freebsd_version() { printf '%s' "$1" | sed -E 's/-beta\.?/.b/; s/-alpha\.?/.a/; s/-rc\.?/.r/; s/-/./g'; }
+
+# ── The FreeBSD artifacts, checked as artifacts ──────────────────────────────
+# Functions rather than case arms so they can be exercised against a file in
+# dist/ without running the whole release — which is how they were tested,
+# against the artifacts the build box had already produced.
+#
+# A FreeBSD .pkg is pkg(8)'s archive, not Installer's flat package: a tar with
+# the two manifests at its head, readable with the bsdtar every host has. What
+# build-freebsd.sh asserts at create time is asserted AGAIN here, on the file
+# that actually reached dist/ — a copy from the build box is the thing being
+# blessed, not the box's log.
+check_freebsd_pkg() {
+  local a="$1" list cm want
+  list="$(tar -tf "$a" 2>/dev/null)" || { note "$a: not a readable pkg archive"; return; }
+  for want in '^\+MANIFEST$' '^\+COMPACT_MANIFEST$' \
+              '^/usr/local/bin/tangent$' '^/usr/local/bin/tangent-jack$' \
+              '/share/applications/tangent\.desktop$' \
+              '/icons/hicolor/128x128/apps/tangent\.png$' \
+              '^/usr/local/share/licenses/tangent/LICENSE$' \
+              '^/usr/local/share/licenses/tangent/OFL\.txt$' \
+              '^/usr/local/share/licenses/tangent/THIRD-PARTY-LICENSES$'; do
+    printf '%s\n' "$list" | grep -Eq "$want" || note "$a: missing $want"
+  done
+  cm="$(tar -xOf "$a" +COMPACT_MANIFEST 2>/dev/null || true)"
+  [ -n "$cm" ] || { note "$a: no readable +COMPACT_MANIFEST"; return; }
+  # alsa-lib decides whether the app STARTS on the machine this port exists
+  # for, lilv the same; a GhostBSD base dependency installs nowhere else.
+  for want in alsa-lib alsa-plugins lilv; do
+    case "$cm" in *"\"$want\""*) ;; *) note "$a: manifest does not declare $want" ;; esac
+  done
+  case "$cm" in *GhostBSD-*) note "$a: depends on a GhostBSD base package (will not install on plain FreeBSD)" ;; esac
+  printf '%s' "$cm" | grep -Eq "\"version\": ?\"${PKG_VERSION//./\\.}\"" \
+    || note "$a: manifest version is not $PKG_VERSION"
+}
+
+# An offline bundle: the app's own pkg, its dependency pkgs beside it, the
+# installer the README's first line names, and the same licence texts every
+# other archive carries. The generic README/LICENSE/OFL checks have already
+# run on the listing by the time this is called.
+check_freebsd_bundle() {
+  local a="$1" list="$2" dep
+  printf '%s\n' "$list" | grep -Eq "/tangent-${PKG_VERSION//./\\.}-freebsd-[^/]*\.pkg$" \
+    || note "$a: no tangent pkg inside"
+  printf '%s\n' "$list" | grep -Eq '/install\.sh$' \
+    || note "$a: no install.sh (README's first instruction)"
+  printf '%s\n' "$list" | grep -Eq '/THIRD-PARTY-LICENSES$' \
+    || note "$a: no THIRD-PARTY-LICENSES"
+  for dep in alsa-lib alsa-plugins lilv; do
+    printf '%s\n' "$list" | grep -Eq "/${dep}-[0-9][^/]*\.pkg$" \
+      || note "$a: no $dep pkg (the app does not start without it)"
+  done
+  case "$a" in
+    *-complete.tar.gz)
+      # 'complete' is for a box that has only ever had Xorg: the graphics
+      # stack and the encoder are exactly what it is for.
+      for dep in mesa-dri ffmpeg; do
+        printf '%s\n' "$list" | grep -Eq "/${dep}-[0-9][^/]*\.pkg$" \
+          || note "$a: 'complete' bundle without $dep"
+      done ;;
+  esac
 }
 
 # ── Verify the version ───────────────────────────────────────────────────────
@@ -46,6 +123,8 @@ if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-
   echo "could not read a sane version from Cargo.toml (got '$VERSION')" >&2
   exit 2
 fi
+
+PKG_VERSION="$(freebsd_version "$VERSION")"
 
 echo "==> Tangent $VERSION  host=$(uname -s)/$(uname -m)"
 case "$VERSION" in
@@ -160,15 +239,17 @@ fi
 
 # ── Purge artifacts belonging to other versions ──────────────────────────────
 # Left in place they get swept up by any `Tangent-*` / `tangent-*` glob at checksum
-# or upload time. Only the four known artifact name shapes are ever touched.
+# or upload time. Only the known artifact name shapes are ever touched — and a
+# FreeBSD artifact is known by pkg's spelling of the version, not Cargo's.
 mkdir -p dist
 if [ "${KEEP_STALE:-0}" != "1" ]; then
   shopt -s nullglob
   STALE=()
   for f in dist/Tangent-*-macos-*.zip dist/Tangent-*-macos-*.dmg \
            dist/tangent-*-linux-*.tar.gz dist/tangent-*-windows-*.zip \
-           dist/Tangent-*-macos.pkg dist/Tangent-*-windows-setup.exe; do
-    case "$f" in *"-${VERSION}-"*) continue ;; esac
+           dist/Tangent-*-macos.pkg dist/Tangent-*-windows-setup.exe \
+           dist/tangent-*-freebsd-*.pkg dist/tangent-*-freebsd-*.tar.gz; do
+    case "$f" in *"-${VERSION}-"*|*"-${PKG_VERSION}-"*) continue ;; esac
     STALE+=("$f")
   done
   shopt -u nullglob
@@ -202,6 +283,12 @@ if [ "$SUMS_ONLY" = 0 ]; then
     Linux)
       scripts/build-linux-native.sh
       ;;
+    FreeBSD)
+      # The .pkg always. The two offline bundles need `pkg fetch`, which
+      # needs root: without it the script says so and exits 0, and the
+      # bundle check below is what puts that on the record as a problem.
+      scripts/build-freebsd.sh
+      ;;
     *)
       echo "no build path for $(uname -s); see docs/RELEASE.md" >&2
       exit 2
@@ -215,10 +302,23 @@ fi
 shopt -s nullglob
 ARTIFACTS=()
 for f in dist/*-"${VERSION}"-*; do [ -f "$f" ] && ARTIFACTS+=("$f"); done
+# The FreeBSD artifacts wear pkg's spelling, which is only the same string
+# for a final release; a prerelease's are found by their own name.
+if [ "$PKG_VERSION" != "$VERSION" ]; then
+  for f in dist/tangent-"${PKG_VERSION}"-freebsd-*; do [ -f "$f" ] && ARTIFACTS+=("$f"); done
+fi
 shopt -u nullglob
 if [ "${#ARTIFACTS[@]}" -eq 0 ]; then
   echo "no artifacts for $VERSION in dist/ — nothing to check or checksum" >&2
   exit 1
+fi
+# A FreeBSD release is the .pkg AND both bundles — the small one is for the
+# person this port exists for. Only judged on the host that builds them.
+if [ "$(uname -s)" = FreeBSD ] && [ "$SUMS_ONLY" = 0 ]; then
+  for kind in desktop complete; do
+    ls dist/tangent-"${PKG_VERSION}"-freebsd-*-"$kind".tar.gz >/dev/null 2>&1 \
+      || note "no $kind bundle for $PKG_VERSION (build-freebsd.sh needs root or doas to fetch it)"
+  done
 fi
 
 echo "==> Checking ${#ARTIFACTS[@]} artifact(s)"
@@ -228,6 +328,10 @@ for a in "${ARTIFACTS[@]}"; do
   # as the empty Linux tarball: it installs, it looks right, and the thing the
   # user came for is not there.
   case "$a" in
+    *-freebsd-*.pkg)
+      check_freebsd_pkg "$a"
+      continue
+      ;;
     *.pkg)
       exp="$(mktemp -d)"
       if pkgutil --expand "$a" "$exp/x" 2>/dev/null; then
@@ -297,6 +401,9 @@ for a in "${ARTIFACTS[@]}"; do
       ;;
     *windows*)
       printf '%s\n' "$list" | grep -Eq '^tangent\.exe$'        || note "$a: no tangent.exe"
+      ;;
+    *-freebsd-*)
+      check_freebsd_bundle "$a" "$list"
       ;;
     *linux*)
       printf '%s\n' "$list" | grep -Eq '/tangent$'             || note "$a: NO BINARY (the pre-2.1.0 empty-tarball bug)"

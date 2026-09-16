@@ -146,6 +146,19 @@ install -m 0644 "$ROOT/assets/tangent.desktop" \
 # a taskbar slot, and the hairlines in it scale down to nothing anyway.
 install -m 0644 "$ROOT/assets/tangent-128.png" \
                 "$PREFIXDIR/share/icons/hicolor/128x128/apps/tangent.png"
+# **The licence texts accompany every copy**, as every other artifact's
+# already do (docs/RELEASE.md): the OFL requires it of the fonts embedded in
+# the binary, and THIRD-PARTY-LICENSES is this project's own rule. pkg's
+# convention for them is share/licenses/<name>/, and release.sh refuses a
+# .pkg without them — this package shipped two releases with only LICENSE.
+LIC="$PREFIXDIR/share/licenses/tangent"
+mkdir -p "$LIC/font-licenses"
+install -m 0644 "$ROOT/LICENSE"                "$LIC/LICENSE"
+install -m 0644 "$ROOT/THIRD-PARTY-LICENSES"   "$LIC/THIRD-PARTY-LICENSES"
+install -m 0644 "$ROOT/assets/fonts/OFL.txt"   "$LIC/OFL.txt"
+for f in "$ROOT"/assets/font-licenses/*.txt; do
+    install -m 0644 "$f" "$LIC/font-licenses/"
+done
 
 # ── Manifest ─────────────────────────────────────────────────────────────────
 sed "s/@@VERSION@@/$PKG_VERSION/" \
@@ -244,7 +257,13 @@ bundle() {
     cp "$FINAL" "$dir/"
     cp "$ROOT/installer/freebsd/install.sh" "$dir/install.sh"
     chmod 755 "$dir/install.sh"
-    cp "$ROOT/LICENSE" "$dir/LICENSE" 2>/dev/null || true
+    # The same licence set every other archive carries — see the staging
+    # above for why, and release.sh for what refuses a bundle without them.
+    cp "$ROOT/LICENSE" "$dir/LICENSE"
+    cp "$ROOT/THIRD-PARTY-LICENSES" "$dir/THIRD-PARTY-LICENSES"
+    cp "$ROOT/assets/fonts/OFL.txt" "$dir/OFL.txt"
+    mkdir -p "$dir/font-licenses"
+    cp "$ROOT"/assets/font-licenses/*.txt "$dir/font-licenses/"
     write_readme "$kind" > "$dir/README.txt"
 
     out="$DIST/tangent-$PKG_VERSION-freebsd-$ABI_TAG-$kind.tar.gz"
@@ -284,6 +303,9 @@ WHAT IS IN HERE
         printf 'every dependency, so this works on a\n                      machine that has never had a desktop package installed.' )
     install.sh        the installer
     README.txt        this
+    LICENSE, OFL.txt, THIRD-PARTY-LICENSES, font-licenses/
+                      the licences: Tangent's, the embedded fonts', and
+                      everything else the binary carries
 
 AFTER INSTALLING
 

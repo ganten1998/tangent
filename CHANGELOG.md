@@ -10,7 +10,29 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+### Added
+
+- **FreeBSD is a release platform.** `scripts/release.sh` on a FreeBSD host
+  runs `build-freebsd.sh`, checks the `.pkg` and both offline bundles the way
+  every other artifact is checked - both manifests, the binaries, the desktop
+  entry, the licence texts, the declared `alsa-lib`, `alsa-plugins` and `lilv`,
+  no GhostBSD base dependency, the right version - and `publish-github.sh`
+  uploads them. pkg spells a prerelease its own way (`5.0.0-rc.1` is
+  `5.0.0.r1`), so the three scripts share one `sed` and `check.sh` holds the
+  copies byte-identical. Until now the port built and shipped by hand, outside
+  every checksum and upload glob; the decision whether it ships is made.
+
 ### Fixed
+
+- **The FreeBSD package and bundles now carry the licence texts.** Every
+  other artifact ships `LICENSE`, `OFL.txt`, `THIRD-PARTY-LICENSES` and the
+  `font-licenses/` folder; the FreeBSD `.pkg` installed none of them and the
+  bundles carried only `LICENSE`. The OFL requires its text to accompany the
+  fonts embedded in the binary, so this was a licence gap, not a cosmetic one.
+  The `.pkg` installs them under `share/licenses/tangent/`, the bundles carry
+  them at the top level, and `release.sh` refuses either without them - which
+  is what found it: the new checks, run against the artifacts already in
+  `dist/`, failed on exactly those files and nothing else.
 
 - **An open band with no camera no longer holds the window at 30 fps.** The
   band asks the capture thread for a preview whenever it is open, and the

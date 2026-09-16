@@ -8,3 +8,15 @@ bin/tangent
 bin/tangent-jack
 share/applications/tangent.desktop
 share/icons/hicolor/128x128/apps/tangent.png
+@comment The licence texts, under pkg's own convention for them. release.sh
+@comment refuses a package without all three; build-freebsd.sh stages them.
+share/licenses/tangent/LICENSE
+share/licenses/tangent/OFL.txt
+share/licenses/tangent/THIRD-PARTY-LICENSES
+share/licenses/tangent/font-licenses/Hack-LICENSE.txt
+share/licenses/tangent/font-licenses/JetBrainsMono-OFL-1.1.txt
+share/licenses/tangent/font-licenses/NOTICE.txt
+share/licenses/tangent/font-licenses/NotoEmoji-OFL-1.1.txt
+share/licenses/tangent/font-licenses/Terminess-OFL-1.1.txt
+share/licenses/tangent/font-licenses/Ubuntu-Font-Licence-1.0.txt
+share/licenses/tangent/font-licenses/emoji-icon-font-MIT.txt

@@ -155,9 +155,15 @@ Notes on the set:
   `scripts/build-installer.sh macos` yourself after `build-macos.sh`, before
   checksums. The supporter email hands out the pkg permalink, so a release
   published without a fresh pkg breaks that link.
-- **FreeBSD** builds via `scripts/build-freebsd.sh` on a FreeBSD host, but is
-  outside the checksum and upload globs; whether its package ships with a
-  release is still an open decision.
+- **FreeBSD ships.** `scripts/release.sh` on a FreeBSD host runs
+  `scripts/build-freebsd.sh`, checks the `.pkg` and both offline bundles, and
+  `publish-github.sh` uploads them. Two things to know: pkg spells a
+  prerelease its own way (`5.0.0-rc.1` is `5.0.0.r1`, one shared `sed` in all
+  three scripts), so a prerelease's FreeBSD files do not match the
+  `*-<version>-*` glob and are found by their own name; and the bundles need
+  `pkg fetch`, which needs root — run `release.sh` as root or with `doas`, or
+  the run finishes with the missing bundles on the record as problems. The
+  `.pkg` installs the licence texts under `share/licenses/tangent/`.
 
 Every archive contains `README.txt` (generated from `docs/ARTIFACT-README.md`),
 `LICENSE`, `THIRD-PARTY-LICENSES`, `OFL.txt` and the `font-licenses/` folder.
@@ -216,6 +222,15 @@ Per artifact, it verifies and refuses to bless a release on failure:
 - **Linux tarballs**: the `tangent` binary (the pre-2.1.0 empty-tarball bug),
   `install.sh` (the README's first instruction; 4.92.0 shipped without it),
   and `tangent-ffmpeg` (video on a clean machine; also shipped missing once).
+- **FreeBSD pkg**: both manifests, `bin/tangent`, `bin/tangent-jack`, the
+  desktop entry and icon, and `LICENSE`, `OFL.txt`, `THIRD-PARTY-LICENSES`
+  under `share/licenses/tangent/` (the package shipped twice with only
+  `LICENSE`); the compact manifest must declare `alsa-lib`, `alsa-plugins`
+  and `lilv`, must not depend on a GhostBSD base package, and must carry this
+  version.
+- **FreeBSD bundles**: the app's own pkg inside, `install.sh`,
+  `THIRD-PARTY-LICENSES`, and the `alsa-lib`, `alsa-plugins` and `lilv`
+  pkgs; the `complete` bundle additionally `mesa-dri` and `ffmpeg`.
 
 These checks exist because every one of them has actually failed silently at
 least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
@@ -234,7 +249,9 @@ least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
 5. **Build**: `scripts/release.sh` on the Mac builds macOS, Windows and both
    Linux tarballs in one pass, then run `scripts/build-installer.sh macos`
    for the pkg (see the gap above) and `scripts/release.sh --sums-only` to
-   fold it into the checksums.
+   fold it into the checksums. On the FreeBSD box, `scripts/release.sh` (as
+   root or with `doas`, for the bundles) builds and checks the FreeBSD set;
+   copy its three files into the Mac's `dist/` before `--sums-only`.
 6. **Smoke-test.** `open dist/Tangent.app`. For Linux,
    `scripts/ship-linux.sh <ssh-host> [x86_64|aarch64]` installs the tarball
    on a real Linux box and proves it starts, finds ALSA and opens a window,
