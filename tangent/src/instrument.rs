@@ -7779,6 +7779,9 @@ impl Renderer {
             // "100 percent a volume jump on a send added". Every path a lane
             // reaches the master by has to answer to the same switch.
             let direct = self.route_direct.get(strip.index()).copied().unwrap_or(1.0);
+            // See `folder_chain_gain`: the room's subtrahend for a grouped
+            // strip is what its folders will make of it, not the raw input.
+            let chain = self.folder_chain_gain(lane);
             for i in 0..n {
                 // The room's own slew, advanced here rather than above: it
                 // moves once per frame however many inputs are open, and
@@ -7826,7 +7829,7 @@ impl Renderer {
                     // four inputs share one buffer and the last one to run
                     // would otherwise be the only one the speakers were spared.
                     if let Some(d) = self.input_dry.get_mut(at + c) {
-                        *d += src * keep_out;
+                        *d += src * keep_out * chain[c.min(1)];
                     }
                     // Post-fader, like every other send here, and closed with
                     // the room: a channel nobody can hear must not arrive back
@@ -10716,6 +10719,36 @@ impl Renderer {
             // and it moves because there is finally something in the bus.
             self.shared.note_strip_peak(Strip::Channel(ch), peak);
         }
+    }
+
+    /// **What the folders above a lane will make of what it puts on the
+    /// bus**, per side: the product of every ancestor's slewed gain and pan.
+    ///
+    /// A grouped strip reaches the mix through its folder's fold, not on
+    /// its own, so what the room has to keep out of a withheld live input
+    /// is what the FOLD contributed, not the raw input. The subtrahend used
+    /// to be the raw input: a muted folder contributed nothing, and taking
+    /// the input off a room that never received it put it into the
+    /// speakers inverted — the owner's "tracks can be heard if record armed
+    /// and their parent folder is muted". The folder's RACK is not
+    /// modelled: with inserts on a folder the cancellation is as
+    /// approximate as it has always been. A lane with no folder gets 1.
+    fn folder_chain_gain(&self, lane: usize) -> [f32; 2] {
+        let mut g = [1.0f32; 2];
+        let mut up = self.folders.get(lane).copied().unwrap_or(-1);
+        let mut hops = 0;
+        while let Ok(a) = usize::try_from(up) {
+            if a >= CHANNELS || hops > CHANNELS {
+                break;
+            }
+            let (pl, pr) = pan_gains(self.lane_pan(a));
+            let fg = self.channel_gain.get(a).copied().unwrap_or(1.0);
+            g[0] *= fg * pl;
+            g[1] *= fg * pr;
+            up = self.folders.get(a).copied().unwrap_or(-1);
+            hops += 1;
+        }
+        g
     }
 
     /// Push the recorder's mix, whole frames only.
@@ -26141,6 +26174,81 @@ mod tests {
                 assert!(room > 0.4, "{case}: the speakers got nothing (peak {room})");
             } else {
                 assert!(room < 1.0e-3, "{case}: the input reached the speakers (peak {room})");
+            }
+        }
+    }
+
+    /// **A grouped strip's live input reaches the mix through its folder,
+    /// so what the room keeps out is what the FOLD contributed.** The
+    /// subtrahend used to be the raw input: a folder that muted or turned
+    /// the child down contributed less than that, and the difference came
+    /// out of the speakers inverted — the owner's "tracks can be heard if
+    /// record armed and their parent folder is muted". A muted folder keeps
+    /// its armed child out of the room AND, since the fold is where the
+    /// folder's mute lives, out of the take; an unmuted folder passes it to
+    /// the take and the room still hears nothing with monitoring off.
+    #[test]
+    fn an_armed_child_of_a_muted_folder_stays_out_of_the_room() {
+        // (folder muted, monitoring) -> (in the take, in the room)
+        for (folder_muted, monitoring, take_wants, room_wants) in [
+            (true, false, false, false),
+            (true, true, false, false),
+            (false, false, true, false),
+            (false, true, true, true),
+        ] {
+            let shared = Arc::new(Shared::new());
+            let (tap_tx, tap_rx) = RingBuffer::<f32>::new(1 << 16);
+            let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+            let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
+            r.monitor = Some(in_rx);
+            r.monitor_channels = 1;
+            r.monitor_widths = inputs_array([1]);
+            r.monitor_scratch = vec![0.0; 8192];
+            // Lane 1 is the child, lane 2 its folder — pushed the way the desk
+            // pushes it, so the renderer's own tree walk builds the folder.
+            shared.folder_of[1].store(2, Ordering::Relaxed);
+            shared.pick_strip[0].store(1, Ordering::Relaxed);
+            shared.midi_off.store(1 << 1, Ordering::Relaxed);
+            shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+            shared.channel_gains[2].store(1.0f32.to_bits(), Ordering::Relaxed);
+            shared.armed.store(1 << 1, Ordering::Relaxed);
+            if folder_muted {
+                shared.muted.store(1 << 2, Ordering::Relaxed);
+            }
+            r.channel_gain[1] = 1.0;
+            r.channel_gain[2] = 1.0;
+            shared.monitor_on.store(monitoring, Ordering::Relaxed);
+            let mut tap = RecorderTap {
+                rx: tap_rx,
+                channels: TAP_CHANNELS,
+                sample_rate: 48_000,
+                dropped: Arc::clone(&shared),
+            };
+            let mut out = vec![0.0f32; 256 * 2];
+            let mut captured = Vec::new();
+            let (mut taped, mut room) = (0.0f32, 0.0f32);
+            let blocks = 48_000 * 10 / 256;
+            for b in 0..blocks {
+                for _ in 0..256 {
+                    let _ = in_tx.push(0.5);
+                }
+                let now = (b as u64) * 256 * 1_000_000_000 / 48_000;
+                r.render(&mut out, now as Nanos, now as Nanos);
+                captured.clear();
+                tap.drain(&mut captured);
+                taped = captured.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+                room = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+            }
+            let case = format!("folder_muted={folder_muted} monitoring={monitoring}");
+            if take_wants {
+                assert!(taped > 0.4, "{case}: the child is missing from the take (peak {taped})");
+            } else {
+                assert!(taped < 1.0e-3, "{case}: the child reached the take (peak {taped})");
+            }
+            if room_wants {
+                assert!(room > 0.4, "{case}: the speakers got nothing (peak {room})");
+            } else {
+                assert!(room < 1.0e-3, "{case}: the child reached the speakers (peak {room})");
             }
         }
     }
