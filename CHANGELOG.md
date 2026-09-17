@@ -40,6 +40,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **An armed strip inside a muted folder no longer comes out of the
+  speakers.** A grouped strip's live input reaches the mix through its
+  folder's fold, but what the room kept out of a withheld input was the raw
+  input, so with the folder muted, or merely turned down, the difference
+  came out of the speakers inverted: the take was silent and the room was
+  not. What the room keeps out now follows the folder chain's gain and pan,
+  so a muted folder keeps its armed child out of the room as well as out of
+  the take.
+
 - **An armed strip is in the take whatever the mute does, and the band's
   VU follows it.** The take is the desk, and the desk dropped a strip nobody
   could hear, armed or not, so the VU over a vocal being recorded
