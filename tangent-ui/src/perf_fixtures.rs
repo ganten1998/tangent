@@ -385,6 +385,7 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
             capo_style: s.capo_style.clone(),
             tuning: s.fretboard_tuning.clone(),
         }),
+        frozen: Some(s.frozen_lanes.clone()),
     }
 }
 

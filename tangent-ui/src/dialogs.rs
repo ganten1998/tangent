@@ -98,6 +98,11 @@ pub enum Dialog {
         /// keyboard at once, rather than to whichever of the four somebody
         /// remembered.
         midi_clips: usize,
+        /// Whether the lane is frozen, and whether the row may be offered
+        /// at all (a used, non-folder lane with something to render, or a
+        /// frozen one to thaw). Appended, the struct's law.
+        frozen: bool,
+        can_freeze: bool,
     },
     /// The project export: sources, rate, shape, formats, speed — and the
     /// arrange view's time selection, if one stands.
@@ -1448,6 +1453,16 @@ fn track_export_row_h(midi_clips: usize) -> f32 {
     }
 }
 
+/// What the Freeze row costs the track menu in height, or nothing when
+/// the lane has nothing to freeze and nothing to thaw.
+fn track_freeze_row_h(can_freeze: bool) -> f32 {
+    if can_freeze {
+        TRACK_EXPORT_ROW_H + TRACK_EXPORT_ROW_GAP
+    } else {
+        0.0
+    }
+}
+
 /// What the Insert Track row costs a live track's menu.
 ///
 /// Unconditional on a live track, unlike its two neighbours: inserting does
@@ -1587,6 +1602,8 @@ pub enum DialogAction {
     /// Take this whole track — kind, name, colour, levels, bays and clips —
     /// and hold it for an empty slot.
     TrackCopy(usize),
+    /// Freeze this lane, or thaw it — see `ProjectRequest::Freeze`.
+    TrackFreeze(usize),
     /// Put the held track on this EMPTY slot.
     TrackPaste(usize),
     /// Paint one channel by hand — index into `STRIP_COLORS`.
@@ -10621,11 +10638,14 @@ fn show_on(
             serial,
             can_paste,
             midi_clips,
+            frozen,
+            can_freeze,
         } => {
             let t = theme(face);
             let lane = *lane;
             let removable = *removable;
             let midi_clips = *midi_clips;
+            let (frozen, can_freeze) = (*frozen, *can_freeze);
             // An EMPTY slot's menu is a different, much smaller thing: there
             // is no track here to remove, recolour or badge. `removable` is
             // what says a track exists — it is false for the buses too, which
@@ -10665,6 +10685,7 @@ fn show_on(
                     520.0,
                     TRACK_DIALOG_H
                         + track_export_row_h(midi_clips)
+                        + track_freeze_row_h(can_freeze)
                         + track_paste_row_h(removable, can_paste)
                         + track_insert_row_h(removable),
                 ),
@@ -10672,6 +10693,7 @@ fn show_on(
                     520.0,
                     TRACK_DIALOG_H
                         + track_export_row_h(midi_clips)
+                        + track_freeze_row_h(can_freeze)
                         + track_paste_row_h(removable, can_paste)
                         + track_insert_row_h(removable),
                 ),
@@ -10825,6 +10847,34 @@ fn show_on(
                                         .clicked()
                                     {
                                         action = Some(DialogAction::ExportMidi(lane));
+                                    }
+                                    ui.add_space(TRACK_EXPORT_ROW_GAP);
+                                }
+                                // **Freeze, or thaw.** One row, two faces, the
+                                // way the bays' BYPASS row is one row.
+                                // Cmd/Ctrl+Shift+F on the selected track is the
+                                // same door.
+                                if can_freeze {
+                                    let label = if frozen {
+                                        "Unfreeze Track"
+                                    } else {
+                                        "Freeze Track  (renders the rack, then rests it)"
+                                    };
+                                    if ui
+                                        .add_sized(
+                                            Vec2::new(
+                                                ui.available_width(),
+                                                TRACK_EXPORT_ROW_H,
+                                            ),
+                                            Button::new(
+                                                RichText::new(label)
+                                                    .font(plain(11.0))
+                                                    .color(t.text),
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some(DialogAction::TrackFreeze(lane));
                                     }
                                     ui.add_space(TRACK_EXPORT_ROW_GAP);
                                 }

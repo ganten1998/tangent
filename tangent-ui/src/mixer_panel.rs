@@ -112,6 +112,8 @@ pub struct StripView<'a> {
     /// every list in this app grows at the end: an existing field's meaning
     /// is a thing other code has already been written against.
     pub bypassed: [bool; INSERTS * 2],
+    /// **Frozen** - see `arrangement_panel::LaneView::frozen`. Appended.
+    pub frozen: bool,
 }
 
 impl StripView<'_> {
@@ -2845,11 +2847,28 @@ fn strip(
             // that vanishes on precisely the themes somebody chose for being
             // warm. See the all-theme sweep in this file's tests.
             let bypassed = v.bypassed.get(n).copied().unwrap_or(false);
-            let tab = if bypassed {
+            // **Frost over a frozen strip's bays**, before amber: a frozen
+            // rack rests whole, bypass or no bypass, and the first bay wears
+            // the snowflake the lane's header wears.
+            let tab = if v.frozen {
+                crate::arrangement_panel::FROST_INK
+            } else if bypassed {
                 crate::recorder_panel::lit_on(p.mute, p.face)
             } else {
                 p.lit
             };
+            if v.frozen {
+                painter.rect_filled(*cell, 1.0, crate::arrangement_panel::FROST_TINT);
+                if n == 0 {
+                    let r = (cell.height() * 0.3).clamp(3.0, 6.0);
+                    crate::arrangement_panel::snowflake(
+                        painter,
+                        Pos2::new(cell.right() - r - 2.0, cell.center().y),
+                        r,
+                        crate::arrangement_panel::FROST_INK,
+                    );
+                }
+            }
             painter.rect_filled(
                 Rect::from_min_max(
                     cell.min,
@@ -3768,6 +3787,7 @@ mod tests {
             armed: false,
             keyed: [false; INSERTS * 2],
             bypassed: [false; INSERTS * 2],
+            frozen: false,
         }
     }
 

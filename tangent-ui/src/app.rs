@@ -6726,6 +6726,7 @@ impl TangentApp {
                     let (seat, bay) = recorder::seat_bay(i, n);
                     self.insert_bypassed(seat, bay)
                 }),
+                frozen: i < recorder::CHANNELS && self.lane_frozen(i).is_some(),
                 kind,
                 icon,
                 empty,
@@ -6838,6 +6839,7 @@ impl TangentApp {
                     }),
                     // The master's two racks, resolved the way its names
                     // are: slots 0..2 are the extra seat, 3..5 the original.
+                    frozen: false,
                     bypassed: std::array::from_fn(|n| {
                         let (seat, bay) =
                             recorder::seat_bay(recorder::STRIPS, n);
@@ -9722,6 +9724,7 @@ impl TangentApp {
                 capo_style: &s.capo_style,
                 tuning: &s.fretboard_tuning,
             }),
+            frozen: Some(&s.frozen_lanes),
         }
     }
 
@@ -10012,6 +10015,22 @@ impl TangentApp {
                 self.settings.fretboard_tuning = n.tuning.to_owned();
             }
         }
+        // **A freeze does not outlive its document.** `None` here is "this
+        // document has nothing frozen", not "the live value stands" — see
+        // `DeskSnap::frozen` — because the file a freeze points at lives in
+        // that document's media folder and no other. One entry per lane,
+        // the last one said wins, and a lane the desk does not have is
+        // dropped rather than carried.
+        let mut frozen: Vec<crate::arrangement::FrozenLane> = Vec::new();
+        for z in d.frozen.iter().flatten() {
+            if z.lane >= recorder::CHANNELS || z.path.is_empty() || !z.len_s.is_finite() {
+                continue;
+            }
+            frozen.retain(|f| f.lane != z.lane);
+            frozen.push(z.clone());
+        }
+        frozen.sort_by_key(|f| f.lane);
+        self.settings.frozen_lanes = frozen;
         // A group is not a send destination — `set_is_folder` enforces
         // that at the gesture, but a document's folder arrives here, and
         // the routes it must displace live in settings, not in the
@@ -10593,6 +10612,139 @@ impl TangentApp {
     /// wears the wood.
     /// Whether channel `n` IS a track: an input bound, clips standing on
     /// it, or added bare by the + circle / Ctrl+T.
+    // ── track freezing ──────────────────────────────────────────────────
+
+    /// The frozen file standing in for this lane, if the lane is frozen.
+    /// See `arrangement::FrozenLane`.
+    pub fn lane_frozen(&self, lane: usize) -> Option<&crate::arrangement::FrozenLane> {
+        self.settings.frozen_lanes.iter().find(|z| z.lane == lane)
+    }
+
+    /// Every frozen lane, in lane order.
+    pub fn frozen_lanes(&self) -> &[crate::arrangement::FrozenLane] {
+        &self.settings.frozen_lanes
+    }
+
+    /// Whether a freeze would render anything: a used channel that is not a
+    /// folder, not already frozen, and carries a clip or a loaded bay.
+    /// A folder is its children's fold and freezes with them, not alone.
+    pub fn can_freeze(&self, lane: usize) -> bool {
+        lane < recorder::CHANNELS
+            && self.channel_used(lane)
+            && !self.is_folder(lane)
+            && self.lane_frozen(lane).is_none()
+            && (self.arrangement.clips.iter().any(|c| c.lane == lane)
+                || (0..recorder::INSERTS).any(|b| self.insert(lane, b).is_some()))
+    }
+
+    /// **Cmd/Ctrl+Shift+F on the selected track.** Frozen thaws, live freezes,
+    /// and a lane with nothing to render says so rather than doing nothing.
+    fn freeze_selected(&mut self) {
+        let Some(lane) = self.selected_channel.filter(|n| *n < recorder::CHANNELS) else {
+            self.notify(crate::notify::Kind::Info, "Select a track to freeze it.");
+            return;
+        };
+        self.freeze_toggle(lane);
+    }
+
+    /// Freeze this lane, or thaw it if it is frozen.
+    pub fn freeze_toggle(&mut self, lane: usize) {
+        if self.lane_frozen(lane).is_some() {
+            self.unfreeze_track(lane);
+            return;
+        }
+        if !self.can_freeze(lane) {
+            let why = if self.is_folder(lane) {
+                "A folder freezes with its tracks - freeze those."
+            } else if !self.channel_used(lane) {
+                "Nothing on that track to freeze."
+            } else {
+                "Nothing on that track to freeze - it has no clips and no bays."
+            };
+            self.notify(crate::notify::Kind::Info, why);
+            return;
+        }
+        if self.project_doc().is_none() {
+            self.notify(
+                crate::notify::Kind::Info,
+                "Save the project first - the frozen file lives in its media folder.",
+            );
+            return;
+        }
+        // The host renders and comes back through `note_frozen`.
+        self.project_request = Some(crate::ports::ProjectRequest::Freeze(lane));
+    }
+
+    /// **Thaw**: the lane's own clips and rack come back exactly as they
+    /// were, because nothing about them changed while it was frozen. The
+    /// rendered file is left in the media folder: undo can refreeze without
+    /// a render, and a file nothing points at costs nothing but disk.
+    pub fn unfreeze_track(&mut self, lane: usize) {
+        let before = self.settings.frozen_lanes.len();
+        self.settings.frozen_lanes.retain(|z| z.lane != lane);
+        if self.settings.frozen_lanes.len() == before {
+            return;
+        }
+        self.arr_save_edits();
+        let name = self.channel_display_name(lane);
+        self.notify(crate::notify::Kind::Success, format!("Thawed {name}"));
+    }
+
+    /// **The host's word that the render is done.** `path` is relative to
+    /// the document like a clip's, `len_s` the file's length. The lane is
+    /// disarmed: a take onto a frozen lane would record into clips the
+    /// frozen file does not know about. Joins undo through `arr_save_edits`.
+    pub fn note_frozen(&mut self, lane: usize, path: String, len_s: f64) {
+        if lane >= recorder::CHANNELS || path.is_empty() || !len_s.is_finite() {
+            return;
+        }
+        self.settings.frozen_lanes.retain(|z| z.lane != lane);
+        self.settings.frozen_lanes.push(crate::arrangement::FrozenLane {
+            lane,
+            path,
+            len_s: len_s.max(0.0),
+        });
+        self.settings.frozen_lanes.sort_by_key(|z| z.lane);
+        if let Some(mask) = self.settings.channel_armed.as_mut() {
+            *mask &= !(1u32 << lane.min(31));
+        }
+        self.arr_save_edits();
+        let name = self.channel_display_name(lane);
+        self.notify(crate::notify::Kind::Success, format!("Froze {name}"));
+    }
+
+    /// Says why the edit was refused, and that it was. `true` when the lane
+    /// is frozen.
+    fn frozen_refuses(&mut self, lane: usize) -> bool {
+        if self.lane_frozen(lane).is_none() {
+            return false;
+        }
+        let name = self.channel_display_name(lane);
+        self.notify(
+            crate::notify::Kind::Info,
+            format!("{name} is frozen - unfreeze it to edit (Cmd/Ctrl+Shift+F)."),
+        );
+        true
+    }
+
+    /// `frozen_refuses`, for a clip by id.
+    fn frozen_refuses_clip(&mut self, id: u64) -> bool {
+        match self.arrangement.clips.iter().find(|c| c.id == id).map(|c| c.lane) {
+            Some(lane) => self.frozen_refuses(lane),
+            None => false,
+        }
+    }
+
+    /// The lane of the first selected clip that is frozen, if any.
+    fn arr_selected_frozen_lane(&self) -> Option<usize> {
+        self.arrangement
+            .clips
+            .iter()
+            .filter(|c| self.arr_selected == Some(c.id) || self.arr_multi.contains(&c.id))
+            .map(|c| c.lane)
+            .find(|lane| self.lane_frozen(*lane).is_some())
+    }
+
     pub fn channel_used(&self, n: usize) -> bool {
         self.channel_kind(n).is_some()
             || self.lane_has_clips(n)
@@ -11435,6 +11587,8 @@ impl TangentApp {
             // this window can hold. The guard on `native_file_dialogs` is the
             // one `arr_export_midi` states: no OS panel, no export, so no row
             // about one.
+            frozen: self.lane_frozen(lane).is_some(),
+            can_freeze: self.lane_frozen(lane).is_some() || self.can_freeze(lane),
             midi_clips: if self.caps.native_file_dialogs {
                 self.arrangement
                     .clips
@@ -12501,6 +12655,20 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     ///
     /// The constant-tempo answer is unchanged, because the conversion is a
     /// multiply in that case and this reduces to the modulo it replaces.
+    /// **The playhead walks the grid on the arrow keys**, in the arrange
+    /// view: a grid step per press, a bar per press with Shift, and onto the
+    /// grid when snap is on so a head parked between lines lands on one.
+    /// The owner: "need arrow keys to move the playhead in arrange view".
+    /// Never below zero, and never further than asked: with snap on the
+    /// step is rounded to the nearest line, which from a line IS the next
+    /// line, and from between two lines is the nearer of the two ahead.
+    fn arr_step_playhead(&mut self, dir: f64, by_bar: bool) {
+        let step = if by_bar { self.arr_bar_s() } else { self.arr_grid_s() }.max(0.01);
+        let to = (self.playhead_s() + dir.signum() * step).max(0.0);
+        let to = self.arr_snap_t(to);
+        self.locate(to);
+    }
+
     fn arr_snap_t(&self, t: f64) -> f64 {
         if !self.settings.arr_snap {
             return t.max(0.0);
@@ -16151,6 +16319,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     fn arr_delete_selected(&mut self) {
+        // **A frozen lane's clips stay** - they are what the frozen file was
+        // rendered from, and thawing has to find them. The nodes and rows
+        // below are untouched by this: only clips are frozen.
+        if let Some(lane) = self.arr_selected_frozen_lane() {
+            self.frozen_refuses(lane);
+            return;
+        }
         // **A chosen automation row goes first.** It is the only thing
         // selected when it is selected — see `arr_select_auto_row` — so this
         // can never take a clip somebody meant to keep.
@@ -17513,6 +17688,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     /// keypress in the same frame reads. A run of Enter presses that waited a
     /// round trip each would stack every note on one grid line.
     fn me_locate(&mut self, to: f64) {
+        self.locate(to);
+    }
+
+    /// The same, from anywhere: the arrange view's arrows walk the playhead
+    /// through this too. See `me_locate` for why it writes both sides.
+    fn locate(&mut self, to: f64) {
         let to = to.max(0.0);
         self.recorder.position_s = to;
         self.request_recorder(recorder::RecorderRequest::Locate(to));
@@ -17949,6 +18130,61 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
 
     /// DELETE the whole selection, highest index first so nothing slides
     /// under the knife.
+    /// **Backspace takes a note back and puts the playhead where it was.**
+    ///
+    /// Enter writes a note and walks the playhead past it; Backspace is its
+    /// undo key, and an undo that left the head where the deleted note used
+    /// to end would have the next Enter write into the hole. So the head
+    /// goes to the start of what was deleted, which is where it stood before
+    /// that note was written: the owner's "make backspace deleting a note
+    /// move the playhead back to its previous position". With nothing
+    /// selected it takes the note that ended last at or before the head,
+    /// the way Backspace in text takes the character before the cursor.
+    /// Delete still deletes without moving anything.
+    fn me_backspace(&mut self) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let mut sel = st.selected.clone();
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+            return;
+        };
+        let head = self.playhead_s();
+        let start_of = |n: &crate::arrangement::ArrNote| clip.start_s + (n.at_s - clip.offset_s);
+        if sel.is_empty() {
+            let last = clip
+                .notes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| start_of(n) + n.dur_s <= head + 1.0e-6)
+                .max_by(|a, b| {
+                    (start_of(a.1) + a.1.dur_s)
+                        .partial_cmp(&(start_of(b.1) + b.1.dur_s))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.0.cmp(&b.0))
+                })
+                .map(|(i, _)| i);
+            sel = last.into_iter().collect();
+        }
+        if sel.is_empty() {
+            return;
+        }
+        let back = sel
+            .iter()
+            .filter_map(|&i| clip.notes.get(i))
+            .map(start_of)
+            .fold(f64::INFINITY, f64::min);
+        let floor = clip.start_s;
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.selected = sel;
+        }
+        self.me_delete_selected();
+        if back.is_finite() {
+            self.me_locate(back.max(floor));
+        }
+    }
+
     fn me_delete_selected(&mut self) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -18179,6 +18415,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     fn open_midi_editor(&mut self, id: u64) {
+        if let Some(lane) = self.arrangement.clips.iter().find(|c| c.id == id).map(|c| c.lane) {
+            if self.lane_frozen(lane).is_some() {
+                self.frozen_refuses(lane);
+                return;
+            }
+        }
         let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
             return;
         };
@@ -20645,24 +20887,38 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 if arrow(egui::Key::ArrowDown) {
                     self.me_extend_selection(-1);
                 }
+            } else if alt_k {
+                // **Alt walks the SELECTION**, in time and in pitch. The
+                // bare left and right used to nudge whenever a note was held,
+                // and Enter leaves the note it wrote held, so the arrows
+                // stopped being the playhead the moment a note went in: the
+                // owner's "need arrow keys to move the playhead in ... midi
+                // view". The nudge keeps a chord, one modifier over.
+                if arrow(egui::Key::ArrowLeft) {
+                    self.me_nudge(-1.0, 0);
+                }
+                if arrow(egui::Key::ArrowRight) {
+                    self.me_nudge(1.0, 0);
+                }
+                if arrow(egui::Key::ArrowUp) {
+                    self.me_nudge(0.0, 1);
+                    self.me_cursor_follows();
+                }
+                if arrow(egui::Key::ArrowDown) {
+                    self.me_nudge(0.0, -1);
+                    self.me_cursor_follows();
+                }
             } else if bare {
                 let holding = self
                     .midi_edit
                     .as_ref()
                     .is_some_and(|st| !st.selected.is_empty());
+                // **Left and right are the playhead, selection or not.**
                 if arrow(egui::Key::ArrowLeft) {
-                    if holding {
-                        self.me_nudge(-1.0, 0);
-                    } else {
-                        self.me_step_playhead(-1.0);
-                    }
+                    self.me_step_playhead(-1.0);
                 }
                 if arrow(egui::Key::ArrowRight) {
-                    if holding {
-                        self.me_nudge(1.0, 0);
-                    } else {
-                        self.me_step_playhead(1.0);
-                    }
+                    self.me_step_playhead(1.0);
                 }
                 if arrow(egui::Key::ArrowUp) {
                     if holding {
@@ -20687,10 +20943,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.me_insert_at_playhead();
             }
 
-            if ctx.input(|i| {
-                i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
-            }) {
+            // **Delete deletes; Backspace also steps back.** See `me_backspace`.
+            if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
                 self.me_delete_selected();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Backspace)) {
+                self.me_backspace();
             }
         }
 
@@ -22303,6 +22561,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             .clamp(1, recorder::CHANNELS as i64);
                         if next != cur {
                             self.settings.arr_visible = next as u8;
+                            // And the height it was chosen at - see `carried_count`.
+                            self.settings.arr_visible_at =
+                                arr_timeline_h(&self.settings, self.count_pane());
                             // Re-clamp the STORE too — the mixer's rule:
                             // zooming in while scrolled deep left the
                             // stale value above the new max, and wheel-up
@@ -22988,7 +23249,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                                 })
                                 .map(|c| (c.id, c.start_s, c.lane))
                                 .collect();
-                            self.arr_drag = Some(ArrDrag::Move { id, dt });
+                            if !self.frozen_refuses_clip(id) {
+                                self.arr_drag = Some(ArrDrag::Move { id, dt });
+                            }
                         }
                     }
                     Some(A::ClipLeft(id)) | Some(A::ClipRight(id)) | Some(A::FadeIn(id))
@@ -23029,11 +23292,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                                 orig.iter().map(|c| c.start_s).fold(f64::MAX, f64::min)
                             };
                             self.arr_stretch_orig = orig;
-                            self.arr_drag = Some(ArrDrag::Stretch {
-                                id,
-                                from_left: edge_left,
-                                anchor,
-                            });
+                            self.arr_drag = if self.frozen_refuses_clip(id) {
+                                None
+                            } else {
+                                Some(ArrDrag::Stretch {
+                                    id,
+                                    from_left: edge_left,
+                                    anchor,
+                                })
+                            };
+                        } else if self.frozen_refuses_clip(id) {
+                            self.arr_drag = None;
                         } else {
                             self.arr_drag = Some(match hit {
                                 Some(A::ClipLeft(_)) => ArrDrag::TrimLeft { id },
@@ -23073,8 +23342,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                             // channel it simply does not sound, which is
                             // the neat kind of nothing, the owner's word.
                             let anchor = self.arr_snap_t(t);
-                            self.arr_pending = Some((lane, anchor, anchor));
-                            self.arr_drag = Some(ArrDrag::CreateMidi { lane, anchor });
+                            if !self.frozen_refuses(lane) {
+                                self.arr_pending = Some((lane, anchor, anchor));
+                                self.arr_drag = Some(ArrDrag::CreateMidi { lane, anchor });
+                            }
                         } else if alt {
                             // Alt-drag GRABS the view: the hand moves the
                             // window, the song stays put.
@@ -23749,6 +24020,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         {
             self.time_sel = None;
         }
+        // **Left and right walk the playhead**, a grid step a press and a
+        // bar with Shift — see `arr_step_playhead`. Not while a control has
+        // keyboard focus (`a11y_on`): its arrows are the screen reader's.
+        if keys_ok && self.midi_edit.is_none() && self.a11y_on.is_none() {
+            let (left, right, by_bar) = ctx.input(|i| {
+                let plain = !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.alt;
+                (
+                    plain && i.key_pressed(egui::Key::ArrowLeft),
+                    plain && i.key_pressed(egui::Key::ArrowRight),
+                    i.modifiers.shift,
+                )
+            });
+            if left {
+                self.arr_step_playhead(-1.0, by_bar);
+            }
+            if right {
+                self.arr_step_playhead(1.0, by_bar);
+            }
+        }
         // **The zoom keys: `-` out, `=` in, `W` fits the biggest clip** —
         // each increment around the playhead, the wheel's own anchor.
         if keys_ok && self.midi_edit.is_none() {
@@ -23830,13 +24120,22 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // Two meanings, decided by what is chosen, and both are the
             // gesture somebody would actually make: several tracks picked
             // means "group these", an empty slot means "start a group here".
-            // See `make_folder`.
+            // See `make_folder`. **Cmd/Ctrl+F is the folder, Cmd/Ctrl+Shift+F
+            // the FREEZE** - the owner's ruling after a day with them the
+            // other way round.
             if ctx.input(|i| {
                 (i.modifiers.command || i.modifiers.ctrl)
                     && !i.modifiers.shift
                     && i.key_pressed(egui::Key::F)
             }) {
                 self.make_folder();
+            }
+            if ctx.input(|i| {
+                (i.modifiers.command || i.modifiers.ctrl)
+                    && i.modifiers.shift
+                    && i.key_pressed(egui::Key::F)
+            }) {
+                self.freeze_selected();
             }
         }
         // **Ctrl/Cmd+Shift+N: normalise.**
@@ -24289,6 +24588,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     // A folder's own mute dims the folder AND its children;
                     // a track muted on its own is left alone, because its
                     // switch already says so.
+                    frozen: self.lane_frozen(n).is_some(),
                     folder_silent: {
                         let by_parent = self
                             .folder_of(n)
@@ -27866,26 +28166,39 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         // count from the window; a Shift+wheel writes a concrete number and
         // the derivation steps aside for good (see `default_mixer_visible`).
         //
-        // No screen-size forcing on the CHOSEN value: the floor it used to
+        // No screen-size FLOOR on the chosen value: the one it used to
         // impose was exactly what killed Shift+wheel zoom in fullscreen — the
-        // owner's "track zoom regressed". The fold no longer reads this
-        // either; windowed or full, a chosen zoom is the user's. The pane is
-        // read only on the auto side, so growing the window still moves the
-        // DEFAULT and still leaves a chosen count alone.
+        // owner's "track zoom regressed". What a chosen count does get is
+        // CARRIED, see `carried_count`: on the pane it was chosen on, and on
+        // any pane within a sixth of it (full screen against maximised), it
+        // is the number the hand set, so the wheel always lands where it
+        // asked; only a pane of a materially different size — the laptop
+        // after the external — gets the same DENSITY instead of the same
+        // number. The wheel then records the new pane with the new number.
+        let pane = self.count_pane();
         let want = if self.settings.mixer_visible == 0 {
-            default_mixer_visible(self.count_pane())
+            default_mixer_visible(pane)
         } else {
-            self.settings.mixer_visible as usize
+            carried_count(
+                self.settings.mixer_visible as usize,
+                self.settings.mixer_visible_at,
+                mixer_run_w(pane),
+            )
         };
         want.clamp(1, self.active_channels())
     }
     fn arr_visible(&self) -> usize {
         // Zero is the auto sentinel; see `mixer_visible` and
         // `default_arr_visible`.
+        let pane = self.count_pane();
         let want = if self.settings.arr_visible == 0 {
-            default_arr_visible(&self.settings, self.count_pane())
+            default_arr_visible(&self.settings, pane)
         } else {
-            self.settings.arr_visible as usize
+            carried_count(
+                self.settings.arr_visible as usize,
+                self.settings.arr_visible_at,
+                arr_timeline_h(&self.settings, pane),
+            )
         };
         want.clamp(1, self.active_channels())
     }
@@ -31779,6 +32092,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 self.dialog = None;
                 self.remove_selected_channels(lane);
             }
+            DialogAction::TrackFreeze(lane) => {
+                self.dialog = None;
+                self.freeze_toggle(lane);
+            }
             DialogAction::TrackCopy(lane) => {
                 self.dialog = None;
                 self.copy_track(lane);
@@ -32850,10 +33167,55 @@ fn sensible_visible_count(span_px: f32, item_px: f32, floor: usize, ceil: usize)
 /// arm returned a flat dozen on a first launch, which was a guess about a
 /// screen; the answer now is a measurement of the 1300-point window that first
 /// launch actually opens — eight lanes, the same as his.
-fn default_arr_visible(settings: &Settings, pane: Vec2) -> usize {
+/// The timeline's own height in this pane: everything under the recorder
+/// band. The measure every lane count is taken against.
+fn arr_timeline_h(settings: &Settings, pane: Vec2) -> f32 {
     let w = pane.x.max(1.0).trunc();
     let recorder = band_sizes_at(settings, w).recorder_h;
-    let avail = (pane.y - recorder).max(0.0);
+    (pane.y - recorder).max(0.0)
+}
+
+/// The desk's scrolling run in this pane: the width less the two pinned
+/// columns and the margins. The measure every strip count is taken against.
+fn mixer_run_w(pane: Vec2) -> f32 {
+    (pane.x - 20.0 - 2.0 * COMFY_STRIP_PITCH).max(0.0)
+}
+
+/// How far a pane may differ from the one a count was chosen on before the
+/// count is carried rather than kept, as a fraction. Wide enough that a
+/// full-screen window keeps a count chosen maximised (five points in a
+/// thousand on the owner's external), narrow enough that a laptop's 982
+/// points never keep a count chosen for 1440.
+const CARRY_TOLERANCE: f32 = 0.15;
+
+/// **A chosen count is a density.** `chosen` lanes over `at` points was the
+/// lane height the hand asked for; on a pane whose measure is `now`, the
+/// same height gives a different count, snapped to the ladder the defaults
+/// use. Within `CARRY_TOLERANCE` of the pane it was chosen on the count is
+/// kept as chosen - a hand that picked eleven gets eleven there, not the
+/// nearest rung. A count with no height recorded (an older settings file)
+/// is taken as it is: there is nothing to carry it by.
+///
+/// The owner's own numbers: a dozen chosen maximised on his external, 1112
+/// points of timeline, is eight on the laptop's 654, and eight chosen on
+/// the laptop is a dozen back on the external. "12 tracks still fit ... but
+/// they are thin and it should really be 8 on a native display as small as
+/// this."
+fn carried_count(chosen: usize, at: f32, now: f32) -> usize {
+    if chosen == 0 {
+        return 0;
+    }
+    if !(at > 0.0) || !(now > 0.0) {
+        return chosen;
+    }
+    if (now / at - 1.0).abs() <= CARRY_TOLERANCE {
+        return chosen;
+    }
+    sensible_visible_count(now, at / chosen as f32, 1, recorder::CHANNELS)
+}
+
+fn default_arr_visible(settings: &Settings, pane: Vec2) -> usize {
+    let avail = arr_timeline_h(settings, pane);
     // **Ten is the most a DEFAULT opens with**, at the owner's word. It was
     // a dozen — "12 default now at 100 Percent and up, and 10 at 75
     // percent" — and he came back to it: "we didn't successfully set 100
@@ -32904,7 +33266,7 @@ fn default_arr_visible(settings: &Settings, pane: Vec2) -> usize {
 fn default_mixer_visible(pane: Vec2) -> usize {
     // 20 = the desk's two 10-point edge margins; `2.0 * COMFY_STRIP_PITCH` =
     // the two pinned columns that never scroll.
-    let run = (pane.x - 20.0 - 2.0 * COMFY_STRIP_PITCH).max(0.0);
+    let run = mixer_run_w(pane);
     // **The ceiling is SIXTEEN, and that is what puts the whole desk on a
     // full screen.** It was `CHANNELS`, the supporter's thirty-two, which no
     // width could reach comfortably — thirty-two at this pitch wants 3400
@@ -33937,6 +34299,8 @@ impl TangentApp {
                 // to be open. Zero keeps the demo's dialog the same height
                 // every time it is photographed.
                 midi_clips: 0,
+                frozen: false,
+                can_freeze: false,
             });
         }
         // **Audio Setup**, which is now where the interface's short name is
@@ -35895,6 +36259,7 @@ impl TangentApp {
                             .clamp(1, recorder::CHANNELS as i64);
                         if next != cur {
                             self.settings.mixer_visible = next as u8;
+                            self.settings.mixer_visible_at = mixer_run_w(self.count_pane());
                             // Per notch: debounced, see `save_settings_soon`.
                             self.save_settings_soon();
                         }
@@ -35923,6 +36288,9 @@ impl TangentApp {
             // **Ctrl/Cmd+F: group the selection into a folder**, exactly
             // the arrangement's chord — same handler, same refusals — so a
             // hand that learned it there finds it here.
+            // Bare makes the folder; Shift is the freeze - see the
+            // arrangement's own copy of this chord. Two reads, each naming
+            // its whole chord, because the card test reads them that way.
             if !self.dialog_blocks_keys(&ctx)
                 && !self.text_entry_active()
                 && ctx.input(|i| {
@@ -35932,6 +36300,16 @@ impl TangentApp {
                 })
             {
                 self.make_folder();
+            }
+            if !self.dialog_blocks_keys(&ctx)
+                && !self.text_entry_active()
+                && ctx.input(|i| {
+                    (i.modifiers.command || i.modifiers.ctrl)
+                        && i.modifiers.shift
+                        && i.key_pressed(egui::Key::F)
+                })
+            {
+                self.freeze_selected();
             }
             // **Ctrl/Cmd+C/V/X: the CHANNEL clipboard**, as the arrangement
             // does it when no clips are selected - copy the selected track
@@ -41411,6 +41789,288 @@ mod tests {
     /// case goes red; make the press locate instead of select and the first
     /// block goes red; leave `arr_marker_sel` alone on a delete and the last
     /// block goes red.
+    /// **A chosen lane count carries its height to another display.** The
+    /// owner's numbers: a dozen chosen maximised on the external (1112 points
+    /// of timeline) is eight on the laptop's 654, full screen on the external
+    /// (1174) keeps the dozen, eight chosen on the laptop is a dozen back on
+    /// the external, and a count from a settings file that never recorded a
+    /// height is taken as it is.
+    #[test]
+    fn a_chosen_lane_count_is_a_density_that_carries_across_displays() {
+        assert_eq!(carried_count(12, 1112.0, 1112.0), 12);
+        assert_eq!(carried_count(12, 1112.0, 1174.0), 12, "full screen is within tolerance");
+        assert_eq!(carried_count(11, 1112.0, 1174.0), 11, "a hand-picked eleven stays eleven there");
+        assert_eq!(carried_count(12, 1112.0, 654.0), 8, "the laptop, maximised");
+        assert_eq!(carried_count(8, 654.0, 1112.0), 12, "and back to the external");
+        assert_eq!(carried_count(12, 0.0, 654.0), 12, "no height recorded: taken as it is");
+        assert_eq!(carried_count(12, 1112.0, 0.0), 12, "no pane yet: taken as it is");
+        assert_eq!(carried_count(0, 1112.0, 654.0), 0, "the auto sentinel is not carried");
+        assert_eq!(
+            carried_count(3, 300.0, 3000.0),
+            recorder::CHANNELS,
+            "carried past the desk is clamped to the desk"
+        );
+        // The mixer's run carries the same way.
+        assert_eq!(carried_count(14, 1400.0, 700.0), 6);
+    }
+
+    /// A MIDI clip on lane 0 from 2 s to 6 s, opened in the editor with
+    /// the playhead at its start and snap off, so a note's length is the
+    /// only thing that moves the head.
+    fn editor_on_an_empty_clip() -> (egui::Context, TangentApp) {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 0,
+            path: String::new(),
+            start_s: 2.0,
+            offset_s: 0.0,
+            len_s: 4.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "m".into(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        let id = app.arrangement.clips[0].id;
+        app.open_midi_editor(id);
+        app.settings.midi_snap = false;
+        app.me_locate(2.0);
+        while app.take_recorder_request().is_some() {}
+        (ctx, app)
+    }
+
+    /// **Backspace takes the note back and the playhead with it.** Two
+    /// Enters write two notes and leave the head after the second; one
+    /// Backspace deletes the second and puts the head where it stood before
+    /// that note was written, and the next Backspace does the same for the
+    /// first. Delete, by contrast, leaves the head alone.
+    #[test]
+    fn backspace_in_the_editor_deletes_the_last_note_and_steps_the_playhead_back() {
+        let (_ctx, mut app) = editor_on_an_empty_clip();
+        app.me_insert_at_playhead();
+        let after_one = app.playhead_s();
+        app.me_insert_at_playhead();
+        let after_two = app.playhead_s();
+        assert_eq!(app.arrangement.clips[0].notes.len(), 2, "two Enters, two notes");
+        assert!(after_two > after_one && after_one > 2.0, "Enter did not walk the head: {after_one} {after_two}");
+
+        app.me_backspace();
+        assert_eq!(app.arrangement.clips[0].notes.len(), 1, "Backspace did not take the note back");
+        assert!(
+            (app.playhead_s() - after_one).abs() < 1.0e-9,
+            "the head did not come back to {after_one}: {}",
+            app.playhead_s()
+        );
+        let asked: Vec<_> = std::iter::from_fn(|| app.take_recorder_request()).collect();
+        assert!(
+            asked.iter().any(|r| matches!(r, recorder::RecorderRequest::Locate(t) if (t - after_one).abs() < 1.0e-9)),
+            "the engine was not told about the step back: {asked:?}"
+        );
+
+        // Nothing selected now: Backspace still takes the note before the head.
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.selected.clear();
+        }
+        app.me_backspace();
+        assert!(app.arrangement.clips[0].notes.is_empty(), "the first note survived a second Backspace");
+        assert!((app.playhead_s() - 2.0).abs() < 1.0e-9, "the head is not back at the clip's start: {}", app.playhead_s());
+
+        // Delete: the note goes, the head stays.
+        app.me_insert_at_playhead();
+        let head = app.playhead_s();
+        app.me_delete_selected();
+        assert!(app.arrangement.clips[0].notes.is_empty());
+        assert!((app.playhead_s() - head).abs() < 1.0e-9, "Delete moved the head");
+    }
+
+    /// **The arrows are the playhead in the editor whether or not a note is
+    /// held, and Alt is the nudge.** Pinned in the source: the bare left and
+    /// right arrows reach `me_step_playhead` with no `holding` test in the
+    /// way, `me_nudge` on the time axis sits under `alt_k`, and Backspace
+    /// has its own handler.
+    #[test]
+    fn the_editors_bare_arrows_are_the_playhead_and_alt_is_the_nudge() {
+        let whole = include_str!("app.rs");
+        let src = &whole[..whole.find("#[cfg(test)]\nmod tests {").expect("the tests module")];
+        let at = src.find("} else if alt_k {").expect("the Alt arrow block is gone");
+        let bare = src[at..].find("} else if bare {").expect("the bare arrow block is gone") + at;
+        let alt_block = &src[at..bare];
+        assert!(alt_block.contains("self.me_nudge(-1.0, 0);") && alt_block.contains("self.me_nudge(1.0, 0);"), "the time nudge left Alt");
+        let bare_end = src[bare..].find("if arrow(egui::Key::ArrowUp)").expect("the bare Up arrow") + bare;
+        let bare_lr = &src[bare..bare_end];
+        assert!(bare_lr.contains("self.me_step_playhead(-1.0);") && bare_lr.contains("self.me_step_playhead(1.0);"), "the bare arrows are no longer the playhead");
+        assert!(!bare_lr.contains("me_nudge("), "the bare left/right nudge again");
+        assert!(src.contains("i.key_pressed(egui::Key::Backspace)) {\n                self.me_backspace();"), "Backspace no longer steps back");
+    }
+
+    /// **In the arrange view the arrows walk the grid.** A grid step a
+    /// press, onto the grid when snap is on, a bar with Shift, never below
+    /// zero, and the engine is told each time.
+    #[test]
+    fn the_arrange_views_arrows_walk_the_playhead_along_the_grid() {
+        let (_ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.arr_snap = true;
+        app.settings.arr_grid_exp = -2;
+        let grid = app.arr_grid_s();
+        let bar = app.arr_bar_s();
+        app.locate(0.0);
+        while app.take_recorder_request().is_some() {}
+
+        app.arr_step_playhead(1.0, false);
+        assert!((app.playhead_s() - grid).abs() < 1.0e-9, "one press is not one grid step: {} vs {grid}", app.playhead_s());
+        app.arr_step_playhead(1.0, false);
+        assert!((app.playhead_s() - 2.0 * grid).abs() < 1.0e-9, "two presses are not two steps: {}", app.playhead_s());
+        app.arr_step_playhead(-1.0, false);
+        assert!((app.playhead_s() - grid).abs() < 1.0e-9, "left did not come back one step: {}", app.playhead_s());
+        app.arr_step_playhead(-1.0, false);
+        app.arr_step_playhead(-1.0, false);
+        assert_eq!(app.playhead_s(), 0.0, "the head went below zero");
+
+        app.arr_step_playhead(1.0, true);
+        assert!((app.playhead_s() - bar).abs() < 1.0e-9, "Shift is not a bar: {} vs {bar}", app.playhead_s());
+
+        // Off the grid with snap on: the press lands on a line, not a fraction past one.
+        app.locate(grid * 0.3);
+        app.arr_step_playhead(1.0, false);
+        let landed = app.playhead_s() / grid;
+        assert!((landed - landed.round()).abs() < 1.0e-6 && landed >= 1.0, "a press from between lines landed off the grid: {landed}");
+
+        let asked: Vec<_> = std::iter::from_fn(|| app.take_recorder_request()).collect();
+        assert!(asked.iter().filter(|r| matches!(r, recorder::RecorderRequest::Locate(_))).count() >= 7, "the engine was not told about every step: {asked:?}");
+    }
+
+    /// A desk with a saved document in a scratch folder and one MIDI clip
+    /// on lane 0: the least a lane needs before it can be frozen.
+    fn desk_with_a_clip_to_freeze() -> (egui::Context, TangentApp, u64) {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let dir = std::env::temp_dir().join(format!("tangent-freeze-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch project dir");
+        app.project_doc = crate::arrangement::doc_in(&dir);
+        app.arrangement.add_clip(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![crate::arrangement::ArrNote {
+                at_s: 0.0,
+                dur_s: 0.5,
+                key: 60,
+                vel: 100,
+                muted: false,
+            }],
+            lane: 0,
+            path: String::new(),
+            start_s: 1.0,
+            offset_s: 0.0,
+            len_s: 2.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "m".into(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        let id = app.arrangement.clips[0].id;
+        app.arr_save_edits();
+        app.undo_reset();
+        while app.take_project_request().is_some() {}
+        (ctx, app, id)
+    }
+
+    /// **Freezing asks the host; the host's word freezes the lane; a
+    /// second press thaws it without a host.** The frozen lane is disarmed,
+    /// cannot be frozen twice, and the freeze rides undo like any other
+    /// edit to the document.
+    #[test]
+    fn freezing_asks_the_host_and_the_hosts_word_freezes_the_lane() {
+        let (_ctx, mut app, _id) = desk_with_a_clip_to_freeze();
+        assert!(app.can_freeze(0), "a lane with a clip should be freezable");
+        let empty = (0..recorder::CHANNELS)
+            .find(|n| !app.channel_used(*n))
+            .expect("an unused lane on the stock desk");
+        assert!(!app.can_freeze(empty), "an empty lane is not");
+        app.settings.channel_armed = Some(0b11);
+
+        app.freeze_toggle(0);
+        assert!(
+            matches!(app.take_project_request(), Some(crate::ports::ProjectRequest::Freeze(0))),
+            "the host was not asked to render"
+        );
+        assert!(app.lane_frozen(0).is_none(), "the lane froze before the render");
+
+        app.note_frozen(0, "media/frozen-01-7.wav".into(), 4.5);
+        let z = app.lane_frozen(0).expect("the host's word froze the lane");
+        assert_eq!((z.path.as_str(), z.len_s), ("media/frozen-01-7.wav", 4.5));
+        assert_eq!(app.settings.channel_armed, Some(0b10), "the frozen lane was not disarmed");
+        assert!(!app.can_freeze(0), "a frozen lane offered a second freeze");
+        assert!(
+            app.desk_snapshot().frozen.as_deref().is_some_and(|f| f.len() == 1 && f[0].lane == 0),
+            "the document does not carry the freeze"
+        );
+
+        app.freeze_toggle(0);
+        assert!(app.lane_frozen(0).is_none(), "a second press did not thaw");
+        assert!(app.take_project_request().is_none(), "thawing asked the host for something");
+
+        app.note_frozen(0, "media/frozen-01-8.wav".into(), 4.5);
+        assert!(app.lane_frozen(0).is_some());
+        app.undo();
+        assert!(app.lane_frozen(0).is_none(), "undo did not thaw the lane");
+    }
+
+    /// **A frozen lane's clips are shown and not touched**: Delete leaves
+    /// them, the editor does not open on them, and thawing gives both back.
+    #[test]
+    fn a_frozen_lanes_clips_refuse_the_edit_until_it_thaws() {
+        let (_ctx, mut app, id) = desk_with_a_clip_to_freeze();
+        app.note_frozen(0, "media/frozen-01-1.wav".into(), 3.0);
+        app.arr_selected = Some(id);
+        app.arr_delete_selected();
+        assert_eq!(app.arrangement.clips.len(), 1, "Delete took a frozen lane's clip");
+        app.open_midi_editor(id);
+        assert!(app.midi_edit.is_none(), "the editor opened on a frozen lane's clip");
+
+        app.unfreeze_track(0);
+        app.open_midi_editor(id);
+        assert!(app.midi_edit.is_some(), "the editor stayed shut after the thaw");
+        app.midi_edit = None;
+        app.arr_selected = Some(id);
+        app.arr_delete_selected();
+        assert!(app.arrangement.clips.is_empty(), "Delete still refused after the thaw");
+    }
+
+    /// **A freeze needs a saved project and something to render**, and says
+    /// so instead of asking the host for nothing.
+    #[test]
+    fn a_freeze_needs_a_saved_project_and_something_to_render() {
+        let (_ctx, mut app, _id) = desk_with_a_clip_to_freeze();
+        app.project_doc = std::path::PathBuf::new();
+        app.freeze_toggle(0);
+        assert!(app.take_project_request().is_none(), "an unsaved project asked for a render");
+        let (_ctx, mut app, _id) = desk_with_a_clip_to_freeze();
+        app.selected_channel = Some(3);
+        app.freeze_selected();
+        assert!(app.take_project_request().is_none(), "an empty lane asked for a render");
+        app.selected_channel = Some(0);
+        app.freeze_selected();
+        assert!(
+            matches!(app.take_project_request(), Some(crate::ports::ProjectRequest::Freeze(0))),
+            "Cmd/Ctrl+Shift+F on the selected track did not ask"
+        );
+    }
+
     #[test]
     fn a_left_press_carries_a_flag_and_never_moves_the_playhead() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);

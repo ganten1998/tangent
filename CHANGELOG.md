@@ -40,6 +40,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A chosen track count carries its density to another display.** A
+  lane count set with Shift+wheel was applied as a number wherever the
+  window went, so a dozen chosen on a 1440-point external display were a
+  dozen thin lanes on the laptop's 982. The count now remembers the
+  timeline height it was chosen at and, on a pane of materially different
+  size, gives the same lane height instead: twelve on the external is eight
+  on the laptop, and eight on the laptop is twelve back on the external.
+  The mixer's strip count does the same with the desk's width. A count from
+  an older settings file, which recorded no height, is taken as it is until
+  it is next changed.
+
 - **An armed strip inside a muted folder no longer comes out of the
   speakers.** A grouped strip's live input reaches the mix through its
   folder's fold, but what the room kept out of a withheld input was the raw
@@ -79,6 +90,29 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   seemed frozen. The cover is now mirrored into that window as well.
 
 ### Added
+
+- **Track freezing.** Cmd/Ctrl+Shift+F on the selected track, or Freeze
+  Track on the track's right-click menu, renders the track through its insert
+  rack, post-insert and pre-fader, into the project's media folder and
+  plays that file in its place while the rack and any built-in instrument
+  on it stand down: the plugins keep their state and pay nothing. Fader,
+  pan, mute, solo and sends stay live, so the render leaves them out. The
+  frozen track is painted under frost with a snowflake, its clips are shown
+  and not editable, and the same key or row thaws it. The freeze travels in
+  the project and rides undo. Cmd/Ctrl+F still makes a folder.
+
+- **The arrow keys walk the playhead.** In the arrange view, Left and Right
+  move the playhead a grid step, onto the grid when snap is on, and a bar
+  with Shift. In the MIDI editor they are the playhead whether or not a
+  note is selected; Enter leaves the note it wrote selected, so the bare
+  arrows had stopped being the playhead the moment a note went in. Nudging
+  the selection, in time and in pitch, moved to Alt+arrows.
+
+- **Backspace in the MIDI editor steps back.** It deletes the selected
+  note, or with nothing selected the note that ended last before the
+  playhead, and puts the playhead where it stood before that note was
+  written, so a run of Enter presses can be walked back the way it was
+  typed. Delete still deletes without moving anything.
 
 - **FreeBSD is a release platform.** `scripts/release.sh` on a FreeBSD host
   runs `build-freebsd.sh`, checks the `.pkg` and both offline bundles the way
