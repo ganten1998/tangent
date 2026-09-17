@@ -1415,6 +1415,11 @@ pub struct Settings {
     /// `u32` covers the desk with no bits nobody can set. The masks above are
     /// `u64` because they reach the buses too.
     pub channel_armed: Option<u32>,
+    /// **Which lanes are frozen**, mirrored from the document: see
+    /// `arrangement::FrozenLane`. Not written to the settings file, because a
+    /// freeze is a fact about one document's media folder and travels in the
+    /// document; this is only where the live desk keeps it between frames.
+    pub frozen_lanes: Vec<crate::arrangement::FrozenLane>,
     /// Whether the after-a-take report appears. A take with a PROBLEM ignores
     /// this: see `App::report_take`.
     ///
@@ -1512,6 +1517,18 @@ pub struct Settings {
     /// also climbs when the window is maximised — see `app::count_pane`.
     pub mixer_visible: u8,
     pub arr_visible: u8,
+    /// **The timeline height, in points, at which `arr_visible` was chosen**,
+    /// and the desk's scrolling run at which `mixer_visible` was. Zero is
+    /// "not recorded": a settings file from before this, or a count never
+    /// chosen. A chosen count is a DENSITY, not a number - the lane height it
+    /// gave on the display it was chosen on is what the hand asked for, and
+    /// the same height is what it should get anywhere - so on a pane of a
+    /// materially different size the count is carried by the ratio and
+    /// snapped to the ladder; see `app::carried_count`. The owner met the
+    /// alternative on 2026-09-17: a dozen lanes chosen on a 1440-point
+    /// external display, thin as wire on the laptop's 982.
+    pub arr_visible_at: f32,
+    pub mixer_visible_at: f32,
     /// How many KEYS the MIDI editor shows at once (semitones); Shift+wheel
     /// over the roll zooms it. Clamped to a legible band on load.
     pub midi_keys_visible: u8,
@@ -2021,6 +2038,7 @@ impl Default for Settings {
             // Nothing written down: the app resolves the shipped rule once.
             // See the field.
             channel_armed: None,
+            frozen_lanes: Vec::new(),
             strip_phase: 0,
             strip_soloed: 0,
             show_take_summary: true,
@@ -2051,6 +2069,8 @@ impl Default for Settings {
             // choice. See `mixer_visible`'s doc and `app::default_arr_visible`.
             mixer_visible: 0,
             arr_visible: 0,
+            arr_visible_at: 0.0,
+            mixer_visible_at: 0.0,
             // Three octaves of keys, the editor's long-standing default.
             midi_keys_visible: 36,
             tracks_added: 0,
@@ -3482,6 +3502,14 @@ impl Settings {
         if let Some(n) = map.shift_remove("arr_visible").and_then(|v| v.as_u64()) {
             s.arr_visible = if n == 0 { 0 } else { n.clamp(1, chans) } as u8;
         }
+        // The heights the counts were chosen at: a finite, positive number
+        // or nothing. See `arr_visible_at`.
+        if let Some(v) = map.shift_remove("arr_visible_at").and_then(|v| v.as_f64()) {
+            s.arr_visible_at = if v.is_finite() && v > 0.0 { v as f32 } else { 0.0 };
+        }
+        if let Some(v) = map.shift_remove("mixer_visible_at").and_then(|v| v.as_f64()) {
+            s.mixer_visible_at = if v.is_finite() && v > 0.0 { v as f32 } else { 0.0 };
+        }
         if let Some(n) = map.shift_remove("midi_keys_visible").and_then(|v| v.as_u64()) {
             s.midi_keys_visible = n.clamp(12, 96) as u8;
         }
@@ -4548,6 +4576,8 @@ impl Settings {
         map.insert("arr_header_w".into(), Value::from(self.arr_header_w));
         map.insert("mixer_visible".into(), Value::from(self.mixer_visible));
         map.insert("arr_visible".into(), Value::from(self.arr_visible));
+        map.insert("arr_visible_at".into(), Value::from(self.arr_visible_at));
+        map.insert("mixer_visible_at".into(), Value::from(self.mixer_visible_at));
         map.insert("midi_keys_visible".into(), Value::from(self.midi_keys_visible));
         map.insert("tracks_added".into(), Value::from(self.tracks_added));
         map.insert(
@@ -5158,6 +5188,8 @@ impl Settings {
         self.camera_pane_left = fresh.camera_pane_left;
         self.mixer_visible = fresh.mixer_visible;
         self.arr_visible = fresh.arr_visible;
+        self.mixer_visible_at = fresh.mixer_visible_at;
+        self.arr_visible_at = fresh.arr_visible_at;
         self.midi_keys_visible = fresh.midi_keys_visible;
         self.midi_editor_floating = fresh.midi_editor_floating;
         self.arr_header_w = fresh.arr_header_w;
@@ -7211,6 +7243,15 @@ mod tests {
         assert_eq!(wild.mixer_visible as usize, crate::recorder::CHANNELS, "too many clamps down");
         assert_eq!(wild.arr_visible, 0, "zero is the auto sentinel, left as itself");
         assert_eq!(wild.midi_keys_visible, 12, "too few keys clamps to the floor");
+        // The heights the counts were chosen at ride along, and nonsense
+        // reads as "not recorded".
+        let mut s = Settings::default();
+        s.arr_visible_at = 1112.0;
+        s.mixer_visible_at = 1400.5;
+        let back = Settings::from_json(&s.to_json());
+        assert_eq!((back.arr_visible_at, back.mixer_visible_at), (1112.0, 1400.5));
+        let wild = Settings::from_json(r#"{"arr_visible_at": -3, "mixer_visible_at": "x"}"#);
+        assert_eq!((wild.arr_visible_at, wild.mixer_visible_at), (0.0, 0.0));
     }
 
     #[test]

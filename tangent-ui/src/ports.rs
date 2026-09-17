@@ -841,6 +841,11 @@ pub enum ProjectRequest {
     /// The same pass, but every used lane lands in its own WAV under
     /// `<project>/export/stems/`.
     ExportStems,
+    /// **Freeze this lane**: render it through its rack, post-insert and
+    /// pre-fader, into the project's media folder, and hand the file back
+    /// through `TangentApp::note_frozen`. The host does the render because
+    /// the host owns the engines; the app owns the fact.
+    Freeze(usize),
     /// **Put the default template's DESK back to the one Tangent ships
     /// with.** Appended at the END, this enum's law.
     ///

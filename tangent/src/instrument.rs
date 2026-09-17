@@ -2502,6 +2502,14 @@ struct Shared {
     /// reads some bays' new state and some bays' old state and never a bay's
     /// wrong state.
     insert_bypass: Vec<AtomicU32>,
+    /// **Which lanes are FROZEN**, a mask over the channel seats. A frozen
+    /// seat's rack stands down whole, every bay skipped as a bypassed bay
+    /// is, and its latency reads zero so the lane is compensated like the
+    /// plain audio lane it now is: the frozen file was rendered
+    /// timeline-true, the render's own latency lead cut off its front. See
+    /// `Engine::set_frozen`, `Engine::offline_stem_lead` and the host's
+    /// `reload_clips`.
+    frozen: AtomicU32,
 
     // ── the IR wizard's capture road ────────────────────────────────────────
     /// A one-shot capture job on its way IN — host to audio thread, the
@@ -2699,6 +2707,7 @@ impl Shared {
             insert_key: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             insert_key_n: AtomicUsize::new(0),
             insert_bypass: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
+            frozen: AtomicU32::new(0),
             pending_ir: Mutex::new(None),
             finished_ir: Mutex::new(None),
             ir_stop: AtomicBool::new(false),
@@ -3297,6 +3306,11 @@ impl Rack {
     }
 
     fn latency(shared: &Shared, seat: usize) -> u32 {
+        // A frozen seat reports none: its rack does not run, and its file
+        // was rendered with the lead already cut - see `Shared::frozen`.
+        if seat < 32 && shared.frozen.load(Ordering::Relaxed) & (1u32 << seat) != 0 {
+            return 0;
+        }
         (0..INSERTS)
             .filter_map(|b| shared.seat_latency.get(seat * INSERTS + b))
             .map(|c| c.load(Ordering::Relaxed))
@@ -3828,6 +3842,16 @@ fn run_rack(
         Some((s, b)) if s == seat => Some(b),
         _ => None,
     };
+    // **A frozen seat's rack stands down whole** - the state every bay
+    // bypassed would leave, which is the signal untouched in `planar` since
+    // the copy-back below never runs. The tap still hears what its bay
+    // would see, as a bypassed bay's does. See `Shared::frozen`.
+    if seat < 32 && shared.frozen.load(Ordering::Relaxed) & (1u32 << seat) != 0 {
+        if tap_bay.is_some() {
+            push_insert_tap(shared, planar, frames);
+        }
+        return;
+    }
     // **The song's position, for a built-in voice.** Three relaxed loads
     // per rack call; the beat is the frame the callback reached, at the
     // board's tempo — the same figure the arpeggiator would free-run from
@@ -11432,6 +11456,21 @@ impl Engine {
 
     /// One rendered block of an OFFLINE engine, `out` interleaved stereo.
     /// Does nothing on a live engine — the callback owns that render.
+    /// **How far a lane's stem runs late of the timeline in the offline
+    /// render**, in frames: the desk's compensation delays every lane's
+    /// post-rack signal to the slowest rack, less what the lane's own
+    /// folders add on the way to the master. A freeze drops this many
+    /// frames off the front of the stem so the file is timeline-true and
+    /// the frozen lane can be compensated as a plain audio lane. Read once
+    /// the first block has rendered, when the racks are loaded and measured.
+    pub fn offline_stem_lead(&self, lane: usize) -> u32 {
+        let Some(r) = self.offline.as_ref() else {
+            return 0;
+        };
+        let max = r.shared.max_latency.load(Ordering::Relaxed);
+        max.saturating_sub(r.folder_lat.get(lane).copied().unwrap_or(0))
+    }
+
     pub fn render_offline(&mut self, out: &mut [f32]) {
         let Some(r) = self.offline.as_mut() else {
             return;
@@ -13845,6 +13884,13 @@ impl Engine {
     // `&self`, like `set_routes` and `set_insert_keys`: the whole write is
     // interior atomics and the publish path holds the engine by shared
     // reference.
+    /// Which channel seats are frozen - see `Shared::frozen`.
+    pub fn set_frozen(&self, mask: u32) {
+        if self.shared.frozen.load(Ordering::Relaxed) != mask {
+            self.shared.frozen.store(mask, Ordering::Relaxed);
+        }
+    }
+
     pub fn set_insert_bypass(&self, bays: &[(usize, usize)]) {
         for (i, cell) in self.shared.insert_bypass.iter().enumerate() {
             let want = u32::from(bays.contains(&(i / INSERTS, i % INSERTS)));
@@ -26251,6 +26297,44 @@ mod tests {
                 assert!(room < 1.0e-3, "{case}: the child reached the speakers (peak {room})");
             }
         }
+    }
+
+    /// **A frozen seat reports no latency**, so the lane is compensated as
+    /// the plain audio lane it now is - its file was rendered with the lead
+    /// cut - and its rack stands down before the first bay is looked at.
+    #[test]
+    fn a_frozen_seat_reports_no_latency_and_its_rack_stands_down() {
+        let shared = Shared::new();
+        shared.seat_latency[INSERTS].store(100, Ordering::Relaxed);
+        shared.seat_latency[INSERTS + 1].store(20, Ordering::Relaxed);
+        assert_eq!(Rack::latency(&shared, 1), 120, "a live seat sums its bays");
+        shared.frozen.store(1 << 1, Ordering::Relaxed);
+        assert_eq!(Rack::latency(&shared, 1), 0, "a frozen seat still reported latency");
+        assert_eq!(Rack::latency(&shared, 0), 0);
+        // The rack's early-out sits before the bay loop, on the same mask.
+        let src = include_str!("instrument.rs");
+        let at = src.find("fn run_rack(").expect("run_rack");
+        let end = src[at..].find("\n}\n").map_or(src.len(), |n| at + n);
+        let body = &src[at..end];
+        let frozen = body.find("shared.frozen.load(Ordering::Relaxed)").expect("run_rack no longer asks the frozen mask");
+        let loop_at = body.find("for (bay, slot) in rack.slots.iter_mut().enumerate()").expect("the bay loop");
+        assert!(frozen < loop_at, "the frozen check is not before the bay loop");
+    }
+
+    /// **The offline stem lead is the desk's compensation less the lane's
+    /// folders' share**: what a freeze drops off the front of the file.
+    #[test]
+    fn the_offline_stem_lead_is_the_compensation_less_the_folders_share() {
+        let mut e = Engine::offline(48_000, Timebase::new())
+            .expect("an offline engine");
+        {
+            let r = e.offline.as_mut().expect("the offline renderer");
+            r.shared.max_latency.store(300, Ordering::Relaxed);
+            r.folder_lat[2] = 100;
+        }
+        assert_eq!(e.offline_stem_lead(0), 300);
+        assert_eq!(e.offline_stem_lead(2), 200);
+        assert_eq!(e.offline_stem_lead(CHANNELS + 5), 300, "an out-of-range lane reads the bare lead");
     }
 
     #[test]

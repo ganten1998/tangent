@@ -562,6 +562,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("DEL", "remove the selected channel"),
             ("C-T", "ctrl+T: a new track"),
             ("C-F", "ctrl+F: group the selection into a folder"),
+            ("C-S-F", "ctrl+shift+F: freeze the selected track - again to thaw it"),
             ("C-C/V/X", "copy the track · paste onto an empty slot · cut"),
             ("FLDR", "the folder glyph: hide or show its tracks"),
             ("NOTE", "the \u{266a} at a track's foot: its MIDI to the theory view"),
@@ -601,11 +602,13 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("CA-WHL", "ctrl+alt: grid finer or coarser"),
             ("NAV", "corner box: drag left/right scrolls · up/down zooms"),
             ("-/=", "zoom out / in, in steps, around the playhead"),
+            ("L/R", "left / right: the playhead a grid step · shift: a bar"),
             ("W", "fit the biggest clip - empty: the shipped zoom"),
             ("S-ARM", "shift+arm: this lane alone - every other arm stands down"),
             ("C-T", "ctrl+T: a new track"),
             ("C-C/V/X", "copy · paste · cut the selected clips - or nodes"),
             ("C-F", "group the selection into a folder"),
+            ("C-S-F", "freeze the selected track - renders its rack, then rests it; again to thaw"),
             // "MIDI clips", because that is the truth: `arr_glue_selection`
             // filters to MIDI and refuses everything else — welding audio
             // means rendering, a different operation with a different cost.
@@ -650,7 +653,12 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             // modifiers refine it. The bare row has to say BOTH its jobs
             // because which one it does is a property of the moment and not
             // of the key — see the arrows' own note in `midi_editor_input`.
-            ("ARROWS", "a note in hand: nudge it · nothing in hand: playhead and pitch cursor"),
+            // **The bare arrows are the playhead and the pitch cursor,
+            // whatever is in hand**; the nudge moved to Alt the day the owner
+            // found Enter's own note stealing the arrows from the playhead.
+            ("ARROWS", "left / right: the playhead · up / down: the pitch cursor - a note in hand: its pitch"),
+            ("A-ARR", "alt: nudge the selection in time and pitch"),
+            ("BKSP", "delete the selection - or the note before the playhead - and step back"),
             ("S-L/R", "lengthen / shorten the selection by a step"),
             ("S-U/D", "take the note above / below into the selection"),
             ("C-A-U/D", "the selection an octave up / down"),
@@ -1011,10 +1019,12 @@ mod tests {
             "DEL" => vec!["Delete"],
             "ESC" => vec!["Escape"],
             "ARROWS" => vec!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"],
+            "L/R" => vec!["ArrowLeft", "ArrowRight"],
             "C-A" => vec!["A"],
             "C-D" => vec!["D"],
             "C-G" => vec!["G"],
             "C-F" => vec!["F"],
+            "C-S-F" => vec!["F"],
             "C-S-N" => vec!["N"],
             "C-M" => vec!["M"],
             "C-T" => vec!["T"],
@@ -1202,7 +1212,7 @@ mod tests {
         let spoken_for: &[(&str, &str)] = &[
             // The laptop half of the same key, answering wherever Delete
             // does — an alias, like F1 for help, not a second shortcut.
-            ("Backspace", "DEL's unlisted alias"),
+            ("Backspace", "the editor's step-back, carded as BKSP; the arrangement's alias of DEL"),
             // **`S` is on the editor's card and cannot be spelled here.**
             // `keys_of` maps a LABEL to keys for every view at once, and the
             // arrangement already has an `S` row that it dispatches through

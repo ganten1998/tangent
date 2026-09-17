@@ -533,6 +533,21 @@ struct OfflineBounce {
     /// per-frame tick out of the way while `write_export` owns the files.
     /// See `tick_offline_bounce`, which is where the two are told apart.
     writing: bool,
+    /// A freeze riding this render - see `DesktopApp::start_freeze`.
+    freeze: Option<FreezeJob>,
+}
+
+/// **A freeze in flight on the offline mirror.** One lane's stem, written
+/// under the project's `media/`, handed to the app through `note_frozen`
+/// when the render is done.
+struct FreezeJob {
+    lane: usize,
+    /// Relative to the document, the way the app stores a clip's path.
+    rel_path: String,
+    /// Frames still to drop off the front of the stem: the render's latency
+    /// lead, read once the first block has gone through. See
+    /// `Engine::offline_stem_lead`.
+    skip: Option<u64>,
 }
 
 /// **One stem being written, and whether anything has reached it yet.**
@@ -8906,6 +8921,44 @@ impl DesktopApp {
     /// saved states", and the difference is the export bug the stems chips
     /// were blamed for: see `desk_insert_state`.
     fn start_offline_bounce(&mut self, spec: tangent_ui::ports::ProjectExportSpec) {
+        self.start_offline_render(spec, None);
+    }
+
+    /// **Freeze a lane**: the offline mirror renders the whole desk the way
+    /// an export does, and only this lane's stem is kept, tapped post-rack
+    /// and made pre-fader by neutralising the lane in the mirror: gain at
+    /// unity, pan at centre (the law is unity there), every mute and solo
+    /// off, and the lane's own gain, pan and mute automation left out. The
+    /// fader, pan, mute, solo and sends stay live on the frozen lane, so
+    /// they must not be baked in. Written as 32-bit float at the live
+    /// engine's rate so playback resamples nothing.
+    fn start_freeze(&mut self, lane: usize) {
+        let rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(48_000, |e| e.output().sample_rate);
+        let spec = tangent_ui::ports::ProjectExportSpec {
+            master: false,
+            stems: true,
+            stems_dry: false,
+            rate,
+            mono: false,
+            name: "freeze".to_owned(),
+            realtime: false,
+            span: None,
+            depth: tangent_ui::ports::ExportDepth::Float32,
+            open_when_done: false,
+            ..Default::default()
+        };
+        self.start_offline_render(spec, Some(lane));
+    }
+
+    fn start_offline_render(
+        &mut self,
+        spec: tangent_ui::ports::ProjectExportSpec,
+        freeze: Option<usize>,
+    ) {
         // Every road out of here is a road out of a message that is already
         // standing — see `start_bounce`, which says why.
         macro_rules! refuse {
@@ -8931,7 +8984,15 @@ impl DesktopApp {
                 .notify(Kind::Error, "Nothing to export — the timeline is empty.");
             refuse!();
         }
-        let Some(out_dir) = self.export_out_dir(&spec) else {
+        let out_dir = if freeze.is_some() {
+            // The frozen file is project media, beside the recordings.
+            self.app
+                .project_doc()
+                .and_then(|d| d.parent().map(|p| p.join("media")))
+        } else {
+            self.export_out_dir(&spec)
+        };
+        let Some(out_dir) = out_dir else {
             self.app.notify(Kind::Error, "export: no project open");
             refuse!();
         };
@@ -8949,11 +9010,25 @@ impl DesktopApp {
                 }
             };
         // ── the desk, exactly as the live walk pushes it ──
-        e.set_desk(&self.app.desk());
+        {
+            let mut desk = self.app.desk();
+            if freeze.is_some() {
+                // Nothing may silence the lane being frozen, and a mute or a
+                // solo on the desk would - through its own bit or a folder's.
+                desk.muted.iter_mut().for_each(|m| *m = false);
+                desk.soloed.iter_mut().for_each(|m| *m = false);
+            }
+            e.set_desk(&desk);
+        }
         let gains = self.app.gains();
         for ch in 0..tangent_ui::recorder::CHANNELS {
             e.set_channel_gain(ch, gains.channels[ch]);
             e.set_channel_pan(ch, self.app.channel_pan(ch));
+        }
+        if let Some(lane) = freeze {
+            // Post-rack and PRE-fader: unity gain, centre pan (unity there).
+            e.set_channel_gain(lane, 1.0);
+            e.set_channel_pan(lane, 0.0);
         }
         // No live input of any kind: every arm down, every port silent.
         e.set_midi_off(u64::MAX);
@@ -9016,7 +9091,26 @@ impl DesktopApp {
         // ignored the automation would be the same class of quiet wrongness
         // as one whose bar lines were somewhere else: it plays, it sounds
         // plausible, and it is not what you were listening to.
-        e.set_automation(self.app.engine_automation());
+        e.set_automation(match freeze {
+            Some(lane) => {
+                // The lane's fader stays live, so its rides are not rendered.
+                let mut out = tangent_ui::automation::Automation::default();
+                for c in self.app.engine_automation().curves() {
+                    let fader = c.lane == lane
+                        && matches!(
+                            c.param,
+                            tangent_ui::automation::AutoParam::Gain
+                                | tangent_ui::automation::AutoParam::Pan
+                                | tangent_ui::automation::AutoParam::Mute
+                        );
+                    if !fader {
+                        out.set(c.clone());
+                    }
+                }
+                out
+            }
+            None => self.app.engine_automation(),
+        });
         // The built-in: rendered by the engine itself when a channel's
         // first bay names it — the live walk's own rule.
         let builtin_lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
@@ -9237,7 +9331,23 @@ impl DesktopApp {
             None
         };
         let mut stems = Vec::new();
-        if spec.stems {
+        let mut freeze_job = None;
+        if let Some(lane) = freeze {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let name = format!("frozen-{:02}-{stamp}.wav", lane + 1);
+            let path = out_dir.join(&name);
+            let _ = std::fs::remove_file(&path);
+            match tangent_record::wav::WavWriter::create(&path, wav_spec, &bext) {
+                Ok(w) => stems.push(StemWriter { lane, path, writer: w, loud: false }),
+                Err(err) => {
+                    self.app.notify(Kind::Error, format!("freeze: {err}"));
+                    return;
+                }
+            }
+            freeze_job = Some(FreezeJob { lane, rel_path: format!("media/{name}"), skip: None });
+        } else if spec.stems {
             let dir = out_dir.join(spec.stems_folder());
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 self.app
@@ -9285,7 +9395,10 @@ impl DesktopApp {
         self.app.notify_raise(
             EXPORT_RUNNING,
             Kind::Info,
-            format!("Rendering at full speed… ({} stem writers)", stems.len()),
+            match freeze {
+                Some(lane) => format!("Freezing {}…", self.app.channel_display_name(lane)),
+                None => format!("Rendering at full speed… ({} stem writers)", stems.len()),
+            },
         );
         self.recorder.offline_bounce = Some(OfflineBounce {
             e,
@@ -9299,7 +9412,41 @@ impl DesktopApp {
             stem_scratch: Vec::new(),
             out_dir,
             peaks: vec![(0.0, 0.0); tangent_ui::ports::EXPORT_PEAKS],
+            freeze: freeze_job,
         });
+    }
+
+    /// **The freeze's render is done**: close the file, measure it, and hand
+    /// it to the app, which owns the fact and its undo. See `start_freeze`.
+    fn finish_freeze(&mut self) {
+        let Some(b) = self.recorder.offline_bounce.take() else {
+            return;
+        };
+        let OfflineBounce { stems, freeze, spec, .. } = b;
+        self.app.notify_lower(EXPORT_RUNNING);
+        self.app.set_export_progress(None);
+        let Some(job) = freeze else {
+            return;
+        };
+        let mut frames = None;
+        for s in stems {
+            if s.lane != job.lane {
+                let _ = s.writer.finish();
+                continue;
+            }
+            let n = s.writer.frames();
+            match s.writer.finish() {
+                Ok(()) => frames = Some(n),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&s.path);
+                    self.app.notify(Kind::Error, format!("freeze failed: {e}"));
+                }
+            }
+        }
+        if let Some(n) = frames {
+            let len_s = n as f64 / f64::from(spec.rate.max(1));
+            self.app.note_frozen(job.lane, job.rel_path, len_s);
+        }
     }
 
     /// Drive the full-speed export: as many blocks as ~80 ms allows, every
@@ -9323,6 +9470,11 @@ impl DesktopApp {
             let out = &mut b.block[..n * 2];
             out.fill(0.0);
             b.e.render_offline(out);
+            if let Some(job) = b.freeze.as_mut() {
+                if job.skip.is_none() {
+                    job.skip = Some(u64::from(b.e.offline_stem_lead(job.lane)));
+                }
+            }
             if let Some((_, w)) = b.master.as_mut() {
                 if b.spec.mono {
                     fold.clear();
@@ -9351,7 +9503,17 @@ impl DesktopApp {
                         }
                     }
                     s.loud |= any_sound(&fold);
-                    let _ = s.writer.write_interleaved(&fold);
+                    // A freeze drops its latency lead off the front, once.
+                    let mut drop = 0usize;
+                    if let Some(job) = b.freeze.as_mut() {
+                        if job.lane == s.lane {
+                            let left = job.skip.unwrap_or(0);
+                            drop = usize::try_from(left).unwrap_or(usize::MAX).min(frames);
+                            job.skip = Some(left - drop as u64);
+                        }
+                    }
+                    let per = if b.spec.mono { 1 } else { 2 };
+                    let _ = s.writer.write_interleaved(&fold[drop * per..]);
                 }
             }
             // The wave, bucketed by where this block sits in the whole
@@ -9382,7 +9544,7 @@ impl DesktopApp {
             self.app
                 .set_export_progress(Some(tangent_ui::ports::ExportProgress {
                     fraction,
-                    label: "Rendering".to_owned(),
+                    label: if b.freeze.is_some() { "Freezing" } else { "Rendering" }.to_owned(),
                     peaks: b.peaks.clone(),
                 }));
             self.recorder.offline_bounce = Some(b);
@@ -9414,8 +9576,13 @@ impl DesktopApp {
             Some(f) => format!("{} and {}", b.spec.primary.ext(), f.ext()),
             None => b.spec.primary.ext().to_owned(),
         });
+        let (label, chore) = if b.freeze.is_some() {
+            ("Freezing", Chore::FinishFreeze)
+        } else {
+            ("Writing files", Chore::WriteExport)
+        };
         self.recorder.offline_bounce = Some(b);
-        self.announce(ctx, "Writing files", detail, Chore::WriteExport);
+        self.announce(ctx, label, detail, chore);
     }
 
     /// Close the render's files and run the format pass, with the
@@ -9591,6 +9758,7 @@ impl DesktopApp {
             Q::Export(spec) => ("Preparing export", Some(spec.source_label().to_owned())),
             Q::ExportTrack => ("Preparing export", Some("master".to_owned())),
             Q::ExportStems => ("Preparing export", Some("stems".to_owned())),
+            Q::Freeze(lane) => ("Preparing freeze", Some(self.app.channel_display_name(*lane).to_string())),
         };
         // **Save is the one of these that is usually instant, and it is
         // also the one pressed every few minutes.** An overlay that flashes
@@ -9782,6 +9950,9 @@ impl DesktopApp {
             // record, which is what a bare "export stems" row means.
             tangent_ui::ports::ProjectRequest::ExportStems => {
                 self.start_bounce(true, false, None);
+            }
+            tangent_ui::ports::ProjectRequest::Freeze(lane) => {
+                self.start_freeze(lane);
             }
             tangent_ui::ports::ProjectRequest::New
             | tangent_ui::ports::ProjectRequest::NewKeeping
@@ -10603,7 +10774,9 @@ impl DesktopApp {
                 // The clip's notes with its loop spelled out — one function,
                 // shared with the offline bounce. See `midi_clip_notes`.
                 let notes = midi_clip_notes(clip, f64::from(rate));
-                if !notes.is_empty() {
+                // A frozen lane's clips stay on the page and off the engine:
+                // its file plays instead, placed below the loop.
+                if !notes.is_empty() && self.app.lane_frozen(clip.lane).is_none() {
                     midi_placed.push(crate::instrument::PlacedMidi {
                         strip: clip.lane.min(tangent_ui::recorder::CHANNELS - 1),
                         start: frames(clip.start_s),
@@ -10738,7 +10911,7 @@ impl DesktopApp {
             }
             let len_s = clip.play_len_s(file_s);
             span = span.max(clip.start_s + len_s);
-            if stand_in.is_none() {
+            if stand_in.is_none() && self.app.lane_frozen(clip.lane).is_none() {
                 placed.extend(audio_clip_passes(
                     clip,
                     &decoded.clip,
@@ -10757,6 +10930,55 @@ impl DesktopApp {
             // **The clip's own picture**, from its pyramid. See
             // `clip_picture`.
             clip_infos.push(clip_picture(clip, &decoded, rate, wave_view, stand_in));
+        }
+        // **A frozen lane plays its rendered self**: one file from the
+        // timeline's start, in place of the clips the loop withheld for it.
+        // Through the same cache, so the file stays warm and counts as live
+        // the way a clip's does, and decoded here and now: a float WAV of
+        // the desk's own making reads fast, and the lane has nothing else to
+        // play until it is in.
+        if let Some(doc_path) = doc_path.as_ref() {
+            for z in self.app.frozen_lanes().to_vec() {
+                let path = tangent_ui::arrangement::Arrangement::resolve(doc_path, &z.path);
+                live_files.insert(path.clone());
+                let decoded = match self.track_cache.get(&path) {
+                    Some(c) => c.clone(),
+                    None => match tangent_record::decode::decode(&path, rate) {
+                        Ok(c) => {
+                            let c = Decoded::of(c);
+                            self.track_cache.insert(path.clone(), c.clone());
+                            c
+                        }
+                        Err(e) => {
+                            error = format!("frozen file: {e}");
+                            continue;
+                        }
+                    },
+                };
+                let whole = tangent_ui::arrangement::ArrClip {
+                    kind: tangent_ui::arrangement::ClipKind::Audio,
+                    notes: Vec::new(),
+                    pedal: Vec::new(),
+                    lane: z.lane,
+                    path: z.path.clone(),
+                    start_s: 0.0,
+                    offset_s: 0.0,
+                    len_s: 0.0,
+                    loop_s: 0.0,
+                    fade_in_s: 0.0,
+                    fade_out_s: 0.0,
+                    name: String::new(),
+                    id: 0,
+                    anchor: Default::default(),
+                    follow_tempo: false,
+                    stretch: 1.0,
+                    stretch_mode: String::new(),
+                    gain: 1.0,
+                    extra: Default::default(),
+                };
+                span = span.max(decoded.clip.seconds());
+                placed.extend(audio_clip_passes(&whole, &decoded.clip, f64::from(rate), 1.0));
+            }
         }
         self.stretch_seen.retain(|id, _| stretched_ids.contains(id));
         for note in notes {
@@ -12428,6 +12650,7 @@ impl DesktopApp {
         // is stored at the plugin's own address - so unlike the keys above
         // there is no `seat_bay` translation here to get wrong.
         engine_set_insert_bypass(e, self.app.insert_bypass());
+        e.set_frozen(frozen_lane_mask(self.app.frozen_lanes()));
     }
 
     /// Copy the faders, the click and the tempo into the audio thread.
@@ -12634,7 +12857,9 @@ impl DesktopApp {
         let midi_off =
             tangent_ui::recorder::live_midi_off(&kinds, armed, self.app.midi_editor_lane());
         crate::devices::set_channel_picks(&self.recorder.audio, explicit);
-        e.set_midi_off(u64::from(midi_off));
+        // A frozen lane listens to nothing: its rack rests and its file
+        // plays, so a note into it would sound through nothing anyway.
+        e.set_midi_off(u64::from(midi_off) | u64::from(frozen_lane_mask(self.app.frozen_lanes())));
         // **And WHAT each lane is listening to**, pushed whole beside the arm
         // mask every frame. Two separate questions on purpose: `midi_off` says
         // whether a lane is listening at all (arm, the editor), this says to
@@ -12666,8 +12891,12 @@ impl DesktopApp {
             }
             e.set_punches(punches);
         }
-        e.set_builtin_strips(builtin_mask);
-        e.set_keys_strips(keys_mask);
+        // The built-ins on a frozen lane stand down with its rack: the file
+        // carries what they played. Their instances outlive the freeze - the
+        // patch and params are pushed every frame - so thawing is instant.
+        let thawed = !frozen_lane_mask(self.app.frozen_lanes());
+        e.set_builtin_strips(builtin_mask & thawed);
+        e.set_keys_strips(keys_mask & thawed);
         // **Every keyboard lane's own state, every frame.** This used to be
         // one guarded push because a patch change rebuilt the voice pool;
         // that died when the pool learned to carry both mechanisms, so a
@@ -14243,6 +14472,11 @@ fn furnish_mirror_bay(
 /// buffer have to agree and one place to agree in is cheaper than five — see
 /// `Shared::stems_dry`.
 #[cfg(feature = "recorder")]
+/// The frozen lanes as the engine's mask - see `Shared::frozen`.
+fn frozen_lane_mask(frozen: &[tangent_ui::arrangement::FrozenLane]) -> u32 {
+    frozen.iter().fold(0u32, |m, z| m | 1u32 << z.lane.min(31))
+}
+
 fn arm_stem_tap(e: &crate::instrument::Engine, stems: bool, dry: bool) {
     e.set_stems(stems);
     e.set_stems_dry(stems && dry);
@@ -18141,6 +18375,8 @@ enum Chore {
     /// The offline render is finished: close the files and run the format
     /// pass. See `tick_offline_bounce`.
     WriteExport,
+    /// Close a freeze's file and hand it to the app - see `finish_freeze`.
+    FinishFreeze,
     /// Walk every VST3 root again. One `read_dir` per root and one bundle
     /// opened per plugin found, all of it on this thread.
     RescanPlugins,
@@ -18887,6 +19123,7 @@ impl DesktopApp {
                 }
             }
             Chore::WriteExport => self.write_export(),
+            Chore::FinishFreeze => self.finish_freeze(),
             Chore::RescanPlugins => self.rescan_plugins(),
             Chore::SaveCopy(path) => {
                 self.app
@@ -22708,6 +22945,48 @@ mod tests {").expect("the tests module")];
     /// announced last frame loads this frame — plus a new engine and a
     /// timed backstop. Pinned: the needle loop iterates `comp_rows`, and the
     /// stale flag is raised off `insert_announced`.
+    /// **The freeze's plumbing, pinned end to end**: the clip reload keeps
+    /// a frozen lane's own clips off the engine and places its file, the
+    /// per-frame push hands the engine the frozen mask and stands the
+    /// built-ins down, the render neutralises the lane and leaves its fader
+    /// rides out, and the tick cuts the latency lead off the file's front.
+    #[test]
+    fn a_freeze_reaches_the_engine_the_render_and_the_reload() {
+        let whole = include_str!("desktop.rs");
+        let src = &whole[..whole.find("\nmod tests {").expect("the tests module")];
+        let body_of = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("`{name}` is gone"));
+            let end = src[at + 1..].find("\n    fn ").map_or(src.len(), |n| at + 1 + n);
+            &src[at..end]
+        };
+        let reload = body_of("fn reload_clips(&mut self");
+        assert_eq!(
+            reload.matches("self.app.lane_frozen(clip.lane).is_none()").count(),
+            2,
+            "a frozen lane's MIDI and audio clips are not both withheld"
+        );
+        assert!(reload.contains("self.app.frozen_lanes().to_vec()"), "the frozen file is no longer placed");
+        let render = body_of("fn start_offline_render(");
+        for needle in [
+            "e.set_channel_gain(lane, 1.0)",
+            "e.set_channel_pan(lane, 0.0)",
+            "desk.soloed.iter_mut()",
+            "tangent_ui::automation::AutoParam::Mute",
+            "FreezeJob { lane, rel_path",
+        ] {
+            assert!(render.contains(needle), "the render lost `{needle}`");
+        }
+        let tick = body_of("fn tick_offline_bounce(&mut self");
+        assert!(tick.contains("offline_stem_lead(job.lane)"), "the tick no longer reads the lead");
+        assert!(tick.contains("write_interleaved(&fold[drop * per..])"), "the lead is no longer cut");
+        assert!(tick.contains("Chore::FinishFreeze"), "a freeze ends in the export's chore");
+        let routes = body_of("fn publish_routes(&self");
+        assert!(routes.contains("e.set_frozen(frozen_lane_mask("), "the engine is not told what is frozen");
+        let push = body_of("fn push_monitor_settings(&mut self)");
+        assert!(push.contains("builtin_mask & thawed"), "a frozen built-in still renders");
+        assert!(push.contains("u64::from(frozen_lane_mask("), "a frozen lane still listens");
+    }
+
     #[test]
     fn the_comp_needles_read_an_index_that_goes_stale_on_the_announce_edge() {
         let whole = include_str!("desktop.rs");

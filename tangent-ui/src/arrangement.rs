@@ -1107,6 +1107,14 @@ pub struct DeskSnap {
     pub feel: Option<Feel>,
     /// See [`Notation`].
     pub notation: Option<Notation>,
+    /// **Which lanes are frozen, and to what file.** See [`FrozenLane`].
+    ///
+    /// The one desk field where "the document does not say" does NOT mean
+    /// "the live value stands": a freeze is a fact about THIS document's
+    /// media folder, so a document that carries no `frozen` has nothing
+    /// frozen, and opening it thaws whatever the last one had. The live
+    /// desk always says `Some`, empty when nothing is frozen.
+    pub frozen: Option<Vec<FrozenLane>>,
 }
 
 /// **What the built-in instruments are set to**, per strip.
@@ -1223,6 +1231,23 @@ pub struct Notation {
     pub capo: i64,
     pub capo_style: String,
     pub tuning: String,
+}
+
+/// **A frozen lane: its rendered self, and where it lives.**
+///
+/// A freeze renders the lane's clips through its rack, post-insert and
+/// pre-fader, into one file under the project's `media/`, and while the
+/// lane is frozen that file plays in place of the clips with the rack
+/// stood down — the plugins keep their state and pay nothing. The fader,
+/// pan, mute, solo and sends stay live, which is why the render leaves
+/// them out. `len_s` is the file's length, kept here so the host never has
+/// to resolve it late the way a clip's `len_s == 0` is resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrozenLane {
+    pub lane: usize,
+    /// Relative to the document, like a clip's `path` — see `resolve`.
+    pub path: String,
+    pub len_s: f64,
 }
 
 /// **Which channels a desk arms when nothing says otherwise.**
@@ -1364,6 +1389,8 @@ pub struct DeskRef<'a> {
     pub feel: Option<Feel>,
     /// See [`DeskSnap::notation`].
     pub notation: Option<NotationRef<'a>>,
+    /// See [`DeskSnap::frozen`].
+    pub frozen: Option<&'a [FrozenLane]>,
 }
 
 /// [`Rack`] borrowed — see [`DeskRef`].
@@ -1479,6 +1506,7 @@ impl DeskRef<'_> {
                 capo_style: n.capo_style.to_owned(),
                 tuning: n.tuning.to_owned(),
             }),
+            frozen: self.frozen.map(<[FrozenLane]>::to_vec),
         }
     }
 
@@ -1704,6 +1732,15 @@ impl DeskRef<'_> {
             f.str(n.capo_style);
             f.str(n.tuning);
         }
+        opt(f, self.frozen.is_some());
+        if let Some(fr) = self.frozen {
+            f.u64(fr.len() as u64);
+            for z in fr {
+                f.u64(z.lane as u64);
+                f.str(&z.path);
+                f.u64(z.len_s.to_bits());
+            }
+        }
     }
 }
 
@@ -1779,6 +1816,7 @@ impl DeskSnap {
                 capo_style: &n.capo_style,
                 tuning: &n.tuning,
             }),
+            frozen: self.frozen.as_deref(),
         }
     }
 
@@ -2045,6 +2083,23 @@ impl DeskSnap {
             nm.insert("capo_style".into(), Value::String(n.capo_style.clone()));
             nm.insert("tuning".into(), Value::String(n.tuning.clone()));
             m.insert("notation".into(), Value::Object(nm));
+        }
+        if let Some(fr) = self.frozen.as_ref() {
+            let rows = fr
+                .iter()
+                .map(|z| {
+                    let mut zm = Map::new();
+                    zm.insert("lane".into(), Value::Number((z.lane as u64).into()));
+                    zm.insert("path".into(), Value::String(z.path.clone()));
+                    zm.insert(
+                        "len_s".into(),
+                        serde_json::Number::from_f64(z.len_s)
+                            .map_or(Value::Null, Value::Number),
+                    );
+                    Value::Object(zm)
+                })
+                .collect();
+            m.insert("frozen".into(), Value::Array(rows));
         }
         Value::Object(m)
     }
@@ -2399,6 +2454,18 @@ impl DeskSnap {
                     capo_style: s("capo_style", ""),
                     tuning: s("tuning", ""),
                 }
+            }),
+            frozen: m.get("frozen").and_then(Value::as_array).map(|rows| {
+                rows.iter()
+                    .filter_map(|r| {
+                        let zm = r.as_object()?;
+                        let lane = usize::try_from(zm.get("lane")?.as_u64()?).ok()?;
+                        let path = zm.get("path")?.as_str()?.to_owned();
+                        let len_s = zm.get("len_s").and_then(Value::as_f64).unwrap_or(0.0);
+                        (lane < crate::recorder::CHANNELS && !path.is_empty() && len_s.is_finite())
+                            .then_some(FrozenLane { lane, path, len_s: len_s.max(0.0) })
+                    })
+                    .collect()
             }),
             inserts,
         })
@@ -4522,6 +4589,11 @@ mod tests {
                 capo_style: "silver".into(),
                 tuning: "Drop D".into(),
             }),
+            frozen: Some(vec![FrozenLane {
+                lane: 1,
+                path: "media/frozen-02-1.wav".into(),
+                len_s: 12.5,
+            }]),
         });
         let mut extra = Map::new();
         extra.insert("a_newer_builds_key".into(), Value::from("kept"));
@@ -4903,6 +4975,17 @@ mod tests {
             desk(a).varispeed = Some(v);
         });
         moves_both("the varispeed going unsaid", |a| desk(a).varispeed = None);
+        moves_both("a lane freezing", |a| {
+            desk(a).frozen = Some(vec![FrozenLane {
+                lane: 0,
+                path: "media/frozen-01-7.wav".into(),
+                len_s: 3.0,
+            }]);
+        });
+        moves_both("a frozen lane's file", |a| {
+            desk(a).frozen.as_mut().unwrap()[0].path = "media/frozen-02-8.wav".into();
+        });
+        moves_both("the freeze going unsaid", |a| desk(a).frozen = None);
         moves_both("the click's division", |a| {
             desk(a).click.as_mut().unwrap().div = 0;
         });

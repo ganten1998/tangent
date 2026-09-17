@@ -114,6 +114,10 @@ pub struct LaneView<'a> {
     /// -1..1, the strip's pan — the third.
     pub pan: f32,
     pub peak: [f32; 2],
+    /// **Frozen**: the lane plays its rendered self and its rack rests.
+    /// Painted under frost with a snowflake on the header; its clips are
+    /// shown and not editable. Appended, the struct's law.
+    pub frozen: bool,
 }
 
 /// One clip on a lane, resolved: `len_s` is real seconds (the host resolved
@@ -4156,6 +4160,30 @@ fn input_chip(painter: &Painter, r: Rect, word: &str, has: bool, p: &Ink, size: 
 /// `ArrangeView` in reach. A derivation copied there would be a second place
 /// that decides what the arrangement's ground is, and the two would come apart
 /// the first time either was tuned. So there is one, and both callers use it.
+/// The frost over a frozen lane: a cool wash that reads on a dark and a
+/// light surface alike, and the ink its snowflake is drawn in.
+pub const FROST_TINT: Color32 = Color32::from_rgba_premultiplied(48, 72, 96, 72);
+pub const FROST_INK: Color32 = Color32::from_rgb(184, 226, 255);
+
+/// A six-spoke snowflake of radius `r` about `c`: three lines through the
+/// centre, a pair of short barbs near each tip. Drawn, not typed, so it
+/// needs no glyph a face might lack.
+pub fn snowflake(painter: &Painter, c: Pos2, r: f32, ink: Color32) {
+    let stroke = Stroke::new(1.0_f32, ink);
+    for k in 0..3 {
+        let a = std::f32::consts::PI / 3.0 * k as f32;
+        let d = Vec2::new(a.cos(), a.sin()) * r;
+        painter.line_segment([c - d, c + d], stroke);
+        let side = Vec2::new(-d.y, d.x) * 0.3;
+        for s in [-1.0f32, 1.0] {
+            let tip = c + d * s;
+            let back = tip - d * s * 0.4;
+            painter.line_segment([back, back + side], stroke);
+            painter.line_segment([back, back - side], stroke);
+        }
+    }
+}
+
 pub fn lane_field(strip: Color32, well: Color32, dark: bool) -> Color32 {
     crate::recorder_panel::legible_surface(if dark {
         shade(well, 1.55)
@@ -6070,6 +6098,27 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             painter.rect_filled(row.panel, 0.0, Color32::from_black_alpha(96));
         }
     }
+    // **A frozen lane is under frost**, clips and header alike, and wears
+    // a snowflake at the header's right edge. Over the clips, so what is
+    // drawn reads as "here, but not for touching" - the clips are what the
+    // frozen file was rendered from and thawing brings them back.
+    for row in &l.rows {
+        let RowKind::Track(lane) = row.kind else {
+            continue;
+        };
+        if !view.lanes.get(lane).is_some_and(|v| v.frozen) || !row.lane.is_positive() {
+            continue;
+        }
+        painter.rect_filled(row.lane, 0.0, FROST_TINT);
+    }
+    for (i, row) in l.header_rows.iter().enumerate() {
+        if !view.lanes.get(i).is_some_and(|v| v.frozen) || !row.panel.is_positive() {
+            continue;
+        }
+        painter.rect_filled(row.panel, 0.0, FROST_TINT);
+        let r = (row.panel.height() * 0.22).clamp(3.0, 6.0);
+        snowflake(painter, Pos2::new(row.panel.right() - r - 4.0, row.panel.top() + r + 3.0), r, FROST_INK);
+    }
 
     // ── the TIME SELECTION: a veil over the span, on ruler and lanes ──────
     // AFTER the clips, deliberately: the veil and its boundary lines are
@@ -7429,6 +7478,7 @@ LaneView {
     folder_count: 0,
     hidden: false,
     folder_silent: false,
+    frozen: false,
             automation: Vec::new(),
             route_count: 0,
             stereo: true,
