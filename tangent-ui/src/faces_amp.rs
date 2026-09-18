@@ -401,7 +401,7 @@ fn param_row(
 ) -> Option<FaceAction> {
     let p = live.face.params.iter().find(|p| p.id == id)?;
     slider_row(ui, st, &p.name, &p.reading, p.value, p.default)
-        .map(|value| FaceAction::Set { id, value })
+        .map(|ask| crate::faces::ask_to_action(id, ask))
 }
 
 /// One toggle as a stepped kit row wearing its choice.

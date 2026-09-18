@@ -340,6 +340,9 @@ pub struct RecorderView<'a> {
     /// Set while the last take clipped, so the report after Stop can say so
     /// even after the meter has been reset.
     pub clip_warning: bool,
+    /// **The limiter is out of circuit**, so its dial is drawn dark. See
+    /// `TangentApp::limiter_disabled`. Appended, the struct's law.
+    pub limiter_off: bool,
 }
 
 /// The band timeline's overview of the ARRANGEMENT: every clip as a block
@@ -427,6 +430,7 @@ impl RecorderView<'_> {
             hide_elapsed: false,
             message: None,
             clip_warning: false,
+            limiter_off: false,
         }
     }
 }
@@ -1988,6 +1992,7 @@ impl RecorderState {
             view_window: (0.0, 60.0),
             meters: self.meters,
             master: self.master,
+            limiter_off: false,
             gr_db: self.gr_db,
             dest: &self.dest,
             project_dest: &self.project_dest,
@@ -2489,6 +2494,15 @@ pub enum RecorderRequest {
     /// mirrors optimistically (`TangentApp::set_insert_param`), so a face
     /// never waits a frame to see its own drag.
     SetInsertParam { strip: usize, slot: usize, id: u32, value: f32 },
+    /// **Set one knob on a built-in insert from words typed into its
+    /// reading.** Same addressing as `SetInsertParam`; `text` is what the
+    /// hand typed - "-12", "440", "1.5k", "off". The host reads it on the
+    /// unit's own scale (`builtin_fx::value_for_reading`), applies it
+    /// through the one road a drag takes, and pushes the face back so the
+    /// reading shows the number it landed on. Words the unit cannot read
+    /// change nothing. The sender does NOT mirror this one: it has no value
+    /// to mirror, which is the whole reason the words travel.
+    TypeInsertParam { strip: usize, slot: usize, id: u32, text: String },
     /// **Aim the engine's ONE insert tap at a mixer slot, or take it off**
     /// — the feed behind an EQ face's analyzer and an imager face's
     /// vectorscope. `strip` and `slot` are DESK terms (`Strip::index` and

@@ -1061,6 +1061,14 @@ struct Band {
     /// [`DENOISE_OFF`] means the band never reduces.
     thr_norm: f32,
     thr_db: f32,
+    /// **What the BANK gates on**, in dB. Equal to `thr_db` for a print the
+    /// bank learned; for one a spectral kernel learned it is the bank's own
+    /// measurement of the same noise, taken by `learn_feed` during the
+    /// pass, because the two kernels measure a band differently and a
+    /// spectral print read as a bank knee sat in the middle of the noise -
+    /// the owner's "learn on bank then switch works, but not vice versa".
+    /// Persisted beside the print as `k0..k31`; see `Denoise::knees`.
+    knee_db: f32,
     /// Learn accumulators: tick count, Σ level, Σ level² (dB domain).
     n: f64,
     sum: f64,
@@ -1087,6 +1095,7 @@ impl Band {
         bq: [Biquad { z1: 0.0, z2: 0.0 }; 2],
         thr_norm: 0.0,
         thr_db: DENOISE_THR_DB.0,
+        knee_db: DENOISE_THR_DB.0,
         n: 0.0,
         sum: 0.0,
         sumsq: 0.0,
@@ -1094,10 +1103,11 @@ impl Band {
 
     /// Forget what was playing, keep what was learned.
     fn quiesce(&mut self) {
-        let (thr_norm, thr_db) = (self.thr_norm, self.thr_db);
+        let (thr_norm, thr_db, knee_db) = (self.thr_norm, self.thr_db, self.knee_db);
         *self = Band::IDLE;
         self.thr_norm = thr_norm;
         self.thr_db = thr_db;
+        self.knee_db = knee_db;
     }
 }
 
@@ -2082,9 +2092,33 @@ impl Denoise {
             let norm = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
             b.thr_norm = norm;
             b.thr_db = DENOISE_THR_DB.0 + (DENOISE_THR_DB.1 - DENOISE_THR_DB.0) * norm;
+            // A print with no knees of its own gates the bank at its
+            // thresholds, which is every bank print's reading anyway.
+            b.knee_db = b.thr_db;
         }
         self.recount();
         self.refloor();
+    }
+    /// **The bank's knees**, normalized like [`Denoise::thresholds`]: the 32
+    /// `k0..k31` symbols a session persists beside the print. Equal to the
+    /// thresholds for a print the bank learned; for one a spectral kernel
+    /// learned, the bank's own measurement of the same noise. See
+    /// [`Band::knee_db`].
+    pub fn knees(&self) -> [f32; DENOISE_BANDS] {
+        let span = DENOISE_THR_DB.1 - DENOISE_THR_DB.0;
+        let mut out = [0.0_f32; DENOISE_BANDS];
+        for (o, b) in out.iter_mut().zip(self.band.iter()) {
+            *o = ((b.knee_db - DENOISE_THR_DB.0) / span).clamp(0.0, 1.0);
+        }
+        out
+    }
+    /// Restore persisted knees, after [`Denoise::set_thresholds`]. Clamped
+    /// and non-finite-proofed the same way.
+    pub fn set_knees(&mut self, knees: &[f32; DENOISE_BANDS]) {
+        for (b, &t) in self.band.iter_mut().zip(knees.iter()) {
+            let norm = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
+            b.knee_db = DENOISE_THR_DB.0 + (DENOISE_THR_DB.1 - DENOISE_THR_DB.0) * norm;
+        }
     }
 
     /// The honest latency, in samples, for the current settings — what a
@@ -2181,6 +2215,7 @@ impl Denoise {
             for (p, b) in proposed.iter().zip(self.band.iter_mut()) {
                 b.thr_norm = *p;
                 b.thr_db = DENOISE_THR_DB.0 + (DENOISE_THR_DB.1 - DENOISE_THR_DB.0) * *p;
+                b.knee_db = b.thr_db;
             }
             DenoiseLearn::Taught
         };
@@ -2254,9 +2289,15 @@ impl Denoise {
             self.learn_outcome = if proposed.iter().all(|n| *n < DENOISE_OFF) {
                 DenoiseLearn::Silent
             } else {
-                for (p, b) in proposed.iter().zip(self.band.iter_mut()) {
+                // The print is the spectral kernel's own reading; the bank's
+                // knee beside it is the bank's, taken by `learn_feed` during
+                // the same pass. A band the bank's ear did not hear enough
+                // of keeps the threshold as its knee.
+                let knees = self.bank_knees_proposed();
+                for ((p, b), k) in proposed.iter().zip(self.band.iter_mut()).zip(knees) {
                     b.thr_norm = *p;
                     b.thr_db = DENOISE_THR_DB.0 + (DENOISE_THR_DB.1 - DENOISE_THR_DB.0) * *p;
+                    b.knee_db = k.unwrap_or(b.thr_db);
                 }
                 DenoiseLearn::Taught
             };
@@ -2386,13 +2427,13 @@ impl Denoise {
                 // closing back at the threshold itself and only after the
                 // hold has run out. See DENOISE_HYSTERESIS_DB for why the
                 // window sits above rather than straddling.
-                if b.env_db >= b.thr_db + DENOISE_HYSTERESIS_DB {
+                if b.env_db >= b.knee_db + DENOISE_HYSTERESIS_DB {
                     b.open = true;
                     b.hold = self.hold_ticks;
                 } else if b.open {
                     if b.hold > 0 {
                         b.hold -= 1;
-                    } else if b.env_db <= b.thr_db {
+                    } else if b.env_db <= b.knee_db {
                         b.open = false;
                     }
                 }
@@ -2405,7 +2446,7 @@ impl Denoise {
                     // threshold the band sits; the quadratic meets both
                     // straight segments tangent, so there is no corner for
                     // a level to sit on and buzz.
-                    let under = b.thr_db - b.level_db;
+                    let under = b.knee_db - b.level_db;
                     let w = DENOISE_KNEE_DB;
                     let wanted = if 2.0 * under <= -w {
                         0.0
@@ -3215,6 +3256,88 @@ impl Denoise {
     ///
     /// The input is read out of the buffer before the output is written
     /// into it, because they are the same buffer.
+    /// The sidechain high-pass the bank's ear reads through, from the
+    /// SC HPF dial: on or off, and the one-pole coefficient when on.
+    fn sidechain_hpf(&self, params: &DenoiseParams) -> (bool, f32) {
+        let sr = f64::from(self.sample_rate);
+        let geo = |range: (f32, f32), t: f32| {
+            f64::from(range.0) * f64::from(range.1 / range.0).powf(f64::from(t))
+        };
+        // The dial's own clamp, as `process` reads every knob.
+        let hpf = if params.sc_hpf.is_finite() { params.sc_hpf.clamp(0.0, 1.0) } else { 0.0 };
+        let hpf_on = hpf >= DENOISE_OFF;
+        let a_hp = if hpf_on {
+            (1.0 - (-std::f64::consts::TAU * geo(DENOISE_SC_HPF_HZ, hpf) / sr).exp()) as f32
+        } else {
+            0.0
+        };
+        (hpf_on, a_hp)
+    }
+    /// **The bank's ear, run during a learn on a spectral kernel.** One
+    /// input frame through the same mono mid, the same sidechain high-pass
+    /// and the same 32 resonators the bank listens with, and the same tick
+    /// into `control` - which, learning, does nothing but accumulate the
+    /// per-band statistics `bank_knees_proposed` reads at the falling edge.
+    /// So a print a spectral kernel learns carries a bank knee measured the
+    /// bank's own way, and switching to the bank afterwards gates where a
+    /// bank learn of the same room would have. Costs nothing outside a
+    /// pass, and a pass is a few seconds with a mouse held down.
+    fn learn_feed(&mut self, l: f32, r: f32, hpf_on: bool, a_hp: f32) {
+        let mut d = 0.5 * (l + r);
+        if hpf_on {
+            self.hp_lp = flush(self.hp_lp + a_hp * (d - self.hp_lp));
+            d -= self.hp_lp;
+        } else {
+            self.hp_lp = d;
+        }
+        for (b, dz) in self.band.iter_mut().zip(self.design.iter()) {
+            if dz.inert {
+                continue;
+            }
+            let re = dz.pr * b.re - dz.pi * b.im + dz.g * d;
+            let im = dz.pi * b.re + dz.pr * b.im;
+            b.re = flush(re);
+            b.im = flush(im);
+            let re2 = dz.pr * b.re2 - dz.pi * b.im2 + dz.g * re;
+            let im2 = dz.pi * b.re2 + dz.pr * b.im2 + dz.g * im;
+            b.re2 = flush(re2);
+            b.im2 = flush(im2);
+            b.eacc += re2 * re2 + im2 * im2;
+        }
+        self.phase += 1;
+        if self.phase >= self.tick_len {
+            let plan = TickPlan {
+                learning: true,
+                cap_db: 0.0,
+                slope: 0.0,
+                a_rel_slow: 0.0,
+                a_rel_fast: 0.0,
+            };
+            self.control(&plan);
+            self.phase = 0;
+        }
+    }
+    /// **What the bank would have frozen**, per band, from the statistics
+    /// its ear accumulated during the pass: mean + [`DENOISE_LEARN_SIGMA`]·σ
+    /// + [`DENOISE_LEARN_HEADROOM_DB`], in dB, clamped to the threshold
+    /// range - the arithmetic `freeze_thresholds` does for a bank learn.
+    /// `None` for a band that heard fewer ticks than a pass needs.
+    fn bank_knees_proposed(&self) -> [Option<f32>; DENOISE_BANDS] {
+        let min_ticks = self.min_learn_ticks;
+        let mut out = [None; DENOISE_BANDS];
+        for (o, b) in out.iter_mut().zip(self.band.iter()) {
+            if b.n < min_ticks {
+                continue;
+            }
+            let mean = b.sum / b.n;
+            let var = (b.sumsq / b.n - mean * mean).max(0.0);
+            let thr = mean
+                + f64::from(DENOISE_LEARN_SIGMA) * var.sqrt()
+                + f64::from(DENOISE_LEARN_HEADROOM_DB);
+            *o = Some((thr as f32).clamp(DENOISE_THR_DB.0, DENOISE_THR_DB.1));
+        }
+        out
+    }
     fn process_spectral(
         &mut self,
         buf: &mut [f32],
@@ -3227,6 +3350,7 @@ impl Denoise {
             return;
         }
         let plan = self.spectral_plan(params);
+        let (hpf_on, a_hp) = self.sidechain_hpf(params);
         let mut done = 0usize;
         while done < frames {
             let take = (hop - self.sp.stage_fill).min(frames - done);
@@ -3238,8 +3362,12 @@ impl Denoise {
                 // bank's own read gives. Here it also keeps the OUTPUT
                 // finite: an infinity in the analysed frame comes back out
                 // of the inverse transform smeared across the whole hop.
-                self.sp.in_ring[2 * w] = flush_bad(buf[f]);
-                self.sp.in_ring[2 * w + 1] = flush_bad(buf[f + 1]);
+                let (l, r) = (flush_bad(buf[f]), flush_bad(buf[f + 1]));
+                self.sp.in_ring[2 * w] = l;
+                self.sp.in_ring[2 * w + 1] = r;
+                if self.learning {
+                    self.learn_feed(l, r, hpf_on, a_hp);
+                }
                 w += 1;
                 if w == n {
                     w = 0;
@@ -5422,6 +5550,86 @@ mod tests {
     ///
     /// The timing is printed as well, because a kernel that cannot run in
     /// realtime is not allocation-free, it is just differently unusable.
+    /// **A print learned on a spectral kernel gates the bank like the
+    /// bank's own.** The spectral learn freezes each band at the geometric
+    /// mean of a windowed periodogram; the bank gates on mean + 2σ + 4 dB
+    /// of its resonators' level, a different measurement of the same
+    /// noise. Read as a bank knee, the spectral print sat in the middle of
+    /// the noise and the bank chattered on it - the owner's "learn on bank
+    /// then switch to Studio or Live works, but not vice versa". So a
+    /// spectral pass now runs the bank's ear as well and freezes a bank
+    /// knee beside the print, and switching to the bank afterwards reads
+    /// what a bank learn of the same room would have.
+    #[test]
+    fn a_print_learned_on_a_spectral_kernel_gates_the_bank_like_its_own() {
+        let span = DENOISE_THR_DB.1 - DENOISE_THR_DB.0;
+        for kernel in [DenoiseKernel::SpectralStudio, DenoiseKernel::SpectralLive] {
+            let spectral = learned(kernel, 0x5EED, 0.05, SR, 1.5);
+            let bank = learned(DenoiseKernel::Bank, 0x5EED, 0.05, SR, 1.5);
+            let (knees, own) = (spectral.knees(), bank.thresholds());
+            let mut worst = 0.0f32;
+            for (b, (k, t)) in knees.iter().zip(own.iter()).enumerate() {
+                if *t < DENOISE_OFF {
+                    continue;
+                }
+                let d = (k - t).abs() * span;
+                assert!(
+                    d < 2.0,
+                    "{}: band {b} knee {:.1} dB against the bank's own {:.1} dB",
+                    kernel.label(),
+                    DENOISE_THR_DB.0 + k * span,
+                    DENOISE_THR_DB.0 + t * span
+                );
+                worst = worst.max(d);
+            }
+            assert!(worst > 0.0, "{}: no band was compared", kernel.label());
+            // And the print itself is still the spectral kernel's: a knee
+            // is not a threshold, or the floor would have moved.
+            assert!(
+                spectral.thresholds().iter().zip(knees.iter()).any(|(t, k)| (t - k).abs() * span > 3.0),
+                "{}: the knees are the print - the spectral floor was overwritten",
+                kernel.label()
+            );
+
+            // Switched to the bank, the print cuts the noise it learned.
+            let mut dn = spectral;
+            let frames = (SR * 1.0) as usize;
+            let mut buf = Noise::new(0x5EED, 0.05, SR).frames(frames);
+            let before = (buf.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>() / buf.len() as f64).sqrt();
+            let mut warm = Noise::new(0x5EED, 0.05, SR).frames(frames);
+            dn.process(&mut warm, frames, 2, &on(DenoiseKernel::Bank));
+            dn.process(&mut buf, frames, 2, &on(DenoiseKernel::Bank));
+            let after = (buf.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>() / buf.len() as f64).sqrt();
+            let cut = 20.0 * (before / after.max(1.0e-12)).log10();
+            assert!(
+                cut > 6.0,
+                "{} print on the bank cut the noise by {cut:.1} dB",
+                kernel.label()
+            );
+        }
+    }
+
+    /// A print with no knees of its own - every print from before the
+    /// knees existed - gates the bank at its thresholds, as it always did,
+    /// and a knee set afterwards wins.
+    #[test]
+    fn a_print_without_knees_gates_at_its_thresholds() {
+        let mut dn = Denoise::new(SR);
+        let mut thr = [0.0_f32; DENOISE_BANDS];
+        for (i, t) in thr.iter_mut().enumerate() {
+            *t = 0.3 + 0.01 * i as f32;
+        }
+        dn.set_thresholds(&thr);
+        for (k, t) in dn.knees().iter().zip(dn.thresholds().iter()) {
+            assert!((k - t).abs() < 1.0e-5, "a print without knees gates at {k}, not its threshold {t}");
+        }
+        let mut knees = thr;
+        knees[4] = 0.8;
+        dn.set_knees(&knees);
+        assert!((dn.knees()[4] - 0.8).abs() < 1.0e-6);
+        assert!((dn.thresholds()[4] - thr[4]).abs() < 1.0e-6, "a knee moved the print");
+    }
+
     #[test]
     fn nothing_on_the_audio_thread_allocates_not_even_a_kernel_change() {
         let seconds = 10.0_f32;

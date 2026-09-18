@@ -2253,6 +2253,8 @@ struct Shared {
     /// the seat cell to `u32::MAX` as it adopts, so a settled learner costs
     /// nothing once drained.
     learn_thr: Vec<AtomicU32>,
+    /// The bank's knees beside the thresholds - see `Denoise::knees`.
+    learn_knee: Vec<AtomicU32>,
     learn_seat: AtomicU32,
     lane_latency: [AtomicU32; CHANNELS],
     /// **What everything is aligned TO** — the largest of the sixteen
@@ -2640,6 +2642,9 @@ impl Shared {
             seat_latency: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             seat_gr: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             learn_thr: (0..crate::units::denoise::DENOISE_BANDS)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+            learn_knee: (0..crate::units::denoise::DENOISE_BANDS)
                 .map(|_| AtomicU32::new(0))
                 .collect(),
             learn_seat: AtomicU32::new(u32::MAX),
@@ -4082,8 +4087,11 @@ fn run_rack(
                 // host adopts them into the durable ledger
                 // (`adopt_learned_thresholds`), because the instance is out
                 // here where nobody can ask it at save time.
-                if let Some(thr) = unit.learn_snapshot() {
+                if let Some((thr, knee)) = unit.learn_snapshot() {
                     for (cell, t) in shared.learn_thr.iter().zip(thr) {
+                        cell.store(t.to_bits(), Ordering::Relaxed);
+                    }
+                    for (cell, t) in shared.learn_knee.iter().zip(knee) {
                         cell.store(t.to_bits(), Ordering::Relaxed);
                     }
                     shared
@@ -6642,6 +6650,15 @@ impl Renderer {
             };
             let mono = self.shared.master_mono.load(Ordering::Relaxed);
             if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
+                // **The lamp answers for the peak INTO the limiter.** With a
+                // limiter in circuit the master never clips, so the latch
+                // below, taken after it, could never light: the owner's
+                // "make it such that the VU meters trigger on peak again".
+                // A sample at the ceiling here is a peak the limiter is
+                // about to catch, and that is what a peak lamp is for.
+                if mix.iter().any(|s| s.abs() >= CLIP_LEVEL) {
+                    clipped = true;
+                }
                 self.master_effects.process(
                     mix,
                     n,
@@ -13696,6 +13713,10 @@ impl Engine {
         for (k, cell) in self.shared.learn_thr.iter().enumerate() {
             let v = f32::from_bits(cell.load(Ordering::Relaxed));
             bay.extra.push((format!("t{k}"), v.to_string()));
+        }
+        for (k, cell) in self.shared.learn_knee.iter().enumerate() {
+            let v = f32::from_bits(cell.load(Ordering::Relaxed));
+            bay.extra.push((format!("k{k}"), v.to_string()));
         }
     }
 
@@ -26335,6 +26356,48 @@ mod tests {
         assert_eq!(e.offline_stem_lead(0), 300);
         assert_eq!(e.offline_stem_lead(2), 200);
         assert_eq!(e.offline_stem_lead(CHANNELS + 5), 300, "an out-of-range lane reads the bare lead");
+    }
+
+    /// **The lamp answers for the peak INTO the limiter.** A limiter in
+    /// circuit holds the master under the ceiling, so a latch taken after it
+    /// could never light: an input hot enough to clip lights the lamp while
+    /// the output stays held. The owner's "make it such that the VU meters
+    /// trigger on peak again (they currently do not)".
+    #[test]
+    fn the_lamp_lights_for_a_peak_into_the_limiter() {
+        let shared = Arc::new(Shared::new());
+        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 14);
+        let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+        let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
+        r.monitor = Some(in_rx);
+        r.monitor_channels = 1;
+        r.monitor_widths = inputs_array([1]);
+        r.monitor_scratch = vec![0.0; 8192];
+        shared.pick_strip[0].store(1, Ordering::Relaxed);
+        shared.midi_off.store(1 << 1, Ordering::Relaxed);
+        shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+        shared.armed.store(1 << 1, Ordering::Relaxed);
+        shared.monitor_on.store(false, Ordering::Relaxed);
+        shared
+            .limiter_mix
+            .store(tangent_ui::recorder::LIMITER_SHIPS_AT.to_bits(), Ordering::Relaxed);
+        r.channel_gain[1] = 1.0;
+        let mut out = vec![0.0f32; 256 * 2];
+        let mut peak = 0.0f32;
+        for b in 0..200 {
+            for i in 0..256 {
+                // A 1 kHz-ish tone at 1.5, well over the ceiling.
+                let t = (b * 256 + i) as f32 / 48_000.0;
+                let _ = in_tx.push(1.5 * (t * 6_283.0).sin());
+            }
+            let now = (b as u64) * 256 * 1_000_000_000 / 48_000;
+            r.render(&mut out, now as Nanos, now as Nanos);
+            if b > 100 {
+                peak = peak.max(out.iter().fold(0.0f32, |a, s| a.max(s.abs())));
+            }
+        }
+        assert!(shared.clipped.load(Ordering::Relaxed), "a peak into the limiter did not light the lamp");
+        assert!(peak < 1.0, "the limiter let the master through at {peak}");
     }
 
     #[test]

@@ -1674,6 +1674,18 @@ fn effect_defaults() -> tangent_ui::ports::EffectDefaults {
             },
             // The reverb's own selector: the plate, or the smooth tail that
             // is nobody's hardware. See `effects::ReverbMode`.
+            // **The limiter's circuit switch.** Out by default - the owner's
+            // ruling - and the row on its face puts it in. The send the
+            // engine sees is the TOP of the dial while it is out, so the
+            // engine needs no flag of its own; see `TangentApp::effect_sends`.
+            tangent_ui::ports::ChoiceParam {
+                key: "limiter_circuit".to_owned(),
+                options: vec![
+                    ("out".to_owned(), "Disabled".to_owned()),
+                    ("in".to_owned(), "In circuit".to_owned()),
+                ],
+                default: "out".to_owned(),
+            },
             tangent_ui::ports::ChoiceParam {
                 key: "reverb_mode".to_owned(),
                 options: crate::effects::ReverbMode::ALL
@@ -5780,6 +5792,23 @@ impl DesktopApp {
                         // let a stale frame yank a dragged slider backward.
                         // One strip, one frame behind the finger - the lag a
                         // reading can wear, where "never" could not.
+                        push_builtin_faces(&mut self.app, e, strip);
+                    }
+                }
+                R::TypeInsertParam { strip, slot, id, text } => {
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        // Read on the unit's own scale, by the same
+                        // `describe` that prints the reading, so what the
+                        // field shows after Enter is the number typed.
+                        let value = e.builtin_insert(strip, slot).and_then(|(spec, values)| {
+                            crate::builtin_fx::value_for_reading(spec.path, id, &text, values)
+                        });
+                        if let Some(value) = value {
+                            e.set_insert_param(strip, slot, id, value);
+                        }
+                        // Pushed either way: a refused word leaves the
+                        // reading as it was, and the face has to be told
+                        // so rather than left showing the words.
                         push_builtin_faces(&mut self.app, e, strip);
                     }
                 }
@@ -22985,6 +23014,57 @@ mod tests {").expect("the tests module")];
         let push = body_of("fn push_monitor_settings(&mut self)");
         assert!(push.contains("builtin_mask & thawed"), "a frozen built-in still renders");
         assert!(push.contains("u64::from(frozen_lane_mask("), "a frozen lane still listens");
+    }
+
+    /// **A repeating clip's tail, as the blade now makes it, plays on from
+    /// where the head stopped.** The whole note set, the source's loop and an
+    /// offset at the cut: the reader wraps the notes into the tail's own time
+    /// by `at_s - offset_s + loop_s * pass`, so a note at 0.5 in a
+    /// two-second bar, on a tail cut at 5 and three seconds long, sounds once,
+    /// at 1.5 - the third repeat's copy - and never before the tail begins.
+    /// This is the contract `arr_split_at_playhead` relies on.
+    #[test]
+    fn a_repeating_tails_notes_wrap_on_from_the_cut() {
+        let tail = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Midi,
+            notes: vec![tangent_ui::arrangement::ArrNote {
+                at_s: 0.5,
+                dur_s: 0.25,
+                key: 60,
+                vel: 100,
+                muted: false,
+            }],
+            pedal: Vec::new(),
+            lane: 0,
+            path: String::new(),
+            start_s: 5.0,
+            offset_s: 5.0,
+            len_s: 3.0,
+            loop_s: 2.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: String::new(),
+            id: 9,
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+            extra: Default::default(),
+        };
+        let notes = midi_clip_notes(&tail, 1_000.0);
+        assert_eq!(notes.len(), 1, "the tail sounds {} notes, not one", notes.len());
+        assert_eq!(notes[0].at, 1_500, "the note landed at frame {}, not 1500", notes[0].at);
+        // demo2's shape: a 13.7 s bar repeating over 96 s, cut at the second
+        // repeat - the tail carries every further repeat.
+        let mut demo = tail;
+        demo.start_s = 27.4285625;
+        demo.offset_s = 27.4285625;
+        demo.len_s = 68.57143749999992;
+        demo.loop_s = 13.714285714285714;
+        let notes = midi_clip_notes(&demo, 48_000.0);
+        assert_eq!(notes.len(), 5, "the tail sounds {} repeats, not five", notes.len());
+        assert_eq!(notes[0].at, 24_000, "the first repeat's note is at frame {}", notes[0].at);
     }
 
     #[test]

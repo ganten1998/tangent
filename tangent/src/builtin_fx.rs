@@ -877,6 +877,110 @@ pub fn describe(path: &str, id: u32, value: f32, siblings: &[f32]) -> String {
     }
 }
 
+/// **The number a reading carries, in the reading's base unit** - or the
+/// number somebody typed into one, read the same way so the two can be
+/// compared.
+///
+/// The first numeric run in the text, with a sign and a fraction, and the
+/// unit word after it folded in: "1.5 kHz" and "1.5k" are 1500, "2.00 s"
+/// is 2000 (`fmt_ms` prints seconds past a thousand milliseconds), "35%"
+/// is 35, "4.0:1" is 4, "Q 0.71" is 0.71, "+3.0 dB" is 3. A reading with
+/// no number in it - "off", "in", "Spectral only" - answers `None`.
+pub fn reading_number(text: &str) -> Option<f64> {
+    let s = text.trim();
+    let starts_number = |i: usize, c: char| {
+        c.is_ascii_digit()
+            || ((c == '-' || c == '+' || c == '.')
+                && s[i + c.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|n| n.is_ascii_digit() || n == '.'))
+    };
+    let start = s.char_indices().find(|&(i, c)| starts_number(i, c))?.0;
+    let mut end = start;
+    for (i, c) in s[start..].char_indices() {
+        let sign = i == 0 && (c == '-' || c == '+');
+        if c.is_ascii_digit() || c == '.' || sign {
+            end = start + i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let n: f64 = s[start..end].parse().ok()?;
+    if !n.is_finite() {
+        return None;
+    }
+    // "k" is a thousand of the unit; a bare "s" is a thousand milliseconds.
+    // "ms" starts with an m and is left alone.
+    let unit = s[end..].trim_start();
+    let scale = if unit.starts_with(['k', 'K', 's']) { 1_000.0 } else { 1.0 };
+    Some(n * scale)
+}
+
+/// **A knob position for words typed into its reading**, on the unit's own
+/// scale - `None` when the unit cannot read them.
+///
+/// The inverse of [`describe`], found rather than spelled: the readings are
+/// one match arm per knob and an inverse written beside each would be a
+/// second copy of every range in the suite, drifting from the first. So the
+/// knob's travel is sampled, every sample is read back through `describe`
+/// itself, and the typed number goes to the sample that reads nearest it,
+/// sharpened by bisection between that sample's neighbours. A word that IS
+/// a reading - "off" on a knob that has one - goes to the first sample that
+/// says it. A number past either end lands on that end, which is what a
+/// field means by a number past its end. `siblings` for the reason
+/// `describe` takes them: a reading can depend on what another knob says.
+pub fn value_for_reading(path: &str, id: u32, typed: &str, siblings: &[f32]) -> Option<f32> {
+    let want = typed.trim();
+    if want.is_empty() {
+        return None;
+    }
+    const N: usize = 256;
+    let at = |i: usize| i as f32 / N as f32;
+    let read = |v: f32| describe(path, id, v, siblings);
+    let lower = want.to_lowercase();
+    if let Some(i) = (0..=N).find(|&i| read(at(i)).trim().to_lowercase() == lower) {
+        return Some(at(i));
+    }
+    let n = reading_number(want)?;
+    let num_at = |v: f32| reading_number(&read(v));
+    let mut best: Option<(usize, f64)> = None;
+    for i in 0..=N {
+        if let Some(x) = num_at(at(i)) {
+            let d = (x - n).abs();
+            if best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((i, d));
+            }
+        }
+    }
+    let (i, _) = best?;
+    let (mut lo, mut hi) = (at(i.saturating_sub(1)), at((i + 1).min(N)));
+    let (Some(n_lo), Some(n_hi)) = (num_at(lo), num_at(hi)) else {
+        return Some(at(i));
+    };
+    if n_lo == n_hi {
+        return Some(at(i));
+    }
+    let rising = n_hi > n_lo;
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        let Some(n_mid) = num_at(mid) else { break };
+        if (n_mid < n) == rising {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // The readings quantise, so the bracket can straddle a step: of the
+    // three positions in hand, the one that reads nearest the number.
+    let mid = 0.5 * (lo + hi);
+    [lo, mid, hi, at(i)]
+        .into_iter()
+        .filter_map(|v| num_at(v).map(|x| (v, (x - n).abs())))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(v, _)| v)
+}
+
 /// A stepped parameter's positions, in step order, for the face's cycling
 /// row. Continuous parameters answer empty.
 pub fn choices(path: &str, id: u32) -> Vec<String> {
@@ -1121,11 +1225,15 @@ pub struct BuiltinBay {
 /// `ir_path` is the convolver's impulse file.
 pub fn is_extra_symbol(path: &str, symbol: &str) -> bool {
     match path {
-        DENOISE_PATH => symbol
-            .strip_prefix('t')
-            .and_then(|n| n.parse::<usize>().ok())
-            // "t07" must NOT alias t7 — one value per symbol, one spelling.
-            .is_some_and(|n| n < crate::units::denoise::DENOISE_BANDS && symbol == format!("t{n}")),
+        // `t<n>` is the print and `k<n>` the bank's knee beside it - see
+        // `Denoise::knees`. "t07" must NOT alias t7: one value per symbol,
+        // one spelling.
+        DENOISE_PATH => ['t', 'k'].into_iter().any(|p| {
+            symbol
+                .strip_prefix(p)
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_some_and(|n| n < crate::units::denoise::DENOISE_BANDS && symbol == format!("{p}{n}"))
+        }),
         IR_PATH => symbol == "ir_path",
         // **The sampler's file, named rather than carried.** The audio
         // travels the drum kit's road (`instrument::SamplerSample`) and never
@@ -1345,25 +1453,37 @@ impl BuiltinUnit {
         match self {
             BuiltinUnit::Denoise(u) => {
                 use crate::units::denoise::DENOISE_BANDS;
+                // `t<n>` lines are the print, `k<n>` the bank's knees; a blob
+                // from before the knees existed has only the first, and
+                // `set_thresholds` gives such a print knees equal to its
+                // thresholds - the reading every bank print had anyway.
                 let mut thresholds = [0.0f32; DENOISE_BANDS];
-                let mut any = false;
+                let mut knees = [0.0f32; DENOISE_BANDS];
+                let (mut any_t, mut any_k) = (false, false);
                 for (symbol, value) in extra {
-                    let Some(k) = symbol
-                        .strip_prefix('t')
-                        .and_then(|n| n.parse::<usize>().ok())
-                        .filter(|k| *k < DENOISE_BANDS)
+                    let Some(prefix) = symbol.chars().next().filter(|c| *c == 't' || *c == 'k') else {
+                        continue;
+                    };
+                    let Some(k) = symbol[1..].parse::<usize>().ok().filter(|k| *k < DENOISE_BANDS)
                     else {
                         continue;
                     };
-                    if let Ok(v) = value.parse::<f32>() {
+                    let Ok(v) = value.parse::<f32>() else {
+                        continue;
+                    };
+                    if prefix == 't' {
                         thresholds[k] = v;
-                        any = true;
+                        any_t = true;
+                    } else {
+                        knees[k] = v;
+                        any_k = true;
                     }
                 }
-                // Nothing learned in the blob leaves the fresh all-off state
-                // alone; `set_thresholds` itself washes non-finite to off.
-                if any {
+                if any_t {
                     u.kernel.set_thresholds(&thresholds);
+                }
+                if any_k {
+                    u.kernel.set_knees(&knees);
                 }
                 None
             }
@@ -1480,9 +1600,14 @@ impl BuiltinUnit {
     /// which is the block the kernel froze them on. The engine forwards the
     /// snapshot into a shared cell the host adopts into its ledger; every
     /// other unit answers `None`, the `gain_reduction_db` shape exactly.
-    pub fn learn_snapshot(&mut self) -> Option<[f32; crate::units::denoise::DENOISE_BANDS]> {
+    pub fn learn_snapshot(
+        &mut self,
+    ) -> Option<(
+        [f32; crate::units::denoise::DENOISE_BANDS],
+        [f32; crate::units::denoise::DENOISE_BANDS],
+    )> {
         match self {
-            BuiltinUnit::Denoise(u) => u.publish.then(|| u.kernel.thresholds()),
+            BuiltinUnit::Denoise(u) => u.publish.then(|| (u.kernel.thresholds(), u.kernel.knees())),
             _ => None,
         }
     }
@@ -3364,6 +3489,7 @@ mod tests {
         let extra = vec![
             ("t0".to_owned(), "0.25".to_owned()),
             ("t31".to_owned(), "0.75".to_owned()),
+            ("k0".to_owned(), "0.5".to_owned()),
         ];
         let text = state_text(spec, &spec.defaults(), &extra);
         assert_eq!(
@@ -3378,6 +3504,10 @@ mod tests {
         // under a second spelling, and another unit claims none of them.
         assert!(is_extra_symbol(DENOISE_PATH, "t0"));
         assert!(is_extra_symbol(DENOISE_PATH, "t31"));
+        assert!(is_extra_symbol(DENOISE_PATH, "k0"), "the bank's knees ride beside the print");
+        assert!(is_extra_symbol(DENOISE_PATH, "k31"));
+        assert!(!is_extra_symbol(DENOISE_PATH, "k32"));
+        assert!(!is_extra_symbol(DENOISE_PATH, "k07"));
         assert!(!is_extra_symbol(DENOISE_PATH, "t32"));
         assert!(!is_extra_symbol(DENOISE_PATH, "t07"));
         assert!(!is_extra_symbol(DENOISE_PATH, "ir_path"));
@@ -3509,12 +3639,25 @@ mod tests {
         unit.set_param(0, 0.0);
         let input = noise_planar(frames, &mut seed);
         unit.process(&input, frames, &mut out);
-        let thr = unit
+        let (thr, knees) = unit
             .learn_snapshot()
             .expect("the freeze block must offer the thresholds");
         assert!(
             thr.iter().any(|t| *t > 0.05),
             "a broadband learn froze an all-off bank: {thr:?}"
+        );
+        // The unit ships on Spectral Studio, so this print is the spectral
+        // kernel's own reading and the knees beside it are the BANK's
+        // measurement of the same noise, taken by `learn_feed` during the
+        // same pass - see `Band::knee_db`. Real knees, then: every band
+        // heard, in range, and not simply the print copied over.
+        assert!(
+            knees.iter().all(|k| k.is_finite() && (0.0..=1.0).contains(k) && *k > 0.05),
+            "a broadband spectral learn left the bank's knees unheard: {knees:?}"
+        );
+        assert!(
+            knees.iter().zip(thr.iter()).any(|(k, t)| (k - t).abs() > 1.0e-3),
+            "a spectral print's knees were the print itself, so the bank never listened"
         );
         // One block later the offer is withdrawn — the ledger has it now.
         let input = noise_planar(frames, &mut seed);
@@ -3530,6 +3673,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(k, t)| (format!("t{k}"), t.to_string()))
+            .chain(knees.iter().enumerate().map(|(k, t)| (format!("k{k}"), t.to_string())))
             .collect();
         let mut restored = spec.create(48_000.0, &spec.defaults());
         assert!(restored.apply_extra_state(&extra).is_none());
@@ -3539,6 +3683,75 @@ mod tests {
         for (k, (a, b)) in thr.iter().zip(r.kernel.thresholds()).enumerate() {
             assert!((a - b).abs() < 1.0e-6, "band {k}: froze {a}, restored {b}");
         }
+        // And the knees came back as their own lines, not as the print.
+        for (k, (a, b)) in knees.iter().zip(r.kernel.knees()).enumerate() {
+            assert!((a - b).abs() < 1.0e-5, "band {k}: knee froze {a}, restored {b}");
+        }
+    }
+
+    /// **A reading's number, in its base unit, however the reading spells
+    /// it** - and the same for what a hand types, so the two compare.
+    #[test]
+    fn a_readings_number_is_read_in_its_base_unit() {
+        let cases: [(&str, Option<f64>); 14] = [
+            ("+3.0 dB", Some(3.0)),
+            ("-12.5 dB", Some(-12.5)),
+            ("440 Hz", Some(440.0)),
+            ("1.5 kHz", Some(1500.0)),
+            ("1.5k", Some(1500.0)),
+            ("35%", Some(35.0)),
+            ("4.0:1", Some(4.0)),
+            ("Q 0.71", Some(0.71)),
+            ("2.00 s", Some(2000.0)),
+            ("500 ms", Some(500.0)),
+            ("0 dB knee", Some(0.0)),
+            ("off", None),
+            ("Spectral only", None),
+            ("", None),
+        ];
+        for (text, want) in cases {
+            assert_eq!(reading_number(text), want, "{text:?}");
+        }
+    }
+
+    /// **Words typed into a reading land the knob where the reading says
+    /// those words** - the inverse of `describe`, found by search rather
+    /// than spelled per knob, on every kind of scale the suite prints:
+    /// linear dB, a log sweep in Hz, a ratio, a percent, a knob that says
+    /// "off" at its foot, and a number past the end.
+    #[test]
+    fn typed_words_land_a_knob_where_its_reading_says_them() {
+        let none: &[f32] = &[];
+        let reads = |path: &str, id: u32, v: f32| describe(path, id, v, none);
+        // The trim: a linear dB range.
+        let v = value_for_reading(TRIM_PATH, 0, "-6", none).expect("dB");
+        assert_eq!(reads(TRIM_PATH, 0, v), "-6.0 dB");
+        let v = value_for_reading(TRIM_PATH, 0, "+3 dB", none).expect("dB with its unit");
+        assert_eq!(reads(TRIM_PATH, 0, v), "+3.0 dB");
+        // An EQ frequency: a log sweep, typed three ways. Compared as a
+        // number, because `fmt_hz` says "1000 Hz" on one side of a
+        // thousand and "1.0 kHz" on the other and either is the answer.
+        for typed in ["1000", "1k", "1.0 kHz"] {
+            let v = value_for_reading(EQ_PATH, 2, typed, none).expect(typed);
+            let hz = reading_number(&reads(EQ_PATH, 2, v)).expect("a frequency");
+            assert!((hz - 1000.0).abs() <= 5.0, "{typed} landed on {hz} Hz");
+        }
+        let v = value_for_reading(EQ_PATH, 2, "440", none).expect("Hz");
+        assert_eq!(reads(EQ_PATH, 2, v), "440 Hz");
+        // The compressor's ratio and a percent.
+        let v = value_for_reading(COMP_PATH, 1, "4", none).expect("ratio");
+        assert_eq!(reads(COMP_PATH, 1, v), "4.0:1");
+        let v = value_for_reading(COMP_PATH, 5, "35%", none).expect("percent");
+        assert_eq!(reads(COMP_PATH, 5, v), "35%");
+        // A word the knob has a position for.
+        let v = value_for_reading(IMAGER_PATH, 2, "off", none).expect("off");
+        assert_eq!(reads(IMAGER_PATH, 2, v), "off");
+        // Past either end: the end.
+        assert_eq!(value_for_reading(COMP_PATH, 5, "250", none), Some(1.0));
+        assert_eq!(value_for_reading(COMP_PATH, 5, "-40", none), Some(0.0));
+        // Not a number, and not a word the knob knows: nothing moves.
+        assert_eq!(value_for_reading(COMP_PATH, 5, "loud", none), None);
+        assert_eq!(value_for_reading(COMP_PATH, 5, "   ", none), None);
     }
 
     /// Write a 32-bit float WAV the test owns byte for byte, so the IR road

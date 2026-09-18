@@ -1837,6 +1837,9 @@ pub enum DialogAction {
     /// One knob on a built-in insert, in DESK terms — the app converts to
     /// the seat once, on its side of the wall.
     SetInsertParam { strip: usize, slot: usize, id: u32, value: f32 },
+    /// A face's reading was typed into: the words, for the host to read
+    /// on the unit's own scale. See `faces::FaceAction::Type`.
+    TypeInsertParam { strip: usize, slot: usize, id: u32, text: String },
     /// Save the face's current values under a name; the app reads its own
     /// mirror for the values, so the action stays a wish, not a payload.
     FaceSavePreset { strip: usize, slot: usize, name: String },
@@ -7497,6 +7500,14 @@ fn show_on(
                                             slot,
                                             id,
                                             value,
+                                        })
+                                    }
+                                    crate::faces::FaceAction::Type { id, text } => {
+                                        Some(DialogAction::TypeInsertParam {
+                                            strip,
+                                            slot,
+                                            id,
+                                            text,
                                         })
                                     }
                                     crate::faces::FaceAction::SetPair {
@@ -16397,7 +16408,7 @@ at: None,
                         "Tangent Imager",
                         "Tangent Tape",
                         "Tangent Comp",
-                        "Tangent Denoise (Experimental)",
+                        "Tangent Denoise",
                         "Tangent Amp",
                         "Tangent Drive",
                         "Tangent Trem",

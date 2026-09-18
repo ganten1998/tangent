@@ -1793,13 +1793,13 @@ fn parse_object(text: &str) -> Result<Map<String, Value>, String> {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            // **Dark out of the box, on every view.** The owner's ruling:
-            // a fresh install opens dark, and the three flags that carry it
-            // — this one for the theory surfaces, `arr_dark` for the
-            // arrangement field, `me_dark` for the MIDI editor — agree from
-            // the first launch rather than one of them differing until
-            // somebody presses D.
-            dark_mode: true,
+            // **The theory surfaces open LIGHT; the arrange field and the
+            // editor open dark.** Three flags carry the three views — this
+            // one for the theory surfaces, `arr_dark` for the arrangement
+            // field, `me_dark` for the MIDI editor — and they used to agree
+            // from the first launch. The owner's ruling of 2026-09-18: "make
+            // light mode the default in just the theory view."
+            dark_mode: false,
             desk_state_shift_v13: false,
             desk_state_shift_v14: false,
             pad_state_shift_v18: false,
@@ -7556,28 +7556,27 @@ mod tests {
     #[test]
     fn defaults_match_spec_table() {
         let s = Settings::default();
-        // **Dark, and Centennial, out of the box** — the owner's ruling. The
-        // three dark flags agree from the first launch; a settings file that
-        // names something else still wins, which is what `theme_name` in the
-        // round-trip tests is for.
-        assert!(s.dark_mode && s.arr_dark && s.me_dark);
+        // **Light theory, dark arrange and editor, Centennial** — the owner's
+        // rulings. A settings file that names something else still wins,
+        // which is what `theme_name` in the round-trip tests is for.
+        assert!(!s.dark_mode && s.arr_dark && s.me_dark);
         // The struct's own name matches the roles beside it; the SHIPPED
         // theme is Centennial and is applied in `first_launch`, which is
         // also what `reset` goes back to.
         assert_eq!(s.theme_name, "Default");
         let fresh = Settings::first_launch();
         assert_eq!(fresh.theme_name, "Default", "a fresh install wears the Default theme");
-        assert!(fresh.dark_mode && fresh.arr_dark && fresh.me_dark);
+        assert!(!fresh.dark_mode && fresh.arr_dark && fresh.me_dark);
         // **Reset everything goes back to Default, dark**, from a theme and
         // a mode somebody chose — driven, because "the defaults are right"
         // and "the reset reaches them" are two different claims.
         let mut reset = Settings::default();
         crate::theme::by_name("Iris").expect("Iris is a factory theme").apply(&mut reset);
-        reset.dark_mode = false;
+        reset.dark_mode = true;
         reset.reset(ResetScope::Everything);
         assert_eq!(reset.theme_name, "Default", "Reset everything left the theme");
         assert_eq!(reset.background_color, Settings::default().background_color, "Reset everything left Iris's colours");
-        assert!(reset.dark_mode, "Reset everything came back light");
+        assert!(!reset.dark_mode, "Reset everything came back dark on the theory surfaces");
         assert_eq!(reset.font_choice, crate::fonts::FontChoice::default().key());
         assert_eq!(s.white_key_idle_color.to_hex(), "#e8dcc0");
         assert_eq!(s.black_key_idle_color.to_hex(), "#1a1a1a");
@@ -8050,7 +8049,7 @@ mod tests {
             _ => unreachable!(),
         };
         let s = Settings::from_map(map);
-        assert!(s.dark_mode); // wrong type => default, which now ships dark
+        assert!(!s.dark_mode); // wrong type => default, which ships light on the theory surfaces
         assert_eq!(s.window_size_percent, 150);
         assert_eq!(s.detached_chord_height, -3);
         assert_eq!(s.detached_height_for_use(), 50.0); // D-UI-1 fallback
