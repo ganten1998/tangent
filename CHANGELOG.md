@@ -40,6 +40,59 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A noise print learned on Spectral Studio or Live now works on Bank.**
+  The spectral kernels freeze each band at the geometric mean of a
+  windowed periodogram, and the bank gates on a different measurement of
+  the same noise, so a spectral print read as a bank knee sat in the middle
+  of the noise. A spectral pass now runs the bank's own analysers as well
+  and stores a bank knee beside the print, persisted as `k0..k31` next to
+  `t0..t31`; a print from before this gates the bank at its thresholds as
+  it always did, and re-learning gives it knees. The unit is called Tangent
+  Denoise now, without "(Experimental)".
+
+- **The band's peak lamp lights again with the limiter in circuit.** The
+  clip latch was taken after the master's limiter, which holds the master
+  under the ceiling, so it could never light. It now also answers for a
+  sample at the ceiling going INTO the limiter.
+
+- **The master limiter ships out of circuit, with a Circuit row on its
+  right-click face to put it back.** Out, the engine is sent the top of the
+  dial whatever the dial says, and the dial is drawn dark. Projects and
+  settings from before this have no circuit choice and open with the
+  limiter out.
+
+- **The theory view opens light by default.** The arrangement field and
+  the MIDI editor still open dark; a settings file that says otherwise
+  still wins.
+
+- **The right-click menu's submenus answer on time again, and a panel no
+  longer lights a row the hand has not touched.** When the window learned
+  to rest between frames (5.0.0-dev, 2026-09-15) the menu's own asks became
+  the only frames it got, and egui takes its predicted frame time off every
+  ask: a 140 ms dwell asked for again on the frame that fell 16 ms short
+  took two rounds, 248 ms, and a 60 ms rest 88. Each is now asked for by
+  what is left of it. The submenu panel, which on the desktop is its own
+  window that reports the last pointer position it saw, now lights no row
+  until the hand has moved inside it, and starts over for every submenu
+  it is refilled for.
+
+- **Every plugin face's reading is a field, and Shift makes its slider
+  fine.** Click a reading to type a value - "-12", "440", "1.5k", "35%",
+  "off" - and Enter lands the knob where the reading says those words; the
+  host reads the words on the unit's own scale, so the field shows the
+  number typed. Escape, or the focus going elsewhere, changes nothing.
+  Shift held during a drag moves the knob a quarter as far, the ratio the
+  Analog and sampler dials already turn at, and a press made with Shift
+  down no longer knocks the knob to the press point first.
+
+- **Splitting a repeating MIDI clip no longer leaves the tail empty.** A
+  clip whose loop is shorter than its length keeps every note inside its
+  first pass, and the blade handed the tail only the notes at or past the
+  cut in source time, which past the first pass is none of them. A
+  repeating clip's tail now takes every note and pedal edge, the same loop
+  and an offset at the cut, and plays on from where the head stopped; a
+  clip that does not repeat still divides at the blade as before.
+
 - **A chosen track count carries its density to another display.** A
   lane count set with Shift+wheel was applied as a number wherever the
   window went, so a dozen chosen on a 1440-point external display were a

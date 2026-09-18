@@ -3865,6 +3865,7 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
                 turning: view.turning == Some(field),
                 reading: gain_text(g),
                 cap: p.master,
+                dim: false,
             },
             p,
         );
@@ -3886,6 +3887,7 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
                 turning: view.turning == Some(field),
                 reading: knob_reading(view.fx_units[fx.index()], v),
                 cap: fx.cap_themed(p),
+                dim: fx == Fx::Limiter && view.limiter_off,
             },
             p,
         );
@@ -6441,6 +6443,10 @@ struct Knob<'a> {
     /// The cap. The effects share one; the tempo has its own, which is what
     /// makes it read as part of the transport rather than a fourth send.
     cap: Color32,
+    /// **Out of circuit**: drawn dark, cap and slot, so a dial that applies
+    /// nothing does not read as one that does. The limiter, when its
+    /// circuit row says so.
+    dim: bool,
 }
 
 /// Which way tick `i` of [`KNOB_TICKS`] stands out from the dial's centre.
@@ -6548,14 +6554,21 @@ fn draw_knob(painter: &Painter, cell: Rect, k: &Knob<'_>, p: &Palette) {
     painter.circle_filled(c, rad, Color32::from_rgb(0x14, 0x12, 0x12));
     // The cap, inset, in its own colour.
     let cap = rad * 0.64;
-    painter.circle_filled(c, cap, k.cap);
+    // A dim knob keeps its position and loses its light: the cap at a third
+    // of its colour, the slot in the face's own grey rather than white.
+    let (cap_ink, slot_ink) = if k.dim {
+        (k.cap.gamma_multiply(0.33), Color32::from_rgb(0x4a, 0x50, 0x58))
+    } else {
+        (k.cap, Color32::from_rgb(0xd8, 0xe4, 0xf2))
+    };
+    painter.circle_filled(c, cap, cap_ink);
     // The slot. Across the whole cap and through the centre, which is what a
     // screwdriver slot looks like and what makes the angle readable at
     // fourteen points: a short pointer at one edge is a dot at this size.
     let d = dir(angle);
     painter.line_segment(
         [c - d * cap * 0.92, c + d * cap * 0.92],
-        Stroke::new((cap * 0.30).max(1.0), Color32::from_rgb(0xd8, 0xe4, 0xf2)),
+        Stroke::new((cap * 0.30).max(1.0), slot_ink),
     );
 }
 
@@ -6592,6 +6605,7 @@ fn draw_tempo(
             turning,
             reading: tempo_text(bpm),
             cap: TEMPO_CAP,
+            dim: false,
         },
         p,
     );
@@ -9999,6 +10013,7 @@ mod tests {
                                 hide_elapsed: dark,
                                 message: Some("recorded 4:12 to nocturne-2026-08-16-141203"),
                                 clip_warning: true,
+                                limiter_off: false,
                             };
                             let r = band(w);
                             let _ = ctx.run(Default::default(), |ctx| {
@@ -10951,10 +10966,14 @@ impl Fx {
             // with a title and a Reset in it would be a panel that punishes
             // the right-click somebody used on the seven knobs beside it.
             Fx::Gain => [FxRow::NONE; FX_ROWS],
+            // **The circuit switch first.** The limiter ships OUT of circuit
+            // (the owner's ruling, 2026-09-18) and this row is where it goes
+            // back in; a dial turned while it is out is drawn dark and
+            // applies nothing. See `TangentApp::limiter_disabled`.
             Fx::Limiter => [
+                step("limiter_circuit", "Circuit"),
                 slide("limiter_release", "Release"),
                 slide("limiter_knee", "Knee"),
-                FxRow::NONE,
                 FxRow::NONE,
                 FxRow::NONE,
                 FxRow::NONE,

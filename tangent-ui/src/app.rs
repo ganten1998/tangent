@@ -6912,6 +6912,7 @@ impl TangentApp {
                 window: self.settings.lufs_window,
                 ..self.recorder.loudness
             },
+            limiter_off: self.limiter_disabled(),
             ..self.recorder.view(
             self.settings.record_take_name.as_deref().unwrap_or_default(),
             self.name_focused,
@@ -16411,11 +16412,32 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // A note the blade passes through is clamped to the head; a note
             // cannot sound across two clips.
             let cut = c.offset_s + head;
-            let tail_notes: Vec<crate::arrangement::ArrNote> =
-                c.notes.iter().filter(|n| n.at_s >= cut).cloned().collect();
-            c.notes.retain(|n| n.at_s < cut);
-            for n in &mut c.notes {
-                n.dur_s = n.dur_s.min(cut - n.at_s).max(0.0);
+            // **A REPEATING clip's tail keeps the repeat, notes and all.** A
+            // clip whose loop is shorter than its length plays its first pass
+            // over and over; every note it has lives inside that pass, in
+            // source time, and the readers wrap them with `offset_s` and
+            // `loop_s`. Dividing such a clip's notes at `offset_s + head` is
+            // therefore wrong on both sides once the cut is past the first
+            // pass: the tail is handed the notes at or beyond a time none of
+            // them reach, and comes up EMPTY - the owner's demo2, two bars
+            // repeating over four, cut at the second: "splitting midi clips
+            // ... results in the latter half being empty". So a repeating
+            // clip's tail takes every note and every pedal edge, the same
+            // loop, and an `offset_s` at the cut, and the readers' own
+            // wrapping plays it on from where the head stopped. The head is
+            // left whole too: its length is the blade, and a pass cut short
+            // grows back complete when its edge is pulled out again.
+            let repeats = c.loop_s > 1.0e-6 && c.loop_s < len - 1.0e-9;
+            let tail_notes: Vec<crate::arrangement::ArrNote> = if repeats {
+                c.notes.clone()
+            } else {
+                c.notes.iter().filter(|n| n.at_s >= cut).cloned().collect()
+            };
+            if !repeats {
+                c.notes.retain(|n| n.at_s < cut);
+                for n in &mut c.notes {
+                    n.dur_s = n.dur_s.min(cut - n.at_s).max(0.0);
+                }
             }
             // **The pedal divides at the same blade, and the tail INHERITS
             // the level it was cut at.**
@@ -16432,7 +16454,16 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // times, exactly like the notes above: the tail's `offset_s` is
             // `c.offset_s + head`, which IS `cut`.
             let mut tail_pedal: Vec<crate::arrangement::ArrPedal> = Vec::new();
+            // A repeating clip's pedal rides its loop whole - see
+            // `clip_pedal_in_song_time`, which restates the standing level at
+            // every pass start, the tail's own included.
+            if repeats {
+                tail_pedal = c.pedal.clone();
+            }
             for cc in [64_u8, 66, 67] {
+                if repeats {
+                    break;
+                }
                 let at_cut = c
                     .pedal
                     .iter()
@@ -16447,13 +16478,17 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     });
                 }
             }
-            tail_pedal.extend(c.pedal.iter().filter(|e| e.at_s >= cut).copied());
+            if !repeats {
+                tail_pedal.extend(c.pedal.iter().filter(|e| e.at_s >= cut).copied());
+            }
             tail_pedal.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
             // The head keeps only what happened before the blade. It needs no
             // closing lift: a clip's pedal is released when the clip ends,
             // which the timeline does for every clip whether or not anybody
             // wrote it down. See `mix_channels`.
-            c.pedal.retain(|e| e.at_s < cut);
+            if !repeats {
+                c.pedal.retain(|e| e.at_s < cut);
+            }
             tails.push(crate::arrangement::ArrClip {
                 pedal: tail_pedal,
                 kind: c.kind,
@@ -16472,7 +16507,9 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                 // half bars. Re-cutting the head's loop to its new length
                 // would throw the pass away and weld the repeats it had into
                 // one, which is glue's verb and not the blade's.
-                loop_s: len - head,
+                // A repeating clip's tail keeps the repeat; any other tail is
+                // a new clip and takes a loop over its own length.
+                loop_s: if repeats { c.loop_s } else { len - head },
                 fade_in_s: 0.0,
                 fade_out_s: tail_fade,
                 name: c.name.clone(),
@@ -25710,6 +25747,25 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         });
     }
 
+    /// **Set one knob on a built-in bay from words typed into its
+    /// reading.** No optimistic mirror, because there is no value here to
+    /// mirror: the host owns the mapping from words to a position and
+    /// answers with a face push. Any shield a drag left on this knob is
+    /// taken down first, or that push - the one carrying the typed number
+    /// - would be held off as an old echo for up to thirty frames.
+    pub fn type_insert_param(&mut self, strip: usize, slot: usize, id: u32, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.pending_inserts.remove(&(strip, slot, id));
+        self.request_recorder(recorder::RecorderRequest::TypeInsertParam {
+            strip,
+            slot,
+            id,
+            text,
+        });
+    }
+
     /// The compressor face's meter for one bay, forwarded per frame by the
     /// host — positive dB of gain reduction, already max-held over the
     /// frame's blocks on the engine side.
@@ -26195,8 +26251,24 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             self.settings.hpf_mix as f32,
             self.settings.lpf_mix as f32,
             self.settings.gain_mix as f32,
-            self.settings.limiter_mix as f32,
+            // Out of circuit is the TOP of the dial - a threshold above
+            // everything, catching nothing - whatever the dial says.
+            if self.limiter_disabled() {
+                1.0
+            } else {
+                self.settings.limiter_mix as f32
+            },
         ]
+    }
+
+    /// **Whether the master's limiter is out of circuit.** The
+    /// `limiter_circuit` choice on its face: "in" puts it back, anything
+    /// else - including the absence every project and settings file from
+    /// before this has - is out. The owner's ruling, 2026-09-18: off by
+    /// default, a disable row on the right-click menu, a darkened dial
+    /// while it is off.
+    pub fn limiter_disabled(&self) -> bool {
+        self.choice_key("limiter_circuit") != "in"
     }
 
     /// How fast the desk plays, as a multiplier. 1.0 is off.
@@ -31716,6 +31788,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             DialogAction::SetInsertParam { strip, slot, id, value } => {
                 let (seat, bay) = recorder::seat_bay(strip, slot);
                 self.set_insert_param(seat, bay, id, value);
+            }
+            DialogAction::TypeInsertParam { strip, slot, id, text } => {
+                let (seat, bay) = recorder::seat_bay(strip, slot);
+                self.type_insert_param(seat, bay, id, text);
             }
             // Both, in the order they were asked for, through the one road a
             // single one takes — so a pair is exactly two of the same thing
@@ -41814,6 +41890,38 @@ mod tests {
         assert_eq!(carried_count(14, 1400.0, 700.0), 6);
     }
 
+    /// **The limiter ships out of circuit and its face row puts it back.**
+    /// Out, the engine is sent the top of the dial whatever the dial says
+    /// and the view draws the dial dark; in, the dial's own value goes.
+    #[test]
+    fn the_limiter_ships_out_of_circuit_and_its_row_puts_it_back() {
+        let (_ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.set_effect_defaults(crate::ports::EffectDefaults {
+            choices: vec![crate::ports::ChoiceParam {
+                key: "limiter_circuit".to_owned(),
+                options: vec![
+                    ("out".to_owned(), "Disabled".to_owned()),
+                    ("in".to_owned(), "In circuit".to_owned()),
+                ],
+                default: "out".to_owned(),
+            }],
+            ..Default::default()
+        });
+        app.settings.limiter_mix = 0.5;
+        assert!(app.limiter_disabled(), "the limiter did not ship out of circuit");
+        assert_eq!(app.effect_sends()[7], 1.0, "out of circuit is the top of the dial");
+        assert!(app.recorder_layout_view().limiter_off, "the view does not know the dial is dark");
+        let rows = recorder_panel::Fx::Limiter.rows(true);
+        assert_eq!((rows[0].key, rows[0].step), ("limiter_circuit", true), "the circuit row is not first on the face");
+
+        app.pick_choice("limiter_circuit", 1);
+        assert!(!app.limiter_disabled());
+        assert_eq!(app.effect_sends()[7], 0.5, "in circuit, the dial's own value goes");
+        assert!(!app.recorder_layout_view().limiter_off);
+        app.pick_choice("limiter_circuit", 0);
+        assert!(app.limiter_disabled());
+    }
+
     /// A MIDI clip on lane 0 from 2 s to 6 s, opened in the editor with
     /// the playhead at its start and snap off, so a note's length is the
     /// only thing that moves the head.
@@ -49335,6 +49443,16 @@ mod tests {
                         .map(|(k, l)| (k.to_owned(), l.to_owned()))
                         .collect(),
                     default: "1".to_owned(),
+                },
+                // The limiter's circuit, as the host supplies it: out, then
+                // in, shipping out - see `limiter_disabled`.
+                crate::ports::ChoiceParam {
+                    key: "limiter_circuit".to_owned(),
+                    options: [("out", "Disabled"), ("in", "In circuit")]
+                        .into_iter()
+                        .map(|(k, l)| (k.to_owned(), l.to_owned()))
+                        .collect(),
+                    default: "out".to_owned(),
                 },
                 // The reverb's own selector. Both positions, because there
                 // are only two and the test steps to the NEXT one.
@@ -61441,21 +61559,20 @@ mod folder_tests {
         );
     }
 
-    /// **The blade makes a clip, so the clip it makes is a loop — and the
-    /// half it cuts FROM keeps the loop it already had.**
+    /// **A repeating clip cut through keeps repeating on BOTH sides of the
+    /// blade.** The head is the same clip, shorter, and a four-bar clip
+    /// repeating one bar, cut at two and a half, still repeats that bar; and
+    /// the tail repeats the same bar from where the head stopped, which
+    /// takes every note the source had, the source's loop, and an offset at
+    /// the cut. The tail used to be born as a new clip with a loop over its
+    /// own length and only the notes at or past the cut in source time, and
+    /// a repeating clip has no notes past its first pass: the owner's demo2,
+    /// cut at the second repeat, gave an empty tail.
     ///
-    /// Two rules that look like one and are not. The tail is a brand new clip
-    /// and takes the birthright every other construction site here gives:
-    /// a loop over its own length, so its right edge pulls out into repeats
-    /// rather than stopping. The head is not new — it is the same clip,
-    /// shorter — and a four-bar clip repeating one bar, cut at two and a
-    /// half, still repeats that bar. Re-cutting the head's loop to its new
-    /// length would weld those repeats into a single pass, which is glue's
-    /// verb and not the blade's.
-    ///
-    /// Revert checks performed: put `loop_s: 0.0` back on the tail and the
-    /// tail assert names it; set the head's loop to its new length and the
-    /// head assert names that.
+    /// Revert checks performed: give the tail `len - head` as its loop and
+    /// the loop assert names it; filter its notes at the cut and the note
+    /// assert names that; set the head's loop to its new length and the head
+    /// assert names that.
     #[test]
     fn a_split_gives_the_tail_a_loop_and_leaves_the_head_its_own() {
         let (_ctx, mut a) = headless(Caps::DESKTOP);
@@ -61499,11 +61616,51 @@ mod folder_tests {
             .expect("the tail landed");
         assert!((tail.len_s - 3.0).abs() < 1.0e-9, "the tail is {} long", tail.len_s);
         assert!(
+            (tail.loop_s - 2.0).abs() < 1.0e-9,
+            "the tail's loop is {} - a repeating clip's tail keeps the repeat",
+            tail.loop_s
+        );
+        assert!((tail.offset_s - 5.0).abs() < 1.0e-9, "the tail's offset is {}", tail.offset_s);
+        assert_eq!(tail.notes.len(), 1, "the tail of a repeating clip lost its note");
+        assert!((tail.notes[0].at_s - 0.5).abs() < 1.0e-9, "the note's source time moved");
+        assert_eq!(head.notes.len(), 1, "the head lost its note");
+
+        // **A clip that does not repeat divides at the blade**, and its tail
+        // is a new clip with a loop over its own length: only the notes at or
+        // past the cut, kept in source time, and the head trimmed at the cut.
+        let (_ctx, mut a) = headless(Caps::DESKTOP);
+        a.settings.arr_snap = false;
+        let note = |at_s: f64| crate::arrangement::ArrNote {
+            at_s,
+            dur_s: 0.25,
+            key: 60,
+            vel: 100,
+            muted: false,
+        };
+        a.arrangement.clips.push(crate::arrangement::ArrClip {
+            pedal: Vec::new(),
+            id: 7,
+            lane: 0,
+            kind: crate::arrangement::ClipKind::Midi,
+            start_s: 0.0,
+            len_s: 8.0,
+            loop_s: 8.0,
+            notes: vec![note(1.0), note(6.0)],
+            ..Default::default()
+        });
+        a.arr_selected = Some(7);
+        a.recorder.position_s = 5.0;
+        a.arr_split_at_playhead();
+        let head = a.arrangement.clips.iter().find(|c| c.id == 7).expect("the head");
+        let tail = a.arrangement.clips.iter().find(|c| c.id != 7).expect("the tail");
+        assert_eq!(head.notes.len(), 1, "the head kept a note past the cut");
+        assert_eq!(tail.notes.len(), 1, "the tail lost the note past the cut");
+        assert!((tail.notes[0].at_s - 6.0).abs() < 1.0e-9, "the tail's note moved in source time");
+        assert!((tail.offset_s - 5.0).abs() < 1.0e-9);
+        assert!(
             (tail.loop_s - tail.len_s).abs() < 1.0e-9 && tail.loop_s > 0.0,
-            "the tail was born with loop {} against a length of {} - a clip \
-             the blade made is a clip, and every clip is a loop",
-            tail.loop_s,
-            tail.len_s
+            "a non-repeating clip's tail is a new clip with a loop over its own length, not {}",
+            tail.loop_s
         );
     }
 

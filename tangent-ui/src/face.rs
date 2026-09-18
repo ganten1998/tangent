@@ -368,11 +368,229 @@ pub(crate) fn alt_home_gesture(resp: &egui::Response) -> bool {
     resp.ctx.input(|i| i.modifiers.alt)
 }
 
-/// One continuous parameter as a row: name, slider, reading. Returns the new
-/// value when the hand moved it. The kit's contract, in one place:
-/// double-click puts the knob back to `default` (never a UI constant — the
-/// caller passes the DSP's own number), the hover says so, and the reading
-/// dims when the knob is at rest, all exactly as the keyboard panel does.
+/// What a slider row asked for: the knob's own value when the hand moved
+/// it, or the words typed into its reading.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SliderAsk {
+    /// Put the knob here, normalised.
+    Value(f32),
+    /// **The reading was typed into and committed** - "-12", "440", "1.5k",
+    /// "35%", "off". The row cannot spell what that is on the knob's own
+    /// scale: every reading is printed on the HOST side by the unit's own
+    /// mapping, so the face and the sound can never disagree, and the same
+    /// rule means only the host can read one back. The text travels up.
+    Type(String),
+}
+
+/// How much of a drag a slider takes while Shift is held: a quarter, the
+/// ratio the Analog and sampler dials already turn at for their own fine
+/// drag (`FINE_PER_PT / DRAG_PER_PT`), so "shift for fine" is one feel
+/// across the suite.
+pub const FINE_RATIO: f32 = 0.25;
+
+/// Where a press-and-drag on a slider stands, kept in egui's per-widget
+/// scratch for the length of the gesture. See [`fine_slider`].
+#[derive(Clone, Copy)]
+struct SliderDrag {
+    /// The pointer's x on the previous frame of the gesture.
+    last_x: f32,
+    /// Shift has been held at some point in this gesture, so the knob has
+    /// parted from the pointer and stays on the RELATIVE rule until the
+    /// button is let go.
+    parted: bool,
+}
+
+/// **The kit's slider: egui's own look, with Shift for a fine drag.**
+/// Returns the response and, on any frame the hand moved it, the new value.
+///
+/// `egui::Slider` maps the pointer's x straight onto the value, which is
+/// what makes a click anywhere on the track jump the knob there - and also
+/// why no plugin face had a fine drag: a quarter-rate drag under an
+/// absolute mapping snaps the knob back under the pointer the moment the
+/// rate changes, and the owner's "they also don't reduce slider sens when
+/// holding shift" was the whole of the kit's sliders. So the widget is the
+/// kit's own, drawn from the same style fields egui's reads, and it keeps
+/// two rules:
+///
+/// * Unshifted it is egui's: the knob goes where the pointer is, on the
+///   press and for as long as the button is held.
+/// * Shift PARTS the knob from the pointer. From then until the release
+///   the knob moves by the pointer's travel - a quarter of it while Shift
+///   is down ([`FINE_RATIO`]), all of it once Shift is up - and never
+///   snaps back under the hand. A press made with Shift already down
+///   parts them at once, so a fine adjustment starts on the knob where it
+///   stands rather than wherever the press landed.
+///
+/// An alt-press moves nothing, because an alt-click is the reset gesture
+/// and a reset that first knocked the knob to the press point would show
+/// as a flinch. The double-click reset is [`home_gesture`]'s, unchanged.
+fn fine_slider(ui: &mut egui::Ui, value: f32, default: f32) -> (egui::Response, Option<f32>) {
+    let thickness = ui
+        .text_style_height(&egui::TextStyle::Body)
+        .max(ui.spacing().interact_size.y);
+    let size = Vec2::new(ui.spacing().slider_width, thickness);
+    let resp = ui.allocate_response(size, egui::Sense::click_and_drag());
+    let rect = resp.rect;
+    let radius = rect.height() / 2.5;
+    let track = rect.x_range().shrink(radius);
+    let key = resp.id.with("face-slider-drag");
+    let mut out = None;
+    let (shift, alt, pressed_now) =
+        ui.input(|i| (i.modifiers.shift, i.modifiers.alt, i.pointer.primary_pressed()));
+    if home_gesture(&resp) {
+        out = Some(default);
+        ui.data_mut(|d| d.remove::<SliderDrag>(key));
+    } else if resp.is_pointer_button_down_on() && !alt {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let held: Option<SliderDrag> = ui.data(|d| d.get_temp(key));
+            let mut drag = match held {
+                Some(d) if !pressed_now => d,
+                _ => SliderDrag { last_x: p.x, parted: shift },
+            };
+            let dx = p.x - drag.last_x;
+            drag.last_x = p.x;
+            drag.parted |= shift;
+            let next = if drag.parted {
+                let rate = if shift { FINE_RATIO } else { 1.0 };
+                value + dx / track.span().max(1.0) * rate
+            } else {
+                egui::remap_clamp(p.x, track, 0.0..=1.0)
+            };
+            ui.data_mut(|d| d.insert_temp(key, drag));
+            let next = next.clamp(0.0, 1.0);
+            if (next - value).abs() > 1.0e-6 {
+                out = Some(next);
+            }
+        }
+    } else {
+        ui.data_mut(|d| d.remove::<SliderDrag>(key));
+    }
+    // Painted exactly as egui paints its own, from the same style fields,
+    // so a face wears the same slider it did.
+    if ui.is_rect_visible(rect) {
+        let shown = out.unwrap_or(value).clamp(0.0, 1.0);
+        let visuals = ui.style().interact(&resp);
+        let widgets = &ui.visuals().widgets;
+        let rail_radius = (ui.spacing().slider_rail_height / 2.0).max(0.0);
+        let rail = Rect::from_min_max(
+            egui::pos2(rect.left(), rect.center().y - rail_radius),
+            egui::pos2(rect.right(), rect.center().y + rail_radius),
+        );
+        let corner = widgets.inactive.corner_radius;
+        ui.painter().rect_filled(rail, corner, widgets.inactive.bg_fill);
+        let center = egui::pos2(egui::lerp(track, shown), rail.center().y);
+        if ui.visuals().slider_trailing_fill {
+            let mut trailing = rail;
+            trailing.max.x = center.x + corner.nw as f32;
+            ui.painter()
+                .rect_filled(trailing, corner, ui.visuals().selection.bg_fill);
+        }
+        match ui.style().visuals.handle_shape {
+            egui::style::HandleShape::Circle => {
+                ui.painter().add(egui::epaint::CircleShape {
+                    center,
+                    radius: radius + visuals.expansion,
+                    fill: visuals.bg_fill,
+                    stroke: visuals.fg_stroke,
+                });
+            }
+            egui::style::HandleShape::Rect { aspect_ratio } => {
+                let v = Vec2::new(radius * aspect_ratio, radius) + Vec2::splat(visuals.expansion);
+                ui.painter().rect(
+                    Rect::from_center_size(center, 2.0 * v),
+                    visuals.corner_radius,
+                    visuals.bg_fill,
+                    visuals.fg_stroke,
+                    StrokeKind::Inside,
+                );
+            }
+        }
+    }
+    (resp, out)
+}
+
+/// **The reading, which is also a field.** Drawn as the dimmed-or-inked
+/// label it always was; a click on it opens the same words as a text box,
+/// selected whole so the first key replaces them, and Enter or Tab commits
+/// what was typed. Escape, or the focus going elsewhere, puts the label
+/// back with nothing changed - the band's rule for its own numeric cells:
+/// only Enter commits, because a field that applied whatever it held when
+/// the hand wandered off would apply the fumble too.
+///
+/// Returns the committed text; the row hands it up as [`SliderAsk::Type`]
+/// because the number's scale is the host's. The owner: "none of our
+/// plugins currently have typing enabled fields."
+fn reading_field(
+    ui: &mut egui::Ui,
+    st: &FaceStyle,
+    name: &str,
+    reading: &str,
+    at_rest: bool,
+    width: f32,
+) -> Option<String> {
+    let key = ui.id().with(("face-reading", name));
+    let edit_id = key.with("edit");
+    let font = FontId::new(10.0, fonts::courier());
+    let typing: Option<String> = ui.data(|d| d.get_temp(key));
+    let Some(mut text) = typing else {
+        let label = ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(reading)
+                        // **`FontFamily::Monospace` draws NOTHING in this
+                        // app.** `egui` is depended on with
+                        // `default-features = false`, so its Monospace
+                        // family arrives EMPTY and a galley in it lays out
+                        // at zero by zero; every reading on every face was
+                        // invisible for exactly that reason once. The
+                        // named Courier family is the one that exists.
+                        .font(font.clone())
+                        .color(if at_rest { st.s.faint } else { st.s.ink }),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_text("click to type a value");
+        if label.clicked() {
+            ui.data_mut(|d| d.insert_temp(key, reading.to_owned()));
+            // Selected whole, so the first key replaces the reading rather
+            // than appending to it - what every DAW's field does.
+            let mut state = egui::TextEdit::load_state(ui.ctx(), edit_id).unwrap_or_default();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(reading.chars().count()),
+            )));
+            egui::TextEdit::store_state(ui.ctx(), edit_id, state);
+            ui.memory_mut(|m| m.request_focus(edit_id));
+        }
+        return None;
+    };
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut text)
+            .id(edit_id)
+            .font(font)
+            .desired_width(width.max(24.0)),
+    );
+    let (commit, abandon) = ui.input(|i| {
+        (
+            i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Tab),
+            i.key_pressed(egui::Key::Escape),
+        )
+    });
+    if resp.lost_focus() || abandon {
+        ui.data_mut(|d| d.remove::<String>(key));
+        return (commit && !abandon).then_some(text);
+    }
+    ui.data_mut(|d| d.insert_temp(key, text));
+    None
+}
+
+/// One continuous parameter as a row: name, slider, reading. Returns what
+/// the hand asked for - see [`SliderAsk`]. The kit's contract, in one
+/// place: double-click or alt-click puts the knob back to `default` (never
+/// a UI constant - the caller passes the DSP's own number), Shift makes the
+/// drag fine, the reading is typed into by clicking it, the hover says so,
+/// and the reading dims when the knob is at rest, all exactly as the
+/// keyboard panel does.
 pub fn slider_row(
     ui: &mut egui::Ui,
     st: &FaceStyle,
@@ -380,7 +598,7 @@ pub fn slider_row(
     reading: &str,
     value: f32,
     default: f32,
-) -> Option<f32> {
+) -> Option<SliderAsk> {
     let mut out = None;
     ui.horizontal(|ui| {
         let w = ui.available_width();
@@ -391,58 +609,19 @@ pub fn slider_row(
                 egui::RichText::new(name).font(bold(11.0)).color(st.s.ink),
             ),
         );
-        let mut v = value;
         ui.spacing_mut().slider_width = w * (1.0 - LABEL_W - READING_W) - 16.0;
-        let resp = ui.add(egui::Slider::new(&mut v, 0.0..=1.0).show_value(false));
-        // **A slider has to be TOLD to sense clicks before it can be
-        // double-clicked.** `egui::Slider` allocates itself with
-        // `Sense::drag()` alone, and `Response::double_clicked` is gated on
-        // the CLICKED flag, which egui only ever sets for a widget whose
-        // sense says it wants clicks. So the `resp.double_clicked()` this
-        // row used to ask — and the identical line the keys panel asks —
-        // could not be true on any frame, on any theme, on any unit: the
-        // hover text has been promising a gesture the widget was deaf to.
-        // Re-registering the SAME id with the click sense added is egui's
-        // own remedy for exactly this ("use `interact` to sense more things
-        // after adding a widget"), and it costs no extra id, so the rows
-        // below keep the ids they had.
-        //
-        // The two responses are not interchangeable: `changed` is a flag the
-        // slider stamps on the response object it returned, and the
-        // re-interacted one is a fresh object that never saw it. Read each
-        // from the one that knows.
-        let hand = resp.interact(egui::Sense::click());
-        if home_gesture(&hand) {
-            out = Some(default);
-        } else if resp.changed() {
-            out = Some(v);
+        let (hand, moved) = fine_slider(ui, value, default);
+        if let Some(v) = moved {
+            out = Some(SliderAsk::Value(v));
         }
-        hand.on_hover_text("drag to set; double-click or alt-click to reset");
+        hand.on_hover_text(
+            "drag to set; shift for fine; double-click or alt-click to reset; click the reading to type",
+        );
         let at_rest = (value - default).abs() < 0.5 / 100.0;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(reading)
-                    // **`FontFamily::Monospace` draws NOTHING in this app.**
-                    //
-                    // `egui` is depended on with `default-features = false`,
-                    // so `FontDefinitions::default()` arrives with its
-                    // Proportional and Monospace families EMPTY, and
-                    // `fonts::install` fills neither — it inserts the two
-                    // named Courier families and maps the text STYLES onto
-                    // them. A `FontId::monospace` galley therefore lays out
-                    // at zero by zero: the shape is emitted, its `text()`
-                    // still answers, and not one pixel is drawn.
-                    //
-                    // Every reading on every face built from this kit has
-                    // been invisible for exactly that reason. It was found
-                    // by looking at a rendering of the sampler's panel —
-                    // ten rows with a name, a slider and no number anywhere
-                    // on them — and by nothing else: the row allocates
-                    // correctly, so no fit sweep sees it, and an ink sweep
-                    // can only measure ink that was laid down.
-                    .font(FontId::new(10.0, fonts::courier()))
-                    .color(if at_rest { st.s.faint } else { st.s.ink }),
-            );
+            if let Some(text) = reading_field(ui, st, name, reading, at_rest, w * READING_W) {
+                out = Some(SliderAsk::Type(text));
+            }
         });
     });
     out
@@ -2109,7 +2288,7 @@ mod tests {
         const HOME: f32 = 0.25;
         let at = egui::pos2(200.0, 9.0);
 
-        let frame = |events: Vec<egui::Event>| -> Option<f32> {
+        let frame = |events: Vec<egui::Event>| -> Option<SliderAsk> {
             let mut out = None;
             let _ = ctx.run(
                 egui::RawInput {
@@ -2134,7 +2313,7 @@ mod tests {
         let _ = frame(vec![press_at(at, true)]);
         assert_eq!(
             frame(vec![press_at(at, false)]),
-            Some(HOME),
+            Some(SliderAsk::Value(HOME)),
             "a double-click on a slider row did not ask for the DSP's default"
         );
     }
@@ -2159,7 +2338,7 @@ mod tests {
 
         let frame = |events: Vec<egui::Event>,
                      modifiers: egui::Modifiers|
-         -> Option<f32> {
+         -> Option<SliderAsk> {
             let mut out = None;
             let _ = ctx.run(
                 egui::RawInput {
@@ -2183,7 +2362,7 @@ mod tests {
         let _ = frame(vec![press_with(at, true, alt)], alt);
         assert_eq!(
             frame(vec![press_with(at, false, alt)], alt),
-            Some(HOME),
+            Some(SliderAsk::Value(HOME)),
             "an alt-click on a slider row did not ask for the DSP's default"
         );
     }
@@ -2213,7 +2392,7 @@ mod tests {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
                         .show(ctx, |ui| {
-                            if let Some(v) =
+                            if let Some(SliderAsk::Value(v)) =
                                 slider_row(ui, &st, "DRIVE", "50%", *value, 0.25)
                             {
                                 *value = v;
@@ -2239,6 +2418,124 @@ mod tests {
             value > 0.99,
             "the drag was dropped when the hand left the track: {value}"
         );
+    }
+
+    /// **Shift makes a slider drag a quarter as far.** Forty points of
+    /// travel unshifted, then the same forty with Shift held, on one row
+    /// whose value is fed back each frame as a face's is: the second move
+    /// is `FINE_RATIO` of the first, and a press made with Shift down does
+    /// not first knock the knob to the press point.
+    #[test]
+    fn shift_makes_a_slider_drag_a_quarter_as_far() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 200.0));
+        let mut value = 0.50_f32;
+        let frame = |events: Vec<egui::Event>, modifiers: egui::Modifiers, value: &mut f32| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    modifiers,
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            if let Some(SliderAsk::Value(v)) =
+                                slider_row(ui, &st, "DRIVE", "50%", *value, 0.25)
+                            {
+                                *value = v;
+                            }
+                        });
+                },
+            );
+        };
+        let none = egui::Modifiers::NONE;
+        let shift = egui::Modifiers::SHIFT;
+        let a = egui::pos2(200.0, 9.0);
+        let b = egui::pos2(240.0, 9.0);
+        let c = egui::pos2(280.0, 9.0);
+        // Unshifted: press (the knob jumps under the hand), drag forty.
+        frame(vec![egui::Event::PointerMoved(a)], none, &mut value);
+        frame(vec![press_at(a, true)], none, &mut value);
+        let v0 = value;
+        frame(vec![egui::Event::PointerMoved(b)], none, &mut value);
+        let full = value - v0;
+        frame(vec![press_at(b, false)], none, &mut value);
+        assert!(full > 0.05, "an unshifted forty-point drag moved the knob by {full}");
+        // Shifted: the press moves nothing, the same forty moves a quarter.
+        let v1 = value;
+        frame(vec![press_with(b, true, shift)], shift, &mut value);
+        assert!(
+            (value - v1).abs() < 1.0e-6,
+            "a press with Shift held knocked the knob from {v1} to {value}"
+        );
+        frame(vec![egui::Event::PointerMoved(c)], shift, &mut value);
+        let fine = value - v1;
+        frame(vec![press_with(c, false, shift)], shift, &mut value);
+        assert!(
+            (fine - full * FINE_RATIO).abs() < 0.01,
+            "the shifted drag moved {fine} against {full} unshifted; wanted a quarter"
+        );
+    }
+
+    /// **The reading is a field: click it, type, Enter, and the words go
+    /// up.** The row cannot say what "-6" is on the knob's scale, so the
+    /// ask is the text itself - `SliderAsk::Type` - and the label opens
+    /// selected whole, so the first key replaces the reading rather than
+    /// appending to it.
+    #[test]
+    fn a_reading_typed_into_hands_up_the_words() {
+        let ctx = a_test_ctx();
+        let st = a_test_style();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 60.0));
+        let frame = |events: Vec<egui::Event>| -> Option<SliderAsk> {
+            let mut out = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            out = slider_row(ui, &st, "DRIVE", "80%", 0.80, 0.25);
+                        });
+                },
+            );
+            out
+        };
+        // The reading sits at the right-hand end of the row.
+        let on_reading = egui::pos2(392.0, 9.0);
+        let _ = frame(vec![]);
+        let _ = frame(vec![egui::Event::PointerMoved(on_reading)]);
+        let _ = frame(vec![press_at(on_reading, true)]);
+        let _ = frame(vec![press_at(on_reading, false)]);
+        // The box is up and focused: what is typed replaces the selection.
+        let _ = frame(vec![]);
+        assert!(
+            ctx.memory(|m| m.focused()).is_some(),
+            "clicking the reading opened no field to type into"
+        );
+        let _ = frame(vec![egui::Event::Text("-6".to_owned())]);
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert_eq!(
+            frame(vec![enter]),
+            Some(SliderAsk::Type("-6".to_owned())),
+            "Enter did not hand up the typed words"
+        );
+        // And the label is back, with nothing pending.
+        assert_eq!(frame(vec![]), None);
     }
 
     /// **Alt-click a stepped row and it goes home** — and a plain second

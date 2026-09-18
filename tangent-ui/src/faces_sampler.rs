@@ -868,7 +868,7 @@ fn one_row(ui: &mut egui::Ui, st: &FaceStyle, live: &FaceLive, id: u32) -> Optio
         p.reading.clone()
     };
     face::slider_row(ui, st, &p.name, &reading, p.value, p.default)
-        .map(|value| FaceAction::Set { id, value })
+        .map(|ask| crate::faces::ask_to_action(id, ask))
 }
 
 // ── the browser, the main door ──────────────────────────────────────────────

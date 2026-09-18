@@ -51,7 +51,7 @@ pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
     // because they are the fixed chain's own effects made seatable.
     (
         "@tangent-denoise",
-        "Tangent Denoise (Experimental)",
+        "Tangent Denoise",
         "learns your noise, then takes exactly what you dial out",
     ),
     (
@@ -515,6 +515,24 @@ pub enum FaceAction {
     /// A PATH and nothing else, the [`Self::PickSample`] bargain: the face
     /// knows where it is standing and the host owns the setting.
     SetMediaDefault { path: String },
+    /// **A reading was typed into.** Appended at the END, this enum's law.
+    ///
+    /// `text` is what the hand typed and committed with Enter - "-12",
+    /// "440", "1.5k", "off" - and the host turns it into a value with the
+    /// unit's own mapping (`builtin_fx::value_for_reading`), because the
+    /// readings are printed there and only there. The face never guesses a
+    /// scale. See `face::SliderAsk::Type`.
+    Type { id: u32, text: String },
+}
+
+/// What a slider row asked for, as the action the face raises: a value is
+/// a `Set`, typed words are a `Type`. One place, because three faces draw
+/// kit rows and each used to spell the map itself.
+pub(crate) fn ask_to_action(id: u32, ask: face::SliderAsk) -> FaceAction {
+    match ask {
+        face::SliderAsk::Value(value) => FaceAction::Set { id, value },
+        face::SliderAsk::Type(text) => FaceAction::Type { id, text },
+    }
 }
 
 fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {
@@ -525,7 +543,7 @@ fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {
 fn row(ui: &mut egui::Ui, st: &FaceStyle, face: &BuiltinFace, id: u32) -> Option<FaceAction> {
     let p = param(face, id)?;
     slider_row(ui, st, &p.name, &p.reading, p.value, p.default)
-        .map(|value| FaceAction::Set { id, value })
+        .map(|ask| ask_to_action(id, ask))
 }
 
 /// One stepped parameter as a kit row: the button wears the current choice,

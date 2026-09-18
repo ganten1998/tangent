@@ -549,6 +549,21 @@ pub struct MenuState {
     /// Whether the pointer has moved far enough since then to count as
     /// pointing at something. Sticky once true.
     armed: bool,
+    /// **The submenu's own arming**, the parent's rule applied to its panel:
+    /// where the pointer was when the panel last (re)opened, in the panel's
+    /// own coordinates, and whether it has moved `ARM_SLOP` inside it since.
+    /// Until it has, the panel draws no hover at all.
+    ///
+    /// On the desktop the panel is its own window with its own pointer
+    /// stream, and the one surface serves every submenu in turn - it moves
+    /// and refills as the pointer travels down the parent. A window the
+    /// pointer is not in reports the LAST position it saw there, which is
+    /// the row the hand left by; refilled for another submenu, that row lit
+    /// before the hand had touched the panel. The owner: "jumps to the top
+    /// selection when entering a submenu again." Reset whenever
+    /// `submenu_open` changes, so every panel earns its hover afresh.
+    sub_first_pointer: Option<Pos2>,
+    sub_hover_armed: bool,
     /// Kept so a submenu can be clamped too, not just the menu. Tuning and
     /// Capo sit near the BOTTOM of a long menu and Capo is ten rows deep, so
     /// unclamped they run off the screen and their lower rows cannot be
@@ -688,6 +703,26 @@ fn settle_submenu(
             true
         }
     }
+}
+
+/// **How long until a wait that began at `since` is over** - what the menu
+/// asks its next frame for while a dwell or a rest is running.
+///
+/// It used to ask for the whole `SUB_SWITCH_DWELL` (or `REST_FOR`) again on
+/// every frame, and that was fine for as long as the window painted sixty
+/// frames a second regardless: the state machine was sampled every 16 ms and
+/// the dwell ended within a frame of when it should. The window rests now
+/// (2026-09-15), so the menu's own asks are the only frames it gets - and
+/// egui subtracts its predicted frame time from every ask "to make it less
+/// likely we over-shoot the target". A 140 ms ask therefore landed at
+/// 124 ms, sixteen short of the dwell, and that frame asked for another
+/// full 140: every switch took two rounds, 248 ms, and a rest 88 instead
+/// of 60. The owner: "the right click main context menu is finnicky."
+///
+/// Asking for what is LEFT lands the second frame at the deadline itself,
+/// which is when the dwell was designed to end.
+fn due_in(wait: std::time::Duration, since: Instant, now: Instant) -> std::time::Duration {
+    wait.saturating_sub(now.duration_since(since))
 }
 
 /// How long the pointer must stay on a different row before the menu acts.
@@ -1552,6 +1587,8 @@ impl MenuState {
             rest: None,
             first_pointer: None,
             armed: false,
+            sub_first_pointer: None,
+            sub_hover_armed: false,
             monitor: monitor_size,
             dark_mode: view.dark_mode,
             face: view.face,
@@ -1884,13 +1921,27 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
     ) {
         // Still waiting out the dwell. Ask for the frame that will end it, or a
         // pointer that has stopped moving would sit there forever.
-        ctx.request_repaint_after(SUB_SWITCH_DWELL);
+        //
+        // **For the time LEFT, not the whole dwell again** - see `due_in`.
+        let wait = state
+            .pending_sub
+            .map_or(SUB_SWITCH_DWELL, |(_, at)| due_in(SUB_SWITCH_DWELL, at, now));
+        ctx.request_repaint_after(wait);
     }
     // And the frame that will notice it has come to rest. A pointer let go of
     // produces no events at all, so without this the menu would only settle if
     // something else happened to be animating.
     if pointer.is_some() && !still {
-        ctx.request_repaint_after(REST_FOR);
+        let wait = state
+            .rest
+            .map_or(REST_FOR, |(_, since)| due_in(REST_FOR, since, now));
+        ctx.request_repaint_after(wait);
+    }
+    // A different panel, or the same one again, has to earn its hover afresh -
+    // see `sub_hover_armed`.
+    if state.submenu_open != submenu_open {
+        state.sub_first_pointer = None;
+        state.sub_hover_armed = false;
     }
 
     // ── Submenu (sibling, Qt-style to the right) ──────────────────────────
@@ -1950,6 +2001,23 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         let report = crate::shell::surface(ctx, caps, &sub_spec, &mut |ui, want_close| {
             apply_menu_style(ui.style_mut(), c);
             scale_menu_font(ui.style_mut(), font_scale);
+            // **Hover only once the hand has moved inside the panel** - see
+            // `sub_hover_armed`. Read from THIS surface's own input, which
+            // on the desktop is the panel window's and not the parent's.
+            if let Some(p) = ui.ctx().input(|i| i.pointer.latest_pos()) {
+                match state.sub_first_pointer {
+                    None => state.sub_first_pointer = Some(p),
+                    Some(first) => {
+                        if (p - first).length() > ARM_SLOP {
+                            state.sub_hover_armed = true;
+                        }
+                    }
+                }
+            }
+            if !state.sub_hover_armed {
+                let inactive = ui.style().visuals.widgets.inactive;
+                ui.style_mut().visuals.widgets.hovered = inactive;
+            }
             let rect = ui.max_rect();
             draw_menu_backdrop(ui.painter(), rect, c, caps);
             let items = state
@@ -2262,6 +2330,184 @@ mod tests {
             after.is_empty(),
             "{} filled rect(s) were painted over the menu's edge at {edge}: {after:?}",
             after.len()
+        );
+    }
+
+    /// **A wait is asked for by what is left of it, not restarted every
+    /// frame.** See `due_in`: egui takes its predicted frame time off every
+    /// ask, so an ask for the whole `REST_FOR` on the frame that fell 16 ms
+    /// short of it doubled the rest, and the dwell with it. Measured here on
+    /// the rest, because a moving pointer's rest ask is the shorter of the
+    /// two and so the one the frame is scheduled by.
+    #[test]
+    fn a_rest_is_asked_for_by_what_is_left_of_it() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 800.0));
+        let _ = ctx.run(
+            egui::RawInput { screen_rect: Some(screen), ..Default::default() },
+            |_| {},
+        );
+        let mut v = view();
+        v.caps = Caps::PLUGIN;
+        let mut state = Some(MenuState::open(&ctx, v, Pos2::new(30.0, 30.0), Some(screen.size())));
+        let (menu, row_h, row_top) = {
+            let st = state.as_ref().expect("the menu did not open");
+            (Rect::from_min_size(st.pos, st.size), st.row_h, st.subs[0].row_top)
+        };
+        let frame = |state: &mut Option<MenuState>, at: Pos2| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    focused: true,
+                    events: vec![egui::Event::PointerMoved(at)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = show(ctx, state);
+                },
+            )
+        };
+        // Arrive on a submenu row from a point of the menu a row's height
+        // away, so the menu is armed and a dwell is pending as well.
+        let on_row = Pos2::new(menu.left() + 20.0, menu.top() + row_top + row_h * 0.5);
+        let _ = frame(&mut state, Pos2::new(on_row.x, on_row.y + 2.0 * row_h));
+        let _ = frame(&mut state, on_row);
+        let since = state
+            .as_ref()
+            .and_then(|st| st.rest)
+            .map(|(_, since)| since)
+            .expect("the pointer on a row was not noted as resting");
+        std::thread::sleep(Duration::from_millis(30));
+        // A stalled test runner could sleep through the whole rest, and then
+        // there is no ask left to measure; say nothing rather than lie.
+        if since.elapsed() >= REST_FOR - Duration::from_millis(10) {
+            return;
+        }
+        let out = frame(&mut state, on_row);
+        let asked = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |o| o.repaint_delay);
+        // What is left of the 60 ms rest, less egui's 1/60 s: about 13 ms.
+        // Restarting the rest asked for 60 less 1/60 s, which is 43.
+        assert!(
+            asked < Duration::from_millis(35),
+            "the frame after 30 ms of a 60 ms rest was asked for in {asked:?}"
+        );
+    }
+
+    /// `due_in` on its own: the time left, and never less than nothing.
+    #[test]
+    fn due_in_counts_down_and_stops_at_zero() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        assert_eq!(due_in(ms(140), t0, t0 + ms(40)), ms(100));
+        assert_eq!(due_in(ms(140), t0, t0 + ms(140)), ms(0));
+        assert_eq!(due_in(ms(140), t0, t0 + ms(500)), ms(0));
+    }
+
+    /// **A submenu panel lights no row until the hand has moved inside it,
+    /// and starts over for every panel it becomes.** See `sub_hover_armed`.
+    ///
+    /// Drawn inline, where the panel shares the pointer with the menu and a
+    /// stale position cannot happen, so the stale state is put there by hand:
+    /// a panel that believes the pointer has not moved since it opened, with
+    /// the pointer on one of its rows. The desktop's panel arrives in that
+    /// state by itself whenever the window it serves is refilled.
+    #[test]
+    fn a_panel_earns_its_hover_afresh_for_every_submenu_it_shows() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 900.0));
+        let _ = ctx.run(
+            egui::RawInput { screen_rect: Some(screen), ..Default::default() },
+            |_| {},
+        );
+        let mut v = view();
+        v.caps = Caps::PLUGIN;
+        let mut state = Some(MenuState::open(&ctx, v, Pos2::new(30.0, 30.0), Some(screen.size())));
+        let (menu, row_h, tops) = {
+            let st = state.as_ref().expect("the menu did not open");
+            assert!(st.subs.len() >= 2, "the test needs two submenus to switch between");
+            (
+                Rect::from_min_size(st.pos, st.size),
+                st.row_h,
+                st.subs.iter().map(|g| g.row_top).collect::<Vec<_>>(),
+            )
+        };
+        let frame = |state: &mut Option<MenuState>, at: Pos2| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    focused: true,
+                    events: vec![egui::Event::PointerMoved(at)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = show(ctx, state);
+                },
+            )
+        };
+        // Whether any row to the RIGHT of the menu - the panel - is lit: a
+        // row-high rectangle with any fill at all. An unlit row is drawn
+        // fully transparent, and a lit one wears the selection colour under
+        // the inline panel's own alpha, so the fill is asked for and not
+        // the colour; the backdrop and its shadow are taller than a row.
+        let panel_lit = |out: &egui::FullOutput| {
+            out.shapes.iter().any(|s| match &s.shape {
+                egui::Shape::Rect(rs) => {
+                    rs.fill.a() > 0
+                        && rs.rect.min.x >= menu.right() - 1.0
+                        && rs.rect.height() <= row_h + 1.0
+                }
+                _ => false,
+            })
+        };
+        let open_by_rest = |state: &mut Option<MenuState>, at: Pos2, want: usize| {
+            let _ = frame(state, at);
+            std::thread::sleep(REST_FOR + Duration::from_millis(15));
+            let _ = frame(state, at);
+            assert_eq!(
+                state.as_ref().and_then(|st| st.submenu_open),
+                Some(want),
+                "resting on submenu row {want} did not open it"
+            );
+        };
+        let row_0 = Pos2::new(menu.left() + 20.0, menu.top() + tops[0] + row_h * 0.5);
+        let row_1 = Pos2::new(menu.left() + 20.0, menu.top() + tops[1] + row_h * 0.5);
+        // Arm the menu from a row away, then rest on the first submenu row.
+        let _ = frame(&mut state, Pos2::new(row_0.x, row_0.y + 2.0 * row_h));
+        open_by_rest(&mut state, row_0, 0);
+        // The panel's first row sits beside the row that opened it.
+        let in_panel = Pos2::new(menu.right() + 20.0, row_0.y);
+        // The stale state, by hand: the panel opened with the pointer already
+        // where it is, and nothing has moved since.
+        {
+            let st = state.as_mut().expect("menu");
+            st.sub_first_pointer = Some(in_panel);
+            st.sub_hover_armed = false;
+        }
+        let out = frame(&mut state, in_panel);
+        assert!(
+            !panel_lit(&out),
+            "a panel the hand has not moved in lit the row under a stale pointer"
+        );
+        // Moved inside it: the row lights.
+        let out = frame(&mut state, in_panel + Vec2::new(ARM_SLOP + 4.0, 0.0));
+        assert!(
+            state.as_ref().is_some_and(|st| st.sub_hover_armed),
+            "moving inside the panel did not arm it"
+        );
+        assert!(panel_lit(&out), "an armed panel lit nothing under the pointer");
+        // Another submenu: the panel is refilled, and it starts over.
+        let _ = frame(&mut state, Pos2::new(row_1.x, row_1.y + 2.0 * row_h));
+        open_by_rest(&mut state, row_1, 1);
+        assert!(
+            state.as_ref().is_some_and(|st| !st.sub_hover_armed),
+            "a panel refilled for another submenu kept the old one's arming"
         );
     }
 
