@@ -2602,7 +2602,7 @@ struct Shared {
 /// look at, and a fence per block to make a meter prettier is a fence per
 /// block.
 #[repr(align(128))]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RtLoadCells {
     /// The last block's render time, nanoseconds.
     last_ns: AtomicU64,
@@ -2620,10 +2620,79 @@ struct RtLoadCells {
     /// How long the block had, nanoseconds: the frames the device granted
     /// over the rate. Written with the rest so a reader needs neither.
     deadline_ns: AtomicU64,
-    /// A log2 histogram of block times, bucket `i` counting blocks whose
-    /// time had `i` as its highest set bit. Thirty-two buckets covers one
-    /// nanosecond to four seconds, which is every block that can exist.
-    hist: [AtomicU32; 32],
+    /// A histogram of block times. See [`rt_bucket`] for the shape: one
+    /// nanosecond to four seconds at an eighth of an octave.
+    hist: [AtomicU32; RT_HIST_BUCKETS],
+}
+
+/// `[T; N]: Default` stops at thirty-two in std, so the histogram's two
+/// hundred and fifty-six buckets need this written out.
+impl Default for RtLoadCells {
+    fn default() -> Self {
+        Self {
+            last_ns: AtomicU64::default(),
+            peak_ns: AtomicU64::default(),
+            high_ns: AtomicU64::default(),
+            sum_ns: AtomicU64::default(),
+            blocks: AtomicU64::default(),
+            deadline_ns: AtomicU64::default(),
+            hist: std::array::from_fn(|_| AtomicU32::default()),
+        }
+    }
+}
+
+/// Sub-buckets per octave in [`RtLoadCells::hist`], as a power of two.
+///
+/// **Three, not zero, because the meter has to be finer than the thing it
+/// measures.** A plain log2 histogram puts 524 us and 1048 us in one bucket,
+/// and the figures that decide whether a desk is fast enough live inside
+/// that bucket: a p99 of 600 us and a budget of 800 us read as the same
+/// number, so every question about the fan-out was unanswerable by the meter
+/// built to answer it. Eight sub-buckets per octave is 9% resolution, which
+/// separates those two, and costs a shift and a mask on the audio thread.
+const RT_HIST_SUB_BITS: u32 = 3;
+const RT_HIST_SUB: u64 = 1 << RT_HIST_SUB_BITS;
+/// Enough for `1 ns` to `2^32 ns`, a little over four seconds. Anything
+/// longer is not a block, it is a hang, and it lands in the last bucket.
+const RT_HIST_BUCKETS: usize = 256;
+
+/// Which bucket `ns` belongs in.
+///
+/// Below [`RT_HIST_SUB`] a bucket is one nanosecond wide and the index IS
+/// the value. Above it, the top [`RT_HIST_SUB_BITS`] bits below the leading
+/// one pick the sub-bucket, which is the usual floating-point split: octave
+/// for the exponent, the bits under it for the mantissa. Monotone by
+/// construction, which is what [`RtLoadCells::read`] walks.
+///
+/// **Zero is a real argument, not a defensive one.** The early returns in
+/// `render` produce a zero-nanosecond block (no device channels, or a
+/// varispeed phase that asked for no program frames), and the arithmetic
+/// below would underflow on it. It takes the first branch instead. A panic
+/// here would cross the cpal boundary, which this file's own note calls
+/// undefined behaviour.
+fn rt_bucket(ns: u64) -> usize {
+    if ns < RT_HIST_SUB {
+        return ns as usize;
+    }
+    // `ns >= RT_HIST_SUB` so `leading_zeros` is at most `63 - SUB_BITS` and
+    // neither subtraction can wrap.
+    let octave = u64::from(63 - ns.leading_zeros());
+    let sub = (ns >> (octave - u64::from(RT_HIST_SUB_BITS))) & (RT_HIST_SUB - 1);
+    let bucket = ((octave - u64::from(RT_HIST_SUB_BITS) + 1) << RT_HIST_SUB_BITS) | sub;
+    (bucket as usize).min(RT_HIST_BUCKETS - 1)
+}
+
+/// The smallest time that lands in `bucket`, which is what a percentile
+/// taken from this histogram reports. The inverse of [`rt_bucket`] on its
+/// own boundaries.
+fn rt_bucket_floor(bucket: usize) -> u64 {
+    let bucket = bucket as u64;
+    if bucket < RT_HIST_SUB {
+        return bucket;
+    }
+    let group = (bucket >> RT_HIST_SUB_BITS) - 1;
+    let sub = bucket & (RT_HIST_SUB - 1);
+    (RT_HIST_SUB | sub) << group
 }
 
 /// What one reader sees of the real-time meter. See [`Engine::rt_load`].
@@ -2635,9 +2704,9 @@ pub struct RtLoad {
     /// The largest block since the stream opened, which no read clears.
     pub high_ns: u64,
     pub mean_ns: u64,
-    /// The 99th percentile, to the resolution of a log2 histogram, so it is
-    /// a bucket's lower bound and not a sample. Honest about being coarse:
-    /// a p99 of 65 us means "at least 65 and under 131".
+    /// The 99th percentile, to the resolution of [`rt_bucket`], so it is a
+    /// bucket's lower bound and not a sample. Honest about being coarse: a
+    /// p99 of 65 us means "at least 65 and under about 71".
     pub p99_ns: u64,
     pub blocks: u64,
     pub deadline_ns: u64,
@@ -2667,13 +2736,7 @@ impl RtLoadCells {
         self.sum_ns.fetch_add(ns, Ordering::Relaxed);
         self.blocks.fetch_add(1, Ordering::Relaxed);
         self.deadline_ns.store(deadline_ns, Ordering::Relaxed);
-        // **`max(1)` is not tidiness.** `63 - 0u64.leading_zeros()`
-        // underflows, and the early returns in `render` really do produce a
-        // zero-nanosecond block (no device channels, or a varispeed phase
-        // that asked for no program frames). A panic here crosses the cpal
-        // boundary, which this file's own note calls undefined behaviour.
-        let bucket = ((63 - ns.max(1).leading_zeros()) as usize).min(31);
-        if let Some(cell) = self.hist.get(bucket) {
+        if let Some(cell) = self.hist.get(rt_bucket(ns)) {
             cell.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2685,14 +2748,14 @@ impl RtLoadCells {
         let counts: Vec<u64> = self.hist.iter().map(|c| u64::from(c.load(Ordering::Relaxed))).collect();
         let total: u64 = counts.iter().sum();
         // The first bucket that carries the 99th percentile, reported as its
-        // own lower bound: `1 << i` nanoseconds.
+        // own lower bound.
         let want = total.saturating_mul(99) / 100;
         let mut seen = 0u64;
         let mut p99 = 0u64;
         for (i, n) in counts.iter().enumerate() {
             seen += n;
             if seen >= want && *n > 0 {
-                p99 = 1u64 << i;
+                p99 = rt_bucket_floor(i);
                 break;
             }
         }
@@ -3918,6 +3981,56 @@ struct KeyFeed<'a> {
 mod engine_parts {
     use super::*;
 
+    /// **The meter has to be finer than the thing it measures.** The old
+    /// log2 histogram put the fan-out's measured result and the budget it
+    /// was being judged against in the same bucket, so every question about
+    /// it was unanswerable by the instrument built to answer it. This walks
+    /// the whole range a block can take and asserts the two properties a
+    /// percentile read off it depends on.
+    #[test]
+    fn the_load_histogram_can_tell_six_hundred_microseconds_from_eight_hundred() {
+        assert_ne!(rt_bucket(600_000), rt_bucket(800_000));
+
+        // Monotone, in range, and never worse than one part in eight. The
+        // step is 1.03x so every bucket boundary in the range is visited.
+        let mut ns = 1u64;
+        let mut last = rt_bucket(0);
+        assert_eq!(last, 0);
+        while ns < 4_000_000_000 {
+            let b = rt_bucket(ns);
+            assert!(b >= last, "{ns} went backwards");
+            assert!(b < RT_HIST_BUCKETS, "{ns} overflowed the histogram");
+            // The reported figure is the bucket's floor, so it must never
+            // overstate, and must not understate by more than the width.
+            let floor = rt_bucket_floor(b);
+            assert!(floor <= ns, "{ns} reported as {floor}");
+            assert!(
+                ns - floor <= ns / RT_HIST_SUB,
+                "{ns} reported as {floor}, coarser than an eighth of an octave"
+            );
+            last = b;
+            ns = (ns + 1).max(ns * 103 / 100);
+        }
+
+        // A hang is not a block: it saturates rather than wrapping into a
+        // low bucket, which would read as the fastest block ever rendered.
+        assert_eq!(rt_bucket(u64::MAX), RT_HIST_BUCKETS - 1);
+    }
+
+    /// **The pool has to ask the machine how wide it is.** It was a `4`,
+    /// which is right for the five performance cores this was built on and
+    /// leaves most of the silicon idle on anything larger.
+    #[test]
+    fn the_fan_out_is_never_wider_than_the_cores_it_has() {
+        let cores = performance_cores();
+        assert!(cores >= 1, "a machine with no cores is running this test");
+        let peers = fanout_peers();
+        // The callback itself renders a lane, so the pool is the other
+        // cores, and a machine too small to have any gets none at all.
+        assert!(peers < cores.max(1), "the pool claimed every core");
+        assert_eq!(peers == 0, cores < 3);
+    }
+
     /// **No two lanes share a seat**, which is the whole argument that lets
     /// `lane_seats` hand a lane its racks with three `split_at_mut`s and no
     /// unsafe, and the whole argument that will let a worker hold them.
@@ -4246,9 +4359,59 @@ fn seat_is_frozen(shared: &Shared, seat: usize) -> bool {
 /// answers ten on this machine against five performance cores, counting the
 /// efficiency ones, and the measured spread says those are where the long
 /// tail comes from: at fifteen plain threads the medians split into two
-/// populations by core kind. The real-time thread is one of the five, so the
-/// pool is four peers and the callback renders a lane itself while it waits.
-const FANOUT_PEERS: usize = 4;
+/// populations by core kind. The real-time thread is one of those cores, so
+/// the pool is the rest of them and the callback renders a lane itself while
+/// it waits.
+///
+/// **This has to be asked of the machine, not written down.** It was a `4`
+/// until now, which is right for the five performance cores this was built
+/// on and wrong everywhere else: the same four peers face ten cores on an
+/// M4 Max and sixteen on an Ultra, so the biggest desks run on the machines
+/// that leave the most silicon idle. [`LanePool::new`] clamps the answer to
+/// sixteen, and one peer means the pool is pointless, so a machine that
+/// reports two cores or fewer gets none and takes the serial road.
+fn fanout_peers() -> usize {
+    let cores = performance_cores();
+    if cores < 3 { 0 } else { cores - 1 }
+}
+
+/// The performance cores, or the whole count where a machine has one kind.
+///
+/// `hw.perflevel0.physicalcpu` is the big cores on Apple silicon and is
+/// absent on Intel, where `hw.physicalcpu` is the same number by another
+/// name. Off macOS there is no workgroup to join, so the fan-out gate never
+/// rises on its own and this figure is only read through `TANGENT_FANOUT`
+/// `force`; the halving there is the same guess [`desktop`] already makes
+/// about hyperthreads.
+#[cfg(target_os = "macos")]
+fn performance_cores() -> usize {
+    for name in [c"hw.perflevel0.physicalcpu", c"hw.physicalcpu"] {
+        let mut out: u32 = 0;
+        let mut len = size_of::<u32>();
+        // SAFETY: the one-call shape, with a buffer of exactly the size the
+        // key returns. A non-zero status leaves `out` at zero and we try the
+        // next key; a key that answers something absurd is clamped by the
+        // caller and by `LanePool::new`.
+        let ok = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                std::ptr::addr_of_mut!(out).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ) == 0
+        };
+        if ok && out > 0 {
+            return out as usize;
+        }
+    }
+    4
+}
+
+#[cfg(not(target_os = "macos"))]
+fn performance_cores() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(2))
+}
 
 /// One lane's whole render, gathered so that the fork can hold thirty-two of
 /// them at once.
@@ -12695,7 +12858,10 @@ impl Engine {
         r.fanout = on
             .then(|| RtPlan::for_block(256, 48_000))
             .flatten()
-            .map(|plan| LanePool::new(FANOUT_PEERS, None, plan));
+            .and_then(|plan| {
+                let peers = fanout_peers();
+                (peers > 0).then(|| LanePool::new(peers, None, plan))
+            });
         r.fanout_any = on;
     }
 
@@ -13035,11 +13201,15 @@ impl Engine {
         let pool = (!offline || fanout_mode() == Fanout::Force)
             .then(|| RtPlan::for_block(buffer_frames.unwrap_or(256).max(1), rate))
             .flatten()
-            .map(|plan| {
+            .and_then(|plan| {
+                let peers = fanout_peers();
+                if peers == 0 {
+                    return None;
+                }
                 let wg = crate::outpath::device_id(Some(&name))
                     .and_then(Workgroup::for_device)
                     .map(Arc::new);
-                LanePool::new(FANOUT_PEERS, wg, plan)
+                Some(LanePool::new(peers, wg, plan))
             });
         let renderer = Renderer {
             shared: Arc::clone(&shared),

@@ -200,6 +200,47 @@ Verdict key: **CONFIRMED** = both verifiers upheld the claim. **DOUBTFUL** = one
 | 15 | BU-2 | DX7 "powf x7 + fmodf x6 per voice per sample" | They compile to `__exp10f`/`exp2f`, never `powf`; whole render is 66 to 117 us at 16 voices (2 to 4.4% of deadline), not 0.3 to 0.6 ms | DEAD AS STATED (both) | Take the one-line `fmodf` replacement (49% of the DX7 by one lens, 17.6 us by the other). The proposed `db_to_amp` lookup table buys 2.5 us and is not worth it |
 | 16 | PH-4 | Per-bay buffer copies and zero-fills | 0.057 us/bay, 2.75 us for 48 bays, 0.10% of deadline | DOUBTFUL (cost refuted) | **Do not fix.** The proposed removal of the output pre-zero drops the only guard against another lane's audio leaking through a summing or silence-flagging plugin, for 2 us of 2667 |
 
+### 3.0 What has landed since this was written (2026-09-19)
+
+Gaps 2, 3, 4, 5, 6, 7 and 8 are done. Gap 1 is done as far as the fan-out
+goes; the look-ahead half of it is not being built, and Lane 6 in the
+appendix says why.
+
+**Gap 5, the convolver, was worse than the row above says and is now the
+clearest win in the sweep.** The row priced the fixed transform floor. It
+did not price what the phase lock does to the distribution, which turned out
+to be the larger half. Two changes landed: the two channels now ride through
+one complex transform in each direction instead of two, with the twiddles
+tabulated rather than rotated in the inner loop; and each instance starts its
+staging buffer at its own offset so the desk's bays no longer all step on the
+same block. Per step, measured: a one-partition response 36.3 to 17.0 us, a
+four-partition response 37.2 to 17.2, a two-second response 83.3 to 66.4.
+
+On a desk of 96 bays, thirty-two lanes carrying three half-second responses
+each, at 128 frames, serial (`rt_bench`, this machine):
+
+| | before | after |
+|---|---|---|
+| p50 | 121.5 us | 755.3 us |
+| p99 | 5488.8 us | 1136.6 us |
+| p99 as a share of the deadline | 205.8% | 42.6% |
+| blocks over deadline, of 2000 | 500 | 0 |
+
+The p50 rising and the p99 falling by 4.8x IS the phase lock being undone:
+the same work, spread instead of stacked. Exactly one block in four was late
+before. None is now. At 64 frames the same desk went from 387.9% to 49.9%.
+
+**That rung also settles Lane 6.** Its acceptance gate (clause b) is a 96-bay
+heavy desk under 30% of the deadline. Forked, the rung measures p99 390.3 us,
+**14.6%** at 128 frames and 19.1% at 64. The gate the riskiest item in the
+plan was written against is met without it.
+
+Two smaller items landed with it. The render load meter kept its distribution
+in octaves, so 524 and 1048 us were one reading and it could not score its own
+gate; it keeps eighths of an octave now. And `FANOUT_PEERS` was a hardcoded 4,
+right for this machine's five performance cores and wrong on every larger one;
+the pool asks the machine now.
+
 ### 3.1 The threading-seam map is the part you cannot build from as written
 
 This matters more than any single microsecond, so it gets its own paragraph. All four threading-seam findings were refuted at least once, and **three of the four by both verifiers**. Every refutation was the same species: the mechanism is real, the enumeration is incomplete, and building on it as written would ship a bug. The corrected facts a fan-out or a look-ahead must respect:
@@ -347,6 +388,70 @@ One housekeeping note: the in-process bench left `tangent/src/rt_bench.rs` (393 
 **Risk.** HIGH, and the highest-consequence risk is one line of missing plumbing. Without the audio workgroup join and a real-time policy the parallel path is measurably WORSE than the serial engine it replaces: the 15-thread probe showed medians splitting into P-core and E-core populations (37 vs 52 us) with per-block maxima of 380 to 2634 us, so a fork-join defined by its slowest worker would lose whole blocks. That is why the contract makes the join mandatory and the acceptance requires the with/without number. Second risk, the privatisation list: three verifiers independently found scratch buffers the original map omitted (key_io, dry_io, builtin_scratch, keys_scratch, send_io, pad_io, lane_notes/lane_controls) plus the mix and aux += accumulators; missing any one is a data race, not a tuning question. Third, the eligibility set: the original map's rule admitted drum lanes, whose channel seat mix_pad_lane clocks a second time, which is exactly the double-clocking of a stateful chain that instrument.rs:10010-10038 exists to forbid. Fourth, keyed lanes must be ordered after their key source. Fifth, the master bus summation ORDER changes (float addition is not associative), so any bit-exact render regression test flips; that is inaudible and expected, and the -120 dBFS null test is what proves it. No behaviour the owner can hear changes if the contract is met: mute, solo, fader, pan and send are all applied by the serial fold after the join, so they stay instant.
 
 ### Lane 6: anticipative
+
+**DECISION 2026-09-19: NOT BUILT, and the gate it was written against is
+already met by the lane before it.** Four independent design reads of the
+ownership, invalidation and consumption protocol were run before any of it
+was written. All four returned `needs-terms`, and three of them found
+crash-or-race breaks in the protocol as specified, not in a hypothetical
+implementation of it:
+
+- The RT thread cannot both wait for an acknowledgement before touching a
+  lane's seats and fall back to rendering that lane itself when the
+  acknowledgement has not arrived. The second rule is the exact aliasing the
+  first forbids, and a worker that is merely descheduled is inside
+  `render_lane` on that lane's `Rack` while the callback starts its own.
+- `swap_plugins` walks every rack at the head of every callback and the
+  arrival signal is one desk-wide counter with no lane in it. Dropping a
+  plugin onto a track that is playing would free a VST3 instance while a
+  worker is inside its `process`.
+- The dx7, Keys, sampler and pending-voice handoffs all `mem::replace` a
+  lane's seats from the RT thread and discover the lane only after popping.
+- `DeskRef` is not stable across blocks: `auto_params` is cleared and pushed
+  into every block, so a worker holding one past its own block reads a `Vec`
+  whose length is being reset underneath it.
+- A lane's clip audio and its MIDI have no future to read. `clip_lane` is one
+  block deep for the whole desk, and the `sounding` ledger is a single
+  pitch-keyed `u128`, so neither can be given a future one lane at a time.
+
+Each is fixable, and together they are a sixteen-term invalidation contract,
+an epoch handshake, position-keyed rings, a partial-span loop-edge rule and a
+10,000-block randomised torture test. The fourth read priced that against
+what it buys and the arithmetic does not support building it:
+
+- **The acceptance gate above (clause b) is 96 x PLATE-140 with 90 bays on
+  non-armed lanes at under 30% of the deadline. Section 4.1 projects LANE 5,
+  which has landed, at about 22% on the same rung.** The gate written for the
+  riskiest item in the plan is satisfied by the item before it.
+- In the mixing case this feature is sold on, a 24-lane desk at three
+  commercial bays is about 19% of the deadline after the fork. Anticipation
+  takes it to roughly 7%. That is 12 points of a deadline that is already
+  four-fifths empty, bought in the one session where the owner rides plugin
+  knobs continuously, which is the session that invalidates the ring 60 times
+  a second. One lane with six Pro-R bays under a knob drag is 116 ms of CPU a
+  second re-rendering audio nobody hears.
+- In the tracking case it buys close to nothing, as the goal above already
+  concedes, and that is where a knob on a pre-rendered lane lands 10 to 21 ms
+  late. The MIDI fast lane exists to kill a 3 to 10 ms delay.
+- It would be macOS-only. Off macOS there is no workgroup, `RtReady` never
+  rises and the engine renders serially. Tangent ships on Windows, Linux and
+  FreeBSD.
+
+**What was done instead**, in the order the read ranked them: the load
+meter's resolution (it could not tell 600 us from 800 us, so it could not
+score its own gate), the pool width (hardcoded to this machine's five
+performance cores), the convolver's transform cost and its step phase, and a
+bench rung heavy enough to score the fork. See the 2026-09-19 entries in the
+CHANGELOG. `pinned_lanes`, the pure-logic half of this lane, was written and
+tested and then reverted; the patch is not in the tree because the
+invalidation read found the rule itself incomplete, in that the room's rack
+claim outlives a disarm by about 138 ms while the rule drops the lane the
+instant it is disarmed.
+
+**If it is ever revisited**, it is a setting, default off, and the changelog
+has to say three things plainly: a knob on a pre-rendered track lands up to a
+look-ahead late, arming mid-roll can click, and every seek and loop wrap pays
+its first block on the real-time thread.
 
 **Goal.** Stage two: render playback-only lanes N blocks AHEAD of the callback into per-lane sample-addressed rings, which is the mechanism REAPER's 15 worker threads actually use. This is what takes non-armed lanes off the per-block deadline entirely and turns their cost into average throughput over all cores, rather than merely dividing it by five.
 
