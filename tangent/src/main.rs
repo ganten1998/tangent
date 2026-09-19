@@ -32,6 +32,12 @@ mod plugin_guard;
 
 /// What else is standing between the mix and the speakers.
 mod outpath;
+/// Threads that are allowed to miss the deadline as little as the audio
+/// thread is: the real-time policy and the device workgroup a lane worker
+/// needs before it is worth forking onto. See the module docs for the
+/// measurement that makes the join mandatory rather than an optimisation.
+#[cfg(feature = "recorder")]
+mod rtwork;
 /// Six-operator FM, and real DX7 cartridges to feed it. The instrument the app
 /// has when it has no instrument, so a fresh install makes a sound. The default
 /// patch is written in the source: no samples, no data, no licence questions.
