@@ -12442,16 +12442,23 @@ impl Renderer {
                 if is_builtin || is_keys {
                     self.probe_inst_pins |= bit;
                 }
-                // **The MIDI source only, now.** Audio clips were pinned
-                // here because the desk kept one block of them for every
-                // lane at once; a lane pulls its own span for whatever block
-                // it is rendering, so an audio lane has a future to read.
-                // What is left is the pitch-keyed `sounding` word, the
-                // shared `active_clip` list and the flat `midi_cursor`,
-                // which are step 3.
-                if lane_has_clips {
-                    self.probe_clip_pins |= bit;
-                }
+                // **Nothing is pinned by its source any more.** Audio was
+                // pinned because the desk kept one block of it for every lane
+                // at once, and MIDI because what was sounding lived in a
+                // pitch-keyed word shared with the live stream, a desk-wide
+                // list with a cap, and a cursor per clip. A lane pulls its
+                // own audio for whatever block it renders, and its notes are
+                // found by where the block is rather than by where the last
+                // one left off.
+                //
+                // What is left of the MIDI state is a model of the
+                // INSTRUMENT rather than of the playhead: which pitches this
+                // lane's instrument has been told about and when each is due
+                // to end. It advances in step with the sink whichever block
+                // feeds it. Whether a RENDERED block may then be thrown away
+                // is a different question, and it is step 5's; it is not a
+                // question about whether the lane has a future to read.
+                let _ = lane_has_clips;
             }
         }
 

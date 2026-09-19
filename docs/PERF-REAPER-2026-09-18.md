@@ -670,8 +670,51 @@ owner said go on 2026-09-19; progress is marked here.
    was frame-major over the whole clip list, so a block cost frames times
    clips whatever the clips were doing, with a single looped clip expanded by
    the host into as many as four thousand passes.
-3. Per-lane MIDI: split the pitch-keyed `u128` `sounding` ledger and the flat
-   `midi_cursor`.
+3. **DONE.** Per-lane MIDI. Six commits. The note-ONs turned out to be
+   position-pure exactly as the audio was, so `midi_cursor` is DELETED (it was
+   never anything but a cache of
+   `notes.partition_point(|n| start + n.at < from)`), along with the
+   desk-wide `active_clip` list, its 256-entry cap, `clip_parked`, and the
+   clip half of the pitch-keyed `sounding` word. The MIDI schedule is
+   lane-sorted and indexed like the audio one.
+
+   **One piece of genuine state survives, and naming why matters.** A
+   note-off is a promise made to a stateful instrument: it is owed because an
+   on was SENT, not because the timeline says a note ended. The shipped code
+   already knew this and said so by keeping the sounding list across a clip
+   list swap while resetting every cursor, so a note from a retired
+   arrangement still gets its off. What replaces it is per lane and is a model
+   of the INSTRUMENT rather than of the playhead: `told` (a bit per pitch),
+   `told_off` (when each is due) and `park_from`, about 33 KB against the 4 KB
+   pool it replaces.
+
+   **Two shipped bugs fell out of it.** The sounding word had two unrelated
+   owners, the live keyboard and the clip walk, so a clip note ending on pitch
+   P cleared the bit a held live key on P had set and that key then got no off
+   at the next stop or locate. And the flush's note-offs were never delivered
+   at all: the per-lane walk reads the live list zipped against a list of lane
+   masks, a zip stops at the shorter side, and the flush pushed to the notes
+   and never to the masks. A DX7 survived only via a blanket sweep beside the
+   flush, which reaches no Keys instance, no Analog and no hosted plugin, so
+   those rang on through a stop.
+
+   **The probe, re-run.** No lane is pinned by its source any more:
+
+   | desk | after step 2 | after step 3 |
+   |---|---|---|
+   | knowersomething1 (real) | 61.7% | **100.0%** |
+   | moscow1 (real) | 0.0% | **100.0%** |
+   | benjamin1, demo1, demo2 (real) | 0.0% | **100.0%** |
+   | 8 x Analog, 8 voices | 0.0% | **100.0%** |
+   | every audio rung | 100.0% | 100.0% |
+
+   The only rungs below 100% are the all-frozen desk at 94.6% and the stopped
+   transport at 61.8%, both of which are pinned on purpose.
+
+   **What this does and does not mean.** It means no lane lacks a future to
+   read: the source question is closed. It does NOT mean a rendered block may
+   be thrown away, which is a different question about a stateful sink and is
+   step 5's.
 4. The ownership protocol: an epoch handshake, a per-lane swap arrival mask so
    `swap_plugins` cannot free an instance under a worker, peek-don't-pop on the
    dx7 / Keys / sampler / pending-voice rings, and a per-lane `DeskRef` copy.
