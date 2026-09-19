@@ -688,8 +688,8 @@ impl LanePool {
         // **The caller works too**, rather than waiting on four threads to do
         // what five could: the real-time thread is one of the cores.
         while let Some(ch) = claim(&self.gate.owed, round) {
+            let _mark = MarkDone { done: &self.gate.done, bit: 1u32 << ch };
             work(ch);
-            self.gate.done.fetch_or(1u32 << ch, Ordering::AcqRel);
         }
         // ── the barrier, and why it is not a bare spin ──────────────────
         //
@@ -732,6 +732,46 @@ impl Drop for LanePool {
         self.gate.wake.notify_all();
         for h in self.hands.drain(..) {
             let _ = h.join();
+        }
+    }
+}
+
+/// **Marks a lane done however the work leaves.**
+///
+/// The barrier is `while done != lanes`, with no timeout and no exit, and the
+/// thread spinning on it is the audio callback. A worker holds no lock while
+/// it calls the work closure, so a panic in there poisons nothing and is
+/// simply an unwind: it skips the line that marks the lane, and the callback
+/// then spins and yields for ever. That is not a dropout, it is the audio
+/// thread never returning again.
+///
+/// A plugin is the obvious way in, but so is any `unwrap` on the render path,
+/// and this file's own note says a panic crossing the cpal boundary is
+/// undefined behaviour, so the engine must not be relying on there never
+/// being one. Marking the lane from a destructor makes the barrier complete
+/// on every path out, including that one.
+struct MarkDone<'a> {
+    done: &'a AtomicU32,
+    bit: u32,
+}
+
+impl Drop for MarkDone<'_> {
+    fn drop(&mut self) {
+        self.done.fetch_or(self.bit, Ordering::AcqRel);
+    }
+}
+
+/// The same for the readiness count, so a worker that unwinds out of its
+/// whole body does not leave the pool believing it is wider than it is.
+struct MarkGone<'a> {
+    ready: &'a RtReady,
+    counted: bool,
+}
+
+impl Drop for MarkGone<'_> {
+    fn drop(&mut self) {
+        if self.counted {
+            self.ready.0.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -810,6 +850,10 @@ fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: RtPlan) {
     if counted {
         gate.ready.0.fetch_add(1, Ordering::Relaxed);
     }
+    let _gone = MarkGone {
+        ready: &gate.ready,
+        counted,
+    };
     let mut seen = 0u64;
     loop {
         let round = {
@@ -842,14 +886,14 @@ fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: RtPlan) {
             &*transmute::<(*const (), *const ()), *const (dyn Fn(usize) + Sync)>(job.work)
         };
         while let Some(ch) = claim(&gate.owed, round) {
+            // The lane is marked when this guard drops, which is on every
+            // path out of `work` including an unwind. See `MarkDone`.
+            let _mark = MarkDone { done: &gate.done, bit: 1u32 << ch };
             work(ch);
-            gate.done.fetch_or(1u32 << ch, Ordering::AcqRel);
         }
     }
-    if counted {
-        gate.ready.0.fetch_sub(1, Ordering::Relaxed);
-    }
-    // `joined` drops here, on this thread, leaving the workgroup.
+    // `_gone` decrements the readiness count, and `joined` drops here, on
+    // this thread, leaving the workgroup.
     drop(joined);
     // And whatever the platform's policy took, on the thread that took it.
     // A no-op everywhere but Windows, where the scheduler hands back a handle
@@ -895,6 +939,33 @@ mod tests {
         assert_eq!(claim(&wrapped, u64::MAX), Some(0));
         let wide = AtomicU64::new(owed_word(3, 1 << 31));
         assert_eq!(claim(&wide, 3), Some(31), "the top lane was lost to the round");
+    }
+
+    /// **A panic in one lane must not hang the audio thread for ever.**
+    ///
+    /// The barrier has no timeout and no exit, and the thread waiting on it
+    /// is the callback. A worker holds no lock while it calls the work
+    /// closure, so an unwind poisons nothing; it used to simply skip the
+    /// line that marks the lane, leaving the callback spinning and yielding
+    /// with nothing that could ever satisfy it.
+    #[test]
+    fn a_panic_in_one_lane_still_finishes_the_block() {
+        // Asserted on the guard rather than by running a pool: the panic
+        // would land on a worker thread, where the harness turns it into a
+        // dead thread rather than a result this test can read, and the thing
+        // that matters is exactly the guard's contract.
+        let marked = AtomicU32::new(0);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _mark = MarkDone { done: &marked, bit: 1 << 4 };
+            panic!("inside the work");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(
+            marked.load(Ordering::Relaxed),
+            1 << 4,
+            "a lane that panicked was never marked done, so the callback \
+             would spin on the barrier for ever"
+        );
     }
 
     /// **The readiness bar is the same everywhere; only the mechanisms
@@ -987,9 +1058,19 @@ mod tests {
     fn a_pool_with_no_workgroup_is_never_ready() {
         let plan = RtPlan::for_block(128, 48_000).expect("plan");
         let pool = LanePool::new(4, None, plan);
-        // No workgroup was handed in, so no worker can be both real-time and
-        // joined, whatever the scheduler said.
+        // **On macOS.** No workgroup was handed in, so no worker can be both
+        // real-time and joined, whatever the scheduler said.
+        //
+        // Off macOS this is deliberately NOT true and must not be asserted:
+        // there is no workgroup to join on those platforms, so the real-time
+        // policy is the whole bar and a worker that gets it counts. Asserting
+        // zero here would make the suite red on Windows, Linux and FreeBSD
+        // for doing exactly what it was changed to do.
+        #[cfg(target_os = "macos")]
         assert_eq!(pool.ready(), 0);
+        // What holds everywhere: readiness never exceeds the pool, and a
+        // worker counts only if it was given a policy.
+        assert!(pool.ready() <= pool.width());
         assert!(pool.width() >= 1);
     }
 }

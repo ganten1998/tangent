@@ -51,6 +51,13 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   parallel render also in hand the ninety-six bays sit at 15% of the
   deadline at 128 frames and 19% at 64.
 
+- **A plugin that crashes can no longer take the audio with it.** If
+  anything went wrong while a worker was processing one track, the main audio
+  thread was left waiting for that track to be finished, with nothing that
+  could ever satisfy it, spinning until the app was killed. The track is now
+  marked finished on every way out, including that one, so the block
+  completes and the app keeps playing.
+
 - **A race in the parallel render is closed.** A worker reads what it is
   meant to do once per round and then loops asking for the next track. If it
   was interrupted between finishing one track and asking again, the main
