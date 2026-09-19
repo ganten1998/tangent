@@ -203,8 +203,9 @@ Verdict key: **CONFIRMED** = both verifiers upheld the claim. **DOUBTFUL** = one
 ### 3.0 What has landed since this was written (2026-09-19)
 
 Gaps 2, 3, 4, 5, 6, 7, 8 and 10 are done. Gap 1 is done as far as the
-fan-out goes; the look-ahead half of it is not being built, and Lane 6 in the
-appendix says why. That leaves no CONFIRMED gap unaddressed.
+fan-out goes. The look-ahead half of it is not being built, and Lane 6 in the
+appendix says why, but "not being built" is not the same as "addressed": gap
+1's stated fix names both halves, so it should be read as half done.
 
 **Gap 10, the latency poll, was three defects rather than one.** The host
 worked out its whole plugin-window state over `(STRIPS + 1) * INSERTS` bays,
@@ -242,10 +243,43 @@ The p50 rising and the p99 falling by 4.8x IS the phase lock being undone:
 the same work, spread instead of stacked. Exactly one block in four was late
 before. None is now. At 64 frames the same desk went from 387.9% to 49.9%.
 
-**That rung also settles Lane 6.** Its acceptance gate (clause b) is a 96-bay
-heavy desk under 30% of the deadline. Forked, the rung measures p99 390.3 us,
-**14.6%** at 128 frames and 19.1% at 64. The gate the riskiest item in the
-plan was written against is met without it.
+**That rung does NOT settle Lane 6. Corrected 2026-09-19, same day.** It was
+written here that it did, on a p99 of 390.3 us, 14.6% at 128 frames. That was
+the wrong rung, and the claim is withdrawn.
+
+A convolver bay is BURSTY: it costs nothing for three blocks and everything
+on the fourth, and `CONV_SPREAD` levels those bursts across the desk. Lane 6's
+gate names 96 instances of Rev PLATE-140, which costs the same amount on every
+block, so its peak IS its mean and there is no phase to stagger. Per bay per
+block the two rungs differ by about 3.8x, and the single largest contributor
+to the 14.6% was a lever no hosted plugin has.
+
+**The gate's own rung has now been run**, with that plugin, at that layout,
+32 lanes x 3 bays (`rt_bench.rs`, the `GATE_PLUGIN` block):
+
+| 96 x Rev PLATE-140, 128 frames | serial | forked |
+|---|---|---|
+| mean | 4657.1 us | 1031.3 us |
+| p99 | 6393.4 us | 1338.0 us |
+| p99 as a share of the deadline | 239.8% | **50.2%** |
+| blocks over deadline, of 2000 | 2000 | 1 |
+
+At 64 frames, forked: p99 997.3 us, **74.8%**, 6 blocks over.
+
+**The gate is p99 under 30%. The fork measures 50.2%. It is not met.** Two
+caveats in both directions. The plugin costs 48.1 us per instance inside this
+engine against the 28.2 us the sweep measured for it standalone, a 1.7x
+discrepancy worth its own look; scaling the plugin part back to 28.2 us puts
+the forked p99 at about 30%, i.e. exactly on the line. And the forked figures
+are taken through `TANGENT_FANOUT=force`, which is plain timeshare threads, so
+a real-time pool should do better than this reads.
+
+What the number does and does not change. It does NOT reopen the build
+decision: every non-arithmetic reason in the Lane 6 DECISION block stands, and
+the strongest of them is not in that block at all (see the PDC note there). It
+does mean this desk, 96 commercial reverbs with nothing armed, is a shape the
+fan-out alone does not comfortably fit, and that is the first concrete session
+where look-ahead would be the remaining mechanism.
 
 Two smaller items landed with it. The render load meter kept its distribution
 in octaves, so 524 and 1048 us were one reading and it could not score its own
@@ -431,10 +465,14 @@ an epoch handshake, position-keyed rings, a partial-span loop-edge rule and a
 10,000-block randomised torture test. The fourth read priced that against
 what it buys and the arithmetic does not support building it:
 
-- **The acceptance gate above (clause b) is 96 x PLATE-140 with 90 bays on
-  non-armed lanes at under 30% of the deadline. Section 4.1 projects LANE 5,
-  which has landed, at about 22% on the same rung.** The gate written for the
-  riskiest item in the plan is satisfied by the item before it.
+- **WITHDRAWN, same day.** This originally read that the gate is already met
+  by the item before it, on a 14.6% measured on a convolver desk and a 22%
+  projection in section 4.1. Both were wrong. The convolver desk is the wrong
+  rung by about 3.8x per bay, the 22% is a mean quoted against a p99 gate and
+  rests on a 4.5x fork projection the shipped fork measured at 2.2 to 3.3x,
+  and section 4.1's own gate is 70%, not the 30% of this clause. The gate's
+  rung has now been run: **50.2%**, and 74.8% at 64 frames. See section 3.0.
+  The gate is NOT met, and this item is deferred on risk, not on that number.
 - In the mixing case this feature is sold on, a 24-lane desk at three
   commercial bays is about 19% of the deadline after the fork. Anticipation
   takes it to roughly 7%. That is 12 points of a deadline that is already
@@ -460,10 +498,43 @@ invalidation read found the rule itself incomplete, in that the room's rack
 claim outlives a disarm by about 138 ms while the rule drops the lane the
 instant it is disarmed.
 
+**The reason that actually decides it is not any of the above, and it was
+found only after the gate claim was withdrawn.** `DelayLine::run` advances its
+write cursor by `frames` on every call (`instrument.rs:1372`), and both PDC
+lines run INSIDE `render_lane`. So a block that is rendered ahead and then
+discarded has already advanced that lane's delay line, permanently, against
+the mix. The ring is discarded by a loop-edge drag at 60 Hz, a tempo change, a
+seek, a plugin swap and an arm toggle. This is a property of look-ahead
+itself, not of worker ownership, and no narrowing of the feature removes it:
+not a one-block depth, not frozen lanes only, not rendering ahead on the
+real-time thread. Until both delay lines are clocked at CONSUMPTION in the
+fold rather than at render, the feature cannot be made correct in ANY variant,
+and that work has never been scoped. It is also why there is no cheap spike: a
+shadow render that throws its result away still advances every delay line,
+every compressor envelope and every convolver fill cursor it touches, and
+`BuiltinUnit::gain_reduction_db` is a destructive drain (`units/comp.rs:356`),
+so a shadow steals the meter reading of the block that will actually be heard.
+
+**Two things that would teach something real, in order, neither of which is a
+look-ahead:**
+1. Done: run the gate rung. See section 3.0.
+2. A read-only eligibility and discard probe. In the decide walk, OR the
+   complement of the pinned set into an `eligible: u32` from terms that loop
+   already computes, count the discard triggers, publish three cells beside
+   `RtLoadCells` and read them out behind the existing env-var door. No
+   thread, no unsafe, not one output sample changed, so the bit-exact null
+   test stays green unconditionally. It measures the two numbers all four
+   design reads guessed at and none measured: how many lanes in a real song
+   would qualify at all, and how often the ring would be thrown away.
+
 **If it is ever revisited**, it is a setting, default off, and the changelog
 has to say three things plainly: a knob on a pre-rendered track lands up to a
 look-ahead late, arming mid-roll can click, and every seek and loop wrap pays
-its first block on the real-time thread.
+its first block on the real-time thread. Note also that a default-off setting
+buys less than it sounds: it gates the ring, but the per-lane clip seed, the
+`sounding` split, the `DeskRef` copy and the swap arrival mask all ship
+unconditionally, on every platform, including the three that can never reach
+the feature.
 
 **Goal.** Stage two: render playback-only lanes N blocks AHEAD of the callback into per-lane sample-addressed rings, which is the mechanism REAPER's 15 worker threads actually use. This is what takes non-armed lanes off the per-block deadline entirely and turns their cost into average throughput over all cores, rather than merely dividing it by five.
 

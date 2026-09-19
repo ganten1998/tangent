@@ -679,6 +679,56 @@ fn rt_bench() {
         break;
     }
 
+    // ── THE GATE RUNG: 96 instances of a commercial reverb ────────────
+    //
+    // **This is the shape the plan's own acceptance clause names**, and the
+    // reason it is worth its own rows is that the IR rows above are NOT it.
+    // A convolver is bursty: it costs nothing for three blocks and
+    // everything on the fourth. A plugin like this costs the same amount on
+    // every block. Two desks with the same mean can therefore have very
+    // different p99s, and the p99 is what the gate is written against, so a
+    // gate scored on the bursty desk is not the gate.
+    //
+    // Thirty-two lanes of three bays. Skipped, with a line, wherever the
+    // plugin is not installed or will not instantiate in a test process.
+    const GATE_PLUGIN: &str = "/Library/Audio/Plug-Ins/VST3/Rev PLATE-140.vst3";
+    if Path::new(GATE_PLUGIN).exists() {
+        let mut e = audio_desk(32, &[]);
+        let mut ok = true;
+        'seat: for lane in 0..32 {
+            for bay in 0..3 {
+                match e.load_insert(lane, bay, Some(Path::new(GATE_PLUGIN)), None) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        println!("note: the gate plugin loaded but lane {lane} bay {bay} reports no tenant");
+                        ok = false;
+                        break 'seat;
+                    }
+                    Err(err) => {
+                        println!("note: the gate plugin would not load in a test process: {err}");
+                        ok = false;
+                        break 'seat;
+                    }
+                }
+            }
+        }
+        if ok {
+            let name = Path::new(GATE_PLUGIN)
+                .file_stem()
+                .map_or_else(|| GATE_PLUGIN.to_owned(), |s| s.to_string_lossy().into_owned());
+            rows.push(measure(&format!("96 bays x {name} (VST3)"), &mut e, WARMUP, BLOCK));
+            rows.push(measure(&format!("96 bays x {name} (VST3) @ 64 fr"), &mut e, WARMUP, 64));
+        }
+        // Emptied by hand before the engine drops, so the plugins are torn
+        // down on this thread rather than with the renderer.
+        for lane in 0..32 {
+            for bay in 0..3 {
+                let _ = e.load_insert(lane, bay, None, None);
+            }
+        }
+        drop(e);
+    }
+
     println!("\n── what the shapes imply ──");
     let get = |n: &str| rows.iter().find(|r| r.name == n).map(|r| r.mean);
     if let (Some(one), Some(sixteen), Some(thirty_two)) = (
