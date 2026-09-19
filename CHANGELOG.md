@@ -101,6 +101,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **A frozen track stops being processed twice.** Freezing renders a lane
+  through everything it holds and plays the result as an ordinary audio
+  clip, so the file already contains all six insert bays and the whole
+  pedalboard. The stand-down that is supposed to switch those off asked
+  whether a SEAT was frozen, which is true of a lane's first three bays and
+  false of its second three and its seven pedal slots: those kept running,
+  over a file they had already been baked into, and kept reporting their
+  latency as well, so the lane also sat late against the rest of the mix by
+  their lookahead. It asks which LANE a seat belongs to now.
+
+  **This changes the sound of a track you have already frozen**, the moment
+  the project opens, if it carries anything in bays 4 to 6 or an amp with
+  pedals. That is the sound the freeze was meant to give you, and it is not
+  the one you have been hearing. A track with three bays or fewer and no amp
+  was always correct and is untouched.
+
 - **Automation on a plugin insert reaches the plugin.** It never has. The
   host files a block's automation points into the parameter pool the plugin
   reads, and then cleared that pool before calling the plugin, so the count
