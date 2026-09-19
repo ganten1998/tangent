@@ -515,10 +515,62 @@ every compressor envelope and every convolver fill cursor it touches, and
 `BuiltinUnit::gain_reduction_db` is a destructive drain (`units/comp.rs:356`),
 so a shadow steals the meter reading of the block that will actually be heard.
 
-**Two things that would teach something real, in order, neither of which is a
-look-ahead:**
-1. Done: run the gate rung. See section 3.0.
-2. A read-only eligibility and discard probe. In the decide walk, OR the
+**Both things that would teach something real have now been done, and the
+second one answers the question.**
+1. The gate rung. See section 3.0: 50.2%, the gate is not met.
+2. **The eligibility probe. Built, run, and it reports zero.** See below.
+
+### Lane 6: what the eligibility probe measured (2026-09-19)
+
+`TANGENT_PROBE=1` turns on a read-only counter in the decide and render walks
+(`ProbeCells`, `Renderer::note_eligibility`). It renders nothing early, spawns
+no thread, uses no unsafe and changes no output sample. It reports, in
+NANOSECONDS actually spent inside `render_lane` and not in lanes, how much of
+a block's work a look-ahead would have been allowed to move off the deadline.
+Three tiers: as the engine stands; assuming a per-lane k-deep future for clip
+audio and MIDI is built; and assuming the instrument-instance handoffs stop
+writing a lane's seat from the callback.
+
+Over the owner's own projects, twelve seconds each from the head, 128 frames,
+via `the_eligibility_probe_over_real_projects` (all 189 project files verified
+byte-identical afterwards):
+
+| project | lanes rendering | us/block in lanes | eligible now | + source | + instruments |
+|---|---|---|---|---|---|
+| knowersomething1 | 7.3 | 934 | **0.0%** | 100% | 100% |
+| moscow1 | 7.0 | 45 | **0.0%** | 100% | 100% |
+| demo1 | 1.0 | 88 | **0.0%** | 100% | 100% |
+| benjamin1 | 1.0 | 51 | **0.0%** | 100% | 100% |
+| demo2 | 1.0 | 13 | **0.0%** | 100% | 100% |
+
+And over all 23 synthetic rungs in `rt_bench`, including the 96-bay commercial
+reverb desk: **eligible now 0.0% on every single one.** The one that is not
+100% at the next tier is the all-frozen desk (96.2%) and the stopped desk
+(59.9%), which is the resting rule already having taken those lanes away.
+
+**Zero is not "small", and it is structural rather than an artefact of a
+conservative mask.** `clip_lane` is one block deep for the WHOLE desk and
+`clip_lanes` is a whole-timeline mask, so every lane that renders has clips
+and no lane that has clips has a future to read. A lane with nothing under
+the playhead does not render at all any more, because the resting rule landed
+first. The two features overlap exactly: the work look-ahead would have moved
+off the deadline is the work the rest rule already stopped doing.
+
+**So the entire value of the feature is behind the piece nobody has scoped.**
+The gap between the first column and the second is 100 points, and crossing it
+means giving every anticipated lane its own k-deep clip seed and splitting a
+single pitch-keyed `u128` note ledger per lane. That is not a term in the
+contract; it is a different engine. Until it exists, the measured ceiling on
+the whole feature is zero.
+
+**The discard half of the probe cannot be measured offline and reads a
+truthful zero.** Every event that would throw a ring away is a user-interface
+write, and a headless render of a saved document makes none. The counters
+ship (param, transport, loop, tempo, swap, arm) and would be read after a live
+session with the owner's hands on the desk. That is the one number still
+missing, and it can only lower the answer, not raise it.
+
+**A read-only eligibility and discard probe.** In the decide walk, OR the
    complement of the pinned set into an `eligible: u32` from terms that loop
    already computes, count the discard triggers, publish three cells beside
    `RtLoadCells` and read them out behind the existing env-var door. No

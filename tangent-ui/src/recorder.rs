@@ -4144,6 +4144,13 @@ pub struct AudioStatus {
     /// `None` where no block has been rendered yet, or where the engine is
     /// not running.
     pub rt_load: Option<(f32, f32)>,
+    /// **The eligibility probe's line, when it is running.** `None` in every
+    /// build nobody has asked: see the engine's `ProbeCells`. It is here and
+    /// not only in the bench because the half of that measurement which
+    /// matters most, how often a look-ahead ring would be thrown away, is
+    /// made of user-interface writes and cannot be measured by any offline
+    /// render.
+    pub probe: Option<String>,
 }
 
 impl AudioStatus {
@@ -4466,6 +4473,7 @@ mod tests {
             graph_floor: None,
             dropouts: None,
             rt_load: None,
+            probe: None,
         };
         let rt = status.round_trip_ms().expect("both sides are open");
         assert!(
@@ -6057,6 +6065,7 @@ observed_frames: None,
             graph_floor: None,
             dropouts: None,
             rt_load: None,
+            probe: None,
         };
         assert!((both.round_trip_ms().unwrap() - 16.0).abs() < 1e-3);
 
@@ -6078,6 +6087,7 @@ observed_frames: None,
                 graph_floor: None,
                 dropouts: None,
                 rt_load: None,
+                probe: None,
             },
             AudioStatus {
                 input: None,
@@ -6086,6 +6096,7 @@ observed_frames: None,
                 graph_floor: None,
                 dropouts: None,
                 rt_load: None,
+                probe: None,
             },
             // And a side that will not say its buffer size cannot contribute
             // half a figure.
@@ -6096,6 +6107,7 @@ observed_frames: None,
                 graph_floor: None,
                 dropouts: None,
                 rt_load: None,
+                probe: None,
             },
         ] {
             assert_eq!(one.round_trip_ms(), None);
@@ -6117,6 +6129,7 @@ observed_frames: None,
             graph_floor: None,
             dropouts: None,
             rt_load: None,
+            probe: None,
         }
         .rates_disagree());
 
@@ -6127,6 +6140,7 @@ observed_frames: None,
             graph_floor: None,
             dropouts: None,
             rt_load: None,
+            probe: None,
         }
         .rates_disagree());
 
@@ -6138,6 +6152,7 @@ observed_frames: None,
             graph_floor: None,
             dropouts: None,
             rt_load: None,
+            probe: None,
         }
         .rates_disagree());
     }

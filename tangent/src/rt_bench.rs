@@ -149,6 +149,11 @@ fn audio_desk(lanes: usize, inserts: &[&str]) -> Engine {
     // parks and runs its rack whether or not anything feeds it. A bench that
     // left that standing would measure a desk nobody records on.
     e.set_armed(0);
+    // **An audio track's `midi_off` bit is SET**, and zero means every lane
+    // is listening to live MIDI. Leaving it at the default would make every
+    // lane here read as an instrument lane, which matters to nothing in the
+    // timings and to everything in the eligibility probe.
+    e.set_midi_off(u64::MAX);
     e.set_desk(&quiet_desk());
     let clip = noise(12.0);
     let len = clip.frames() as u64;
@@ -182,6 +187,11 @@ fn audio_desk(lanes: usize, inserts: &[&str]) -> Engine {
 fn ir_desk(lanes: usize, bays: usize, ir_seconds: f64) -> Engine {
     let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
     e.set_armed(0);
+    // **An audio track's `midi_off` bit is SET**, and zero means every lane
+    // is listening to live MIDI. Leaving it at the default would make every
+    // lane here read as an instrument lane, which matters to nothing in the
+    // timings and to everything in the eligibility probe.
+    e.set_midi_off(u64::MAX);
     e.set_desk(&quiet_desk());
     let clip = noise(12.0);
     let len = clip.frames() as u64;
@@ -291,6 +301,11 @@ fn ir_state(seconds: f64) -> Vec<u8> {
 fn instrument_desk(lanes: usize, unit: &str, voices: usize) -> Engine {
     let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
     e.set_armed(0);
+    // **Nothing armed means nothing listening**, even on instrument lanes:
+    // `live_midi_off` clears a lane's bit only when it is a MIDI channel AND
+    // armed, or is the one lane an open editor names. These lanes play from
+    // clips, so a mixing session is what this models.
+    e.set_midi_off(u64::MAX);
     e.set_desk(&quiet_desk());
     let notes: Arc<Vec<ClipNote>> = Arc::new(
         (0..voices)
@@ -364,6 +379,13 @@ fn measure(name: &str, e: &mut Engine, warmup: usize, block: usize) -> Stats {
         .fold(0.0f32, |m, p| m.max(p[0]).max(p[1]));
     let s = Stats::from(name, block, us);
     println!("{}   [peak {peak:.4}]", s.line());
+    // The eligibility probe, when it is on. Zeroed per row so each shape's
+    // figure is its own; the counters live on the engine's `Shared`, which
+    // is per desk here, so this only matters for shapes measured twice.
+    let probe = e.probe();
+    if probe.blocks > 0 {
+        println!("    {}", probe.line());
+    }
     s
 }
 
@@ -385,6 +407,11 @@ fn measure(name: &str, e: &mut Engine, warmup: usize, block: usize) -> Stats {
 fn a_reverb_tail_is_never_cut_off_by_a_lane_going_to_rest() {
     let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
     e.set_armed(0);
+    // **An audio track's `midi_off` bit is SET**, and zero means every lane
+    // is listening to live MIDI. Leaving it at the default would make every
+    // lane here read as an instrument lane, which matters to nothing in the
+    // timings and to everything in the eligibility probe.
+    e.set_midi_off(u64::MAX);
     e.set_desk(&quiet_desk());
     // Half a second of noise into a plate, then nothing for ten seconds.
     let clip = noise(0.5);

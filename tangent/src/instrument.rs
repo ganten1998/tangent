@@ -2593,6 +2593,8 @@ struct Shared {
     /// writer measured a 2.7x penalty, and this is read by the UI every
     /// frame while the audio thread writes it every block.
     rt: RtLoadCells,
+    /// The eligibility probe's counters. Untouched unless the probe is on.
+    probe: ProbeCells,
 }
 
 /// The real-time meter's cells, on a line of their own. See [`Shared::rt`].
@@ -2771,6 +2773,204 @@ impl RtLoadCells {
     }
 }
 
+/// **What a look-ahead would have been allowed to render early.**
+///
+/// The anticipative render is not built and, on the evidence, will not be:
+/// see `docs/PERF-REAPER-2026-09-18.md`, Lane 6. Four design reads of it
+/// disagreed about the one thing that decides whether it is worth anything,
+/// which is how much of a real song's per-block work is even ELIGIBLE to be
+/// moved off the deadline, and none of them measured it. This measures it.
+///
+/// It renders nothing early, spawns no thread, uses no unsafe and changes
+/// not one output sample. It counts, and it counts nothing at all unless
+/// `TANGENT_PROBE` is set, because a counter on the audio thread that ships
+/// to everyone to answer a question nobody is asking is the same objection
+/// the look-ahead itself failed.
+///
+/// **Time, not lanes.** An empty lane and a lane carrying three reverbs are
+/// both one lane, so a count of lanes can say "22 of 32" and mean anything
+/// between 5% and 95% of the block. Every figure here that decides anything
+/// is nanoseconds actually spent inside `render_lane`.
+///
+/// **Two eligible sets, because they answer different questions.**
+/// `strict` is what could be rendered ahead with no new engineering beyond
+/// the ownership protocol. `loose` additionally assumes the hardest missing
+/// piece is built: `clip_lane` is one block deep for the whole desk and the
+/// `sounding` ledger is a single pitch-keyed `u128`, so today NO lane
+/// carrying audio or MIDI clips has a future to read, which on a real song
+/// is most of the desk. The gap between the two numbers IS the price of
+/// that piece.
+#[repr(align(128))]
+#[derive(Debug, Default)]
+struct ProbeCells {
+    blocks: AtomicU64,
+    /// Lanes that actually rendered, summed over blocks, and the two
+    /// eligible subsets of them.
+    rendered: AtomicU64,
+    strict: AtomicU64,
+    loose: AtomicU64,
+    /// The same three in nanoseconds inside `render_lane`.
+    rendered_ns: AtomicU64,
+    strict_ns: AtomicU64,
+    loose_ns: AtomicU64,
+    /// A third tier: `loose`, and additionally assuming the dx7 / Keys /
+    /// sampler instance handoffs stop `mem::replace`-ing a lane's seat from
+    /// the real-time thread. That one is cheap to fix (peek the lane out of
+    /// the arrival ring and leave it there), so it is separated from the
+    /// expensive source work rather than lumped with it.
+    freed: AtomicU64,
+    freed_ns: AtomicU64,
+    /// Blocks in which a look-ahead ring would have been thrown away, by
+    /// what threw it. A block can trip several, so these do not sum to
+    /// `discard_blocks`.
+    discard_blocks: AtomicU64,
+    discard_param: AtomicU64,
+    discard_transport: AtomicU64,
+    discard_loop: AtomicU64,
+    discard_tempo: AtomicU64,
+    discard_swap: AtomicU64,
+    discard_arm: AtomicU64,
+}
+
+/// One reader's view of [`ProbeCells`]. See [`Engine::probe`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Probe {
+    pub blocks: u64,
+    pub rendered: u64,
+    pub strict: u64,
+    pub loose: u64,
+    pub rendered_ns: u64,
+    pub strict_ns: u64,
+    pub loose_ns: u64,
+    pub freed: u64,
+    pub freed_ns: u64,
+    pub discard_blocks: u64,
+    pub discard_param: u64,
+    pub discard_transport: u64,
+    pub discard_loop: u64,
+    pub discard_tempo: u64,
+    pub discard_swap: u64,
+    pub discard_arm: u64,
+}
+
+impl Probe {
+    /// The share of render time that could have been moved off the deadline
+    /// with no new engineering, or `None` before anything has rendered.
+    pub fn strict_share(self) -> Option<f64> {
+        (self.rendered_ns > 0).then(|| self.strict_ns as f64 / self.rendered_ns as f64)
+    }
+
+    /// The same, assuming a per-lane future for clip audio and MIDI is
+    /// built. The distance between the two is what that work is worth.
+    pub fn loose_share(self) -> Option<f64> {
+        (self.rendered_ns > 0).then(|| self.loose_ns as f64 / self.rendered_ns as f64)
+    }
+
+    /// The same again, additionally assuming the instrument-instance
+    /// handoffs no longer write a lane's seat from the callback.
+    pub fn freed_share(self) -> Option<f64> {
+        (self.rendered_ns > 0).then(|| self.freed_ns as f64 / self.rendered_ns as f64)
+    }
+
+    /// The share of blocks in which a ring would have been discarded.
+    pub fn discard_share(self) -> Option<f64> {
+        (self.blocks > 0).then(|| self.discard_blocks as f64 / self.blocks as f64)
+    }
+
+    pub fn line(self) -> String {
+        let pct = |v: Option<f64>| v.map_or_else(|| "n/a".to_owned(), |f| format!("{:.1}%", f * 100.0));
+        format!(
+            "probe: {} blocks, {:.1} lanes rendered/block, {} us/block in lanes; \
+             eligible now {} ({:.1} lanes), +source {} ({:.1} lanes), +instruments {} ({:.1} lanes); \
+             discards {} of blocks (param {}, transport {}, loop {}, tempo {}, swap {}, arm {})",
+            self.blocks,
+            if self.blocks > 0 { self.rendered as f64 / self.blocks as f64 } else { 0.0 },
+            if self.blocks > 0 { self.rendered_ns / self.blocks / 1000 } else { 0 },
+            pct(self.strict_share()),
+            if self.blocks > 0 { self.strict as f64 / self.blocks as f64 } else { 0.0 },
+            pct(self.loose_share()),
+            if self.blocks > 0 { self.loose as f64 / self.blocks as f64 } else { 0.0 },
+            pct(self.freed_share()),
+            if self.blocks > 0 { self.freed as f64 / self.blocks as f64 } else { 0.0 },
+            pct(self.discard_share()),
+            self.discard_param,
+            self.discard_transport,
+            self.discard_loop,
+            self.discard_tempo,
+            self.discard_swap,
+            self.discard_arm,
+        )
+    }
+}
+
+impl ProbeCells {
+    fn read(&self) -> Probe {
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        Probe {
+            blocks: g(&self.blocks),
+            rendered: g(&self.rendered),
+            strict: g(&self.strict),
+            loose: g(&self.loose),
+            rendered_ns: g(&self.rendered_ns),
+            strict_ns: g(&self.strict_ns),
+            loose_ns: g(&self.loose_ns),
+            freed: g(&self.freed),
+            freed_ns: g(&self.freed_ns),
+            discard_blocks: g(&self.discard_blocks),
+            discard_param: g(&self.discard_param),
+            discard_transport: g(&self.discard_transport),
+            discard_loop: g(&self.discard_loop),
+            discard_tempo: g(&self.discard_tempo),
+            discard_swap: g(&self.discard_swap),
+            discard_arm: g(&self.discard_arm),
+        }
+    }
+}
+
+/// The desk-wide words whose movement would throw a look-ahead ring away.
+///
+/// Counted rather than acted on. Each is one relaxed load a block, and only
+/// when the probe is on. The ones that matter are the ones that move at DRAG
+/// rate: a loop edge dragged during a time selection moves sixty times a
+/// second and invalidates all thirty-two rings at once, while a knob moves
+/// as often and invalidates one. The design reads disagreed about which of
+/// those the owner's sessions actually do, which is the second thing this
+/// exists to settle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProbeWatch {
+    transport: u64,
+    loop_a: u64,
+    loop_b: u64,
+    bpm: u64,
+    swaps: u32,
+    armed: u32,
+}
+
+impl ProbeWatch {
+    fn read(shared: &Shared) -> Self {
+        Self {
+            transport: shared.transport_req.load(Ordering::Relaxed),
+            loop_a: shared.loop_a.load(Ordering::Relaxed),
+            loop_b: shared.loop_b.load(Ordering::Relaxed),
+            bpm: shared.bpm.load(Ordering::Relaxed),
+            swaps: shared.pending_swaps.load(Ordering::Relaxed),
+            armed: shared.armed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Whether the eligibility probe runs at all, read once per process.
+///
+/// Off by default and off in every build nobody has asked, because the terms
+/// it needs are thirty-two lanes of atomic loads on the real-time thread and
+/// a clock either side of every lane's render.
+fn probe_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("TANGENT_PROBE").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 impl Shared {
     fn new() -> Self {
         Self {
@@ -2930,6 +3130,7 @@ impl Shared {
             ir_peak_r: AtomicU32::new(0),
             stems_dry: AtomicBool::new(false),
             rt: RtLoadCells::default(),
+            probe: ProbeCells::default(),
         }
     }
 
@@ -4214,6 +4415,122 @@ mod engine_parts {
         assert!(!r.lane_wants[CH], "one knob turn woke the lane permanently");
     }
 
+    /// **Every way a lane can be too live to render ahead**, one at a time,
+    /// against a real `Shared`.
+    ///
+    /// The rule is the part of a look-ahead that cannot be tested by
+    /// listening: a lane wrongly included sounds perfect until the one
+    /// session where it does not, and then it is a stale block served to
+    /// the room. Three terms of the original four were wrong, and a later
+    /// read found three more this had missed, so each is asserted on its own
+    /// here rather than as a set.
+    #[test]
+    fn a_lane_that_is_live_in_any_way_is_never_rendered_ahead() {
+        use tangent_ui::recorder::folder_extra_seat;
+        let shared = Shared::new();
+        let none = [false; CHANNELS];
+        // `Shared::new` arms everything and leaves every lane's MIDI on, so
+        // start from the quiet desk a session actually has.
+        shared.armed.store(0, Ordering::Relaxed);
+        shared.midi_off.store(u64::MAX, Ordering::Relaxed);
+        let base = pinned_lanes(&shared, &none, 0, 0, false);
+        assert_eq!(base, 0, "a desk with nothing live pinned {base:#x}");
+
+        const CH: usize = 5;
+        let bit = 1u32 << CH;
+        let one = |shared: &Shared| pinned_lanes(shared, &none, 0, 0, false) & bit != 0;
+
+        // Live MIDI is the mask being CLEAR, and it is not the armed set:
+        // an open MIDI editor makes its clip's lane the only live one.
+        shared.midi_off.store(u64::MAX & !(1u64 << CH), Ordering::Relaxed);
+        assert!(one(&shared), "a lane with live MIDI was offered to the look-ahead");
+        shared.midi_off.store(u64::MAX, Ordering::Relaxed);
+        assert!(!one(&shared));
+
+        shared.armed.store(bit, Ordering::Relaxed);
+        assert!(one(&shared), "an armed lane was offered to the look-ahead");
+        shared.armed.store(0, Ordering::Relaxed);
+
+        // The punch is snapshotted at the record press and never rewritten,
+        // so a lane disarmed mid-take is still punched.
+        shared.punch[CH].store(48_000, Ordering::Relaxed);
+        assert!(one(&shared), "a punched lane was offered to the look-ahead");
+        shared.punch[CH].store(u64::MAX, Ordering::Relaxed);
+
+        // A frozen lane plays a file and runs nothing: cheaper live.
+        shared.frozen.store(bit, Ordering::Relaxed);
+        assert!(one(&shared), "a frozen lane was offered to the look-ahead");
+        shared.frozen.store(0, Ordering::Relaxed);
+
+        // A drum lane's channel seat is clocked again by the pad pass.
+        shared.drum_strips.store(bit, Ordering::Relaxed);
+        assert!(one(&shared), "a drum lane was offered to the look-ahead");
+        shared.drum_strips.store(0, Ordering::Relaxed);
+
+        // **The room's claim, which is the term that withdrew the first
+        // version of this rule.** It outlives a disarm by about 138 ms, so
+        // it cannot be derived from `armed`; it is passed in from the masks
+        // `mix_monitor` rebuilds.
+        assert!(
+            pinned_lanes(&shared, &none, 0, bit, false) & bit != 0,
+            "a lane the room still claims was offered to the look-ahead"
+        );
+
+        // The insert tap reads a MID-rack signal from inside the render.
+        shared
+            .insert_tap_route
+            .store(pack_tap(CH, 1), Ordering::Relaxed);
+        assert!(one(&shared), "the tapped lane was offered to the look-ahead");
+        shared.insert_tap_route.store(0, Ordering::Relaxed);
+        assert!(!one(&shared));
+
+        // A folder's rack runs at the fold, over the summed children.
+        let mut folders = [false; CHANNELS];
+        folders[CH] = true;
+        assert!(
+            pinned_lanes(&shared, &folders, 0, 0, false) & bit != 0,
+            "a folder was offered to the look-ahead"
+        );
+
+        // A send destination's rack is clocked a second time by the sends
+        // pass, and the lane pass is the only pass that keys it.
+        assert!(
+            pinned_lanes(&shared, &none, bit, 0, false) & bit != 0,
+            "a send destination was offered to the look-ahead"
+        );
+
+        // A keyed lane reads a snapshot of the PREVIOUS chunk, which does
+        // not exist for a future block. Only while the feature is live.
+        shared.insert_key[CH * INSERTS].store(pack_key(2), Ordering::Relaxed);
+        assert!(
+            pinned_lanes(&shared, &none, 0, 0, true) & bit != 0,
+            "a sidechain-keyed lane was offered to the look-ahead"
+        );
+        assert!(
+            pinned_lanes(&shared, &none, 0, 0, false) & bit == 0,
+            "a keyed lane was pinned although the whole feature is off"
+        );
+        shared.insert_key[CH * INSERTS].store(0, Ordering::Relaxed);
+
+        // **The EXTRA rack gets a real key feed too**, and the first version
+        // of this scanned only the lane's own seat.
+        shared.insert_key[folder_extra_seat(CH) * INSERTS + 2].store(pack_key(2), Ordering::Relaxed);
+        assert!(
+            pinned_lanes(&shared, &none, 0, 0, true) & bit != 0,
+            "a lane keyed on its extra rack was offered to the look-ahead"
+        );
+        shared.insert_key[folder_extra_seat(CH) * INSERTS + 2].store(0, Ordering::Relaxed);
+
+        // The seven pedal seats are handed `None` and must NOT be scanned,
+        // or the count goes the other way and under-reports.
+        shared.insert_key[tangent_ui::recorder::amp_pedal_seat(CH, 3) * INSERTS]
+            .store(pack_key(2), Ordering::Relaxed);
+        assert!(
+            pinned_lanes(&shared, &none, 0, 0, true) & bit == 0,
+            "a pedal seat's key pinned a lane that no key feed reaches"
+        );
+    }
+
     /// **The meter reads the block it just rendered.**
     ///
     /// Not a tautology: the hook is a wrapper around a function with four
@@ -4378,6 +4695,106 @@ fn lane_of_seat(seat: usize) -> Option<usize> {
 fn seat_is_frozen(shared: &Shared, seat: usize) -> bool {
     lane_of_seat(seat)
         .is_some_and(|ch| shared.frozen.load(Ordering::Relaxed) & (1u32 << ch) != 0)
+}
+
+/// **Which lanes may NEVER be rendered ahead of the callback.**
+///
+/// The fan-out divides a block's work across cores; rendering ahead would
+/// take a lane off the per-block deadline altogether, which is the mechanism
+/// REAPER's worker threads use. That feature is NOT built, and this exists to
+/// measure whether it would be worth building: see [`Probe`]. What a
+/// look-ahead cannot do is guess, and the set of lanes it must not touch is
+/// larger and stranger than it first looks. Seven independent reads of this
+/// engine have now been asked what one would break, and every term below is
+/// one of their answers.
+///
+/// This is the DESK-WIDE half, the part that can be answered from [`Shared`]
+/// and a handful of masks. The decide walk adds the terms only it holds
+/// (`audition_rang`, `has_audio`, `lane_has_clips`, the built-in and Keys
+/// instances); see [`Renderer::note_eligibility`].
+///
+/// * **Live MIDI**, which is `midi_off` CLEAR and not the armed set. An
+///   open MIDI editor makes its own clip's lane the only live one and
+///   deafens every armed lane, so the two masks disagree exactly when it
+///   matters.
+/// * **Armed**, for its input.
+/// * **Punched**, because the punch is snapshotted at the record press and
+///   never rewritten, so a lane disarmed mid-take stays punched.
+/// * **Frozen**, which plays a file and runs nothing: cheaper live.
+/// * **Drum lanes**, on the RAW `drum_strips` mask and not the walk's own
+///   drum branch. `mix_pads` selects on that mask alone and clocks the
+///   channel seat a second time, so a drum lane also holding a DX7 fails the
+///   walk's branch and is still clocked twice.
+/// * **Folders**, whose rack runs at the fold over the summed children.
+/// * **Send destinations**, whose rack the sends pass clocks again and
+///   which take their sidechain key only in the lane pass.
+/// * **Room-claimed lanes**, `room_rack | board_live`. **This is the term a
+///   rule keyed on `armed` gets wrong**, and it is why the earlier version of
+///   this function was withdrawn: `mix_monitor` keeps clocking an input's
+///   rack while `live || monitor_gain > 1e-6`, and that gain is a one-pole
+///   on a 10 ms tau, so the claim outlives a disarm by about 138 ms, which
+///   is 52 blocks at 128 frames. Both masks are one chunk late, which is
+///   good enough to COUNT with and would not be good enough to render on.
+/// * **Sidechain-keyed lanes**, which read a whole-desk snapshot of the
+///   PREVIOUS chunk: there is no such thing for a future block. Scanned on
+///   the lane's own seat AND its folder extra seat, both of which are handed
+///   a real `KeyFeed`; the seven pedal seats are handed `None` and are
+///   deliberately not scanned.
+/// * **The lane the insert TAP names**, whose mid-rack signal is pushed from
+///   inside the render and would lead the audio.
+///
+/// The Fx bus and the two master seats are not channels and never reach this
+/// loop, so they are asserted rather than tested per lane.
+fn pinned_lanes(
+    shared: &Shared,
+    folders: &[bool; CHANNELS],
+    receives: u32,
+    room: u32,
+    keys_live: bool,
+) -> u32 {
+    let midi_off = shared.midi_off.load(Ordering::Relaxed);
+    let armed = shared.armed.load(Ordering::Relaxed);
+    let drums = shared.drum_strips.load(Ordering::Relaxed);
+    let frozen = shared.frozen.load(Ordering::Relaxed);
+    let mut pinned = receives | drums | room | frozen;
+    // The tap names one seat; the lane that owns it is pinned.
+    if let Some(ch) = unpack_tap(shared.insert_tap_route.load(Ordering::Relaxed))
+        .and_then(|(seat, _)| lane_of_seat(seat))
+    {
+        pinned |= 1u32 << ch.min(CHANNELS - 1);
+    }
+    for ch in 0..CHANNELS {
+        let bit = 1u32 << ch;
+        if pinned & bit != 0 {
+            continue;
+        }
+        if midi_off & (1u64 << ch) == 0 || armed & bit != 0 {
+            pinned |= bit;
+            continue;
+        }
+        if shared.punch[ch].load(Ordering::Relaxed) != u64::MAX {
+            pinned |= bit;
+            continue;
+        }
+        if folders.get(ch).copied().unwrap_or(false) {
+            pinned |= bit;
+            continue;
+        }
+        if keys_live {
+            let seats = [ch, tangent_ui::recorder::folder_extra_seat(ch)];
+            if seats.iter().any(|seat| {
+                (0..INSERTS).any(|b| {
+                    shared
+                        .insert_key
+                        .get(seat * INSERTS + b)
+                        .is_some_and(|c| unpack_key(c.load(Ordering::Relaxed)).is_some())
+                })
+            }) {
+                pinned |= bit;
+            }
+        }
+    }
+    pinned
 }
 
 /// **How wide the fan-out is allowed to be.**
@@ -6372,6 +6789,19 @@ struct Renderer {
     /// milliseconds of a fading-in signal at the price of the duplication
     /// this app has been bitten by three times.
     board_live: u32,
+    /// **The eligibility probe.** See [`ProbeCells`]. `probe` is latched
+    /// from the environment once, so the per-block cost of all of this is a
+    /// branch on a `bool` when it is off.
+    probe: bool,
+    /// Lanes the DECIDE walk pinned this block, which is the half
+    /// [`pinned_lanes`] cannot see, and the clip-source half kept apart
+    /// because it is the one a future engine could remove.
+    probe_walk_pins: u32,
+    probe_clip_pins: u32,
+    probe_inst_pins: u32,
+    /// The desk words the probe watches for a change, to count the blocks in
+    /// which a look-ahead ring would have been thrown away.
+    probe_watch: ProbeWatch,
     /// **Which channels the ROOM clocked a rack for**, written by
     /// `mix_monitor` and read by the lane pass, exactly as
     /// [`Renderer::board_live`] is and for a sharper version of the same
@@ -10542,6 +10972,55 @@ impl Renderer {
         out
     }
 
+    /// **Record one chunk for the eligibility probe.** See [`ProbeCells`].
+    ///
+    /// Counts only; it renders nothing early and decides nothing. The
+    /// discard half is the second question: how often a look-ahead ring
+    /// would have been thrown away before it was consumed. It is answered by
+    /// watching the desk words that would invalidate one, and it is only
+    /// meaningful in a LIVE session, because every one of those words is
+    /// written by the user interface and an offline render makes no such
+    /// write. An offline discard rate is a truthful zero that measures
+    /// nothing.
+    fn note_eligibility(&mut self, wanted: u32, masks: [u32; 3], ns: [u64; 4]) {
+        let c = &self.shared.probe;
+        let first = c.blocks.fetch_add(1, Ordering::Relaxed) == 0;
+        c.rendered.fetch_add(u64::from(wanted.count_ones()), Ordering::Relaxed);
+        c.strict.fetch_add(u64::from(masks[0].count_ones()), Ordering::Relaxed);
+        c.loose.fetch_add(u64::from(masks[1].count_ones()), Ordering::Relaxed);
+        c.freed.fetch_add(u64::from(masks[2].count_ones()), Ordering::Relaxed);
+        c.rendered_ns.fetch_add(ns[0], Ordering::Relaxed);
+        c.strict_ns.fetch_add(ns[1], Ordering::Relaxed);
+        c.loose_ns.fetch_add(ns[2], Ordering::Relaxed);
+        c.freed_ns.fetch_add(ns[3], Ordering::Relaxed);
+
+        let now = ProbeWatch::read(&self.shared);
+        let was = std::mem::replace(&mut self.probe_watch, now);
+        // The first chunk has nothing to compare against, and a watch that
+        // started at zero would read as six discards at once.
+        if first {
+            return;
+        }
+        let mut any = false;
+        let mut bump = |cell: &AtomicU64, fired: bool| {
+            if fired {
+                cell.fetch_add(1, Ordering::Relaxed);
+                any = true;
+            }
+        };
+        // A knob, a preset or an automation point for any lane. This is the
+        // one that is claimed to run at drag rate.
+        bump(&c.discard_param, self.param_lanes != 0);
+        bump(&c.discard_transport, now.transport != was.transport);
+        bump(&c.discard_loop, now.loop_a != was.loop_a || now.loop_b != was.loop_b);
+        bump(&c.discard_tempo, now.bpm != was.bpm);
+        bump(&c.discard_swap, now.swaps != was.swaps);
+        bump(&c.discard_arm, now.armed != was.armed);
+        if any {
+            c.discard_blocks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn mix_channels(
         &mut self,
         frames: usize,
@@ -10765,6 +11244,9 @@ impl Renderer {
         // head. Everything in that gap is still owed. See
         // `pending_wrap_from`.
         let due_from = wrap_from.map_or(at, |a| a.min(at));
+        self.probe_walk_pins = 0;
+        self.probe_clip_pins = 0;
+        self.probe_inst_pins = 0;
         for ch in 0..CHANNELS {
             // Holding the sentinel is not enough: the INSTANCE has to have
             // arrived. Between the bay being filled and the ring delivering,
@@ -11357,6 +11839,34 @@ impl Renderer {
             std::mem::swap(&mut lane_notes, &mut self.lane_note_bank[ch]);
             std::mem::swap(&mut lane_controls, &mut self.lane_ctl_bank[ch]);
             self.lane_wants[ch] = true;
+            // **The probe's half of the pin rule, gathered where the terms
+            // live.** Only for a lane that is actually about to render: a
+            // parked lane is neither pinned nor eligible, it costs nothing
+            // already, and counting it as eligible would report headroom
+            // that the resting-desk rule reclaimed a week ago.
+            if self.probe {
+                let bit = 1u32 << ch.min(CHANNELS - 1);
+                // `audition_rang` and not the `Shared` cell: the cell is the
+                // key-DOWN level, and the lane keeps rendering through the
+                // release tail.
+                if auditioning {
+                    self.probe_walk_pins |= bit;
+                }
+                // The built-in and Keys seats, kept apart because the fix is
+                // cheap: the arrival rings carry `(lane, T)`, so a handoff
+                // can peek the lane and leave it in the ring rather than
+                // `mem::replace`-ing a seat a worker may be inside.
+                if is_builtin || is_keys {
+                    self.probe_inst_pins |= bit;
+                }
+                // The clip sources, kept apart because they are the pins a
+                // different engine could remove: `clip_lane` is one block
+                // deep for the whole desk and `sounding` is a single
+                // pitch-keyed word, so neither has a future to read today.
+                if has_audio || lane_has_clips {
+                    self.probe_clip_pins |= bit;
+                }
+            }
         }
 
         // ── THE RENDER, which is the walk that forks ─────────────────────
@@ -11375,6 +11885,43 @@ impl Renderer {
         let wanted: u32 = (0..CHANNELS).fold(0u32, |m, ch| {
             if self.lane_wants[ch] { m | (1u32 << ch) } else { m }
         });
+        // ── the eligibility probe's two masks for this block ─────────────
+        //
+        // Three conditions pin the WHOLE desk rather than a lane. A stopped
+        // transport, because `pos` does not advance and every "future" block
+        // asks for the same position. Varispeed, because `render` sizes each
+        // chunk from a phase accumulator so the chunk LENGTH is not knowable
+        // in advance. And a stems export, because the dry copy is taken at
+        // render while the fold reads it at consumption.
+        let (probe_strict, probe_loose, probe_freed) = if self.probe {
+            if !rolling || self.varispeed_ratio().is_some() || self.stems_live {
+                (0, 0, 0)
+            } else {
+                let desk = pinned_lanes(
+                    &self.shared,
+                    &self.folder_is,
+                    receives,
+                    self.room_rack | self.board_live,
+                    self.keys_live,
+                );
+                let pinned = desk | self.probe_walk_pins;
+                (
+                    wanted & !(pinned | self.probe_clip_pins | self.probe_inst_pins),
+                    wanted & !(pinned | self.probe_inst_pins),
+                    wanted & !pinned,
+                )
+            }
+        } else {
+            (0, 0, 0)
+        };
+        // Nanoseconds, not lanes: an empty lane and a lane carrying three
+        // reverbs are both one lane. Written from the render walk, which may
+        // be several threads, so they are atomics even though nothing here
+        // synchronises anything.
+        let probe_all_ns = AtomicU64::new(0);
+        let probe_strict_ns = AtomicU64::new(0);
+        let probe_loose_ns = AtomicU64::new(0);
+        let probe_freed_ns = AtomicU64::new(0);
         if wanted != 0 {
             let desk = DeskRef {
                 clip_lane: &self.clip_lane,
@@ -11486,13 +12033,32 @@ impl Renderer {
             // one thread ever reaches a given `ch`.
             let cells = LaneCells(jobs.map(std::cell::UnsafeCell::new));
             let folded = AtomicU32::new(0);
+            let probe = self.probe;
             let render = |ch: usize| {
                 let Some(job) = cells.take(ch) else {
                     return;
                 };
                 let LaneWork { mut seats, mut io, plan } = job;
+                // `Instant::now` on Apple silicon is a commpage read: no
+                // syscall, no lock, no allocation. It is still only paid
+                // when the probe is on.
+                let started = probe.then(Instant::now);
                 if render_lane(&mut seats, &mut io, &plan, &desk) {
                     folded.fetch_or(1u32 << ch, Ordering::Relaxed);
+                }
+                if let Some(started) = started {
+                    let ns = started.elapsed().as_nanos() as u64;
+                    let bit = 1u32 << ch.min(CHANNELS - 1);
+                    probe_all_ns.fetch_add(ns, Ordering::Relaxed);
+                    if probe_strict & bit != 0 {
+                        probe_strict_ns.fetch_add(ns, Ordering::Relaxed);
+                    }
+                    if probe_loose & bit != 0 {
+                        probe_loose_ns.fetch_add(ns, Ordering::Relaxed);
+                    }
+                    if probe_freed & bit != 0 {
+                        probe_freed_ns.fetch_add(ns, Ordering::Relaxed);
+                    }
                 }
             };
             // **The fan-out, only onto threads that are really real-time.**
@@ -11524,6 +12090,18 @@ impl Renderer {
             for ch in 0..CHANNELS {
                 self.lane_folds[ch] = folded & (1u32 << ch) != 0;
             }
+        }
+        if self.probe {
+            self.note_eligibility(
+                wanted,
+                [probe_strict, probe_loose, probe_freed],
+                [
+                    probe_all_ns.load(Ordering::Relaxed),
+                    probe_strict_ns.load(Ordering::Relaxed),
+                    probe_loose_ns.load(Ordering::Relaxed),
+                    probe_freed_ns.load(Ordering::Relaxed),
+                ],
+            );
         }
 
         // ── THE FOLD, a walk of its own ──────────────────────────────────
@@ -13424,6 +14002,11 @@ impl Engine {
             stems_dry: false,
             board_ran: 0,
             board_live: 0,
+            probe: probe_on(),
+            probe_walk_pins: 0,
+            probe_clip_pins: 0,
+            probe_inst_pins: 0,
+            probe_watch: ProbeWatch::default(),
             room_rack: 0,
         };
 
@@ -15583,6 +16166,12 @@ impl Engine {
     /// still glitch, because what the room hears is the block that missed.
     pub fn rt_load(&self) -> RtLoad {
         self.shared.rt.read()
+    }
+
+    /// The eligibility probe's counters. See [`ProbeCells`]. All zero unless
+    /// `TANGENT_PROBE` is set in the environment.
+    pub fn probe(&self) -> Probe {
+        self.shared.probe.read()
     }
 
     pub fn health(&self) -> (bool, u64) {
@@ -19153,6 +19742,11 @@ mod tests {
             stems_dry: false,
             board_ran: 0,
             board_live: 0,
+            probe: probe_on(),
+            probe_walk_pins: 0,
+            probe_clip_pins: 0,
+            probe_inst_pins: 0,
+            probe_watch: ProbeWatch::default(),
             room_rack: 0,
             racks,
             lane_quiet: vec![0; CHANNELS],
