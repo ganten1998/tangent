@@ -368,6 +368,11 @@ pub(crate) fn desk_of(s: &Settings) -> DeskSnap {
             beats: s.record_count_in_beats,
             in_take: s.record_count_in_in_take,
         }),
+        look: Some(crate::arrangement::Look {
+            theme: s.theme_name.clone(),
+            palette: s.palette_choice,
+            palette_auto: s.palette_auto,
+        }),
         take_name: Some(s.record_take_name.clone().unwrap_or_default()),
         feel: Some(crate::arrangement::Feel {
             snap: s.midi_snap,
