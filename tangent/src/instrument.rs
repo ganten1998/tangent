@@ -224,6 +224,8 @@ use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::sync::{Arc, Mutex};
+
+use crate::rtwork::{LanePool, RtPlan, Workgroup};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -324,6 +326,28 @@ const MAX_BPM: f64 = 300.0;
 /// Twenty buffers at the slowest plausible size; if the callback has not run in
 /// that time it is not running at all.
 const RETIRE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// **How long to wait when there is no audio thread to wait FOR.**
+///
+/// Every retire wait below is a poll of a ring the CALLBACK pops into, and
+/// an offline engine has no callback: nothing will ever arrive, so the wait
+/// is the full [`RETIRE_TIMEOUT`] and then a shrug. That is a quarter of a
+/// second per seat, and an export furnishes every seat it holds before its
+/// first sample - forty-eight of them is twelve seconds of a frozen window,
+/// measured, with the progress bar at zero and nothing to say why.
+///
+/// The retiree is not lost either way. `hand_off_insert`'s own doc says the
+/// stream's teardown drops what the wait did not collect, and an offline
+/// engine's teardown is `Drop` on the renderer it owns, which happens when
+/// the export ends.
+fn retire_deadline(offline: bool) -> Instant {
+    Instant::now()
+        + if offline {
+            Duration::ZERO
+        } else {
+            RETIRE_TIMEOUT
+        }
+}
 
 /// Peak-hold fall rate, matching `tangent-record`'s meter so the two read the same.
 const HOLD_DECAY_DB_PER_SEC: f32 = 20.0;
@@ -3800,10 +3824,52 @@ mod seat_disjointness {
             }
         }
     }
+
+    /// **And the carve answers for every lane**, against a real engine's own
+    /// bank rather than against the arithmetic alone. The render walk splits
+    /// all thirty-two at once; `lane_seats` is the same split stated one
+    /// lane at a time, and if the two ever disagree this is what says so.
+    #[test]
+    fn a_lane_can_be_carved_out_of_a_real_bank() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let r = e.offline.as_mut().expect("an offline engine keeps its renderer");
+        for ch in 0..CHANNELS {
+            assert!(
+                lane_seats(
+                    &mut r.racks,
+                    &mut r.dx7s,
+                    &mut r.keys_lanes,
+                    &mut r.pdc,
+                    &mut r.dry_pdc,
+                    ch,
+                )
+                .is_some(),
+                "lane {ch}'s seats could not be carved out of a full bank"
+            );
+        }
+        // Past the end is refused rather than folded onto lane 0.
+        assert!(
+            lane_seats(
+                &mut r.racks,
+                &mut r.dx7s,
+                &mut r.keys_lanes,
+                &mut r.pdc,
+                &mut r.dry_pdc,
+                CHANNELS,
+            )
+            .is_none(),
+            "a channel past the last one was carved anyway"
+        );
+    }
 }
 
 /// **One lane's seats, carved out of the bank so the compiler can see they
 /// are its own.**
+///
+/// The render walk carves all thirty-two at once (it needs every borrow to
+/// exist before the fork uses any of them), so this is the one-lane
+/// statement of the same arithmetic, kept because it is what the
+/// disjointness test exercises and what a reader should be pointed at.
 ///
 /// Three `split_at_mut`s and no unsafe. It works because `recorder.rs` lays
 /// the blocks out end to end and lane-strided: a channel's own seat is
@@ -3812,6 +3878,7 @@ mod seat_disjointness {
 /// and never overlap, for any `ch`, which is what makes the split legal for
 /// a lane and therefore for a worker. `None` when the bank is short, which
 /// no shipped desk is and every test is entitled to be.
+#[cfg_attr(not(test), allow(dead_code))]
 fn lane_seats<'a>(
     racks: &'a mut [Rack],
     dx7s: &'a mut [Option<Box<crate::dx7::Dx7>>],
@@ -3837,6 +3904,114 @@ fn lane_seats<'a>(
         rack_pdc: pdc.get_mut(ch)?,
         dry_pdc: dry_pdc.get_mut(ch)?,
     })
+}
+
+/// **How wide the fan-out is allowed to be.**
+///
+/// The performance cores, and no wider. `os_workgroup_max_parallel_threads`
+/// answers ten on this machine against five performance cores, counting the
+/// efficiency ones, and the measured spread says those are where the long
+/// tail comes from: at fifteen plain threads the medians split into two
+/// populations by core kind. The real-time thread is one of the five, so the
+/// pool is four peers and the callback renders a lane itself while it waits.
+const FANOUT_PEERS: usize = 4;
+
+/// One lane's whole render, gathered so that the fork can hold thirty-two of
+/// them at once.
+struct LaneWork<'a> {
+    seats: LaneSeats<'a>,
+    io: LaneIo<'a>,
+    plan: LanePlan<'a>,
+}
+
+/// **Thirty-two cells, one per lane, and the reason the fork's closure can
+/// be `Sync`.**
+///
+/// The work inside is `&mut` through and through; what makes handing it to
+/// several threads sound is that each lane's job is taken out of its own
+/// cell exactly once, and `LanePool::run` gives a lane to exactly one
+/// thread. The cell is what lets the compiler stay out of an argument it
+/// cannot check, with the argument written at the `unsafe` that needs it.
+struct LaneCells<'a>([std::cell::UnsafeCell<Option<LaneWork<'a>>>; CHANNELS]);
+
+// SAFETY: `LaneWork` is `Send` (every borrow in it is to state one lane owns
+// and no other lane can name - see `lane_seats` and the disjointness test),
+// and the only access to a cell is the single `take` in the fork's closure,
+// which runs once per lane on whichever one thread claimed that lane.
+unsafe impl Sync for LaneCells<'_> {}
+// SAFETY: the same argument. The cells are handed to the pool by shared
+// reference and every one of them is emptied by exactly one thread.
+unsafe impl Send for LaneCells<'_> {}
+
+impl<'a> LaneCells<'a> {
+    /// **Lane `ch`'s work, once.** A second call for the same lane, on any
+    /// thread, answers `None`.
+    ///
+    /// A method rather than an `unsafe` block at the call site for two
+    /// reasons. It is the only place the cells are touched, so the argument
+    /// has one home; and a closure that spelled `self.0[ch]` would capture
+    /// the ARRAY rather than the wrapper under the 2021 capture rules, and
+    /// the `unsafe impl Sync` above would not reach it.
+    fn take(&self, ch: usize) -> Option<LaneWork<'a>> {
+        // SAFETY: `LanePool::run` hands each lane to exactly one thread -
+        // `claim` clears one bit with one compare-exchange, so the thread
+        // that observed it set is the only one that can have cleared it -
+        // and this is the only access to any cell. The serial path calls
+        // this the same way, one `ch` at a time on one thread.
+        unsafe { (*self.0.get(ch)?.get()).take() }
+    }
+}
+
+
+/// What `TANGENT_FANOUT` says about the lane render.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fanout {
+    /// `0`: render every lane on the callback, exactly as every build before
+    /// this one did.
+    Never,
+    /// Absent or anything else: fork, but only onto workers that really took
+    /// the real-time policy and really joined the device's workgroup. This is
+    /// what a session runs.
+    WhenReady,
+    /// `force`: fork whenever there is a pool at all, readiness or not, and
+    /// give an OFFLINE engine one as well.
+    ///
+    /// **A test and bench door, and not a faster setting.** It is how
+    /// `the_fork_renders_what_the_single_walk_rendered` gets two engines to
+    /// disagree about threading and agree about audio, and how `rt_bench`
+    /// can time a fan-out with no device open. What it measures is plain
+    /// threads: the measurement in `rtwork` says those are worse than the
+    /// serial walk under a real deadline, which is exactly why the
+    /// production gate is readiness and not this.
+    Force,
+}
+
+fn fanout_mode() -> Fanout {
+    static MODE: std::sync::OnceLock<Fanout> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("TANGENT_FANOUT").as_deref() {
+        Ok("0") => Fanout::Never,
+        Ok("force") => Fanout::Force,
+        _ => Fanout::WhenReady,
+    })
+}
+
+/// **One lane's transient buffers.** See `Renderer::lane_scratch`.
+struct LaneScratch {
+    fx_out: Vec<Vec<f32>>,
+    key_io: Vec<Vec<f32>>,
+    builtin: Vec<f32>,
+    keys: Vec<f32>,
+}
+
+impl LaneScratch {
+    fn new() -> Self {
+        Self {
+            fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            builtin: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            keys: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+        }
+    }
 }
 
 /// **What the render pass leaves the fold to read.**
@@ -5084,17 +5259,6 @@ struct Renderer {
     dx7s: Vec<Option<Box<crate::dx7::Dx7>>>,
     dx7_incoming: Consumer<(usize, Option<Box<crate::dx7::Dx7>>)>,
     dx7_retiring: Producer<(usize, Option<Box<crate::dx7::Dx7>>)>,
-    /// The built-in's own output, before its slot gain.
-    ///
-    /// **It needs a buffer of its own for the same reason a plugin does.** The
-    /// FM renders by ADDING into whatever it is handed, so rendering it
-    /// straight onto the bus leaves no moment at which its contribution is
-    /// separable — and therefore no moment at which a fader can be applied to
-    /// it. That is exactly what happened: the DX7's slot fader moved a number
-    /// that reached the settings, the engine and the meter, and never once
-    /// reached the audio. ONE scratch serves every lane: the walk renders a
-    /// lane, copies it out, and only then moves to the next.
-    builtin_scratch: Vec<f32>,
     /// The modelled keyboards, on the same per-lane terms as the DX7s above.
     ///
     /// This one is WHY the per-lane rework happened: with a single `Keys`
@@ -5106,7 +5270,6 @@ struct Renderer {
     keys_lanes: Vec<Option<Box<crate::keys::Keys>>>,
     keys_incoming: Consumer<(usize, Option<Box<crate::keys::Keys>>)>,
     keys_retiring: Producer<(usize, Option<Box<crate::keys::Keys>>)>,
-    keys_scratch: Vec<f32>,
     /// **What each lane's audition has actually been TOLD**, which is what
     /// `Shared::audition` is reconciled against once a block. `None` where
     /// the lane has been told nothing.
@@ -5231,6 +5394,28 @@ struct Renderer {
     lane_loud: Vec<bool>,
     /// Deinterleaved in and out for it. Preallocated, like everything else the
     /// audio thread touches.
+    /// **The peers the lane render forks onto**, or `None` where there are
+    /// none to fork onto: off macOS, on a device that publishes no IO
+    /// workgroup, or in an offline engine, which has no device and no
+    /// deadline and wants every core for the render it is already running
+    /// flat out.
+    fanout: Option<LanePool>,
+    /// **Fork onto the pool whatever the kernel said.** Set only by
+    /// `Engine::set_offline_fanout`, which is how the null test gets two
+    /// engines to disagree about threading and agree about audio. A session
+    /// leaves it false and the readiness gate decides.
+    fanout_any: bool,
+    /// **Each lane's own scratch, so a worker needs no index of its own.**
+    ///
+    /// `fx_out`, `key_io` and the two instrument scratches are transient
+    /// WITHIN one lane's render: a rack writes its block into `fx_out` and
+    /// `run_rack` copies it straight back. That makes them per-worker state
+    /// rather than per-lane, in principle. They are kept per LANE anyway,
+    /// because a worker that had to know which of itself it was would have
+    /// to be told, and the closure the pool calls is handed a lane number
+    /// and nothing else. Half a megabyte to make the fork's inner call take
+    /// one argument, allocated once.
+    lane_scratch: Vec<LaneScratch>,
     /// **Each lane's own notes and controls for this chunk.**
     ///
     /// One pair served the whole desk while the pass was a single walk,
@@ -10511,38 +10696,23 @@ impl Renderer {
             self.lane_wants[ch] = true;
         }
 
-        // ── THE RENDER, a walk of its own ────────────────────────────────
+        // ── THE RENDER, which is the walk that forks ─────────────────────
         //
         // Nothing in here reads or writes anything another lane's render
-        // touches: its own seats, its own row of `lane_out`, and a read-only
-        // view of a desk that stopped changing when the walk above ended.
-        // That is what makes it forkable, and the reason the deciding half
-        // had to be lifted out first.
-        for ch in 0..CHANNELS {
-            if !self.lane_wants[ch] {
-                continue;
-            }
-            let prep = self.lane_prep[ch];
-            let plan = LanePlan {
-                ch,
-                frames,
-                is_builtin: prep.is_builtin,
-                is_keys: prep.is_keys,
-                is_folder: prep.is_folder,
-                rack_live: prep.rack_live,
-                has_audio: prep.has_audio,
-                room_owns: prep.room_owns,
-                armed: prep.armed,
-                board_runs: prep.board_runs,
-                stems_dry: self.stems_dry,
-                keys_live: self.keys_live,
-                pdc_max,
-                folder_lat: prep.folder_lat,
-                pedal_latency: prep.pedal_latency,
-                notes: &self.lane_note_bank[ch],
-                controls: &self.lane_ctl_bank[ch],
-                sample: self.sampler_samples.get(ch).and_then(Option::as_ref),
-            };
+        // touches: its own seats, its own row of `lane_out`, its own
+        // scratch, and a read-only view of a desk that stopped changing when
+        // the walk above ended. That is what makes it forkable, and the
+        // reason the deciding half had to be lifted out first.
+        //
+        // The seats are carved for every lane at once rather than one at a
+        // time, because the fork needs all thirty-two borrows to exist
+        // before any of them is used. Three `split_at_mut`s and six
+        // iterators, all of it safe: see `lane_seats` for the arithmetic
+        // that makes the blocks disjoint.
+        let wanted: u32 = (0..CHANNELS).fold(0u32, |m, ch| {
+            if self.lane_wants[ch] { m | (1u32 << ch) } else { m }
+        });
+        if wanted != 0 {
             let desk = DeskRef {
                 clip_lane: &self.clip_lane,
                 auto_params: &self.auto_params,
@@ -10551,32 +10721,148 @@ impl Renderer {
                 key_prev_frames: self.key_prev_frames,
                 controls: &self.controls,
             };
-            let mut io = LaneIo {
-                // **This lane's own row, not the desk's one scratch.** See
-                // `lane_out`: the fold is a second walk now, so a lane's
-                // result has to survive the next lane's render.
-                fx_in: &mut self.lane_out[ch],
-                fx_out: &mut self.fx_out,
-                dry_io: &mut self.lane_dry[ch],
-                key_io: &mut self.key_io,
-                builtin: &mut self.builtin_scratch,
-                keys_scratch: &mut self.keys_scratch,
-            };
-            let Some(mut seats) = lane_seats(
-                &mut self.racks,
-                &mut self.dx7s,
-                &mut self.keys_lanes,
-                &mut self.pdc,
-                &mut self.dry_pdc,
-                ch,
-            ) else {
-                continue;
-            };
-            if !render_lane(&mut seats, &mut io, &plan, &desk) {
-                continue;
+            let stems_dry = self.stems_dry;
+            let keys_live = self.keys_live;
+            let preps = &self.lane_prep;
+            let notes = &self.lane_note_bank;
+            let ctls = &self.lane_ctl_bank;
+            let samples = &self.sampler_samples;
+            let mut jobs: [Option<LaneWork<'_>>; CHANNELS] = std::array::from_fn(|_| None);
+            {
+                let extra_at = tangent_ui::recorder::FOLDER_EXTRA_SEATS;
+                let pedals = tangent_ui::recorder::AMP_PEDALS;
+                let (low, rest) = self.racks.split_at_mut(extra_at);
+                let (extra_blk, rest) = rest.split_at_mut(CHANNELS);
+                let (board_blk, _) = rest.split_at_mut(CHANNELS * pedals);
+                let mut primaries = low.iter_mut();
+                let mut extras = extra_blk.iter_mut();
+                let mut boards = board_blk.chunks_mut(pedals);
+                let mut dx7s = self.dx7s.iter_mut();
+                let mut keys = self.keys_lanes.iter_mut();
+                let mut pdcs = self.pdc.iter_mut();
+                let mut dry_pdcs = self.dry_pdc.iter_mut();
+                let mut outs = self.lane_out.iter_mut();
+                let mut drys = self.lane_dry.iter_mut();
+                let mut scratches = self.lane_scratch.iter_mut();
+                for (ch, job) in jobs.iter_mut().enumerate() {
+                    let (
+                        Some(rack),
+                        Some(extra),
+                        Some(board),
+                        Some(dx7),
+                        Some(keys_lane),
+                        Some(rack_pdc),
+                        Some(dry_pdc),
+                        Some(out),
+                        Some(dry),
+                        Some(scratch),
+                    ) = (
+                        primaries.next(),
+                        extras.next(),
+                        boards.next(),
+                        dx7s.next(),
+                        keys.next(),
+                        pdcs.next(),
+                        dry_pdcs.next(),
+                        outs.next(),
+                        drys.next(),
+                        scratches.next(),
+                    )
+                    else {
+                        break;
+                    };
+                    if wanted & (1u32 << ch) == 0 {
+                        continue;
+                    }
+                    let prep = preps[ch];
+                    *job = Some(LaneWork {
+                        seats: LaneSeats {
+                            rack,
+                            extra,
+                            board,
+                            dx7,
+                            keys: keys_lane,
+                            rack_pdc,
+                            dry_pdc,
+                        },
+                        io: LaneIo {
+                            fx_in: out,
+                            fx_out: &mut scratch.fx_out,
+                            dry_io: dry,
+                            key_io: &mut scratch.key_io,
+                            builtin: &mut scratch.builtin,
+                            keys_scratch: &mut scratch.keys,
+                        },
+                        plan: LanePlan {
+                            ch,
+                            frames,
+                            is_builtin: prep.is_builtin,
+                            is_keys: prep.is_keys,
+                            is_folder: prep.is_folder,
+                            rack_live: prep.rack_live,
+                            has_audio: prep.has_audio,
+                            room_owns: prep.room_owns,
+                            armed: prep.armed,
+                            board_runs: prep.board_runs,
+                            stems_dry,
+                            keys_live,
+                            pdc_max,
+                            folder_lat: prep.folder_lat,
+                            pedal_latency: prep.pedal_latency,
+                            notes: &notes[ch],
+                            controls: &ctls[ch],
+                            sample: samples.get(ch).and_then(Option::as_ref),
+                        },
+                    });
+                }
             }
-            self.lane_folds[ch] = true;
+            // **One lane, one hand.** The cells exist so that the closure the
+            // pool calls can be `Fn` and `Sync` while the work inside it is
+            // very much `&mut`: each lane's job is taken out of its own cell
+            // exactly once, and the pool's own claim is what guarantees only
+            // one thread ever reaches a given `ch`.
+            let cells = LaneCells(jobs.map(std::cell::UnsafeCell::new));
+            let folded = AtomicU32::new(0);
+            let render = |ch: usize| {
+                let Some(job) = cells.take(ch) else {
+                    return;
+                };
+                let LaneWork { mut seats, mut io, plan } = job;
+                if render_lane(&mut seats, &mut io, &plan, &desk) {
+                    folded.fetch_or(1u32 << ch, Ordering::Relaxed);
+                }
+            };
+            // **The fan-out, only onto threads that are really real-time.**
+            // `ready` counts the workers that took the policy AND joined the
+            // device's workgroup; short of the full width, the measurement
+            // says forking is slower than not, so this walks instead.
+            match self.fanout.as_ref().filter(|p| {
+                p.width() > 0
+                    && match fanout_mode() {
+                        Fanout::Never => false,
+                        // **A pool with no workgroup is never ready**, so
+                        // this is what a session runs on: fork only onto
+                        // workers the kernel really scheduled. `fanout_any`
+                        // is the null test's door, and nothing else sets it.
+                        Fanout::WhenReady => self.fanout_any || p.ready() >= p.width(),
+                        Fanout::Force => true,
+                    }
+            }) {
+                Some(pool) => pool.run(wanted, &render),
+                None => {
+                    for ch in 0..CHANNELS {
+                        if wanted & (1u32 << ch) != 0 {
+                            render(ch);
+                        }
+                    }
+                }
+            }
+            let folded = folded.load(Ordering::Relaxed);
+            for ch in 0..CHANNELS {
+                self.lane_folds[ch] = folded & (1u32 << ch) != 0;
+            }
         }
+
         // ── THE FOLD, a walk of its own ──────────────────────────────────
         //
         // **Ascending, and that is load-bearing.** `mix` and `aux` are
@@ -11921,6 +12207,25 @@ impl Engine {
         max.saturating_sub(r.folder_lat.get(lane).copied().unwrap_or(0))
     }
 
+    /// **Give this offline engine a pool, or take it away.** Tests only.
+    ///
+    /// `Engine::offline` builds none, because an export has no deadline and
+    /// wants every core for the render it is already running flat out. The
+    /// null test needs two engines that disagree about threading and agree
+    /// about audio, so it asks for one here rather than through the
+    /// environment, which is read once per process and cannot answer twice.
+    #[cfg(test)]
+    pub fn set_offline_fanout(&mut self, on: bool) {
+        let Some(r) = self.offline.as_mut() else {
+            return;
+        };
+        r.fanout = on
+            .then(|| RtPlan::for_block(256, 48_000))
+            .flatten()
+            .map(|plan| LanePool::new(FANOUT_PEERS, None, plan));
+        r.fanout_any = on;
+    }
+
     pub fn render_offline(&mut self, out: &mut [f32]) {
         let Some(r) = self.offline.as_mut() else {
             return;
@@ -12233,6 +12538,26 @@ impl Engine {
         // The ReaStream send ring, the same generous third of a second so the
         // sender thread's scheduling jitter never starves or overruns it.
         let (reastream_tx, reastream_rx) = RingBuffer::<f32>::new(1 << 15);
+        // **The peers, if the device will have them.** Built here, off the
+        // audio thread, because a worker takes a thread stack and a
+        // workgroup membership and neither belongs on a callback. Offline
+        // engines get none: no device, no deadline, and the export is
+        // already running flat out on every core it can reach.
+        //
+        // The plan is the block the engine ASKED for rather than the one the
+        // device will grant, because the grant is not known until the first
+        // callback and a policy asking for a period SHORTER than the real
+        // one is the harmful direction. `pick_buffer` asks for what the
+        // device offered, so the two agree on everything this app opens.
+        let pool = (!offline || fanout_mode() == Fanout::Force)
+            .then(|| RtPlan::for_block(buffer_frames.unwrap_or(256).max(1), rate))
+            .flatten()
+            .map(|plan| {
+                let wg = crate::outpath::device_id(Some(&name))
+                    .and_then(Workgroup::for_device)
+                    .map(Arc::new);
+                LanePool::new(FANOUT_PEERS, wg, plan)
+            });
         let renderer = Renderer {
             shared: Arc::clone(&shared),
             timebase,
@@ -12315,8 +12640,6 @@ impl Engine {
             keys_lanes: (0..CHANNELS).map(|_| None).collect(),
             keys_incoming,
             keys_retiring,
-            builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
-            keys_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             channel_gain: [1.0; CHANNELS],
             effects: crate::effects::Effects::new_send(rate as f32),
             master_effects: crate::effects::Effects::new(rate as f32),
@@ -12329,6 +12652,9 @@ impl Engine {
             racks,
             lane_quiet: vec![0; CHANNELS],
             lane_loud: vec![false; CHANNELS],
+            fanout: pool,
+            fanout_any: false,
+            lane_scratch: (0..CHANNELS).map(|_| LaneScratch::new()).collect(),
             lane_note_bank: (0..CHANNELS)
                 .map(|_| Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2))
                 .collect(),
@@ -13219,7 +13545,7 @@ impl Engine {
             self.shared.pending_swaps.fetch_sub(1, Ordering::Release);
             return Err(refused);
         }
-        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        let deadline = retire_deadline(self.offline.is_some());
         while Instant::now() < deadline {
             if let Ok(old) = pair.from_audio.pop() {
                 return Ok(Some(old));
@@ -14638,7 +14964,7 @@ impl Engine {
         if self.click_to_audio.push(next).is_err() {
             return;
         }
-        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        let deadline = retire_deadline(self.offline.is_some());
         while Instant::now() < deadline {
             if let Ok(old) = self.click_from_audio.pop() {
                 drop(old);
@@ -14739,7 +15065,7 @@ impl Engine {
         if self.pad_to_audio.push((lane, kit)).is_err() {
             return false;
         }
-        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        let deadline = retire_deadline(self.offline.is_some());
         while Instant::now() < deadline {
             if let Ok(old) = self.pad_from_audio.pop() {
                 drop(old);
@@ -14773,7 +15099,7 @@ impl Engine {
         if self.sampler_to_audio.push((lane, s)).is_err() {
             return false;
         }
-        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        let deadline = retire_deadline(self.offline.is_some());
         while Instant::now() < deadline {
             if let Ok(old) = self.sampler_from_audio.pop() {
                 drop(old);
@@ -14793,7 +15119,7 @@ impl Engine {
         if self.preview_to_audio.push(clip).is_err() {
             return;
         }
-        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        let deadline = retire_deadline(self.offline.is_some());
         while Instant::now() < deadline {
             if let Ok(old) = self.preview_from_audio.pop() {
                 drop(old);
@@ -15317,7 +15643,7 @@ impl Engine {
         if self.maps_to_audio.push(maps).is_err() {
             return;
         }
-        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        let deadline = retire_deadline(self.offline.is_some());
         while Instant::now() < deadline {
             if let Ok(old) = self.maps_from_audio.pop() {
                 drop(old);
@@ -15368,7 +15694,7 @@ impl Engine {
         if self.auto_to_audio.push(auto).is_err() {
             return;
         }
-        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        let deadline = retire_deadline(self.offline.is_some());
         while Instant::now() < deadline {
             if let Ok(old) = self.auto_from_audio.pop() {
                 drop(old);
@@ -18112,6 +18438,9 @@ mod tests {
             racks,
             lane_quiet: vec![0; CHANNELS],
             lane_loud: vec![false; CHANNELS],
+            fanout: None,
+            fanout_any: false,
+            lane_scratch: (0..CHANNELS).map(|_| LaneScratch::new()).collect(),
             lane_note_bank: (0..CHANNELS)
                 .map(|_| Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2))
                 .collect(),
@@ -18182,8 +18511,6 @@ mod tests {
             rate: RATE,
             dev_channels: dev_ch,
             mix: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
-            builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
-            keys_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             channel_gain: [1.0; CHANNELS],
             midi,
             ui_params,
