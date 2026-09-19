@@ -51,6 +51,15 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   parallel render also in hand the ninety-six bays sit at 15% of the
   deadline at 128 frames and 19% at 64.
 
+- **A race in the parallel render is closed.** A worker reads what it is
+  meant to do once per round and then loops asking for the next track. If it
+  was interrupted between finishing one track and asking again, the main
+  audio thread could meanwhile finish the round, move on, and hand out the
+  next round's work; the interrupted worker would then take one of those
+  tracks and run it against instructions that no longer existed. One audio
+  buffer is several rounds, so the two were microseconds apart. Each round is
+  now stamped, and a worker holding a stale one is given nothing.
+
 - **The parallel render works on Windows, Linux and FreeBSD.** Spreading a
   block's plugin work across cores only ever engaged on macOS, because it
   refuses to run on threads the system has not promised to schedule on time,
