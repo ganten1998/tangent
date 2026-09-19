@@ -12784,9 +12784,19 @@ impl Engine {
             RingBuffer::<tangent_ui::automation::Automation>::new(2);
         let (auto_retiring, auto_from_audio) =
             RingBuffer::<tangent_ui::automation::Automation>::new(2);
-        // The drumpad kit's pair, same capacity, same reason.
-        let (pad_to_audio, pad_incoming) = RingBuffer::<(usize, PadKit)>::new(2);
-        let (pad_retiring, pad_from_audio) = RingBuffer::<(usize, PadKit)>::new(2);
+        // **The drumpad kit's pair, as deep as the sampler's and for the
+        // same reason, plus one the sampler does not have.**
+        //
+        // Two was right while the only caller was the live desk, which
+        // retries a refused kit on the next frame until it lands. The
+        // EXPORT path does not: it furnishes every drum lane in one pass
+        // before a single block is rendered, and ignores the answer. With a
+        // ring of two and no callback to drain it, the third drum lane's
+        // kit was refused and silently discarded, so a project with three
+        // or more kits exported with the third onward SILENT - in the file,
+        // not in the room, which is the worst place to find out.
+        let (pad_to_audio, pad_incoming) = RingBuffer::<(usize, PadKit)>::new(CHANNELS + 2);
+        let (pad_retiring, pad_from_audio) = RingBuffer::<(usize, PadKit)>::new(CHANNELS + 2);
         // The sampler's pair. Deeper than the kit's two: a project opening
         // with a sampler on several lanes delivers them in one frame, and a
         // ring of two would park all but the first two until the next.
@@ -19808,6 +19818,88 @@ mod tests {
     ///
     /// Drum lanes are the fixture because they are the cheapest thing in
     /// this engine that makes a predictable noise on a named channel.
+    /// **Every drum lane's kit reaches an offline engine**, which is what
+    /// an export is.
+    ///
+    /// The kit crosses on a ring by the same swap protocol every other
+    /// heavy object uses, and that ring held two. The live desk retries a
+    /// refused kit on the next frame until it lands, so two was enough
+    /// there; the export path furnishes every lane in one pass before a
+    /// block is rendered and ignores the answer. The third kit was refused
+    /// and silently discarded, so a project with three or more kits
+    /// exported with the third onward SILENT - in the file, where it is
+    /// found long after the session.
+    ///
+    /// Asserted by COMPARING two lanes against six rather than against an
+    /// absolute level, because that is the difference the bug makes and it
+    /// calibrates itself: if the ring drops everything past the second, the
+    /// two renders are identical.
+    #[test]
+    fn every_drum_lanes_kit_reaches_an_offline_engine() {
+        use std::sync::Arc;
+        let render = |lanes: usize| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            for l in 0..lanes {
+                assert!(
+                    e.set_pad_kit(l, test_kit(&[0], 4_800, 0.5)),
+                    "lane {l} of {lanes}: the kit was refused by an engine with no \
+                     callback to drain the ring"
+                );
+                e.set_channel_gain(l, 1.0);
+            }
+            // A lane only strikes a pad if the engine knows it is a drum lane.
+            e.set_drum_strips((0..lanes).fold(0u32, |m, l| m | (1u32 << l)));
+            e.set_midi_clips(
+                (0..lanes)
+                    .map(|l| PlacedMidi {
+                        pedal: Arc::new(Vec::new()),
+                        strip: l,
+                        start: 0,
+                        len: 48_000,
+                        notes: Arc::new(vec![ClipNote {
+                            at: 0,
+                            dur: 2_400,
+                            key: PAD_BASE,
+                            vel: 100,
+                        }]),
+                    })
+                    .collect(),
+            );
+            // **The kits land one per block**, by the swap protocol every
+            // heavy object here uses, so the transport is held until they
+            // are all in. Rolling first would strike the first pad before
+            // the later lanes had a kit, and the test would fail for a
+            // reason that is not the bug.
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 512 * 2];
+            for _ in 0..(lanes + 4) {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut peak = 0.0f32;
+            for _ in 0..16 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+            }
+            peak
+        };
+        let two = render(2);
+        let six = render(6);
+        assert!(two > 0.01, "even two drum lanes rendered silence: {two}");
+        // Six identical strikes, in phase, against two. The bound is loose
+        // because the master is not a bare sum, and it is far above what a
+        // ring that kept only the first two could produce, which is exactly
+        // `two`.
+        assert!(
+            six > two * 1.5,
+            "six drum lanes peaked at {six} and two at {two}: the kits past the \
+             second never arrived"
+        );
+    }
+
     #[test]
     fn a_folder_sums_its_children_and_its_fader_governs_the_group() {
         use std::sync::Arc;
