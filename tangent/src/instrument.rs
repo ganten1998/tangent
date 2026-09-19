@@ -2891,8 +2891,17 @@ impl Probe {
     /// ceiling on anything a look-ahead can ever move. The rest is the
     /// decide walk, the fold, the buses, the master and the taps, and it
     /// stays on the deadline whatever is rendered early.
+    ///
+    /// **`None` once the pool forks, and that is not a limitation to work
+    /// around.** Lane time is summed across whichever threads rendered, so
+    /// on a forked block it is CPU time and the block is wall-clock time,
+    /// and dividing one by the other answers a question nobody asked. It
+    /// read 137% on a live desk, which is how this was noticed. Serial, the
+    /// two are the same clock and the ratio means what it says.
     pub fn lane_share(self) -> Option<f64> {
-        (self.block_ns > 0).then(|| self.rendered_ns as f64 / self.block_ns as f64)
+        (self.block_ns > 0)
+            .then(|| self.rendered_ns as f64 / self.block_ns as f64)
+            .filter(|f| *f <= 1.0)
     }
 
     /// The share of blocks in which a ring would have been discarded.
@@ -2904,7 +2913,8 @@ impl Probe {
         let pct = |v: Option<f64>| v.map_or_else(|| "n/a".to_owned(), |f| format!("{:.1}%", f * 100.0));
         format!(
             "probe: {} blocks, {:.1} lanes rendered/block, {} us/block in lanes \
-             ({} of the block, so a look-ahead's floor is {}); \
+             ({} of the block, so a look-ahead's floor is {}; lane time is \
+             summed across workers, so both read n/a once the pool forks); \
              eligible now {} ({:.1} lanes), +source {} ({:.1} lanes), +instruments {} ({:.1} lanes); \
              discards {} of blocks (param {}, transport {}, loop {}, tempo {}, swap {}, arm {})",
             self.blocks,
@@ -12930,6 +12940,21 @@ impl Renderer {
             for ch in 0..CHANNELS {
                 self.lane_folds[ch] = folded & (1u32 << ch) != 0;
             }
+        } else {
+            // **A block that renders nothing folds nothing.**
+            //
+            // This was inside the branch above, so on a block where no track
+            // wanted to render at all the flags kept the PREVIOUS block's
+            // values. The fold then ran for those tracks over `lane_out`,
+            // which still held the audio of the block before, and mixed it
+            // into the master a second time. One repeated buffer is a click,
+            // and it lands exactly where a desk goes quiet: the last block
+            // before everything rests.
+            //
+            // It also clocked that track's delay compensation an extra time
+            // once that moved to consumption, so the track came back from the
+            // gap a buffer out of step with the rest of the desk.
+            self.lane_folds = [false; CHANNELS];
         }
         if self.probe {
             self.note_eligibility(
@@ -28467,6 +28492,68 @@ mod tests {
         r.render(&mut out, 0, 0);
         let left = shared.pending_voices.lock().map(|g| g.len()).unwrap_or(0);
         assert_eq!(left, 0, "the kept patch was never applied once the track was free");
+    }
+
+    /// **A block that renders nothing folds nothing.**
+    ///
+    /// The fold's per-track flags were only written on a block where at least
+    /// one track wanted to render. On a block where none did they kept the
+    /// previous block's values, and the fold then ran for those tracks over a
+    /// buffer that still held the audio of the block before, mixing it into
+    /// the master a second time. One repeated buffer is a click, and it lands
+    /// exactly where a desk goes quiet.
+    ///
+    /// Reported as a slight breakup in parts of a song, with the load meter
+    /// showing nothing, which is how it should look: the cost was never the
+    /// problem.
+    #[test]
+    fn a_block_that_renders_nothing_folds_nothing() {
+        use std::sync::Arc;
+        let clip = Placed {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: vec![0.5; 8000],
+                rate: 48_000,
+                source: PathBuf::from("hold.wav"),
+            }),
+            strip: 0,
+            start: 0,
+            offset: 0,
+            len: 4000,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+        };
+        let (mut r, _tx, shared) = renderer_with_midi(2);
+        let (mut to_audio, _from) = r.hijack_track_rings();
+        to_audio.push(vec![clip]).expect("room");
+        shared.armed.store(0, Ordering::Relaxed);
+        shared.transport_at.store(0, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
+        shared.rolling.store(true, Ordering::Relaxed);
+
+        // One block that really does render, so the buffer holds something.
+        let mut out = vec![0.0_f32; 2 * 256];
+        r.render(&mut out, 0, 0);
+        assert!(
+            out.iter().any(|v| v.abs() > 0.1),
+            "the fixture never sounded, so this proves nothing"
+        );
+
+        // Now take the clips away and stop. Nothing feeds any track, so no
+        // track wants to render, and the master must be silent rather than
+        // carrying the block before it.
+        to_audio.push(Vec::new()).expect("room");
+        shared.rolling.store(false, Ordering::Relaxed);
+        for block in 0..4 {
+            out.fill(0.0);
+            r.render(&mut out, 0, 0);
+            let peak = out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(
+                peak < 1.0e-6,
+                "block {block} folded a track that rendered nothing: the \
+                 previous buffer came through again at {peak}"
+            );
+        }
     }
 
     /// **A parked transport seeds silence.**
