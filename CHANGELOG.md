@@ -101,6 +101,16 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **An export no longer loses the third drum track onward.** A kit crosses
+  to the engine on a handoff ring that held two, which was enough for the
+  live desk because it retries a refused kit on the next frame until it
+  lands. The export path does not: it hands over every drum lane in one
+  pass before a single block is rendered, and never looked at the answer.
+  So a project with three or more drum tracks rendered a file in which the
+  third onward were silent, discovered whenever somebody listened to the
+  bounce. The ring is as deep as the sampler's now, which is one slot per
+  channel and two spare.
+
 - **A frozen track stops being processed twice.** Freezing renders a lane
   through everything it holds and plays the result as an ordinary audio
   clip, so the file already contains all six insert bays and the whole
