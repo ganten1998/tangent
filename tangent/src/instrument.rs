@@ -7809,7 +7809,29 @@ impl Renderer {
         // there and the old one goes back to be dropped on the thread that
         // made it.
         let mut swapped = 0;
-        for rack in &mut self.racks {
+        // **Not a seat a worker is holding.** `Rack::swap` replaces a slot
+        // and hands the displaced plugin back for the interface thread to
+        // drop, which runs the plugin's own teardown: dropping a reverb onto
+        // a track that is playing would free a VST3 instance while a worker
+        // was inside its `process`.
+        //
+        // Which track a seat belongs to is arithmetic, not a lookup, so no
+        // side table is needed and none of it can go stale: a track's own
+        // seat is its number, its extra rack and its seven pedal seats are
+        // fixed offsets from it, and every other seat answers `None` because
+        // no bus, master or pad seat is ever held.
+        //
+        // A skipped arrival stays in its ring and `pending_swaps` stays
+        // above zero, so the walk runs again next block and the swap lands
+        // the moment the track is released. That is the same backpressure
+        // the ring already applies when the return side is full.
+        let leased = self.leased;
+        for (seat, rack) in self.racks.iter_mut().enumerate() {
+            if lane_of_seat(seat)
+                .is_some_and(|ch| leased & (1u32 << ch.min(CHANNELS - 1)) != 0)
+            {
+                continue;
+            }
             swapped += rack.swap();
         }
         if swapped > 0 {
@@ -28319,6 +28341,67 @@ mod tests {
                 .zip(&r.note_lanes)
                 .any(|(n, m)| !n.on && n.pitch == 64 && *m != 0),
             "no lane was told the held note had ended"
+        );
+    }
+
+    /// **A plugin dropped onto a held track waits for it.**
+    ///
+    /// `Rack::swap` replaces a slot and hands the displaced plugin back for
+    /// the interface thread to drop, which runs the plugin's own teardown.
+    /// Doing that to a track a worker is inside is the crash the owner would
+    /// hit first, and by an ordinary action: dragging a reverb onto a track
+    /// that is playing.
+    ///
+    /// The walk skips the seats of a held track. Nothing is lost by it: the
+    /// arrival stays in its ring and the count that gates the walk stays
+    /// above zero, so it lands on the block after the track is released.
+    #[test]
+    fn a_plugin_dropped_onto_a_held_track_waits_for_it() {
+        use crate::builtin_fx::EQ_PATH;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        const HELD: usize = 3;
+        e.offline.as_mut().expect("renderer").leased = 1u32 << HELD;
+        e.load_insert(HELD, 0, Some(Path::new(EQ_PATH)), None)
+            .expect("the built-in loads")
+            .expect("a tenant");
+        let mut out = vec![0.0f32; 128 * 2];
+        for _ in 0..4 {
+            e.render_offline(&mut out);
+        }
+        // Asked of the RACK, not of the engine's own record of what it
+        // loaded: the swap is what would free the displaced plugin, and the
+        // record is written on the loading thread before any of that.
+        let seated = |e: &Engine, ch: usize| {
+            e.offline
+                .as_ref()
+                .expect("renderer")
+                .racks
+                .get(ch)
+                .is_some_and(|r| r.slots[0].0.is_some())
+        };
+        assert!(
+            !seated(&e, HELD),
+            "the plugin landed on a held track, so its predecessor would have \
+             been freed under the worker holding it"
+        );
+
+        // Released: it arrives, and nothing was thrown away on the way.
+        e.offline.as_mut().expect("renderer").leased = 0;
+        e.render_offline(&mut out);
+        assert!(
+            seated(&e, HELD),
+            "the deferred plugin never arrived, so it was dropped rather than waited"
+        );
+
+        // And a free track is not held up by a held one.
+        e.offline.as_mut().expect("renderer").leased = 1u32 << HELD;
+        e.load_insert(HELD + 1, 0, Some(Path::new(EQ_PATH)), None)
+            .expect("the built-in loads")
+            .expect("a tenant");
+        e.render_offline(&mut out);
+        assert!(
+            seated(&e, HELD + 1),
+            "a free track's plugin was held up by an unrelated held track"
         );
     }
 
