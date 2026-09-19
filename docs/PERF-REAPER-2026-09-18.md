@@ -202,9 +202,21 @@ Verdict key: **CONFIRMED** = both verifiers upheld the claim. **DOUBTFUL** = one
 
 ### 3.0 What has landed since this was written (2026-09-19)
 
-Gaps 2, 3, 4, 5, 6, 7 and 8 are done. Gap 1 is done as far as the fan-out
-goes; the look-ahead half of it is not being built, and Lane 6 in the
-appendix says why.
+Gaps 2, 3, 4, 5, 6, 7, 8 and 10 are done. Gap 1 is done as far as the
+fan-out goes; the look-ahead half of it is not being built, and Lane 6 in the
+appendix says why. That leaves no CONFIRMED gap unaddressed.
+
+**Gap 10, the latency poll, was three defects rather than one.** The host
+worked out its whole plugin-window state over `(STRIPS + 1) * INSERTS` bays,
+the first 108 seats, and used it for three things: gating `poll_latency`,
+noticing a window close so the preset behind it is saved, and repainting
+while a window is open, which on Linux IS the plugin GUI's run loop. Every
+folder extra rack and all seven amp pedal seats of every lane fall outside
+that window, so a plugin seated there could go out of PDC alignment after a
+preset click, lose its state on close, and freeze on Linux. The engine now
+answers `open_insert_editors()` over `RACK_SEATS`, and the host reads the
+count before and after the poll rather than filling a 108-element array a
+frame.
 
 **Gap 5, the convolver, was worse than the row above says and is now the
 clearest win in the sweep.** The row priced the fixed transform floor. It

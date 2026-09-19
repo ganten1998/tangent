@@ -4374,26 +4374,18 @@ impl DesktopApp {
         // notified because the user closes one with the OS's close button,
         // which the plugin's view knows about and we only find out by asking.
         if let Some(e) = self.recorder.engine.as_mut() {
-            // Fixed arrays, not two `Vec`s a frame: the bay list never
-            // changes size.
-            const EDITOR_BAYS: usize =
-                (tangent_ui::recorder::STRIPS + 1) * tangent_ui::recorder::INSERTS;
-            let bay_of = |i: usize| (i / tangent_ui::recorder::INSERTS, i % tangent_ui::recorder::INSERTS);
-            let bays = (0..EDITOR_BAYS).map(bay_of);
-            let was: [bool; EDITOR_BAYS] = std::array::from_fn(|i| {
-                let (st, b) = bay_of(i);
-                e.insert_editor_open(st, b)
-            });
+            let was_open = e.open_insert_editors();
             e.poll_editor();
+            let now_open = e.open_insert_editors();
             // **Ask the open plugins whether their latency moved.**
             //
-            // Only while a window is (or was, this frame) open: `was` and
-            // not the post-poll state, so the frame an editor closes on is
-            // still covered. A preset click is the thing that changes a
+            // Only while a window is (or was, this frame) open: the count
+            // taken BEFORE the poll, not after it, so the frame an editor
+            // closes on is still covered. A preset click is the thing that changes a
             // plugin's latency, and clicking presets means looking at it.
             // See `Engine::poll_latency` for why not a timer and why not
             // on-close-only.
-            if was.iter().any(|&w| w) && e.poll_latency() {
+            if was_open > 0 && e.poll_latency() {
                 // The engine republishes the alignment from the atomics on
                 // its own next block; this is only so the READOUT catches up
                 // in the same breath rather than on the next mouse move.
@@ -4402,14 +4394,7 @@ impl DesktopApp {
             // An editor that has just closed is a preset that has just been
             // chosen. Save then, rather than only at quit, because the gap
             // between the two is where a force-quit loses the sound.
-            let closed = bays.clone().zip(was).any(|((st, b), w)| {
-                w && !self
-                    .recorder
-                    .engine
-                    .as_ref()
-                    .is_some_and(|e| e.insert_editor_open(st, b))
-            });
-            if closed {
+            if now_open < was_open {
                 self.save_plugin_states();
             }
             // **While any plugin window is open, keep the frames coming.**
@@ -4419,12 +4404,7 @@ impl DesktopApp {
             // plugin animations are written against; on the other platforms
             // the OS drives the windows and this only makes the close button
             // noticed within a frame rather than on the next mouse move.
-            let any_open = self
-                .recorder
-                .engine
-                .as_ref()
-                .is_some_and(|e| bays.clone().any(|(st, b)| e.insert_editor_open(st, b)));
-            if any_open {
+            if now_open > 0 {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
         }
