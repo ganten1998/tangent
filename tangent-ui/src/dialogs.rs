@@ -9673,6 +9673,39 @@ fn show_on(
                                 ui.label(RichText::new(text).font(plain(10.0)).color(color));
                             }
 
+                            // ── what the render costs ────────────────────────
+                            //
+                            // **Two numbers, because the average is the
+                            // misleading one.** A desk can sit at four percent
+                            // and still glitch: what the room hears is the
+                            // block that missed its deadline, not the mean of
+                            // the ones that made it. So the line says what the
+                            // last block cost AND the worst since the stream
+                            // opened, and only the second one is ever coloured.
+                            //
+                            // This is the figure every other DAW's performance
+                            // meter has shown for years and this app has never
+                            // had. Nothing could be ranked or proven without
+                            // it: a change that made the engine faster and one
+                            // that made it slower looked the same from here.
+                            if let Some((now, worst)) = status.rt_load {
+                                // Coloured only where it matters: at seven
+                                // tenths of the deadline a desk is close
+                                // enough that one more plugin is a dropout,
+                                // and past the whole of it there already is
+                                // one.
+                                let color = if worst >= 0.7 { warn } else { dim };
+                                ui.label(
+                                    RichText::new(format!(
+                                        "render {:.0}% of the block, worst {:.0}%",
+                                        now * 100.0,
+                                        worst * 100.0
+                                    ))
+                                    .font(plain(10.0))
+                                    .color(color),
+                                );
+                            }
+
                             // ── who else is in the path ──────────────────────
                             //
                             // **Directly under the round trip, because it is

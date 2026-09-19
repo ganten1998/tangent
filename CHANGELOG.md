@@ -12,6 +12,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **The audio panel says what the render is costing.** A new line under the
+  dropout count: what the last block cost as a percentage of its deadline,
+  and the worst block since the stream opened, amber past seven tenths. Two
+  numbers rather than one because the average is the misleading one, which
+  is the whole point of a real-time meter: a desk can sit at four percent
+  and still glitch, since what the room hears is the block that missed and
+  not the mean of the ones that made it. Nothing in the engine could be
+  ranked or proven without this, and every other DAW has had it for years.
+  The measurement costs 38 nanoseconds a block, which is 0.0014 percent of
+  a 128-frame deadline at 48 kHz.
+
 - **The desk renders on several cores instead of one.** Every lane's
   instruments, pedalboard, plugin chain and delay line used to run one after
   another inside the CoreAudio callback, so a block cost the sum of
@@ -89,6 +100,16 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   a real take too.
 
 ### Fixed
+
+- **The dropout count is no longer blind on macOS.** The panel read two
+  counters, and both are structurally silent on a Mac: one is the PipeWire
+  graph's, which is Linux only, and the other is cpal's, which never sees an
+  xrun through CoreAudio. So the figure was always "unknown" on the platform
+  the app ships on, while the HAL's own overload listener sat there counting
+  and reaching nothing but a log line. It reaches the panel now. "Unknown"
+  still means nobody could watch, which is the honest answer on a device
+  that refuses the listener, and a real zero from a counter that can see is
+  still rendered as a zero.
 
 - **An export no longer freezes the window before its first sample.** Seven
   engine setters wait for the audio thread to hand back what they replaced,

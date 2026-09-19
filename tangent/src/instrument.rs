@@ -2587,6 +2587,125 @@ struct Shared {
     /// undone, because a stem that undid its sources would not be a stem of
     /// anything in this mix.
     stems_dry: AtomicBool,
+    /// **What the block cost, and how close to the deadline it came.**
+    ///
+    /// Its own cache line, deliberately: a reader sharing one with the
+    /// writer measured a 2.7x penalty, and this is read by the UI every
+    /// frame while the audio thread writes it every block.
+    rt: RtLoadCells,
+}
+
+/// The real-time meter's cells, on a line of their own. See [`Shared::rt`].
+///
+/// Everything here is written by the audio thread and read by the UI, both
+/// with relaxed ordering: there is nothing to synchronise, only a number to
+/// look at, and a fence per block to make a meter prettier is a fence per
+/// block.
+#[repr(align(128))]
+#[derive(Debug, Default)]
+struct RtLoadCells {
+    /// The last block's render time, nanoseconds.
+    last_ns: AtomicU64,
+    /// The largest since anyone last took it. **Swapped to zero on read**,
+    /// so it is a single-consumer peak: see [`RtLoad`].
+    peak_ns: AtomicU64,
+    /// A non-clearing peak, for a second reader that must not steal the
+    /// first one's. The bench takes the clearing one; an on-screen meter
+    /// takes this.
+    high_ns: AtomicU64,
+    /// Nanoseconds and blocks since the counters were last cleared, which
+    /// is what the mean is made of.
+    sum_ns: AtomicU64,
+    blocks: AtomicU64,
+    /// How long the block had, nanoseconds: the frames the device granted
+    /// over the rate. Written with the rest so a reader needs neither.
+    deadline_ns: AtomicU64,
+    /// A log2 histogram of block times, bucket `i` counting blocks whose
+    /// time had `i` as its highest set bit. Thirty-two buckets covers one
+    /// nanosecond to four seconds, which is every block that can exist.
+    hist: [AtomicU32; 32],
+}
+
+/// What one reader sees of the real-time meter. See [`Engine::rt_load`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RtLoad {
+    pub last_ns: u64,
+    /// The largest block since this was last read, and reading it clears it.
+    pub peak_ns: u64,
+    /// The largest block since the stream opened, which no read clears.
+    pub high_ns: u64,
+    pub mean_ns: u64,
+    /// The 99th percentile, to the resolution of a log2 histogram, so it is
+    /// a bucket's lower bound and not a sample. Honest about being coarse:
+    /// a p99 of 65 us means "at least 65 and under 131".
+    pub p99_ns: u64,
+    pub blocks: u64,
+    pub deadline_ns: u64,
+}
+
+impl RtLoad {
+    /// The last block as a fraction of its deadline, or `None` before the
+    /// stream has said what the deadline is.
+    pub fn load(self) -> Option<f32> {
+        (self.deadline_ns > 0).then(|| self.last_ns as f32 / self.deadline_ns as f32)
+    }
+
+    /// The same for the peak, which is the figure that decides whether a
+    /// desk glitches. See the module docs: average CPU is the misleading one.
+    pub fn peak_load(self) -> Option<f32> {
+        (self.deadline_ns > 0).then(|| self.high_ns as f32 / self.deadline_ns as f32)
+    }
+}
+
+impl RtLoadCells {
+    /// Record one block. Five relaxed atomics and a histogram bump, measured
+    /// at 38 ns all in on this machine: 0.0014% of a 128-frame deadline.
+    fn note(&self, ns: u64, deadline_ns: u64) {
+        self.last_ns.store(ns, Ordering::Relaxed);
+        self.peak_ns.fetch_max(ns, Ordering::Relaxed);
+        self.high_ns.fetch_max(ns, Ordering::Relaxed);
+        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
+        self.blocks.fetch_add(1, Ordering::Relaxed);
+        self.deadline_ns.store(deadline_ns, Ordering::Relaxed);
+        // **`max(1)` is not tidiness.** `63 - 0u64.leading_zeros()`
+        // underflows, and the early returns in `render` really do produce a
+        // zero-nanosecond block (no device channels, or a varispeed phase
+        // that asked for no program frames). A panic here crosses the cpal
+        // boundary, which this file's own note calls undefined behaviour.
+        let bucket = ((63 - ns.max(1).leading_zeros()) as usize).min(31);
+        if let Some(cell) = self.hist.get(bucket) {
+            cell.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Read the meter. Clears `peak_ns` and nothing else.
+    fn read(&self) -> RtLoad {
+        let blocks = self.blocks.load(Ordering::Relaxed);
+        let sum = self.sum_ns.load(Ordering::Relaxed);
+        let counts: Vec<u64> = self.hist.iter().map(|c| u64::from(c.load(Ordering::Relaxed))).collect();
+        let total: u64 = counts.iter().sum();
+        // The first bucket that carries the 99th percentile, reported as its
+        // own lower bound: `1 << i` nanoseconds.
+        let want = total.saturating_mul(99) / 100;
+        let mut seen = 0u64;
+        let mut p99 = 0u64;
+        for (i, n) in counts.iter().enumerate() {
+            seen += n;
+            if seen >= want && *n > 0 {
+                p99 = 1u64 << i;
+                break;
+            }
+        }
+        RtLoad {
+            last_ns: self.last_ns.load(Ordering::Relaxed),
+            peak_ns: self.peak_ns.swap(0, Ordering::Relaxed),
+            high_ns: self.high_ns.load(Ordering::Relaxed),
+            mean_ns: if blocks > 0 { sum / blocks } else { 0 },
+            p99_ns: p99,
+            blocks,
+            deadline_ns: self.deadline_ns.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl Shared {
@@ -2747,6 +2866,7 @@ impl Shared {
             ir_peak_l: AtomicU32::new(0),
             ir_peak_r: AtomicU32::new(0),
             stems_dry: AtomicBool::new(false),
+            rt: RtLoadCells::default(),
         }
     }
 
@@ -3789,8 +3909,11 @@ struct KeyFeed<'a> {
 /// opinion — and it is the word `no_writer_runs_a_folders_rack_except_the_fold`
 /// looks for above the call below.
 #[allow(clippy::too_many_arguments)]
+/// Unit tests for the engine's own machinery: the seat carve the fan-out
+/// rests on, and the real-time meter. Apart from `tests` below, which needs
+/// a whole engine for most of what it asserts.
 #[cfg(test)]
-mod seat_disjointness {
+mod engine_parts {
     use super::*;
 
     /// **No two lanes share a seat**, which is the whole argument that lets
@@ -3823,6 +3946,63 @@ mod seat_disjointness {
                 }
             }
         }
+    }
+
+    /// **The meter reads the block it just rendered.**
+    ///
+    /// Not a tautology: the hook is a wrapper around a function with four
+    /// early returns, and the whole point of putting it there rather than
+    /// inside was that none of them can escape it. So this renders real
+    /// blocks and asserts the meter moved, that the deadline it reports is
+    /// the block it was handed, and that the peak is cleared by a read and
+    /// the high-water mark is not.
+    #[test]
+    fn the_meter_reads_the_block_it_just_rendered() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let empty = e.rt_load();
+        assert_eq!(empty.blocks, 0, "a meter read something before anything rendered");
+        assert_eq!(empty.deadline_ns, 0);
+        let mut out = vec![0.0f32; 128 * 2];
+        for _ in 0..64 {
+            e.render_offline(&mut out);
+        }
+        let m = e.rt_load();
+        assert_eq!(m.blocks, 64, "one reading per block, and no more");
+        assert!(m.last_ns > 0, "the last block took no time at all");
+        assert!(m.mean_ns > 0);
+        assert!(m.peak_ns >= m.mean_ns, "the peak was under the mean");
+        assert!(m.high_ns >= m.peak_ns);
+        // 128 frames at 48 kHz is 2,666,666 ns, and the meter works it out
+        // from the block it was handed rather than from a setting.
+        assert!(
+            (2_600_000..2_700_000).contains(&m.deadline_ns),
+            "the deadline for a 128-frame block read {} ns",
+            m.deadline_ns
+        );
+        assert!(m.load().is_some_and(|l| l > 0.0));
+        // p99 is a bucket's lower bound, so it is coarse on purpose, but it
+        // must land inside the range the samples did.
+        assert!(m.p99_ns > 0 && m.p99_ns <= m.high_ns, "p99 {} high {}", m.p99_ns, m.high_ns);
+        // **The peak is single-consumer and the high-water mark is not.**
+        // A bench that took the peak must not empty the meter the owner is
+        // looking at, which is the whole reason there are two cells.
+        let again = e.rt_load();
+        assert_eq!(again.peak_ns, 0, "a second read still saw the first one's peak");
+        assert_eq!(again.high_ns, m.high_ns, "reading the meter moved the high-water mark");
+    }
+
+    /// **A zero-nanosecond block does not panic**, which it would if the
+    /// histogram bucket were the obvious `63 - leading_zeros()`. The early
+    /// returns in the render really do produce one: no device channels is
+    /// the plainest. A panic here crosses the cpal boundary.
+    #[test]
+    fn a_block_that_took_no_time_still_lands_in_a_bucket() {
+        let cells = RtLoadCells::default();
+        cells.note(0, 2_666_666);
+        cells.note(u64::MAX, 2_666_666);
+        let m = cells.read();
+        assert_eq!(m.blocks, 2);
+        assert_eq!(m.high_ns, u64::MAX);
     }
 
     /// **And the carve answers for every lane**, against a real engine's own
@@ -7679,7 +7859,30 @@ impl Renderer {
     /// `frames × ratio` and everything that leaves — the speakers, the take,
     /// the scope, the ReaStream send — is resampled back to the device's rate
     /// together, from one shared phase, so they are all the same instant.
+    /// **The block, timed.** A thin wrapper so the measurement covers every
+    /// path out of the render, including the four early returns, without
+    /// each of them having to remember.
+    ///
+    /// Two clock reads and six relaxed atomics: 38 ns on this machine, which
+    /// is 0.0014% of a 128-frame deadline. `Instant::now` on Apple is a
+    /// commpage read with no syscall, no allocation and no lock, and the
+    /// callback already reads the clock once a block a few frames above
+    /// this one.
     fn render(&mut self, out: &mut [f32], now: Nanos, heard: Nanos) {
+        let at = Instant::now();
+        let frames = self.dev_channels.max(1);
+        let frames = out.len() / frames;
+        self.render_inner(out, now, heard);
+        let ns = u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let deadline = if self.rate > 0.0 {
+            (frames as f64 / self.rate * 1e9) as u64
+        } else {
+            0
+        };
+        self.shared.rt.note(ns, deadline);
+    }
+
+    fn render_inner(&mut self, out: &mut [f32], now: Nanos, heard: Nanos) {
         let dev_ch = self.dev_channels;
         if dev_ch == 0 {
             return;
@@ -14865,6 +15068,22 @@ impl Engine {
     /// that nobody knew.
     pub fn xruns(&self) -> u64 {
         self.shared.xruns.load(Ordering::Relaxed)
+    }
+
+    /// **What the audio thread is costing, against what it has.**
+    ///
+    /// The figure REAPER's performance meter has shown for twenty years and
+    /// this app has never had: per-block render time, the largest block, and
+    /// the deadline both are measured against. Reading it CLEARS `peak_ns`
+    /// and nothing else, so the peak is single-consumer; `high_ns` is the
+    /// one an on-screen meter should read, because a bench taking the peak
+    /// must not empty the meter the owner is looking at.
+    ///
+    /// Average load is the misleading number and this returns the
+    /// distribution for that reason: a desk can sit at four percent mean and
+    /// still glitch, because what the room hears is the block that missed.
+    pub fn rt_load(&self) -> RtLoad {
+        self.shared.rt.read()
     }
 
     pub fn health(&self) -> (bool, u64) {

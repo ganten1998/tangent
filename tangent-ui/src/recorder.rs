@@ -4131,6 +4131,19 @@ pub struct AudioStatus {
     /// that as nothing at all: a zero from "nobody looked" has already been
     /// believed once on this project, through a take that was half silence.
     pub dropouts: Option<u64>,
+    /// **What the render is costing against what it has**, as a percentage
+    /// of the block's deadline: the last block, and the worst since the
+    /// stream opened.
+    ///
+    /// The figure REAPER's performance meter has shown for twenty years and
+    /// this app has never had. It is a pair rather than one number because
+    /// the average is the misleading one: a desk can sit at four percent and
+    /// still glitch, since what the room hears is the block that missed, not
+    /// the mean of the ones that did not.
+    ///
+    /// `None` where no block has been rendered yet, or where the engine is
+    /// not running.
+    pub rt_load: Option<(f32, f32)>,
 }
 
 impl AudioStatus {
@@ -4452,6 +4465,7 @@ mod tests {
             monitor_ms: Some(4.0),
             graph_floor: None,
             dropouts: None,
+            rt_load: None,
         };
         let rt = status.round_trip_ms().expect("both sides are open");
         assert!(
@@ -6042,6 +6056,7 @@ observed_frames: None,
             monitor_ms: None,
             graph_floor: None,
             dropouts: None,
+            rt_load: None,
         };
         assert!((both.round_trip_ms().unwrap() - 16.0).abs() < 1e-3);
 
@@ -6062,6 +6077,7 @@ observed_frames: None,
                 monitor_ms: None,
                 graph_floor: None,
                 dropouts: None,
+                rt_load: None,
             },
             AudioStatus {
                 input: None,
@@ -6069,6 +6085,7 @@ observed_frames: None,
                 monitor_ms: None,
                 graph_floor: None,
                 dropouts: None,
+                rt_load: None,
             },
             // And a side that will not say its buffer size cannot contribute
             // half a figure.
@@ -6078,6 +6095,7 @@ observed_frames: None,
                 monitor_ms: None,
                 graph_floor: None,
                 dropouts: None,
+                rt_load: None,
             },
         ] {
             assert_eq!(one.round_trip_ms(), None);
@@ -6098,6 +6116,7 @@ observed_frames: None,
             monitor_ms: None,
             graph_floor: None,
             dropouts: None,
+            rt_load: None,
         }
         .rates_disagree());
 
@@ -6107,6 +6126,7 @@ observed_frames: None,
             monitor_ms: None,
             graph_floor: None,
             dropouts: None,
+            rt_load: None,
         }
         .rates_disagree());
 
@@ -6117,6 +6137,7 @@ observed_frames: None,
             monitor_ms: None,
             graph_floor: None,
             dropouts: None,
+            rt_load: None,
         }
         .rates_disagree());
     }
