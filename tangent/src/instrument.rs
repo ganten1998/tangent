@@ -28494,6 +28494,69 @@ mod tests {
         assert_eq!(left, 0, "the kept patch was never applied once the track was free");
     }
 
+    /// **Three audio tracks playing at once sum to what they are.**
+    ///
+    /// Reported from a real session: a breakup on audio clips only, absent
+    /// with two tracks playing and back the moment a third is unmuted, with
+    /// the load meter showing nothing and no dropout recorded. No plugins
+    /// are involved here and every clip is a constant, so the master is
+    /// arithmetic: any wobble at all is the engine and not the material.
+    #[test]
+    fn three_audio_tracks_playing_at_once_sum_to_what_they_are() {
+        use std::sync::Arc;
+        let flat = |strip: usize, level: f32| Placed {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: vec![level; 48_000 * 2],
+                rate: 48_000,
+                source: PathBuf::from("flat.wav"),
+            }),
+            strip,
+            start: 0,
+            offset: 0,
+            len: 48_000,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+        };
+        for lanes in 1..=4usize {
+            let (mut r, _tx, shared) = renderer_with_midi(2);
+            let (mut to_audio, _from) = r.hijack_track_rings();
+            let levels: Vec<f32> = (0..lanes).map(|i| 0.05 + i as f32 * 0.05).collect();
+            let clips: Vec<Placed> = levels
+                .iter()
+                .enumerate()
+                .map(|(i, v)| flat(i, *v))
+                .collect();
+            to_audio.push(clips).expect("room");
+            shared.armed.store(0, Ordering::Relaxed);
+            shared.transport_at.store(0, Ordering::Relaxed);
+            shared.transport_req.store(1, Ordering::Release);
+            shared.rolling.store(true, Ordering::Relaxed);
+
+            // Well past every fader slew, so what is left is the sum.
+            let mut out = vec![0.0_f32; 2 * 256];
+            for _ in 0..40 {
+                out.fill(0.0);
+                r.render(&mut out, 0, 0);
+            }
+            let want: f32 = levels.iter().sum();
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for v in out.iter().step_by(2) {
+                lo = lo.min(*v);
+                hi = hi.max(*v);
+            }
+            println!("{lanes} lane(s): want {want:.4}, got {lo:.6}..{hi:.6}");
+            assert!(
+                (hi - lo).abs() < 1.0e-5,
+                "{lanes} playing tracks do not hold a steady level: {lo} to {hi}"
+            );
+            assert!(
+                (hi - want).abs() < 1.0e-3,
+                "{lanes} playing tracks summed to {hi}, not {want}"
+            );
+        }
+    }
+
     /// **A block that renders nothing folds nothing.**
     ///
     /// The fold's per-track flags were only written on a block where at least
