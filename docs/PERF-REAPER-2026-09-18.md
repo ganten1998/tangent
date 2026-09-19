@@ -715,7 +715,64 @@ owner said go on 2026-09-19; progress is marked here.
    read: the source question is closed. It does NOT mean a rendered block may
    be thrown away, which is a different question about a stateful sink and is
    step 5's.
-4. **NOT BUILT. The protocol was designed, attacked, and did not survive.**
+4. **THE TERMS ARE BUILT AND GREEN. THE SWITCH IS NOT.** Everything that had
+   to become true before a worker may hold a track across a block boundary is
+   done, each on its own, each with a test that sets the `leased` mask
+   directly and asserts the behaviour. The mask is zero in every build,
+   because nothing leases yet.
+   - `a8ea7c7` **the automation answers for the position it is asked about.**
+     This was the review's find and the one that would have been silent. It
+     was resolved once per block for ONE position into a single desk-wide
+     table, so a track worked on ahead and the tracks on the deadline could
+     not both be fed. The position-dependent half is a pure function now, for
+     the desk's own fader, pan, send and mute and for every automated plugin
+     parameter. The one-shot knob and preset road stays, and a track it lands
+     on is pinned by `param_lanes` anyway.
+   - `d58e6b1` **the pool is stopped before the desk is freed.** Field order
+     had the rack bank, the DX7s and the Keys dropped before the pool, so
+     teardown freed every seat and then stopped the threads that render into
+     them. An explicit `Drop` takes the pool first.
+   - `10dd7b2` **an instrument arriving for a held track waits.** The
+     sampler, DX7 and Keys rings and the patch queue all learned their track
+     only after taking the arrival. They look first now. The patch queue had
+     to change shape from `drain` to `retain`, because a drain takes every
+     entry before any track is looked at and the obvious gate would have
+     dropped a patch rather than deferring it.
+   - `7463ff6` **a plugin dropped onto a held track waits for it.** The swap
+     walk skips a held track's seats. The review's own design used a mask on
+     the shared state and had two faults in it; which track a seat belongs to
+     is arithmetic, so there is no table to keep in step and neither fault
+     exists.
+
+   **What is left is the switch itself, and it is one coherent piece:**
+   1. The per-track instrument feed moves to the worker. The decide walk
+      writes each track's instrument every block (Keys `set_patch`,
+      `set_params`, `set_pedal`, the DX7's pedal, and every note push). It is
+      not behind a ring and cannot be peeked. Step 3 is what made it
+      movable: it is per track now, where it used to touch a desk-wide pitch
+      ledger and a shared 256-entry list.
+   2. A second dispatch shape in `rtwork`. `LanePool::run`'s soundness
+      argument IS its barrier, stated three times in its own doc, so a
+      free-running worker needs `'static` per-track work records owned by the
+      pool, per-track ready flags, and an explicit happens-before edge in
+      place of the one the barrier supplies for free.
+   3. A per-track output ring, k blocks deep, keyed by SAMPLE POSITION and
+      block LENGTH rather than by block index.
+   4. The revoke and acknowledge handshake, and the rule that a track which
+      has not acknowledged is rendered by NOBODY that block. "Render it
+      serially instead" is the aliasing the handshake exists to forbid.
+   5. Step 5's invalidation contract, and the setting, default off.
+
+   **Two things to carry into that work.** No test in this repository can
+   detect a data race: there is no loom, no miri and no thread sanitiser
+   wiring, and the code is audio callbacks, plugin FFI and real-time threads,
+   so none of the three is cheap to add. The protocol has to be argued; what
+   is testable is gate coverage, and the four commits above are exactly that.
+   And `k` should be expressed in milliseconds rather than blocks: the
+   design's block-count formula gave a constant 10.67 ms at 512, 256, 128 and
+   64 frames and halved at 32, which is the one case worth having.
+
+   **The original design, for the record, did not survive its attack.**
    Three live faults it turned up on the way ARE fixed and shipped, because
    each stands alone and none of them is about the look-ahead:
    - `74c60fb` a worker that is late could claim a lane belonging to the NEXT
