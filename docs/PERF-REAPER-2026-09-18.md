@@ -715,11 +715,56 @@ owner said go on 2026-09-19; progress is marked here.
    read: the source question is closed. It does NOT mean a rendered block may
    be thrown away, which is a different question about a stateful sink and is
    step 5's.
-4. The ownership protocol: an epoch handshake, a per-lane swap arrival mask so
-   `swap_plugins` cannot free an instance under a worker, peek-don't-pop on the
-   dx7 / Keys / sampler / pending-voice rings, and a per-lane `DeskRef` copy.
-5. The invalidation contract, roughly sixteen terms, with per-lane and
-   per-span discard rather than a whole-ring one.
+4. **NOT BUILT. The protocol was designed, attacked, and did not survive.**
+   Three live faults it turned up on the way ARE fixed and shipped, because
+   each stands alone and none of them is about the look-ahead:
+   - `74c60fb` a worker that is late could claim a lane belonging to the NEXT
+     round and run it through the previous round's closure, which is a
+     `mix_channels` stack frame that has returned. One callback is several
+     chunks, so the rounds are microseconds apart. The claim word carries the
+     round now and a stale claim is refused.
+   - `cf942dd` a panic anywhere inside a lane's render skipped the line that
+     marks the lane done, and the barrier has no timeout and no exit, so the
+     audio callback spun and yielded for ever. The lane is marked from a
+     destructor now. The readiness count is handed back the same way.
+   - `cf942dd` a test asserting a workgroup-less pool is never ready was made
+     false on three platforms by step 6 and had no `cfg` guard.
+
+   **What the attack found in the protocol itself**, all of it fixable but
+   none of it built:
+   - The automation plan is impossible as written. `resolve_automation` runs
+     once per chunk for ONE position, clears the single desk-wide
+     `auto_params`, and destructively drains the `ui_params` ring, so a leased
+     lane at `at + k` and the pinned lanes at `at` cannot both be fed. That is
+     silent wrong audio. The fix is the move that worked twice already: the
+     CURVE half is position-pure (`curve.value_at(secs)`) and can be pulled
+     per lane for any position, while the `ui_params` half is one-shot and
+     already pins its lane through `param_lanes`. That split is step 4's real
+     first commit.
+   - The per-lane swap mask leaks a permanently sticky bit on
+     `hand_off_exchange`'s push-failure rollback, and cannot bound the walk it
+     replaces because `lane_of_seat` answers `None` for bus, master and pad
+     seats.
+   - Nothing in the state machine forces a leased lane back to free, so every
+     deferred operation can starve on a busy lane.
+   - Promoting `pinned_lanes` out of the probe loses three guards that are
+     only in its caller: a stopped transport, varispeed, and a stems export.
+   - The `k` formula gives a constant 10.67 ms at 512, 256, 128 and 64 frames
+     and 5.33 ms at 32, which is the one case the design calls the prize.
+
+   **The largest piece of ground nobody had named**, and it only became
+   possible because of step 3: the decide walk writes each lane's instrument
+   every block (Keys `set_patch` / `set_params` / `set_pedal`, the DX7's
+   pedal, and every note push). That is not behind a ring and cannot be
+   peeked; for a leased lane it has to MOVE to the worker. It could not have
+   moved before step 3, because it touched a desk-wide pitch ledger and a
+   shared 256-entry list. Now it is per lane and can travel with the lane.
+
+5. **NOT BUILT.** The invalidation contract for the RENDER. Note that the
+   SOURCE's contract is empty after steps 2 and 3, which is a different and
+   much smaller thing. The discard rate is still the one number nobody has,
+   and it can only come from a live session: the counters ship behind
+   `TANGENT_PROBE=1` and read out in the audio panel.
 6. **DONE, and it applies to the already-shipped fan-out, not only to the
    look-ahead.** Windows gets the Multimedia Class Scheduler Service ("Pro
    Audio" at CRITICAL, with the handle returned on the thread that took it);
