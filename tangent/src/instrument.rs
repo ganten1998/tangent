@@ -4487,6 +4487,94 @@ mod engine_parts {
         );
     }
 
+    /// **The lane index narrows the walk and never changes the sum.**
+    ///
+    /// The clip list is sorted by lane on the host thread so the audio thread
+    /// can hand each lane its own run instead of walking the whole
+    /// arrangement once per lane. Two things have to hold. The sort must be
+    /// STABLE, because two clips overlapping on one lane are summed with `+=`
+    /// and f32 addition is not associative, so their order is the sum. And a
+    /// list that is not sorted must still produce the right mix, slowly,
+    /// rather than the wrong mix quickly.
+    #[test]
+    fn the_lane_index_narrows_the_walk_and_never_changes_the_sum() {
+        use std::path::PathBuf;
+        let mk = |strip: usize, start: u64, gain: f32, seed: f32| Placed {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: (0..2_000).map(|i| seed + i as f32 * 1e-4).collect(),
+                rate: 48_000,
+                source: PathBuf::from("run.wav"),
+            }),
+            strip,
+            start,
+            offset: 0,
+            len: 900,
+            fade_in: 32,
+            fade_out: 64,
+            gain,
+        };
+        // Deliberately NOT in lane order, and with two on one lane whose
+        // relative order decides the last bits.
+        let unsorted = vec![
+            mk(7, 0, 0.9, 0.5),
+            mk(2, 100, 1.1, -0.25),
+            mk(7, 200, 0.4, 0.125),
+            mk(0, 0, 1.0, 0.75),
+            mk(2, 300, 0.7, -0.5),
+        ];
+        let mut sorted = unsorted.clone();
+        sorted.sort_by_key(|p| p.strip.min(CHANNELS - 1));
+
+        // The table: absent for the unsorted list, present and exact for the
+        // sorted one.
+        assert!(
+            lane_bounds(&unsorted).is_none(),
+            "a list that is not lane-monotonic was given a bounds table"
+        );
+        let at = lane_bounds(&sorted).expect("a sorted list has bounds");
+        assert_eq!(at[0], 0);
+        assert_eq!((at[1] - at[0], at[3] - at[2], at[8] - at[7]), (1, 2, 2));
+        assert_eq!(at[CHANNELS], sorted.len() as u32);
+        for ch in 0..CHANNELS {
+            for placed in lane_run(&sorted, Some(&at), ch) {
+                assert_eq!(
+                    placed.strip.min(CHANNELS - 1),
+                    ch,
+                    "lane {ch}'s run holds another lane's clip"
+                );
+            }
+        }
+        assert!(
+            lane_bounds(&[]).is_some_and(|b| b.iter().all(|v| *v == 0)),
+            "an empty list has an empty table, not none at all"
+        );
+
+        // And the sum does not move, three ways: unsorted with no table,
+        // sorted with no table, sorted through the table.
+        let frames = 256usize;
+        let pull = |clips: &[Placed], table: Option<&[u32; CHANNELS + 1]>| {
+            let mut out = vec![vec![0.0f32; frames]; TAP_CHANNELS];
+            let mut all = Vec::new();
+            for ch in 0..CHANNELS {
+                pull_lane_clips(lane_run(clips, table, ch), ch, 150, frames, u64::MAX, &mut out);
+                all.extend(out[0].iter().copied());
+                all.extend(out[1].iter().copied());
+            }
+            all
+        };
+        let base = pull(&unsorted, None);
+        assert!(base.iter().any(|v| *v != 0.0), "the fixture made no sound");
+        for (name, got) in [
+            ("the sort", pull(&sorted, None)),
+            ("the index", pull(&sorted, Some(&at))),
+        ] {
+            assert!(
+                base.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{name} moved a bit"
+            );
+        }
+    }
+
     /// **Nothing a worker owns may advance a ring the timeline clocks.**
     ///
     /// Both delay compensation lines used to run at the end of `render_lane`
@@ -5371,6 +5459,7 @@ struct DeskRef<'a> {
     /// is moving.
     clips_rolling: bool,
     punch: &'a [u64; CHANNELS],
+    clip_first: Option<&'a [u32; CHANNELS + 1]>,
     auto_params: &'a [Vec<tangent_host::ParamPoint>],
     shared: &'a Shared,
     key_prev: &'a [f32],
@@ -5393,6 +5482,46 @@ struct DeskRef<'a> {
 /// Answers whether the lane produced anything to fold. `false` is every one
 /// of the three ways the old body reached its `continue`: a scratch too
 /// short for the block, and an inactive instrument on a bare lane.
+/// Where each lane's run begins in a lane-sorted clip list, and `None` if the
+/// list is not sorted by lane.
+///
+/// One counting pass, taken when a list arrives and never per block. The
+/// `None` is not defensive tidiness: `Engine::set_clips` sorts, but a test or
+/// a future caller that pushes a list another way must get the right mix
+/// slowly rather than the wrong mix quickly.
+fn lane_bounds(clips: &[Placed]) -> Option<[u32; CHANNELS + 1]> {
+    let mut at = [0u32; CHANNELS + 1];
+    let mut last = 0usize;
+    for (i, placed) in clips.iter().enumerate() {
+        let lane = placed.strip.min(CHANNELS - 1);
+        if lane < last {
+            return None;
+        }
+        if lane > last {
+            let start = u32::try_from(i).ok()?;
+            for slot in at.get_mut(last + 1..=lane)? {
+                *slot = start;
+            }
+            last = lane;
+        }
+    }
+    let end = u32::try_from(clips.len()).ok()?;
+    for slot in at.get_mut(last + 1..)? {
+        *slot = end;
+    }
+    Some(at)
+}
+
+/// The slice of `clips` that can hold lane `ch`, or the whole list when there
+/// is no table. Narrowing only: the pull filters by strip regardless.
+fn lane_run<'a>(clips: &'a [Placed], first: Option<&[u32; CHANNELS + 1]>, ch: usize) -> &'a [Placed] {
+    let Some(at) = first else { return clips };
+    let (Some(a), Some(z)) = (at.get(ch), at.get(ch + 1)) else {
+        return clips;
+    };
+    clips.get(*a as usize..*z as usize).unwrap_or(clips)
+}
+
 /// **One LANE's timeline audio for one span, as a pure function of that span.**
 ///
 /// The per-lane twin of [`fill_clip_span`], and the shape the rest of the
@@ -5526,7 +5655,7 @@ fn render_lane(
         let clip_here = has_audio && !room_owns && desk.clips_rolling;
         if clip_here {
             pull_lane_clips(
-                desk.clips,
+                lane_run(desk.clips, desk.clip_first, ch),
                 ch,
                 desk.clips_at,
                 frames,
@@ -7024,6 +7153,16 @@ struct Renderer {
     /// timeline sees one value. Written where `mix_clips` used to read the
     /// atomics inline, and read by both pull sites.
     punch_now: [u64; CHANNELS],
+    /// **Where each lane's clips begin in `clips`**, one past the end at
+    /// `CHANNELS`. `None` when the list is not lane-monotonic, which a host
+    /// that forgot to sort would produce and which must not be a wrong mix.
+    ///
+    /// Correctness never depends on it: `pull_lane_clips` skips clips whose
+    /// strip is not the lane it was asked about, so the table only ever
+    /// narrows the walk. It exists because the pull happens once per lane
+    /// rather than once per desk, and without it a desk of N clips costs 32N
+    /// intersection tests instead of N.
+    clip_first: Option<[u32; CHANNELS + 1]>,
     /// **APPENDED — which lanes have audio standing on them anywhere on the
     /// timeline**, one bit per channel. Recomputed once a block from the
     /// clip list rather than asked per lane, because the channel walk asks
@@ -9730,8 +9869,9 @@ impl Renderer {
                 // Pulled for THIS block, into a scratch of its own: the read
                 // below is inside a per-sample loop that also advances the
                 // monitor's smoother, so it cannot be streamed.
+                let run = lane_run(&self.clips, self.clip_first.as_ref(), lane.min(CHANNELS - 1));
                 pull_lane_clips(
-                    &self.clips,
+                    run,
                     lane.min(CHANNELS - 1),
                     at,
                     n,
@@ -10477,6 +10617,7 @@ impl Renderer {
             if let Ok(next) = self.track_incoming.pop() {
                 let old = std::mem::replace(&mut self.clips, next);
                 let _ = self.track_retiring.push(old);
+                self.clip_first = lane_bounds(&self.clips);
             }
         }
         // **The punch, once a block, before anything can return early.** Two
@@ -12289,6 +12430,7 @@ impl Renderer {
                 clips_at: at,
                 clips_rolling: rolling,
                 punch: &self.punch_now,
+                clip_first: self.clip_first.as_ref(),
                 auto_params: &self.auto_params,
                 shared: &self.shared,
                 key_prev: &self.key_prev,
@@ -14349,6 +14491,7 @@ impl Engine {
             ir_phase: 0.0,
             clip_room: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             punch_now: [u64::MAX; CHANNELS],
+            clip_first: None,
             clip_lanes: 0,
             clip_under: 0,
             dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
@@ -16660,7 +16803,17 @@ impl Engine {
     /// not come) is parked, retried by the tick, and replaced by anything
     /// newer that arrives meanwhile — the list that would have been
     /// overtaken anyway. `track_loaded` is stored at the call, as before.
-    pub fn set_clips(&mut self, clips: Vec<Placed>) {
+    pub fn set_clips(&mut self, mut clips: Vec<Placed>) {
+        // **Sorted by lane, here on the host thread**, so that the audio
+        // thread can hand each lane its own run instead of walking the whole
+        // arrangement once per lane. Sorting costs nothing where allocation
+        // is already free, and the audio side keeps a bounds table.
+        //
+        // **STABLE, and that is arithmetic and not taste.** Two clips
+        // overlapping on one lane are summed with `+=` and f32 addition is
+        // not associative, so within-lane order IS the sum. An unstable sort
+        // reorders equal keys and moves the last bits of somebody's mix.
+        clips.sort_by_key(|p| p.strip.min(CHANNELS - 1));
         // Whatever came back earlier is dropped first, so the ring always has
         // room and two rapid loads cannot wedge.
         while self.track_from_audio.pop().is_ok() {}
@@ -20090,6 +20243,7 @@ mod tests {
             ir_phase: 0.0,
             clip_room: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             punch_now: [u64::MAX; CHANNELS],
+            clip_first: None,
             clip_lanes: 0,
             clip_under: 0,
             dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
