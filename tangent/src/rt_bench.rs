@@ -831,13 +831,35 @@ fn rt_bench() {
     //
     // Thirty-two lanes of three bays. Skipped, with a line, wherever the
     // plugin is not installed or will not instantiate in a test process.
-    const GATE_PLUGIN: &str = "/Library/Audio/Plug-Ins/VST3/Rev PLATE-140.vst3";
-    if Path::new(GATE_PLUGIN).exists() {
+    //
+    // **`TANGENT_GATE_PLUGIN` names another one**, and `TANGENT_GATE_STATE` a
+    // sidecar to seat it with. Both exist for the head-to-head against
+    // another host: a comparison is only worth having if BOTH sides run the
+    // same plugin at the same settings, and the other host cannot be asked to
+    // run this one at ITS defaults.
+    let gate_plugin = std::env::var("TANGENT_GATE_PLUGIN")
+        .unwrap_or_else(|_| "/Library/Audio/Plug-Ins/VST3/Rev PLATE-140.vst3".to_owned());
+    let gate_state: Option<Vec<u8>> = std::env::var("TANGENT_GATE_STATE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::fs::read(&p).ok())
+        .map(|raw| match raw.iter().position(|b| *b == 0) {
+            // A Tangent sidecar is `<bundle path>\0<container>`; anything
+            // else is handed over whole.
+            Some(at) if raw[..at].starts_with(b"/") => raw[at + 1..].to_vec(),
+            _ => raw,
+        });
+    if Path::new(&gate_plugin).exists() {
         let mut e = audio_desk(32, &[]);
         let mut ok = true;
         'seat: for lane in 0..32 {
             for bay in 0..3 {
-                match e.load_insert(lane, bay, Some(Path::new(GATE_PLUGIN)), None) {
+                match e.load_insert(
+                    lane,
+                    bay,
+                    Some(Path::new(&gate_plugin)),
+                    gate_state.as_deref(),
+                ) {
                     Ok(Some(_)) => {}
                     Ok(None) => {
                         println!("note: the gate plugin loaded but lane {lane} bay {bay} reports no tenant");
@@ -853,11 +875,19 @@ fn rt_bench() {
             }
         }
         if ok {
-            let name = Path::new(GATE_PLUGIN)
+            let name = Path::new(&gate_plugin)
                 .file_stem()
-                .map_or_else(|| GATE_PLUGIN.to_owned(), |s| s.to_string_lossy().into_owned());
+                .map_or_else(|| gate_plugin.to_owned(), |s| s.to_string_lossy().into_owned());
             rows.push(measure(&format!("96 bays x {name} (VST3)"), &mut e, WARMUP, BLOCK));
             rows.push(measure(&format!("96 bays x {name} (VST3) @ 64 fr"), &mut e, WARMUP, 64));
+            // **The same desk at bigger grains**, which is not a deadline
+            // question at all: it is how much of this shape's cost is PER
+            // BLOCK rather than per frame. A host that renders offline
+            // chooses its own grain and pays the per-block part far less
+            // often, so the throughput gap between this engine and another
+            // one is mostly this number. See `docs/PERF-REAPER-2026-09-18.md`.
+            rows.push(measure(&format!("96 bays x {name} (VST3) @ 256 fr"), &mut e, WARMUP, 256));
+            rows.push(measure(&format!("96 bays x {name} (VST3) @ 512 fr"), &mut e, WARMUP, 512));
         }
         // Emptied by hand before the engine drops, so the plugins are torn
         // down on this thread rather than with the renderer.
