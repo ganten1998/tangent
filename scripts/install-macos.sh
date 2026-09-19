@@ -96,6 +96,25 @@ if [ -d "$DEST" ]; then
     echo "      remove it with:  sudo rm -rf /Library/Audio/Plug-Ins/VST3/Tangent.vst3"
   fi
   echo "==> Replacing $OLD with $VERSION"
+  # **Can this shell still write inside an app bundle?**
+  #
+  # macOS 26 brought App Management: a process may not modify another app's
+  # bundle in /Applications unless the user has granted it that permission in
+  # System Settings. A terminal usually has not, and the refusal is EPERM on
+  # every write, including `mkdir Contents` and a bare `touch`.
+  #
+  # That turned the in-place replace below into a one-way trip: the contents
+  # were deleted, because DELETING an app is allowed so that people can
+  # uninstall one, and then the copy could not land. It left
+  # /Applications/Tangent.app an empty directory and the machine with no
+  # installed app, which is precisely the failure the whole ordering at the
+  # top of this script exists to prevent. It is checked here rather than
+  # discovered, and the probe runs BEFORE anything is removed.
+  IN_PLACE=0
+  if touch "$DEST/.tangent-install-probe" 2>/dev/null; then
+    rm -f "$DEST/.tangent-install-probe"
+    IN_PLACE=1
+  fi
   # The number the whole exercise is about. Compared after the copy, so the
   # claim "the alias still resolves" is CHECKED rather than assumed.
   INODE_BEFORE=$(stat -f %i "$DEST" 2>/dev/null || echo "")
@@ -117,7 +136,23 @@ if [ -d "$DEST" ]; then
   # MERGES, so a file that existed in the old version and not in the new one
   # would otherwise survive into the installed bundle and break its
   # signature.
-  find "$DEST" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  if [ "$IN_PLACE" = 1 ]; then
+    find "$DEST" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  else
+    # **The bundle goes whole, and its inode with it.** Every alias made to
+    # this app - SoundSource's exclusion, Loopback's source, a Dock item, a
+    # login item - is a reference to the directory that was there when the
+    # rule was made, so each of those has to be re-pointed once after this.
+    # The alternative is refusing to install at all, which is worse.
+    echo "NOTE: this shell cannot write inside an app bundle, so the bundle is"
+    echo "      being replaced rather than refilled, and its identity changes."
+    echo "      Aliases to Tangent (SoundSource exclusions, Loopback sources,"
+    echo "      Dock and login items) need re-pointing once after this."
+    echo "      To keep the identity across installs instead, grant this"
+    echo "      terminal App Management in System Settings > Privacy &"
+    echo "      Security > App Management, and run this again."
+    rm -rf "$DEST"
+  fi
 else
   echo "==> Installing $VERSION"
 fi
@@ -132,6 +167,9 @@ ditto "$APP" "$DEST"
 if [ ! -x "$DEST/Contents/MacOS/tangent" ]; then
   echo "error: the copy did not land — $DEST has no executable." >&2
   echo "       The build is still in $APP; re-run this script." >&2
+  echo "       If this says 'Operation not permitted', it is App Management:" >&2
+  echo "       grant this terminal App Management in System Settings >" >&2
+  echo "       Privacy & Security, or remove $DEST by hand and re-run." >&2
   exit 1
 fi
 
