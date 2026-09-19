@@ -880,3 +880,125 @@ the feature.
 **Expected gain.** Structural rather than arithmetic: it removes non-armed lanes from the per-block deadline entirely, which is the only mechanism that closes the remaining distance to REAPER's shipped configuration. Stage one divides the serial sum by about 5; stage two makes the per-block figure the PINNED set only. In a mixing session, where the owner's own usage is 0 to 2 armed lanes, that is nearly the whole desk. In a tracking session with 8 to 18 armed inputs on the Scarlett it buys close to nothing, and stage one is what carries that case; state that in the acceptance so the win is not oversold. No measurement supports a specific multiplier here, because no look-ahead exists to measure; the gate is the 30%-of-deadline rung and the device-bench parity number, not a projection.
 
 **Risk.** HIGHEST IN THE PLAN, and the evidence says so directly: three of the four threading-seam findings were refuted by BOTH verifiers, every one of them for an incomplete enumeration that would have shipped a bug (room_rack cannot authorise a future block; key_prev does not exist for one; tempo is a live per-block input; varispeed makes chunk lengths unpredictable; the punch and the MIDI-editor rule mean the live set is not the armed set). Build nothing here until lane 1's meter can score it and lane 5's fan-out is green, and derive the eligibility mask from the corrected rule in the contract rather than from the original map. Behaviour changes the owner WILL notice, all of which REAPER also has and which must be accepted deliberately: a knob turned on a pre-rendered lane lands up to a look-ahead late or forces a re-render spike at the moment of touch; arming mid-roll discards blocks a stateful chain has already consumed, so a compressor envelope or reverb tail belongs to audio nobody heard and a click is possible; the first live note after arming can land a look-ahead late (8 chunks at 128 frames is 21 ms, 43 ms at 256), which is the same perceptual territory as the 3 to 10 ms delay the MIDI fast lane was built to kill; every loop wrap and seek re-renders its first block on the real-time thread. Memory: 200 ms of look-ahead is about 75 KB per lane and 2.46 MB for 32 lanes, which is nothing. The handoff machinery itself measured 0.31 us per block for 16 lanes, 0.012% of the deadline, so none of the risk is in the bookkeeping.
+
+---
+
+# 2026-09-19: the head-to-head, at last, and what it says
+
+The sweep had no REAPER number. It has one now, taken on the owner's own
+machine with the same plugin at the same settings on both sides.
+
+## The shape
+
+32 tracks, 3 FabFilter Pro-R 2 per track (96 instances), 12 s of noise,
+48 kHz. The plugin and its state come from the owner's own
+`jaco1.RfxChain`, so REAPER's copy and Tangent's copy are the same preset:
+REAPER's `<VST>` payload is a 68-byte wrapper around the plugin's own
+`FFBS` blob, and that blob was re-wrapped in a `TGST` container and handed
+to `Engine::load_insert` through the new `TANGENT_GATE_PLUGIN` /
+`TANGENT_GATE_STATE` doors on `rt_bench`.
+
+REAPER is driven by `-renderproject` on a project file written here. It
+needs no ReaScript and touches nothing of the user's.
+
+**Two ways to get this wrong, both hit before the number was believed.**
+A `<VST>` block with no base64 payload is silently ignored: the render came
+out FASTER than the no-FX control with identical CPU, and the output file
+differed only because REAPER dithers, which two renders of the identical dry
+project also do. And `RENDER_SRATE`, `RENDER_CHANNELS` and `RENDER_TAILMS`
+are ReaScript property names, not project-file tokens: REAPER answers them
+with a modal "3 elements not understood", renders at its last-used rate
+(44.1 kHz, resampling every track), and the run takes 413 s. The project
+sample rate is `SAMPLERATE 48000 1 0`, where the middle field forces it.
+
+## The numbers
+
+REAPER, wall clock, average of repeats:
+
+    32 tracks, no plugins                      1.77 s
+    32 tracks x 3 Pro-R 2 (96 instances)       5.61 s    25.5 s of CPU
+    => the plugins cost                        3.3-3.8 s of wall per 12 s
+
+Tangent, `rt_bench`, mean us per block x blocks per 12 s:
+
+    grain    mean us   us/frame   wall/12 s   % of a 128 fr deadline
+    64          1114.2    17.41      10.03 s      126.5%   (41/2000 over)
+    128         1583.9    12.37       7.13 s       83.8%   (0 over)
+    256         2162.8     8.45       4.87 s       44.6%   (0 over)
+    512         2791.5     5.45       3.14 s       33.3%   (0 over)
+
+## What it says, which is not what either side of the argument expected
+
+**The DSP is level.** At the grain REAPER's offline render chooses for
+itself, Tangent renders the same desk in 3.14 s against REAPER's 3.3 to
+3.8 s. There is no engine deficit to close.
+
+**The whole difference is GRAIN SIZE**, and it is large: 5.45 us per frame
+at 512 frames against 17.41 at 64, a factor of 3.2. Tangent's grain is the
+callback's chunk, capped at `MAX_BLOCK`; REAPER's offline render picks its
+own, and REAPER's LIVE grain is picked by anticipative FX, which is the
+feature this document is about.
+
+So the case for the look-ahead is not "Tangent is slower than REAPER". It
+is exactly and only this: **it would give a 64-frame session the CPU
+efficiency of a 512-frame one**, measured at 3.2x on this desk, while the
+output latency stays at 64 frames. On the same desk today, 64 frames misses
+the deadline on 41 blocks in 2000 and 512 frames uses a third of it.
+
+That is also the honest limit of the claim. On the 96 x Rev PLATE-140 rung
+the fork alone already passes at 43.2% of the deadline at 128 frames and
+58.1% at 64, so the feature buys that desk nothing. It pays on the heavier
+desk, at the smaller buffer, and nowhere else.
+
+# 2026-09-19: the pipeline design, and why it is not the one in the plan above
+
+Speculate-and-discard - render a future block, throw it away when the desk
+moves - cannot work, and the reason is not in the plan above. The plan says
+a discard is free because step 1 moved the PDC delay line to consumption.
+That is true of the delay line and of nothing else: **every stateful unit in
+the lane's rack has also advanced**, a reverb's delay lines, a compressor's
+envelope, a hosted VST3's everything. None can be rewound and none can be
+snapshotted on the audio thread. Re-rendering after a discard runs those
+units over the same samples twice.
+
+The replacement is a PIPELINE: each lane rendered exactly once, n grains
+before the fold needs it, nothing speculative and nothing discarded. Five
+adversarial reads of it against this code found it does not survive as
+written either, and the findings are worth more than the design was:
+
+1. **There is no ring, and the ring is the design.** `lane_out[ch]` is ONE
+   row that is the render's seed, the render's output, the PDC's in-place
+   buffer at consumption and the fold's source (`:12813`, `:11778`,
+   `:13036`). Same for `lane_dry`. `LanePrep` and `lane_folds` are
+   single-slot decide-walk state read at consumption, so the fold would
+   apply the wrong grain's decisions. They must travel WITH the grain.
+2. **Raw pointers into `Renderer`'s fields are invalidated by the next
+   callback.** The plan rules out `*mut Renderer` and then commits the same
+   error one level down: `mix_channels` re-carves the whole rack bank with
+   three `split_at_mut` and six `iter_mut` EVERY chunk for all 32 lanes
+   (`:12805-12815`). The lane banks have to leave `Renderer` for a
+   pool-owned `Arc<LaneBank>` of `UnsafeCell`s the callback never reborrows.
+3. **`leased` is not the universal gate it is described as.** It gates four
+   arrival rings and `swap_plugins`. It does not gate `mix_monitor`'s
+   `&mut self.racks[ch]`, `fold_folders`, the flush's `all_notes_off` sweep
+   over every instrument (`:8427`), the decide walk's per-lane instrument
+   feed, or the decide walk's own `racks[ch].is_empty()` /
+   `holds_a_voice()` / `rack_holds_amp()` - and that last is every block.
+4. **`Gate` cannot be shared between the two dispatch shapes.** `run`
+   STORES the whole `owed` word and zeroes `done` (`rtwork.rs:655`), so a
+   still-outstanding lane loses its bit and its `MarkDone` makes `done`
+   never equal `lanes`: the callback spins for ever.
+5. **The pin set is one chunk LATE and the pipeline needs it n chunks
+   EARLY.** `room_rack` and `board_live` say so in their own docs
+   (`:5264`, `:7545`, `:7614`): "good enough to COUNT with and not good
+   enough to render on". Arming a track, plugging in a guitar or dragging a
+   send is a present-tense action. The best available answer is that arming
+   becomes a flush point with one chunk of dry monitoring, which is a
+   user-facing behaviour change and has to be accepted deliberately.
+
+And one correction to the cost list above: a flush is not merely "n grains
+of rack state past the abandoned position". It deletes note-offs whose
+`told` entry the decide walk has already cleared, pedal edges already marked
+sent, and knob points already popped destructively off `ui_params` - so a
+locate would leave a stuck note, a stuck damper and a lost plugin edit. The
+decide walk's edge state has to commit at COLLECT, not at dispatch.

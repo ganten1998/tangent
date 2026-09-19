@@ -10,7 +10,40 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A session with a piano in it no longer opens with a quiet high C
+  playing.** Every hosted instrument is warmed up at load: it is played a
+  test note and listened to, because several will render silence for
+  seconds after they report being ready and there is no way to ask them.
+  The note is a C7, and the drain that clears it afterwards counted a block
+  as quiet once it fell below the level that answers "is this instrument
+  making a sound at all" - which is the wrong question, and its answer is a
+  quiet note rather than silence. The instance then crossed to the audio
+  thread still decaying, so the note was heard on every open of a session
+  with a piano in it and printed into renders of one.
+
+  The drain now waits for real silence, and the instrument is flushed first
+  by the same means a panic button uses, which turns out to clear it in a
+  single block. The measured level a rack is handed went from -40 dBFS to
+  -180, and loading each bay got faster, not slower, because the drain
+  finishes at once instead of waiting out eight blocks of decay.
+
 ### Changed
+
+- **A session carries its theme.** The theme and the channel palette were
+  settings of the machine, so a project opened wearing whatever the last
+  one left behind. They travel in the document now, beside the desk, the
+  rack and the editor's feel that moved there before them. Changing a theme
+  is a session edit and undoes like one.
+
+  What travels is the theme's NAME, not its colours, which is what the app
+  already meant by a theme: hand-edit a colour and you have a modified
+  theme, and saving it under a name is how you keep it. A project written
+  before this opens on whatever theme is live and records it at the next
+  save, and a project naming a theme that has since been deleted opens on
+  the default.
+
 
 - **The IR reverb costs less than half what it did, and the reverbs on a
   desk stop landing on the same block.** Two separate faults, both in the
