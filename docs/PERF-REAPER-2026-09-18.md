@@ -720,8 +720,21 @@ owner said go on 2026-09-19; progress is marked here.
    dx7 / Keys / sampler / pending-voice rings, and a per-lane `DeskRef` copy.
 5. The invalidation contract, roughly sixteen terms, with per-lane and
    per-span discard rather than a whole-ring one.
-6. Real-time policies for Windows, Linux and FreeBSD, or the whole thing is
-   macOS-only, exactly as the shipped fork is today.
+6. **DONE, and it applies to the already-shipped fan-out, not only to the
+   look-ahead.** Windows gets the Multimedia Class Scheduler Service ("Pro
+   Audio" at CRITICAL, with the handle returned on the thread that took it);
+   Linux and FreeBSD get `SCHED_FIFO` at a quarter of the way up the class,
+   deliberately below the callback it serves. The readiness bar is unchanged
+   in kind: a worker counts only with a real-time policy, and the workgroup
+   half is tested only where a workgroup exists, which is macOS. `EPERM` on a
+   desktop with no `RLIMIT_RTPRIO` means no pool, which is the same answer
+   macOS gives a refused join.
+
+   Verified by cross-compiling: the Linux target type-checks clean through
+   `scripts/build-cross.sh check-linux`, and the Windows branch type-checks
+   against `x86_64-pc-windows-msvc` directly (the full Windows crate cannot
+   cross-check here, because an unrelated C dependency needs a toolchain this
+   machine does not have). Neither has been RUN on its platform.
 
 **The one number still missing is the tax**, and it is the only one that can
 make this not worth it: how often the ring is thrown away. Every automation
