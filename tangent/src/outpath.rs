@@ -122,6 +122,17 @@ pub use mac::{nominal_rate, OverloadWatch};
 #[cfg(target_os = "macos")]
 pub use mac::probe;
 
+/// See `mac::device_id`. Off macOS there is no HAL to ask, so nothing can
+/// be resolved and `rtwork` finds no workgroup, which is the same answer.
+#[cfg(target_os = "macos")]
+pub(crate) use mac::device_id;
+
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+pub(crate) fn device_id(_device: Option<&str>) -> Option<u32> {
+    None
+}
+
 #[cfg(target_os = "macos")]
 mod mac {
     use super::OutputPath;
@@ -336,6 +347,14 @@ mod mac {
     }
 
     /// The device the monitor is playing into, by the name it was opened with.
+    /// The HAL's id for the device the engine opened, by the name it
+    /// reported. Crate-visible so `rtwork` can ask the same device for its
+    /// IO workgroup: one resolver, so the overload watch and the worker
+    /// pool can never end up watching and joining two different boxes.
+    pub(crate) fn device_id(device: Option<&str>) -> Option<AudioObjectID> {
+        resolve(device)
+    }
+
     fn resolve(device: Option<&str>) -> Option<AudioObjectID> {
         let Some(wanted) = device else {
             // No name means the app took the system default, which is what

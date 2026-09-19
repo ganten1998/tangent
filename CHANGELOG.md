@@ -12,6 +12,32 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **The desk renders on several cores instead of one.** Every lane's
+  instruments, pedalboard, plugin chain and delay line used to run one after
+  another inside the CoreAudio callback, so a block cost the sum of
+  everything the desk held while the other fourteen cores did nothing. The
+  lane pass is three walks now: one that decides, which touches the state
+  the whole desk shares and stays a single walk; one that renders, which
+  touches nothing but a lane's own seats and its own row of output, and
+  which forks across a pool of worker threads; and one that folds, in
+  ascending lane order. Measured on this machine at 128 frames with the
+  fan-out forced on and no device open: sixteen lanes of EQ, compressor and
+  plate went from 145 to 66 microseconds a block, sixteen denoisers from 183
+  to 76, and eight lanes of the Analog synth at eight voices each from 523
+  to 160. The sum is bit-identical either way, which is what the ascending
+  fold buys, and a test asserts it sample for sample rather than to a
+  tolerance.
+
+  **The workers are real-time threads or there are no workers.** Each one
+  takes a mach time-constraint policy derived from the block the device
+  granted and joins that device's own IO workgroup; a worker that fails
+  either does not count, and a pool that is short renders serially instead.
+  That is not caution. Fifteen ordinary threads measured worse than the
+  single walk they would replace, one of them taking a whole deadline in a
+  single block. Off macOS, and on any device that publishes no workgroup,
+  nothing is ever ready and the engine renders exactly as it did.
+  `TANGENT_FANOUT=0` turns it off.
+
 - **Ten themes: seven replaced and three retuned.** The owner's list, in
   his words: Valentine keeps its slot with more red, "like the original TUI
   application"; Sandstone keeps its slot with a darker sand, because "even
@@ -63,6 +89,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   a real take too.
 
 ### Fixed
+
+- **An export no longer freezes the window before its first sample.** Seven
+  engine setters wait for the audio thread to hand back what they replaced,
+  giving up after 250 ms. An offline engine has no audio thread, so every
+  one of those waits ran to the full quarter second and then shrugged, and
+  an export furnishes every seat it holds before it renders anything: at
+  forty-eight seats that is twelve seconds of a frozen window with the
+  progress bar at zero and nothing to say why. The wait is skipped where
+  there is no callback to wait for. Nothing is leaked by it, because the
+  renderer's own teardown drops whatever the wait did not collect, which is
+  what the wait's own note already said.
 
 - **A noise print learned on Spectral Studio or Live now works on Bank.**
   The spectral kernels freeze each band at the geometric mean of a

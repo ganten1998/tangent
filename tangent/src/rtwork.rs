@@ -531,11 +531,34 @@ impl LanePool {
             work(ch);
             self.gate.done.fetch_or(1u32 << ch, Ordering::AcqRel);
         }
-        // The barrier. A spin rather than a condvar: what is left is a worker
-        // finishing a lane it already holds, which is microseconds, and a
-        // park here would cost more than it saves.
+        // ── the barrier, and why it is not a bare spin ──────────────────
+        //
+        // What is left at this point is a worker finishing a lane it already
+        // holds, which is microseconds, so a few hundred spins is the right
+        // first answer and a condvar would cost more than it saves.
+        //
+        // **But a real-time thread that only spins can starve the very
+        // worker it is waiting for.** That is not hypothetical: the first
+        // version of this loop was a bare `spin_loop`, and under the test
+        // suite - many processes, more real-time threads than cores - it
+        // wedged a whole test binary at 99% of one core for nine minutes,
+        // with its four workers parked at priority 97 and unable to get the
+        // CPU to finish. On a machine with a game or a browser on it, that
+        // is the same shape as a hang.
+        //
+        // So the spin is bounded and then the thread yields. Yielding from
+        // an audio callback is ordinarily forbidden; here it is the
+        // opposite, because everything this thread is waiting for is another
+        // thread in the same workgroup with the same deadline, and giving
+        // one of them the core IS the progress this thread wants.
+        let mut spins = 0u32;
         while self.gate.done.load(Ordering::Acquire) != lanes {
-            std::hint::spin_loop();
+            spins = spins.saturating_add(1);
+            if spins < SPINS_BEFORE_YIELD {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
         }
     }
 }
@@ -552,6 +575,13 @@ impl Drop for LanePool {
         }
     }
 }
+
+/// How long the barrier spins before it starts yielding the core.
+///
+/// A few microseconds on this machine, which covers a worker that is nearly
+/// done, and short enough that a worker which has not been scheduled at all
+/// gets the core rather than the spinner. See `LanePool::run`.
+const SPINS_BEFORE_YIELD: u32 = 2_000;
 
 /// The set bits of `lanes`, low to high.
 fn lane_iter(lanes: u32) -> impl Iterator<Item = usize> {

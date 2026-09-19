@@ -249,6 +249,61 @@ fn measure(name: &str, e: &mut Engine, warmup: usize, block: usize) -> Stats {
     s
 }
 
+/// **The fork renders what the single walk rendered.**
+///
+/// The one property that matters more than any microsecond: a desk rendered
+/// on four threads must come out as a desk rendered on one. Two engines with
+/// the same lanes, the same clips and the same inserts, one with a pool and
+/// one without, rendered block for block and compared sample for sample.
+///
+/// Asserted BIT-EXACT rather than to a tolerance, which is a stronger claim
+/// than the fan-out strictly needs and is available because the fold was
+/// kept ascending: `mix` and `aux` are accumulated with `+=`, f32 addition
+/// is not associative, and ascending order is the single walk's own order.
+/// The day that stops holding, this test says so rather than a listener.
+///
+/// Not `#[ignore]`d: it is seconds, and it is the test that would catch a
+/// missed private buffer, which is the failure this whole change risks.
+#[test]
+fn the_fork_renders_what_the_single_walk_rendered() {
+    let shapes: [(&str, fn() -> Engine); 4] = [
+        ("16 lanes x 3 EQ", || audio_desk(16, &["@tangent-eq", "@tangent-eq", "@tangent-eq"])),
+        ("16 lanes x [EQ, comp, plate]", || {
+            audio_desk(16, &["@tangent-eq", "@tangent-comp", "@tangent-plate"])
+        }),
+        ("16 lanes x denoise", || audio_desk(16, &["@tangent-denoise"])),
+        ("8 lanes x Analog", || instrument_desk(8, "@tangent-analog", 8)),
+    ];
+    for (name, build) in shapes {
+        let mut one = build();
+        let mut many = build();
+        one.set_offline_fanout(false);
+        many.set_offline_fanout(true);
+        let n = BLOCK * 2;
+        let mut a = vec![0.0f32; n];
+        let mut b = vec![0.0f32; n];
+        // Enough blocks for every delay line, envelope and reverb tail in
+        // the chain to be carrying state, so a buffer shared between two
+        // lanes has had every chance to show. A shared buffer shows in the
+        // first block, not the fiftieth; the rest is for the stateful
+        // chains. Two hundred costs a tenth of a second now that an
+        // offline engine no longer waits on a callback it does not have.
+        for block in 0..200 {
+            one.render_offline(&mut a);
+            many.render_offline(&mut b);
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert!(
+                    x.to_bits() == y.to_bits(),
+                    "{name}: block {block} sample {i}: one walk gave {x}, four gave {y}"
+                );
+            }
+        }
+        // And it was not silence agreeing with silence.
+        let peak = a.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.001, "{name}: the reference render was silent, so the test proved nothing");
+    }
+}
+
 #[test]
 #[ignore = "a bench: run it deliberately with --ignored --nocapture"]
 fn rt_bench() {
