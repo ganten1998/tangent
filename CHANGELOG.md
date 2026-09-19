@@ -12,6 +12,30 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **Ten themes: seven replaced and three retuned.** The owner's list, in
+  his words: Valentine keeps its slot with more red, "like the original TUI
+  application"; Sandstone keeps its slot with a darker sand, because "even
+  light mode" was "too harsh"; Centennial keeps its slot with a slightly
+  darker recorder. Studio, Aurora, Blueprint and Porcelain were replaced
+  with "something more inspired and not yet covered by the rest of the
+  themes"; Dusk and Iris were "too close" to each other; Nocturne was "also
+  just Navi". In their slots now: Ochre, the pigment as the band, with
+  cornflower and indigo; Reed, the reed electric piano this app models, in
+  the avocado the 200 wore; Zinc, the patina metal and the only violet in
+  the set, with brass for what is held; Celadon, the glaze, cool where
+  Sandstone is warm; Prism, charcoal with one colour per control; Storm,
+  slate and the bolt, the only theme built on yellow; and Amber, the other
+  phosphor console beside the green one. Every theme in the set was colour
+  checked in both modes against the whole suite before it shipped, which is
+  what the owner asked for: legible the first time.
+
+  No slot moved. A theme's position is the index a saved desk keeps as its
+  palette choice, so each new theme took the retired one's row and each
+  retired run kept every byte it had in the strip table; a desk that painted
+  a track from one of them still paints it the same colour. The seven new
+  palettes were appended whole, and the velocity lane's colours were
+  re-solved for all nineteen themes against each theme's own roll.
+
 - **The denoiser's spectral kernels open and close like an instrument, not a
   gate.** Measured on the owner's take against a render he prefers: the old
   kernel wrote every band's gain fresh every 5 ms frame and snapped a band from
