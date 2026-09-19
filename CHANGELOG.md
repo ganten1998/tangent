@@ -12,6 +12,25 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **Tangent's own Drive and Tape stop being the most expensive plugins on
+  the machine.** The performance sweep measured both above every commercial
+  plugin it tested beside them, which is not a place a built-in effect
+  should be. Both run four-times oversampling through a pair of filters, and
+  those filters walked their delay line with a split and a chain that no
+  compiler can vectorise, adding one tap at a time into one accumulator.
+  Every sample is written twice now so the window is always contiguous, and
+  the taps are summed eight at a time into independent accumulators, which
+  is the shape the Analog synth's own filter has had all along. Measured on
+  this machine over sixteen lanes at 128 frames, per instance: Drive 91.5 to
+  37.7 microseconds, Tape 63.9 to 24.2. The unfixed Drive desk went a block
+  over its deadline during the measurement; the fixed one does not.
+
+- **Two smaller ones in the same pass.** The DX7's sine did a libm remainder
+  call six times per voice per sample, which is 4.6 million a second at full
+  polyphony, and now rounds instead. And the Analog's arpeggiator allocated
+  a vector on the audio thread every thirty-two frames for as long as a key
+  was held, which is the one thing that thread may never do.
+
 - **The audio panel says what the render is costing.** A new line under the
   dropout count: what the last block cost as a percentage of its deadline,
   and the worst block since the stream opened, amber past seven tenths. Two

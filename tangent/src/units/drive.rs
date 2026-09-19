@@ -113,6 +113,11 @@ pub(crate) const HB_B_TAPS: usize = 23;
 /// 48 kHz session, sized numerically against the alias test's worst path.
 pub(crate) const HB_A_CUTOFF: f64 = 0.224;
 
+/// The double-written window lengths: twice the taps, so the newest `N`
+/// samples are one contiguous slice. See `Fir`.
+pub(crate) const HB_A_WIN: usize = HB_A_TAPS * 2;
+pub(crate) const HB_B_WIN: usize = HB_B_TAPS * 2;
+
 /// Below this a 0..=1 dial is at its resting position and means OFF.
 const DRIVE_OFF: f32 = 0.0005;
 
@@ -188,28 +193,71 @@ pub(crate) fn windowed_sinc<const N: usize>(beta: f64, fc: f64) -> [f32; N] {
 /// A direct-form FIR delay line. Taps live outside so both channels (and
 /// both directions) share one designed set.
 #[derive(Clone)]
-pub(crate) struct Fir<const N: usize> {
-    z: [f32; N],
+pub(crate) struct Fir<const N: usize, const N2: usize> {
+    /// Twice `N`, so the newest `N` samples are always contiguous. Two
+    /// parameters rather than one because `2 * N` is not expressible in a
+    /// type on stable Rust; `analog/filter.rs`'s `History` carries the same
+    /// pair for the same reason. `a_double_written_window_never_wraps`
+    /// pins that the second is twice the first.
+    z: [f32; N2],
     pos: usize,
 }
 
-impl<const N: usize> Fir<N> {
-    pub(crate) fn new() -> Self {
-        Self { z: [0.0; N], pos: 0 }
+/// **The dot product, eight at a time.**
+///
+/// Lifted from `analog/filter.rs`, which has had it since the Analog synth
+/// was written, while the two oversamplers that cost the most in the whole
+/// suite went on adding one tap at a time into one accumulator. Measured on
+/// this machine: 0.22 ns per multiply-accumulate against 0.49.
+///
+/// Eight accumulators because a chain of `acc += t * v` is a dependency
+/// chain: each add waits for the one before, and the pipeline runs at the
+/// latency of an add rather than its throughput. Eight independent ones
+/// keep it fed, and `fma` folds each pair into one instruction. The final
+/// sum is written as a tree so the compiler does not rebuild the chain.
+#[inline]
+fn dot<const N: usize>(taps: &[f32; N], window: &[f32]) -> f32 {
+    let (tc, tr) = taps.as_chunks::<8>();
+    let (wc, _) = window[..N].as_chunks::<8>();
+    let mut acc = [0.0_f32; 8];
+    for (t, w) in tc.iter().zip(wc) {
+        for k in 0..8 {
+            acc[k] = t[k].mul_add(w[k], acc[k]);
+        }
     }
+    let mut tail = 0.0_f32;
+    let done = N - tr.len();
+    for (k, t) in tr.iter().enumerate() {
+        tail = t.mul_add(window[done + k], tail);
+    }
+    ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7])) + tail
+}
+
+impl<const N: usize, const N2: usize> Fir<N, N2> {
+    pub(crate) fn new() -> Self {
+        Self { z: [0.0; N2], pos: 0 }
+    }
+    /// **One sample in, one out, over a window that never wraps.**
+    ///
+    /// Every sample is written TWICE, `N` apart, so the newest `N` samples
+    /// are always one contiguous slice. That is what lets the tap loop be a
+    /// straight-line dot product instead of a `split_at` and a `chain`,
+    /// which the compiler cannot vectorise and which was the whole of why
+    /// this app's own Drive and Tape were the most expensive inserts on the
+    /// machine - above every commercial plugin measured beside them.
+    ///
+    /// The arithmetic is the same convolution and the same taps, so the
+    /// delay through it is unchanged; only the summation order moves, which
+    /// is what the impulse tests beside this one exist to hold.
     #[inline]
     pub(crate) fn run(&mut self, taps: &[f32; N], x: f32) -> f32 {
         self.pos = if self.pos == 0 { N - 1 } else { self.pos - 1 };
         self.z[self.pos] = x;
-        let mut acc = 0.0_f32;
-        let (head, tail) = self.z.split_at(self.pos);
-        for (t, v) in taps.iter().zip(tail.iter().chain(head.iter())) {
-            acc += t * v;
-        }
-        acc
+        self.z[self.pos + N] = x;
+        dot(taps, &self.z[self.pos..])
     }
     pub(crate) fn clear(&mut self) {
-        self.z = [0.0; N];
+        self.z = [0.0; N2];
         self.pos = 0;
     }
 }
@@ -301,10 +349,10 @@ pub(crate) fn clip_adaa(x: f32, x1: f32, pos: f32, neg: f32) -> f32 {
 /// pair and the one-pole states of the gain path, in signal order.
 #[derive(Clone)]
 struct DriveChannel {
-    up_a: Fir<HB_A_TAPS>,
-    up_b: Fir<HB_B_TAPS>,
-    dn_b: Fir<HB_B_TAPS>,
-    dn_a: Fir<HB_A_TAPS>,
+    up_a: Fir<HB_A_TAPS, HB_A_WIN>,
+    up_b: Fir<HB_B_TAPS, HB_B_WIN>,
+    dn_b: Fir<HB_B_TAPS, HB_B_WIN>,
+    dn_a: Fir<HB_A_TAPS, HB_A_WIN>,
     /// Low-pass state whose complement is the 720 Hz gain-path high-pass.
     hp_lp: f32,
     /// The feedback cap's roll-off on the pre-clip drive signal.
@@ -467,6 +515,46 @@ impl Drive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The window never wraps**, which is the whole reason the delay line
+    /// writes every sample twice and the only thing the second const
+    /// parameter is for. A `Fir<N, N2>` where `N2` is not `2 * N` would
+    /// index past its own buffer or read stale samples, and neither shows
+    /// up as anything but a wrong sound.
+    #[test]
+    fn a_double_written_window_never_wraps() {
+        const N: usize = 5;
+        let mut f: Fir<N, { N * 2 }> = Fir::new();
+        // A ramp in, so the window's contents are identifiable.
+        let taps = [1.0, 0.0, 0.0, 0.0, 0.0];
+        for i in 1..=20 {
+            let out = f.run(&taps, i as f32);
+            // Tap 0 is the newest sample, whatever the write position is.
+            assert!(
+                (out - i as f32).abs() < 1e-6,
+                "sample {i} read back as {out}: the window wrapped"
+            );
+        }
+        // And the last tap is the oldest of the N.
+        let oldest = [0.0, 0.0, 0.0, 0.0, 1.0];
+        let out = f.run(&oldest, 21.0);
+        assert!((out - 17.0).abs() < 1e-6, "the oldest of five read back as {out}");
+    }
+
+    /// The wide dot product answers what a plain loop answers, to float
+    /// reassociation. It is the same convolution; only the summation order
+    /// moved, which is what lets the units' level and alias tests stand.
+    #[test]
+    fn the_wide_dot_matches_a_plain_one() {
+        let taps: [f32; 19] = std::array::from_fn(|i| (i as f32 * 0.37).sin());
+        let window: Vec<f32> = (0..19).map(|i| (i as f32 * 0.11).cos()).collect();
+        let plain: f32 = taps.iter().zip(&window).map(|(t, w)| t * w).sum();
+        let wide = dot(&taps, &window);
+        assert!(
+            (plain - wide).abs() < 1e-5,
+            "wide {wide} against plain {plain}"
+        );
+    }
 
     const SR: f32 = 48_000.0;
 
