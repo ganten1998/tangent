@@ -549,6 +549,20 @@ pub struct MenuState {
     /// Whether the pointer has moved far enough since then to count as
     /// pointing at something. Sticky once true.
     armed: bool,
+    /// **Where the open panel is, in the same coordinates the parent reads
+    /// its pointer in.**
+    ///
+    /// The corridor needs it; see `heading_for`. Set on the frame the panel
+    /// is placed, so it is one frame behind on the first frame of a new
+    /// panel, which is the frame the pointer is still on the parent row
+    /// anyway.
+    sub_rect: Option<Rect>,
+    /// Where the pointer was on the previous frame, in the parent's own
+    /// coordinates: the apex of the corridor. See `heading_for`.
+    last_pointer: Option<Pos2>,
+    /// When the pointer first entered the corridor, so a hand that stops
+    /// inside it can still choose a different category. See `CORRIDOR_FOR`.
+    corridor_since: Option<Instant>,
     /// **The submenu's own arming**, the parent's rule applied to its panel:
     /// where the pointer was when the panel last (re)opened, in the panel's
     /// own coordinates, and whether it has moved `ARM_SLOP` inside it since.
@@ -645,6 +659,7 @@ fn note_rest(rest: &mut Option<(Pos2, Instant)>, pointer: Option<Pos2>, now: Ins
 ///
 /// Returns whether a change is still pending, so the caller can ask for the
 /// frame that will complete it.
+#[allow(clippy::too_many_arguments)]
 fn settle_submenu(
     open: &mut Option<usize>,
     pending: &mut Option<(Option<usize>, Instant)>,
@@ -653,12 +668,24 @@ fn settle_submenu(
     armed: bool,
     still: bool,
     clicked: bool,
+    // The pointer is inside the corridor to the open panel, so the rows it
+    // is crossing are on the way to somewhere and not a choice. See
+    // `heading_for`.
+    travelling: bool,
     now: Instant,
 ) -> bool {
     // **Nothing at all until the pointer has moved.** The menu is placed under
     // the cursor, so the row it appears beneath was never chosen — acting on it
     // is how every single opening produced the top submenu.
     if !armed {
+        return false;
+    }
+    // **Travelling beats resting.** A hand on its way to the open panel is
+    // crossing rows, not picking them, and a pause halfway across is still
+    // the same journey. A PRESS still decides, below: the corridor withholds
+    // a guess and never a decision.
+    if travelling && !clicked {
+        *pending = None;
         return false;
     }
     // A press says which one, and says it now. This is the escape hatch: when
@@ -704,6 +731,71 @@ fn settle_submenu(
         }
     }
 }
+
+
+/// **Is the pointer on its way to the open panel?**
+///
+/// The classic safe triangle, and the reason a delay alone was not enough.
+/// A panel that would overflow the bottom of the screen is pulled UP by
+/// `clamp_submenu`, sometimes a long way: most of this menu's categories
+/// open from rows below the halfway mark and the deepest are ten rows tall.
+/// Reaching such a panel means travelling up and right, ACROSS the rows in
+/// between, and every one of those rows is a submenu that would open if the
+/// hand paused on it for `SUB_SWITCH_DWELL`. The owner's report, twice:
+/// "the right click context menu is still jumping to the top when a submenu
+/// is selected."
+///
+/// So while a panel is open, the triangle from where the pointer was to that
+/// panel's near edge is a corridor: a pointer inside it is going somewhere,
+/// not choosing, and the rows it crosses do not count. This is what Apple's
+/// menus do and what the note on `SUB_SWITCH_DWELL` said a delay would stand
+/// in for. It does not.
+///
+/// `from` is the previous pointer position, `to` the panel. Both in the same
+/// space, which the caller is responsible for.
+fn heading_for(from: Pos2, now: Pos2, panel: Rect) -> bool {
+    if !panel.is_positive() {
+        return false;
+    }
+    // **A hand that has not moved is resting, not travelling.** The apex of
+    // the triangle is the previous position, so a stationary pointer sits
+    // exactly on it and would read as inside for as long as it stayed
+    // there: the corridor would hold off every choice until its cap ran
+    // out. Resting is the gesture the dwell exists to serve.
+    if (now - from).length() < REST_SLOP {
+        return false;
+    }
+    // The near edge: the side of the panel that faces the menu. A panel
+    // flipped to the LEFT by the clamp faces the other way, and the whole
+    // point of a corridor is that it works for that one too.
+    let near_x = if panel.center().x >= from.x { panel.left() } else { panel.right() };
+    // Widened by a row's worth so a hand that clips the corner of the
+    // triangle is still travelling rather than choosing.
+    let top = Pos2::new(near_x, panel.top() - CORRIDOR_SLOP);
+    let bottom = Pos2::new(near_x, panel.bottom() + CORRIDOR_SLOP);
+    // Inside the triangle (from, top, bottom), by the sign of the three
+    // cross products. Degenerate triangles answer false, which is the safe
+    // side: it means the ordinary dwell decides.
+    let side = |a: Pos2, b: Pos2, p: Pos2| (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+    let d1 = side(from, top, now);
+    let d2 = side(top, bottom, now);
+    let d3 = side(bottom, from, now);
+    let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(neg && pos)
+}
+
+/// How far outside the panel's own height the corridor still reaches. One
+/// row, so a hand that cuts the corner is still read as travelling.
+const CORRIDOR_SLOP: f32 = 24.0;
+
+/// How long the corridor may hold a switch off before the hand is taken to
+/// have stopped rather than travelled.
+///
+/// Apple caps its triangle the same way. Without a cap, a pointer parked
+/// inside the corridor - which includes a good deal of the panel's own
+/// approach - would never be able to choose a different category at all.
+const CORRIDOR_FOR: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// **How long until a wait that began at `since` is over** - what the menu
 /// asks its next frame for while a dwell or a rest is running.
@@ -1587,6 +1679,9 @@ impl MenuState {
             rest: None,
             first_pointer: None,
             armed: false,
+            sub_rect: None,
+            last_pointer: None,
+            corridor_since: None,
             sub_first_pointer: None,
             sub_hover_armed: false,
             monitor: monitor_size,
@@ -1909,6 +2004,25 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
     }
     let now = Instant::now();
     let still = note_rest(&mut state.rest, pointer, now);
+    // **On its way to the open panel, or choosing?** See `heading_for`: a
+    // panel pulled up the screen by the clamp is reached by travelling
+    // ACROSS the rows between, and without this every one of them is a
+    // category the hand appears to have paused on.
+    let travelling = match (pointer, state.last_pointer, state.sub_rect) {
+        (Some(now_at), Some(was), Some(panel)) => heading_for(was, now_at, panel),
+        _ => false,
+    };
+    // Capped, so a hand that STOPS inside the corridor can still choose.
+    let travelling = if travelling {
+        let since = *state.corridor_since.get_or_insert(now);
+        now.duration_since(since) < CORRIDOR_FOR
+    } else {
+        state.corridor_since = None;
+        false
+    };
+    if pointer.is_some() {
+        state.last_pointer = pointer;
+    }
     if settle_submenu(
         &mut state.submenu_open,
         &mut state.pending_sub,
@@ -1917,6 +2031,7 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         state.armed,
         still,
         clicked_submenu,
+        travelling,
         now,
     ) {
         // Still waiting out the dwell. Ask for the frame that will end it, or a
@@ -1986,6 +2101,15 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
         if let Some(mon) = state.monitor {
             sub_pos = clamp_submenu(sub_pos, sub_size, state.pos.x, mon);
         }
+        // **Kept in the coordinates the parent reads its pointer in**, which
+        // is the whole of the difference between the two hosts: inline the
+        // menu is a layer and both are canvas points; on the desktop the
+        // menu is a window, its pointer is window-local, and `sub_pos` is
+        // where the panel sits on the SCREEN.
+        state.sub_rect = Some(Rect::from_min_size(
+            if caps.child_windows { sub_pos - state.pos.to_vec2() } else { sub_pos },
+            sub_size,
+        ));
 
         let sub_spec = crate::shell::SurfaceSpec {
             id: SUBMENU_ID,
@@ -2098,7 +2222,7 @@ mod tests {
         still: bool,
         now: Instant,
     ) -> bool {
-        settle_submenu(open, pending, hovered, plain, armed, still, false, now)
+        settle_submenu(open, pending, hovered, plain, armed, still, false, false, now)
     }
 
     /// **The box is wide enough for the words, in every bundled face.**
@@ -2503,12 +2627,83 @@ mod tests {
         );
         assert!(panel_lit(&out), "an armed panel lit nothing under the pointer");
         // Another submenu: the panel is refilled, and it starts over.
-        let _ = frame(&mut state, Pos2::new(row_1.x, row_1.y + 2.0 * row_h));
+        //
+        // Approached from ABOVE, down the menu. Coming up from below would
+        // cross the corridor to the open panel, which is exactly the journey
+        // `heading_for` exists to hold off, and the switch would correctly
+        // not happen. See `a_hand_crossing_rows_to_reach_a_clamped_panel`.
+        let _ = frame(&mut state, row_0);
         open_by_rest(&mut state, row_1, 1);
         assert!(
             state.as_ref().is_some_and(|st| !st.sub_hover_armed),
             "a panel refilled for another submenu kept the old one's arming"
         );
+    }
+
+    /// **The corridor to an open panel**, which is the fault the owner
+    /// reported twice: "the right click context menu is still jumping to
+    /// the top when a submenu is selected."
+    ///
+    /// A panel that would overflow the bottom of the screen is pulled UP by
+    /// `clamp_submenu`, and most of this menu's categories open from rows
+    /// below the halfway mark. Reaching the displaced panel means moving up
+    /// and right ACROSS the rows in between, and a pause of one dwell on any
+    /// of them used to switch to it: with a panel clamped to the top of the
+    /// screen, that is the first category in the list.
+    ///
+    /// Asserted on `heading_for` directly, because the geometry is the whole
+    /// of the fix and driving it through a real menu would make the test
+    /// about layout instead.
+    #[test]
+    fn a_hand_crossing_rows_to_reach_a_clamped_panel_chooses_none_of_them() {
+        // A menu at x 30..250, and a panel for a row near the bottom that
+        // the clamp has pulled right up to the top of the screen.
+        let panel = Rect::from_min_size(Pos2::new(250.0, 20.0), Vec2::new(200.0, 300.0));
+        // The hand leaves a row low in the menu and heads up and right.
+        let from = Pos2::new(150.0, 560.0);
+        for step in [
+            Pos2::new(180.0, 480.0),
+            Pos2::new(200.0, 400.0),
+            Pos2::new(230.0, 300.0),
+            Pos2::new(248.0, 200.0),
+        ] {
+            assert!(
+                heading_for(from, step, panel),
+                "a hand at {step:?} on its way to a panel at {panel:?} was read as choosing"
+            );
+        }
+        // Straight down the menu, away from the panel: that IS a choice and
+        // the corridor must not swallow it.
+        for step in [Pos2::new(150.0, 600.0), Pos2::new(140.0, 640.0)] {
+            assert!(
+                !heading_for(from, step, panel),
+                "a hand at {step:?} walking down the menu was held off by the corridor"
+            );
+        }
+        // And a panel that the clamp flipped to the LEFT is reached the
+        // other way, which is the case a "moving right" rule would miss.
+        let flipped = Rect::from_min_size(Pos2::new(-180.0, 20.0), Vec2::new(200.0, 300.0));
+        assert!(
+            heading_for(from, Pos2::new(90.0, 300.0), flipped),
+            "a hand reaching a left-flipped panel was read as choosing"
+        );
+    }
+
+    /// **Travelling withholds a guess and never a decision.** The corridor
+    /// stops a hover from switching the open panel; a PRESS still does,
+    /// because a press is the escape hatch the dwell's own note promises.
+    #[test]
+    fn the_corridor_holds_a_hover_and_yields_to_a_press() {
+        let t = Instant::now();
+        let mut open = Some(2);
+        let mut pending = None;
+        // Resting on row 5 while travelling: nothing moves.
+        assert!(!settle_submenu(&mut open, &mut pending, Some(5), false, true, true, false, true, t));
+        assert_eq!(open, Some(2), "the corridor let a crossed row take the panel");
+        assert!(pending.is_none(), "the corridor left a wait behind");
+        // The same row, pressed: it opens at once.
+        assert!(!settle_submenu(&mut open, &mut pending, Some(5), false, true, false, true, true, t));
+        assert_eq!(open, Some(5), "a press was swallowed by the corridor");
     }
 
     fn view() -> MenuView {
@@ -3865,6 +4060,7 @@ mod tests {
             true,
             false,
             true,
+            false,
             t
         ));
         assert_eq!(open, Some(5), "a click was made to wait for a dwell");

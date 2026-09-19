@@ -4015,6 +4015,65 @@ mod engine_parts {
         assert_eq!(lane_of_seat(bus), None, "a bus seat was attributed to a channel");
     }
 
+    /// **A parked lane still hears a knob, and a preset.**
+    ///
+    /// The road a knob turn and a preset load take to the audio thread is
+    /// DESTRUCTIVE: `ui_params` is a ring, `resolve_automation` pops the
+    /// point off it into `auto_params`, `auto_params` is cleared at the top
+    /// of the next block, and the only reader is `run_rack`. So a lane that
+    /// does not render the block the point arrived in does not delay the
+    /// edit, it loses it. Nothing re-sends it, the face keeps the new value
+    /// and so does the saved project, and the instance plays the old sound
+    /// for the rest of the session.
+    ///
+    /// Reachable today with the transport STOPPED: a lane with no notes and
+    /// nothing armed parks after `RACK_PARK_S`, and a preset loaded onto it
+    /// then is gone. Only `rolling` in `live_now` hides it during playback,
+    /// which is also why it had to be fixed before any idle-lane skip could
+    /// be considered.
+    #[test]
+    fn a_parked_lane_still_hears_a_knob() {
+        const CH: usize = 4;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_armed(0);
+        e.load_insert(CH, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), None)
+            .expect("the trim loads")
+            .expect("and seats");
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; 512 * 2];
+        // Past RACK_PARK_S with nothing to keep it awake: 8 seconds at
+        // 48 kHz in 512-frame blocks, and a few more for the seating swap.
+        let blocks = (RACK_PARK_S * 48_000.0 / 512.0) as usize + 8;
+        for _ in 0..blocks {
+            e.render_offline(&mut out);
+        }
+        let parked = {
+            let r = e.offline.as_ref().expect("a renderer");
+            !r.lane_wants[CH]
+        };
+        assert!(parked, "the lane never parked, so this test proves nothing");
+        // The knob, turned while it sleeps.
+        e.set_insert_param(CH, 0, 0, 0.8);
+        e.render_offline(&mut out);
+        let woke = {
+            let r = e.offline.as_ref().expect("a renderer");
+            r.lane_wants[CH]
+        };
+        assert!(
+            woke,
+            "a parked lane slept through a knob turn, so the point was popped \
+             off its ring and cleared without ever reaching the instance"
+        );
+        // And it goes back to sleep afterwards rather than being woken for
+        // good by one edit. A wake resets the park counter, so it is another
+        // whole window and not a few blocks.
+        for _ in 0..blocks {
+            e.render_offline(&mut out);
+        }
+        let r = e.offline.as_ref().expect("a renderer");
+        assert!(!r.lane_wants[CH], "one knob turn woke the lane permanently");
+    }
+
     /// **The meter reads the block it just rendered.**
     ///
     /// Not a tautology: the hook is a wrapper around a function with four
@@ -5710,6 +5769,17 @@ struct Renderer {
     /// folder (which owns its own fader, pan and send at the fold) and
     /// whether it is armed (which picks the meter's source).
     lane_prep: [LanePrep; CHANNELS],
+    /// **Which lanes had a parameter arrive for them this block.**
+    ///
+    /// A knob turn and a preset load reach the audio thread on `ui_params`,
+    /// which `resolve_automation` drains DESTRUCTIVELY into `auto_params`,
+    /// and `auto_params` is cleared at the top of the next block. The only
+    /// reader is `run_rack`. So a lane that does not render this block does
+    /// not merely delay the edit: it loses it, and nothing re-sends it.
+    ///
+    /// That is why a lane with a parameter waiting counts as live. See
+    /// `a_parked_lane_still_hears_a_knob`.
+    param_lanes: u32,
     /// Which lanes the deciding walk left for the render walk to do.
     lane_wants: [bool; CHANNELS],
     /// Which lanes rendered something to fold this chunk. False for every
@@ -9037,6 +9107,10 @@ impl Renderer {
         for q in &mut self.auto_params {
             q.clear();
         }
+        // **Which lanes are owed a parameter this block.** See
+        // `param_lanes`: a lane that skips its render loses the point
+        // rather than deferring it, so this is what keeps it awake.
+        self.param_lanes = 0;
         // **Before the early return below, not after it.** A plugin's own
         // window works in a song with no automation at all — which is most
         // songs — and draining these after the `is_empty` shortcut would have
@@ -9052,6 +9126,14 @@ impl Renderer {
             let Some(q) = self.auto_params.get_mut(lane * INSERTS + bay) else {
                 continue;
             };
+            // `lane` here is a SEAT. `lane_of_seat` folds a channel's own
+            // seat, its extra rack and its seven pedal seats onto the one
+            // lane whose render carries all of them, and answers `None` for
+            // a master, bus or pad seat, whose racks run in passes the park
+            // never touches.
+            if let Some(ch) = lane_of_seat(lane) {
+                self.param_lanes |= 1u32 << ch.min(CHANNELS - 1);
+            }
             // **The LAST value for an id wins, in place.** A knob dragged
             // across three frames lands three points in one block and only
             // the last is the position the hand is in; a preset sends each
@@ -9119,6 +9201,14 @@ impl Renderer {
             let Some(q) = self.auto_params.get_mut(slot_lane * INSERTS + bay) else {
                 continue;
             };
+            // A curve is re-walked from the document every block, so a point
+            // dropped here really is delivered by the next one - unlike the
+            // ui road above. It still keeps its lane awake, because a lane
+            // waking mid-ramp under a curve it has not been fed jumps to the
+            // curve's current value instead of arriving on it.
+            if let Some(ch) = lane_of_seat(slot_lane) {
+                self.param_lanes |= 1u32 << ch.min(CHANNELS - 1);
+            }
             // The cap is the pre-grown capacity: pushing past it would
             // allocate, which is the one thing this thread may not do.
             if q.len() < q.capacity() {
@@ -10927,6 +11017,14 @@ impl Renderer {
                 || auditioning
                 || !lane_notes.is_empty()
                 || !lane_controls.is_empty()
+                // **A parameter waiting for this lane wakes it.** The knob
+                // and preset road is destructive: the point is popped off
+                // its ring into a queue that is cleared next block, and the
+                // only reader is inside the render. A parked lane does not
+                // defer the edit, it loses it, and the face and the saved
+                // project keep the new value while the instance keeps the
+                // old. See `param_lanes`.
+                || self.param_lanes & (1u32 << ch.min(CHANNELS - 1)) != 0
                 || self.shared.armed.load(Ordering::Relaxed) & (1u32 << ch.min(31)) != 0;
             let rate = self.rate;
             let parked = park_lane(
@@ -12973,6 +13071,7 @@ impl Engine {
                 .map(|_| Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3))
                 .collect(),
             lane_prep: [LanePrep::default(); CHANNELS],
+            param_lanes: 0,
             lane_wants: [false; CHANNELS],
             lane_folds: [false; CHANNELS],
             lane_out: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
@@ -18775,6 +18874,7 @@ mod tests {
                 .map(|_| Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3))
                 .collect(),
             lane_prep: [LanePrep::default(); CHANNELS],
+            param_lanes: 0,
             lane_wants: [false; CHANNELS],
             lane_folds: [false; CHANNELS],
             lane_out: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
