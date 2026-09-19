@@ -69,6 +69,24 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   go out of time alignment after a preset click, lose its settings on close,
   and on Linux stop responding. It is asked over every slot now.
 
+- **A note held when you press stop is now actually told to stop.** The
+  engine sends a note-off for every note being held when the transport stops
+  or the playhead jumps, and none of them were being delivered. A DX7
+  survived because a separate sweep silences DX7 instances directly; that
+  sweep reaches no Keys instrument, no Analog and no third-party plugin, so
+  those kept ringing.
+
+  Underneath it, the record of what was sounding was a single list keyed by
+  pitch with two unrelated owners, the live keyboard and clip playback. A
+  clip note ending on a pitch cleared the record of a key you were holding on
+  that same pitch, and that key then got no note-off at all. Each track keeps
+  its own record now.
+
+- **One track's dense chord no longer delays another track's note.** What was
+  sounding lived in one list for the whole desk with a fixed cap, filled from
+  track 1 upward, so two busy tracks could push a third track's note a block
+  late. There is no shared pool any more.
+
 - **Every track now reads its own audio, instead of the desk keeping one
   block of everything.** The timeline used to be assembled once per block
   into a single buffer holding every track, which each track then copied its
