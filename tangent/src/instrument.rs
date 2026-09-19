@@ -7542,6 +7542,21 @@ struct Renderer {
     /// milliseconds of a fading-in signal at the price of the duplication
     /// this app has been bitten by three times.
     board_live: u32,
+    /// **Lanes a worker is holding across a block boundary.**
+    ///
+    /// Zero in every build today, because nothing leases yet. It exists now
+    /// because the terms that depend on it are the ones that decide whether
+    /// leasing is safe, and they are far easier to get right, and to test,
+    /// one at a time than all at once inside the commit that flips it on.
+    ///
+    /// Everything that WRITES a lane's seats from the callback consults it:
+    /// the sampler, DX7 and Keys arrival rings, and the patch queue. Each of
+    /// those learns its lane only after taking the arrival, so each has to
+    /// look before it takes, and leave it where it is for a lane it may not
+    /// touch. That is the shape the racks' own handoff already uses when the
+    /// retiring ring is full: backpressure, not loss.
+    leased: u32,
+
     /// **The eligibility probe.** See [`ProbeCells`]. `probe` is latched
     /// from the environment once, so the per-block cost of all of this is a
     /// branch on a `bool` when it is off.
@@ -7748,6 +7763,14 @@ impl Renderer {
     /// pointer move.
     fn swap_sampler_samples(&mut self) {
         while self.sampler_retiring.slots() > 0 {
+            // **Look before taking.** The arrival carries its lane, so the
+            // lane can be read without committing; a lane a worker holds
+            // leaves its arrival in the ring and gets it on a later block.
+            match self.sampler_incoming.peek() {
+                Ok((lane, _)) if self.leased & (1u32 << (*lane).min(31)) != 0 => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
             let Ok((lane, next)) = self.sampler_incoming.pop() else {
                 break;
             };
@@ -11818,6 +11841,13 @@ impl Renderer {
         // incoming one is left alone too — backpressure, not loss; the host
         // repeats its diff every frame until it lands.
         while self.dx7_retiring.slots() > 0 {
+            // Peeked for its lane first, and left alone for a leased one.
+            // See `Renderer::leased`.
+            match self.dx7_incoming.peek() {
+                Ok((lane, _)) if self.leased & (1u32 << (*lane).min(31)) != 0 => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
             let Ok((lane, next)) = self.dx7_incoming.pop() else {
                 break;
             };
@@ -11829,6 +11859,13 @@ impl Renderer {
             }
         }
         while self.keys_retiring.slots() > 0 {
+            // Peeked for its lane first, and left alone for a leased one.
+            // See `Renderer::leased`.
+            match self.keys_incoming.peek() {
+                Ok((lane, _)) if self.leased & (1u32 << (*lane).min(31)) != 0 => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
             let Ok((lane, next)) = self.keys_incoming.pop() else {
                 break;
             };
@@ -11844,11 +11881,22 @@ impl Renderer {
         // session loads, and `Voice` is inline numbers so dropping the pairs
         // here frees nothing.
         if let Ok(mut g) = self.shared.pending_voices.try_lock() {
-            for (lane, v) in g.drain(..) {
-                if let Some(Some(d)) = self.dx7s.get_mut(lane) {
-                    d.set_voice(v);
+            // **`retain`, not `drain`.** This is the one arrival road where
+            // the obvious gate loses data instead of deferring it: `drain`
+            // takes every entry before any lane is looked at, so a skip
+            // would drop that lane's patch on the floor. The queue is
+            // already the deferral mechanism; keeping an entry is how it is
+            // used as one, and `retain` allocates nothing.
+            let (leased, dx7s) = (self.leased, &mut self.dx7s);
+            g.retain(|(lane, v)| {
+                if leased & (1u32 << (*lane).min(31)) != 0 {
+                    return true;
                 }
-            }
+                if let Some(Some(d)) = dx7s.get_mut(*lane) {
+                    d.set_voice(*v);
+                }
+                false
+            });
         }
         // The note the LAST block's walk parked, if any — taken so it lasts
         // exactly one block unless the walk below parks again.
@@ -14777,6 +14825,7 @@ impl Engine {
             stems_dry: false,
             board_ran: 0,
             board_live: 0,
+            leased: 0,
             probe: probe_on(),
             probe_walk_pins: 0,
             probe_clip_pins: 0,
@@ -20435,6 +20484,21 @@ mod tests {
             (to, from)
         }
 
+        /// The same for the DX7's instance rings, so a test can send an
+        /// instance to a lane and see whether the callback took it.
+        fn hijack_dx7_rings(
+            &mut self,
+        ) -> (
+            Producer<(usize, Option<Box<crate::dx7::Dx7>>)>,
+            Consumer<(usize, Option<Box<crate::dx7::Dx7>>)>,
+        ) {
+            let (to, incoming) = RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(4);
+            let (retiring, from) = RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(4);
+            self.dx7_incoming = incoming;
+            self.dx7_retiring = retiring;
+            (to, from)
+        }
+
         fn hijack_midi_rings(&mut self) -> (Producer<Vec<PlacedMidi>>, Consumer<Vec<PlacedMidi>>) {
             let (to, incoming) = RingBuffer::<Vec<PlacedMidi>>::new(2);
             let (retiring, from) = RingBuffer::<Vec<PlacedMidi>>::new(2);
@@ -20536,6 +20600,7 @@ mod tests {
             stems_dry: false,
             board_ran: 0,
             board_live: 0,
+            leased: 0,
             probe: probe_on(),
             probe_walk_pins: 0,
             probe_clip_pins: 0,
@@ -28255,6 +28320,70 @@ mod tests {
                 .any(|(n, m)| !n.on && n.pitch == 64 && *m != 0),
             "no lane was told the held note had ended"
         );
+    }
+
+    /// **An arrival for a held track waits rather than landing or vanishing.**
+    ///
+    /// Everything that replaces a track's instrument from the callback
+    /// learns which track it is for only AFTER taking the arrival off its
+    /// ring, so each had to be changed to look first. The rule they now
+    /// follow is the one the racks' own handoff already used when the
+    /// retiring ring is full: leave it where it is and take it later.
+    /// Backpressure, not loss.
+    ///
+    /// The patch queue is the exception and is the reason this is tested
+    /// rather than argued: it was drained, and a drain takes every entry
+    /// before any track is looked at, so the obvious gate would have dropped
+    /// a patch on the floor instead of deferring it.
+    #[test]
+    fn an_arrival_for_a_held_track_waits_instead_of_landing() {
+        use crate::dx7::Dx7;
+        let shared = Arc::new(Shared::new());
+        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
+        let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+        let (mut to_audio, _from) = r.hijack_dx7_rings();
+        const HELD: usize = 4;
+        const FREE: usize = 5;
+
+        // One instance for a held track and one for a free track. The held
+        // one is queued first, so a gate that merely skipped would take the
+        // free one and leave the ring out of order.
+        to_audio
+            .push((HELD, Some(Box::new(Dx7::new(48_000.0)))))
+            .expect("room");
+        r.leased = 1u32 << HELD;
+        let mut out = vec![0.0_f32; 2 * 128];
+        r.render(&mut out, 0, 0);
+        assert!(
+            r.dx7s[HELD].is_none(),
+            "a held track's instrument was replaced under the worker holding it"
+        );
+
+        // Released, and it lands on the very next block. Nothing was lost.
+        r.leased = 0;
+        r.render(&mut out, 0, 0);
+        assert!(
+            r.dx7s[HELD].is_some(),
+            "the deferred instrument never arrived, so it was dropped rather than waited"
+        );
+
+        // And the patch queue, which is the one that had to change shape.
+        let voice = crate::dx7::Voice::default();
+        r.leased = 1u32 << FREE;
+        if let Ok(mut g) = shared.pending_voices.lock() {
+            g.push((FREE, voice.clone()));
+            g.push((HELD, voice));
+        }
+        r.render(&mut out, 0, 0);
+        let left = shared.pending_voices.lock().map(|g| g.len()).unwrap_or(0);
+        assert_eq!(
+            left, 1,
+            "the held track's patch was not kept for later, so it was lost"
+        );
+        r.leased = 0;
+        r.render(&mut out, 0, 0);
+        let left = shared.pending_voices.lock().map(|g| g.len()).unwrap_or(0);
+        assert_eq!(left, 0, "the kept patch was never applied once the track was free");
     }
 
     /// **A parked transport seeds silence.**
