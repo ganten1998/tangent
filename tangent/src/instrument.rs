@@ -3839,6 +3839,16 @@ fn lane_seats<'a>(
     })
 }
 
+/// **What the render pass leaves the fold to read.**
+///
+/// Copied out of the render's own locals rather than re-derived, so the two
+/// walks cannot come to different answers about one lane.
+#[derive(Clone, Copy, Default)]
+struct LanePrep {
+    is_folder: bool,
+    armed: bool,
+}
+
 /// **The buffers one lane renders through.**
 ///
 /// One set served the whole desk while the lane pass was a single walk, and
@@ -5213,6 +5223,30 @@ struct Renderer {
     lane_loud: Vec<bool>,
     /// Deinterleaved in and out for it. Preallocated, like everything else the
     /// audio thread touches.
+    /// **What the render pass decided about each lane, for the fold.**
+    ///
+    /// The two the fold cannot re-derive cheaply: whether the lane is a
+    /// folder (which owns its own fader, pan and send at the fold) and
+    /// whether it is armed (which picks the meter's source).
+    lane_prep: [LanePrep; CHANNELS],
+    /// Which lanes rendered something to fold this chunk. False for every
+    /// way the render walked away: parked, fed by nothing, no rack and no
+    /// audio, a bank too short, or an inactive instrument on a bare lane.
+    lane_folds: [bool; CHANNELS],
+    /// **Where each lane's finished audio waits for the fold.**
+    ///
+    /// The lane pass used to render every channel through the one `fx_in`
+    /// and fold it on the spot, which is why it could only ever be one walk:
+    /// lane 1's render overwrites lane 0's result. A lane writes its own row
+    /// here now, and the fold is a second walk over all of them in ascending
+    /// order - which is the order that keeps the master's sum bit-identical
+    /// to the single walk, because f32 addition is not associative.
+    ///
+    /// 128 KB at `CHANNELS` by `TAP_CHANNELS` by `MAX_BLOCK`, allocated once.
+    lane_out: Vec<Vec<Vec<f32>>>,
+    /// The dry twin of [`Self::lane_out`], filled only while a dry stem is
+    /// wanted. See the dry copy in `render_lane`.
+    lane_dry: Vec<Vec<Vec<f32>>>,
     fx_in: Vec<Vec<f32>>,
     fx_out: Vec<Vec<f32>>,
     /// The effects bus's own buffer, one block long, interleaved like `mix`.
@@ -9884,6 +9918,8 @@ impl Renderer {
 
         // The per-lane note list, taken out of `self` so the loop below can
         // read the live list and the clips while filling it.
+        // Nothing folds until a render says so; see `lane_folds`.
+        self.lane_folds = [false; CHANNELS];
         let mut lane_notes = std::mem::take(&mut self.lane_notes);
         // Taken out of `self` for the same reason `lane_notes` is: the loop
         // below reads the live list and the block's pedal moves while it
@@ -10461,9 +10497,12 @@ impl Renderer {
                 controls: &self.controls,
             };
             let mut io = LaneIo {
-                fx_in: &mut self.fx_in,
+                // **This lane's own row, not the desk's one scratch.** See
+                // `lane_out`: the fold is a second walk now, so a lane's
+                // result has to survive the next lane's render.
+                fx_in: &mut self.lane_out[ch],
                 fx_out: &mut self.fx_out,
-                dry_io: &mut self.dry_io,
+                dry_io: &mut self.lane_dry[ch],
                 key_io: &mut self.key_io,
                 builtin: &mut self.builtin_scratch,
                 keys_scratch: &mut self.keys_scratch,
@@ -10481,8 +10520,24 @@ impl Renderer {
             if !render_lane(&mut seats, &mut io, &plan, &desk) {
                 continue;
             }
+            self.lane_prep[ch] = LanePrep { is_folder, armed };
+            self.lane_folds[ch] = true;
+        }
+        // ── THE FOLD, a walk of its own ──────────────────────────────────
+        //
+        // **Ascending, and that is load-bearing.** `mix` and `aux` are
+        // accumulated with `+=` and f32 addition is not associative, so the
+        // order lanes are added in decides the last bits of the master.
+        // Ascending reproduces the single walk this pass used to be, exactly,
+        // which is what lets the render above become several walks without
+        // the sum moving.
+        for ch in 0..CHANNELS {
+            if !self.lane_folds[ch] {
+                continue;
+            }
             // The fold: fader, send, peak — the channel's own, exactly as
             // every other strip does it.
+            let LanePrep { is_folder, armed, .. } = self.lane_prep[ch];
             let target = if channel_is_heard(ch, &parents, muted, soloed) {
                 self.lane_gain(ch)
             } else {
@@ -10530,8 +10585,8 @@ impl Renderer {
                     self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
                     self.channel_gain[ch]
                 };
-                let s0 = self.fx_in.first().map_or(0.0, |b| b[f]);
-                let s1 = self.fx_in.get(1).map_or(0.0, |b| b[f]);
+                let s0 = self.lane_out[ch].first().map_or(0.0, |b| b[f]);
+                let s1 = self.lane_out[ch].get(1).map_or(0.0, |b| b[f]);
                 raw = raw.max(s0.abs()).max(s1.abs());
                 raw_pk[0] = raw_pk[0].max(s0.abs());
                 raw_pk[1] = raw_pk[1].max(s1.abs());
@@ -10561,8 +10616,8 @@ impl Renderer {
                 // `pan_r` rather than recomputing them, so the two cannot
                 // drift apart when somebody changes one of them.
                 if dry_on {
-                    let dl = self.dry_io.first().map_or(0.0, |b| b[f]) * g * pan_l;
-                    let dr = self.dry_io.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
+                    let dl = self.lane_dry[ch].first().map_or(0.0, |b| b[f]) * g * pan_l;
+                    let dr = self.lane_dry[ch].get(1).map_or(0.0, |b| b[f]) * g * pan_r;
                     if let Some(d) = self.dry_scratch.get_mut(..frames * CHANNELS * 2) {
                         d[f * CHANNELS * 2 + ch * 2] += dl;
                         d[f * CHANNELS * 2 + ch * 2 + 1] += dr;
@@ -12220,6 +12275,10 @@ impl Engine {
             racks,
             lane_quiet: vec![0; CHANNELS],
             lane_loud: vec![false; CHANNELS],
+            lane_prep: [LanePrep::default(); CHANNELS],
+            lane_folds: [false; CHANNELS],
+            lane_out: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
+            lane_dry: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
@@ -17992,6 +18051,10 @@ mod tests {
             racks,
             lane_quiet: vec![0; CHANNELS],
             lane_loud: vec![false; CHANNELS],
+            lane_prep: [LanePrep::default(); CHANNELS],
+            lane_folds: [false; CHANNELS],
+            lane_out: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
+            lane_dry: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             master_effects: crate::effects::Effects::new(RATE as f32),
