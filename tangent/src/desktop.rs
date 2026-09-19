@@ -1174,6 +1174,13 @@ const CLIP_WAVE_BUCKETS: usize = 600;
 /// number in a file. [`MAX_TIMELINE_FRAMES`] is the one clamp: every
 /// position and length the schedule carries passes through here, so any
 /// sum of a few of them fits a `u64` with room to spare.
+/// How often the eligibility probe's line goes to the log while it is on.
+///
+/// Five seconds is short enough to watch a session change and long enough
+/// that an hour of it is seven hundred lines rather than two hundred
+/// thousand.
+const PROBE_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn frames_at(rate: f64, seconds: f64) -> u64 {
     let frames = (seconds.max(0.0) * rate).round();
     if frames >= MAX_TIMELINE_FRAMES as f64 {
@@ -3509,13 +3516,40 @@ impl DesktopApp {
             // Off unless `TANGENT_PROBE` is set, in which case this is the
             // only place the discard counters can be read: they are made of
             // user-interface writes and no offline render makes one.
-            probe: self
-                .recorder
-                .engine
-                .as_ref()
-                .map(crate::instrument::Engine::probe)
-                .filter(|p| p.blocks > 0)
-                .map(crate::instrument::Probe::line),
+            probe: {
+                let line = self
+                    .recorder
+                    .engine
+                    .as_ref()
+                    .map(crate::instrument::Engine::probe)
+                    .filter(|p| p.blocks > 0)
+                    .map(crate::instrument::Probe::line);
+                // **And into the log, once every few seconds.**
+                //
+                // The panel is the reading for whoever is at the desk; the
+                // log is the reading for whoever is not. The discard half of
+                // this measurement can only come from a live session, so it
+                // has to survive that session being over, and a number
+                // somebody had to read off a screen and retype is a number
+                // that arrives wrong or not at all.
+                //
+                // Throttled rather than per frame, because it runs at up to
+                // sixty a second and the figures are cumulative: every line
+                // would be the same answer with a longer denominator.
+                if let Some(line) = line.as_deref() {
+                    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+                    if let Ok(mut last) = LAST.lock() {
+                        let now = std::time::Instant::now();
+                        let due = last
+                            .is_none_or(|t| now.duration_since(t) >= PROBE_LOG_EVERY);
+                        if due {
+                            *last = Some(now);
+                            log::info!("{line}");
+                        }
+                    }
+                }
+                line
+            },
         });
 
         // The buffer size, on the edge. Reopening both streams is expensive —
