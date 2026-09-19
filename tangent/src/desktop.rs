@@ -3536,6 +3536,28 @@ impl DesktopApp {
                 // Throttled rather than per frame, because it runs at up to
                 // sixty a second and the figures are cumulative: every line
                 // would be the same answer with a longer denominator.
+                // **And the peak beside it.** The probe reports means, and a
+                // breakup is not a mean: a desk at a fifth of its deadline on
+                // average can still miss one block in a thousand, and that is
+                // what a listener hears. The load meter carries the worst
+                // block and the count of blocks that went over; both belong
+                // in the same line, or reading one without the other says a
+                // desk is fine when it is not.
+                let load = self.recorder.engine.as_ref().map(|e| {
+                    let m = e.rt_load();
+                    format!(
+                        "load: last {} us, worst {} us, p99 {} us, deadline {} us{}",
+                        m.last_ns / 1000,
+                        m.high_ns / 1000,
+                        m.p99_ns / 1000,
+                        m.deadline_ns / 1000,
+                        if m.deadline_ns > 0 && m.high_ns > m.deadline_ns {
+                            " - THE WORST BLOCK WENT OVER"
+                        } else {
+                            ""
+                        },
+                    )
+                });
                 if let Some(line) = line.as_deref() {
                     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
                     if let Ok(mut last) = LAST.lock() {
@@ -3544,7 +3566,10 @@ impl DesktopApp {
                             .is_none_or(|t| now.duration_since(t) >= PROBE_LOG_EVERY);
                         if due {
                             *last = Some(now);
-                            log::info!("{line}");
+                            match load.as_deref() {
+                                Some(load) => log::info!("{line}; {load}"),
+                                None => log::info!("{line}"),
+                            }
                         }
                     }
                 }
@@ -19698,6 +19723,15 @@ mod tests {
         }
 
         // Every bay, so a lane costs what it really costs.
+        //
+        // **Unless the caller asks for none.** A song with analog-modelled
+        // plugins does not render the same twice, so no before-and-after
+        // comparison of one is possible. Stripped of its racks the same
+        // arrangement is pure arithmetic over decoded files, which is what
+        // makes a difference between two builds mean something.
+        if std::env::var_os("TANGENT_NO_INSERTS").is_some() {
+            return finish(e, app, rate);
+        }
         let inserts = tangent_ui::recorder::INSERTS;
         for i in 0..(crate::instrument::RACK_SEATS * inserts) {
             let (seat, bay) = (i / inserts, i % inserts);
@@ -19707,7 +19741,13 @@ mod tests {
             let _ = furnish_mirror_bay(e, None, seat, bay, path);
         }
 
-        // The clips, decoded at this rate.
+        finish(e, app, rate);
+    }
+
+    /// The clips half of [`furnish_probe_engine`], so the no-plugin path can
+    /// reach it without repeating it.
+    fn finish(e: &mut crate::instrument::Engine, app: &TangentApp, rate: u32) {
+        use tangent_ui::recorder::CHANNELS;
         let Some(doc_path) = app.project_doc().map(std::path::Path::to_path_buf) else {
             return;
         };
