@@ -7122,7 +7122,7 @@ mod tests {
 
         let mut live = Settings::first_launch();
         live.window_size_percent = 175;
-        live.theme_name = "Iris".into();
+        live.theme_name = "Rhodes".into();
         // NOT saved to a settings file first: this is the case the doc
         // comment names — the live desk is ahead of the file on disk, and a
         // backup taken by copying that file would be one edit stale.
@@ -7130,7 +7130,7 @@ mod tests {
 
         let back = Settings::load_backup_from(&path).expect("the backup did not read back");
         assert_eq!(back.window_size_percent, 175);
-        assert_eq!(back.theme_name, "Iris");
+        assert_eq!(back.theme_name, "Rhodes");
 
         // A torn or absent backup is `None`, never half a desk: a way back
         // that restores nine tenths of your settings is worse than none,
@@ -7571,11 +7571,11 @@ mod tests {
         // a mode somebody chose — driven, because "the defaults are right"
         // and "the reset reaches them" are two different claims.
         let mut reset = Settings::default();
-        crate::theme::by_name("Iris").expect("Iris is a factory theme").apply(&mut reset);
+        crate::theme::by_name("Rhodes").expect("Rhodes is a factory theme").apply(&mut reset);
         reset.dark_mode = true;
         reset.reset(ResetScope::Everything);
         assert_eq!(reset.theme_name, "Default", "Reset everything left the theme");
-        assert_eq!(reset.background_color, Settings::default().background_color, "Reset everything left Iris's colours");
+        assert_eq!(reset.background_color, Settings::default().background_color, "Reset everything left Rhodes's colours");
         assert!(!reset.dark_mode, "Reset everything came back dark on the theory surfaces");
         assert_eq!(reset.font_choice, crate::fonts::FontChoice::default().key());
         assert_eq!(s.white_key_idle_color.to_hex(), "#e8dcc0");

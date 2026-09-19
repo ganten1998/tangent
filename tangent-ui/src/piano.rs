@@ -946,7 +946,7 @@ mod tests {
             .collect();
         assert_eq!(
             lifted,
-            ["Nocturne", "Phosphor"],
+            ["Amber", "Phosphor"],
             "a different set of themes needs the sharps lifted now"
         );
     }

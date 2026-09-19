@@ -28,6 +28,12 @@ beside it, because equal luminance is not equal vividness.
                  Rust sweeps (the dark two, and Silverface)
     --silverface the Silverface run re-derived from its families and proved
                  equal to the pinned bytes, plus the whole-desk gates
+    --redo       the 2026-09-18 redo: the seven replacement runs re-derived
+                 from their families and proved equal to the pins, plus the
+                 whole-desk gates on each (the Rust floors, ported)
+    --themes     every factory theme designed in this file (the redo's ten,
+                 Phosphor, Silverface) held to the ported Rust sweeps;
+                 `--dark` is the old spelling and still works
 """
 import colorsys
 import re
@@ -184,10 +190,10 @@ SHIPPED = {
         click=(0x3f, 0x34, 0x31),
         # **#0a5fc2 until 584354f, and this copy did not follow.** That
         # commit changed index 300 in the Rust from a blue to this red and
-        # left the frozen copy here on the old value, so `--check` has
-        # reported two failures ever since: the drift itself, and the
-        # byte-identity claim that rests on it. The table is the source of
-        # truth for a colour and this file is a pin on it, so the pin moved.
+        # left the frozen copy here on the old value, so `--check` has been
+        # reporting two failures -- the drift and the byte-identity that
+        # depends on it -- ever since. The table is the source of truth for
+        # a colour and this file is a pin on it, so the pin moved.
         master=(0xB0, 0x2A, 0x37),
     ),
     "Valentine": dict(
@@ -703,10 +709,179 @@ EXT2_RUNS["Silverface"] = [
     (0x26, 0x63, 0x87), (0x34, 0x2c, 0x26), (0x13, 0x48, 0x45), (0x8e, 0x36, 0x39),
 ]
 
+
+# ── the 2026-09-18 redo: seven runs, appended after Silverface ─────────────
+#
+# **Seven themes replaced in their slots, and their runs appended whole.**
+# The owner's list: Studio, Aurora, Blueprint and Porcelain "replaced with
+# something more inspired and not yet covered by the rest of the themes",
+# Dusk and Iris "too close: replace them", Nocturne "also just Navi". The
+# seven that took their slots are Ochre, Reed, Pewter, Celadon, Prism, Storm
+# and Amber, and each one's desk is designed here the way Silverface's was:
+# four families, `family`'s walk over all four tones, the extensions on the
+# half-tones with the hue nudged, a quiet click in the theme's own cast, and
+# a master found by `make_master` from the theme's hue. The retired seven
+# keep every byte (see RETIRED); these start at index 708.
+#
+# One spec per run: name, slot, the four families (label, hue, sat), the
+# click (hue, sat), and the hue the master search starts from.
+REDO = [
+    ("Ochre", 5, [("gold", 44, 0.85), ("navy", 225, 0.65), ("bronze", 30, 0.60), ("steel", 210, 0.35)], (44, 0.22), 44),
+    ("Reed", 6, [("avocado", 76, 0.60), ("coral", 8, 0.70), ("sage", 100, 0.30), ("olive", 50, 0.50)], (215, 0.18), 8),
+    ("Zinc", 9, [("zinc", 280, 0.30), ("brass", 42, 0.70), ("violet", 292, 0.58), ("steel", 212, 0.32)], (120, 0.16), 355),
+    ("Celadon", 10, [("celadon", 150, 0.35), ("plum", 315, 0.55), ("pine", 160, 0.60), ("moss", 100, 0.25)], (35, 0.20), 315),
+    ("Prism", 14, [("red", 0, 0.72), ("yellow", 48, 0.75), ("green", 130, 0.62), ("blue", 215, 0.72)], (240, 0.12), 0),
+    ("Storm", 15, [("slate", 215, 0.30), ("yellow", 50, 0.70), ("storm", 222, 0.60), ("grey", 215, 0.10)], (35, 0.22), 50),
+    ("Amber", 16, [("amber", 40, 0.85), ("orange", 25, 0.75), ("umber", 35, 0.45), ("gold", 48, 0.60)], (40, 0.20), 25),
+]
+
+# The pins: what the machinery above produced, frozen the day it shipped and
+# proved equal on every `--redo`. Empty until a run is designed; the report
+# prints a paste-ready block for any run without one.
+REDO_PINS = {
+    "Ochre": dict(
+        slots=[
+            (0x2a, 0x21, 0x06), (0x24, 0x35, 0x66), (0x60, 0x44, 0x27), (0x49, 0x5c, 0x70),
+            (0x44, 0x35, 0x0a), (0x31, 0x46, 0x86), (0x77, 0x53, 0x30), (0x1b, 0x23, 0x2a),
+            (0x5b, 0x47, 0x0e), (0x42, 0x58, 0x99), (0x2d, 0x20, 0x12), (0x2c, 0x38, 0x44),
+            (0x71, 0x57, 0x11), (0x16, 0x21, 0x3f), (0x48, 0x32, 0x1d), (0x3b, 0x4c, 0x5c),
+        ],
+        ext=[
+            (0x33, 0x2f, 0x08), (0x36, 0x3c, 0x78), (0x64, 0x50, 0x28), (0x50, 0x5f, 0x7b),
+            (0x48, 0x42, 0x0b), (0x46, 0x4d, 0x90), (0x71, 0x5b, 0x2d), (0x27, 0x2e, 0x3b),
+        ],
+        ext2=[
+            (0x74, 0x49, 0x11), (0x35, 0x5e, 0x98), (0x42, 0x28, 0x1a), (0x32, 0x44, 0x4c),
+            (0x81, 0x55, 0x1b), (0x1a, 0x2f, 0x4b), (0x5d, 0x38, 0x25), (0x40, 0x56, 0x62),
+        ],
+        click=(0x58, 0x53, 0x44),
+        master=(0x95, 0x43, 0x0c),
+    ),
+    "Reed": dict(
+        slots=[
+            (0x1f, 0x24, 0x0f), (0x5e, 0x25, 0x1c), (0x3f, 0x4e, 0x37), (0x63, 0x5b, 0x32),
+            (0x31, 0x3a, 0x17), (0x7e, 0x32, 0x26), (0x4d, 0x60, 0x44), (0x25, 0x22, 0x13),
+            (0x42, 0x4e, 0x1f), (0x94, 0x42, 0x35), (0x1d, 0x24, 0x1a), (0x3c, 0x37, 0x1e),
+            (0x51, 0x60, 0x27), (0x3b, 0x17, 0x12), (0x2f, 0x3a, 0x29), (0x50, 0x4a, 0x28),
+        ],
+        ext=[
+            (0x25, 0x31, 0x14), (0x65, 0x34, 0x1e), (0x42, 0x58, 0x3e), (0x60, 0x60, 0x30),
+            (0x34, 0x46, 0x1c), (0x80, 0x41, 0x27), (0x4b, 0x64, 0x46), (0x2f, 0x2f, 0x18),
+        ],
+        ext2=[
+            (0x51, 0x56, 0x23), (0x99, 0x43, 0x46), (0x29, 0x30, 0x22), (0x4c, 0x40, 0x26),
+            (0x5d, 0x62, 0x27), (0x54, 0x19, 0x1b), (0x3a, 0x44, 0x30), (0x61, 0x51, 0x30),
+        ],
+        click=(0x4d, 0x53, 0x5d),
+        master=(0xb4, 0x19, 0x0e),
+    ),
+    "Zinc": dict(
+        slots=[
+            (0x28, 0x1f, 0x2c), (0x43, 0x35, 0x14), (0x68, 0x36, 0x70), (0x4c, 0x5c, 0x70),
+            (0x40, 0x31, 0x47), (0x5a, 0x47, 0x1b), (0x7b, 0x47, 0x84), (0x1c, 0x22, 0x2a),
+            (0x56, 0x43, 0x5f), (0x6f, 0x58, 0x21), (0x33, 0x17, 0x37), (0x2e, 0x37, 0x43),
+            (0x6a, 0x52, 0x75), (0x29, 0x21, 0x0c), (0x52, 0x25, 0x58), (0x3e, 0x4b, 0x5a),
+        ],
+        ext=[
+            (0x37, 0x28, 0x3a), (0x48, 0x41, 0x16), (0x78, 0x3c, 0x76), (0x53, 0x5e, 0x79),
+            (0x4f, 0x3a, 0x53), (0x5c, 0x54, 0x1c), (0x85, 0x48, 0x82), (0x28, 0x2d, 0x3b),
+        ],
+        ext2=[
+            (0x5c, 0x4c, 0x6d), (0x7f, 0x56, 0x26), (0x40, 0x21, 0x4d), (0x34, 0x43, 0x4c),
+            (0x69, 0x57, 0x7c), (0x3e, 0x2a, 0x12), (0x5a, 0x2f, 0x6c), (0x42, 0x56, 0x61),
+        ],
+        click=(0x49, 0x56, 0x49),
+        master=(0x96, 0x0c, 0x17),
+    ),
+    "Celadon": dict(
+        slots=[
+            (0x18, 0x24, 0x1e), (0x55, 0x26, 0x49), (0x21, 0x52, 0x42), (0x50, 0x5f, 0x48),
+            (0x27, 0x3b, 0x31), (0x71, 0x33, 0x62), (0x29, 0x65, 0x51), (0x1e, 0x23, 0x1b),
+            (0x34, 0x4f, 0x42), (0x89, 0x41, 0x77), (0x0f, 0x26, 0x1f), (0x30, 0x39, 0x2b),
+            (0x40, 0x62, 0x51), (0x35, 0x18, 0x2e), (0x19, 0x3d, 0x31), (0x41, 0x4d, 0x3a),
+        ],
+        ext=[
+            (0x20, 0x31, 0x2c), (0x65, 0x2e, 0x4e), (0x25, 0x5b, 0x52), (0x4f, 0x63, 0x4b),
+            (0x2e, 0x46, 0x3e), (0x81, 0x3a, 0x64), (0x2a, 0x68, 0x5d), (0x26, 0x30, 0x24),
+        ],
+        ext2=[
+            (0x3a, 0x59, 0x45), (0x87, 0x47, 0x81), (0x15, 0x33, 0x24), (0x3b, 0x43, 0x33),
+            (0x42, 0x65, 0x4e), (0x46, 0x20, 0x43), (0x1d, 0x49, 0x33), (0x4c, 0x56, 0x41),
+        ],
+        click=(0x59, 0x52, 0x47),
+        master=(0xaa, 0x0e, 0x83),
+    ),
+    "Prism": dict(
+        slots=[
+            (0x40, 0x12, 0x12), (0x40, 0x36, 0x10), (0x20, 0x53, 0x28), (0x2c, 0x5a, 0x9c),
+            (0x66, 0x1d, 0x1d), (0x56, 0x49, 0x16), (0x27, 0x67, 0x32), (0x11, 0x22, 0x3b),
+            (0x81, 0x2e, 0x2e), (0x69, 0x5a, 0x1a), (0x0f, 0x27, 0x13), (0x1b, 0x37, 0x5f),
+            (0x97, 0x3f, 0x3f), (0x27, 0x22, 0x0a), (0x18, 0x3e, 0x1e), (0x24, 0x4a, 0x7f),
+        ],
+        ext=[
+            (0x4e, 0x1f, 0x16), (0x44, 0x43, 0x11), (0x24, 0x5d, 0x37), (0x45, 0x5b, 0x9e),
+            (0x6f, 0x2c, 0x1f), (0x57, 0x55, 0x16), (0x28, 0x6a, 0x3e), (0x1a, 0x2a, 0x5c),
+        ],
+        ext2=[
+            (0x8f, 0x33, 0x43), (0x79, 0x58, 0x1e), (0x14, 0x34, 0x14), (0x1b, 0x44, 0x62),
+            (0x9a, 0x41, 0x4f), (0x3b, 0x2b, 0x0f), (0x1c, 0x4a, 0x1c), (0x23, 0x57, 0x7c),
+        ],
+        click=(0x51, 0x51, 0x5d),
+        master=(0xb6, 0x0f, 0x30),
+    ),
+    "Storm": dict(
+        slots=[
+            (0x1d, 0x23, 0x2a), (0x3e, 0x36, 0x13), (0x32, 0x49, 0x7d), (0x57, 0x5c, 0x61),
+            (0x2f, 0x38, 0x43), (0x53, 0x49, 0x19), (0x3d, 0x59, 0x99), (0x21, 0x22, 0x24),
+            (0x3f, 0x4a, 0x5a), (0x66, 0x5b, 0x1f), (0x17, 0x22, 0x3a), (0x35, 0x37, 0x3a),
+            (0x4e, 0x5c, 0x6f), (0x26, 0x22, 0x0c), (0x25, 0x36, 0x5c), (0x47, 0x4a, 0x4e),
+        ],
+        ext=[
+            (0x29, 0x2e, 0x3b), (0x43, 0x43, 0x14), (0x44, 0x4e, 0x8d), (0x5b, 0x5e, 0x66),
+            (0x3a, 0x41, 0x53), (0x55, 0x55, 0x1a), (0x4e, 0x59, 0x9d), (0x2c, 0x2d, 0x31),
+        ],
+        ext2=[
+            (0x44, 0x55, 0x61), (0x75, 0x59, 0x23), (0x1c, 0x2f, 0x45), (0x3e, 0x42, 0x44),
+            (0x4d, 0x60, 0x6e), (0x39, 0x2b, 0x11), (0x27, 0x43, 0x62), (0x4e, 0x54, 0x57),
+        ],
+        click=(0x5a, 0x52, 0x46),
+        master=(0x83, 0x4e, 0x0a),
+    ),
+    "Amber": dict(
+        slots=[
+            (0x2c, 0x20, 0x07), (0x52, 0x2e, 0x15), (0x58, 0x48, 0x30), (0x67, 0x5b, 0x29),
+            (0x48, 0x33, 0x0b), (0x6d, 0x3e, 0x1b), (0x6c, 0x58, 0x3b), (0x26, 0x22, 0x0f),
+            (0x60, 0x45, 0x0e), (0x87, 0x4c, 0x22), (0x28, 0x21, 0x16), (0x3e, 0x36, 0x19),
+            (0x76, 0x55, 0x12), (0x33, 0x1c, 0x0d), (0x41, 0x35, 0x24), (0x54, 0x49, 0x21),
+        ],
+        ext=[
+            (0x35, 0x2e, 0x08), (0x57, 0x3c, 0x16), (0x5c, 0x52, 0x33), (0x62, 0x60, 0x27),
+            (0x4b, 0x40, 0x0b), (0x6e, 0x4c, 0x1c), (0x69, 0x5d, 0x3a), (0x2f, 0x2f, 0x13),
+        ],
+        ext2=[
+            (0x79, 0x47, 0x14), (0x94, 0x49, 0x31), (0x3a, 0x2b, 0x20), (0x50, 0x3f, 0x20),
+            (0x86, 0x52, 0x1f), (0x4c, 0x21, 0x13), (0x52, 0x3c, 0x2d), (0x66, 0x4f, 0x29),
+        ],
+        click=(0x58, 0x53, 0x47),
+        master=(0xa4, 0x33, 0x29),
+    ),
+}
+
+for _name, _p in REDO_PINS.items():
+    APPENDED_RUNS[_name] = dict(slots=_p["slots"], click=_p["click"], master=_p["master"])
+    EXT_RUNS[_name] = _p["ext"]
+    EXT2_RUNS[_name] = _p["ext2"]
+
 # Every run in the table, in TABLE order — which is also `PALETTES` order
 # once the retired are skipped.
 ALL_RUNS = {**SHIPPED, **DARK_RUNS, **APPENDED_RUNS}
-RETIRED = {"Carbon"}
+# **Retired by NAME, bytes frozen** (see the DARK_RUNS note above Carbon).
+# The 2026-09-18 redo replaced seven themes IN THEIR SLOTS -- Studio,
+# Aurora, Blueprint, Porcelain, Dusk, Iris and Nocturne -- and each one's
+# four blocks stay exactly where they were, reachable by every desk that
+# ever painted a track with them. The replacements' runs are appended after
+# Silverface (see REDO below) and the slot's Palette row points there.
+RETIRED = {"Carbon", "Studio", "Aurora", "Blueprint", "Porcelain", "Dusk", "Iris", "Nocturne"}
 
 # Where each run's four blocks sit. The first sixteen follow the original
 # formula; the dark batch was appended after the 300-block masters; the
@@ -721,7 +896,23 @@ for _i, _n in enumerate(SHIPPED):
 for _i, _n in enumerate(DARK_RUNS):
     TABLE_AT[_n] = dict(base=316 + 17 * _i, master=367 + _i, ext=498 + 8 * _i, ext2=650 + 8 * _i)
 TABLE_AT["Silverface"] = dict(base=674, master=691, ext=692, ext2=700)
-TABLE_LEN = 708
+# 708 was the table's length the day Silverface shipped; the redo's seven
+# runs extend it (see TABLE_LEN below REDO_PINS).
+TABLE_LEN_SILVERFACE = 708
+for _i, _spec in enumerate(REDO):
+    _b = TABLE_LEN_SILVERFACE + 34 * _i
+    TABLE_AT[_spec[0]] = dict(base=_b, master=_b + 17, ext=_b + 18, ext2=_b + 26)
+TABLE_LEN = TABLE_LEN_SILVERFACE + 34 * len(REDO)
+
+# The menu: `factory()`'s order, which is `PALETTES`' order and the index a
+# saved desk's `palette_choice` means. Not derivable from the table any
+# more -- a replaced slot points past the runs that follow it -- so it is
+# written down once and `--check` holds the Rust to it.
+MENU = [
+    "Default", "Valentine", "Hydra", "Navi", "Mono", "Ochre", "Reed",
+    "Sandstone", "Centennial", "Zinc", "Celadon", "Moss", "Rhodes", "Copper",
+    "Prism", "Storm", "Amber", "Phosphor", "Silverface",
+]
 
 
 def live_masters():
@@ -836,8 +1027,10 @@ def check(verbose=True):
     if len(cols) != TABLE_LEN:
         errs.append(f"STRIP_COLORS holds {len(cols)} entries, want {TABLE_LEN}")
     live = [n for n in ALL_RUNS if n not in RETIRED]
-    if [n for n, *_ in pals] != live:
-        errs.append("palette names/order differ between Rust and ALL_RUNS minus RETIRED")
+    if [n for n, *_ in pals] != MENU:
+        errs.append("palette names/order differ between Rust and MENU")
+    if sorted(live) != sorted(MENU):
+        errs.append("MENU and ALL_RUNS minus RETIRED name different runs")
     for name, base, mat, ext, ext2 in pals:
         want = TABLE_AT.get(name)
         if want is None:
@@ -862,7 +1055,7 @@ def check(verbose=True):
     # and the values themselves are compared exactly, above and below this
     # line. Only the literals move: lowercasing the whole file would take
     # the theme names in the block comments with it and every block would
-    # stop matching.
+    # stop matching, which is exactly what the first cut of this did.
     folded = re.sub(r"0x([0-9A-Fa-f]{2})", lambda m: "0x" + m.group(1).lower(), src)
     if HAND != cols[:27]:
         errs.append("the hand grid here has drifted from the Rust")
@@ -887,7 +1080,7 @@ def check(verbose=True):
             e = table[name]
             if e != cols[b0 : b0 + 8]:
                 errs.append(f"{name}: the embedded {label} run has drifted from the Rust")
-            if "\n".join(ext_lines(name, label, lo, hi, b0, e)) not in folded:
+            if "\n".join(ext_lines(name, label, lo, hi, b0, e)) not in src:
                 errs.append(f"{name}: the emitted {label} block is not byte-identical")
             for j, c in enumerate(e):
                 if not wants_light_ink(c) or ink_contrast(c) < INK_FLOOR:
@@ -953,10 +1146,10 @@ def check(verbose=True):
         # **Everything not already printed beside its palette**, which is
         # not the same as "everything whose prefix is not a run name". The
         # filter used to be the latter, so the byte-identity and extension
-        # errors -- all prefixed with a run's name, none of them `perrs` --
-        # were counted in the total and never shown: a run could report
-        # CHECK FAILS (56) and print two lines. `shown` is what the palette
-        # loop actually said.
+        # errors -- all of which are prefixed with a run's name and none of
+        # which are `perrs` -- were counted in the total and never shown:
+        # a run of this script could say CHECK FAILS (56) and print two
+        # lines. `shown` is what the palette loop actually said.
         for e in errs:
             if e not in shown:
                 say(f"  - {e}")
@@ -1056,6 +1249,137 @@ def silverface_report():
     print()
     print("ALL PASS" if not errs else f"SILVERFACE FAILS ({len(errs)})")
     return len(errs)
+
+
+# ── the redo's designers and gates ─────────────────────────────────────────
+
+
+def live_master_items():
+    """(name, master) for every run a person can choose."""
+    return [(n, p["master"]) for n, p in ALL_RUNS.items() if n not in RETIRED]
+
+
+def redo_ext(fams, first, nudge):
+    """Eight channels seeded from run slots `first..first+8`: the seed's
+    family on the half-tone above the seed's tone, hue nudged `nudge` --
+    `faceplate_ext`'s walk over any four families."""
+    out = []
+    for j in range(8):
+        i = first + j
+        _, hue, sat = fams[i % 4]
+        out.append(make(hue + nudge, sat, None, lum=HALF_TONES[(i // 4 + i) % 4]))
+    return out
+
+
+def design_redo(spec, others):
+    """One replacement run from its spec. `others` is every master that is
+    live at the time -- the shipped ones and the redo runs designed before
+    this one -- so the spread gate sees the whole menu."""
+    name, _slot, fams, (chue, csat), hue0 = spec
+    slots = []
+    for i in range(16):
+        _, hue, sat = fams[i % 4]
+        slots.append(make(hue, sat, (i // 4 + i) % 4))
+    click = make(chue, csat, None, lum=HALF_TONES[2])
+    master = make_master(slots, click, others, hue0=hue0)
+    return dict(
+        slots=slots,
+        click=click,
+        master=master,
+        ext=redo_ext(fams, 0, 10.0),
+        ext2=redo_ext(fams, 8, -10.0),
+    )
+
+
+def desk_errors(p, others):
+    """The whole thirty-two-channel desk against every floor the Rust holds
+    a live palette to, in one list. The floors are the tests' own:
+    `every_auto_palette_colour_can_carry_the_ink_printed_on_it` (4.5:1
+    under the ivory), `adjacent_channels_never_wear_the_same_colour_twice_over`
+    (10 dE across all thirty-two, seams included),
+    `every_auto_palette_dresses_all_sixteen_channels_differently`,
+    `the_click_and_the_master_stand_apart_from_every_channel` (the click 8
+    dE off every channel and 20 off the desk's one red master, which is
+    index 27 and not the run's own), `one_red_master_stands_off_every_palette`
+    (index 27 at least 8 dE from every channel), and the chroma ceiling
+    every strip colour obeys. The run's own master keeps `master_ok`."""
+    slots, click, master = p["slots"], p["click"], p["master"]
+    desk = slots + p["ext"] + p["ext2"]
+    errs = []
+    if len(set(desk)) != 32:
+        errs.append("the desk repeats a colour")
+    for j, (a, b) in enumerate(zip(desk, desk[1:])):
+        d = de(a, b)
+        if d < ADJ_FLOOR:
+            errs.append(f"channels {j + 1}/{j + 2} dE {d:.1f} < {ADJ_FLOOR}")
+    for j, c in enumerate(desk):
+        if not wants_light_ink(c) or ink_contrast(c) < INK_FLOOR:
+            errs.append(f"channel {j + 1} {hexs(c)} fails the ink gate ({ink_contrast(c):.2f}:1)")
+        if chroma(c) > CHROMA_MAX:
+            errs.append(f"channel {j + 1} {hexs(c)} chroma {chroma(c):.1f} > {CHROMA_MAX}")
+        if de(c, MASTER_STRIP) < 8.0:
+            errs.append(f"channel {j + 1} {hexs(c)} only {de(c, MASTER_STRIP):.1f} dE from the desk's red master")
+    if not wants_light_ink(click) or ink_contrast(click) < INK_FLOOR:
+        errs.append(f"click {hexs(click)} fails the ink gate")
+    near = min(de(click, c) for c in desk)
+    if near < CLICK_DE_MIN:
+        errs.append(f"click only dE {near:.1f} from a channel")
+    if de(click, MASTER_STRIP) < 20.0:
+        errs.append(f"click only {de(click, MASTER_STRIP):.1f} dE from the desk's red master")
+    if master is None:
+        errs.append("no master clears the gates")
+    elif not master_ok(master, slots, click, others):
+        errs.append("the run's own master fails its gates (ink / own-run distance / spread)")
+    return errs
+
+
+def redo_report():
+    """`--redo`: every replacement run re-derived from its spec, proved equal
+    to its pin (or printed as one to paste), and held to `desk_errors`."""
+    bad = 0
+    designed = []
+    for spec in REDO:
+        name = spec[0]
+        others = [m for n, m in live_master_items() if n != name and n not in REDO_PINS] + designed
+        others += [m for n, m in live_master_items() if n in REDO_PINS and n != name]
+        fresh = design_redo(spec, others)
+        errs = desk_errors(fresh, others)
+        pin = REDO_PINS.get(name)
+        if pin is None:
+            print(f"{name}: NO PIN YET -- paste this into REDO_PINS:")
+            print(f'    "{name}": dict(')
+            for k in ("slots", "ext", "ext2"):
+                print(f"        {k}=[")
+                row = fresh[k]
+                for i in range(0, len(row), 4):
+                    print("            " + " ".join(f"({r:#04x}, {g:#04x}, {b:#04x})," for r, g, b in row[i:i + 4]))
+                print("        ],")
+            c, m = fresh["click"], fresh["master"]
+            print(f"        click=({c[0]:#04x}, {c[1]:#04x}, {c[2]:#04x}),")
+            if m:
+                print(f"        master=({m[0]:#04x}, {m[1]:#04x}, {m[2]:#04x}),")
+            print("    ),")
+        else:
+            for k in ("slots", "click", "master", "ext", "ext2"):
+                if fresh[k] != pin[k]:
+                    errs.append(f"{k}: the machinery no longer reproduces the pin")
+        if fresh["master"]:
+            designed.append(fresh["master"])
+        desk = fresh["slots"] + fresh["ext"] + fresh["ext2"]
+        ds = [de(a, b) for a, b in zip(desk, desk[1:])]
+        spread = min((de(fresh["master"], m) for m in others), default=0.0) if fresh["master"] else 0.0
+        print(
+            f"{name:8s} {'FAIL' if errs else 'ok':4s} adj {min(ds):4.1f}+ "
+            f"ink {min(ink_contrast(c) for c in desk):.2f}:1+ chroma {max(chroma(c) for c in desk):4.1f}- "
+            f"click {hexs(fresh['click'])} master {hexs(fresh['master']) if fresh['master'] else '-'} "
+            f"spread {spread:.1f}"
+        )
+        for e in errs:
+            print(f"           - {e}")
+        bad += len(errs)
+    print()
+    print("ALL PASS" if not bad else f"REDO FAILS ({bad})")
+    return bad
 
 
 # ── the retired abstract palettes ──────────────────────────────────────────
@@ -1389,95 +1713,231 @@ SURFACE_ROLES = [
     "meter_bg", "fx_strip", "fretboard",
 ]
 
+
+def H(h):
+    """A colour from its hex spelling, so a theme below reads like the Rust."""
+    h = h.lstrip("#")
+    return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def T(**roles):
+    """One theme: every role by name, hex in, tuples out; `dark` is the
+    theme's own dark set the way the Rust `dark_of` writes it."""
+    out = {k: H(v) for k, v in roles.items() if k != "dark"}
+    out["dark"] = {k: H(v) for k, v in roles.get("dark", {}).items()}
+    return out
+
+
 # `dark` is the theme's own dark set, the way the Rust `dark_of` writes it;
-# a light theme names only the ground and takes the keyboard swap.
+# every factory theme names only its ground there and takes the keyboard
+# swap and the lift (`idle_colors` below, ported from piano.rs).
+#
+# Nocturne was designed here and is retired (2026-09-18, "also just Navi");
+# its bytes stay in DARK_RUNS. Phosphor's entry used to name a dark
+# keyboard of its own, which the Rust no longer carries -- see piano.rs --
+# so it names its ground alone now, like everybody else.
 DESIGNED_THEMES = {
-    "Nocturne": dict(
-        background=(0x0A, 0x1C, 0x34),
-        white_key=(0x0A, 0x1C, 0x34),
-        black_key=(0x06, 0x12, 0x24),
-        key_active=(0x7F, 0x9B, 0xFF),
-        sustain=(0x40, 0xE8, 0xFF),
-        key_separator=(0x26, 0x50, 0x80),
-        text=(0xE0, 0xF0, 0xFF),
-        theory_line=(0x37, 0x57, 0x82),
-        interval_text=(0xA8, 0xC8, 0xD8),
-        recorder_bg=(0x26, 0x42, 0x6A),
-        fx_knob=(0x00, 0xD8, 0xF8),
-        master_knob=(0xF0, 0x90, 0x30),
-        varispeed=(0xC9, 0xD8, 0xE8),
-        velocity_loud=(0xFE, 0x6C, 0x56),
-        velocity_quiet=(0x18, 0xAD, 0x8F),
-        meter_bg=(0x06, 0x12, 0x24),
-        scope_draw=(0x40, 0xE8, 0xFF),
-        fx_strip=(0x19, 0x2E, 0x48),
-        input_chip=(0x55, 0x78, 0xFF),
-        fretboard=(0x06, 0x12, 0x24),
-        string=(0x78, 0x98, 0xB8),
-        dark=dict(
-            background=(0x06, 0x12, 0x24),
-            white_key=(0x46, 0x59, 0x7A),
-            black_key=(0x1E, 0x33, 0x50),
-        ),
-    ),
-    "Phosphor": dict(
-        background=(0x0B, 0x0E, 0x0A),
-        white_key=(0x0B, 0x0E, 0x0A),
-        black_key=(0x05, 0x07, 0x05),
-        key_active=(0xA3, 0xE0, 0x48),
-        sustain=(0xD2, 0xA3, 0x6C),
-        key_separator=(0x22, 0x2C, 0x1E),
-        text=(0xC8, 0xE8, 0xB0),
-        theory_line=(0x3A, 0x48, 0x34),
-        interval_text=(0x9A, 0xC0, 0x84),
-        recorder_bg=(0x1C, 0x2C, 0x16),
-        fx_knob=(0x8F, 0xAE, 0x3F),
-        master_knob=(0xE0, 0x58, 0x40),
-        varispeed=(0xC8, 0xE8, 0xB0),
-        velocity_loud=(0xE8, 0x8C, 0x40),
-        velocity_quiet=(0x48, 0xA8, 0x88),
-        meter_bg=(0x05, 0x07, 0x05),
-        scope_draw=(0xA3, 0xE0, 0x48),
-        fx_strip=(0x16, 0x22, 0x12),
-        input_chip=(0x6F, 0xAE, 0x3F),
-        fretboard=(0x05, 0x07, 0x05),
-        string=(0x6A, 0x80, 0x60),
-        dark=dict(
-            background=(0x05, 0x07, 0x05),
-            white_key=(0x4E, 0x5A, 0x40),
-            black_key=(0x1E, 0x28, 0x17),
-        ),
+    "Phosphor": T(
+        background="#0b0e0a", white_key="#0b0e0a", black_key="#050705",
+        key_active="#a3e048", sustain="#d2a36c", key_separator="#222c1e",
+        text="#c8e8b0", theory_line="#3a4834", interval_text="#9ac084",
+        recorder_bg="#1c2c16", fx_knob="#8fae3f", master_knob="#e05840",
+        varispeed="#c8e8b0", velocity_loud="#e88c40", velocity_quiet="#48a888",
+        meter_bg="#050705", scope_draw="#a3e048", fx_strip="#162212",
+        input_chip="#6fae3f", fretboard="#050705", string="#6a8060",
+        dark=dict(background="#050705"),
     ),
     # The turquoise is not the panel's #18808f: that one sits at luminance
     # 0.176, in the dead zone, and read 2.94:1 on the band and 3.75:1 under
     # its own note name. Lifted to 0.24 — the lowest turquoise that clears
     # the band at 3:1 and the dark ink at 4.5:1 — it keeps the most of what
     # a lit key can have against aluminum naturals (2.25:1).
-    "Silverface": dict(
-        background=(0xC9, 0xCD, 0xD2),
-        white_key=(0xC9, 0xCD, 0xD2),
-        black_key=(0x1B, 0x1D, 0x20),
-        key_active=(0x1B, 0x94, 0xA6),
-        sustain=(0x3B, 0x5A, 0x8C),
-        key_separator=(0x3A, 0x3E, 0x44),
-        text=(0xD8, 0xDE, 0xE6),
-        theory_line=(0x8A, 0x90, 0x99),
-        interval_text=(0x9F, 0xB3, 0xC4),
-        recorder_bg=(0x2A, 0x2E, 0x33),
-        fx_knob=(0x3F, 0xB8, 0xC9),
-        master_knob=(0xE0, 0x48, 0x3A),
-        varispeed=(0xD8, 0xDE, 0xE6),
+    "Silverface": T(
+        background="#c9cdd2", white_key="#c9cdd2", black_key="#1b1d20",
+        key_active="#1b94a6", sustain="#3b5a8c", key_separator="#3a3e44",
+        text="#d8dee6", theory_line="#8a9099", interval_text="#9fb3c4",
+        recorder_bg="#2a2e33", fx_knob="#3fb8c9", master_knob="#e0483a",
+        varispeed="#d8dee6",
         # velgen's solver against this roll, hot 12 / cool 190: the panel's
         # own pair sat at 2.7:1 and 2.4:1 on the dark roll.
-        velocity_loud=(0xFF, 0x78, 0x57),
-        velocity_quiet=(0x1D, 0xAF, 0xCD),
-        meter_bg=(0x14, 0x16, 0x1A),
-        scope_draw=(0x64, 0xD8, 0xE8),
-        fx_strip=(0x1F, 0x22, 0x26),
-        input_chip=(0x8A, 0xA0, 0xB8),
-        fretboard=(0x14, 0x16, 0x1A),
-        string=(0x8A, 0x90, 0x99),
-        dark=dict(background=(0x1B, 0x1D, 0x20)),
+        velocity_loud="#ff7857", velocity_quiet="#1dafcd",
+        meter_bg="#14161a", scope_draw="#64d8e8", fx_strip="#1f2226",
+        input_chip="#8aa0b8", fretboard="#14161a", string="#8a9099",
+        dark=dict(background="#1b1d20"),
+    ),
+}
+
+# ── the 2026-09-18 redo: ten themes ──────────────────────────────────────────
+#
+# Three retuned at the owner's word and seven replaced in their slots.
+# Designed here against `theme_gates` first; the Rust in theme.rs is the
+# transcription. The velocity pairs are velgen.py's (`velgen.py emit`
+# against theme.rs), copied back here so the gate sees the whole theme.
+#
+# **Valentine, more red.** The owner: "keep, but more red, like the original
+# TUI application." The marks were always the TUI's own (rose, coral, amber,
+# jade, crimson); what read purple was the SURFACES, a mauve band at hue
+# 314 and a wine strip at 319. Both move to the crimson side of the plum
+# (342 and 338), and the dark ground follows from #251524 to #23131a.
+#
+# **Sandstone, darker sand.** "Make even light mode a darker sand colour;
+# it is too harsh now." The page came down from a near-white (0.90
+# luminance) to sand (0.62), the band with it (0.66 to 0.49), and every
+# mark that clears 3:1 on the old band was re-measured on the new one: the
+# fx knob deepened a step, the scope trace with it.
+#
+# **Centennial, a darker band.** "Make the recorder colour slightly darker
+# grey." 0x c2 to 0x b6, about seven percent, and the gold marks deepened
+# one step so they keep 3:1 on it.
+REDO_THEMES = {
+    "Valentine": T(
+        background="#f3dce7", white_key="#f3dce7", black_key="#23131a",
+        key_active="#ff5fa2", sustain="#ffb454", key_separator="#66283e",
+        text="#f3dce7", theory_line="#a87284", interval_text="#4cc7a4",
+        recorder_bg="#5a2a3c", fx_knob="#ff8a5b", master_knob="#ff3b5c",
+        varispeed="#f3dce7", velocity_loud="#ff7083", velocity_quiet="#19b384",
+        meter_bg="#23131a", scope_draw="#4cc7a4", fx_strip="#4e2232",
+        input_chip="#4cc7a4", fretboard="#23131a", string="#a87284",
+        dark=dict(background="#23131a"),
+    ),
+    "Sandstone": T(
+        background="#e0cfa8", white_key="#e0cfa8", black_key="#2b241d",
+        key_active="#9a4925", sustain="#3a4a24", key_separator="#9c8a70",
+        text="#3a3128", theory_line="#8a7858", interval_text="#8a5a2c",
+        recorder_bg="#ded1b2", fx_knob="#9a4522", master_knob="#a03828",
+        varispeed="#40606e", velocity_loud="#ba3a1a", velocity_quiet="#3c7428",
+        meter_bg="#d3c49f", scope_draw="#4e6238", fx_strip="#c3ae82",
+        input_chip="#7d8f5a", fretboard="#b9a37c", string="#5a4c3a",
+        dark=dict(background="#2b241d"),
+    ),
+    "Centennial": T(
+        background="#f2f1ee", white_key="#f2f1ee", black_key="#26262a",
+        key_active="#6f5515", sustain="#3f4a55", key_separator="#9a9aa0",
+        text="#1f1f23", theory_line="#8e8e96", interval_text="#6f5714",
+        recorder_bg="#b6b6bc", fx_knob="#725716", master_knob="#9c3226",
+        varispeed="#35506e", velocity_loud="#ffa3ab", velocity_quiet="#47d067",
+        meter_bg="#2a2a2e", scope_draw="#d8b45a", fx_strip="#d5d5da",
+        input_chip="#5d6b78", fretboard="#3a3a40", string="#c9c9cf",
+        dark=dict(background="#26262a"),
+    ),
+    # Ochre: the earth pigment as the BAND, the one warm band in the set
+    # with real chroma (Rhodes' brown and Copper's verdigris sit under 15).
+    # Chalk page, bone knobs, cornflower for what sounds, indigo for what is
+    # held: the yellow ochre and ultramarine of a fresco. A band at 0.084
+    # luminance is lighter than any other dark band here, which is why
+    # every mark on it is pale: 3:1 over it starts at 0.35.
+    "Ochre": T(
+        background="#f1ede2", white_key="#f1ede2", black_key="#1e1a12",
+        key_active="#8ab0d8", sustain="#2e3a7a", key_separator="#8a7030",
+        text="#f4ecd6", theory_line="#a89460", interval_text="#f0d080",
+        recorder_bg="#5a4111", fx_knob="#ecdcb0", master_knob="#ff7a6a",
+        varispeed="#8ab0d8", velocity_loud="#fe7d3d", velocity_quiet="#709ffe",
+        meter_bg="#241c0e", scope_draw="#f0b830", fx_strip="#4a3510",
+        input_chip="#8ab0d8", fretboard="#241c0e", string="#c8b070",
+        dark=dict(background="#1e1a12"),
+    ),
+    # Reed: the reed electric piano this app models (keys/reed.rs), in the
+    # avocado the 200 wore: an olive band, the lid's black-olive strips,
+    # ivory keys, the script's coral for what sounds, a pale sage for what
+    # is held, an amber pilot lamp on the master, bone knobs.
+    "Reed": T(
+        background="#f3efdc", white_key="#f3efdc", black_key="#171a10",
+        key_active="#ff8468", sustain="#cfe0a8", key_separator="#4e5a28",
+        text="#f3efdc", theory_line="#8e9460", interval_text="#cfe0a8",
+        recorder_bg="#424c22", fx_knob="#efe2b0", master_knob="#f5b830",
+        varispeed="#8fb0c8", velocity_loud="#fe7256", velocity_quiet="#76ab5c",
+        meter_bg="#1c2010", scope_draw="#c8e070", fx_strip="#262b14",
+        input_chip="#ff8468", fretboard="#1c2010", string="#c0c098",
+        dark=dict(background="#171a10"),
+    ),
+    # Zinc: the metal, and the violet the set lost. Blueprint's slot
+    # (retired 2026-09-18, "essentially an alternate Navi"), so the one hue
+    # the replacement must not be is blue. Zinc weathers to a blue-violet
+    # grey and nothing else here is violet at all since Dusk and Iris went,
+    # so the band is that patina with brass for what is HELD -- the two
+    # metals an old panel is made of -- and a pale zinc lilac for what
+    # sounds. The brass is deeper than a brass wants to be: at #c99a3a it
+    # read 1.19:1 against the lilac, which is a held note and a struck one
+    # telling nothing apart.
+    #
+    # **It began as a mid-tone desk and could not stay one.** The first
+    # design for this slot was a pewter band at 0.30 luminance with dark ink
+    # on it -- the daylight desk that does not glare, which is genuinely not
+    # covered by the rest. Every gate in this file passed and
+    # `dialogs::every_theme_dresses_the_export_window` did not: a well in
+    # the middle of the range sits within 3:1 of the app's shipped transport
+    # red, so the playhead had to be recoloured on all four of that theme's
+    # dressings, where the whole set is allowed seven. That is not a
+    # technicality -- a desk where the one fixed red in the app has to be
+    # moved everywhere is a desk fighting the transport -- so the concept
+    # yielded and the metal stayed. See `playhead_moves`.
+    "Zinc": T(
+        background="#e8e4ee", white_key="#e8e4ee", black_key="#1a1622",
+        key_active="#b9a8e0", sustain="#b08430", key_separator="#4a4060",
+        text="#e8e4ee", theory_line="#6a5f80", interval_text="#c9b8e8",
+        recorder_bg="#332a45", fx_knob="#bfb0e0", master_knob="#ff5a6a",
+        varispeed="#78c8d8", velocity_loud="#ff7088", velocity_quiet="#19b394",
+        meter_bg="#1a1622", scope_draw="#cbb8f0", fx_strip="#282036",
+        input_chip="#8f7fb8", fretboard="#1a1622", string="#a09ab0",
+        dark=dict(background="#1a1622"),
+    ),
+    # Celadon: the glaze. A light desk cool where Sandstone is warm and
+    # green where Centennial is grey, with plum for what sounds and pine for
+    # what is held -- both DARK, as marks on paper have to be. The well is
+    # dark with a pale celadon trace, like Centennial's.
+    "Celadon": T(
+        background="#e2ebe6", white_key="#e2ebe6", black_key="#2c3a34",
+        key_active="#7e3a6c", sustain="#1e3c2e", key_separator="#8fa89a",
+        text="#24302a", theory_line="#8fa89a", interval_text="#5a3a6a",
+        recorder_bg="#c3d4c8", fx_knob="#6e3060", master_knob="#9a2a2a",
+        varispeed="#24504a", velocity_loud="#ffa3c2", velocity_quiet="#1ed793",
+        meter_bg="#22302a", scope_draw="#a8d8c0", fx_strip="#d2dfd5",
+        input_chip="#5a7a6a", fretboard="#9ab0a4", string="#2c3a34",
+        dark=dict(background="#2c3a34"),
+    ),
+    # Prism: charcoal, and one colour per control -- the slider caps of a
+    # polysynth. Cyan for what sounds, magenta for what is held, yellow
+    # knobs, a red master, green on the scope, orange on the input chip;
+    # the pitch dial is the one white thing so it is not another cap.
+    "Prism": T(
+        background="#eeeef2", white_key="#eeeef2", black_key="#18181c",
+        key_active="#38b8f0", sustain="#f050b0", key_separator="#35353c",
+        text="#ecece8", theory_line="#8a8a92", interval_text="#f0c020",
+        recorder_bg="#35353c", fx_knob="#f0c020", master_knob="#ff4040",
+        varispeed="#e6e6ec", velocity_loud="#ff7070", velocity_quiet="#21a7eb",
+        meter_bg="#1c1c20", scope_draw="#50e070", fx_strip="#28282e",
+        input_chip="#f08a30", fretboard="#1c1c20", string="#a0a0a8",
+        dark=dict(background="#18181c"),
+    ),
+    # Storm: slate, and the bolt. A blue-grey band darker than Pewter's
+    # and greyer than Navi's, cloud-white knobs, and yellow -- the one hero
+    # colour no other theme uses -- for what sounds and for the pitch
+    # dial; deep storm blue for what is held.
+    "Storm": T(
+        background="#dde3e9", white_key="#dde3e9", black_key="#14181e",
+        key_active="#f5d33a", sustain="#2a5896", key_separator="#3d4654",
+        text="#e8edf2", theory_line="#8a98a8", interval_text="#e8c848",
+        recorder_bg="#3d4654", fx_knob="#d4dbe2", master_knob="#ff5a5a",
+        varispeed="#f5d33a", velocity_loud="#ff8370", velocity_quiet="#70a8fe",
+        meter_bg="#1a1f26", scope_draw="#f5d33a", fx_strip="#2e3540",
+        input_chip="#7fa8c8", fretboard="#1a1f26", string="#a8b4c0",
+        dark=dict(background="#14181e"),
+    ),
+    # Amber: the other phosphor. Phosphor is the green console; this is the
+    # amber one beside it, in Nocturne's slot, designed dark the way that
+    # pair was: its light ground is a near-black and the piano lifts its
+    # sharps (piano.rs `keys_apart`). Everything glows one amber -- text,
+    # keys, knobs, trace -- with a paler bloom for what is held and the
+    # warning red-orange on the master, the same red Phosphor wears.
+    "Amber": T(
+        background="#100c06", white_key="#100c06", black_key="#080604",
+        key_active="#ffb000", sustain="#ffe0a0", key_separator="#3a2a10",
+        text="#ffcf70", theory_line="#52401a", interval_text="#e0a848",
+        recorder_bg="#2a2010", fx_knob="#e09a20", master_knob="#ff4a28",
+        varispeed="#f0d8a8", velocity_loud="#ea5c38", velocity_quiet="#169c6f",
+        meter_bg="#080604", scope_draw="#ffb000", fx_strip="#201808",
+        input_chip="#e09a20", fretboard="#080604", string="#8a7040",
+        dark=dict(background="#080604"),
     ),
 }
 
@@ -1485,6 +1945,288 @@ INK_LIGHT = (0xE8, 0xDC, 0xC0)
 INK_DARK = (0x1A, 0x1A, 0x1A)
 DEAD_LO, DEAD_HI = 0.12, 0.22
 
+
+def mix(a, b, t):
+    """`piano::mix` / `mixer_panel::mix`: a blend truncated to bytes, the
+    way the Rust `as u8` does it."""
+    return tuple(int(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def shade(c, k):
+    """`mixer_panel::shade_face` / `recorder_panel::shade`."""
+    return tuple(int(min(255.0, max(0.0, v * k))) for v in c)
+
+
+def keys_apart(natural, sharp):
+    """`piano::keys_apart`: the sharps walked away from the naturals until
+    they clear 9:1, toward the desk's own ink and never past it."""
+    if contrast(sharp, natural) >= 9.0:
+        return sharp
+    away = INK_LIGHT if luminance(natural) < 0.18 else INK_DARK
+    out = sharp
+    for k in range(1, 21):
+        out = mix(sharp, away, k * 0.05)
+        if contrast(out, natural) >= 9.0:
+            break
+    return out
+
+
+def keys_the_right_way_up(naturals, sharps, dark):
+    """`piano::keys_the_right_way_up`: pale naturals in light mode, dark
+    ones in dark mode, whatever the theme handed in."""
+    paler = luminance(naturals) > luminance(sharps)
+    return (sharps, naturals) if paler == dark else (naturals, sharps)
+
+
+def idle_colors(t, dark):
+    """`piano::idle_colors`: what the keyboard is painted, both modes."""
+    white, black = t["white_key"], t["black_key"]
+    if not dark:
+        return keys_the_right_way_up(white, keys_apart(white, black), False)
+    d = t.get("dark", {})
+    naturals = d.get("white_key", black)
+    sharps = d.get("black_key", white)
+    return keys_the_right_way_up(naturals, keys_apart(naturals, sharps), True)
+
+
+
+# ── the app's own derivations, ported ──────────────────────────────────────
+#
+# **Every surface below is a copy of a Rust function, named for it.** A
+# design tool that solves against a DIFFERENT ground than the one the app
+# paints is a tool that lies (velgen.py's own words about the roll), and the
+# 2026-09-18 redo proved it twice over: seven themes cleared every gate in
+# this file and then failed five suites in tangent-ui, because those suites
+# measure surfaces DERIVED from the roles -- a dialog's well, a browser row's
+# ground under two veils, the marker strip, the varispeed readout at rest --
+# and nothing here knew how to derive them. They are here now, so the Python
+# fails first.
+
+
+def lerp(a, b, t):
+    """`recorder_panel`'s `step`/`lerp`: a blend truncated to bytes."""
+    return tuple(int(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def gamma_multiply(c, k):
+    """`Color32::gamma_multiply`, rounded the way ecolor rounds."""
+    return tuple(int(v * k + 0.5) for v in c)
+
+
+def legible_surface(c):
+    """`recorder_panel::legible_surface`: the dead-zone guard."""
+    if max(contrast(c, INK_LIGHT), contrast(c, INK_DARK)) >= 4.5:
+        return c
+    ink, toward = (INK_LIGHT, (0, 0, 0)) if contrast(c, INK_LIGHT) > contrast(c, INK_DARK) else (INK_DARK, (255, 255, 255))
+    out = c
+    for step in range(1, 51):
+        out = lerp(c, toward, step * 0.02)
+        if contrast(out, ink) >= 4.6:
+            break
+    return out
+
+
+def toward(c, bg, t):
+    """`recorder_panel::toward`: a blend ROUNDED, where `lerp` truncates.
+    The two differ by a bit and the dead-zone decisions built on them are
+    load-bearing, so they are separate functions here as they are there."""
+    return tuple(int(round(x + (y - x) * t)) for x, y in zip(c, bg))
+
+
+def distinct_surface_at(face, ground, floor):
+    """`recorder_panel::distinct_surface_at`.
+
+    **Sixteen COMPOUNDING steps of 0.08, and the bound is the point.** It
+    reaches 74% of the way to the extreme and stops, so a surface that
+    cannot be separated comes back not separated rather than walked to
+    white -- which is how the sampler's file row measures 2.88:1 on a theme
+    whose panel and glass are both mid-tone. A port that walked further
+    would report a legibility this app does not have."""
+    if contrast(face, ground) >= floor:
+        return face
+    away = (255, 255, 255) if wants_light_ink(ground) else (0, 0, 0)
+    out = face
+    for _ in range(16):
+        out = toward(out, away, 0.08)
+        if contrast(out, ground) >= floor:
+            break
+    return out
+
+
+def hold_ink(soft, ink, bg):
+    """`recorder_panel::hold_ink`: a quieted ink walked back until it reads."""
+    if contrast(soft, bg) >= 4.5:
+        return soft
+    for k in range(1, 13):
+        t = 1.0 - k * (1.0 / 12.0)
+        out = lerp(ink, soft, t)
+        if contrast(out, bg) >= 4.5:
+            return out
+    return ink
+
+
+def surface_of(face):
+    """`recorder_panel::surface_of`: a whole floating panel from one colour."""
+    bg = legible_surface(face)
+    light_ink = wants_light_ink(bg)
+    ink = INK_LIGHT if light_ink else INK_DARK
+    up = (255, 255, 255) if light_ink else (0, 0, 0)
+    down = (0, 0, 0) if light_ink else (255, 255, 255)
+
+    def hold(target):
+        if contrast(ink, target) >= 4.6:
+            return target
+        out = target
+        for k in range(1, 21):
+            out = lerp(target, bg, k * 0.05)
+            if contrast(ink, out) >= 4.6:
+                break
+        return out
+
+    return dict(
+        bg=bg,
+        ink=ink,
+        faint=hold_ink(lerp(ink, bg, 0.34), ink, bg),
+        raised=hold(lerp(bg, up, 0.14)),
+        hover=hold(lerp(bg, up, 0.26)),
+        well=lerp(bg, down, 0.30),
+        edge=lerp(ink, bg, 0.45),
+    )
+
+
+def band_palette(t):
+    """`recorder_panel::palette`: the band and everything derived from it.
+    It does NOT branch on dark mode -- the band follows its own background,
+    which is why these readings are the same in both."""
+    bg = t["recorder_bg"]
+    dark = wants_light_ink(bg)
+    return dict(
+        bg=bg,
+        well=shade(bg, 0.55 if dark else 0.88),
+        field=shade(bg, 1.35 if dark else 0.94),
+        ink=INK_LIGHT if dark else INK_DARK,
+        faint=hold_ink(
+            (0x9a, 0x92, 0x80) if dark else (0x6b, 0x60, 0x4a),
+            INK_LIGHT if dark else INK_DARK,
+            bg,
+        ),
+        accent=t["key_active"],
+        lcd=t["scope_draw"],
+        lcd_face=t["meter_bg"],
+        fx_knob=t["fx_knob"],
+        master=t["master_knob"],
+        varispeed=t["varispeed"],
+    )
+
+
+def face_style(face, lcd, lcd_face):
+    """`face::FaceStyle::new`: the panel, the glass and the three tiers."""
+    s = surface_of(face)
+    glass = distinct_surface_at(lcd_face, s["bg"], 1.25)
+    away = (0, 0, 0) if luminance(lcd) > luminance(glass) else (255, 255, 255)
+    guard = 0
+    while (contrast(lcd, glass) < 3.0 or contrast(glass, s["bg"]) < 1.25) and guard < 40:
+        glass = lerp(glass, away, 0.06)
+        guard += 1
+
+    def tier(blend, floor):
+        t = blend
+        c = lerp(glass, lcd, t)
+        while contrast(c, glass) < floor and t < 1.0:
+            t += 0.05
+            c = lerp(glass, lcd, t)
+        return c
+
+    return dict(s=s, lcd=lcd, glass=glass, tiers=[tier(1.0, 3.0), tier(0.62, 2.0), tier(0.50, 1.6)])
+
+
+def media_row_ground(face, light_ink):
+    """`drumpad_panel::media_row_ground`: the panel under two black veils."""
+    def veil(c, a):
+        k = 1.0 - a / 255.0
+        return tuple(int(v * k) for v in c)
+    return veil(veil(face, 60 if light_ink else 26), 40 if light_ink else 16)
+
+
+def panel_face(t, dark):
+    """`TangentApp::panel_face`: the desk's strip, shaded in dark mode.
+    Every factory theme names only `dark.background`, so the dark branch is
+    always the shade."""
+    return shade(t["fx_strip"], 0.88) if dark else t["fx_strip"]
+
+
+def separate(c, t):
+    """`arrangement_panel::separate`: away from itself, whichever way it
+    has room to go."""
+    return lerp(c, (255, 255, 255) if wants_light_ink(c) else (0, 0, 0), t)
+
+
+def marker_strip(t, dark):
+    """`arrangement_panel::ink`'s `ruler`: the blend that gives the strip
+    its character, walked until it is a surface of its own."""
+    wood = t["recorder_bg"]
+    strip = t["fx_strip"]
+    well = t["meter_bg"]
+    lane = legible_surface(shade(well, 1.55) if dark else lerp(well, strip, 0.46))
+    r = legible_surface(separate(lerp(wood, lane, 0.55), 0.10))
+    for _ in range(9):
+        if contrast(r, wood) >= 1.35:
+            break
+        r = legible_surface(separate(r, 0.06))
+    return r
+
+
+def derived_errors(name, t):
+    """The five tangent-ui sweeps that measure a DERIVED surface, ported.
+
+    Each is named for the test it answers, and each is here because the
+    2026-09-18 redo failed it with every gate above green:
+
+    - `arrangement_panel::the_marker_strip_is_legibly_separate_from_the_band`
+    - `recorder_panel::every_theme_dresses_the_varispeed_dial_legibly`
+      (the readout at rest, which is the band's ink at 0.7 gamma)
+    - `faces_sampler::the_browsers_rows_read_on_the_ground_they_are_drawn_on`
+      and `the_sampler_prints_its_ink_on_the_surface_it_lands_on_on_every_theme`
+    - the mid-tone half of `dialogs::every_theme_dresses_the_export_window`:
+      a dressing whose well sits within 3:1 of the shipped red makes the
+      playhead move, and that test pins how many of the seventy-six do.
+    """
+    errs = []
+    p = band_palette(t)
+    for dark in (False, True):
+        mode = "dark" if dark else "light"
+        # The marker strip against the band.
+        r = contrast(marker_strip(t, dark), t["recorder_bg"])
+        if r < 1.3:
+            errs.append(f"marker strip ({mode}) {r:.2f}:1 on the band < 1.3")
+        # The varispeed readout at rest: the band's ink at 0.7 gamma.
+        rest = contrast(gamma_multiply(p["ink"], 0.7), p["bg"])
+        if rest < 3.0:
+            errs.append(f"the varispeed reading at rest ({mode}) {rest:.2f}:1 < 3")
+        # The browser rows, on the panel under two veils.
+        st = face_style(p["bg"], p["lcd"], p["lcd_face"])
+        ground = media_row_ground(st["s"]["bg"], wants_light_ink(st["s"]["bg"]))
+        for what, ink in (("a file", distinct_surface_at(st["tiers"][0], ground, 4.5)),
+                          ("a folder", st["s"]["ink"])):
+            rr = contrast(ink, ground)
+            if rr < 4.5:
+                errs.append(f"browser row, {what} ({mode}) {rr:.2f}:1 < 4.5")
+    return errs
+
+
+def playhead_moves(t):
+    """How many of this theme's FOUR export-window dressings need the
+    shipped red moved -- two modes by two faces, the desk's strip and the
+    band's ground. `dialogs::every_theme_dresses_the_export_window` pins the
+    total across the set."""
+    red = (0xE8, 0x3A, 0x4E)
+    n = 0
+    for dark in (False, True):
+        for face in (panel_face(t, dark), t["recorder_bg"]):
+            well = surface_of(face)["well"]
+            if distinct_surface_at(red, well, 3.0) != red:
+                n += 1
+    return n
 
 def theme_gates(name, t):
     """The Rust acceptance tests, ported — pass here first, then in Rust."""
@@ -1505,7 +2247,6 @@ def theme_gates(name, t):
         )
     # The band's derived parts must separate (the terminal-background trap).
     light_ink = contrast(band, INK_LIGHT) > contrast(band, INK_DARK)
-    shade = lambda c, k: tuple(min(255, round(v * k)) for v in c)
     well, field = (
         (shade(band, 0.55), shade(band, 1.35))
         if light_ink
@@ -1527,28 +2268,65 @@ def theme_gates(name, t):
             errs.append(f"{role} {hexs(t[role])} lum {l:.3f} in the dead zone")
         if chroma(t[role]) > CHROMA_MAX:
             errs.append(f"{role} {hexs(t[role])} chroma {chroma(t[role]):.1f} > {CHROMA_MAX}")
-    # **The keyboard, both modes** — piano.rs's two sweeps. Every key fill is
-    # a surface with a note name on it: the idle pair as the mode paints
-    # them, the lit key and the held key in either mode. The one that fails
-    # is always a lit colour parked in the dead zone.
-    swapped = (
-        dark.get("white_key", t["black_key"]),
-        dark.get("black_key", t["white_key"]),
-    )
-    fills = [
-        ("natural idle", t["white_key"]), ("sharp idle", t["black_key"]),
-        ("natural idle (dark)", swapped[0]), ("sharp idle (dark)", swapped[1]),
-        ("lit key", t["key_active"]), ("held key", t["sustain"]),
-    ]
-    for what, c in fills:
-        if ink_contrast(c) < 4.5:
-            errs.append(f"note name on the {what} {hexs(c)} {ink_contrast(c):.2f}:1 < 4.5")
-    ground = dark.get("background", t["black_key"])
-    shows = max(contrast(swapped[0], ground), contrast(swapped[1], ground))
-    if shows < 2.0:
-        errs.append(f"dark keyboard {shows:.2f}:1 on its ground < 2")
-    if contrast(*swapped) < 1.25:
-        errs.append(f"dark keys {contrast(*swapped):.2f}:1 apart < 1.25")
+    # **The keyboard, both modes, as the piano PAINTS it** -- the swap, the
+    # lift and the right-way-up rule ported from piano.rs, so a theme whose
+    # light ground is a near-black is measured on the keys it gets rather
+    # than the ones it named. Every key fill is a surface with a note name
+    # on it (`every_theme_prints_readable_note_names_in_both_modes`); the
+    # sharps carry the keyboard against the page and the two keys are told
+    # apart (`every_theme_keeps_a_legible_keyboard_in_both_modes`); light
+    # mode has pale naturals and dark mode dark ones
+    # (`every_theme_paints_its_naturals_the_right_way_up`); and the page --
+    # the naturals -- takes dark ink in light mode and light ink in dark
+    # (`theory_panel::every_theme_grounds_the_theory_view_in_its_own_colour`).
+    for is_dark in (False, True):
+        mode = "dark" if is_dark else "light"
+        naturals, sharps = idle_colors(t, is_dark)
+        for what, c in (
+            (f"natural idle ({mode})", naturals), (f"sharp idle ({mode})", sharps),
+            (f"lit key ({mode})", t["key_active"]), (f"held key ({mode})", t["sustain"]),
+        ):
+            if ink_contrast(c) < 4.5:
+                errs.append(f"note name on the {what} {hexs(c)} {ink_contrast(c):.2f}:1 < 4.5")
+        page = naturals
+        if contrast(sharps, page) < 4.5:
+            errs.append(f"{mode} keyboard {contrast(sharps, page):.2f}:1 on its page < 4.5")
+        if contrast(naturals, sharps) < 3.0:
+            errs.append(f"{mode} keys {contrast(naturals, sharps):.2f}:1 apart < 3")
+        if (luminance(naturals) > luminance(sharps)) == is_dark:
+            errs.append(f"{mode} keyboard is upside down")
+        if wants_light_ink(page) != is_dark:
+            errs.append(f"{mode} page {hexs(page)} takes the other mode's ink")
+    # **The lift is INERT here, or this theme has joined the dark two.**
+    # `piano::keys_apart` walks the sharps away from the naturals when a
+    # theme cannot separate them itself, and
+    # `every_theme_keeps_a_legible_keyboard_in_both_modes` names the themes
+    # that need it: Amber and Phosphor, whose light ground is a near-black
+    # and who therefore have no key colour left to spend. Any other theme
+    # needing it is one whose page and sharps have drifted together, which
+    # is exactly what a darker page does if its sharps do not follow -- the
+    # first cut of the 2026-09-18 Sandstone dropped its page to sand and
+    # left its sharps where they were, 6.66:1 apart where the walk starts
+    # at 9:1, and joined a list that is supposed to have two names on it.
+    if (keys_apart(t["white_key"], t["black_key"]) != t["black_key"]) != (
+        name in ("Amber", "Phosphor")
+    ):
+        errs.append(
+            f"the piano lifts this theme's sharps "
+            f"({contrast(t['black_key'], t['white_key']):.2f}:1 between the keys)"
+        )
+    # **The strip face, both modes** (`every_theme_prints_legibly_on_its_own_strip_face`):
+    # the engraved ink at 4.5 and the quieter ink -- pulled 42% toward the
+    # face -- at 2.2, on the face as light mode paints it and on the face
+    # shaded 0.88 as dark mode does.
+    for is_dark in (False, True):
+        face = shade(t["fx_strip"], 0.88) if is_dark else t["fx_strip"]
+        engrave = INK_LIGHT if wants_light_ink(face) else (0x24, 0x20, 0x1A)
+        if contrast(engrave, face) < 4.5:
+            errs.append(f"strip face ink ({'dark' if is_dark else 'light'}) {contrast(engrave, face):.2f}:1 < 4.5")
+        faint = mix(engrave, face, 0.42)
+        if contrast(faint, face) < 2.2:
+            errs.append(f"strip face faint ink ({'dark' if is_dark else 'light'}) {contrast(faint, face):.2f}:1 < 2.2")
     # Text and lines on the GROUND. On a dark theme the band's ink is also
     # the page's; a light theme's page takes measured ink instead, so only
     # the line is asked of it (the theory view pushes it to 1.9 regardless).
@@ -1563,14 +2341,26 @@ def theme_gates(name, t):
         errs.append(
             f"theory_line on the ground {contrast(t['theory_line'], t['background']):.2f}:1 < 1.7"
         )
+    # The pitch dial is none of the knobs beside it
+    # (`no_theme_paints_the_varispeed_into_a_knob_beside_it`): 25 dE from
+    # the master, the effect knobs, and the two fixed caps.
+    for what, other in (
+        ("the master", t["master_knob"]), ("the effect knobs", t["fx_knob"]),
+        ("the limiter", (0x2f, 0x8f, 0x5c)), ("the gain", (0xd8, 0x93, 0x2c)),
+    ):
+        if de(t["varispeed"], other) <= 25.0:
+            errs.append(f"varispeed and {what} {de(t['varispeed'], other):.1f} dE apart <= 25")
+    # And everything the app DERIVES from those roles.
+    errs.extend(derived_errors(name, t))
     return errs
 
 
 def dark_report():
     bad = 0
-    for name, t in DESIGNED_THEMES.items():
+    for name, t in {**REDO_THEMES, **DESIGNED_THEMES}.items():
         errs = theme_gates(name, t)
-        print(f"{name:10s} {'FAIL' if errs else 'ok'}")
+        moves = playhead_moves(t)
+        print(f"{name:10s} {'FAIL' if errs else 'ok':4s} playhead moves on {moves} of its 4 dressings")
         for e in errs:
             print(f"           - {e}")
         bad += len(errs)
@@ -1582,8 +2372,10 @@ def dark_report():
 if __name__ == "__main__":
     import sys
 
-    if "--dark" in sys.argv:
+    if "--dark" in sys.argv or "--themes" in sys.argv:
         raise SystemExit(1 if dark_report() else 0)
+    if "--redo" in sys.argv:
+        raise SystemExit(1 if redo_report() else 0)
     if "--silverface" in sys.argv:
         raise SystemExit(1 if silverface_report() else 0)
     if "--gradients" in sys.argv:
