@@ -69,6 +69,25 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   go out of time alignment after a preset click, lose its settings on close,
   and on Linux stop responding. It is asked over every slot now.
 
+- **Every track now reads its own audio, instead of the desk keeping one
+  block of everything.** The timeline used to be assembled once per block
+  into a single buffer holding every track, which each track then copied its
+  own row out of. A track asks for its own audio directly now, for whichever
+  block is being worked on. Nothing about the sound changes and the whole
+  clip test suite says so, to the sample: placement, trim, fades, pan, mute,
+  solo, punch-in, the route through a track's plugins, and what the master
+  hears of it.
+
+  Two things come out of it. Assembling the timeline used to cost the same
+  whether or not any clip was near the playhead, and a single looped clip is
+  expanded into as many as four thousand pieces, so a long arrangement paid
+  for all of them on every block; it now costs one comparison each. And this
+  is the change that makes processing tracks ahead of time possible at all.
+  Measured on this machine, of the work a track costs in a block, the share
+  that could be done in advance went from nothing to all of it on an audio
+  desk, and to 62% on the largest of the projects here, the rest of which is
+  MIDI and is the next piece of work.
+
 - **Track delay compensation is applied where the audio is used, not where
   it is made.** Every track carries two small delay lines that hold it back
   so it lands in time with tracks whose plugins are slower. They used to run

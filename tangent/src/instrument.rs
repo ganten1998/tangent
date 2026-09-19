@@ -12361,11 +12361,14 @@ impl Renderer {
                 if is_builtin || is_keys {
                     self.probe_inst_pins |= bit;
                 }
-                // The clip sources, kept apart because they are the pins a
-                // different engine could remove: `clip_lane` is one block
-                // deep for the whole desk and `sounding` is a single
-                // pitch-keyed word, so neither has a future to read today.
-                if has_audio || lane_has_clips {
+                // **The MIDI source only, now.** Audio clips were pinned
+                // here because the desk kept one block of them for every
+                // lane at once; a lane pulls its own span for whatever block
+                // it is rendering, so an audio lane has a future to read.
+                // What is left is the pitch-keyed `sounding` word, the
+                // shared `active_clip` list and the flat `midi_cursor`,
+                // which are step 3.
+                if lane_has_clips {
                     self.probe_clip_pins |= bit;
                 }
             }
