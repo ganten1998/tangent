@@ -633,7 +633,43 @@ owner said go on 2026-09-19; progress is marked here.
    the whole suite including the four compensation tests, the grouped-latency
    test and the bit-exact fork null test. Pinned by
    `a_lane_worker_can_no_longer_reach_a_delay_line`.
-2. A per-lane, k-deep clip seed, replacing the one-block whole-desk `clip_lane`.
+2. **DONE.** A per-lane clip source, replacing the one-block whole-desk
+   `clip_lane`. Built as a PULL rather than a ring: the buffer is deleted, not
+   deepened, and a lane asks the schedule for its own span for whatever block
+   it is rendering. Because nothing is stored, the source's invalidation list
+   is EMPTY rather than the four terms a ring would need or the sixteen the
+   render contract carries: a seek, a loop edge moving at drag rate, a clip
+   list swap, a punch, varispeed and a short final block all need no action.
+   Five commits: the pure clip-major fill with a bit-identity oracle, the
+   per-lane pull with the room as first consumer, the seed pulling and the
+   buffer deleted, the lane-sorted index, and this measurement.
+
+   **The probe, re-run after it.** Audio lanes have a future to read now:
+
+   | desk | eligible before | eligible after | floor |
+   |---|---|---|---|
+   | 96 x Rev PLATE-140 | 0.0% | **100.0%** | 0.6% |
+   | 32 lanes x 3 IR | 0.0% | **100.0%** | 3.1% |
+   | 16 x Drive | 0.0% | **100.0%** | 2.9% |
+   | 16 x [EQ, comp, plate] | 0.0% | **100.0%** | 11.9% |
+   | knowersomething1 (real) | 0.0% | **61.7%** | 3.0% |
+   | moscow1 (real) | 0.0% | 0.0% | 35.3% |
+   | 8 x Analog, 8 voices | 0.0% | 0.0% | 3.7% |
+
+   The two that did not move are MIDI. moscow1 is seven Rhodes lanes and the
+   Analog rung plays from MIDI clips; what still pins them is the pitch-keyed
+   `sounding` word, the shared `active_clip` list and the flat `midi_cursor`,
+   which is step 3. knowersomething1's 61.7% is the audio share of a song that
+   is part audio and part MIDI, which is what a mixed session should read.
+
+   Two notes for whoever reads these numbers next. The "us/block in lanes"
+   column ROSE, because the clip fill moved inside the per-lane timing window
+   when it moved into the render. Nothing is slower; the accounting boundary
+   moved, and it moved the right way, because that share is exactly what a
+   look-ahead can take off the deadline. And the walk itself got cheaper: it
+   was frame-major over the whole clip list, so a block cost frames times
+   clips whatever the clips were doing, with a single looped clip expanded by
+   the host into as many as four thousand passes.
 3. Per-lane MIDI: split the pitch-keyed `u128` `sounding` ledger and the flat
    `midi_cursor`.
 4. The ownership protocol: an epoch handshake, a per-lane swap arrival mask so
