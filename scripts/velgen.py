@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Design the sixteen VELOCITY gradients — the pair of colours a theme lends
+"""Design the nineteen VELOCITY gradients — the pair of colours a theme lends
 the velocity lane — against the same rules the Rust tests enforce, then emit
 the Rust.
 
@@ -41,8 +41,9 @@ Usage:
     python3 scripts/velgen.py emit     # the Rust, ready to paste
 """
 import colorsys
-import json
+import re
 import sys
+from pathlib import Path
 
 INK_LIGHT = (0xE8, 0xDC, 0xC0)
 INK_DARK = (0x1A, 0x1A, 0x1A)
@@ -215,34 +216,56 @@ HUES = {
     "Hydra":      (18, 158),   # its coral against its seafoam
     "Navi":       (8, 168),    # warm red on navy, cyan-green back
     "Mono":       (0, 130),    # neutral theme keeps the canonical pair
-    "Studio":     (14, 96),    # console amber-red, olive
-    "Aurora":     (338, 148),  # magenta-red, aurora green
+    "Ochre":      (20, 220),   # brick against ultramarine, a fresco's pair
+    "Reed":       (10, 100),   # the script's coral, the sage
     "Sandstone":  (12, 104),   # brick and moss, for a warm paper roll
     "Centennial": (355, 134),  # a flat red and a flat green, like the theme
-    "Blueprint":  (20, 176),   # orange-red is the only warm on a blue print
-    "Porcelain":  (348, 146),  # crimson and sage
+    "Zinc":       (350, 168),  # a red for the brass, a green for the patina
+    "Celadon":    (340, 158),  # plum-red and the glaze's own green
     "Moss":       (24, 168),   # rust, and a cool green that is NOT the roll
     "Rhodes":     (6, 156),    # red over warm brown, jade back
     "Copper":     (16, 164),   # copper-red against its teal
-    "Dusk":       (344, 170),  # rose and teal, both cooled for violet
-    "Iris":       (330, 140),  # magenta-red, spring green
+    "Prism":      (0, 200),    # the red cap and the cyan cap
+    "Storm":      (8, 216),    # red against storm blue
+    "Amber":      (12, 160),   # red-orange, and the same teal Phosphor keeps
+    "Phosphor":   (27, 160),   # the console's orange and its teal
+    "Silverface": (12, 190),   # the jewel's glow and the script's turquoise
+    # The 2026-09-18 redo retired Studio (14, 96), Aurora (338, 148),
+    # Blueprint (20, 176), Porcelain (348, 146), Dusk (344, 170) and Iris
+    # (330, 140); their pairs went with them.
 }
 
 
+THEME_RS = Path(__file__).resolve().parent.parent / "tangent-ui" / "src" / "theme.rs"
+
+
 def themes():
-    return json.load(open("/private/tmp/claude-501/-Users-ganten/"
-                          "a525df4f-d8b8-4237-9509-53687aa6cac6/"
-                          "scratchpad/themes.json"))
+    """Every factory theme's `meter_bg` and `fx_strip`, straight out of
+    `theme.rs` -- the two roles the roll is derived from.
 
-
-def default_theme():
-    """Default is written in `factory_default()` and not in `factory()`."""
-    return {"meter_bg": [0x0B, 0x0E, 0x0A], "fx_strip": [0xE3, 0xD9, 0xBD]}
+    It used to read a JSON dump of the theme table left in a scratch folder
+    by the session that first ran it, which was gone the next time anybody
+    needed this script. The Rust is the one copy of the table that cannot
+    go missing, so it is parsed here, `factory_default()` included."""
+    src = THEME_RS.read_text()
+    out = {}
+    start = src.index("pub fn factory_default()")
+    end = src.index("pub fn user_themes()")
+    for m in re.finditer(r'name: "(\w+)"\.to_owned\(\),(.*?)dark: dark_of', src[start:end], re.S):
+        name, fields = m.group(1), m.group(2)
+        roles = {
+            f.group(1): [int(f.group(i), 16) for i in (2, 3, 4)]
+            for f in re.finditer(
+                r"(\w+): c\(0x([0-9a-fA-F]{2}), 0x([0-9a-fA-F]{2}), 0x([0-9a-fA-F]{2})\)",
+                fields,
+            )
+        }
+        out[name] = {"meter_bg": roles["meter_bg"], "fx_strip": roles["fx_strip"]}
+    return out
 
 
 def build():
     data = themes()
-    data["Default"] = default_theme()
     out = []
     for name, (hot, cool) in HUES.items():
         t = data[name]
@@ -252,6 +275,16 @@ def build():
         ]
         loud, lm = solve(hot, faces)
         # The loud end first, then the quiet one UNDER it — see `solve`.
+        #
+        # **Exactly under it, with no slack.** Allowing the quiet end a
+        # little more contrast than the loud one looks harmless and is not:
+        # `midi_editor::a_louder_note_is_never_less_visible_than_a_quieter_one`
+        # measures both ends AFTER the painter has pushed them off the roll,
+        # and a push moves the two ends by different amounts — so a pair
+        # solved a fifth of a point apart came out 0.28 apart on Valentine,
+        # past the 0.25 that test allows. A theme whose roll cannot carry a
+        # quiet end under its loud one is a theme whose roll has to move,
+        # which is what `palgen.py --themes` is for.
         quiet, qm = solve(cool, faces, ceiling=lm)
         out.append((name, loud, quiet, lm, qm, faces))
     return out
@@ -266,11 +299,13 @@ def report():
           f"{'dE':>5s}  faces(light/dark)")
     bad = 0
     for name, loud, quiet, lm, qm, faces in build():
-        sep = de(loud, quiet)
         flag = ""
+        sep = 0.0 if loud is None or quiet is None else de(loud, quiet)
         if loud is None or quiet is None:
             flag = "  <-- UNSOLVED"
             bad += 1
+            print(f"{name:12s} {'-':>9s} {'-':>9s} {flag}")
+            continue
         elif sep < SEPARATION:
             flag = f"  <-- ends only {sep:.0f} apart"
             bad += 1
@@ -282,7 +317,7 @@ def report():
               f"#{'%02x%02x%02x' % faces[0]}/#{'%02x%02x%02x' % faces[1]}{flag}")
     print()
     print("floor", FLOOR, " separation", SEPARATION, " chroma max", CHROMA_MAX)
-    print("FAIL" if bad else "all sixteen clear both grounds on their own theme")
+    print("FAIL" if bad else "all nineteen clear both grounds on their own theme")
 
 
 def emit():

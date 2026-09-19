@@ -340,3 +340,40 @@ Keytoggle clicks additionally trigger an immediate (off-timer) GUI + chord-detec
 | Button hover | `#c0b49c` | `#2a2a2a` |
 
 Custom key colors replace the defaults everywhere they're referenced, including the dark-mode swap (dark mode always renders white keys with `black_key_idle_color` and vice versa).
+
+### 15.1 Factory themes (Tangent)
+
+The Rust app paints every role above, and more, from a named theme
+(`tangent-ui/src/theme.rs`, `factory()`). The list is an index: a saved desk
+persists the theme's position as `palette_choice`, so a theme is replaced in
+its slot and never removed or reordered. Nineteen ship. The page is the
+light-mode ground and the naturals; the band is the recorder; the desk is
+the insert strips. Every theme passes the sweeps in `every_theme_*` tests
+across tangent-ui, in both modes, before it ships; the designs and the
+gates they answer to are `scripts/palgen.py --themes` and `--redo`.
+
+| # | Theme | Page (light) | Band | Desk | Sounds / held | Identity |
+|---|---|---|---|---|---|---|
+| 0 | Default | `#e8dcc0` | `#61373a` | `#e3d9bd` | `#6c9bd2` / `#d2a36c` | bone and walnut, the shipped look |
+| 1 | Valentine | `#f3dce7` | `#5a2a3c` | `#4e2232` | `#ff5fa2` / `#ffb454` | the owner's Focusrite panel; wine, not mauve, since 2026-09-18 |
+| 2 | Hydra | `#d6e8e4` | `#1d4a4e` | `#1c383c` | `#3fd9b8` / `#e8845c` | the owner's routing TUI, teal depths |
+| 3 | Navi | `#e0f0ff` | `#26426a` | `#192e48` | `#7f9bff` / `#40e8ff` | the owner's graph viewer, night blues |
+| 4 | Mono | `#d8d8d8` | `#3c3c3c` | `#262626` | `#888888` / `#525252` | greys, one red |
+| 5 | Ochre | `#f1ede2` | `#5a4111` | `#4a3510` | `#8ab0d8` / `#2e3a7a` | the pigment as the band; cornflower and indigo |
+| 6 | Reed | `#f3efdc` | `#424c22` | `#262b14` | `#ff8468` / `#cfe0a8` | the reed piano the app models, in avocado |
+| 7 | Sandstone | `#e0cfa8` | `#ded1b2` | `#c3ae82` | `#9a4925` / `#3a4a24` | light desk, sand (the page darkened 2026-09-18) |
+| 8 | Centennial | `#f2f1ee` | `#b6b6bc` | `#d5d5da` | `#6f5515` / `#3f4a55` | light desk, the DX7 II Centennial's silver and gold |
+| 9 | Zinc | `#e8e4ee` | `#332a45` | `#282036` | `#b9a8e0` / `#b08430` | the patina metal, and the set's only violet; brass held |
+| 10 | Celadon | `#e2ebe6` | `#c3d4c8` | `#d2dfd5` | `#7e3a6c` / `#1e3c2e` | light desk, the glaze; plum and pine |
+| 11 | Moss | `#e4ead9` | `#2f4029` | `#26331f` | `#8fc46a` / `#b07f28` | forest, lichen, amber |
+| 12 | Rhodes | `#efe6d2` | `#3c322a` | `#2e2620` | `#d9a441` / `#9674c0` | black tolex, cream keys, the nameplate red |
+| 13 | Copper | `#e8e2d4` | `#2c4a44` | `#233a36` | `#e08a4a` / `#6fd8c0` | verdigris and rust |
+| 14 | Prism | `#eeeef2` | `#35353c` | `#28282e` | `#38b8f0` / `#f050b0` | charcoal, one colour per control |
+| 15 | Storm | `#dde3e9` | `#3d4654` | `#2e3540` | `#f5d33a` / `#2a5896` | slate and the bolt |
+| 16 | Amber | derived bone | `#2a2010` | `#201808` | `#ffb000` / `#ffe0a0` | the amber phosphor console; ground dark, `#080604` |
+| 17 | Phosphor | derived bone | `#1c2c16` | `#162212` | `#a3e048` / `#d2a36c` | the green phosphor console; ground dark, `#050705` |
+| 18 | Silverface | `#c9cdd2` | `#2a2e33` | `#1f2226` | `#1b94a6` / `#3b5a8c` | the Dual Showman's faceplate |
+
+Retired by name, bytes kept in the strip table: Carbon (2026-09-02), and
+Studio, Aurora, Blueprint, Porcelain, Dusk, Iris, Nocturne (2026-09-18). A
+saved `theme_name` of any of them falls back to Default.
