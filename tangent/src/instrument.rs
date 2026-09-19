@@ -3455,9 +3455,11 @@ impl Rack {
     }
 
     fn latency(shared: &Shared, seat: usize) -> u32 {
-        // A frozen seat reports none: its rack does not run, and its file
-        // was rendered with the lead already cut - see `Shared::frozen`.
-        if seat < 32 && shared.frozen.load(Ordering::Relaxed) & (1u32 << seat) != 0 {
+        // A frozen LANE's seats report none: none of its racks run, and its
+        // file was rendered with the lead already cut - see `Shared::frozen`
+        // and `lane_of_seat`. This asked whether the SEAT was frozen, which
+        // is the same question only for a lane's first block of three.
+        if seat_is_frozen(shared, seat) {
             return 0;
         }
         (0..INSERTS)
@@ -3948,6 +3950,71 @@ mod engine_parts {
         }
     }
 
+    /// **A frozen lane stands ALL of its racks down, and publishes no
+    /// latency for any of them.**
+    ///
+    /// The freeze renders a lane through every seat it holds and places the
+    /// result as a plain audio clip, so the file already contains bays 0 to
+    /// 5 and the pedalboard. The guard asked whether the SEAT was frozen,
+    /// which is true of a lane's own seat (`ch`) and false of its extra rack
+    /// (`FOLDER_EXTRA_SEATS + ch`) and its seven pedals: those kept running,
+    /// over a file they had already been baked into. Double processing, and
+    /// their latency still reaching the lane's delay line and the published
+    /// figure.
+    ///
+    /// Asserted on `Rack::latency` for all three blocks, because the
+    /// latency half is the one that can ruin a mix silently: a frozen lane
+    /// whose bays 4 to 6 still published would sit late against everything
+    /// else by exactly their lookahead.
+    #[test]
+    fn a_frozen_lane_stands_down_every_seat_it_owns() {
+        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS};
+        let e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let r = e.offline.as_ref().expect("a renderer");
+        const CH: usize = 3;
+        // A latency on every one of the lane's seats, as a linear-phase EQ
+        // in bay 4 or a lookahead pedal would publish.
+        let seats: Vec<usize> = std::iter::once(CH)
+            .chain(std::iter::once(folder_extra_seat(CH)))
+            .chain((0..AMP_PEDALS).map(|p| amp_pedal_seat(CH, p)))
+            .collect();
+        for seat in &seats {
+            if let Some(cell) = r.shared.seat_latency.get(seat * INSERTS) {
+                cell.store(64, Ordering::Relaxed);
+            }
+        }
+        for seat in &seats {
+            assert_eq!(
+                Rack::latency(&r.shared, *seat),
+                64,
+                "seat {seat} reported nothing before the freeze"
+            );
+        }
+        r.shared.frozen.store(1u32 << CH, Ordering::Relaxed);
+        for seat in &seats {
+            assert_eq!(
+                Rack::latency(&r.shared, *seat),
+                0,
+                "seat {seat} still publishes latency on a frozen lane"
+            );
+        }
+        // And a NEIGHBOUR is untouched: the mask is per lane, not a clamp
+        // that folds every high seat onto lane 0.
+        let other = folder_extra_seat(CH + 1);
+        if let Some(cell) = r.shared.seat_latency.get(other * INSERTS) {
+            cell.store(64, Ordering::Relaxed);
+        }
+        assert_eq!(
+            Rack::latency(&r.shared, other),
+            64,
+            "freezing lane {CH} silenced lane {}'s extra rack",
+            CH + 1
+        );
+        // A bus seat belongs to no channel and must never be read as one.
+        let bus = tangent_ui::recorder::bus_extra_seat(Strip::Click.index());
+        assert_eq!(lane_of_seat(bus), None, "a bus seat was attributed to a channel");
+    }
+
     /// **The meter reads the block it just rendered.**
     ///
     /// Not a tautology: the hook is a wrapper around a function with four
@@ -4084,6 +4151,34 @@ fn lane_seats<'a>(
         rack_pdc: pdc.get_mut(ch)?,
         dry_pdc: dry_pdc.get_mut(ch)?,
     })
+}
+
+/// **Which LANE a seat belongs to, for the frozen mask.**
+///
+/// A lane owns three blocks of seats: its own at `ch`, its extra rack at
+/// `folder_extra_seat(ch)` and its seven pedals at `amp_pedal_seat(ch, _)`.
+/// The frozen test used to read the seat number directly, which is true of
+/// the first block and silently false of the other two, so a frozen lane
+/// stood down bays 0 to 2 and went on running bays 3 to 5 and its whole
+/// pedalboard - over a file those very units had already been baked into by
+/// the freeze render. Double processing, and its latency still published.
+///
+/// `None` for a seat that belongs to no channel: a bus, a master, a pad.
+/// Those are never frozen and must not be folded onto lane 0 by a clamp.
+fn lane_of_seat(seat: usize) -> Option<usize> {
+    if seat < CHANNELS {
+        return Some(seat);
+    }
+    if let Some(ch) = tangent_ui::recorder::folder_extra_of(seat) {
+        return (ch < CHANNELS).then_some(ch);
+    }
+    tangent_ui::recorder::amp_pedal_of(seat).map(|(ch, _)| ch).filter(|ch| *ch < CHANNELS)
+}
+
+/// Whether the lane that owns `seat` is frozen. See [`lane_of_seat`].
+fn seat_is_frozen(shared: &Shared, seat: usize) -> bool {
+    lane_of_seat(seat)
+        .is_some_and(|ch| shared.frozen.load(Ordering::Relaxed) & (1u32 << ch) != 0)
 }
 
 /// **How wide the fan-out is allowed to be.**
@@ -4744,11 +4839,14 @@ fn run_rack(
         Some((s, b)) if s == seat => Some(b),
         _ => None,
     };
-    // **A frozen seat's rack stands down whole** - the state every bay
+    // **A frozen LANE's racks stand down whole** - the state every bay
     // bypassed would leave, which is the signal untouched in `planar` since
     // the copy-back below never runs. The tap still hears what its bay
-    // would see, as a bypassed bay's does. See `Shared::frozen`.
-    if seat < 32 && shared.frozen.load(Ordering::Relaxed) & (1u32 << seat) != 0 {
+    // would see, as a bypassed bay's does. See `Shared::frozen` and
+    // `lane_of_seat`: this asked whether the SEAT was frozen, so a frozen
+    // lane's extra rack and pedalboard kept running over a file the freeze
+    // render had already baked them into.
+    if seat_is_frozen(shared, seat) {
         if tap_bay.is_some() {
             push_insert_tap(shared, planar, frames);
         }
@@ -27321,9 +27419,14 @@ mod tests {
         }
     }
 
-    /// **A frozen seat reports no latency**, so the lane is compensated as
-    /// the plain audio lane it now is - its file was rendered with the lead
-    /// cut - and its rack stands down before the first bay is looked at.
+    /// **A frozen lane's seat reports no latency**, so the lane is
+    /// compensated as the plain audio lane it now is - its file was
+    /// rendered with the lead cut - and its rack stands down before the
+    /// first bay is looked at.
+    ///
+    /// The mask is read through `seat_is_frozen`, which asks which LANE a
+    /// seat belongs to; see `a_frozen_lane_stands_down_every_seat_it_owns`
+    /// for why the seat number on its own was the wrong question.
     #[test]
     fn a_frozen_seat_reports_no_latency_and_its_rack_stands_down() {
         let shared = Shared::new();
@@ -27338,7 +27441,9 @@ mod tests {
         let at = src.find("fn run_rack(").expect("run_rack");
         let end = src[at..].find("\n}\n").map_or(src.len(), |n| at + n);
         let body = &src[at..end];
-        let frozen = body.find("shared.frozen.load(Ordering::Relaxed)").expect("run_rack no longer asks the frozen mask");
+        let frozen = body
+            .find("seat_is_frozen(shared, seat)")
+            .expect("run_rack no longer asks the frozen mask");
         let loop_at = body.find("for (bay, slot) in rack.slots.iter_mut().enumerate()").expect("the bay loop");
         assert!(frozen < loop_at, "the frozen check is not before the bay loop");
     }
