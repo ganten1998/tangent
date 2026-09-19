@@ -12,6 +12,58 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **The IR reverb costs less than half what it did, and the reverbs on a
+  desk stop landing on the same block.** Two separate faults, both in the
+  convolver every IR bay is built on.
+
+  It transformed four blocks of audio per step where two would do. Audio is
+  real, and a complex transform of a real signal wastes half of itself, so
+  the left and right channels now ride together through one transform in
+  each direction and come apart afterwards by symmetry. It also worked out
+  its own rotation angles inside the innermost loop, five hundred times a
+  block, for angles that are the same on every block of every instance for
+  the life of the program; they are worked out once now. Measured on this
+  machine, per step: a cabinet-length response 36.3 to 17.0 microseconds, a
+  room 37.2 to 17.2, a two-second hall 83.3 to 66.4.
+
+  The second fault cost nothing on average and everything at the peak. Every
+  convolver in the app started its staging buffer at zero, so every IR bay
+  on the desk crossed its partition boundary on the same block and the
+  entire cost of all of them landed in one block out of four, with three
+  quiet blocks around it. Dropouts are decided by the worst block, not the
+  average one. Each instance now starts at its own offset, so the same work
+  is spread across the whole period. The delay the unit reports is
+  unchanged, to the sample, at every offset, and a transport stop no longer
+  puts them all back in step.
+
+  Together, on this machine, a desk of thirty-two tracks carrying three
+  half-second reverbs each, ninety-six in all, at 128 frames:
+
+  | | before | after |
+  | --- | --- | --- |
+  | worst block in a hundred | 5489 us | 1137 us |
+  | that as a share of the deadline | 206% | 43% |
+  | blocks that missed the deadline, of 2000 | 500 | 0 |
+
+  One block in four was late before, which is a dropout every eleven
+  milliseconds for as long as the reverbs are running. None is late now. At
+  64 frames the same desk went from 388% of its deadline to 50%. With the
+  parallel render also in hand the ninety-six bays sit at 15% of the
+  deadline at 128 frames and 19% at 64.
+
+- **The parallel render follows the machine it is on.** The pool that
+  spreads a block's plugin work across cores was fixed at four workers,
+  which is right for the five performance cores it was built on and wrong
+  on anything larger: the same four faced ten on an M4 Max and more on an
+  Ultra, so the machines with the most silicon left the most of it idle. It
+  asks the machine now. Nothing changes on this Mac.
+
+- **The render load meter can tell one number from another.** It kept its
+  distribution in octaves, so 524 and 1048 microseconds were the same
+  reading, which put every figure that decides whether a desk is fast enough
+  inside a single bucket. It keeps eighths of an octave now, which is about
+  nine percent, at the cost of a shift and a mask per block.
+
 - **A track with nothing to play stops being processed.** While the
   transport was rolling, every track with a plugin on it and a clip anywhere
   in the song ran its whole chain on every block, over silence, for the gaps

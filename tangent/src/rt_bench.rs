@@ -30,7 +30,7 @@ use tangent_record::audio::Timebase;
 use tangent_ui::recorder::{Desk, STRIPS};
 
 use crate::builtin_fx::{
-    ANALOG_PATH, CHORUS_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, ECHO_PATH, EQ_PATH,
+    ANALOG_PATH, CHORUS_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, ECHO_PATH, EQ_PATH, IR_PATH,
     PLATE_PATH, TAPE_PATH,
 };
 use crate::instrument::{ClipNote, Engine, Placed, PlacedMidi};
@@ -169,6 +169,121 @@ fn audio_desk(lanes: usize, inserts: &[&str]) -> Engine {
     e.set_transport(1, 0);
     e.set_rolling(true);
     e
+}
+
+/// **An engine whose lanes carry real impulse responses.**
+///
+/// The convolver is the one built-in whose cost is set by a file rather than
+/// a knob, and the sweep put it at the top of the remaining gap list: a fixed
+/// transform cost on every bay whatever the IR length, paid on the block the
+/// staging buffer happens to fill. Half a second of reverb is about what a
+/// commercial bay costs on this machine, so ninety-six of them is the rung
+/// the plan's own acceptance gate was written against.
+fn ir_desk(lanes: usize, bays: usize, ir_seconds: f64) -> Engine {
+    let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine needs no device");
+    e.set_armed(0);
+    e.set_desk(&quiet_desk());
+    let clip = noise(12.0);
+    let len = clip.frames() as u64;
+    let clips: Vec<Placed> = (0..lanes)
+        .map(|lane| Placed {
+            clip: Arc::clone(&clip),
+            strip: lane,
+            start: 0,
+            offset: 0,
+            len,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 0.5,
+        })
+        .collect();
+    e.set_clips(clips);
+
+    let state = ir_state(ir_seconds);
+    for lane in 0..lanes {
+        for bay in 0..bays {
+            e.load_insert(lane, bay, Some(Path::new(IR_PATH)), Some(&state))
+                .unwrap_or_else(|err| panic!("the IR bay did not load into lane {lane}: {err}"))
+                .unwrap_or_else(|| panic!("the IR loaded but bay {bay} reports no tenant"));
+            // **A bay that quietly failed to find its file is a wire**, and
+            // a wire would measure as the fastest reverb ever written. This
+            // is the whole proof: the bay's error slot is empty only if the
+            // WAV was found, decoded and accepted by `Convolver::set_ir`,
+            // which is the one call that builds the spectra.
+            assert!(
+                e.insert_state_error(lane, bay).is_none(),
+                "lane {lane} bay {bay}: {:?}",
+                e.insert_state_error(lane, bay)
+            );
+        }
+    }
+    e.set_transport(1, 0);
+    e.set_rolling(true);
+    e
+}
+
+/// A decaying-noise IR of `seconds`, written to a real file, wrapped in the
+/// state blob a bay restores itself from. Written once per length and left
+/// behind in the temp directory, which is where the suite's other fixtures go.
+fn ir_state(seconds: f64) -> Vec<u8> {
+    let spec = crate::builtin_fx::spec_for(IR_PATH).expect("the IR bay has a spec");
+    let frames = (seconds * f64::from(RATE)) as usize;
+    let mut samples = Vec::with_capacity(frames * 2);
+    let mut seed = 0x51ED_5EEDu64;
+    for i in 0..frames {
+        let t = i as f64 / f64::from(RATE);
+        let env = (-t / (seconds * 0.35).max(0.05)).exp() as f32;
+        for _ in 0..2 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            // 24 bits mapped to -1..1.
+            let n = (seed >> 40) as f32 / 8_388_608.0 - 1.0;
+            samples.push(n * env);
+        }
+    }
+    // **Normalised to unit energy per channel**, which is what a real
+    // capture is and what keeps three of these in series from compounding
+    // into a signal no reverb produces. A bench measuring a runaway level
+    // is measuring the wrong thing.
+    for ch in 0..2 {
+        let energy: f64 = samples
+            .iter()
+            .skip(ch)
+            .step_by(2)
+            .map(|s| f64::from(*s) * f64::from(*s))
+            .sum();
+        let gain = (1.0 / energy.max(1e-12).sqrt()) as f32;
+        for s in samples.iter_mut().skip(ch).step_by(2) {
+            *s *= gain;
+        }
+    }
+    let mut wav = Vec::with_capacity(samples.len() * 4 + 64);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&0u32.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&3u16.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&0u32.to_le_bytes());
+    wav.extend_from_slice(&0u16.to_le_bytes());
+    wav.extend_from_slice(&32u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&((samples.len() * 4) as u32).to_le_bytes());
+    for s in &samples {
+        wav.extend_from_slice(&s.to_le_bytes());
+    }
+    let path = std::env::temp_dir().join(format!(
+        "tangent-bench-ir-{}-{}ms.wav",
+        std::process::id(),
+        (seconds * 1000.0) as u64
+    ));
+    std::fs::write(&path, &wav).expect("the bench IR writes");
+    crate::builtin_fx::state_text(
+        spec,
+        &spec.defaults(),
+        &[("ir_path".to_owned(), path.display().to_string())],
+    )
+    .into_bytes()
 }
 
 /// An offline engine with `lanes` instrument lanes, each holding one built-in
@@ -501,6 +616,22 @@ fn rt_bench() {
 
     let mut e = audio_desk(32, &[EQ_PATH, EQ_PATH, EQ_PATH]);
     rows.push(measure("32 lanes x 3 EQ", &mut e, WARMUP, BLOCK));
+    drop(e);
+
+    // ── the convolver, which is the bay a file makes expensive ────────────
+    //
+    // Read the p99 here, not the mean. A convolver works in bursts: it does
+    // nothing at all for three blocks out of four at this block size and
+    // then transforms, so its mean is a quarter of what any one block
+    // actually costs, and the mean is not what glitches.
+    let mut e = ir_desk(16, 1, 2.0);
+    rows.push(measure("16 lanes x IR, 2 s response", &mut e, WARMUP, BLOCK));
+    drop(e);
+    // **Ninety-six bays**: the rung the plan's acceptance gate names, at
+    // roughly what a commercial reverb costs a bay on this machine.
+    let mut e = ir_desk(32, 3, 0.5);
+    rows.push(measure("32 lanes x 3 IR, 0.5 s response", &mut e, WARMUP, BLOCK));
+    rows.push(measure("32 lanes x 3 IR, 0.5 s @ 64 fr", &mut e, WARMUP, 64));
     drop(e);
 
     // ── an instrument, which is what a lane costs when it GENERATES ───────

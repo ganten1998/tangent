@@ -74,6 +74,23 @@
 /// latency: the output FIFO is primed with one partition of silence.
 pub const CONV_PARTITION: usize = 512;
 
+/// **How many distinct step phases instances are spread across.**
+///
+/// Every convolver on the desk used to step on the same block. `fill`
+/// starts at zero in every instance, so sixteen IR bays crossed the
+/// partition boundary together and the whole cost of all of them landed in
+/// one block out of four at 128 frames, with three near-empty blocks
+/// around it. The peak is what glitches, not the mean, so that was the
+/// worst possible arrangement of the same work.
+///
+/// Staggering where each instance starts in its staging buffer spreads the
+/// steps across the whole period, and costs nothing: `set_ir` already
+/// primes the output FIFO by what is staged, so a unit that starts part
+/// full reports and delivers the same one-partition latency as one that
+/// starts empty. Sixteen divides the partition evenly and covers every
+/// block size down to 32 frames.
+const CONV_SPREAD: usize = 16;
+
 /// FFT size: two partitions, the textbook K = 2B — each 512-sample block is
 /// transformed alongside the previous one so the circular convolution's
 /// contaminated half falls entirely in the discarded first partition.
@@ -134,15 +151,63 @@ pub enum IrLayout {
 
 // ── the FFT ─────────────────────────────────────────────────────────────────
 
-/// In-place radix-2 complex FFT, f32 — the audio-path transform, the same
-/// house idiom as `stretch.rs`, duplicated because a unit stands alone.
-/// f32 is enough here: 1024 points keeps the roundtrip error near −140 dB,
-/// far under any IR's noise floor. Guards mirror the original.
+/// The twiddle factors for one [`FFT_SIZE`] transform, built once.
+///
+/// **The recurrence this replaces was the most expensive thing in the
+/// transform.** Rotating the twiddle by a complex multiply inside the
+/// butterfly loop costs four multiplies and two adds per butterfly, on top
+/// of the four and six the butterfly itself needs: better than a third of
+/// the transform spent working out an angle that is the same on every block
+/// of every instance for the life of the process. It also drifts, because a
+/// rotation applied five hundred times in f32 does not land where it
+/// started.
+///
+/// One table serves every stage: stage `len` wants `w^(k * FFT_SIZE / len)`,
+/// so the stride does the work. The inverse transform is the conjugate, so
+/// it serves that too.
+struct Twiddles {
+    re: [f32; FFT_SIZE / 2],
+    im: [f32; FFT_SIZE / 2],
+}
+
+/// **Built off the audio thread, always.** `Convolver::new` does not
+/// transform, but `Engine::build` does, and it is host-side by contract, so
+/// by the time `step` reads this the table is already here and the
+/// `get_or_init` is a load and a branch. The `OnceLock` is belt and braces
+/// against a future caller that is not.
+static TWIDDLES: std::sync::OnceLock<Twiddles> = std::sync::OnceLock::new();
+
+fn twiddles() -> &'static Twiddles {
+    TWIDDLES.get_or_init(|| {
+        let mut t = Twiddles {
+            re: [0.0; FFT_SIZE / 2],
+            im: [0.0; FFT_SIZE / 2],
+        };
+        for i in 0..FFT_SIZE / 2 {
+            // f64 for the table, f32 for the transform: the angles are
+            // worked out once and every block afterwards leans on them.
+            let ang = -std::f64::consts::TAU * i as f64 / FFT_SIZE as f64;
+            t.re[i] = ang.cos() as f32;
+            t.im[i] = ang.sin() as f32;
+        }
+        t
+    })
+}
+
+/// In-place radix-2 complex FFT of exactly [`FFT_SIZE`] points, f32 - the
+/// audio-path transform, the same house idiom as `stretch.rs`, duplicated
+/// because a unit stands alone. f32 is enough here: 1024 points keeps the
+/// roundtrip error near -140 dB, far under any IR's noise floor.
+///
+/// The length is fixed rather than free because [`twiddles`] is sized for
+/// it, and every caller in this file transforms a whole block. A slice of
+/// any other length is left alone, as the old guard did.
 fn fft(re: &mut [f32], im: &mut [f32], inverse: bool) {
-    let n = re.len();
-    if n < 2 || n & (n - 1) != 0 || im.len() != n {
+    if re.len() != FFT_SIZE || im.len() != FFT_SIZE {
         return;
     }
+    let n = FFT_SIZE;
+    let tw = twiddles();
     let mut j = 0usize;
     for i in 1..n {
         let mut bit = n >> 1;
@@ -158,24 +223,24 @@ fn fft(re: &mut [f32], im: &mut [f32], inverse: bool) {
     }
     let mut len = 2usize;
     while len <= n {
-        let ang = std::f32::consts::TAU / len as f32 * if inverse { 1.0 } else { -1.0 };
-        let (wr, wi) = (ang.cos(), ang.sin());
+        let half = len / 2;
+        let stride = n / len;
         let mut i = 0;
         while i < n {
-            let (mut cr, mut ci) = (1.0f32, 0.0f32);
-            for k in 0..len / 2 {
+            for k in 0..half {
+                let t = k * stride;
+                // The forward table is the conjugate of the inverse one,
+                // which is why there is only one of them.
+                let (cr, ci) = (tw.re[t], if inverse { -tw.im[t] } else { tw.im[t] });
                 let (ur, ui) = (re[i + k], im[i + k]);
                 let (vr, vi) = (
-                    re[i + k + len / 2] * cr - im[i + k + len / 2] * ci,
-                    re[i + k + len / 2] * ci + im[i + k + len / 2] * cr,
+                    re[i + k + half] * cr - im[i + k + half] * ci,
+                    re[i + k + half] * ci + im[i + k + half] * cr,
                 );
                 re[i + k] = ur + vr;
                 im[i + k] = ui + vi;
-                re[i + k + len / 2] = ur - vr;
-                im[i + k + len / 2] = ui - vi;
-                let nr = cr * wr - ci * wi;
-                ci = cr * wi + ci * wr;
-                cr = nr;
+                re[i + k + half] = ur - vr;
+                im[i + k + half] = ui - vi;
             }
             i += len;
         }
@@ -298,8 +363,9 @@ impl Engine {
     }
 
     /// Forget the audio, keep the IR: rings, history and FIFO to silence,
-    /// FIFO re-primed to a full partition.
-    fn reset(&mut self) {
+    /// FIFO re-primed to `prime`, which is a full partition less whatever
+    /// the owner's staging restarts holding. See [`CONV_SPREAD`].
+    fn reset(&mut self, prime: usize) {
         for r in &mut self.ring {
             r.fill(0.0);
         }
@@ -311,7 +377,7 @@ impl Engine {
         }
         self.head = 0;
         self.out_head = 0;
-        self.out_len = if self.live { CONV_PARTITION } else { 0 };
+        self.out_len = if self.live { prime.min(CONV_PARTITION) } else { 0 };
     }
 
     /// One partition in, one partition out: transform the staged input,
@@ -321,15 +387,38 @@ impl Engine {
     fn step(&mut self, stage: &[Vec<f32>; 2]) {
         let np = self.n_part;
         self.head = (self.head + np - 1) % np;
-        for ch in 0..2 {
-            self.re[..CONV_PARTITION].copy_from_slice(&self.prev[ch]);
-            self.re[CONV_PARTITION..].copy_from_slice(&stage[ch]);
-            self.prev[ch].copy_from_slice(&stage[ch]);
-            self.im.fill(0.0);
-            fft(&mut self.re, &mut self.im, false);
-            let dst = &mut self.ring[ch][self.head * 2 * BINS..][..2 * BINS];
-            dst[..BINS].copy_from_slice(&self.re[..BINS]);
-            dst[BINS..].copy_from_slice(&self.im[..BINS]);
+        // **Both channels in one transform.** The input is real, so half of
+        // a complex transform was being thrown away: the old code filled
+        // `im` with zeros, transformed, and kept only the Hermitian half of
+        // the answer, twice. Riding the left channel in the real part and
+        // the right in the imaginary part gives both spectra from one
+        // transform, and they come apart below by symmetry alone.
+        self.re[..CONV_PARTITION].copy_from_slice(&self.prev[0]);
+        self.re[CONV_PARTITION..].copy_from_slice(&stage[0]);
+        self.im[..CONV_PARTITION].copy_from_slice(&self.prev[1]);
+        self.im[CONV_PARTITION..].copy_from_slice(&stage[1]);
+        self.prev[0].copy_from_slice(&stage[0]);
+        self.prev[1].copy_from_slice(&stage[1]);
+        fft(&mut self.re, &mut self.im, false);
+        {
+            // `Z = L + jR` splits as `L[k] = (Z[k] + conj(Z[-k]))/2` and
+            // `R[k] = (Z[k] - conj(Z[-k]))/2j`, with `-k` taken mod the
+            // transform length so that DC and Nyquist, which are their own
+            // mirrors, need no special case.
+            let base = self.head * 2 * BINS;
+            let (re, im) = (&self.re, &self.im);
+            let [left, right] = &mut self.ring;
+            let l = &mut left[base..][..2 * BINS];
+            let r = &mut right[base..][..2 * BINS];
+            for k in 0..BINS {
+                let m = (FFT_SIZE - k) % FFT_SIZE;
+                let (zr, zi) = (re[k], im[k]);
+                let (mr, mi) = (re[m], im[m]);
+                l[k] = 0.5 * (zr + mr);
+                l[BINS + k] = 0.5 * (zi - mi);
+                r[k] = 0.5 * (zi + mi);
+                r[BINS + k] = 0.5 * (mr - zr);
+            }
         }
         self.acc[0].fill(0.0);
         self.acc[1].fill(0.0);
@@ -351,25 +440,32 @@ impl Engine {
             }
         }
         let cap = 2 * CONV_PARTITION;
-        for out_ch in 0..2 {
-            {
-                let (ar, ai) = self.acc[out_ch].split_at(BINS);
-                self.re[..BINS].copy_from_slice(ar);
-                self.im[..BINS].copy_from_slice(ai);
-                // The mirror half: the input was real, so the spectrum is
-                // Hermitian and the top bins are conjugates, not storage.
-                for k in 1..FFT_SIZE / 2 {
-                    self.re[FFT_SIZE - k] = ar[k];
-                    self.im[FFT_SIZE - k] = -ai[k];
-                }
+        {
+            // The same trick backwards. Both accumulated spectra are
+            // Hermitian, because every term in them is, so `L + jR` inverts
+            // to a complex signal whose real part is the left output and
+            // whose imaginary part is the right one. The mirror half is
+            // still built by hand, because only the kept bins were summed,
+            // but it is built once now instead of twice.
+            let (ar, ai) = self.acc[0].split_at(BINS);
+            let (br, bi) = self.acc[1].split_at(BINS);
+            let (re, im) = (&mut self.re, &mut self.im);
+            for k in 0..BINS {
+                re[k] = ar[k] - bi[k];
+                im[k] = ai[k] + br[k];
             }
-            fft(&mut self.re, &mut self.im, true);
-            // Overlap-save: the first partition of the inverse transform is
-            // circular contamination; the second is the answer.
-            for i in 0..CONV_PARTITION {
-                let idx = (self.out_head + self.out_len + i) % cap;
-                self.out[out_ch][idx] = self.re[CONV_PARTITION + i];
+            for k in 1..FFT_SIZE / 2 {
+                re[FFT_SIZE - k] = ar[k] + bi[k];
+                im[FFT_SIZE - k] = br[k] - ai[k];
             }
+        }
+        fft(&mut self.re, &mut self.im, true);
+        // Overlap-save: the first partition of the inverse transform is
+        // circular contamination; the second is the answer.
+        for i in 0..CONV_PARTITION {
+            let idx = (self.out_head + self.out_len + i) % cap;
+            self.out[0][idx] = self.re[CONV_PARTITION + i];
+            self.out[1][idx] = self.im[CONV_PARTITION + i];
         }
         self.out_len += CONV_PARTITION;
     }
@@ -393,8 +489,15 @@ impl Engine {
 /// Uniform partitioned convolution with true-stereo IR sets, click-free
 /// swapping and a phase-coherent dry blend. See the module header for the
 /// design; see [`Convolver::process`] for the contract.
+/// Handed out in order so that instances built together do not step
+/// together. See [`CONV_SPREAD`].
+static NEXT_PHASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub struct Convolver {
     sample_rate: f32,
+    /// Where this instance's staging starts, and returns to after a
+    /// [`Convolver::clear`]. See [`CONV_SPREAD`].
+    phase: usize,
     /// Input staging toward the next partition, per channel.
     stage: [Vec<f32>; 2],
     fill: usize,
@@ -416,11 +519,23 @@ pub struct Convolver {
 }
 
 impl Convolver {
+    /// A convolver whose steps fall where the last one's did not. See
+    /// [`CONV_SPREAD`] for why that matters and why it is free.
     pub fn new(sample_rate: f32) -> Self {
+        let n = NEXT_PHASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self::at_phase(sample_rate, (n % CONV_SPREAD) * (CONV_PARTITION / CONV_SPREAD))
+    }
+
+    /// The same, at a stated phase. Production takes [`Convolver::new`];
+    /// this exists so a test can assert an exact sample position without
+    /// depending on how many convolvers the rest of the suite built first.
+    pub fn at_phase(sample_rate: f32, phase: usize) -> Self {
+        let phase = phase % CONV_PARTITION;
         Self {
             sample_rate: sample_rate.max(8_000.0),
+            phase,
             stage: [vec![0.0; CONV_PARTITION], vec![0.0; CONV_PARTITION]],
-            fill: 0,
+            fill: phase,
             dry: [vec![0.0; CONV_PARTITION], vec![0.0; CONV_PARTITION]],
             dry_pos: 0,
             slots: [Engine::empty(), Engine::empty()],
@@ -589,7 +704,9 @@ impl Convolver {
         for s in &mut self.stage {
             s.fill(0.0);
         }
-        self.fill = 0;
+        // Back to this instance's own phase, not to zero: a transport
+        // stop must not re-align every convolver on the desk.
+        self.fill = self.phase;
         for d in &mut self.dry {
             d.fill(0.0);
         }
@@ -600,8 +717,9 @@ impl Convolver {
             self.fading = false;
         }
         self.fade_pos = 0;
+        let prime = CONV_PARTITION - self.phase;
         for slot in &mut self.slots {
-            slot.reset();
+            slot.reset(prime);
         }
     }
 
@@ -664,7 +782,7 @@ mod tests {
     #[test]
     fn a_unit_impulse_ir_is_a_null_modulo_the_latency() {
         for sr in [44_100.0f32, 48_000.0, 96_000.0] {
-            let mut c = Convolver::new(sr);
+            let mut c = Convolver::at_phase(sr, 0);
             assert_eq!(c.latency(), 512);
             assert!(c.set_ir(&[vec![1.0], vec![1.0]], IrLayout::Stereo));
             let frames = 8_192;
@@ -701,7 +819,7 @@ mod tests {
         let p = ConvolverParams::default();
 
         let run = |chunk: usize| -> Vec<f32> {
-            let mut c = Convolver::new(SR);
+            let mut c = Convolver::at_phase(SR, 0);
             assert!(c.set_ir(&irs, IrLayout::Stereo));
             let mut buf = input.clone();
             let mut pos = 0;
@@ -772,7 +890,7 @@ mod tests {
                 .collect()
         };
         let irs = [make(&mut seed), make(&mut seed)];
-        let mut c = Convolver::new(SR);
+        let mut c = Convolver::at_phase(SR, 0);
         assert!(c.set_ir(&irs, IrLayout::Stereo), "a 20 s IR was refused");
         assert_eq!(c.latency(), CONV_PARTITION as u32, "a long IR moved the latency");
 
@@ -828,7 +946,7 @@ mod tests {
                 .collect()
         };
         let irs = [make(&mut seed), make(&mut seed)];
-        let mut c = Convolver::new(SR);
+        let mut c = Convolver::at_phase(SR, 0);
         assert!(c.set_ir(&irs, IrLayout::Stereo));
 
         let seconds = 10.0f64;
@@ -862,6 +980,135 @@ mod tests {
         );
     }
 
+    /// **The stagger never moves the latency.** Every instance starts its
+    /// staging at a different offset so that the desk's IR bays do not all
+    /// step on the same block; the whole argument that this is free is that
+    /// the priming in `set_ir` cancels the offset exactly. This walks every
+    /// phase a real instance can be handed and asserts the impulse comes
+    /// out at the reported latency, to the sample, at each one.
+    #[test]
+    fn a_staggered_convolver_reports_the_same_latency_as_any_other() {
+        let step = CONV_PARTITION / CONV_SPREAD;
+        for i in 0..CONV_SPREAD {
+            let phase = i * step;
+            let mut c = Convolver::at_phase(SR, phase);
+            let mut ir = vec![0.0f32; 8];
+            ir[0] = 1.0;
+            assert!(c.set_ir(&[ir.clone(), ir], IrLayout::Stereo));
+            let lat = c.latency() as usize;
+            // The first load fades up over two partitions, so the impulse
+            // goes in after that rather than into the ramp.
+            let at = 2 * CONV_PARTITION;
+            let frames = 5 * CONV_PARTITION;
+            let mut buf = vec![0.0f32; frames * 2];
+            buf[at * 2] = 1.0;
+            buf[at * 2 + 1] = 1.0;
+            let p = ConvolverParams::default();
+            // Chunked unevenly on purpose: the phase must survive a block
+            // boundary landing anywhere inside the staging buffer.
+            let mut pos = 0;
+            while pos < frames {
+                let n = 97.min(frames - pos);
+                c.process(&mut buf[pos * 2..], n, 2, &p);
+                pos += n;
+            }
+            let want = at + lat;
+            for ch in 0..2 {
+                assert!(
+                    (buf[want * 2 + ch] - 1.0).abs() < 1e-3,
+                    "phase {phase}: the impulse was not at the reported latency"
+                );
+            }
+            let strays: Vec<usize> = (0..frames)
+                .filter(|&i| i != want && buf[i * 2].abs() > 1e-3)
+                .collect();
+            assert!(strays.is_empty(), "phase {phase}: stray energy at {strays:?}");
+        }
+    }
+
+    /// **A stop must not re-align the desk.** `clear` used to send every
+    /// instance back to phase zero, which put them all back on the same
+    /// block the moment the transport stopped, which is exactly when a
+    /// session is most likely to be rebuilt from silence.
+    #[test]
+    fn a_stop_leaves_each_convolver_on_its_own_phase() {
+        let phase = 3 * (CONV_PARTITION / CONV_SPREAD);
+        let mut c = Convolver::at_phase(SR, phase);
+        let mut ir = vec![0.0f32; 8];
+        ir[0] = 1.0;
+        assert!(c.set_ir(&[ir.clone(), ir], IrLayout::Stereo));
+        let mut buf = noise(CONV_PARTITION * 3, 11);
+        let p = ConvolverParams::default();
+        c.process(&mut buf, CONV_PARTITION * 3, 2, &p);
+        c.clear();
+        let frames = 4 * CONV_PARTITION;
+        let mut imp = vec![0.0f32; frames * 2];
+        imp[0] = 1.0;
+        imp[1] = 1.0;
+        c.process(&mut imp, frames, 2, &p);
+        let lat = c.latency() as usize;
+        assert!(
+            (imp[lat * 2] - 1.0).abs() < 1e-3,
+            "after a stop the impulse moved off the reported latency"
+        );
+    }
+
+    /// **Instances built in a row do not step in a row.**
+    #[test]
+    fn convolvers_built_together_do_not_all_step_on_the_same_block() {
+        let built: Vec<Convolver> = (0..CONV_SPREAD).map(|_| Convolver::new(SR)).collect();
+        let phases: std::collections::HashSet<usize> = built.iter().map(|c| c.phase).collect();
+        assert_eq!(
+            phases.len(),
+            CONV_SPREAD,
+            "{CONV_SPREAD} convolvers in a row landed on {} phases",
+            phases.len()
+        );
+    }
+
+    /// **The fixed cost of a step, which is what a short IR pays.**
+    ///
+    /// Not a test, a measurement: `cargo test --release ... -- --ignored
+    /// --nocapture`. A cabinet or a plate is one or two partitions, so
+    /// nearly all of its cost is the transforms, and sixteen such bays on a
+    /// desk is an ordinary guitar session rather than a stress case.
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn the_fixed_cost_of_a_step() {
+        for (name, ir_len) in [
+            ("1 partition (a cabinet)", CONV_PARTITION),
+            ("4 partitions (a room)", 4 * CONV_PARTITION),
+            ("2 s (a hall)", 2 * 48_000),
+        ] {
+            let mut seed = 99u64;
+            let make = |seed: &mut u64| -> Vec<f32> {
+                (0..ir_len).map(|_| lcg(seed) * 0.02).collect()
+            };
+            let irs = [make(&mut seed), make(&mut seed)];
+            let mut c = Convolver::at_phase(SR, 0);
+            assert!(c.set_ir(&irs, IrLayout::Stereo));
+            let steps = 2_000;
+            let frames = steps * CONV_PARTITION;
+            let mut buf = noise(frames, 7);
+            let p = ConvolverParams::default();
+            // Twice, reporting the second: the first row otherwise reads
+            // the cost of warming this code path rather than running it.
+            let mut per_step = 0.0;
+            for _ in 0..2 {
+                let start = std::time::Instant::now();
+                let mut pos = 0;
+                while pos < frames {
+                    let n = CONV_PARTITION.min(frames - pos);
+                    c.process(&mut buf[pos * 2..], n, 2, &p);
+                    pos += n;
+                }
+                per_step = start.elapsed().as_secs_f64() / steps as f64 * 1e6;
+            }
+            println!("convolver {name}: {per_step:.1} us per step");
+            assert!(buf.iter().all(|s| s.is_finite()));
+        }
+    }
+
     /// **An IR swap mid-stream never clicks**: through a steady sine, a
     /// swap between two tap IRs moves the level smoothly — no
     /// sample-to-sample jump beyond what the sine itself moves, within a
@@ -875,7 +1122,7 @@ mod tests {
         let mut buf = input.clone();
         let p = ConvolverParams::default();
 
-        let mut c = Convolver::new(SR);
+        let mut c = Convolver::at_phase(SR, 0);
         assert!(c.set_ir(&[vec![1.0], vec![1.0]], IrLayout::Stereo));
         c.process(&mut buf[..swap_at * 2], swap_at, 2, &p);
         assert!(c.set_ir(&[vec![0.9], vec![0.9]], IrLayout::Stereo));
@@ -912,7 +1159,7 @@ mod tests {
     #[test]
     fn mix_at_zero_is_a_wire_whatever_is_loaded() {
         for trim in [0.0f32, 0.5, 1.0] {
-            let mut c = Convolver::new(SR);
+            let mut c = Convolver::at_phase(SR, 0);
             assert!(c.set_ir(&[noise(600, 3).into_iter().take(600).collect(), noise(600, 4).into_iter().take(600).collect()], IrLayout::Stereo));
             // Warm it up wet first, so the wire also proves the off-clear.
             let mut warm = noise(2_048, 8);
@@ -943,7 +1190,7 @@ mod tests {
         for bits in 0..4u32 {
             let d = |bit: u32| [0.0f32, 1.0][(bits >> bit & 1) as usize];
             let p = ConvolverParams { mix: d(0).max(0.01), trim: d(1) };
-            let mut c = Convolver::new(SR);
+            let mut c = Convolver::at_phase(SR, 0);
             assert!(c.set_ir(&irs, IrLayout::TrueStereo));
             for _ in 0..2 {
                 let mut buf: Vec<f32> = noise(frames, 11).iter().map(|v| v * 4.0).collect();
@@ -964,7 +1211,7 @@ mod tests {
     /// and channels past the first two are never written.
     #[test]
     fn mono_is_left_alone_and_a_third_channel_is_never_touched() {
-        let mut c = Convolver::new(SR);
+        let mut c = Convolver::at_phase(SR, 0);
         assert!(c.set_ir(&[vec![1.0], vec![1.0]], IrLayout::Stereo));
         let mut mono: Vec<f32> = (0..256).map(|i| (i as f32 * 0.02).sin()).collect();
         let before = mono.clone();
@@ -994,7 +1241,7 @@ mod tests {
         ir[0] = 0.8;
         ir[700] = -0.5; // A tap in the second partition, so tails cross steps.
         let irs = [ir.clone(), ir.clone()];
-        let mut c = Convolver::new(SR);
+        let mut c = Convolver::at_phase(SR, 0);
         assert!(c.set_ir(&irs, IrLayout::Stereo));
         let p = ConvolverParams::default();
         let mut warm = noise(4_096, 21);
