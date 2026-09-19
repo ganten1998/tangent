@@ -86,6 +86,10 @@ mod stretch;
 /// reason `record` is (docs/RECORDER-PLAN.md §12a).
 #[cfg(feature = "recorder")]
 mod instrument;
+/// A device-less bench of the engine's real-time path: what one callback
+/// block costs against its deadline, shape by shape. Tests only.
+#[cfg(all(test, feature = "recorder"))]
+mod rt_bench;
 /// FreeBSD's MIDI input, because midir has no backend there at all. Shaped as
 /// a drop-in for the handful of midir calls `midi` makes, so the difference is
 /// one `use` and not a second code path. A target gate, not a feature gate —
