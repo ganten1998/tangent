@@ -4568,6 +4568,83 @@ mod engine_parts {
         }
     }
 
+    /// **The automation answers for the position it is asked about.**
+    ///
+    /// This is step 4's prerequisite and the third time the same move has
+    /// been made. The automation is resolved once per block for ONE position
+    /// into one desk-wide table, so a lane rendered ahead and the lanes on
+    /// the deadline could not both be fed, and the failure would have been
+    /// silent: a knob drag landing on one set or the other.
+    ///
+    /// The half that depends on position is now a pure function of the
+    /// document and the position, for both the desk's own controls and the
+    /// plugins' parameters. The other half, the one-shot knob and preset
+    /// edits that arrive on a ring, is not a function of anything and stays
+    /// where it is; a lane those land on is pinned by `param_lanes`.
+    #[test]
+    fn the_automation_answers_for_the_position_it_is_asked_about() {
+        use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+        let ramp = |lane: usize, param: AutoParam| {
+            Curve::sanitised(
+                lane,
+                param,
+                vec![
+                    Point { at_s: 0.0, value: 0.0, shape: Shape::Linear },
+                    Point { at_s: 10.0, value: 1.0, shape: Shape::Linear },
+                ],
+            )
+        };
+        let mut doc = Automation::default();
+        doc.set(ramp(3, AutoParam::Gain));
+        doc.set(ramp(5, AutoParam::Pan));
+        doc.set(ramp(2, AutoParam::Plugin { bay: 1, id: 7 }));
+
+        // A position gives that position's value, wherever the playhead is.
+        let near = automation_now(&doc, 0, 2.5);
+        let far = automation_now(&doc, 0, 7.5);
+        let g = |a: &AutoNow| a.gain[3].expect("lane 3 is automated");
+        assert!((g(&near) - 0.25).abs() < 1e-6, "near was {}", g(&near));
+        assert!((g(&far) - 0.75).abs() < 1e-6, "far was {}", g(&far));
+
+        // **Asking far ahead does not disturb the answer for now**, which is
+        // the property the whole overhaul rests on and the reason this is a
+        // function rather than a pass over a shared table.
+        let again = automation_now(&doc, 0, 2.5);
+        assert!(
+            near.gain == again.gain
+                && near.pan == again.pan
+                && near.send == again.send
+                && near.mute == again.mute
+                && near.master_gain == again.master_gain,
+            "the automation is not a pure function of its position"
+        );
+
+        // A held control is left alone at every position.
+        let held = automation_now(&doc, 1 << 3, 2.5);
+        assert!(held.gain[3].is_none(), "a suspended lane took its curve anyway");
+        assert!(held.pan[5].is_some(), "suspending one lane silenced another");
+
+        // And the plugin parameters, the same way.
+        let seats = RACK_SEATS * INSERTS;
+        let mut out: Vec<Vec<tangent_host::ParamPoint>> =
+            (0..seats).map(|_| Vec::with_capacity(8)).collect();
+        let touched = fill_automation_params(&doc, 0, 7.5, &mut out);
+        assert_ne!(touched, 0, "no lane was reported awake, so nothing was written");
+        let wrote: Vec<f32> = out.iter().flatten().map(|p| p.value as f32).collect();
+        assert_eq!(wrote.len(), 1, "expected exactly the one automated bay");
+        assert!((wrote[0] - 0.75).abs() < 1e-6, "the bay took {}", wrote[0]);
+
+        // Twice for one position is the same answer; a different position is
+        // a different one. The queues are cleared by the caller, as in the
+        // engine, so this fills fresh each time.
+        for q in &mut out {
+            q.clear();
+        }
+        let _ = fill_automation_params(&doc, 0, 2.5, &mut out);
+        let early: Vec<f64> = out.iter().flatten().map(|p| p.value).collect();
+        assert!((early[0] - 0.25).abs() < 1e-6, "the bay took {} at 2.5 s", early[0]);
+    }
+
     /// **Nothing a worker owns may advance a ring the timeline clocks.**
     ///
     /// Both delay compensation lines used to run at the end of `render_lane`
@@ -5547,6 +5624,127 @@ fn lane_range(first: Option<&[u32; CHANNELS + 1]>, ch: usize, len: usize) -> std
     };
     let (a, z) = (*a as usize, *z as usize);
     if a <= z && z <= len { a..z } else { 0..len }
+}
+
+/// **Every automated plugin parameter's value at a position**, written into
+/// the per-seat queues, with the lanes it touched returned so the caller can
+/// keep them awake.
+///
+/// A pure function of the document and the position, and a free function for
+/// the same reason [`automation_now`] is: a lane rendered for a block other
+/// than the one the callback is on needs its curves read at THAT block, and
+/// the single desk-wide table this fills is resolved once per chunk for one
+/// position. Splitting the position-dependent half out is what makes two
+/// positions possible at all.
+///
+/// The other half, the one-shot knob and preset edits, is not a function of
+/// position and is not here. See `resolve_automation`.
+fn fill_automation_params(
+    automation: &tangent_ui::automation::Automation,
+    suspend: u64,
+    secs: f64,
+    out: &mut [Vec<tangent_host::ParamPoint>],
+) -> u32 {
+    use tangent_ui::automation::AutoParam;
+    let mut lanes = 0u32;
+        for curve in automation.curves() {
+            let AutoParam::Plugin { bay, id } = curve.param else {
+                continue;
+            };
+            let lane = curve.lane;
+            if suspend & (1 << lane.min(63)) != 0 {
+                continue;
+            }
+            // **The MASTER's rack is a block past the channels'.**
+            //
+            // Its bays are a real rack — the bus compressor at the end of
+            // the record — and its curves are stored under a lane one past
+            // the channels, so without this the menu offered its parameters
+            // and the engine dropped every one of them on the floor.
+            //
+            // **And it is TWO blocks**, because the master's strip carries
+            // six bays in two racks. Bays 0..2 are the original rack's and
+            // 3..5 the one added above it — appended, never renumbered, so a
+            // curve already drawn still names its own plugin. See
+            // `TangentApp::master_bay`, which is the same rule on the way in.
+            let Some((slot_lane, bay)) = param_slot(lane, usize::from(bay)) else {
+                continue;
+            };
+            let Some(value) = curve.value_at(secs) else {
+                continue;
+            };
+            let Some(q) = out.get_mut(slot_lane * INSERTS + bay) else {
+                continue;
+            };
+            // A curve is re-walked from the document every block, so a point
+            // dropped here really is delivered by the next one - unlike the
+            // ui road above. It still keeps its lane awake, because a lane
+            // waking mid-ramp under a curve it has not been fed jumps to the
+            // curve's current value instead of arriving on it.
+            if let Some(ch) = lane_of_seat(slot_lane) {
+                lanes |= 1u32 << ch.min(CHANNELS - 1);
+            }
+            // The cap is the pre-grown capacity: pushing past it would
+            // allocate, which is the one thing this thread may not do.
+            if q.len() < q.capacity() {
+                q.push(tangent_host::ParamPoint {
+                    // One point at the head of the block. A parameter is not
+                    // audio — a plugin smooths its own — and a point per
+                    // frame would be five hundred COM writes a block for a
+                    // value nobody can hear move that fast.
+                    offset: 0,
+                    id,
+                    value,
+                });
+            }
+        }
+    lanes
+}
+
+/// **The desk's automated fader, pan, send and mute at a position.**
+///
+/// A pure function of the document and the position, which the walk it came
+/// out of already was: every value is `value_at(lane, param, secs)`, and
+/// `suspend` is a mask of the lanes whose hand is on the control and whose
+/// curve must not argue with it mid-gesture.
+///
+/// It is a free function so that it can be asked for a position other than
+/// the one the callback is on, which is what a lane rendered ahead needs.
+/// The other half of the automation, the one-shot knob and preset edits that
+/// arrive on a ring, is NOT a function of position and stays where it is:
+/// see `resolve_automation`, and note that a lane those land on is pinned by
+/// `param_lanes` anyway.
+fn automation_now(
+    automation: &tangent_ui::automation::Automation,
+    suspend: u64,
+    secs: f64,
+) -> AutoNow {
+    use tangent_ui::automation::AutoParam;
+    let mut now = AutoNow::default();
+        for lane in 0..CHANNELS {
+            if suspend & (1 << lane) != 0 {
+                now.gain[lane] = None;
+                now.pan[lane] = None;
+                now.send[lane] = None;
+                now.mute[lane] = None;
+                continue;
+            }
+            now.gain[lane] = automation
+                .value_at(lane, AutoParam::Gain, secs)
+                .map(|v| v as f32);
+            now.pan[lane] = automation
+                .value_at(lane, AutoParam::Pan, secs)
+                .map(|v| v as f32);
+            now.send[lane] = automation
+                .value_at(lane, AutoParam::Send, secs)
+                .map(|v| v as f32);
+            // A switch written as a curve: heard below half, muted above it.
+            now.mute[lane] = automation
+                .value_at(lane, AutoParam::Mute, secs)
+                .map(|v| v >= 0.5);
+        }
+
+    now
 }
 
 /// **One LANE's timeline audio for one span, as a pure function of that span.**
@@ -10356,83 +10554,13 @@ impl Renderer {
         // hundred and forty-four bays; asking every bay whether it has a curve
         // would be four hundred lookups a block to find three. The curve list
         // is the source of truth and it is already sorted.
-        for curve in self.automation.curves() {
-            let AutoParam::Plugin { bay, id } = curve.param else {
-                continue;
-            };
-            let lane = curve.lane;
-            if suspend & (1 << lane.min(63)) != 0 {
-                continue;
-            }
-            // **The MASTER's rack is a block past the channels'.**
-            //
-            // Its bays are a real rack — the bus compressor at the end of
-            // the record — and its curves are stored under a lane one past
-            // the channels, so without this the menu offered its parameters
-            // and the engine dropped every one of them on the floor.
-            //
-            // **And it is TWO blocks**, because the master's strip carries
-            // six bays in two racks. Bays 0..2 are the original rack's and
-            // 3..5 the one added above it — appended, never renumbered, so a
-            // curve already drawn still names its own plugin. See
-            // `TangentApp::master_bay`, which is the same rule on the way in.
-            let Some((slot_lane, bay)) = param_slot(lane, usize::from(bay)) else {
-                continue;
-            };
-            let Some(value) = curve.value_at(secs) else {
-                continue;
-            };
-            let Some(q) = self.auto_params.get_mut(slot_lane * INSERTS + bay) else {
-                continue;
-            };
-            // A curve is re-walked from the document every block, so a point
-            // dropped here really is delivered by the next one - unlike the
-            // ui road above. It still keeps its lane awake, because a lane
-            // waking mid-ramp under a curve it has not been fed jumps to the
-            // curve's current value instead of arriving on it.
-            if let Some(ch) = lane_of_seat(slot_lane) {
-                self.param_lanes |= 1u32 << ch.min(CHANNELS - 1);
-            }
-            // The cap is the pre-grown capacity: pushing past it would
-            // allocate, which is the one thing this thread may not do.
-            if q.len() < q.capacity() {
-                q.push(tangent_host::ParamPoint {
-                    // One point at the head of the block. A parameter is not
-                    // audio — a plugin smooths its own — and a point per
-                    // frame would be five hundred COM writes a block for a
-                    // value nobody can hear move that fast.
-                    offset: 0,
-                    id,
-                    value,
-                });
-            }
-        }
-        for lane in 0..CHANNELS {
-            if suspend & (1 << lane) != 0 {
-                self.auto.gain[lane] = None;
-                self.auto.pan[lane] = None;
-                self.auto.send[lane] = None;
-                self.auto.mute[lane] = None;
-                continue;
-            }
-            self.auto.gain[lane] = self
-                .automation
-                .value_at(lane, AutoParam::Gain, secs)
-                .map(|v| v as f32);
-            self.auto.pan[lane] = self
-                .automation
-                .value_at(lane, AutoParam::Pan, secs)
-                .map(|v| v as f32);
-            self.auto.send[lane] = self
-                .automation
-                .value_at(lane, AutoParam::Send, secs)
-                .map(|v| v as f32);
-            // A switch written as a curve: heard below half, muted above it.
-            self.auto.mute[lane] = self
-                .automation
-                .value_at(lane, AutoParam::Mute, secs)
-                .map(|v| v >= 0.5);
-        }
+        self.param_lanes |= fill_automation_params(
+            &self.automation,
+            suspend,
+            secs,
+            &mut self.auto_params,
+        );
+        self.auto = automation_now(&self.automation, suspend, secs);
         // **The master's own curve**, read at the lane the UI addresses it
         // by — one past the channels. Suspended by the same rule a channel
         // is: a fader being HELD is the hand talking, and a curve must not
