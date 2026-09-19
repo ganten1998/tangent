@@ -5797,6 +5797,16 @@ struct LaneSeats<'a> {
 /// half built.
 struct LanePlan<'a> {
     ch: usize,
+    /// **The absolute sample position this lane is rendering**, which is
+    /// not necessarily the position the callback is on.
+    ///
+    /// It used to be one value for the whole walk, on `DeskRef`, because
+    /// every lane rendered the block the callback was on. A grain render
+    /// asks different lanes for different spans in the same callback - that
+    /// is the whole of the stagger - so the position belongs to the lane's
+    /// plan beside its frame count, and `DeskRef` keeps only what every lane
+    /// really does share.
+    at: u64,
     frames: usize,
     is_builtin: bool,
     is_keys: bool,
@@ -5817,11 +5827,11 @@ struct LanePlan<'a> {
 struct DeskRef<'a> {
     /// **The clip schedule, not a buffer of it.** The whole-desk block of
     /// pre-rack timeline audio is gone: a lane pulls its own span from this,
-    /// for `clips_at`, which is the block this walk is rendering. That is
-    /// what lets the source answer for any block rather than only for the one
-    /// the callback is on.
+    /// for the position in its OWN `LanePlan::at`. That is what lets the
+    /// source answer for any block rather than only for the one the callback
+    /// is on, and it is why the position is not here: two lanes in one walk
+    /// can be rendering two different spans.
     clips: &'a [Placed],
-    clips_at: u64,
     /// The stopped-transport gate the deleted buffer's early return used to
     /// supply. Without it a parked position is re-read every callback and the
     /// clips buzz one block of themselves under a readout that says nothing
@@ -6137,6 +6147,7 @@ fn render_lane(
     desk: &DeskRef<'_>,
 ) -> bool {
     let ch = plan.ch;
+    let at = plan.at;
     let frames = plan.frames;
     let is_builtin = plan.is_builtin;
     let is_keys = plan.is_keys;
@@ -6181,7 +6192,7 @@ fn render_lane(
             pull_lane_clips(
                 lane_run(desk.clips, desk.clip_first, ch),
                 ch,
-                desk.clips_at,
+                at,
                 frames,
                 desk.punch.get(ch).copied().unwrap_or(u64::MAX),
                 io.fx_in,
@@ -13070,7 +13081,6 @@ impl Renderer {
         if wanted != 0 {
             let desk = DeskRef {
                 clips: &self.clips,
-                clips_at: at,
                 clips_rolling: rolling,
                 punch: &self.punch_now,
                 clip_first: self.clip_first.as_ref(),
@@ -13156,6 +13166,7 @@ impl Renderer {
                         },
                         plan: LanePlan {
                             ch,
+                            at,
                             frames,
                             is_builtin: prep.is_builtin,
                             is_keys: prep.is_keys,
