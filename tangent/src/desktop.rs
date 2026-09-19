@@ -12775,6 +12775,9 @@ impl DesktopApp {
         // there is no `seat_bay` translation here to get wrong.
         engine_set_insert_bypass(e, self.app.insert_bypass());
         e.set_frozen(frozen_lane_mask(self.app.frozen_lanes()));
+        // **How far ahead a track's effects are rendered.** One store of a
+        // frame count; see `Settings::render_ahead_ms` for what it trades.
+        e.set_grain_ms(self.app.render_ahead_ms());
     }
 
     /// Copy the faders, the click and the tempo into the audio thread.

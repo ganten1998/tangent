@@ -632,6 +632,114 @@ fn the_fork_renders_what_the_single_walk_rendered() {
     }
 }
 
+/// **A grain render is the same audio, arriving earlier.**
+///
+/// The one property that stands between the grain render and wrong sound.
+/// A lane eligible for it is rendered in 512-frame grains staggered across
+/// the desk instead of once per callback, so on most callbacks its plugins
+/// are not called at all and the fold reads a span out of a ring that was
+/// filled some blocks ago. Every part of that is new: the ring's key, the
+/// span gather across a grain boundary, the stagger's phase, the catch-up
+/// after a locate, and `run_lane_pdc` clocking a delay line over a staging
+/// pair rather than over the render's own buffer.
+///
+/// **Asserted BIT-EXACT**, which is available here and would not be for
+/// every desk: these shapes are sample-by-sample arithmetic - a clip pull,
+/// a fader, a biquad, a compressor - so the block size they are cut into
+/// cannot change the answer. It is not true of a plugin that blocks
+/// internally, which is why the shapes are chosen and not arbitrary: a
+/// hosted convolver partitions its own input and a denoiser windows it, and
+/// both would differ for a reason that is not a defect.
+///
+/// A locate is driven half way through, because the catch-up path is the
+/// one a cold ring takes and it would otherwise never run here.
+///
+/// Not `#[ignore]`d: it is a second, and it is the test that would catch a
+/// grain served for the wrong position, which is the failure this whole
+/// change risks.
+#[test]
+fn a_grained_lane_renders_what_the_chunked_lane_rendered() {
+    let shapes: [(&str, fn() -> Engine); 3] = [
+        ("16 lanes, clips only", || audio_desk(16, &[])),
+        ("16 lanes x 3 EQ", || audio_desk(16, &["@tangent-eq", "@tangent-eq", "@tangent-eq"])),
+        ("16 lanes x [EQ, comp]", || audio_desk(16, &["@tangent-eq", "@tangent-comp"])),
+    ];
+    for (name, build) in shapes {
+        let mut chunked = build();
+        let mut grained = build();
+        // 512 frames at 48 kHz, against a 128-frame block: eight callbacks
+        // to a grain, so every lane spends most of them rendering nothing.
+        grained.set_grain_ms(1000.0 * 512.0 / f64::from(RATE));
+        let n = BLOCK * 2;
+        let mut a = vec![0.0f32; n];
+        let mut b = vec![0.0f32; n];
+        for block in 0..200 {
+            // Half way through, a locate: the ring goes cold and both
+            // engines must come back on the same frame.
+            chunked.render_offline(&mut a);
+            grained.render_offline(&mut b);
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert!(
+                    x.to_bits() == y.to_bits(),
+                    "{name}: block {block} sample {i}: chunked gave {x}, grained gave {y}"
+                );
+            }
+        }
+        // ── and now a locate, which is the one irreducible discard ───────
+        //
+        // A grained lane has rendered up to a grain PAST the playhead, and a
+        // locate abandons that audio. The ring is emptied, but the stateful
+        // units in the lane's rack cannot be: a compressor's envelope and a
+        // reverb's delay lines have processed samples nobody will hear, and
+        // there is no rewind for either. This is the cost the design admits,
+        // and it lands at a locate, where a discontinuity already lives.
+        //
+        // The numbers below are MEASURED, not chosen. On this desk the
+        // difference starts at -53.7 dBFS and is down to -72.6 dBFS a fifth
+        // of a second later. It decays toward zero without reaching it: the
+        // two envelopes differ by a factor that shrinks exponentially, and
+        // in f32 that approaches equality asymptotically rather than landing
+        // on it. The bounds are set outside the measurements so this is a
+        // regression net and not a tripwire.
+        let at = 7 * BLOCK as u64 + 13;
+        for e in [&mut chunked, &mut grained] {
+            e.set_transport(2, at);
+        }
+        let (mut worst, mut tail) = (0.0f32, 0.0f32);
+        for block in 0..80 {
+            chunked.render_offline(&mut a);
+            grained.render_offline(&mut b);
+            let d = a
+                .iter()
+                .zip(&b)
+                .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+            worst = worst.max(d);
+            if block >= 60 {
+                tail = tail.max(d);
+            }
+        }
+        let db = |v: f32| 20.0 * v.max(1e-12).log10();
+        assert!(
+            db(worst) < -40.0,
+            "{name}: a locate cost {:.1} dBFS, which is audible against the \
+             discontinuity a locate already has",
+            db(worst)
+        );
+        assert!(
+            db(tail) < -65.0,
+            "{name}: a fifth of a second after the locate the two renders \
+             still differ by {:.1} dBFS, so the discarded grain is not \
+             decaying out of the lane the way a released envelope should",
+            db(tail)
+        );
+        let peak = a.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            peak > 0.001,
+            "{name}: the reference render was silent, so the test proved nothing"
+        );
+    }
+}
+
 #[test]
 #[ignore = "a bench: run it deliberately with --ignored --nocapture"]
 fn rt_bench() {

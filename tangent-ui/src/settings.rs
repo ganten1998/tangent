@@ -1171,6 +1171,26 @@ pub struct Settings {
     /// set — hand-painted channels keep their own.
     pub auto_palette: bool,
     pub palette_choice: i64,
+    /// **How far ahead a track's effects are rendered, in milliseconds.
+    /// Zero is off.**
+    ///
+    /// A machine setting, not a session one, which is why it lives here
+    /// beside the buffer size and not in `DeskSnap`: it trades a little
+    /// responsiveness for a lot of headroom and the right answer depends on
+    /// the computer, not on the song.
+    ///
+    /// A track eligible for it is rendered in grains of this length instead
+    /// of once per audio callback, with the grain boundaries staggered
+    /// across tracks so each callback refills a share of the desk. **The
+    /// output is not delayed**: a grain is rendered earlier in wall clock
+    /// for the same positions. What IS delayed is the desk's answer to a
+    /// change - a plugin knob, an automation edit or a clip edit lands on a
+    /// grained track up to this many milliseconds late, while faders, sends,
+    /// mute and solo are folded at consumption and are unaffected.
+    ///
+    /// Measured on 96 hosted reverbs at a 64-frame buffer, 10.7 ms of it
+    /// takes the worst block from 132% of the deadline to 65%.
+    pub render_ahead_ms: f64,
     /// **Whether the palette FOLLOWS the theme.**
     ///
     /// On by default, which is what "auto" means in the track menu: every
@@ -1956,6 +1976,7 @@ impl Default for Settings {
             drums_pan: 0.0,
             auto_palette: true,
             palette_choice: 0,
+            render_ahead_ms: 0.0,
             palette_auto: true,
             // **Channel 0 ships as the DRUMPAD, channel 1 as the DX7.** The
             // two built-in instruments sit side by side in the first two
@@ -3230,6 +3251,13 @@ impl Settings {
         }
         take_bool(&mut map, "auto_palette", &mut s.auto_palette);
         take_bool(&mut map, "palette_auto", &mut s.palette_auto);
+        if let Some(v) = map
+            .shift_remove("render_ahead_ms")
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite())
+        {
+            s.render_ahead_ms = v.clamp(0.0, 50.0);
+        }
         if let Some(n) = map.shift_remove("palette_choice").and_then(|v| v.as_i64()) {
             s.palette_choice =
                 n.rem_euclid(crate::mixer_panel::PALETTES.len() as i64);
@@ -4506,6 +4534,7 @@ impl Settings {
         );
         map.insert("auto_palette".into(), Value::Bool(self.auto_palette));
         map.insert("palette_choice".into(), Value::from(self.palette_choice));
+        map.insert("render_ahead_ms".into(), Value::from(self.render_ahead_ms));
         map.insert("drums_gain".into(), serde_json::json!(self.drums_gain));
         map.insert("drums_pan".into(), serde_json::json!(self.drums_pan));
         map.insert(
@@ -5327,6 +5356,10 @@ impl Settings {
         self.record_input_off = fresh.record_input_off;
         self.record_buffer_frames = fresh.record_buffer_frames;
         self.record_sample_rate = fresh.record_sample_rate;
+        // Beside the buffer size, because it is the same kind of decision:
+        // what this MACHINE can carry, traded against how quickly the desk
+        // answers. See `Settings::render_ahead_ms`.
+        self.render_ahead_ms = fresh.render_ahead_ms;
         self.audio_system = fresh.audio_system.clone();
         self.media_default_dir = fresh.media_default_dir.clone();
         self.track_path = fresh.track_path.clone();
