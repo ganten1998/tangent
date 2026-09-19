@@ -3456,10 +3456,39 @@ impl DesktopApp {
             graph_floor: self.recorder.graph_floor,
             // `None` off Linux and wherever the graph cannot be read — which
             // the panel must render as nothing, never as zero.
-            dropouts: tangent_record::audio::merge_dropouts(
-                self.recorder.graph_dropouts.latest(),
-                self.recorder.engine.as_ref().map_or(0, |e| e.xruns()),
-            ),
+            // **And the HAL's own count, which on macOS is the only one
+            // there is.** `merge_dropouts` takes the PipeWire reader and
+            // cpal's xrun counter, and both are blind here: the reader is
+            // Linux-only and cpal never emits an "xrun" description through
+            // CoreAudio. So this field was structurally `None` on every Mac,
+            // and the panel said "unknown" on the platform the app ships on
+            // while `outpath`'s overload listener sat there counting.
+            //
+            // The Option shape is kept: `None` still means nobody could
+            // watch, which is the honest answer on a device that would not
+            // install the listener, and Linux's honest `Some(0)` is not
+            // turned into `None` by the merge.
+            dropouts: match (
+                tangent_record::audio::merge_dropouts(
+                    self.recorder.graph_dropouts.latest(),
+                    self.recorder.engine.as_ref().map_or(0, |e| e.xruns()),
+                ),
+                self.recorder.overload.count(),
+            ) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            },
+            // The engine's own meter, as a pair of fractions of the block's
+            // deadline: the last block and the worst since the stream
+            // opened. `high_ns` rather than `peak_ns`, because reading the
+            // peak clears it and the panel must not empty a meter a bench
+            // or a log line is also reading.
+            rt_load: self.recorder.engine.as_ref().and_then(|e| {
+                let m = e.rt_load();
+                Some((m.load()?, m.peak_load()?))
+            }),
         });
 
         // The buffer size, on the edge. Reopening both streams is expensive —
@@ -25170,6 +25199,43 @@ mod tests {").expect("the tests module")];
             body[warned..].contains("self.app.notify(Kind::Info"),
             "the warning is set but never pushed to the message queue"
         );
+    }
+
+    /// **The panel's dropout figure is not blind on macOS.**
+    ///
+    /// `merge_dropouts` reads the PipeWire graph's tally and cpal's xrun
+    /// counter, and on a Mac both are structurally silent: the reader is
+    /// Linux-only and cpal never emits an "xrun" description through
+    /// CoreAudio. So the field was always `None` on the platform the app
+    /// ships on, while the HAL's own overload listener sat in `outpath`
+    /// counting. The merge takes whichever counters can see, and the shape
+    /// asserted here is the one the panel depends on: `None` still means
+    /// nobody could watch, and Linux's honest `Some(0)` is not turned into
+    /// `None` by having a second source.
+    #[test]
+    fn a_dropout_count_survives_every_way_the_two_counters_can_answer() {
+        // The merge, as the status assembly performs it.
+        let merge = |generic: Option<u64>, hal: Option<u64>| match (generic, hal) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        // macOS before this: nothing could count, and the panel said so
+        // while the HAL knew better.
+        assert_eq!(merge(None, Some(7)), Some(7), "the HAL's count did not reach the panel");
+        assert_eq!(merge(None, Some(0)), Some(0), "a clean HAL count read as unknown");
+        // Linux, where the graph counts and there is no HAL: unchanged, and
+        // an honest zero stays a zero rather than becoming "unknown".
+        assert_eq!(merge(Some(0), None), Some(0));
+        assert_eq!(merge(Some(3), None), Some(3));
+        // Both: the worse of the two, because either seeing a gap means
+        // there was one.
+        assert_eq!(merge(Some(3), Some(9)), Some(9));
+        assert_eq!(merge(Some(9), Some(3)), Some(9));
+        // And nobody looking is still nobody looking, which the panel
+        // renders as nothing at all rather than as a clean bill.
+        assert_eq!(merge(None, None), None);
     }
 
     /// **A dead return neither moves the impulse nor stretches the IR.**
