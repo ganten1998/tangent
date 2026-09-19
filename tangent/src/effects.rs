@@ -1009,7 +1009,42 @@ impl Pole {
 // `pub(crate)` — visibility only, no behaviour change: `units/plate.rs` embeds
 // this struct as the engine of the per-lane insert form. Same for the trim
 // consts above and for `Chorus`/`TapeEcho` below.
+
+/// **A coefficient that only changes when its control does.**
+///
+/// Every one of these is `(-k / rate).exp()`, and the units below are
+/// handed one FRAME at a time, so each was a libm call per sample: three in
+/// the chorus, two in the tape echo, one in the plate, on every lane
+/// carrying them. The formula is block-constant in all but name, because
+/// the only thing that moves it is a knob.
+///
+/// Memoised on the INPUT rather than recomputed on a timer, so the answer
+/// is exactly the answer the call would have given - the same `exp`, on the
+/// same argument, just not again - and a knob still takes effect on the
+/// sample it is turned.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Memo {
+    arg: f32,
+    val: f32,
+}
+
+impl Memo {
+    #[inline]
+    pub(crate) fn exp_of(&mut self, arg: f32) -> f32 {
+        // Bit equality, not an epsilon: two arguments that differ at all
+        // give different poles, and a filter that ignored a small change
+        // would be a filter whose knob had a dead zone.
+        if arg.to_bits() != self.arg.to_bits() {
+            self.arg = arg;
+            self.val = arg.exp();
+        }
+        self.val
+    }
+}
+
 pub(crate) struct Plate {
+    /// See `Memo`: a pole that only moves when its knob does.
+    damp_memo: Memo,
     /// Predelay, allocated for the longest [`PLATE_PREDELAY_MS`] can ask.
     pre: [Vec<f32>; 2],
     pre_at: usize,
@@ -1049,6 +1084,7 @@ impl Plate {
         let scale = |n: usize| ((n as f32) * sr / DESIGN_RATE).max(1.0);
         let pre_cap = (sr * PLATE_PREDELAY_MS.1 / 1_000.0) as usize + 2;
         Self {
+            damp_memo: Memo::default(),
             pre: [vec![0.0; pre_cap], vec![0.0; pre_cap]],
             pre_at: 0,
             bandwidth: [Pole::default(); 2],
@@ -1212,7 +1248,9 @@ impl Plate {
         let (rat_lo, rat_hi) = p.reverb_mode.tone_ratio();
         let ratio = rat_lo + (rat_hi - rat_lo) * tone;
         // A one-pole whose corner is `corner`, expressed as its pole.
-        let damp_a = (-std::f32::consts::TAU * corner / self.sample_rate).exp();
+        let damp_a = self
+            .damp_memo
+            .exp_of(-std::f32::consts::TAU * corner / self.sample_rate);
         // How much of the damped signal is mixed back in. At ratio 1 the
         // damper is out of circuit and the tail is flat; at ratio 0.22 the top
         // decays to a fifth of the mid-band length.
@@ -1698,6 +1736,10 @@ impl Spring {
 /// A three-head tape echo whose first head follows the session tempo.
 // `pub(crate)`: embedded by `units/echo.rs`. See the note on [`Plate`].
 pub(crate) struct TapeEcho {
+    /// See `Memo`: a pole that only moves when its knob does.
+    loss_memo: Memo,
+    /// See `Memo`: a pole that only moves when its knob does.
+    bump_memo: Memo,
     /// The tape itself. **One loop, mono**, because that is what is in the
     /// machine: the three heads read the same magnetisation at three points.
     tape: Vec<f32>,
@@ -1723,6 +1765,8 @@ impl TapeEcho {
     pub(crate) fn new(sample_rate: f32) -> Self {
         let cap = (sample_rate * MAX_TAPE_SECS) as usize + 2;
         Self {
+            loss_memo: Memo::default(),
+            bump_memo: Memo::default(),
             tape: vec![0.0; cap],
             at: 0,
             len: sample_rate * FREE_SECS,
@@ -1832,14 +1876,18 @@ impl TapeEcho {
         // take the top off, and the tone control moves where.
         let tone = p.delay_tone.clamp(0.0, 1.0);
         let corner = TAPE_TONE_HZ.0 + (TAPE_TONE_HZ.1 - TAPE_TONE_HZ.0) * tone;
-        let a = (-std::f32::consts::TAU * corner / self.sample_rate).exp();
+        let a = self
+            .loss_memo
+            .exp_of(-std::f32::consts::TAU * corner / self.sample_rate);
         self.loss = flush(loop_sum * (1.0 - a) + self.loss * a);
         let mut back = self.loss;
 
         // The head bump: a little of the very bottom put back, which is what a
         // record head's geometry does and why tape echo thickens as it repeats
         // rather than just darkening.
-        let ba = (-std::f32::consts::TAU * TAPE_BUMP_HZ / self.sample_rate).exp();
+        let ba = self
+            .bump_memo
+            .exp_of(-std::f32::consts::TAU * TAPE_BUMP_HZ / self.sample_rate);
         self.bump = flush(back * (1.0 - ba) + self.bump * ba);
         back += self.bump * TAPE_BUMP;
 
@@ -1976,6 +2024,13 @@ pub(crate) const CHORUS_LP_HZ: (f32, f32) = (2_600.0, 9_000.0);
 /// sits at a steady value and then reverses rather than easing continuously.
 // `pub(crate)`: embedded by `units/chorus.rs`. See the note on [`Plate`].
 pub(crate) struct Chorus {
+    /// See `Memo`: a pole that only moves when its knob does.
+    tone_memo: Memo,
+    /// The gate's three poles, which are fixed times at a fixed rate and so
+    /// are worked out once rather than six hundred thousand times a second.
+    env_a: f32,
+    gate_open_a: f32,
+    gate_close_a: f32,
     buf: [Vec<f32>; 2],
     at: usize,
     /// The LFO's position, 0..1, wrapping.
@@ -1998,6 +2053,10 @@ impl Chorus {
         let longest = CHORUS_FLOOR_MS + CHORUS_SPAN_MS.1;
         let cap = (sample_rate * longest * 2.0 / 1000.0) as usize + 4;
         Self {
+            tone_memo: Memo::default(),
+            env_a: (-1.0 / (CHORUS_ENV_MS * 0.001 * sample_rate)).exp(),
+            gate_open_a: (-1.0 / (CHORUS_GATE_OPEN_MS * 0.001 * sample_rate)).exp(),
+            gate_close_a: (-1.0 / (CHORUS_GATE_CLOSE_MS * 0.001 * sample_rate)).exp(),
             buf: [vec![0.0; cap], vec![0.0; cap]],
             at: 0,
             phase: 0.0,
@@ -2047,7 +2106,11 @@ impl Chorus {
 
         // The BBD's bandwidth, as a one-pole coefficient.
         let cutoff = CHORUS_LP_HZ.0 + (CHORUS_LP_HZ.1 - CHORUS_LP_HZ.0) * p.chorus_tone;
-        let a = (-std::f32::consts::TAU * cutoff / self.sample_rate).exp();
+        // Memoised: this is handed one frame at a time and the pole only
+        // moves when the tone knob does. See `Memo`.
+        let a = self
+            .tone_memo
+            .exp_of(-std::f32::consts::TAU * cutoff / self.sample_rate);
 
         // **The gate, which is the CE-1's answer to a compander.** Every other
         // bucket-brigade chorus of the era wrapped its delay line in one to
@@ -2056,14 +2119,13 @@ impl Chorus {
         // leaves after it, which is a sound rather than a defect — and a model
         // with neither is missing the thing people mean by "that chorus".
         let peak = input[0].abs().max(input[1].abs());
-        let coeff = |ms: f32| (-1.0 / (ms * 0.001 * self.sample_rate)).exp();
-        self.env = flush(peak.max(self.env * coeff(CHORUS_ENV_MS)));
+        // **Three constants, worked out once.** These are fixed millisecond
+        // times against a fixed rate, and this function is handed one frame
+        // at a time, so each was a libm call per sample for a number that
+        // never moves. See `Chorus::new`.
+        self.env = flush(peak.max(self.env * self.env_a));
         let want = if self.env > CHORUS_GATE_FLOOR { 1.0 } else { 0.0 };
-        let slew = if want > self.gate {
-            coeff(CHORUS_GATE_OPEN_MS)
-        } else {
-            coeff(CHORUS_GATE_CLOSE_MS)
-        };
+        let slew = if want > self.gate { self.gate_open_a } else { self.gate_close_a };
         self.gate = flush(want + (self.gate - want) * slew);
 
         self.noise ^= self.noise << 13;

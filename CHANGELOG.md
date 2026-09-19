@@ -45,6 +45,18 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   37.7 microseconds, Tape 63.9 to 24.2. The unfixed Drive desk went a block
   over its deadline during the measurement; the fixed one does not.
 
+- **The chorus, the echo and the plate stop recomputing filter poles per
+  sample.** Each is handed one frame at a time and worked out its own
+  coefficients from a knob that had not moved, which is a libm call per
+  sample: three in the chorus, two in the tape echo, one in the plate. They
+  are remembered on the value that produced them now, so a knob still takes
+  effect on the sample it is turned and the arithmetic is otherwise the same
+  call on the same argument. The chorus's gate had three more that are fixed
+  times at a fixed rate, and those are worked out once when it is built.
+  Measured over sixteen lanes: chorus 61.5 to 46.9 microseconds a block, a
+  quarter off. The echo moved about four percent, which is inside the
+  measurement's own noise.
+
 - **Two smaller ones in the same pass.** The DX7's sine did a libm remainder
   call six times per voice per sample, which is 4.6 million a second at full
   polyphony, and now rounds instead. And the Analog's arpeggiator allocated

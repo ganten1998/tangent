@@ -29,7 +29,10 @@ use std::time::Instant;
 use tangent_record::audio::Timebase;
 use tangent_ui::recorder::{Desk, STRIPS};
 
-use crate::builtin_fx::{ANALOG_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, EQ_PATH, PLATE_PATH, TAPE_PATH};
+use crate::builtin_fx::{
+    ANALOG_PATH, CHORUS_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, ECHO_PATH, EQ_PATH,
+    PLATE_PATH, TAPE_PATH,
+};
 use crate::instrument::{ClipNote, Engine, Placed, PlacedMidi};
 
 /// The block every shape is measured at: the middle of the three sizes the
@@ -475,6 +478,14 @@ fn rt_bench() {
         3_600,
         BLOCK,
     ));
+    drop(e);
+
+    // The two that recompute a filter pole per sample, or did.
+    let mut e = audio_desk(16, &[CHORUS_PATH]);
+    rows.push(measure("16 lanes x Chorus", &mut e, WARMUP, BLOCK));
+    drop(e);
+    let mut e = audio_desk(16, &[ECHO_PATH]);
+    rows.push(measure("16 lanes x Echo", &mut e, WARMUP, BLOCK));
     drop(e);
 
     // **Our own two most expensive units**, which the sweep measured above
