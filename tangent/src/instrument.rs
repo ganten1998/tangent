@@ -4645,6 +4645,41 @@ mod engine_parts {
         assert!((early[0] - 0.25).abs() < 1e-6, "the bay took {} at 2.5 s", early[0]);
     }
 
+    /// **The pool is stopped before the seats it renders into are freed.**
+    ///
+    /// Field order is the whole of the hazard: `racks`, `dx7s` and
+    /// `keys_lanes` are declared before `fanout`, and Rust drops fields in
+    /// declaration order, so without an explicit `Drop` the desk is freed
+    /// while the worker threads are still alive. Asserted against the source
+    /// because the property is an ORDER, and the only runtime test for it
+    /// would be a race that does not reproduce.
+    #[test]
+    fn the_pool_is_stopped_before_the_desk_is_freed() {
+        let src = include_str!("instrument.rs");
+        let decl = src
+            .rsplit_once("\nstruct Renderer {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("Renderer is declared");
+        let (racks, fanout) = (
+            decl.find("racks: Vec<Rack>").expect("the rack bank"),
+            decl.find("fanout: Option<LanePool>").expect("the pool"),
+        );
+        assert!(
+            racks < fanout,
+            "the pool now comes first, so the note below is stale rather than wrong"
+        );
+        let imp = src
+            .rsplit_once("impl Drop for Renderer {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("Renderer has a Drop, which is what makes the order explicit");
+        assert!(
+            imp.contains("self.fanout.take()"),
+            "Renderer's Drop no longer takes the pool first:\n{imp}"
+        );
+    }
+
     /// **Nothing a worker owns may advance a ring the timeline clocks.**
     ///
     /// Both delay compensation lines used to run at the end of `render_lane`
@@ -7555,6 +7590,27 @@ struct Renderer {
     /// on the chunk an input is first armed — inaudible, and the alternative
     /// is a second walk of the interface at the head of every block.
     room_rack: u32,
+}
+
+
+/// **The pool goes before the seats it renders into.**
+///
+/// Rust drops a struct's fields in declaration order, and `racks`, `dx7s` and
+/// `keys_lanes` are declared long before `fanout`. So a plain drop frees every
+/// seat on the desk and THEN stops the threads that render into them.
+///
+/// Nothing is reading them today, because a worker only touches a seat inside
+/// a dispatch and a dispatch only happens from `render`, which is not running
+/// while this is. That is an argument about the current call graph rather than
+/// a property of the type, and it is the first thing a lane held across blocks
+/// would break. Stating the order here costs one line and removes the
+/// argument: the pool's own `Drop` sets the stop flag, wakes every worker and
+/// JOINS it, so by the time any seat is freed there is no thread left that
+/// could reach one.
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        drop(self.fanout.take());
+    }
 }
 
 impl Renderer {
