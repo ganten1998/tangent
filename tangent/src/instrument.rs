@@ -4246,6 +4246,136 @@ mod engine_parts {
         assert_eq!(rt_bucket(u64::MAX), RT_HIST_BUCKETS - 1);
     }
 
+    /// **The clip walk was turned inside out and the sum did not move.**
+    ///
+    /// `fill_clip_span` used to be `for frame { for clip }`, which costs
+    /// `frames * clips` whatever the clips are doing. It is `for clip { for
+    /// frame }` over the intersection now, which is the shape a lane needs if
+    /// it is ever to be asked for a block other than the one the callback is
+    /// on. The sum has to be bit-identical, because f32 addition is not
+    /// associative and two clips overlapping on one lane are added with `+=`.
+    ///
+    /// The oracle is the old nest, written out here rather than referred to,
+    /// so this test keeps proving something after the original is gone.
+    #[test]
+    fn inverting_the_clip_walk_did_not_move_a_single_bit() {
+        use std::path::PathBuf;
+        // Ramps rather than constants: a constant hides an off-by-one in the
+        // fade arithmetic, and a shared value hides an ordering change.
+        let clip = |n: usize, seed: f32| {
+            Arc::new(tangent_record::decode::Clip {
+                samples: (0..n * 2).map(|i| seed + i as f32 * 1e-3).collect(),
+                rate: 48_000,
+                source: PathBuf::from("span.wav"),
+            })
+        };
+        let mk = |strip, start, offset, len, fade_in, fade_out, gain, seed| Placed {
+            clip: clip(4_000, seed),
+            strip,
+            start,
+            offset,
+            len,
+            fade_in,
+            fade_out,
+            gain,
+        };
+        let clips = vec![
+            // Two overlapping on ONE lane, so the accumulation order is under
+            // test, with fades that overlap the span's edges both ways.
+            mk(3, 100, 0, 900, 64, 128, 0.8, 0.5),
+            mk(3, 500, 7, 1_200, 0, 300, 1.3, -0.25),
+            // One that starts inside the span, one that ends inside it, one
+            // nowhere near it, and one on the last lane.
+            mk(0, 700, 3, 400, 16, 16, 1.0, 0.125),
+            mk(1, 0, 0, 650, 0, 0, 1.0, -0.75),
+            mk(2, 900_000, 0, 1_000, 0, 0, 1.0, 0.3),
+            mk(CHANNELS - 1, 640, 11, 500, 32, 0, 0.5, 0.9),
+            // A gain the sanitiser has to catch, and one past the clamp.
+            mk(4, 600, 0, 500, 0, 0, f32::NAN, 0.2),
+            mk(5, 600, 0, 500, 0, 0, 1_000.0, 0.15),
+        ];
+        // A punch that cuts one lane part way through the span, which the
+        // inversion turned from a per-frame test into a span bound.
+        let mut punch = [u64::MAX; CHANNELS];
+        punch[3] = 800;
+        punch[1] = 0;
+
+        let at = 640u64;
+        let frames = 512usize;
+        let stride = CHANNELS * 2;
+        let mut got = vec![0.0f32; frames * stride];
+        fill_clip_span(&clips, at, frames, &punch, &mut got);
+
+        // ── the oracle: the nest exactly as it was ───────────────────────
+        let mut want = vec![0.0f32; frames * stride];
+        for f in 0..frames {
+            let now = at + f as u64;
+            for placed in &clips {
+                let lane = placed.strip.min(CHANNELS - 1);
+                let Some(k) = now.checked_sub(placed.start) else {
+                    continue;
+                };
+                if k >= placed.len {
+                    continue;
+                }
+                if now >= punch[lane] {
+                    continue;
+                }
+                let i = match usize::try_from(placed.offset + k) {
+                    Ok(frame) => frame * 2,
+                    Err(_) => continue,
+                };
+                let (cl, cr) = match (placed.clip.samples.get(i), placed.clip.samples.get(i + 1)) {
+                    (Some(a), Some(b)) => (*a, *b),
+                    _ => continue,
+                };
+                let mut env = 1.0f32;
+                if placed.fade_in > 0 && k < placed.fade_in {
+                    env *= k as f32 / placed.fade_in as f32;
+                }
+                let left = placed.len - k;
+                if placed.fade_out > 0 && left <= placed.fade_out {
+                    env *= (left - 1) as f32 / placed.fade_out as f32;
+                }
+                let clip_g = if placed.gain.is_finite() {
+                    placed.gain.clamp(0.0, 64.0)
+                } else {
+                    1.0
+                };
+                if let Some(v) = want.get_mut(f * stride + lane * 2) {
+                    *v += cl * env * clip_g;
+                }
+                if let Some(v) = want.get_mut(f * stride + lane * 2 + 1) {
+                    *v += cr * env * clip_g;
+                }
+            }
+        }
+
+        assert!(
+            want.iter().any(|v| *v != 0.0),
+            "the fixture produced silence, so this proved nothing"
+        );
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "sample {i} (frame {}, lane {}) moved: {g} vs {w}",
+                i / stride,
+                (i % stride) / 2
+            );
+        }
+
+        // **And the same span asked for twice is the same answer**, which is
+        // the property that makes it safe to ask for a block that is not the
+        // one the callback is on.
+        let mut again = vec![0.0f32; frames * stride];
+        fill_clip_span(&clips, at, frames, &punch, &mut again);
+        assert!(
+            got.iter().zip(&again).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the clip source is not a pure function of its span"
+        );
+    }
+
     /// **Nothing a worker owns may advance a ring the timeline clocks.**
     ///
     /// Both delay compensation lines used to run at the end of `render_lane`
@@ -5140,6 +5270,114 @@ struct DeskRef<'a> {
 /// Answers whether the lane produced anything to fold. `false` is every one
 /// of the three ways the old body reached its `continue`: a scratch too
 /// short for the block, and an inactive instrument on a bare lane.
+/// **One span of the timeline's clip audio, as a pure function of where
+/// that span is.**
+///
+/// No cursor, no cache, no decode, no allocation and no lock: every
+/// sample is `samples[(offset + k) * 2 + c] * fade(k) * gain`, read
+/// straight out of an `Arc<Clip>` the host decoded whole. Stretch and
+/// loop are resolved before the audio thread ever sees this, into extra
+/// `Placed` passes, so what arrives here is a flat list of span, offset,
+/// fade and gain.
+///
+/// **That purity is the point**, and it is why this is a free function
+/// rather than a method. A lane can only be rendered for a block other
+/// than the one the callback is on if its source can be asked for that
+/// block, and everything impure that used to surround this loop stays
+/// behind in `mix_clips`: the clip-list swap, the `lane_gain` smoothing,
+/// the `clip_lanes` and `clip_under` masks, the stopped-transport early
+/// return. Ask this for any `at` and it answers for that `at`.
+///
+/// **Clip-major, not frame-major, and the inversion is not cosmetic.**
+/// It used to be `for f { for placed in clips }`, which is
+/// `frames * clips` iterations whatever the clips are doing, with no cap
+/// anywhere and a single looped clip expanded by the host into as many as
+/// four thousand passes. Now each clip is intersected with the span once
+/// and only the frames it actually covers are walked, so a desk full of
+/// clips nobody is near costs one comparison each.
+///
+/// The sum is bit-identical to the walk it replaces. For any one output
+/// sample the contributing clips are still visited in list order, because
+/// the outer loop IS list order and each clip writes every frame it
+/// covers before the next one starts; `+=` on the same cell therefore
+/// happens in the same sequence, which is the only thing f32 addition's
+/// lack of associativity can notice.
+///
+/// `dst` is the whole-desk, frame-major, lane-interleaved buffer and is
+/// ACCUMULATED into, so the caller zeroes it.
+fn fill_clip_span(
+    clips: &[Placed],
+    at: u64,
+    frames: usize,
+    punch: &[u64; CHANNELS],
+    dst: &mut [f32],
+) {
+    let stride = CHANNELS * 2;
+    let end = at.saturating_add(frames as u64);
+    for placed in clips {
+        let lane = placed.strip.min(CHANNELS - 1);
+        // **The intersection, in u64 and before any cast**, because a
+        // position grows without bound. Before a clip and past its end
+        // are both silence and both ordinary.
+        //
+        // **Being recorded over, right now**: from the punch frame on,
+        // this lane's clips are the material the take is replacing and
+        // must not be heard against it. It was a per-frame test and is
+        // the span's upper bound now, which is the same cut.
+        let from = at.max(placed.start);
+        let to = end
+            .min(placed.start.saturating_add(placed.len))
+            .min(punch[lane]);
+        if to <= from {
+            continue;
+        }
+        // **The clip's own level, and nothing else's.** Sanitised rather
+        // than trusted: this multiplies into somebody's monitors. The
+        // lane's fader, pan, mute, solo and send are the channel fold's,
+        // one strip's worth applied once, which is what stopped a clip on
+        // a folder needing a special case here.
+        let clip_g = if placed.gain.is_finite() {
+            placed.gain.clamp(0.0, 64.0)
+        } else {
+            1.0
+        };
+        for now in from..to {
+            let f = (now - at) as usize;
+            let k = now - placed.start;
+            let i = match usize::try_from(placed.offset + k) {
+                Ok(frame) => frame * 2,
+                Err(_) => continue,
+            };
+            // Bounds-checked rather than trusted: `k < len` is the clamp,
+            // and this is the line that would panic on the audio thread
+            // if the host ever pushed a `len` past the file.
+            let (cl, cr) = match (placed.clip.samples.get(i), placed.clip.samples.get(i + 1)) {
+                (Some(a), Some(b)) => (*a, *b),
+                _ => continue,
+            };
+            // The fades: linear ramps in frames, worked out from the u64
+            // distances so a four-minute clip cannot lose precision. The
+            // head ramp rises 0 to 1 over `fade_in`; the tail falls to
+            // exactly 0 ON the last frame, so a faded clip cannot click
+            // shut.
+            let mut env = 1.0f32;
+            if placed.fade_in > 0 && k < placed.fade_in {
+                env *= k as f32 / placed.fade_in as f32;
+            }
+            let left = placed.len - k;
+            if placed.fade_out > 0 && left <= placed.fade_out {
+                env *= (left - 1) as f32 / placed.fade_out as f32;
+            }
+            if let Some(v) = dst.get_mut(f * stride + lane * 2) {
+                *v += cl * env * clip_g;
+            }
+            if let Some(v) = dst.get_mut(f * stride + lane * 2 + 1) {
+                *v += cr * env * clip_g;
+            }
+        }
+    }
+}
+
 fn render_lane(
     seats: &mut LaneSeats<'_>,
     io: &mut LaneIo<'_>,
@@ -10204,81 +10442,7 @@ impl Renderer {
         }
         // Disjoint fields, so the borrows are disjoint: the clip list is read
         // while the per-lane buffer is written.
-        let (clips, dst) = (&self.clips, &mut self.clip_lane);
-        let stride = CHANNELS * 2;
-        for f in 0..frames {
-            // Project frame. The u64 compares come BEFORE any cast, because
-            // `p` grows without bound; before a clip and past its end are
-            // both silence, and both are ordinary.
-            //
-            // **No compensation subtracted here any more.** It used to be
-            // `now - hold[lane]`, with a `checked_sub` standing in for the
-            // silence a delay line puts out before it has been fed — the
-            // note that lived here explained at length why saturating would
-            // have repeated the first sample for the first `pdc` frames.
-            // The lane's delay line does that job now, and does it with an
-            // actual ring, so there is nothing left to reason about: the
-            // clip reads its own frame and the wait happens downstream.
-            let now = at + f as u64;
-            for placed in clips {
-                let lane = placed.strip.min(CHANNELS - 1);
-                let Some(k) = now.checked_sub(placed.start) else {
-                    continue;
-                };
-                if k >= placed.len {
-                    continue;
-                }
-                // **Being recorded over, right now**: from the punch frame
-                // on, this lane's clips are the material the take is
-                // replacing, and the take must not be heard against them.
-                if now >= punch[lane] {
-                    continue;
-                }
-                let i = match usize::try_from(placed.offset + k) {
-                    Ok(frame) => frame * 2,
-                    Err(_) => continue,
-                };
-                // Bounds-checked rather than trusted: `k < len` is the
-                // clamp, and this is the line that would panic on the audio
-                // thread if the host ever pushed a len past the file.
-                let (cl, cr) = match (placed.clip.samples.get(i), placed.clip.samples.get(i + 1)) {
-                    (Some(a), Some(b)) => (*a, *b),
-                    _ => continue,
-                };
-                // The fades: linear ramps in frames, computed from the u64
-                // distances so a four-minute clip cannot lose precision.
-                // The head ramp rises 0 -> 1 over `fade_in`; the tail falls
-                // to exactly 0 ON the last frame, so a faded clip cannot
-                // click shut.
-                let mut env = 1.0f32;
-                if placed.fade_in > 0 && k < placed.fade_in {
-                    env *= k as f32 / placed.fade_in as f32;
-                }
-                let left = placed.len - k;
-                if placed.fade_out > 0 && left <= placed.fade_out {
-                    env *= (left - 1) as f32 / placed.fade_out as f32;
-                }
-                // **The clip's own level, and nothing else's.** Sanitised
-                // here rather than trusted: this multiplies into somebody's
-                // monitors, and the rule the gains follow everywhere else.
-                // The lane's fader, pan, mute, solo and send are the channel
-                // fold's, one strip's worth applied once — which is what
-                // stopped a clip on a folder needing a special case in this
-                // loop: `mix_channels` already knows a folder's row carries
-                // no fader of its own.
-                let clip_g = if placed.gain.is_finite() {
-                    placed.gain.clamp(0.0, 64.0)
-                } else {
-                    1.0
-                };
-                if let Some(v) = dst.get_mut(f * stride + lane * 2) {
-                    *v += cl * env * clip_g;
-                }
-                if let Some(v) = dst.get_mut(f * stride + lane * 2 + 1) {
-                    *v += cr * env * clip_g;
-                }
-            }
-        }
+        fill_clip_span(&self.clips, at, frames, &punch, &mut self.clip_lane);
     }
 
     /// The drumpad: sixteen one-shot voices, summed straight onto the bus.
