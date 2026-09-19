@@ -42,10 +42,26 @@
 //! be scheduled is slower than not forking at all, so the honest answer to a
 //! refused policy is to stop forking.
 //!
-//! Off macOS there is no workgroup, [`RtReady`] never rises, and the engine
-//! renders exactly as it did. Windows has `AvSetMmThreadCharacteristics` and
-//! Linux has `SCHED_FIFO`; neither is this change's to add, and a pool
-//! running without either is the thing the measurement forbids.
+//! # And on the other three platforms
+//!
+//! The workgroup is macOS's alone. Windows has the Multimedia Class Scheduler
+//! Service, where a thread declares itself "Pro Audio" and is given the same
+//! treatment the system gives its own audio path; Linux and FreeBSD have
+//! `SCHED_FIFO`, which is the real-time scheduler by another name. Both are
+//! wired up here, and both are REQUIRED in the same way the mach policy is:
+//! a worker that cannot get one does not count toward [`RtReady`], and a pool
+//! short of its width does not fork.
+//!
+//! What differs is only the second half. The workgroup test is applied where
+//! a workgroup exists, which is macOS; elsewhere the real-time policy is the
+//! whole of the bar, because there is nothing else to join. That is not a
+//! relaxation of the measurement above, it is the measurement applied to a
+//! platform that has one mechanism instead of two.
+//!
+//! On Linux and FreeBSD the policy needs permission the desktop may not
+//! grant: without `RLIMIT_RTPRIO` or a `rtkit` grant, `pthread_setschedparam`
+//! returns `EPERM` and the honest answer is the one macOS gives to a refused
+//! join, which is to stop forking and render serially.
 
 // **Not wired to the engine yet, and that is deliberate.** The pool, the
 // policy and the join are one self-contained piece with its own tests; the
@@ -113,7 +129,7 @@ impl RtReady {
 }
 
 #[cfg(target_os = "macos")]
-pub use mac::{realtime, Workgroup};
+pub use mac::{realtime, release_realtime, Workgroup, HAS_WORKGROUP};
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -272,6 +288,15 @@ mod mac {
         }
     }
 
+    /// **macOS has a workgroup as well as a policy**, and a worker counts
+    /// as ready only with both. See the module header.
+    pub const HAS_WORKGROUP: bool = true;
+
+    /// Nothing to hand back here: the [`Membership`]'s own `Drop` leaves the
+    /// workgroup, on the thread that joined it. Windows has a handle that
+    /// does need returning, which is why this exists at all.
+    pub fn release_realtime() {}
+
     /// Put the CALLING thread on the real-time scheduler. `true` only on
     /// `KERN_SUCCESS`; anything else leaves it timeshare, which the pool
     /// treats as "there is no pool".
@@ -320,15 +345,19 @@ mod mac {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub use elsewhere::{realtime, Workgroup};
+pub use elsewhere::{realtime, release_realtime, Workgroup, HAS_WORKGROUP};
 
 #[cfg(not(target_os = "macos"))]
 mod elsewhere {
     use super::RtPlan;
     use std::sync::Arc;
 
-    /// No workgroup off macOS, so nothing joins one and [`super::RtReady`]
-    /// never rises: the engine renders serially, exactly as it did.
+    /// **There is no workgroup to join off macOS**, so the readiness test is
+    /// the real-time policy alone. See the module header: this is the same
+    /// bar applied to a platform with one mechanism rather than two, not a
+    /// lower one.
+    pub const HAS_WORKGROUP: bool = false;
+
     pub struct Workgroup;
     pub struct Membership;
 
@@ -341,10 +370,112 @@ mod elsewhere {
         }
     }
 
+    /// **Windows: the Multimedia Class Scheduler Service.** A thread that
+    /// registers as "Pro Audio" is scheduled the way the system schedules its
+    /// own audio path, which is what every Windows host does and the only
+    /// supported way to ask. `AvSetMmThreadPriority` at CRITICAL puts it at
+    /// the top of that class.
+    ///
+    /// The two symbols are declared here rather than pulled in as another
+    /// `windows-sys` feature, which is the same choice the macOS half makes
+    /// for the six workgroup symbols: one link attribute against a system
+    /// library that has shipped since Vista.
+    ///
+    /// The handle has to be handed back ON THIS THREAD, so it is parked in a
+    /// thread-local and returned by [`release_realtime`] when the worker
+    /// leaves, exactly as the workgroup membership is.
+    #[cfg(target_os = "windows")]
     pub fn realtime(_plan: RtPlan) -> bool {
-        false
+        use std::ffi::c_void;
+        const AVRT_PRIORITY_CRITICAL: i32 = 2;
+        #[link(name = "avrt")]
+        extern "system" {
+            fn AvSetMmThreadCharacteristicsW(task: *const u16, index: *mut u32) -> *mut c_void;
+            fn AvSetMmThreadPriority(handle: *mut c_void, priority: i32) -> i32;
+        }
+        // "Pro Audio", NUL-terminated, as UTF-16.
+        const TASK: [u16; 10] = [
+            b'P' as u16, b'r' as u16, b'o' as u16, b' ' as u16, b'A' as u16, b'u' as u16,
+            b'd' as u16, b'i' as u16, b'o' as u16, 0,
+        ];
+        let mut index: u32 = 0;
+        // SAFETY: a NUL-terminated wide literal and a live out parameter. A
+        // failure returns null, which is checked before anything uses it.
+        let handle = unsafe { AvSetMmThreadCharacteristicsW(TASK.as_ptr(), &mut index) };
+        if handle.is_null() {
+            return false;
+        }
+        // SAFETY: the handle this call just returned, on the thread it was
+        // made for.
+        if unsafe { AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL) } == 0 {
+            // Registered but not promoted: hand it back and count as no pool
+            // rather than fork onto an ordinary thread.
+            release_realtime();
+            return false;
+        }
+        HANDLE.with(|h| h.set(handle as usize));
+        true
     }
+
+    #[cfg(target_os = "windows")]
+    thread_local! {
+        static HANDLE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Give back whatever [`realtime`] took, on the thread that took it.
+    #[cfg(target_os = "windows")]
+    pub fn release_realtime() {
+        use std::ffi::c_void;
+        #[link(name = "avrt")]
+        extern "system" {
+            fn AvRevertMmThreadCharacteristics(handle: *mut c_void) -> i32;
+        }
+        let handle = HANDLE.with(|h| h.replace(0));
+        if handle != 0 {
+            // SAFETY: a handle this thread took and has not yet returned.
+            unsafe { AvRevertMmThreadCharacteristics(handle as *mut c_void) };
+        }
+    }
+
+    /// **Linux and FreeBSD: `SCHED_FIFO`.** The real-time scheduler by
+    /// another name, and the one every audio client on these systems asks
+    /// for.
+    ///
+    /// The priority is deliberately LOW within the class. A worker sits
+    /// below the audio callback it is serving, so that a pool which somehow
+    /// spun could never starve the thread holding the device; the barrier
+    /// yields after a bounded spin for the same reason. `EPERM` is the
+    /// ordinary answer on a desktop with no `RLIMIT_RTPRIO` and no rtkit
+    /// grant, and it means there is no pool, which is the honest outcome.
+    #[cfg(not(target_os = "windows"))]
+    pub fn realtime(_plan: RtPlan) -> bool {
+        // SAFETY: the two priority queries take a policy and return a bound
+        // or -1; nothing is dereferenced.
+        let (lo, hi) = unsafe {
+            (
+                libc::sched_get_priority_min(libc::SCHED_FIFO),
+                libc::sched_get_priority_max(libc::SCHED_FIFO),
+            )
+        };
+        if lo < 0 || hi < lo {
+            return false;
+        }
+        // A quarter of the way up the class: above everything timeshare,
+        // comfortably below where a driver or the callback itself would sit.
+        let param = libc::sched_param {
+            sched_priority: lo + (hi - lo) / 4,
+        };
+        // SAFETY: a live, correctly typed parameter for this thread.
+        let kr = unsafe {
+            libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param)
+        };
+        kr == 0
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn release_realtime() {}
 }
+
 
 /// One job for the pool: a lane number and the pointer to the work.
 ///
@@ -625,7 +756,11 @@ fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: RtPlan) {
         // way this worker does not count as ready.
         Some(Err(_)) | None => None,
     };
-    let counted = rt && joined.is_some();
+    // **Both where there are both, the policy alone where there is only
+    // one.** The workgroup is macOS's; Windows and the unixes have the
+    // scheduler and nothing to join, so requiring a join there would mean
+    // never forking at all. See the module header.
+    let counted = rt && (joined.is_some() || !HAS_WORKGROUP);
     if counted {
         gate.ready.0.fetch_add(1, Ordering::Relaxed);
     }
@@ -670,10 +805,37 @@ fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: RtPlan) {
     }
     // `joined` drops here, on this thread, leaving the workgroup.
     drop(joined);
+    // And whatever the platform's policy took, on the thread that took it.
+    // A no-op everywhere but Windows, where the scheduler hands back a handle
+    // that must be returned from here and nowhere else.
+    release_realtime();
 }
 
 #[cfg(test)]
 mod tests {
+    /// **The readiness bar is the same everywhere; only the mechanisms
+    /// differ.** macOS has a policy AND a workgroup and a worker needs both.
+    /// Windows and the unixes have the scheduler and nothing to join, so
+    /// requiring a join there would mean the pool never forms and the whole
+    /// fan-out stayed macOS-only, which is what this commit is about.
+    ///
+    /// Asserted rather than left to a comment, because the rule is one
+    /// boolean in one line and the failure is silent on three platforms this
+    /// machine cannot run.
+    #[test]
+    fn a_worker_counts_as_ready_on_the_platforms_terms() {
+        let counted = |rt: bool, joined: bool, has_wg: bool| rt && (joined || !has_wg);
+        // macOS: both, or nothing.
+        assert!(counted(true, true, true));
+        assert!(!counted(true, false, true), "a macOS worker counted without its workgroup");
+        assert!(!counted(false, true, true), "a worker counted without the policy");
+        // Elsewhere: the policy is the whole bar, and it is still required.
+        assert!(counted(true, false, false));
+        assert!(!counted(false, false, false), "a worker counted with no policy at all");
+        // And the constant says which world this build is in.
+        assert_eq!(HAS_WORKGROUP, cfg!(target_os = "macos"));
+    }
+
     use super::*;
     use std::sync::atomic::AtomicUsize;
 

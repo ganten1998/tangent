@@ -51,6 +51,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   parallel render also in hand the ninety-six bays sit at 15% of the
   deadline at 128 frames and 19% at 64.
 
+- **The parallel render works on Windows, Linux and FreeBSD.** Spreading a
+  block's plugin work across cores only ever engaged on macOS, because it
+  refuses to run on threads the system has not promised to schedule on time,
+  and the only way of asking for that promise it knew was the macOS one.
+  Windows is asked through the audio scheduling service every host on that
+  platform uses, and Linux and FreeBSD through the real-time scheduler, at a
+  priority deliberately below the audio callback itself. Where the system
+  refuses, which on a Linux desktop without the right permission it will,
+  nothing forks and the engine runs exactly as before. Type-checked for all
+  three targets from here; not yet run on any of them.
+
 - **The parallel render follows the machine it is on.** The pool that
   spreads a block's plugin work across cores was fixed at four workers,
   which is right for the five performance cores it was built on and wrong
