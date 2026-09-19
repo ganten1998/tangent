@@ -6530,10 +6530,11 @@ struct Renderer {
     /// free one, so it arrives behind an `Arc` through `pending_track` and the
     /// old one is dropped by whoever pushed the new one.
     clips: Vec<Placed>,
-    /// The MIDI half of the schedule, and a cursor per clip — advanced while
-    /// the transport rolls, re-sought on a jump.
+    /// The MIDI half of the schedule. There was a cursor per clip beside it,
+    /// advanced by the walk and re-sought on a jump; see the note on the
+    /// `partition_point` that replaced it.
     midi_clips: Vec<PlacedMidi>,
-    midi_cursor: Vec<usize>,
+    /// The MIDI half of the schedule, and a cursor per clip — advanced while
     /// Clip notes sounding right now, so their offs land on time — and land
     /// AT ALL on a stop or a jump.
     /// **What each lane's instrument has been told, and when each of those
@@ -11676,19 +11677,15 @@ impl Renderer {
                 let old = std::mem::replace(&mut self.midi_clips, next);
                 let _ = self.midi_retiring.push(old);
                 self.midi_first = lane_bounds(&self.midi_clips);
-                self.midi_cursor.clear();
-                self.midi_cursor.resize(self.midi_clips.len(), 0);
-                // Fresh cursors owe nothing: what stands behind the playhead
-                // now is the fast-forward's to skip, not a parked note's due.
+                // A new schedule owes nothing: what stands behind the
+                // playhead now is skipped by where the search starts, not by
+                // a cursor anybody has to remember to rewind.
                 self.park_from = [u64::MAX; CHANNELS];
             }
         }
-        // A jump rewinds every cursor: each fast-forwards to the playhead on
-        // its next pass, skipping without sounding.
+        // A jump owes nothing behind where it landed. There is no cursor to
+        // rewind any more; the search starts from the block.
         if flush {
-            for c in &mut self.midi_cursor {
-                *c = 0;
-            }
             self.park_from = [u64::MAX; CHANNELS];
         }
         // **Every lane holding a drumpad**, not the first. A drum instrument
@@ -11913,7 +11910,11 @@ impl Renderer {
                 // **This lane's own park, taken for one block.** It used to
                 // be one desk-wide bit, so a chord storm on lane 0 changed
                 // what lane 31 was willing to sound.
-                let parked = std::mem::replace(&mut self.park_from[ch], u64::MAX) != u64::MAX;
+                // **And the frame it still owes from.** `u64::MAX` when it
+                // owes nothing, so the `min` below leaves the ordinary block
+                // starting exactly where the playhead is.
+                let owed = std::mem::replace(&mut self.park_from[ch], u64::MAX);
+                let from = due_from.min(owed);
                 // **Offs FIRST.** Two notes on one key back to back — the
                 // owner's tied chords — put the first's off and the
                 // second's on in the same block, and ons pushed first got
@@ -11944,23 +11945,29 @@ impl Renderer {
                     }
                     lane_has_clips = true;
                     let mc = &self.midi_clips[idx];
-                    let mut cur = self.midi_cursor.get(idx).copied().unwrap_or(0);
+                    // **Where this clip's block begins, FOUND rather than
+                    // remembered.** There was a cursor per clip, advanced by
+                    // the walk and reset wholesale by a locate and by a clip
+                    // list swap. It was never anything but a cache of this
+                    // one line: the notes are sorted by time, so where the
+                    // block starts is a binary search. Deleting it is what
+                    // stops a locate and a loop wrap needing to know the note
+                    // walk exists, which is the argument this file already
+                    // makes for the pedal, applied to notes.
+                    let mut cur = mc.notes.partition_point(|n| {
+                        mc.start.saturating_add(n.at) < from
+                    });
                     while cur < mc.notes.len() {
                         let nt = mc.notes[cur];
                         let on_f = mc.start.saturating_add(nt.at);
                         if on_f >= end {
                             break;
                         }
-                        // Behind the playhead (a jump landed past it), past
-                        // the clip's trimmed end — or inside the region a
+                        // Past the clip's trimmed end, or inside the region a
                         // rolling record is REPLACING: skipped, not sounded.
-                        // The one exception is a note the LAST block parked:
-                        // it is behind by a block at most, and it sounds now,
-                        // at the top of this one, instead of being dropped.
-                        if (on_f < due_from && !parked)
-                            || nt.at >= mc.len
-                            || on_f >= self.punch_now[ch]
-                        {
+                        // Behind the playhead needs no test any more; the
+                        // search above started past it.
+                        if nt.at >= mc.len || on_f >= self.punch_now[ch] {
                             cur += 1;
                             continue;
                         }
@@ -11974,7 +11981,22 @@ impl Renderer {
                             // `pending`. The cursor now stays ON the note and
                             // `clip_parked` keeps the next block's walk from
                             // fast-forwarding over it.
-                            self.park_from[ch] = due_from;
+                            // **The frame this lane still owes from**, and
+                            // the smallest of them if several clips park:
+                            // nothing between here and the block's end has
+                            // been delivered by this clip, so the next block
+                            // re-derives from here.
+                            //
+                            // The honest limit, and it needs an ARMED lane
+                            // with more than two hundred and fifty-six events
+                            // in one block to reach at all, because a lane
+                            // holds at most one note per pitch: a note an
+                            // EARLIER clip on this lane already delivered
+                            // this block, at a frame past this one, is
+                            // re-derived next block and re-articulates. It
+                            // used to arrive a block late instead. Neither is
+                            // silence, which is what this guard is for.
+                            self.park_from[ch] = self.park_from[ch].min(on_f);
                             break;
                         }
                         cur += 1;
@@ -12020,7 +12042,6 @@ impl Renderer {
                             self.told_off[ch][key] = mc.start.saturating_add(end_rel);
                         }
                     }
-                    self.midi_cursor[idx] = cur;
                 }
                 // The offs that fall due inside this block, on this lane.
                 let mut held = self.told[ch];
@@ -14393,7 +14414,6 @@ impl Engine {
             note_lanes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             clips: Vec::new(),
             midi_clips: Vec::new(),
-            midi_cursor: Vec::new(),
             told: [0; CHANNELS],
             told_off: Box::new([[0; 128]; CHANNELS]),
             park_from: [u64::MAX; CHANNELS],
@@ -20364,7 +20384,6 @@ mod tests {
             fx_return_gain: 1.0,
             clips: Vec::new(),
             midi_clips: Vec::new(),
-            midi_cursor: Vec::new(),
             told: [0; CHANNELS],
             told_off: Box::new([[0; 128]; CHANNELS]),
             park_from: [u64::MAX; CHANNELS],
@@ -27493,7 +27512,6 @@ mod tests {
                 notes: Arc::new(vec![ClipNote { at: 0, dur: 40_000, key: 100, vel: 100 }]),
             },
         ];
-        r.midi_cursor = vec![0; r.midi_clips.len()];
         r.midi_first = lane_bounds(&r.midi_clips);
         shared.transport_at.store(0, Ordering::Relaxed);
         shared.transport_req.store(1, Ordering::Release);
@@ -27508,8 +27526,9 @@ mod tests {
             "lane 2's note was withheld by the storm on lanes 0 and 1"
         );
         assert_eq!(
-            r.midi_cursor[2], 1,
-            "lane 2's cursor did not advance, so its note was parked"
+            r.sounding_notes().iter().filter(|(l, _)| *l == 2).count(),
+            1,
+            "lane 2 sounded something other than its one note"
         );
         // And both storms are fully held, so nothing was starved either way.
         for lane in [0usize, 1] {
@@ -27546,7 +27565,6 @@ mod tests {
                 }]),
             })
             .collect();
-        r.midi_cursor = vec![0; 4];
         shared.loop_a.store(4_096, Ordering::Relaxed);
         shared.loop_b.store(8_192, Ordering::Relaxed);
         shared.rolling.store(true, Ordering::Relaxed);
@@ -27628,7 +27646,6 @@ mod tests {
                 }]),
             },
         ];
-        r.midi_cursor = vec![0, 0];
         // From zero, and 9_997 frames long: not a multiple of 512, so every
         // wrap overshoots by a different amount and the gap is real.
         shared.loop_a.store(0, Ordering::Relaxed);
@@ -27717,7 +27734,6 @@ mod tests {
             len: f(8.205_128_205_128_206),
             notes: Arc::new(notes),
         }];
-        r.midi_cursor = vec![0];
         shared.rolling.store(true, Ordering::Relaxed);
         // Land the transport just before the seam and roll through it.
         r.pos = f(c2_at) - 128;
