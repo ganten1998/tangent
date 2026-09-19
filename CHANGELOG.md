@@ -58,6 +58,17 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Ultra, so the machines with the most silicon left the most of it idle. It
   asks the machine now. Nothing changes on this Mac.
 
+- **A plugin seated past the third bay gets the same treatment as one in
+  it.** The app asks the open plugin windows three questions once a frame:
+  whether a preset just moved the plugin's delay, whether a window has just
+  closed so its settings can be saved, and whether to keep drawing, which on
+  Linux is what actually runs the plugin's own window. It asked only over the
+  first hundred and eight bays, which is the tracks' first three slots and
+  the master. Everything else, the second rack behind a folder and all seven
+  pedals in front of an amp, was outside the question. A plugin there could
+  go out of time alignment after a preset click, lose its settings on close,
+  and on Linux stop responding. It is asked over every slot now.
+
 - **The render load meter can tell one number from another.** It kept its
   distribution in octaves, so 524 and 1048 microseconds were the same
   reading, which put every figure that decides whether a desk is fast enough

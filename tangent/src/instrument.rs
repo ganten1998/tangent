@@ -4017,6 +4017,33 @@ mod engine_parts {
         assert_eq!(rt_bucket(u64::MAX), RT_HIST_BUCKETS - 1);
     }
 
+    /// **The plugin-window poll has to reach every seat, not the first
+    /// hundred and eight.** It was gated on `(STRIPS + 1) * INSERTS` bays,
+    /// which stops at the channel strips and the two master seats. Every
+    /// extra rack and all seven amp pedal seats of every lane fall outside
+    /// it, so a plugin seated there was never asked whether a preset moved
+    /// its latency, never had its state saved when its window closed, and
+    /// on Linux, where that poll IS the plugin GUI's run loop, had its
+    /// window frozen. This states where the old boundary fell and that the
+    /// seats beyond it are real ones the engine renders.
+    #[test]
+    fn the_editor_poll_reaches_the_seats_past_the_channel_strips() {
+        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS};
+        // The old window was seats `0..=STRIPS`, which is `(STRIPS + 1)`
+        // seats of `INSERTS` bays each.
+        let old_last = STRIPS;
+        for ch in 0..CHANNELS {
+            let extra = folder_extra_seat(ch);
+            assert!(extra > old_last, "lane {ch}'s extra rack was inside the old window");
+            assert!(extra < RACK_SEATS, "lane {ch}'s extra rack is past every seat");
+            for pedal in 0..AMP_PEDALS {
+                let seat = amp_pedal_seat(ch, pedal);
+                assert!(seat > old_last, "lane {ch} pedal {pedal} was inside the old window");
+                assert!(seat < RACK_SEATS, "lane {ch} pedal {pedal} is past every seat");
+            }
+        }
+    }
+
     /// **The pool has to ask the machine how wide it is.** It was a `4`,
     /// which is right for the five performance cores this was built on and
     /// leaves most of the silicon idle on anything larger.
@@ -14364,6 +14391,26 @@ impl Engine {
     }
 
     /// Is this insert's window open right now?
+    /// **How many bays have an editor open, anywhere on the desk.**
+    ///
+    /// The host asks once a frame and uses the answer three ways: to gate
+    /// [`Engine::poll_latency`], to notice a window closing so the preset
+    /// behind it is saved, and to keep repainting while one is open, which
+    /// on Linux IS the plugin GUI's run loop.
+    ///
+    /// It used to work all three out itself over `(STRIPS + 1) * INSERTS`
+    /// bays, which is the first hundred and eight seats. That misses every
+    /// extra rack and all seven amp pedal seats of every lane, so a plugin
+    /// in bay four was never asked whether its preset moved its latency,
+    /// never had its state saved when its window closed, and on Linux had
+    /// its window frozen. Counted here instead, over every seat the engine
+    /// actually has.
+    pub fn open_insert_editors(&self) -> usize {
+        (0..RACK_SEATS)
+            .map(|strip| (0..INSERTS).filter(|slot| self.insert_editor_open(strip, *slot)).count())
+            .sum()
+    }
+
     pub fn insert_editor_open(&self, strip: usize, slot: usize) -> bool {
         self.insert_editors
             .get(strip)
