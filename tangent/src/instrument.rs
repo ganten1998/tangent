@@ -4545,7 +4545,7 @@ mod engine_parts {
             }
         }
         assert!(
-            lane_bounds(&[]).is_some_and(|b| b.iter().all(|v| *v == 0)),
+            lane_bounds::<Placed>(&[]).is_some_and(|b| b.iter().all(|v| *v == 0)),
             "an empty list has an empty table, not none at all"
         );
 
@@ -5482,18 +5482,37 @@ struct DeskRef<'a> {
 /// Answers whether the lane produced anything to fold. `false` is every one
 /// of the three ways the old body reached its `continue`: a scratch too
 /// short for the block, and an inactive instrument on a bare lane.
-/// Where each lane's run begins in a lane-sorted clip list, and `None` if the
+/// **Which lane a scheduled thing stands on.** Implemented by both schedules
+/// so that one bounds table and one narrowing serve audio clips and MIDI
+/// clips alike, rather than two spellings that can drift.
+trait LaneOf {
+    fn lane(&self) -> usize;
+}
+
+impl LaneOf for Placed {
+    fn lane(&self) -> usize {
+        self.strip.min(CHANNELS - 1)
+    }
+}
+
+impl LaneOf for PlacedMidi {
+    fn lane(&self) -> usize {
+        self.strip.min(CHANNELS - 1)
+    }
+}
+
+/// Where each lane's run begins in a lane-sorted list, and `None` if the
 /// list is not sorted by lane.
 ///
 /// One counting pass, taken when a list arrives and never per block. The
 /// `None` is not defensive tidiness: `Engine::set_clips` sorts, but a test or
 /// a future caller that pushes a list another way must get the right mix
 /// slowly rather than the wrong mix quickly.
-fn lane_bounds(clips: &[Placed]) -> Option<[u32; CHANNELS + 1]> {
+fn lane_bounds<T: LaneOf>(clips: &[T]) -> Option<[u32; CHANNELS + 1]> {
     let mut at = [0u32; CHANNELS + 1];
     let mut last = 0usize;
     for (i, placed) in clips.iter().enumerate() {
-        let lane = placed.strip.min(CHANNELS - 1);
+        let lane = placed.lane();
         if lane < last {
             return None;
         }
@@ -5514,12 +5533,27 @@ fn lane_bounds(clips: &[Placed]) -> Option<[u32; CHANNELS + 1]> {
 
 /// The slice of `clips` that can hold lane `ch`, or the whole list when there
 /// is no table. Narrowing only: the pull filters by strip regardless.
-fn lane_run<'a>(clips: &'a [Placed], first: Option<&[u32; CHANNELS + 1]>, ch: usize) -> &'a [Placed] {
+fn lane_run<'a, T: LaneOf>(
+    clips: &'a [T],
+    first: Option<&[u32; CHANNELS + 1]>,
+    ch: usize,
+) -> &'a [T] {
     let Some(at) = first else { return clips };
     let (Some(a), Some(z)) = (at.get(ch), at.get(ch + 1)) else {
         return clips;
     };
     clips.get(*a as usize..*z as usize).unwrap_or(clips)
+}
+
+/// The same narrowing as [`lane_run`] but as an index RANGE, for a walk that
+/// needs the global position of each entry as well as the entry.
+fn lane_range(first: Option<&[u32; CHANNELS + 1]>, ch: usize, len: usize) -> std::ops::Range<usize> {
+    let Some(at) = first else { return 0..len };
+    let (Some(a), Some(z)) = (at.get(ch), at.get(ch + 1)) else {
+        return 0..len;
+    };
+    let (a, z) = (*a as usize, *z as usize);
+    if a <= z && z <= len { a..z } else { 0..len }
 }
 
 /// **One LANE's timeline audio for one span, as a pure function of that span.**
@@ -7163,6 +7197,8 @@ struct Renderer {
     /// rather than once per desk, and without it a desk of N clips costs 32N
     /// intersection tests instead of N.
     clip_first: Option<[u32; CHANNELS + 1]>,
+    /// The same table for the MIDI schedule. See [`lane_bounds`].
+    midi_first: Option<[u32; CHANNELS + 1]>,
     /// **APPENDED — which lanes have audio standing on them anywhere on the
     /// timeline**, one bit per channel. Recomputed once a block from the
     /// clip list rather than asked per lane, because the channel walk asks
@@ -11599,6 +11635,7 @@ impl Renderer {
             if let Ok(next) = self.midi_incoming.pop() {
                 let old = std::mem::replace(&mut self.midi_clips, next);
                 let _ = self.midi_retiring.push(old);
+                self.midi_first = lane_bounds(&self.midi_clips);
                 self.midi_cursor.clear();
                 self.midi_cursor.resize(self.midi_clips.len(), 0);
                 // Fresh cursors owe nothing: what stands behind the playhead
@@ -11865,7 +11902,7 @@ impl Renderer {
                     }
                     i += 1;
                 }
-                for idx in 0..self.midi_clips.len() {
+                for idx in lane_range(self.midi_first.as_ref(), ch, self.midi_clips.len()) {
                     if self.midi_clips[idx].strip.min(CHANNELS - 1) != ch {
                         continue;
                     }
@@ -14495,6 +14532,7 @@ impl Engine {
             clip_room: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             punch_now: [u64::MAX; CHANNELS],
             clip_first: None,
+            midi_first: None,
             clip_lanes: 0,
             clip_under: 0,
             dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
@@ -16833,7 +16871,13 @@ impl Engine {
     /// Hand the audio thread the arrangement's MIDI schedule, whole — the
     /// same swap protocol as `set_clips`, so the old list drops HERE, never
     /// in the callback, and the same park-and-retry instead of a wait.
-    pub fn set_midi_clips(&mut self, clips: Vec<PlacedMidi>) {
+    pub fn set_midi_clips(&mut self, mut clips: Vec<PlacedMidi>) {
+        // Lane-sorted on the host thread, exactly as `set_clips` is and for
+        // the same two reasons: so the audio thread can walk one lane's run
+        // instead of the whole arrangement once per lane, and STABLY, because
+        // within-lane order decides which of two overlapping clips wins a
+        // race on the same pitch.
+        clips.sort_by_key(|p| p.strip.min(CHANNELS - 1));
         while self.midi_from_audio.pop().is_ok() {}
         self.midi_pending = None;
         if let Err(rtrb::PushError::Full(clips)) = self.midi_to_audio.push(clips) {
@@ -20247,6 +20291,7 @@ mod tests {
             clip_room: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             punch_now: [u64::MAX; CHANNELS],
             clip_first: None,
+            midi_first: None,
             clip_lanes: 0,
             clip_under: 0,
             dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
