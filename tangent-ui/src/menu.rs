@@ -430,13 +430,47 @@ fn measured_height(entries: &[Entry], row_h: f32) -> f32 {
 /// wrong. Grouping the menu into categories made that a much bigger risk:
 /// Chords, Theory, Fretboard, Wood, Tuning and Capo all open from rows below
 /// the halfway mark, so nearly every hover in the menu now depends on this.
-fn clamp_submenu(pos: Pos2, size: Vec2, menu_left: f32, mon: Vec2) -> Pos2 {
-    let mut p = pos;
-    if p.y + size.y > mon.y {
-        p.y = (mon.y - size.y).max(0.0);
+/// **The box the screen actually occupies, or `None` when we cannot say.**
+///
+/// This is the fault behind "the right click context menu is jumping to the
+/// top", reported three times, and it is not in the menu's logic at all.
+///
+/// egui hands the app a monitor SIZE and no origin: `ViewportInfo::
+/// monitor_size` is `window.current_monitor().size()`, full stop. Both
+/// clamps here then treated the screen as the box from `(0, 0)` to that
+/// size. On a single display that is true. On a SECOND display it is not:
+/// window positions on macOS are global across the whole desktop, so a
+/// window on a monitor placed below or to the right of the primary one has
+/// coordinates outside that box entirely. Every `pos + size > mon` test is
+/// then true, and the clamp does what it is told - it moves the menu, and
+/// its submenu, to `mon - size`, which is the top of the PRIMARY display's
+/// coordinate box. The menu jumps to the top, every time, on the external
+/// display, and not once on the built-in.
+///
+/// The honest answer with the data available: clamp only when the anchor is
+/// inside the box we were given, because only then do we know the box is
+/// the screen the menu is on. A menu near the edge of a second display may
+/// now run off it, which is a far smaller fault than being teleported, and
+/// the real fix is a monitor RECT from the host, which knows.
+fn screen_box(anchor: Pos2, screen: Option<Rect>) -> Option<Rect> {
+    let screen = screen?;
+    if !screen.is_positive() {
+        return None;
     }
-    if p.x + size.x > mon.x {
-        p.x = (menu_left - size.x).max(0.0);
+    // Where the host could name the display, this is that display and the
+    // anchor is on it. Where it could not, the box is the size-only guess
+    // and containing the anchor is the only evidence that it is the right
+    // screen at all.
+    screen.contains(anchor).then_some(screen)
+}
+
+fn clamp_submenu(pos: Pos2, size: Vec2, menu_left: f32, screen: Rect) -> Pos2 {
+    let mut p = pos;
+    if p.y + size.y > screen.max.y {
+        p.y = (screen.max.y - size.y).max(screen.min.y);
+    }
+    if p.x + size.x > screen.max.x {
+        p.x = (menu_left - size.x).max(screen.min.x);
     }
     p
 }
@@ -578,11 +612,14 @@ pub struct MenuState {
     /// `submenu_open` changes, so every panel earns its hover afresh.
     sub_first_pointer: Option<Pos2>,
     sub_hover_armed: bool,
+    /// The screen the menu is on, as a RECTANGLE and not merely a size.
+    /// See `screen_box`: a size alone is not a screen on a second display.
+    ///
     /// Kept so a submenu can be clamped too, not just the menu. Tuning and
     /// Capo sit near the BOTTOM of a long menu and Capo is ten rows deep, so
     /// unclamped they run off the screen and their lower rows cannot be
     /// clicked. Size never hit this: it is the first row and seven rows tall.
-    monitor: Option<Vec2>,
+    monitor: Option<Rect>,
     dark_mode: bool,
     face: (u8, u8, u8),
     opened_at: Instant,
@@ -1576,7 +1613,7 @@ impl MenuState {
         ctx: &egui::Context,
         view: MenuView,
         global_pos: Pos2,
-        monitor_size: Option<Vec2>,
+        screen: Option<Rect>,
     ) -> Self {
         let entries = build_entries(view.clone());
         let font = FontId::new(MENU_FONT_SIZE, fonts::courier_bold());
@@ -1624,7 +1661,7 @@ impl MenuState {
         // scroll fallback in `shell::surface` takes over rather than shrinking
         // into illegibility.
         let mut font_scale = 1.0_f32;
-        if let Some(mon) = monitor_size {
+        if let Some(mon) = screen.map(|s| s.size()) {
             if measured_height(&entries, row_h) > mon.y {
                 // Solved, not approximated. Separators are a fixed 3 points
                 // and do not shrink, so scaling the whole height by a ratio
@@ -1665,7 +1702,7 @@ impl MenuState {
             }
         }
 
-        let pos = place(global_pos, Vec2::new(width, height), monitor_size);
+        let pos = place(global_pos, Vec2::new(width, height), screen);
 
         Self {
             pos,
@@ -1684,7 +1721,7 @@ impl MenuState {
             corridor_since: None,
             sub_first_pointer: None,
             sub_hover_armed: false,
-            monitor: monitor_size,
+            monitor: screen,
             dark_mode: view.dark_mode,
             face: view.face,
             opened_at: Instant::now(),
@@ -1709,14 +1746,19 @@ impl MenuState {
 /// Its own function because it is what the tests assert against, and because
 /// `open` needs a live `egui::Context` to measure text with — the arithmetic
 /// needs neither.
-pub fn place(at: Pos2, size: Vec2, monitor: Option<Vec2>) -> Pos2 {
+pub fn place(at: Pos2, size: Vec2, screen: Option<Rect>) -> Pos2 {
     let mut pos = at;
-    let Some(mon) = monitor else { return pos };
-    if pos.x + size.x > mon.x {
-        pos.x = (mon.x - size.x).max(0.0);
+    // See `screen_box`: a monitor SIZE with no origin is only a screen when
+    // the point being placed is inside it. On a second display it is not,
+    // and clamping against it moves the menu to another screen's top left.
+    let Some(screen) = screen_box(at, screen) else {
+        return pos;
+    };
+    if pos.x + size.x > screen.max.x {
+        pos.x = (screen.max.x - size.x).max(screen.min.x);
     }
-    if pos.y + size.y > mon.y {
-        pos.y = (mon.y - size.y).max(0.0);
+    if pos.y + size.y > screen.max.y {
+        pos.y = (screen.max.y - size.y).max(screen.min.y);
     }
     pos
 }
@@ -2098,8 +2140,11 @@ pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<Me
             Some(r) => Pos2::new(state.pos.x + state.size.x, state.pos.y + r.min.y),
             None => Pos2::new(state.pos.x + state.size.x, state.pos.y + row_top),
         };
-        if let Some(mon) = state.monitor {
-            sub_pos = clamp_submenu(sub_pos, sub_size, state.pos.x, mon);
+        // **Only against a screen we know the menu is on.** See `screen_box`:
+        // the anchor here is the menu's own left edge, in the same global
+        // coordinates the monitor box would be.
+        if let Some(screen) = screen_box(state.pos, state.monitor) {
+            sub_pos = clamp_submenu(sub_pos, sub_size, state.pos.x, screen);
         }
         // **Kept in the coordinates the parent reads its pointer in**, which
         // is the whole of the difference between the two hosts: inline the
@@ -2326,7 +2371,7 @@ mod tests {
         v.staff_on = true;
         v.chord_strip = true;
         v.camera_pane_on = true;
-        let m = MenuState::open(&ctx, v, Pos2::new(900.0, 1000.0), Some(mon));
+        let m = MenuState::open(&ctx, v, Pos2::new(900.0, 1000.0), Some(Rect::from_min_size(Pos2::ZERO, mon)));
         // Whatever it measures out at, it may not sit further from the hand
         // than the amount by which it overflows the screen.
         let overflow = (1000.0 + m.size.y - mon.y).max(0.0);
@@ -2348,7 +2393,7 @@ mod tests {
     /// height where pinning moves it by the part that does not fit.
     #[test]
     fn a_menu_moves_no_further_than_it_has_to() {
-        let mon = Some(Vec2::new(2560.0, 1440.0));
+        let mon = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 1440.0)));
         let size = Vec2::new(300.0, 560.0);
         // Room below: it opens exactly where it was asked to.
         let at = Pos2::new(400.0, 200.0);
@@ -2400,7 +2445,7 @@ mod tests {
         // question with a quieter answer.
         let mut v = view();
         v.caps = Caps::PLUGIN;
-        let mut state = Some(MenuState::open(&ctx, v, Pos2::new(30.0, 30.0), Some(screen.size())));
+        let mut state = Some(MenuState::open(&ctx, v, Pos2::new(30.0, 30.0), Some(screen)));
         let menu = {
             let st = state.as_ref().expect("the menu did not open");
             Rect::from_min_size(st.pos, st.size)
@@ -2475,7 +2520,7 @@ mod tests {
         );
         let mut v = view();
         v.caps = Caps::PLUGIN;
-        let mut state = Some(MenuState::open(&ctx, v, Pos2::new(30.0, 30.0), Some(screen.size())));
+        let mut state = Some(MenuState::open(&ctx, v, Pos2::new(30.0, 30.0), Some(screen)));
         let (menu, row_h, row_top) = {
             let st = state.as_ref().expect("the menu did not open");
             (Rect::from_min_size(st.pos, st.size), st.row_h, st.subs[0].row_top)
@@ -2552,7 +2597,7 @@ mod tests {
         );
         let mut v = view();
         v.caps = Caps::PLUGIN;
-        let mut state = Some(MenuState::open(&ctx, v, Pos2::new(30.0, 30.0), Some(screen.size())));
+        let mut state = Some(MenuState::open(&ctx, v, Pos2::new(30.0, 30.0), Some(screen)));
         let (menu, row_h, tops) = {
             let st = state.as_ref().expect("the menu did not open");
             assert!(st.subs.len() >= 2, "the test needs two submenus to switch between");
@@ -2704,6 +2749,58 @@ mod tests {
         // The same row, pressed: it opens at once.
         assert!(!settle_submenu(&mut open, &mut pending, Some(5), false, true, false, true, true, t));
         assert_eq!(open, Some(5), "a press was swallowed by the corridor");
+    }
+
+    /// **A menu on a second display is not dragged onto the first.**
+    ///
+    /// The fault the owner reported three times, and it was never in the
+    /// menu's logic. egui gives the app a monitor SIZE and no origin, so
+    /// both clamps treated the screen as the box from the origin to that
+    /// size. Window positions on macOS are global across the desktop, so a
+    /// window on a display placed below or to the right of the primary one
+    /// sits outside that box, every overflow test is true, and the clamp
+    /// moves the menu - and its submenu - to the primary display's top.
+    ///
+    /// On the primary display nothing changes, which is the other half of
+    /// what has to be true.
+    #[test]
+    fn a_menu_on_a_second_display_is_left_where_it_opened() {
+        // The external, as macOS reports it: the primary display's box
+        // begins at the origin and the second one's does not.
+        let mon = Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 1440.0));
+        let size = Vec2::new(220.0, 300.0);
+        // The primary display: clamped exactly as before, at both edges.
+        assert_eq!(place(Pos2::new(100.0, 100.0), size, Some(mon)), Pos2::new(100.0, 100.0));
+        assert_eq!(
+            place(Pos2::new(2500.0, 1400.0), size, Some(mon)),
+            Pos2::new(2340.0, 1140.0),
+            "a menu at the primary display's corner was not pulled back onto it"
+        );
+        // A laptop screen ARRANGED BELOW the external: global coordinates
+        // past the external's height. The menu stays where the hand is.
+        let below = Pos2::new(400.0, 1900.0);
+        assert_eq!(
+            place(below, size, Some(mon)),
+            below,
+            "a menu on a display below the primary one was dragged to the top of the primary"
+        );
+        // And to the right, which is the other common arrangement.
+        let right = Pos2::new(3000.0, 300.0);
+        assert_eq!(place(right, size, Some(mon)), right);
+        // The box itself: known only where the anchor is inside it.
+        assert!(screen_box(Pos2::new(10.0, 10.0), Some(mon)).is_some());
+        assert!(screen_box(below, Some(mon)).is_none());
+        assert!(screen_box(Pos2::new(10.0, 10.0), None).is_none());
+        assert!(screen_box(Pos2::new(10.0, 10.0), Some(Rect::ZERO)).is_none());
+        // And with the host's real answer, a menu on the second display is
+        // clamped to THAT display rather than left unprotected.
+        let second = Rect::from_min_size(Pos2::new(0.0, 1440.0), Vec2::new(1512.0, 982.0));
+        let low = Pos2::new(400.0, 2300.0);
+        let p = place(low, size, Some(second));
+        assert!(
+            p.y + size.y <= second.max.y + 0.5 && p.y >= second.min.y,
+            "{p:?} was not kept on the second display {second:?}"
+        );
     }
 
     fn view() -> MenuView {
@@ -3282,7 +3379,7 @@ mod tests {
     /// where only Capo used to be.
     #[test]
     fn every_submenu_is_pulled_back_onto_the_screen_near_a_corner() {
-        let mon = Vec2::new(1440.0, 900.0);
+        let mon = Rect::from_min_size(Pos2::ZERO, Vec2::new(1440.0, 900.0));
         let row_h = 21.0; // a typical measured row; the clamp is height-blind
         let width = 260.0;
         // The fullest menu there is: fretboard on, so Wood/Tuning/Capo exist,
@@ -3295,11 +3392,11 @@ mod tests {
             // right-clicked low on a small screen puts its rows.
             let p = clamp_submenu(Pos2::new(1380.0, 860.0), size, 1120.0, mon);
             assert!(
-                p.y >= 0.0 && p.y + size.y <= mon.y,
+                p.y >= mon.min.y && p.y + size.y <= mon.max.y,
                 "[{name}] runs off the bottom at {p:?}"
             );
             assert!(
-                p.x >= 0.0 && p.x + size.x <= mon.x,
+                p.x >= mon.min.x && p.x + size.x <= mon.max.x,
                 "[{name}] runs off the right at {p:?}"
             );
             assert!(

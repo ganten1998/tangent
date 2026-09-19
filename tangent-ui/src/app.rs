@@ -1785,6 +1785,16 @@ pub struct TangentApp {
     /// one, so anything that centres on it lands in the corner of the screen.
     main_origin_known: bool,
     monitor_size: Option<Vec2>,
+    /// **The display the window is on, as a RECTANGLE**, pushed by the host
+    /// because egui only ever says how BIG the monitor is and never where.
+    ///
+    /// Everything that clamps something to "the screen" needs the origin as
+    /// well: window positions are global across the whole desktop, so on a
+    /// second display the size-only box is not the screen the window is on,
+    /// and clamping against it moves menus and dialogs to the primary
+    /// display's corner. `None` where the host cannot say, and the clamps
+    /// then fall back to the rule that is honest without it.
+    monitor_rect: Option<Rect>,
     /// The restored-off-screen rescue runs once, not every frame.
     offscreen_checked: bool,
     main_live_pos: Option<Pos2>,
@@ -3996,6 +4006,7 @@ impl TangentApp {
             window_scale: 1.0,
             main_origin_known: false,
             monitor_size: None,
+            monitor_rect: None,
             offscreen_checked: false,
             main_live_pos: None,
             main_live_size: None,
@@ -7121,8 +7132,7 @@ impl TangentApp {
     /// The band's own menu, at a point already put through
     /// [`Self::surface_frame`] by its caller.
     fn open_menu_at(&mut self, ctx: &egui::Context, anchor: Pos2) {
-        let (_, box_) = self.surface_frame();
-        self.menu_state = Some(MenuState::open(ctx, self.menu_view(), anchor, box_));
+        self.menu_state = Some(MenuState::open(ctx, self.menu_view(), anchor, self.menu_screen()));
     }
 
     /// The GLOBAL cut of the menu — what a right-click on the arrangement
@@ -7164,10 +7174,25 @@ impl TangentApp {
         // `at` is WINDOW-LOCAL — every caller reads the pointer straight
         // from the egui context. See `surface_frame` for why that is
         // sometimes the answer and sometimes half of it.
-        let (origin, box_) = self.surface_frame();
+        let (origin, _) = self.surface_frame();
         let mut view = self.menu_view();
         view.global_only = true;
-        self.menu_state = Some(MenuState::open(ctx, view, at + origin, box_));
+        self.menu_state = Some(MenuState::open(ctx, view, at + origin, self.menu_screen()));
+    }
+
+    /// The screen a menu opened at `at` should be clamped to, or `None`
+    /// when nothing honest can be said. The host's answer where there is
+    /// one; otherwise the size-only box egui names, which `menu::place`
+    /// then only trusts if the anchor is inside it. See `monitor_rect`.
+    fn menu_screen(&self) -> Option<Rect> {
+        self.monitor_rect
+            .or_else(|| self.monitor_size.map(|m| Rect::from_min_size(Pos2::ZERO, m)))
+    }
+
+    /// **The display the window is on**, from a host that can ask the OS.
+    /// See `monitor_rect`; `None` clears it.
+    pub fn set_monitor_rect(&mut self, rect: Option<Rect>) {
+        self.monitor_rect = rect;
     }
 
     /// Colour of the supporter heart, or None when it should not be drawn.
@@ -52089,7 +52114,7 @@ mod tests {
                             &ctx,
                             a,
                             Pos2::ZERO,
-                            Some(Vec2::new(4000.0, 4000.0)),
+                            Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(4000.0, 4000.0))),
                         ))
                     };
                     assert!(

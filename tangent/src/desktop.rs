@@ -746,6 +746,10 @@ fn keys_patch_of(index: usize) -> crate::keys::Patch {
 
 pub struct DesktopApp {
     app: TangentApp,
+    /// Where the window was when the display under it was last looked up.
+    /// The lookup walks the active displays, so it happens when the window
+    /// moves rather than every frame. See `display_rect_at`.
+    display_probe_at: Option<egui::Pos2>,
     /// **Whether the window is currently covering its whole screen** because
     /// it is borderless AND maximised. See `crate::macwin::cover_screen`.
     ///
@@ -3414,6 +3418,19 @@ impl DesktopApp {
                         None => " - no size was requested".to_owned(),
                     }
                 );
+            }
+        }
+
+        // **Which display the window is on**, which egui will not say: it
+        // names the monitor's SIZE and never its origin, so everything that
+        // clamps to "the screen" was working from a box at the coordinate
+        // origin. See `display_rect_at`. Asked only when the window has
+        // moved, because it walks the active displays.
+        {
+            let at = ctx.input(|i| i.viewport().inner_rect.map(|r| r.center()));
+            if at != self.display_probe_at {
+                self.display_probe_at = at;
+                self.app.set_monitor_rect(at.and_then(Self::display_rect_at));
             }
         }
 
@@ -16402,6 +16419,51 @@ fn wav_seconds(path: &std::path::Path) -> Option<f32> {
 }
 
 impl DesktopApp {
+    /// **The rectangle of the display a point is on**, in the global
+    /// coordinates egui reports window positions in.
+    ///
+    /// egui hands the app a monitor SIZE and no origin - `ViewportInfo::
+    /// monitor_size` is `current_monitor().size()` and nothing else - so
+    /// everything that clamped a menu, a dialog or a detached window to
+    /// "the screen" treated it as the box from the origin to that size.
+    /// True of one display. On a second one, whose global coordinates start
+    /// past the primary's, every overflow test answers yes and the clamp
+    /// moves the thing to the primary display's corner. That is the whole
+    /// of "the right click context menu is jumping to the top".
+    ///
+    /// Core Graphics knows, and answers in global display points, which is
+    /// the same unit and scale egui uses here - see `os_cursor_points`.
+    #[cfg(target_os = "macos")]
+    fn display_rect_at(point: egui::Pos2) -> Option<egui::Rect> {
+        use core_graphics::display::{CGDisplay, CGPoint};
+        // The display under the point; `displays_with_point` is not bound by
+        // this crate, so the active displays are asked in turn, which is at
+        // most a handful and happens when the window moves.
+        let ids = CGDisplay::active_displays().ok()?;
+        let hit = ids.into_iter().map(CGDisplay::new).find(|d| {
+            let b = d.bounds();
+            let p = CGPoint::new(f64::from(point.x), f64::from(point.y));
+            p.x >= b.origin.x
+                && p.y >= b.origin.y
+                && p.x < b.origin.x + b.size.width
+                && p.y < b.origin.y + b.size.height
+        })?;
+        let b = hit.bounds();
+        let r = egui::Rect::from_min_size(
+            egui::pos2(b.origin.x as f32, b.origin.y as f32),
+            egui::vec2(b.size.width as f32, b.size.height as f32),
+        );
+        r.is_positive().then_some(r)
+    }
+
+    /// No answer off macOS, so the clamp falls back to the rule that is
+    /// honest without one: clamp only where the anchor is already inside
+    /// the box egui named. See `menu::screen_box`.
+    #[cfg(not(target_os = "macos"))]
+    fn display_rect_at(_point: egui::Pos2) -> Option<egui::Rect> {
+        None
+    }
+
     /// The pointer during a FILE DRAG, in window-local points — or `None`
     /// when nothing is being dragged and on platforms that are not asked.
     ///
@@ -16870,6 +16932,7 @@ impl DesktopApp {
             pushed_auto: None,
             midi_lane,
             app,
+            display_probe_at: None,
             covering_screen: false,
             decor_want_content: None,
             #[cfg(feature = "recorder")]
