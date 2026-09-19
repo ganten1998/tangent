@@ -4690,6 +4690,102 @@ mod engine_parts {
         );
     }
 
+    /// **Two grains can honestly hold one position, and the NEWER is the
+    /// one the fold owes the listener.**
+    ///
+    /// This shipped broken for one test run and
+    /// `the_backing_track_follows_the_transport` is what caught it, reading
+    /// as a locate that did not locate. Park the transport at frame 0 and a
+    /// grain covering 0..256 is stamped; locate to 100 and the next grain
+    /// covers 100..356. Both contain frame 100. A `find` over the slots in
+    /// index order took whichever happened to sit first and spliced the tail
+    /// of a superseded timeline onto the head of the new one.
+    ///
+    /// Written against `LaneGrains` directly rather than through a render,
+    /// because the property is about the ring's own lookup rule and a test
+    /// that had to arrange a locate to reach it would not say so.
+    #[test]
+    fn the_newest_grain_covering_a_position_is_the_one_that_is_read() {
+        let mut g = LaneGrains::new(256);
+        let fill = |g: &mut LaneGrains, at: u64, v: f32| {
+            for row in g.hold(at, 256).iter_mut() {
+                row[..256].fill(v);
+            }
+            g.keep(256, true, false, false);
+        };
+        // The parked transport's grain, then the one the locate made.
+        fill(&mut g, 0, 1.0);
+        fill(&mut g, 100, 2.0);
+
+        let mut dst = vec![vec![0.0f32; 256]; TAP_CHANNELS];
+        let key = g.gather(100, 256, &mut dst).expect("the ring holds 100..356");
+        assert_eq!(key.at, 100, "the older grain was chosen");
+        assert!(
+            dst[0][..256].iter().all(|v| (*v - 2.0).abs() < f32::EPSILON),
+            "the fold read audio rendered for a timeline that has been replaced"
+        );
+    }
+
+    /// **A span the grains do not cover is refused, not half-answered.**
+    ///
+    /// The other half of the key's job. A cold ring, and a ring holding only
+    /// the wrong part of the song, must both say `None` so the fold skips
+    /// the lane - the alternative is a block of somebody else's audio at
+    /// full level, which is what the single row this replaced would have
+    /// given.
+    #[test]
+    fn a_span_the_ring_does_not_hold_is_refused() {
+        let mut g = LaneGrains::new(256);
+        let mut dst = vec![vec![0.0f32; 256]; TAP_CHANNELS];
+        assert!(g.gather(0, 256, &mut dst).is_none(), "a cold ring answered");
+
+        for row in g.hold(0, 256).iter_mut() {
+            row[..256].fill(1.0);
+        }
+        g.keep(256, true, false, false);
+        assert!(g.gather(0, 256, &mut dst).is_some(), "the grain it holds");
+        assert!(
+            g.gather(200, 256, &mut dst).is_none(),
+            "a span running off the end of the ring was half-answered"
+        );
+        assert!(
+            g.gather(4096, 256, &mut dst).is_none(),
+            "a span nowhere near the ring was answered"
+        );
+
+        g.clear();
+        assert!(g.gather(0, 256, &mut dst).is_none(), "a cleared ring answered");
+    }
+
+    /// **A span across a grain boundary is gathered from both**, and folds
+    /// if either half had audio.
+    #[test]
+    fn a_span_that_straddles_two_grains_is_gathered_from_both() {
+        let mut g = LaneGrains::new(256);
+        for row in g.hold(0, 128).iter_mut() {
+            row[..128].fill(1.0);
+        }
+        // The first half is silence as far as the fold is concerned.
+        g.keep(128, false, false, false);
+        for row in g.hold(128, 128).iter_mut() {
+            row[..128].fill(2.0);
+        }
+        g.keep(128, true, false, false);
+
+        let mut dst = vec![vec![0.0f32; 256]; TAP_CHANNELS];
+        let key = g.gather(64, 128, &mut dst).expect("64..192 spans both grains");
+        assert!(
+            dst[0][..64].iter().all(|v| (*v - 1.0).abs() < f32::EPSILON)
+                && dst[0][64..128].iter().all(|v| (*v - 2.0).abs() < f32::EPSILON),
+            "the two halves did not come from the two grains"
+        );
+        assert!(
+            key.folded,
+            "a span whose second half has audio must fold, or half a block \
+             of a clip that started mid-grain is dropped"
+        );
+    }
+
     /// **Nothing a worker owns may advance a ring the timeline clocks.**
     ///
     /// Both delay compensation lines used to run at the end of `render_lane`
@@ -5515,6 +5611,164 @@ struct LaneIo<'a> {
     key_io: &'a mut Vec<Vec<f32>>,
     builtin: &'a mut Vec<f32>,
     keys_scratch: &'a mut Vec<f32>,
+}
+
+/// **How many grains of one lane's audio the ring holds.**
+///
+/// Two, and two is enough by construction: a lane either renders the grain
+/// it is about to start consuming, or one grain ahead of the one it is
+/// consuming, and never further than that. A third slot would only be
+/// reachable by a lane that had fallen two grains behind, which is a lane
+/// that has missed its deadline twice and has a different problem.
+const GRAIN_SLOTS: usize = 2;
+
+/// **What a slot of [`LaneGrains`] says about the audio in it.**
+///
+/// The key is the whole of the safety argument for reading a buffer that was
+/// filled by an earlier chunk: the fold asks for a span and gets it only if
+/// a slot really holds that span. A stale slot answers `false` rather than
+/// handing back the audio of somewhere else in the song.
+#[derive(Clone, Copy, Default)]
+struct GrainKey {
+    /// The absolute sample position of the grain's first frame.
+    at: u64,
+    /// How many frames of it are valid. **Zero means the slot holds
+    /// nothing** - what the ring starts as and what a flush leaves behind.
+    frames: u32,
+    /// Whether the render put anything in it the fold should sum.
+    ///
+    /// This is `lane_folds` made a property of the SPAN rather than of the
+    /// callback, and it has to be: a grain outlives the chunk that made it,
+    /// so a per-callback flag would describe a different block by the time
+    /// the fold read it. That fault has been seen once already in this file
+    /// - see the `else` arm that clears `lane_folds` when nothing renders.
+    folded: bool,
+    /// What the decide walk decided about this span, for the two terms the
+    /// FOLD reads.
+    ///
+    /// The latency terms are deliberately NOT here. `run_lane_pdc` re-reads
+    /// `folder_lat` and `pedal_latency` at consumption, because a delay line
+    /// is clocked once per consumed chunk and must answer for the desk's
+    /// compensation NOW, not for the desk's compensation when the grain was
+    /// made.
+    is_folder: bool,
+    armed: bool,
+}
+
+/// **One lane's rendered audio, as a ring of grains keyed by position.**
+///
+/// The row this replaces was the render's seed, the render's output, the
+/// delay line's in-place buffer at consumption and the fold's source, all at
+/// once, which is only coherent while those are the same chunk. A grain that
+/// covers more than one callback needs them told apart, so the audio lives
+/// in a slot with a key and the fold copies the span it wants into a staging
+/// pair of its own.
+struct LaneGrains {
+    slots: [Vec<Vec<f32>>; GRAIN_SLOTS],
+    keys: [GrainKey; GRAIN_SLOTS],
+    /// The slot the next render fills.
+    next: usize,
+}
+
+impl LaneGrains {
+    fn new(frames: usize) -> Self {
+        Self {
+            slots: std::array::from_fn(|_| vec![vec![0.0; frames]; TAP_CHANNELS]),
+            keys: [GrainKey::default(); GRAIN_SLOTS],
+            next: 0,
+        }
+    }
+
+    /// **Take the next slot for a grain at `at`, and hand back its rows.**
+    ///
+    /// The key is stamped as EMPTY here and filled in by [`Self::keep`] once
+    /// the render has finished, so a render that walks away leaves a slot
+    /// that answers "nothing", never a slot that claims audio it does not
+    /// hold.
+    fn hold(&mut self, at: u64, frames: usize) -> &mut Vec<Vec<f32>> {
+        let slot = self.next;
+        self.keys[slot] = GrainKey { at, frames: 0, ..GrainKey::default() };
+        for row in &mut self.slots[slot] {
+            if row.len() < frames {
+                row.resize(frames, 0.0);
+            }
+        }
+        &mut self.slots[slot]
+    }
+
+    /// Finish the grain the last [`Self::hold`] opened.
+    fn keep(&mut self, frames: usize, folded: bool, is_folder: bool, armed: bool) {
+        let slot = self.next;
+        let at = self.keys[slot].at;
+        self.keys[slot] = GrainKey {
+            at,
+            frames: u32::try_from(frames).unwrap_or(0),
+            folded,
+            is_folder,
+            armed,
+        };
+        self.next = (slot + 1) % GRAIN_SLOTS;
+    }
+
+    /// The slot holding the frame at `at`, **newest first**, if any does.
+    ///
+    /// The order is the whole of it, and it is not tidiness. Two slots can
+    /// each honestly contain one position: park the transport at 0 and a
+    /// grain covering 0..256 is stamped, then locate to 100 and the next
+    /// grain covers 100..356. Both contain 100. Taking the older one splices
+    /// the tail of a superseded timeline onto the head of the new one -
+    /// `the_backing_track_follows_the_transport` caught exactly that, and it
+    /// read as a locate that did not locate.
+    ///
+    /// The newest is always right: an older grain covering the same position
+    /// was rendered for a timeline that has since been replaced.
+    fn slot_at(&self, at: u64) -> Option<usize> {
+        (0..GRAIN_SLOTS)
+            .map(|i| (self.next + GRAIN_SLOTS - 1 - i) % GRAIN_SLOTS)
+            .find(|&i| {
+                let k = self.keys[i];
+                k.frames > 0 && at >= k.at && at < k.at + u64::from(k.frames)
+            })
+    }
+
+    /// **Copy `frames` from `at` into `dst`, across a grain boundary if the
+    /// span straddles one.** `None` when the ring does not hold the whole
+    /// span, which is what a locate and a cold start leave behind.
+    fn gather(&self, at: u64, frames: usize, dst: &mut [Vec<f32>]) -> Option<GrainKey> {
+        let first = self.slot_at(at)?;
+        let mut done = 0usize;
+        let mut key = self.keys[first];
+        while done < frames {
+            let here = at + done as u64;
+            let Some(i) = self.slot_at(here) else {
+                return None;
+            };
+            let k = self.keys[i];
+            let off = (here - k.at) as usize;
+            let n = (k.frames as usize - off).min(frames - done);
+            for c in 0..TAP_CHANNELS {
+                let (Some(src), Some(row)) = (self.slots[i].get(c), dst.get_mut(c)) else {
+                    continue;
+                };
+                if row.len() < frames {
+                    row.resize(frames, 0.0);
+                }
+                row[done..done + n].copy_from_slice(&src[off..off + n]);
+            }
+            // A span that straddles two grains folds if EITHER half has
+            // audio: the alternative is dropping half a block of a lane
+            // whose clip started mid-grain.
+            key.folded |= k.folded;
+            done += n;
+        }
+        Some(key)
+    }
+
+    /// Forget everything. A locate, a transport stop, a varispeed change.
+    fn clear(&mut self) {
+        self.keys = [GrainKey::default(); GRAIN_SLOTS];
+        self.next = 0;
+    }
 }
 
 /// **The seats and the machines lane `ch` owns, and nothing else's.**
@@ -7158,8 +7412,17 @@ struct Renderer {
     /// order - which is the order that keeps the master's sum bit-identical
     /// to the single walk, because f32 addition is not associative.
     ///
-    /// 128 KB at `CHANNELS` by `TAP_CHANNELS` by `MAX_BLOCK`, allocated once.
-    lane_out: Vec<Vec<Vec<f32>>>,
+    /// `GRAIN_SLOTS` x `TAP_CHANNELS` x `MAX_BLOCK` per lane, allocated
+    /// once: 256 KB, twice what the single row cost.
+    lane_grain: Vec<LaneGrains>,
+    /// **The one span the fold is looking at**, copied out of the ring.
+    ///
+    /// One pair for the whole desk rather than one per lane, because the
+    /// fold visits lanes one at a time. It is also where `run_lane_pdc`
+    /// clocks the delay line, which is what keeps that line reading a
+    /// contiguous stream of consumed frames however the grains under it are
+    /// cut.
+    lane_stage: Vec<Vec<f32>>,
     /// The dry twin of [`Self::lane_out`], filled only while a dry stem is
     /// wanted. See the dry copy in `render_lane`.
     lane_dry: Vec<Vec<Vec<f32>>>,
@@ -10836,6 +11099,26 @@ impl Renderer {
             self.seen_req = req;
             self.pos = self.shared.transport_at.load(Ordering::Relaxed);
             self.shared.transport_ack.store(req, Ordering::Release);
+            // **A locate empties every lane's grain ring.**
+            //
+            // The key alone would not do it. A grain covering 0..256 and a
+            // grain covering 100..356 BOTH honestly contain frame 100, so
+            // after a locate the ring can answer a span out of audio
+            // rendered for a timeline that no longer exists.
+            // `LaneGrains::slot_at` takes the newest of the two and is
+            // right to, but "newest" is a tie-break, not a licence to keep
+            // a superseded grain around: the next span could fall entirely
+            // inside the old one and be answered from it.
+            //
+            // A wrap is deliberately NOT here. It arms `pending_flush`
+            // below, and the position it lands on is one the loop's own
+            // arithmetic produced, so the grains either side of it are both
+            // still the timeline's. Throwing them away would make a
+            // practised two-bar loop pay a full-desk catch-up every lap,
+            // which is the one workflow this whole overhaul is for.
+            for g in &mut self.lane_grain {
+                g.clear();
+            }
         }
         // The wrap's flush, armed on the PREVIOUS block — consumed now, when
         // `at` is the wrapped position and rewinding the cursors lands them
@@ -11775,8 +12058,13 @@ impl Renderer {
             pdc_max.saturating_sub(own).saturating_sub(prep.folder_lat),
         )
         .unwrap_or(0);
-        if let (Some(line), Some(row)) = (self.pdc.get_mut(ch), self.lane_out.get_mut(ch)) {
-            line.run(row, frames, want);
+        // **Over the staging pair, which is the lane's CONSUMED stream.**
+        // The grains under it may be cut anywhere; what this line sees is
+        // one contiguous run of frames in consumption order, which is the
+        // only thing `DelayLine::run` can be handed - it advances its write
+        // cursor by `frames` on every call and has no way to rewind.
+        if let Some(line) = self.pdc.get_mut(ch) {
+            line.run(&mut self.lane_stage, frames, want);
         }
         // **And the dry copy waits `own` frames LONGER**, on a line of its
         // own, because it is the one signal here that did not pay the rack.
@@ -12810,7 +13098,17 @@ impl Renderer {
                 let mut boards = board_blk.chunks_mut(pedals);
                 let mut dx7s = self.dx7s.iter_mut();
                 let mut keys = self.keys_lanes.iter_mut();
-                let mut outs = self.lane_out.iter_mut();
+                // **A slot, not a row.** Each lane's render fills the next
+                // slot of its own ring, stamped with the position it is
+                // rendering; the fold asks the ring for a span rather than
+                // trusting that the row it finds is the block it wants.
+                //
+                // The ring itself is carved here and the slot is opened
+                // BELOW, after the `wanted` test: `hold` invalidates the
+                // slot it opens, because the render is about to overwrite
+                // its samples, and a lane that then renders nothing would
+                // have thrown away a grain it still owed the fold.
+                let mut outs = self.lane_grain.iter_mut();
                 let mut drys = self.lane_dry.iter_mut();
                 let mut scratches = self.lane_scratch.iter_mut();
                 for (ch, job) in jobs.iter_mut().enumerate() {
@@ -12849,7 +13147,7 @@ impl Renderer {
                             keys: keys_lane,
                         },
                         io: LaneIo {
-                            fx_in: out,
+                            fx_in: out.hold(at, frames),
                             fx_out: &mut scratch.fx_out,
                             dry_io: dry,
                             key_io: &mut scratch.key_io,
@@ -12939,6 +13237,16 @@ impl Renderer {
             let folded = folded.load(Ordering::Relaxed);
             for ch in 0..CHANNELS {
                 self.lane_folds[ch] = folded & (1u32 << ch) != 0;
+                // **Close the slot this lane's render opened.** Done here,
+                // after the fork has joined, because `keep` needs the whole
+                // ring by `&mut` and the render only ever held one slot's
+                // rows. A lane the walk skipped never opened one.
+                if wanted & (1u32 << ch) != 0 {
+                    let prep = self.lane_prep[ch];
+                    if let Some(g) = self.lane_grain.get_mut(ch) {
+                        g.keep(frames, self.lane_folds[ch], prep.is_folder, prep.armed);
+                    }
+                }
             }
         } else {
             // **A block that renders nothing folds nothing.**
@@ -12978,14 +13286,27 @@ impl Renderer {
         // which is what lets the render above become several walks without
         // the sum moving.
         for ch in 0..CHANNELS {
-            if !self.lane_folds[ch] {
-                continue;
-            }
+            // **Ask the ring for THIS span, and take what it decided with
+            // it.** A slot that does not hold the span answers `None` -
+            // which is what a locate and a cold start leave behind - and a
+            // lane with nothing to fold is skipped exactly as before.
+            //
+            // The two decisions come out of the KEY rather than out of
+            // `lane_prep`, because a grain can outlive the chunk that made
+            // it and `lane_prep` describes the chunk the decide walk last
+            // ran for.
+            let key = {
+                let (grains, stage) = (&self.lane_grain, &mut self.lane_stage);
+                match grains.get(ch).and_then(|g| g.gather(at, frames, stage)) {
+                    Some(k) if k.folded => k,
+                    _ => continue,
+                }
+            };
             // **The lane's delay compensation, at CONSUMPTION.**
             self.run_lane_pdc(ch, frames, pdc_max);
             // The fold: fader, send, peak — the channel's own, exactly as
             // every other strip does it.
-            let LanePrep { is_folder, armed, .. } = self.lane_prep[ch];
+            let GrainKey { is_folder, armed, .. } = key;
             let target = if channel_is_heard(ch, &parents, muted, soloed) {
                 self.lane_gain(ch)
             } else {
@@ -13033,8 +13354,8 @@ impl Renderer {
                     self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
                     self.channel_gain[ch]
                 };
-                let s0 = self.lane_out[ch].first().map_or(0.0, |b| b[f]);
-                let s1 = self.lane_out[ch].get(1).map_or(0.0, |b| b[f]);
+                let s0 = self.lane_stage.first().map_or(0.0, |b| b[f]);
+                let s1 = self.lane_stage.get(1).map_or(0.0, |b| b[f]);
                 raw = raw.max(s0.abs()).max(s1.abs());
                 raw_pk[0] = raw_pk[0].max(s0.abs());
                 raw_pk[1] = raw_pk[1].max(s1.abs());
@@ -14790,7 +15111,8 @@ impl Engine {
             param_lanes: 0,
             lane_wants: [false; CHANNELS],
             lane_folds: [false; CHANNELS],
-            lane_out: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
+            lane_grain: (0..CHANNELS).map(|_| LaneGrains::new(MAX_BLOCK as usize)).collect(),
+            lane_stage: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             lane_dry: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -20694,7 +21016,8 @@ mod tests {
             param_lanes: 0,
             lane_wants: [false; CHANNELS],
             lane_folds: [false; CHANNELS],
-            lane_out: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
+            lane_grain: (0..CHANNELS).map(|_| LaneGrains::new(MAX_BLOCK as usize)).collect(),
+            lane_stage: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             lane_dry: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
