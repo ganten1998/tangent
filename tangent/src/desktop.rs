@@ -3506,6 +3506,16 @@ impl DesktopApp {
                 let m = e.rt_load();
                 Some((m.load()?, m.peak_load()?))
             }),
+            // Off unless `TANGENT_PROBE` is set, in which case this is the
+            // only place the discard counters can be read: they are made of
+            // user-interface writes and no offline render makes one.
+            probe: self
+                .recorder
+                .engine
+                .as_ref()
+                .map(crate::instrument::Engine::probe)
+                .filter(|p| p.blocks > 0)
+                .map(crate::instrument::Probe::line),
         });
 
         // The buffer size, on the edge. Reopening both streams is expensive —
@@ -19395,6 +19405,212 @@ impl DesktopApp {
 #[cfg(all(test, feature = "recorder"))]
 mod tests {
     use tangent_ui::busy::{Busy, Progress};
+
+    /// **Run the eligibility probe over the owner's own projects.**
+    ///
+    /// Not a test, a measurement:
+    /// `TANGENT_PROBE=1 cargo test --release -p tangent --bin tangent
+    /// the_eligibility_probe_over_real_projects -- --ignored --nocapture`.
+    ///
+    /// The probe answers how much of a real song's per-block render work
+    /// could be moved off the deadline by an anticipative render. Four design
+    /// reads of that feature guessed at the answer and none measured it. The
+    /// rungs in `rt_bench` measure it on synthetic desks; this measures it on
+    /// the real thing, which is the only place the mix of instrument lanes,
+    /// folders, sends and frozen tracks is somebody's actual session rather
+    /// than a bench author's idea of one.
+    ///
+    /// **Read-only with respect to the projects.** It opens each document and
+    /// never saves; `Caps::PLUGIN` leaves `persist_global_settings` down so
+    /// nothing reaches the runner's own settings either, and
+    /// `IVORY_SETTINGS_PATH` is redirected as a second belt.
+    ///
+    /// **The discard half of the probe cannot be measured here and reads
+    /// zero.** Every event that would throw a look-ahead ring away is a
+    /// user-interface write, and a headless render of a saved document makes
+    /// none. That number needs the owner's hands on the desk.
+    #[test]
+    #[ignore = "a measurement over the owner's own projects, not an assertion"]
+    fn the_eligibility_probe_over_real_projects() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            println!("no HOME, nothing to measure");
+            return;
+        };
+        let root = home.join("Documents/Tangent Media/Projects");
+        let shelf = std::env::temp_dir().join(format!("tangent-probe-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&shelf);
+        // SAFETY: nothing else in this process has started a thread that
+        // reads the environment, and the value is a path just created here.
+        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", shelf.join("settings.json")) };
+
+        let mut names: Vec<String> = std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|d| d.path().join("project.tan").is_file())
+            .filter_map(|d| d.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        if names.is_empty() {
+            println!("no projects under {}", root.display());
+            return;
+        }
+        for name in names {
+            let doc = root.join(&name).join("project.tan");
+            let ctx = egui::Context::default();
+            // `PLUGIN` and not `DESKTOP`: `Caps::DESKTOP` sets
+            // `persist_global_settings`, and this opens somebody's real work.
+            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+            app.open_project(&doc);
+            let rate = 48_000u32;
+            let Ok(mut e) =
+                crate::instrument::Engine::offline(rate, tangent_record::audio::Timebase::new())
+            else {
+                continue;
+            };
+            furnish_probe_engine(&mut e, &app, rate);
+            // Twelve seconds from the song's head at 128 frames: long enough
+            // for the park windows to settle, short enough to run every
+            // project in a sitting.
+            let block = 128usize;
+            let blocks = 12 * rate as usize / block;
+            let mut out = vec![0.0f32; block * 2];
+            e.set_transport(2, 0);
+            e.set_rolling(true);
+            for _ in 0..blocks {
+                e.render_offline(&mut out);
+            }
+            let p = e.probe();
+            if p.blocks == 0 {
+                println!("{name:<22} the probe is off (set TANGENT_PROBE=1)");
+                return;
+            }
+            println!("{name:<22} {}", p.line());
+        }
+    }
+
+    /// Furnish `e` from `app` with everything the eligibility probe reads,
+    /// plus the racks and clips without which the lanes cost nothing and the
+    /// nanosecond weighting would mean nothing.
+    ///
+    /// **Deliberately NOT the export's furnishing.** `start_offline_render`
+    /// pushes `set_armed(0)` and `set_midi_off(u64::MAX)`, which is right for
+    /// a bounce and would make every lane eligible here by construction. This
+    /// pushes the arm and MIDI state the session actually has, through the
+    /// same `live_midi_off` rule the live walk uses.
+    fn furnish_probe_engine(e: &mut crate::instrument::Engine, app: &TangentApp, rate: u32) {
+        use tangent_ui::recorder::CHANNELS;
+        e.set_desk(&app.desk());
+        let gains = app.gains();
+        for ch in 0..CHANNELS {
+            e.set_channel_gain(ch, gains.channels[ch]);
+            e.set_channel_pan(ch, app.channel_pan(ch));
+        }
+        e.set_master_gain(gains.master);
+        e.set_fx_return(gains.fx_return);
+        e.set_tempo(app.tempo_bpm());
+        e.set_metronome_enabled(false);
+        e.set_monitor_on(false);
+        e.set_folders(app.folder_parents());
+
+        // **The live arm and MIDI state, which is the whole point.**
+        let armed = app.armed_mask();
+        let kinds: Vec<_> = (0..CHANNELS).map(|ch| app.channel_kind(ch)).collect();
+        let midi_off = tangent_ui::recorder::live_midi_off(&kinds, armed, app.midi_editor_lane());
+        let frozen = frozen_lane_mask(app.frozen_lanes());
+        e.set_midi_off(u64::from(midi_off) | u64::from(frozen));
+        e.set_armed(armed);
+
+        let mask = |f: &dyn Fn(usize) -> bool| {
+            (0..CHANNELS).fold(0u32, |m, ch| if f(ch) { m | 1 << ch.min(31) } else { m })
+        };
+        e.set_builtin_strips(mask(&|ch| {
+            app.insert(ch, 0) == Some(tangent_ui::dialogs::BUILTIN_PATH)
+        }));
+        e.set_drum_strips(mask(&|ch| {
+            app.insert(ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH)
+        }));
+        e.set_keys_strips(mask(&|ch| {
+            app.insert(ch, 0) == Some(tangent_ui::dialogs::KEYS_PATH)
+        }));
+
+        // The routes and the sidechain key table, as `publish_routes` does.
+        {
+            let outs = e.output().channels as usize;
+            let mut routes = app.routes().clone();
+            routes.prune(outs, CHANNELS);
+            e.set_routes(&routes);
+            let keys: Vec<(usize, usize, usize)> = app
+                .insert_keys()
+                .0
+                .iter()
+                .filter(|k| k.from < CHANNELS)
+                .map(|k| {
+                    let (seat, bay) = tangent_ui::recorder::seat_bay(k.strip, k.slot);
+                    (seat, bay, k.from)
+                })
+                .collect();
+            engine_set_insert_keys(e, &keys);
+        }
+
+        // Every bay, so a lane costs what it really costs.
+        let inserts = tangent_ui::recorder::INSERTS;
+        for i in 0..(crate::instrument::RACK_SEATS * inserts) {
+            let (seat, bay) = (i / inserts, i % inserts);
+            let Some(path) = app.insert(seat, bay).filter(|p| !is_instrument_sentinel(p)) else {
+                continue;
+            };
+            let _ = furnish_mirror_bay(e, None, seat, bay, path);
+        }
+
+        // The clips, decoded at this rate.
+        let Some(doc_path) = app.project_doc().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let doc = app.arrangement().clone();
+        let mut placed = Vec::new();
+        let mut midi_placed = Vec::new();
+        let mut cache: std::collections::HashMap<
+            std::path::PathBuf,
+            Arc<tangent_record::decode::Clip>,
+        > = std::collections::HashMap::new();
+        let frames = |s: f64| frames_at(f64::from(rate), s);
+        for clip in &doc.clips {
+            if clip.kind == tangent_ui::arrangement::ClipKind::Midi {
+                let notes = midi_clip_notes(clip, f64::from(rate));
+                if !notes.is_empty() {
+                    midi_placed.push(crate::instrument::PlacedMidi {
+                        strip: clip.lane.min(CHANNELS - 1),
+                        start: frames(clip.start_s),
+                        len: frames(clip.len_s),
+                        notes: Arc::new(notes),
+                        pedal: Arc::new(midi_clip_pedal(clip, f64::from(rate))),
+                    });
+                }
+                continue;
+            }
+            let path = tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
+            let decoded = match cache.get(&path) {
+                Some(c) => Arc::clone(c),
+                None => match tangent_record::decode::decode(&path, rate) {
+                    Ok(c) => {
+                        let c = Arc::new(c);
+                        cache.insert(path.clone(), Arc::clone(&c));
+                        c
+                    }
+                    Err(_) => continue,
+                },
+            };
+            placed.extend(audio_clip_passes(
+                clip,
+                &decoded,
+                f64::from(rate),
+                clip.gain as f32,
+            ));
+        }
+        e.set_clips(placed);
+        e.set_midi_clips(midi_placed);
+    }
 
     /// **A cover asks for its band; it never spells one.**
     ///

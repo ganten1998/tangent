@@ -69,6 +69,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   go out of time alignment after a preset click, lose its settings on close,
   and on Linux stop responding. It is asked over every slot now.
 
+- **The audio panel can show what a look-ahead would have been worth, and
+  the answer is nothing.** Set `TANGENT_PROBE=1` and a line appears under the
+  render load giving how much of each block's track processing could have been
+  done in advance, off the deadline, the way some other programs do it. It is
+  a counter and nothing else: it processes nothing early, starts no thread and
+  changes no sound, and it is absent from every run that does not ask for it.
+
+  Measured over this machine's own projects and over twenty-three test desks
+  including one carrying ninety-six commercial reverbs, the figure is zero
+  every time. A track can only be worked on in advance if its audio has a
+  future to read, and the source that feeds a track is one block deep for the
+  whole desk, so any track that is processing at all is a track that cannot
+  be run ahead. It also overlaps almost exactly with the change that stopped
+  processing tracks with nothing to play: the work that would have been moved
+  off the deadline is the work that is no longer being done.
+
 - **The render load meter can tell one number from another.** It kept its
   distribution in octaves, so 524 and 1048 microseconds were the same
   reading, which put every figure that decides whether a desk is fast enough

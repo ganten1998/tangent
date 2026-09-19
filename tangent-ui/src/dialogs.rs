@@ -9705,6 +9705,16 @@ fn show_on(
                                     .color(color),
                                 );
                             }
+                            // **The eligibility probe**, when somebody has
+                            // asked for it. Not a performance reading: it is
+                            // how much of the block a look-ahead would have
+                            // been allowed to render early, and how often it
+                            // would have had to throw the result away.
+                            if let Some(line) = status.probe.as_deref() {
+                                ui.label(
+                                    RichText::new(line).font(plain(10.0)).color(dim),
+                                );
+                            }
 
                             // ── who else is in the path ──────────────────────
                             //
