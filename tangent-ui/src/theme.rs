@@ -507,47 +507,72 @@ impl Theme {
 
 /// Every theme that ships in the binary, Default first.
 ///
-/// **Sixteen, and they are a spread rather than variations on one idea.**
-/// One light-ivory default, one warm-paper light theme, and six darks that do
-/// not repeat a hue: plum, teal, navy, grey, warm-console, indigo. Three of
-/// them are the owner's own applications' palettes, kept faithful to what
-/// those apps look like rather than approximated.
+/// **Nineteen, and they are a spread rather than variations on one idea.**
+/// Three are the owner's own applications' palettes (Valentine, Hydra,
+/// Navi), kept faithful to what those apps look like rather than
+/// approximated; four are instrument panels the app has some claim to
+/// (Centennial, Rhodes, Silverface, Reed); the rest are materials and
+/// weather. Three desks are light (Sandstone, Centennial, Celadon), one is
+/// mid-tone (Pewter), two carry their ground dark (Phosphor, Amber) and the
+/// others are a pale page over a dark desk, with no two dark bands on one
+/// hue: wine, rose-wine, teal, navy, grey, ochre, avocado, iron-slate,
+/// forest, chocolate, verdigris, charcoal, slate, umber, green-black,
+/// slate-black.
+///
+/// **The order is an index.** `factory()`'s position is what a saved desk
+/// persists as `palette_choice`, and `mixer_panel::PALETTES` is in the same
+/// order, so a theme is replaced IN ITS SLOT and never removed or reordered.
+/// The 2026-09-18 redo did exactly that for seven of them (Studio, Aurora,
+/// Blueprint, Porcelain, Dusk, Iris, Nocturne); their names are gone from
+/// here, their palette bytes stay in `STRIP_COLORS`, and the slot's row in
+/// `PALETTES` points at the replacement's appended run.
 pub fn factory() -> Vec<Theme> {
     vec![
         Theme::factory_default(),
         // ── Valentine: the owner's Focusrite control panel. Dark plum with a
         // rose highlight and one coral spark for anything engaged; meters ramp
-        // jade → amber → crimson, so the scope is jade and the master crimson.
+        // jade to amber to crimson, so the scope is jade and the master crimson.
+        //
+        // **More red, at the owner's word (2026-09-18): "like the original TUI
+        // application."** The marks were always the TUI's own (rose, coral,
+        // amber, jade, crimson); what read purple was the SURFACES. The band
+        // sat at hue 314, a mauve, and the strip at 319, both a long way
+        // round the wheel from the crimson and the rose that carry the app.
+        // Both moved to the red side of the plum (342 and 338), the lines,
+        // the strings and the key cuts with them, and the dark ground went
+        // from #251524 to #23131a so it is a plum-black and not a violet
+        // one. Designed and gated by `scripts/palgen.py --themes`.
+        //
+        // The sustain is amber, not the coral it started as: rose and coral
+        // differ in HUE but barely in brightness (1.22:1), so a held note and
+        // a struck one looked alike at a glance and identical to anyone who
+        // does not separate red from orange. Amber is 1.6:1 clear of the rose
+        // and is Valentine's own warning colour.
         Theme {
             name: "Valentine".to_owned(),
             background: c(0xf3, 0xdc, 0xe7),
             white_key: c(0xf3, 0xdc, 0xe7),
-            black_key: c(0x25, 0x15, 0x24),
+            black_key: c(0x23, 0x13, 0x1a),
             key_active: c(0xff, 0x5f, 0xa2),
-            // Amber, not the coral it started as: rose and coral differ in
-            // HUE but barely in brightness (1.22:1), so a held note and a
-            // struck one looked alike at a glance and identical to anyone
-            // who does not separate red from orange. Amber is 1.6:1 clear of
-            // the rose and is Valentine's own warning colour.
             sustain: c(0xff, 0xb4, 0x54),
-            key_separator: c(0x5e, 0x2c, 0x4e),
+            key_separator: c(0x66, 0x28, 0x3e),
             text: c(0xf3, 0xdc, 0xe7),
-            theory_line: c(0xa3, 0x76, 0x8f),
+            theory_line: c(0xa8, 0x72, 0x84),
             interval_text: c(0x4c, 0xc7, 0xa4),
-            recorder_bg: c(0x52, 0x30, 0x4a),
+            recorder_bg: c(0x5a, 0x2a, 0x3c),
             fx_knob: c(0xff, 0x8a, 0x5b),
             master_knob: c(0xff, 0x3b, 0x5c),
-            varispeed: c(0xF3, 0xDC, 0xE7),
-            meter_bg: c(0x25, 0x15, 0x24),
+            varispeed: c(0xf3, 0xdc, 0xe7),
+            meter_bg: c(0x23, 0x13, 0x1a),
             scope_draw: c(0x4c, 0xc7, 0xa4),
-            fx_strip: c(0x5e, 0x2c, 0x4e),
+            fx_strip: c(0x4e, 0x22, 0x32),
             input_chip: c(0x4c, 0xc7, 0xa4),
-            fretboard: c(0x25, 0x15, 0x24),
-            string: c(0xa3, 0x76, 0x8f),
-                        velocity_loud: c(0xff, 0x70, 0x83),
+            fretboard: c(0x23, 0x13, 0x1a),
+            string: c(0xa8, 0x72, 0x84),
+            velocity_loud: c(0xff, 0x70, 0x83),
             velocity_quiet: c(0x19, 0xb3, 0x84),
             channel_palette: Some(1),
-            dark: dark_of(&[("background", (0x25, 0x15, 0x24))]),
+            dark: dark_of(&[("background", (0x23, 0x13, 0x1a))]),
         },
         // ── Hydra: the owner's audio-routing TUI. Near-black teal depths, a
         // bioluminescent seafoam glow, and exactly one warm coral — which is
@@ -669,191 +694,237 @@ pub fn factory() -> Vec<Theme> {
             channel_palette: Some(4),
             dark: dark_of(&[("background", (0x14, 0x14, 0x14))]),
         },
-        // ── Studio: the analogue console. Warm charcoal, cream legends, VU
-        // amber for anything that moves, an oxblood master, and the sage-green
-        // lamp old gear uses for "connected" on the input chip.
+        // ── Ochre: the earth pigment as the BAND. Studio's slot (retired
+        // 2026-09-18, the owner: "replace with something more inspired and
+        // not yet covered by the rest of the themes"), and the one warm band
+        // in the set with real chroma, where Rhodes' brown and Copper's
+        // verdigris sit under 15. Chalk page, bone knobs, cornflower for what
+        // sounds and indigo for what is held: the yellow ochre and
+        // ultramarine of a fresco. The band is lighter (0.084 luminance)
+        // than any other dark band here, which is why every mark on it is
+        // pale: 3:1 over it starts at 0.35, so the master is a salmon rather
+        // than a crimson. Designed and gated by `scripts/palgen.py --themes`,
+        // its desk by `--redo`, as are the six below.
         Theme {
-            name: "Studio".to_owned(),
-            background: c(0xe8, 0xe2, 0xd4),
-            white_key: c(0xe8, 0xe2, 0xd4),
-            black_key: c(0x19, 0x17, 0x14),
-            key_active: c(0xd8, 0xa0, 0x3c),
-            sustain: c(0x79, 0x5b, 0x28),
-            key_separator: c(0x3a, 0x35, 0x2e),
-            text: c(0xe8, 0xe2, 0xd4),
-            theory_line: c(0x6b, 0x63, 0x55),
-            interval_text: c(0xc0, 0x8f, 0x4a),
-            recorder_bg: c(0x4a, 0x40, 0x38),
-            fx_knob: c(0xd8, 0xa0, 0x3c),
-            // Oxblood lifted twice: once because it was 2.1:1 against the
-            // old band, again when the band itself came up out of near-black.
-            // The one control that can silence everything must be findable.
-            master_knob: c(0xe8, 0x72, 0x58),
-            varispeed: c(0xDC, 0xD3, 0xBE),
-            meter_bg: c(0x27, 0x24, 0x20),
-            scope_draw: c(0xd8, 0xa0, 0x3c),
-            fx_strip: c(0x3a, 0x35, 0x2e),
-            input_chip: c(0x7f, 0xa0, 0x5a),
-            fretboard: c(0x27, 0x24, 0x20),
-            string: c(0xa8, 0x98, 0x80),
-                        velocity_loud: c(0xff, 0x7e, 0x57),
-            velocity_quiet: c(0x80, 0xb1, 0x5f),
+            name: "Ochre".to_owned(),
+            background: c(0xf1, 0xed, 0xe2),
+            white_key: c(0xf1, 0xed, 0xe2),
+            black_key: c(0x1e, 0x1a, 0x12),
+            key_active: c(0x8a, 0xb0, 0xd8),
+            sustain: c(0x2e, 0x3a, 0x7a),
+            key_separator: c(0x8a, 0x70, 0x30),
+            text: c(0xf4, 0xec, 0xd6),
+            theory_line: c(0xa8, 0x94, 0x60),
+            interval_text: c(0xf0, 0xd0, 0x80),
+            recorder_bg: c(0x5a, 0x41, 0x11),
+            fx_knob: c(0xec, 0xdc, 0xb0),
+            master_knob: c(0xff, 0x7a, 0x6a),
+            varispeed: c(0x8a, 0xb0, 0xd8),
+            meter_bg: c(0x24, 0x1c, 0x0e),
+            scope_draw: c(0xf0, 0xb8, 0x30),
+            fx_strip: c(0x4a, 0x35, 0x10),
+            input_chip: c(0x8a, 0xb0, 0xd8),
+            fretboard: c(0x24, 0x1c, 0x0e),
+            string: c(0xc8, 0xb0, 0x70),
+            velocity_loud: c(0xfe, 0x7d, 0x3d),
+            velocity_quiet: c(0x70, 0x9f, 0xfe),
             channel_palette: Some(5),
-            dark: dark_of(&[("background", (0x19, 0x17, 0x14))]),
+            dark: dark_of(&[("background", (0x1e, 0x1a, 0x12))]),
         },
-        // ── Aurora: indigo night with a mint/violet complementary pair — mint
-        // for what is sounding, violet for what is HELD, so the two states of
-        // a note are opposite ends of the wheel and never confusable.
+        // ── Reed: the reed electric piano this app models (keys/reed.rs), in
+        // the avocado the 200 wore. Aurora's slot (retired 2026-09-18). An
+        // olive band, the lid's black-olive strips, ivory keys, the script's
+        // coral for what sounds, a pale sage for what is held, the amber
+        // pilot lamp on the master and bone knobs. The coral is a step paler
+        // than the script's own: #ff7a62 read 2.92:1 on the band.
         Theme {
-            name: "Aurora".to_owned(),
-            background: c(0xdf, 0xe4, 0xee),
-            white_key: c(0xdf, 0xe4, 0xee),
-            black_key: c(0x12, 0x14, 0x1b),
-            key_active: c(0x5c, 0xe8, 0xb4),
-            sustain: c(0xa9, 0x7b, 0xf0),
-            key_separator: c(0x2a, 0x2e, 0x40),
-            text: c(0xdf, 0xe4, 0xee),
-            theory_line: c(0x4a, 0x50, 0x68),
-            interval_text: c(0x7f, 0xd4, 0xf0),
-            recorder_bg: c(0x33, 0x3a, 0x54),
-            fx_knob: c(0x5c, 0xe8, 0xb4),
-            master_knob: c(0xe0, 0x56, 0x7a),
-            varispeed: c(0x8F, 0xD8, 0xF5),
-            meter_bg: c(0x1e, 0x21, 0x30),
-            scope_draw: c(0x5c, 0xe8, 0xb4),
-            fx_strip: c(0x2a, 0x2e, 0x40),
-            input_chip: c(0xa9, 0x7b, 0xf0),
-            fretboard: c(0x1e, 0x21, 0x30),
-            string: c(0x6b, 0x72, 0x90),
-                        velocity_loud: c(0xff, 0x70, 0xa5),
-            velocity_quiet: c(0x1a, 0xb8, 0x63),
+            name: "Reed".to_owned(),
+            background: c(0xf3, 0xef, 0xdc),
+            white_key: c(0xf3, 0xef, 0xdc),
+            black_key: c(0x17, 0x1a, 0x10),
+            key_active: c(0xff, 0x84, 0x68),
+            sustain: c(0xcf, 0xe0, 0xa8),
+            key_separator: c(0x4e, 0x5a, 0x28),
+            text: c(0xf3, 0xef, 0xdc),
+            theory_line: c(0x8e, 0x94, 0x60),
+            interval_text: c(0xcf, 0xe0, 0xa8),
+            recorder_bg: c(0x42, 0x4c, 0x22),
+            fx_knob: c(0xef, 0xe2, 0xb0),
+            master_knob: c(0xf5, 0xb8, 0x30),
+            varispeed: c(0x8f, 0xb0, 0xc8),
+            meter_bg: c(0x1c, 0x20, 0x10),
+            scope_draw: c(0xc8, 0xe0, 0x70),
+            fx_strip: c(0x26, 0x2b, 0x14),
+            input_chip: c(0xff, 0x84, 0x68),
+            fretboard: c(0x1c, 0x20, 0x10),
+            string: c(0xc0, 0xc0, 0x98),
+            velocity_loud: c(0xfe, 0x72, 0x56),
+            velocity_quiet: c(0x76, 0xab, 0x5c),
             channel_palette: Some(6),
-            dark: dark_of(&[("background", (0x12, 0x14, 0x1b))]),
+            dark: dark_of(&[("background", (0x17, 0x1a, 0x10))]),
         },
-        // ── Sandstone: the LIGHT one, and the reason the set needs it — every
-        // other theme here is dark, and a person working in daylight has
-        // nowhere to go. Warm sand paper, umber ink, terracotta for what
-        // moves, sage for what is held. The scope draws DARK, because on a
-        // pale meter a bright trace is invisible: the one place a light theme
-        // cannot simply invert a dark one.
+        // ── Sandstone: the LIGHT one, and the reason the set needs it. Warm
+        // sand paper, umber ink, terracotta for what moves, sage for what is
+        // held. The scope draws DARK, because on a pale meter a bright trace
+        // is invisible: the one place a light theme cannot simply invert a
+        // dark one.
+        //
+        // **Darker sand, at the owner's word (2026-09-18): "make even light
+        // mode a darker sand colour; it is too harsh now."** The page was a
+        // near-white (#faf4e8, 0.90 luminance) and every surface on it paler
+        // still; it is sand now (#e0cfa8, 0.62), the band came down with it
+        // (0.66 to 0.49) and the strips, the well and the neck followed.
+        // Every mark that cleared 3:1 on the old band was measured again on
+        // the new one: the effect knob deepened a step (#a84f28 to #9a4522,
+        // 2.9:1 to 3.4:1) and the scope trace with it; the terracotta and
+        // the master clear as they were. The dark ground is untouched.
+        //
+        // **A light theme is not a dark one inverted.** On paper the marks
+        // have to go DARKER to be seen, not brighter: the terracotta is
+        // deepened until it reads on sand, and the sustain is deepened
+        // further still, so a held note and a struck one are told apart by
+        // weight the way ink is.
         Theme {
             name: "Sandstone".to_owned(),
-            background: c(0xfa, 0xf4, 0xe8),
-            white_key: c(0xfa, 0xf4, 0xe8),
-            black_key: c(0x4a, 0x3f, 0x34),
-            // **A light theme is not a dark one inverted.** On paper the
-            // marks have to go DARKER to be seen, not brighter: the
-            // terracotta is deepened until it reads on sand, and the sustain
-            // is deepened further still, so a held note and a struck one are
-            // told apart by weight the way ink is.
+            background: c(0xe0, 0xcf, 0xa8),
+            white_key: c(0xe0, 0xcf, 0xa8),
+            black_key: c(0x2b, 0x24, 0x1d),
             key_active: c(0x9a, 0x49, 0x25),
             sustain: c(0x3a, 0x4a, 0x24),
             key_separator: c(0x9c, 0x8a, 0x70),
             text: c(0x3a, 0x31, 0x28),
-            theory_line: c(0x9c, 0x8a, 0x70),
+            theory_line: c(0x8a, 0x78, 0x58),
             interval_text: c(0x8a, 0x5a, 0x2c),
-            recorder_bg: c(0xe0, 0xd3, 0xba),
-            fx_knob: c(0xa8, 0x4f, 0x28),
+            recorder_bg: c(0xde, 0xd1, 0xb2),
+            fx_knob: c(0x9a, 0x45, 0x22),
             master_knob: c(0xa0, 0x38, 0x28),
-            varispeed: c(0x40, 0x60, 0x6E),
-            meter_bg: c(0xde, 0xd2, 0xbc),
-            scope_draw: c(0x5a, 0x70, 0x40),
-            fx_strip: c(0xd5, 0xc8, 0xb0),
+            varispeed: c(0x40, 0x60, 0x6e),
+            meter_bg: c(0xd3, 0xc4, 0x9f),
+            scope_draw: c(0x4e, 0x62, 0x38),
+            fx_strip: c(0xc3, 0xae, 0x82),
             input_chip: c(0x7d, 0x8f, 0x5a),
-            fretboard: c(0xc9, 0xb5, 0x96),
-            string: c(0x6b, 0x5c, 0x48),
-                        velocity_loud: c(0xc6, 0x3e, 0x1c),
-            velocity_quiet: c(0x31, 0x85, 0x13),
+            fretboard: c(0xb9, 0xa3, 0x7c),
+            string: c(0x5a, 0x4c, 0x3a),
+            velocity_loud: c(0xba, 0x3a, 0x1a),
+            velocity_quiet: c(0x3c, 0x74, 0x28),
             channel_palette: Some(7),
-            dark: dark_of(&[("background", (0x4a, 0x3f, 0x34))]),
+            dark: dark_of(&[("background", (0x2b, 0x24, 0x1d))]),
         },
-        // ── Centennial: the DX7 II Centennial, 1987 — Yamaha's hundredth
+        // ── Centennial: the DX7 II Centennial, 1987: Yamaha's hundredth
         // birthday in brushed silver with gold legends and black cheeks. The
         // gold is an ACCENT and never the text: it is beautiful at 3:1 on
         // silver and unreadable as a paragraph. Slate blue on the input chip
         // is the one cool note, as it is on the instrument.
+        //
+        // **A darker band, at the owner's word (2026-09-18): "make the
+        // recorder colour slightly darker grey."** #c2c2c8 to #b6b6bc, about
+        // seven percent, and the gold marks deepened one step (#785c17 to
+        // #6f5515, #7d5f18 to #725716) so they keep 3:1 on it; the master
+        // clears as it was.
         Theme {
             name: "Centennial".to_owned(),
             background: c(0xf2, 0xf1, 0xee),
             white_key: c(0xf2, 0xf1, 0xee),
             black_key: c(0x26, 0x26, 0x2a),
-            key_active: c(0x78, 0x5c, 0x17),
+            key_active: c(0x6f, 0x55, 0x15),
             sustain: c(0x3f, 0x4a, 0x55),
             key_separator: c(0x9a, 0x9a, 0xa0),
             text: c(0x1f, 0x1f, 0x23),
             theory_line: c(0x8e, 0x8e, 0x96),
             interval_text: c(0x6f, 0x57, 0x14),
-            recorder_bg: c(0xc2, 0xc2, 0xc8),
-            fx_knob: c(0x7d, 0x5f, 0x18),
+            recorder_bg: c(0xb6, 0xb6, 0xbc),
+            fx_knob: c(0x72, 0x57, 0x16),
             master_knob: c(0x9c, 0x32, 0x26),
-            varispeed: c(0x35, 0x50, 0x6E),
+            varispeed: c(0x35, 0x50, 0x6e),
             meter_bg: c(0x2a, 0x2a, 0x2e),
             scope_draw: c(0xd8, 0xb4, 0x5a),
             fx_strip: c(0xd5, 0xd5, 0xda),
             input_chip: c(0x5d, 0x6b, 0x78),
             fretboard: c(0x3a, 0x3a, 0x40),
             string: c(0xc9, 0xc9, 0xcf),
-                        velocity_loud: c(0xff, 0xa3, 0xab),
+            velocity_loud: c(0xff, 0xa3, 0xab),
             velocity_quiet: c(0x47, 0xd0, 0x67),
             channel_palette: Some(8),
             dark: dark_of(&[("background", (0x26, 0x26, 0x2a))]),
         },
-        // ── Blueprint: a cyanotype. Prussian ground, chalk lines, and one
-        // ochre for what is HELD — the pencil annotation on a blue print.
+        // ── Zinc: the metal, and the violet the set lost. Blueprint's
+        // slot (retired 2026-09-18, "essentially an alternate Navi"), so
+        // the one hue the replacement must not be is blue. Zinc weathers to
+        // a blue-violet grey, and nothing here is violet at all since Dusk
+        // and Iris went, so the band is that patina with brass for what is
+        // HELD — the two metals an old panel is made of — and a pale zinc
+        // lilac for what sounds. The brass is deeper than a brass wants to
+        // be: a lighter one read 1.19:1 against the lilac, which is a held
+        // note and a struck one telling nothing apart.
+        //
+        // **It began as a mid-tone desk and could not stay one.** The first
+        // design for this slot was a pewter band at 0.30 luminance carrying
+        // dark ink — the daylight desk that does not glare, which is
+        // genuinely not covered by the rest of the set. Every colour gate
+        // passed and `dialogs::every_theme_dresses_the_export_window` did
+        // not: a well in the middle of the range sits within 3:1 of this
+        // app's one fixed transport red, so the playhead had to be
+        // recoloured on all four of that theme's dressings where the whole
+        // set is allowed seven. A desk that makes the app move its own red
+        // everywhere is a desk fighting the transport, so the concept
+        // yielded and the metal stayed. See `scripts/palgen.py`'s
+        // `playhead_moves`.
         Theme {
-            name: "Blueprint".to_owned(),
-            background: c(0xe6, 0xee, 0xf7),
-            white_key: c(0xe6, 0xee, 0xf7),
-            black_key: c(0x0d, 0x1c, 0x33),
-            key_active: c(0x7f, 0xb2, 0xe8),
-            sustain: c(0xf7, 0xd9, 0x8a),
-            key_separator: c(0x2b, 0x4a, 0x70),
-            text: c(0xe6, 0xee, 0xf7),
-            theory_line: c(0x5b, 0x7f, 0xa8),
-            interval_text: c(0xa8, 0xc4, 0xe0),
-            recorder_bg: c(0x20, 0x45, 0x6e),
-            fx_knob: c(0x7f, 0xb2, 0xe8),
-            master_knob: c(0xf0, 0x70, 0x5f),
-            varispeed: c(0xE8, 0xE4, 0xD8),
-            meter_bg: c(0x0f, 0x24, 0x40),
-            scope_draw: c(0x9f, 0xd0, 0xf5),
-            fx_strip: c(0x1a, 0x3a, 0x5e),
-            input_chip: c(0x6f, 0xc3, 0xb8),
-            fretboard: c(0x13, 0x2b, 0x47),
-            string: c(0x8f, 0xa8, 0xc0),
-                        velocity_loud: c(0xfe, 0x7d, 0x3d),
-            velocity_quiet: c(0x2b, 0xb4, 0xaa),
+            name: "Zinc".to_owned(),
+            background: c(0xe8, 0xe4, 0xee),
+            white_key: c(0xe8, 0xe4, 0xee),
+            black_key: c(0x1a, 0x16, 0x22),
+            key_active: c(0xb9, 0xa8, 0xe0),
+            sustain: c(0xb0, 0x84, 0x30),
+            key_separator: c(0x4a, 0x40, 0x60),
+            text: c(0xe8, 0xe4, 0xee),
+            theory_line: c(0x6a, 0x5f, 0x80),
+            interval_text: c(0xc9, 0xb8, 0xe8),
+            recorder_bg: c(0x33, 0x2a, 0x45),
+            fx_knob: c(0xbf, 0xb0, 0xe0),
+            master_knob: c(0xff, 0x5a, 0x6a),
+            varispeed: c(0x78, 0xc8, 0xd8),
+            meter_bg: c(0x1a, 0x16, 0x22),
+            scope_draw: c(0xcb, 0xb8, 0xf0),
+            fx_strip: c(0x28, 0x20, 0x36),
+            input_chip: c(0x8f, 0x7f, 0xb8),
+            fretboard: c(0x1a, 0x16, 0x22),
+            string: c(0xa0, 0x9a, 0xb0),
+            velocity_loud: c(0xff, 0x70, 0x88),
+            velocity_quiet: c(0x19, 0xb3, 0x94),
             channel_palette: Some(9),
-            dark: dark_of(&[("background", (0x0d, 0x1c, 0x33))]),
+            dark: dark_of(&[("background", (0x1a, 0x16, 0x22))]),
         },
-        // ── Porcelain: the other light theme, and cool where Sandstone is
-        // warm. Delft cobalt on cool white, with a violet sustain so the two
-        // note states are told apart by hue as well as by weight.
+        // ── Celadon: the glaze. Porcelain's slot (retired 2026-09-18). The
+        // third light desk, cool where Sandstone is warm and green where
+        // Centennial is grey, with plum for what sounds and pine for what is
+        // held, both DARK, as marks on paper have to be. A dark well with a
+        // pale celadon trace, like Centennial's.
         Theme {
-            name: "Porcelain".to_owned(),
-            background: c(0xfb, 0xfb, 0xfc),
-            white_key: c(0xfb, 0xfb, 0xfc),
-            black_key: c(0x2a, 0x33, 0x40),
-            key_active: c(0x2f, 0x5f, 0xa8),
-            sustain: c(0x9b, 0x6f, 0xd0),
-            key_separator: c(0xb6, 0xbc, 0xc4),
-            text: c(0x23, 0x2a, 0x33),
-            theory_line: c(0x9a, 0xa4, 0xb0),
-            interval_text: c(0x3a, 0x6e, 0xa8),
-            recorder_bg: c(0xcc, 0xd2, 0xd9),
-            fx_knob: c(0x2f, 0x5f, 0xa8),
-            master_knob: c(0xa8, 0x3a, 0x30),
-            varispeed: c(0x24, 0x54, 0x4A),
-            meter_bg: c(0x28, 0x31, 0x3c),
-            scope_draw: c(0x4a, 0x90, 0xd0),
-            fx_strip: c(0xdd, 0xe2, 0xe8),
-            input_chip: c(0x5a, 0x8a, 0x7a),
-            fretboard: c(0x39, 0x42, 0x4e),
-            string: c(0xc2, 0xc8, 0xd0),
-                        velocity_loud: c(0xff, 0xa3, 0xb6),
-            velocity_quiet: c(0x33, 0xd7, 0x7a),
+            name: "Celadon".to_owned(),
+            background: c(0xe2, 0xeb, 0xe6),
+            white_key: c(0xe2, 0xeb, 0xe6),
+            black_key: c(0x2c, 0x3a, 0x34),
+            key_active: c(0x7e, 0x3a, 0x6c),
+            sustain: c(0x1e, 0x3c, 0x2e),
+            key_separator: c(0x8f, 0xa8, 0x9a),
+            text: c(0x24, 0x30, 0x2a),
+            theory_line: c(0x8f, 0xa8, 0x9a),
+            interval_text: c(0x5a, 0x3a, 0x6a),
+            recorder_bg: c(0xc3, 0xd4, 0xc8),
+            fx_knob: c(0x6e, 0x30, 0x60),
+            master_knob: c(0x9a, 0x2a, 0x2a),
+            varispeed: c(0x24, 0x50, 0x4a),
+            meter_bg: c(0x22, 0x30, 0x2a),
+            scope_draw: c(0xa8, 0xd8, 0xc0),
+            fx_strip: c(0xd2, 0xdf, 0xd5),
+            input_chip: c(0x5a, 0x7a, 0x6a),
+            fretboard: c(0x9a, 0xb0, 0xa4),
+            string: c(0x2c, 0x3a, 0x34),
+            velocity_loud: c(0xff, 0xa3, 0xc2),
+            velocity_quiet: c(0x1e, 0xd7, 0x93),
             channel_palette: Some(10),
-            dark: dark_of(&[("background", (0x2a, 0x33, 0x40))]),
+            dark: dark_of(&[("background", (0x2c, 0x3a, 0x34))]),
         },
         // ── Moss: deep forest, lichen text, and a low amber sustain. The
         // sustain is DARKER than the struck note here — on a green ground a
@@ -941,154 +1012,132 @@ pub fn factory() -> Vec<Theme> {
             channel_palette: Some(13),
             dark: dark_of(&[("background", (0x14, 0x20, 0x1d))]),
         },
-        // ── Dusk: the sky twenty minutes after sunset — violet overhead,
-        // warm at the horizon. The horizon colour is what sounds; the
-        // overhead blue is what is held.
+        // ── Prism: charcoal, and one colour per control, the slider caps of
+        // a polysynth. Dusk's slot (retired 2026-09-18, "Dusk and Iris are
+        // too close: replace them"). Cyan for what sounds, magenta for what
+        // is held, yellow knobs, a red master, green on the scope, orange on
+        // the input chip; the pitch dial is the one white thing so it is not
+        // another cap.
         Theme {
-            name: "Dusk".to_owned(),
-            background: c(0xec, 0xe6, 0xf0),
-            white_key: c(0xec, 0xe6, 0xf0),
-            black_key: c(0x16, 0x12, 0x28),
-            key_active: c(0xf0, 0x92, 0x5a),
-            sustain: c(0x7f, 0x8c, 0xe0),
-            key_separator: c(0x33, 0x2a, 0x4a),
-            text: c(0xec, 0xe6, 0xf0),
-            theory_line: c(0x6a, 0x5f, 0x8a),
-            interval_text: c(0xc0, 0xa8, 0xe8),
-            recorder_bg: c(0x3a, 0x2f, 0x55),
-            fx_knob: c(0xf0, 0x92, 0x5a),
-            master_knob: c(0xe0, 0x4a, 0x6a),
-            varispeed: c(0xC0, 0xA8, 0xE8),
-            meter_bg: c(0x1b, 0x16, 0x30),
-            scope_draw: c(0xf0, 0xb0, 0x70),
-            fx_strip: c(0x2c, 0x24, 0x44),
-            input_chip: c(0x8f, 0x7f, 0xd0),
-            fretboard: c(0x22, 0x1b, 0x3a),
-            string: c(0x9a, 0x90, 0xb8),
-                        velocity_loud: c(0xff, 0x70, 0x96),
-            velocity_quiet: c(0x19, 0xb3, 0x99),
+            name: "Prism".to_owned(),
+            background: c(0xee, 0xee, 0xf2),
+            white_key: c(0xee, 0xee, 0xf2),
+            black_key: c(0x18, 0x18, 0x1c),
+            key_active: c(0x38, 0xb8, 0xf0),
+            sustain: c(0xf0, 0x50, 0xb0),
+            key_separator: c(0x35, 0x35, 0x3c),
+            text: c(0xec, 0xec, 0xe8),
+            theory_line: c(0x8a, 0x8a, 0x92),
+            interval_text: c(0xf0, 0xc0, 0x20),
+            recorder_bg: c(0x35, 0x35, 0x3c),
+            fx_knob: c(0xf0, 0xc0, 0x20),
+            master_knob: c(0xff, 0x40, 0x40),
+            varispeed: c(0xe6, 0xe6, 0xec),
+            meter_bg: c(0x1c, 0x1c, 0x20),
+            scope_draw: c(0x50, 0xe0, 0x70),
+            fx_strip: c(0x28, 0x28, 0x2e),
+            input_chip: c(0xf0, 0x8a, 0x30),
+            fretboard: c(0x1c, 0x1c, 0x20),
+            string: c(0xa0, 0xa0, 0xa8),
+            velocity_loud: c(0xff, 0x70, 0x70),
+            velocity_quiet: c(0x21, 0xa7, 0xeb),
             channel_palette: Some(14),
-            dark: dark_of(&[("background", (0x16, 0x12, 0x28))]),
+            dark: dark_of(&[("background", (0x18, 0x18, 0x1c))]),
         },
-        // ── Iris: deep violet with its complement, chartreuse. The widest
-        // hue gap in the set, so a sounding note cannot be mistaken for a
-        // held one at any glance.
+        // ── Storm: slate, and the bolt. Iris's slot (retired 2026-09-18). A
+        // blue-grey band darker than Pewter's and greyer than Navi's,
+        // cloud-white knobs, and yellow, the one hero no other theme uses,
+        // for what sounds and for the pitch dial; deep storm blue for what
+        // is held.
         Theme {
-            name: "Iris".to_owned(),
-            background: c(0xee, 0xe8, 0xf4),
-            white_key: c(0xee, 0xe8, 0xf4),
-            black_key: c(0x19, 0x10, 0x26),
-            key_active: c(0xc8, 0xe0, 0x5a),
-            sustain: c(0xb0, 0x7f, 0xe8),
-            key_separator: c(0x3a, 0x2a, 0x52),
-            text: c(0xee, 0xe8, 0xf4),
-            theory_line: c(0x6f, 0x5a, 0x8c),
-            interval_text: c(0xd8, 0xe8, 0x8a),
-            recorder_bg: c(0x3f, 0x2d, 0x5c),
-            fx_knob: c(0xc8, 0xe0, 0x5a),
-            master_knob: c(0xe0, 0x50, 0x7a),
-            varispeed: c(0x9A, 0xB4, 0xF0),
-            meter_bg: c(0x1e, 0x13, 0x30),
-            scope_draw: c(0xd8, 0xf0, 0x70),
-            fx_strip: c(0x31, 0x22, 0x43),
-            input_chip: c(0x9f, 0x7f, 0xd8),
-            fretboard: c(0x25, 0x18, 0x40),
-            string: c(0xa8, 0x98, 0xc0),
-                        velocity_loud: c(0xff, 0x57, 0xab),
-            velocity_quiet: c(0x18, 0xae, 0x4a),
+            name: "Storm".to_owned(),
+            background: c(0xdd, 0xe3, 0xe9),
+            white_key: c(0xdd, 0xe3, 0xe9),
+            black_key: c(0x14, 0x18, 0x1e),
+            key_active: c(0xf5, 0xd3, 0x3a),
+            sustain: c(0x2a, 0x58, 0x96),
+            key_separator: c(0x3d, 0x46, 0x54),
+            text: c(0xe8, 0xed, 0xf2),
+            theory_line: c(0x8a, 0x98, 0xa8),
+            interval_text: c(0xe8, 0xc8, 0x48),
+            recorder_bg: c(0x3d, 0x46, 0x54),
+            fx_knob: c(0xd4, 0xdb, 0xe2),
+            master_knob: c(0xff, 0x5a, 0x5a),
+            varispeed: c(0xf5, 0xd3, 0x3a),
+            meter_bg: c(0x1a, 0x1f, 0x26),
+            scope_draw: c(0xf5, 0xd3, 0x3a),
+            fx_strip: c(0x2e, 0x35, 0x40),
+            input_chip: c(0x7f, 0xa8, 0xc8),
+            fretboard: c(0x1a, 0x1f, 0x26),
+            string: c(0xa8, 0xb4, 0xc0),
+            velocity_loud: c(0xff, 0x83, 0x70),
+            velocity_quiet: c(0x70, 0xa8, 0xfe),
             channel_palette: Some(15),
-            dark: dark_of(&[("background", (0x19, 0x10, 0x26))]),
+            dark: dark_of(&[("background", (0x14, 0x18, 0x1e))]),
         },
         // ── the dark two. Sixteen light themes and not one dark one was
-        // the audit's finding, so these carry the ground itself dark — which
+        // the audit's finding, so these carry the ground itself dark, which
         // makes the naturals dark and the sharps darker, the way every dark
-        // instrument panel reads. Each grew from values already living here
-        // rather than invented: Nocturne is Navi's night side worn in light
-        // mode, Phosphor is the console green the scope always implied.
-        // Designed and gated by `scripts/palgen.py --dark` BEFORE this Rust
-        // existed; the factory-loop tests below are the second lock.
+        // instrument panel reads. Designed and gated by `scripts/palgen.py`
+        // BEFORE this Rust existed; the factory-loop tests below are the
+        // second lock.
         //
-        // There were three. Carbon — Default's own dark constants promoted
-        // to a theme — was retired by the owner as a worse version of
-        // Studio. It left by NAME: a saved `theme_name` of "Carbon" falls
-        // back to Default, its palette bytes stay in `STRIP_COLORS` for
-        // every desk that painted a track with them, and only `PALETTES`
-        // closed the gap, so Nocturne and Phosphor point one lower without
-        // a byte of theirs moving.
+        // There were three, then two, and the two have changed once. Carbon
+        // (Default's own dark constants promoted to a theme) was retired by
+        // the owner on 2026-09-02 as a worse version of Studio. Nocturne
+        // (Navi's night side) was retired on 2026-09-18 ("Nocturne is also
+        // just Navi: replace") and Amber took its slot. Each left by NAME: a
+        // saved `theme_name` of either falls back to Default, its palette
+        // bytes stay in `STRIP_COLORS` for every desk that painted a track
+        // with them, and only `PALETTES` moved. Carbon's retirement closed
+        // a gap (Nocturne and Phosphor pointed one lower); Nocturne's did
+        // not, because Amber's row points at its own appended run.
         //
-        // **These two NAMED their own dark keyboard, and it is gone.** In
-        // dark mode `piano::idle_colors` SWAPS the keys — naturals take the
-        // sharps' colour and sharps the naturals' — so a light theme's ivory
-        // white key becomes the bright sharp that carries the keyboard
-        // against the near-black ground, and the naturals themselves equal
-        // that ground, by the theory-ground rule. These themes are ALREADY
-        // dark, so the swap made both keys near-black and the band read as
-        // one flat mask; the answer at the time was to name
-        // `dark.white_key`/`dark.black_key` outright, one mid navy and one
-        // mid green, and lift the keyboard off its ground by hand.
+        // **These themes name their ground and nothing else.** In dark mode
+        // `piano::idle_colors` SWAPS the keys, and on a theme whose BOTH
+        // grounds are near-black every field this struct has for a key is
+        // already spoken for: `white_key` is the light page and `black_key`
+        // the dark one (`the_theory_ground_is_the_keyboard_not_the_band`).
+        // Naming `dark.white_key`/`dark.black_key` to lift the keyboard by
+        // hand was tried and was wrong (a mid slab floating on near-black;
+        // the owner photographed it four times), and their LIGHT keyboards
+        // were the same mask (1.04:1 and 1.10:1, against 9 to 15:1 on every
+        // other theme). `piano::keys_apart` lifts the sharps clear instead,
+        // in both modes and only where a theme is trapped this way, and
+        // `keys_the_right_way_up` puts the pair the right way round; see
+        // them for the rule and the numbers. The piano's
+        // `every_theme_keeps_a_legible_keyboard_in_both_modes` names the
+        // themes that need the lift, and it is these two.
         //
-        // That answer stopped being needed the day `piano::keys_apart` began
-        // walking in dark mode as well as light, and once it was not needed
-        // it was actively wrong: a natural key at 0.099 and 0.093 luminance
-        // against grounds of 0.007 and 0.002, where all sixteen other themes
-        // paint their dark naturals ON the ground at 0.010 to 0.014. The
-        // owner, photographing it a fourth time: "Dark mode - bright (and
-        // probably wrong) Keyboard." It was bright because it was the only
-        // keyboard in the set that did not sit on its own page — a mid slab
-        // floating on near-black, with the derived sharps at full bone on top
-        // of it.
-        //
-        // So they name their ground and nothing else, like everybody else,
-        // and the derivation that exists for exactly this trap does the rest.
-        // `dark.background` still equals `black_key`, the theory-ground rule
-        // the sweep beside it checks.
-        //
-        // **And their LIGHT keyboards were the same mask, which the dark fix
-        // did not touch.** The owner again: "Phosphor and Nocturne both still
-        // have the dark mode mask over the keyboard issue… the mask is in
-        // light mode." Measured before the fix: Nocturne 1.10:1, Phosphor
-        // 1.04:1, against 9–15:1 on every one of the other seventeen. The
-        // keyboard was not dim; it was absent.
-        //
-        // **Neither of these themes could fix it from here, and that is why
-        // the answer is in the piano.** The naturals must equal `background`
-        // (the theory page sits on the naturals' colour —
-        // `the_theory_ground_is_the_keyboard_not_the_band`) and the sharps
-        // must equal `dark.background` (the dark page sits on the sharps'),
-        // so on a theme whose BOTH grounds are near-black every field this
-        // struct has for a key is already spoken for. Every other theme has
-        // slack because its light ground is pale; these two have none.
-        // `piano::keys_apart` lifts the sharps clear instead, and only where
-        // a theme is trapped this way — see it for the rule and the numbers.
-        //
-        // ── Nocturne: Navi's night side, worn as the light-mode dress. The
-        // periwinkle and cyan are the same values the Navi theme carries,
-        // already proven against these very surfaces.
+        // ── Amber: the other phosphor. Phosphor is the green console; this
+        // is the amber one beside it. Everything glows one amber (text,
+        // keys, knobs, trace) with a paler bloom for what is held and the
+        // warning red-orange on the master, the same red Phosphor wears.
         Theme {
-            name: "Nocturne".to_owned(),
-            background: c(0x0a, 0x1c, 0x34),
-            white_key: c(0x0a, 0x1c, 0x34),
-            black_key: c(0x06, 0x12, 0x24),
-            key_active: c(0x7f, 0x9b, 0xff),
-            sustain: c(0x40, 0xe8, 0xff),
-            key_separator: c(0x26, 0x50, 0x80),
-            text: c(0xe0, 0xf0, 0xff),
-            theory_line: c(0x37, 0x57, 0x82),
-            interval_text: c(0xa8, 0xc8, 0xd8),
-            recorder_bg: c(0x26, 0x42, 0x6a),
-            fx_knob: c(0x00, 0xd8, 0xf8),
-            master_knob: c(0xf0, 0x90, 0x30),
-            varispeed: c(0xc9, 0xd8, 0xe8),
-            velocity_loud: c(0xfe, 0x6c, 0x56),
-            velocity_quiet: c(0x18, 0xad, 0x8f),
-            meter_bg: c(0x06, 0x12, 0x24),
-            scope_draw: c(0x40, 0xe8, 0xff),
-            fx_strip: c(0x19, 0x2e, 0x48),
-            input_chip: c(0x55, 0x78, 0xff),
-            fretboard: c(0x06, 0x12, 0x24),
-            string: c(0x78, 0x98, 0xb8),
+            name: "Amber".to_owned(),
+            background: c(0x10, 0x0c, 0x06),
+            white_key: c(0x10, 0x0c, 0x06),
+            black_key: c(0x08, 0x06, 0x04),
+            key_active: c(0xff, 0xb0, 0x00),
+            sustain: c(0xff, 0xe0, 0xa0),
+            key_separator: c(0x3a, 0x2a, 0x10),
+            text: c(0xff, 0xcf, 0x70),
+            theory_line: c(0x52, 0x40, 0x1a),
+            interval_text: c(0xe0, 0xa8, 0x48),
+            recorder_bg: c(0x2a, 0x20, 0x10),
+            fx_knob: c(0xe0, 0x9a, 0x20),
+            master_knob: c(0xff, 0x4a, 0x28),
+            varispeed: c(0xf0, 0xd8, 0xa8),
+            meter_bg: c(0x08, 0x06, 0x04),
+            scope_draw: c(0xff, 0xb0, 0x00),
+            fx_strip: c(0x20, 0x18, 0x08),
+            input_chip: c(0xe0, 0x9a, 0x20),
+            fretboard: c(0x08, 0x06, 0x04),
+            string: c(0x8a, 0x70, 0x40),
+            velocity_loud: c(0xea, 0x5c, 0x38),
+            velocity_quiet: c(0x16, 0x9c, 0x6f),
             channel_palette: Some(16),
-            dark: dark_of(&[("background", (0x06, 0x12, 0x24))]),
+            dark: dark_of(&[("background", (0x08, 0x06, 0x04))]),
         },
         // ── Phosphor: the green console. Scope-green actives, one warm
         // amber for the held state, and a warning red-orange master.
@@ -1296,10 +1345,10 @@ pub const EXAMPLE: &str = r##"{
   "_comment5": "channels, the click and the master wear. A number, not a colour,",
   "_comment6": "one palette per factory theme, in the menu's order:",
   "_comment7": "0 Default     1 Valentine   2 Hydra       3 Navi",
-  "_comment8": "4 Mono        5 Studio      6 Aurora      7 Sandstone",
-  "_comment9": "8 Centennial  9 Blueprint  10 Porcelain  11 Moss",
-  "_comment10": "12 Rhodes    13 Copper    14 Dusk       15 Iris",
-  "_comment10b": "16 Nocturne  17 Phosphor  18 Silverface",
+  "_comment8": "4 Mono        5 Ochre       6 Reed        7 Sandstone",
+  "_comment9": "8 Centennial  9 Zinc       10 Celadon    11 Moss",
+  "_comment10": "12 Rhodes    13 Copper    14 Prism      15 Storm",
+  "_comment10b": "16 Amber     17 Phosphor  18 Silverface",
   "_comment11": "It only takes effect while the track menu's palette is on AUTO;",
   "_comment12": "a palette picked by hand there outlives any theme. Leave it out",
   "_comment13": "and the channels keep dressing for whichever theme is applied.",
