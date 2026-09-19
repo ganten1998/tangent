@@ -6635,7 +6635,7 @@ struct Renderer {
     clip_parked: bool,
     /// Every pitch currently sounding, from the note stream this renderer
     /// itself handed out. What a stop or a jump has to end.
-    sounding: u128,
+    live_sounding: u128,
     /// The clip arriving, and the one going back to be dropped where it came
     /// from. The pair IS the routing, exactly as a plugin's is.
     track_incoming: Consumer<Vec<Placed>>,
@@ -7751,9 +7751,9 @@ impl Renderer {
                 if let Ok(pitch) = u8::try_from(note.pitch) {
                     if pitch < 128 {
                         if note.on {
-                            self.sounding |= 1 << pitch;
+                            self.live_sounding |= 1 << pitch;
                         } else {
-                            self.sounding &= !(1 << pitch);
+                            self.live_sounding &= !(1 << pitch);
                         }
                     }
                 }
@@ -8097,12 +8097,16 @@ impl Renderer {
             self.publish_latency();
             let muted = self.muted_now(muted);
             let flush = jumped || (self.was_rolling && !rolling);
-            if flush && self.sounding != 0 {
+            if flush && self.live_sounding != 0 {
                 for d in self.dx7s.iter_mut().flatten() {
                     d.all_notes_off();
                 }
+                for k in self.keys_lanes.iter_mut().flatten() {
+                    k.all_notes_off();
+                }
                 for pitch in 0..128u8 {
-                    if self.sounding & (1 << pitch) != 0 && self.notes.len() < MAX_EVENTS_PER_BLOCK
+                    if self.live_sounding & (1 << pitch) != 0
+                        && self.notes.len() < MAX_EVENTS_PER_BLOCK
                     {
                         self.notes.push(Note {
                             offset: 0,
@@ -8110,9 +8114,19 @@ impl Renderer {
                             velocity: 0.0,
                             on: false,
                         });
+                        // **And the lane mask beside it, or this never
+                        // arrives.** The per-lane walk reads the live list as
+                        // `notes.iter().zip(&note_lanes)`, and a zip stops at
+                        // the shorter side: every off pushed here was dropped
+                        // on the floor, and only the blanket sweep above kept
+                        // a DX7 from ringing through a stop. Every lane,
+                        // because an off for a pitch a lane is not holding is
+                        // a no-op everywhere, and the alternative is
+                        // remembering which lanes were told about each pitch.
+                        self.note_lanes.push(u32::MAX);
                     }
                 }
-                self.sounding = 0;
+                self.live_sounding = 0;
             }
             self.was_rolling = rolling;
             // The stem tap's block: the flag read once, the scratch
@@ -11865,7 +11879,6 @@ impl Renderer {
                             });
                         }
                         if a.key < 128 {
-                            self.sounding &= !(1u128 << a.key);
                         }
                         self.active_clip.swap_remove(i);
                         continue;
@@ -11895,7 +11908,6 @@ impl Renderer {
                             });
                         }
                         if a.key < 128 {
-                            self.sounding &= !(1u128 << a.key);
                         }
                         self.active_clip.swap_remove(i);
                         continue;
@@ -11923,7 +11935,7 @@ impl Renderer {
                         // at the top of this one, instead of being dropped.
                         if (on_f < due_from && !parked)
                             || nt.at >= mc.len
-                            || on_f >= self.shared.punch[ch].load(Ordering::Relaxed)
+                            || on_f >= self.punch_now[ch]
                         {
                             cur += 1;
                             continue;
@@ -11992,7 +12004,6 @@ impl Renderer {
                             off: mc.start.saturating_add(end_rel),
                         });
                         if nt.key < 128 {
-                            self.sounding |= 1u128 << nt.key;
                         }
                     }
                     self.midi_cursor[idx] = cur;
@@ -12011,7 +12022,6 @@ impl Renderer {
                             });
                         }
                         if a.key < 128 {
-                            self.sounding &= !(1u128 << a.key);
                         }
                         self.active_clip.swap_remove(i);
                         continue;
@@ -14386,7 +14396,7 @@ impl Engine {
             pending_flush: false,
             pending_wrap_from: None,
             clip_parked: false,
-            sounding: 0,
+            live_sounding: 0,
             bar_clock: BarClock::default(),
             maps: Maps::default(),
             maps_incoming,
@@ -20356,7 +20366,7 @@ mod tests {
             pending_flush: false,
             pending_wrap_from: None,
             clip_parked: false,
-            sounding: 0,
+            live_sounding: 0,
             // Abandoned peers, like the MIDI ring above: pop reports empty
             // and push fills to capacity, which is all a test needs.
             track_incoming: RingBuffer::<Vec<Placed>>::new(2).1,
@@ -27488,14 +27498,14 @@ mod tests {
         // parked note sounds.
         out.fill(0.0);
         r.render(&mut out, 0, 0);
-        assert!(
-            r.sounding & (1 << 100) != 0,
-            "the withheld clip note never sounded"
-        );
+        // **Asked of `active_clip` and not of the live ledger.** The ledger
+        // used to carry clip notes too, on the same pitch-keyed word the live
+        // stream uses, and it no longer does: `active_clip` carries the lane
+        // as well and is what every clip off is actually emitted from.
         assert!(
             r.active_clip.iter().any(|a| a.key == 100 && a.lane == 2),
-            "the parked note is missing from the sounding ledger, so its \
-             off will never be emitted"
+            "the withheld clip note never sounded, so its off will never be \
+             emitted either"
         );
         assert_eq!(r.midi_cursor[2], 1);
     }
@@ -27986,6 +27996,53 @@ mod tests {
         );
     }
 
+    /// **A note held through a stop is told to stop, and the telling
+    /// arrives.**
+    ///
+    /// The flush pushes a velocity-zero note for every pitch the live stream
+    /// is holding, and every one of them was dropped on the floor. The
+    /// per-lane walk reads the live list as `notes.iter().zip(&note_lanes)`,
+    /// a zip stops at the shorter side, and the flush pushed to the notes and
+    /// not to the mask. Only the blanket sweep beside it kept a DX7 from
+    /// ringing through a stop, and that sweep reaches no Keys instance, no
+    /// Analog and no hosted plugin.
+    ///
+    /// The two lists are the delivery contract, so this asserts the contract
+    /// rather than one instrument's silence: any future note pushed without a
+    /// mask goes the same way and this catches it.
+    #[test]
+    fn a_note_ended_by_a_stop_is_told_to_a_lane() {
+        let (mut r, mut tx, shared) = renderer_with_midi(2);
+        shared.rolling.store(true, Ordering::Relaxed);
+        let mut out = vec![0.0_f32; 2 * 64];
+        queue(&mut tx, 0, [0x90, 64, 100]);
+        r.render(&mut out, 0, 0);
+        assert_ne!(r.live_sounding & (1 << 64), 0, "the note-on was never seen");
+        assert_eq!(
+            r.notes.len(),
+            r.note_lanes.len(),
+            "the live list and its lane masks are already out of step"
+        );
+
+        // Stop: the flush falls due on the next block.
+        shared.rolling.store(false, Ordering::Relaxed);
+        r.render(&mut out, 0, 0);
+        assert_eq!(r.live_sounding, 0, "stopping left a note stranded");
+        assert_eq!(
+            r.notes.len(),
+            r.note_lanes.len(),
+            "the flush pushed a note-off with no lane mask, so the zip in the \
+             lane walk drops it and every instrument but a DX7 rings on"
+        );
+        assert!(
+            r.notes
+                .iter()
+                .zip(&r.note_lanes)
+                .any(|(n, m)| !n.on && n.pitch == 64 && *m != 0),
+            "no lane was told the held note had ended"
+        );
+    }
+
     /// **A parked transport seeds silence.**
     ///
     /// The clip walk used to return after zeroing when the transport was not
@@ -28283,11 +28340,11 @@ mod tests {
         queue(&mut tx, 0, [0x90, 60, 100]);
         let mut out = vec![0.0_f32; 2 * 64];
         r.render(&mut out, 0, 0);
-        assert_ne!(r.sounding & (1 << 60), 0, "the note-on was never seen");
+        assert_ne!(r.live_sounding & (1 << 60), 0, "the note-on was never seen");
         shared.rolling.store(false, Ordering::Relaxed);
         let mut out = vec![0.0_f32; 2 * 64];
         r.render(&mut out, 0, 0);
-        assert_eq!(r.sounding, 0, "stopping left a note stranded");
+        assert_eq!(r.live_sounding, 0, "stopping left a note stranded");
     }
 
     /// **The built-in's slot fader moves the built-in.**
