@@ -9730,6 +9730,11 @@ impl TangentApp {
                 beats: s.record_count_in_beats,
                 in_take: s.record_count_in_in_take,
             }),
+            look: Some(crate::arrangement::LookRef {
+                theme: &s.theme_name,
+                palette: s.palette_choice,
+                palette_auto: s.palette_auto,
+            }),
             // **No name is the empty string here**, never a missing key:
             // `None` on this field means the DOCUMENT did not say, and a
             // live desk always does. See `DeskSnap::take_name`.
@@ -9989,6 +9994,31 @@ impl TangentApp {
             self.settings.metronome_div = c.div.clamp(0, 8);
             self.settings.metronome_in_take = c.in_take;
             self.settings.click_sample = c.sample.clone();
+        }
+        // **The session's look.** See `arrangement::Look`: the document
+        // carries the theme's NAME, not forty resolved colours.
+        //
+        // The order is the point. `palette_auto` is set FIRST because
+        // `Theme::apply` reads it and leaves `palette_choice` alone when a
+        // palette was picked by hand; then the theme paints every role; then
+        // a hand-picked palette is put back over the top, because `apply`
+        // deliberately did not touch it.
+        //
+        // A name that has gone - a user theme whose file was deleted, or a
+        // document from another machine - falls back to the factory default,
+        // which is what every other theme lookup in this app does and is the
+        // one theme that always exists.
+        if let Some(l) = d.look.as_ref() {
+            self.settings.palette_auto = l.palette_auto;
+            match crate::theme::by_name(&l.theme) {
+                Some(t) => t.apply(&mut self.settings),
+                None => crate::theme::Theme::factory_default().apply(&mut self.settings),
+            }
+            if !l.palette_auto {
+                self.settings.palette_choice = l
+                    .palette
+                    .rem_euclid(crate::mixer_panel::PALETTES.len() as i64);
+            }
         }
         if let Some(v) = d.transpose {
             self.settings.transpose =
@@ -25204,6 +25234,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
         if let Some(t) = all.get(at) {
             t.apply(&mut self.settings);
             self.save_settings();
+            // **A look is a session edit now.** See `arrangement::Look`: the
+            // theme travels in the document, so changing it changes the desk
+            // and the document has to be able to say so - and to undo it.
+            self.undo_commit();
         }
     }
 
@@ -31002,6 +31036,8 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     crate::theme::Theme::factory_default().apply(&mut self.settings);
                 }
                 self.save_settings();
+                // See `cycle_theme`: the theme is part of the session.
+                self.undo_commit();
             }
             MenuAction::SaveThemeAs => {
                 // The colours the app is wearing, named by hand. Seeded with
@@ -32296,6 +32332,10 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
                     *palette_auto = self.settings.palette_auto;
                 }
                 self.save_settings();
+                // The palette travels in the document beside the theme, and
+                // the neighbouring `TrackColor` row already committed. See
+                // `arrangement::Look`.
+                self.undo_commit();
             }
             DialogAction::ProjectExportOpen => {
                 let mut spec = self.export_project_spec.clone();
@@ -59415,6 +59455,17 @@ mod folder_tests {
         s.fretboard_capo = 2;
         s.capo_style = "silver".into();
         s.fretboard_tuning = "Drop D".into();
+        // **The look, through the theme's own door.** Applying it rather
+        // than setting `theme_name` by hand is the point: what has to travel
+        // is a theme the open can re-apply, so the fixture has to be a
+        // session a theme really painted. The palette is then taken off auto
+        // by hand, which is the state a document must be able to say and a
+        // name alone cannot.
+        crate::theme::by_name("Rhodes")
+            .expect("Rhodes is a factory theme")
+            .apply(s);
+        s.palette_auto = false;
+        s.palette_choice = 6;
 
         // Written into the document exactly as a save writes one.
         let mut arr = crate::arrangement::Arrangement::default();
@@ -59457,6 +59508,8 @@ mod folder_tests {
         s.fretboard_capo = 0;
         s.capo_style = "wood".into();
         s.fretboard_tuning = "Standard".into();
+        crate::theme::Theme::factory_default().apply(s);
+        s.palette_auto = true;
 
         app.open_project(&doc);
 
@@ -59496,6 +59549,18 @@ mod folder_tests {
         assert_eq!(s.record_count_in_bars, 2, "the count-in");
         assert!(s.record_count_in_in_take, "the count-in going into the take");
         assert_eq!(s.record_take_name.as_deref(), Some("nocturne"), "the take name");
+        // **The theme, and that it was APPLIED and not merely remembered.**
+        // A name in the settings with the last session's colours still on
+        // screen is the fault in a new costume, so the background is checked
+        // against the theme's own rather than against a literal.
+        assert_eq!(s.theme_name, "Rhodes", "the theme's name");
+        assert_eq!(
+            Some(s.background_color),
+            crate::theme::by_name("Rhodes").expect("Rhodes").background,
+            "the theme's name came back but its colours did not"
+        );
+        assert!(!s.palette_auto, "the hand-picked palette went back to auto");
+        assert_eq!(s.palette_choice, 6, "the channel palette");
         assert!(!s.midi_snap, "the editor's magnet");
         assert_eq!(s.midi_grid_exp, -5, "the editor's grid");
         assert!(!s.midi_swing, "the swing switch");

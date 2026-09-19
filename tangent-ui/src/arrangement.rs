@@ -1107,6 +1107,8 @@ pub struct DeskSnap {
     pub feel: Option<Feel>,
     /// See [`Notation`].
     pub notation: Option<Notation>,
+    /// See [`Look`].
+    pub look: Option<Look>,
     /// **Which lanes are frozen, and to what file.** See [`FrozenLane`].
     ///
     /// The one desk field where "the document does not say" does NOT mean
@@ -1181,6 +1183,37 @@ pub struct Click {
     pub in_take: bool,
     /// `click_sample`: the sound file, empty for the one that ships.
     pub sample: String,
+}
+
+/// **What the session LOOKS like** — its theme, and the channel palette.
+///
+/// The owner asked for it after everything else had moved: "make themes
+/// session dependent". A theme was one of the few things the 2026-09-15 sweep
+/// left in settings on purpose, beside the hardware and the window, and the
+/// reason it is a fair thing to move is that a theme is about the WORK -
+/// which song this is - and not about the machine it is being made on.
+///
+/// **The NAME, and not the colours.** That is the app's own model of a theme
+/// already: `Theme::apply`'s doc says "the theme name is the record. Someone
+/// who then hand-edits one colour has a modified theme, and `capture` is how
+/// they keep it." Storing forty resolved colours per document would freeze
+/// every project against a theme that is later edited, and would make a
+/// hand-tweaked palette undistinguishable from a named one. A name that has
+/// gone - a deleted user theme - falls back the way every other name lookup
+/// in this app falls back, to the one theme that always exists.
+///
+/// The palette travels beside it because it is a colour decision the user
+/// makes in the same breath, and `palette_auto` travels beside THAT because
+/// without it a document could not say the difference between "this session
+/// follows its theme's palette" and "this session was left on palette 6".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Look {
+    /// `theme_name`.
+    pub theme: String,
+    /// `palette_choice`: the index into `mixer_panel::PALETTES`.
+    pub palette: i64,
+    /// `palette_auto`: the palette follows the theme rather than a hand pick.
+    pub palette_auto: bool,
 }
 
 /// **The count-in** — its length in bars, the legacy beats key that length
@@ -1389,6 +1422,8 @@ pub struct DeskRef<'a> {
     pub feel: Option<Feel>,
     /// See [`DeskSnap::notation`].
     pub notation: Option<NotationRef<'a>>,
+    /// See [`DeskSnap::look`].
+    pub look: Option<LookRef<'a>>,
     /// See [`DeskSnap::frozen`].
     pub frozen: Option<&'a [FrozenLane]>,
 }
@@ -1423,6 +1458,14 @@ pub struct NotationRef<'a> {
     pub capo: i64,
     pub capo_style: &'a str,
     pub tuning: &'a str,
+}
+
+/// [`Look`] borrowed — see [`DeskRef`].
+#[derive(Clone, Copy)]
+pub struct LookRef<'a> {
+    pub theme: &'a str,
+    pub palette: i64,
+    pub palette_auto: bool,
 }
 
 /// [`Instruments`] borrowed — see [`DeskRef`].
@@ -1497,6 +1540,11 @@ impl DeskRef<'_> {
             }),
             transpose: self.transpose,
             count_in: self.count_in,
+            look: self.look.map(|l| Look {
+                theme: l.theme.to_owned(),
+                palette: l.palette,
+                palette_auto: l.palette_auto,
+            }),
             take_name: self.take_name.map(str::to_owned),
             feel: self.feel,
             notation: self.notation.map(|n| Notation {
@@ -1741,6 +1789,16 @@ impl DeskRef<'_> {
                 f.u64(z.len_s.to_bits());
             }
         }
+        // **Appended, and that is the rule for every field added here**: the
+        // fingerprint is a walk in declaration order, so a term inserted
+        // among the others moves every existing document's hash and reads as
+        // "everything changed" the first time an old session is opened.
+        opt(f, self.look.is_some());
+        if let Some(l) = self.look {
+            f.str(l.theme);
+            f.u64(l.palette as u64);
+            f.bool(l.palette_auto);
+        }
     }
 }
 
@@ -1807,6 +1865,11 @@ impl DeskSnap {
             }),
             transpose: self.transpose,
             count_in: self.count_in,
+            look: self.look.as_ref().map(|l| LookRef {
+                theme: &l.theme,
+                palette: l.palette,
+                palette_auto: l.palette_auto,
+            }),
             take_name: self.take_name.as_deref(),
             feel: self.feel,
             notation: self.notation.as_ref().map(|n| NotationRef {
@@ -2060,6 +2123,13 @@ impl DeskSnap {
             cm.insert("beats".into(), Value::Number(c.beats.into()));
             cm.insert("in_take".into(), Value::Bool(c.in_take));
             m.insert("count_in".into(), Value::Object(cm));
+        }
+        if let Some(l) = self.look.as_ref() {
+            let mut lm = Map::new();
+            lm.insert("theme".into(), Value::String(l.theme.clone()));
+            lm.insert("palette".into(), Value::Number(l.palette.into()));
+            lm.insert("palette_auto".into(), Value::Bool(l.palette_auto));
+            m.insert("look".into(), Value::Object(lm));
         }
         if let Some(v) = self.take_name.as_ref() {
             m.insert("take_name".into(), Value::String(v.clone()));
@@ -2416,6 +2486,22 @@ impl DeskSnap {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                 }
+            }),
+            look: m.get("look").and_then(Value::as_object).map(|lm| Look {
+                theme: lm
+                    .get("theme")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                palette: lm.get("palette").and_then(Value::as_i64).unwrap_or(0),
+                // **True when the key is missing**, because that is what a
+                // theme's own palette does by default: a document written by
+                // a build that did not know about the hand pick should open
+                // following its theme rather than pinned to palette zero.
+                palette_auto: lm
+                    .get("palette_auto")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
             }),
             take_name: m.get("take_name").and_then(Value::as_str).map(str::to_owned),
             feel: m.get("feel").and_then(Value::as_object).map(|fm| {
@@ -4572,6 +4658,11 @@ mod tests {
             }),
             transpose: Some(-3),
             count_in: Some(CountIn { bars: 2, beats: 8, in_take: true }),
+            look: Some(Look {
+                theme: "Rhodes".into(),
+                palette: 6,
+                palette_auto: false,
+            }),
             take_name: Some("nocturne".into()),
             feel: Some(Feel {
                 snap: true,
@@ -5008,6 +5099,16 @@ mod tests {
             desk(a).count_in.as_mut().unwrap().in_take = false;
         });
         moves_both("the count-in going unsaid", |a| desk(a).count_in = None);
+        moves_both("the theme", |a| {
+            desk(a).look.as_mut().unwrap().theme = "Centennial".into();
+        });
+        moves_both("the channel palette", |a| {
+            desk(a).look.as_mut().unwrap().palette = 2;
+        });
+        moves_both("the palette going back to following the theme", |a| {
+            desk(a).look.as_mut().unwrap().palette_auto = true;
+        });
+        moves_both("the look going unsaid", |a| desk(a).look = None);
         moves_both("the take name", |a| desk(a).take_name = Some("etude".into()));
         // **A CLEARED name is not an unsaid one.** The empty string is a
         // document saying "no name", which a session holding one has to be
