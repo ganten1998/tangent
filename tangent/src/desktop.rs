@@ -19523,6 +19523,116 @@ mod tests {
         }
     }
 
+    /// **Render a real project offline and hunt for discontinuities.**
+    ///
+    /// `TANGENT_PROJECT=knowersomething1 cargo test --release -p tangent
+    /// --bin tangent the_master_has_no_discontinuities -- --ignored
+    /// --nocapture`
+    ///
+    /// A breakup that the load meter does not show is not a missed deadline,
+    /// it is a wrong sample. This renders the song through the same offline
+    /// path the export uses and reports every place the master jumps by more
+    /// than a neighbourhood of it can explain, which is what a click is.
+    ///
+    /// It cannot prove there is no click a listener would hear, because a
+    /// discontinuity inside a loud passage is masked and a quiet one is not.
+    /// What it does is turn "somewhere in the song" into a frame number.
+    #[test]
+    #[ignore = "a hunt over a real project, not an assertion"]
+    fn the_master_has_no_discontinuities() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let name = std::env::var("TANGENT_PROJECT").unwrap_or_else(|_| "knowersomething1".into());
+        let doc = home
+            .join("Documents/Tangent Media/Projects")
+            .join(&name)
+            .join("project.tan");
+        if !doc.is_file() {
+            println!("no project at {}", doc.display());
+            return;
+        }
+        let shelf = std::env::temp_dir().join(format!("tangent-click-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&shelf);
+        // SAFETY: single-threaded here, and a path this process just made.
+        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", shelf.join("settings.json")) };
+        let ctx = egui::Context::default();
+        let mut app = TangentApp::new(&ctx, Settings::default(), Caps::PLUGIN);
+        app.open_project(&doc);
+        let rate = 48_000u32;
+        let Ok(mut e) =
+            crate::instrument::Engine::offline(rate, tangent_record::audio::Timebase::new())
+        else {
+            return;
+        };
+        furnish_probe_engine(&mut e, &app, rate);
+        e.set_transport(2, 0);
+        e.set_rolling(true);
+
+        let block = 256usize;
+        let seconds = 60usize;
+        let blocks = seconds * rate as usize / block;
+        let mut out = vec![0.0f32; block * 2];
+        let mut whole: Vec<f32> = Vec::with_capacity(blocks * block * 2);
+        for _ in 0..blocks {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            whole.extend_from_slice(&out);
+        }
+
+        // **The whole master, raw**, when somewhere to put it is named. Two
+        // builds rendering the same project must produce the same samples,
+        // and comparing them is the only way to tell a click this overhaul
+        // introduced from a transient the song has always had.
+        if let Some(path) = std::env::var_os("TANGENT_DUMP") {
+            let mut bytes = Vec::with_capacity(whole.len() * 4);
+            for v in &whole {
+                bytes.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+            let _ = std::fs::write(&path, &bytes);
+            println!("    wrote {} samples to {}", whole.len(), path.to_string_lossy());
+        }
+
+        // A click is a step far larger than the steps around it. The window
+        // is a tenth of a second, which is long enough to hold a transient
+        // and short enough not to average a whole song into one number.
+        let win = rate as usize / 10;
+        let mut worst: Vec<(usize, f32, f32)> = Vec::new();
+        for ch in 0..2 {
+            let x: Vec<f32> = whole.iter().skip(ch).step_by(2).copied().collect();
+            for start in (0..x.len().saturating_sub(win)).step_by(win) {
+                let s = &x[start..start + win];
+                let mut steps: Vec<f32> = s.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+                if steps.is_empty() {
+                    continue;
+                }
+                steps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let median = steps[steps.len() / 2];
+                let biggest = *steps.last().unwrap_or(&0.0);
+                // A transient is a few times the median. Forty times it, on
+                // a window that has any signal at all, is not a transient.
+                if median > 1.0e-7 && biggest > median * 40.0 && biggest > 0.01 {
+                    worst.push((start, biggest, median));
+                }
+            }
+        }
+        worst.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let peak = whole.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        println!(
+            "{name}: {} frames rendered, peak {peak:.4}, {} suspicious windows",
+            whole.len() / 2,
+            worst.len()
+        );
+        for (at, jump, median) in worst.iter().take(12) {
+            println!(
+                "    frame {at} ({:.2} s): step {jump:.4} against a median of {median:.6}, \
+                 block boundary {}",
+                *at as f64 / f64::from(rate),
+                at % block == 0
+            );
+        }
+    }
+
     /// Furnish `e` from `app` with everything the eligibility probe reads,
     /// plus the racks and clips without which the lanes cost nothing and the
     /// nanosecond weighting would mean nothing.
