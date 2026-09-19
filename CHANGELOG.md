@@ -101,6 +101,23 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The right-click menu stops jumping to the top when you reach for a
+  submenu.** A panel that would run off the bottom of the screen is pulled
+  upward, and most of this menu's categories open from rows below halfway,
+  so the panel often sits well above the row that opened it. Getting to it
+  means moving up and across the rows in between, and pausing on any of them
+  for a seventh of a second switched to that one instead. With the panel
+  clamped near the top of the screen, the row you landed on was the first
+  category in the list, which is exactly what it looked like: the menu
+  jumping to the top.
+
+  A hand inside the triangle between where it started and the open panel is
+  now read as travelling rather than choosing, which is what native menus
+  do and what the earlier fix, a plain delay, could not achieve. A hand that
+  stops is still choosing, a press still decides immediately, and the
+  corridor gives up after four tenths of a second so a hand parked in it can
+  still pick something else.
+
 - **An export no longer loses the third drum track onward.** A kit crosses
   to the engine on a handoff ring that held two, which was enough for the
   live desk because it retries a refused kit on the next frame until it
