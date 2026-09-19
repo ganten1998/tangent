@@ -3765,6 +3765,523 @@ struct KeyFeed<'a> {
 /// opinion — and it is the word `no_writer_runs_a_folders_rack_except_the_fold`
 /// looks for above the call below.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+mod seat_disjointness {
+    use super::*;
+
+    /// **No two lanes share a seat**, which is the whole argument that lets
+    /// `lane_seats` hand a lane its racks with three `split_at_mut`s and no
+    /// unsafe, and the whole argument that will let a worker hold them.
+    /// Asserted rather than read off the constants, because the constants
+    /// live in another crate and a block inserted between them would break
+    /// this silently.
+    #[test]
+    fn the_seats_a_lane_owns_never_meet_another_lanes() {
+        use tangent_ui::recorder::{amp_pedal_seat, folder_extra_seat, AMP_PEDALS};
+        let mut seen = std::collections::HashMap::new();
+        for ch in 0..CHANNELS {
+            let mut mine = vec![ch, folder_extra_seat(ch)];
+            mine.extend((0..AMP_PEDALS).map(|p| amp_pedal_seat(ch, p)));
+            // The order `lane_seats` splits on: own seat, then the extra,
+            // then the board, each strictly after the last.
+            assert!(ch < folder_extra_seat(ch), "lane {ch}: the extra seat is not past the channel");
+            assert!(
+                folder_extra_seat(ch) < amp_pedal_seat(ch, 0),
+                "lane {ch}: the board is not past the extra seat"
+            );
+            assert!(
+                amp_pedal_seat(ch, AMP_PEDALS - 1) < RACK_SEATS,
+                "lane {ch}: the board runs off the end of the bank"
+            );
+            for seat in mine {
+                if let Some(other) = seen.insert(seat, ch) {
+                    panic!("seat {seat} belongs to lane {other} and to lane {ch}");
+                }
+            }
+        }
+    }
+}
+
+/// **One lane's seats, carved out of the bank so the compiler can see they
+/// are its own.**
+///
+/// Three `split_at_mut`s and no unsafe. It works because `recorder.rs` lays
+/// the blocks out end to end and lane-strided: a channel's own seat is
+/// `ch`, its extra rack is `FOLDER_EXTRA_SEATS + ch`, and its board is the
+/// seven at `AMP_PEDAL_SEATS + ch * AMP_PEDALS`. Those three are ordered
+/// and never overlap, for any `ch`, which is what makes the split legal for
+/// a lane and therefore for a worker. `None` when the bank is short, which
+/// no shipped desk is and every test is entitled to be.
+fn lane_seats<'a>(
+    racks: &'a mut [Rack],
+    dx7s: &'a mut [Option<Box<crate::dx7::Dx7>>],
+    keys_lanes: &'a mut [Option<Box<crate::keys::Keys>>],
+    pdc: &'a mut [DelayLine],
+    dry_pdc: &'a mut [DelayLine],
+    ch: usize,
+) -> Option<LaneSeats<'a>> {
+    let extra_at = tangent_ui::recorder::folder_extra_seat(ch);
+    let board_at = tangent_ui::recorder::amp_pedal_seat(ch, 0);
+    let pedals = tangent_ui::recorder::AMP_PEDALS;
+    if ch >= CHANNELS || board_at + pedals > racks.len() || extra_at <= ch || board_at <= extra_at {
+        return None;
+    }
+    let (low, rest) = racks.split_at_mut(extra_at);
+    let (mid, high) = rest.split_at_mut(board_at - extra_at);
+    Some(LaneSeats {
+        rack: low.get_mut(ch)?,
+        extra: mid.first_mut()?,
+        board: high.get_mut(..pedals)?,
+        dx7: dx7s.get_mut(ch)?,
+        keys: keys_lanes.get_mut(ch)?,
+        rack_pdc: pdc.get_mut(ch)?,
+        dry_pdc: dry_pdc.get_mut(ch)?,
+    })
+}
+
+/// **The buffers one lane renders through.**
+///
+/// One set served the whole desk while the lane pass was a single walk, and
+/// that is exactly what a second lane cannot borrow: every one of these is
+/// written by the lane being rendered and read by the next line of its own
+/// chain. Gathered into a struct so that the day the pass forks, a worker
+/// takes one of these and the compiler proves the rest of the desk is not
+/// in it.
+struct LaneIo<'a> {
+    fx_in: &'a mut Vec<Vec<f32>>,
+    fx_out: &'a mut Vec<Vec<f32>>,
+    dry_io: &'a mut Vec<Vec<f32>>,
+    key_io: &'a mut Vec<Vec<f32>>,
+    builtin: &'a mut Vec<f32>,
+    keys_scratch: &'a mut Vec<f32>,
+}
+
+/// **The seats and the machines lane `ch` owns, and nothing else's.**
+///
+/// Disjoint across lanes by seat arithmetic rather than by convention:
+/// `folder_extra_seat(ch)` is `FOLDER_EXTRA_SEATS + ch` and
+/// `amp_pedal_seat(ch, p)` is `AMP_PEDAL_SEATS + ch * AMP_PEDALS + p`, with
+/// the two blocks laid end to end, so one `split_at_mut` of the rack bank
+/// hands every lane its own without a line of unsafe. See
+/// `the_seats_a_lane_owns_never_meet_another_lanes`.
+struct LaneSeats<'a> {
+    rack: &'a mut Rack,
+    extra: &'a mut Rack,
+    board: &'a mut [Rack],
+    dx7: &'a mut Option<Box<crate::dx7::Dx7>>,
+    keys: &'a mut Option<Box<crate::keys::Keys>>,
+    rack_pdc: &'a mut DelayLine,
+    dry_pdc: &'a mut DelayLine,
+}
+
+/// **What the lane pass decided about one lane before it rendered.**
+///
+/// Everything here is read from the desk while the pass is still serial, so
+/// that the render itself asks the desk nothing. The two that are not mere
+/// copies are worth naming: `board_runs` carries the pedalboard CLAIM,
+/// which is one word for the whole desk and therefore the caller's to take;
+/// and `sample`, `notes` and `controls` are borrows of state the serial
+/// half built.
+struct LanePlan<'a> {
+    ch: usize,
+    frames: usize,
+    is_builtin: bool,
+    is_keys: bool,
+    is_folder: bool,
+    rack_live: bool,
+    has_audio: bool,
+    room_owns: bool,
+    armed: bool,
+    board_runs: bool,
+    stems_dry: bool,
+    keys_live: bool,
+    pdc_max: u32,
+    folder_lat: u32,
+    pedal_latency: u32,
+    notes: &'a [Note],
+    controls: &'a [Control],
+    sample: Option<&'a SamplerSample>,
+}
+
+/// **What every lane reads and none of them writes.**
+struct DeskRef<'a> {
+    clip_lane: &'a [f32],
+    auto_params: &'a [Vec<tangent_host::ParamPoint>],
+    shared: &'a Shared,
+    key_prev: &'a [f32],
+    key_prev_frames: usize,
+    /// The LIVE control list, which the pedalboard takes when the lane is
+    /// armed. The lane's own list is `LanePlan::controls`.
+    controls: &'a [Control],
+}
+
+/// **One lane, from its source to the end of its delay line.**
+///
+/// Lifted out of `mix_channels` unchanged: the same seed, the same
+/// instrument render, the same dry copy, the same pedalboard, the same two
+/// racks and the same two delay lines, in the same order. What changed is
+/// what it borrows. It took the whole renderer and reached into it for
+/// twenty fields; it now takes one lane's seats, one set of buffers, the
+/// decisions the serial pass made and a read-only view of the desk - which
+/// is the shape a worker can be handed.
+///
+/// Answers whether the lane produced anything to fold. `false` is every one
+/// of the three ways the old body reached its `continue`: a scratch too
+/// short for the block, and an inactive instrument on a bare lane.
+fn render_lane(
+    seats: &mut LaneSeats<'_>,
+    io: &mut LaneIo<'_>,
+    plan: &LanePlan<'_>,
+    desk: &DeskRef<'_>,
+) -> bool {
+    let ch = plan.ch;
+    let frames = plan.frames;
+    let is_builtin = plan.is_builtin;
+    let is_keys = plan.is_keys;
+    let is_folder = plan.is_folder;
+    let rack_live = plan.rack_live;
+    let has_audio = plan.has_audio;
+    let room_owns = plan.room_owns;
+    let armed = plan.armed;
+    let pdc_max = plan.pdc_max;
+    let lane_notes = plan.notes;
+    let lane_controls = plan.controls;
+    // **The lane's SOURCE, planar for the rack — the timeline's
+    // audio first.**
+    //
+    // This used to be three branches that each FILLED `fx_in`: the
+    // DX7 wrote its render over it, the keyboard wrote its render
+    // over it, and everything else wrote silence. The timeline was
+    // nowhere in the list, because the timeline folded itself onto
+    // the bus somewhere else entirely.
+    //
+    // Seeding first and ADDING after is what lets both live on one
+    // lane. The two instrument scratches are zeroed and then
+    // rendered into — the instruments ADD, which is why the scratch
+    // exists at all — so `+=` here is the same arithmetic the old
+    // `=` was over a buffer that had just been filled with silence,
+    // and it is the only shape in which a lane can carry an
+    // instrument AND a clip without one of them being quietly
+    // discarded.
+    {
+        // **A clip the ROOM has taken is not seeded here.** When this
+        // lane's rack belongs to the room, the monitor pass sums this
+        // same clip into its own pre-rack input and folds it wet — so
+        // seeding it here as well would put it on the bus twice, once
+        // wet and once dry. The lane keeps everything else it carries:
+        // its instrument, its notes, its fader, its meter.
+        let clip_here = has_audio && !room_owns;
+        // Disjoint fields borrow disjointly, which is the only
+        // reason this can be written as a copy rather than a
+        // per-sample method call.
+        let (fx, clip) = (&mut io.fx_in, &desk.clip_lane);
+        for c in 0..TAP_CHANNELS {
+            let Some(dst) = fx.get_mut(c) else {
+                continue;
+            };
+            if clip_here {
+                for f in 0..frames {
+                    dst[f] = clip
+                        .get(f * CHANNELS * 2 + ch * 2 + c)
+                        .copied()
+                        .unwrap_or(0.0);
+                }
+            } else {
+                let n = frames.min(dst.len());
+                dst[..n].fill(0.0);
+            }
+        }
+    }
+    // One scratch serves every lane of an instrument kind: this lane
+    // renders, copies out, and only then does the walk reach the next.
+    if is_builtin && seats.dx7.as_ref().is_some_and(|d| d.active()) {
+        let want = frames * TAP_CHANNELS;
+        let Some(scratch) = io.builtin.get_mut(..want) else {
+            return false;
+        };
+        scratch.fill(0.0);
+        if let Some(d) = seats.dx7.as_mut() {
+            d.render(scratch, frames, TAP_CHANNELS);
+        }
+        for c in 0..TAP_CHANNELS {
+            let Some(dst) = io.fx_in.get_mut(c) else {
+                continue;
+            };
+            for f in 0..frames {
+                dst[f] += scratch[f * TAP_CHANNELS + c];
+            }
+        }
+    } else if is_keys && seats.keys.as_ref().is_some_and(|k| k.active()) {
+        // Its own scratch, for the reason `builtin_scratch` documents:
+        // the instrument ADDS into what it is handed, so rendering it
+        // onto the bus would leave no moment at which its contribution
+        // is separable and therefore none at which a fader can reach
+        // it. The DX7's slot fader was silent for exactly that reason.
+        let want = frames * TAP_CHANNELS;
+        let Some(scratch) = io.keys_scratch.get_mut(..want) else {
+            return false;
+        };
+        scratch.fill(0.0);
+        if let Some(k) = seats.keys.as_mut() {
+            k.render(scratch, frames, TAP_CHANNELS);
+        }
+        for c in 0..TAP_CHANNELS {
+            let Some(dst) = io.fx_in.get_mut(c) else {
+                continue;
+            };
+            for f in 0..frames {
+                dst[f] += scratch[f * TAP_CHANNELS + c];
+            }
+        }
+    } else if !rack_live && !has_audio {
+        // Nothing to play and nothing to play it through: an
+        // inactive instrument on a bare lane. The seed above has
+        // already left `fx_in` silent, so there is nothing to undo.
+        return false;
+    }
+    // **The dry copy, taken here: after the source is assembled and
+    // before one plugin has seen it.**
+    //
+    // This is the only moment in the block at which a channel's own
+    // audio exists WITHOUT its own processing: the clip and the
+    // instrument have just finished being summed into `fx_in`, and
+    // the pedalboard a few lines below has not run yet. Copied
+    // rather than recomputed, because recomputing would mean a
+    // second walk of the clip list and a second render of the
+    // instrument — and the second render of a stateful instrument is
+    // not the same sound as the first.
+    if plan.stems_dry {
+        let (dry, fx) = (&mut io.dry_io, &io.fx_in);
+        for c in 0..TAP_CHANNELS {
+            let (Some(dst), Some(src)) = (dry.get_mut(c), fx.get(c)) else {
+                continue;
+            };
+            let n = frames.min(dst.len()).min(src.len());
+            dst[..n].copy_from_slice(&src[..n]);
+        }
+    }
+    // **The lane pass stands aside for a seat the ROOM is playing.**
+    //
+    // One rack per seat, one clock per chunk. See
+    // `Renderer::room_rack` for the whole of why, and for what the
+    // owner heard when this was missing.
+    //
+    // The consequence, stated rather than hidden: a clip on a lane
+    // whose input the room is monitoring goes to the bus DRY that
+    // chunk. That is what shipped for years — the comment on `armed`
+    // above says so — and it is the narrow price of not clocking a
+    // stateful chain twice. It costs `bf9300e`'s fix nothing where
+    // that fix was aimed: an audio track being MIXED is not a track
+    // the room is monitoring, so a compressor on a recorded vocal
+    // still runs, which was the fault that commit existed to end.
+    // Giving a recording channel both at once needs the timeline's
+    // audio summed into the room's own `fx_in` and the room's dry
+    // subtrahend taken from an input-only pass — two runs of a
+    // non-linear chain to separate what one run mixed — and that is
+    // a bigger piece of work than the regression it would close.
+    if rack_live && !is_folder && !room_owns {
+        // ── THE PEDALBOARD ─────────────────────────────────────────
+        // **A bay holding the amp arms the channel's seven pedal
+        // racks**, run over `fx_in` — the signal as it stands before
+        // this channel's own rack, which is the amp's input in the
+        // seeded shape. A LOOSE lane's board runs here; a folder's
+        // runs over the summed group in `fold_folders`, because
+        // that is where a group's audio exists; and a channel with a
+        // guitar plugged into it runs its board in `mix_monitor`,
+        // over the input, because that is where the signal being
+        // PLAYED exists. Once per chunk whichever of the three it
+        // is, which is the whole rule: a pedal is a stateful chain
+        // and a second run per chunk double-clocks it.
+        //
+        // `live: false` — this pass is the timeline's, so it stands
+        // aside for a channel the room owned last chunk. Both rules
+        // live inside [`Instrument::run_pedalboard`] rather than
+        // here, so no call site can hold a different opinion.
+        if plan.board_runs {
+            // The claim itself - one board per channel per chunk -
+            // is taken by the caller, before the seats are carved,
+            // because `board_ran` is one word for the whole desk
+            // and a lane worker may not touch it. See `LanePlan`.
+            run_board(
+                seats.board,
+                tangent_ui::recorder::amp_pedal_seat(ch, 0),
+                desk.auto_params,
+                &mut io.fx_in,
+                &mut io.fx_out,
+                desk.shared,
+                frames,
+                if armed { desk.controls } else { &[] },
+            );
+        }
+        // Taken AFTER the board rather than at the head of the
+        // block, and not for tidiness: `&self.controls` is an
+        // immutable borrow of the whole of `self`, and the board
+        // above needs `&mut self` for the racks. Hoisted, it made
+        // the one call this refactor exists for uncompilable.
+        // **This lane's own controls**, which is the pedal fix's
+        // last mile: a rack used to be handed `&self.controls`, the
+        // LIVE list, so a clip's pedal had no door into a VST3
+        // instrument even once the clip carried it. The arm gate
+        // moved inside — see where the list is filled — because a
+        // clip's pedal plays on an unarmed lane exactly as its notes
+        // do, and the arm is what the notes' own comment calls "the
+        // whole point of the arm".
+        let controls: &[Control] = &lane_controls;
+        // **This seat's own parameter queue, not the empty one.** Every rack
+        // outside the general channels used to be handed an empty queue,
+        // which was true while the only writer was an automation curve —
+        // curves address lanes and a pad is not a lane. It stopped being
+        // true when a plugin's OWN window became a writer: a bay on a pad
+        // can hold an LV2 effect, that effect can have an editor, and a
+        // knob turned in it would have moved on screen and changed
+        // nothing. Taken before the rack is borrowed mutably — two fields,
+        // so the borrows are disjoint only if each is one expression.
+        let seat_params: [&[tangent_host::ParamPoint]; INSERTS] =
+            std::array::from_fn(|b| {
+                desk.auto_params
+                    .get((ch) * INSERTS + b)
+                    .map_or(&[][..], Vec::as_slice)
+            });
+        // Guarded by `!is_folder` at this block's head — a folder's
+        // rack belongs to the fold, per the checklist's rule.
+        run_rack(
+            seats.rack,
+            &mut io.fx_in,
+            frames,
+            &mut io.fx_out,
+            &lane_notes,
+            controls,
+        &seat_params,
+            desk.shared,
+            ch,
+            // **THE road a sampler's audio takes.** This is the pass
+            // that carries the lane's notes, so it is the pass a
+            // voice bay renders on.
+            plan.sample,
+            // **THE key pass for a channel's seat** — the one run
+            // per chunk that carries the sidechain, reading LAST
+            // chunk's snapshot (see `key_prev` for the proof that
+            // same-block is structurally impossible here). Post-
+            // fader by doctrine: a muted or un-soloed source keys
+            // silence BY DESIGN.
+            plan.keys_live.then(|| KeyFeed {
+                prev: desk.key_prev,
+                prev_frames: desk.key_prev_frames,
+                io: &mut io.key_io,
+            }),
+        );
+        // **And bays 3..5, over what bays 0..2 just left.** Six bays
+        // are one chain; see `run_extra_rack`, which holds the
+        // is_folder guard this block's head already applied.
+        run_extra_rack(
+            seats.extra,
+            is_folder,
+            &desk.auto_params,
+            &mut io.fx_in,
+            &mut io.fx_out,
+            desk.shared,
+            tangent_ui::recorder::folder_extra_seat(ch),
+            frames,
+            &lane_notes,
+            &lane_controls,
+            plan.sample,
+            plan.keys_live.then(|| KeyFeed {
+                prev: desk.key_prev,
+                prev_frames: desk.key_prev_frames,
+                io: &mut io.key_io,
+            }),
+        );
+    }
+    // **And the lane waits for the slowest of its neighbours.**
+    //
+    // Straight after the rack and before the fold, which is the one
+    // place a channel's own audio exists as a separate buffer. A
+    // chain that delays by `L` needs `max - L` more to arrive with
+    // everything else; the chain with the most latency waits for
+    // nothing.
+    //
+    // **And the clips wait HERE now**, on this line, by this
+    // formula. They used to wait in `mix_clips`, by a second
+    // arithmetic formula written for a signal that passed through no
+    // rack — one that had to reconstruct, per lane, everything this
+    // one subtracts. The two agreed for a loose channel and were
+    // kept in step by hand for a grouped one; nothing kept them in
+    // step for an AMP-bearing one, where this formula subtracts
+    // seven pedal seats and the clips' never did. There is one
+    // formula now and no way for them to drift.
+    //
+    // Runs whether or not the rack is live, so switching the last
+    // plugin off does not leave the lane early by its own latency
+    // for one block before the figures catch up.
+    {
+        // **One formula, folder or not: wait for what this lane's
+        // audio does NOT pay on its way out.**
+        //
+        // A wait is additive, so where it is inserted does not
+        // matter — only the total. A loose channel pays its own
+        // rack. A child pays its own rack and then every rack it is
+        // folded through. A folder's own row pays no rack HERE, but
+        // its rack runs over the sum a moment later, so it pays it
+        // just the same. All three come to `own + folded through`,
+        // which is why the special case that used to sit here was
+        // both unnecessary and wrong: it left a group a bus
+        // compressor's lookahead late.
+        // **Both racks, folder or not.** A folder pays its second at
+        // the fold and a loose lane pays its own a line above this
+        // one (`run_channel_extra`); either way the audio has been
+        // through six bays by the time it leaves, so the wait
+        // subtracts six bays' worth.
+        let mut own = Rack::latency(desk.shared, ch).saturating_add(
+            Rack::latency(desk.shared, tangent_ui::recorder::folder_extra_seat(ch)),
+        );
+        // An amp-bearing lane also pays its pedal racks on the way
+        // out, so the wait subtracts them too — `publish_latency`
+        // counts them into the target by the same rule, and the two
+        // must not drift or the lane waits for its own pedals.
+        //
+        // A FOLDER's board is armed by either of its racks and runs
+        // at the fold, which is still on this lane's way out, so the
+        // one figure covers both. It used to be `rack_holds_amp` on
+        // this lane's own rack alone, and that was wrong in both
+        // directions at once for a group: an amp in bays 3..5 paid
+        // nothing for a board it wore, and an amp in bay 0 paid for
+        // a board that was not running. See `pedal_latency`.
+        own = own.saturating_add(plan.pedal_latency);
+        let want = usize::try_from(
+            pdc_max
+                .saturating_sub(own)
+                .saturating_sub(plan.folder_lat),
+        )
+        .unwrap_or(0);
+        if let Some(line) = Some(&mut *seats.rack_pdc) {
+            line.run(&mut io.fx_in, frames, want);
+        }
+        // **And the dry copy waits `own` frames LONGER**, on a line
+        // of its own, because it is the one signal here that did not
+        // pay the rack.
+        //
+        // The wet copy's total is `own` of real plugin delay plus
+        // `max - own - folded` of ring: `max - folded`. The dry copy
+        // has no plugin delay at all, so its ring is the whole
+        // `max - folded` and the two come out of the fold on the
+        // same frame. Get this wrong in the obvious way — reuse
+        // `want` — and a dry stems export is correct on every lane
+        // whose plugins report zero latency and silently early on
+        // the one lane carrying the linear-phase EQ, which is the
+        // worst possible distribution of a bug.
+        if plan.stems_dry {
+            let dry_want = usize::try_from(
+                pdc_max.saturating_sub(plan.folder_lat),
+            )
+            .unwrap_or(0);
+            if let Some(line) = Some(&mut *seats.dry_pdc) {
+                line.run(&mut io.dry_io, frames, dry_want);
+            }
+        }
+    }
+    true
+}
+
 fn run_extra_rack(
     // **The one seat, not the whole bank.** It took `&mut [Rack]` and an
     // absolute index, which reads naturally and borrows all 4,389 seats to
@@ -9896,329 +10413,73 @@ impl Renderer {
                 }
                 continue;
             }
-            // **The lane's SOURCE, planar for the rack — the timeline's
-            // audio first.**
-            //
-            // This used to be three branches that each FILLED `fx_in`: the
-            // DX7 wrote its render over it, the keyboard wrote its render
-            // over it, and everything else wrote silence. The timeline was
-            // nowhere in the list, because the timeline folded itself onto
-            // the bus somewhere else entirely.
-            //
-            // Seeding first and ADDING after is what lets both live on one
-            // lane. The two instrument scratches are zeroed and then
-            // rendered into — the instruments ADD, which is why the scratch
-            // exists at all — so `+=` here is the same arithmetic the old
-            // `=` was over a buffer that had just been filled with silence,
-            // and it is the only shape in which a lane can carry an
-            // instrument AND a clip without one of them being quietly
-            // discarded.
-            // **Whether the ROOM owns this seat's rack this chunk**, set by
-            // the monitor pass at the end of the last one. Read here rather
-            // than at the rack gate below because the SEEDING needs it too.
+            // **The lane, rendered.** See `render_lane`: the same seed,
+            // instruments, dry copy, pedalboard, racks and delay lines that
+            // stood here, over one lane's own seats and buffers rather than
+            // over the whole renderer. The claim on the pedalboard is taken
+            // HERE, while the pass is still serial, because `board_ran` is
+            // one word for the whole desk.
             let room_owns = self.room_rack & (1u32 << ch.min(31)) != 0;
-            {
-                // **A clip the ROOM has taken is not seeded here.** When this
-                // lane's rack belongs to the room, the monitor pass sums this
-                // same clip into its own pre-rack input and folds it wet — so
-                // seeding it here as well would put it on the bus twice, once
-                // wet and once dry. The lane keeps everything else it carries:
-                // its instrument, its notes, its fader, its meter.
-                let clip_here = has_audio && !room_owns;
-                // Disjoint fields borrow disjointly, which is the only
-                // reason this can be written as a copy rather than a
-                // per-sample method call.
-                let (fx, clip) = (&mut self.fx_in, &self.clip_lane);
-                for c in 0..TAP_CHANNELS {
-                    let Some(dst) = fx.get_mut(c) else {
-                        continue;
-                    };
-                    if clip_here {
-                        for f in 0..frames {
-                            dst[f] = clip
-                                .get(f * CHANNELS * 2 + ch * 2 + c)
-                                .copied()
-                                .unwrap_or(0.0);
-                        }
-                    } else {
-                        let n = frames.min(dst.len());
-                        dst[..n].fill(0.0);
-                    }
-                }
-            }
-            // One scratch serves every lane of an instrument kind: this lane
-            // renders, copies out, and only then does the walk reach the next.
-            if is_builtin && self.dx7s[ch].as_ref().is_some_and(|d| d.active()) {
-                let want = frames * TAP_CHANNELS;
-                let Some(scratch) = self.builtin_scratch.get_mut(..want) else {
-                    continue;
-                };
-                scratch.fill(0.0);
-                if let Some(d) = self.dx7s[ch].as_mut() {
-                    d.render(scratch, frames, TAP_CHANNELS);
-                }
-                for c in 0..TAP_CHANNELS {
-                    let Some(dst) = self.fx_in.get_mut(c) else {
-                        continue;
-                    };
-                    for f in 0..frames {
-                        dst[f] += scratch[f * TAP_CHANNELS + c];
-                    }
-                }
-            } else if is_keys && self.keys_lanes[ch].as_ref().is_some_and(|k| k.active()) {
-                // Its own scratch, for the reason `builtin_scratch` documents:
-                // the instrument ADDS into what it is handed, so rendering it
-                // onto the bus would leave no moment at which its contribution
-                // is separable and therefore none at which a fader can reach
-                // it. The DX7's slot fader was silent for exactly that reason.
-                let want = frames * TAP_CHANNELS;
-                let Some(scratch) = self.keys_scratch.get_mut(..want) else {
-                    continue;
-                };
-                scratch.fill(0.0);
-                if let Some(k) = self.keys_lanes[ch].as_mut() {
-                    k.render(scratch, frames, TAP_CHANNELS);
-                }
-                for c in 0..TAP_CHANNELS {
-                    let Some(dst) = self.fx_in.get_mut(c) else {
-                        continue;
-                    };
-                    for f in 0..frames {
-                        dst[f] += scratch[f * TAP_CHANNELS + c];
-                    }
-                }
-            } else if !rack_live && !has_audio {
-                // Nothing to play and nothing to play it through: an
-                // inactive instrument on a bare lane. The seed above has
-                // already left `fx_in` silent, so there is nothing to undo.
+            // **Claimed only where the render would have claimed it.** The
+            // board call sat inside the `rack_live && !is_folder &&
+            // !room_owns` gate, so taking the claim for every lane here
+            // spends a FOLDER's claim in the lane pass and leaves
+            // `fold_folders` - which is where a group's board belongs - with
+            // nothing to run.
+            let board_runs = rack_live
+                && !is_folder
+                && !room_owns
+                && self.amp_board_arms(ch)
+                && self.claim_board(ch, false);
+            let pedal_latency = self.pedal_latency(ch);
+            let plan = LanePlan {
+                ch,
+                frames,
+                is_builtin,
+                is_keys,
+                is_folder,
+                rack_live,
+                has_audio,
+                room_owns,
+                armed,
+                board_runs,
+                stems_dry: self.stems_dry,
+                keys_live: self.keys_live,
+                pdc_max,
+                folder_lat: self.folder_lat[ch],
+                pedal_latency,
+                notes: &lane_notes,
+                controls: &lane_controls,
+                sample: self.sampler_samples.get(ch).and_then(Option::as_ref),
+            };
+            let desk = DeskRef {
+                clip_lane: &self.clip_lane,
+                auto_params: &self.auto_params,
+                shared: &self.shared,
+                key_prev: &self.key_prev,
+                key_prev_frames: self.key_prev_frames,
+                controls: &self.controls,
+            };
+            let mut io = LaneIo {
+                fx_in: &mut self.fx_in,
+                fx_out: &mut self.fx_out,
+                dry_io: &mut self.dry_io,
+                key_io: &mut self.key_io,
+                builtin: &mut self.builtin_scratch,
+                keys_scratch: &mut self.keys_scratch,
+            };
+            let Some(mut seats) = lane_seats(
+                &mut self.racks,
+                &mut self.dx7s,
+                &mut self.keys_lanes,
+                &mut self.pdc,
+                &mut self.dry_pdc,
+                ch,
+            ) else {
                 continue;
-            }
-            // **The dry copy, taken here: after the source is assembled and
-            // before one plugin has seen it.**
-            //
-            // This is the only moment in the block at which a channel's own
-            // audio exists WITHOUT its own processing: the clip and the
-            // instrument have just finished being summed into `fx_in`, and
-            // the pedalboard a few lines below has not run yet. Copied
-            // rather than recomputed, because recomputing would mean a
-            // second walk of the clip list and a second render of the
-            // instrument — and the second render of a stateful instrument is
-            // not the same sound as the first.
-            if self.stems_dry {
-                let (dry, fx) = (&mut self.dry_io, &self.fx_in);
-                for c in 0..TAP_CHANNELS {
-                    let (Some(dst), Some(src)) = (dry.get_mut(c), fx.get(c)) else {
-                        continue;
-                    };
-                    let n = frames.min(dst.len()).min(src.len());
-                    dst[..n].copy_from_slice(&src[..n]);
-                }
-            }
-            // **The lane pass stands aside for a seat the ROOM is playing.**
-            //
-            // One rack per seat, one clock per chunk. See
-            // `Renderer::room_rack` for the whole of why, and for what the
-            // owner heard when this was missing.
-            //
-            // The consequence, stated rather than hidden: a clip on a lane
-            // whose input the room is monitoring goes to the bus DRY that
-            // chunk. That is what shipped for years — the comment on `armed`
-            // above says so — and it is the narrow price of not clocking a
-            // stateful chain twice. It costs `bf9300e`'s fix nothing where
-            // that fix was aimed: an audio track being MIXED is not a track
-            // the room is monitoring, so a compressor on a recorded vocal
-            // still runs, which was the fault that commit existed to end.
-            // Giving a recording channel both at once needs the timeline's
-            // audio summed into the room's own `fx_in` and the room's dry
-            // subtrahend taken from an input-only pass — two runs of a
-            // non-linear chain to separate what one run mixed — and that is
-            // a bigger piece of work than the regression it would close.
-            if rack_live && !is_folder && !room_owns {
-                // ── THE PEDALBOARD ─────────────────────────────────────────
-                // **A bay holding the amp arms the channel's seven pedal
-                // racks**, run over `fx_in` — the signal as it stands before
-                // this channel's own rack, which is the amp's input in the
-                // seeded shape. A LOOSE lane's board runs here; a folder's
-                // runs over the summed group in `fold_folders`, because
-                // that is where a group's audio exists; and a channel with a
-                // guitar plugged into it runs its board in `mix_monitor`,
-                // over the input, because that is where the signal being
-                // PLAYED exists. Once per chunk whichever of the three it
-                // is, which is the whole rule: a pedal is a stateful chain
-                // and a second run per chunk double-clocks it.
-                //
-                // `live: false` — this pass is the timeline's, so it stands
-                // aside for a channel the room owned last chunk. Both rules
-                // live inside [`Instrument::run_pedalboard`] rather than
-                // here, so no call site can hold a different opinion.
-                if self.amp_board_arms(ch) {
-                    self.run_pedalboard(ch, frames, armed, false);
-                }
-                // Taken AFTER the board rather than at the head of the
-                // block, and not for tidiness: `&self.controls` is an
-                // immutable borrow of the whole of `self`, and the board
-                // above needs `&mut self` for the racks. Hoisted, it made
-                // the one call this refactor exists for uncompilable.
-                // **This lane's own controls**, which is the pedal fix's
-                // last mile: a rack used to be handed `&self.controls`, the
-                // LIVE list, so a clip's pedal had no door into a VST3
-                // instrument even once the clip carried it. The arm gate
-                // moved inside — see where the list is filled — because a
-                // clip's pedal plays on an unarmed lane exactly as its notes
-                // do, and the arm is what the notes' own comment calls "the
-                // whole point of the arm".
-                let controls: &[Control] = &lane_controls;
-                // **This seat's own parameter queue, not the empty one.** Every rack
-                // outside the general channels used to be handed an empty queue,
-                // which was true while the only writer was an automation curve —
-                // curves address lanes and a pad is not a lane. It stopped being
-                // true when a plugin's OWN window became a writer: a bay on a pad
-                // can hold an LV2 effect, that effect can have an editor, and a
-                // knob turned in it would have moved on screen and changed
-                // nothing. Taken before the rack is borrowed mutably — two fields,
-                // so the borrows are disjoint only if each is one expression.
-                let seat_params: [&[tangent_host::ParamPoint]; INSERTS] =
-                    std::array::from_fn(|b| {
-                        self.auto_params
-                            .get((ch) * INSERTS + b)
-                            .map_or(&[][..], Vec::as_slice)
-                    });
-                // Guarded by `!is_folder` at this block's head — a folder's
-                // rack belongs to the fold, per the checklist's rule.
-                run_rack(
-                    &mut self.racks[ch],
-                    &mut self.fx_in,
-                    frames,
-                    &mut self.fx_out,
-                    &lane_notes,
-                    controls,
-                &seat_params,
-                    &self.shared,
-                    ch,
-                    // **THE road a sampler's audio takes.** This is the pass
-                    // that carries the lane's notes, so it is the pass a
-                    // voice bay renders on.
-                    self.sampler_samples.get(ch).and_then(Option::as_ref),
-                    // **THE key pass for a channel's seat** — the one run
-                    // per chunk that carries the sidechain, reading LAST
-                    // chunk's snapshot (see `key_prev` for the proof that
-                    // same-block is structurally impossible here). Post-
-                    // fader by doctrine: a muted or un-soloed source keys
-                    // silence BY DESIGN.
-                    self.keys_live.then(|| KeyFeed {
-                        prev: &self.key_prev,
-                        prev_frames: self.key_prev_frames,
-                        io: &mut self.key_io,
-                    }),
-                );
-                // **And bays 3..5, over what bays 0..2 just left.** Six bays
-                // are one chain; see `run_extra_rack`, which holds the
-                // is_folder guard this block's head already applied.
-                run_extra_rack(
-                    &mut self.racks[tangent_ui::recorder::folder_extra_seat(ch)],
-                    is_folder,
-                    &self.auto_params,
-                    &mut self.fx_in,
-                    &mut self.fx_out,
-                    &self.shared,
-                    tangent_ui::recorder::folder_extra_seat(ch),
-                    frames,
-                    &lane_notes,
-                    &lane_controls,
-                    self.sampler_samples.get(ch).and_then(Option::as_ref),
-                    self.keys_live.then(|| KeyFeed {
-                        prev: &self.key_prev,
-                        prev_frames: self.key_prev_frames,
-                        io: &mut self.key_io,
-                    }),
-                );
-            }
-            // **And the lane waits for the slowest of its neighbours.**
-            //
-            // Straight after the rack and before the fold, which is the one
-            // place a channel's own audio exists as a separate buffer. A
-            // chain that delays by `L` needs `max - L` more to arrive with
-            // everything else; the chain with the most latency waits for
-            // nothing.
-            //
-            // **And the clips wait HERE now**, on this line, by this
-            // formula. They used to wait in `mix_clips`, by a second
-            // arithmetic formula written for a signal that passed through no
-            // rack — one that had to reconstruct, per lane, everything this
-            // one subtracts. The two agreed for a loose channel and were
-            // kept in step by hand for a grouped one; nothing kept them in
-            // step for an AMP-bearing one, where this formula subtracts
-            // seven pedal seats and the clips' never did. There is one
-            // formula now and no way for them to drift.
-            //
-            // Runs whether or not the rack is live, so switching the last
-            // plugin off does not leave the lane early by its own latency
-            // for one block before the figures catch up.
-            {
-                // **One formula, folder or not: wait for what this lane's
-                // audio does NOT pay on its way out.**
-                //
-                // A wait is additive, so where it is inserted does not
-                // matter — only the total. A loose channel pays its own
-                // rack. A child pays its own rack and then every rack it is
-                // folded through. A folder's own row pays no rack HERE, but
-                // its rack runs over the sum a moment later, so it pays it
-                // just the same. All three come to `own + folded through`,
-                // which is why the special case that used to sit here was
-                // both unnecessary and wrong: it left a group a bus
-                // compressor's lookahead late.
-                // **Both racks, folder or not.** A folder pays its second at
-                // the fold and a loose lane pays its own a line above this
-                // one (`run_channel_extra`); either way the audio has been
-                // through six bays by the time it leaves, so the wait
-                // subtracts six bays' worth.
-                let mut own = Rack::latency(&self.shared, ch).saturating_add(
-                    Rack::latency(&self.shared, tangent_ui::recorder::folder_extra_seat(ch)),
-                );
-                // An amp-bearing lane also pays its pedal racks on the way
-                // out, so the wait subtracts them too — `publish_latency`
-                // counts them into the target by the same rule, and the two
-                // must not drift or the lane waits for its own pedals.
-                //
-                // A FOLDER's board is armed by either of its racks and runs
-                // at the fold, which is still on this lane's way out, so the
-                // one figure covers both. It used to be `rack_holds_amp` on
-                // this lane's own rack alone, and that was wrong in both
-                // directions at once for a group: an amp in bays 3..5 paid
-                // nothing for a board it wore, and an amp in bay 0 paid for
-                // a board that was not running. See `pedal_latency`.
-                own = own.saturating_add(self.pedal_latency(ch));
-                let want = usize::try_from(
-                    pdc_max
-                        .saturating_sub(own)
-                        .saturating_sub(self.folder_lat[ch]),
-                )
-                .unwrap_or(0);
-                if let Some(line) = self.pdc.get_mut(ch) {
-                    line.run(&mut self.fx_in, frames, want);
-                }
-                // **And the dry copy waits `own` frames LONGER**, on a line
-                // of its own, because it is the one signal here that did not
-                // pay the rack.
-                //
-                // The wet copy's total is `own` of real plugin delay plus
-                // `max - own - folded` of ring: `max - folded`. The dry copy
-                // has no plugin delay at all, so its ring is the whole
-                // `max - folded` and the two come out of the fold on the
-                // same frame. Get this wrong in the obvious way — reuse
-                // `want` — and a dry stems export is correct on every lane
-                // whose plugins report zero latency and silently early on
-                // the one lane carrying the linear-phase EQ, which is the
-                // worst possible distribution of a bug.
-                if self.stems_dry {
-                    let dry_want = usize::try_from(
-                        pdc_max.saturating_sub(self.folder_lat[ch]),
-                    )
-                    .unwrap_or(0);
-                    if let Some(line) = self.dry_pdc.get_mut(ch) {
-                        line.run(&mut self.dry_io, frames, dry_want);
-                    }
-                }
+            };
+            if !render_lane(&mut seats, &mut io, &plan, &desk) {
+                continue;
             }
             // The fold: fader, send, peak — the channel's own, exactly as
             // every other strip does it.
@@ -10455,15 +10716,31 @@ impl Renderer {
     /// borrows never meet. The lane pass passes the transport's own arming
     /// and the room passes its strip's; the fold passes `false`, because a
     /// bus is not played.
+    /// **The claim, which is one board per channel per chunk.**
+    ///
+    /// Rule 1 and rule 2 in the order [`Self::run_pedalboard`] argues them,
+    /// with the answer handed back rather than acted on, so the lane pass
+    /// can take the claim while it is still serial and hand a worker a
+    /// board it is already entitled to run. `board_ran` is one word for the
+    /// whole desk: a worker may read the answer, never take it.
+    fn claim_board(&mut self, ch: usize, live: bool) -> bool {
+        // The mask is `u32` and `CHANNELS` is 32, so the clamp is a bounds
+        // check and never a fold of one channel onto another.
+        let bit = 1u32 << ch.min(CHANNELS - 1);
+        if self.board_ran & bit != 0 || (!live && self.board_live & bit != 0) {
+            return false;
+        }
+        self.board_ran |= bit;
+        true
+    }
+
     fn run_pedalboard(&mut self, ch: usize, frames: usize, armed: bool, live: bool) {
         // Rule 1 and rule 2, in the order they are argued above. The mask
         // is `u32` and `CHANNELS` is 32, so the clamp is a bounds check and
         // never a fold of one channel onto another.
-        let bit = 1u32 << ch.min(CHANNELS - 1);
-        if self.board_ran & bit != 0 || (!live && self.board_live & bit != 0) {
+        if !self.claim_board(ch, live) {
             return;
         }
-        self.board_ran |= bit;
         let controls: &[Control] = if armed { &self.controls } else { &[] };
         let first = tangent_ui::recorder::amp_pedal_seat(ch, 0);
         let Some(board) = self
