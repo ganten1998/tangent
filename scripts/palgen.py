@@ -182,7 +182,13 @@ SHIPPED = {
             (0x1c, 0x65, 0x57), (0x19, 0x38, 0x5b), (0x6b, 0x4d, 0x8e), (0x60, 0x1b, 0x49),
         ],
         click=(0x3f, 0x34, 0x31),
-        master=(0x0a, 0x5f, 0xc2),
+        # **#0a5fc2 until 584354f, and this copy did not follow.** That
+        # commit changed index 300 in the Rust from a blue to this red and
+        # left the frozen copy here on the old value, so `--check` has
+        # reported two failures ever since: the drift itself, and the
+        # byte-identity claim that rests on it. The table is the source of
+        # truth for a colour and this file is a pin on it, so the pin moved.
+        master=(0xB0, 0x2A, 0x37),
     ),
     "Valentine": dict(
         slots=[
@@ -818,6 +824,9 @@ def check(verbose=True):
     """Everything `--check` stands behind, 0 failures or a report of them."""
     say = print if verbose else (lambda *a, **k: None)
     errs = []
+    # The errors the per-palette loop prints beside their palette; the tail
+    # below prints everything else rather than guessing by prefix.
+    shown = set()
     src, cols, pals = parse_rust()
 
     # The SHAPE first: TABLE_LEN entries, PALETTES in table order with the
@@ -845,6 +854,16 @@ def check(verbose=True):
     # The embedded copy against the Rust, value by value and byte by byte --
     # the retired included, because a run nobody can pick is still a run
     # somebody's saved desk points at.
+    #
+    # **Against a copy whose HEX is lowercased, because hex case is not a
+    # byte of colour.** Index 300 is spelled with capitals in the Rust and
+    # every other row with lowercase; a generator that insisted on one
+    # spelling would be pinning a typographic habit rather than the table,
+    # and the values themselves are compared exactly, above and below this
+    # line. Only the literals move: lowercasing the whole file would take
+    # the theme names in the block comments with it and every block would
+    # stop matching.
+    folded = re.sub(r"0x([0-9A-Fa-f]{2})", lambda m: "0x" + m.group(1).lower(), src)
     if HAND != cols[:27]:
         errs.append("the hand grid here has drifted from the Rust")
     if MASTER_STRIP != cols[27]:
@@ -858,9 +877,9 @@ def check(verbose=True):
             errs.append(f"{name}: the embedded run has drifted from the Rust")
         if p["master"] != cols[at["master"]]:
             errs.append(f"{name}: the embedded master has drifted from the Rust")
-        if "\n".join(run_lines(name, base, p)) not in src:
+        if "\n".join(run_lines(name, base, p)) not in folded:
             errs.append(f"{name}: the emitted run is not byte-identical to the file")
-        if master_line(at["master"], name, p["master"]) not in src:
+        if master_line(at["master"], name, p["master"]) not in folded:
             errs.append(f"{name}: the emitted master line is not byte-identical")
         cmax = CHROMA_MONO if name == "Mono" else CHROMA_MAX
         for label, table, lo, hi in (("ext", EXT_RUNS, 17, 24), ("ext2", EXT2_RUNS, 25, 32)):
@@ -868,7 +887,7 @@ def check(verbose=True):
             e = table[name]
             if e != cols[b0 : b0 + 8]:
                 errs.append(f"{name}: the embedded {label} run has drifted from the Rust")
-            if "\n".join(ext_lines(name, label, lo, hi, b0, e)) not in src:
+            if "\n".join(ext_lines(name, label, lo, hi, b0, e)) not in folded:
                 errs.append(f"{name}: the emitted {label} block is not byte-identical")
             for j, c in enumerate(e):
                 if not wants_light_ink(c) or ink_contrast(c) < INK_FLOOR:
@@ -928,10 +947,18 @@ def check(verbose=True):
         for e in perrs:
             say(f"            - {e}")
         errs.extend(f"{name}: {e}" for e in perrs)
+        shown.update(f"{name}: {e}" for e in perrs)
 
     if verbose:
+        # **Everything not already printed beside its palette**, which is
+        # not the same as "everything whose prefix is not a run name". The
+        # filter used to be the latter, so the byte-identity and extension
+        # errors -- all prefixed with a run's name, none of them `perrs` --
+        # were counted in the total and never shown: a run could report
+        # CHECK FAILS (56) and print two lines. `shown` is what the palette
+        # loop actually said.
         for e in errs:
-            if e.split(":")[0] not in ALL_RUNS:
+            if e not in shown:
                 say(f"  - {e}")
         say()
         say("ALL PASS" if not errs else f"CHECK FAILS ({len(errs)})")
