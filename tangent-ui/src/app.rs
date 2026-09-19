@@ -52873,7 +52873,7 @@ mod tests {
         for scope in crate::settings::ResetScope::ALL {
             let mut s = Settings::first_launch();
             // Something worth losing, in each of the five parts.
-            s.theme_name = "Iris".into();
+            s.theme_name = "Rhodes".into();
             s.window_size_percent = 175;
             s.fretboard_capo = 3;
             s.channel_gains[2] = 0.25;
@@ -52938,7 +52938,7 @@ mod tests {
         let _ = std::fs::remove_file(Settings::backup_path());
 
         let mut s = Settings::first_launch();
-        s.theme_name = "Iris".into();
+        s.theme_name = "Rhodes".into();
         s.background_color = Rgb { r: 9, g: 9, b: 9 };
         s.record_audio_device = Some("Scarlett 18i20".to_owned());
         s.channel_gains[2] = 0.25;
@@ -52967,7 +52967,7 @@ mod tests {
         // And it works, across everything the reset touched.
         app.apply_dialog_action(DialogAction::UndoReset);
         run_frame(&ctx, &mut app);
-        assert_eq!(app.settings.theme_name, "Iris", "Undo did not put the theme back");
+        assert_eq!(app.settings.theme_name, "Rhodes", "Undo did not put the theme back");
         assert_eq!(
             app.settings.background_color,
             Rgb { r: 9, g: 9, b: 9 }
@@ -58776,11 +58776,11 @@ mod heart_ring_tests {
         // A different theme gives a different heart, without anybody choosing.
         let other = crate::theme::factory()
             .into_iter()
-            .find(|t| t.name == "Iris")
-            .expect("Iris ships");
+            .find(|t| t.name == "Rhodes")
+            .expect("Rhodes ships");
         other.apply(&mut app.settings);
-        let iris = app.heart_color(0.0).expect("still a heart");
-        assert_ne!(still, iris, "the heart did not follow the theme");
+        let other_heart = app.heart_color(0.0).expect("still a heart");
+        assert_ne!(still, other_heart, "the heart did not follow the theme");
     }
 
     /// The wave travels, and it travels the way round the owner asked for.
