@@ -225,9 +225,20 @@ const SAT_FB: f32 = 0.35;
 ///   24 kHz, 42 at 25, past 80 by 26, so the worst alias it can pass sits at
 ///   23 kHz, 42 dB down, and everything below 22 kHz is 80 dB down or
 ///   better.
+/// **The tape borrows the drive's delay line** rather than keeping a second
+/// copy of the same code. They were identical, and both were the slow
+/// shape: a `split_at` and a `chain` that no compiler can vectorise.
+use crate::units::drive::Fir;
+
 const OS: usize = 4;
 const OS_A_TAPS: usize = 79;
 const OS_B_TAPS: usize = 21;
+
+/// The double-written window lengths for the shared `Fir`: twice the taps,
+/// so the newest `N` samples are one contiguous slice and the tap loop is a
+/// straight dot product.
+const OS_A_WIN: usize = OS_A_TAPS * 2;
+const OS_B_WIN: usize = OS_B_TAPS * 2;
 
 /// Stage A's cutoff as a fraction of its own running rate; 0.25 would be the
 /// exact halfband. Shaded below the fold for the reason [`OS`] gives.
@@ -476,48 +487,14 @@ fn windowed_sinc<const N: usize>(beta: f64, fc: f64) -> [f32; N] {
     taps
 }
 
-/// A direct-form FIR delay line. The taps live outside it so both channels
-/// and both directions share one designed set.
-#[derive(Clone)]
-struct Fir<const N: usize> {
-    z: [f32; N],
-    pos: usize,
-}
-
-impl<const N: usize> Fir<N> {
-    fn new() -> Self {
-        Self {
-            z: [0.0; N],
-            pos: 0,
-        }
-    }
-
-    #[inline]
-    fn run(&mut self, taps: &[f32; N], x: f32) -> f32 {
-        self.pos = if self.pos == 0 { N - 1 } else { self.pos - 1 };
-        self.z[self.pos] = x;
-        let mut acc = 0.0_f32;
-        let (head, tail) = self.z.split_at(self.pos);
-        for (t, v) in taps.iter().zip(tail.iter().chain(head.iter())) {
-            acc += t * v;
-        }
-        acc
-    }
-
-    fn clear(&mut self) {
-        self.z = [0.0; N];
-        self.pos = 0;
-    }
-}
-
 /// One channel's four delay lines: up through 2× then 4×, and back down the
 /// same way.
 #[derive(Clone)]
 struct OsChannel {
-    up_a: Fir<OS_A_TAPS>,
-    up_b: Fir<OS_B_TAPS>,
-    dn_b: Fir<OS_B_TAPS>,
-    dn_a: Fir<OS_A_TAPS>,
+    up_a: Fir<OS_A_TAPS, OS_A_WIN>,
+    up_b: Fir<OS_B_TAPS, OS_B_WIN>,
+    dn_b: Fir<OS_B_TAPS, OS_B_WIN>,
+    dn_a: Fir<OS_A_TAPS, OS_A_WIN>,
 }
 
 impl OsChannel {

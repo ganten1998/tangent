@@ -29,7 +29,7 @@ use std::time::Instant;
 use tangent_record::audio::Timebase;
 use tangent_ui::recorder::{Desk, STRIPS};
 
-use crate::builtin_fx::{ANALOG_PATH, COMP_PATH, DENOISE_PATH, EQ_PATH, PLATE_PATH};
+use crate::builtin_fx::{ANALOG_PATH, COMP_PATH, DENOISE_PATH, DRIVE_PATH, EQ_PATH, PLATE_PATH, TAPE_PATH};
 use crate::instrument::{ClipNote, Engine, Placed, PlacedMidi};
 
 /// The block every shape is measured at: the middle of the three sizes the
@@ -370,6 +370,17 @@ fn rt_bench() {
 
     let mut e = audio_desk(16, &[DENOISE_PATH]);
     rows.push(measure("16 lanes x denoise (spectral studio)", &mut e, WARMUP, BLOCK));
+    drop(e);
+
+    // **Our own two most expensive units**, which the sweep measured above
+    // every commercial plugin on this machine. One per lane, because at
+    // three per lane an unfixed Drive desk does not fit the deadline at all
+    // and the row would say only that.
+    let mut e = audio_desk(16, &[DRIVE_PATH]);
+    rows.push(measure("16 lanes x Drive", &mut e, WARMUP, BLOCK));
+    drop(e);
+    let mut e = audio_desk(16, &[TAPE_PATH]);
+    rows.push(measure("16 lanes x Tape", &mut e, WARMUP, BLOCK));
     drop(e);
 
     let mut e = audio_desk(32, &[EQ_PATH, EQ_PATH, EQ_PATH]);

@@ -265,10 +265,19 @@ impl Arp {
     pub fn run(&mut self, p: &ArpParams, t: Transport, frames: usize, out: &mut Vec<ArpOut>) {
         self.hold = p.hold;
         if !p.hold {
-            // The latch came off: keep what is physically down.
-            let down = self.down.clone();
+            // **The latch came off: keep what is physically down.**
+            //
+            // Cleared and re-extended rather than cloned. `down.clone()`
+            // allocates a Vec on the AUDIO THREAD, every 32-frame chunk, for
+            // as long as a key is held with hold off - which is the arp's
+            // ordinary state. `extend_from_slice` writes into the capacity
+            // `pattern` already has; the two vectors are the same length by
+            // construction and neither ever grows past the held-key count.
+            //
+            // Disjoint borrows, so this needs no temporary at all: the clone
+            // existed only to satisfy the borrow checker.
             self.pattern.clear();
-            self.pattern.extend(down);
+            self.pattern.extend_from_slice(&self.down);
         }
         let on = p.mode != ArpMode::Off && !self.pattern.is_empty();
         if !on {
