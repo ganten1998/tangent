@@ -29232,6 +29232,12 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
     }
 
     /// The tempo the click, the count-in and the SMF tempo mark all share.
+    /// How far ahead a track's effects are rendered, in milliseconds; zero
+    /// is off. See `Settings::render_ahead_ms`.
+    pub fn render_ahead_ms(&self) -> f64 {
+        self.settings.render_ahead_ms
+    }
+
     pub fn tempo_bpm(&self) -> f64 {
         // **The take's tempo, override and all.** This read the SETTINGS while
         // `export_spec` reads the session-only override, so a tempo set for one

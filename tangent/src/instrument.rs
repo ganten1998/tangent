@@ -1985,6 +1985,17 @@ struct Shared {
     /// level's clothes. Safe to re-assert every frame, because nothing keys
     /// off its edges any more.
     rolling: AtomicBool,
+    /// **How long a grain is, in FRAMES; zero is off.** See
+    /// [`Engine::set_grain_ms`], which is where the milliseconds become
+    /// frames, and `Renderer::plan_grains`, which is the only reader.
+    ///
+    /// Here rather than on the renderer because the LIVE renderer is not a
+    /// field of `Engine` - it lives inside the device callback's closure -
+    /// so every live setting reaches it through this board. It also means
+    /// two engines in one process can disagree about it, which is what the
+    /// null test needs, and the null test is the only thing standing
+    /// between a grain render and wrong audio.
+    grain: AtomicU32,
     /// The frame the callback reached at the end of the last chunk.
     transport_pos: AtomicU64,
     /// **The engine's sample rate, for whoever on the audio thread needs
@@ -3034,6 +3045,7 @@ impl Shared {
             transport_req: AtomicU64::new(0),
             transport_ack: AtomicU64::new(0),
             rolling: AtomicBool::new(false),
+            grain: AtomicU32::new(0),
             rate: AtomicU32::new(48_000),
             transport_pos: AtomicU64::new(0),
             loop_a: AtomicU64::new(0),
@@ -5764,6 +5776,29 @@ impl LaneGrains {
         Some(key)
     }
 
+    /// The key of the grain that starts LATEST, if the ring holds one.
+    fn newest(&self) -> Option<GrainKey> {
+        self.keys
+            .iter()
+            .filter(|k| k.frames > 0)
+            .max_by_key(|k| k.at)
+            .copied()
+    }
+
+    /// Whether the ring holds every frame of `at..at + frames`.
+    fn covers(&self, at: u64, frames: usize) -> bool {
+        let mut done = 0u64;
+        while done < frames as u64 {
+            let here = at + done;
+            let Some(i) = self.slot_at(here) else {
+                return false;
+            };
+            let k = self.keys[i];
+            done += u64::from(k.frames) - (here - k.at);
+        }
+        true
+    }
+
     /// Forget everything. A locate, a transport stop, a varispeed change.
     fn clear(&mut self) {
         self.keys = [GrainKey::default(); GRAIN_SLOTS];
@@ -7410,6 +7445,10 @@ struct Renderer {
     param_lanes: u32,
     /// Which lanes the deciding walk left for the render walk to do.
     lane_wants: [bool; CHANNELS],
+    /// **The span each lane is rendering this chunk**, which is the chunk's
+    /// own span unless the grain clock moved it. See `plan_grains`.
+    lane_at: [u64; CHANNELS],
+    lane_len: [usize; CHANNELS],
     /// Which lanes rendered something to fold this chunk. False for every
     /// way the render walked away: parked, fed by nothing, no rack and no
     /// audio, a bank too short, or an inactive instrument on a bare lane.
@@ -12043,6 +12082,148 @@ impl Renderer {
         out
     }
 
+    /// **How many lanes share one refill phase.**
+    ///
+    /// Eight, so at a 64-frame callback and a 512-frame grain each callback
+    /// refills about an eighth of the desk rather than all of it at once.
+    /// The number is a spread, not a schedule: a lane refills when the
+    /// playhead has passed its share of the grain it is consuming, so a
+    /// callback of any size lands somewhere sensible.
+    const GRAIN_PHASES: u64 = 8;
+
+    /// **Decide what span each lane renders this chunk.**
+    ///
+    /// Runs between the deciding walk and the render, and it is the whole of
+    /// the grain render's scheduling. Three answers per lane:
+    ///
+    /// - **Nothing.** The ring already holds this chunk's span and it is not
+    ///   this lane's turn to look ahead. This is the common case and it is
+    ///   where the saving comes from: the lane's plugins are not called at
+    ///   all this callback.
+    /// - **The next grain**, when the lane is consuming its newest grain and
+    ///   the playhead has passed this lane's phase of it. The other slot is
+    ///   free by construction, because the one being consumed is the newest.
+    /// - **A catch-up at the chunk's own position**, when the ring does not
+    ///   hold the span: a cold start, the block after a locate, or a lane
+    ///   that has just started wanting to render.
+    ///
+    /// **The saving is real only because the fixed cost of a block is
+    /// per-INSTANCE.** Measured on 96 plugin instances, a block costs
+    /// 765 us before a single frame is rendered and 5.46 us per frame after
+    /// it; eight times fewer blocks for the same audio is where the 3.2x
+    /// comes from. See `docs/PERF-REAPER-2026-09-18.md`.
+    fn plan_grains(
+        &mut self,
+        at: u64,
+        frames: usize,
+        rolling: bool,
+        grain: usize,
+        free: u32,
+    ) {
+        // The default every lane keeps: this chunk, as it always was.
+        for ch in 0..CHANNELS {
+            self.lane_at[ch] = at;
+            self.lane_len[ch] = frames;
+        }
+        // **Off, or on a desk where a grain cannot mean anything.** A
+        // stopped transport re-reads one position for ever; varispeed sizes
+        // each chunk from a phase accumulator so the NEXT chunk's length is
+        // not knowable; a stems export takes a dry copy at render and reads
+        // it at consumption. Each of these already zeroes the eligibility
+        // probe's masks, and for the same reasons.
+        if grain <= frames || !rolling || self.stems_live || self.varispeed_ratio().is_some() {
+            return;
+        }
+        // **A grain may not cross the loop's end.** The wrap folds the
+        // overshoot back to `loop_a`, so audio rendered past `loop_b` is
+        // audio of a bar that will not be played next. Clipping the grain
+        // there costs one short grain a lap; FLUSHING on every wrap, which
+        // is what the first draft of this did, costs a full-desk catch-up a
+        // lap in exactly the workflow the feature is for.
+        let loop_b = {
+            let (a, b) = (
+                self.shared.loop_a.load(Ordering::Relaxed),
+                self.shared.loop_b.load(Ordering::Relaxed),
+            );
+            (b > a && at < b).then_some(b)
+        };
+        for ch in 0..CHANNELS {
+            if !self.lane_wants[ch] || !self.grain_ok(ch, free) {
+                continue;
+            }
+            let Some(g) = self.lane_grain.get(ch) else {
+                continue;
+            };
+            // Where the lane's newest grain ends, and whether the chunk is
+            // being served from it rather than from the one behind it.
+            let newest = g.newest();
+            let holds = g.covers(at, frames);
+            match (holds, newest) {
+                // The ring cannot answer: render the chunk's span, widened
+                // to a grain so the next callbacks are served from it.
+                (false, _) => {
+                    self.lane_len[ch] = Self::clip_grain(at, grain.max(frames), loop_b);
+                }
+                // Served from the newest grain, so the older slot is free.
+                // Look ahead when this lane's phase has come up.
+                (true, Some(key)) if at >= key.at => {
+                    let into = at - key.at;
+                    let phase = (ch as u64 % Self::GRAIN_PHASES) * grain as u64
+                        / Self::GRAIN_PHASES;
+                    let end = key.at + u64::from(key.frames);
+                    if into >= phase && end > at {
+                        self.lane_at[ch] = end;
+                        self.lane_len[ch] = Self::clip_grain(end, grain, loop_b);
+                    } else {
+                        self.lane_wants[ch] = false;
+                    }
+                }
+                // Served from the older slot: the look-ahead is already
+                // rendered and there is nothing to do.
+                (true, _) => self.lane_wants[ch] = false,
+            }
+            if self.lane_len[ch] == 0 {
+                self.lane_wants[ch] = false;
+            }
+        }
+    }
+
+    /// A grain that would cross the loop's end is cut short at it.
+    fn clip_grain(from: u64, len: usize, loop_b: Option<u64>) -> usize {
+        match loop_b {
+            Some(b) if from < b => len.min((b - from) as usize),
+            Some(_) => 0,
+            None => len,
+        }
+    }
+
+    /// **May this lane be rendered a grain at a time?**
+    ///
+    /// The stage-one rule, and it is deliberately narrow: a lane with NOTES
+    /// in the span may not, because the deciding walk builds a lane's note
+    /// list for the chunk it is on and a grain covering a different span
+    /// would be handed the wrong notes. That is the next piece of work and
+    /// it is not this one.
+    ///
+    /// Everything else the lane needs is already a pure function of the
+    /// position it is asked about: `pull_lane_clips` takes the span, and
+    /// automation is answered by `automation_now` for whatever second it is
+    /// given. Those two are what steps two and three of this overhaul were
+    /// for.
+    fn grain_ok(&self, ch: usize, free: u32) -> bool {
+        self.lane_note_bank
+            .get(ch)
+            .is_none_or(|n| n.is_empty())
+            && self
+                .lane_ctl_bank
+                .get(ch)
+                .is_none_or(|c| c.is_empty())
+            && !self.lane_prep[ch].is_folder
+            && !self.lane_prep[ch].room_owns
+            && !self.lane_prep[ch].armed
+            && free & (1u32 << ch.min(CHANNELS - 1)) != 0
+    }
+
     fn run_lane_pdc(&mut self, ch: usize, frames: usize, pdc_max: u32) {
         let prep = self.lane_prep[ch];
         // **One formula, folder or not: wait for what this lane's audio does
@@ -13038,6 +13219,28 @@ impl Renderer {
         // before any of them is used. Three `split_at_mut`s and six
         // iterators, all of it safe: see `lane_seats` for the arithmetic
         // that makes the blocks disjoint.
+        // ── THE GRAIN CLOCK ──────────────────────────────────────────────
+        //
+        // Runs here, after the deciding walk has said which lanes want to
+        // render and before the render gathers them, because it answers a
+        // different question: not WHETHER a lane renders but WHAT SPAN it
+        // renders, and for most lanes on most callbacks the answer is that
+        // it has already been rendered and there is nothing to do.
+        {
+            let grain = self.shared.grain.load(Ordering::Relaxed) as usize;
+            let free = if grain > frames {
+                !pinned_lanes(
+                    &self.shared,
+                    &self.folder_is,
+                    receives,
+                    self.room_rack | self.board_live,
+                    self.keys_live,
+                )
+            } else {
+                0
+            };
+            self.plan_grains(at, frames, rolling, grain, free);
+        }
         let wanted: u32 = (0..CHANNELS).fold(0u32, |m, ch| {
             if self.lane_wants[ch] { m | (1u32 << ch) } else { m }
         });
@@ -13147,6 +13350,10 @@ impl Renderer {
                     if wanted & (1u32 << ch) == 0 {
                         continue;
                     }
+                    // **This lane's span, which the grain clock may have
+                    // moved.** Equal to the chunk's own unless the clock is
+                    // on and this lane is eligible for it.
+                    let (lane_at, lane_len) = (self.lane_at[ch], self.lane_len[ch]);
                     let prep = preps[ch];
                     *job = Some(LaneWork {
                         seats: LaneSeats {
@@ -13157,7 +13364,7 @@ impl Renderer {
                             keys: keys_lane,
                         },
                         io: LaneIo {
-                            fx_in: out.hold(at, frames),
+                            fx_in: out.hold(lane_at, lane_len),
                             fx_out: &mut scratch.fx_out,
                             dry_io: dry,
                             key_io: &mut scratch.key_io,
@@ -13166,8 +13373,8 @@ impl Renderer {
                         },
                         plan: LanePlan {
                             ch,
-                            at,
-                            frames,
+                            at: lane_at,
+                            frames: lane_len,
                             is_builtin: prep.is_builtin,
                             is_keys: prep.is_keys,
                             is_folder: prep.is_folder,
@@ -13254,8 +13461,9 @@ impl Renderer {
                 // rows. A lane the walk skipped never opened one.
                 if wanted & (1u32 << ch) != 0 {
                     let prep = self.lane_prep[ch];
+                    let len = self.lane_len[ch];
                     if let Some(g) = self.lane_grain.get_mut(ch) {
-                        g.keep(frames, self.lane_folds[ch], prep.is_folder, prep.armed);
+                        g.keep(len, self.lane_folds[ch], prep.is_folder, prep.armed);
                     }
                 }
             }
@@ -14669,6 +14877,34 @@ impl Engine {
         r.fanout_any = on;
     }
 
+    /// **How far ahead a lane is rendered, in milliseconds. Zero is off.**
+    ///
+    /// The grain render's one knob. A lane eligible for it is rendered in
+    /// grains of this length instead of once per callback, with the grain
+    /// boundaries staggered across lanes so each callback refills a share of
+    /// the desk rather than all of it. Output latency is unchanged: a grain
+    /// is rendered EARLIER in wall clock for the SAME positions.
+    ///
+    /// The saving comes from the fixed cost of a block being per-INSTANCE.
+    /// Measured on 96 hosted reverbs, a block costs 765 us before a single
+    /// frame is rendered and 5.46 us per frame after it, so eight times
+    /// fewer blocks for the same audio is most of the cost. On that desk at
+    /// a 64-frame buffer it takes the p99 from 132% of the deadline to 65%.
+    ///
+    /// **What it costs**, and it has to be said plainly: a desk change lands
+    /// on a grained lane up to this many milliseconds late. Faders, sends,
+    /// mute and solo are folded at consumption and are unaffected; a plugin
+    /// knob, an automation edit and a clip edit are not.
+    pub fn set_grain_ms(&self, ms: f64) {
+        let rate = f64::from(self.output.sample_rate.max(1));
+        let frames = if ms > 0.0 {
+            ((ms / 1000.0 * rate) as u32).min(MAX_BLOCK as u32)
+        } else {
+            0
+        };
+        self.shared.grain.store(frames, Ordering::Relaxed);
+    }
+
     pub fn render_offline(&mut self, out: &mut [f32]) {
         let Some(r) = self.offline.as_mut() else {
             return;
@@ -15121,6 +15357,8 @@ impl Engine {
             lane_prep: [LanePrep::default(); CHANNELS],
             param_lanes: 0,
             lane_wants: [false; CHANNELS],
+            lane_at: [0; CHANNELS],
+            lane_len: [0; CHANNELS],
             lane_folds: [false; CHANNELS],
             lane_grain: (0..CHANNELS).map(|_| LaneGrains::new(MAX_BLOCK as usize)).collect(),
             lane_stage: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -21026,6 +21264,8 @@ mod tests {
             lane_prep: [LanePrep::default(); CHANNELS],
             param_lanes: 0,
             lane_wants: [false; CHANNELS],
+            lane_at: [0; CHANNELS],
+            lane_len: [0; CHANNELS],
             lane_folds: [false; CHANNELS],
             lane_grain: (0..CHANNELS).map(|_| LaneGrains::new(MAX_BLOCK as usize)).collect(),
             lane_stage: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
