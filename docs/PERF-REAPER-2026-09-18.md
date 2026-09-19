@@ -563,6 +563,84 @@ single pitch-keyed `u128` note ledger per lane. That is not a term in the
 contract; it is a different engine. Until it exists, the measured ceiling on
 the whole feature is zero.
 
+### What a look-ahead WOULD be worth, if the source rewrite is accepted
+
+Asked 2026-09-19 by the owner, who does not mind an overhaul that touches the
+effects and previous projects. That removes the objection the zero above rests
+on, so the question becomes what the ceiling is. The probe was extended to
+time the WHOLE block against the part inside `render_lane`, because the rest
+of the block is the decide walk, the fold, the sends, the buses, the master
+and the taps, and no look-ahead moves any of it. That share is the floor.
+
+| desk | lane work | look-ahead floor |
+|---|---|---|
+| 96 x Rev PLATE-140 | 99.1% | 0.9% |
+| 16 x Drive | 96.5% | 3.5% |
+| 8 x Analog, 8 voices | 96.4% | 3.6% |
+| 32 lanes x 3 IR | 95.8% | 4.2% |
+| 16 x denoise | 89.0% | 11.0% |
+| 16 x [EQ, comp, plate] | 85.7% | 14.3% |
+| knowersomething1 (real) | 97.1% | 2.9% |
+| moscow1 (real) | 70.4% | 29.6% |
+| 32 bare lanes | 10.7% | 89.3% |
+
+**On any desk heavy enough to matter, 96 to 99% of the block is work a
+look-ahead could move.** The floor is 1 to 4%. So the ceiling is real and
+large, and the earlier zero was entirely about the source, not about the
+shape of the engine.
+
+What that converts to, on this machine at 128 frames, for the 96-reverb desk:
+
+| | serial | forked (shipped) | prerendered (ceiling) |
+|---|---|---|---|
+| p99 as a share of the deadline | 239.8% | 50.2% | about 1.5% |
+| late blocks, of 2000 | 2000 | 1 | 0 |
+
+**But the gain is not more plugins at 128 frames.** The addressable grid is 32
+lanes x 3 primary bays plus 3 on an extra seat, so 192 bays and no more. At
+the commercial average of 20.0 us a bay the full grid is 3840 us serial, which
+the shipped fork already carries at roughly half a deadline. The fork covers
+the whole product at 128 frames. The headroom a look-ahead adds there cannot
+be spent, because there are no more slots to fill.
+
+**Where it can be spent, in order:**
+1. **Buffer size, which is the real prize.** Halving the buffer doubles a
+   desk's share of the deadline today: the 96-reverb desk is 50.2% forked at
+   128 frames and 74.8% with six late blocks at 64. Prerendered, the block
+   carries only the spine, which is small at every buffer, and the limit
+   becomes total CPU, which does not change with buffer size at all. That is
+   32 or 64 frame monitoring with a full mix loaded, which today needs freezing.
+2. **Heavy instruments.** Sixteen the modelled piano lanes is 5058 us serial, about 55%
+   of a 128-frame deadline forked, and about 2% prerendered.
+3. **Headroom against the machine being busy with something else.**
+
+**The limit that replaces the deadline is throughput, and it is generous but
+finite.** The 96-reverb desk needs 4657 us of CPU per 2667 us of audio, which
+is 1.75 of five performance cores. Doubling the desk to the full grid is 3.5
+cores. A look-ahead converts a per-block wall into a throughput wall, and on
+this machine that wall is roughly three times further out.
+
+**What it would cost, priced for someone who accepts the overhaul:**
+1. Move both PDC delay lines out of `render_lane` and clock them at
+   CONSUMPTION in the fold. Required for every variant, standalone correctness
+   improvement, and the one piece that survives a revert as a gain.
+2. A per-lane, k-deep clip seed, replacing the one-block whole-desk `clip_lane`.
+3. Per-lane MIDI: split the pitch-keyed `u128` `sounding` ledger and the flat
+   `midi_cursor`.
+4. The ownership protocol: an epoch handshake, a per-lane swap arrival mask so
+   `swap_plugins` cannot free an instance under a worker, peek-don't-pop on the
+   dx7 / Keys / sampler / pending-voice rings, and a per-lane `DeskRef` copy.
+5. The invalidation contract, roughly sixteen terms, with per-lane and
+   per-span discard rather than a whole-ring one.
+6. Real-time policies for Windows, Linux and FreeBSD, or the whole thing is
+   macOS-only, exactly as the shipped fork is today.
+
+**The one number still missing is the tax**, and it is the only one that can
+make this not worth it: how often the ring is thrown away. Every automation
+point and knob move on a prerendered track discards its work, and on a heavy
+track a 60 Hz automation lane could eat the gain outright. The counters ship
+and read out in the audio panel.
+
 **The discard half of the probe cannot be measured offline and reads a
 truthful zero.** Every event that would throw a ring away is a user-interface
 write, and a headless render of a saved document makes none. The counters

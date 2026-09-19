@@ -2809,6 +2809,19 @@ struct ProbeCells {
     rendered: AtomicU64,
     strict: AtomicU64,
     loose: AtomicU64,
+    /// **The whole block, and how many of them**, so the lane figures below
+    /// have a denominator taken from the same run. Without it the only
+    /// comparison available is against `rt_bench`'s own mean, which averages
+    /// a different set of blocks, and the answer came out anywhere between
+    /// 13% and 52%.
+    ///
+    /// This is the number that prices the feature: the part of a block that
+    /// is NOT inside `render_lane` is the decide walk, the fold, the sends,
+    /// the buses, the master and the taps, and a look-ahead moves none of it.
+    /// Whatever fraction that is, is the floor the feature can never go
+    /// below however much it renders early.
+    callbacks: AtomicU64,
+    block_ns: AtomicU64,
     /// The same three in nanoseconds inside `render_lane`.
     rendered_ns: AtomicU64,
     strict_ns: AtomicU64,
@@ -2839,6 +2852,8 @@ pub struct Probe {
     pub rendered: u64,
     pub strict: u64,
     pub loose: u64,
+    pub callbacks: u64,
+    pub block_ns: u64,
     pub rendered_ns: u64,
     pub strict_ns: u64,
     pub loose_ns: u64,
@@ -2872,6 +2887,14 @@ impl Probe {
         (self.rendered_ns > 0).then(|| self.freed_ns as f64 / self.rendered_ns as f64)
     }
 
+    /// **The share of the whole block that is lane work**, which is the
+    /// ceiling on anything a look-ahead can ever move. The rest is the
+    /// decide walk, the fold, the buses, the master and the taps, and it
+    /// stays on the deadline whatever is rendered early.
+    pub fn lane_share(self) -> Option<f64> {
+        (self.block_ns > 0).then(|| self.rendered_ns as f64 / self.block_ns as f64)
+    }
+
     /// The share of blocks in which a ring would have been discarded.
     pub fn discard_share(self) -> Option<f64> {
         (self.blocks > 0).then(|| self.discard_blocks as f64 / self.blocks as f64)
@@ -2880,12 +2903,15 @@ impl Probe {
     pub fn line(self) -> String {
         let pct = |v: Option<f64>| v.map_or_else(|| "n/a".to_owned(), |f| format!("{:.1}%", f * 100.0));
         format!(
-            "probe: {} blocks, {:.1} lanes rendered/block, {} us/block in lanes; \
+            "probe: {} blocks, {:.1} lanes rendered/block, {} us/block in lanes \
+             ({} of the block, so a look-ahead's floor is {}); \
              eligible now {} ({:.1} lanes), +source {} ({:.1} lanes), +instruments {} ({:.1} lanes); \
              discards {} of blocks (param {}, transport {}, loop {}, tempo {}, swap {}, arm {})",
             self.blocks,
             if self.blocks > 0 { self.rendered as f64 / self.blocks as f64 } else { 0.0 },
             if self.blocks > 0 { self.rendered_ns / self.blocks / 1000 } else { 0 },
+            pct(self.lane_share()),
+            pct(self.lane_share().map(|f| 1.0 - f)),
             pct(self.strict_share()),
             if self.blocks > 0 { self.strict as f64 / self.blocks as f64 } else { 0.0 },
             pct(self.loose_share()),
@@ -2911,6 +2937,8 @@ impl ProbeCells {
             rendered: g(&self.rendered),
             strict: g(&self.strict),
             loose: g(&self.loose),
+            callbacks: g(&self.callbacks),
+            block_ns: g(&self.block_ns),
             rendered_ns: g(&self.rendered_ns),
             strict_ns: g(&self.strict_ns),
             loose_ns: g(&self.loose_ns),
@@ -8676,6 +8704,10 @@ impl Renderer {
             0
         };
         self.shared.rt.note(ns, deadline);
+        if self.probe {
+            self.shared.probe.callbacks.fetch_add(1, Ordering::Relaxed);
+            self.shared.probe.block_ns.fetch_add(ns, Ordering::Relaxed);
+        }
     }
 
     fn render_inner(&mut self, out: &mut [f32], now: Nanos, heard: Nanos) {
