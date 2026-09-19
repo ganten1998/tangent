@@ -6096,6 +6096,14 @@ struct Renderer {
     /// the answer is deliberately whole-timeline rather than
     /// under-the-playhead.
     clip_lanes: u32,
+    /// **Which lanes have a clip under the playhead this block.**
+    ///
+    /// The per-block twin of [`Self::clip_lanes`], which is deliberately a
+    /// whole-timeline answer. Three sites must keep reading the
+    /// whole-timeline one and not this: the seed in `render_lane`, the
+    /// folder walk, and the lane pass's `has_audio`. This one decides only
+    /// whether a lane is worth RENDERING, never whether it has audio at all.
+    clip_under: u32,
     /// **APPENDED — the DRY stem block**, `stem_scratch`'s exact layout and
     /// its exact indexing, filled only while a dry stems pass is running.
     ///
@@ -9509,10 +9517,35 @@ impl Renderer {
         // over silence while the song is parked, which is exactly what a
         // MIDI track's have always done.
         let mut lanes = 0u32;
+        // **And which of them have something under the playhead RIGHT NOW.**
+        //
+        // `clip_lanes` above is deliberately a whole-timeline answer, for
+        // the reason written on it. This is its per-block twin, and it is
+        // the term that lets a lane with nothing to play rest between its
+        // clips instead of running its chain over silence for the length of
+        // the song. Computed here, in the walk that already visits every
+        // clip, so it costs one span test each and nothing at all per frame.
+        //
+        // By SPAN and not by sample: a recorded rest, a fade-out or a quiet
+        // passage is still the clip playing, and a lane that parked inside
+        // one would wake on the next loud moment with its chain cold.
+        let mut under = 0u32;
+        let end = at.saturating_add(frames as u64);
         for placed in &self.clips {
-            lanes |= 1u32 << placed.strip.min(CHANNELS - 1);
+            let bit = 1u32 << placed.strip.min(CHANNELS - 1);
+            lanes |= bit;
+            if rolling && placed.start < end && at < placed.start.saturating_add(placed.len) {
+                under |= bit;
+            }
+        }
+        for m in &self.midi_clips {
+            let bit = 1u32 << m.strip.min(CHANNELS - 1);
+            if rolling && m.start < end && at < m.start.saturating_add(m.len) {
+                under |= bit;
+            }
         }
         self.clip_lanes = lanes;
+        self.clip_under = under;
         if lanes != 0 {
             if let Some(cl) = self.clip_lane.get_mut(..frames * CHANNELS * 2) {
                 cl.fill(0.0);
@@ -10333,6 +10366,18 @@ impl Renderer {
         // because it changes when a plugin is loaded and not within a
         // buffer. See `publish_latency`.
         let pdc_max = self.shared.max_latency.load(Ordering::Relaxed);
+        // **Which lanes the sends pass will also run**, lifted from that
+        // pass's own loop. A destination's rack is clocked a second time
+        // over the arrivals, so such a lane must never rest: its chain
+        // would change clock rate mid-song, and this pass is the only one
+        // that ever hands a channel seat its sidechain key. See `live_now`.
+        let mut receives = 0u32;
+        for i in 0..self.route_n {
+            let (_, target, hardware, _, gain) = self.route_cache[i];
+            if !hardware && gain > 0.0 && target < CHANNELS {
+                receives |= 1u32 << target;
+            }
+        }
         // Instrument instances arriving or leaving, by the kit's own swap
         // protocol: built and freed on the UI thread, installed here by
         // pointer swap. Whatever a slot held rides back on the retiring ring,
@@ -11013,7 +11058,36 @@ impl Renderer {
                 || self.racks[tangent_ui::recorder::folder_extra_seat(ch)].holds_a_voice();
             let sounding = self.lane_instrument_active(ch)
                 || self.lane_loud.get(ch).copied().unwrap_or(true);
-            let live_now = rolling
+            // **What keeps a lane awake while the transport rolls.**
+            //
+            // `rolling` alone used to, which meant every lane with a rack
+            // and a clip ANYWHERE on the timeline ran its whole chain on
+            // every block of the song, over silence, for the gaps between
+            // its clips and for the whole of a part it does not play on.
+            // Muting saved 12.7% of a 48-insert desk, measured, because a
+            // plugin costs the same on silence as on signal.
+            //
+            // Four terms replace it, and each answers one of the ways this
+            // is easy to get wrong:
+            //
+            // * `clip_under` - something to play this block. By span, so a
+            //   rest inside a take is still the take playing.
+            // * `lane_loud` - the lane's own measured pre-fader output from
+            //   last block. A reverb tail, a delay repeat, an amp's hiss:
+            //   anything still making sound keeps its lane rendering until
+            //   it falls under `PARK_FLOOR`, which is -80 dBFS. That is
+            //   what stops a tail being guillotined mid-song, and it is
+            //   also why the park needs no fade: nothing audible is cut.
+            // * `receives` - a send destination. Its rack is clocked a
+            //   SECOND time by the sends pass, so parking it would change a
+            //   stateful chain's clock rate mid-song, and the lane pass is
+            //   the only pass that ever hands that seat its sidechain key.
+            // * `param_lanes` - see the field: a knob or a preset for this
+            //   lane arrived this block, and a skipped block loses it.
+            let live_now = (rolling
+                && (self.clip_under & (1u32 << ch.min(CHANNELS - 1)) != 0
+                    || self.lane_loud.get(ch).copied().unwrap_or(true)
+                    || receives & (1u32 << ch.min(CHANNELS - 1)) != 0))
                 || auditioning
                 || !lane_notes.is_empty()
                 || !lane_controls.is_empty()
@@ -13145,6 +13219,7 @@ impl Engine {
             ir_phase: 0.0,
             clip_lane: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             clip_lanes: 0,
+            clip_under: 0,
             dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             dry_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             dry_pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
@@ -18853,6 +18928,7 @@ mod tests {
             ir_phase: 0.0,
             clip_lane: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             clip_lanes: 0,
+            clip_under: 0,
             dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             dry_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             dry_pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),

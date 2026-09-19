@@ -12,6 +12,26 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Changed
 
+- **A track with nothing to play stops being processed.** While the
+  transport was rolling, every track with a plugin on it and a clip anywhere
+  in the song ran its whole chain on every block, over silence, for the gaps
+  between its clips and for every part it does not play on. Muting a track
+  saved almost nothing, because a plugin costs the same on silence as on
+  signal. A track now rests when it has nothing under the playhead and has
+  stopped making sound, and wakes for its next clip. Measured on this
+  machine at 128 frames, sixteen tracks with an EQ, compressor and plate
+  each, ten of them idle: 149 to 64 microseconds a block.
+
+  Four things keep a track awake, and each answers a way this is easy to get
+  wrong. Something under the playhead, tested by span so a rest inside a
+  take is still the take playing. Its own measured output, so a reverb tail
+  or a delay repeat keeps its track running until it falls below -80 dBFS,
+  which is what stops a tail being cut off mid-song and is also why the rest
+  needs no fade: nothing audible is ever taken away. Being the destination
+  of a send, because such a track's plugins are clocked a second time by the
+  send pass and are handed their sidechain there. And any knob turn, preset
+  or automation point that arrived for it this block.
+
 - **Tangent's own Drive and Tape stop being the most expensive plugins on
   the machine.** The performance sweep measured both above every commercial
   plugin it tested beside them, which is not a place a built-in effect

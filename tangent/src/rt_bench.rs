@@ -249,6 +249,76 @@ fn measure(name: &str, e: &mut Engine, warmup: usize, block: usize) -> Stats {
     s
 }
 
+/// **A lane that rests is a lane that had gone quiet, not one that was
+/// still sounding.**
+///
+/// While the transport rolls, a lane with a rack and any clip anywhere used
+/// to run its whole chain on every block of the song. It rests now when it
+/// has nothing under the playhead, which is most of a song for most tracks
+/// and is worth about 2.3x on a desk where ten of sixteen lanes are idle.
+///
+/// The risk that buys is a reverb tail cut off mid-song, and the term that
+/// removes it is the lane's own measured output: a lane keeps rendering
+/// while it is above `PARK_FLOOR`, which is -80 dBFS. So this plays a short
+/// clip through a plate and then watches the decay for ten seconds, and
+/// asserts that the block where the lane finally stops contributing was
+/// already inaudible. That is also why the rest needs no fade.
+#[test]
+fn a_reverb_tail_is_never_cut_off_by_a_lane_going_to_rest() {
+    let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+    e.set_armed(0);
+    e.set_desk(&quiet_desk());
+    // Half a second of noise into a plate, then nothing for ten seconds.
+    let clip = noise(0.5);
+    let len = clip.frames() as u64;
+    e.set_clips(vec![Placed {
+        clip,
+        strip: 0,
+        start: 0,
+        offset: 0,
+        len,
+        fade_in: 0,
+        fade_out: 0,
+        gain: 0.5,
+    }]);
+    seat(&mut e, 1, &[PLATE_PATH]);
+    e.set_transport(1, 0);
+    e.set_rolling(true);
+    let mut out = vec![0.0f32; BLOCK * 2];
+    // Fourteen seconds. The plate is under the floor by about two and a
+    // half, and the rest waits a further `RACK_PARK_S` of quiet after that,
+    // so the moment being tested lands around eleven.
+    let blocks = (14.0 * f64::from(RATE) / BLOCK as f64) as usize;
+    let mut last_heard = 0.0f32;
+    let mut first_silent: Option<usize> = None;
+    for b in 0..blocks {
+        out.fill(0.0);
+        e.render_offline(&mut out);
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        if peak > 0.0 {
+            last_heard = peak;
+            first_silent = None;
+        } else if first_silent.is_none() {
+            first_silent = Some(b);
+        }
+    }
+    // It really did decay rather than running on for ever, or the test
+    // proves nothing about the cut.
+    let at = first_silent.expect(
+        "the lane never went to rest in fourteen seconds, so the saving this \
+         whole change exists for is not happening",
+    );
+    let secs = at as f64 * BLOCK as f64 / f64::from(RATE);
+    assert!(secs > 8.0, "the lane rested after {secs:.1}s, sooner than the park window");
+    // And the last sound before it stopped was already below the floor the
+    // rest is keyed on, so nothing audible was taken away.
+    assert!(
+        last_heard <= 1.0e-4,
+        "the tail was cut at {last_heard} ({:.1} dBFS), which is audible",
+        20.0 * last_heard.max(1e-12).log10()
+    );
+}
+
 /// **The fork renders what the single walk rendered.**
 ///
 /// The one property that matters more than any microsecond: a desk rendered
@@ -370,6 +440,41 @@ fn rt_bench() {
 
     let mut e = audio_desk(16, &[DENOISE_PATH]);
     rows.push(measure("16 lanes x denoise (spectral studio)", &mut e, WARMUP, BLOCK));
+    drop(e);
+
+    // **A desk where most lanes have nothing to play**, which is what a
+    // song looks like for most of its length. Ten of the sixteen lanes'
+    // clips sit past the end of the measurement, so those lanes have a rack
+    // and nothing under the playhead.
+    let mut e = audio_desk(16, &[EQ_PATH, COMP_PATH, PLATE_PATH]);
+    {
+        let clip = noise(12.0);
+        let len = clip.frames() as u64;
+        // Six lanes play from zero; the rest start a minute in.
+        let clips: Vec<Placed> = (0..16)
+            .map(|lane| Placed {
+                clip: Arc::clone(&clip),
+                strip: lane,
+                start: if lane < 6 { 0 } else { u64::from(RATE) * 60 },
+                offset: 0,
+                len,
+                fade_in: 0,
+                fade_out: 0,
+                gain: 0.5,
+            })
+            .collect();
+        e.set_clips(clips);
+    }
+    // **Warmed past the park window**, which is eight seconds of a lane
+    // making nothing: at 128 frames that is three thousand blocks, and the
+    // ordinary four hundred would time a desk whose idle lanes have not
+    // been idle long enough to rest yet.
+    rows.push(measure(
+        "16 lanes x [EQ, comp, plate], 10 with nothing to play",
+        &mut e,
+        3_600,
+        BLOCK,
+    ));
     drop(e);
 
     // **Our own two most expensive units**, which the sweep measured above
