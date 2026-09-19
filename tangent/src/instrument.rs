@@ -3766,7 +3766,14 @@ struct KeyFeed<'a> {
 /// looks for above the call below.
 #[allow(clippy::too_many_arguments)]
 fn run_extra_rack(
-    racks: &mut [Rack],
+    // **The one seat, not the whole bank.** It took `&mut [Rack]` and an
+    // absolute index, which reads naturally and borrows all 4,389 seats to
+    // touch one of them. That is the borrow a lane worker cannot have: two
+    // lanes hold provably disjoint seats and the compiler could not be told
+    // so while this signature existed. The seat NUMBER is still a
+    // parameter, because the automation queue and the board are addressed
+    // by it.
+    rack: &mut Rack,
     is_folder: bool,
     auto_params: &[Vec<tangent_host::ParamPoint>],
     planar: &mut [Vec<f32>],
@@ -3786,7 +3793,7 @@ fn run_extra_rack(
     if is_folder {
         return;
     }
-    if racks.get(extra).is_none_or(Rack::is_empty) {
+    if rack.is_empty() {
         return;
     }
     // This seat's own parameter queue, exactly as the first rack takes its
@@ -3797,7 +3804,7 @@ fn run_extra_rack(
             .map_or(&[][..], Vec::as_slice)
     });
     run_rack(
-        &mut racks[extra],
+        rack,
         planar,
         frames,
         out,
@@ -6272,7 +6279,7 @@ impl Renderer {
                     // (`recorder::bays_on`), seated past everything in
                     // `BUS_EXTRA_SEATS`, and six bays are one chain.
                     run_extra_rack(
-                        &mut self.racks,
+                        &mut self.racks[tangent_ui::recorder::bus_extra_seat(Strip::Click.index())],
                         false,
                         &self.auto_params,
                         &mut self.fx_in,
@@ -7792,7 +7799,7 @@ impl Renderer {
                         // inside the `!is_folder` arm; `run_extra_rack` holds
                         // the guard as well, so neither can drift.
                         run_extra_rack(
-                            &mut self.racks,
+                            &mut self.racks[tangent_ui::recorder::folder_extra_seat(strip.index())],
                             is_folder,
                             &self.auto_params,
                             &mut self.fx_in,
@@ -10108,7 +10115,7 @@ impl Renderer {
                 // are one chain; see `run_extra_rack`, which holds the
                 // is_folder guard this block's head already applied.
                 run_extra_rack(
-                    &mut self.racks,
+                    &mut self.racks[tangent_ui::recorder::folder_extra_seat(ch)],
                     is_folder,
                     &self.auto_params,
                     &mut self.fx_in,
@@ -10458,18 +10465,56 @@ impl Renderer {
         }
         self.board_ran |= bit;
         let controls: &[Control] = if armed { &self.controls } else { &[] };
-        for pedal in 0..tangent_ui::recorder::AMP_PEDALS {
-            let seat = tangent_ui::recorder::amp_pedal_seat(ch, pedal);
-            // An empty pedal rack costs this one load and nothing else —
+        let first = tangent_ui::recorder::amp_pedal_seat(ch, 0);
+        let Some(board) = self
+            .racks
+            .get_mut(first..first + tangent_ui::recorder::AMP_PEDALS)
+        else {
+            return;
+        };
+        run_board(
+            board,
+            first,
+            &self.auto_params,
+            &mut self.fx_in,
+            &mut self.fx_out,
+            &self.shared,
+            frames,
+            controls,
+        );
+    }
+}
+
+/// **One lane's pedalboard, over the buffer its amp is about to see.**
+///
+/// A free function over the seven seats and nothing else, so a lane worker
+/// can be handed its own board: `&mut self` borrowed all 4,389 seats to
+/// touch seven that belong to one channel by construction. `first` is the
+/// board's own base seat, which the automation queue is addressed by.
+#[allow(clippy::too_many_arguments)]
+fn run_board(
+    board: &mut [Rack],
+    first: usize,
+    auto_params: &[Vec<tangent_host::ParamPoint>],
+    planar: &mut [Vec<f32>],
+    out: &mut [Vec<f32>],
+    shared: &Shared,
+    frames: usize,
+    controls: &[Control],
+) {
+    for (pedal, rack) in board.iter_mut().enumerate() {
+        let seat = first + pedal;
+        {
+            // An empty pedal rack costs this one load and nothing else -
             // every channel's default state.
-            if self.racks[seat].is_empty() {
+            if rack.is_empty() {
                 continue;
             }
             // The seat's own queue, taken before the rack is borrowed
             // mutably, as every caller does.
             let pedal_params: [&[tangent_host::ParamPoint]; INSERTS] =
                 std::array::from_fn(|b| {
-                    self.auto_params
+                    auto_params
                         .get(seat * INSERTS + b)
                         .map_or(&[][..], Vec::as_slice)
                 });
@@ -10478,14 +10523,14 @@ impl Renderer {
             // the hand's CONTROLS still reach a pedal that listens for them,
             // and the fold hands an empty set because a bus is not played.
             run_rack(
-                &mut self.racks[seat],
-                &mut self.fx_in,
+                rack,
+                planar,
                 frames,
-                &mut self.fx_out,
+                out,
                 &[],
                 controls,
                 &pedal_params,
-                &self.shared,
+                shared,
                 seat,
                 // **NOT-A-CHANNEL:** a pedal seat lives past every channel
                 // index, so it can never have a lane's sample.
@@ -10496,7 +10541,9 @@ impl Renderer {
             );
         }
     }
+}
 
+impl Renderer {
     fn fold_folders(
         &mut self,
         frames: usize,
