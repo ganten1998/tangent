@@ -4303,8 +4303,22 @@ mod engine_parts {
         let at = 640u64;
         let frames = 512usize;
         let stride = CHANNELS * 2;
+        // The desk, rebuilt the way it is built now: one pull per lane into
+        // that lane's own planar buffer, scattered back into the whole-desk
+        // layout the oracle below writes. Each lane is written exactly once,
+        // because the pull zeroes and accumulates inside itself.
+        let fill_desk = |dst: &mut [f32]| {
+            let mut planar = vec![vec![0.0f32; frames]; TAP_CHANNELS];
+            for lane in 0..CHANNELS {
+                pull_lane_clips(&clips, lane, at, frames, punch[lane], &mut planar);
+                for f in 0..frames {
+                    dst[f * stride + lane * 2] = planar[0][f];
+                    dst[f * stride + lane * 2 + 1] = planar[1][f];
+                }
+            }
+        };
         let mut got = vec![0.0f32; frames * stride];
-        fill_clip_span(&clips, at, frames, &punch, &mut got);
+        fill_desk(&mut got);
 
         // ── the oracle: the nest exactly as it was ───────────────────────
         let mut want = vec![0.0f32; frames * stride];
@@ -4369,7 +4383,7 @@ mod engine_parts {
         // the property that makes it safe to ask for a block that is not the
         // one the callback is on.
         let mut again = vec![0.0f32; frames * stride];
-        fill_clip_span(&clips, at, frames, &punch, &mut again);
+        fill_desk(&mut again);
         assert!(
             got.iter().zip(&again).all(|(a, b)| a.to_bits() == b.to_bits()),
             "the clip source is not a pure function of its span"
@@ -4412,7 +4426,6 @@ mod engine_parts {
             fade_out: 0,
             gain: 1.0,
         }];
-        let punch = [u64::MAX; CHANNELS];
         let frames = 512usize;
         let mut out: Vec<Vec<f32>> = vec![vec![0.0; frames]; TAP_CHANNELS];
 
@@ -4445,17 +4458,6 @@ mod engine_parts {
                 .all(|(x, y)| x.to_bits() == y.to_bits())),
             "asking for a distant span changed the answer for the current one"
         );
-
-        // **And the two spellings agree.** The whole-desk fill is what the
-        // seed still reads; the per-lane pull is what replaces it. They must
-        // produce the same samples or deleting the buffer changes the mix.
-        let stride = CHANNELS * 2;
-        let mut desk = vec![0.0f32; frames * stride];
-        fill_clip_span(&clips, 1_000, frames, &punch, &mut desk);
-        for f in 0..frames {
-            assert_eq!(desk[f * stride + LANE * 2].to_bits(), near[0][f].to_bits());
-            assert_eq!(desk[f * stride + LANE * 2 + 1].to_bits(), near[1][f].to_bits());
-        }
 
         // A clip that ends inside the span leaves the rest SILENT, and that
         // is the one genuinely new failure mode: the buffer handed to the
@@ -5356,7 +5358,19 @@ struct LanePlan<'a> {
 
 /// **What every lane reads and none of them writes.**
 struct DeskRef<'a> {
-    clip_lane: &'a [f32],
+    /// **The clip schedule, not a buffer of it.** The whole-desk block of
+    /// pre-rack timeline audio is gone: a lane pulls its own span from this,
+    /// for `clips_at`, which is the block this walk is rendering. That is
+    /// what lets the source answer for any block rather than only for the one
+    /// the callback is on.
+    clips: &'a [Placed],
+    clips_at: u64,
+    /// The stopped-transport gate the deleted buffer's early return used to
+    /// supply. Without it a parked position is re-read every callback and the
+    /// clips buzz one block of themselves under a readout that says nothing
+    /// is moving.
+    clips_rolling: bool,
+    punch: &'a [u64; CHANNELS],
     auto_params: &'a [Vec<tangent_host::ParamPoint>],
     shared: &'a Shared,
     key_prev: &'a [f32],
@@ -5379,114 +5393,6 @@ struct DeskRef<'a> {
 /// Answers whether the lane produced anything to fold. `false` is every one
 /// of the three ways the old body reached its `continue`: a scratch too
 /// short for the block, and an inactive instrument on a bare lane.
-/// **One span of the timeline's clip audio, as a pure function of where
-/// that span is.**
-///
-/// No cursor, no cache, no decode, no allocation and no lock: every
-/// sample is `samples[(offset + k) * 2 + c] * fade(k) * gain`, read
-/// straight out of an `Arc<Clip>` the host decoded whole. Stretch and
-/// loop are resolved before the audio thread ever sees this, into extra
-/// `Placed` passes, so what arrives here is a flat list of span, offset,
-/// fade and gain.
-///
-/// **That purity is the point**, and it is why this is a free function
-/// rather than a method. A lane can only be rendered for a block other
-/// than the one the callback is on if its source can be asked for that
-/// block, and everything impure that used to surround this loop stays
-/// behind in `mix_clips`: the clip-list swap, the `lane_gain` smoothing,
-/// the `clip_lanes` and `clip_under` masks, the stopped-transport early
-/// return. Ask this for any `at` and it answers for that `at`.
-///
-/// **Clip-major, not frame-major, and the inversion is not cosmetic.**
-/// It used to be `for f { for placed in clips }`, which is
-/// `frames * clips` iterations whatever the clips are doing, with no cap
-/// anywhere and a single looped clip expanded by the host into as many as
-/// four thousand passes. Now each clip is intersected with the span once
-/// and only the frames it actually covers are walked, so a desk full of
-/// clips nobody is near costs one comparison each.
-///
-/// The sum is bit-identical to the walk it replaces. For any one output
-/// sample the contributing clips are still visited in list order, because
-/// the outer loop IS list order and each clip writes every frame it
-/// covers before the next one starts; `+=` on the same cell therefore
-/// happens in the same sequence, which is the only thing f32 addition's
-/// lack of associativity can notice.
-///
-/// `dst` is the whole-desk, frame-major, lane-interleaved buffer and is
-/// ACCUMULATED into, so the caller zeroes it.
-fn fill_clip_span(
-    clips: &[Placed],
-    at: u64,
-    frames: usize,
-    punch: &[u64; CHANNELS],
-    dst: &mut [f32],
-) {
-    let stride = CHANNELS * 2;
-    let end = at.saturating_add(frames as u64);
-    for placed in clips {
-        let lane = placed.strip.min(CHANNELS - 1);
-        // **The intersection, in u64 and before any cast**, because a
-        // position grows without bound. Before a clip and past its end
-        // are both silence and both ordinary.
-        //
-        // **Being recorded over, right now**: from the punch frame on,
-        // this lane's clips are the material the take is replacing and
-        // must not be heard against it. It was a per-frame test and is
-        // the span's upper bound now, which is the same cut.
-        let from = at.max(placed.start);
-        let to = end
-            .min(placed.start.saturating_add(placed.len))
-            .min(punch[lane]);
-        if to <= from {
-            continue;
-        }
-        // **The clip's own level, and nothing else's.** Sanitised rather
-        // than trusted: this multiplies into somebody's monitors. The
-        // lane's fader, pan, mute, solo and send are the channel fold's,
-        // one strip's worth applied once, which is what stopped a clip on
-        // a folder needing a special case here.
-        let clip_g = if placed.gain.is_finite() {
-            placed.gain.clamp(0.0, 64.0)
-        } else {
-            1.0
-        };
-        for now in from..to {
-            let f = (now - at) as usize;
-            let k = now - placed.start;
-            let i = match usize::try_from(placed.offset + k) {
-                Ok(frame) => frame * 2,
-                Err(_) => continue,
-            };
-            // Bounds-checked rather than trusted: `k < len` is the clamp,
-            // and this is the line that would panic on the audio thread
-            // if the host ever pushed a `len` past the file.
-            let (cl, cr) = match (placed.clip.samples.get(i), placed.clip.samples.get(i + 1)) {
-                (Some(a), Some(b)) => (*a, *b),
-                _ => continue,
-            };
-            // The fades: linear ramps in frames, worked out from the u64
-            // distances so a four-minute clip cannot lose precision. The
-            // head ramp rises 0 to 1 over `fade_in`; the tail falls to
-            // exactly 0 ON the last frame, so a faded clip cannot click
-            // shut.
-            let mut env = 1.0f32;
-            if placed.fade_in > 0 && k < placed.fade_in {
-                env *= k as f32 / placed.fade_in as f32;
-            }
-            let left = placed.len - k;
-            if placed.fade_out > 0 && left <= placed.fade_out {
-                env *= (left - 1) as f32 / placed.fade_out as f32;
-            }
-            if let Some(v) = dst.get_mut(f * stride + lane * 2) {
-                *v += cl * env * clip_g;
-            }
-            if let Some(v) = dst.get_mut(f * stride + lane * 2 + 1) {
-                *v += cr * env * clip_g;
-            }
-        }
-    }
-}
-
 /// **One LANE's timeline audio for one span, as a pure function of that span.**
 ///
 /// The per-lane twin of [`fill_clip_span`], and the shape the rest of the
@@ -5612,25 +5518,27 @@ fn render_lane(
         // seeding it here as well would put it on the bus twice, once
         // wet and once dry. The lane keeps everything else it carries:
         // its instrument, its notes, its fader, its meter.
-        let clip_here = has_audio && !room_owns;
-        // Disjoint fields borrow disjointly, which is the only
-        // reason this can be written as a copy rather than a
-        // per-sample method call.
-        let (fx, clip) = (&mut io.fx_in, &desk.clip_lane);
-        for c in 0..TAP_CHANNELS {
-            let Some(dst) = fx.get_mut(c) else {
-                continue;
-            };
-            if clip_here {
-                for f in 0..frames {
-                    dst[f] = clip
-                        .get(f * CHANNELS * 2 + ch * 2 + c)
-                        .copied()
-                        .unwrap_or(0.0);
+        //
+        // **Pulled, not copied out of a desk-wide block.** The lane asks the
+        // schedule for its own span, which is what lets it be asked for a
+        // block other than the one the callback is on. `clips_rolling` is the
+        // stopped-transport gate the deleted buffer's early return supplied.
+        let clip_here = has_audio && !room_owns && desk.clips_rolling;
+        if clip_here {
+            pull_lane_clips(
+                desk.clips,
+                ch,
+                desk.clips_at,
+                frames,
+                desk.punch.get(ch).copied().unwrap_or(u64::MAX),
+                io.fx_in,
+            );
+        } else {
+            for c in 0..TAP_CHANNELS {
+                if let Some(dst) = io.fx_in.get_mut(c) {
+                    let n = frames.min(dst.len());
+                    dst[..n].fill(0.0);
                 }
-            } else {
-                let n = frames.min(dst.len());
-                dst[..n].fill(0.0);
             }
         }
     }
@@ -7107,20 +7015,6 @@ struct Renderer {
     /// The test tone's phase, 0..1 of a cycle — the renderer's, not the
     /// job's, so a job swap can never click mid-cycle.
     ir_phase: f64,
-    /// **APPENDED — the timeline's audio, laid out per lane, pre-fader and
-    /// pre-rack.** `CHANNELS * 2` interleaved floats per frame, exactly
-    /// `stem_scratch`'s layout, so the two can be read with the same index
-    /// arithmetic and nobody has to hold two shapes in their head.
-    ///
-    /// This buffer is why an insert on an audio track finally does
-    /// something. `mix_clips` writes the clip here instead of folding it
-    /// onto the bus, and the channel walk seeds its rack input from it — so
-    /// the clip takes the same road as the lane's live input and its
-    /// instrument, through the same rack, on the same delay line, into the
-    /// same fold. Bought whole at construction like every other scratch:
-    /// the audio thread allocates nothing. About a megabyte at
-    /// `MAX_BLOCK` × 32 lanes × stereo.
-    clip_lane: Vec<f32>,
     /// **One lane's clip audio, pulled for the room.** `mix_monitor` reads
     /// the timeline inside a per-sample loop that also advances a smoother,
     /// so it cannot stream; it fills this once for the input's lane and then
@@ -10635,11 +10529,6 @@ impl Renderer {
         }
         self.clip_lanes = lanes;
         self.clip_under = under;
-        if lanes != 0 {
-            if let Some(cl) = self.clip_lane.get_mut(..frames * CHANNELS * 2) {
-                cl.fill(0.0);
-            }
-        }
         // **Stopped means silent, exactly as it always has.** Without this the
         // parked position is re-read every callback and the clips buzz one
         // block of themselves under a readout that says nothing is moving.
@@ -10673,9 +10562,6 @@ impl Renderer {
                 self.lane_gain[lane] += (target[lane] - self.lane_gain[lane]) * coeff;
             }
         }
-        // Disjoint fields, so the borrows are disjoint: the clip list is read
-        // while the per-lane buffer is written.
-        fill_clip_span(&self.clips, at, frames, &punch, &mut self.clip_lane);
     }
 
     /// The drumpad: sixteen one-shot voices, summed straight onto the bus.
@@ -12399,7 +12285,10 @@ impl Renderer {
         let probe_freed_ns = AtomicU64::new(0);
         if wanted != 0 {
             let desk = DeskRef {
-                clip_lane: &self.clip_lane,
+                clips: &self.clips,
+                clips_at: at,
+                clips_rolling: rolling,
+                punch: &self.punch_now,
                 auto_params: &self.auto_params,
                 shared: &self.shared,
                 key_prev: &self.key_prev,
@@ -14458,7 +14347,6 @@ impl Engine {
             key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             ir: None,
             ir_phase: 0.0,
-            clip_lane: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             clip_room: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             punch_now: [u64::MAX; CHANNELS],
             clip_lanes: 0,
@@ -20200,7 +20088,6 @@ mod tests {
             key_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             ir: None,
             ir_phase: 0.0,
-            clip_lane: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             clip_room: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             punch_now: [u64::MAX; CHANNELS],
             clip_lanes: 0,
@@ -27895,6 +27782,60 @@ mod tests {
             "the playhead did not move: {}",
             e.transport_position()
         );
+    }
+
+    /// **A parked transport seeds silence.**
+    ///
+    /// The clip walk used to return after zeroing when the transport was not
+    /// rolling, and its own note said why: without it the parked position is
+    /// re-read every callback and the clips buzz one block of themselves
+    /// under a readout that says nothing is moving. The walk no longer
+    /// produces audio at all, so that gate has to be carried to the two
+    /// places that pull instead, and this is the one that would be heard.
+    #[test]
+    fn a_parked_transport_seeds_silence() {
+        use std::sync::Arc;
+        let clip = Placed {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: vec![1.0; 8000],
+                rate: 48_000,
+                source: PathBuf::from("park.wav"),
+            }),
+            strip: 0,
+            start: 0,
+            offset: 0,
+            len: 4000,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+        };
+        let (mut r, _tx, shared) = renderer_with_midi(2);
+        let (mut to_audio, _from) = r.hijack_track_rings();
+        to_audio.push(vec![clip]).expect("room");
+        shared.transport_at.store(0, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
+        let mut out = vec![0.0_f32; 2 * 512];
+
+        // Rolling: it sounds, so the fixture is not silent for some other
+        // reason and the assertion below means something.
+        shared.rolling.store(true, Ordering::Relaxed);
+        r.render(&mut out, 0, 0);
+        assert!(
+            out.iter().any(|v| v.abs() > 0.1),
+            "the clip never sounded, so the parked case proves nothing"
+        );
+
+        // Parked over the same material: nothing, block after block.
+        shared.rolling.store(false, Ordering::Relaxed);
+        for block in 0..4 {
+            out.fill(0.0);
+            r.render(&mut out, 0, 0);
+            assert!(
+                out.iter().all(|v| v.abs() < 1.0e-6),
+                "block {block} of a parked transport played its clip: {}",
+                out.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+            );
+        }
     }
 
     #[test]
