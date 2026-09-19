@@ -4246,6 +4246,69 @@ mod engine_parts {
         assert_eq!(rt_bucket(u64::MAX), RT_HIST_BUCKETS - 1);
     }
 
+    /// **Nothing a worker owns may advance a ring the timeline clocks.**
+    ///
+    /// Both delay compensation lines used to run at the end of `render_lane`
+    /// and now run at consumption, in the fold. The reason is not tidiness:
+    /// `DelayLine::run` advances its write cursor by `frames` on every call
+    /// and nothing can rewind it, so a lane rendered ahead of the block that
+    /// consumes it and then thrown away would shift that lane against the
+    /// mix permanently. Every variant of a look-ahead needs this, which is
+    /// why it landed on its own and first.
+    ///
+    /// Asserted against the source because the property is an ABSENCE, and
+    /// the engine cannot yet demonstrate it by rendering: with no look-ahead
+    /// built, a lane is rendered exactly once per block it is folded in, so
+    /// the two placements produce identical audio and no output test can
+    /// tell them apart. What a reader can tell apart is whether the worker's
+    /// seats still hold a delay line.
+    #[test]
+    fn a_lane_worker_can_no_longer_reach_a_delay_line() {
+        // **Every anchor takes the LAST match, not the first.** This module
+        // sits above the code it reads, so the string literals below are
+        // themselves the first occurrence of each anchor in the file, and a
+        // `split_once` would have searched this test rather than the engine
+        // and passed without looking at anything.
+        let src = include_str!("instrument.rs");
+        let seats = src
+            .rsplit_once("struct LaneSeats<'a> {")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(body, _)| body)
+            .expect("LaneSeats is declared");
+        assert!(
+            seats.contains("rack:"),
+            "the seats were not found, so this test proved nothing:\n{seats}"
+        );
+        assert!(
+            !seats.contains("DelayLine"),
+            "a worker's seats hold a delay line again: it would be advanced by \
+             a block that may never be heard.\n{seats}"
+        );
+        let render = src
+            .rsplit_once("\nfn render_lane(")
+            .and_then(|(_, rest)| rest.split_once("\nfn run_extra_rack("))
+            .map(|(body, _)| body)
+            .expect("render_lane is declared above run_extra_rack");
+        // The type, not the function name: the note left on that line points
+        // at `run_lane_pdc` on purpose, and a check for the string would be
+        // tripped by the sentence explaining why the line is not there.
+        assert!(
+            !render.contains("DelayLine") && !render.contains("seats.rack_pdc"),
+            "render_lane reaches a compensation line again"
+        );
+        // And the fold does clock it, once, where the audio is consumed.
+        let fold = src
+            .rsplit_once("\u{2500}\u{2500} THE FOLD, a walk of its own \u{2500}\u{2500}")
+            .and_then(|(_, rest)| rest.split_once("self.lane_notes = lane_notes;"))
+            .map(|(body, _)| body)
+            .expect("the fold is labelled and ends where it hands the banks back");
+        assert_eq!(
+            fold.matches("self.run_lane_pdc(").count(),
+            1,
+            "the fold clocks the lane's compensation other than exactly once"
+        );
+    }
+
     /// **The plugin-window poll has to reach every seat, not the first
     /// hundred and eight.** It was gated on `(STRIPS + 1) * INSERTS` bays,
     /// which stops at the channel strips and the two master seats. Every
@@ -4630,8 +4693,6 @@ mod engine_parts {
                     &mut r.racks,
                     &mut r.dx7s,
                     &mut r.keys_lanes,
-                    &mut r.pdc,
-                    &mut r.dry_pdc,
                     ch,
                 )
                 .is_some(),
@@ -4644,8 +4705,6 @@ mod engine_parts {
                 &mut r.racks,
                 &mut r.dx7s,
                 &mut r.keys_lanes,
-                &mut r.pdc,
-                &mut r.dry_pdc,
                 CHANNELS,
             )
             .is_none(),
@@ -4674,8 +4733,6 @@ fn lane_seats<'a>(
     racks: &'a mut [Rack],
     dx7s: &'a mut [Option<Box<crate::dx7::Dx7>>],
     keys_lanes: &'a mut [Option<Box<crate::keys::Keys>>],
-    pdc: &'a mut [DelayLine],
-    dry_pdc: &'a mut [DelayLine],
     ch: usize,
 ) -> Option<LaneSeats<'a>> {
     let extra_at = tangent_ui::recorder::folder_extra_seat(ch);
@@ -4692,8 +4749,6 @@ fn lane_seats<'a>(
         board: high.get_mut(..pedals)?,
         dx7: dx7s.get_mut(ch)?,
         keys: keys_lanes.get_mut(ch)?,
-        rack_pdc: pdc.get_mut(ch)?,
-        dry_pdc: dry_pdc.get_mut(ch)?,
     })
 }
 
@@ -5032,8 +5087,6 @@ struct LaneSeats<'a> {
     board: &'a mut [Rack],
     dx7: &'a mut Option<Box<crate::dx7::Dx7>>,
     keys: &'a mut Option<Box<crate::keys::Keys>>,
-    rack_pdc: &'a mut DelayLine,
-    dry_pdc: &'a mut DelayLine,
 }
 
 /// **What the lane pass decided about one lane before it rendered.**
@@ -5057,9 +5110,6 @@ struct LanePlan<'a> {
     board_runs: bool,
     stems_dry: bool,
     keys_live: bool,
-    pdc_max: u32,
-    folder_lat: u32,
-    pedal_latency: u32,
     notes: &'a [Note],
     controls: &'a [Control],
     sample: Option<&'a SamplerSample>,
@@ -5105,7 +5155,6 @@ fn render_lane(
     let has_audio = plan.has_audio;
     let room_owns = plan.room_owns;
     let armed = plan.armed;
-    let pdc_max = plan.pdc_max;
     let lane_notes = plan.notes;
     let lane_controls = plan.controls;
     // **The lane's SOURCE, planar for the rack — the timeline's
@@ -5354,93 +5403,10 @@ fn render_lane(
             }),
         );
     }
-    // **And the lane waits for the slowest of its neighbours.**
-    //
-    // Straight after the rack and before the fold, which is the one
-    // place a channel's own audio exists as a separate buffer. A
-    // chain that delays by `L` needs `max - L` more to arrive with
-    // everything else; the chain with the most latency waits for
-    // nothing.
-    //
-    // **And the clips wait HERE now**, on this line, by this
-    // formula. They used to wait in `mix_clips`, by a second
-    // arithmetic formula written for a signal that passed through no
-    // rack — one that had to reconstruct, per lane, everything this
-    // one subtracts. The two agreed for a loose channel and were
-    // kept in step by hand for a grouped one; nothing kept them in
-    // step for an AMP-bearing one, where this formula subtracts
-    // seven pedal seats and the clips' never did. There is one
-    // formula now and no way for them to drift.
-    //
-    // Runs whether or not the rack is live, so switching the last
-    // plugin off does not leave the lane early by its own latency
-    // for one block before the figures catch up.
-    {
-        // **One formula, folder or not: wait for what this lane's
-        // audio does NOT pay on its way out.**
-        //
-        // A wait is additive, so where it is inserted does not
-        // matter — only the total. A loose channel pays its own
-        // rack. A child pays its own rack and then every rack it is
-        // folded through. A folder's own row pays no rack HERE, but
-        // its rack runs over the sum a moment later, so it pays it
-        // just the same. All three come to `own + folded through`,
-        // which is why the special case that used to sit here was
-        // both unnecessary and wrong: it left a group a bus
-        // compressor's lookahead late.
-        // **Both racks, folder or not.** A folder pays its second at
-        // the fold and a loose lane pays its own a line above this
-        // one (`run_channel_extra`); either way the audio has been
-        // through six bays by the time it leaves, so the wait
-        // subtracts six bays' worth.
-        let mut own = Rack::latency(desk.shared, ch).saturating_add(
-            Rack::latency(desk.shared, tangent_ui::recorder::folder_extra_seat(ch)),
-        );
-        // An amp-bearing lane also pays its pedal racks on the way
-        // out, so the wait subtracts them too — `publish_latency`
-        // counts them into the target by the same rule, and the two
-        // must not drift or the lane waits for its own pedals.
-        //
-        // A FOLDER's board is armed by either of its racks and runs
-        // at the fold, which is still on this lane's way out, so the
-        // one figure covers both. It used to be `rack_holds_amp` on
-        // this lane's own rack alone, and that was wrong in both
-        // directions at once for a group: an amp in bays 3..5 paid
-        // nothing for a board it wore, and an amp in bay 0 paid for
-        // a board that was not running. See `pedal_latency`.
-        own = own.saturating_add(plan.pedal_latency);
-        let want = usize::try_from(
-            pdc_max
-                .saturating_sub(own)
-                .saturating_sub(plan.folder_lat),
-        )
-        .unwrap_or(0);
-        if let Some(line) = Some(&mut *seats.rack_pdc) {
-            line.run(&mut io.fx_in, frames, want);
-        }
-        // **And the dry copy waits `own` frames LONGER**, on a line
-        // of its own, because it is the one signal here that did not
-        // pay the rack.
-        //
-        // The wet copy's total is `own` of real plugin delay plus
-        // `max - own - folded` of ring: `max - folded`. The dry copy
-        // has no plugin delay at all, so its ring is the whole
-        // `max - folded` and the two come out of the fold on the
-        // same frame. Get this wrong in the obvious way — reuse
-        // `want` — and a dry stems export is correct on every lane
-        // whose plugins report zero latency and silently early on
-        // the one lane carrying the linear-phase EQ, which is the
-        // worst possible distribution of a bug.
-        if plan.stems_dry {
-            let dry_want = usize::try_from(
-                pdc_max.saturating_sub(plan.folder_lat),
-            )
-            .unwrap_or(0);
-            if let Some(line) = Some(&mut *seats.dry_pdc) {
-                line.run(&mut io.dry_io, frames, dry_want);
-            }
-        }
-    }
+    // **The lane does NOT wait here any more.** Its delay compensation used
+    // to run on this line, on the two rings below, and it is clocked at
+    // CONSUMPTION now: see `Renderer::run_lane_pdc`. Nothing a worker owns
+    // advances a ring whose position is the timeline's.
     true
 }
 
@@ -11014,6 +10980,86 @@ impl Renderer {
     /// written by the user interface and an offline render makes no such
     /// write. An offline discard rate is a truthful zero that measures
     /// nothing.
+    /// **The lane waits for the slowest of its neighbours, at CONSUMPTION.**
+    ///
+    /// A chain that delays by `L` needs `max - L` more to arrive with
+    /// everything else; the chain with the most latency waits for nothing.
+    /// And the clips wait here too, by this formula: they used to wait in
+    /// `mix_clips`, by a second arithmetic written for a signal that passed
+    /// through no rack, and the two agreed for a loose channel, were kept in
+    /// step by hand for a grouped one, and nothing kept them in step for an
+    /// AMP-bearing one. There is one formula and no way for them to drift.
+    ///
+    /// **This used to run at the end of `render_lane` and it has moved.** It
+    /// is the same thing today, block for block and sample for sample,
+    /// because `lane_folds` is exactly the set of lanes whose render reached
+    /// that line. It stops being the same thing the moment a lane is
+    /// rendered ahead of the block that consumes it: [`DelayLine::run`]
+    /// advances its write cursor by `frames` on EVERY call, with nothing
+    /// that can rewind it, so a block rendered early and then thrown away
+    /// would shift that lane against the mix permanently, by up to
+    /// `MAX_PDC_FRAMES`. Clocked here it advances exactly once per block
+    /// that is actually heard, whoever rendered it and whenever.
+    ///
+    /// It also reads the latency figures at the instant they are APPLIED
+    /// rather than at the instant the audio was made, which is the right one
+    /// of the two: a plugin whose latency moved in between would otherwise
+    /// align the lane to a figure the desk no longer has.
+    ///
+    /// Runs whether or not the rack is live, so switching the last plugin
+    /// off does not leave the lane early by its own latency for one block
+    /// while the figures catch up.
+    fn run_lane_pdc(&mut self, ch: usize, frames: usize, pdc_max: u32) {
+        let prep = self.lane_prep[ch];
+        // **One formula, folder or not: wait for what this lane's audio does
+        // NOT pay on its way out.** A wait is additive, so where it is
+        // inserted does not matter, only the total. A loose channel pays its
+        // own rack. A child pays its own rack and then every rack it is
+        // folded through. A folder's own row pays no rack here, but its rack
+        // runs over the sum a moment later, so it pays it just the same. All
+        // three come to `own + folded through`, which is why the special
+        // case that used to sit here was both unnecessary and wrong: it left
+        // a group a bus compressor's lookahead late.
+        //
+        // **Both racks, folder or not**, and an amp-bearing lane's seven
+        // pedal racks as well, because they all run on the way out.
+        // `publish_latency` counts them into the target by the same rule and
+        // the two must not drift, or the lane waits for its own pedals.
+        let own = Rack::latency(&self.shared, ch)
+            .saturating_add(Rack::latency(
+                &self.shared,
+                tangent_ui::recorder::folder_extra_seat(ch),
+            ))
+            .saturating_add(prep.pedal_latency);
+        let want = usize::try_from(
+            pdc_max.saturating_sub(own).saturating_sub(prep.folder_lat),
+        )
+        .unwrap_or(0);
+        if let (Some(line), Some(row)) = (self.pdc.get_mut(ch), self.lane_out.get_mut(ch)) {
+            line.run(row, frames, want);
+        }
+        // **And the dry copy waits `own` frames LONGER**, on a line of its
+        // own, because it is the one signal here that did not pay the rack.
+        //
+        // The wet copy's total is `own` of real plugin delay plus
+        // `max - own - folded` of ring: `max - folded`. The dry copy has no
+        // plugin delay at all, so its ring is the whole `max - folded` and
+        // the two come out of the fold on the same frame. Get this wrong in
+        // the obvious way, by reusing `want`, and a dry stems export is
+        // correct on every lane whose plugins report zero latency and
+        // silently early on the one lane carrying the linear-phase EQ, which
+        // is the worst possible distribution of a bug.
+        if self.stems_dry {
+            let dry_want =
+                usize::try_from(pdc_max.saturating_sub(prep.folder_lat)).unwrap_or(0);
+            if let (Some(line), Some(row)) =
+                (self.dry_pdc.get_mut(ch), self.lane_dry.get_mut(ch))
+            {
+                line.run(row, frames, dry_want);
+            }
+        }
+    }
+
     fn note_eligibility(&mut self, wanted: u32, masks: [u32; 3], ns: [u64; 4]) {
         let c = &self.shared.probe;
         let first = c.blocks.fetch_add(1, Ordering::Relaxed) == 0;
@@ -11981,8 +12027,6 @@ impl Renderer {
                 let mut boards = board_blk.chunks_mut(pedals);
                 let mut dx7s = self.dx7s.iter_mut();
                 let mut keys = self.keys_lanes.iter_mut();
-                let mut pdcs = self.pdc.iter_mut();
-                let mut dry_pdcs = self.dry_pdc.iter_mut();
                 let mut outs = self.lane_out.iter_mut();
                 let mut drys = self.lane_dry.iter_mut();
                 let mut scratches = self.lane_scratch.iter_mut();
@@ -11993,8 +12037,6 @@ impl Renderer {
                         Some(board),
                         Some(dx7),
                         Some(keys_lane),
-                        Some(rack_pdc),
-                        Some(dry_pdc),
                         Some(out),
                         Some(dry),
                         Some(scratch),
@@ -12004,8 +12046,6 @@ impl Renderer {
                         boards.next(),
                         dx7s.next(),
                         keys.next(),
-                        pdcs.next(),
-                        dry_pdcs.next(),
                         outs.next(),
                         drys.next(),
                         scratches.next(),
@@ -12024,8 +12064,6 @@ impl Renderer {
                             board,
                             dx7,
                             keys: keys_lane,
-                            rack_pdc,
-                            dry_pdc,
                         },
                         io: LaneIo {
                             fx_in: out,
@@ -12048,9 +12086,6 @@ impl Renderer {
                             board_runs: prep.board_runs,
                             stems_dry,
                             keys_live,
-                            pdc_max,
-                            folder_lat: prep.folder_lat,
-                            pedal_latency: prep.pedal_latency,
                             notes: &notes[ch],
                             controls: &ctls[ch],
                             sample: samples.get(ch).and_then(Option::as_ref),
@@ -12148,6 +12183,8 @@ impl Renderer {
             if !self.lane_folds[ch] {
                 continue;
             }
+            // **The lane's delay compensation, at CONSUMPTION.**
+            self.run_lane_pdc(ch, frames, pdc_max);
             // The fold: fader, send, peak — the channel's own, exactly as
             // every other strip does it.
             let LanePrep { is_folder, armed, .. } = self.lane_prep[ch];

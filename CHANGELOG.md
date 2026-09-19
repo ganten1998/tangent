@@ -69,6 +69,16 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   go out of time alignment after a preset click, lose its settings on close,
   and on Linux stop responding. It is asked over every slot now.
 
+- **Track delay compensation is applied where the audio is used, not where
+  it is made.** Every track carries two small delay lines that hold it back
+  so it lands in time with tracks whose plugins are slower. They used to run
+  as the last step of processing a track. They now run as the first step of
+  mixing it in. Nothing about the sound changes, to the sample, and the whole
+  test suite says so, including the four alignment tests and the one that
+  compares grouped and ungrouped playback. What changes is that a delay line
+  can no longer be advanced by processing that is later discarded, which is
+  the first piece of groundwork for processing tracks ahead of time.
+
 - **The audio panel can show what a look-ahead would have been worth, and
   the answer is nothing.** Set `TANGENT_PROBE=1` and a line appears under the
   render load giving how much of each block's track processing could have been
