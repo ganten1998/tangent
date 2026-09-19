@@ -72,7 +72,7 @@
 #![allow(dead_code)]
 
 use std::mem::{size_of, transmute};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// The time-constraint parameters for one worker, in nanoseconds.
@@ -518,8 +518,22 @@ struct Gate {
     /// wake harmless.
     round: Mutex<u64>,
     wake: Condvar,
-    /// Lanes not yet claimed by any worker, as a bitmask.
-    owed: AtomicU32,
+    /// **The round in the high half, the unclaimed lanes in the low half.**
+    ///
+    /// The round is not decoration. A worker reads the work pointer once per
+    /// round and then loops on this word; if it is descheduled between
+    /// finishing its last lane and its next look, the caller can meanwhile
+    /// have completed its barrier, RETURNED, and dispatched the next chunk,
+    /// which stores a fresh set of lanes here. The worker would then wake,
+    /// claim one of those, and call it through the previous round's pointer,
+    /// which is a `mix_channels` stack frame that has gone. One callback is
+    /// several chunks and therefore several rounds back to back, so the two
+    /// are not far apart in time.
+    ///
+    /// Carrying the round makes that unrepresentable rather than unlikely: a
+    /// claim only succeeds for the round the claimant read, and a worker
+    /// holding a stale round finds nothing to do and parks.
+    owed: AtomicU64,
     /// Lanes finished. The caller waits for this to equal what it asked for.
     done: AtomicU32,
     /// Set once at teardown; a parked worker wakes, sees it and returns.
@@ -555,7 +569,7 @@ impl LanePool {
         let gate = Arc::new(Gate {
             round: Mutex::new(0),
             wake: Condvar::new(),
-            owed: AtomicU32::new(0),
+            owed: AtomicU64::new(0),
             done: AtomicU32::new(0),
             stop: AtomicBool::new(false),
             ready: RtReady::default(),
@@ -623,7 +637,22 @@ impl LanePool {
             }
             return;
         }
-        self.gate.owed.store(lanes, Ordering::Release);
+        // **The round is decided here and PUBLISHED LAST.** The lanes are
+        // stamped with it below, the workers read it back off the condvar,
+        // and a claim is refused unless the two agree. The bump itself stays
+        // after the job is written, because that is what orders the two: a
+        // worker that sees this round is guaranteed to see the job that goes
+        // with it, and there is exactly one caller of this method.
+        let round = {
+            let Ok(round) = self.gate.round.lock() else {
+                for ch in lane_iter(lanes) {
+                    work(ch);
+                }
+                return;
+            };
+            round.wrapping_add(1)
+        };
+        self.gate.owed.store(owed_word(round, lanes), Ordering::Release);
         self.gate.done.store(0, Ordering::Release);
         {
             let mut job = match self.gate.job.lock() {
@@ -652,13 +681,13 @@ impl LanePool {
             };
             job.lanes = lanes;
         }
-        if let Ok(mut round) = self.gate.round.lock() {
-            *round = round.wrapping_add(1);
+        if let Ok(mut r) = self.gate.round.lock() {
+            *r = round;
         }
         self.gate.wake.notify_all();
         // **The caller works too**, rather than waiting on four threads to do
         // what five could: the real-time thread is one of the cores.
-        while let Some(ch) = claim(&self.gate.owed) {
+        while let Some(ch) = claim(&self.gate.owed, round) {
             work(ch);
             self.gate.done.fetch_or(1u32 << ch, Ordering::AcqRel);
         }
@@ -724,21 +753,38 @@ fn lane_iter(lanes: u32) -> impl Iterator<Item = usize> {
 /// The `fetch_and` that clears the bit is what makes a lane one worker's:
 /// whoever observed it set and cleared it owns it, and nobody else can
 /// observe the same transition.
-fn claim(owed: &AtomicU32) -> Option<usize> {
+fn claim(owed: &AtomicU64, round: u64) -> Option<usize> {
     loop {
         let now = owed.load(Ordering::Acquire);
-        if now == 0 {
+        // **Not my round, not my work.** See the field: this is the whole of
+        // what stops a late worker running the previous round's closure.
+        if now >> LANE_BITS != round & ROUND_MASK {
             return None;
         }
-        let ch = now.trailing_zeros() as usize;
-        let bit = 1u32 << ch;
+        let lanes = now as u32;
+        if lanes == 0 {
+            return None;
+        }
+        let ch = lanes.trailing_zeros() as usize;
+        // Clearing one lane bit leaves the round where it is.
         if owed
-            .compare_exchange_weak(now, now & !bit, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange_weak(now, now & !(1u64 << ch), Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             return Some(ch);
         }
     }
+}
+
+/// How many low bits of [`Gate::owed`] are the lane mask; the rest is the
+/// round. Thirty-two, because the mask is one bit per channel and there are
+/// thirty-two of those.
+const LANE_BITS: u32 = 32;
+const ROUND_MASK: u64 = u64::MAX >> LANE_BITS;
+
+/// The word a dispatch stores: this round's lanes, stamped with this round.
+fn owed_word(round: u64, lanes: u32) -> u64 {
+    ((round & ROUND_MASK) << LANE_BITS) | u64::from(lanes)
 }
 
 /// One worker's whole life: become real-time, join, then park and work.
@@ -795,7 +841,7 @@ fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: RtPlan) {
         let work: &(dyn Fn(usize) + Sync) = unsafe {
             &*transmute::<(*const (), *const ()), *const (dyn Fn(usize) + Sync)>(job.work)
         };
-        while let Some(ch) = claim(&gate.owed) {
+        while let Some(ch) = claim(&gate.owed, round) {
             work(ch);
             gate.done.fetch_or(1u32 << ch, Ordering::AcqRel);
         }
@@ -813,6 +859,44 @@ fn worker(gate: &Arc<Gate>, wg: Option<&Arc<Workgroup>>, plan: RtPlan) {
 
 #[cfg(test)]
 mod tests {
+    /// **A worker that is late may not take the next round's work.**
+    ///
+    /// The bug this pins shipped. A worker reads the work pointer once per
+    /// round and then loops on the claim word. Between finishing its last
+    /// lane and looking again it can be descheduled, and in that window the
+    /// caller can complete its barrier, RETURN, and dispatch the next chunk,
+    /// which stores a fresh set of lanes. The worker would wake, claim one of
+    /// those, and call it through a pointer to a stack frame that has gone.
+    /// One callback is several chunks, so the two rounds are microseconds
+    /// apart, not milliseconds.
+    ///
+    /// It cannot be caught by running the pool, because it needs one exact
+    /// interleaving and nothing in this repo can force one. What CAN be
+    /// tested is the word: a claim is refused unless the round matches, so
+    /// the interleaving stops being representable.
+    #[test]
+    fn a_stale_worker_claims_nothing() {
+        let owed = AtomicU64::new(owed_word(7, 0b1011));
+        // The round that stored it takes its lanes, lowest first.
+        assert_eq!(claim(&owed, 7), Some(0));
+        assert_eq!(claim(&owed, 7), Some(1));
+        // A worker still in the previous round finds nothing, although there
+        // is plainly work in the word.
+        assert_eq!(owed.load(Ordering::Relaxed) as u32, 0b1000, "lanes are left");
+        assert_eq!(claim(&owed, 6), None, "a stale round claimed the next round's lane");
+        assert_eq!(claim(&owed, 8), None, "a round that has not happened claimed a lane");
+        // And the right round still gets it.
+        assert_eq!(claim(&owed, 7), Some(3));
+        assert_eq!(claim(&owed, 7), None);
+
+        // The round is carried whole, and wraps with the counter rather than
+        // colliding with the lane mask.
+        let wrapped = AtomicU64::new(owed_word(u64::MAX, 1));
+        assert_eq!(claim(&wrapped, u64::MAX), Some(0));
+        let wide = AtomicU64::new(owed_word(3, 1 << 31));
+        assert_eq!(claim(&wide, 3), Some(31), "the top lane was lost to the round");
+    }
+
     /// **The readiness bar is the same everywhere; only the mechanisms
     /// differ.** macOS has a policy AND a workgroup and a worker needs both.
     /// Windows and the unixes have the scheduler and nothing to join, so
