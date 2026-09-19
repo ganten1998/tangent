@@ -192,8 +192,28 @@ pub struct Policy {
     /// one loud block is a discontinuity, not an instrument.
     pub confirm_blocks: u32,
 
-    /// Consecutive blocks below [`Policy::sound_threshold`] that end the drain.
+    /// Consecutive blocks below [`Policy::quiet_threshold`] that end the drain.
     pub quiet_blocks: u32,
+
+    /// **Peak below which the drain calls the probe note GONE**, which is not
+    /// the same question as [`Policy::sound_threshold`] and must not be the
+    /// same number.
+    ///
+    /// `sound_threshold` answers "is this instrument making a sound at all",
+    /// and -40 dBFS is right for that: it separates a cold Augmented GRAND
+    /// PIANO at 0.003 from a warm one at 0.167 with 23 dB of margin. The
+    /// drain was reusing it, and so ended the moment the tail fell BELOW
+    /// -40 dBFS - which is not silence, it is a quiet note. The instance then
+    /// crossed to the audio thread still decaying, and the owner heard "a
+    /// quiet high C" on every open of a session with a piano in it, and found
+    /// it in his renders. `what_a_deskful_of_sampled_instruments_costs_to_open`
+    /// had been printing `handed to the rack at -40.0 dBFS` the whole time.
+    ///
+    /// -80 dBFS, which is below the noise floor of any record anyone will
+    /// make with this, and four times further down than the sounding test.
+    /// The flush usually gets there in one block; this is what catches a
+    /// plugin that ignores it.
+    pub quiet_threshold: f32,
 
     /// MIDI pitch of the probe note. C7 by default: high enough that a piano's
     /// decay is about a second rather than twenty, low enough to be inside the
@@ -250,6 +270,7 @@ impl Default for Policy {
             sound_threshold: 0.01,
             confirm_blocks: 3,
             quiet_blocks: 8,
+            quiet_threshold: 0.0001,
             probe_pitch: 96,
             probe_velocity: 0.5,
             release_velocity: 0.5,
@@ -370,6 +391,15 @@ pub struct Readiness {
     probe_deadline: Duration,
     drain_started: Duration,
     tail_capped: bool,
+    /// Set when the gate wants its caller to flush the instrument, cleared by
+    /// [`Readiness::take_flush`]. The gate does not own the instrument - it
+    /// owns a closure that renders one block - so it can ask and no more.
+    flush_wanted: bool,
+    /// Asked once per warm-up, however many blocks the drain takes.
+    flush_done: bool,
+    /// The peak of the last block rendered before the gate let go: what the
+    /// rack is handed. See [`Readiness::handed_over`].
+    handed_over: f32,
 }
 
 impl Readiness {
@@ -392,6 +422,9 @@ impl Readiness {
             probe_deadline: Duration::ZERO,
             drain_started: Duration::ZERO,
             tail_capped: false,
+            flush_wanted: false,
+            flush_done: false,
+            handed_over: 0.0,
         }
     }
 
@@ -463,12 +496,29 @@ impl Readiness {
             }
         }
 
-        if finite && peak.abs() >= self.policy.sound_threshold {
+        // **Two different questions, two different numbers.** Outside the
+        // drain the question is "is this instrument making a sound at all",
+        // and `sound_threshold` answers it. Inside the drain the question is
+        // "has the test note gone", and -40 dBFS is not gone. See
+        // [`Policy::quiet_threshold`].
+        let quiet_at = if self.phase == Phase::Draining {
+            self.policy.quiet_threshold
+        } else {
+            self.policy.sound_threshold
+        };
+        if finite && peak.abs() >= quiet_at {
             self.sounding_run += 1;
             self.quiet_run = 0;
         } else {
             self.sounding_run = 0;
             self.quiet_run += 1;
+        }
+        // **The flush is asked for once, and only after the release has been
+        // rendered.** Flushing a plugin that still believes the note is down
+        // would leave it holding a note nothing will ever release.
+        if self.phase == Phase::Draining && self.held.is_none() && !self.flush_done {
+            self.flush_done = true;
+            self.flush_wanted = true;
         }
 
         self.advance_phase();
@@ -595,6 +645,10 @@ impl Readiness {
             on: false,
         };
         let _ = render(std::slice::from_ref(&off));
+        // An abandoned warm-up is exactly the case where the tail was never
+        // drained, so this is where a flush is worth most.
+        self.flush_wanted = true;
+        self.flush_done = true;
     }
 
     /// **The one call an integrator needs.** False until the probe is released
@@ -657,6 +711,25 @@ impl Readiness {
     /// probe may still be audible for a moment after arming.
     pub fn probe_tail_capped(&self) -> bool {
         self.tail_capped
+    }
+
+    /// **Does the caller owe the instrument a flush?** True once per warm-up,
+    /// after the probe's release has been rendered, and cleared by reading it.
+    ///
+    /// The host's standard way of telling a VST3 to forget what it is holding
+    /// is to turn processing off and on again; the SDK says a plugin should
+    /// clear its buffers when processing is turned back on. This gate renders
+    /// through a closure and cannot make that call itself, so it asks. See
+    /// [`warm_up`], which is the caller that answers.
+    pub fn take_flush(&mut self) -> bool {
+        std::mem::replace(&mut self.flush_wanted, false)
+    }
+
+    /// **The peak of the last block before the gate let go**, which is what
+    /// the rack is handed and therefore what a listener hears when the
+    /// instance crosses to the audio thread. Zero until [`warm_up`] fills it.
+    pub fn handed_over(&self) -> f32 {
+        self.handed_over
     }
 
     /// A note this gate believes is still sounding. See [`Readiness::cancel`].
@@ -809,10 +882,45 @@ pub fn warm_up(inst: &mut Instance, policy: Policy) -> Readiness {
         }
         let at = started.elapsed();
         gate.step(at, &mut |notes| block_peak(inst, &mut bufs, notes));
+        if gate.take_flush() {
+            flush(inst, &mut bufs);
+        }
     }
     // Failure can latch with the probe still down.
     gate.cancel(&mut |notes| block_peak(inst, &mut bufs, notes));
+    if gate.take_flush() {
+        flush(inst, &mut bufs);
+    }
+    // **What the rack is handed, measured rather than assumed.** One more
+    // block with no events, discarded like every other block here, and its
+    // peak is the level the instance crosses to the audio thread at.
+    gate.handed_over = block_peak(inst, &mut bufs, &[]).unwrap_or(0.0).abs();
     gate
+}
+
+/// **Tell the instrument to forget what it is holding.**
+///
+/// Turning processing off and on again is the host's standard flush: the SDK
+/// says a plugin should clear its buffers when processing is turned back on,
+/// and that is how every DAW's panic button reaches a VST3. Measured on
+/// the modelled piano with a real session's preset, it takes a probe tail from
+/// -40.2 dBFS to silence in one call and costs 125 nanoseconds.
+///
+/// **Not the only defence**, because whether a given plugin really clears is
+/// a fact about that plugin. The drain that follows keeps rendering until the
+/// tail is under [`Policy::quiet_threshold`], so a plugin that ignores this
+/// is caught by the threshold instead of by hope.
+///
+/// Processing is left ON, which is where [`Instance::set_processing`] is
+/// about to be driven anyway by every caller of [`warm_up`].
+fn flush(inst: &mut Instance, bufs: &mut Vec<Vec<f32>>) {
+    // From either starting state: `set_processing` is a no-op when it is
+    // already where it is being put, so the `true` first is what guarantees
+    // the plugin actually sees the off-then-on edge.
+    let _ = inst.set_processing(true);
+    let _ = inst.set_processing(false);
+    let _ = inst.set_processing(true);
+    let _ = block_peak(inst, bufs, &[]);
 }
 
 #[cfg(test)]
@@ -829,6 +937,11 @@ mod tests {
         level: f32,
         /// Blocks the tail keeps sounding after a note-off.
         tail_blocks: u32,
+        /// Peak while the tail is ringing, when that is not the same as
+        /// [`Fake::level`]. A real release is not a cliff: it passes THROUGH
+        /// the level that answers "is this thing sounding" on its way down,
+        /// which is the whole of what this file got wrong.
+        tail_level: Option<f32>,
         /// Sounds with no input at all, like a patch with a running arpeggiator.
         self_sounding: bool,
         /// Blocks after which every render fails.
@@ -851,6 +964,7 @@ mod tests {
                 loads_at: Duration::ZERO,
                 level: 0.2,
                 tail_blocks: 0,
+                tail_level: None,
                 self_sounding: false,
                 fails_at: None,
                 nonfinite_until: None,
@@ -892,7 +1006,12 @@ mod tests {
             } else if self.tail_left > 0 {
                 self.tail_left -= 1;
             }
-            Ok(if sounding { self.level } else { 0.0 })
+            let ringing = !self.holding && sounding;
+            Ok(match (sounding, ringing, self.tail_level) {
+                (false, _, _) => 0.0,
+                (true, true, Some(tail)) => tail,
+                (true, _, _) => self.level,
+            })
         }
 
         fn note_ons(&self) -> usize {
@@ -1002,6 +1121,75 @@ mod tests {
         drive(&mut g, &mut fake, Duration::from_secs(10));
         assert_eq!(g.state(), State::Ready);
         assert_eq!(g.evidence(), Some(Evidence::Probe));
+    }
+
+    /// **A release is not a cliff, and the drain must not treat it as one.**
+    ///
+    /// This is the bug the owner heard: "a quiet high C" on every open of a
+    /// session with a piano in it, and in his renders. C7 is
+    /// [`Policy::probe_pitch`]. The drain counted a block as quiet when it
+    /// fell below [`Policy::sound_threshold`], which is -40 dBFS and answers
+    /// a completely different question, so the gate let go of a piano that
+    /// was still decaying and the instance crossed to the audio thread
+    /// ringing. Measured on the modelled piano before the fix:
+    /// `handed to the rack at -40.0 dBFS`, the threshold to the tenth of a
+    /// decibel.
+    ///
+    /// The fake's tail sits at 0.005 - under the sounding threshold, over
+    /// [`Policy::quiet_threshold`] - and never decays, so a drain that ends
+    /// on the wrong number ends after eight blocks with `tail_capped` false.
+    #[test]
+    fn a_tail_under_the_sounding_threshold_is_not_yet_silence() {
+        let mut fake = Fake::new();
+        fake.tail_blocks = 100_000;
+        fake.tail_level = Some(0.005);
+        let mut g = gate(quick());
+        drive(&mut g, &mut fake, Duration::from_secs(10));
+        assert_eq!(g.state(), State::Ready);
+        assert_eq!(
+            fake.note_ons(),
+            fake.note_offs(),
+            "the release still has to go out"
+        );
+        assert!(
+            g.probe_tail_capped(),
+            "the drain ended believing a note at -46 dBFS was silence; it is the \
+             level the owner heard on every open"
+        );
+    }
+
+    /// **The flush is asked for exactly once, and only after the release.**
+    ///
+    /// Flushing a plugin that still believes the note is down leaves it
+    /// holding a note nothing will ever release, so the order is the point of
+    /// the test and not an implementation detail. See [`Readiness::take_flush`]
+    /// and [`flush`].
+    #[test]
+    fn the_gate_asks_for_one_flush_and_only_once_the_note_is_released() {
+        let mut fake = Fake::new();
+        let mut g = gate(quick());
+        let block = Duration::from_secs_f64(g.block_seconds());
+        let mut at = Duration::ZERO;
+        let mut asks = 0usize;
+        let mut offs_when_asked = None;
+        while g.state() == State::Loading && at < Duration::from_secs(10) {
+            at += block;
+            g.step(at, &mut |notes| fake.render(at, notes));
+            if g.take_flush() {
+                asks += 1;
+                offs_when_asked.get_or_insert(fake.note_offs());
+            }
+        }
+        if g.take_flush() {
+            asks += 1;
+            offs_when_asked.get_or_insert(fake.note_offs());
+        }
+        assert_eq!(asks, 1, "one warm-up, one flush");
+        assert_eq!(
+            offs_when_asked,
+            Some(fake.note_ons()),
+            "the flush was asked for before every probe note had been released"
+        );
     }
 
     #[test]
@@ -1522,6 +1710,109 @@ mod tests {
         assert_eq!(a.probe_pitch, b.probe_pitch);
         assert_eq!(a.drain_cap, b.drain_cap);
         assert_eq!(a.max_rate, b.max_rate);
+    }
+
+    /// Throwaway probe: **after the gate lets go, how loud is the test note
+    /// still, and what silences it?**
+    ///
+    /// ```text
+    /// TANGENT_PROBE_BUNDLE="/Library/Audio/Plug-Ins/VST3/Grand 9.vst3" \
+    /// TANGENT_PROBE_STATE=".../state/insert-state-3-0.bin" \
+    /// cargo test -p tangent-host --lib --release -- --ignored how_loud_the_test_note --nocapture
+    /// ```
+    ///
+    /// The owner hears "a quiet high C" on every open of a session with a
+    /// piano in it, and it is in his renders. C7 is `Policy::probe_pitch`.
+    /// The deskful probe above already reports the handover level and reads
+    /// -40.0 dBFS, which is `Policy::sound_threshold` to the tenth of a
+    /// decibel - the drain ends when the tail falls below the number that
+    /// answers "is this instrument making a sound at all", and then hands the
+    /// instance to the audio thread still making one.
+    ///
+    /// This measures the two things a fix has to choose between: how long the
+    /// tail takes to reach a threshold worth calling silence, and whether the
+    /// VST3 flush (`setProcessing` false then true) gets there for nothing.
+    #[test]
+    #[ignore = "measures a real instrument"]
+    fn how_loud_the_test_note_still_is_when_the_gate_lets_go() {
+        let Some(bundle) = std::env::var_os("TANGENT_PROBE_BUNDLE").map(std::path::PathBuf::from)
+        else {
+            panic!("set TANGENT_PROBE_BUNDLE to a VST3 bundle");
+        };
+        let state: Option<Vec<u8>> = std::env::var("TANGENT_PROBE_STATE")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("{p}: {e}")))
+            .map(|raw| match raw.iter().position(|b| *b == 0) {
+                Some(at) => raw[at + 1..].to_vec(),
+                None => raw,
+            });
+        let module = crate::scan::module_for(&bundle).expect("open the bundle");
+        let class = module.audio_modules().first().expect("a class").clone();
+        let mut inst = Instance::create(&module, &class, Setup::default()).expect("instantiate");
+        if let Some(bytes) = &state {
+            let _ = inst.load_state(bytes);
+        }
+        let gate = warm_up(&mut inst, Policy::at_load());
+        println!("  gate: {:?}, {:?}, tail capped {}", gate.state(), gate.evidence(), gate.probe_tail_capped());
+
+        let db = |v: f32| 20.0 * v.max(1e-12).log10();
+        let frames = inst.setup().max_block.max(1) as f64;
+        let rate = inst.setup().sample_rate.max(1.0);
+        let per_block = frames / rate;
+        let mut bufs: Vec<Vec<f32>> = Vec::new();
+
+        // **What the rack is handed, block by block**, out to five seconds of
+        // rendered audio with no events at all.
+        let mut reached: [Option<f64>; 3] = [None; 3];
+        let marks = [-60.0f32, -80.0, -100.0];
+        let blocks = (5.0 / per_block) as usize;
+        let mut first = 0.0f32;
+        for b in 0..blocks {
+            let pk = block_peak(&mut inst, &mut bufs, &[]).unwrap_or(0.0).abs();
+            if b == 0 {
+                first = pk;
+            }
+            for (i, m) in marks.iter().enumerate() {
+                if reached[i].is_none() && db(pk) < *m {
+                    reached[i] = Some((b + 1) as f64 * per_block);
+                }
+            }
+            if reached.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        println!("  handed over at {:.1} dBFS ({frames} frames per block)", db(first));
+        for (m, at) in marks.iter().zip(reached) {
+            match at {
+                Some(t) => println!("    below {m:>6.0} dBFS after {:.0} ms of rendering", t * 1000.0),
+                None => println!("    below {m:>6.0} dBFS  NOT within 5 s"),
+            }
+        }
+
+        // **Does the standard VST3 flush silence it?** A host that wants a
+        // plugin to forget what it is holding toggles `setProcessing`, and
+        // the SDK says the plugin should clear its buffers when processing is
+        // turned back on. Whether a given plugin really does is a fact about
+        // that plugin, so it is measured rather than assumed.
+        let mut inst2 = Instance::create(&module, &class, Setup::default()).expect("instantiate");
+        if let Some(bytes) = &state {
+            let _ = inst2.load_state(bytes);
+        }
+        let _ = warm_up(&mut inst2, Policy::at_load());
+        let before = block_peak(&mut inst2, &mut bufs, &[]).unwrap_or(0.0).abs();
+        let _ = inst2.set_processing(true);
+        let _ = inst2.set_processing(false);
+        let _ = inst2.set_processing(true);
+        let mut after = 0.0f32;
+        for _ in 0..4 {
+            after = after.max(block_peak(&mut inst2, &mut bufs, &[]).unwrap_or(0.0).abs());
+        }
+        println!(
+            "  setProcessing flush: {:.1} dBFS -> {:.1} dBFS",
+            db(before),
+            db(after)
+        );
     }
 
     /// Throwaway probe: **stage by stage, what does one bay of a real
