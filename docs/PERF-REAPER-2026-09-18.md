@@ -620,10 +620,19 @@ is 1.75 of five performance cores. Doubling the desk to the full grid is 3.5
 cores. A look-ahead converts a per-block wall into a throughput wall, and on
 this machine that wall is roughly three times further out.
 
-**What it would cost, priced for someone who accepts the overhaul:**
-1. Move both PDC delay lines out of `render_lane` and clock them at
+**What it would cost, priced for someone who accepts the overhaul.** The
+owner said go on 2026-09-19; progress is marked here.
+
+1. **DONE.** Move both PDC delay lines out of `render_lane` and clock them at
    CONSUMPTION in the fold. Required for every variant, standalone correctness
    improvement, and the one piece that survives a revert as a gain.
+   `Renderer::run_lane_pdc` runs at the head of the fold's per-lane body;
+   `LaneSeats` no longer carries a `DelayLine` and `LanePlan` no longer
+   carries `pdc_max`, `folder_lat` or `pedal_latency`, so a worker cannot
+   reach a ring the timeline clocks. Behaviour-preserving today, proven by
+   the whole suite including the four compensation tests, the grouped-latency
+   test and the bit-exact fork null test. Pinned by
+   `a_lane_worker_can_no_longer_reach_a_delay_line`.
 2. A per-lane, k-deep clip seed, replacing the one-block whole-desk `clip_lane`.
 3. Per-lane MIDI: split the pitch-keyed `u128` `sounding` ledger and the flat
    `midi_cursor`.
