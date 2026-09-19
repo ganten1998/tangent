@@ -658,6 +658,44 @@ impl StateHandle {
         out.sort_by(|a, b| a.title.cmp(&b.title).then(a.id.cmp(&b.id)));
         out
     }
+
+    /// **What every parameter reads RIGHT NOW, in the plugin's own words** -
+    /// `(title, normalised, display, units)`. Main thread only, like the rest
+    /// of this handle.
+    ///
+    /// A diagnostic, and it earned its place. A session where one compressor
+    /// sounded wrong could not be told apart from a session where the HOST
+    /// had restored that compressor wrong, because nothing outside the
+    /// plugin's own window could say what it was set to: `parameters()`
+    /// answers what knobs exist and where they rest by default, and a saved
+    /// state is an opaque blob. This asks the plugin to read its own dial.
+    ///
+    /// `getParamStringByValue` is what the plugin uses to fill its own
+    /// display, so "-29.3 dB" here is the string a person would see in the
+    /// window, units and all - which is the only form in which a restored
+    /// setting can be compared against what somebody remembers dialling in.
+    pub fn readings(&self) -> Vec<(String, f64, String, String)> {
+        let Some(controller) = self.controller.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for p in self.parameters() {
+            // SAFETY: a live controller on the thread that owns it - the
+            // whole reason this handle is `!Send`.
+            let v = unsafe { controller.getParamNormalized(p.id) };
+            let mut text = [0 as vst3::Steinberg::Vst::TChar; 128];
+            // SAFETY: as above; `text` is a writable 128-unit buffer, which
+            // is what `String128` is defined to be.
+            let ok = unsafe { controller.getParamStringByValue(p.id, v, &raw mut text) };
+            let shown = if ok == kResultOk {
+                crate::instance::utf16_to_string(&text)
+            } else {
+                String::new()
+            };
+            out.push((p.title, v, shown, p.units));
+        }
+        out
+    }
 }
 
 #[cfg(test)]

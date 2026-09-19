@@ -16414,6 +16414,30 @@ impl Engine {
             .and_then(|h| h.save().ok())
     }
 
+    /// **What a hosted bay is SET TO**, in the plugin's own words:
+    /// `(title, normalised, display, units)`, empty for a bay that is not a
+    /// VST3 or publishes no controller. Main thread only, like
+    /// [`Self::save_insert_state`].
+    ///
+    /// Diagnostic. A restored session that sounds wrong and a session the
+    /// host restored wrong are the same observation until somebody can read
+    /// the dial from outside the plugin's window. See
+    /// `tangent_host::StateHandle::readings`.
+    ///
+    /// **Test-only until something in the app asks it**, because a `pub fn`
+    /// in a binary that nothing calls is dead code and the gate says so. The
+    /// caller is `furnish_probe_engine`'s `TANGENT_READ` door, which is how
+    /// a saved session's compressor was read without opening its window.
+    #[cfg(test)]
+    pub fn insert_readings(&self, strip: usize, slot: usize) -> Vec<(String, f64, String, String)> {
+        self.insert_state_handles
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .and_then(Option::as_ref)
+            .map(tangent_host::StateHandle::readings)
+            .unwrap_or_default()
+    }
+
     /// **What one insert offers an automation lane.** `None` for an empty
     /// bay or a plugin with no edit controller, which is legal — a plugin
     /// that publishes no parameters has nothing to automate.

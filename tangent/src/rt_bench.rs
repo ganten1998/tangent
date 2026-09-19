@@ -176,6 +176,119 @@ fn audio_desk(lanes: usize, inserts: &[&str]) -> Engine {
     e
 }
 
+/// **One lane, one real plugin, and a look at what comes out.**
+///
+/// `TANGENT_PLUGIN="/Library/Audio/Plug-Ins/VST3/FabFilter Pro-C 3.vst3"
+/// cargo test --release -p tangent --bin tangent one_plugin_on_one_lane --
+/// --ignored --nocapture`
+///
+/// A breakup reported on one track with one compressor on it, absent when
+/// that compressor is switched off, and invisible to the load meter. This
+/// puts the same plugin on one lane over a steady signal and reports every
+/// place the output steps by more than its neighbourhood can explain, which
+/// is what a click is. A compressor over a constant tone should produce
+/// nothing but a smooth envelope.
+#[test]
+#[ignore = "a hunt with a real plugin, not an assertion"]
+fn one_plugin_on_one_lane() {
+    let Ok(bundle) = std::env::var("TANGENT_PLUGIN") else {
+        println!("set TANGENT_PLUGIN to a .vst3 bundle");
+        return;
+    };
+    if !Path::new(&bundle).exists() {
+        println!("no plugin at {bundle}");
+        return;
+    }
+    // **A steady tone, not noise.** A click in noise is invisible; a click
+    // in a sine is the only thing in the picture. Loud enough that a
+    // compressor has something to do.
+    let rate = f64::from(RATE);
+    let secs = 20.0;
+    let frames = (secs * rate) as usize;
+    let mut samples = Vec::with_capacity(frames * 2);
+    for i in 0..frames {
+        let t = i as f64 / rate;
+        // A tone that swells and falls, so the compressor opens and closes
+        // rather than sitting at one gain reduction for twenty seconds.
+        let env = 0.15 + 0.6 * (0.5 - 0.5 * (t * std::f64::consts::TAU / 4.0).cos());
+        let v = (env * (t * 220.0 * std::f64::consts::TAU).sin()) as f32;
+        samples.push(v);
+        samples.push(v);
+    }
+    let clip = Arc::new(tangent_record::decode::Clip {
+        samples,
+        rate: RATE,
+        source: PathBuf::from("tone.wav"),
+    });
+
+    let mut e = Engine::offline(RATE, Timebase::new()).expect("an offline engine");
+    e.set_armed(0);
+    e.set_midi_off(u64::MAX);
+    e.set_desk(&quiet_desk());
+    let len = clip.frames() as u64;
+    e.set_clips(vec![Placed {
+        clip,
+        strip: 0,
+        start: 0,
+        offset: 0,
+        len,
+        fade_in: 0,
+        fade_out: 0,
+        gain: 1.0,
+    }]);
+    match e.load_insert(0, 0, Some(Path::new(&bundle)), None) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            println!("{bundle} loaded but bay 0 reports no tenant");
+            return;
+        }
+        Err(err) => {
+            println!("{bundle} would not load here: {err}");
+            return;
+        }
+    }
+    e.set_transport(1, 0);
+    e.set_rolling(true);
+
+    let block = 256usize;
+    let blocks = frames / block;
+    let mut out = vec![0.0f32; block * 2];
+    let mut whole: Vec<f32> = Vec::with_capacity(blocks * block * 2);
+    for _ in 0..blocks {
+        out.fill(0.0);
+        e.render_offline(&mut out);
+        whole.extend_from_slice(&out);
+    }
+    let left: Vec<f32> = whole.iter().step_by(2).copied().collect();
+    let peak = left.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    // The step between neighbouring samples of a 220 Hz tone is tiny; the
+    // biggest honest one is at the zero crossing of the loudest passage.
+    let mut steps: Vec<(usize, f32)> = left
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| (i, (w[1] - w[0]).abs()))
+        .collect();
+    steps.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let median = {
+        let mut v: Vec<f32> = left.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[v.len() / 2]
+    };
+    println!(
+        "{}: peak {peak:.4}, median step {median:.6}",
+        Path::new(&bundle).file_stem().unwrap_or_default().to_string_lossy()
+    );
+    for (at, step) in steps.iter().take(10) {
+        println!(
+            "    frame {at} ({:.4} s): step {step:.5} = {:.0}x the median, block boundary {}",
+            *at as f64 / rate,
+            step / median.max(1e-9),
+            at % block == 0
+        );
+    }
+    assert!(peak > 0.01, "the fixture made no sound");
+}
+
 /// **An engine whose lanes carry real impulse responses.**
 ///
 /// The convolver is the one built-in whose cost is set by a file rather than

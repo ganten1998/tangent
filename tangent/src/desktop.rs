@@ -19594,8 +19594,13 @@ mod tests {
         e.set_transport(2, 0);
         e.set_rolling(true);
 
-        let block = 256usize;
-        let seconds = 60usize;
+        let env_usize = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let block = env_usize("TANGENT_BLOCK", 256);
+        let seconds = env_usize("TANGENT_SECONDS", 60);
+        let start = env_usize("TANGENT_START", 0);
+        e.set_transport(3, (start * rate as usize) as u64);
         let blocks = seconds * rate as usize / block;
         let mut out = vec![0.0f32; block * 2];
         let mut whole: Vec<f32> = Vec::with_capacity(blocks * block * 2);
@@ -19669,7 +19674,18 @@ mod tests {
     /// same `live_midi_off` rule the live walk uses.
     fn furnish_probe_engine(e: &mut crate::instrument::Engine, app: &TangentApp, rate: u32) {
         use tangent_ui::recorder::CHANNELS;
-        e.set_desk(&app.desk());
+        // `TANGENT_SOLO=5,7` solos those lanes, so one track can be listened
+        // to through the same master chain the whole mix goes through rather
+        // than through a second code path that would answer about itself.
+        let mut desk = app.desk();
+        if let Ok(list) = std::env::var("TANGENT_SOLO") {
+            for lane in list.split(',').filter_map(|v| v.trim().parse::<usize>().ok()) {
+                if let Some(f) = desk.soloed.get_mut(lane) {
+                    *f = true;
+                }
+            }
+        }
+        e.set_desk(&desk);
         let gains = app.gains();
         for ch in 0..CHANNELS {
             e.set_channel_gain(ch, gains.channels[ch]);
@@ -19681,6 +19697,45 @@ mod tests {
         e.set_metronome_enabled(false);
         e.set_monitor_on(false);
         e.set_folders(app.folder_parents());
+
+        // **The project's own plugin state, and its bypass table.**
+        //
+        // Neither arrives with the document. `TangentApp::open_project` reads
+        // `project.tan`; the knobs live in `<project>/state/` as sidecars and
+        // the real app copies them onto the live shelf at open
+        // (`copy_states_from_shelf`), which is a step of the DESKTOP wrapper
+        // and not of the app this harness drives. Without it every bay here
+        // ran at its shipped defaults — an EQ still flat, a compressor still
+        // at 1 : 1 — which is exactly the "processed stem is the dry stem"
+        // fault `saved_insert_state` documents, and it made a click hunt over
+        // a real session a hunt over a session nobody has.
+        //
+        // The shelf is the one the caller redirected `IVORY_SETTINGS_PATH`
+        // at, so this copies INTO scratch and never writes the project.
+        if let Some(doc) = app.project_doc() {
+            if let Some(dir) = doc.parent().map(|d| d.join("state")) {
+                mirror_sidecars(&dir, &global_state_dir());
+            }
+        }
+        // Keyed by SEAT already, which is what the engine's table wants.
+        // `TANGENT_BYPASS` adds bays to it — `5:1` for "take the compressor
+        // on track six out of circuit" — so two renders of one session can
+        // be differenced to see what one plugin is doing.
+        let seat_bay_list = |key: &str| -> Vec<(usize, usize)> {
+            std::env::var(key)
+                .unwrap_or_default()
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .filter_map(|item| {
+                    let (s, b) = item.split_once(':')?;
+                    Some((s.trim().parse().ok()?, b.trim().parse().ok()?))
+                })
+                .collect()
+        };
+        let mut bypass: Vec<(usize, usize)> = app.insert_bypass().to_vec();
+        bypass.extend(seat_bay_list("TANGENT_BYPASS"));
+        e.set_insert_bypass(&bypass);
+        let skip = seat_bay_list("TANGENT_SKIP");
 
         // **The live arm and MIDI state, which is the whole point.**
         let armed = app.armed_mask();
@@ -19738,7 +19793,45 @@ mod tests {
             let Some(path) = app.insert(seat, bay).filter(|p| !is_instrument_sentinel(p)) else {
                 continue;
             };
+            // `TANGENT_SKIP=5:0` leaves that bay EMPTY rather than bypassed,
+            // which is a different question: a bypassed bay still holds a
+            // plugin, still reports its latency and still walks this loop.
+            if skip.iter().any(|&(s, b)| s == seat && b == bay) {
+                continue;
+            }
             let _ = furnish_mirror_bay(e, None, seat, bay, path);
+        }
+        // `TANGENT_READ=5:1` prints what that bay is set to, as the plugin
+        // itself spells each dial, plus whether its saved state survives a
+        // round trip through this host.
+        for (seat, bay) in seat_bay_list("TANGENT_READ") {
+            let Some(path) = app.insert(seat, bay) else {
+                continue;
+            };
+            let saved = saved_insert_state(seat, bay, path).unwrap_or_default();
+            let again = e.save_insert_state(seat, bay).unwrap_or_default();
+            println!(
+                "  seat {seat} bay {bay} {path}\n    saved {} B, re-saved {} B, identical {}",
+                saved.len(),
+                again.len(),
+                saved == again,
+            );
+            for (title, v, shown, units) in e.insert_readings(seat, bay) {
+                println!("      {title:<24} {v:.6}  {shown} {units}");
+            }
+        }
+        if std::env::var_os("TANGENT_SEATS").is_some() {
+            for i in 0..(crate::instrument::RACK_SEATS * inserts) {
+                let (seat, bay) = (i / inserts, i % inserts);
+                let Some(path) = app.insert(seat, bay) else {
+                    continue;
+                };
+                println!(
+                    "    seat {seat} bay {bay}: state {} B  bypassed {}  {path}",
+                    saved_insert_state(seat, bay, path).map_or(0, |v| v.len()),
+                    e.insert_bypassed(seat, bay),
+                );
+            }
         }
 
         finish(e, app, rate);
