@@ -3847,6 +3847,14 @@ fn lane_seats<'a>(
 struct LanePrep {
     is_folder: bool,
     armed: bool,
+    is_builtin: bool,
+    is_keys: bool,
+    rack_live: bool,
+    has_audio: bool,
+    room_owns: bool,
+    board_runs: bool,
+    folder_lat: u32,
+    pedal_latency: u32,
 }
 
 /// **The buffers one lane renders through.**
@@ -5223,12 +5231,24 @@ struct Renderer {
     lane_loud: Vec<bool>,
     /// Deinterleaved in and out for it. Preallocated, like everything else the
     /// audio thread touches.
+    /// **Each lane's own notes and controls for this chunk.**
+    ///
+    /// One pair served the whole desk while the pass was a single walk,
+    /// because a lane's list was built and consumed before the walk reached
+    /// the next one. The deciding half fills these and the render half
+    /// reads them, so every lane's list has to survive until its render:
+    /// thirty-two pairs, each at the capacity the shared pair had, filled by
+    /// a swap rather than a copy so no block allocates.
+    lane_note_bank: Vec<Vec<Note>>,
+    lane_ctl_bank: Vec<Vec<Control>>,
     /// **What the render pass decided about each lane, for the fold.**
     ///
     /// The two the fold cannot re-derive cheaply: whether the lane is a
     /// folder (which owns its own fader, pan and send at the fold) and
     /// whether it is armed (which picks the meter's source).
     lane_prep: [LanePrep; CHANNELS],
+    /// Which lanes the deciding walk left for the render walk to do.
+    lane_wants: [bool; CHANNELS],
     /// Which lanes rendered something to fold this chunk. False for every
     /// way the render walked away: parked, fed by nothing, no rack and no
     /// audio, a bank too short, or an inactive instrument on a bare lane.
@@ -9918,7 +9938,9 @@ impl Renderer {
 
         // The per-lane note list, taken out of `self` so the loop below can
         // read the live list and the clips while filling it.
-        // Nothing folds until a render says so; see `lane_folds`.
+        // Nothing renders until the deciding walk says so, and nothing
+        // folds until a render says so.
+        self.lane_wants = [false; CHANNELS];
         self.lane_folds = [false; CHANNELS];
         let mut lane_notes = std::mem::take(&mut self.lane_notes);
         // Taken out of `self` for the same reason `lane_notes` is: the loop
@@ -10449,12 +10471,14 @@ impl Renderer {
                 }
                 continue;
             }
-            // **The lane, rendered.** See `render_lane`: the same seed,
-            // instruments, dry copy, pedalboard, racks and delay lines that
-            // stood here, over one lane's own seats and buffers rather than
-            // over the whole renderer. The claim on the pedalboard is taken
-            // HERE, while the pass is still serial, because `board_ran` is
-            // one word for the whole desk.
+            // ── and that is the end of what deciding this lane costs ──
+            //
+            // Everything above mutates state the whole desk shares: the
+            // sounding ledger keyed by pitch, the active-clip list and its
+            // cap, the pad hits and their cap, the MIDI cursors. It is one
+            // walk and stays one walk. What is recorded here is exactly what
+            // the render needs and nothing that would make it ask the desk a
+            // question.
             let room_owns = self.room_rack & (1u32 << ch.min(31)) != 0;
             // **Claimed only where the render would have claimed it.** The
             // board call sat inside the `rack_live && !is_folder &&
@@ -10467,25 +10491,56 @@ impl Renderer {
                 && !room_owns
                 && self.amp_board_arms(ch)
                 && self.claim_board(ch, false);
-            let pedal_latency = self.pedal_latency(ch);
-            let plan = LanePlan {
-                ch,
-                frames,
+            self.lane_prep[ch] = LanePrep {
+                is_folder,
+                armed,
                 is_builtin,
                 is_keys,
-                is_folder,
                 rack_live,
                 has_audio,
                 room_owns,
-                armed,
                 board_runs,
+                folder_lat: self.folder_lat[ch],
+                pedal_latency: self.pedal_latency(ch),
+            };
+            // **Banked by a swap, not a copy.** The local keeps the bank's
+            // old allocation and clears it at the top of the next lane, so
+            // thirty-two lists cost thirty-two swaps and no block allocates.
+            std::mem::swap(&mut lane_notes, &mut self.lane_note_bank[ch]);
+            std::mem::swap(&mut lane_controls, &mut self.lane_ctl_bank[ch]);
+            self.lane_wants[ch] = true;
+        }
+
+        // ── THE RENDER, a walk of its own ────────────────────────────────
+        //
+        // Nothing in here reads or writes anything another lane's render
+        // touches: its own seats, its own row of `lane_out`, and a read-only
+        // view of a desk that stopped changing when the walk above ended.
+        // That is what makes it forkable, and the reason the deciding half
+        // had to be lifted out first.
+        for ch in 0..CHANNELS {
+            if !self.lane_wants[ch] {
+                continue;
+            }
+            let prep = self.lane_prep[ch];
+            let plan = LanePlan {
+                ch,
+                frames,
+                is_builtin: prep.is_builtin,
+                is_keys: prep.is_keys,
+                is_folder: prep.is_folder,
+                rack_live: prep.rack_live,
+                has_audio: prep.has_audio,
+                room_owns: prep.room_owns,
+                armed: prep.armed,
+                board_runs: prep.board_runs,
                 stems_dry: self.stems_dry,
                 keys_live: self.keys_live,
                 pdc_max,
-                folder_lat: self.folder_lat[ch],
-                pedal_latency,
-                notes: &lane_notes,
-                controls: &lane_controls,
+                folder_lat: prep.folder_lat,
+                pedal_latency: prep.pedal_latency,
+                notes: &self.lane_note_bank[ch],
+                controls: &self.lane_ctl_bank[ch],
                 sample: self.sampler_samples.get(ch).and_then(Option::as_ref),
             };
             let desk = DeskRef {
@@ -10520,7 +10575,6 @@ impl Renderer {
             if !render_lane(&mut seats, &mut io, &plan, &desk) {
                 continue;
             }
-            self.lane_prep[ch] = LanePrep { is_folder, armed };
             self.lane_folds[ch] = true;
         }
         // ── THE FOLD, a walk of its own ──────────────────────────────────
@@ -12275,7 +12329,14 @@ impl Engine {
             racks,
             lane_quiet: vec![0; CHANNELS],
             lane_loud: vec![false; CHANNELS],
+            lane_note_bank: (0..CHANNELS)
+                .map(|_| Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2))
+                .collect(),
+            lane_ctl_bank: (0..CHANNELS)
+                .map(|_| Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3))
+                .collect(),
             lane_prep: [LanePrep::default(); CHANNELS],
+            lane_wants: [false; CHANNELS],
             lane_folds: [false; CHANNELS],
             lane_out: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
             lane_dry: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
@@ -18051,7 +18112,14 @@ mod tests {
             racks,
             lane_quiet: vec![0; CHANNELS],
             lane_loud: vec![false; CHANNELS],
+            lane_note_bank: (0..CHANNELS)
+                .map(|_| Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2))
+                .collect(),
+            lane_ctl_bank: (0..CHANNELS)
+                .map(|_| Vec::with_capacity(MAX_CONTROLS_PER_BLOCK + 3))
+                .collect(),
             lane_prep: [LanePrep::default(); CHANNELS],
+            lane_wants: [false; CHANNELS],
             lane_folds: [false; CHANNELS],
             lane_out: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
             lane_dry: vec![vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS]; CHANNELS],
