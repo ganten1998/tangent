@@ -101,6 +101,16 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **Automation on a plugin insert reaches the plugin.** It never has. The
+  host files a block's automation points into the parameter pool the plugin
+  reads, and then cleared that pool before calling the plugin, so the count
+  it reported was zero and every curve was silently inert: the knob moved on
+  screen, the project saved the curve, and the sound never changed. Built-in
+  and LV2 inserts were unaffected, because their parameters take another
+  road. The clear happens first now. Anyone who has drawn automation on a
+  VST3 insert will hear it start working, which is the correct behaviour and
+  is still a change worth knowing about before opening an old project.
+
 - **The dropout count is no longer blind on macOS.** The panel read two
   counters, and both are structurally silent on a Mac: one is the PipeWire
   graph's, which is Linux only, and the other is cpal's, which never sees an

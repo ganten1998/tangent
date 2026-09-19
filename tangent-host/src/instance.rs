@@ -1568,11 +1568,25 @@ impl Instance {
             ch.resize(frames, 0.0);
         }
 
-        // ── the events ──────────────────────────────────────────────────────
+        // ── the parameter changes ───────────────────────────────────────────
         //
-        // Reused, not rebuilt. The list is a COM object the plugin calls into
-        // during `process`, and it used to be `ComWrapper::new`d — an `Arc`
-        // allocation and a refcounted free, per block, on the audio thread.
+        // The pool is reused, not rebuilt: `clear` is one `Cell` write and
+        // every point below is two more. This is the part of `process` that a
+        // plugin calls back into while the audio deadline is running.
+        //
+        // **The clear comes FIRST, and for two years it did not.** It sat
+        // below the automation loop, so every point a curve had just filed
+        // was erased before `process` ran: `clear` sets the pool's used count
+        // to zero, `getParameterCount` returns that count, and the plugin
+        // therefore saw none of them. Every automation lane the owner has
+        // ever drawn on a VST3 insert was inert, silently, while the knob
+        // moved on screen and the saved project kept the curve. It was
+        // introduced by the commit that ADDED automation (6a7051e4, 2026-08-28)
+        // pushing its new loop above a clear that already existed; nothing
+        // moved the clear, and nothing could have noticed without a plugin.
+        // `the_pool_carries_a_curve_into_the_block` is what notices now.
+        self.changes.clear();
+
         // **Automation first, so a curve and a CC that name the same
         // parameter land in one queue in time order.** `queue_for` returns the
         // SAME queue for an id it has already seen this block, and a plugin
@@ -1585,17 +1599,16 @@ impl Instance {
             }
         }
 
+        // ── the events ──────────────────────────────────────────────────────
+        //
+        // Reused, not rebuilt. The list is a COM object the plugin calls into
+        // during `process`, and it used to be `ComWrapper::new`d — an `Arc`
+        // allocation and a refcounted free, per block, on the audio thread.
         self.scratch.events.clear();
         for n in events {
             self.scratch.events.push_note(n);
         }
 
-        // ── the control changes ─────────────────────────────────────────────
-        //
-        // The pool is reused, not rebuilt: `clear` is one `Cell` write and every
-        // point below is two more. This is the part of `process` that a plugin
-        // calls back into while the audio deadline is running.
-        self.changes.clear();
         self.drain_editor_edits();
         let last = frames.saturating_sub(1) as i32;
         let mut unmapped = 0usize;
@@ -2951,6 +2964,58 @@ pub(crate) fn utf16_to_string(raw: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A curve filed this block is still in the pool when `process` runs.**
+    ///
+    /// The order in `process_through` is: clear the pool, file the
+    /// automation, file the editor edits, file the controls, call the
+    /// plugin. For two years the clear sat BELOW the automation loop, so a
+    /// curve's points were filed into the pool and then erased by the clear
+    /// before the plugin could read them: `clear` zeroes the used count and
+    /// `getParameterCount` returns exactly that count. Every automation lane
+    /// ever drawn on a VST3 insert was inert, while the knob moved on screen
+    /// and the project saved the curve.
+    ///
+    /// It needs no plugin to catch, only the pool and the order, which is
+    /// why it is asserted here rather than left to a listener: fill the pool
+    /// the way the automation loop does and ask it what a plugin would ask.
+    #[test]
+    fn the_pool_carries_a_curve_into_the_block() {
+        let pool = ParamChanges::new();
+        // A block's worth of automation on two parameters, as
+        // `resolve_automation` produces it.
+        pool.clear();
+        for (id, offset, value) in [(7u32, 0i32, 0.25f64), (7, 63, 0.75), (11, 0, 0.5)] {
+            let q = pool.queue_for(id).expect("the pool has room for two ids");
+            assert!(q.push(offset, value), "a point would not file");
+        }
+        // What the plugin asks, through the COM interface it is handed.
+        // SAFETY: the pool is live and the index is in range.
+        let count = unsafe { pool.getParameterCount() };
+        assert_eq!(count, 2, "a plugin saw {count} automated parameters instead of 2");
+        let mut ids: Vec<u32> = pool
+            .queues
+            .iter()
+            .take(count as usize)
+            .map(|q| q.id.get())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![7, 11], "the plugin was offered the wrong parameters");
+        // And both points on one parameter survive, which is what makes a
+        // curve a curve rather than a jump.
+        let seven = pool
+            .queues
+            .iter()
+            .take(count as usize)
+            .find(|q| q.id.get() == 7)
+            .expect("parameter 7 has a queue");
+        assert_eq!(seven.len.get(), 2, "the two points on parameter 7 did not survive");
+        // And a clear really does empty it, which is what made the old order
+        // silent rather than merely wrong.
+        pool.clear();
+        // SAFETY: as above.
+        assert_eq!(unsafe { pool.getParameterCount() }, 0);
+    }
 
     #[test]
     fn the_host_reports_a_name_a_plugin_can_read() {
