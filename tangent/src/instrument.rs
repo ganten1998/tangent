@@ -4376,6 +4376,115 @@ mod engine_parts {
         );
     }
 
+    /// **A lane can be asked for a block it is not on.**
+    ///
+    /// This is step 2's deliverable stated as an assertion, and it could not
+    /// have been written before it: the clip source was one block deep for
+    /// the whole desk, so there was no span to ask for but the current one.
+    ///
+    /// Three properties, and the feature needs all three. The answer for a
+    /// span is the audio that span holds, wherever the playhead happens to
+    /// be. Asking for a far span does not disturb the answer for a near one,
+    /// because nothing is stored. And the per-lane spelling agrees with the
+    /// whole-desk one to the bit, which is what lets the whole-desk buffer be
+    /// deleted without listening to anything.
+    #[test]
+    fn a_lane_can_be_asked_for_a_block_it_is_not_on() {
+        use std::path::PathBuf;
+        // Every sample carries the file frame it came from, so a wrong span
+        // is not a small error, it is a readable number.
+        const N: usize = 40_000;
+        let clip = Arc::new(tangent_record::decode::Clip {
+            samples: (0..N * 2)
+                .map(|i| (i / 2) as f32 + if i % 2 == 0 { 0.0 } else { 0.5 })
+                .collect(),
+            rate: 48_000,
+            source: PathBuf::from("ramp.wav"),
+        });
+        const LANE: usize = 6;
+        let clips = vec![Placed {
+            clip,
+            strip: LANE,
+            start: 1_000,
+            offset: 0,
+            len: N as u64,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+        }];
+        let punch = [u64::MAX; CHANNELS];
+        let frames = 512usize;
+        let mut out: Vec<Vec<f32>> = vec![vec![0.0; frames]; TAP_CHANNELS];
+
+        // The span the transport is on, and one eight blocks ahead of it.
+        for at in [1_000u64, 1_000 + 8 * 512] {
+            pull_lane_clips(&clips, LANE, at, frames, u64::MAX, &mut out);
+            for f in 0..frames {
+                let want = (at - 1_000) as f32 + f as f32;
+                assert_eq!(
+                    out[0][f].to_bits(),
+                    want.to_bits(),
+                    "span at {at}, frame {f}: the source answered for the wrong position"
+                );
+                assert_eq!(out[1][f].to_bits(), (want + 0.5).to_bits());
+            }
+        }
+
+        // **Asking far ahead does not disturb the answer for now**, which is
+        // the property a ring would have had to guard with a position key and
+        // a discard rule, and which falls out of storing nothing.
+        let mut near = vec![vec![0.0; frames]; TAP_CHANNELS];
+        pull_lane_clips(&clips, LANE, 1_000, frames, u64::MAX, &mut near);
+        pull_lane_clips(&clips, LANE, 900_000, frames, u64::MAX, &mut out);
+        let mut again = vec![vec![0.0; frames]; TAP_CHANNELS];
+        pull_lane_clips(&clips, LANE, 1_000, frames, u64::MAX, &mut again);
+        assert!(
+            near.iter().zip(&again).all(|(a, b)| a
+                .iter()
+                .zip(b)
+                .all(|(x, y)| x.to_bits() == y.to_bits())),
+            "asking for a distant span changed the answer for the current one"
+        );
+
+        // **And the two spellings agree.** The whole-desk fill is what the
+        // seed still reads; the per-lane pull is what replaces it. They must
+        // produce the same samples or deleting the buffer changes the mix.
+        let stride = CHANNELS * 2;
+        let mut desk = vec![0.0f32; frames * stride];
+        fill_clip_span(&clips, 1_000, frames, &punch, &mut desk);
+        for f in 0..frames {
+            assert_eq!(desk[f * stride + LANE * 2].to_bits(), near[0][f].to_bits());
+            assert_eq!(desk[f * stride + LANE * 2 + 1].to_bits(), near[1][f].to_bits());
+        }
+
+        // A clip that ends inside the span leaves the rest SILENT, and that
+        // is the one genuinely new failure mode: the buffer handed to the
+        // pull is the lane's own previous output, so a fill that zeroed only
+        // what it covered would follow a clip with processed audio at level.
+        out[0][..frames].fill(9.0);
+        out[1][..frames].fill(9.0);
+        let short = vec![Placed {
+            clip: Arc::new(tangent_record::decode::Clip {
+                samples: vec![1.0; 200],
+                rate: 48_000,
+                source: PathBuf::from("short.wav"),
+            }),
+            strip: LANE,
+            start: 0,
+            offset: 0,
+            len: 40,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+        }];
+        pull_lane_clips(&short, LANE, 0, frames, u64::MAX, &mut out);
+        assert!(out[0][..40].iter().all(|v| *v == 1.0), "the clip did not sound");
+        assert!(
+            out[0][40..frames].iter().all(|v| *v == 0.0),
+            "the lane's previous output survived past the end of its clip"
+        );
+    }
+
     /// **Nothing a worker owns may advance a ring the timeline clocks.**
     ///
     /// Both delay compensation lines used to run at the end of `render_lane`
@@ -5373,6 +5482,90 @@ fn fill_clip_span(
             }
             if let Some(v) = dst.get_mut(f * stride + lane * 2 + 1) {
                 *v += cr * env * clip_g;
+            }
+        }
+    }
+}
+
+/// **One LANE's timeline audio for one span, as a pure function of that span.**
+///
+/// The per-lane twin of [`fill_clip_span`], and the shape the rest of the
+/// overhaul is built on: a lane can be asked for any block, not only the one
+/// the callback is on, because nothing is stored and nothing is consumed.
+/// Ask it twice for the same span and it answers the same thing.
+///
+/// `out` is PLANAR, `out[c][..frames]`, which is `fx_in`'s own shape, so the
+/// audio lands where the rack wants it with no interleaved buffer in between.
+///
+/// **It zeroes the whole of `frames` first, unconditionally, and that is not
+/// hygiene.** The caller's buffer is `lane_out[ch]`, which is the lane's own
+/// OUTPUT from last block. A fill that zeroed only the frames a clip covers
+/// would follow a clip ending mid-block with that lane's processed audio at
+/// full level for the rest of the block.
+///
+/// The whole-desk snapshot [`fill_clip_span`] builds was given up on purpose.
+/// Anything later wanting pre-rack timeline audio for the whole desk should
+/// call this once per lane rather than reintroduce a buffer beside it.
+fn pull_lane_clips(
+    clips: &[Placed],
+    ch: usize,
+    at: u64,
+    frames: usize,
+    punch: u64,
+    out: &mut [Vec<f32>],
+) {
+    for c in 0..TAP_CHANNELS {
+        if let Some(dst) = out.get_mut(c) {
+            let n = frames.min(dst.len());
+            dst[..n].fill(0.0);
+        }
+    }
+    let end = at.saturating_add(frames as u64);
+    for placed in clips {
+        if placed.strip.min(CHANNELS - 1) != ch {
+            continue;
+        }
+        let from = at.max(placed.start);
+        let to = end.min(placed.start.saturating_add(placed.len)).min(punch);
+        if to <= from {
+            continue;
+        }
+        let clip_g = if placed.gain.is_finite() {
+            placed.gain.clamp(0.0, 64.0)
+        } else {
+            1.0
+        };
+        for now in from..to {
+            let f = (now - at) as usize;
+            let k = now - placed.start;
+            let i = match usize::try_from(placed.offset + k) {
+                Ok(frame) => frame * 2,
+                Err(_) => continue,
+            };
+            // Bounds-checked rather than trusted, and it must STAY that way:
+            // this runs inside `render_lane`, which runs in the pool closure,
+            // where a panic crosses a thread boundary.
+            let (cl, cr) = match (placed.clip.samples.get(i), placed.clip.samples.get(i + 1)) {
+                (Some(a), Some(b)) => (*a, *b),
+                _ => continue,
+            };
+            let mut env = 1.0f32;
+            if placed.fade_in > 0 && k < placed.fade_in {
+                env *= k as f32 / placed.fade_in as f32;
+            }
+            let left = placed.len - k;
+            if placed.fade_out > 0 && left <= placed.fade_out {
+                env *= (left - 1) as f32 / placed.fade_out as f32;
+            }
+            if let Some(dst) = out.first_mut() {
+                if let Some(v) = dst.get_mut(f) {
+                    *v += cl * env * clip_g;
+                }
+            }
+            if let Some(dst) = out.get_mut(1) {
+                if let Some(v) = dst.get_mut(f) {
+                    *v += cr * env * clip_g;
+                }
             }
         }
     }
@@ -6928,6 +7121,15 @@ struct Renderer {
     /// the audio thread allocates nothing. About a megabyte at
     /// `MAX_BLOCK` × 32 lanes × stereo.
     clip_lane: Vec<f32>,
+    /// **One lane's clip audio, pulled for the room.** `mix_monitor` reads
+    /// the timeline inside a per-sample loop that also advances a smoother,
+    /// so it cannot stream; it fills this once for the input's lane and then
+    /// reads it. Planar, one block, 4 KiB.
+    clip_room: Vec<Vec<f32>>,
+    /// **The punch, snapshotted once a block** so that every reader of the
+    /// timeline sees one value. Written where `mix_clips` used to read the
+    /// atomics inline, and read by both pull sites.
+    punch_now: [u64; CHANNELS],
     /// **APPENDED — which lanes have audio standing on them anywhere on the
     /// timeline**, one bit per channel. Recomputed once a block from the
     /// clip list rather than asked per lane, because the channel walk asks
@@ -8036,7 +8238,7 @@ impl Renderer {
             // and to the bus in one pass. Both were downstream of the effects
             // before and reached neither.
             //
-            self.mix_monitor(n, muted, soloed);
+            self.mix_monitor(n, at, rolling, muted, soloed);
             self.mix_preview(n);
             // The drumpad, upstream of the bus return, the room split and
             // the master — so the pads are limited, mastered, heard and
@@ -9093,7 +9295,12 @@ impl Renderer {
     ///
     /// It reaches the SPEAKERS only when somebody asked to hear it, and the
     /// two used to be the same switch. See the gate below.
-    fn mix_monitor(&mut self, frames: usize, muted: u64, soloed: u64) {
+    /// `at` and `rolling` are the BLOCK'S, handed down from `run_transport`,
+    /// and never `self.pos`: that has already been advanced by `frames` by
+    /// the time this runs, so deriving a position here would give the room
+    /// the next block of the take against the current block of the live
+    /// input, a whole buffer of lead on the one path a player is listening to.
+    fn mix_monitor(&mut self, frames: usize, at: u64, rolling: bool, muted: u64, soloed: u64) {
         // Cleared first, so every path out of here that adds nothing to the
         // mix also leaves the room equal to the take.
         self.room_live = false;
@@ -9619,14 +9826,33 @@ impl Renderer {
             // The clip takes `monitor_gain` exactly as the input does, so the
             // fader sits in the same place for both — ahead of the rack, which
             // is where this pass has always put it.
-            let merge_clip = takes_rack && clip_on_lane && monitoring;
+            //
+            // **And only while the transport rolls.** `mix_clips` returns
+            // after zeroing when it is not, and without that term the parked
+            // position is re-read every callback and the clips buzz one block
+            // of themselves under a readout that says nothing is moving.
+            let merge_clip = takes_rack && clip_on_lane && monitoring && rolling;
+            if merge_clip {
+                // Pulled for THIS block, into a scratch of its own: the read
+                // below is inside a per-sample loop that also advances the
+                // monitor's smoother, so it cannot be streamed.
+                pull_lane_clips(
+                    &self.clips,
+                    lane.min(CHANNELS - 1),
+                    at,
+                    n,
+                    self.punch_now[lane.min(CHANNELS - 1)],
+                    &mut self.clip_room,
+                );
+            }
             for i in 0..n {
                 self.monitor_gain[input] += (target - self.monitor_gain[input]) * self.gain_coeff;
                 for c in 0..TAP_CHANNELS {
                     let col = dev_col(c.min(width - 1));
                     let clip = if merge_clip {
-                        self.clip_lane
-                            .get(i * CHANNELS * 2 + lane * 2 + c.min(1))
+                        self.clip_room
+                            .get(c.min(1))
+                            .and_then(|r| r.get(i))
                             .copied()
                             .unwrap_or(0.0)
                     } else {
@@ -10359,6 +10585,13 @@ impl Renderer {
                 let _ = self.track_retiring.push(old);
             }
         }
+        // **The punch, once a block, before anything can return early.** Two
+        // readers ask the timeline for this block, this walk and the room's,
+        // and a punch read twice could differ between them: `set_punches`
+        // writes it mid-roll at the record press and never rewrites it.
+        for lane in 0..CHANNELS {
+            self.punch_now[lane] = self.shared.punch[lane].load(Ordering::Relaxed);
+        }
         // **Which lanes have audio standing on them ANYWHERE on the
         // timeline** — not "under the playhead this block", and not "while
         // rolling".
@@ -10433,7 +10666,7 @@ impl Renderer {
             } else {
                 0.0
             };
-            punch[lane] = self.shared.punch[lane].load(Ordering::Relaxed);
+            punch[lane] = self.punch_now[lane];
         }
         for _ in 0..frames {
             for lane in 0..CHANNELS {
@@ -14226,6 +14459,8 @@ impl Engine {
             ir: None,
             ir_phase: 0.0,
             clip_lane: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            clip_room: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            punch_now: [u64::MAX; CHANNELS],
             clip_lanes: 0,
             clip_under: 0,
             dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
@@ -19966,6 +20201,8 @@ mod tests {
             ir: None,
             ir_phase: 0.0,
             clip_lane: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            clip_room: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
+            punch_now: [u64::MAX; CHANNELS],
             clip_lanes: 0,
             clip_under: 0,
             dry_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
