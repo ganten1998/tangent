@@ -34,7 +34,28 @@ TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 [ -n "$TOOLCHAIN_BIN" ] && export PATH="$TOOLCHAIN_BIN:$HOME/.cargo/bin:$PATH"
 
 echo "==> cargo test --workspace"
-cargo test --workspace
+# **`--exclude linuxvideo`, because the root `exclude` does not reach it.**
+#
+# Cargo's workspace `exclude` stops auto-discovery; it does NOT stop a package
+# that a member names as a path dependency from becoming a member itself. The
+# other vendored trees escape only because they arrive through
+# `[patch.crates-io]`. `cargo metadata` lists `tangent-record/vendor/linuxvideo`
+# as a member on every platform despite sitting in that exclude list, so
+# `--workspace` builds it unconditionally - and it is a Unix-only crate, so on
+# WINDOWS `cargo test --workspace` does not compile at all (13 errors in
+# `uoctl`: `std::os::fd`, `libc::ioctl`, a missing `platform` module). The
+# target gating in tangent-record/Cargo.toml is correct and irrelevant; a
+# member is built because it is a member.
+#
+# Naming the exclusion here is what the root Cargo.toml's comment already says
+# it wants: no `--workspace` opinions about someone else's code.
+#
+# **`--no-fail-fast`, because otherwise a red gate under-reports.** Without it
+# cargo stops at the first failing test binary and the four crates after
+# `tangent` never run - which on a cross-platform check hid five failures in
+# `tangent_ui` behind one in `tangent`. A gate that is going to fail should say
+# how much is failing.
+cargo test --workspace --exclude linuxvideo --no-fail-fast
 
 echo "==> cargo test -p tangent-core  (stock engine — feature unification hides it above)"
 cargo test -p tangent-core
