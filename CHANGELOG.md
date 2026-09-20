@@ -43,6 +43,9 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Twelve seconds of that desk takes 4.9 seconds to render at a 64-frame
   buffer with this on, against 12.4 with it off.
 
+  This is about PLAYING. Bouncing a mix is a separate path that renders on
+  one core and is not affected by any of it.
+
   **Auto is the setting to use.** It works the length out from the buffer
   size every callback - eight buffers' worth, up to 10.7 ms - and measured
   against every fixed value at every buffer size it lands on the best one
