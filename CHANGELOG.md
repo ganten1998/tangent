@@ -43,8 +43,8 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   Twelve seconds of that desk takes 4.9 seconds to render at a 64-frame
   buffer with this on, against 12.4 with it off.
 
-  This is about PLAYING. Bouncing a mix is a separate path that renders on
-  one core and is not affected by any of it.
+  This is about PLAYING. Bouncing a mix is a separate path, unaffected by
+  any of it, and it got its own speed-up below.
 
   **Auto is the setting to use.** It works the length out from the buffer
   size every callback - eight buffers' worth, up to 10.7 ms - and measured
@@ -86,11 +86,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   rendered both ways differ less than the same song rendered twice the old
   way.
 
-  It also works where spreading live playback across cores currently does
-  not. Playing live needs a real-time scheduling grant from the operating
-  system, and neither the Linux nor the FreeBSD installer asks for one yet,
-  so on those a session quietly renders everything on one core. A bounce
-  asks for no such permission and is unaffected.
+  It also works where spreading live playback across cores can fail
+  silently. Playing live needs a real-time scheduling grant from the
+  operating system; a bounce asks for no such permission and is never
+  affected. On Windows and macOS an app can ask for itself, so there is
+  nothing to arrange. On Linux and FreeBSD the grant is given at install
+  time, and both installers now ask for it - see below.
 
   A bounce uses every core, not just the fast ones. Playing live can only
   use the fast cores - a slow one holds up the whole block and makes
@@ -102,6 +103,22 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   arrangement showing and it comes back on the arrangement; save it on the
   mixer and it comes back on the mixer. It travels in the project file
   beside the theme, so it follows the song rather than the machine.
+
+- **The Linux and FreeBSD installers ask for real-time audio scheduling.**
+  Spreading a song's tracks across cores while it plays needs permission
+  from the operating system, and without it Tangent quietly does all the
+  work on one thread - it does not warn, it just sounds like a slower
+  computer. macOS and Windows let an app ask for itself. Linux and FreeBSD
+  do not: it is granted once, at install time, by something running as root.
+
+  On Linux the installer adds `@audio - rtprio 95` in
+  `/etc/security/limits.d/` and puts you in the `audio` group. On FreeBSD it
+  loads `mac_priority` and puts you in the `realtime` group. Both print what
+  they did, both are undone by `--uninstall`, and `--no-rt` skips it if you
+  would rather arrange it yourself. Neither asks for locked memory, which
+  Tangent does not use.
+
+  Log out and back in for a new group to take effect.
 
 ### Fixed
 
