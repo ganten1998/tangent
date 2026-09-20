@@ -90,6 +90,12 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   cannot: that needs a real-time scheduling grant the system only gives
   root, and a bounce asks for no such thing.
 
+  A bounce uses every core, not just the fast ones. Playing live can only
+  use the fast cores - a slow one holds up the whole block and makes
+  things worse - but nothing is waiting on a bounce block by block, so a
+  slow core doing some of the work beats it doing none. On this machine
+  that is the difference between a bounce taking 3.8 seconds and 1.9.
+
 ### Fixed
 
 - **A frozen track's effects now look and behave frozen.** They are already

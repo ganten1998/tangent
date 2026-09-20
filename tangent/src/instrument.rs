@@ -5454,6 +5454,46 @@ fn fanout_peers() -> usize {
     if cores < 3 { 0 } else { cores - 1 }
 }
 
+/// **How many peers a BOUNCE should use**, which is a different question.
+///
+/// [`fanout_peers`] asks for performance cores, and it is right to: a
+/// worker on an efficiency core in a REAL-TIME fork is slower than not
+/// forking at all, because the block waits for the slowest hand and the
+/// medians split into two populations by core kind. None of that applies
+/// to an export. There is no deadline to miss and no block to wait on; an
+/// efficiency core doing some of the work is strictly better than it doing
+/// none, and the only figure that matters is how much silicon is turning.
+///
+/// So this asks for every core the machine will admit to, less one so the
+/// interface still draws its progress bar. `LanePool::new` clamps to
+/// sixteen.
+///
+/// **Measured, bouncing 96 hosted reverbs at 512-frame blocks**, and the
+/// difference between the two questions is the whole of this function:
+///
+/// | | wall / 12 s | CPU / 12 s |
+/// |---|---|---|
+/// | serial | 13.72 s | 14.04 s |
+/// | performance cores (4 peers) | 3.79 s | 18.10 s |
+/// | every core (14 peers) | **1.87 s** | 23.82 s |
+///
+/// Twice as fast again for asking the right question, and 7.3x over the
+/// serial walk. The CPU figure rises because an efficiency core does less
+/// per watt-second, and for a bounce that is the correct trade: wall clock
+/// is what somebody is waiting through.
+///
+/// **This is what the live gate was costing an export.** On a four-thread
+/// Linux box `performance_cores` halves the count to two, `fanout_peers`
+/// answers zero for anything under three, and the export pool was never
+/// built - a bounce on a machine with four idle cores ran on one. Worse on
+/// a machine with four REAL cores and no hyperthreading, where the same
+/// halving throws away half of a correct answer. Found by the tester on
+/// `dresden`, who measured the fan-out at 1.00x there and went and read
+/// why.
+fn offline_peers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().saturating_sub(1).max(1))
+}
+
 /// The performance cores, or the whole count where a machine has one kind.
 ///
 /// `hw.perflevel0.physicalcpu` is the big cores on Apple silicon and is
@@ -15327,9 +15367,10 @@ impl Engine {
         let Some(r) = self.offline.as_mut() else {
             return;
         };
-        r.fanout = on.then(fanout_peers).filter(|p| *p > 0).map(|peers| {
-            LanePool::new(peers, None, None)
-        });
+        r.fanout = on
+            .then(offline_peers)
+            .filter(|p| *p > 1)
+            .map(|peers| LanePool::new(peers, None, None));
         r.fanout_any = on;
     }
 

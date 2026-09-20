@@ -1671,3 +1671,52 @@ that cannot take the policy does not count toward `ready`, so the live
 fan-out there collapses to the serial walk. The offline pool asks for no
 policy and is unaffected - which is the argument for having built it that
 way rather than a happy accident.
+
+## The bounce was asking the wrong question about cores
+
+The tester on `dresden` measured the fan-out at exactly 1.00x there and
+went and read why rather than reporting a number. `fanout_peers` is
+`performance_cores() - 1`, zero below three, and the non-macOS
+`performance_cores` is `available_parallelism() / 2`. Four threads halve
+to two, two is below three, and **no pool was ever built** - so the export
+fan-out shipped an hour earlier was a no-op on that whole class of machine.
+Worse on a box with four REAL cores and no hyperthreading, where the same
+halving throws away half of a correct answer.
+
+The gate is right for the LIVE fork and wrong for a bounce, and they are
+different questions. A worker on an efficiency core in a real-time fan-out
+is slower than not forking, because the block waits for the slowest hand.
+An export has no block to wait on and no deadline to miss: an efficiency
+core doing some of the work is strictly better than it doing none.
+
+`offline_peers` asks for every core less one. Measured here, bouncing 96
+hosted reverbs at 512-frame blocks:
+
+| | wall / 12 s | CPU / 12 s |
+|---|---:|---:|
+| serial | 13.72 s | 14.04 s |
+| performance cores, 4 peers | 3.79 s | 18.10 s |
+| **every core, 14 peers** | **1.87 s** | 23.82 s |
+
+Twice as fast again, 7.3x over serial, and **REAPER's 3.82 s is now twice
+this**. The CPU figure rises because an efficiency core does less per
+watt-second; for a bounce that is the right trade, because wall clock is
+what somebody is waiting through.
+
+**A measurement that nearly went in the document wrong.** The first run of
+that table reported 13.46 s for the fourteen-peer case - no gain at all -
+and the explanation was that the door turning it on had never reached
+disk. `git status` showed the file unmodified while the edit had reported
+success. The lesson is the cheap one: when a measurement says a change did
+nothing, check the change is there before believing the measurement.
+
+## And the hosted-plugin test found its own bar
+
+Rev PLATE-140 modulates its delay lines with noise, so it differs from
+ITSELF. Holding the fork to a margin over the control's worst SAMPLE does
+not work either, because that figure swings between -24 and -40 dBFS run
+to run. Energy does: across five runs the two serial renders differ by
+0.00 to 0.01 dB of total energy while their samples differ by up to 8 dB
+of spread. Different tail, same amount of it, every time. That is the bar
+the fork is held to for a plugin like this, and Pro-R 2 - which is
+deterministic - is still held to bits.
