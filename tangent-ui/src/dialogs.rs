@@ -424,6 +424,13 @@ pub enum Dialog {
         buffer: Option<u32>,
         /// Rate for both streams, or `None` for the devices' own.
         rate: Option<u32>,
+        /// **How far ahead a track's effects are rendered, in milliseconds;
+        /// zero is off.** Here because it is the same kind of decision as the
+        /// buffer size two rows above it - what this machine can carry,
+        /// traded against how quickly the desk answers - and because a
+        /// setting with no switch is worse than no setting.
+        /// See `Settings::render_ahead_ms`.
+        ahead: f64,
         /// Every audio system this build can open.
         systems: Vec<String>,
         /// The one in use, or `None` for the platform's default.
@@ -1675,6 +1682,9 @@ pub enum DialogAction {
     /// Frames per audio callback, or `None` for the device's own default.
     /// Applies to both streams and reopens them.
     SetBufferFrames(Option<u32>),
+    /// Milliseconds of render-ahead; zero is off. See
+    /// `Settings::render_ahead_ms`.
+    SetRenderAhead(f64),
     /// Sample rate for both streams, or `None` for the devices' own.
     /// Applies to both and reopens them, exactly as the buffer does.
     SetSampleRate(Option<u32>),
@@ -9325,6 +9335,7 @@ fn show_on(
             status,
             buffer,
             rate,
+            ahead,
             systems,
             system,
             rates,
@@ -9896,6 +9907,43 @@ fn show_on(
                                 RichText::new(jack_note.unwrap_or(
                                     "both streams reopen; not while a take is rolling",
                                 ))
+                                .font(plain(10.0))
+                                .color(dim),
+                            );
+                            ui.add_space(10.0);
+
+                            // ── how far ahead a track's effects are rendered ─
+                            //
+                            // Beside the buffer because it is the same
+                            // bargain: what this machine can carry against
+                            // how quickly the desk answers. It does NOT
+                            // reopen a stream and it does NOT add latency -
+                            // a track is rendered earlier in wall clock for
+                            // the same positions - so it is safe to move
+                            // mid-take, unlike the two rows above.
+                            ui.label(
+                                RichText::new("RENDER AHEAD").font(bold(11.0)).color(t.text),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                let mut pick = |ui: &mut egui::Ui, label: &str, val: f64| {
+                                    if ui
+                                        .selectable_label((*ahead - val).abs() < 0.05, label)
+                                        .clicked()
+                                    {
+                                        *ahead = val;
+                                        action = Some(DialogAction::SetRenderAhead(val));
+                                    }
+                                };
+                                pick(ui, "Off", 0.0);
+                                for ms in [2.5_f64, 5.0, 10.7] {
+                                    pick(ui, &format!("{ms:.1} ms"), ms);
+                                }
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "more headroom at a small buffer; a plugin knob lands \
+                                     up to this late",
+                                )
                                 .font(plain(10.0))
                                 .color(dim),
                             );
@@ -15267,6 +15315,7 @@ at: None,
             },
             // The "Device" chip: nothing chosen.
             buffer: None,
+            ahead: 0.0,
             rate: None,
             systems: Vec::new(),
             system: None,
@@ -15364,6 +15413,7 @@ at: None,
                 ..Default::default()
             },
             buffer: Some(512),
+            ahead: 0.0,
             rate: None,
             systems: Vec::new(),
             system: None,
@@ -15442,6 +15492,7 @@ at: None,
                 ..Default::default()
             },
             buffer: Some(256),
+            ahead: 0.0,
             rate: None,
             systems: Vec::new(),
             system: None,

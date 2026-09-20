@@ -10,6 +10,36 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+### Added
+
+- **Render ahead: the CPU headroom of a big buffer at the latency of a
+  small one.** A new row in the audio setup panel, beside the buffer size
+  and off by default.
+
+  A track's effects are normally run once per audio callback, and most of
+  what a plugin costs is paid per call rather than per sample: ninety-six
+  reverbs cost about 765 microseconds before a single frame is rendered.
+  With this on, a track's effects run in longer stretches instead, with the
+  stretches staggered across tracks so each callback refills a share of the
+  desk rather than all of it.
+
+  **Nothing is delayed.** A stretch is rendered earlier in wall clock for
+  the same positions in the song, so the sound comes out when it always
+  did. What does arrive later is the desk's answer to a CHANGE: a plugin
+  knob, an automation edit or a clip edit lands on a rendered-ahead track up
+  to the chosen number of milliseconds late. Faders, sends, mute and solo
+  are applied at the moment the audio is played and are unaffected.
+
+  Measured here on thirty-two tracks carrying three reverbs each, at a
+  64-frame buffer: the worst block goes from 132% of the deadline to 65%,
+  and from 41 misses in 2000 blocks to one. At 128 frames, 84% to 52%.
+
+  Armed tracks, tracks listening to live MIDI, folders, send destinations,
+  sidechained tracks and anything being auditioned always run on the
+  callback's own block, so tracking and monitoring are untouched. So do
+  tracks carrying an instrument, for now, for the reason in the Fixed note
+  below.
+
 ### Fixed
 
 - **A session with a piano in it no longer opens with a quiet high C

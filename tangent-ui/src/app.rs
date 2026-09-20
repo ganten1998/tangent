@@ -28194,6 +28194,7 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             // version of itself.
             status: self.audio_status.clone(),
             buffer: self.settings.buffer_frames(),
+            ahead: self.settings.render_ahead_ms,
             rate: self.settings.sample_rate(),
             systems,
             system: self.settings.audio_system().map(str::to_owned),
@@ -32404,6 +32405,13 @@ fn matches_stock(d: &crate::arrangement::DeskSnap, shipped: &[(usize, &str)]) ->
             }
             DialogAction::BrowseTo(dir) => self.browse_request = Some(dir),
             DialogAction::Browsed { what, path } => self.finish_browse(what, path),
+            DialogAction::SetRenderAhead(ms) => {
+                // No stream reopens and no latency is added, so unlike the
+                // buffer this one is safe to move while a take is rolling.
+                // The engine picks it up on the next publish.
+                self.settings.render_ahead_ms = ms.clamp(0.0, 50.0);
+                self.save_settings();
+            }
             DialogAction::SetBufferFrames(frames) => {
                 self.settings.record_buffer_frames = i64::from(frames.unwrap_or(0));
                 self.save_settings();
