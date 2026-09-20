@@ -1245,3 +1245,80 @@ control - which the change cannot touch - was itself 4.65x worse (3909
 against 840). The two scale together to within 5%, and the p50s scale
 together to within 0.2%. Not shipped. It is worth one run on a quiet
 machine before it is either taken or dropped.
+
+---
+
+# 2026-09-20, later: the rest of the hardening, and the final numbers
+
+## Three more tests, and what they found
+
+`a_stopped_transport_stays_silent_and_comes_back_clean`,
+`varispeed_and_stems_fall_back_to_the_chunk_mid_roll` and
+`the_pins_that_arrive_mid_roll_do_not_re_run_a_rack` cover the modes that
+were previously "asserted by construction". All three failed first time,
+and all three were the same thing, which is worth stating once:
+
+**A grained lane's rack is up to one grain AHEAD of the playhead.** Any
+operation that suspends or re-points it - a stop, varispeed, a stems
+export, a freeze, calling a lane a drum lane - resumes it from a point
+further along than a chunked desk's. For a dense reverb that is a
+PERMANENT decorrelation: two plates whose delay lines differ at all never
+reconverge, so every block after the transition compares at -12 to -15
+dBFS for ever.
+
+And it is inaudible, which the measurement says precisely: **the total
+energy of the two streams differs by 0.01 to 0.06 dB**, worst window 3.21
+dB. Same tail, same loudness, different noise. The samples were the wrong
+thing to compare, exactly as they are for a locate and for a built-in
+instrument's wander.
+
+What IS bit-exact, and is asserted as such: arming a track, punching in,
+and the insert tap. Those leave the rack running, so the drain covers them
+completely and not one sample moves. The distinction is now in the test as
+a field, `keeps_the_rack`, rather than a hope.
+
+## The phase count was wrong for small buffers
+
+`GRAIN_PHASES` was a flat 8: eight groups of lanes refilling at eight
+points across a grain. At a 64-frame callback with a 512-frame grain that
+is exactly one phase per callback, which is why it looked right.
+
+At a **32-frame** callback the same grain spans sixteen callbacks, so two
+phases landed on one block. Measured: **74.9% of the deadline and 270 late
+blocks in 4200 at a 512-frame grain, against 58.4% and 26 at 256** - a
+bigger grain came out worse on a desk where it used LESS CPU. The
+throughput was fine; the work was lumpy.
+
+It is now `grain / frames`, capped at the lane count. Same desk, same
+machine, after: **68.7% and 28 late at 512, 55.6% and 2 at 256.** The off
+control moved 10% between the two runs; the late-block count moved 9.6x.
+
+## The final numbers
+
+96 x Pro-R 2, fan-out forced, 4200 blocks per condition, and a video call
+still running, so still pessimistic.
+
+| callback | render ahead | p50 us | % of deadline | wall / 12 s | CPU / 12 s | late |
+|---|---|---:|---:|---:|---:|---:|
+| 32 fr | off | 1025.0 | 153.8% | 18.45 s | 90.13 s | 4200 |
+| 32 fr | 5 ms | 370.5 | **55.6%** | 6.67 s | 28.47 s | 2 |
+| 32 fr | 10.7 ms | 458.0 | 68.7% | 8.24 s | 20.81 s | 28 |
+| 64 fr | off | 1382.5 | 103.7% | 12.44 s | 59.54 s | 2607 |
+| 64 fr | 5 ms | 713.8 | 53.5% | 6.42 s | 27.58 s | **0** |
+| 64 fr | 10.7 ms | 539.5 | **40.5%** | 4.86 s | 21.11 s | **0** |
+| 128 fr | off | 1807.8 | 67.8% | 8.13 s | 38.35 s | 0 |
+| 128 fr | 5 ms | 1373.7 | 51.5% | 6.18 s | 25.96 s | 0 |
+| 128 fr | 10.7 ms | 1028.0 | **38.6%** | 4.63 s | 19.97 s | 0 |
+
+REAPER, same project, offline, this afternoon: **5.61 s wall, 25.5 s CPU.**
+
+- At **128 frames**: 4.63 s and 19.97 s. Ahead of REAPER's offline render.
+- At **64 frames**: 4.86 s and 21.11 s. Still ahead, at a 1.33 ms deadline.
+- At **32 frames**: 6.67 s and 28.47 s at the setting that suits it. Behind
+  REAPER's offline figure by about 15%, at a 0.67 ms deadline - and
+  possible at all, which it was not this morning.
+
+**At 32 frames, 5 ms is the better setting and 10.7 ms is not**, which is
+the one place the knob's largest value is not its best. Worth saying in the
+panel one day; not worth an automatic choice, because the right answer
+depends on the desk as well as the buffer.
