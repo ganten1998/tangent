@@ -7103,9 +7103,25 @@ pub fn export_source_chip(spec: &crate::ports::ProjectExportSpec) -> usize {
 /// one line here and needs no discipline from anybody later.
 pub fn set_export_source(spec: &mut crate::ports::ProjectExportSpec, chip: usize) {
     spec.master = chip != 1;
+    let had_stems = spec.stems;
     spec.stems = chip != 0;
     if !spec.stems {
         spec.stems_dry = false;
+    } else if !had_stems {
+        // **Arriving at stems comes up DRY.** The owner's ruling, and this is
+        // the only place it can be said: the mode lives in a pair whose
+        // fourth state is closed at this door, so `Default` cannot carry
+        // `stems_dry` while `stems` is off without opening exactly the state
+        // the line above exists to shut. Set it where the choice becomes
+        // reachable instead, which is the same instant the mode row stops
+        // being drawn disabled.
+        //
+        // Only on ARRIVAL, not on every press: a hand that has moved to
+        // Processed and then adjusts something else on the SOURCE row keeps
+        // what it chose. Leaving stems and coming back is a fresh arrival and
+        // does start dry again, which is the same rule and not an exception
+        // to it.
+        spec.stems_dry = true;
     }
 }
 

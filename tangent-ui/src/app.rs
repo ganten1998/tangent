@@ -5581,7 +5581,9 @@ impl TangentApp {
         // would flip a whole selection when the hand meant one of it. The
         // plain press still spreads, which is what keeps a selected group
         // arming together.
-        if (self.alt_down || self.shift_down) && matches!(hit, H::Arm(_)) {
+        if (self.alt_down || self.shift_down)
+            && matches!(hit, H::Arm(_) | H::Mute(_) | H::Solo(_))
+        {
             self.apply_mixer_hit_one(hit, value);
             return;
         }
@@ -5631,6 +5633,24 @@ impl TangentApp {
             // where the ordering that makes it safe lives.
             H::Remove(_) => {}
             _ => {}
+        }
+    }
+
+    /// **What a switch mask becomes when one strip's bit is pressed.**
+    ///
+    /// The arm's arithmetic, lifted so the mute and the solo can share it
+    /// rather than growing their own copy of a rule the owner asked to be
+    /// the same. `alt` is the exclusive gesture: the pressed bit ALONE, or
+    /// nothing at all when it was already alone - which is what makes one
+    /// key both arrive at a single strip and leave with none. Without it the
+    /// press is an ordinary toggle, and whether that toggle spreads across
+    /// the strip selection is decided a layer up in `apply_mixer_hit`.
+    fn switch_next(live: u64, index: usize, alt: bool) -> u64 {
+        let bit = 1u64 << index;
+        if alt {
+            if live == bit { 0 } else { bit }
+        } else {
+            live ^ bit
         }
     }
 
@@ -5767,12 +5787,36 @@ impl TangentApp {
                     self.open_input_menu(n);
                 }
             }
-            H::Mute(i) => self.settings.strip_muted ^= 1 << i.desk_index(),
+            // **The arm's three gestures, on the other two switches.** The
+            // owner: "solo/mute should be subject to the same shift and alt
+            // clicking logic that the record arm button has". Read
+            // `H::Arm`'s block below for the reasoning; this is the same
+            // arithmetic over a different mask, deliberately, because a hand
+            // that has learned one of these three switches has learned all
+            // of them.
+            //
+            // Plain toggles and carries the strip selection with it. ALT is
+            // exclusive - this strip alone - and alt on the strip that is
+            // already alone clears everything, so the same key both arrives
+            // at one and leaves with none. SHIFT toggles ONE strip without
+            // spreading, which is what lets a sweep build or unpick a set.
+            //
+            // Exclusive solo is the gesture this is most worth having: it is
+            // what every other desk means by alt-clicking a solo, and it was
+            // the only way to hear one track that meant clicking every other
+            // track off.
+            H::Mute(i) => {
+                self.settings.strip_muted =
+                    Self::switch_next(self.settings.strip_muted, i.desk_index(), self.alt_down);
+            }
             // **Polarity.** A bit beside the mute's, because it is the same
             // kind of switch: one per strip, about the signal, either on or
             // off. The engine reads the mask and turns it into a sign.
             H::Phase(i) => self.settings.strip_phase ^= 1 << i.desk_index(),
-            H::Solo(i) => self.settings.strip_soloed ^= 1 << i.desk_index(),
+            H::Solo(i) => {
+                self.settings.strip_soloed =
+                    Self::switch_next(self.settings.strip_soloed, i.desk_index(), self.alt_down);
+            }
             // **The icon, and the plus that stands where it will be.**
             //
             // On an UNUSED channel the whole panel is this target and pressing
@@ -44946,6 +44990,63 @@ mod tests {
         assert_eq!(app.settings.strip_muted, muted, "the mute did not come back");
         assert_eq!(app.settings.strip_soloed, soloed, "the solo did not come back");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The mute and the solo answer the arm's three gestures.**
+    ///
+    /// The owner: "solo/mute should be subject to the same shift and alt
+    /// clicking logic that the record arm button has". They were bare
+    /// toggles, so the only way to hear one track was to click every other
+    /// track off - and exclusive solo is the single gesture every other desk
+    /// gives you for that.
+    ///
+    /// Asserted through `apply_mixer_hit`, not `apply_mixer_hit_one`,
+    /// because half the rule lives in the guard there: a MODIFIED press
+    /// touches ONE strip where a plain one carries the whole selection, and
+    /// a test that went straight to the inner call would pass with that
+    /// guard deleted.
+    #[test]
+    fn a_mute_and_a_solo_take_the_arms_modifiers() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::Column;
+        let (_, mut app) = headless(Caps::DESKTOP);
+        let bit = |n: usize| 1u64 << Column(n).desk_index();
+        app.settings.strip_muted = 0;
+        app.settings.strip_soloed = 0;
+
+        // Plain presses stack, exactly as the arm's do.
+        app.apply_mixer_hit(Hit::Mute(Column(2)), 0.0);
+        app.apply_mixer_hit(Hit::Mute(Column(3)), 0.0);
+        assert_eq!(app.settings.strip_muted, bit(2) | bit(3), "plain mutes did not stack");
+        // …and a second plain press takes just that one back out.
+        app.apply_mixer_hit(Hit::Mute(Column(3)), 0.0);
+        assert_eq!(app.settings.strip_muted, bit(2), "a plain mute did not toggle off");
+
+        // SHIFT builds a set and unpicks it, one strip at a time.
+        app.shift_down = true;
+        app.apply_mixer_hit(Hit::Mute(Column(4)), 0.0);
+        assert_eq!(app.settings.strip_muted, bit(2) | bit(4), "shift+mute did not add");
+        app.apply_mixer_hit(Hit::Mute(Column(4)), 0.0);
+        assert_eq!(app.settings.strip_muted, bit(2), "shift+mute could not take it back out");
+        app.shift_down = false;
+
+        // ALT is THIS STRIP ALONE, and alt on the one already alone clears.
+        app.alt_down = true;
+        app.apply_mixer_hit(Hit::Mute(Column(5)), 0.0);
+        assert_eq!(app.settings.strip_muted, bit(5), "alt+mute did not stand the rest down");
+        app.apply_mixer_hit(Hit::Mute(Column(5)), 0.0);
+        assert_eq!(app.settings.strip_muted, 0, "alt+mute on the lone strip did not clear it");
+
+        // The solo is the same arithmetic over the other mask — exclusive
+        // solo being the gesture this whole change is worth having for.
+        app.apply_mixer_hit(Hit::Solo(Column(2)), 0.0);
+        assert_eq!(app.settings.strip_soloed, bit(2), "alt+solo is not exclusive");
+        app.apply_mixer_hit(Hit::Solo(Column(6)), 0.0);
+        assert_eq!(app.settings.strip_soloed, bit(6), "alt+solo did not move the solo");
+        app.alt_down = false;
+
+        // And the two masks stayed out of each other's way throughout.
+        assert_eq!(app.settings.strip_muted, 0, "soloing moved the mutes");
     }
 
     /// **A plain arm TOGGLES; Shift arms one lane alone; the SILENT arms
