@@ -1188,8 +1188,16 @@ pub struct Settings {
     /// grained track up to this many milliseconds late, while faders, sends,
     /// mute and solo are folded at consumption and are unaffected.
     ///
-    /// Measured on 96 hosted reverbs at a 64-frame buffer, 10.7 ms of it
-    /// takes the worst block from 132% of the deadline to 65%.
+    /// **Zero is off and a NEGATIVE is auto**, which is the setting to
+    /// reach for: the engine works the grain out per callback as eight
+    /// buffers' worth capped at 10.7 ms, which measured best at every
+    /// buffer size on a quiet machine. See `instrument::GRAIN_AUTO_BLOCKS`
+    /// for the table that decided the eight.
+    ///
+    /// Measured on 96 hosted reverbs, forked: at a 64-frame buffer the
+    /// worst block goes from 83% of the deadline and 140 late blocks in
+    /// 4200 to 36% and none; at 32 frames, from 124% and every block late
+    /// to 48% and none.
     pub render_ahead_ms: f64,
     /// **Whether the palette FOLLOWS the theme.**
     ///
@@ -3256,7 +3264,12 @@ impl Settings {
             .and_then(|v| v.as_f64())
             .filter(|v| v.is_finite())
         {
-            s.render_ahead_ms = v.clamp(0.0, 50.0);
+            // **Negative is AUTO** and is kept as one value, so the clamp
+            // has to let it through: the engine reads a negative as "work
+            // the grain out from the buffer" (`GRAIN_AUTO`). Anything below
+            // -1 folds onto -1 so a hand-edited file cannot invent a second
+            // spelling of the same mode.
+            s.render_ahead_ms = if v < 0.0 { -1.0 } else { v.clamp(0.0, 50.0) };
         }
         if let Some(n) = map.shift_remove("palette_choice").and_then(|v| v.as_i64()) {
             s.palette_choice =
