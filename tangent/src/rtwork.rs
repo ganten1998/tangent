@@ -62,14 +62,45 @@
 //! grant: without `RLIMIT_RTPRIO` or a `rtkit` grant, `pthread_setschedparam`
 //! returns `EPERM` and the honest answer is the one macOS gives to a refused
 //! join, which is to stop forking and render serially.
-
-// **Not wired to the engine yet, and that is deliberate.** The pool, the
-// policy and the join are one self-contained piece with its own tests; the
-// lane pass that will fork onto it is the commit after this one. Landing
-// them together would have put a worker pool and a rewrite of `mix_channels`
-// in the same diff, which is the one shape a change to the audio thread must
-// not have.
-#![allow(dead_code)]
+//!
+//! # Granting it, which is an install problem and not a code one
+//!
+//! `EPERM` here is not a bug to work around, and there is nothing this
+//! module can do about it: the fix is administrative and belongs to the
+//! installer.
+//!
+//! **FreeBSD is not root-only**, which is the opposite of what a bare
+//! `rtprio(1)` test suggests. The mechanism is `mac_priority(4)`, which
+//! grants `PRIV_SCHED_RTPRIO` and `PRIV_SCHED_SETPOLICY` to members of the
+//! `realtime` group, gid 47 - the direct counterpart of Linux's audio
+//! group. On a stock GhostBSD install the group is already in `/etc/group`
+//! and `mac_priority.ko` is already on disk; what is missing is
+//! `mac_priority_load="YES"` in `loader.conf` and the membership. The
+//! policy matches the GID NUMBER, so a same-named group at another gid
+//! looks right and grants nothing.
+//!
+//! Linux's counterpart is the audio group with an `RLIMIT_RTPRIO` line in
+//! `limits.d`, or rtkit where a session bus has one. Group membership on
+//! its own is usually not enough; the limits line is what grants it, and
+//! it is distro-dependent.
+//!
+//! **Neither installer does this yet.** Measured 2026-09-20 on the tester's
+//! GhostBSD box: `rtprio 10 /usr/bin/true` returns EPERM for an ordinary
+//! uid and succeeds once the module is loaded and the user is in `realtime`.
+//! `installer/linux/install.sh` greps zero for `rtprio`, `RLIMIT_RTPRIO`,
+//! `limits.d`, `rtkit`, `SCHED_FIFO` and the audio group alike, so Linux has
+//! the same silent failure.
+//!
+//! The reason to care which: an ungranted desktop does not fail loudly. It
+//! renders every lane on the callback thread and sounds exactly like a slow
+//! computer, and nothing in the interface can tell the user which one they
+//! have. The grant has to be something the install does rather than
+//! something the user is expected to discover.
+//!
+//! One caution before anyone writes the test: this module takes the policy
+//! through `pthread_setschedparam(SCHED_FIFO)`, not the `rtprio(2)` syscall.
+//! They share `PRIV_SCHED_RTPRIO` so the privilege conclusion carries, but a
+//! green `rtprio(1)` is a proxy for this code path and not a test of it.
 
 use std::mem::{size_of, transmute};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};

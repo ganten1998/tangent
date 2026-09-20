@@ -4,6 +4,7 @@
 #   ./install.sh                 install for everyone (asks for root)
 #   ./install.sh --home          install for just you, no root, no pkg
 #   ./install.sh --no-tune       skip the USB audio latency tunable
+#   ./install.sh --no-rt         skip the real-time scheduling grant
 #   ./install.sh --uninstall     take it back out
 #   ./install.sh --dry-run       print what would happen and do nothing
 #   ./install.sh --help
@@ -37,6 +38,7 @@ Install Tangent on FreeBSD.
   ./install.sh                 install for everyone (asks for root)
   ./install.sh --home          install for just you, no root, no pkg
   ./install.sh --no-tune       skip the USB audio latency tunable
+  ./install.sh --no-rt         skip the real-time scheduling grant
   ./install.sh --uninstall     take it back out
   ./install.sh --dry-run       print what would happen and do nothing
   ./install.sh --help          this
@@ -56,17 +58,29 @@ takes the round trip from 36.7 ms to 27.6 ms, and it is what makes JACK's
 low-latency settings possible at all. It costs nothing measurable in stability
 and it is one clearly marked, reversible line in /etc/sysctl.conf. --no-tune
 skips it; --uninstall removes it.
+
+A system-wide install also puts you in the 'realtime' group and loads the
+mac_priority policy that makes that group mean something. Without it Tangent
+cannot put its render workers on the real-time scheduler, and a worker that
+cannot be scheduled does not count - so the mixer renders every track on one
+core no matter how many you have. This is the same grant the Linux audio
+group exists to give. It is two reversible changes, a group membership and
+one marked line in /boot/loader.conf. --no-rt skips it; --uninstall takes
+back whatever it granted. A new group only applies to new logins, so it asks
+you to log out and back in.
 USAGE
 }
 
 MODE=install
 DRY=0
 TUNE=1
+RT=1
 for arg in "$@"; do
     case "$arg" in
         --home)      MODE=home ;;
         --uninstall) MODE=uninstall ;;
         --no-tune)   TUNE=0 ;;
+        --no-rt)     RT=0 ;;
         --dry-run)   DRY=1 ;;
         -h|--help)   usage; exit 0 ;;
         *) echo "unknown option: $arg" >&2; echo >&2; usage >&2; exit 2 ;;
@@ -79,6 +93,11 @@ done
 TUNE_BEGIN="# --- Tangent audio latency tuning (installer) ---"
 TUNE_END="# --- end Tangent audio latency tuning ---"
 SYSCTL_CONF=/etc/sysctl.conf
+
+RT_BEGIN="# --- Tangent real-time scheduling (installer) ---"
+RT_END="# --- end Tangent real-time scheduling ---"
+LOADER_CONF=/boot/loader.conf
+RT_GROUP=realtime
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '==> %s\n' "$*"; }
@@ -184,6 +203,146 @@ untune_audio() {
     sysctl hw.usb.uaudio.buffer_ms=4 >/dev/null 2>&1 || true
 }
 
+# **Which human asked for this.**
+#
+# ensure_root re-execs the script through doas or sudo, so by the time the
+# grant runs $USER is root and the person who typed the command survives only
+# in what the escalation tool left behind. Both set a variable; logname(1)
+# reads the login name out of the session's utmpx entry and covers `su -` and
+# a root login. Putting root in an unprivileged group would be pointless, so
+# root is rejected at every step rather than silently "succeeding".
+target_user() {
+    for tu_v in "${SUDO_USER:-}" "${DOAS_USER:-}"; do
+        if [ -n "$tu_v" ] && [ "$tu_v" != root ]; then
+            printf '%s\n' "$tu_v"; return 0
+        fi
+    done
+    tu_l="$(logname 2>/dev/null || true)"
+    if [ -n "$tu_l" ] && [ "$tu_l" != root ]; then
+        printf '%s\n' "$tu_l"; return 0
+    fi
+    return 1
+}
+
+# **The grant that decides whether the mixer uses one core or all of them.**
+#
+# Tangent renders lanes onto a worker pool, and the pool is gated on readiness:
+# `rtwork` counts the workers that actually took the real-time policy, and the
+# fork takes the serial walk whenever that count is short of the pool's width.
+# That gate is not defensive programming, it is a measurement — an ordinary
+# timeshare thread misses whole deadlines, and a fork-join is defined by its
+# slowest worker, so a pool that cannot be scheduled is SLOWER than not
+# forking at all.
+#
+# On FreeBSD the policy is SCHED_FIFO through pthread_setschedparam(3), which
+# needs PRIV_SCHED_RTPRIO. Unprivileged, that call returns EPERM, the pool
+# reports zero ready, and every track renders on the callback thread — on one
+# core, silently, with no error the user ever sees. That silence is the whole
+# reason this step exists: nothing in the UI can tell you it happened.
+#
+# mac_priority(4) is FreeBSD's answer and the direct counterpart of the Linux
+# audio group: it grants PRIV_SCHED_RTPRIO and PRIV_SCHED_SETPOLICY to any
+# process running with gid 47, the 'realtime' group. On a stock system that
+# group ALREADY EXISTS in /etc/group and the module is already on disk — the
+# two things missing are the load and the membership, which is all this does.
+#
+# The module is loaded now AND written to loader.conf, for the same reason the
+# sysctl above is applied now and written to sysctl.conf: one for this boot,
+# one for the next. The granted user is recorded inside the marked block so
+# that --uninstall gives back precisely what this granted and nothing more — a
+# user who was already in 'realtime' before Tangent existed keeps it.
+grant_realtime() {
+    [ "$RT" = 1 ] || { say "Skipping the real-time scheduling grant (--no-rt)."; return 0; }
+
+    RT_USER="$(target_user || true)"
+    if [ -z "$RT_USER" ]; then
+        step "Real-time scheduling"
+        say "    Could not tell which user to add to the '$RT_GROUP' group, so this"
+        say "    was skipped. Without it the mixer renders on one core. To do it"
+        say "    by hand:  pw groupmod $RT_GROUP -m <your-username>"
+        return 0
+    fi
+
+    step "Granting real-time scheduling to $RT_USER (mac_priority + '$RT_GROUP' group)"
+
+    if [ "$DRY" = 1 ]; then
+        say "    would kldload mac_priority and append a marked block to $LOADER_CONF"
+        say "    would run: pw groupmod $RT_GROUP -m $RT_USER"
+        return 0
+    fi
+
+    # The group is created if a stripped system lacks it. gid 47 is not
+    # arbitrary: it is the number mac_priority(4) defaults to, and the policy
+    # matches on the NUMBER, so a group of this name at any other gid would
+    # look right in /etc/group and grant nothing.
+    if ! pw groupshow "$RT_GROUP" >/dev/null 2>&1; then
+        pw groupadd "$RT_GROUP" -g 47 2>/dev/null \
+            || say "    could not create the '$RT_GROUP' group"
+    fi
+
+    # Load for this boot. Already-loaded is success, not failure.
+    if ! kldstat -q -m mac_priority 2>/dev/null; then
+        kldload mac_priority >/dev/null 2>&1 \
+            || say "    could not load mac_priority now; it will load at next boot"
+    fi
+
+    # And for the next one. Marked, so --uninstall can find exactly this and
+    # leave anything the user wrote around it alone.
+    if grep -q "^mac_priority_load" "$LOADER_CONF" 2>/dev/null; then
+        say "    a mac_priority_load setting is already present; leaving it alone"
+    else
+        {
+            printf '%s\n' "$RT_BEGIN"
+            printf '%s\n' "# Lets members of the '$RT_GROUP' group (gid 47) use the real-time"
+            printf '%s\n' "# scheduler. Tangent's render workers need it; without it the"
+            printf '%s\n' "# mixer renders every track on one core. See mac_priority(4)."
+            printf '%s\n' "# granted-to: $RT_USER"
+            printf '%s\n' 'mac_priority_load="YES"'
+            printf '%s\n' "$RT_END"
+        } >> "$LOADER_CONF"
+        say "    written to $LOADER_CONF for next boot"
+    fi
+
+    if id -Gn "$RT_USER" 2>/dev/null | grep -qw "$RT_GROUP"; then
+        say "    $RT_USER was already in '$RT_GROUP'; leaving it alone"
+        # Recorded as pre-existing so --uninstall does not take away a
+        # membership this script did not grant.
+        sed -i '' "s|^# granted-to: $RT_USER\$|# granted-to: (pre-existing)|" \
+            "$LOADER_CONF" 2>/dev/null || true
+    else
+        pw groupmod "$RT_GROUP" -m "$RT_USER" \
+            || say "    could not add $RT_USER to '$RT_GROUP'"
+    fi
+}
+
+# Gives back exactly what grant_realtime took, and nothing it found already
+# there. The module is left LOADED: unloading a MAC policy on a running system
+# is not worth doing for an uninstall, and the loader.conf line going away
+# means it is gone at the next boot anyway.
+ungrant_realtime() {
+    grep -q "^$RT_BEGIN$" "$LOADER_CONF" 2>/dev/null || return 0
+    step "Removing the real-time scheduling grant"
+    if [ "$DRY" = 1 ]; then
+        say "    would remove the marked block from $LOADER_CONF and the group membership"
+        return 0
+    fi
+
+    RT_WHO="$(sed -n "s|^# granted-to: ||p" "$LOADER_CONF" 2>/dev/null | head -1)"
+
+    awk -v b="$RT_BEGIN" -v e="$RT_END" '
+        $0 == b { skip = 1 } skip == 0 { print } $0 == e { skip = 0 }
+    ' "$LOADER_CONF" > "$LOADER_CONF.tangent-new" &&
+        mv "$LOADER_CONF.tangent-new" "$LOADER_CONF"
+
+    if [ -n "$RT_WHO" ] && [ "$RT_WHO" != "(pre-existing)" ]; then
+        pw groupmod "$RT_GROUP" -d "$RT_WHO" 2>/dev/null \
+            && say "    $RT_WHO removed from '$RT_GROUP'" \
+            || say "    could not remove $RT_WHO from '$RT_GROUP'"
+    else
+        say "    '$RT_GROUP' membership was not this installer's to remove; kept"
+    fi
+}
+
 case "$MODE" in
 
 install)
@@ -215,12 +374,24 @@ install)
     tune_audio
 
     say ""
+    grant_realtime
+
+    say ""
     step "Done"
     say "Run it from the Multimedia menu, or type: tangent"
     if [ "$TUNE" = 1 ]; then
         say ""
         say "If a USB audio interface is plugged in right now, unplug and replug"
         say "it once — the lower-latency buffering applies when a device attaches."
+    fi
+    # Said last and said plainly, because it is the one step the installer
+    # cannot take for the user and the one whose absence is invisible: a
+    # process keeps the groups it started with, so the running desktop session
+    # is still without the grant no matter what /etc/group now says.
+    if [ "$RT" = 1 ]; then
+        say ""
+        say "Log out and back in before using Tangent. A new group only applies"
+        say "to new logins, and until then the mixer renders on a single core."
     fi
     say "To remove it later:  pkg delete $PKGNAME"
     ;;
@@ -307,6 +478,7 @@ uninstall)
         # remarkable thing for an uninstaller to do unasked.
         run pkg delete -y "$PKGNAME"
         untune_audio
+        ungrant_realtime
         REMOVED=1
         say ""
         say "Dependencies were left installed. To remove any that nothing else"
