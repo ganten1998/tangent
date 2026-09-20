@@ -86,9 +86,11 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   rendered both ways differ less than the same song rendered twice the old
   way.
 
-  It also works on FreeBSD, where spreading live playback across cores
-  cannot: that needs a real-time scheduling grant the system only gives
-  root, and a bounce asks for no such thing.
+  It also works where spreading live playback across cores currently does
+  not. Playing live needs a real-time scheduling grant from the operating
+  system, and neither the Linux nor the FreeBSD installer asks for one yet,
+  so on those a session quietly renders everything on one core. A bounce
+  asks for no such permission and is unaffected.
 
   A bounce uses every core, not just the fast ones. Playing live can only
   use the fast cores - a slow one holds up the whole block and makes

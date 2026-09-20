@@ -1720,3 +1720,82 @@ to run. Energy does: across five runs the two serial renders differ by
 of spread. Different tail, same amount of it, every time. That is the bar
 the fork is held to for a plugin like this, and Pro-R 2 - which is
 deterministic - is still held to bits.
+
+---
+
+# 2026-09-20: two corrections from the FreeBSD box
+
+## FreeBSD is NOT root-only, and the table above says it is
+
+What this document said an hour ago:
+
+| FreeBSD | `rtprio` refused to a normal uid - root only | live fan-out: **no** |
+
+That is wrong, and the mistake was mine: a refused `rtprio(1)` was read as
+"the platform cannot", when it only means "this user has not been granted".
+`rtprio(1)`'s own man page names the way through:
+
+> Only root is allowed to set realtime or idle priority for a process.
+> Exceptional privileges can be granted through the `mac_priority(4)` policy
+> and the `realtime` and `idletime` user groups.
+
+`mac_priority(4)` grants `PRIV_SCHED_RTPRIO` and `PRIV_SCHED_SETPOLICY` to
+members of gid 47, `realtime`. **It is the direct counterpart of Linux's
+audio group.** On a stock GhostBSD install the group is already in
+`/etc/group` and `mac_priority.ko` is already on disk; the two missing
+pieces are `mac_priority_load="YES"` in `loader.conf` and the membership.
+Measured on the tester's box: EPERM for uid 1001 before, `rc=0` after, and
+`idprio` still correctly refused because the same user is not in `idletime`
+- the policy discriminates by gid rather than blanket-granting.
+
+So the corrected row:
+
+| | grant | live fan-out |
+|---|---|---|
+| macOS | mach policy + audio workgroup | yes |
+| Linux | audio group + `RLIMIT_RTPRIO`, or rtkit | yes, where granted |
+| FreeBSD | `mac_priority(4)` + gid 47 `realtime` | yes, where granted |
+
+**And neither installer grants it.** `installer/linux/install.sh` greps
+zero for `rtprio`, `RLIMIT_RTPRIO`, `limits.d`, `limits.conf`,
+`pam_limits`, `rtkit`, `SCHED_FIFO`, `memlock` and the audio group alike -
+verified here, not taken on report. The only group it mentions is
+`video,render` for the GPU, printed as advice rather than executed. So the
+open item is not "does the platform allow it" but "does the install ask for
+it", on both.
+
+## Every live number in this document is a CEILING, not the shipped path
+
+`rt_bench` drives `Engine::offline`, and `instrument.rs:15693` reads:
+
+```rust
+let pool = (!offline || fanout_mode() == Fanout::Force)
+```
+
+An offline engine gets no pool unless `Force` is set. So the bench has two
+settings and neither is production: without `force` it is the serial walk by
+construction, and with `force` the readiness gate is bypassed. The shipped
+gate is `self.fanout_any || p.ready() >= p.width()`, which forks only onto
+workers that actually took the policy.
+
+**Everything quoted here under `TANGENT_FANOUT=force` is therefore the
+hardware ceiling with the gate lifted, not what a session gets.** On macOS
+the grant normally succeeds, so the two should coincide - but that is an
+expectation and nobody has measured it. Measuring the shipped path needs a
+real device open, which this bench cannot provide.
+
+This does not touch the EXPORT numbers: `set_offline_fanout` builds the pool
+the exporter really uses and sets `fanout_any`, so those measure the shipped
+path exactly.
+
+## And a measuring lesson from that box, worth more than its numbers
+
+The tester re-ran `force` right after the RT grant landed and got WORSE
+numbers, with one shape going from 0 to 16 missed blocks. That reads as "the
+grant hurt". It was heat: an i5-1135G7 in a laptop chassis after back-to-back
+cargo builds, a 36% swing in `min` from thermal throttling alone, and the
+serial arm stable to under 1% across a 14C swing because a single-core load
+does not trigger it. Interleaved pairs at matched temperatures put the real
+figures at ~3.2x / ~2.2x / ~2.5x.
+
+A number taken right after a build, on a laptop, is a number about the fan.
