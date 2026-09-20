@@ -1167,3 +1167,81 @@ every callback size a device can actually hand over.
 - **A device that changes buffer size mid-stream** is tested offline, where
   the engine sees the same sequence of spans. The driver's own
   reconfiguration path is not.
+
+---
+
+# 2026-09-20: where this actually stands against REAPER
+
+Same desk, same plugin, same preset as the head-to-head above: 32 tracks,
+three FabFilter Pro-R 2 each, 96 instances, the state out of the owner's
+own `jaco1.RfxChain`.
+
+**The machine was not quiet.** A video call was running for all of it, load
+average 5 to 7. The first attempt at this was a plain sweep and it was
+worthless: the row the grain cannot touch - 512 frames, which is
+`MAX_BLOCK`, so the grain can never exceed the callback - held to 2% across
+four runs while the 128-frame row moved 37%. `grain_ab` was written for
+that: every condition is timed back to back inside one repeat, the ratio is
+taken inside the repeat, and process CPU is recorded beside the wall clock.
+The per-repeat ratio ranges below are the evidence that it worked.
+
+Every Tangent figure here is therefore PESSIMISTIC. REAPER's was taken this
+afternoon on a quieter machine.
+
+## The numbers
+
+Tangent, 64-frame callback, fan-out forced, 10000 blocks per condition:
+
+| render ahead | p50 us | % of 1333 us | wall / 12 s | CPU / 12 s | late blocks |
+|---|---:|---:|---:|---:|---:|
+| off | 1213.9 | 91.0% | 10.92 s | 51.54 s | 840 / 10000 |
+| 5 ms (256 fr) | 650.0 | 48.8% | 5.85 s | 25.10 s | **0** |
+| 10.7 ms (512 fr) | 498.0 | 37.4% | 4.48 s | 18.67 s | **0** |
+
+At a 128-frame callback: 63.1% off, 48.2% at 5 ms, 37.0% at 10.7 ms.
+
+Paired ratios, which are what survives a busy machine: **1.87x** at 5 ms
+(per-repeat range 1.86 to 1.87) and **2.44x** at 10.7 ms (2.41 to 2.44).
+At 128 frames, 1.31x and 1.70x.
+
+REAPER, the same project, `-renderproject`, this afternoon:
+
+| | wall / 12 s | CPU / 12 s |
+|---|---:|---:|
+| 32 tracks x 3 Pro-R 2 | 5.61 s | 25.5 s |
+| 32 tracks, no plugins | 1.77 s | not recorded |
+
+## What it says
+
+**Tangent at a 64-frame live buffer now renders this desk faster, and on
+less CPU, than REAPER renders it OFFLINE.** 4.48 s of wall and 18.67 s of
+CPU against 5.61 s and 25.5 s, with a video call running on Tangent's side
+and not on REAPER's, and with Tangent holding a 1.33 ms deadline that an
+offline render does not have.
+
+That is a different claim from the one this document opened with, and the
+gap it closes is the one it identified: the whole difference was grain
+size, measured at 3.2x, and the grain render recovers 2.44x of it.
+
+**What is NOT claimed.** These are `Engine::offline` with the fan-out
+forced, not a device callback: no driver interleave, no monitor input pass,
+no xrun accounting, and a plain thread rather than a time-constraint one.
+REAPER's CPU includes its UI and writing the file; Tangent's includes
+neither. The two are close enough that the remaining honest statement is
+"level, and no longer behind", not a ranking.
+
+## What a loop costs
+
+A wrap empties every lane's ring, so the block after one rebuilds the whole
+desk's look-ahead. Measured, 10000 blocks at 64 frames with a one-second
+loop: **10 late blocks at 5 ms and 11 at 10.7 ms**, against 0 with no loop,
+and against 840 to 1115 with the feature off. One late block a lap.
+
+**An attempt to remove it failed to measure.** Rebuilding each lane only as
+far as its own phase, so the desk comes back up staggered rather than all
+on one block, halves the post-wrap work on paper. Measured like for like it
+was indistinguishable: 54 late blocks against 11, on a run whose OFF
+control - which the change cannot touch - was itself 4.65x worse (3909
+against 840). The two scale together to within 5%, and the p50s scale
+together to within 0.2%. Not shipped. It is worth one run on a quiet
+machine before it is either taken or dropped.
